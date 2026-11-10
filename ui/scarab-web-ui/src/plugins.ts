@@ -3,15 +3,51 @@
 // form sends and what a badge says.
 //
 // A PluginInstallation is an org's approval of exactly (image digest,
-// manifest). Every catalog plugin installs the same way, pinned by digest;
-// the publisher is a fact shown beside it, not a different path. The server
-// may still refuse an install (a 403 or 409), and its text is shown
-// verbatim. These helpers only let the form say what is wrong before the
-// round trip — where the two could disagree the server wins.
+// manifest). Every plugin installs the same way: the admin names the
+// manifest's git source, reads what it asks for, and installs an image pinned
+// by digest. Who publishes it changes nothing. The server may still refuse an
+// install (a 403 or 409), and its text is shown verbatim. These helpers only
+// let the form say what is wrong before the round trip — where the two could
+// disagree the server wins.
+import { pinnedSourceError } from "./libraries";
 
 /** A PluginInstallation name: a DNS-1123 label, as the server checks it. */
 const DNS1123_LABEL = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
+
+/** Why `source` is not a plugin manifest source
+ *  (`<host>/<owner>/<repo>//<path>@<commit>`, the path `.json`, `.yaml` or
+ *  `.yml`), or `null`. An empty field is not an error yet. */
+export function manifestSourceError(source: string): string | null {
+  return pinnedSourceError(source, {
+    ext: /\.(json|ya?ml)$/,
+    example: "scarab-plugin//manifest.json",
+    hint: "The manifest is a repo-relative .json, .yaml or .yml path.",
+  });
+}
+
+/** The manifest fetch form as the dialog holds it. */
+export type ManifestFetchForm = {
+  source: string;
+  /** A ForgeConnection id; empty = read anonymously. */
+  connection: string;
+};
+
+/** What `POST …/plugin-fetch` carries — structurally the generated
+ *  `FetchPluginManifestRequest`. */
+export type ManifestFetchBody = { source: string; connection?: string };
+
+/** The body for `form`, or the first reason it cannot be sent. */
+export function toManifestFetchBody(
+  form: ManifestFetchForm,
+): { body: ManifestFetchBody; error?: undefined } | { body?: undefined; error: string } {
+  const source = form.source.trim().replace(/^https:\/\//, "");
+  if (!source) return { error: "A source is required." };
+  const problem = manifestSourceError(source);
+  if (problem) return { error: problem };
+  const connection = form.connection.trim();
+  return { body: connection ? { source, connection } : { source } };
+}
 
 /** Why `name` cannot name a new installation, or `null` if it can. `taken`
  *  is the org's current installations; a RETIRED name (uninstalled once) is
@@ -29,54 +65,71 @@ export function installNameError(name: string, taken: readonly string[] = []): s
  * Why `image` cannot be installed, or `null` if it can (or is still empty —
  * the form stays unsubmittable then, without shouting at a blank field).
  *
- * A plugin installs only by digest: `<repository>@sha256:<64 lowercase hex>`.
- * A tag can change under the same name, and what an admin approves is the
- * digest. With `repository` given, the image must come from the repository
- * the catalog lists for the plugin.
+ * A plugin installs only by digest: `<repository>@sha256:<64 lowercase hex>`,
+ * from any repository. A tag can change under the same name, and what an
+ * admin approves is the digest.
  */
-export function imageError(image: string, repository?: string): string | null {
+export function imageError(image: string): string | null {
   if (image.length === 0) return null;
   const at = image.indexOf("@sha256:");
   if (at < 0) return "Pin the image by digest: append @sha256:<digest> — a tag can change under you.";
   const repo = image.slice(0, at);
   const digest = image.slice(at + "@sha256:".length);
-  if (repository && repo !== repository) {
-    return `The image must be ${repository}@sha256:…, the repository the catalog lists for this plugin.`;
-  }
+  if (repo === "" || /\s/.test(repo)) return "Name the image repository before @sha256:.";
   if (!SHA256_HEX.test(digest)) return "The digest must be 64 lowercase hex characters.";
   return null;
 }
 
 /** The install form as the dialog holds it. */
 export type InstallForm = {
-  plugin: string;
   name: string;
   image: string;
   /** Values for the manifest's `config_keys`; blank ones are not sent. */
   config: Record<string, string>;
+  /** Blank claim = no storage. */
+  storage: StorageForm;
+};
+
+/** The reviewed manifest an install names: what `POST …/plugin-fetch`
+ *  returned, and the connection it was read through. */
+export type ReviewedManifest = {
+  source: string;
+  manifest_sha256: string;
+  connection?: string;
 };
 
 /** What `POST /v1/orgs/{org}/plugins` carries — structurally the generated
  *  `InstallPluginRequest`. */
 export type InstallBody = {
-  plugin: string;
   name: string;
   image: string;
+  source: string;
+  manifest_sha256: string;
+  connection?: string;
   config?: Record<string, string>;
+  storage?: StorageBody;
 };
 
-/** The body for `form`, or the first reason it cannot be sent. */
+/** The body for `form` against the manifest just reviewed, or the first
+ *  reason it cannot be sent. */
 export function toInstallBody(
   form: InstallForm,
-  opts: { repository?: string; taken?: readonly string[] } = {},
+  reviewed: ReviewedManifest | null,
+  opts: { taken?: readonly string[] } = {},
 ): { body: InstallBody; error?: undefined } | { body?: undefined; error: string } {
-  if (!form.plugin) return { error: "Pick a plugin to install." };
+  if (!reviewed) return { error: "Read the manifest and review it first." };
   const nameProblem = installNameError(form.name, opts.taken);
   if (nameProblem) return { error: nameProblem };
   const image = form.image.trim();
   if (!image) return { error: "An image is required." };
-  const imageProblem = imageError(image, opts.repository);
+  const imageProblem = imageError(image);
   if (imageProblem) return { error: imageProblem };
+  let storage: StorageBody | undefined;
+  if (form.storage.claim.trim() !== "" || form.storage.mount_path.trim() !== "") {
+    const built = toStorageBody(form.storage);
+    if (!built.body) return { error: built.error };
+    storage = built.body;
+  }
   const config = Object.fromEntries(
     Object.entries(form.config)
       .map(([k, v]) => [k, v.trim()] as const)
@@ -84,12 +137,106 @@ export function toInstallBody(
   );
   return {
     body: {
-      plugin: form.plugin,
       name: form.name,
       image,
+      source: reviewed.source,
+      manifest_sha256: reviewed.manifest_sha256,
+      ...(reviewed.connection ? { connection: reviewed.connection } : {}),
       ...(Object.keys(config).length > 0 ? { config } : {}),
+      ...(storage ? { storage } : {}),
     },
   };
+}
+
+// ── Manifest review ──────────────────────────────────────────────────────
+// What the install dialog shows of a fetched manifest before an admin
+// approves it: every capability, connection slot, config key and gate, and
+// the org's installations of the same plugin.
+
+/** What a capability lets the plugin do, as the review shows it. */
+const CAPABILITY: Record<string, string> = {
+  use_connection: "send reads through the broker on its connections",
+  resolve_gates: "pass or fail the gates it defines",
+  approve_gates: "approve gates",
+  report_deployments: "report deployments",
+  subscribe_events: "subscribe to events",
+  offer_actions: "offer actions",
+  contribute_ui: "contribute UI",
+};
+
+/** A gate input or output: `name: type`, `?` when a Pipeline may omit it. */
+export function gateFieldLabel(f: { name: string; type: string; required: boolean }): string {
+  return `${f.name}: ${f.type}${f.required ? "" : "?"}`;
+}
+
+/** An installation of the same plugin, and whether it approved this exact
+ *  manifest. */
+export type InstalledView = { name: string; image: string; sameManifest: boolean };
+
+/** A fetched manifest as the review lists it. */
+export type ManifestReview = {
+  plugin: string;
+  capabilities: { key: string; label: string }[];
+  connections: { name: string; auth: string; rules: string[] }[];
+  configKeys: string[];
+  gates: { name: string; description: string; inputs: string[]; outputs: string[] }[];
+  installed: InstalledView[];
+};
+
+/** The review of `fetched`: everything its manifest asks for, in the
+ *  manifest's order, and the org's installations of the same plugin. */
+export function manifestReview(fetched: {
+  manifest: {
+    plugin: string;
+    capabilities: readonly string[];
+    connections: readonly {
+      name: string;
+      auth_schemes: readonly string[];
+      read_rules: readonly { method: string; path: string; query: readonly string[] }[];
+    }[];
+    config_keys: readonly string[];
+    gates: readonly {
+      name: string;
+      description: string;
+      inputs: readonly { name: string; type: string; required: boolean }[];
+      outputs: readonly { name: string; type: string; required: boolean }[];
+    }[];
+  };
+  manifest_sha256: string;
+  installed: readonly { name: string; image: string; manifest_sha256: string }[];
+}): ManifestReview {
+  const m = fetched.manifest;
+  return {
+    plugin: m.plugin,
+    capabilities: m.capabilities.map((key) => ({ key, label: CAPABILITY[key] ?? key.replace(/_/g, " ") })),
+    connections: m.connections.map((c) => ({
+      name: c.name,
+      auth: c.auth_schemes.join(", "),
+      rules: c.read_rules.map(ruleLabel),
+    })),
+    configKeys: [...m.config_keys],
+    gates: m.gates.map((g) => ({
+      name: g.name,
+      description: g.description,
+      inputs: g.inputs.map(gateFieldLabel),
+      outputs: g.outputs.map(gateFieldLabel),
+    })),
+    installed: fetched.installed.map((i) => ({
+      name: i.name,
+      image: i.image,
+      sameManifest: i.manifest_sha256 === fetched.manifest_sha256,
+    })),
+  };
+}
+
+/** A name for a new installation: the plugin's own name, or `<plugin>-2`,
+ *  `-3`, … while that is taken. */
+export function suggestedInstallName(plugin: string, taken: readonly string[]): string {
+  if (!taken.includes(plugin)) return plugin;
+  for (let n = 2; ; n++) {
+    const name = `${plugin}-${n}`;
+    if (!taken.includes(name)) return name;
+  }
 }
 
 /** A badge's colour, in the StatusBadge palette's terms: `ok` = a healthy
@@ -146,21 +293,6 @@ export function shortDigest(imageOrDigest: string, chars = 12): string {
 export function imageRepository(image: string): string {
   const at = image.indexOf("@");
   return at >= 0 ? image.slice(0, at) : image;
-}
-
-/**
- * Who publishes a plugin: the owner segment of its image repository, the
- * way a library's publisher is its source's owner.
- * `ghcr.io/thulasi-ram/scarab-plugin-argocd@sha256:…` → `thulasi-ram`. The
- * catalog names no publisher of its own, so this is read from the image.
- * `""` when the repository has no owner segment (`argocd`, `ghcr.io/argocd`).
- */
-export function pluginPublisher(imageOrRepository: string): string {
-  const parts = imageRepository(imageOrRepository.trim()).split("/").filter((p) => p !== "");
-  // A first segment with a "." or ":" (or `localhost`) is a registry host.
-  const first = parts[0] ?? "";
-  if (/[.:]/.test(first) || first === "localhost") parts.shift();
-  return parts.length >= 2 ? parts[0]! : "";
 }
 
 // --- PluginConnections ----------------------------------------

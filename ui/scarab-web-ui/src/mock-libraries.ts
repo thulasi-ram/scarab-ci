@@ -5,7 +5,7 @@
 // list. Page query parameters pick a variant, so each screen can be
 // captured:
 //
-//   /orgs/acme/settings/libraries?libs=empty | ?libs=missing   the two empty states
+//   /orgs/acme/settings/libraries?libs=empty     the empty state
 //   /acme/edge-gateway/runs/<PLUGIN>?gate=pass | exp | kill
 //   /acme/orders-api/run                         the compile errors (pick release)
 //   /acme/orders-api?status=refused              refused rows
@@ -39,11 +39,9 @@ const YANK_REASON =
 
 // ── Settings › Libraries ─────────────────────────────────────────────────
 const installation = (o: Partial<S["LibraryInstallationDto"]> & Pick<S["LibraryInstallationDto"], "publisher" | "name" | "content_hash" | "source">): S["LibraryInstallationDto"] => ({
-  first_party: false,
   installed_by: "a.kim",
   installed_at: ago(6 * day),
   yanked: null,
-  update: null,
   ...o,
 });
 
@@ -54,10 +52,7 @@ const fullLibraries: S["OrgLibrariesDto"] = {
       name: "clone",
       content_hash: CLONE,
       source: CLONE_SRC,
-      first_party: true,
-      installed_by: "scarab:defaults",
       installed_at: ago(20 * day),
-      update: { content_hash: CLONE_NEW, source: CLONE_SRC.replace(/@.*/, "@2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b"), release: "v0.4.1", security_fix: true },
     }),
     installation({ publisher: "acme", name: "deploy-helm", content_hash: HELM, source: HELM_SRC }),
     installation({ publisher: "acme", name: "http-probe", content_hash: PROBE, source: "github.com/acme/scarab-libs//http-probe.yaml@8c2f4e1a9d7b3c5e0f6a2b8d4c1e7f9a3b5d2c6e", installed_by: "j.lee" }),
@@ -81,40 +76,14 @@ const fullLibraries: S["OrgLibrariesDto"] = {
     { content_hash: h("7e2b9a4c1d08"), reason: "pins kaniko v1.23.0, which prints registry credentials when a push fails", yanked_by: "a.kim", yanked_at: ago(2 * 3_600_000) },
     { content_hash: h("91f03ac2d7e5"), reason: "ran helm without --atomic; a failed upgrade left payments-api half rolled out", yanked_by: "a.kim", yanked_at: ago(9 * day) },
   ],
-  first_party: [
-    { publisher: "thulasi-ram", name: "clone", content_hash: CLONE_NEW, source: CLONE_SRC, release: "v0.4.1", security_fix: true, installed: true },
-    { publisher: "thulasi-ram", name: "build-image", content_hash: h("c1d2e3f4a5b6"), source: "github.com/thulasi-ram/scarab-ci//libs/build-image.yaml@2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b", release: "v0.4.1", security_fix: false, installed: false },
+  trusted_sources: [
+    { source: CLONE_SRC.replace(/@.*/, ""), trusted_by: "a.kim", trusted_at: ago(20 * day) },
+    { source: "github.com/acme/scarab-libs//git-tag.yaml", trusted_by: "a.kim", trusted_at: ago(3 * day) },
   ],
-  manifest_error: null,
-  defaults: { state: "installed", missing: [], mirror: null, updated_at: ago(20 * day) },
-  trusted_sources: [{ source: "github.com/acme/scarab-libs//git-tag.yaml", trusted_by: "a.kim", trusted_at: ago(3 * day) }],
 };
 
 function orgLibraries(): S["OrgLibrariesDto"] {
-  const v = page().get("libs");
-  if (v === "empty") {
-    return { ...fullLibraries, installations: [], yanks: [], trusted_sources: [], defaults: { state: "offered", missing: [], mirror: null, updated_at: 0 }, first_party: fullLibraries.first_party.map((f) => ({ ...f, installed: false })) };
-  }
-  if (v === "missing") {
-    const err = (path: string) =>
-      `GET https://github.com/thulasi-ram/scarab-ci/raw/1f0e9d8c7b6a…/libs/${path}: dial tcp 140.82.121.4:443: i/o timeout`;
-    return {
-      ...fullLibraries,
-      installations: [],
-      yanks: [],
-      trusted_sources: [],
-      first_party: fullLibraries.first_party.map((f) => ({ ...f, installed: false })),
-      defaults: {
-        state: "missing",
-        mirror: null,
-        updated_at: ago(5 * min),
-        missing: [
-          { publisher: "thulasi-ram", name: "clone", error: err("clone.yaml") },
-          { publisher: "thulasi-ram", name: "build-image", error: err("build-image.yaml") },
-        ],
-      },
-    };
-  }
+  if (page().get("libs") === "empty") return { installations: [], yanks: [], trusted_sources: [] };
   return fullLibraries;
 }
 
@@ -203,7 +172,6 @@ const fetchedUpgrade: S["FetchedLibraryDto"] = {
   content_hash: HELM_NEW,
   source: HELM_NEW_SRC,
   content: NEW,
-  first_party: false,
   current: { content_hash: HELM, source: HELM_SRC },
   diff: lineDiff(OLD, NEW),
 };
@@ -408,16 +376,25 @@ const compileErrors: S["CompileErrorDto"][] = [
 ];
 refused[0]!.errors = compileErrors;
 
-/** The library and ADR-0076 routes, or null to fall through. */
+/** The library, yank and plugin-gate routes, or null to fall through. */
 export function libraryRoute(
   p: string,
   method: string,
   json: (body: unknown, init?: ResponseInit) => Response,
+  body = "",
 ): Response | null {
   let m: RegExpMatchArray | null;
   if (/^\/v1\/orgs\/[^/]+\/libraries$/.test(p)) return json(orgLibraries());
   if (/^\/v1\/orgs\/[^/]+\/libraries\/fetch$/.test(p)) return json(fetchedUpgrade);
   if (/^\/v1\/orgs\/[^/]+\/library-yanks\/[^/]+\/impact$/.test(p)) return json(yankImpact);
+  if (/^\/v1\/orgs\/[^/]+\/library-trust$/.test(p)) {
+    // Echo a trust, without the commit; persist nothing.
+    if (method === "POST") {
+      const req = JSON.parse(body || "{}") as { source?: string };
+      return json({ source: (req.source ?? "").replace(/@.*/, ""), trusted_by: "a.kim", trusted_at: now });
+    }
+    if (method === "DELETE") return new Response(null, { status: 204 });
+  }
   if (/^\/v1\/orgs\/[^/]+\/library-yanks$/.test(p) && method === "POST") {
     return json({ content_hash: CLONE, reason: YANK_REASON, yanked_by: "a.kim", yanked_at: now });
   }

@@ -812,15 +812,19 @@ export async function deletePrivilegeGrant(org: string, env: string, project: st
   await send(`${projectPath(org, env, project)}/privilege-grant`, "DELETE");
 }
 
-// --- Plugins — an org's PluginInstallations:
-// approvals of one pinned digest of a first-party plugin, with a kill switch.
-// Every write's refusal text (403 third-party / 409 name taken or retired) is
-// passed through verbatim — it is the answer to "why will this not install". ---
+// --- Plugins — an org's PluginInstallations: approvals of one image digest
+// and one reviewed manifest, with a kill switch. Every plugin installs the
+// same way: fetch its manifest from a git source, review it, then install.
+// Every write's refusal text (409 name taken or retired, or the source no
+// longer reads as the reviewed manifest) is passed through verbatim — it is
+// the answer to "why will this not install". ---
 
-/** A plugin this Scarab can install (first-party only, today). */
-export type PluginCatalogEntry = components["schemas"]["PluginCatalogEntryDto"];
 /** An org's approval to run one pinned digest of a plugin. */
 export type PluginInstallation = components["schemas"]["PluginInstallationDto"];
+/** What a plugin asks for: what an install approves with the image digest. */
+export type PluginManifest = components["schemas"]["PluginManifestDto"];
+/** A manifest read for review (`POST …/plugin-fetch`); nothing is stored. */
+export type FetchedPluginManifest = components["schemas"]["FetchedPluginManifestDto"];
 /** What an uninstall returns. */
 export type UninstalledPlugin = components["schemas"]["UninstalledPluginDto"];
 
@@ -829,7 +833,7 @@ export type UninstalledPlugin = components["schemas"]["UninstalledPluginDto"];
 export type OrgLibraries = components["schemas"]["OrgLibrariesDto"];
 export type LibraryInstallation = components["schemas"]["LibraryInstallationDto"];
 export type FetchedLibrary = components["schemas"]["FetchedLibraryDto"];
-export type LibraryDefaults = components["schemas"]["LibraryDefaultsDto"];
+export type TrustedSource = components["schemas"]["TrustedSourceDto"];
 
 /** The org's libraries (`GET …/libraries`); `null` = this server does not
  *  manage libraries (404). */
@@ -919,28 +923,37 @@ export async function unyankLibrary(org: string, hash: string): Promise<void> {
   if (!response.ok) throw new Error(errorText(error) || `could not lift the yank (${response.status})`);
 }
 
-/** Install the missing first-party libraries (`POST …/library-defaults/retry`),
- *  optionally from a mirror. Asks for a step-up. */
-export async function retryLibraryDefaults(
-  org: string,
-  body: components["schemas"]["RetryDefaultsRequest"],
-): Promise<LibraryDefaults> {
-  const { data, error, response } = await api.POST("/v1/orgs/{org}/library-defaults/retry", {
+/** Trust a library source with long-lived forge credentials (`POST
+ *  …/library-trust`). The commit is dropped: trust holds for every version
+ *  from the source. Asks for a step-up. */
+export async function trustLibrarySource(org: string, source: string): Promise<TrustedSource> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/library-trust", {
     params: { path: { org } },
-    body,
+    body: { source },
   });
-  if (error || !data) throw new Error(errorText(error) || `could not install the libraries (${response.status})`);
+  if (error || !data) throw new Error(errorText(error) || `could not trust ${source} (${response.status})`);
   return data;
 }
 
-/** The installable plugins (`GET …/plugin-catalog`); `null` = this server
- *  runs no plugins (404). */
-export async function listPluginCatalog(org: string): Promise<PluginCatalogEntry[] | null> {
-  const { data, error, response } = await api.GET("/v1/orgs/{org}/plugin-catalog", {
-    params: { path: { org } },
+/** Stop trusting a library source (`DELETE …/library-trust?source=`). */
+export async function untrustLibrarySource(org: string, source: string): Promise<void> {
+  const { error, response } = await api.DELETE("/v1/orgs/{org}/library-trust", {
+    params: { path: { org }, query: { source } },
   });
-  if (response.status === 404) return null;
-  if (error || !data) throw new Error(errorText(error) || "failed to load the plugin catalog");
+  if (error) throw new Error(errorText(error) || `could not stop trusting ${source} (${response.status})`);
+}
+
+/** Read a plugin manifest from a git source for review (`POST
+ *  …/plugin-fetch`). Stores and installs nothing. */
+export async function fetchPluginManifest(
+  org: string,
+  body: components["schemas"]["FetchPluginManifestRequest"],
+): Promise<FetchedPluginManifest> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/plugin-fetch", {
+    params: { path: { org } },
+    body,
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not read ${body.source} (${response.status})`);
   return data;
 }
 
@@ -955,7 +968,9 @@ export async function listPlugins(org: string): Promise<PluginInstallation[] | n
   return data;
 }
 
-/** Install a first-party plugin pinned by digest (`POST …/plugins`). */
+/** Install a plugin from a reviewed manifest, its image pinned by digest
+ *  (`POST …/plugins`). The server reads the source again and refuses (409)
+ *  when it no longer has the reviewed hash. Asks for a step-up. */
 export async function installPlugin(
   org: string,
   body: components["schemas"]["InstallPluginRequest"],

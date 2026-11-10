@@ -3399,6 +3399,10 @@ h1, .crumb-head, .run-title {
 .plg-conn-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .plg-slot { color: var(--soft-white); }
 .plg-caps { display: flex; gap: 6px; flex-wrap: wrap; }
+.plg-review { display: grid; gap: 8px; }
+.plg-review .lib-facts { padding: 0; }
+.plg-review-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 6px; }
+.plg-review-rules { margin: 4px 0 0; padding-left: 16px; font: var(--t-mono); color: var(--sage); }
 /* The broker journal: one row per journaled request; the path wraps, the
    short cells do not. */
 .plg-journal-wrap { overflow-x: auto; }
@@ -3539,14 +3543,10 @@ h1, .crumb-head, .run-title {
    errors, refused runs. From the reviewed mock (adr-0076-ui-mock). ── */
 /* --- Libraries: proposed badges --- */
 .lib-trust { color: var(--ok-ink); }
-.lib-upd { color: var(--sage); }
-.lib-sec { color: var(--danger); }
 .lib-badges { display: inline-flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .lib-hash { font: var(--t-mono); color: var(--copper); }
 .lib-src { font: var(--t-mono); color: var(--muted-sage); word-break: break-all; }
 .lib-notice { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.lib-notice.sec { color: var(--danger); }
-.lib-notice.upd { color: var(--sage); }
 .lib-notice.yank { color: var(--danger); }
 /* table variant */
 .lib-table td { vertical-align: top; }
@@ -3696,14 +3696,8 @@ h1, .crumb-head, .run-title {
 .lib-empty { display: grid; justify-items: center; gap: 6px; text-align: center; padding: 4px 12px 6px; }
 .lib-empty .t1 { display: flex; gap: 7px; align-items: center; font: var(--t-label); color: var(--soft-white); }
 .lib-empty .t1 svg { color: var(--muted-sage); }
-.lib-empty .t1.warn svg { color: var(--warn); }
 .lib-empty .t2 { margin: 0; color: var(--sage); max-width: 580px; }
 .lib-empty .acts { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-top: 6px; }
-.lib-empty .acts .btn.on { border-color: var(--emerald); color: var(--emerald); }
-.lib-pane { width: min(600px, 100%); text-align: left; border-top: 1px dotted var(--border); padding-top: 12px; margin-top: 8px; display: grid; gap: 8px; }
-.lib-pane .row { display: flex; gap: 8px; }
-.lib-pane .row .f-ctl { flex: 1; }
-.lib-pane .row .btn { flex: none; white-space: nowrap; }
 .lib-errs { color: var(--muted-sage); }
 .lib-errs summary { cursor: pointer; font: var(--t-mono); }
 .lib-errs pre { margin: 6px 0 0; white-space: pre-wrap; text-align: left; font: var(--t-mono); color: var(--sage); }

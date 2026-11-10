@@ -1,11 +1,12 @@
 // Plugins — the Settings section where an org admin installs a plugin, sees
 // whether it is running, kills it, and binds its connections.
 //
-// A PluginInstallation is the approval of exactly (image digest, manifest), so
-// the install form asks for a digest and shows what the manifest asks for.
-// Every catalog plugin installs through the same form; its publisher is shown
-// as a field, read from the image repository. A refusal from the server is
-// shown verbatim. Kill revokes at the token-to-installation mapping, so it
+// A PluginInstallation is the approval of exactly (image digest, manifest).
+// Every plugin installs the same way: the admin names the manifest's git
+// source, the server reads it (and stores nothing), the dialog shows
+// everything it asks for, and Install sends the reviewed manifest's hash with
+// an image pinned by digest. Who publishes a plugin changes nothing: it is
+// untrusted code either way. A refusal from the server is shown verbatim. Kill revokes at the token-to-installation mapping, so it
 // bites on the next request rather than when a token expires. Uninstall
 // retires the name forever.
 //
@@ -29,17 +30,18 @@ import {
   deletePluginConnection,
   deletePluginStorage,
   enablePlugin,
+  fetchPluginManifest,
   getPluginBrokerJournal,
   installPlugin,
   killPlugin,
-  listPluginCatalog,
+  listConnections,
   listPluginConnections,
   listPlugins,
   putPluginConnection,
   putPluginStorage,
   uninstallPlugin,
   type BrokerJournalEntry,
-  type PluginCatalogEntry,
+  type FetchedPluginManifest,
   type PluginConnection,
   type PluginInstallation,
 } from "../api/client";
@@ -56,8 +58,12 @@ import {
   imageRepository,
   INSECURE_HTTP_WARNING,
   isInsecureHttp,
-  pluginPublisher,
+  manifestReview,
+  manifestSourceError,
+  suggestedInstallName,
   toConnectionBody,
+  toManifestFetchBody,
+  type ManifestFetchForm,
   type ConnectionForm,
   installNameError,
   runtimeBadge,
@@ -150,8 +156,8 @@ export default function Plugins(props: { org: string }) {
               when={rows().length > 0}
               fallback={
                 <p class="empty">
-                  No plugins installed. A plugin connects Scarab to a vendor tool, such as
-                  Argo CD.
+                  No plugins installed. A plugin connects Scarab to a vendor tool, such as Argo CD.
+                  To install one, enter the git source of its manifest and the image to run.
                 </p>
               }
             >
@@ -185,7 +191,8 @@ export default function Plugins(props: { org: string }) {
                 <Icon icon="shield-check" size={12} /> An installation approves one image digest
                 and exactly what its manifest asks for — a new digest is a new install. A
                 plugin acts as{" "}
-                <span class="mono">plugin:&lt;name&gt;</span>, never as a person.
+                <span class="mono">plugin:&lt;name&gt;</span>, never as a person. Installing asks
+                you to confirm with your passkey.
               </small>
             </p>
           </Show>
@@ -267,16 +274,9 @@ function PluginRow(props: {
       <div class="tok-head">
         <Icon icon="boxes" size={15} />
         <span class="tok-name mono">{p().name}</span>
-        <span class="tok-scope mono" title="The catalog plugin">
+        <span class="tok-scope mono" title="The plugin's name, from its manifest">
           {p().plugin}
         </span>
-        <Show when={pluginPublisher(p().image)}>
-          {(pub) => (
-            <span class="tok-scope" title="The publisher: the owner of the image repository">
-              by <span class="mono">{pub()}</span>
-            </span>
-          )}
-        </Show>
         <span class="tok-role" title="What it acts as in audit — not tied to any human">
           {p().principal}
         </span>
@@ -835,192 +835,350 @@ function ConnectionRow(props: {
   );
 }
 
-/** Install a catalog plugin, pinned by digest. Every catalog entry takes
- *  this one path; the publisher is shown, not branched on. */
+/** Install a plugin: read its manifest from a git source, review what it
+ *  asks for, then approve it with an image pinned by digest. Every plugin
+ *  takes this one path. */
 function InstallDialog(props: {
   org: string;
   taken: string[];
   onClose: () => void;
   onInstalled: (p: PluginInstallation) => void;
 }) {
-  const [catalog] = createResource(
+  // A private repository is read through a connection of this org.
+  const [connections] = createResource(
     () => props.org,
-    (o) => listPluginCatalog(o),
+    (o) => listConnections(o).catch(() => []),
   );
-  const [plugin, setPlugin] = createSignal("");
+  const [source, setSource] = createSignal<ManifestFetchForm>({ source: "", connection: "" });
+  const [fetched, setFetched] = createSignal<FetchedPluginManifest | null>(null);
+  // The connection the shown manifest was read through: the install names
+  // the same one.
+  const [fetchedVia, setFetchedVia] = createSignal("");
   const [name, setName] = createSignal("");
   const [image, setImage] = createSignal("");
   const [config, setConfig] = createSignal<Record<string, string>>({});
-  const [saving, setSaving] = createSignal(false);
+  const [storage, setStorage] = createSignal<StorageForm>({ claim: "", mount_path: "" });
+  const [busy, setBusy] = createSignal<"" | "fetch" | "install">("");
   const [error, setError] = createSignal<string | null>(null);
 
-  const entries = () => catalog() ?? [];
-  const entry = (): PluginCatalogEntry | undefined => entries().find((c) => c.plugin === plugin());
-
-  /** Picking a plugin prefills its repository (the admin supplies the
-   *  digest) and, if the name is still blank, its catalog key. */
-  const choose = (key: string) => {
-    setPlugin(key);
-    const c = entries().find((x) => x.plugin === key);
-    setConfig({});
-    if (!c) return;
-    setImage(`${c.image_repository}@sha256:`);
-    if (!name()) setName(c.plugin);
+  // Changing the source drops the review: what is installed is what was read.
+  const setSourceField = (k: keyof ManifestFetchForm, v: string) => {
+    setFetched(null);
+    setSource((f) => ({ ...f, [k]: v }));
+  };
+  const fetchBody = () => toManifestFetchBody(source());
+  const review = () => {
+    const f = fetched();
+    return f ? manifestReview(f) : null;
   };
 
-  const built = () =>
-    toInstallBody(
-      { plugin: plugin(), name: name(), image: image(), config: config() },
-      { repository: entry()?.image_repository, taken: props.taken },
+  const doFetch = async () => {
+    const body = fetchBody().body;
+    if (!body || busy()) return;
+    setBusy("fetch");
+    setError(null);
+    try {
+      const f = await fetchPluginManifest(props.org, body);
+      setFetched(f);
+      setFetchedVia(body.connection ?? "");
+      setConfig({});
+      if (!name()) setName(suggestedInstallName(f.manifest.plugin, props.taken));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not read the manifest.");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const built = () => {
+    const f = fetched();
+    return toInstallBody(
+      { name: name(), image: image(), config: config(), storage: storage() },
+      f ? { source: f.source, manifest_sha256: f.manifest_sha256, connection: fetchedVia() || undefined } : null,
+      { taken: props.taken },
     );
-  // Quiet while a field is untouched: a blank name, or the prefilled
-  // `<repository>@sha256:` still waiting for its digest.
+  };
+  // Quiet while a field is untouched.
   const nameProblem = () => (name() ? installNameError(name(), props.taken) : null);
-  const imageProblem = () => {
-    const img = image().trim();
-    const untouched = !!entry() && img === `${entry()!.image_repository}@sha256:`;
-    return untouched ? null : imageError(img, entry()?.image_repository);
+  const imageProblem = () => imageError(image().trim());
+  const storageProblem = () => {
+    const s = storage();
+    if (s.claim.trim() === "" && s.mount_path.trim() === "") return null;
+    return toStorageBody(s).error ?? null;
   };
 
   const install = async () => {
     const body = built().body;
-    if (!body || saving()) return;
-    setSaving(true);
+    if (!body || busy()) return;
+    setBusy("install");
     setError(null);
     try {
       props.onInstalled(await installPlugin(props.org, body));
     } catch (e) {
-      // A 403 (the server refuses this plugin) or a 409 (name taken or
-      // retired, or plugins off) is the whole answer.
+      // A 409 (name taken or retired, or the source no longer reads as the
+      // reviewed manifest) is the whole answer.
       setError(e instanceof Error ? e.message : "Could not install the plugin.");
     } finally {
-      setSaving(false);
+      setBusy("");
     }
   };
 
   return (
     <Modal
+      size="wide"
       eyebrow={`${props.org} · plugins`}
       title="Install plugin"
-      purpose="Approve one image digest and exactly what its manifest asks for."
-      busy={saving()}
+      purpose="Read the plugin's manifest, review what it asks for, and approve it with one image digest."
+      busy={busy() !== ""}
       onClose={props.onClose}
       footer={
         <>
           <Show when={error()}>
             <ModalMessage>{error()}</ModalMessage>
           </Show>
-          <button class="btn btn-ghost" type="button" onClick={props.onClose} disabled={saving()}>
+          <button class="btn btn-ghost" type="button" onClick={props.onClose} disabled={busy() !== ""}>
             Cancel
           </button>
-          <button class="btn btn-primary" type="button" disabled={!built().body || saving()} onClick={install}>
-            <Icon icon="plus" size={14} /> {saving() ? "Installing…" : "Install"}
+          <button
+            class="btn btn-primary"
+            type="button"
+            disabled={!built().body || busy() !== ""}
+            onClick={() => void install()}
+          >
+            <Icon icon="plus" size={14} /> {busy() === "install" ? "Installing…" : "Install"}
           </button>
         </>
       }
     >
-      <ModalSection n={1} title="Plugin">
-        <Show when={catalog.error}>
-          <p class="error">Could not load the plugin catalog.</p>
-        </Show>
-        <Show when={!catalog.loading && !catalog.error && entries().length === 0}>
-          <p class="empty">This server has no plugins to install.</p>
-        </Show>
-        <Field label="Plugin" required help={entry()?.description}>
-          <Select mono value={plugin()} onValue={choose}>
-            <option value="">choose a plugin…</option>
-            <For each={entries()}>
+      <ModalSection n={1} title="Manifest source">
+        <Field
+          label="Source"
+          required
+          error={manifestSourceError(source().source)}
+          help={
+            <>
+              The plugin's manifest file in a git repository at a full commit id:{" "}
+              <span class="mono">&lt;host&gt;/&lt;owner&gt;/&lt;repo&gt;//&lt;path&gt;@&lt;commit&gt;</span>
+              , the path ending in <span class="mono">.json</span>, <span class="mono">.yaml</span> or{" "}
+              <span class="mono">.yml</span>. A public repository on github.com or a Forgejo
+              connection's host is read without credentials.
+            </>
+          }
+        >
+          <Input
+            mono
+            placeholder="github.com/acme/scarab-plugin-argocd//plugin.json@<commit>"
+            value={source().source}
+            onValue={(v) => setSourceField("source", v)}
+          />
+        </Field>
+        <Field label="Connection (private repository)">
+          <Select value={source().connection} onValue={(v) => setSourceField("connection", v)}>
+            <option value="">none: read it anonymously</option>
+            <For each={connections() ?? []}>
               {(c) => (
-                <option value={c.plugin}>
-                  {pluginPublisher(c.image_repository) ? `${c.plugin} · ${pluginPublisher(c.image_repository)}` : c.plugin}
+                <option value={c.id}>
+                  {c.id} ({c.kind}, {c.base_url})
                 </option>
               )}
             </For>
           </Select>
         </Field>
-        <Show when={entry()}>
-          {(c) => (
-            <div>
-              <p class="dlg-ctx">
-                <span class="k">Publisher</span>{" "}
-                {pluginPublisher(c().image_repository) || "none in the image name"}
-              </p>
-              <p class="f-help">
-                The owner of <span class="mono">{c().image_repository}</span>: whose image you are
-                approving.
-              </p>
-            </div>
-          )}
+        <div class="modal-actions">
+          <button
+            class="btn btn-ghost btn-sm"
+            type="button"
+            disabled={!fetchBody().body || busy() !== ""}
+            onClick={() => void doFetch()}
+          >
+            <Icon icon="search" size={14} /> {busy() === "fetch" ? "Reading…" : "Read and review"}
+          </button>
+        </div>
+        <p class="f-help">Reading stores nothing; nothing is installed until you approve it below.</p>
+      </ModalSection>
+
+      <Show when={fetched() && review()}>
+        <ModalSection n={2} title="What it asks for">
+          <ManifestReviewView fetched={fetched()!} />
+        </ModalSection>
+
+        <ModalSection n={3} title="Installation">
+          <Field
+            label="Name"
+            required
+            error={nameProblem()}
+            help={
+              <>
+                A DNS-1123 label: lowercase letters, digits and "-", at most 63. It acts as{" "}
+                <span class="mono">plugin:{name() || "<name>"}</span>. Unique in the org and never
+                reused — not even after an uninstall.
+              </>
+            }
+          >
+            <Input mono placeholder={review()!.plugin} value={name()} onValue={setName} />
+          </Field>
+          <Field
+            label="Image"
+            required
+            error={imageProblem()}
+            help={
+              <>
+                Any repository, pinned by digest: <span class="mono">&lt;repository&gt;@sha256:&lt;64 hex&gt;</span>.
+                A tag can change under the same name; a digest cannot.
+              </>
+            }
+          >
+            <Input mono placeholder="registry.example.com/team/plugin@sha256:…" value={image()} onValue={setImage} />
+          </Field>
+        </ModalSection>
+
+        <Show when={review()!.configKeys.length > 0}>
+          <ModalSection n={4} title="Settings">
+            <For each={review()!.configKeys}>
+              {(key) => (
+                <Field plainLabel label={<span class="mono">{key}</span>}>
+                  <Input
+                    mono
+                    placeholder="optional"
+                    value={config()[key] ?? ""}
+                    onValue={(v) => setConfig((cfg) => ({ ...cfg, [key]: v }))}
+                  />
+                </Field>
+              )}
+            </For>
+          </ModalSection>
         </Show>
-      </ModalSection>
 
-      <ModalSection n={2} title="Installation">
-        <Field
-          label="Name"
-          required
-          error={nameProblem()}
-          help={
-            <>
-              A DNS-1123 label: lowercase letters, digits and "-", at most 63. It acts as{" "}
-              <span class="mono">plugin:{name() || "<name>"}</span>. Unique in the org and never
-              reused — not even after an uninstall.
-            </>
-          }
-        >
-          <Input mono placeholder="argocd-prod" value={name()} onValue={setName} />
-        </Field>
-        <Field
-          label="Image"
-          required
-          error={imageProblem()}
-          help={
-            <>
-              Pinned by digest — paste the <span class="mono">sha256:</span> of the release you are
-              approving. A tag can change under the same name; a digest cannot.
-            </>
-          }
-        >
-          <Input mono placeholder="ghcr.io/…@sha256:…" value={image()} onValue={setImage} />
-        </Field>
-      </ModalSection>
-
-      <Show when={entry()}>
-        {(c) => (
-          <>
-            <Show when={c().manifest.config_keys.length > 0}>
-              <ModalSection n={3} title="Settings">
-                <For each={c().manifest.config_keys}>
-                  {(key) => (
-                    <Field plainLabel label={<span class="mono">{key}</span>}>
-                      <Input
-                        mono
-                        placeholder="optional"
-                        value={config()[key] ?? ""}
-                        onValue={(v) => setConfig((cfg) => ({ ...cfg, [key]: v }))}
-                      />
-                    </Field>
-                  )}
-                </For>
-              </ModalSection>
-            </Show>
-            <ModalSection n={c().manifest.config_keys.length > 0 ? 4 : 3} title="You are approving">
-              <div class="plg-caps">
-                <For each={c().manifest.capabilities}>
-                  {(cap) => <span class="dep-tag dep-tag-muted">{cap.replace(/_/g, " ")}</span>}
-                </For>
-              </div>
-              <For each={c().manifest.connections}>
-                {(slot) => (
-                  <p class="f-help">
-                    connection <span class="mono">{slot.name}</span> ({slot.auth_schemes.join(", ")}) —
-                    read only: <span class="mono">{slot.read_rules.map(ruleLabel).join(", ")}</span>
-                  </p>
-                )}
-              </For>
-            </ModalSection>
-          </>
-        )}
+        <ModalSection n={review()!.configKeys.length > 0 ? 5 : 4} title="Storage (optional)">
+          <Field
+            label="Claim"
+            error={storageProblem()}
+            help={
+              <>
+                A PersistentVolumeClaim an operator created in the plugin namespace, with the
+                annotation{" "}
+                <span class="mono">
+                  scarab.io/plugin-installation={props.org}/{name() || "<name>"}
+                </span>
+                . Leave it blank for none; you can add it later.
+              </>
+            }
+          >
+            <Input
+              mono
+              placeholder="argocd-state"
+              value={storage().claim}
+              onValue={(v) => setStorage((s) => ({ ...s, claim: v }))}
+            />
+          </Field>
+          <Field label="Mount path">
+            <Input
+              mono
+              placeholder={DEFAULT_STORAGE_MOUNT_PATH}
+              value={storage().mount_path}
+              onValue={(v) => setStorage((s) => ({ ...s, mount_path: v }))}
+            />
+          </Field>
+        </ModalSection>
       </Show>
     </Modal>
+  );
+}
+
+/** Everything a fetched manifest asks for, as the install dialog shows it
+ *  before approval. */
+function ManifestReviewView(props: { fetched: FetchedPluginManifest }) {
+  const r = () => manifestReview(props.fetched);
+  return (
+    <div class="plg-review">
+      <dl class="lib-facts">
+        <dt>Plugin</dt>
+        <dd class="m">{r().plugin}</dd>
+        <dt>Source</dt>
+        <dd class="m">{props.fetched.source}</dd>
+        <dt>Manifest SHA-256</dt>
+        <dd class="m">{props.fetched.manifest_sha256}</dd>
+        <dt>Capabilities</dt>
+        <dd>
+          <Show when={r().capabilities.length > 0} fallback={<span class="subtle">none</span>}>
+            <ul class="plg-review-list">
+              <For each={r().capabilities}>
+                {(c) => (
+                  <li>
+                    <span class="mono">{c.key}</span> <span class="subtle">· {c.label}</span>
+                  </li>
+                )}
+              </For>
+            </ul>
+          </Show>
+        </dd>
+        <dt>Connections</dt>
+        <dd>
+          <Show when={r().connections.length > 0} fallback={<span class="subtle">none</span>}>
+            <ul class="plg-review-list">
+              <For each={r().connections}>
+                {(c) => (
+                  <li>
+                    <span class="mono">{c.name}</span> <span class="subtle">· auth {c.auth || "none"} · reads only:</span>
+                    <ul class="plg-review-rules">
+                      <For each={c.rules}>{(rule) => <li class="mono">{rule}</li>}</For>
+                    </ul>
+                  </li>
+                )}
+              </For>
+            </ul>
+          </Show>
+        </dd>
+        <dt>Config keys</dt>
+        <dd class="m">
+          <Show when={r().configKeys.length > 0} fallback={<span class="subtle">none</span>}>
+            {r().configKeys.join(", ")}
+          </Show>
+        </dd>
+        <dt>Gates</dt>
+        <dd>
+          <Show when={r().gates.length > 0} fallback={<span class="subtle">none</span>}>
+            <ul class="plg-review-list">
+              <For each={r().gates}>
+                {(g) => (
+                  <li>
+                    <span class="mono">{g.name}</span>
+                    <Show when={g.description}>
+                      <span class="subtle"> · {g.description}</span>
+                    </Show>
+                    <div class="subtle">
+                      inputs <span class="mono">{g.inputs.join(", ") || "none"}</span> · outputs{" "}
+                      <span class="mono">{g.outputs.join(", ") || "none"}</span>
+                    </div>
+                  </li>
+                )}
+              </For>
+            </ul>
+          </Show>
+        </dd>
+        <dt>Installed here</dt>
+        <dd>
+          <Show when={r().installed.length > 0} fallback={<span class="subtle">no installation of this plugin</span>}>
+            <ul class="plg-review-list">
+              <For each={r().installed}>
+                {(i) => (
+                  <li>
+                    <span class="mono">{i.name}</span>{" "}
+                    <span class="subtle" title={i.image}>
+                      · <span class="mono">{shortDigest(i.image)}</span> ·{" "}
+                      {i.sameManifest ? "approved with this manifest" : "approved with a different manifest"}
+                    </span>
+                  </li>
+                )}
+              </For>
+            </ul>
+          </Show>
+        </dd>
+      </dl>
+      <details class="lib-errs">
+        <summary>the file as read · {props.fetched.content.split("\n").length} lines</summary>
+        <pre>{props.fetched.content}</pre>
+      </details>
+    </div>
   );
 }

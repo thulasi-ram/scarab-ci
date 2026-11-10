@@ -7,7 +7,6 @@ import {
   impactRunLabel,
   inputsChange,
   numberDiff,
-  releaseSources,
   reviewChecks,
   reviewHref,
   sideBySide,
@@ -22,10 +21,17 @@ const C = "0123456789abcdef0123456789abcdef01234567";
 describe("trust", () => {
   it("keys a source without its commit and names why a version is trusted", () => {
     expect(trustKey(`github.com/acme/libs//x.yaml@${C}`)).toBe("github.com/acme/libs//x.yaml");
-    const lib = { publisher: "acme", name: "x", source: `github.com/acme/libs//x.yaml@${C}`, first_party: false };
+    const lib = { source: `github.com/acme/libs//x.yaml@${C}` };
     expect(trustNote(lib, [])).toBeNull();
     expect(trustNote(lib, [{ source: "github.com/acme/libs//x.yaml", trusted_by: "a.kim" }])).toMatch(/by a\.kim/);
-    expect(trustNote({ ...lib, publisher: "thulasi-ram", name: "clone", first_party: true }, [])).toMatch(/by default/);
+  });
+  it("trusts no library by default, whoever publishes it", () => {
+    const clone = { source: `github.com/thulasi-ram/scarab-ci//libs/clone.yaml@${C}` };
+    expect(trustNote(clone, [])).toBeNull();
+    expect(trustNote(clone, [{ source: "github.com/acme/libs//x.yaml", trusted_by: "a.kim" }])).toBeNull();
+    expect(
+      trustNote(clone, [{ source: "github.com/thulasi-ram/scarab-ci//libs/clone.yaml", trusted_by: "a.kim" }]),
+    ).toMatch(/by a\.kim/);
   });
 });
 
@@ -114,48 +120,18 @@ describe("review checks", () => {
     expect(inputsChange(NEW, OLD)).toBe("removes timeout");
     expect(inputsChange(OLD, OLD)).toBe("no input added or removed");
     const content = `${NEW}\n  - id: smoke\n    invoke: lib:acme/http-probe\n  - id: x\n    image: busybox\n    forge_token: true`;
-    const checks = reviewChecks(content, false, [{ publisher: "acme", name: "http-probe", content_hash: "2c8f61d0a9e4ffff" }]);
-    expect(checks.map((c) => c.tone)).toEqual(["ok", "ok", "warn", "warn", "info"]);
+    const checks = reviewChecks(content, [{ publisher: "acme", name: "http-probe", content_hash: "2c8f61d0a9e4ffff" }]);
+    expect(checks.map((c) => c.tone)).toEqual(["ok", "ok", "warn", "warn"]);
     expect(checks[1]!.text).toBe("Invokes lib:acme/http-probe, installed here at 2c8f61d0a9e4");
     expect(checks[2]!.text).toBe("Not pinned by digest: busybox");
-    expect(checks.at(-1)!.text).toBe("The hash is not in a Scarab release manifest");
-    const clean = reviewChecks(OLD, true, []);
-    expect(clean.map((c) => c.tone)).toEqual(["ok", "ok", "info", "ok"]);
-    expect(clean.at(-1)!.text).toBe("The hash is in Scarab's release manifest");
+    expect(checks.at(-1)!.text).toMatch(/only if this source is trusted/);
+    const clean = reviewChecks(OLD, []);
+    expect(clean.map((c) => c.tone)).toEqual(["ok", "ok", "info"]);
   });
   it("links the review page with what is known", () => {
     expect(reviewHref("acme", {})).toBe("/orgs/acme/settings/libraries/review");
     expect(reviewHref("acme", { source: "s@c", publisher: "acme", name: "", connection: undefined })).toBe(
       "/orgs/acme/settings/libraries/review?source=s%40c&publisher=acme",
     );
-  });
-});
-
-describe("release sources", () => {
-  const listed = (name: string, installed: boolean) => ({
-    publisher: "thulasi-ram",
-    name,
-    source: `github.com/thulasi-ram/scarab-ci//libs/${name}.yaml@${C}`,
-    release: "v0.4.1",
-    security_fix: false,
-    installed,
-  });
-
-  it("offers the manifest's libraries that are not installed, as plain sources", () => {
-    const out = releaseSources([listed("clone", true), listed("zeta", false), listed("build-image", false)]);
-    expect(out.map((r) => r.id)).toEqual(["lib:thulasi-ram/build-image", "lib:thulasi-ram/zeta"]);
-    expect(out[0]).toEqual({
-      id: "lib:thulasi-ram/build-image",
-      source: `github.com/thulasi-ram/scarab-ci//libs/build-image.yaml@${C}`,
-      publisher: "thulasi-ram",
-      name: "build-image",
-      release: "v0.4.1",
-      security_fix: false,
-    });
-  });
-
-  it("offers nothing when every listed library is installed", () => {
-    expect(releaseSources([listed("clone", true)])).toEqual([]);
-    expect(releaseSources([])).toEqual([]);
   });
 });

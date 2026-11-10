@@ -13,13 +13,17 @@ import {
   isInsecureHttp,
   toConnectionBody,
   installNameError,
-  pluginPublisher,
+  gateFieldLabel,
+  manifestReview,
+  manifestSourceError,
   runtimeBadge,
   shortDigest,
   stateBadge,
   storageClaimError,
   storageMountPathError,
+  suggestedInstallName,
   toInstallBody,
+  toManifestFetchBody,
   toStorageBody,
 } from "./plugins";
 
@@ -43,70 +47,160 @@ describe("installNameError", () => {
   });
 });
 
+const COMMIT = "6e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d";
+const SOURCE = `github.com/acme/scarab-plugin-argocd//plugin.json@${COMMIT}`;
+const SHA = "b7e3".padEnd(64, "9");
+
 describe("imageError", () => {
-  it("stays quiet on an empty field", () => {
-    expect(imageError("", REPO)).toBeNull();
+  it("is quiet while empty, and wants a digest", () => {
+    expect(imageError("")).toBeNull();
+    expect(imageError(`${REPO}:v1.2.0`)).toMatch(/@sha256:/);
+    expect(imageError(IMAGE)).toBeNull();
   });
 
-  it("insists on a digest, not a tag", () => {
-    expect(imageError(`${REPO}:v1.2.0`, REPO)).toMatch(/@sha256:/);
-    expect(imageError(IMAGE, REPO)).toBeNull();
+  it("refuses a short or upper-case digest, and a missing repository", () => {
+    expect(imageError(`${REPO}@sha256:abc`)).toMatch(/64 lowercase hex/);
+    expect(imageError(`${REPO}@sha256:${DIGEST.toUpperCase()}`)).toMatch(/64 lowercase hex/);
+    expect(imageError(`@sha256:${DIGEST}`)).toMatch(/repository/);
   });
 
-  it("refuses a short or uppercase digest", () => {
-    expect(imageError(`${REPO}@sha256:abc`, REPO)).toMatch(/64 lowercase hex/);
-    expect(imageError(`${REPO}@sha256:${DIGEST.toUpperCase()}`, REPO)).toMatch(/64 lowercase hex/);
-  });
-
-  it("refuses a repository other than the catalog's, naming the one it wants", () => {
-    const err = imageError(`${REPO}-evil@sha256:${DIGEST}`, REPO);
-    expect(err).toContain(`${REPO}@sha256:`);
-    expect(err).not.toMatch(/first-party|third-party/);
+  it("accepts any repository pinned by digest", () => {
+    expect(imageError(`registry.example.com/team/argocd@sha256:${DIGEST}`)).toBeNull();
+    expect(imageError(`argocd@sha256:${DIGEST}`)).toBeNull();
   });
 });
 
-describe("pluginPublisher", () => {
-  it("reads the owner after the registry host, from a repository or a pinned image", () => {
-    expect(pluginPublisher(REPO)).toBe("acme");
-    expect(pluginPublisher("ghcr.io/thulasi-ram/scarab-plugin-argocd")).toBe("thulasi-ram");
-    expect(pluginPublisher(IMAGE)).toBe("acme");
-    expect(pluginPublisher("localhost:5000/acme/argocd@sha256:" + DIGEST)).toBe("acme");
-    expect(pluginPublisher("localhost/acme/argocd")).toBe("acme");
+describe("manifest source", () => {
+  it("wants a .json, .yaml or .yml file pinned to a full commit", () => {
+    expect(manifestSourceError("")).toBeNull();
+    expect(manifestSourceError(SOURCE)).toBeNull();
+    expect(manifestSourceError(`git.acme.dev/platform/plugins//argocd/plugin.yml@${COMMIT}`)).toBeNull();
+    expect(manifestSourceError(`github.com/acme/p//plugin.yaml@${COMMIT}`)).toBeNull();
+    expect(manifestSourceError("github.com/acme/p//plugin.json@main")).toMatch(/full commit id/);
+    expect(manifestSourceError(`github.com/acme/p//plugin.toml@${COMMIT}`)).toMatch(/\.json, \.yaml or \.yml/);
+    expect(manifestSourceError(`github.com/acme/p/plugin.json@${COMMIT}`)).toMatch(/\/\//);
   });
 
-  it("reads a Docker Hub path without a host the same way", () => {
-    expect(pluginPublisher("acme/argocd")).toBe("acme");
-  });
-
-  it("is empty when there is no owner segment", () => {
-    expect(pluginPublisher("argocd")).toBe("");
-    expect(pluginPublisher("ghcr.io/argocd")).toBe("");
-    expect(pluginPublisher("")).toBe("");
+  it("sends the connection only when one is picked", () => {
+    expect(toManifestFetchBody({ source: ` https://${SOURCE} `, connection: "" })).toEqual({ body: { source: SOURCE } });
+    expect(toManifestFetchBody({ source: SOURCE, connection: "gh-acme" })).toEqual({
+      body: { source: SOURCE, connection: "gh-acme" },
+    });
+    expect(toManifestFetchBody({ source: "", connection: "" }).error).toMatch(/required/);
   });
 });
 
 describe("toInstallBody", () => {
-  const form = { plugin: "argocd", name: "argocd-prod", image: IMAGE, config: {} };
+  const form = { name: "argocd-prod", image: IMAGE, config: {}, storage: { claim: "", mount_path: "" } };
+  const reviewed = { source: SOURCE, manifest_sha256: SHA };
 
-  it("sends the form, omitting config when every value is blank", () => {
-    expect(toInstallBody({ ...form, config: { ARGOCD_UI_URL: "  " } }, { repository: REPO })).toEqual({
-      body: { plugin: "argocd", name: "argocd-prod", image: IMAGE },
+  it("sends the reviewed source and hash, omitting config and storage when blank", () => {
+    expect(toInstallBody({ ...form, config: { ARGOCD_UI_URL: "  " } }, reviewed)).toEqual({
+      body: { name: "argocd-prod", image: IMAGE, source: SOURCE, manifest_sha256: SHA },
     });
   });
 
-  it("sends only the config values that are set, trimmed", () => {
-    const r = toInstallBody(
-      { ...form, config: { ARGOCD_UI_URL: " https://argo.example ", OWNER_ANNOTATION: "" } },
-      { repository: REPO },
-    );
-    expect(r.body?.config).toEqual({ ARGOCD_UI_URL: "https://argo.example" });
+  it("sends the connection the manifest was read through", () => {
+    expect(toInstallBody(form, { ...reviewed, connection: "gh-acme" }).body?.connection).toBe("gh-acme");
   });
 
-  it("reports the first problem: plugin, then name, then image", () => {
-    expect(toInstallBody({ ...form, plugin: "" }).error).toMatch(/Pick a plugin/);
-    expect(toInstallBody({ ...form, name: "Bad" }).error).toMatch(/not a valid name/);
-    expect(toInstallBody({ ...form, image: "" }).error).toMatch(/image is required/);
-    expect(toInstallBody({ ...form, image: REPO }, { repository: REPO }).error).toMatch(/@sha256:/);
+  it("sends only the config values that are set, trimmed, and the storage when named", () => {
+    const r = toInstallBody(
+      {
+        ...form,
+        config: { ARGOCD_UI_URL: " https://argo.example ", OWNER_ANNOTATION: "" },
+        storage: { claim: "argocd-state", mount_path: "" },
+      },
+      reviewed,
+    );
+    expect(r.body?.config).toEqual({ ARGOCD_UI_URL: "https://argo.example" });
+    expect(r.body?.storage).toEqual({ claim: "argocd-state" });
+  });
+
+  it("reports the first problem: no review, then name, image and storage", () => {
+    expect(toInstallBody(form, null).error).toMatch(/review it first/);
+    expect(toInstallBody({ ...form, name: "Bad" }, reviewed).error).toMatch(/not a valid name/);
+    expect(toInstallBody({ ...form, image: "" }, reviewed).error).toMatch(/image is required/);
+    expect(toInstallBody({ ...form, image: REPO }, reviewed).error).toMatch(/@sha256:/);
+    expect(toInstallBody({ ...form, storage: { claim: "", mount_path: "/data" } }, reviewed).error).toMatch(
+      /claim's name/,
+    );
+    expect(toInstallBody({ ...form, name: "argocd" }, reviewed, { taken: ["argocd"] }).error).toMatch(
+      /already installed/,
+    );
+  });
+});
+
+describe("manifestReview", () => {
+  const fetched = {
+    manifest_sha256: SHA,
+    manifest: {
+      plugin: "argocd",
+      capabilities: ["use_connection", "resolve_gates", "some_new_thing"],
+      connections: [
+        {
+          name: "argocd",
+          auth_schemes: ["bearer"],
+          read_rules: [
+            { method: "GET", path: "/api/version", query: [] },
+            { method: "GET", path: "/api/v1/applications/*", query: ["appNamespace", "project"] },
+          ],
+        },
+      ],
+      config_keys: ["ARGOCD_UI_URL"],
+      gates: [
+        {
+          name: "wait-live",
+          description: "Pass when the Application is synced.",
+          inputs: [
+            { name: "app", type: "string", required: true },
+            { name: "timeout", type: "number", required: false },
+          ],
+          outputs: [{ name: "revision", type: "string", required: true }],
+        },
+      ],
+    },
+    installed: [
+      { name: "argocd", image: IMAGE, manifest_sha256: SHA },
+      { name: "argocd-us", image: IMAGE, manifest_sha256: "91c0".padEnd(64, "2") },
+    ],
+  };
+
+  it("lists everything the manifest asks for, in its order", () => {
+    const r = manifestReview(fetched);
+    expect(r.plugin).toBe("argocd");
+    expect(r.capabilities.map((c) => c.key)).toEqual(["use_connection", "resolve_gates", "some_new_thing"]);
+    // A capability this UI does not know still shows, by its key.
+    expect(r.capabilities[2]!.label).toBe("some new thing");
+    expect(r.connections).toEqual([
+      {
+        name: "argocd",
+        auth: "bearer",
+        rules: ["GET /api/version", "GET /api/v1/applications/* ?appNamespace&project"],
+      },
+    ]);
+    expect(r.configKeys).toEqual(["ARGOCD_UI_URL"]);
+    expect(r.gates).toEqual([
+      {
+        name: "wait-live",
+        description: "Pass when the Application is synced.",
+        inputs: ["app: string", "timeout: number?"],
+        outputs: ["revision: string"],
+      },
+    ]);
+  });
+
+  it("says which installations approved this exact manifest", () => {
+    expect(manifestReview(fetched).installed).toEqual([
+      { name: "argocd", image: IMAGE, sameManifest: true },
+      { name: "argocd-us", image: IMAGE, sameManifest: false },
+    ]);
+  });
+
+  it("labels a gate field and suggests a free installation name", () => {
+    expect(gateFieldLabel({ name: "app", type: "string", required: true })).toBe("app: string");
+    expect(suggestedInstallName("argocd", [])).toBe("argocd");
+    expect(suggestedInstallName("argocd", ["argocd", "argocd-2"])).toBe("argocd-3");
   });
 });
 

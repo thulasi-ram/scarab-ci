@@ -32,7 +32,8 @@ type OverlayDto = components["schemas"]["EnvironmentProjectOverlayDto"];
 type GrantDto = components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
 type ProjectEnvironmentDto = components["schemas"]["ProjectEnvironmentDto"];
 type EnvironmentProjectDto = components["schemas"]["EnvironmentProjectDto"];
-type PluginCatalogEntryDto = components["schemas"]["PluginCatalogEntryDto"];
+type PluginManifestDto = components["schemas"]["PluginManifestDto"];
+type FetchedPluginManifestDto = components["schemas"]["FetchedPluginManifestDto"];
 type PluginInstallationDto = components["schemas"]["PluginInstallationDto"];
 type PluginConnectionDto = components["schemas"]["PluginConnectionDto"];
 type BrokerJournalEntryDto = components["schemas"]["BrokerJournalEntryDto"];
@@ -897,7 +898,7 @@ function environmentProjects(env: OrgEnvironmentDto): EnvironmentProjectDto[] {
 // ── Plugins — Settings › Plugins. `argocd` is running;
 // `argocd-us` is killed. Writes echo a record and persist nothing.
 const ARGOCD_REPO = "ghcr.io/thulasi-ram/scarab-plugin-argocd";
-const argocdManifest: PluginCatalogEntryDto["manifest"] = {
+const argocdManifest: PluginManifestDto = {
   plugin: "argocd",
   capabilities: ["use_connection", "resolve_gates"],
   connections: [
@@ -931,15 +932,20 @@ const argocdManifest: PluginCatalogEntryDto["manifest"] = {
     },
   ],
 };
-const pluginCatalog: PluginCatalogEntryDto[] = [
-  {
-    plugin: "argocd",
-    description: "Reads Argo CD Application state through its connection.",
-    image_repository: ARGOCD_REPO,
-    manifest: argocdManifest,
-    first_party: true,
-  },
-];
+const ARGOCD_MANIFEST_SHA = "b7e3".padEnd(64, "9");
+// What `POST …/plugin-fetch` returns for any source: the Argo CD manifest,
+// and the org's two installations of it (one approved with an older
+// manifest).
+const fetchedArgocdManifest = (source: string): FetchedPluginManifestDto => ({
+  source: source || "github.com/acme/scarab-plugin-argocd//plugin.json@6e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d",
+  content: JSON.stringify(argocdManifest, null, 2) + "\n",
+  manifest: argocdManifest,
+  manifest_sha256: ARGOCD_MANIFEST_SHA,
+  installed: [
+    { name: "argocd", image: `${ARGOCD_REPO}@sha256:${"4f2a1c9e7b3d".padEnd(64, "0")}`, manifest_sha256: ARGOCD_MANIFEST_SHA },
+    { name: "argocd-us", image: `${ARGOCD_REPO}@sha256:${"d81e6b02c4aa".padEnd(64, "0")}`, manifest_sha256: "91c0".padEnd(64, "2") },
+  ],
+});
 const pluginInstallation = (
   name: string,
   digest: string,
@@ -951,7 +957,7 @@ const pluginInstallation = (
   plugin: "argocd",
   principal: `plugin:${name}`,
   image: `${ARGOCD_REPO}@sha256:${digest.padEnd(64, "0")}`,
-  manifest_sha256: "b7e3".padEnd(64, "9"),
+  manifest_sha256: ARGOCD_MANIFEST_SHA,
   config: { ARGOCD_UI_URL: "https://argocd.acme.example" },
   state: "enabled",
   runtime_status: "running",
@@ -965,8 +971,6 @@ const pluginInstallation = (
   storage: null,
   ...o,
 });
-// Libraries: one installed library with a newer first-party
-// version that fixes a security problem.
 const plugins: PluginInstallationDto[] = [
   pluginInstallation("argocd", "4f2a1c9e7b3d", {
     runtime_message: "watching 6 applications",
@@ -1651,7 +1655,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   // Ahead of the library routes, which answer every other repo's refused
   // runs with an empty list.
   if (p === "/v1/repos/acme/scarab/refused-runs") return json({ refused: scheduleRefused });
-  const lib = libraryRoute(p, method, json);
+  const lib = libraryRoute(p, method, json, body);
   if (lib) return lib;
   const pol = policyRoute(p, search, method, body, json);
   if (pol) return pol;
@@ -1930,14 +1934,37 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     return stored ? json(stored) : new Response("not found", { status: 404 });
   }
 
-  // Plugins: catalog, installations, kill/enable, uninstall.
-  if (/^\/v1\/orgs\/[^/]+\/plugin-catalog$/.test(p)) return json(pluginCatalog);
+  // Plugins: manifest review, installations, kill/enable, uninstall.
+  if (/^\/v1\/orgs\/[^/]+\/plugin-fetch$/.test(p) && method === "POST") {
+    // Any source reads as the Argo CD manifest.
+    const req = JSON.parse(body || "{}") as { source?: string };
+    return json(fetchedArgocdManifest(req.source ?? ""));
+  }
   if (/^\/v1\/orgs\/[^/]+\/plugins$/.test(p)) {
     if (method === "POST") {
-      // The body is not visible here; echo a fresh, still-pending install.
+      // Echo a fresh, still-pending install of what was sent; nothing is kept.
+      const req = JSON.parse(body || "{}") as {
+        name?: string;
+        image?: string;
+        manifest_sha256?: string;
+        config?: Record<string, string>;
+        storage?: { claim: string; mount_path?: string | null } | null;
+      };
+      const name = req.name || "argocd-staging";
       return json(
-        pluginInstallation("argocd-staging", "0a1b2c3d4e5f", {
+        pluginInstallation(name, "0a1b2c3d4e5f", {
           id: "1d2e3f4a5b",
+          ...(req.image ? { image: req.image } : {}),
+          ...(req.manifest_sha256 ? { manifest_sha256: req.manifest_sha256 } : {}),
+          config: req.config ?? {},
+          storage: req.storage
+            ? {
+                claim: req.storage.claim,
+                mount_path: req.storage.mount_path || "/data",
+                owner_annotation: "scarab.io/plugin-installation",
+                owner_annotation_value: `acme/${name}`,
+              }
+            : null,
           state: "enabled",
           runtime_status: "pending",
           runtime_message: "",
