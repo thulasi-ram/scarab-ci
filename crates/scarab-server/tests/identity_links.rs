@@ -381,7 +381,7 @@ async fn linking_proves_and_merges_an_imported_account_without_email() {
     assert_eq!(resp.status(), StatusCode::FOUND);
     assert_eq!(
         resp.headers()["location"],
-        "/settings/profile?identity_linked=default&merged=ada-gh"
+        "/settings/profile?identity_linked=default&merged=1"
     );
     let folded = pg.principal(&ada_gh).await.unwrap().unwrap();
     assert_eq!(folded.merged_into.as_deref(), Some(ada_id));

@@ -84,9 +84,9 @@ describe("linkNotice", () => {
       kind: "ok",
       text: "Linked your GitHub account. You can now sign in with it.",
     });
-    const merged = linkNotice("?identity_linked=default&merged=ada-gh", [github]);
+    const merged = linkNotice("?identity_linked=default&merged=1", [github]);
     expect(merged?.kind).toBe("ok");
-    expect(merged?.text).toContain("signed in before as ada-gh");
+    expect(merged?.text).toContain("signed in here before as another account");
   });
 
   it("an error wins and carries the server's own words", () => {

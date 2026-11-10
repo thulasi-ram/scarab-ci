@@ -8521,17 +8521,16 @@ async fn link_callback(
     {
         Ok(scarab_identity::LinkOutcome::Merged {
             from,
-            from_handle,
             removed_passkeys,
+            ..
         }) => {
             record_removed_passkeys(st, &principal.subject, &from, &removed_passkeys, &sid, now)
                 .await;
-            // The handle, for the person's own notice: it names the account
-            // they just proved they hold.
+            // A flag, not the folded account's handle: a URL carries no
+            // readable name (it lands in history and logs).
             format!(
-                "/settings/profile?identity_linked={}&merged={}",
-                flow.provider,
-                query_escape(&from_handle)
+                "/settings/profile?identity_linked={}&merged=1",
+                flow.provider
             )
         }
         Ok(scarab_identity::LinkOutcome::NeedsFoldedPasskey { from, .. }) => {

@@ -110,7 +110,8 @@ export type Notice = { kind: "ok" | "error"; text: string };
 /**
  * What the link callback's redirect (`/account?…`) says happened. The
  * callback is a browser redirect, so its outcome rides in the query string:
- * `identity_linked` (+ `merged` when another Principal was folded in), or
+ * `identity_linked` (+ `merged=1` when another Principal was folded in; the
+ * URL never names it), or
  * `identity_link_error` with the server's own explanation.
  */
 export function linkNotice(search: string, providers: ProviderLike[]): Notice | null {
@@ -120,11 +121,11 @@ export function linkNotice(search: string, providers: ProviderLike[]): Notice | 
   const linked = q.get("identity_linked");
   if (!linked) return null;
   const name = providerName(providers, linked);
-  const merged = q.get("merged");
+  const merged = q.get("merged") === "1";
   return {
     kind: "ok",
     text: merged
-      ? `Linked your ${name} account. It had signed in before as ${merged}; that history, its roles and its tokens are now yours.`
+      ? `Linked your ${name} account. It had signed in here before as another account; that account's history, roles and tokens are now yours.`
       : `Linked your ${name} account. You can now sign in with it.`,
   };
 }
