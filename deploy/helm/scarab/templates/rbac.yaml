@@ -1,9 +1,12 @@
 {{- if .Values.rbac.create -}}
 {{- /*
-  The k8s executor (crates/scarab-executor-k8s) creates one Pod per step,
-  deletes it on completion, and tails its logs (ADR-0013). It re-attaches to an
-  existing Pod after a control-plane restart (get/list). Scope the Role to the
-  namespace step Pods land in — the release namespace by default.
+  The k8s executor (crates/scarab-executor-k8s) creates one Pod per step and
+  tails its logs (ADR-0013). It re-attaches to an existing Pod after a
+  control-plane restart (get/list). The step Pod sweep (git-bug 986542a) lists
+  the Pods, Services and NetworkPolicies labelled managed-by=scarab and deletes
+  those of Runs that finished more than SCARAB_RETENTION_STEP_POD_MINUTES ago
+  (list/delete). Scope the Role to the namespace step Pods land in — the
+  release namespace by default.
 */ -}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -55,14 +58,16 @@ rules:
     # Shared services (ADR-0058): the executor creates a cluster-DNS Service per
     # shared-service instance so opt-in step Pods can reach it, and deletes it on
     # Run/Take teardown. (The service *Pod* itself is covered by the pods rule.)
+    # `list`: the step Pod sweep finds a finished Run's leftover Services.
     resources: ["services"]
-    verbs: ["get", "create", "delete"]
+    verbs: ["get", "list", "create", "delete"]
   - apiGroups: ["networking.k8s.io"]
     # Shared services (ADR-0058): a NetworkPolicy scopes reachability of each
     # shared service to the Pods that opted in via `uses:`; created with the
-    # service and deleted on teardown.
+    # service and deleted on teardown. `list`: the step Pod sweep finds a
+    # finished Run's leftover NetworkPolicies.
     resources: ["networkpolicies"]
-    verbs: ["get", "create", "delete"]
+    verbs: ["get", "list", "create", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
