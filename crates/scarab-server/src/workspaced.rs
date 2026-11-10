@@ -10117,6 +10117,7 @@ mod tests {
             retention_artifact_days: 90,
             retention_workspace_days: 14,
             retention_pack_days: 14,
+            retention_step_pod_minutes: 60,
             retention_config_file: None,
             cas_concurrency: 4,
             connections: vec![],
