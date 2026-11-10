@@ -3495,6 +3495,10 @@ pub struct ProjectDto {
     /// Derived from the connection's kind + base_url (the stored base is the API
     /// host, which differs from the web host on GitHub).
     pub repo_url: String,
+    /// The forge connection it is bound through: the `{id}` of
+    /// `/v1/connections/{id}/…`, and the row of `GET /v1/connections` that
+    /// says whether it is managed by configuration.
+    pub connection_id: String,
     /// Epoch millis of the project's most recent run, or `null` if it has never
     /// run — the dashboard's recency signal (ADR-0046). The domain carries no
     /// push/created_at yet, so never-run repos have no ordering key here.
@@ -3738,6 +3742,7 @@ async fn list_projects(
                 owner: repo.owner,
                 name: repo.name,
                 repo_url,
+                connection_id: resolved.connection.id,
                 last_run_at,
                 unreachable_since: resolved.unreachable_since,
             });
@@ -11699,9 +11704,11 @@ pub struct ConnectionDto {
     /// guard is keyed that way), so with two connections of one kind this is a
     /// per-kind liveness signal, not a per-connection one.
     pub last_delivery_at: Option<i64>,
-    /// The Projects this connection serves, from its repo bindings — a Project
-    /// *is* a binding (ADR-0046), so this is the connection's whole footprint.
-    pub projects: Vec<ConnectionProjectDto>,
+    /// How many repositories are enabled through this connection: its repo
+    /// bindings, each a Project (ADR-0046). A count, not the list: a
+    /// connection can hold thousands. The org's repositories page
+    /// (`GET /v1/orgs/{org}/repos?connection=`) lists them.
+    pub enabled_repos: u64,
     /// Can the forge enumerate what this credential reaches? Gates the re-sync
     /// affordance: GitHub can, so a drifted registry is healable; an adapter that
     /// cannot should not offer a button that always errors.
@@ -11717,20 +11724,6 @@ pub struct ConnectionDto {
     /// list must not perform one per row just to discover the button is
     /// pointless. The endpoint itself remains the authority.
     pub supports_preflight: bool,
-}
-
-/// A Project a connection serves, plus the forge coordinate it came from.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ConnectionProjectDto {
-    pub org: String,
-    pub project: String,
-    pub owner: String,
-    pub name: String,
-    /// Unix-ms since when its forge connection has not reached it (the
-    /// GitHub App's installation stopped covering it), or `null`. The
-    /// Project is kept; its events are ignored and no run can start until
-    /// the forge covers it again or an admin disables it.
-    pub unreachable_since: Option<i64>,
 }
 
 /// `POST /v1/connections` body (ADR-0060 part D, manual path): the forge to
@@ -12041,7 +12034,7 @@ fn is_loopback_callback(url: &str) -> bool {
 #[utoipa::path(
     get,
     path = "/v1/connections",
-    summary = "Registered forge connections + their bound Projects and health (ADR-0060)",
+    summary = "Registered forge connections, how many repositories each has enabled, and their health (ADR-0060)",
     params(("org" = Option<String>, Query, description = "only the connections serving this org")),
     responses(
         (status = 200, body = [ConnectionDto]),
@@ -12084,27 +12077,10 @@ async fn list_connections(
         .collect();
     let mut out = Vec::with_capacity(conns.len());
     for conn in conns {
-        let mut projects = Vec::new();
-        for repo in connections
-            .repos_of(&conn.id)
+        let enabled_repos = connections
+            .repo_count_of(&conn.id)
             .await
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?
-        {
-            if let Some(resolved) = connections
-                .resolve(&repo)
-                .await
-                .map_err(|e| ApiError::BadRequest(e.to_string()))?
-            {
-                projects.push(ConnectionProjectDto {
-                    org: resolved.org,
-                    project: resolved.project,
-                    owner: repo.owner,
-                    name: repo.name,
-                    unreachable_since: resolved.unreachable_since,
-                });
-            }
-        }
-        projects.sort_by(|a, b| (&a.org, &a.project).cmp(&(&b.org, &b.project)));
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
         let credential_present = credential_present(&st, &conn).await;
         let last_delivery_at = connections
             .last_delivery_at(conn.kind)
@@ -12147,7 +12123,7 @@ async fn list_connections(
             credential_ref: conn.credential_ref,
             credential_present,
             last_delivery_at,
-            projects,
+            enabled_repos,
             supports_resync,
             supports_preflight,
             managed_by_config,
@@ -12974,6 +12950,9 @@ pub struct OrgReposQuery {
     pub per_page: Option<u32>,
     /// Only repositories whose name contains this text, ignoring case.
     pub q: Option<String>,
+    /// Only repositories of this connection: enabled through it, or, when
+    /// not enabled, reached through it. Only its forge is asked.
+    pub connection: Option<String>,
 }
 
 /// Default page size for `GET /v1/orgs/{org}/repos`.
@@ -13038,7 +13017,7 @@ pub struct OrgReposPageDto {
 /// Enabling a repository is opt-in, so this is the list an admin enables
 /// from (`POST /v1/connections/{id}/repos`) and disables from (`DELETE
 /// /v1/connections/{id}/repos/{owner}/{name}`). The forge is asked live, as
-/// the Add repository pick-list is (`…/available-repos`); no list of
+/// the bind pick-list is (`…/available-repos`); no list of
 /// available repositories is stored. The forge port returns a connection's
 /// whole list, so the server pages the merged result.
 ///
@@ -13052,7 +13031,8 @@ pub struct OrgReposPageDto {
         ("org" = String, Path, description = "org"),
         ("page" = Option<u32>, Query, description = "1-based page (default 1)"),
         ("per_page" = Option<u32>, Query, description = "repositories per page (default 25, max 100)"),
-        ("q" = Option<String>, Query, description = "only names containing this text, ignoring case")
+        ("q" = Option<String>, Query, description = "only names containing this text, ignoring case"),
+        ("connection" = Option<String>, Query, description = "only repositories of this connection id")
     ),
     responses(
         (status = 200, body = OrgReposPageDto),
@@ -13128,9 +13108,11 @@ async fn org_repos(
     // What each connection serving the org reaches, owned by the org: only
     // those can be bound through it (git-bug 19b0a45).
     let mut unlisted = Vec::new();
+    // With `?connection=`, only that connection's forge is asked.
+    let only = q.connection.as_deref();
     for conn in all
         .iter()
-        .filter(|c| c.org.as_deref() == Some(org.as_str()))
+        .filter(|c| c.org.as_deref() == Some(org.as_str()) && only.is_none_or(|id| c.id == id))
     {
         let reported = match connection_adapter(&st, conn).await {
             Ok(forge) => forge.list_accessible_repos().await,
@@ -13144,7 +13126,7 @@ async fn org_repos(
                 unlisted.push(UnlistedConnectionDto {
                     connection_id: conn.id.clone(),
                     reason: format!(
-                        "{} cannot list its repositories; add one by name on the Connections page",
+                        "{} cannot list its repositories, so only the enabled ones are listed",
                         conn.kind.as_str()
                     ),
                 });
@@ -13182,9 +13164,10 @@ async fn org_repos(
     let matching: Vec<OrgRepoDto> = rows
         .into_values()
         .filter(|r| {
-            needle
-                .as_deref()
-                .is_none_or(|n| r.name.to_lowercase().contains(n))
+            only.is_none_or(|id| r.connection_id == id)
+                && needle
+                    .as_deref()
+                    .is_none_or(|n| r.name.to_lowercase().contains(n))
         })
         .collect();
     let total = matching.len();
@@ -13215,8 +13198,7 @@ async fn org_repos(
 ///
 /// There is no `projects` table: a Project *is* a `forge_repos` binding
 /// (ADR-0046), so this endpoint is the repo→Project onboarding flow — "Enable"
-/// on the org's repositories page and "Add repository" on its Connections —
-/// for every forge. After it, the repo appears on `GET /v1/repos`, can hold
+/// on the org's repositories page — for every forge. After it, the repo appears on `GET /v1/repos`, can hold
 /// Environments and secrets, and its pushes resolve to a tenant. A GitHub
 /// installation makes its repos available but binds none of them, so this is
 /// the GitHub path too.
@@ -14183,7 +14165,6 @@ impl utoipa::Modify for StepUpResponses {
         SecretMatrixRow,
         SilenceCellRequest,
         ConnectionDto,
-        ConnectionProjectDto,
         CreateConnectionRequest,
         AssignConnectionOrgRequest,
         ConnectionOrgDto,

@@ -257,14 +257,10 @@ async fn the_list_reports_bound_projects_and_health_without_the_credential() {
     assert_eq!(c["credential_present"], true);
     assert_eq!(c["supports_resync"], true, "GitHub can enumerate");
     assert_eq!(c["managed_by_config"], false);
-    // Every bound repo, as its governed Project — a Project IS the binding.
-    let projects: Vec<&str> = c["projects"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|p| p["project"].as_str().unwrap())
-        .collect();
-    assert_eq!(projects, vec!["api", "web"], "sorted, both bindings");
+    // How many repos are bound, as a count: the list is the org's
+    // repositories page, not this payload.
+    assert_eq!(c["enabled_repos"], 2, "both bindings");
+    assert!(c.get("projects").is_none(), "no per-repo list: {c}");
     // No delivery has been recorded, so liveness is UNKNOWN — not "broken".
     assert!(c["last_delivery_at"].is_null());
 
@@ -805,7 +801,7 @@ async fn creating_a_connection_writes_the_credential_through_and_never_echoes_it
         .expect("the created connection is listed");
     assert_eq!(fj["kind"], "forgejo");
     assert_eq!(fj["credential_present"], true);
-    assert_eq!(fj["projects"], serde_json::json!([]));
+    assert_eq!(fj["enabled_repos"], 0);
     // Forgejo's base URL IS its web host (its API lives under /api/v1).
     assert_eq!(fj["web_url"], "https://git.acme.test");
 

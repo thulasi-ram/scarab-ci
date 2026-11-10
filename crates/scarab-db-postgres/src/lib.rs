@@ -3394,6 +3394,16 @@ impl ForgeConnectionStore for PostgresDb {
             .collect())
     }
 
+    async fn repo_count_of(&self, connection_id: &str) -> Result<u64, RegistryError> {
+        let n: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM forge_repos WHERE connection_id = $1")
+                .bind(connection_id)
+                .fetch_one(self.pool())
+                .await
+                .map_err(reg_err)?;
+        Ok(n as u64)
+    }
+
     async fn resolve(&self, repo: &RepoRef) -> Result<Option<ResolvedRepo>, RegistryError> {
         let row = sqlx::query(
             "SELECT c.id, c.kind, c.base_url, c.credential_ref, c.org AS conn_org,

@@ -224,7 +224,7 @@
         "tags": [
           "Forge Connections"
         ],
-        "summary": "Registered forge connections + their bound Projects and health (ADR-0060)",
+        "summary": "Registered forge connections, how many repositories each has enabled, and their health (ADR-0060)",
         "description": "Read-only, and per Org (git-bug 19b0a45): the caller sees the connections\nof the Orgs it administers, and a global admin also sees the unassigned\nones. No credential material is ever returned — only whether the handle\nresolves.",
         "operationId": "list_connections",
         "parameters": [
@@ -570,7 +570,7 @@
           "Forge Connections"
         ],
         "summary": "Bind a repo to a connection, creating its Project, and register its webhook (ADR-0060)",
-        "description": "There is no `projects` table: a Project *is* a `forge_repos` binding\n(ADR-0046), so this endpoint is the repo→Project onboarding flow — \"Enable\"\non the org's repositories page and \"Add repository\" on its Connections —\nfor every forge. After it, the repo appears on `GET /v1/repos`, can hold\nEnvironments and secrets, and its pushes resolve to a tenant. A GitHub\ninstallation makes its repos available but binds none of them, so this is\nthe GitHub path too.\n\nRegistration is attempted **after** the binding lands and its failure is\n*reported, not rolled back*: the binding is the durable governance fact, a\nhook is a remote side effect on a system that may be momentarily unreachable,\nand unbinding on a failed hook call would delete a Project an admin just\nasked for. `POST …/repos/{owner}/{name}/webhook` retries.",
+        "description": "There is no `projects` table: a Project *is* a `forge_repos` binding\n(ADR-0046), so this endpoint is the repo→Project onboarding flow — \"Enable\"\non the org's repositories page — for every forge. After it, the repo appears on `GET /v1/repos`, can hold\nEnvironments and secrets, and its pushes resolve to a tenant. A GitHub\ninstallation makes its repos available but binds none of them, so this is\nthe GitHub path too.\n\nRegistration is attempted **after** the binding lands and its failure is\n*reported, not rolled back*: the binding is the durable governance fact, a\nhook is a remote side effect on a system that may be momentarily unreachable,\nand unbinding on a failed hook call would delete a Project an admin just\nasked for. `POST …/repos/{owner}/{name}/webhook` retries.",
         "operationId": "bind_repo",
         "parameters": [
           {
@@ -5425,7 +5425,7 @@
           "Repositories"
         ],
         "summary": "An org's repositories, enabled and not, one page at a time",
-        "description": "Enabling a repository is opt-in, so this is the list an admin enables\nfrom (`POST /v1/connections/{id}/repos`) and disables from (`DELETE\n/v1/connections/{id}/repos/{owner}/{name}`). The forge is asked live, as\nthe Add repository pick-list is (`…/available-repos`); no list of\navailable repositories is stored. The forge port returns a connection's\nwhole list, so the server pages the merged result.\n\nRead on the org may list it; `can_change` says per row whether the caller\nmay also act on it.",
+        "description": "Enabling a repository is opt-in, so this is the list an admin enables\nfrom (`POST /v1/connections/{id}/repos`) and disables from (`DELETE\n/v1/connections/{id}/repos/{owner}/{name}`). The forge is asked live, as\nthe bind pick-list is (`…/available-repos`); no list of\navailable repositories is stored. The forge port returns a connection's\nwhole list, so the server pages the merged result.\n\nRead on the org may list it; `can_change` says per row whether the caller\nmay also act on it.",
         "operationId": "org_repos",
         "parameters": [
           {
@@ -5463,6 +5463,15 @@
             "name": "q",
             "in": "query",
             "description": "only names containing this text, ignoring case",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "connection",
+            "in": "query",
+            "description": "only repositories of this connection id",
             "required": false,
             "schema": {
               "type": "string"
@@ -9411,7 +9420,7 @@
           "web_url",
           "credential_ref",
           "credential_present",
-          "projects",
+          "enabled_repos",
           "supports_resync",
           "managed_by_config",
           "supports_preflight"
@@ -9428,6 +9437,12 @@
           "credential_ref": {
             "type": "string",
             "description": "The `_forge`-scoped handle the credential lives under. An opaque name,\nnot the secret."
+          },
+          "enabled_repos": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many repositories are enabled through this connection: its repo\nbindings, each a Project (ADR-0046). A count, not the list: a\nconnection can hold thousands. The org's repositories page\n(`GET /v1/orgs/{org}/repos?connection=`) lists them.",
+            "minimum": 0
           },
           "id": {
             "type": "string"
@@ -9454,13 +9469,6 @@
               "null"
             ],
             "description": "The Org this connection serves (git-bug 19b0a45); `null` = unassigned,\nvisible to and editable by global admins only."
-          },
-          "projects": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ConnectionProjectDto"
-            },
-            "description": "The Projects this connection serves, from its repo bindings — a Project\n*is* a binding (ADR-0046), so this is the connection's whole footprint."
           },
           "supports_preflight": {
             "type": "boolean",
@@ -9554,38 +9562,6 @@
               "null"
             ],
             "description": "Why the check could not run, when it could not — an adapter that cannot\nintrospect, a credential that does not resolve, a forge that errored."
-          }
-        }
-      },
-      "ConnectionProjectDto": {
-        "type": "object",
-        "description": "A Project a connection serves, plus the forge coordinate it came from.",
-        "required": [
-          "org",
-          "project",
-          "owner",
-          "name"
-        ],
-        "properties": {
-          "name": {
-            "type": "string"
-          },
-          "org": {
-            "type": "string"
-          },
-          "owner": {
-            "type": "string"
-          },
-          "project": {
-            "type": "string"
-          },
-          "unreachable_since": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Unix-ms since when its forge connection has not reached it (the\nGitHub App's installation stopped covering it), or `null`. The\nProject is kept; its events are ignored and no run can start until\nthe forge covers it again or an admin disables it."
           }
         }
       },
@@ -12646,9 +12622,14 @@
           "project",
           "owner",
           "name",
-          "repo_url"
+          "repo_url",
+          "connection_id"
         ],
         "properties": {
+          "connection_id": {
+            "type": "string",
+            "description": "The forge connection it is bound through: the `{id}` of\n`/v1/connections/{id}/…`, and the row of `GET /v1/connections` that\nsays whether it is managed by configuration."
+          },
           "last_run_at": {
             "type": [
               "integer",
