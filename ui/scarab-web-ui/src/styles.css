@@ -1045,10 +1045,6 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   font: var(--t-mono);
 }
 
-.secret-row .btn-danger {
-  margin-left: auto;
-}
-
 .error {
   color: var(--danger);
   font: var(--t-body);
@@ -1968,8 +1964,10 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 }
 .preflight-sev.req { color: var(--danger); border-color: var(--danger); }
 
-/* How many repositories a connection has enabled, and the link to them. */
-.conn-projects { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+/* The Connections list: a connection's id under its forge and host. */
+.conn-id { display: block; margin-top: 2px; color: var(--muted-sage); }
+/* A connection page's panel body that is not a label and value grid. */
+.conn-detail { padding: 12px 14px; }
 
 /* ════════════════════════════════════════════════════════════════════════
    Dashboard (engineer landing): action inbox · activity · all-clear
@@ -3296,11 +3294,13 @@ h1, .crumb-head, .run-title {
 /* Inside the two-week renewal window: a warning an operator can still act on,
    which is the only reason to colour it at all. */
 .tok-soon { color: var(--copper); }
-/* The org's list (git-bug a4cb94f): one row per token, sorted by the server. */
+/* Both token lists (git-bug a4cb94f): one row per token; the org's is sorted by the server. */
 .tok-sort { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 4px 0 10px; }
 .tok-sort-label { color: var(--muted-sage); margin-right: 4px; }
 .tok-table td { vertical-align: middle; }
-.tok-table td:nth-child(n + 4):nth-child(-n + 7) { white-space: nowrap; }
+.tok-table td.nw { white-space: nowrap; }
+.tok-table th, .tok-table .tok-state { white-space: nowrap; }
+.tok-table .chips { display: flex; margin-top: 5px; }
 .tok-table tr.tok-dead { opacity: 0.6; }
 .tok-table-scroll { overflow-x: auto; }
 
@@ -3530,6 +3530,25 @@ h1, .crumb-head, .run-title {
   color: var(--warn); border: 1px dashed var(--border-warn);
   border-radius: var(--radius-sm); padding: 2px 8px;
 }
+/* A sub-block of the step-up panel: its heading, chips and note, spaced by the
+   grid, not by the heading's margins. */
+.sec-block { display: grid; gap: 8px; }
+.sec-block .sec-sub { margin: 0; }
+.sec-block p { margin: 0; }
+/* An admin chip an owner can click to reset that admin's passkeys. */
+.sec-chip-btn {
+  background: none; border: 0; padding: 0; margin: 0;
+  font: inherit; color: inherit; cursor: pointer;
+}
+.sec-chip-btn:hover, .sec-chip-btn:focus-visible { text-decoration: underline; text-underline-offset: 3px; }
+/* The reset dialog's member list: one radio row per member. */
+.sec-pick { display: grid; gap: 6px; max-height: 320px; overflow-y: auto; }
+.sec-pick label {
+  display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+  padding: 7px 10px; border: 1px solid var(--border-soft); border-radius: var(--radius-sm);
+  font: var(--t-body); cursor: pointer;
+}
+.sec-pick label.on { border-color: var(--emerald); }
 .sec-result { display: grid; gap: 10px; margin-top: 10px; }
 .sec-result-body {
   margin: 0; background: var(--terminal); color: var(--terminal-ink);

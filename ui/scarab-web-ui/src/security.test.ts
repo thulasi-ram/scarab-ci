@@ -15,6 +15,7 @@ import {
   requestErrorLink,
   requestErrorText,
   resetCandidates,
+  resetResultText,
   resultSecret,
   resultText,
   shouldAutoEnroll,
@@ -222,5 +223,16 @@ describe("the confirm page", () => {
     expect(resultText({ removed: 2 })).toBe('{\n  "removed": 2\n}');
     expect(resultText("deleted")).toBe("deleted");
     expect(resultText(null)).toBe("");
+  });
+});
+
+describe("resetResultText", () => {
+  it("counts what the reset removed and revoked", () => {
+    expect(resetResultText({ subject: "j.lee", removed: 2, windows_revoked: 1 })).toBe(
+      "Reset j.lee: 2 passkeys removed, 1 confirmation revoked.",
+    );
+    expect(resetResultText({ subject: "j.lee", removed: 1, windows_revoked: 0 })).toBe(
+      "Reset j.lee: 1 passkey removed, 0 confirmations revoked.",
+    );
   });
 });

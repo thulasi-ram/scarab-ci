@@ -13,6 +13,7 @@ import { AccountSettings, LegacySettings, NewOrgSettings, OrgSettings } from "./
 import LibraryReview from "./routes/LibraryReview";
 import LibraryManage from "./routes/LibraryManage";
 import PluginManage from "./routes/PluginManage";
+import ConnectionManage from "./routes/ConnectionManage";
 import MemberManage from "./routes/MemberManage";
 import { EnvironmentManage, EnvironmentRedirect } from "./routes/EnvironmentPage";
 import ConfirmRequest from "./routes/ConfirmRequest";
@@ -59,6 +60,11 @@ export default function App() {
           `<publisher>~<name>`, a plugin installation its id. */}
       <Route path="/orgs/:org/settings/libraries/:id/manage" component={LibraryManage} />
       <Route path="/orgs/:org/settings/plugins/:id/manage" component={PluginManage} />
+      {/* One forge connection, inside the settings frame with Connections
+          marked. Five segments with a static `connections`, so it collides
+          with neither the settings sections (four) nor another section's
+          page; a connection id is one path segment. */}
+      <Route path="/orgs/:org/settings/connections/:id" component={ConnectionManage} />
       {/* One member, keyed by the subject (one encoded segment): a binding
           has no id of its own. */}
       <Route path="/orgs/:org/settings/members/:subject/manage" component={MemberManage} />

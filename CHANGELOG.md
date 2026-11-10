@@ -195,6 +195,14 @@ release.yml uses that version's section as the GitHub Release text. See
   Escape), shows an org you do not administer without letting you pick it, sets New
   organization… apart under a rule, and opens above a dialog. The docs version dropdown is a
   menu of links to each version.
+- **Connections, Secrets, API tokens and Security in Organization settings are reorganised.**
+  Connections lists one row per connection, with tags such as credential missing or no
+  deliveries yet; each connection has its own page (`…/settings/connections/<id>`) with its
+  credential, last delivery, app check, Manage repositories, Re-sync and Remove. Secrets has
+  New secret at the top right and Replace and Delete (with the name typed) on each row. Both API
+  token pages list tokens with the same row and tags (active, expires soon, revoked, never
+  used), and New token moves to the header of Account settings › API tokens. On Security, an
+  owner resets a member's passkeys from a Reset passkeys dialog instead of an inline list.
 
 ### Bug Fixes
 

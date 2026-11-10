@@ -362,17 +362,12 @@ function orgBody(id: string, org: string): JSX.Element {
       );
     case "secrets":
       return (
-        <>
-          <ScopedSecrets scope={{ org }} title={`Org secrets · ${org}`} emptyLabel="No org-wide secrets yet." />
-          <p class="subtle">
-            <small>
-              <Icon icon="key-round" size={12} /> Org secrets are the base of the inheritance chain —
-              every repo and environment in <b>{org}</b> resolves them unless it sets the same key at
-              a narrower scope. Per-repo and per-environment values live on the repository's Secrets
-              tab.
-            </small>
-          </p>
-        </>
+        <ScopedSecrets
+          scope={{ org }}
+          title={`Org secrets · ${org}`}
+          emptyLabel="No org-wide secrets yet."
+          note="A repository or Environment that sets the same name uses its own value; set those on the repository's Secrets tab."
+        />
       );
     case "policies":
       return <OrgPolicies org={org} />;

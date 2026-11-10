@@ -313,6 +313,13 @@ export function canResetPasskeys(s: { caller_role?: string | null } | null | und
   return s?.caller_role === "owner";
 }
 
+/** What a passkey reset did, as one line. */
+export function resetResultText(r: { subject: string; removed: number; windows_revoked: number }): string {
+  const keys = `${r.removed} passkey${r.removed === 1 ? "" : "s"} removed`;
+  const windows = `${r.windows_revoked} confirmation${r.windows_revoked === 1 ? "" : "s"} revoked`;
+  return `Reset ${r.subject}: ${keys}, ${windows}.`;
+}
+
 /** The members a reset can name: each subject once (a person may hold a
  * binding on the org and on several projects), sorted, with whether they are
  * one of the admins holding no passkey. */

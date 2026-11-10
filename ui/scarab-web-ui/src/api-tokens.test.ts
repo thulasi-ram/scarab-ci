@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
+  activeCount,
   mintableOrgs,
+  tokenChips,
   daysLeft,
   expiresSoon,
   expiryLabel,
@@ -152,5 +154,36 @@ describe("mintableOrgs", () => {
   });
   it("offers nothing when the person holds no role anywhere", () => {
     expect(mintableOrgs([])).toEqual([]);
+  });
+});
+
+describe("tokenChips", () => {
+  const labels = (t: Parameters<typeof tokenChips>[0]) => tokenChips(t, NOW).map((c) => c.label);
+
+  it("marks a live token active, and a used one carries nothing else", () => {
+    expect(labels({ ...token(), last_used_at: NOW - DAY })).toEqual(["active"]);
+  });
+
+  it("warns inside the two-week window and when it was never used", () => {
+    expect(labels({ ...token({ expires_at: NOW + 3 * DAY }), last_used_at: null })).toEqual([
+      "active",
+      "expires soon",
+      "never used",
+    ]);
+  });
+
+  it("says revoked over expired, and offers no expiry warning for a dead token", () => {
+    expect(labels({ ...token({ revoked_at: NOW - DAY, expires_at: NOW - 2 * DAY }), last_used_at: NOW })).toEqual([
+      "revoked",
+    ]);
+    expect(labels({ ...token({ expires_at: NOW - DAY }), last_used_at: NOW - 3 * DAY })).toEqual(["expired"]);
+  });
+});
+
+describe("activeCount", () => {
+  it("counts only the tokens that still authenticate", () => {
+    expect(
+      activeCount([token(), token({ revoked_at: NOW - DAY }), token({ expires_at: NOW - 1 }), token()], NOW),
+    ).toBe(2);
   });
 });

@@ -150,6 +150,51 @@ test("the old Event log address opens Security with its filters, and the refusal
   expect(errors).toEqual([]);
 });
 
+test("an owner resets a member's passkeys from a dialog: pick, type the name, see what was removed", async ({
+  page,
+}) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/security");
+  const panel = page.locator(".panel", { hasText: "Security · step-up" });
+  // No member list inline: one button in the header.
+  await expect(panel.getByRole("radio")).toHaveCount(0);
+  await expect(panel.getByRole("link", { name: "enroll a passkey" })).toHaveAttribute(
+    "href",
+    "/settings/security?enroll=1",
+  );
+
+  // An admin without a passkey opens the dialog with that admin picked.
+  await panel.getByRole("list", { name: "Admins without a passkey" }).getByRole("button", { name: "j.lee" }).click();
+  let dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("radio", { name: /j\.lee/ })).toBeChecked();
+  await expect(dialog.getByText("no passkey", { exact: true })).toHaveCount(1);
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+
+  await panel.getByRole("button", { name: "Reset passkeys" }).click();
+  dialog = page.getByRole("dialog");
+  const next = dialog.getByRole("button", { name: "Continue" });
+  await expect(next).toBeDisabled();
+  await dialog.getByRole("radio", { name: /m\.diaz/ }).check();
+  await next.click();
+
+  // The typed confirm; Cancel goes back to the member list.
+  dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("Reset every passkey m.diaz holds?");
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(page.getByRole("dialog").getByRole("radio", { name: /m\.diaz/ })).toBeChecked();
+  await page.getByRole("dialog").getByRole("button", { name: "Continue" }).click();
+  dialog = page.getByRole("dialog");
+  const go = dialog.getByRole("button", { name: "Reset passkeys" });
+  await expect(go).toBeDisabled();
+  await dialog.getByRole("textbox", { name: "Type m.diaz to confirm" }).fill("m.diaz");
+  await go.click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(panel.locator(".notice-ok")).toHaveText("Reset m.diaz: 2 passkeys removed, 1 confirmation revoked.");
+  // An admin left with no passkey joins the list.
+  await expect(panel.getByRole("list", { name: "Admins without a passkey" })).toContainText("m.diaz");
+  expect(errors).toEqual([]);
+});
+
 test("an org the caller does not administer shows no org sections", async ({ page }) => {
   await page.goto("/orgs/initech/settings/members");
   await expect(page.getByText(/You do not administer/)).toBeVisible();
@@ -789,33 +834,68 @@ test("Connections lists the org's connections and, for a global admin, the unass
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/connections");
   const page_ = page.locator("section.page");
-  await expect(page_.getByText("forgejo-7f3a91c2", { exact: true })).toBeVisible();
+  const list = page_.getByRole("table", { name: "Forge connections" });
   const unassigned = page_.locator(".panel", { hasText: "Unassigned connections" });
   await expect(unassigned.getByText("github-install-90211", { exact: true })).toBeVisible();
 
-  // A connection shows how many repositories it has enabled and links to
-  // them on the org page; it lists none and enables or disables none.
-  const row = page_.locator("li.conn", { hasText: "forgejo-7f3a91c2" });
-  await expect(row).toContainText("1 enabled repository");
-  await expect(page_.locator("li.conn", { hasText: "gh-acme" })).toContainText("7 enabled repositories");
-  await expect(page_.getByRole("button", { name: "Add repository" })).toHaveCount(0);
-  await expect(page_.getByRole("button", { name: "Disable", exact: true })).toHaveCount(0);
-  await expect(page_.getByRole("link", { name: "acme/infra" })).toHaveCount(0);
-  // An unassigned connection serves no org, so it has no org page to link to.
-  await expect(unassigned.getByRole("link", { name: "Manage repositories" })).toHaveCount(0);
-  await expect(row.getByRole("link", { name: "Manage repositories" })).toHaveAttribute(
+  // One row per connection: forge and host linking to its page, how many
+  // repositories it has enabled, and none of them listed.
+  const row = list.getByRole("row", { name: /forgejo-7f3a91c2/ });
+  await expect(row.getByRole("link", { name: "Forgejo git.acme.dev" })).toHaveAttribute(
     "href",
-    "/orgs/acme?connection=forgejo-7f3a91c2",
+    "/orgs/acme/settings/connections/forgejo-7f3a91c2",
   );
+  await expect(row).toContainText("1 enabled repository");
+  await expect(list.getByRole("row", { name: /gh-acme/ })).toContainText("7 enabled repositories");
+  await expect(list.getByRole("link", { name: "acme/infra" })).toHaveCount(0);
+  // Re-sync and Remove live on the connection's page, not on the list.
+  await expect(list.getByRole("button", { name: /Re-sync|Remove/ })).toHaveCount(0);
+  // An unassigned connection serves no org, so it has no page to link to.
+  await expect(unassigned.getByRole("link", { name: "Manage", exact: true })).toHaveCount(0);
 
-  // Removing a connection asks for its id typed exactly.
-  await row.getByRole("button", { name: "Remove", exact: true }).click();
+  // Add Forgejo connection sits in the panel header and opens a dialog.
+  await page_.getByRole("button", { name: "Add Forgejo connection" }).click();
+  await expect(page.getByRole("dialog")).toContainText("Connect a Forgejo or Codeberg instance");
+  await page.getByRole("dialog").getByRole("button", { name: "Cancel" }).click();
+  expect(errors).toEqual([]);
+});
+
+test("a connection's page holds its credential, deliveries, app check, re-sync and remove", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/connections");
+  await page.getByRole("row", { name: /gh-acme/ }).getByRole("link", { name: "Manage", exact: true }).click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/connections\/gh-acme$/);
+  // Inside the settings frame, with Connections marked.
+  const nav = page.getByRole("navigation", { name: "Settings" });
+  await expect(nav.getByRole("link", { name: "Connections" })).toHaveAttribute("aria-current", "page");
+  const page_ = page.locator("section.page");
+  await expect(page_.getByRole("heading", { level: 1 })).toContainText("gh-acme");
+  await expect(page_.locator(".panel", { hasText: "Credential" })).toContainText(/github-app\s*Status\s*Resolves\./);
+  await expect(page_).toContainText("app configuration matches what Scarab needs");
+  await expect(page_.getByRole("link", { name: "Manage on GitHub →" })).toHaveAttribute(
+    "href",
+    "https://github.com/settings/installations",
+  );
+  await expect(page_.getByRole("link", { name: "Manage repositories" })).toHaveAttribute(
+    "href",
+    "/orgs/acme?connection=gh-acme",
+  );
+  await page_.getByRole("button", { name: /Re-sync/ }).click();
+  await expect(page_.locator(".notice-ok")).toContainText("enabled repositories confirmed");
+
+  // Removing it asks for its id typed exactly.
+  await page_.getByRole("button", { name: "Remove connection" }).click();
   const dialog = page.getByRole("dialog");
-  await expect(dialog).toContainText("This also removes its 1 project");
+  await expect(dialog).toContainText("This also removes its 7 projects");
   const go = dialog.getByRole("button", { name: "Remove connection" });
   await expect(go).toBeDisabled();
-  await dialog.getByRole("textbox", { name: "Type forgejo-7f3a91c2 to confirm" }).fill("forgejo-7f3a91c2");
+  await dialog.getByRole("textbox", { name: "Type gh-acme to confirm" }).fill("gh-acme");
   await expect(go).toBeEnabled();
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+
+  // A connection the org does not have says so.
+  await page.goto("/orgs/acme/settings/connections/nope");
+  await expect(page.locator("section.page")).toContainText("nope is not a connection of acme");
   expect(errors).toEqual([]);
 });
 
@@ -826,9 +906,8 @@ test("a connection's repositories are managed on the org page, and a Forgejo web
   page,
 }) => {
   const errors = collectErrors(page);
-  await page.goto("/orgs/acme/settings/connections");
-  const row = page.locator("li.conn", { hasText: "forgejo-7f3a91c2" });
-  await row.getByRole("link", { name: "Manage repositories" }).click();
+  await page.goto("/orgs/acme/settings/connections/forgejo-7f3a91c2");
+  await page.getByRole("link", { name: "Manage repositories" }).click();
   await expect(page).toHaveURL(/\/orgs\/acme\?connection=forgejo-7f3a91c2$/);
   const rows = page.locator(".org-repo-row");
   await expect(rows).toHaveCount(3);
@@ -886,7 +965,7 @@ test("a global admin makes a new org from the org dropdown and lands on its conn
   // panel: the new org reached `admin_orgs` on the next `/v1/me`.
   const page_ = page.locator("section.page");
   await expect(page_.getByText("forgejo-5be0d4a1", { exact: true })).toBeVisible();
-  await expect(page_.getByText("https://git.initech.dev", { exact: true })).toBeVisible();
+  await expect(page_.getByRole("link", { name: "Forgejo git.initech.dev" })).toBeVisible();
   await expect(page_.getByText(/You do not administer/)).toHaveCount(0);
   expect(errors).toEqual([]);
 });
@@ -934,19 +1013,71 @@ test("a global admin assigns an unassigned connection to an org", async ({ page 
   expect(errors).toEqual([]);
 });
 
+test("org secrets: New secret in the header, Replace with the name filled in, Delete with the name typed", async ({
+  page,
+}) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/secrets");
+  const panel = page.locator(".panel", { hasText: "Org secrets · acme" });
+  const list = panel.getByRole("list", { name: "Secrets" });
+  await expect(list.getByRole("listitem")).toHaveCount(2);
+
+  // New secret, from the panel header.
+  await panel.getByRole("button", { name: "New secret" }).click();
+  let dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("heading", { name: "New secret" })).toBeVisible();
+  await dialog.getByRole("textbox", { name: "Name" }).fill("NPM_TOKEN");
+  await dialog.getByLabel("Value").fill("npm_x");
+  await dialog.getByRole("button", { name: "Save" }).click();
+  await expect(list.getByText("NPM_TOKEN", { exact: true })).toBeVisible();
+
+  // Replace keeps the name and still asks before overwriting.
+  await list.getByRole("listitem").filter({ hasText: "GHCR_TOKEN" }).getByRole("button", { name: "Replace" }).click();
+  dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("heading", { name: "Replace secret" })).toBeVisible();
+  await expect(dialog.getByRole("textbox", { name: "Name" })).toHaveValue("GHCR_TOKEN");
+  const save = dialog.getByRole("button", { name: "Save" });
+  await expect(save).toBeDisabled();
+  await dialog.getByRole("checkbox").check();
+  await expect(save).toBeEnabled();
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+
+  // Delete asks for the name typed exactly.
+  await list.getByRole("listitem").filter({ hasText: "SENTRY_DSN" }).getByRole("button", { name: "Delete" }).click();
+  dialog = page.getByRole("dialog");
+  const go = dialog.getByRole("button", { name: "Delete secret" });
+  await expect(go).toBeDisabled();
+  await dialog.getByRole("textbox", { name: "Type SENTRY_DSN to confirm" }).fill("SENTRY_DSN");
+  await go.click();
+  await expect(list.getByText("SENTRY_DSN", { exact: true })).toHaveCount(0);
+
+  // One note, inside the panel; no button under the list.
+  await expect(panel.getByText(/Values are never shown\. Setting a name again replaces it\./)).toHaveCount(1);
+  await expect(page.locator("section.page").getByRole("button", { name: "New secret" })).toHaveCount(1);
+  expect(errors).toEqual([]);
+});
+
 test("a token minted under Account settings shows in the org's list", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/settings/tokens");
   await expect(page.getByRole("heading", { level: 1, name: "API tokens", exact: true })).toBeVisible();
   const page_ = page.locator("section.page");
-  await expect(page_.getByText("release-bot", { exact: true })).toBeVisible();
+  const mine = page_.getByRole("table", { name: "Your API tokens" });
+  await expect(mine.getByText("release-bot", { exact: true })).toBeVisible();
+  // Your own list has no owner column; each row carries its state tags.
+  await expect(mine.getByRole("columnheader", { name: "Owner" })).toHaveCount(0);
+  await expect(mine.getByRole("row", { name: /status poller/ })).toContainText("expires soon");
+  await expect(mine.getByRole("row", { name: /amy's laptop/ })).toContainText("revoked");
+  await expect(mine.getByRole("row", { name: /amy's laptop/ }).getByRole("button", { name: "Revoke" })).toHaveCount(0);
 
-  await page_.getByRole("button", { name: "New token" }).click();
+  // New token sits in the panel header.
+  await page_.locator(".panel-h").getByRole("button", { name: "New token" }).click();
   await page.getByRole("textbox", { name: "name" }).fill("e2e laptop");
   await page.getByRole("button", { name: "Mint token" }).click();
   await expect(page.getByText(/^scarab_pat_/)).toBeVisible();
   await page.getByRole("button", { name: "I've copied it" }).click();
   await expect(page_.getByText("e2e laptop", { exact: true })).toBeVisible();
+  await expect(mine.getByRole("row", { name: /e2e laptop/ })).toContainText("never used");
 
   // The org's list: the new token with its owner, and no mint button there.
   // Organization settings is its own page, reached from the user menu.
@@ -958,6 +1089,8 @@ test("a token minted under Account settings shows in the org's list", async ({ p
   const row = page_.getByRole("row", { name: /e2e laptop/ });
   await expect(row).toBeVisible();
   await expect(row.getByText("a.kim", { exact: true })).toBeVisible();
+  await expect(row).toContainText("active");
+  await expect(row).toContainText("up to viewer");
   await expect(page_.getByRole("button", { name: "New token" })).toHaveCount(0);
 
   // By last use the project token is second; by calls the status poller,
