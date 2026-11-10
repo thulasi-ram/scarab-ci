@@ -34,9 +34,10 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
 
 /**
- * Count `org`'s runs among the most recent runs of every org the caller can
- * read (`GET /v1/runs?limit=`). `limit` is the size that was asked for, so a
- * full list whose oldest run falls inside the week is reported as partial.
+ * Count `org`'s runs among `runs`, the org's most recent runs
+ * (`GET /v1/runs?org=&limit=`; runs of other orgs are ignored). `limit` is
+ * the size that was asked for, so a full list whose oldest run falls inside
+ * the week is reported as partial.
  */
 export function orgRunStats<T extends OrgRunLike>(
   runs: readonly T[],

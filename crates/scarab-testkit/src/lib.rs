@@ -1811,6 +1811,20 @@ impl Db for InMemoryDb {
         Ok(out)
     }
 
+    async fn list_runs_for_org(&self, org: &str, limit: u32) -> Result<Vec<RunSummary>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<RunSummary> = st
+            .runs
+            .iter()
+            .filter(|(run, _)| st.run_tenant.get(*run).is_some_and(|(o, _)| o == org))
+            .map(|(run, status)| fake_run_summary(&st, run, *status))
+            .collect();
+        // Newest first, then id — matches the adapter's ORDER BY.
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.run.0.cmp(&a.run.0)));
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+
     async fn list_runs_for_tenant(
         &self,
         org: &str,

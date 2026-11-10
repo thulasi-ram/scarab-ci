@@ -120,9 +120,9 @@ api.use({
 });
 
 /** List recent runs, newest first (dogfoods `GET /v1/runs`). */
-export async function listRuns(limit = 50): Promise<RunSummary[]> {
+export async function listRuns(limit = 50, org?: string): Promise<RunSummary[]> {
   const { data, error } = await api.GET("/v1/runs", {
-    params: { query: { limit } },
+    params: { query: org ? { limit, org } : { limit } },
   });
   if (error || !data) {
     throw new Error("failed to list runs");

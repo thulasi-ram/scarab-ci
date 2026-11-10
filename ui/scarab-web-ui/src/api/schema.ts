@@ -10639,6 +10639,8 @@ export interface operations {
             query?: {
                 /** @description max runs to return (default 50, max 200) */
                 limit?: number;
+                /** @description only this org's runs, applied before `limit`; must not be empty */
+                org?: string;
             };
             header?: never;
             path?: never;
@@ -10653,6 +10655,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["RunListResponse"];
                 };
+            };
+            /** @description `org` present but empty */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

@@ -1793,7 +1793,10 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   const imported = p.match(/^\/v1\/repos\/[^/]+\/([^/]+)\/bindings\/import$/);
   if (imported) return json(mockResync(decodeURIComponent(imported[1]!)));
   if (p === "/v1/repos") return json(projects);
-  if (p === "/v1/runs") return json({ runs });
+  if (p === "/v1/runs") {
+    const org = new URLSearchParams(search).get("org");
+    return json({ runs: org ? runs.filter((r) => r.org === org) : runs });
+  }
 
   let m: RegExpMatchArray | null;
 

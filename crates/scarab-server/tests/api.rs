@@ -172,6 +172,61 @@ async fn list_runs_returns_recent_runs_newest_first() {
     assert_eq!(runs[0]["id"], "newer");
 }
 
+/// `?org=` keeps one org's runs, and it filters before the limit: the
+/// newest runs belong to another org, and the org's own are still returned.
+#[tokio::test]
+async fn list_runs_filters_by_org_before_the_limit() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    let clock: Arc<FakeClock> = Arc::new(FakeClock::new(1_000));
+    let app = router(app_state(db.clone(), clock));
+
+    for (id, org, at) in [
+        ("acme-old", "acme", 1_000),
+        ("acme-new", "acme", 2_000),
+        ("globex-1", "globex", 3_000),
+        ("globex-2", "globex", 4_000),
+    ] {
+        let run = RunId(id.into());
+        db.create_run(&run, 1, 1, scarab_engine::Timestamp(at))
+            .await
+            .unwrap();
+        db.set_run_tenant(&run, org, "web").await.unwrap();
+    }
+
+    let list = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            (resp.status(), body_json(resp).await)
+        }
+    };
+    let ids = |doc: &serde_json::Value| -> Vec<String> {
+        doc["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let (status, doc) = list("/v1/runs?org=acme&limit=2").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&doc), vec!["acme-new", "acme-old"]);
+
+    let (_, doc) = list("/v1/runs?org=acme&limit=1").await;
+    assert_eq!(ids(&doc), vec!["acme-new"]);
+
+    // Without it, every org's runs, newest first.
+    let (_, doc) = list("/v1/runs?limit=2").await;
+    assert_eq!(ids(&doc), vec!["globex-2", "globex-1"]);
+
+    let (status, _) = list("/v1/runs?org=").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn openapi_is_served_and_describes_the_ir_subset() {
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());

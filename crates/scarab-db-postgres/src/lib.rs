@@ -1781,6 +1781,25 @@ impl Db for PostgresDb {
         rows.into_iter().map(run_summary_from_row).collect()
     }
 
+    async fn list_runs_for_org(&self, org: &str, limit: u32) -> Result<Vec<RunSummary>, DbError> {
+        // `runs_tenant_idx` leads with `tenant_org`.
+        let rows = sqlx::query(
+            "SELECT id, status, created_at, updated_at, tenant_org, tenant_project, run_number,
+                    origin_trigger_kind, origin_actor, origin_ref, origin_sha, origin_pr_number,
+                    origin_pr_base, pipeline, trigger_title, deploy_environment, is_deploy_run
+             FROM runs
+             WHERE tenant_org = $1
+             ORDER BY created_at DESC, id DESC
+             LIMIT $2",
+        )
+        .bind(org)
+        .bind(limit as i64)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        rows.into_iter().map(run_summary_from_row).collect()
+    }
+
     async fn list_runs_for_tenant(
         &self,
         org: &str,

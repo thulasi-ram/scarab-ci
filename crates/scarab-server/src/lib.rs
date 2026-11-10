@@ -2442,11 +2442,14 @@ pub fn compile_errors(text: &str) -> Vec<CompileErrorDto> {
         .collect()
 }
 
-/// Query for [`list_runs`]: an optional page size.
+/// Query for [`list_runs`]: an optional page size and org.
 #[derive(Debug, Deserialize)]
 pub struct ListRunsQuery {
     /// Max runs to return (default [`DEFAULT_RUNS_LIMIT`], capped at [`MAX_RUNS_LIMIT`]).
     pub limit: Option<u32>,
+    /// Only the runs of this org, filtered before `limit`. Absent = every
+    /// org; present but empty is a 400.
+    pub org: Option<String>,
 }
 
 /// Query for [`list_repo_runs`]: a page size plus an optional Environment.
@@ -2471,8 +2474,14 @@ const MAX_RUNS_LIMIT: u32 = 200;
 #[utoipa::path(
     get,
     path = "/v1/runs",
-    params(("limit" = Option<u32>, Query, description = "max runs to return (default 50, max 200)")),
-    responses((status = 200, body = RunListResponse))
+    params(
+        ("limit" = Option<u32>, Query, description = "max runs to return (default 50, max 200)"),
+        ("org" = Option<String>, Query, description = "only this org's runs, applied before `limit`; must not be empty")
+    ),
+    responses(
+        (status = 200, body = RunListResponse),
+        (status = 400, description = "`org` present but empty")
+    )
 )]
 async fn list_runs(
     State(st): State<AppState>,
@@ -2486,7 +2495,15 @@ async fn list_runs(
     // dev submissions) are visible to global roles only.
     let caller = authenticate(&st, &headers, Action::Read).await?;
     let limit = q.limit.unwrap_or(DEFAULT_RUNS_LIMIT).min(MAX_RUNS_LIMIT);
-    let mut runs = st.db.list_runs(limit).await?;
+    let mut runs = match q.org.as_deref() {
+        Some("") => {
+            return Err(ApiError::BadRequest(
+                "`org` must name an org; omit it to list every org's runs".into(),
+            ))
+        }
+        Some(org) => st.db.list_runs_for_org(org, limit).await?,
+        None => st.db.list_runs(limit).await?,
+    };
     if !caller.may_globally(Action::Read) {
         // Resolve each distinct tenant once, never per run.
         let mut allowed: std::collections::HashMap<(String, String), bool> =

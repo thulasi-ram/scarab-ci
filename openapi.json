@@ -6763,6 +6763,15 @@
               "format": "int32",
               "minimum": 0
             }
+          },
+          {
+            "name": "org",
+            "in": "query",
+            "description": "only this org's runs, applied before `limit`; must not be empty",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -6775,6 +6784,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "`org` present but empty"
           }
         },
         "security": [

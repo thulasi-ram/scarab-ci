@@ -23,7 +23,7 @@ import Icon from "../components/Icon";
 
 /** Repositories per page. */
 const PER_PAGE = 25;
-/** How many of the most recent runs the counts are taken from (the server's cap). */
+/** How many of the org's most recent runs the counts are taken from (the server's cap). */
 const RUNS_LIMIT = 200;
 /** How long typing in the filter must pause before the list is asked again. */
 const FILTER_DELAY_MS = 300;
@@ -44,7 +44,7 @@ export default function OrgPage() {
     () => ({ org: org(), page: page(), q: query(), epoch: epoch() }),
     (k) => listOrgRepos(k.org, { page: k.page, perPage: PER_PAGE, q: k.q }),
   );
-  const [runs] = createResource(() => listRuns(RUNS_LIMIT));
+  const [runs] = createResource(org, (o) => listRuns(RUNS_LIMIT, o));
   const stats = () => orgRunStats(runs() ?? [], org(), Date.now(), RUNS_LIMIT);
   const reload = () => setEpoch((e) => e + 1);
 

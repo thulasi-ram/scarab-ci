@@ -922,6 +922,11 @@ pub trait Db: Send + Sync {
     /// source for the `GET /v1/runs` list view.
     async fn list_runs(&self, limit: u32) -> Result<Vec<RunSummary>, DbError>;
 
+    /// The most recent runs of one org (`tenant_org`), newest first, capped at
+    /// `limit` — `GET /v1/runs?org=`, the org page's counts. The org filter is
+    /// applied before the `limit`, so the page holds that org's newest runs.
+    async fn list_runs_for_org(&self, org: &str, limit: u32) -> Result<Vec<RunSummary>, DbError>;
+
     /// The most recent runs for one tenant `(org, project)`, newest first, capped
     /// at `limit` — the source for a repo's `GET /v1/repos/{org}/{repo}/runs`
     /// history and the dashboard's per-repo pass/fail chart. `filter` narrows
