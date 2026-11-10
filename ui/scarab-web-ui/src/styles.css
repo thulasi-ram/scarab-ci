@@ -1848,11 +1848,11 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .envt-mono { font: var(--t-mono); }
 .envt-name.envt-mono { font: var(--t-mono); }
 .envt-quiet { color: var(--muted-sage); }
-.envt-chip {
-  display: inline-block; padding: 1px 8px; border: 1px solid var(--border);
-  border-radius: 20px; font: var(--t-body); line-height: 18px; color: var(--sage);
-}
-.envt-chip.warn { color: var(--warn); border-color: var(--border-warn); }
+/* The This repo cell: plain Body text like the row's other cells, not a
+   pill; a warning gets the warn ink and an icon. */
+.envt-repo { display: inline-flex; align-items: center; gap: 5px; color: var(--sage); }
+.envt-repo.warn { color: var(--warn); }
+.envt-repo svg { flex: none; }
 .envt-link { color: var(--emerald); text-decoration: none; }
 .envt-link:hover { text-decoration: underline; }
 /* The expanded detail: a sentence, the two layers side by side, actions. */
