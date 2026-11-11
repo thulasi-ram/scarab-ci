@@ -18,6 +18,14 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Enhancement
+
+- **Pills are sized from their text, and every breadcrumb starts at home.** Status, state and
+  role pills, the org page's repository states and the dashboard's inbox verbs all use the Mono
+  text style on a 20px pill, so none is taller than the line beside it (they were up to 28px, some
+  in the larger semibold Label style). The repository, run, Run pipeline, organization and
+  settings page headings start with `/`, a link to the dashboard: `/ › acme/orders-api › #22`.
+
 ## [0.3.2] - 2026-11-11
 
 ### Enhancement

@@ -61,6 +61,7 @@ import {
   PLUGIN_POLICIES_ANCHOR,
 } from "../policies";
 import Icon from "../components/Icon";
+import { HomeCrumb } from "../components/PageCrumbs";
 import SearchSelect, { type SelectOption } from "../components/SearchSelect";
 
 const IDENTITY_ERROR = "Could not load your identity. Is the server up?";
@@ -229,6 +230,7 @@ export function SettingsCrumbs(props: { trail: Crumb[]; sub: JSX.Element }) {
     <>
       <div class="page-head">
         <h1 class="settings-crumb">
+          <HomeCrumb size={16} sepClass="settings-crumb-sep" />
           <For each={props.trail}>
             {(c, i) => (
               <>

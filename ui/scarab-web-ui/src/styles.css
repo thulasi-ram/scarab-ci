@@ -660,15 +660,26 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .panel .secrets-body > :is(.table-scroll, .tok-table-scroll) { margin: 0 -14px; }
 .panel .plg-body > .plg-journal-wrap { margin: 0 -14px; }
 
+/* ---- Pills ------------------------------------------------------------ */
+/* Every pill (a status, a state, a role, an inbox verb) is sized from its
+   text: Mono on a 16px line, 1px padding and a 1px border, 20px in all. That
+   sits inside the 19.5px line of the Body text beside it, so a pill never
+   makes its row taller or reads louder than its neighbours. The selectors
+   below set only colour, border style and fill. */
+.badge, .inbox-verb, .tok-state, .tok-role, .org-repo-state, .repo-unreachable-tag {
+  display: inline-block;
+  font: var(--t-mono);
+  line-height: 16px;
+  padding: 1px 6px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
 /* ---- Status badges ---------------------------------------------------- */
 
 .badge {
-  display: inline-block;
-  padding: 2px 10px;
-  border-radius: var(--radius-sm);
-  font: var(--t-mono);
-  text-transform: lowercase;
-  border: 1px solid transparent;
   color: var(--badge-ink);
 }
 
@@ -2064,10 +2075,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 }
 .inbox-row:last-child { border-bottom: none; }
 .inbox-row:hover { background: color-mix(in srgb, var(--emerald) 7%, transparent); }
-.inbox-verb {
-  font: var(--t-label);
-  text-align: center; padding: 3px 6px; border-radius: 5px; border: 1px solid currentColor;
-}
+.inbox-verb { justify-self: start; border-color: currentColor; }
 .verb-approve { color: var(--ok-ink); }
 .verb-rerun  { color: var(--danger); }
 .verb-input  { color: var(--copper); }
@@ -3351,15 +3359,8 @@ h1, .crumb-head, .run-title {
 .tok-scope { color: var(--muted-sage); }
 /* The ceiling, edged not filled (§edges) — copper, because it is a grant and
    not a status. Reads "up to admin" in the markup; the box is only the frame. */
-.tok-role {
-  font: var(--t-mono);
-  color: var(--copper); border: 1px solid var(--border-copper); border-radius: 4px;
-  padding: 1px 6px; white-space: nowrap;
-}
-.tok-state {
-  font: var(--t-label);
-  border: 1px dotted currentColor; border-radius: 3px; padding: 1px 5px;
-}
+.tok-role { color: var(--copper); border-color: var(--border-copper); }
+.tok-state { border: 1px dotted currentColor; }
 .tok-revoked { color: var(--danger); }
 .tok-expired { color: var(--muted-sage); }
 .tok-revoke { margin-left: auto; }
@@ -4221,11 +4222,7 @@ code.c { font: var(--t-mono); color: var(--copper); }
 .org-repo-link { color: var(--soft-white); text-decoration: none; }
 .org-repo-link:hover { color: var(--emerald); text-decoration: underline; text-underline-offset: 3px; }
 .org-repo-off { color: var(--muted-sage); }
-.org-repo-state {
-  font: var(--t-label);
-  color: var(--muted-sage);
-  border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px;
-}
+.org-repo-state { color: var(--muted-sage); border-color: var(--border); }
 .org-repo-state.org-repo-on { color: var(--ok-ink); border-color: currentColor; }
 .org-repo-forge { text-decoration: none; }
 .org-repo-forge:hover { color: var(--emerald); text-decoration: underline; }
@@ -4234,13 +4231,14 @@ code.c { font: var(--t-mono); color: var(--copper); }
 a.head-org { text-decoration: none; }
 a.head-org:hover { color: var(--emerald); text-decoration: underline; text-underline-offset: 4px; }
 .crumb-head-org { color: var(--muted-sage); text-decoration: none; flex: none; }
+/* `/` at the start of every breadcrumb heading: home, the dashboard. */
+.crumb-home { color: var(--muted-sage); text-decoration: none; flex: none; }
+.crumb-home:hover { color: var(--emerald); }
+/* `acme/orders-api` is one crumb: no gap around its slash. */
+.crumb-repo { display: inline-flex; align-items: baseline; flex: none; min-width: 0; }
 .crumb-head-org:hover { color: var(--emerald); text-decoration: underline; text-underline-offset: 4px; }
 /* A bound repository its forge connection no longer reaches. */
-.repo-unreachable-tag {
-  font: var(--t-label);
-  color: var(--warn); border: 1px dashed currentColor;
-  border-radius: 4px; padding: 1px 6px; vertical-align: middle; margin-left: 10px;
-}
+.repo-unreachable-tag { color: var(--warn); border: 1px dashed currentColor; margin-left: 10px; }
 .repo-unreachable-note {
   display: flex; align-items: center; gap: 6px;
   color: var(--warn); margin: 8px 0 0;

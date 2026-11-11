@@ -6,7 +6,6 @@
 // predicate runs server-side at dispatch and comes back as a per-field error.
 import { createResource, createSignal, createEffect, For, Show } from "solid-js";
 import { A, useParams, useNavigate, useLocation } from "@solidjs/router";
-import { orgPageHref } from "../org-page";
 import { listRefs, listPipelines, pipelineInterface, dispatchRun, PipelineCompileError } from "../api/client";
 import CompileErrors from "../components/CompileErrors";
 import {
@@ -19,6 +18,7 @@ import {
   type ParamSpec,
 } from "../params";
 import Icon from "../components/Icon";
+import { HomeCrumb, RepoCrumb } from "../components/PageCrumbs";
 import { Checkbox, Input } from "../components/Field";
 import SearchSelect from "../components/SearchSelect";
 import Doodle from "../components/Doodle";
@@ -188,9 +188,8 @@ export default function RunPipeline() {
 
       <div class="run-head">
         <h1 class="crumb-head">
-          <A href={orgPageHref(org())} class="crumb-head-org">{org()}</A>
-          <Icon icon="chevron-right" size={20} class="crumb-head-sep" />
-          <A href={`/${org()}/${repo()}`} class="crumb-head-link">{repo()}</A>
+          <HomeCrumb size={20} sepClass="crumb-head-sep" />
+          <RepoCrumb org={org()} repo={repo()} link />
           <Icon icon="chevron-right" size={20} class="crumb-head-sep" />
           <span class="crumb-head-title">Run pipeline</span>
         </h1>
