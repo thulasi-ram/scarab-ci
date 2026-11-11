@@ -174,8 +174,8 @@ Which Steps may have it is decided by `origin`. Policies are deny-only
 - The trust is checked again at each Attempt launch, as `forge_token`'s is, so revoking it
   stops retries and re-drives.
 - An org admin trusts a source for the sandbox through the library-trust route, with a
-  step-up. The trust row records what it grants: trusting a source with long-lived forge
-  credentials does not trust it with the sandbox, and the reverse. Trust is keyed by the
+  step-up. Each trust records one grant (`forge_credentials`, `build_sandbox` or
+  `registry_credential`), and one grant implies no other. Trust is keyed by the
   source without its commit, so it carries across upgrades from that source, each
   confirmed with its diff (0076 §4).
 - A Step written in the Pipeline file, or reached through `invoke: file:`, never gets the
@@ -197,13 +197,19 @@ tmpfs, with `DOCKER_CONFIG` pointing at it. It is never an environment variable.
 dockerconfigjson names only the registry the credential is for, so core needs no image-host
 check: the credential authenticates nowhere else.
 
-- The forge-derived credential can write packages, so it reaches only a Step whose defining
-  library the org trusts with forge credentials, whether the forge mints it with a short
-  lifetime or returns a long-lived token.
-- A `REGISTRY_AUTH` secret follows the rules of any scoped secret
-  ([0037](0037-environment-governance.md)).
+- Any registry credential reaches only a Step whose defining library comes from a source the
+  org trusts with a third grant, `registry_credential`. A Step written in the Pipeline file
+  never gets one: with its own command it could read the file, and the `build` kind never
+  handed the credential to an author's command. The value is added to the log redactor.
+- The forge-derived credential can write packages, so it also needs the source trusted with
+  forge credentials, whether the forge mints it with a short lifetime or returns a long-lived
+  token. An org that pushes only to another registry need not grant that.
 - A fork pull request never gets a registry credential, governed or not (key on the event,
-  as `forge_token` does). This is ADR-0075 §7's "no build push" for fork pull requests.
+  as `forge_token` does). Core also tells a sandboxed Step that it runs for a fork pull
+  request, through an environment variable no Pipeline or library may set, and the build
+  library then neither pushes nor exports its layer cache. A library cannot read `event`
+  itself (0076, amendment of 2026-10-30). This is ADR-0075 §7's "no build push" for fork
+  pull requests.
 - The library must keep the credential away from the Dockerfile: inputs checked as in
   df660b6, and whatever the follow-up in df660b6 finds about `RUN` steps reaching the outer
   container decides whether the credential may sit in the build container at all.
@@ -228,9 +234,9 @@ How ECR's 12-hour tokens are handled is decided in ace8135.
 `build` kind with no deprecation window. A `build:` Step fails the Pipeline check with a
 message naming `invoke: lib:thulasi-ram/build`. Existing orgs are not given the library, so
 until an admin installs it, every Pipeline that builds an image fails to compile; until the
-admin trusts its source for the sandbox, `run.create` refuses those Runs. Pushing to the
-forge's own registry also needs the source trusted with forge credentials. The release notes
-say all three.
+admin trusts its source for the sandbox, `run.create` refuses those Runs. Pushing needs the
+source trusted with `registry_credential`, and pushing to the forge's own registry also with
+forge credentials. The release notes say each of these.
 
 ### Consequences
 
