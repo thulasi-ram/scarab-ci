@@ -103,7 +103,15 @@ call still wins.
 
 ### Upgrading
 
-`deploy.sh` handles the two steps an upgrade used to need by hand:
+`deploy.sh` pins the images it deploys by digest. It asks the registry which
+image each tag names now (the server, the results sidecar and the wsfetch
+helper) and deploys `<tag>@sha256:<digest>`, so a tag that was moved, such as a
+re-tagged release or `edge`, rolls every Pod that runs it and Step Pods pull the
+new image instead of starting from the node's copy. If a tag cannot be resolved,
+the deploy stops. `bash deploy/demo-oracle/pin-digest.sh <image>` prints what a
+tag resolves to.
+
+It also handles the two steps an upgrade used to need by hand:
 
 - **A dump first.** When the Helm release already exists, it runs the nightly
   backup Job once with its own key, `pg/pre-deploy/<UTC time>-<tag>.dump`, and
