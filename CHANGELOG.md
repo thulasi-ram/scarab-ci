@@ -18,6 +18,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-12
+
 ### Breaking changes
 
 - **The `build` step kind is removed; build images with `lib:thulasi-ram/build`.** A Pipeline with
@@ -88,6 +90,17 @@ release.yml uses that version's section as the GitHub Release text. See
   only adds a table (`library_source_grants`) for the new grants, so a server from before it
   keeps working against the migrated database.
 
+### Security
+
+- **A fork pull request's Run cannot use `k8s_overlay`.** The fork's author writes the Pipeline,
+  because it is read at the pull request's head. A Run from a fork pull request, or a Run locked
+  out of its Environment's secrets, is now refused at launch when a step sets `k8s_overlay`.
+- **The build library keeps its paths inside the workspace.** `context` and `dockerfile` may not
+  be absolute, hold `..`, a `,` or a control character, and `image` must be an image reference.
+  Before running buildctl, the build step resolves the context and the Dockerfile and refuses
+  (exit 2) one that leads outside `/workspace`, such as through a symlink committed to the
+  repository.
+
 ### Features
 
 - **Trigger on changed files.** A `when:` can read `event.changed_paths`, the files a push or
@@ -127,12 +140,26 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Bug Fixes
 
+- **Placement layers merge like Kubernetes instead of replacing lists.** The baseline, placement
+  profiles and `k8s_overlay` were merged by replacing each list, so a profile's `tolerations`
+  dropped the baseline's, and a `k8s_overlay` that named the step container replaced every
+  container in the Pod. Containers, initContainers and volumes now merge by name, `env` by name,
+  `volumeMounts` by mount path, and tolerations are combined. A layer that names Scarab's own
+  containers (other than `step`) or volumes, mounts over the step's paths, changes the step's
+  built env or uses a `$` patch directive is refused at launch, with the layer it came from
+  ([Placement & resources](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#placement--resources)).
+
 - **The Dashboard lines up with every other page.** Its heading is now `/ › Dashboard`, on the same
   line as the other pages' breadcrumbs, and its first block ("Waiting on you" or the "All clear"
   card, which sat 8px under the heading) starts at the height of a repository's tabs. So does the
   organization page's Overview, which sat 14px lower.
 
 ### Documentation
+
+- **Push to Amazon ECR from EKS.** A new page sets up an IAM role on its own ServiceAccount (IRSA),
+  used only by the build library's push step through a `registry_auth_only` placement profile.
+  The flow has not been run on EKS yet
+  ([Pushing images to Amazon ECR](https://thulasi-ram.github.io/scarab-ci/usage/pushing-to-ecr/)).
 
 - **Links in the design pages work.** CONTEXT and the ADRs link to each other by repo path, which
   the docs site served as-is, so every such link was a 404 (for example
@@ -1293,7 +1320,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/thulasi-ram/scarab-ci/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.2.2...v0.3.0
