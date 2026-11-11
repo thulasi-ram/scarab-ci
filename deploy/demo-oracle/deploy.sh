@@ -138,6 +138,37 @@ if [ -n "${1:-}" ]; then
   unset _i
 fi
 
+# Pin every Scarab image to the digest its tag names right now: the server (the
+# Deployment and the workspace StatefulSet run it), the results sidecar and the
+# wsfetch helper (both ride in Step Pods). A tag can move — a re-tagged release,
+# `edge` on every push to main — and Kubernetes keys both its rollout decision
+# and the node's image cache on the reference string. Deploying `:0.3.2` again
+# after a re-tag rolled only the Deployment (it gets DEPLOY_NONCE below); the
+# StatefulSet kept its Pod, and Step Pods started from the node's old copy. With
+# `<tag>@sha256:<digest>` the string changes whenever the image does, and names
+# exactly one image. A tag that cannot be resolved refuses the deploy rather
+# than falling back to the mutable tag. See pin-digest.sh.
+. "$HERE/pin-digest.sh"
+pinned() {
+  local out
+  if ! out="$(pin_digest "$2")"; then
+    echo "refusing: could not resolve $2 to a digest (is the tag published, and is the registry reachable?)." >&2
+    exit 1
+  fi
+  printf -v "$1" '%s' "$out"
+}
+pinned SERVER_IMAGE "${IMAGE_REPOSITORY:-ghcr.io/thulasi-ram/scarab-server}:${TAG}"
+pinned SCARAB_SIDECAR_IMAGE "${SCARAB_SIDECAR_IMAGE:-ghcr.io/thulasi-ram/scarab-results-sidecar:edge}"
+pinned SCARAB_WSFETCH_IMAGE "${SCARAB_WSFETCH_IMAGE:-ghcr.io/thulasi-ram/scarab-wsfetch:edge}"
+export SCARAB_SIDECAR_IMAGE SCARAB_WSFETCH_IMAGE
+# The chart writes `<repository>:<tag>`, so the tag value carries the digest:
+# `0.3.2@sha256:…` renders `ghcr.io/…/scarab-server:0.3.2@sha256:…`.
+PINNED_TAG="${TAG}@${SERVER_IMAGE##*@}"
+echo "==> images pinned by digest"
+echo "    $SERVER_IMAGE"
+echo "    $SCARAB_SIDECAR_IMAGE"
+echo "    $SCARAB_WSFETCH_IMAGE"
+
 # Force a fresh Pod on every deploy. `edge` is a MUTABLE tag — it never changes
 # string-wise — so a re-run of `helm upgrade` renders a byte-identical Deployment,
 # K8s sees no diff, and the old Pod keeps running the stale image (pullPolicy:
@@ -277,7 +308,7 @@ trap 'rm -f "$VALUES"' EXIT
 cat > "$VALUES" <<YAML
 image:
   repository: ${IMAGE_REPOSITORY:-ghcr.io/thulasi-ram/scarab-server}
-  tag: ${TAG}
+  tag: "${PINNED_TAG}"
   pullPolicy: ${IMAGE_PULL_POLICY:-Always}
 # Changes every deploy => Pod template differs => Helm rolls a fresh Pod that
 # re-pulls the mutable tag (see DEPLOY_NONCE above).
@@ -335,8 +366,8 @@ YAML
 # Deliberately NOT a fallback: there is no flag here that disables the workspace
 # service. A fast path plus a fallback path is two mental models.
 # ---------------------------------------------------------------------------
-SERVER_IMAGE="${IMAGE_REPOSITORY:-ghcr.io/thulasi-ram/scarab-server}:${TAG}"
-WSFETCH_IMAGE="${SCARAB_WSFETCH_IMAGE:-ghcr.io/thulasi-ram/scarab-wsfetch:edge}"
+# Both pinned by digest above.
+WSFETCH_IMAGE="$SCARAB_WSFETCH_IMAGE"
 
 echo "==> namespace $NS"
 kc create namespace "$NS" --dry-run=client -o yaml | kc apply -f -
@@ -524,7 +555,7 @@ if [ -n "$(kc get sts scarab-workspace -n "$NS" \
   kc delete sts scarab-workspace -n "$NS" --cascade=orphan
 fi
 
-echo "==> scarab-server + workspace service (image tag: $TAG)"
+echo "==> scarab-server + workspace service (image: $SERVER_IMAGE)"
 hc upgrade --install scarab "$ROOT/deploy/helm/scarab" -n "$NS" \
   -f "$ROOT/deploy/demo-oracle/values.yaml" -f "$VALUES"
 kc rollout status -n "$NS" deploy/scarab --timeout=300s
