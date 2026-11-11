@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1794425459,"nonce":"njPgdxi3UOfQUJzmjKmp8e0INQk=","added":["type:feat","area:forge","area:pipeline"],"removed":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1794425471,"nonce":"ScntzJgR4+Bmi+Le6M5TksoFJgo=","title":"Triggers cannot filter on changed files: add event.changed_paths for when:","was":"Reported 2026-11-12 from the devops-gitops pilot on Scarab 0.3.2."}]}
