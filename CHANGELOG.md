@@ -20,9 +20,10 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Bug Fixes
 
-- **The Dashboard heading lines up with every other page.** It is now `/ › Dashboard`, on the same
-  line as the other pages' breadcrumbs, and the first block under it sits the same distance below
-  it whether runs wait on you or the page shows "All clear" (the card was 8px under the heading).
+- **The Dashboard lines up with every other page.** Its heading is now `/ › Dashboard`, on the same
+  line as the other pages' breadcrumbs, and its first block ("Waiting on you" or the "All clear"
+  card, which sat 8px under the heading) starts at the height of a repository's tabs. So does the
+  organization page's Overview, which sat 14px lower.
 
 ## [0.3.2] - 2026-11-11
 
