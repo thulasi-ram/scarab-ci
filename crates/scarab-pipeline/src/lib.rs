@@ -4003,11 +4003,14 @@ fn invoke_output_scope(step: &mut StepSpec, exposed: &BTreeMap<String, Option<Ve
 /// unset: the library's own value wins (`resources` per field, `cpu_millis`
 /// and `memory_mib`). Its `when` becomes a [`Guard`] of each, read in the
 /// invoke Step's own scope. `env` never carries, and `placement_profiles`
-/// never carries onto a Step with `forge_token`, `registry_auth` or a
-/// `security.sandbox` (ADR-0076 §1, ADR-0018 amendment of 2026-11-12): a
-/// placement profile is an arbitrary Pod patch, so a caller could otherwise
-/// place a trusted Step next to its own or change the Pod a sandboxed or
-/// credentialed Step runs in.
+/// never carries onto a Step with `forge_token` (ADR-0076 §1): a placement
+/// profile is an arbitrary Pod patch, so a caller could otherwise place a
+/// Step holding a long-lived forge token next to its own. It does carry onto
+/// a Step with `registry_auth` or a `security.sandbox` (ADR-0018 amendment of
+/// 2026-11-12): profiles are written by the operator and an author can only
+/// name one, a build for another architecture needs that architecture's
+/// nodes, and an org Policy over `steps[].placement_profiles` and
+/// `steps[].origin` decides which Runs may name which profile.
 fn carry_invoke_fields(invoke: &StepSpec, inst: &mut StepSpec) {
     if !inst.is_gate() {
         if inst.timeout.is_none() {
@@ -4019,11 +4022,7 @@ fn carry_invoke_fields(invoke: &StepSpec, inst: &mut StepSpec) {
         if inst.resources.memory_mib.is_none() {
             inst.resources.memory_mib = invoke.resources.memory_mib;
         }
-        if inst.placement_profiles.is_empty()
-            && inst.forge_token.is_none()
-            && !inst.registry_auth
-            && inst.sandbox().is_none()
-        {
+        if inst.placement_profiles.is_empty() && inst.forge_token.is_none() {
             inst.placement_profiles = invoke.placement_profiles.clone();
         }
     }
@@ -9704,8 +9703,8 @@ mod tests {
 
     /// `libs/build.yaml` installs and compiles; its Step is `image/image`,
     /// runs in the sandbox with the registry credential, takes every input
-    /// through env, exposes the `image` result, and gets none of the
-    /// invoke's placement profiles.
+    /// through env, exposes the `image` result, and gets the invoke's
+    /// placement profiles.
     #[test]
     fn the_build_library_compiles_with_a_sandbox_and_the_registry_credential() {
         check_installed_library("thulasi-ram/build", BUILD_LIBRARY, &BTreeMap::new())
@@ -9718,7 +9717,7 @@ mod tests {
               - id: image
                 invoke: lib:thulasi-ram/build
                 needs: [src]
-                placement_profiles: [big]
+                placement_profiles: [arm64]
                 with:
                   image: "registry.example/app:${{ event.sha }}"
                   push: "true"
@@ -9737,9 +9736,10 @@ mod tests {
         assert_eq!(step.sandbox(), Some(Sandbox::RootlessBuildkit));
         assert!(step.registry_auth);
         assert!(step.from_installed_library());
-        assert!(
-            step.placement_profiles.is_empty(),
-            "placement_profiles never carries onto a sandboxed Step"
+        assert_eq!(
+            step.placement_profiles,
+            vec!["arm64".to_string()],
+            "a per-architecture build runs on the profile its invoke names"
         );
         assert!(step.image.contains("@sha256:"), "{}", step.image);
         assert!(
@@ -9748,17 +9748,19 @@ mod tests {
         );
     }
 
-    /// `registry_auth` alone also keeps an invoke's placement profiles off
-    /// its Step: a profile could change the Pod the credential is mounted in.
+    /// An invoke's placement profiles carry onto a `registry_auth` Step, and
+    /// a library Step that names its own keeps them.
     #[test]
-    fn placement_profiles_never_carry_onto_a_registry_auth_step() {
-        let lib = "steps: [{ id: push, image: alpine, command: [echo], registry_auth: true }]";
+    fn placement_profiles_carry_onto_a_registry_auth_step_unless_it_names_its_own() {
+        let lib = "steps:\n  - { id: push, image: alpine, command: [echo], registry_auth: true }\n  - { id: own, image: alpine, command: [echo], registry_auth: true, placement_profiles: [amd64] }\n";
         let ir = compile_with(
             "steps: [{ id: p, invoke: file:.scarab/lib/p.yaml, placement_profiles: [big] }]",
             &libs(&[(".scarab/lib/p.yaml", lib)]),
         );
-        assert!(ir.steps[0].registry_auth);
-        assert!(ir.steps[0].placement_profiles.is_empty());
+        let step = |id: &str| ir.steps.iter().find(|s| s.id == id).unwrap();
+        assert!(step("p/push").registry_auth);
+        assert_eq!(step("p/push").placement_profiles, vec!["big".to_string()]);
+        assert_eq!(step("p/own").placement_profiles, vec!["amd64".to_string()]);
     }
 
     /// The build library's `validate:` rules, applied to literal `with:`

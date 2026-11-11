@@ -280,8 +280,8 @@ steps:
   # so this leg stays fast; `dockerfile` is resolved inside the context dir.
   # The Step is `build/image`, and other steps need `build`.
   #
-  # NOTE: `placement_profiles` on this step is not carried onto the
-  # library's sandboxed Step, which runs with the operator's `default` profile.
+  # NOTE: `placement_profiles` here would carry onto the library's Step; it is
+  # left off, so the Step runs with the operator's `default` profile.
   - id: build
     needs: [lint, test]
     invoke: lib:thulasi-ram/build

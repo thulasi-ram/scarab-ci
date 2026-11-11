@@ -381,14 +381,31 @@ compact JSON text.
 - **The sandbox.** The step runs as uid 1000, not privileged, with seccomp and AppArmor
   unconfined, which rootless BuildKit needs. Only a step from an installed library whose source
   the org trusts for the build sandbox gets it; a step written in your Pipeline file never does.
-  A placement profile on the invoke step is not carried onto it, and a sandboxed step may not
-  have `secrets:`.
-- **Other architectures.** BuildKit builds for the architecture of the node it runs on. To build
-  for another one, install a copy of `libs/build.yaml` under another name (`acme/build-arm64`)
-  whose step names the placement profile for those nodes (`placement_profiles: [arm64]`), trust
-  that copy's source for the build sandbox, and invoke one build per architecture, each pushing
-  its own tag. A later step can join the
-  tags into one multi-architecture image with a tool such as `crane index append`.
+  A sandboxed step may not have `secrets:`.
+- **Other architectures.** BuildKit builds for the architecture of the node it runs on, and the
+  invoke step's `placement_profiles` carries onto the library's step. Invoke the library once per
+  architecture, each naming the profile for those nodes and pushing its own tag, then join the
+  tags into one image:
+
+  ```yaml
+  - id: amd64
+    invoke: lib:thulasi-ram/build
+    placement_profiles: [amd64]
+    with: { image: "ghcr.io/acme/app:${{ event.sha }}-amd64", push: true }
+  - id: arm64
+    invoke: lib:thulasi-ram/build
+    placement_profiles: [arm64]
+    with: { image: "ghcr.io/acme/app:${{ event.sha }}-arm64", push: true }
+  - id: manifest
+    image: ghcr.io/acme/crane@sha256:…   # crane and a shell, with a numeric USER
+    needs: [amd64, arm64]
+    registry_auth: true                  # crane reads DOCKER_CONFIG
+    env: [[SHA, "${{ event.sha }}"]]
+    command: [sh, -c, 'crane index append -t "ghcr.io/acme/app:$SHA" -m "ghcr.io/acme/app:$SHA-amd64" -m "ghcr.io/acme/app:$SHA-arm64"']
+  ```
+
+  `docker buildx imagetools create` does the same join. An org Policy over
+  `steps[].placement_profiles` and `steps[].origin` can restrict which profiles a build may name.
 
 The `build` step kind is gone. A `build:` step fails the pipeline check with a message that names
 `invoke: lib:thulasi-ram/build`. The local executor refuses the build library's step; it needs the
