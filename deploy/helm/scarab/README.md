@@ -264,7 +264,10 @@ scarab:
 ```
 
 **`baseline` and `k8s` are Pod fragments, not pod-spec fragments.** They are
-RFC-7386 merge-patched onto the whole Pod, so tolerations live under `spec:`.
+strategic-merged onto the whole Pod, as Kubernetes does, so tolerations live
+under `spec:`. Containers, volumes and env merge by name; a profile's
+`tolerations` are added to the baseline's. The pipeline syntax page has the
+full rules.
 
 The block is rendered verbatim into a mounted ConfigMap and
 `SCARAB_PLACEMENT_CONFIG_FILE` points at it, so the keys are the **server's**
