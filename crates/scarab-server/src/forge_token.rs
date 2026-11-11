@@ -334,7 +334,7 @@ pub async fn sandbox_refusals(
                 let from = match step.origin.last() {
                     Some(link) if link.kind == scarab_pipeline::OriginKind::Library => {
                         format!(
-                            "its library `lib:{}` comes from {}, a source the org `{org}` does                              not trust for the build sandbox; an org admin trusts it under Org                              settings > Libraries",
+                            "its library `lib:{}` comes from {}, a source the org `{org}` does not trust for the build sandbox; an org admin trusts it under Org settings > Libraries",
                             link.name,
                             link.source
                                 .as_deref()
