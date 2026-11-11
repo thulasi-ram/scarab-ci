@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1794426414,"nonce":"5AtJDoyy0lYLma0nyj/POleqBHU=","title":"build: context/dockerfile/image unvalidated: a Dockerfile can read the mounted registry credential","was":"x"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1794426414,"nonce":"lmzhqqkP/hhUNRSV8egIGlKxdew=","added":["type:bug","security","area:executor","area:pipeline"],"removed":null}]}
