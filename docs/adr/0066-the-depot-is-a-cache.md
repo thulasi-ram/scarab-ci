@@ -511,7 +511,7 @@ answer is no, but the reasoning matters more than the verdict, because the insti
 question (do not paint yourself into a corner on an irreversible choice) is right.
 
 **We use SHA-256** (`sha2`, declared in the pure-domain allow-block because hashing is a
-pure function; see [0029](0029-workspace-cas.md) and [0031](0031-crate-boundaries.md)). BLAKE3 appears
+pure function; see [0029](0029-workspace-cas.md) and [0031](0031-pure-computation-deps.md)). BLAKE3 appears
 nowhere in the workspace.
 
 Three reasons not to adopt it now:

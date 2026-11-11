@@ -25,6 +25,14 @@ release.yml uses that version's section as the GitHub Release text. See
   card, which sat 8px under the heading) starts at the height of a repository's tabs. So does the
   organization page's Overview, which sat 14px lower.
 
+### Documentation
+
+- **Links in the design pages work.** CONTEXT and the ADRs link to each other by repo path, which
+  the docs site served as-is, so every such link was a 404 (for example
+  `/tech/context/docs/adr/0001-ci-as-durable-execution.md`). The docs build now points each one at
+  the page it names, or at the file on GitHub when the site has no page for it, and fails on a
+  link to a file that does not exist. Three ADR links that named wrong files are corrected.
+
 ## [0.3.2] - 2026-11-11
 
 ### Features
