@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1794429375,"nonce":"Uib7uBcl+6eyr0CgoZ+RnXZOxH8=","title":"changed_paths misses merge-commit conflict resolutions","was":"changed_paths misses merge-commit conflict resolutions"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1794429375,"nonce":"jEG+qDpFaR5zLvxpH3aen6R5KFI=","added":["type:bug","area:forge"],"removed":null}]}
