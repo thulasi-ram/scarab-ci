@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::{Clock, Db, Executor};
@@ -947,6 +947,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Where people open the UI (SCARAB_UI_URL, default the public URL):
         // the OAuth callback and step-up confirmation links point there.
         .with_ui_url(config.ui_url.clone())
+        // The role and executor, for the About page (GET /v1/about).
+        .with_server_facts(
+            config
+                .role
+                .to_possible_value()
+                .map(|v| v.get_name().to_string())
+                .unwrap_or_default(),
+            config
+                .executor
+                .to_possible_value()
+                .map(|v| v.get_name().to_string())
+                .unwrap_or_default(),
+        )
         // Org-level Environment governance (ADR-0071): what admits and governs
         // every Deploy Run. ALWAYS wired here — an unwired store would admit
         // deploys with no rules, which only a hand-built test state may do.

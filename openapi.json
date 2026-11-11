@@ -94,6 +94,38 @@
         "security": []
       }
     },
+    "/v1/about": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "summary": "The server's version, build commit and how this deployment runs",
+        "operationId": "about",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AboutDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "not signed in"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/auth/callback": {
       "get": {
         "tags": [
@@ -9260,6 +9292,61 @@
   },
   "components": {
     "schemas": {
+      "AboutDto": {
+        "type": "object",
+        "description": "The server's version and how this deployment runs, for the web UI's About\npage. Names what is configured, never a secret or a URL with credentials.",
+        "required": [
+          "version",
+          "started_at",
+          "login",
+          "github_app",
+          "plugins"
+        ],
+        "properties": {
+          "commit": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The git commit the server was built from. `None` for a build that did\nnot record one (a local build)."
+          },
+          "executor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where steps run: `k8s` (one Pod per step) or `local` (host processes)."
+          },
+          "github_app": {
+            "type": "boolean",
+            "description": "The server runs a GitHub App (`SCARAB_GITHUB_APP_ID` is set)."
+          },
+          "login": {
+            "type": "boolean",
+            "description": "People sign in through an OAuth/OIDC provider."
+          },
+          "plugins": {
+            "type": "boolean",
+            "description": "The plugin system is on."
+          },
+          "role": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which part of Scarab this process runs: `converged` (all of it), `api`,\n`scheduler` or `executor`."
+          },
+          "started_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When this server process started, in unix milliseconds."
+          },
+          "version": {
+            "type": "string",
+            "description": "The server's version, e.g. `0.3.2`."
+          }
+        }
+      },
       "ApiTokenDto": {
         "type": "object",
         "description": "One issued token, as the API describes it — record only, never the secret.",

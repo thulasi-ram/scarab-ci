@@ -48,6 +48,10 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY libs ./libs
 
+# The commit this image is built from, recorded in the binary for the About
+# page (`GET /v1/about`). image.yml passes it; a local build leaves it empty.
+ARG SCARAB_GIT_SHA=
+
 # Build only the server binary in release mode, on top of the cooked
 # dependencies.
 RUN cargo build --release --locked -p scarab-server \

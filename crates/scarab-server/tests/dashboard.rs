@@ -61,6 +61,35 @@ async fn me_returns_the_authenticated_principal() {
     assert!(me["display_name"].is_null());
 }
 
+/// The About page reads the server's version and how it was started. The
+/// version is the crate's; the role and executor are what startup recorded.
+#[tokio::test]
+async fn about_reports_the_version_and_how_the_server_was_started() {
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(0));
+    let app = router(app_state(db, clock).with_server_facts("converged", "k8s"));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/about")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let about = body_json(resp).await;
+    assert_eq!(about["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(about["role"], "converged");
+    assert_eq!(about["executor"], "k8s");
+    assert!(about["started_at"].as_i64().unwrap() > 0);
+    // Nothing configured in a hand-built state: no login, no App, no plugins.
+    assert_eq!(about["login"], false);
+    assert_eq!(about["github_app"], false);
+    assert_eq!(about["plugins"], false);
+}
+
 #[tokio::test]
 async fn repo_runs_are_scoped_to_the_tenant_newest_first() {
     let db = Arc::new(InMemoryDb::new());

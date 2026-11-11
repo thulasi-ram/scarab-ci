@@ -3708,6 +3708,8 @@ h1, .crumb-head, .run-title {
 .kv dt { font: var(--t-label); color: var(--muted-sage); }
 .kv dd { margin: 0; min-width: 0; font: var(--t-body); color: var(--soft-white); overflow-wrap: anywhere; }
 .kv dd.m { font: var(--t-mono); }
+.kv dd a { color: var(--emerald); text-underline-offset: 3px; }
+.kv dd a:hover { color: var(--emerald-bright); }
 .kv .lib-checks li svg { margin-top: 4px; }
 .kv-note { margin: 0; padding: 0 14px 12px; font: var(--t-body); color: var(--sage); }
 .kv + .kv-note { margin-top: -4px; }

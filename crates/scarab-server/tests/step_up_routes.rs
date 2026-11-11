@@ -38,6 +38,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("GET", "/v1/auth/providers", "read", "READ"),
     ("POST", "/v1/auth/logout", "auth.logout", "NG"),
     ("GET", "/v1/me", "read", "READ"),
+    ("GET", "/v1/about", "read", "READ"),
     ("POST", "/v1/me/identities/link", "identity.link", "CJ-W"),
     ("GET", "/v1/me/identities/merges/{id}", "read", "READ"),
     (

@@ -1819,6 +1819,18 @@ function json(body: unknown, init?: ResponseInit) {
 function route(pathname: string, search: string, method: string, body = ""): Response | null {
   const p = pathname;
   if (p === "/v1/me") return json(me);
+  if (p === "/v1/about") {
+    return json({
+      version: "0.3.2",
+      commit: "720f3eec4b1d9a6e2c5f8b7a0d3e6f9a1b4c7d0e",
+      started_at: Date.now() - 3 * 3600_000,
+      role: "converged",
+      executor: "k8s",
+      login: true,
+      github_app: true,
+      plugins: true,
+    });
+  }
   // Ahead of the library routes, which answer every other repo's refused
   // runs with an empty list.
   if (p === "/v1/repos/acme/scarab/refused-runs") return json({ refused: scheduleRefused });

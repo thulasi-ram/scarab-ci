@@ -285,6 +285,8 @@ jobs:
           context: ${{ steps.target.outputs.context }}
           file: ${{ steps.target.outputs.dockerfile }}
           platforms: ${{ matrix.platform }}
+          # The server records it for its About page; the other images ignore it.
+          build-args: SCARAB_GIT_SHA=${{ github.sha }}
           push: ${{ github.event_name != 'pull_request' }}
           outputs: ${{ github.event_name != 'pull_request' && format('type=image,name={0}/{1}/{2},push-by-digest=true,name-canonical=true,push=true', env.REGISTRY, github.repository_owner, matrix.image) || 'type=cacheonly' }}
           cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.platform }}

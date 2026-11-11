@@ -327,6 +327,9 @@ pub struct AppState {
     /// built from it. `None` = the public URL. Read it through
     /// [`ui_url`](AppState::ui_url).
     pub ui_url: Option<String>,
+    /// What `GET /v1/about` says about this process besides its version:
+    /// when it started, and the role and executor it was started with.
+    pub server_facts: ServerFacts,
     /// Deployment-supplied forge-connection credentials (ADR-0060 part D): the
     /// env-override half of the one credential-resolution path. The API needs
     /// it so a connection whose credential comes from configuration is not
@@ -392,6 +395,7 @@ impl AppState {
             oauth_providers: Vec::new(),
             public_url: "http://localhost:8080".into(),
             ui_url: None,
+            server_facts: ServerFacts::started_now(),
             credential_overrides: Arc::new(connections_config::CredentialOverrides::new()),
             snapshot_retention_days: DEFAULT_SNAPSHOT_RETENTION_DAYS,
             step_up: step_up::StepUpPolicy::Off,
@@ -723,6 +727,17 @@ impl AppState {
     /// staging stack whose public hostname serves only `/webhooks/`). The
     /// OAuth callback and the step-up confirmation link use it; webhook
     /// URLs and forge status links stay on the public URL.
+    /// The role and executor this process was started with, for `GET /v1/about`.
+    pub fn with_server_facts(
+        mut self,
+        role: impl Into<String>,
+        executor: impl Into<String>,
+    ) -> Self {
+        self.server_facts.role = Some(role.into());
+        self.server_facts.executor = Some(executor.into());
+        self
+    }
+
     pub fn with_ui_url(mut self, ui_url: impl Into<String>) -> Self {
         self.ui_url = Some(ui_url.into());
         self
@@ -12632,6 +12647,89 @@ async fn connection_preflight(
     }))
 }
 
+/// What `GET /v1/about` reports about this process besides its version. The
+/// start time is taken when the [`AppState`] is built, which is at startup.
+#[derive(Debug, Clone, Default)]
+pub struct ServerFacts {
+    /// Unix milliseconds.
+    pub started_at: i64,
+    pub role: Option<String>,
+    pub executor: Option<String>,
+}
+
+impl ServerFacts {
+    fn started_now() -> Self {
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        Self {
+            started_at,
+            role: None,
+            executor: None,
+        }
+    }
+}
+
+/// The git commit the server binary was built from, when the build recorded
+/// one: image.yml passes `SCARAB_GIT_SHA` to the image build. A local build
+/// has none.
+const BUILD_COMMIT: Option<&str> = option_env!("SCARAB_GIT_SHA");
+
+/// The server's version and how this deployment runs, for the web UI's About
+/// page. Names what is configured, never a secret or a URL with credentials.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AboutDto {
+    /// The server's version, e.g. `0.3.2`.
+    pub version: String,
+    /// The git commit the server was built from. `None` for a build that did
+    /// not record one (a local build).
+    pub commit: Option<String>,
+    /// When this server process started, in unix milliseconds.
+    pub started_at: i64,
+    /// Which part of Scarab this process runs: `converged` (all of it), `api`,
+    /// `scheduler` or `executor`.
+    pub role: Option<String>,
+    /// Where steps run: `k8s` (one Pod per step) or `local` (host processes).
+    pub executor: Option<String>,
+    /// People sign in through an OAuth/OIDC provider.
+    pub login: bool,
+    /// The server runs a GitHub App (`SCARAB_GITHUB_APP_ID` is set).
+    pub github_app: bool,
+    /// The plugin system is on.
+    pub plugins: bool,
+}
+
+/// **This server's version and how it runs**: the web UI's About page. Any
+/// signed-in caller may read it.
+#[utoipa::path(
+    get,
+    path = "/v1/about",
+    summary = "The server's version, build commit and how this deployment runs",
+    responses(
+        (status = 200, body = AboutDto),
+        (status = 401, description = "not signed in")
+    )
+)]
+async fn about(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<AboutDto>, ApiError> {
+    authenticate(&st, &headers, Action::Read).await?;
+    let github_app = match st.forge_adapters.as_ref() {
+        Some(adapters) => !matches!(adapters.github_app().await, Ok(None)),
+        None => false,
+    };
+    let facts = &st.server_facts;
+    Ok(Json(AboutDto {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        commit: BUILD_COMMIT.filter(|c| !c.is_empty()).map(str::to_string),
+        started_at: facts.started_at,
+        role: facts.role.clone(),
+        executor: facts.executor.clone(),
+        login: st.auth.is_some(),
+        github_app,
+        plugins: st.plugins.is_some(),
+    }))
+}
+
 /// How this server takes GitHub connections: whether it runs a GitHub App,
 /// and the page that App is installed from.
 #[derive(Debug, Serialize, ToSchema)]
@@ -14063,7 +14161,7 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
         || path.contains("/tokens")
     {
         "Auth & Identity"
-    } else if matches!(path, "/healthz" | "/readyz" | "/metrics") {
+    } else if matches!(path, "/healthz" | "/readyz" | "/metrics" | "/v1/about") {
         "System"
     } else if path.contains("/policies") || path.contains("/policy-") {
         // Before Runs: `/v1/runs/{id}/policy-decisions` is a Policy read.
@@ -14310,6 +14408,7 @@ impl utoipa::Modify for StepUpResponses {
         unlink_identity,
         logout,
         me,
+        about,
         mint_api_token,
         list_api_tokens,
         revoke_api_token,
@@ -14516,6 +14615,7 @@ impl utoipa::Modify for StepUpResponses {
         CapabilityRequirementDto,
         GrantedPermissionDto,
         MeResponse,
+        AboutDto,
         AuthProviderDto,
         LinkIdentityRequest,
         LinkIdentityResponse,

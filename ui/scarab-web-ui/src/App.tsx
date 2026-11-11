@@ -19,6 +19,7 @@ import { EnvironmentManage, EnvironmentRedirect } from "./routes/EnvironmentPage
 import ConfirmRequest from "./routes/ConfirmRequest";
 import OrgPage from "./routes/OrgPage";
 import PolicyEditor from "./routes/PolicyEditor";
+import About from "./routes/About";
 
 export default function App() {
   // The sign-in gate sits ABOVE the Router, not inside its root, and that
@@ -35,6 +36,8 @@ export default function App() {
     <Show when={!unauthenticated()} fallback={<Login />}>
     <Router root={Layout}>
       <Route path="/" component={Repos} />
+      {/* Opened from the user menu: the server's version and how it runs. */}
+      <Route path="/about" component={About} />
       {/* Settings (git-bug 734ffa1), two separate pages: Account settings
           under /settings/<section>, an org's settings under
           /orgs/<org>/settings/<section>. Static first segments, so they
