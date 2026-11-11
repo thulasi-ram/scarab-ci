@@ -1217,7 +1217,7 @@ test("New organization lists the connections waiting for an org, and a global ad
   expect(errors).toEqual([]);
 });
 
-test("org secrets: New secret in the header, Replace with the name filled in, Delete with the name typed", async ({
+test("org secrets: one full-width list like a repository's, edit with the name filled in, delete with the name typed", async ({
   page,
 }) => {
   const errors = collectErrors(page);
@@ -1226,7 +1226,15 @@ test("org secrets: New secret in the header, Replace with the name filled in, De
   const list = panel.getByRole("list", { name: "Secrets" });
   await expect(list.getByRole("listitem")).toHaveCount(2);
 
-  // New secret, from the panel header.
+  // The same list as a repository's Secrets tab, with the count in the header.
+  await expect(panel.locator(".panel-h .tok-count")).toHaveText("2");
+  await expect(list).toHaveClass(/skey-list/);
+  // Full width: the list spans the panel body, not a capped column.
+  const listBox = (await list.boundingBox())!;
+  const bodyBox = (await panel.locator(".secrets-body").boundingBox())!;
+  expect(listBox.width).toBeGreaterThan(bodyBox.width - 60);
+
+  // New secret, from the bar above the list.
   await panel.getByRole("button", { name: "New secret" }).click();
   let dialog = page.getByRole("dialog");
   await expect(dialog.getByRole("heading", { name: "New secret" })).toBeVisible();
@@ -1235,8 +1243,8 @@ test("org secrets: New secret in the header, Replace with the name filled in, De
   await dialog.getByRole("button", { name: "Save" }).click();
   await expect(list.getByText("NPM_TOKEN", { exact: true })).toBeVisible();
 
-  // Replace keeps the name and still asks before overwriting.
-  await list.getByRole("listitem").filter({ hasText: "GHCR_TOKEN" }).getByRole("button", { name: "Replace" }).click();
+  // Edit keeps the name and still asks before overwriting.
+  await list.getByRole("button", { name: "Edit GHCR_TOKEN" }).click();
   dialog = page.getByRole("dialog");
   await expect(dialog.getByRole("heading", { name: "Replace secret" })).toBeVisible();
   await expect(dialog.getByRole("textbox", { name: "Name" })).toHaveValue("GHCR_TOKEN");
@@ -1247,7 +1255,7 @@ test("org secrets: New secret in the header, Replace with the name filled in, De
   await dialog.getByRole("button", { name: "Cancel" }).click();
 
   // Delete asks for the name typed exactly.
-  await list.getByRole("listitem").filter({ hasText: "SENTRY_DSN" }).getByRole("button", { name: "Delete" }).click();
+  await list.getByRole("button", { name: "Delete SENTRY_DSN" }).click();
   dialog = page.getByRole("dialog");
   const go = dialog.getByRole("button", { name: "Delete secret" });
   await expect(go).toBeDisabled();
@@ -1256,7 +1264,7 @@ test("org secrets: New secret in the header, Replace with the name filled in, De
   await expect(list.getByText("SENTRY_DSN", { exact: true })).toHaveCount(0);
 
   // One note, inside the panel; no button under the list.
-  await expect(panel.getByText(/Values are never shown\. Setting a name again replaces it\./)).toHaveCount(1);
+  await expect(panel.getByText(/never displayed: you can overwrite a value but not read it back\. Setting a name again replaces it\./)).toHaveCount(1);
   await expect(page.locator("section.page").getByRole("button", { name: "New secret" })).toHaveCount(1);
   expect(errors).toEqual([]);
 });

@@ -27,6 +27,9 @@ release.yml uses that version's section as the GitHub Release text. See
   Codeberg it shows the instance URL and token form as before. The New organization page asks
   the same question; after a GitHub install, **Check for the organization** opens the org the
   installation created.
+- **Org secrets look like a repository's Secrets tab.** The org's Settings › Secrets shows its
+  count in the header, New secret above the list, and one full-width list with a row per name and
+  its **edit** and **delete** (they were **Replace** and **Delete**, on rows capped at 520px).
 
 ## [0.3.1] - 2026-11-11
 

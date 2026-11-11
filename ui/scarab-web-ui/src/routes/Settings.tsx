@@ -378,6 +378,7 @@ function orgBody(id: string, org: string): JSX.Element {
           scope={{ org }}
           title={`Org secrets · ${org}`}
           emptyLabel="No org-wide secrets yet."
+          summary="every repository that does not set its own"
           note="A repository or Environment that sets the same name uses its own value; set those on the repository's Secrets tab."
         />
       );
