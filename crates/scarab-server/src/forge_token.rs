@@ -507,6 +507,20 @@ impl ForgeCredentialExecutor {
         self
     }
 
+    /// Whether the Run was created from a fork pull request, as its recorded
+    /// trigger says. With no Run store wired (inline dev runs) it is `false`,
+    /// and the build's stored `locked_out` flag decides alone. A failed read
+    /// fails the launch.
+    async fn run_is_fork_pr(&self, step: &StepRun) -> Result<bool, ExecError> {
+        let Some((db, _)) = &self.governance else {
+            return Ok(false);
+        };
+        let trigger = crate::run_trigger(db.as_ref(), &step.run)
+            .await
+            .map_err(|e| ExecError::Other(format!("reading the Run's trigger: {e}")))?;
+        Ok(trigger.is_some_and(|(event, _)| event["fork"].as_bool() == Some(true)))
+    }
+
     /// The registry auth for a build step (ADR-0018 amendment), in precedence
     /// order: the scoped `REGISTRY_AUTH` secret (repo scope, org fallback —
     /// a dockerconfigjson), else the forge-derived credential for the forge's
@@ -626,13 +640,21 @@ impl Executor for ForgeCredentialExecutor {
         // A build step (ADR-0018): resolve its registry auth in memory only —
         // the stored spec never carries a credential.
         if let Some(build) = &spec.build {
-            let (auth_json, derived) = self.registry_auth(build).await;
+            // A spec stored before `locked_out` existed carries neither the
+            // flag nor a fork pull request's `push: false`, so the Run's
+            // recorded trigger is read as well (git-bug a75eacb).
+            let locked = build.locked_out || self.run_is_fork_pr(step).await?;
+            let (auth_json, derived) = if locked {
+                (None, None)
+            } else {
+                self.registry_auth(build).await
+            };
             let mut enriched = spec.clone();
             if let Some(b) = enriched.build.as_mut() {
                 b.registry_auth_json = auth_json;
                 b.derived_auth = derived;
-                // Stored false at Run creation; kept false here too.
-                if b.locked_out {
+                if locked {
+                    b.locked_out = true;
                     b.push = false;
                 }
             }

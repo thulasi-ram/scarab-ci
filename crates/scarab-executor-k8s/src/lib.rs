@@ -5780,9 +5780,19 @@ const BUILD_DOCKERFILE_ENV: &str = "SCARAB_BUILD_DOCKERFILE";
 const BUILD_GUARD: &str = r#"set -eu
 root=/workspace
 fail() { echo "scarab: build refused: $*" >&2; exit 2; }
+nl='
+'
+# Sets r to the resolved path. The `.` keeps a trailing newline in a
+# directory name from being dropped by the command substitution.
+resolve() {
+  r=$(realpath "$1" && echo .) || return 1
+  r=${r%.}
+  r=${r%"$nl"}
+}
 [ -d "$root" ] || fail "no workspace at $root"
 cd "$root" || fail "cannot enter the workspace at $root"
-root=$(realpath .) || fail "cannot resolve the workspace at $root"
+resolve . || fail "cannot resolve the workspace at $root"
+root=$r
 ctx=${SCARAB_BUILD_CONTEXT-}
 df=${SCARAB_BUILD_DOCKERFILE-}
 [ -n "$ctx" ] || fail "no build context"
@@ -5794,11 +5804,11 @@ inside() {
   esac
 }
 [ -e "./$ctx" ] || fail "build context $ctx does not exist in the workspace"
-c=$(realpath "./$ctx") || fail "cannot resolve build context $ctx"
-inside "$c" || fail "build context $ctx resolves outside the workspace"
+resolve "./$ctx" || fail "cannot resolve build context $ctx"
+inside "$r" || fail "build context $ctx resolves outside the workspace"
 [ -e "./$ctx/$df" ] || fail "dockerfile $ctx/$df does not exist in the workspace"
-d=$(realpath "./$ctx/$df") || fail "cannot resolve dockerfile $ctx/$df"
-inside "$d" || fail "dockerfile $ctx/$df resolves outside the workspace"
+resolve "./$ctx/$df" || fail "cannot resolve dockerfile $ctx/$df"
+inside "$r" || fail "dockerfile $ctx/$df resolves outside the workspace"
 exec /usr/bin/buildctl-daemonless.sh "$@"
 "#;
 
@@ -7741,28 +7751,62 @@ mod tests {
         }
     }
 
-    /// git-bug df660b6: runs [`BUILD_GUARD`] with `/bin/sh` against a temp
-    /// workspace and a stub `buildctl-daemonless.sh` that records its args. A symlinked context or Dockerfile pointing outside the
-    /// workspace exits 2 and never reaches the stub.
+    /// git-bug df660b6: `.` and `Dockerfile` reach buildctl with the args
+    /// unchanged; a symlinked context or Dockerfile pointing outside the
+    /// workspace exits 2 and never reaches it.
     #[cfg(unix)]
     #[test]
     fn build_guard_refuses_symlinks_out_of_the_workspace() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::symlink;
+
+        let (tmp, run) = build_guard_harness();
+        let base = tmp.path().canonicalize().unwrap();
+        let ws = base.join("workspace");
+        let outside = base.join("registry");
+        symlink(&outside, ws.join("ctx")).unwrap();
+        std::fs::create_dir(ws.join("df")).unwrap();
+        symlink(outside.join("config.json"), ws.join("df/Dockerfile")).unwrap();
+
+        assert_eq!(run(".", "Dockerfile"), (Some(0), true));
+        assert_eq!(
+            std::fs::read_to_string(base.join("called")).unwrap(),
+            "build\n--opt\na b\n",
+            "the stub gets the args unchanged"
+        );
+        for (context, dockerfile) in [("ctx", "config.json"), ("df", "Dockerfile")] {
+            assert_eq!(
+                run(context, dockerfile),
+                (Some(2), false),
+                "{context}/{dockerfile}"
+            );
+        }
+    }
+
+    /// A temp workspace beside a `registry` directory standing in for the
+    /// credential mount, and [`BUILD_GUARD`] pointed at them and at a stub
+    /// `buildctl-daemonless.sh` that writes its args, one per line, to
+    /// `called`. Returns the temp dir (workspace at `workspace/`, outside at
+    /// `registry/`) and a runner giving `(exit code, reached buildctl)` for a
+    /// context and dockerfile; the runner passes `build --opt "a b"`.
+    #[cfg(unix)]
+    fn build_guard_harness() -> (
+        tempfile::TempDir,
+        impl Fn(&str, &str) -> (Option<i32>, bool),
+    ) {
+        use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
-        let ws = tmp.path().join("workspace");
-        let outside = tmp.path().join("registry");
-        let bin = tmp.path().join("bin");
-        let record = tmp.path().join("called");
-        for d in [&ws, &outside, &bin] {
+        let base = tmp.path().canonicalize().unwrap();
+        let ws = base.join("workspace");
+        let outside = base.join("registry");
+        for d in [&ws, &outside] {
             std::fs::create_dir(d).unwrap();
         }
         std::fs::write(ws.join("Dockerfile"), "FROM scratch\n").unwrap();
         std::fs::write(outside.join("config.json"), "{}").unwrap();
-        symlink(&outside, ws.join("ctx")).unwrap();
-        std::fs::create_dir(ws.join("df")).unwrap();
-        symlink(outside.join("config.json"), ws.join("df/Dockerfile")).unwrap();
-        let stub = bin.join("buildctl-daemonless.sh");
+        std::fs::write(outside.join("Dockerfile"), "FROM scratch\n").unwrap();
+        let record = base.join("called");
+        let stub = base.join("buildctl-daemonless.sh");
         std::fs::write(
             &stub,
             format!(
@@ -7772,49 +7816,111 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        // Production pins the root to the workspace mount and buildctl to
-        // its path in the image; the test points them at the temp workspace
-        // and the stub.
         let pinned = format!("root={WORKSPACE_MOUNT_PATH}\n");
         let buildctl = "exec /usr/bin/buildctl-daemonless.sh ";
         assert!(BUILD_GUARD.contains(&pinned) && BUILD_GUARD.contains(buildctl));
         let guard = BUILD_GUARD
             .replace(&pinned, &format!("root='{}'\n", ws.display()))
             .replace(buildctl, &format!("exec '{}' ", stub.display()));
-        let run = |context: &str, dockerfile: &str| {
+        let run = move |context: &str, dockerfile: &str| {
             let _ = std::fs::remove_file(&record);
-            std::process::Command::new("/bin/sh")
+            let out = std::process::Command::new("/bin/sh")
                 .args(["-c", &guard, "scarab-build", "build", "--opt", "a b"])
-                .current_dir(tmp.path())
+                .current_dir(&base)
                 .env(BUILD_CONTEXT_ENV, context)
                 .env(BUILD_DOCKERFILE_ENV, dockerfile)
                 .output()
-                .unwrap()
+                .unwrap();
+            (out.status.code(), record.exists())
         };
+        (tmp, run)
+    }
 
-        let out = run(".", "Dockerfile");
-        assert!(out.status.success(), "{out:?}");
-        assert_eq!(
-            std::fs::read_to_string(&record).unwrap(),
-            "build\n--opt\na b\n",
-            "the stub gets the args unchanged"
-        );
+    // Attack: reach the credential mount through a relative symlink chain, a symlinked parent directory, a symlink to an in-workspace directory whose Dockerfile links out, or a Dockerfile path through a symlinked directory. Safe outcome: exit 2, buildctl never runs.
+    #[cfg(unix)]
+    #[test]
+    fn build_guard_refuses_symlink_chains_and_symlinked_parents() {
+        use std::os::unix::fs::symlink;
 
-        for (context, dockerfile) in [("ctx", "config.json"), ("df", "Dockerfile")] {
-            let out = run(context, dockerfile);
+        let (tmp, run) = build_guard_harness();
+        let ws = tmp.path().join("workspace");
+        std::fs::create_dir(tmp.path().join("registry/sub")).unwrap();
+        // a -> b -> ../registry, both relative.
+        symlink("b", ws.join("a")).unwrap();
+        symlink("../registry", ws.join("b")).unwrap();
+        // inner -> real (inside); real/Dockerfile -> ../../registry/config.json.
+        std::fs::create_dir(ws.join("real")).unwrap();
+        symlink("../../registry/config.json", ws.join("real/Dockerfile")).unwrap();
+        symlink("real", ws.join("inner")).unwrap();
+        // deep/x -> ../../registry, then the path walks on through it.
+        std::fs::create_dir(ws.join("deep")).unwrap();
+        symlink("../../registry", ws.join("deep/x")).unwrap();
+
+        for (context, dockerfile) in [
+            ("a", "config.json"),
+            ("a", "Dockerfile"),
+            ("b/sub", "../Dockerfile"),
+            ("deep/x/sub", "../config.json"),
+            ("inner", "Dockerfile"),
+            ("./inner/.", "Dockerfile"),
+            (".", "b/Dockerfile"),
+            (".", "deep/x/config.json"),
+            ("deep", "x/Dockerfile"),
+        ] {
             assert_eq!(
-                out.status.code(),
-                Some(2),
-                "{context}/{dockerfile}: {out:?}"
+                run(context, dockerfile),
+                (Some(2), false),
+                "{context} / {dockerfile}"
             );
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            assert!(
-                stderr.starts_with("scarab: ") && stderr.contains("outside the workspace"),
-                "{stderr}"
-            );
-            assert!(!record.exists(), "{context}/{dockerfile} reached buildctl");
         }
+        assert_eq!(run(".", "Dockerfile"), (Some(0), true));
+    }
+
+    // Attack: a symlink to a directory outside the workspace whose path only starts with the workspace's (`/workspace-evil`, `/workspace<newline>`: `$(realpath)` drops the trailing newline, so the context resolves to the root's own spelling). Safe outcome: exit 2, buildctl never runs.
+    #[cfg(unix)]
+    #[test]
+    fn build_guard_refuses_lookalike_workspace_roots() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, run) = build_guard_harness();
+        let ws = tmp.path().join("workspace");
+        for (link, name) in [("sib", "workspace-evil"), ("nl", "workspace\n")] {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("Dockerfile"), "FROM scratch\n").unwrap();
+            symlink(format!("../{name}"), ws.join(link)).unwrap();
+            assert_eq!(run(link, "Dockerfile"), (Some(2), false), "{link}");
+        }
+    }
+
+    // Attack: a context or dockerfile the shell could expand or read as an option (`*` matching a symlink out, `-n`, `$(...)`, a name with spaces), so the guard checks one path and buildctl gets another. Safe outcome: each is taken as a literal path; the ones that do not exist exit 2 and the literal directory builds.
+    #[cfg(unix)]
+    #[test]
+    fn build_guard_takes_paths_literally() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, run) = build_guard_harness();
+        let ws = tmp.path().join("workspace");
+        std::fs::create_dir(ws.join("only")).unwrap();
+        symlink("../../registry", ws.join("only/evil")).unwrap();
+        for (context, dockerfile) in [
+            ("*", "Dockerfile"),
+            ("only/*", "Dockerfile"),
+            ("-n", "Dockerfile"),
+            ("$(echo only/evil)", "Dockerfile"),
+            ("`echo only/evil`", "Dockerfile"),
+            (".", "only/*/Dockerfile"),
+            (". only/evil", "Dockerfile"),
+        ] {
+            assert_eq!(
+                run(context, dockerfile),
+                (Some(2), false),
+                "{context} / {dockerfile}"
+            );
+        }
+        std::fs::create_dir(ws.join("a b")).unwrap();
+        std::fs::write(ws.join("a b/-f"), "FROM scratch\n").unwrap();
+        assert_eq!(run("a b", "-f"), (Some(0), true));
     }
 
     #[test]

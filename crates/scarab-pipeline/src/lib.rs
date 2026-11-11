@@ -1551,6 +1551,14 @@ pub fn build_target_problems(context: &str, dockerfile: &str, image: &str) -> Ve
                 path.escape_debug()
             ));
         }
+        // `buildctl` reads `--local` and `--opt` values as `key=value`; a
+        // comma could start a second field if its parser ever splits on it.
+        if path.contains(',') {
+            problems.push(format!(
+                "`{field}` must not contain a `,`: `{}`",
+                path.escape_debug()
+            ));
+        }
         if path.chars().any(char::is_control) {
             problems.push(format!(
                 "`{field}` must not contain a control character: `{}`",
@@ -10189,6 +10197,16 @@ mod tests {
                 "is not an image reference",
             ),
             (r#"{ image: "a b" }"#, "is not an image reference"),
+            // A committed directory named `ctx,dockerfile=` must not become a
+            // second `--local` source if buildctl ever splits on `,`.
+            (
+                r#"{ context: "ctx,dockerfile=/scarab/registry", dockerfile: config.json, image: "a/b:1" }"#,
+                "`build.context` must not contain a `,`",
+            ),
+            (
+                r#"{ dockerfile: "Dockerfile,context=/scarab/registry", image: "a/b:1" }"#,
+                "`build.dockerfile` must not contain a `,`",
+            ),
             (
                 r#"{ image: "ghcr.io/acme/app:${{ event.sha }}" }"#,
                 "templates are not supported in `build.image` yet",
@@ -10199,6 +10217,61 @@ mod tests {
                 err.iter()
                     .any(|d| d.starts_with("step `image`: ") && d.contains(expect)),
                 "{build}: {err:?}"
+            );
+        }
+    }
+
+    // Attack: an `image:` that adds buildctl output options, a second flag or a shell word. Safe outcome: every one is refused as not an image reference.
+    #[test]
+    fn build_image_cannot_carry_buildctl_options() {
+        for image in [
+            "a/b:1,push=true",
+            "a/b:1,registry.insecure=true",
+            "a/b:1 --output type=local,dest=/scarab/registry",
+            "a/b:1\n--opt",
+            "--help",
+            "-o",
+            "a/b:tag=1",
+            "a/b;id",
+            "$(id)",
+            "a/b:1\u{0}",
+            "type=local",
+            "a/b:1\u{ff0c}push=true",
+            "ghcr.io/acme/app@sha256:abc,push=true",
+        ] {
+            let problems = build_target_problems(".", "Dockerfile", image);
+            assert!(
+                problems.iter().any(|p| p.contains("`build.image`")),
+                "{image:?} passed: {problems:?}"
+            );
+        }
+    }
+
+    // Attack: `.`-spelled and `..`-spelled escapes of the workspace (`./x/..`, `x/../..`, `./..`, a bare `..`, a trailing `/..`). Safe outcome: any `..` component is refused; `.` and `./x` are not.
+    #[test]
+    fn build_paths_spelled_with_dots_stay_in_the_workspace() {
+        for path in [
+            "..",
+            "./..",
+            "./x/..",
+            "x/../..",
+            "x/..",
+            "x//..//",
+            "../scarab/registry",
+            "//scarab/registry",
+        ] {
+            for (context, dockerfile) in [(path, "Dockerfile"), (".", path)] {
+                assert!(
+                    !build_target_problems(context, dockerfile, "a/b:1").is_empty(),
+                    "context {context:?} dockerfile {dockerfile:?} passed"
+                );
+            }
+        }
+        for path in [".", "./", "./x", "x/./y", "x..y", "..x", "x.."] {
+            assert_eq!(
+                build_target_problems(path, "Dockerfile", "a/b:1"),
+                Vec::<String>::new(),
+                "{path:?}"
             );
         }
     }

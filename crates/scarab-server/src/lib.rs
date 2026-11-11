@@ -7577,6 +7577,23 @@ fn run_status_to_forge(s: RunStatus) -> scarab_forge::StatusState {
     }
 }
 
+/// The trigger context (`event`) a Run was created from, and its actor, as
+/// [`persist_run_from_ir`] recorded them on the Run's event log.
+pub(crate) async fn run_trigger(
+    db: &dyn Db,
+    run: &RunId,
+) -> Result<Option<(serde_json::Value, Option<String>)>, DbError> {
+    for e in db.events(run).await? {
+        if let EventPayload::Raw(v) = &e.kind {
+            if v["trigger"]["event"].is_object() {
+                let actor = v["actor"].as_str().map(str::to_string);
+                return Ok(Some((v["trigger"]["event"].clone(), actor)));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Recover a run's `(repo, sha)` from the normalized trigger recorded on its
 /// event log (persisted by [`persist_run_from_ir`]).
 async fn run_forge_coords(

@@ -497,7 +497,8 @@ async fn inline_dev_builds_get_no_auth() {
 /// git-bug a75eacb: a build locked out at Run creation (a fork pull request,
 /// or a Run locked out of its Environment's secrets) launches with no
 /// registry credential, though a Repo `REGISTRY_AUTH` secret and a
-/// forge-derived credential are both available, and does not push.
+/// forge-derived credential are both available, and the launch turns its
+/// push off.
 #[tokio::test]
 async fn a_locked_out_build_gets_no_registry_credential() {
     let secrets = Arc::new(FakeSecrets::new().with_secret(
@@ -520,12 +521,59 @@ async fn a_locked_out_build_gets_no_registry_credential() {
     let mut spec = build_spec("ghcr.io/acme/web:1");
     let build = spec.build.as_mut().unwrap();
     build.locked_out = true;
-    build.push = false;
     let handle = exec.launch(&step_run("image"), &spec).await.unwrap();
     let enriched = inner.launched_spec(&handle).unwrap().build.unwrap();
     assert_eq!(enriched.registry_auth_json, None);
     assert_eq!(enriched.derived_auth, None);
     assert!(!enriched.push);
+}
+
+// Attack: a fork pull request Run created before the release stored its build with `push: true` and no `locked_out`; a retry or Rerun after the upgrade launches it. Safe outcome: the launch reads the Run's recorded trigger (`fork: true`), mounts no credential and does not push.
+#[tokio::test]
+async fn a_fork_pr_build_stored_before_locked_out_existed_gets_no_credential_on_relaunch() {
+    use scarab_engine::{EventKind, EventPayload, EVENT_VERSION};
+    use scarab_testkit::InMemoryEnvironmentGovernance;
+
+    let db = Arc::new(InMemoryDb::new());
+    let run = RunId("r1".into());
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.append_event(&EventKind {
+        version: EVENT_VERSION,
+        run: run.clone(),
+        kind: EventPayload::Raw(serde_json::json!({ "trigger": { "event": {
+            "kind": "pull_request", "fork": true, "number": 7,
+            "repo": { "owner": "acme", "name": "web" }, "sha": "abc123" } } })),
+        at: Timestamp(0),
+    })
+    .await
+    .unwrap();
+    let secrets = Arc::new(FakeSecrets::new().with_secret(
+        &SecretScope::Repo {
+            org: "acme".into(),
+            repo: "web".into(),
+        },
+        "REGISTRY_AUTH",
+        br#"{"auths":{"registry.corp":{"auth":"eDp5"}}}"#,
+    ));
+    let forge = Arc::new(FakeForge::new().with_registry_credential(
+        scarab_forge::RegistryCredential {
+            registry: "ghcr.io".into(),
+            username: "x-access-token".into(),
+            token: "derived".into(),
+        },
+    ));
+    let inner = Arc::new(FakeExecutor::new());
+    let exec = ForgeCredentialExecutor::new(inner.clone(), forge)
+        .with_secrets(secrets)
+        .with_environment_governance(db.clone(), Arc::new(InMemoryEnvironmentGovernance::new()));
+    // What a pre-release server stored: `push` as authored, `locked_out` absent.
+    let spec = build_spec("ghcr.io/acme/web:1");
+    assert!(!spec.build.as_ref().unwrap().locked_out);
+    let handle = exec.launch(&step_run("image"), &spec).await.unwrap();
+    let enriched = inner.launched_spec(&handle).unwrap().build.unwrap();
+    assert_eq!(enriched.registry_auth_json, None, "REGISTRY_AUTH mounted");
+    assert_eq!(enriched.derived_auth, None, "forge credential mounted");
+    assert!(!enriched.push, "a fork pull request build pushed");
 }
 
 // ---------------------------------------------------------------------------
