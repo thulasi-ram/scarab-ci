@@ -18,6 +18,12 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **The Dashboard heading lines up with every other page.** It is now `/ › Dashboard`, on the same
+  line as the other pages' breadcrumbs, and the first block under it sits the same distance below
+  it whether runs wait on you or the page shows "All clear" (the card was 8px under the heading).
+
 ## [0.3.2] - 2026-11-11
 
 ### Features
