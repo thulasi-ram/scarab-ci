@@ -2341,6 +2341,13 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     return new Response(null, { status: 204 });
   }
   if (/^\/v1\/connections\/[^/]+\/preflight$/.test(p)) return json(connectionPreflight);
+  if (p === "/v1/forges/github/app") {
+    return json({
+      app_mode: true,
+      install_url: "https://github.com/apps/scarab-ci/installations/new",
+      unavailable_reason: null,
+    });
+  }
   // Secret names are scope-addressed: no `repo=` is the org scope.
   // The org scope's names change with a save or a delete, for the life of
   // the page.

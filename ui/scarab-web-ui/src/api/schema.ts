@@ -431,6 +431,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/forges/github/app": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The GitHub App this server runs and the page it is installed from
+         * @description A live GitHub call each time; it answers 200 with a reason, not an error,
+         *     when the call fails, so the dialog can still show its steps.
+         */
+        get: operations["github_app_info"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/me": {
         parameters: {
             query?: never;
@@ -3696,6 +3717,28 @@ export interface components {
             /** @description Why — a timer elapsing, an expiry, a rejection's reason. */
             reason?: string | null;
         };
+        /**
+         * @description How this server takes GitHub connections: whether it runs a GitHub App,
+         *     and the page that App is installed from.
+         */
+        GithubAppDto: {
+            /**
+             * @description The server runs in GitHub App mode (`SCARAB_GITHUB_APP_ID` is set), so
+             *     installing the App on an account registers that account's connection.
+             *     `false`: GitHub connections cannot be added from the web UI.
+             */
+            app_mode: boolean;
+            /**
+             * @description Where an admin installs the App (`https://github.com/apps/<slug>/installations/new`).
+             *     `None` when not in App mode, or when GitHub could not be asked.
+             */
+            install_url?: string | null;
+            /**
+             * @description Why `install_url` is missing in App mode: the App key does not resolve,
+             *     or GitHub answered with an error.
+             */
+            unavailable_reason?: string | null;
+        };
         /** @description A permission the forge reports as granted. */
         GrantedPermissionDto: {
             level: string;
@@ -6884,6 +6927,32 @@ export interface operations {
             };
             /** @description this forge adapter cannot enumerate repos */
             501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    github_app_info: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GithubAppDto"];
+                };
+            };
+            /** @description requires Administer on an org */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

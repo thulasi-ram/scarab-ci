@@ -963,10 +963,21 @@ test("Connections lists only the org's own connections", async ({ page }) => {
   // Re-sync and Remove live on the connection's page, not on the list.
   await expect(list.getByRole("button", { name: /Re-sync|Remove/ })).toHaveCount(0);
 
-  // Add Forgejo connection sits in the panel header and opens a dialog.
-  await page_.getByRole("button", { name: "Add Forgejo connection" }).click();
-  await expect(page.getByRole("dialog")).toContainText("Connect a Forgejo or Codeberg instance");
-  await page.getByRole("dialog").getByRole("button", { name: "Cancel" }).click();
+  // Add forge connection sits in the panel header and opens a dialog that
+  // asks which forge. GitHub shows the install steps with the App's install
+  // page from the server; Forgejo shows the URL and token form.
+  await page_.getByRole("button", { name: "Add forge connection" }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("radio", { name: /GitHub/ }).check();
+  await expect(dialog.getByRole("link", { name: "Install on GitHub →" })).toHaveAttribute(
+    "href",
+    "https://github.com/apps/scarab-ci/installations/new",
+  );
+  await expect(dialog).toContainText("Pick the account acme");
+  await dialog.getByRole("radio", { name: /Forgejo or Codeberg/ }).check();
+  await expect(dialog.getByRole("textbox", { name: "Instance URL" })).toBeVisible();
+  await expect(dialog.getByRole("link", { name: "Install on GitHub →" })).toHaveCount(0);
+  await dialog.getByRole("button", { name: "Cancel" }).click();
   expect(errors).toEqual([]);
 });
 
@@ -1063,7 +1074,20 @@ test("a global admin makes a new org from the org dropdown and lands on its conn
   const nav = page.getByRole("navigation", { name: "Settings" });
   await expect(nav.getByText("Organization settings", { exact: true })).toBeVisible();
   await expect(nav.getByRole("link")).toHaveCount(0);
-  await expect(page.getByText(/install the Scarab App on the account/)).toBeVisible();
+  // The page asks which forge. GitHub lists the install steps with the App's
+  // install page; the org comes from the installation, so there is no form.
+  await page.getByRole("radio", { name: /GitHub/ }).check();
+  await expect(page.getByRole("link", { name: "Install on GitHub →" })).toHaveAttribute(
+    "href",
+    "https://github.com/apps/scarab-ci/installations/new",
+  );
+  await expect(page.getByText(/creates the organization in Scarab/)).toBeVisible();
+  await expect(page.locator("#conn-org")).toHaveCount(0);
+  // Nothing installed yet: checking says so and stays on the page.
+  await page.getByRole("button", { name: "Check for the organization" }).click();
+  await expect(page.getByText(/No new organization yet/)).toBeVisible();
+  await expect(page).toHaveURL(/\/orgs\/_new$/);
+  await page.getByRole("radio", { name: /Forgejo or Codeberg/ }).check();
   const add = page.getByRole("button", { name: "Add connection" });
   await expect(add).toBeDisabled();
   await page.locator("#conn-org").fill("initech");

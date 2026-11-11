@@ -1094,6 +1094,15 @@ pub trait ForgeAdapters: Send + Sync {
         &self,
         conn: &ForgeConnection,
     ) -> Result<std::sync::Arc<dyn ForgePort>, ForgeError>;
+
+    /// An adapter that authenticates as the GitHub App itself, not as one of
+    /// its installations, when the server runs in App mode; `None` otherwise
+    /// (token mode, or no GitHub App configured). It answers questions about
+    /// the App before any installation exists, such as the page it is
+    /// installed from ([`ForgePort::describe_capabilities`]).
+    async fn github_app(&self) -> Result<Option<std::sync::Arc<dyn ForgePort>>, ForgeError> {
+        Ok(None)
+    }
 }
 
 /// The result of resolving a [`RepoRef`] through the registry: which

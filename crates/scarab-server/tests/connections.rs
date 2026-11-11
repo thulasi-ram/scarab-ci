@@ -23,7 +23,9 @@ use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
 use scarab_engine::Db;
-use scarab_forge::{ForgeConnection, ForgeConnectionStore, ForgeKind, RepoRef};
+use scarab_forge::{
+    ForgeAdapters, ForgeConnection, ForgeConnectionStore, ForgeError, ForgeKind, ForgePort, RepoRef,
+};
 use scarab_identity::{Binding, BindingOrigin, Principal, RbacStore, Role, Scope};
 use scarab_secrets::{Secret, SecretProvider, SecretScope};
 use scarab_server::{router, AppState, LogService, FORGE_CREDENTIALS_ORG};
@@ -79,6 +81,18 @@ async fn harness_at(
     bound: &[(&str, &str)],
     forge: Arc<FakeForge>,
     seed_credential: bool,
+) -> Harness {
+    harness_with_adapters(public_url, bound, forge, seed_credential, None).await
+}
+
+/// The same stack with a connection-scoped adapter factory wired, which is
+/// what answers questions about the GitHub App itself.
+async fn harness_with_adapters(
+    public_url: &str,
+    bound: &[(&str, &str)],
+    forge: Arc<FakeForge>,
+    seed_credential: bool,
+    adapters: Option<Arc<dyn ForgeAdapters>>,
 ) -> Harness {
     let db = Arc::new(InMemoryDb::new());
     db.put_connection(&ForgeConnection {
@@ -157,8 +171,12 @@ async fn harness_at(
             ),
     );
     let rbac = Arc::new(InMemoryRbac::new());
+    let mut state = AppState::new(db.clone(), Arc::new(FakeClock::new(0)), logs);
+    if let Some(adapters) = adapters {
+        state = state.with_forge_adapters(adapters);
+    }
     let app = router(
-        AppState::new(db.clone(), Arc::new(FakeClock::new(0)), logs)
+        state
             // Note what is NOT here: `with_oauth_login`. Browser login is off in
             // every test on this harness, which used to mean the public URL was
             // lost — see `a_webhook_registers_against_the_configured_public_url`.
@@ -719,6 +737,107 @@ async fn preflight_of_a_connection_whose_credential_is_gone_says_so_without_aski
         .as_str()
         .unwrap()
         .contains("does not resolve"));
+}
+
+// ---------------------------------------------------------------------------
+// The GitHub App's install page, for the Add forge connection dialog: a GitHub
+// connection is added by installing the App, and only the server can ask
+// GitHub which App it runs.
+// ---------------------------------------------------------------------------
+
+/// A server whose GitHub App is `app` (`None` = token mode, no App).
+struct GithubAppAdapters(Option<Arc<FakeForge>>);
+
+#[async_trait::async_trait]
+impl ForgeAdapters for GithubAppAdapters {
+    async fn adapter_for_connection(
+        &self,
+        _conn: &ForgeConnection,
+    ) -> Result<Arc<dyn ForgePort>, ForgeError> {
+        Err(ForgeError::Api("not used here".into()))
+    }
+
+    async fn github_app(&self) -> Result<Option<Arc<dyn ForgePort>>, ForgeError> {
+        Ok(self.0.clone().map(|f| f as Arc<dyn ForgePort>))
+    }
+}
+
+async fn github_app_info(
+    app: Option<Arc<FakeForge>>,
+    code: &str,
+) -> (StatusCode, serde_json::Value) {
+    let h = harness_with_adapters(
+        DEV_PUBLIC_URL,
+        &[],
+        Arc::new(FakeForge::new()),
+        true,
+        Some(Arc::new(GithubAppAdapters(app))),
+    )
+    .await;
+    if code == "orgadmin-code" {
+        h.rbac
+            .grant(
+                &Binding {
+                    subject: "orgadmin".into(),
+                    scope: Scope::Org("acme".into()),
+                    role: Role::Admin,
+                },
+                BindingOrigin::Native,
+            )
+            .await
+            .unwrap();
+    }
+    let session = login(&h.app, code).await;
+    let resp = h
+        .app
+        .clone()
+        .oneshot(authed("GET", "/v1/forges/github/app", &session))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = body_bytes(resp).await;
+    (
+        status,
+        serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn the_github_app_install_page_comes_from_the_app_record() {
+    let app = FakeForge::new().with_app_page("https://github.com/apps/scarab-ci");
+    let (status, body) = github_app_info(Some(Arc::new(app)), "orgadmin-code").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["app_mode"], true);
+    assert_eq!(
+        body["install_url"],
+        "https://github.com/apps/scarab-ci/installations/new"
+    );
+    assert!(body["unavailable_reason"].is_null());
+}
+
+#[tokio::test]
+async fn without_a_github_app_there_is_no_install_page() {
+    let (status, body) = github_app_info(None, "root-code").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["app_mode"], false);
+    assert!(body["install_url"].is_null());
+}
+
+#[tokio::test]
+async fn an_app_github_cannot_describe_says_why() {
+    // An App whose `GET /app` fails: still App mode, no link, and a reason.
+    let (status, body) = github_app_info(Some(Arc::new(FakeForge::new())), "root-code").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["app_mode"], true);
+    assert!(body["install_url"].is_null());
+    assert!(body["unavailable_reason"].is_string());
+}
+
+#[tokio::test]
+async fn the_github_app_install_page_needs_administer() {
+    let app = FakeForge::new().with_app_page("https://github.com/apps/scarab-ci");
+    let (status, _) = github_app_info(Some(Arc::new(app)), "viewer-code").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 // ---------------------------------------------------------------------------

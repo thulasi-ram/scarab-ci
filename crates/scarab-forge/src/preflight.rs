@@ -101,6 +101,11 @@ pub struct ForgeRequirement {
 pub struct ForgeCapabilities {
     pub permissions: BTreeMap<String, String>,
     pub events: BTreeSet<String>,
+    /// The app's own web page, when the forge has one (GitHub's `html_url`,
+    /// `https://github.com/apps/<slug>`). The page an admin installs the app
+    /// from, so the web UI can link to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_page: Option<String>,
 }
 
 impl ForgeCapabilities {
@@ -115,6 +120,7 @@ impl ForgeCapabilities {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             events: events.into_iter().map(str::to_string).collect(),
+            app_page: None,
         }
     }
 }

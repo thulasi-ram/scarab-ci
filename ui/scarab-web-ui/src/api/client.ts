@@ -1758,6 +1758,22 @@ export type CapabilityRequirement = components["schemas"]["CapabilityRequirement
  * `status: "unknown"`, which the caller must render as *unchecked*, not as
  * healthy.
  */
+export type GithubApp = components["schemas"]["GithubAppDto"];
+
+/**
+ * Whether this server runs a GitHub App, and the page it is installed from
+ * (`GET /v1/forges/github/app`). The server asks GitHub for the page, so this
+ * is a live call: the Add forge connection dialog asks only when GitHub is
+ * picked.
+ */
+export async function githubAppInfo(): Promise<GithubApp> {
+  const { data, error, response } = await api.GET("/v1/forges/github/app");
+  if (error || !data) {
+    throw new Error(errorText(error) || `could not ask about the GitHub App (${response.status})`);
+  }
+  return data;
+}
+
 export async function connectionPreflight(id: string): Promise<ConnectionPreflight> {
   const { data, error, response } = await api.GET("/v1/connections/{id}/preflight", {
     params: { path: { id } },

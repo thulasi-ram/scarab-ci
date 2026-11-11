@@ -907,9 +907,15 @@ pub fn capabilities_from_app(body: &Value) -> ForgeCapabilities {
                 .collect()
         })
         .unwrap_or_default();
+    let app_page = body
+        .get("html_url")
+        .and_then(Value::as_str)
+        .map(|u| u.trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty());
     ForgeCapabilities {
         permissions,
         events,
+        app_page,
     }
 }
 
@@ -1785,9 +1791,14 @@ mod tests {
         let caps = capabilities_from_app(&json!({
             "id": 4323648,
             "slug": "scarab-ci",
+            "html_url": "https://github.com/apps/scarab-ci",
             "permissions": { "contents": "read", "statuses": "write", "metadata": "read" },
             "events": ["push", "pull_request"]
         }));
+        assert_eq!(
+            caps.app_page.as_deref(),
+            Some("https://github.com/apps/scarab-ci")
+        );
         assert_eq!(
             caps.permissions.get("statuses").map(String::as_str),
             Some("write")
@@ -1802,6 +1813,7 @@ mod tests {
         }));
         assert!(none.events.is_empty());
         assert_eq!(none.permissions.len(), 1);
+        assert_eq!(none.app_page, None);
 
         // A field GitHub added since must not take the whole readout down.
         let odd = capabilities_from_app(&json!({

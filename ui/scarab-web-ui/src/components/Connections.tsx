@@ -18,10 +18,17 @@
 //   covers, so the connection's page links to GitHub for that.
 // - **Forgejo** emits no installation event, so an admin adds the connection
 //   here (base URL + token). This is the one place a Forgejo connection is
-//   added: Add Forgejo connection, top right of an org's Connections, or, for
+//   added: Add forge connection, top right of an org's Connections, or, for
 //   an org that does not exist yet, the New organization page
 //   (`NewOrgConnection`), which shows the same form with a field for the
 //   org's name.
+//
+// Add forge connection and the New organization page both ask which forge
+// first. For GitHub they show the steps to install the App, with a link to the
+// App's install page that the server asks GitHub for
+// (`GET /v1/forges/github/app`); for Forgejo, the form. On New organization,
+// Check for the organization asks `/v1/me` again and opens the org the
+// installation created.
 //
 // Repositories are opt-in for both, and they are enabled and disabled in one
 // place: the org page (`/orgs/<org>`), which pages and filters them. A
@@ -45,9 +52,11 @@ import {
   connectionPreflight,
   createConnection,
   deleteConnection,
+  githubAppInfo,
   listConnections,
   type CapabilityRequirement,
   type Connection,
+  type GithubApp,
 } from "../api/client";
 import {
   connectionChips,
@@ -61,6 +70,7 @@ import {
   waitingIntro,
 } from "../connections";
 import { absTime, relTime } from "../fmt";
+import { orgPageHref } from "../org-page";
 import { me, refetchMe } from "../session";
 import { FIRST_ORG_SECTION, orgHref } from "../settings-nav";
 import { refetchWaiting, waitingConnections } from "../waiting-connections";
@@ -97,7 +107,7 @@ export default function Connections(props: { org: string }) {
             Forge connections · {props.org} <span class="tok-count">{rows().length}</span>
           </span>
           <button class="btn btn-primary btn-sm" onClick={() => setAdding(true)}>
-            <Icon icon="plus" size={14} /> Add Forgejo connection
+            <Icon icon="plus" size={14} /> Add forge connection
           </button>
         </div>
         <div class="secrets-body">
@@ -158,17 +168,17 @@ export default function Connections(props: { org: string }) {
             <p class="subtle">
               <small>
                 GitHub connections register themselves when the Scarab App is installed on the{" "}
-                <span class="mono">{props.org}</span> account. For Forgejo or Codeberg, use Add
-                Forgejo connection. A connection binds only repositories owned by{" "}
+                <span class="mono">{props.org}</span> account. For Forgejo or Codeberg, add the
+                connection with Add forge connection. A connection binds only repositories owned by{" "}
                 <span class="mono">{props.org}</span>, and only the ones you enable from its page.
               </small>
             </p>
           </Show>
         </div>
         <Show when={adding()}>
-          <ForgejoConnectionForm
+          <AddForgeConnection
             org={props.org}
-            onSaved={() => {
+            onDone={() => {
               reload();
               setAdding(false);
             }}
@@ -189,6 +199,40 @@ export default function Connections(props: { org: string }) {
  */
 export function NewOrgConnection() {
   const nav = useNavigate();
+  const [forge, setForge] = createSignal<Forge | null>(null);
+  const [app] = createResource(
+    () => (forge() === "github" ? true : undefined),
+    () => githubAppInfo(),
+  );
+  // The orgs the caller had when the page opened: an installation that
+  // created an org shows up as one more, once `/v1/me` is asked again.
+  const before = new Set(me()?.admin_orgs ?? []);
+  const [checking, setChecking] = createSignal(false);
+  const [notYet, setNotYet] = createSignal(false);
+  const check = async () => {
+    setChecking(true);
+    setNotYet(false);
+    try {
+      await refetchMe();
+      void refetchWaiting();
+      const added = (me()?.admin_orgs ?? []).filter((o) => !before.has(o));
+      if (added.length === 1) nav(orgHref(added[0]!, FIRST_ORG_SECTION));
+      else setNotYet(true);
+    } finally {
+      setChecking(false);
+    }
+  };
+  const fj = forgejoForm({
+    first: 2,
+    Sec: FormSection,
+    onSaved: async (org) => {
+      // The new org is in `admin_orgs` only once `/v1/me` is asked again.
+      // Then its home section, which is its Connections.
+      await refetchMe();
+      nav(orgHref(org, FIRST_ORG_SECTION));
+    },
+  });
+
   return (
     <div class="panel">
       <div class="panel-h"><span>First forge connection</span></div>
@@ -197,28 +241,234 @@ export function NewOrgConnection() {
           An organization in Scarab is a forge account: the user or organization that owns the
           repositories. It is created by its first connection.
         </p>
-        <p class="subtle">
-          <small>
-            For GitHub, install the Scarab App on the account instead. The installation registers
-            the connection and the organization.
-          </small>
-        </p>
-        <ForgejoConnectionForm
-          onSaved={async (org) => {
-            // The new org is in `admin_orgs` only once `/v1/me` is asked again.
-            // Then its home section, which is its Connections.
-            await refetchMe();
-            nav(orgHref(org, FIRST_ORG_SECTION));
-          }}
-        />
+        <div class="conn-form">
+          <FormSection n={1} title="Forge">
+            <ForgePicker value={forge()} onPick={setForge} disabled={fj.saving()} />
+          </FormSection>
+          <Show when={forge() === "forgejo"}>
+            {fj.sections}
+            <Show when={fj.error()}>
+              <p class="error">{fj.error()}</p>
+            </Show>
+            <div class="modal-actions">{fj.add}</div>
+          </Show>
+          <Show when={forge() === "github"}>
+            <FormSection n={2} title="Install the App">
+              <GithubInstallSteps app={app()} loading={app.loading} failed={!!app.error} />
+            </FormSection>
+            <Show when={notYet()}>
+              <p class="subtle">
+                No new organization yet. GitHub sends the installation within a few seconds. If the
+                connection is listed under Waiting for an organization, assign it there.
+              </p>
+            </Show>
+            <div class="modal-actions">
+              <a class="btn btn-ghost" href={CONNECTIONS_DOCS} target="_blank" rel="noreferrer">
+                Docs
+              </a>
+              <button class="btn btn-primary" type="button" disabled={checking()} onClick={() => void check()}>
+                {checking() ? "Checking…" : "Check for the organization"}
+              </button>
+            </div>
+          </Show>
+        </div>
       </div>
     </div>
   );
 }
 
+/** Where the docs describe setting up the GitHub App and adding connections. */
+const CONNECTIONS_DOCS =
+  "https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#forge-connections";
+
 /**
- * Add a Forgejo/Codeberg connection: the org it serves, an instance URL and an
- * access token.
+ * The Add forge connection dialog, opened from an org's Connections: which
+ * forge, then what that forge needs.
+ *
+ * - **GitHub**: a GitHub connection is created by installing the App on the
+ *   account, so this shows the steps and links to the App's install page. The
+ *   server asks GitHub for that page; a server with no App says so instead.
+ * - **Forgejo / Codeberg**: the instance URL and token form.
+ */
+function AddForgeConnection(props: { org: string; onDone: () => void; onCancel: () => void }) {
+  const [forge, setForge] = createSignal<Forge | null>(null);
+  // Asked once, when GitHub is first picked: it is a live call to GitHub.
+  const [app] = createResource(
+    () => (forge() === "github" ? true : undefined),
+    () => githubAppInfo(),
+  );
+  const fj = forgejoForm({ org: props.org, first: 2, Sec: ModalSection, onSaved: props.onDone });
+  const busy = () => forge() === "forgejo" && fj.saving();
+
+  return (
+    <Modal
+      eyebrow={`${props.org} · connections`}
+      title="Add forge connection"
+      purpose="Connect the forge that hosts this organization's repositories. They become projects once you enable them on the organization page."
+      busy={busy()}
+      onClose={() => props.onCancel()}
+      footer={
+        <>
+          <Show when={forge() === "forgejo" && fj.error()}>
+            <ModalMessage>{fj.error()}</ModalMessage>
+          </Show>
+          <a class="btn btn-ghost" href={CONNECTIONS_DOCS} target="_blank" rel="noreferrer">
+            Docs
+          </a>
+          <button class="btn btn-ghost" type="button" onClick={() => props.onCancel()} disabled={busy()}>
+            Cancel
+          </button>
+          <Show when={forge() === "forgejo"}>{fj.add}</Show>
+          <Show when={forge() === "github"}>
+            <button class="btn btn-primary" type="button" onClick={() => props.onDone()}>
+              Done
+            </button>
+          </Show>
+        </>
+      }
+    >
+      <ModalSection n={1} title="Forge">
+        <ForgePicker value={forge()} onPick={setForge} disabled={busy()} />
+      </ModalSection>
+      <Show when={forge() === "forgejo"}>{fj.sections}</Show>
+      <Show when={forge() === "github"}>
+        <ModalSection n={2} title="Install the App">
+          <GithubInstallSteps org={props.org} app={app()} loading={app.loading} failed={!!app.error} />
+        </ModalSection>
+      </Show>
+    </Modal>
+  );
+}
+
+type Forge = "github" | "forgejo";
+
+/** Which forge a new connection is on. */
+function ForgePicker(props: { value: Forge | null; onPick: (f: Forge) => void; disabled?: boolean }) {
+  const choices: { id: Forge; name: string; how: string }[] = [
+    { id: "github", name: "GitHub", how: "Install the Scarab App on the account" },
+    { id: "forgejo", name: "Forgejo or Codeberg", how: "Instance URL and an access token" },
+  ];
+  return (
+    <div class="sec-pick" role="radiogroup" aria-label="Forge">
+      <For each={choices}>
+        {(c) => (
+          <label classList={{ on: props.value === c.id }}>
+            <input
+              type="radio"
+              name="add-conn-forge"
+              value={c.id}
+              checked={props.value === c.id}
+              disabled={props.disabled}
+              onChange={() => props.onPick(c.id)}
+            />
+            <span class="conn-forge">
+              <span class="tok-name">{c.name}</span>
+              <span class="subtle">{c.how}</span>
+            </span>
+          </label>
+        )}
+      </For>
+    </div>
+  );
+}
+
+/** The steps that add a GitHub connection: install the App on the account,
+ *  then come back and enable repositories. With `org`, the account is that
+ *  org's; without it (New organization), the installation creates the org. */
+function GithubInstallSteps(props: {
+  org?: string;
+  app: GithubApp | undefined;
+  loading: boolean;
+  failed: boolean;
+}) {
+  const noApp = () => props.app != null && !props.app.app_mode;
+  const noLink = () => props.failed || (props.app?.app_mode === true && !props.app.install_url);
+  return (
+    <Show
+      when={!noApp()}
+      fallback={
+        <p class="dlg-text">
+          This server has no GitHub App, so GitHub connections cannot be added. An operator creates
+          the App and gives the server its id (<span class="mono">SCARAB_GITHUB_APP_ID</span>) and
+          private key. The docs list the settings the App needs.
+        </p>
+      }
+    >
+      <ol class="conn-steps">
+        <li>
+          <span>Open the Scarab App's install page on GitHub.</span>
+          <Show when={props.loading}>
+            <span class="subtle">
+              <small>asking GitHub for the App's page…</small>
+            </span>
+          </Show>
+          <Show when={props.app?.install_url}>
+            {(url) => (
+              <a class="btn btn-primary btn-sm conn-install" href={url()} target="_blank" rel="noreferrer">
+                Install on GitHub →
+              </a>
+            )}
+          </Show>
+          <Show when={noLink()}>
+            <span class="subtle">
+              <small>
+                Could not get the App's page
+                {props.app?.unavailable_reason ? `: ${props.app.unavailable_reason}` : ""}. Open it
+                from the App's settings on GitHub: Settings › Developer settings › GitHub Apps ›
+                Install App.
+              </small>
+            </span>
+          </Show>
+        </li>
+        <Show
+          when={props.org}
+          fallback={
+            <>
+              <li>
+                Pick the account that owns the repositories. The installation creates the
+                organization in Scarab, with the account's name.
+              </li>
+              <li>Choose all repositories or only the ones Scarab may build, then Install.</li>
+              <li>
+                Come back here and press Check for the organization. It opens the new
+                organization's Connections.
+              </li>
+              <li>
+                Enable the repositories Scarab should build on the organization page. Installing
+                the App enables none of them.
+              </li>
+            </>
+          }
+        >
+          {(org) => (
+            <>
+              <li>
+                Pick the account <b class="mono">{org()}</b>. The connection serves only
+                repositories that account owns.
+              </li>
+              <li>Choose all repositories or only the ones Scarab may build, then Install.</li>
+              <li>
+                Come back here and press Done. The installation registers the connection, and it
+                is listed on this page.
+              </li>
+              <li>
+                Enable the repositories Scarab should build on the{" "}
+                <A href={orgPageHref(org())}>organization page</A>. Installing the App enables none
+                of them.
+              </li>
+            </>
+          )}
+        </Show>
+      </ol>
+    </Show>
+  );
+}
+
+/**
+ * The Forgejo/Codeberg connection form: the org it serves, an instance URL and
+ * an access token. Returns its sections, its Add button and its state, so the
+ * Add forge connection dialog and the New organization page each lay them out
+ * their own way.
  *
  * Forgejo-only by construction — a GitHub form would be a lie (the server
  * refuses it, because installing the App is the registration). The token field is
@@ -226,15 +476,15 @@ export function NewOrgConnection() {
  * stores it under a handle it generates itself, so there is no code path, here or
  * on the server, that can render it back.
  *
- * With `org`, the org is fixed (the org page it was opened from) and shown
- * read-only; without it, the caller names a new org (the New organization
- * page). With `onCancel` it is a dialog: the same sections in a Modal, the
- * actions in its footer.
+ * With `org`, the org is fixed (the org page it was opened from) and not asked;
+ * without it, the caller names a new org (the New organization page). `first`
+ * is the number of the first section.
  */
-function ForgejoConnectionForm(props: {
+function forgejoForm(props: {
   org?: string;
+  first: number;
+  Sec: (p: { n: number; title: string; children: JSX.Element }) => JSX.Element;
   onSaved: (org: string) => void | Promise<void>;
-  onCancel?: () => void;
 }) {
   const [newOrg, setNewOrg] = createSignal("");
   const [baseUrl, setBaseUrl] = createSignal("");
@@ -266,39 +516,29 @@ function ForgejoConnectionForm(props: {
     }
   };
 
-  // A dialog's sections are ModalSections; on a page they are FormSections.
-  const Sec = (p: { n: number; title: string; children: JSX.Element }) =>
-    props.onCancel ? <ModalSection {...p} /> : <FormSection {...p} />;
-
+  const Sec = props.Sec;
+  // The org section is asked only for a new org; the rest number on from it.
+  const n = (i: number) => props.first + i - (props.org ? 1 : 0);
   const sections = (
     <>
-      <Sec n={1} title="Organization">
-        <Show
-          when={props.org}
-          fallback={
-            <Field
-              id="conn-org"
-              label="Forge account that owns the repositories"
-              required
-              error={newOrg().trim() !== "" ? orgProblem() : null}
-            >
-              <Input mono placeholder="acme" value={newOrg()} onValue={setNewOrg} />
-            </Field>
-          }
-        >
-          {(o) => (
-            <Field label="Organization" help="The connection binds only repositories owned by this account.">
-              <Input mono readOnly value={o()} onValue={() => {}} />
-            </Field>
-          )}
-        </Show>
-      </Sec>
-      <Sec n={2} title="Forgejo instance">
+      <Show when={!props.org}>
+        <Sec n={n(0)} title="Organization">
+          <Field
+            id="conn-org"
+            label="Forge account that owns the repositories"
+            required
+            error={newOrg().trim() !== "" ? orgProblem() : null}
+          >
+            <Input mono placeholder="acme" value={newOrg()} onValue={setNewOrg} />
+          </Field>
+        </Sec>
+      </Show>
+      <Sec n={n(1)} title="Forgejo instance">
         <Field id="conn-url" label="Instance URL" required>
           <Input mono placeholder="https://codeberg.org" value={baseUrl()} onValue={setBaseUrl} />
         </Field>
       </Sec>
-      <Sec n={3} title="Access token">
+      <Sec n={n(2)} title="Access token">
         <Field
           id="conn-token"
           label="Token"
@@ -315,44 +555,7 @@ function ForgejoConnectionForm(props: {
       <Icon icon="plus" size={14} /> {saving() ? "Connecting…" : "Add connection"}
     </button>
   );
-
-  return (
-    <Show
-      when={props.onCancel}
-      fallback={
-        <div class="conn-form">
-          {sections}
-          <Show when={error()}>
-            <p class="error">{error()}</p>
-          </Show>
-          <div class="modal-actions">{add}</div>
-        </div>
-      }
-    >
-      {(cancel) => (
-        <Modal
-          eyebrow={`${props.org} · connections`}
-          title="Add Forgejo connection"
-          purpose="Connect a Forgejo or Codeberg instance. Its repositories become projects once you enable them on the organization page."
-          busy={saving()}
-          onClose={() => cancel()()}
-          footer={
-            <>
-              <Show when={error()}>
-                <ModalMessage>{error()}</ModalMessage>
-              </Show>
-              <button class="btn btn-ghost" type="button" onClick={() => cancel()()} disabled={saving()}>
-                Cancel
-              </button>
-              {add}
-            </>
-          }
-        >
-          {sections}
-        </Modal>
-      )}
-    </Show>
-  );
+  return { sections, add, saving, error };
 }
 
 /**

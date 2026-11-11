@@ -91,7 +91,9 @@ administer (`?org=<org>` narrows it to one).
   **New organization…** at the bottom of the org dropdown (`/orgs/_new`), name the org and add its
   Forgejo connection, or call `POST /v1/connections` with an `org` field. After that, the org's
   own admins add more under its **Settings › Connections**. For GitHub, install the App on the
-  account instead: the installation registers the connection and the org.
+  account instead: the installation registers the connection and the org. The page asks which
+  forge, and for GitHub lists the install steps with a link to the App's install page; **Check
+  for the organization** opens the org the installation created.
 - **An org name** is not empty, is at most 100 characters, and has no `/`, spaces or control
   characters. It is not `.` or `..`, does not start with `_` (those names are Scarab's own), and
   is not one of `settings`, `orgs`, `account` or `security`: a project's page is
@@ -236,8 +238,12 @@ address. The user menu links the pages you may use:
   last entry is **New organization…** (`/orgs/_new`), where a new org is created with its first
   Forgejo connection, and where the connections that serve no org wait for one.
 
-Connections is the one place a forge connection is added: **Add Forgejo connection**, top right
-of an org's Connections, or New organization… for an org Scarab does not have yet. Connections
+Connections is the one place a forge connection is added: **Add forge connection**, top right
+of an org's Connections, or New organization… for an org Scarab does not have yet. The dialog asks
+which forge. For GitHub it lists the steps to install the App on the org's account and links to
+the App's install page, which the server reads from GitHub (`GET /v1/forges/github/app`); a
+server without a GitHub App says so. For Forgejo or Codeberg it asks for the instance URL and an
+access token. Connections
 lists one row per connection: its forge and host, tags such as **credential missing**, **no
 deliveries yet** or **managed by configuration**, how many repositories it has enabled and its
 last webhook delivery. The forge and host link to the connection's page

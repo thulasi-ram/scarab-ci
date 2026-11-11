@@ -1977,6 +1977,16 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 /* The Forgejo connection form: numbered sections (the org, the instance, the
    token), in the Add dialog and on the New organization page. */
 .conn-form { display: flex; flex-direction: column; gap: 14px; }
+/* Add forge connection, GitHub: the install steps, numbered. */
+.conn-steps {
+  margin: 0; padding-left: 20px; display: grid; gap: 10px;
+  font: var(--t-body); line-height: 1.5; color: var(--sage);
+}
+.conn-steps li { padding-left: 4px; }
+.conn-steps li::marker { font: var(--t-mono); color: var(--muted-sage); }
+.conn-steps li > span, .conn-steps li > .conn-install { display: block; }
+.conn-install { width: max-content; margin-top: 6px; }
+.conn-forge { display: grid; gap: 2px; }
 .conn .typed-confirm { margin-top: 10px; }
 .conn .typed-confirm p { margin: 0; font: var(--t-body); }
 .conn {
