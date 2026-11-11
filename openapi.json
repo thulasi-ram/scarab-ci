@@ -838,7 +838,9 @@
     },
     "/v1/forges/github/app": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Forge Connections"
+        ],
         "summary": "The GitHub App this server runs and the page it is installed from",
         "description": "A live GitHub call each time; it answers 200 with a reason, not an error,\nwhen the call fails, so the dialog can still show its steps.",
         "operationId": "github_app_info",

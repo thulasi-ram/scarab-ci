@@ -14047,7 +14047,7 @@ const TAG_GROUPS: &[(&str, &str)] = &[
 fn tag_for_path(path: &str) -> Option<&'static str> {
     let group = if path.starts_with("/webhooks/") {
         "Webhooks"
-    } else if path.starts_with("/v1/connections") {
+    } else if path.starts_with("/v1/connections") || path.starts_with("/v1/forges/") {
         "Forge Connections"
     } else if path.starts_with("/.well-known/")
         || path.starts_with("/v1/auth/")
