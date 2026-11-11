@@ -310,6 +310,14 @@ release.yml uses that version's section as the GitHub Release text. See
   dashboard's waiting rows put what they are about on a line of their own; and the Libraries,
   Plugins, Connections and security event tables scroll inside their own box.
 
+### Misc
+
+- The per-Project environment rules that migration 0088 dropped are gone from the code:
+  `Environment`, `ProtectionRules` and the conversion `migrate_legacy_environment`, and the
+  tests that only checked that conversion. Tests set up Environment baselines, overlays and
+  grants directly (#163, git-bug 7ecf4bc).
+- A plugin gate test no longer fails when a random installation id has no letter in it (#163).
+
 ## [0.3.0] - 2026-11-09
 
 Adds libraries and plugin gates through `invoke`, a policy engine for Run creation, and
