@@ -114,28 +114,34 @@ Where the list comes from:
 - **push**: the `added`, `modified` and `removed` files of every commit in the webhook payload. A
   renamed file is listed under both names.
 - **pull_request**: the forge's pull request files API, asked once per delivery and only when a
-  Pipeline read at that commit reads `event.changed_paths`. A repository that does not use it
-  makes no extra API calls.
+  Pipeline whose `pull_request` trigger matches reads `event.changed_paths`. A repository that
+  does not use it makes no extra API calls. The list is the pull request's files when Scarab
+  handles the webhook, which can differ from the event's head commit if the pull request moved
+  since.
 - Every other trigger (`tag`, `release`, `comment`, `cron`, `manual`, `api`, `upstream`) has no
   list.
 
 Sometimes the list is **unknown**: the trigger has none, the push created the branch or deleted
-it, the push was forced, the payload lists only some of the pushed commits (GitHub lists at most
-2048, Forgejo only the first few and the total), 3,000 or more files changed, or the forge's files
-API returned an error. Unknown is not the same as an empty list. While the list is unknown, a
+it, the push was forced (detected on GitHub only), the payload lists only some of the pushed
+commits (GitHub lists at most 2048, Forgejo only the first few and the total), 3,000 or more files
+changed, or the forge's files API returned an error or did not answer within 5 seconds. Unknown is not the same as an empty list. While the list is unknown, a
 `when:` that needs it counts as true, so the Run starts, and the Run's activity log says why:
 
 ```text
 changed paths unknown: new branch; the path filter in `when:` was not applied (on.push)
 ```
 
+To a `when:`, the field is always there and only its value is unknown, so
+`has(event.changed_paths)` is true either way and cannot test for an unknown list.
+
 The rest of the expression still decides when it can: `event.branch == 'main' &&
 event.changed_paths.exists(…)` is false on another branch whether or not the list is known. A
 `when:` that does not read `event.changed_paths` is unaffected. The same rule applies to a step's
 `when:`: a step that needs an unknown list runs.
 
-Forgejo's push payload does not say whether a push was forced. For a forced push to Forgejo, the
-list holds the files of the commits the push added, not the files of commits it dropped.
+Forced-push detection is GitHub only: Forgejo's push payload does not say whether a push was
+forced. For a forced push to Forgejo, the list holds the files of the commits the push added, not
+the files of commits it dropped.
 
 The list is not stored with the Run, and a template cannot read it: `${{ event.changed_paths }}`
 is a compile error, because anyone who can push chooses the paths.

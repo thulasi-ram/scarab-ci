@@ -189,3 +189,66 @@ async fn a_pipeline_that_does_not_read_the_paths_makes_no_files_request() {
     assert_eq!(trigger(&forge, &db, &pr(7)).await.len(), 1);
     assert_eq!(forge.pr_files_calls(), 0);
 }
+
+// Attack: a pull request adds many Pipeline files that each read
+// `event.changed_paths`, to multiply the forge API calls one webhook costs.
+// Safe outcome: one files request for the delivery, whatever the answer.
+#[tokio::test]
+async fn many_pipelines_reading_the_paths_cost_one_files_request_per_delivery() {
+    let mut forge = FakeForge::new();
+    for i in 0..20 {
+        forge = forge.with_file(&format!(".scarab/p{i:02}.yaml"), CI_TOOLS);
+    }
+    let db = Arc::new(InMemoryDb::new());
+
+    // The files request for #9 fails, so the paths stay unknown.
+    forge.set_pr_files_unknown(9, Some("502 Bad Gateway"));
+    assert_eq!(trigger(&forge, &db, &pr(9)).await.len(), 20);
+    assert_eq!(
+        forge.pr_files_calls(),
+        1,
+        "a failed request is not repeated"
+    );
+
+    forge.set_pr_files(10, &["README.md"]);
+    assert!(trigger(&forge, &db, &pr(10)).await.is_empty());
+    assert_eq!(forge.pr_files_calls(), 2);
+
+    // A Pipeline that runs only on push and reads the paths in a step's
+    // `when:`: its trigger does not match a pull request, so the delivery
+    // asks for no files.
+    let forge = FakeForge::new().with_file(".scarab/push-only.yaml", PUSH_ONLY_STEP_FILTER);
+    forge.set_pr_files(11, &["docker/ci-tools/Dockerfile"]);
+    assert!(trigger(&forge, &db, &pr(11)).await.is_empty());
+    assert_eq!(forge.pr_files_calls(), 0);
+}
+
+/// Runs on push only; one step reads the paths.
+const PUSH_ONLY_STEP_FILTER: &str = r#"
+on:
+  push: {}
+steps:
+  - id: image
+    image: busybox
+    command: ["true"]
+    when: 'event.changed_paths.exists(p, p.startsWith("docker/ci-tools/"))'
+"#;
+
+#[tokio::test(start_paused = true)]
+async fn a_files_request_that_does_not_answer_in_time_starts_the_run_with_a_note() {
+    let forge = FakeForge::new().with_file(".scarab/ci-tools.yaml", CI_TOOLS);
+    forge.set_pr_files(12, &["README.md"]);
+    forge.set_pr_files_delay(std::time::Duration::from_secs(
+        scarab_forge::PULL_REQUEST_FILES_TIMEOUT_SECS + 60,
+    ));
+    let db = Arc::new(InMemoryDb::new());
+
+    let runs = trigger(&forge, &db, &pr(12)).await;
+    assert_eq!(runs.len(), 1, "a slow forge leaves the paths unknown");
+    let notes = notes(&db, &runs[0]).await;
+    assert_eq!(notes.len(), 1);
+    assert!(
+        notes[0].contains(&PathsUnknown::TimedOut.reason()),
+        "{notes:?}"
+    );
+}

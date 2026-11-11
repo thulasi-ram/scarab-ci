@@ -3613,6 +3613,8 @@ pub struct FakeForge {
     /// How many `pull_request_files` calls were made: a Pipeline that does not
     /// read `event.changed_paths` must cost none.
     pr_files_calls: Mutex<usize>,
+    /// How long `pull_request_files` takes to answer: a slow forge.
+    pr_files_delay: Mutex<Option<std::time::Duration>>,
 }
 
 impl FakeForge {
@@ -3632,6 +3634,11 @@ impl FakeForge {
             .lock()
             .unwrap()
             .insert(number, error.map_or(Ok(None), |e| Err(e.to_string())));
+    }
+
+    /// Make `pull_request_files` take `delay` before it answers.
+    pub fn set_pr_files_delay(&self, delay: std::time::Duration) {
+        *self.pr_files_delay.lock().unwrap() = Some(delay);
     }
 
     /// How many `pull_request_files` calls were made.
@@ -4186,6 +4193,10 @@ impl ForgePort for FakeForge {
     ) -> Result<Option<Vec<String>>, ForgeError> {
         self.check_rate_limit()?;
         *self.pr_files_calls.lock().unwrap() += 1;
+        let delay = *self.pr_files_delay.lock().unwrap();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         match self.pr_files.lock().unwrap().get(&number) {
             Some(Ok(paths)) => Ok(paths.clone()),
             Some(Err(e)) => Err(ForgeError::Api(e.clone())),

@@ -6069,30 +6069,43 @@ fn changed_paths_known(ctx: &serde_json::Value) -> bool {
         .is_some()
 }
 
+/// `ctx` with `event.changed_paths` set to `value`.
+fn with_changed_paths(ctx: &serde_json::Value, value: serde_json::Value) -> serde_json::Value {
+    let mut out = ctx.clone();
+    if let Some(ev) = out.get_mut("event").and_then(|v| v.as_object_mut()) {
+        ev.insert(event::CHANGED_PATHS.into(), value);
+    }
+    out
+}
+
 /// Evaluate a `when:` against the trigger context `ctx` (git-bug 418f55e).
 ///
-/// `event.changed_paths` is absent from `ctx` when the paths are unknown. A
-/// `when:` that reads it then evaluates without it: when the rest of the
-/// expression decides alone (`event.branch == 'main' && …` on another
-/// branch is `false`, as CEL's `&&` and `||` absorb an error on one side),
-/// that answer stands. When the answer needed the paths, the `when:` counts
-/// as true, so a Run is never skipped for want of the list. An error that
-/// is not about the paths (the expression fails with an empty list in
-/// their place too) is reported as before.
+/// `event.changed_paths` is absent from `ctx` when the paths are unknown.
+/// To the `when:` the field is always there; only its value is unknown. A
+/// `when:` that reads it is evaluated with the field bound to `0`, a value
+/// that is not a list: `has(event.changed_paths)` and `"changed_paths" in
+/// event` are true, so neither can test for an unknown list, and every list
+/// operation on it is an error. When the rest of the expression decides
+/// alone (`event.branch == 'main' && …` on another branch is `false`, as
+/// CEL's `&&` and `||` absorb an error on one side), that answer stands.
+/// When the answer needed the list, the `when:` counts as true, so a Run is
+/// never skipped for want of it. An error that no list removes (the
+/// expression fails with `[]` and with `[""]` in its place) is reported as
+/// before.
 fn eval_when(expr: &str, ctx: &serde_json::Value) -> Result<WhenOutcome, PipelineError> {
     if changed_paths_known(ctx) || !event::when_reads_changed_paths(expr) {
         return cel::eval_bool(expr, ctx).map(WhenOutcome::Decided);
     }
-    match cel::eval_bool(expr, ctx) {
+    match cel::eval_bool(expr, &with_changed_paths(ctx, serde_json::json!(0))) {
         Ok(b) => Ok(WhenOutcome::Decided(b)),
         Err(e) => {
-            let mut probe = ctx.clone();
-            if let Some(ev) = probe.get_mut("event").and_then(|v| v.as_object_mut()) {
-                ev.insert(event::CHANGED_PATHS.into(), serde_json::json!([]));
-            }
-            match cel::eval_bool(expr, &probe) {
-                Ok(_) => Ok(WhenOutcome::PathsUnknown),
-                Err(_) => Err(e),
+            let some_list_decides = [serde_json::json!([]), serde_json::json!([""])]
+                .into_iter()
+                .any(|list| cel::eval_bool(expr, &with_changed_paths(ctx, list)).is_ok());
+            if some_list_decides {
+                Ok(WhenOutcome::PathsUnknown)
+            } else {
+                Err(e)
             }
         }
     }
@@ -11186,12 +11199,14 @@ steps:
         );
         // `main`: the answer needs the paths, so the trigger runs.
         assert!(matches_trigger(&ir, "push", &push_ctx("main", None)).unwrap());
-        // An error that is not about the paths is still an error.
+        // An error that no path list removes is still an error. (With `||`,
+        // a list that makes the other side true absorbs the error, as it
+        // does when the list is known.)
         let typo = compile(
             r#"
 on:
   push:
-    when: 'event.nope.size() > 0 || event.changed_paths.size() > 0'
+    when: 'event.nope == "x" && event.changed_paths.size() >= 0'
 steps:
   - { id: build, image: busybox }
 "#,
@@ -11240,5 +11255,71 @@ steps:
             changed_paths_unapplied(&ir, "push", &unknown).unwrap(),
             vec!["step `image`".to_string()]
         );
+    }
+
+    // Attack: a `when:` that tests for the field before reading it decides
+    // `false` on its own when the list is unknown (a new branch, a pull request
+    // with 3000 files), so the Pipeline is skipped with no note. Safe outcome:
+    // it counts as matched and is reported as not applied.
+    #[test]
+    fn a_presence_test_on_an_unknown_path_list_does_not_skip_the_trigger() {
+        for when in [
+            r#"has(event.changed_paths) && event.changed_paths.exists(p, p.startsWith("src/"))"#,
+            r#""changed_paths" in event && event.changed_paths.exists(p, p.startsWith("src/"))"#,
+        ] {
+            let ir = compile(&format!(
+                "on:\n  push:\n    when: '{when}'\nsteps:\n  - {{ id: scan, image: busybox }}\n"
+            ));
+            let ctx = push_ctx("feat", None);
+            assert!(
+                matches_trigger(&ir, "push", &ctx).unwrap_or(false),
+                "skipped silently: {when}"
+            );
+            assert_eq!(
+                changed_paths_unapplied(&ir, "push", &ctx).unwrap_or_default(),
+                vec!["on.push".to_string()],
+                "{when}"
+            );
+        }
+    }
+
+    // Attack: a `when:` that indexes the list fails on the empty probe list, so
+    // an unknown list turns the trigger into an error and the delivery stops
+    // there, before the Pipeline files after it. Safe outcome: it counts as
+    // matched, like any other `when:` that needs the list.
+    #[test]
+    fn a_when_that_indexes_an_unknown_path_list_still_matches() {
+        let ir = compile(
+            r#"
+on:
+  push:
+    when: 'event.changed_paths[0].startsWith("src/")'
+steps:
+  - { id: scan, image: busybox }
+"#,
+        );
+        let got = matches_trigger(&ir, "push", &push_ctx("feat", None));
+        assert!(matches!(got, Ok(true)), "got: {got:?}");
+    }
+
+    // Attack: make the list unknown (push a new branch) so that a `when:` which
+    // also restricts the branch counts as matched. Safe outcome: the branch
+    // test still decides, whichever side of `&&` it is written on.
+    #[test]
+    fn an_unknown_path_list_does_not_override_a_false_branch_test_on_either_side() {
+        for when in [
+            r#"event.changed_paths.exists(p, p.startsWith("deploy/")) && event.branch == "main""#,
+            r#"event.branch == "main" && event.changed_paths.exists(p, p.startsWith("deploy/"))"#,
+            r#"!(event.branch != "main" || !event.changed_paths.exists(p, p.startsWith("deploy/")))"#,
+        ] {
+            let ir = compile(&format!(
+                "on:\n  push:\n    when: '{when}'\nsteps:\n  - {{ id: deploy, image: busybox }}\n"
+            ));
+            assert!(
+                !matches_trigger(&ir, "push", &push_ctx("feat", None)).unwrap(),
+                "ran off main: {when}"
+            );
+            assert!(matches_trigger(&ir, "push", &push_ctx("main", None)).unwrap());
+        }
     }
 }

@@ -25,7 +25,9 @@ release.yml uses that version's section as the GitHub Release text. See
   starts a Run only when that directory changed. A push's list comes from its webhook payload, a
   pull request's from the forge's files API, asked only when a Pipeline reads the field. When the
   list is unknown (a new branch, a forced push, a cut commit list, 3,000 or more files, an API
-  error), a `when:` that needs it counts as true and the Run's activity log says why. See
+  error or a request slower than 5 seconds), a `when:` that needs it counts as true and the Run's
+  activity log says why. Forced-push detection is GitHub only: Forgejo's push payload does not
+  say whether a push was forced. See
   [Changed files](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#changed-files-eventchanged_paths).
 
 ### Enhancement

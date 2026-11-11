@@ -304,7 +304,18 @@ pub enum PathsUnknown {
     TooMany,
     /// The forge's pull request files request failed.
     ForgeError,
+    /// The forge did not list the pull request's files within
+    /// [`PULL_REQUEST_FILES_TIMEOUT_SECS`].
+    TimedOut,
 }
+
+/// How long the server waits for a pull request's files (git-bug 418f55e).
+/// A webhook delivery is answered only after its Runs are created, and GitHub
+/// marks a delivery failed when it gets no answer within 10 seconds; the
+/// same delivery also reads and compiles the Pipeline files. Half of that
+/// budget goes to the files walk. Past it the paths are unknown, so the Run
+/// still starts.
+pub const PULL_REQUEST_FILES_TIMEOUT_SECS: u64 = 5;
 
 impl PathsUnknown {
     /// The reason, as the Run's event log states it.
@@ -321,6 +332,10 @@ impl PathsUnknown {
             PathsUnknown::ForgeError => {
                 "the forge did not answer the pull request files request".into()
             }
+            PathsUnknown::TimedOut => format!(
+                "the forge did not list the pull request's files within \
+                 {PULL_REQUEST_FILES_TIMEOUT_SECS} seconds"
+            ),
         }
     }
 }
@@ -331,10 +346,13 @@ impl PathsUnknown {
 ///
 /// Unknown when the push deleted the ref (`deleted`, or `after` all zeros),
 /// created it (`created`, or `before` all zeros), was forced (`forced`), has
-/// no commits listed, or lists fewer commits than it has: fewer than
-/// `total_commits` (Forgejo lists only the first few of a push, and says how
-/// many there were), or `listed_cap` or more (GitHub lists at most 2048 and
-/// sends no total).
+/// no commits listed, or may list fewer commits than it has.
+///
+/// `listed_cap` says how to tell: `Some(cap)` for GitHub, which lists at
+/// most `cap` commits and sends no total, so `cap` or more listed is cut
+/// short; `None` for Forgejo, which lists only the first few commits of a
+/// push and sends `total_commits`, so a list shorter than that total, or a
+/// payload with no total, is cut short.
 pub fn push_changed_paths(payload: &serde_json::Value, listed_cap: Option<usize>) -> ChangedPaths {
     use serde_json::Value;
     let flag = |k: &str| payload.get(k).and_then(Value::as_bool) == Some(true);
@@ -357,9 +375,11 @@ pub fn push_changed_paths(payload: &serde_json::Value, listed_cap: Option<usize>
         return unknown(PathsUnknown::NoCommits);
     };
     let total = payload.get("total_commits").and_then(Value::as_u64);
-    if total.is_some_and(|t| t > commits.len() as u64)
-        || listed_cap.is_some_and(|cap| commits.len() >= cap)
-    {
+    let cut_short = match listed_cap {
+        Some(cap) => commits.len() >= cap || total.is_some_and(|t| t > commits.len() as u64),
+        None => total.is_none_or(|t| t > commits.len() as u64),
+    };
+    if cut_short {
         return unknown(PathsUnknown::Truncated);
     }
     ChangedPaths::of_commits(commits)
@@ -2257,6 +2277,89 @@ mod tests {
         assert!(
             !ctx.to_string().contains("rm -rf"),
             "no part of the message may leak into the flat context"
+        );
+    }
+
+    // Attack: a pushed commit names files with shell and template syntax and
+    // a newline, and repeats a path across commits.
+    // Safe outcome: the names are list items in the `when:` context only, once
+    // each, and never in the context `${{ }}` templates read.
+    #[test]
+    fn hostile_path_names_stay_out_of_the_template_context() {
+        let hostile = ["$(rm -rf /)", "${{ secrets.TOKEN }}", "a\n- b: c", "q\"';`"];
+        let payload = serde_json::json!({
+            "before": "1111111111111111111111111111111111111111",
+            "after": "2222222222222222222222222222222222222222",
+            "total_commits": 2,
+            "commits": [
+                {"added": hostile, "modified": ["src/a.rs"], "removed": []},
+                {"added": [], "modified": ["src/a.rs", "", 7, null], "removed": hostile},
+            ],
+        });
+        let changed_paths = push_changed_paths(&payload, None);
+        let ChangedPaths::Known(paths) = &changed_paths else {
+            panic!("expected a known list, got {changed_paths:?}");
+        };
+        assert_eq!(
+            paths.len(),
+            hostile.len() + 1,
+            "each path once: {}",
+            paths.len()
+        );
+        let event = Event::Push {
+            actor: "octocat".into(),
+            actor_id: String::new(),
+            repo: repo(),
+            r#ref: "refs/heads/main".into(),
+            after: "deadbeef".into(),
+            message: "subject".into(),
+            changed_paths,
+        };
+        let template_ctx = event.context();
+        assert!(template_ctx["event"].get("changed_paths").is_none());
+        assert!(!template_ctx.to_string().contains("rm -rf"));
+        assert!(!template_ctx.to_string().contains("secrets.TOKEN"));
+        assert_eq!(
+            event.when_context()["event"]["changed_paths"]
+                .as_array()
+                .map(Vec::len),
+            Some(hostile.len() + 1)
+        );
+    }
+
+    // Attack: a payload whose commit list is shorter than the push (a
+    // `total_commits` above the listed count), or whose commits name 3000
+    // paths. Safe outcome: the list is unknown, never a short known list.
+    #[test]
+    fn a_short_commit_list_or_3000_paths_is_unknown_not_a_partial_list() {
+        let base = |commits: serde_json::Value, total: u64| {
+            serde_json::json!({
+                "before": "1111111111111111111111111111111111111111",
+                "after": "2222222222222222222222222222222222222222",
+                "total_commits": total,
+                "commits": commits,
+            })
+        };
+        let one = serde_json::json!([{"added": ["README.md"]}]);
+        assert_eq!(
+            push_changed_paths(&base(one.clone(), 2), None),
+            ChangedPaths::Unknown(PathsUnknown::Truncated)
+        );
+        assert_eq!(
+            push_changed_paths(&base(one, 1), None),
+            ChangedPaths::Known(vec!["README.md".into()])
+        );
+        // Forgejo sends a total; a payload without one may be cut short too.
+        let mut no_total = base(serde_json::json!([{"added": ["README.md"]}]), 1);
+        no_total.as_object_mut().unwrap().remove("total_commits");
+        assert_eq!(
+            push_changed_paths(&no_total, None),
+            ChangedPaths::Unknown(PathsUnknown::Truncated)
+        );
+        let many: Vec<String> = (0..CHANGED_PATHS_MAX).map(|i| format!("f{i}")).collect();
+        assert_eq!(
+            push_changed_paths(&base(serde_json::json!([{"added": many}]), 1), None),
+            ChangedPaths::Unknown(PathsUnknown::TooMany)
         );
     }
 

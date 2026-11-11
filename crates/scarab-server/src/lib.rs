@@ -2108,8 +2108,9 @@ fn run_pipeline_name(ir: &scarab_pipeline::PipelineIr, path: &str) -> String {
 }
 
 /// The paths pull request `number` changes, from the forge's files API
-/// (git-bug 418f55e). A failed request is "unknown", never a refused
-/// trigger: the `when:` that wanted the paths counts as true, and the Run
+/// (git-bug 418f55e), waiting at most
+/// [`PULL_REQUEST_FILES_TIMEOUT_SECS`](scarab_forge::PULL_REQUEST_FILES_TIMEOUT_SECS).
+/// A failed or slow request is "unknown", never a refused trigger: the `when:` that wanted the paths counts as true, and the Run
 /// says why.
 async fn pull_request_paths(
     forge: &dyn scarab_forge::ForgePort,
@@ -2117,7 +2118,18 @@ async fn pull_request_paths(
     number: u64,
 ) -> scarab_forge::ChangedPaths {
     use scarab_forge::{ChangedPaths, PathsUnknown};
-    match forge.pull_request_files(repo, number).await {
+    let wait = std::time::Duration::from_secs(scarab_forge::PULL_REQUEST_FILES_TIMEOUT_SECS);
+    let Ok(answer) = tokio::time::timeout(wait, forge.pull_request_files(repo, number)).await
+    else {
+        tracing::warn!(
+            org = %repo.owner,
+            project = %repo.name,
+            pull_request = number,
+            "listing a pull request's files timed out; its changed paths are unknown"
+        );
+        return ChangedPaths::Unknown(PathsUnknown::TimedOut);
+    };
+    match answer {
         Ok(Some(files)) => ChangedPaths::from_paths(files),
         Ok(None) => ChangedPaths::Unknown(PathsUnknown::TooMany),
         Err(e) => {
@@ -5069,6 +5081,18 @@ pub(crate) async fn trigger_runs_from_files(
         )
         .await?;
 
+        // The trigger is matched first, with a pull request's paths not yet
+        // asked for (unknown), so a Pipeline whose trigger does not match
+        // (another kind, a false branch test) costs no files request. Only a
+        // match that may have rested on the unknown paths asks, once per
+        // delivery, and is decided again with the answer.
+        let trigger_matches = |ctx: &serde_json::Value| {
+            scarab_pipeline::matches_trigger(&ir, kind.as_str(), ctx)
+                .map_err(|e| TriggerError::Pipeline(e.to_string()))
+        };
+        if !trigger_matches(&ctx)? {
+            continue;
+        }
         if let (
             scarab_forge::ChangedPaths::Unknown(scarab_forge::PathsUnknown::NotFetched),
             scarab_forge::Event::PullRequest { number, .. },
@@ -5077,13 +5101,10 @@ pub(crate) async fn trigger_runs_from_files(
             if scarab_pipeline::reads_changed_paths(&ir, kind.as_str()) {
                 paths = pull_request_paths(forge, repo, *number).await;
                 paths.apply_to(&mut ctx);
+                if !trigger_matches(&ctx)? {
+                    continue;
+                }
             }
-        }
-
-        let matched = scarab_pipeline::matches_trigger(&ir, kind.as_str(), &ctx)
-            .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
-        if !matched {
-            continue;
         }
         // A chain of follow-ups stops at a pipeline already in it (a loop)
         // and at its length cap; either is a refused Run.
