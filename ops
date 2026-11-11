@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1794429374,"nonce":"/RVrqakXwyFUWRgq+6xPTi7uwR4=","title":"A later placement layer can rewrite containers or volumes the operator baseline added","was":"A later placement layer can rewrite containers or volumes the operator baseline added"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1794429374,"nonce":"Laft15jR4j8+pAUBgBAwvoLyrBg=","added":["area:executor","type:enhancement"],"removed":null}]}
