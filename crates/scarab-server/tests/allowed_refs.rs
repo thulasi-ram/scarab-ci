@@ -58,6 +58,7 @@ fn push(branch: &str) -> Event {
         // A REAL commit SHA — the value pre-fix wrongly matched against allowed_refs.
         after: "1234567890abcdef1234567890abcdef12345678".into(),
         message: "deploy subject".into(),
+        changed_paths: Default::default(),
     }
 }
 

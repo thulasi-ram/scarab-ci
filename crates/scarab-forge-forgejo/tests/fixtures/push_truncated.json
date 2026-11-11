@@ -1,0 +1,90 @@
+{
+  "ref": "refs/heads/main",
+  "before": "6113728f27ae82c7b1a177c8d03f9e96e0adf246",
+  "after": "0d1a26e67d8f5eaf1f6ba5c57fc3c7d91ac0fd1c",
+  "compare_url": "https://forgejo.example.com/acme/app/compare/6113728f27ae82c7b1a177c8d03f9e96e0adf246...0d1a26e67d8f5eaf1f6ba5c57fc3c7d91ac0fd1c",
+  "commits": [
+    {
+      "id": "0d1a26e67d8f5eaf1f6ba5c57fc3c7d91ac0fd1c",
+      "message": "docs: note the new base image\n",
+      "url": "https://forgejo.example.com/acme/app/commit/0d1a26e67d8f5eaf1f6ba5c57fc3c7d91ac0fd1c",
+      "author": {
+        "name": "Octo Cat",
+        "email": "octocat@example.com",
+        "username": "octocat"
+      },
+      "committer": {
+        "name": "Octo Cat",
+        "email": "octocat@example.com",
+        "username": "octocat"
+      },
+      "verification": null,
+      "timestamp": "2026-11-11T10:05:40+05:30",
+      "added": [],
+      "removed": [
+        "docs/old-image.md"
+      ],
+      "modified": [
+        "README.md",
+        "docker/ci-tools/Dockerfile"
+      ]
+    },
+    {
+      "id": "b3c5ed0b4e7f8a9d1c2e3f4a5b6c7d8e9f0a1b2c",
+      "message": "ci-tools: pin the base image\n",
+      "url": "https://forgejo.example.com/acme/app/commit/b3c5ed0b4e7f8a9d1c2e3f4a5b6c7d8e9f0a1b2c",
+      "author": {
+        "name": "Octo Cat",
+        "email": "octocat@example.com",
+        "username": "octocat"
+      },
+      "committer": {
+        "name": "Octo Cat",
+        "email": "octocat@example.com",
+        "username": "octocat"
+      },
+      "verification": null,
+      "timestamp": "2026-11-11T10:02:11+05:30",
+      "added": [
+        "docker/ci-tools/versions.env"
+      ],
+      "removed": [],
+      "modified": [
+        "docker/ci-tools/Dockerfile"
+      ]
+    }
+  ],
+  "total_commits": 7,
+  "head_commit": {
+    "id": "0d1a26e67d8f5eaf1f6ba5c57fc3c7d91ac0fd1c",
+    "message": "docs: note the new base image\n",
+    "added": [],
+    "removed": [
+      "docs/old-image.md"
+    ],
+    "modified": [
+      "README.md",
+      "docker/ci-tools/Dockerfile"
+    ]
+  },
+  "repository": {
+    "id": 7,
+    "name": "app",
+    "full_name": "acme/app",
+    "owner": {
+      "id": 3,
+      "login": "acme",
+      "username": "acme"
+    }
+  },
+  "pusher": {
+    "id": 5,
+    "login": "octocat",
+    "username": "octocat"
+  },
+  "sender": {
+    "id": 5,
+    "login": "octocat",
+    "username": "octocat"
+  }
+}

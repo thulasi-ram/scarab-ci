@@ -214,6 +214,163 @@ pub fn encode_url_component(s: &str) -> String {
     out
 }
 
+/// The most changed files Scarab takes from one trigger (git-bug 418f55e). A
+/// push or pull request that changes this many files or more has unknown
+/// changed paths. GitHub's pull request files API lists at most 3000 files and
+/// says nothing when it stops there, so a list of 3000 may be cut short; the
+/// same number applies to a push so that one rule covers both. It also bounds
+/// the forge calls one pull request costs: 30 pages on GitHub, 60 on Forgejo.
+pub const CHANGED_PATHS_MAX: usize = 3000;
+
+/// The repository paths a trigger changed, as a `when:` reads them through
+/// `event.changed_paths` (git-bug 418f55e), or the reason they are unknown.
+/// Unknown is not the same as an empty list: an empty list says the trigger
+/// changed no file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangedPaths {
+    /// Every path, sorted, each once.
+    Known(Vec<String>),
+    Unknown(PathsUnknown),
+}
+
+impl Default for ChangedPaths {
+    fn default() -> Self {
+        ChangedPaths::Unknown(PathsUnknown::NotGiven)
+    }
+}
+
+impl ChangedPaths {
+    /// A known list from `paths`: sorted and deduplicated, empty entries
+    /// dropped. [`TooMany`](PathsUnknown::TooMany) when there are
+    /// [`CHANGED_PATHS_MAX`] or more.
+    pub fn from_paths(paths: impl IntoIterator<Item = String>) -> Self {
+        let set: std::collections::BTreeSet<String> =
+            paths.into_iter().filter(|p| !p.is_empty()).collect();
+        if set.len() >= CHANGED_PATHS_MAX {
+            return ChangedPaths::Unknown(PathsUnknown::TooMany);
+        }
+        ChangedPaths::Known(set.into_iter().collect())
+    }
+
+    /// The union of `added`, `modified` and `removed` over a push payload's
+    /// `commits` array, the shape GitHub and Forgejo share.
+    pub fn of_commits(commits: &[serde_json::Value]) -> Self {
+        let mut paths = Vec::new();
+        for c in commits {
+            for key in ["added", "modified", "removed"] {
+                if let Some(list) = c.get(key).and_then(serde_json::Value::as_array) {
+                    paths.extend(list.iter().filter_map(|p| p.as_str().map(str::to_string)));
+                }
+            }
+        }
+        Self::from_paths(paths)
+    }
+
+    /// Put the list into a `{ "event": { … } }` context as
+    /// `event.changed_paths` when it is known; leave the context as it is
+    /// when it is not, so the field is absent.
+    pub fn apply_to(&self, ctx: &mut serde_json::Value) {
+        if let (ChangedPaths::Known(paths), Some(event)) = (
+            self,
+            ctx.get_mut("event")
+                .and_then(serde_json::Value::as_object_mut),
+        ) {
+            event.insert("changed_paths".into(), serde_json::json!(paths));
+        }
+    }
+}
+
+/// Why a trigger's changed paths are unknown (git-bug 418f55e).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathsUnknown {
+    /// The trigger kind has no changed paths (a tag, a cron fire, a
+    /// dispatch, a comment, a release, a follow-up).
+    NotGiven,
+    /// A pull request whose files have not been asked of the forge yet.
+    NotFetched,
+    /// The push created the branch: there is no earlier commit to compare with.
+    NewBranch,
+    /// The push was forced: commits it dropped are not in the payload.
+    Forced,
+    /// The push deleted the ref.
+    Deleted,
+    /// The push payload has no commit list.
+    NoCommits,
+    /// The push payload lists only part of the pushed commits.
+    Truncated,
+    /// [`CHANGED_PATHS_MAX`] or more files changed.
+    TooMany,
+    /// The forge's pull request files request failed.
+    ForgeError,
+}
+
+impl PathsUnknown {
+    /// The reason, as the Run's event log states it.
+    pub fn reason(&self) -> String {
+        match self {
+            PathsUnknown::NotGiven => "this trigger does not say which files changed".into(),
+            PathsUnknown::NotFetched => "the pull request's files were not asked for".into(),
+            PathsUnknown::NewBranch => "new branch".into(),
+            PathsUnknown::Forced => "forced push".into(),
+            PathsUnknown::Deleted => "the push deleted the branch".into(),
+            PathsUnknown::NoCommits => "the push payload lists no commits".into(),
+            PathsUnknown::Truncated => "the push payload lists only some of its commits".into(),
+            PathsUnknown::TooMany => format!("{CHANGED_PATHS_MAX} or more files changed"),
+            PathsUnknown::ForgeError => {
+                "the forge did not answer the pull request files request".into()
+            }
+        }
+    }
+}
+
+/// The changed paths of a GitHub or Forgejo push payload (git-bug 418f55e):
+/// the union of every listed commit's `added`, `modified` and `removed`, or
+/// why that union is not the whole change.
+///
+/// Unknown when the push deleted the ref (`deleted`, or `after` all zeros),
+/// created it (`created`, or `before` all zeros), was forced (`forced`), has
+/// no commits listed, or lists fewer commits than it has: fewer than
+/// `total_commits` (Forgejo lists only the first few of a push, and says how
+/// many there were), or `listed_cap` or more (GitHub lists at most 2048 and
+/// sends no total).
+pub fn push_changed_paths(payload: &serde_json::Value, listed_cap: Option<usize>) -> ChangedPaths {
+    use serde_json::Value;
+    let flag = |k: &str| payload.get(k).and_then(Value::as_bool) == Some(true);
+    let sha = |k: &str| payload.get(k).and_then(Value::as_str).unwrap_or_default();
+    let unknown = ChangedPaths::Unknown;
+    if flag("deleted") || is_zero_sha(sha("after")) {
+        return unknown(PathsUnknown::Deleted);
+    }
+    if flag("created") || is_zero_sha(sha("before")) {
+        return unknown(PathsUnknown::NewBranch);
+    }
+    if flag("forced") {
+        return unknown(PathsUnknown::Forced);
+    }
+    let Some(commits) = payload
+        .get("commits")
+        .and_then(Value::as_array)
+        .filter(|c| !c.is_empty())
+    else {
+        return unknown(PathsUnknown::NoCommits);
+    };
+    let total = payload.get("total_commits").and_then(Value::as_u64);
+    if total.is_some_and(|t| t > commits.len() as u64)
+        || listed_cap.is_some_and(|cap| commits.len() >= cap)
+    {
+        return unknown(PathsUnknown::Truncated);
+    }
+    ChangedPaths::of_commits(commits)
+}
+
+/// Whether `sha` is all zeros: the `before` of a push that created its ref,
+/// or the `after` of one that deleted it.
+pub fn is_zero_sha(sha: &str) -> bool {
+    !sha.is_empty() && sha.bytes().all(|b| b == b'0')
+}
+
 /// A forge event, normalized across providers into Scarab's own vocabulary.
 ///
 /// Adapters parse a vendor payload into exactly one of these (see
@@ -240,6 +397,12 @@ pub enum Event {
         /// **deliberately excluded from [`Event::context()`]** (see that method's
         /// security note). Empty when the payload carried no head commit.
         message: String,
+        /// The paths the push changed, from the payload's commit list, or why
+        /// they are not known (git-bug 418f55e). A `when:` reads them as
+        /// `event.changed_paths` ([`Event::when_context`]); a template never
+        /// does, and the Run does not store them.
+        #[serde(default)]
+        changed_paths: ChangedPaths,
     },
     PullRequest {
         /// The forge principal who triggered the PR event (the webhook `sender`).
@@ -620,6 +783,28 @@ impl Event {
         e
     }
 
+    /// The paths this event changed, or why they are unknown (git-bug
+    /// 418f55e). A push carries its own; a pull request's come from the
+    /// forge's files API, which the server asks only when a Pipeline reads
+    /// them, so here they are [`NotFetched`](PathsUnknown::NotFetched). Every
+    /// other kind has none.
+    pub fn changed_paths(&self) -> ChangedPaths {
+        match self {
+            Event::Push { changed_paths, .. } => changed_paths.clone(),
+            Event::PullRequest { .. } => ChangedPaths::Unknown(PathsUnknown::NotFetched),
+            _ => ChangedPaths::Unknown(PathsUnknown::NotGiven),
+        }
+    }
+
+    /// The context a `when:` evaluates against: [`context`](Self::context)
+    /// plus `event.changed_paths` when they are known. Kept out of
+    /// `context()`, which the Run stores, so a Run never stores the list.
+    pub fn when_context(&self) -> serde_json::Value {
+        let mut ctx = self.context();
+        self.changed_paths().apply_to(&mut ctx);
+        ctx
+    }
+
     /// A stable, flat JSON context for CEL trigger matching / interpolation
     /// (ADR-0010): `{ "event": { "kind", "repo", … } }` with event-specific
     /// fields (`branch`/`ref`/`sha` for push, `tag`, `number`, …). Authoring
@@ -925,6 +1110,20 @@ pub trait ForgePort: Send + Sync {
     }
 
     async fn normalize_event(&self, raw: WebhookDelivery) -> Result<Event, ForgeError>;
+
+    /// The paths pull request `number` changes, as the forge's PR files API
+    /// lists them (a renamed file gives both its old and new path), for
+    /// `event.changed_paths` (git-bug 418f55e). `Ok(None)` when it changes
+    /// [`CHANGED_PATHS_MAX`] files or more: the walk stops there. The server
+    /// asks only when a Pipeline's `when:` reads the field, and reads an error
+    /// as "unknown", never as a refused trigger.
+    async fn pull_request_files(
+        &self,
+        _repo: &RepoRef,
+        _number: u64,
+    ) -> Result<Option<Vec<String>>, ForgeError> {
+        Err(ForgeError::Unsupported("listing pull request files".into()))
+    }
 
     async fn set_status(
         &self,
@@ -1664,6 +1863,7 @@ mod tests {
                     r#ref: "refs/heads/main".into(),
                     after: "deadbeef".into(),
                     message: "fix: the thing".into(),
+                    changed_paths: Default::default(),
                 },
                 TriggerKind::Push,
             ),
@@ -1760,6 +1960,7 @@ mod tests {
                 r#ref: "refs/heads/main".into(),
                 after: "abc".into(),
                 message: "subject".into(),
+                changed_paths: Default::default(),
             }
             .actor(),
             Some("octocat")
@@ -1787,6 +1988,7 @@ mod tests {
                 r#ref: "refs/heads/main".into(),
                 after: "abc".into(),
                 message: "subject".into(),
+                changed_paths: Default::default(),
             }
             .actor(),
             None
@@ -1826,6 +2028,7 @@ mod tests {
             r#ref: "main".into(),
             after: "z".into(),
             message: "subject".into(),
+            changed_paths: Default::default(),
         }
         .is_fork_pr());
     }
@@ -1875,6 +2078,7 @@ mod tests {
                 r#ref: "main".into(),
                 after: "x".into(),
                 message: "subject".into(),
+                changed_paths: Default::default(),
             }
             .repo(),
             Some(&repo())
@@ -1893,6 +2097,7 @@ mod tests {
                 r#ref: "refs/heads/main".into(),
                 after: "deadbeef".into(),
                 message: "subject".into(),
+                changed_paths: Default::default(),
             }
             .protection_ref()
             .as_deref(),
@@ -2019,6 +2224,7 @@ mod tests {
             r#ref: "refs/heads/main".into(),
             after: "deadbeef".into(),
             message: "feat: add the widget".into(),
+            changed_paths: Default::default(),
         }
         .context();
         assert_eq!(ctx["event"]["kind"], "push");
@@ -2040,6 +2246,7 @@ mod tests {
             r#ref: "refs/heads/main".into(),
             after: "deadbeef".into(),
             message: "$(rm -rf /) evil subject".into(),
+            changed_paths: Default::default(),
         }
         .context();
         assert!(
@@ -2239,6 +2446,7 @@ mod tests {
             r#ref: "refs/heads/main".into(),
             after: "deadbeef".into(),
             message: "fix: handle empty input\n\nA longer body explaining why.\n".into(),
+            changed_paths: Default::default(),
         }
         .trigger_title();
         assert_eq!(title.as_deref(), Some("fix: handle empty input"));
@@ -2252,6 +2460,7 @@ mod tests {
                 r#ref: "refs/heads/main".into(),
                 after: "deadbeef".into(),
                 message: String::new(),
+                changed_paths: Default::default(),
             }
             .trigger_title(),
             None
@@ -2283,6 +2492,7 @@ mod tests {
             r#ref: "refs/heads/main".into(),
             after: "deadbeef".into(),
             message: subject,
+            changed_paths: Default::default(),
         }
         .trigger_title()
         .expect("a non-empty subject yields a headline");

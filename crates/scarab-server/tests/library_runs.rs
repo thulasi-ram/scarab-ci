@@ -54,6 +54,7 @@ fn push() -> Event {
         r#ref: "refs/heads/main".into(),
         after: SHA.into(),
         message: "ship it".into(),
+        changed_paths: Default::default(),
     }
 }
 
@@ -240,6 +241,7 @@ async fn run_create_refuses_a_yanked_version_with_no_policy_stored() {
             r#ref: "refs/heads/main".into(),
             after: SHA.into(),
             message: "ship it".into(),
+            changed_paths: Default::default(),
         },
     )
     .await

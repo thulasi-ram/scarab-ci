@@ -74,10 +74,27 @@ fn unreadable(field: &str) -> Option<&'static str> {
         "actor_id" => "a forge account id, which is not trigger data a Step needs",
         "body" => "free text that anyone who can comment writes",
         "schedule" => "it comes from the Pipeline itself",
+        "changed_paths" => "file paths that anyone who can push names; a `when:` may read it",
         "message" | "title" | "base" | "reason" => {
             "it is provenance shown on the Run page, not trigger data (ADR-0057)"
         }
         _ => return None,
+    })
+}
+
+/// The `event` field a `when:` reads for the paths a trigger changed
+/// (git-bug 418f55e). Not in [`READABLE`]: the paths are free text that
+/// anyone who can push writes.
+pub const CHANGED_PATHS: &str = "changed_paths";
+
+/// Whether the `when:` expression `expr` reads `event.changed_paths`: a read
+/// of that member, or of `event` whole or by a computed key, which may reach
+/// it. An expression that does not parse reads nothing here.
+pub fn when_reads_changed_paths(expr: &str) -> bool {
+    cel::reads(expr).is_ok_and(|reads| {
+        reads
+            .iter()
+            .any(|r| r.var == "event" && r.first.as_deref().is_none_or(|f| f == CHANGED_PATHS))
     })
 }
 
