@@ -18,6 +18,15 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Enhancement
+
+- **A waiting GitHub connection names its account.** Under **Waiting for an organization** each
+  installation shows its account login, account id and installation id, so two waiting
+  connections with nothing enabled no longer look the same, and **Create a new organization from
+  it** starts with the login filled in. The server stores the login from each `installation`
+  delivery (migration `0094`, filled on the next delivery) and `ConnectionDto` gains
+  `account_login`, `account_id` and `installation_id`.
+
 ### Bug Fixes
 
 - **The Dashboard lines up with every other page.** Its heading is now `/ › Dashboard`, on the same

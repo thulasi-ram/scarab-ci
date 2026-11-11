@@ -728,9 +728,8 @@ function WaitingRow(props: { conn: Connection }) {
 
 /**
  * Assign a waiting connection to an existing org, the account that owns the
- * repositories enabled through it. The connection list does not carry the
- * account's login (git-bug bb8d644), so the choice starts with the first org.
- * The server refuses an org that does not own every enabled repository, one
+ * repositories enabled through it. The choice starts on the org named like
+ * the account's login when there is one, otherwise the first org. The server refuses an org that does not own every enabled repository, one
  * served by another forge, or one no connection serves, and says why; the
  * reason is shown as it comes.
  */
@@ -740,7 +739,10 @@ function AssignConnection(props: {
   onAssigned: (org: string) => Promise<void>;
   onCancel: () => void;
 }) {
-  const [org, setOrg] = createSignal(props.orgs[0] ?? "");
+  const login = props.conn.account_login ?? null;
+  const [org, setOrg] = createSignal(
+    login != null && props.orgs.includes(login) ? login : (props.orgs[0] ?? ""),
+  );
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const save = async () => {
@@ -783,8 +785,9 @@ function AssignConnection(props: {
 
 /**
  * Make a new org from a waiting connection: the same assignment, to a name no
- * org has yet, which creates the org. The name starts empty: the connection
- * list does not carry the account's login (git-bug bb8d644).
+ * org has yet, which creates the org. The name starts as the account's login,
+ * the forge's name for the account that owns the repositories, and is empty
+ * while no installation delivery has recorded one.
  */
 function CreateOrgFromConnection(props: {
   conn: Connection;
@@ -792,7 +795,7 @@ function CreateOrgFromConnection(props: {
   onCreated: (org: string) => Promise<void>;
   onCancel: () => void;
 }) {
-  const [name, setName] = createSignal("");
+  const [name, setName] = createSignal(props.conn.account_login ?? "");
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const problem = () => newOrgNameProblem(name(), props.orgs);

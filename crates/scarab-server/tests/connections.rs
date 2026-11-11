@@ -103,6 +103,7 @@ async fn harness_with_adapters(
         org: Some("acme".into()),
         installation_id: None,
         account_id: None,
+        account_login: None,
     })
     .await
     .unwrap();
@@ -1104,6 +1105,7 @@ async fn deleting_a_connection_with_projects_needs_an_acknowledgement() {
         org: Some("acme".into()),
         installation_id: None,
         account_id: None,
+        account_login: None,
     })
     .await
     .unwrap();

@@ -45,6 +45,7 @@ async fn missing_credential_material_fails_loudly_at_use_time() {
             org: Some("acme".into()),
             installation_id: None,
             account_id: None,
+            account_login: None,
         })
         .await
         .unwrap();
@@ -78,6 +79,7 @@ async fn an_unreachable_repo_fails_with_a_clear_error_without_asking_the_forge()
             org: Some("acme".into()),
             installation_id: None,
             account_id: None,
+            account_login: None,
         })
         .await
         .unwrap();
@@ -123,6 +125,7 @@ async fn a_connection_with_no_bound_repos_still_yields_an_adapter() {
         org: Some("acme".into()),
         installation_id: None,
         account_id: None,
+        account_login: None,
     };
     registry.put_connection(&conn).await.unwrap();
     let scope = SecretScope::Org {
@@ -192,6 +195,7 @@ async fn production_path_posts_a_status_with_run_deep_link_live() {
             org: Some(owner.into()),
             installation_id: None,
             account_id: None,
+            account_login: None,
         })
         .await
         .unwrap();

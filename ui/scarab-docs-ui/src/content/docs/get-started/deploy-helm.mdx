@@ -202,8 +202,11 @@ they do not (no connection has an account id yet), so a global admin assigns it.
 leaves it unassigned. A re-sync through it binds nothing and lists every repository the forge
 reports in `skipped`, so the UI does not offer Re-sync on it.
 
-A global admin assigns it there with **Assign to an organization**, or makes a new org from it
-with **Create a new organization from it**. Both call `PUT /v1/connections/{id}/org` with
+Each row names the forge account: its login and immutable id, and for GitHub the installation
+id, as the last `installation` delivery recorded them (the login follows a rename on the next
+delivery; a row no delivery has reached since the upgrade shows neither). A global admin assigns
+it there with **Assign to an organization**, or makes a new org from it with **Create a new
+organization from it**, whose name starts as the account's login. Both call `PUT /v1/connections/{id}/org` with
 `{ "org": "<name>" }`; a name no org has yet creates the org. It asks for step-up confirmation and
 is recorded in the org's event log.
 The server answers 409 with the reason when a repository bound through the connection is owned

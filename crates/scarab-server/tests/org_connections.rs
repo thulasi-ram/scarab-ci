@@ -61,6 +61,7 @@ fn conn(
         org: org.map(str::to_string),
         installation_id: inst,
         account_id: None,
+        account_login: None,
     }
 }
 
@@ -879,7 +880,9 @@ async fn removing_a_connection_never_takes_another_orgs_project_with_it() {
 #[tokio::test]
 async fn an_installation_by_a_new_holder_of_a_renamed_login_does_not_join_its_org() {
     let h = harness(forge()).await;
-    h.db.set_connection_account("gh-acme", 1).await.unwrap();
+    h.db.set_connection_account("gh-acme", Some(1), "acme")
+        .await
+        .unwrap();
 
     let st = deliver_installation(&h, "rename-1", 9, "acme", 2, &["acme/new"]).await;
     assert_eq!(st, StatusCode::OK);
@@ -903,6 +906,53 @@ async fn an_installation_by_a_new_holder_of_a_renamed_login_does_not_join_its_or
     assert_eq!(c.org.as_deref(), Some("acme"));
     assert!(h.db.repos_of("github-install-10").await.unwrap().is_empty());
     assert!(h.db.resolve(&repo("acme", "more")).await.unwrap().is_none());
+}
+
+/// git-bug bb8d644. A GitHub installation left waiting for an organization
+/// shows its account login, account id and installation id in the list, so a
+/// global admin can tell two waiting connections apart and create the Org
+/// from the login. The login follows a rename on the next delivery; the id
+/// does not change.
+#[tokio::test]
+async fn a_waiting_installation_shows_its_account_and_follows_a_renamed_login() {
+    let h = harness(forge()).await;
+    // gh-acme serves `acme` as account 1, so account 2 named `acme` waits.
+    let st = deliver_installation(&h, "wait-1", 9, "acme", 2, &[]).await;
+    assert_eq!(st, StatusCode::OK);
+    let root = login(&h.app, "root-code").await;
+    let row = |list: &serde_json::Value| {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == "github-install-9")
+            .cloned()
+            .expect("the waiting installation is listed")
+    };
+
+    let (st, list) = call(&h, "GET", "/v1/connections", &root, None).await;
+    assert_eq!(st, StatusCode::OK, "{list}");
+    let c = row(&list);
+    assert_eq!(c["org"], serde_json::Value::Null, "it waits: {c}");
+    assert_eq!(c["account_login"], "acme");
+    assert_eq!(c["account_id"], 2);
+    assert_eq!(c["installation_id"], 9);
+
+    let st = deliver_installation(&h, "wait-2", 9, "acme-labs", 2, &[]).await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, list) = call(&h, "GET", "/v1/connections", &root, None).await;
+    let c = row(&list);
+    assert_eq!(c["account_login"], "acme-labs", "the current login: {c}");
+    assert_eq!(c["account_id"], 2);
+
+    // A connection no installation delivery has reached knows neither.
+    let fj = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "fj-globex")
+        .unwrap();
+    assert_eq!(fj["account_login"], serde_json::Value::Null);
+    assert_eq!(fj["installation_id"], serde_json::Value::Null);
 }
 
 /// D7 of git-bug 19b0a45, the data-only case. A global admin sets up

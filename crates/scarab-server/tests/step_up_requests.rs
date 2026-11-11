@@ -1212,6 +1212,7 @@ async fn a_request_shows_the_query_it_runs_with() {
             org: Some("acme".into()),
             installation_id: None,
             account_id: None,
+            account_login: None,
         })
         .await
         .unwrap();
@@ -1262,6 +1263,7 @@ async fn a_token_raises_no_request_for_another_orgs_connection() {
             org: Some("globex".into()),
             installation_id: None,
             account_id: None,
+            account_login: None,
         })
         .await
         .unwrap();

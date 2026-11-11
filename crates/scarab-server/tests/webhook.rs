@@ -164,6 +164,7 @@ async fn enable_app(db: &InMemoryDb, kind: scarab_forge::ForgeKind) {
         org: Some("acme".into()),
         installation_id: None,
         account_id: None,
+        account_login: None,
     })
     .await
     .unwrap();
@@ -354,6 +355,7 @@ async fn an_installation_serves_its_accounts_org_and_binds_nothing() {
         org: Some("globex".into()),
         installation_id: None,
         account_id: None,
+        account_login: None,
     })
     .await
     .unwrap();
@@ -414,6 +416,7 @@ async fn an_installation_does_not_join_a_same_named_org_of_another_forge() {
         org: Some("acme".into()),
         installation_id: None,
         account_id: None,
+        account_login: None,
     })
     .await
     .unwrap();
@@ -488,6 +491,7 @@ async fn a_delivery_does_not_assign_a_connection_holding_another_owners_repo() {
         org: None,
         installation_id: Some(5),
         account_id: None,
+        account_login: None,
     })
     .await
     .unwrap();
@@ -742,6 +746,7 @@ async fn existing_bindings_survive_later_deliveries_and_a_resync() {
         org: Some("acme".into()),
         installation_id: Some(42),
         account_id: None,
+        account_login: None,
     })
     .await
     .unwrap();
@@ -846,6 +851,7 @@ async fn seed_installation(db: &InMemoryDb, names: &[&str]) {
         org: Some("acme".into()),
         installation_id: Some(42),
         account_id: None,
+        account_login: None,
     })
     .await
     .unwrap();

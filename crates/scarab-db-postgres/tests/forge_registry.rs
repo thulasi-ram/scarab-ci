@@ -19,6 +19,7 @@ fn github_conn() -> ForgeConnection {
         org: Some("acme".into()),
         installation_id: Some(41),
         account_id: None,
+        account_login: None,
     }
 }
 
@@ -31,6 +32,7 @@ fn forgejo_conn() -> ForgeConnection {
         org: Some("acme".into()),
         installation_id: None,
         account_id: None,
+        account_login: None,
     }
 }
 
@@ -234,6 +236,7 @@ async fn a_bind_never_moves_a_repo_across_orgs() {
         org: Some("globex".into()),
         installation_id: Some(42),
         account_id: None,
+        account_login: None,
     };
     db.put_connection(&globex).await.unwrap();
     let legacy = ForgeConnection {
@@ -244,6 +247,7 @@ async fn a_bind_never_moves_a_repo_across_orgs() {
         org: None,
         installation_id: None,
         account_id: None,
+        account_login: None,
     };
     db.put_connection(&legacy).await.unwrap();
 
@@ -316,6 +320,7 @@ async fn orgs_are_recorded_and_outlive_their_connections() {
         org: None,
         installation_id: None,
         account_id: None,
+        account_login: None,
     };
     db.put_connection(&legacy).await.unwrap();
     db.bind_repo("legacy", &repo("initech", "tps"), "initech", "tps")
@@ -415,6 +420,7 @@ async fn a_repo_held_by_another_orgs_connection_moves_to_its_owners() {
         org: Some("globex".into()),
         installation_id: Some(42),
         account_id: None,
+        account_login: None,
     };
     db.put_connection(&globex).await.unwrap();
     sqlx::query(
@@ -497,6 +503,7 @@ fn unassigned(id: &str, kind: ForgeKind, base_url: &str) -> ForgeConnection {
         org: None,
         installation_id: None,
         account_id: None,
+        account_login: None,
     }
 }
 
@@ -657,4 +664,42 @@ async fn the_org_list_includes_orgs_only_a_binding_names() {
     );
 
     tdb.cleanup().await;
+}
+
+/// git-bug bb8d644: the account login is stored, a writer that does not know
+/// it (boot provisioning, the connection form) keeps it, and an installation
+/// delivery replaces it while a delivery without an account id keeps the id.
+#[tokio::test]
+async fn the_account_login_is_kept_and_follows_a_rename() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+
+    db.put_connection(&ForgeConnection {
+        account_id: Some(7),
+        account_login: Some("acme".into()),
+        ..github_conn()
+    })
+    .await
+    .unwrap();
+    db.put_connection(&github_conn()).await.unwrap();
+    let c = db.get_connection("gh-acme").await.unwrap().unwrap();
+    assert_eq!(c.account_login.as_deref(), Some("acme"));
+    assert_eq!(c.account_id, Some(7));
+
+    db.set_connection_account("gh-acme", None, "acme-labs")
+        .await
+        .unwrap();
+    let c = db.get_connection("gh-acme").await.unwrap().unwrap();
+    assert_eq!(c.account_login.as_deref(), Some("acme-labs"));
+    assert_eq!(c.account_id, Some(7), "a delivery without an id keeps it");
+    assert_eq!(
+        db.list_connections().await.unwrap()[0]
+            .account_login
+            .as_deref(),
+        Some("acme-labs")
+    );
 }

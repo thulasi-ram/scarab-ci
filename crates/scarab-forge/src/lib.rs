@@ -1065,6 +1065,14 @@ pub struct ForgeConnection {
     /// recorded).
     #[serde(default)]
     pub account_id: Option<u64>,
+    /// The account's login (a GitHub installation's `account.login`), for
+    /// display only. Updated on every installation delivery, so a renamed
+    /// account shows its current name. Never used to decide anything: a login
+    /// can be renamed and then taken by someone else, so the org check uses
+    /// `account_id`. `None` = not known yet (every other kind, and rows from
+    /// before it was recorded).
+    #[serde(default)]
+    pub account_login: Option<String>,
 }
 
 /// The GitHub App installation id a `github-install-<id>` connection id
@@ -1378,13 +1386,20 @@ pub trait ForgeConnectionStore: Send + Sync {
         Ok(())
     }
 
-    /// Record the forge's account id on connection `id` (an installation
-    /// delivery carries it), leaving its other fields alone. No-op for a
-    /// missing connection.
-    async fn set_connection_account(&self, id: &str, account_id: u64) -> Result<(), RegistryError> {
+    /// Record the forge account on connection `id` from an installation
+    /// delivery: its login always (it may have been renamed), its id when the
+    /// delivery carries one (a known id is never cleared). Leaves the other
+    /// fields alone. No-op for a missing connection.
+    async fn set_connection_account(
+        &self,
+        id: &str,
+        account_id: Option<u64>,
+        account_login: &str,
+    ) -> Result<(), RegistryError> {
         if let Some(conn) = self.get_connection(id).await? {
             self.put_connection(&ForgeConnection {
-                account_id: Some(account_id),
+                account_id: account_id.or(conn.account_id),
+                account_login: Some(account_login.to_string()),
                 ..conn
             })
             .await?;

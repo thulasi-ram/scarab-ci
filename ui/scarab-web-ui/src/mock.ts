@@ -1252,8 +1252,8 @@ const connections: components["schemas"]["ConnectionDto"][] = [
   // the `acme` account again, under an installation whose account id no acme
   // connection records, so the delivery could not prove it is acme's account.
   // 90377 was registered before connections served orgs (a legacy
-  // connection), for an account no org has the name of. The connection list
-  // does not carry the account, so the page shows neither login.
+  // connection), for an account no org has the name of; its delivery a day
+  // ago recorded the login. Each lists its account login and id.
   {
     id: "github-install-90211",
     org: null,
@@ -1267,6 +1267,9 @@ const connections: components["schemas"]["ConnectionDto"][] = [
     supports_resync: true,
     supports_preflight: false,
     managed_by_config: false,
+    installation_id: 90211,
+    account_id: 1029384,
+    account_login: "acme",
   },
   {
     id: "github-install-90377",
@@ -1281,6 +1284,9 @@ const connections: components["schemas"]["ConnectionDto"][] = [
     supports_resync: true,
     supports_preflight: false,
     managed_by_config: false,
+    installation_id: 90377,
+    account_id: 5530911,
+    account_login: "umbrella",
   },
 ];
 

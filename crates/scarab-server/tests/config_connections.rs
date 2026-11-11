@@ -363,6 +363,7 @@ async fn declaring_a_database_owned_connection_in_config_refuses_the_boot() {
         org: None,
         installation_id: None,
         account_id: None,
+        account_login: None,
     })
     .await
     .unwrap();
@@ -457,6 +458,7 @@ async fn the_deployment_override_wins_over_the_secret_store() {
         org: None,
         installation_id: None,
         account_id: None,
+        account_login: None,
     };
     secrets
         .put(
@@ -498,6 +500,7 @@ async fn the_github_app_pem_is_an_override_in_the_same_table() {
         org: None,
         installation_id: None,
         account_id: None,
+        account_login: None,
     };
     let forgejo = ForgeConnection {
         id: "forgejo-main".into(),
@@ -507,6 +510,7 @@ async fn the_github_app_pem_is_an_override_in_the_same_table() {
         org: None,
         installation_id: None,
         account_id: None,
+        account_login: None,
     };
 
     let app_mode = CredentialOverrides::new().with_github_app_pem(Some("PEM".into()), true);

@@ -246,6 +246,7 @@ impl ForgeAdapters for RegistryForge {
             org: None,
             installation_id: None,
             account_id: None,
+            account_login: None,
         };
         self.cached_adapter(&conn).await.map(Some)
     }

@@ -110,6 +110,7 @@ fn harness_with(forge_url: Option<&str>) -> Harness {
             org: Some("acme".into()),
             installation_id: None,
             account_id: None,
+            account_login: None,
         })
         .await
         .unwrap();

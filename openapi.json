@@ -10045,6 +10045,22 @@
           "supports_preflight"
         ],
         "properties": {
+          "account_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The forge's immutable id of the account the connection serves (a\nGitHub installation's `account.id`), recorded from its installation\ndelivery; `null` until one arrives, and for every other kind.",
+            "minimum": 0
+          },
+          "account_login": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "That account's login, for display: refreshed on every installation\ndelivery, so a renamed account shows its current name. Never what\ndecides which Org the connection may serve (`account_id` does).\n`null` until a delivery records it, and for every other kind."
+          },
           "base_url": {
             "type": "string",
             "description": "The API base URL the adapter talks to (GHES / a self-hosted Forgejo)."
@@ -10065,6 +10081,15 @@
           },
           "id": {
             "type": "string"
+          },
+          "installation_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The GitHub App installation this connection is (`github-install-<n>`);\n`null` for every other kind.",
+            "minimum": 0
           },
           "kind": {
             "type": "string",

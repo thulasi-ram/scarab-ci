@@ -475,6 +475,7 @@ async fn connect(db: &InMemoryDb, id: &str, kind: ForgeKind, base: &str) {
         org: None,
         installation_id: None,
         account_id: None,
+        account_login: None,
     })
     .await
     .unwrap();
