@@ -149,9 +149,13 @@ like any other:
 
 Because the library's Step renders like any Step, `${{ event.sha }}` in `image` works.
 
-Core keeps two primitives. Neither is carried from an invoke Step's `placement_profiles`
-(0076 §1 already excludes Steps with `forge_token`): a placement profile is an arbitrary Pod
-patch, so a caller could otherwise change the Pod a sandboxed or credentialed Step runs in.
+Core keeps two primitives. An invoke Step's `placement_profiles` do carry onto a sandboxed or
+`registry_auth` Step, unlike a `forge_token` Step (0076 §1). A native build on an arm64 pool
+needs a profile, and so does a registry login that runs in an operator-written init container
+(the ECR setup). Profiles are written by the operator; an author can only name one, and an org
+Policy over `steps[].placement_profiles` and `steps[].origin` decides which Runs may name which
+profile. A profile still cannot name or change Scarab's own containers, volumes, mounts or env
+(d2b711b).
 
 **1. `security: { sandbox: rootless-buildkit }`.** It sets what `build_security_context`
 (`lib.rs:5732`) and the AppArmor annotation (`lib.rs:4797`) set today: uid 1000, non-root,
@@ -239,5 +243,5 @@ say all three.
   Scarab's own code gets no default trust.
 - Teams can write their own build library (Kaniko, Buildah, BuildKit with other flags). It
   gets the sandbox only if an admin trusts its source, the same as Scarab's.
-- Multi-arch builds can be a library that fans out over placement profiles and merges the
-  per-arch images; a `platforms` input can come later.
+- Multi-arch builds are one invoke per architecture, each naming its placement profile, and a
+  later Step that merges the per-arch images into one index; a `platforms` input can come later.
