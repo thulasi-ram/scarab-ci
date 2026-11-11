@@ -21,7 +21,7 @@ workspace it publishes. Absent = the whole workspace (the implicit default).
 - **Authored + validated now** (submit-time): each path must be non-empty and
   **workspace-relative** — no leading `/`, no `..` traversal out of the
   workspace. An empty list is rejected (omit the key for "everything"). The field
-  travels in the run's stored IR (self-describing, [0022](0022-run-versioning.md)).
+  travels in the run's stored IR (self-describing, [0022](0022-upgrades-and-versioning.md)).
 - **Enforced on the live-workspace path.** The restriction happens at the
   post-step CAS snapshot ([0029](0029-workspace-cas.md)): the executor ingests
   only the declared paths, so the output tree hash reflects the declared paths and nothing else.

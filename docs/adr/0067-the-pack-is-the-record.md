@@ -10,7 +10,7 @@
   [0061](0061-workspace-data-path.md) (**amends part 4's tiering**),
   [0065](0065-retention-cache-and-rederivation.md) (**amends its retention grain**),
   [0029](0029-workspace-cas.md) (the per-file merkle CAS, unchanged),
-  [0007](0007-step-outputs.md) (`outputs:` as the trim boundary)
+  [0007](0007-data-passing-model.md) (`outputs:` as the trim boundary)
 
 ## Context
 
@@ -163,7 +163,7 @@ workspace before uploading anything, so it computes the trimmed closure locally 
 - `cache-only` → kept on the Depot's local disk, **unpromised and evictable**, which preserves the
   post-hoc "what did this build produce" view without paying storage for scratch.
 
-This keeps [0007](0007-step-outputs.md)'s amendment intact: `outputs:` remains a **precision** tool,
+This keeps [0007](0007-data-passing-model.md)'s amendment intact: `outputs:` remains a **precision** tool,
 never something an author declares for speed. The system pays the wire cost of the untrimmed
 remainder, as it does today.
 
@@ -389,7 +389,7 @@ is still unbuilt. None of these reverse a decision; two refine one.
 
 ## References
 
-- [0007](0007-step-outputs.md) — `outputs:` as a precision tool, never a speed knob; the trim
+- [0007](0007-data-passing-model.md) — `outputs:` as a precision tool, never a speed knob; the trim
   boundary part 6 uses
 - [0029](0029-workspace-cas.md) — the per-file merkle CAS; why every write is idempotent and a
   retried pack is a no-op
