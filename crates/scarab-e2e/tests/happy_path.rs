@@ -120,6 +120,7 @@ async fn happy_path_cli_dispatch_to_succeeded_with_logs() {
             org: Some(org.into()),
             installation_id: None,
             account_id: None,
+            account_login: None,
         })
         .await
         .expect("register e2e forge connection");

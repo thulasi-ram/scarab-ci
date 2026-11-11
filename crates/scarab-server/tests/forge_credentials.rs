@@ -16,6 +16,7 @@ fn conn(credential_ref: &str) -> ForgeConnection {
         org: None,
         installation_id: None,
         account_id: None,
+        account_login: None,
     }
 }
 

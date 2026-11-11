@@ -132,20 +132,12 @@ export function enabledReposLabel(n: number): string {
 
 /** What the waiting panel reads from a connection. */
 export interface WaitingLike {
-  id: string;
   kind: string;
   web_url: string;
   enabled_repos: number;
-}
-
-/**
- * The GitHub App installation id of a connection the installation webhook
- * registered (`github-install-<id>`), or null for any other connection.
- */
-export function installationId(c: { id: string; kind: string }): string | null {
-  if (c.kind !== "github") return null;
-  const m = /^github-install-(\d+)$/.exec(c.id);
-  return m ? m[1]! : null;
+  installation_id?: number | null;
+  account_id?: number | null;
+  account_login?: string | null;
 }
 
 /** One line of a waiting connection's facts: a label and its value. */
@@ -156,23 +148,34 @@ export interface WaitingFact {
 
 /**
  * The facts the New organization page lists for a connection that serves no
- * org: its forge and host, its installation id (GitHub), and how many
- * repositories are enabled through it. The connection list does not carry
- * the installation's account login or account id (git-bug bb8d644), so the
- * account is not named.
+ * org: its forge and host, the forge account (its login and immutable id, as
+ * the last installation delivery recorded them), its installation id
+ * (GitHub), and how many repositories are enabled through it. Two waiting
+ * connections of different accounts differ here even with nothing enabled.
  */
 export function waitingFacts(c: WaitingLike): WaitingFact[] {
   const out: WaitingFact[] = [
     { label: "forge", value: `${forgeName(c.kind)} · ${c.web_url.replace(/^https?:\/\//, "")}` },
   ];
-  const install = installationId(c);
-  if (install != null) out.push({ label: "installation", value: install });
+  const account = accountLabel(c);
+  if (account != null) out.push({ label: "account", value: account });
+  if (c.installation_id != null) out.push({ label: "installation", value: String(c.installation_id) });
   const n = c.enabled_repos;
   out.push({
     label: "repositories",
     value: n === 0 ? "none enabled" : `${n} enabled`,
   });
   return out;
+}
+
+/** `acme (id 4321)`, the id alone while no login is recorded, or null when
+ *  neither is known. */
+export function accountLabel(c: Pick<WaitingLike, "account_id" | "account_login">): string | null {
+  const login = c.account_login?.trim() || null;
+  const id = c.account_id ?? null;
+  if (login != null && id != null) return `${login} (id ${id})`;
+  if (login != null) return login;
+  return id != null ? `id ${id}` : null;
 }
 
 /**

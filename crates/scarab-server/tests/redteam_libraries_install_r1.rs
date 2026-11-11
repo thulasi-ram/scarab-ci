@@ -230,6 +230,7 @@ async fn ssrf_a_forgejo_connection_on_an_internal_address_is_not_fetched_anonymo
             org: None,
             installation_id: None,
             account_id: None,
+            account_login: None,
         })
         .await
         .unwrap();
@@ -340,6 +341,7 @@ async fn org_rule_a_binding_on_another_forge_does_not_open_a_github_repo() {
             org: None,
             installation_id: None,
             account_id: None,
+            account_login: None,
         })
         .await
         .unwrap();

@@ -3859,14 +3859,16 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
         conn: &scarab_forge::ForgeConnection,
     ) -> Result<(), scarab_forge::RegistryError> {
         let mut st = self.state.lock().unwrap();
-        // Mirrors Postgres: a known account id survives a writer that does
-        // not know it.
+        // Mirrors Postgres: a known account id and login survive a writer
+        // that does not know them.
         let mut conn = conn.clone();
-        if conn.account_id.is_none() {
-            conn.account_id = st
-                .forge_connections
-                .get(&conn.id)
-                .and_then(|c| c.account_id);
+        if let Some(prev) = st.forge_connections.get(&conn.id) {
+            if conn.account_id.is_none() {
+                conn.account_id = prev.account_id;
+            }
+            if conn.account_login.is_none() {
+                conn.account_login = prev.account_login.clone();
+            }
         }
         if let Some(org) = &conn.org {
             st.orgs.insert(org.clone());

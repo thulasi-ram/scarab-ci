@@ -3122,6 +3122,20 @@ export interface components {
          *     a secret back.
          */
         ConnectionDto: {
+            /**
+             * Format: int64
+             * @description The forge's immutable id of the account the connection serves (a
+             *     GitHub installation's `account.id`), recorded from its installation
+             *     delivery; `null` until one arrives, and for every other kind.
+             */
+            account_id?: number | null;
+            /**
+             * @description That account's login, for display: refreshed on every installation
+             *     delivery, so a renamed account shows its current name. Never what
+             *     decides which Org the connection may serve (`account_id` does).
+             *     `null` until a delivery records it, and for every other kind.
+             */
+            account_login?: string | null;
             /** @description The API base URL the adapter talks to (GHES / a self-hosted Forgejo). */
             base_url: string;
             /**
@@ -3144,6 +3158,12 @@ export interface components {
              */
             enabled_repos: number;
             id: string;
+            /**
+             * Format: int64
+             * @description The GitHub App installation this connection is (`github-install-<n>`);
+             *     `null` for every other kind.
+             */
+            installation_id?: number | null;
             /** @description `github` | `forgejo`. */
             kind: string;
             /**

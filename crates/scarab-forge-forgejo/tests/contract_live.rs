@@ -50,6 +50,7 @@ async fn forgejo_adapter_passes_the_port_contract() {
         org: None,
         installation_id: None,
         account_id: None,
+        account_login: None,
     };
     let forge = ForgejoForge::new(&conn.base_url, &token);
 

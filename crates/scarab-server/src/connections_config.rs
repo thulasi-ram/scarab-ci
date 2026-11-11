@@ -280,6 +280,7 @@ pub async fn provision(
                 installation_id: spec.installation_id,
                 // Kept by the store: config does not know it.
                 account_id: None,
+                account_login: None,
             })
             .await
             .map_err(store_err(&spec.id))?;

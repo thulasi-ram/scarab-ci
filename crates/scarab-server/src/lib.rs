@@ -7742,7 +7742,8 @@ pub(crate) const GITHUB_API_BASE: &str = "https://api.github.com";
 /// a delivery covers the repo again (or a re-sync lists it). Only an admin's
 /// unbind removes the Project.
 ///
-/// The connection `github-install-<id>` records its installation id and the
+/// The connection `github-install-<id>` records its installation id, the
+/// account's login (display only, refreshed on every delivery) and the
 /// account's immutable id, so once it serves an Org its tokens are minted
 /// from that installation only. A connection that already serves an Org
 /// keeps it. An unassigned one takes the account's Org only when
@@ -7771,12 +7772,10 @@ async fn register_installation(
         .map_err(registry)?;
     let mut org = match &existing {
         Some(conn) => {
-            if let Some(account_id) = sync.account_id {
-                connections
-                    .set_connection_account(&conn_id, account_id)
-                    .await
-                    .map_err(registry)?;
-            }
+            connections
+                .set_connection_account(&conn_id, sync.account_id, account)
+                .await
+                .map_err(registry)?;
             conn.org.clone()
         }
         None => {
@@ -7791,6 +7790,7 @@ async fn register_installation(
                     org: None,
                     installation_id: Some(sync.installation_id),
                     account_id: sync.account_id,
+                    account_login: Some(account.to_string()),
                 })
                 .await
                 .map_err(registry)?;
@@ -12003,6 +12003,18 @@ pub struct ConnectionDto {
     /// list must not perform one per row just to discover the button is
     /// pointless. The endpoint itself remains the authority.
     pub supports_preflight: bool,
+    /// The GitHub App installation this connection is (`github-install-<n>`);
+    /// `null` for every other kind.
+    pub installation_id: Option<u64>,
+    /// The forge's immutable id of the account the connection serves (a
+    /// GitHub installation's `account.id`), recorded from its installation
+    /// delivery; `null` until one arrives, and for every other kind.
+    pub account_id: Option<u64>,
+    /// That account's login, for display: refreshed on every installation
+    /// delivery, so a renamed account shows its current name. Never what
+    /// decides which Org the connection may serve (`account_id` does).
+    /// `null` until a delivery records it, and for every other kind.
+    pub account_login: Option<String>,
 }
 
 /// `POST /v1/connections` body (ADR-0060 part D, manual path): the forge to
@@ -12406,6 +12418,9 @@ async fn list_connections(
             supports_resync,
             supports_preflight,
             managed_by_config,
+            installation_id: conn.installation_id,
+            account_id: conn.account_id,
+            account_login: conn.account_login,
         });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -13062,6 +13077,7 @@ async fn create_connection(
             org: Some(org),
             installation_id: None,
             account_id: None,
+            account_login: None,
         })
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;

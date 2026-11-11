@@ -1,11 +1,11 @@
 import { describe, it, expect } from "vitest";
 import {
+  accountLabel,
   connectionChips,
   connectionHost,
   connectionHref,
   enabledReposLabel,
   forgeName,
-  installationId,
   newOrgNameProblem,
   orgNameProblem,
   resyncNote,
@@ -122,28 +122,26 @@ describe("a connection's list row", () => {
 
 describe("connections waiting for an organization", () => {
   const install = {
-    id: "github-install-90211",
     kind: "github",
     web_url: "https://github.com",
     enabled_repos: 0,
+    installation_id: 90211,
+    account_id: 1029384,
+    account_login: "acme",
   };
   const legacy = {
-    id: "forgejo-legacy",
     kind: "forgejo",
     web_url: "https://git.umbrella.dev",
     enabled_repos: 2,
+    installation_id: null,
+    account_id: null,
+    account_login: null,
   };
 
-  it("reads the installation id from an installation's connection id only", () => {
-    expect(installationId(install)).toBe("90211");
-    expect(installationId({ id: "github-install-90211", kind: "forgejo" })).toBeNull();
-    expect(installationId({ id: "gh-acme", kind: "github" })).toBeNull();
-    expect(installationId({ id: "github-install-12x", kind: "github" })).toBeNull();
-  });
-
-  it("lists the forge, the installation and how many repositories are enabled", () => {
+  it("lists the forge, the account, the installation and how many repositories are enabled", () => {
     expect(waitingFacts(install)).toEqual([
       { label: "forge", value: "GitHub · github.com" },
+      { label: "account", value: "acme (id 1029384)" },
       { label: "installation", value: "90211" },
       { label: "repositories", value: "none enabled" },
     ]);
@@ -151,6 +149,14 @@ describe("connections waiting for an organization", () => {
       { label: "forge", value: "Forgejo · git.umbrella.dev" },
       { label: "repositories", value: "2 enabled" },
     ]);
+  });
+
+  it("names the account by login and id, by whichever is known, or not at all", () => {
+    expect(accountLabel({ account_login: "acme", account_id: 7 })).toBe("acme (id 7)");
+    expect(accountLabel({ account_login: null, account_id: 7 })).toBe("id 7");
+    expect(accountLabel({ account_login: "acme" })).toBe("acme");
+    expect(accountLabel({ account_login: " ", account_id: null })).toBeNull();
+    expect(accountLabel({})).toBeNull();
   });
 
   it("refuses an existing org's name for a new org, and every name orgNameProblem refuses", () => {

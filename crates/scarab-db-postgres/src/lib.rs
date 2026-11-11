@@ -3211,20 +3211,22 @@ impl ForgeConnectionStore for PostgresDb {
                 .await
                 .map_err(reg_err)?;
         }
-        // A known account id is kept when the writer does not know it (boot
-        // provisioning, the connection form): it is a fact about the forge
-        // account, recorded only from an installation delivery.
+        // A known account id and login are kept when the writer does not know
+        // them (boot provisioning, the connection form): they are facts about
+        // the forge account, recorded only from an installation delivery.
         sqlx::query(
             "INSERT INTO forge_connections
-                 (id, kind, base_url, credential_ref, org, installation_id, account_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 (id, kind, base_url, credential_ref, org, installation_id, account_id,
+                  account_login)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (id) DO UPDATE SET
                  kind = EXCLUDED.kind,
                  base_url = EXCLUDED.base_url,
                  credential_ref = EXCLUDED.credential_ref,
                  org = EXCLUDED.org,
                  installation_id = EXCLUDED.installation_id,
-                 account_id = COALESCE(EXCLUDED.account_id, forge_connections.account_id)",
+                 account_id = COALESCE(EXCLUDED.account_id, forge_connections.account_id),
+                 account_login = COALESCE(EXCLUDED.account_login, forge_connections.account_login)",
         )
         .bind(&conn.id)
         .bind(conn.kind.as_str())
@@ -3233,6 +3235,7 @@ impl ForgeConnectionStore for PostgresDb {
         .bind(&conn.org)
         .bind(conn.installation_id.map(|i| i as i64))
         .bind(conn.account_id.map(|i| i as i64))
+        .bind(&conn.account_login)
         .execute(&mut *tx)
         .await
         .map_err(reg_err)?;
@@ -3242,7 +3245,7 @@ impl ForgeConnectionStore for PostgresDb {
 
     async fn get_connection(&self, id: &str) -> Result<Option<ForgeConnection>, RegistryError> {
         let row = sqlx::query(
-            "SELECT id, kind, base_url, credential_ref, org, installation_id, account_id
+            "SELECT id, kind, base_url, credential_ref, org, installation_id, account_id, account_login
              FROM forge_connections WHERE id = $1",
         )
         .bind(id)
@@ -3254,7 +3257,7 @@ impl ForgeConnectionStore for PostgresDb {
 
     async fn list_connections(&self) -> Result<Vec<ForgeConnection>, RegistryError> {
         let rows = sqlx::query(
-            "SELECT id, kind, base_url, credential_ref, org, installation_id, account_id
+            "SELECT id, kind, base_url, credential_ref, org, installation_id, account_id, account_login
              FROM forge_connections ORDER BY id",
         )
         .fetch_all(self.pool())
@@ -3437,7 +3440,7 @@ impl ForgeConnectionStore for PostgresDb {
     async fn resolve(&self, repo: &RepoRef) -> Result<Option<ResolvedRepo>, RegistryError> {
         let row = sqlx::query(
             "SELECT c.id, c.kind, c.base_url, c.credential_ref, c.org AS conn_org,
-                    c.installation_id, c.account_id, r.org, r.project, r.unreachable_since
+                    c.installation_id, c.account_id, c.account_login, r.org, r.project, r.unreachable_since
              FROM forge_repos r JOIN forge_connections c ON c.id = r.connection_id
              WHERE r.owner = $1 AND r.name = $2",
         )
@@ -3531,13 +3534,23 @@ impl ForgeConnectionStore for PostgresDb {
         Ok(())
     }
 
-    async fn set_connection_account(&self, id: &str, account_id: u64) -> Result<(), RegistryError> {
-        sqlx::query("UPDATE forge_connections SET account_id = $2 WHERE id = $1")
-            .bind(id)
-            .bind(account_id as i64)
-            .execute(self.pool())
-            .await
-            .map_err(reg_err)?;
+    async fn set_connection_account(
+        &self,
+        id: &str,
+        account_id: Option<u64>,
+        account_login: &str,
+    ) -> Result<(), RegistryError> {
+        sqlx::query(
+            "UPDATE forge_connections
+                SET account_id = COALESCE($2, account_id), account_login = $3
+              WHERE id = $1",
+        )
+        .bind(id)
+        .bind(account_id.map(|i| i as i64))
+        .bind(account_login)
+        .execute(self.pool())
+        .await
+        .map_err(reg_err)?;
         Ok(())
     }
 
@@ -3552,7 +3565,7 @@ impl ForgeConnectionStore for PostgresDb {
         let mut tx = self.pool().begin().await.map_err(reg_err)?;
         lock_org(&mut tx, org).await?;
         let conn = sqlx::query(
-            "SELECT id, kind, base_url, credential_ref, org, installation_id, account_id
+            "SELECT id, kind, base_url, credential_ref, org, installation_id, account_id, account_login
              FROM forge_connections WHERE id = $1 FOR UPDATE",
         )
         .bind(id)
@@ -3582,7 +3595,7 @@ impl ForgeConnectionStore for PostgresDb {
         })
         .collect();
         let servers = sqlx::query(
-            "SELECT id, kind, base_url, credential_ref, org, installation_id, account_id
+            "SELECT id, kind, base_url, credential_ref, org, installation_id, account_id, account_login
              FROM forge_connections c
              WHERE c.id <> $1
                AND (c.org = $2
@@ -3665,6 +3678,7 @@ fn connection_from_row(r: sqlx::postgres::PgRow) -> Result<ForgeConnection, Regi
         account_id: r
             .get::<Option<i64>, _>("account_id")
             .and_then(|i| u64::try_from(i).ok()),
+        account_login: r.get::<Option<String>, _>("account_login"),
     })
 }
 

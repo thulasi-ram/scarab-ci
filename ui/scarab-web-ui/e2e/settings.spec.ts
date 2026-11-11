@@ -1183,6 +1183,9 @@ test("New organization lists the connections waiting for an org, and a global ad
   const otherRow = waiting.locator("li.conn", { hasText: "github-install-90377" });
   await expect(acmeRow.getByText("GitHub · github.com")).toBeVisible();
   await expect(acmeRow.getByText("90211", { exact: true })).toBeVisible();
+  // Each names its account, so two waiting connections tell apart.
+  await expect(acmeRow.getByText("acme (id 1029384)", { exact: true })).toBeVisible();
+  await expect(otherRow.getByText("umbrella (id 5530911)", { exact: true })).toBeVisible();
   await expect(acmeRow.getByText("resolves")).toBeVisible();
   await expect(acmeRow.getByText(/none recorded yet/)).toBeVisible();
   await expect(acmeRow.getByRole("button", { name: "Remove", exact: true })).toBeVisible();
@@ -1201,10 +1204,12 @@ test("New organization lists the connections waiting for an org, and a global ad
   ).toBeVisible();
   await acmeRow.getByRole("button", { name: "Cancel" }).click();
 
-  // A new org from the other one: an existing org's name is refused here.
+  // A new org from the other one, named from its account's login to start;
+  // an existing org's name is refused here.
   await otherRow.getByRole("button", { name: "Create a new organization from it" }).click();
   const name = otherRow.getByRole("textbox", { name: "New organization name" });
   const create = otherRow.getByRole("button", { name: "Create organization" });
+  await expect(name).toHaveValue("umbrella");
   await name.fill("acme");
   await expect(otherRow.getByText("acme is already an organization. Use Assign to an organization.")).toBeVisible();
   await expect(create).toBeDisabled();
