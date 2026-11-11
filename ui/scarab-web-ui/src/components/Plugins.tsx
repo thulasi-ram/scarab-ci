@@ -36,7 +36,6 @@ import {
   toManifestFetchBody,
   toStorageBody,
   DEFAULT_STORAGE_MOUNT_PATH,
-  type BadgeTone,
   type ManifestFetchForm,
   type StorageForm,
 } from "../plugins";
@@ -45,14 +44,6 @@ import Chips from "./Chips";
 import Icon from "./Icon";
 import Modal, { ModalMessage, ModalSection } from "./Modal";
 import { Field, Input, Select } from "./Field";
-
-/** A badge tone in the StatusBadge palette's classes. */
-export const BADGE: Record<BadgeTone, string> = {
-  ok: "badge badge-succeeded",
-  motion: "badge badge-running",
-  danger: "badge badge-failed",
-  muted: "badge badge-skipped",
-};
 
 export default function Plugins(props: { org: string }) {
   const nav = useNavigate();

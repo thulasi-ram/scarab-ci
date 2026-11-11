@@ -3,15 +3,16 @@
 // tone's colour, with a title that says what it means.
 import { For } from "solid-js";
 import type { Chip } from "../libraries";
+import Pill from "./Pill";
 
 export default function Chips(props: { chips: readonly Chip[] }) {
   return (
     <span class="chips">
       <For each={props.chips}>
         {(c) => (
-          <span class={`tok-state chip-${c.tone}`} title={c.title}>
+          <Pill tone={c.tone} look="dotted" title={c.title}>
             {c.label}
-          </span>
+          </Pill>
         )}
       </For>
     </span>

@@ -23,6 +23,7 @@ import DisableRepository from "../components/DisableRepository";
 import Doodle from "../components/Doodle";
 import Icon from "../components/Icon";
 import { HomeCrumb } from "../components/PageCrumbs";
+import Pill from "../components/Pill";
 
 /** Repositories per page. */
 const PER_PAGE = 25;
@@ -254,16 +255,13 @@ export default function OrgPage() {
                         </A>
                       )}
                     </Show>
-                    <span
-                      class="org-repo-state"
-                      classList={{ "org-repo-on": r.enabled }}
-                    >
+                    <Pill tone={r.enabled ? "ok" : "muted"}>
                       {r.enabled ? "Enabled" : "Not enabled"}
-                    </span>
+                    </Pill>
                     <Show when={r.unreachable_since != null}>
-                      <span class="repo-unreachable-tag" title={UNREACHABLE_NOTE}>
+                      <Pill tone="warn" look="dashed" class="repo-unreachable-tag" title={UNREACHABLE_NOTE}>
                         unreachable
-                      </span>
+                      </Pill>
                     </Show>
                     <span class="rr-coord mono" title={`through connection ${r.connection_id}`}>
                       {r.kind}

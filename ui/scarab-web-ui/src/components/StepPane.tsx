@@ -34,6 +34,7 @@ import { shortHash } from "../libraries";
 import { absTime } from "../fmt";
 import Icon from "./Icon";
 import AttemptsDropdown, { type FilmstripTry } from "./AttemptsDropdown";
+import Pill from "./Pill";
 
 type Tab = "logs" | "results" | "outputs" | "workspace" | "origin" | "gate";
 
@@ -514,9 +515,9 @@ export default function StepPane(props: {
               </div>
               <span class="grow1" />
               <Show when={props.deadLettered && attemptsOf().some((a) => a.failed)}>
-                <span class="adeadletter" title="no verdict obtainable — the operator signal">
+                <Pill tone="danger" class="adeadletter" title="no verdict obtainable — the operator signal">
                   ⊘ dead-lettered
-                </span>
+                </Pill>
               </Show>
               <span class="pane-load" classList={{ on: loading() }} aria-hidden="true">
                 <Icon icon="rotate-cw" size={13} />
@@ -624,7 +625,7 @@ export default function StepPane(props: {
                         <div class="kvcard">
                           <div class="kvk">
                             <span>{r.name}</span>
-                            <span class="type">{r.type_name}</span>
+                            <Pill tone="copper">{r.type_name}</Pill>
                           </div>
                           <div class="kvv mono">{showValue(r.value)}</div>
                           <div class="kvfrom">
@@ -878,7 +879,7 @@ export default function StepPane(props: {
                             </span>
                             <div class="t">
                               <div class="l1">
-                                <span class="kind">pipeline</span>
+                                <Pill tone="muted" look="dotted">pipeline</Pill>
                                 <span class="mono">{props.pipeline ? `.scarab/${props.pipeline}.yaml` : "the Pipeline file"}</span>
                               </div>
                               <div class="lib-src">the Run's own file</div>
@@ -892,7 +893,7 @@ export default function StepPane(props: {
                                 </span>
                                 <div class="t">
                                   <div class="l1">
-                                    <span class="kind">{c.kind === "library" ? "lib" : c.kind}</span>
+                                    <Pill tone="muted" look="dotted">{c.kind === "library" ? "lib" : c.kind}</Pill>
                                     <span class="mono">{c.name}</span>
                                     <span class="lib-hash">{shortHash(c.content_hash)}</span>
                                     <Show when={c.kind !== "plugin"}>
@@ -917,7 +918,7 @@ export default function StepPane(props: {
                             </span>
                             <div class="t">
                               <div class="l1">
-                                <span class="kind">step</span>
+                                <Pill tone="muted" look="dotted">step</Pill>
                                 <span class="mono">{s().id.split("/").pop()}</span>
                                 <span class="subtle">
                                   → <span class="mono">{s().id}</span> in this Run
@@ -1070,9 +1071,9 @@ export default function StepPane(props: {
                             {(o) => (
                               <div class="gp-line">
                                 <span class="mono">{o.name}</span>{" "}
-                                <span class="tok-state" style={{ color: "var(--copper)" }}>
+                                <Pill tone="copper" look="dotted">
                                   {o.type}
-                                </span>
+                                </Pill>
                                 {o.value !== undefined && o.value !== null ? (
                                   <>
                                     {" "}= <span class="mono">{typeof o.value === "string" ? o.value : JSON.stringify(o.value)}</span> · by{" "}

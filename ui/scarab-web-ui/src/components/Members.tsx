@@ -18,6 +18,7 @@ import Chips from "./Chips";
 import Modal, { ModalMessage } from "./Modal";
 import { Field, Select } from "./Field";
 import PrincipalSearch from "./PrincipalSearch";
+import Pill from "./Pill";
 
 export default function Members(props: { org: string }) {
   const [bindings, { refetch }] = createResource(() => listBindings(props.org));
@@ -90,7 +91,7 @@ export default function Members(props: { org: string }) {
                           </td>
                           <td>
                             <Show when={r.orgRole} fallback={<span class="subtle">no org role</span>}>
-                              {(role) => <span class="tok-role">{role()}</span>}
+                              {(role) => <Pill tone="copper">{role()}</Pill>}
                             </Show>
                           </td>
                           <td>

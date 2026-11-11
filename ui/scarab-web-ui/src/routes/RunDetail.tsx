@@ -88,6 +88,7 @@ import { type FilmstripTry } from "../components/AttemptsDropdown";
 import DebugShell from "../components/DebugShell";
 import TriggerCell from "../components/TriggerCell";
 import RerunConfirm from "../components/RerunConfirm";
+import Pill from "../components/Pill";
 
 const POLL_MS = 1200;
 
@@ -1390,18 +1391,15 @@ export default function RunDetail() {
                           </a>
                         </span>
                         <Show when={a.step}>
-                          <span class="aprov mono" classList={{ failed: !a.succeeded }}>
+                          <Pill tone={a.succeeded ? "muted" : "danger"}>
                             {a.step}@{a.attempt}
                             {a.succeeded ? "" : " ✗"}
-                          </span>
+                          </Pill>
                         </Show>
                         <Show when={a.of_record}>
-                          <span
-                            class="aofrecord"
-                            title="what the bare name-addressed download serves"
-                          >
-                            Of record
-                          </span>
+                          <Pill tone="accent" title="what the bare name-addressed download serves">
+                            of record
+                          </Pill>
                         </Show>
                         <span class="fsize mono">{fmtSize(a.size)}</span>
                         <span class="fmeta mono">{a.content_type}</span>

@@ -9,6 +9,7 @@
 import { For, Show, createSignal, onCleanup } from "solid-js";
 import { searchPrincipals, type PrincipalMatch } from "../api/client";
 import { Input } from "./Field";
+import Pill from "./Pill";
 
 export default function PrincipalSearch(props: {
   org: string;
@@ -75,13 +76,13 @@ export default function PrincipalSearch(props: {
                   <span class="ps-id mono">{h.handle}</span>
                   <For each={h.identities}>
                     {(i) => (
-                      <span class="ps-acct mono">
+                      <Pill tone="plain" look="dotted">
                         {i.provider}:{i.handle}
-                      </span>
+                      </Pill>
                     )}
                   </For>
                   <Show when={!h.claimed}>
-                    <span class="tok-state tok-expired">not signed in yet</span>
+                    <Pill tone="muted" look="dotted">not signed in yet</Pill>
                   </Show>
                 </button>
               </li>

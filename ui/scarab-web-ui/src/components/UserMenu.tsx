@@ -8,6 +8,7 @@ import { logout } from "../api/client";
 import { me } from "../session";
 import { theme, toggleTheme } from "../theme";
 import { settingsMenu, type SettingsGroupKind } from "../settings-nav";
+import Pill from "./Pill";
 
 const MENU_ICONS: Record<SettingsGroupKind, string> = {
   account: "user",
@@ -69,7 +70,7 @@ export default function UserMenu() {
             </div>
             <div class="um-roles">
               {user().roles.map((r) => (
-                <span class="um-role">{r}</span>
+                <Pill tone="accent" look="tint">{r}</Pill>
               ))}
             </div>
             {/* Settings (git-bug 734ffa1): one entry per settings page,

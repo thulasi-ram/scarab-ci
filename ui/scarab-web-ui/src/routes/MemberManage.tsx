@@ -16,6 +16,7 @@ import { SettingsCrumbs, SettingsFrame } from "./Settings";
 import { Section } from "./LibraryManage";
 import ConfirmDestructive from "../components/ConfirmDestructive";
 import { Select } from "../components/Field";
+import Pill from "../components/Pill";
 
 /** `/orgs/:org/settings/members/:id/manage`. */
 export default function MemberManage() {
@@ -154,7 +155,7 @@ function Member(props: {
           <dt>Sign-in</dt>
           <dd>
             <Show when={r().pending} fallback="Signed in">
-              <span class="tok-state tok-expired">not signed in yet</span>{" "}
+              <Pill tone="muted" look="dotted">not signed in yet</Pill>{" "}
               Imported from the forge. These roles become theirs when they sign in with that forge
               account, and nobody else's.
             </Show>
@@ -190,7 +191,7 @@ function Member(props: {
             <Show when={r().orgRole} fallback={<span class="subtle">no org role</span>}>
               {(x) => (
                 <>
-                  <span class="tok-role">{x()}</span> all of {props.org}
+                  <Pill tone="copper">{x()}</Pill> all of {props.org}
                 </>
               )}
             </Show>
@@ -216,7 +217,7 @@ function Member(props: {
                     </A>
                   </dt>
                   <dd>
-                    <span class="tok-role">{x.role}</span>
+                    <Pill tone="copper">{x.role}</Pill>
                     <Show when={x.source}>
                       {(src) => (
                         <span class="subtle">

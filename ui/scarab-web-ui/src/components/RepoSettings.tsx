@@ -54,6 +54,7 @@ import PrincipalSearch from "./PrincipalSearch";
 import { PersonCell } from "./Members";
 import PolicyLists from "./PolicyLists";
 import { LIBRARY_KINDS, LIBRARY_POLICIES_ANCHOR, PLUGIN_KINDS, PLUGIN_POLICIES_ANCHOR } from "../policies";
+import Pill from "./Pill";
 
 const ROLES = ["viewer", "member", "admin", "owner"];
 
@@ -309,7 +310,7 @@ function RepoAccess(props: { org: string; repo: string; forge: string }) {
                             <PersonCell display={r.display} handle={r.handle} pending={r.pending} />
                           </td>
                           <td>
-                            <span class="tok-role">{r.role}</span>
+                            <Pill tone="copper">{r.role}</Pill>
                             <Show when={r.orgRole}>
                               {(o) => <span class="access-note">also org role {o()}; the higher applies</span>}
                             </Show>
@@ -336,7 +337,7 @@ function RepoAccess(props: { org: string; repo: string; forge: string }) {
                               <PersonCell display={r.display} handle={r.handle} pending={r.pending} />
                             </td>
                             <td>
-                              via org role <span class="tok-role">{r.orgRole}</span>
+                              via org role <Pill tone="copper">{r.orgRole}</Pill>
                             </td>
                             <td>all of {props.org}</td>
                             <td />

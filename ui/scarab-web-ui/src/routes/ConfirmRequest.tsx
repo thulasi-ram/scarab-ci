@@ -28,6 +28,7 @@ import {
 } from "../security";
 import { getAssertion, webauthnAvailable, webauthnErrorText } from "../webauthn";
 import Icon from "../components/Icon";
+import Pill from "../components/Pill";
 
 export default function ConfirmRequest() {
   const params = useParams<{ id: string }>();
@@ -108,9 +109,9 @@ export default function ConfirmRequest() {
               <span>
                 <Icon icon="shield-check" size={13} /> {r().summary.operation}
               </span>
-              <span class={`tok-state ${r().state === "failed" || r().state === "expired" ? "tok-revoked" : ""}`}>
+              <Pill tone={r().state === "failed" || r().state === "expired" ? "danger" : "plain"} look="dotted">
                 {r().state}
-              </span>
+              </Pill>
             </div>
             <div class="secrets-body">
               <dl class="step-up-summary">

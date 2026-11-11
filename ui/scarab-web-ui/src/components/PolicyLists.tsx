@@ -47,6 +47,7 @@ import ConfirmDestructive from "./ConfirmDestructive";
 import Icon from "./Icon";
 import Modal, { ModalMessage, ModalSection } from "./Modal";
 import { Field, Input, Select, Textarea } from "./Field";
+import Pill from "./Pill";
 
 type ListRecord = PolicyRecord & { body: PolicyBody; kind: SettingKind };
 
@@ -133,11 +134,11 @@ export default function PolicyLists(props: {
                     <li class="tok">
                       <div class="tok-head">
                         <span class="tok-name mono">{p.name}</span>
-                        <span class="tok-role">{settingLabel(p.kind)}</span>
+                        <Pill tone="copper">{settingLabel(p.kind)}</Pill>
                         <Show when={p.body.mode === "audit"}>
-                          <span class="tok-role" title="Its denies are recorded, not enforced">
+                          <Pill tone="copper" title="Its denies are recorded, not enforced">
                             audit
-                          </span>
+                          </Pill>
                         </Show>
                         <span class="oenv-actions">
                           <button class="btn btn-ghost btn-sm" type="button" onClick={() => setEditing(p)}>

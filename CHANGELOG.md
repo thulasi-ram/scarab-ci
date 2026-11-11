@@ -18,6 +18,14 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Enhancement
+
+- **One pill for every tag.** Status, state, role and kind tags all come from one `Pill`
+  component: the Mono text style on a 20px pill, in one of a few tones and looks. The tags that
+  were still sized on their own, such as the artifact list's **of record** and provenance, the
+  user menu's roles, Run pipeline's `API` and input types, result types and the invoke chain's
+  kinds, now match the rest. An artifact's name, pills, size and type sit on one line.
+
 ## [0.3.2] - 2026-11-11
 
 ### Features
