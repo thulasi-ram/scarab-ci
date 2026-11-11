@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1794426414,"nonce":"iv2OD1dwXkESTN+nkx2E/WiWvDU=","title":"Fork PR build: steps push and get the registry credential when the Run has no Environment","was":"x"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1794426414,"nonce":"FVLxpk1AqBuWzgt22lL8CmIopXI=","added":["type:bug","security","area:server","area:secrets"],"removed":null}]}
