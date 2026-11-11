@@ -150,12 +150,15 @@ export default function Repos() {
   return (
     <>
       <section class="page">
-        <div class="page-head dash-head">
+        <div class="page-head">
           <h1 class="crumb-head">
             <HomeCrumb size={20} sepClass="crumb-head-sep" />
             <span>Dashboard</span>
           </h1>
         </div>
+        {/* Empty, like a repository's when it has no action: the row keeps the
+            first block at the height of the tabs on the other pages. */}
+        <div class="page-toolbar" />
 
         <Show when={runs.error || projects.error}>
           <p class="error">

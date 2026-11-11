@@ -1517,7 +1517,9 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 /* Contextual CTA sits one level below the header, not inline with it. */
 /* Fixed-height row: rendered even without a CTA so tabs never shift. */
 .page-toolbar { display: flex; justify-content: flex-end; align-items: center; min-height: 39px; margin-top: 12px; }
-.page-toolbar + .tabs { margin-top: 16px; }
+/* What follows the row (a repository's tabs, the org page's Overview, the
+   dashboard's inbox or all-clear card) starts at one height on every page. */
+.page > .page-toolbar + * { margin-top: 16px; }
 /* org prefix inside a repo header, e.g. "acme / web" (context, now that the
    top-bar breadcrumb is gone) */
 /* The org is a prefix, not the title: same style, quieter ink. */
@@ -2090,10 +2092,6 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   background: var(--emerald-surface);
 }
 .allclear .ac-ico { color: var(--ok-ink); flex: none; }
-/* The dashboard has no toolbar row under its heading, so whatever comes first
-   (the inbox, the all-clear card, the loading line or an error) starts one
-   section gap below it, the same in every state. */
-.page-head.dash-head + * { margin-top: 30px; }
 
 /* State-moment beetle: an idle/failed pose stands in for an empty list.
    The caption sits DIRECTLY under the art — it reads as the beetle's own line,
