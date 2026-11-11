@@ -18,6 +18,25 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **The `build` step kind is removed; build images with `lib:thulasi-ram/build`.** A Pipeline with
+  a `build:` step fails to compile, with a message naming the library, until the step is
+  rewritten as `invoke: lib:thulasi-ram/build` with the same `image`, `context`, `dockerfile` and
+  `push` under `with:`. `${{ outputs.<step>.image }}` reads the same result. Nothing is installed
+  in an org by default, so before upgrading an org admin installs
+  `github.com/thulasi-ram/scarab-ci//libs/build.yaml` at a release commit as
+  `thulasi-ram/build` and trusts that source for the build sandbox (the new `build_sandbox` grant
+  of `/library-trust`, or **Build sandbox › Trust source** on the library's page); without that
+  trust, a Run that builds is refused. To push to the forge's own registry with no
+  `REGISTRY_AUTH` secret, the source must also be trusted with forge credentials. A step of a Run
+  created before the upgrade that was stored as a `build` step fails when it would launch, with
+  a message naming the library. The library adds build arguments, a registry or S3 layer cache, a
+  BuildKit image pinned by digest and templates in `image` (such as `${{ event.sha }}`)
+  ([Building an image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#building-an-image),
+  [Install Scarab's build library](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#install-scarabs-build-library),
+  [ADR-0018](https://github.com/thulasi-ram/scarab-ci/blob/main/docs/adr/0018-image-building.md)).
+
 ### Enhancement
 
 - **A waiting GitHub connection names its account.** Under **Waiting for an organization** each

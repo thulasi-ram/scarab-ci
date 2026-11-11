@@ -386,7 +386,7 @@ pub async fn registry_forge_libraries(
 
 /// An [`Executor`] decorator that mints a Step's forge credential when it
 /// launches and revokes it when its Attempt ends (see the module docs), and
-/// resolves a build Step's registry auth (ADR-0018: the scoped
+/// resolves a `registry_auth` Step's registry credential (ADR-0018: the scoped
 /// `REGISTRY_AUTH` secret, else the forge-derived credential for the forge's
 /// own registry). Other steps pass through untouched.
 pub struct ForgeCredentialExecutor {
@@ -552,10 +552,11 @@ impl ForgeCredentialExecutor {
         }
     }
 
-    /// Refuse a forge-token or build Step from a yanked library version (ADR-0076
-    /// §6) before its checkout token or registry auth is asked for. This
-    /// decorator runs before `SecretInjectingExecutor`, whose own yank check
-    /// would come after the credential was minted.
+    /// Refuse a forge-token, sandboxed or `registry_auth` Step from a yanked
+    /// library version (ADR-0076 §6) before its checkout token or registry
+    /// auth is asked for. This decorator runs before
+    /// `SecretInjectingExecutor`, whose own yank check would come after the
+    /// credential was minted.
     pub fn with_libraries(mut self, db: Arc<dyn Db>, libraries: Arc<dyn LibraryStore>) -> Self {
         self.libraries = Some((db, libraries));
         self
@@ -579,7 +580,8 @@ impl ForgeCredentialExecutor {
         }
     }
 
-    /// Re-admit a forge-token or build Step of a deploy Run (ADR-0071 §2)
+    /// Re-admit a forge-token, sandboxed or `registry_auth` Step of a deploy
+    /// Run (ADR-0071 §2)
     /// before its checkout token or registry auth is asked for. This decorator
     /// runs before `SecretInjectingExecutor`, whose own re-admission would
     /// come after the credential was minted (git-bug 66c0368).
@@ -599,7 +601,8 @@ impl ForgeCredentialExecutor {
         self
     }
 
-    /// Enable scoped `REGISTRY_AUTH` resolution for build steps (ADR-0018).
+    /// Enable scoped `REGISTRY_AUTH` resolution for `registry_auth` Steps
+    /// (ADR-0018).
     pub fn with_secrets(mut self, secrets: Arc<dyn scarab_secrets::SecretProvider>) -> Self {
         self.secrets = Some(secrets);
         self
@@ -607,7 +610,7 @@ impl ForgeCredentialExecutor {
 
     /// Whether the Run was created from a fork pull request, as its recorded
     /// trigger says. With no Run store wired (inline dev runs) it is `false`,
-    /// and the build's stored `locked_out` flag decides alone. A failed read
+    /// and the Step's stored `locked_out` flag decides alone. A failed read
     /// fails the launch.
     async fn run_is_fork_pr(&self, step: &StepRun) -> Result<bool, ExecError> {
         let Some((db, _)) = &self.governance else {
@@ -619,42 +622,19 @@ impl ForgeCredentialExecutor {
         Ok(trigger.is_some_and(|(event, _)| event["fork"].as_bool() == Some(true)))
     }
 
-    /// The registry auth for a build step (ADR-0018 amendment): see
-    /// [`resolve_registry_auth`](Self::resolve_registry_auth). The
-    /// forge-derived credential only when it is for the image's registry
-    /// host.
-    async fn registry_auth(
-        &self,
-        build: &scarab_engine::BuildConfig,
-    ) -> (Option<String>, Option<scarab_engine::RegistryCredential>) {
-        if build.locked_out {
-            // A fork pull request, or a Run locked out of its Environment's
-            // secrets: no registry credential, whatever the scopes hold.
-            return (None, None);
-        }
-        self.resolve_registry_auth(
-            &build.repo_owner,
-            &build.repo_name,
-            true,
-            Some(&build.image),
-        )
-        .await
-    }
-
     /// A Run's registry credential (ADR-0018 amendments of 2026-07-17 and
     /// 2026-11-12), in precedence order: the scoped `REGISTRY_AUTH` secret
     /// (Repo scope, then Org scope; a dockerconfigjson), else, when
     /// `forge_derived` allows it, the credential the forge derives for its
-    /// own registry (for a build step, only when `image` is on that
-    /// registry's host). A Run with no repository (`owner` empty) gets none.
-    /// Missing auth degrades to an anonymous build: public pulls keep
-    /// working, and a push fails at the registry with its auth error.
+    /// own registry, which names only that registry. A Run with no
+    /// repository (`owner` empty) gets none. Missing auth degrades to an
+    /// anonymous build: public pulls keep working, and a push fails at the
+    /// registry with its auth error.
     async fn resolve_registry_auth(
         &self,
         owner: &str,
         name: &str,
         forge_derived: bool,
-        image: Option<&str>,
     ) -> (Option<String>, Option<scarab_engine::RegistryCredential>) {
         if owner.is_empty() {
             return (None, None); // inline dev run: no scope, no forge context
@@ -684,18 +664,14 @@ impl ForgeCredentialExecutor {
             name: name.to_string(),
         };
         match self.forge.registry_credential(&repo).await {
-            Ok(Some(cred))
-                if image.is_none_or(|i| i.starts_with(&format!("{}/", cred.registry))) =>
-            {
-                (
-                    None,
-                    Some(scarab_engine::RegistryCredential {
-                        registry: cred.registry,
-                        username: cred.username,
-                        token: cred.token,
-                    }),
-                )
-            }
+            Ok(Some(cred)) => (
+                None,
+                Some(scarab_engine::RegistryCredential {
+                    registry: cred.registry,
+                    username: cred.username,
+                    token: cred.token,
+                }),
+            ),
             _ => (None, None),
         }
     }
@@ -776,7 +752,7 @@ impl ForgeCredentialExecutor {
             None => false,
         };
         let (json, derived) = self
-            .resolve_registry_auth(&config.owner, &config.name, forge_derived, None)
+            .resolve_registry_auth(&config.owner, &config.name, forge_derived)
             .await;
         out.registry_auth_json = json;
         out.derived_auth = derived;
@@ -824,15 +800,12 @@ impl Executor for ForgeCredentialExecutor {
     }
 
     async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
-        // Only a forge-token or build Step asks for a credential here; the
-        // yank check for every other Step is SecretInjecting's.
+        // Only a forge-token, sandboxed or `registry_auth` Step asks for a
+        // credential or a trust here; the yank check for every other Step is
+        // SecretInjecting's.
         // Environment re-admission (ADR-0071 §2) likewise comes before the
         // credential here, not only in SecretInjecting.
-        if spec.build.is_some()
-            || spec.forge_token.is_some()
-            || spec.sandbox.is_some()
-            || spec.registry_auth.is_some()
-        {
+        if spec.forge_token.is_some() || spec.sandbox.is_some() || spec.registry_auth.is_some() {
             self.ensure_not_yanked(step).await?;
             if let Some((db, governance)) = &self.governance {
                 // The `step.admit` decision is recorded by SecretInjecting;
@@ -870,29 +843,6 @@ impl Executor for ForgeCredentialExecutor {
             }
             None => spec,
         };
-        // A build step (ADR-0018): resolve its registry auth in memory only —
-        // the stored spec never carries a credential.
-        if let Some(build) = &spec.build {
-            // A spec stored before `locked_out` existed carries neither the
-            // flag nor a fork pull request's `push: false`, so the Run's
-            // recorded trigger is read as well (git-bug a75eacb).
-            let locked = build.locked_out || self.run_is_fork_pr(step).await?;
-            let (auth_json, derived) = if locked {
-                (None, None)
-            } else {
-                self.registry_auth(build).await
-            };
-            let mut enriched = spec.clone();
-            if let Some(b) = enriched.build.as_mut() {
-                b.registry_auth_json = auth_json;
-                b.derived_auth = derived;
-                if locked {
-                    b.locked_out = true;
-                    b.push = false;
-                }
-            }
-            return self.inner.launch(step, &enriched).await;
-        }
         let Some(config) = &spec.forge_token else {
             return self.inner.launch(step, spec).await;
         };

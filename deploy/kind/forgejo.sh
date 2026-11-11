@@ -12,8 +12,8 @@
 #   - `<owner>/scarab-libs` for each org the stack installs libraries or
 #     plugins into (the admin `scarab-admin`, SCARAB_DEV_ORG and
 #     PLUGIN_VERIFY_ORG): Scarab's clone library pinned to the locally built
-#     scarab-clone:dev image, the notify library, and the Argo CD plugin's
-#     manifest. deploy/kind/libs.sh installs from it through a connection, so
+#     scarab-clone:dev image, the build library, the notify library, and the
+#     Argo CD plugin's manifest. deploy/kind/libs.sh installs from it through a connection, so
 #     a local change to any of them is testable without a push and no install
 #     reads github.com. An org reads only its own repositories through its
 #     connection, so each org has its own copy, owned by a Forgejo user of
@@ -358,13 +358,14 @@ seeded_owners=""
 for o in "$owner" "$dev_org" "$verify_org"; do
   case " $seeded_owners " in *" $o "*) continue ;; esac
   seeded_owners="$seeded_owners $o"
-  echo "==> seeding $o/$libs_repo (clone pinned to scarab-clone:dev, notify, the Argo CD manifest)"
+  echo "==> seeding $o/$libs_repo (clone pinned to scarab-clone:dev, build, notify, the Argo CD manifest)"
   if [ "$o" != "$owner" ]; then
     fj admin user create --username "$o" --password "$password" \
       --email "$o@verify.invalid" --must-change-password=false >/dev/null 2>&1 || true
   fi
   REPO_OWNER="$o" ensure_repo "$libs_repo" true
   REPO_OWNER="$o" put_file "$libs_repo" "clone.yaml" "$clone_dev"
+  REPO_OWNER="$o" put_file "$libs_repo" "build.yaml" "$(cat "$repo_root/libs/build.yaml")"
   REPO_OWNER="$o" put_file "$libs_repo" "notify.yaml" "$(cat "$repo_root/.scarab/lib/notify.yaml")"
   REPO_OWNER="$o" put_file "$libs_repo" "argocd/manifest.json" "$argocd_dev"
   commit="$(api "$base/api/v1/repos/$o/$libs_repo/branches/main" \

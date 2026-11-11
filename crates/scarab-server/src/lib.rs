@@ -7300,35 +7300,6 @@ async fn write_run_from_ir(
                     v.join("; ")
                 ))
             })?;
-            // A `kind: build` step (ADR-0018): the engine runs rootless
-            // BuildKit with this context — never the author's image. The
-            // registry credential resolves at LAUNCH (scoped REGISTRY_AUTH
-            // secret, else the forge-derived credential).
-            // A fork pull request's Pipeline is read at the PR head, so its
-            // author controls `push:` and `image:`. Like a Run locked out of
-            // its Environment, it never pushes and gets no registry
-            // credential at launch.
-            let build_locked_out = locked_out || event.is_fork_pr();
-            let build = step.build.as_ref().map(|b| scarab_engine::BuildConfig {
-                context: if b.context.is_empty() {
-                    ".".into()
-                } else {
-                    b.context.clone()
-                },
-                dockerfile: if b.dockerfile.is_empty() {
-                    "Dockerfile".into()
-                } else {
-                    b.dockerfile.clone()
-                },
-                image: b.image.clone(),
-                repo_owner: event.repo().map(|r| r.owner.clone()).unwrap_or_default(),
-                repo_name: event.repo().map(|r| r.name.clone()).unwrap_or_default(),
-                push: b.push && !build_locked_out,
-                insecure_push: false,
-                locked_out: build_locked_out,
-                registry_auth_json: None,
-                derived_auth: None,
-            });
             let spec = StepSpec {
                 image: step.image.clone(),
                 command: step.command.clone(),
@@ -7371,7 +7342,7 @@ async fn write_run_from_ir(
                 }),
                 sandbox,
                 registry_auth,
-                build,
+                build: None,
                 artifacts: step.artifacts.clone(),
                 placement_profiles: step.placement_profiles.clone(),
                 resources: step.resources.clone(),

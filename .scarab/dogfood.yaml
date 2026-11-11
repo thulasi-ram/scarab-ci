@@ -11,8 +11,9 @@
 #   - RESULTS (ADR-0041/0042) — small typed values, written as
 #     /scarab/results/<name>.json, interpolated downstream as
 #     ${{ outputs.<step>.<name> }}. `version` emits a string, a sha and a count;
-#     `deploy` ASSERTS each one resolved. The `build` step also emits an `image`
-#     result natively (BuildKit --metadata-file).
+#     `deploy` ASSERTS each one resolved. The `build` step (the build library)
+#     also emits an `image` result, `outputs.build.image` (BuildKit
+#     --metadata-file).
 #   - ARTIFACTS (ADR-0052) — files of record under /scarab/artifacts/, selected
 #     by `artifacts:` globs and downloadable at /v1/runs/{id}/artifacts. `lint`
 #     publishes its fmt/clippy reports, each `test` leg its own cargo log, and
@@ -270,22 +271,25 @@ steps:
     artifacts:
       - "*.txt"
 
-  # --- build step (ADR-0018): rootless BuildKit image build -----------------
-  # + resources (ADR-0055). The author names no image/command (the blessed
-  # BuildKit image runs); just what to build. `docker/clone` is a REAL
-  # self-contained context — a small alpine image with no cargo build in it, so
-  # this leg stays fast; `dockerfile:` is resolved inside the context dir.
+  # --- build (ADR-0018): rootless BuildKit through lib:thulasi-ram/build ----
+  # + resources (ADR-0055). An org admin installs the build library and trusts
+  # its source for the build sandbox (deploy/kind/libs.sh does both in the
+  # dev and e2e modes; seed.sh lists them for dogfood). The Pipeline names
+  # what to build; the library's Step runs BuildKit. `docker/clone` is a REAL
+  # self-contained context — a small alpine image with no cargo build in it,
+  # so this leg stays fast; `dockerfile` is resolved inside the context dir.
+  # The Step is `build/image`, and other steps need `build`.
   #
-  # NOTE: `placement_profiles: [...]` belongs here too, but an unregistered
-  # profile is a HARD failure ("unknown placement_profile ... not in the
-  # registry"), so it is left off until a profile is seeded for the cluster.
+  # NOTE: `placement_profiles` on this step is not carried onto the
+  # library's sandboxed Step, which runs with the operator's `default` profile.
   - id: build
     needs: [lint, test]
-    build:
+    invoke: lib:thulasi-ram/build
+    with:
       context: docker/clone
       dockerfile: Dockerfile
       image: ghcr.io/thulasi-ram/scarab-clone
-      push: false
+      push: "false"
     # Sized to fit a single-node colima, not a real build farm.
     resources:
       cpu_millis: 1000

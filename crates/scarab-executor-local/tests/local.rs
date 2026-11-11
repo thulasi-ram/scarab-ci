@@ -264,23 +264,32 @@ async fn a_forge_token_step_is_rejected() {
     );
 }
 
-/// ADR-0018: a build step's contract is rootless BuildKit in a Pod.
+/// ADR-0018 (amendment of 2026-11-12): the build sandbox is a Pod shape and
+/// the registry credential a file mounted into one container, so a Step
+/// with either does not launch on the local backend.
 #[tokio::test]
-async fn a_build_step_is_rejected() {
+async fn a_sandboxed_or_registry_auth_step_is_rejected() {
     let exec = LocalExecutor::new();
     let s = step("r1", "image");
-    let mut sp = spec(&["sh", "-c", "exit 0"]);
-    sp.build = Some(Default::default());
-
-    let err = exec
-        .launch(&s, &sp)
-        .await
-        .expect_err("a build step must not launch on the local backend");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("k8s executor") && msg.contains("ADR-0018"),
-        "the rejection has to point at the backend that CAN do it: {msg}"
-    );
+    let mut sandboxed = spec(&["sh", "-c", "exit 0"]);
+    sandboxed.sandbox = Some(scarab_engine::SandboxConfig {
+        sandbox: scarab_pipeline::Sandbox::RootlessBuildkit,
+        org: "acme".into(),
+        library: "ab".repeat(32),
+    });
+    let mut registry = spec(&["sh", "-c", "exit 0"]);
+    registry.registry_auth = Some(Default::default());
+    for (sp, what) in [(sandboxed, "security.sandbox"), (registry, "registry_auth")] {
+        let err = exec
+            .launch(&s, &sp)
+            .await
+            .expect_err("the step must not launch on the local backend");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("k8s executor") && msg.contains(what),
+            "the rejection has to point at the backend that CAN do it: {msg}"
+        );
+    }
 }
 
 /// ADR-0058: a sidecar service is a container co-located in the step's Pod. A

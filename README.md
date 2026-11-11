@@ -89,8 +89,8 @@ but none of them has carried production load.
   from a GitHub App. Each adapter also has a live contract test (`tests/contract_live.rs`)
   that you run by hand.
 - **Implemented, and tested on a kind cluster.** Pod-per-step execution on Kubernetes
-  (`scarab-executor-k8s`): re-attach after an executor relaunch, step deadlines, cancel, clone
-  and build steps, the workspace feed and drain, artifact harvest, and the results-egress
+  (`scarab-executor-k8s`): re-attach after an executor relaunch, step deadlines, cancel, the
+  clone and build libraries' steps, the workspace feed and drain, artifact harvest, and the results-egress
   sidecar image (`docker/sidecar/`). `just test e2e` runs these live-cluster tests on the
   `scarab-dev` kind cluster (created if missing), and `.github/workflows/e2e.yml` runs the
   same recipe on PRs labelled `ci:full` and weekly, not on every PR.

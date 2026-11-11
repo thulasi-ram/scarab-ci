@@ -439,3 +439,31 @@ async fn a_fork_pull_request_gets_no_registry_credential_at_launch() {
     let auth = inner.launched_spec(&handle).unwrap().registry_auth.unwrap();
     assert_eq!((auth.registry_auth_json, auth.derived_auth), (None, None));
 }
+
+/// With both a `REGISTRY_AUTH` secret and a library trusted with forge
+/// credentials, the secret wins and the forge-derived credential is not
+/// asked for. A Run with no repository (an inline dev Run) gets neither.
+#[tokio::test]
+async fn the_registry_auth_secret_takes_precedence_and_a_run_with_no_repository_gets_none() {
+    let libs =
+        Arc::new(build_library(&[TrustGrant::BuildSandbox, TrustGrant::ForgeCredentials]).await);
+    let inner = Arc::new(FakeExecutor::new());
+    let exec = executor(inner.clone(), libs.clone(), repo_secret(), false).await;
+    let handle = exec.launch(&step_run(), &library_spec(true)).await.unwrap();
+    let auth = inner.launched_spec(&handle).unwrap().registry_auth.unwrap();
+    assert_eq!(
+        auth.registry_auth_json.as_deref().map(str::as_bytes),
+        Some(REGISTRY_AUTH)
+    );
+    assert_eq!(auth.derived_auth, None);
+
+    let inner = Arc::new(FakeExecutor::new());
+    let exec = executor(inner.clone(), libs, repo_secret(), false).await;
+    let mut spec = library_spec(true);
+    let config = spec.registry_auth.as_mut().unwrap();
+    config.owner = String::new();
+    config.name = String::new();
+    let handle = exec.launch(&step_run(), &spec).await.unwrap();
+    let auth = inner.launched_spec(&handle).unwrap().registry_auth.unwrap();
+    assert_eq!((auth.registry_auth_json, auth.derived_auth), (None, None));
+}

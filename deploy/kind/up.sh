@@ -717,7 +717,8 @@ fi
 
 # Scarab's clone library, installed from the in-cluster Forgejo as an org admin
 # installs any library, pinned to the scarab-clone:dev image built above, with
-# its source trusted (deploy/kind/libs.sh). Dev: the dev org. e2e: the Forgejo
+# its source trusted, and its build library, trusted for the build sandbox
+# (deploy/kind/libs.sh). Dev: the dev org. e2e: the Forgejo
 # admin's org, where the forge_token cases run. Dogfood installs from
 # github.com by hand (seed.sh); chaos runs no library.
 case "$mode" in
@@ -728,11 +729,10 @@ esac
 if [ "$mode" = dogfood ]; then
   # The Owner and member role bindings (`scarab-server admin grant
   # --if-absent` in the server Pod). On a fresh database also the one-time
-  # steps that need a passkey: the `production` Environment and the clone
-  # library, installed from its source like any library. On an existing one,
-  # the step that installs it when the installed version is not
-  # libs/clone.yaml. Without
-  # login up.sh did those with plain curl.
+  # steps that need a passkey: the `production` Environment and the clone and
+  # build libraries, installed from their sources like any library. On an
+  # existing one, the step that installs a library when the installed version
+  # is not the file in libs/. Without login up.sh did those with plain curl.
   if [ "$fresh_database" = 1 ]; then
     bash "$here/seed.sh" --checklist
   else

@@ -140,6 +140,48 @@ The library pins the scarab-clone image by digest. To run checkouts from a mirro
 a copy of `libs/clone.yaml` that pins the mirror's image, under the same name, and trust the
 mirror's source instead.
 
+## Install Scarab's build library
+
+`lib:thulasi-ram/build` builds an image with rootless BuildKit
+([Building an image](/scarab-ci/usage/pipeline-syntax/#building-an-image)). It is the file
+`libs/build.yaml` in Scarab's repository. Install it the same way as the clone library, then give
+its source the trust its step needs:
+
+1. Settings › Libraries › **Install library**, with the source
+   `github.com/thulasi-ram/scarab-ci//libs/build.yaml@<commit>`, the commit of a Scarab release tag.
+2. Review the file and install it as `lib:thulasi-ram/build`. Confirm with your passkey.
+3. Trust its source for the build sandbox
+   ([below](#trusting-a-library-for-the-build-sandbox)). Without that, a Run that invokes it is
+   refused with the reason.
+4. To push to the forge's own registry (GHCR, the Forgejo package registry) without a
+   `REGISTRY_AUTH` secret, also trust its source with forge credentials
+   ([below](#trusting-a-library-with-forge-credentials)). Not needed when a `REGISTRY_AUTH` secret
+   at Repo or Org scope holds the registry's credential, or when the build does not push.
+
+The library pins the rootless BuildKit image by digest. A newer BuildKit is a new version of the
+file: upgrade the installation, and trust carries over because the source is the same. To run a
+different builder, or BuildKit with other flags, install your own library and trust its source
+instead. It gets the sandbox on the same terms as Scarab's.
+
+**Upgrading from the `build` step kind.** The release that ships this library removes the
+`build:` step kind, with no release in between that accepts both. A Pipeline with a `build:` step
+fails to compile, with a message naming `invoke: lib:thulasi-ram/build`, until you rewrite the
+step:
+
+```yaml
+# before
+- id: image
+  build: { context: ., dockerfile: Dockerfile, image: ghcr.io/acme/app:1.2.0, push: true }
+
+# after
+- id: image
+  invoke: lib:thulasi-ram/build
+  with: { context: ., dockerfile: Dockerfile, image: ghcr.io/acme/app:1.2.0, push: true }
+```
+
+`${{ outputs.image.image }}` reads the same result as before. A step of a Run created before the
+upgrade that has not launched yet fails when it would launch, with a message naming the library.
+
 ## Trusting a library with forge credentials
 
 A step with `forge_token` receives a forge credential ([Pipeline syntax](/scarab-ci/usage/pipeline-syntax/#forge-credentials-forge_token)).
@@ -150,8 +192,10 @@ Settings › Libraries (**Trust source**), or with the API:
 
 ```sh
 curl -X POST "$SCARAB/v1/orgs/acme/library-trust" \
-  -d '{"source": "github.com/thulasi-ram/scarab-ci//libs/clone.yaml"}'
+  -d '{"source": "github.com/thulasi-ram/scarab-ci//libs/clone.yaml", "grant": "forge_credentials"}'
 ```
+
+`grant` is `forge_credentials` when you leave it out.
 
 Trust is for the source without a commit, so it holds when you upgrade the library from the same
 source, and each upgrade still shows you its diff. Trusting needs a step-up; removing trust
@@ -160,6 +204,26 @@ its source is trusted, and a trusted source no installed library comes from is l
 
 On a GitHub App connection Scarab mints a token for one repository each time a step launches, so
 any step may ask for one and no trust is needed.
+
+## Trusting a library for the build sandbox
+
+A step with `security: { sandbox: rootless-buildkit }` runs as uid 1000, not privileged, with
+seccomp and AppArmor unconfined, which rootless BuildKit needs. Only a step from a library installed
+from a source your org trusts for the build sandbox gets it. A step written in a Pipeline file, or
+reached through `invoke: file:`, never does, and a library that a trusted library invokes needs its
+own trust. No source is trusted by default, Scarab's build library included. An org admin trusts
+a source on the library's page under Settings › Libraries (**Build sandbox › Trust source**), or
+with the API:
+
+```sh
+curl -X POST "$SCARAB/v1/orgs/acme/library-trust" \
+  -d '{"source": "github.com/thulasi-ram/scarab-ci//libs/build.yaml", "grant": "build_sandbox"}'
+```
+
+The two grants are separate: trusting a source with forge credentials does not trust it for the
+build sandbox, and the reverse. Trust is checked when a Run is created and again each time the
+step launches, so removing it (`DELETE …/library-trust?source=<source>&grant=build_sandbox`) stops
+retries and reruns too. Trusting needs a step-up; removing trust does not.
 
 **After an upgrade.** Scarab 0.3.0 trusted its clone library without a trusted-source entry.
 Migration 0090 adds that entry for every org that had the clone library from 0.3.0's release

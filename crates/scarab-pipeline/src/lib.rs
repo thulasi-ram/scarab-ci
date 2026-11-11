@@ -437,6 +437,12 @@ pub const RETIRED_CLONE: &str = "the `clone` Step kind was removed (ADR-0076 §9
     the repository with `invoke: lib:thulasi-ram/clone`, and set `depth`, `submodules` and \
     `lfs` under `with:`";
 
+/// The Pipeline check's answer to a `build:` Step, removed by the ADR-0018
+/// amendment of 2026-11-12: it names the library that replaces it.
+pub const RETIRED_BUILD: &str = "the `build` Step kind was removed (ADR-0018, amendment of \
+    2026-11-12); build an image with `invoke: lib:thulasi-ram/build`, and set `image`, \
+    `context`, `dockerfile` and `push` under `with:`";
+
 /// The Pipeline check's answer to `deployment_requests` and `gate: deployment`,
 /// both removed by ADR-0074: it names what replaces them.
 pub const RETIRED_DEPLOYMENTS: &str = "deployments are no longer recorded by Scarab \
@@ -666,13 +672,12 @@ pub struct StepSpec {
     /// only a Step whose library the org trusts with forge credentials.
     #[serde(default, skip_serializing_if = "is_false")]
     pub registry_auth: bool,
-    /// If set, this is a **build** step (ADR-0018): a first-class rootless
-    /// BuildKit image build. The engine runs the blessed BuildKit image
-    /// (never the author's); the context/dockerfile are workspace-relative,
-    /// so a build step normally `needs` the checkout. Image-less like
-    /// `gate`.
+    /// Removed by the ADR-0018 amendment of 2026-11-12: the `build` Step
+    /// kind, replaced by `invoke: lib:thulasi-ram/build`. Kept as raw data
+    /// only so the Pipeline check can refuse it with [`RETIRED_BUILD`]
+    /// instead of an unknown-field error. Nothing reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build: Option<BuildSpec>,
+    pub build: Option<serde_json::Value>,
     /// If set, this is an **invoke** step (ADR-0038, ADR-0076 §1): the library
     /// it inlines *at compile time*, named with a prefix: `file:<path>` (a
     /// repo-relative library file, read at the caller's ref; no absolute
@@ -1130,11 +1135,6 @@ impl StepSpec {
         self.gate.as_deref() == Some("manual") && self.environment_approval_gate != Some(false)
     }
 
-    /// Is this a build step (ADR-0018 rootless image build)?
-    pub fn is_build(&self) -> bool {
-        self.build.is_some()
-    }
-
     /// Is this an image-less invoke step (a compile-time library inline point)?
     /// True only in authored YAML — [`compile_yaml_with_libs`] resolves every
     /// invoke step away, so a compiled IR never contains one.
@@ -1232,7 +1232,7 @@ fn is_false(b: &bool) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct ServiceSpec {
     /// The OCI image (e.g. `postgres:16`). Serde-defaulted so an absent image
-    /// surfaces as a validation diagnostic, not a parse error (cf. `BuildSpec`).
+    /// surfaces as a validation diagnostic, not a parse error.
     #[serde(default)]
     pub image: String,
     /// Optional command (entrypoint) override — the image default when empty.
@@ -1552,88 +1552,6 @@ pub struct CacheSpec {
     /// Workspace-relative files whose blob hashes form the cache key.
     #[serde(default)]
     pub key: Vec<String>,
-}
-
-/// Configuration of a `build` step (ADR-0018): what to build and where to
-/// push. Registry credentials are NEVER authored here — they are a scoped
-/// `REGISTRY_AUTH` secret (ADR-0037) or derived from the forge connection.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BuildSpec {
-    /// Workspace-relative build context directory (default `.`).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub context: String,
-    /// Dockerfile name within the context (default `Dockerfile`).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub dockerfile: String,
-    /// The image reference to build (and push), e.g. `ghcr.io/acme/app:v1`.
-    /// Serde-defaulted so an absent tag surfaces as a validation diagnostic,
-    /// not a parse error.
-    #[serde(default)]
-    pub image: String,
-    /// Push the built image (default false — build-only validation).
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub push: bool,
-}
-
-/// What is wrong with a `build` step's context, dockerfile and image, one
-/// message per problem; empty when they may be built (git-bug df660b6).
-///
-/// The context and dockerfile become `buildctl` local sources in a container
-/// that also holds the registry credential, so they must stay inside the
-/// workspace: relative, with no `..` component and no control character. An
-/// empty context or dockerfile is the default (`.`, `Dockerfile`). The image
-/// is one field of `buildctl --output`, which is comma-separated, so it must
-/// be an OCI image reference and carry no `,`. Checked when the Pipeline
-/// compiles and again when the step launches, for specs stored before this
-/// check existed.
-pub fn build_target_problems(context: &str, dockerfile: &str, image: &str) -> Vec<String> {
-    let mut problems = Vec::new();
-    for (field, path) in [("build.context", context), ("build.dockerfile", dockerfile)] {
-        if path.is_empty() {
-            continue;
-        }
-        if path.starts_with('/') {
-            problems.push(format!(
-                "`{field}` must be a path relative to the workspace, not `{}`",
-                path.escape_debug()
-            ));
-        }
-        if path.split('/').any(|part| part == "..") {
-            problems.push(format!(
-                "`{field}` must not contain a `..` path component: `{}`",
-                path.escape_debug()
-            ));
-        }
-        // `buildctl` reads `--local` and `--opt` values as `key=value`; a
-        // comma could start a second field if its parser ever splits on it.
-        if path.contains(',') {
-            problems.push(format!(
-                "`{field}` must not contain a `,`: `{}`",
-                path.escape_debug()
-            ));
-        }
-        if path.chars().any(char::is_control) {
-            problems.push(format!(
-                "`{field}` must not contain a control character: `{}`",
-                path.escape_debug()
-            ));
-        }
-    }
-    if image.is_empty() {
-        problems.push("a build step must name the `image:` to build".to_string());
-    } else if image.contains("${{") {
-        problems.push(format!(
-            "`build.image` `{}`: templates are not supported in `build.image` yet",
-            image.escape_debug()
-        ));
-    } else if image.contains(',') || !crate::oci::is_image_reference(image) {
-        problems.push(format!(
-            "`build.image` `{}` is not an image reference",
-            image.escape_debug()
-        ));
-    }
-    problems
 }
 
 /// A step's opt-in retry policy (ADR-0020 syntax, ADR-0047 semantics).
@@ -4683,7 +4601,7 @@ pub fn lint(ir: &PipelineIr) -> Vec<String> {
         let images = std::iter::once(step.image.as_str())
             .chain(step.services.iter().map(|svc| svc.image.as_str()));
         for image in images {
-            // Empty (a gate, clone or build) or computed at launch: nothing
+            // Empty (a gate) or computed at launch: nothing
             // to check here.
             if image.is_empty() || image.contains("${{") || image.contains("@sha256:") {
                 continue;
@@ -5559,32 +5477,27 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         if step.clone.is_some() {
             diagnostics.push(format!("step `{}`: {RETIRED_CLONE}", step.id));
         }
-        // Step kinds are mutually exclusive: a step is a gate, a build, or an
-        // ordinary executed step — never two at once.
-        if step.gate.is_some() && step.build.is_some() {
-            diagnostics.push(format!(
-                "step `{}`: `gate` and `build` are mutually exclusive step kinds",
-                step.id
-            ));
+        // So is the `build` kind (ADR-0018, amendment of 2026-11-12).
+        if step.build.is_some() {
+            diagnostics.push(format!("step `{}`: {RETIRED_BUILD}", step.id));
         }
         // A forge credential is for a Step that runs a Pod with an image the
-        // Pipeline names: a gate runs nothing, and a build runs BuildKit,
-        // which reads its registry credential, not the forge's (ADR-0076 §9).
-        if step.forge_token.is_some() && (step.is_gate() || step.is_build()) {
+        // Pipeline names: a gate runs nothing (ADR-0076 §9).
+        if step.forge_token.is_some() && step.is_gate() {
             diagnostics.push(format!(
                 "step `{}`: `forge_token` is only valid on a step that runs an image (not a \
-                 gate or build step)",
+                 gate)",
                 step.id
             ));
         }
         // The sandbox and the registry credential (ADR-0018, amendment of
         // 2026-11-12) are for a Step that runs an image: a gate runs
-        // nothing, and a build step has its own BuildKit Pod.
+        // nothing.
         if let Some(sandbox) = step.sandbox() {
-            if step.is_gate() || step.is_build() {
+            if step.is_gate() {
                 diagnostics.push(format!(
                     "step `{}`: `security.sandbox` is only valid on a step that runs an image \
-                     (not a gate or build step)",
+                     (not a gate)",
                     step.id
                 ));
             }
@@ -5622,10 +5535,10 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 ));
             }
         }
-        if step.registry_auth && (step.is_gate() || step.is_build()) {
+        if step.registry_auth && step.is_gate() {
             diagnostics.push(format!(
                 "step `{}`: `registry_auth` is only valid on a step that runs an image (not a \
-                 gate or build step)",
+                 gate)",
                 step.id
             ));
         }
@@ -5720,11 +5633,11 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         }
         // Sidecar services (ADR-0058): a service co-locates in the *executed*
         // Step's Pod, so it is only meaningful on an ordinary step — never on a
-        // gate (no Pod) or a build (rootless BuildKit).
-        if !step.services.is_empty() && (step.is_gate() || step.is_build()) {
+        // gate (no Pod).
+        if !step.services.is_empty() && step.is_gate() {
             diagnostics.push(format!(
                 "step `{}`: `services` is only valid on an ordinary executed step \
-                 (not a gate or build step)",
+                 (not a gate)",
                 step.id
             ));
         }
@@ -5754,47 +5667,6 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 diagnostics.push(format!(
                     "step `{}`: `uses` names unknown shared service `{name}` \
                      (declare it under pipeline-level `services:`)",
-                    step.id
-                ));
-            }
-        }
-        // A build step runs the blessed rootless BuildKit image (ADR-0018):
-        // the author names no image/command and needs no privilege (rootless
-        // by construction).
-        if let Some(build) = &step.build {
-            for problem in build_target_problems(&build.context, &build.dockerfile, &build.image) {
-                diagnostics.push(format!("step `{}`: {problem}", step.id));
-            }
-            if !step.image.is_empty() || !step.command.is_empty() {
-                diagnostics.push(format!(
-                    "step `{}`: a build step runs the blessed BuildKit image — it must not \
-                     set an image or command",
-                    step.id
-                ));
-            }
-            if step.security.as_ref().is_some_and(|s| !s.is_baseline()) {
-                diagnostics.push(format!(
-                    "step `{}`: a build step is rootless by construction — it must not request \
-                     privilege escalation",
-                    step.id
-                ));
-            }
-            // The build container holds the registry credential and runs the
-            // repository's Dockerfile: env such as `PATH` or `LD_PRELOAD`
-            // would choose what code runs there, and a secret would sit beside
-            // the credential (git-bug df660b6).
-            if !step.env.is_empty() {
-                diagnostics.push(format!(
-                    "step `{}`: a build step must not set `env:`; build options come from \
-                     `build:` (build args are not supported yet)",
-                    step.id
-                ));
-            }
-            if !step.secrets.is_empty() {
-                diagnostics.push(format!(
-                    "step `{}`: a build step must not set `secrets:`; they would sit in the \
-                     container that holds the registry credential and runs the repository's \
-                     Dockerfile",
                     step.id
                 ));
             }
@@ -5915,7 +5787,7 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                         step.id
                     ));
                 }
-                if step.image.is_empty() && !step.is_build() && step.clone.is_none() {
+                if step.image.is_empty() && step.clone.is_none() && step.build.is_none() {
                     diagnostics.push(format!("step `{}`: missing image", step.id));
                 }
                 if step.gate_after.is_some() {
@@ -9735,7 +9607,7 @@ mod tests {
         "#;
 
     /// The sandbox is a fixed Pod shape: an ADR-0039 grant beside it, or a
-    /// gate or build step asking for it, does not compile.
+    /// gate asking for it or for `registry_auth`, does not compile.
     #[test]
     fn the_sandbox_cannot_be_combined_with_a_grant_or_a_step_kind() {
         for security in [
@@ -9762,7 +9634,7 @@ mod tests {
                 .any(|e| e.contains("`security.sandbox` is only valid on a step that runs")),
             "{errs:?}"
         );
-        let errs = errors(r#"steps: [{ id: b, build: { image: "a/b:1" }, registry_auth: true }]"#);
+        let errs = errors("steps: [{ id: g, gate: manual, registry_auth: true }]");
         assert!(
             errs.iter()
                 .any(|e| e.contains("`registry_auth` is only valid on a step that runs")),
@@ -9908,23 +9780,41 @@ mod tests {
                 "{input}={value:?} passed: {errs:?}"
             );
         };
+        // Ported from the `build` kind's checks (git-bug df660b6): `.`- and
+        // `..`-spelled escapes, absolute paths and a `,` that could start a
+        // second buildctl source.
         for path in [
             "/scarab/registry",
+            "//scarab/registry",
+            "../scarab/registry",
             "..",
+            "./..",
             "ctx/..",
+            "x//..//",
             "./x/../..",
             "ctx,dockerfile=/scarab/registry",
+            "Dockerfile,context=/scarab/registry",
             "a\tb",
             "",
         ] {
             refused("context", path);
             refused("dockerfile", path);
         }
+        // An `image` that adds buildctl output options, a second flag or a
+        // shell word.
         for image in [
             "registry.example/app:1,push=true",
+            "registry.example/app:1,registry.insecure=true",
             "registry.example/app:1 --output type=local",
+            "registry.example/app:1\n--opt",
             "--help",
+            "-o",
             "a/b:tag=1",
+            "a/b;id",
+            "$(id)",
+            "type=local",
+            "a/b:1\u{ff0c}push=true",
+            "ghcr.io/acme/app@sha256:abc,push=true",
             "Registry.example/App:1",
         ] {
             refused("image", image);
@@ -9965,12 +9855,29 @@ mod tests {
             &with_build_library(),
         );
         assert!(ok.is_ok(), "{ok:?}");
+        // A `.` in a path is not a `..` component.
+        for path in [".", "./", "./x", "x/./y", "x..y", "..x", "x.."] {
+            let yaml = format!(
+                "steps:\n  - id: image\n    invoke: lib:thulasi-ram/build\n    with:\n      \
+                 image: registry.example/app:1\n      context: {}\n",
+                serde_json::to_string(path).unwrap()
+            );
+            let ok = compile_with_libraries(&yaml, &with_build_library());
+            assert!(ok.is_ok(), "{path:?}: {ok:?}");
+        }
     }
 
     // --- the clone library replaces the clone kind (ADR-0076 §9) ------------
 
     /// `libs/clone.yaml`, as the release ships it.
     const CLONE_LIBRARY: &str = include_str!("../../../libs/clone.yaml");
+
+    /// The clone and build libraries, installed as an org installs them.
+    fn with_clone_and_build() -> Libraries {
+        let mut libraries = with_clone();
+        libraries.installed.extend(with_build_library().installed);
+        libraries
+    }
 
     fn with_clone() -> Libraries {
         Libraries {
@@ -10037,12 +9944,6 @@ mod tests {
     #[test]
     fn forge_token_is_for_a_step_that_runs_an_image() {
         let errs = errors("steps: [{ id: g, gate: manual, forge_token: read }]");
-        assert!(
-            errs.iter()
-                .any(|e| e.contains("`forge_token` is only valid")),
-            "{errs:?}"
-        );
-        let errs = errors(r#"steps: [{ id: b, build: { image: "a/b:1" }, forge_token: read }]"#);
         assert!(
             errs.iter()
                 .any(|e| e.contains("`forge_token` is only valid")),
@@ -10472,243 +10373,27 @@ mod tests {
         assert!(e.starts_with("`command[1]`"), "{e}");
     }
 
-    // --- build step kind (ADR-0018) -----------------------------------------
+    // --- the build kind is gone (ADR-0018, amendment of 2026-11-12) -------
 
+    /// A `build:` Step fails the Pipeline check naming the library that
+    /// replaces it, whatever its fields.
     #[test]
-    fn build_compiles_to_a_distinct_kind_with_defaults() {
-        let ir = compile(
-            r#"
-            steps:
-              - { id: checkout, image: alpine/git }
-              - id: image
-                needs: [checkout]
-                build:
-                  image: ghcr.io/acme/app:v1
-                  push: true
-            "#,
-        );
-        let image = &ir.steps[1];
-        assert!(image.is_build());
-        assert!(!image.is_gate());
-        let b = image.build.as_ref().unwrap();
-        assert_eq!(b.image, "ghcr.io/acme/app:v1");
-        assert!(b.push);
-        assert!(
-            b.context.is_empty() && b.dockerfile.is_empty(),
-            "defaults resolve at persist"
-        );
-    }
-
-    #[test]
-    fn build_step_rejects_image_command_privilege_and_missing_tag() {
-        // An authored image/command contradicts the blessed BuildKit image.
-        let err = errors(
-            r#"
-            steps:
-              - id: image
-                image: busybox
-                build: { image: "ghcr.io/a/b:1" }
-            "#,
-        );
-        assert!(
-            err.iter()
-                .any(|d| d.contains("must not") && d.contains("image")),
-            "{err:?}"
-        );
-
-        // The image to build is mandatory.
-        let err = errors(
-            r#"
-            steps:
-              - id: image
-                build: {}
-            "#,
-        );
-        assert!(
-            err.iter().any(|d| d.contains("must name the `image:`")),
-            "{err:?}"
-        );
-
-        // Build steps are rootless by construction — no escalation.
-        let err = errors(
-            r#"
-            steps:
-              - id: image
-                build: { image: "ghcr.io/a/b:1" }
-                security: { run_as_root: true }
-            "#,
-        );
-        assert!(err.iter().any(|d| d.contains("rootless")), "{err:?}");
-
-        // Kinds are mutually exclusive.
-        let err = errors(
-            r#"
-            steps:
-              - id: image
-                gate: manual
-                build: { image: "ghcr.io/a/b:1" }
-            "#,
-        );
-        assert!(
-            err.iter().any(|d| d.contains("mutually exclusive")),
-            "{err:?}"
-        );
-    }
-
-    /// git-bug df660b6: the context and dockerfile stay inside the workspace
-    /// (the registry credential is mounted beside it), and the image is one
-    /// image reference (it is a field of the comma-separated `--output`).
-    #[test]
-    fn build_context_dockerfile_and_image_are_checked() {
-        let ir = compile(
-            r#"
-            steps:
-              - id: image
-                build:
-                  context: docker/clone
-                  dockerfile: build/Dockerfile
-                  image: ghcr.io/acme/app:v1
-            "#,
-        );
-        assert!(ir.steps[0].is_build());
-
-        for (build, expect) in [
-            (
-                r#"{ context: /scarab/registry, image: "a/b:1" }"#,
-                "`build.context` must be a path relative to the workspace",
-            ),
-            (
-                r#"{ context: "ctx/../..", image: "a/b:1" }"#,
-                "`build.context` must not contain a `..` path component",
-            ),
-            (
-                r#"{ context: "a\tb", image: "a/b:1" }"#,
-                "`build.context` must not contain a control character",
-            ),
-            (
-                r#"{ dockerfile: /scarab/registry/config.json, image: "a/b:1" }"#,
-                "`build.dockerfile` must be a path relative to the workspace",
-            ),
-            (
-                r#"{ dockerfile: "../Dockerfile", image: "a/b:1" }"#,
-                "`build.dockerfile` must not contain a `..` path component",
-            ),
-            (
-                r#"{ image: "a/b:1,push=true,registry.insecure=true" }"#,
-                "is not an image reference",
-            ),
-            (r#"{ image: "a b" }"#, "is not an image reference"),
-            // A committed directory named `ctx,dockerfile=` must not become a
-            // second `--local` source if buildctl ever splits on `,`.
-            (
-                r#"{ context: "ctx,dockerfile=/scarab/registry", dockerfile: config.json, image: "a/b:1" }"#,
-                "`build.context` must not contain a `,`",
-            ),
-            (
-                r#"{ dockerfile: "Dockerfile,context=/scarab/registry", image: "a/b:1" }"#,
-                "`build.dockerfile` must not contain a `,`",
-            ),
-            (
-                r#"{ image: "ghcr.io/acme/app:${{ event.sha }}" }"#,
-                "templates are not supported in `build.image` yet",
-            ),
+    fn a_build_step_is_refused_naming_the_library() {
+        for yaml in [
+            "steps: [{ id: image, build: {} }]",
+            r#"steps: [{ id: image, build: { image: "ghcr.io/a/b:1", push: true } }]"#,
         ] {
-            let err = errors(&format!("steps: [{{ id: image, build: {build} }}]"));
+            let errs = errors(yaml);
             assert!(
-                err.iter()
-                    .any(|d| d.starts_with("step `image`: ") && d.contains(expect)),
-                "{build}: {err:?}"
+                errs.iter().any(|e| e.starts_with("step `image`: ")
+                    && e.contains("invoke: lib:thulasi-ram/build")),
+                "{errs:?}"
             );
-        }
-    }
-
-    // Attack: an `image:` that adds buildctl output options, a second flag or a shell word. Safe outcome: every one is refused as not an image reference.
-    #[test]
-    fn build_image_cannot_carry_buildctl_options() {
-        for image in [
-            "a/b:1,push=true",
-            "a/b:1,registry.insecure=true",
-            "a/b:1 --output type=local,dest=/scarab/registry",
-            "a/b:1\n--opt",
-            "--help",
-            "-o",
-            "a/b:tag=1",
-            "a/b;id",
-            "$(id)",
-            "a/b:1\u{0}",
-            "type=local",
-            "a/b:1\u{ff0c}push=true",
-            "ghcr.io/acme/app@sha256:abc,push=true",
-        ] {
-            let problems = build_target_problems(".", "Dockerfile", image);
             assert!(
-                problems.iter().any(|p| p.contains("`build.image`")),
-                "{image:?} passed: {problems:?}"
+                errs.iter().all(|e| !e.contains("missing image")),
+                "{errs:?}"
             );
         }
-    }
-
-    // Attack: `.`-spelled and `..`-spelled escapes of the workspace (`./x/..`, `x/../..`, `./..`, a bare `..`, a trailing `/..`). Safe outcome: any `..` component is refused; `.` and `./x` are not.
-    #[test]
-    fn build_paths_spelled_with_dots_stay_in_the_workspace() {
-        for path in [
-            "..",
-            "./..",
-            "./x/..",
-            "x/../..",
-            "x/..",
-            "x//..//",
-            "../scarab/registry",
-            "//scarab/registry",
-        ] {
-            for (context, dockerfile) in [(path, "Dockerfile"), (".", path)] {
-                assert!(
-                    !build_target_problems(context, dockerfile, "a/b:1").is_empty(),
-                    "context {context:?} dockerfile {dockerfile:?} passed"
-                );
-            }
-        }
-        for path in [".", "./", "./x", "x/./y", "x..y", "..x", "x.."] {
-            assert_eq!(
-                build_target_problems(path, "Dockerfile", "a/b:1"),
-                Vec::<String>::new(),
-                "{path:?}"
-            );
-        }
-    }
-
-    /// git-bug df660b6: a build step's container holds the registry
-    /// credential, so it takes no authored env and no secrets.
-    #[test]
-    fn build_step_refuses_env_and_secrets() {
-        let err = errors(
-            r#"
-            steps:
-              - id: image
-                build: { image: "ghcr.io/a/b:1" }
-                env: [[LD_PRELOAD, /workspace/evil.so]]
-            "#,
-        );
-        assert!(
-            err.iter().any(|d| d.starts_with("step `image`: ")
-                && d.contains("must not set `env:`")
-                && d.contains("build options come from `build:`")),
-            "{err:?}"
-        );
-
-        let err = errors(
-            r#"
-            steps:
-              - id: image
-                build: { image: "ghcr.io/a/b:1" }
-                secrets: [NPM_TOKEN]
-            "#,
-        );
-        assert!(
-            err.iter()
-                .any(|d| d.starts_with("step `image`: ") && d.contains("must not set `secrets:`")),
-            "{err:?}"
-        );
     }
 
     #[test]
@@ -11059,7 +10744,7 @@ mod tests {
             dogfood,
             &Libraries {
                 files: libs(&[(".scarab/lib/notify.yaml", notify)]),
-                ..with_clone()
+                ..with_clone_and_build()
             },
         )
         .expect("the dogfood sample must compile");
@@ -11081,7 +10766,7 @@ mod tests {
         let notify = include_str!("../../../.scarab/lib/notify.yaml");
         let libraries = Libraries {
             files: libs(&[(".scarab/lib/notify.yaml", notify)]),
-            ..with_clone()
+            ..with_clone_and_build()
         };
         let ir = compile_with_libraries(dogfood, &libraries)
             .expect("the dogfood kitchen-sink sample must compile to IR");
@@ -11123,30 +10808,42 @@ mod tests {
 
         // The sample is not just a compile fixture — it is the LOCAL DOGFOOD
         // TARGET, dispatched against this repo, so the paths it names must
-        // actually exist here. Compilation cannot catch that: a `build:` naming
+        // actually exist here. Compilation cannot catch that: a build naming
         // an absent Dockerfile only fails in-cluster, after the expensive
         // lint/test legs it depends on have already run.
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        for step in ir.steps.iter() {
-            let Some(build) = step.build.as_ref() else {
-                continue;
+        let mut builds = 0;
+        for step in ir
+            .steps
+            .iter()
+            .filter(|s| s.origin.iter().any(|l| l.name == "thulasi-ram/build"))
+        {
+            builds += 1;
+            let launched = launch(step, json!({}), json!({})).unwrap();
+            let env = |name: &str| {
+                launched
+                    .env
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| panic!("step `{}` sets no {name}", step.id))
             };
-            let context = repo.join(&build.context);
+            let (context_path, dockerfile) =
+                (env("SCARAB_BUILD_CONTEXT"), env("SCARAB_BUILD_DOCKERFILE"));
+            let context = repo.join(&context_path);
             assert!(
                 context.is_dir(),
-                "step `{}` builds context `{}`, which is not a directory in this repo",
+                "step `{}` builds context `{context_path}`, which is not a directory in this repo",
                 step.id,
-                build.context
             );
             // BuildKit resolves `filename` INSIDE the context dir.
             assert!(
-                context.join(&build.dockerfile).is_file(),
-                "step `{}` names dockerfile `{}`, absent from context `{}`",
+                context.join(&dockerfile).is_file(),
+                "step `{}` names dockerfile `{dockerfile}`, absent from context `{context_path}`",
                 step.id,
-                build.dockerfile,
-                build.context
             );
         }
+        assert_eq!(builds, 1, "the sample builds one image");
 
         // The results channel (ADR-0042) drains `/scarab/results/<name>.json`
         // and NOTHING else. A step that redirects into a bare
@@ -11224,10 +10921,6 @@ mod tests {
             (
                 "retry",
                 "steps: [{id: a, image: alpine, retry: {max: 2, onn: failure}}]\n",
-            ),
-            (
-                "build",
-                "steps: [{id: a, build: {image: x, dockerfle: D}}]\n",
             ),
             (
                 "cache",

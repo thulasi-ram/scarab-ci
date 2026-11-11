@@ -736,10 +736,11 @@ pub struct StepSpec {
     /// resolved when each Attempt launches and never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry_auth: Option<RegistryAuthConfig>,
-    /// Set when this is a **build** step (ADR-0018): the engine runs rootless
-    /// BuildKit with this context instead of an authored image/command.
+    /// Set on a spec stored as a `build` Step, a kind the ADR-0018
+    /// amendment of 2026-11-12 removed. Kept as raw data only so the launch
+    /// can refuse it naming `lib:thulasi-ram/build`; nothing else reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build: Option<BuildConfig>,
+    pub build: Option<serde_json::Value>,
     /// Artifact publication globs (ADR-0052): filters what the backend
     /// collects from `/scarab/artifacts/` post-step. Empty = everything.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1062,53 +1063,6 @@ pub struct ProvisioningCollision {
     pub winner: usize,
     /// Index of the root whose entry was overwritten.
     pub loser: usize,
-}
-
-/// The launch context of a `kind: build` step (ADR-0018): what to build
-/// (workspace-relative context/dockerfile) and the image tag to build and
-/// optionally push.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BuildConfig {
-    /// Workspace-relative build context directory (default `.`).
-    #[serde(default)]
-    pub context: String,
-    /// Dockerfile name within the context (default `Dockerfile`).
-    #[serde(default)]
-    pub dockerfile: String,
-    /// The image reference to build (and push), e.g. `ghcr.io/acme/app:sha`.
-    pub image: String,
-    /// The run's repo coordinate (from the trigger), pinned at creation —
-    /// what the scoped `REGISTRY_AUTH` secret resolves against and what the
-    /// forge derives its registry credential for. Empty for inline dev runs.
-    #[serde(default)]
-    pub repo_owner: String,
-    #[serde(default)]
-    pub repo_name: String,
-    /// Push after building.
-    #[serde(default)]
-    pub push: bool,
-    /// Allow pushing to an insecure (plain-HTTP) registry — dev/test clusters
-    /// only; never authored, set by the composition/test harness.
-    #[serde(default)]
-    pub insecure_push: bool,
-    /// A fork pull request, or a Run locked out of its Environment's
-    /// secrets: it never pushes and gets no registry credential at launch.
-    /// Decided at Run creation and stored with the spec; checked again at
-    /// launch.
-    #[serde(default)]
-    pub locked_out: bool,
-    /// A scoped `REGISTRY_AUTH` secret's dockerconfigjson, resolved at
-    /// LAUNCH — **never serialized**; mounted verbatim as the Pod's docker
-    /// config (tmpfs), never env (ADR-0018/0037). Takes precedence over
-    /// [`derived_auth`](Self::derived_auth).
-    #[serde(skip)]
-    pub registry_auth_json: Option<String>,
-    /// A forge-derived registry credential for the forge's own registry
-    /// (ADR-0018 amendment: zero-config GHCR/Forgejo push). Filled at LAUNCH,
-    /// **never serialized**; used only when no scoped `REGISTRY_AUTH` secret
-    /// resolves. Delivered to the Pod as a mounted dockerconfigjson, never env.
-    #[serde(skip)]
-    pub derived_auth: Option<RegistryCredential>,
 }
 
 /// A Step's sandbox (ADR-0018, amendment of 2026-11-12), as Run creation

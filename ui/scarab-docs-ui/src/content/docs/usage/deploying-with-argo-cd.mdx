@@ -118,7 +118,7 @@ FROM quay.io/argoproj/argocd:v2.13.0
 COPY --from=ghcr.io/jqlang/jq:1.7.1 /jq /usr/local/bin/jq
 ```
 
-You can build and push it with a Scarab [`build:` step](/scarab-ci/usage/pipeline-syntax/#steps-the-step-shape).
+You can build and push it with Scarab's [build library](/scarab-ci/usage/pipeline-syntax/#building-an-image).
 Pin the CLI to a version close to your Argo CD server's.
 
 The CLI reads `ARGOCD_SERVER` and `ARGOCD_AUTH_TOKEN` from the environment. If your Argo CD

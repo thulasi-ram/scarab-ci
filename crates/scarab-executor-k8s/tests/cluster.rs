@@ -1812,15 +1812,17 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
     exec.cancel(&h).await.expect("cleanup");
 }
 
-/// LIVE `kind: build` (ADR-0018): rootless BuildKit builds a trivial image
-/// from a CAS-materialized workspace and pushes it to a local in-cluster
-/// registry; a verification step then reads the registry's tag list.
-/// Needs a registry Service in the cluster (SCARAB_TEST_REGISTRY, e.g.
-/// `registry.default.svc.cluster.local:5000` — plain HTTP, hence
-/// insecure_push). `#[ignore]`d + SCARAB_TEST_KUBE gated.
+/// LIVE `lib:thulasi-ram/build` (ADR-0018, amendment of 2026-11-12): the
+/// library's Step, compiled from `libs/build.yaml` and rendered as the
+/// scheduler renders it, runs in the `rootless-buildkit` sandbox, builds a
+/// trivial image from a CAS-materialized workspace and pushes it to a local
+/// in-cluster registry; a verification step then reads the registry's tag
+/// list. Needs a registry Service in the cluster (SCARAB_TEST_REGISTRY, e.g.
+/// `registry.default.svc.cluster.local:5000`, plain HTTP, hence the
+/// library's `insecure_push` input). `#[ignore]`d + SCARAB_TEST_KUBE gated.
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
-async fn build_step_builds_and_pushes_to_a_local_registry() {
+async fn the_build_library_builds_and_pushes_to_a_local_registry() {
     let ns = enter_tier();
     let registry = tier_var("SCARAB_TEST_REGISTRY");
     // The build step inherits its context as a workspace input, so the fetcher
@@ -1855,6 +1857,43 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         .0;
 
     let image = format!("{registry}/scarab-test:live");
+    // The library's Step as Run creation stores it, rendered as the
+    // scheduler renders it at launch.
+    let ir = scarab_pipeline::compile_with_libraries(
+        &format!(
+            "steps:\n  - id: image\n    invoke: lib:thulasi-ram/build\n    with:\n      \
+             image: {image}\n      push: \"true\"\n      insecure_push: \"true\"\n"
+        ),
+        &scarab_pipeline::Libraries {
+            installed: std::collections::BTreeMap::from([(
+                "thulasi-ram/build".to_string(),
+                scarab_pipeline::InstalledLibrary {
+                    content: include_str!("../../../libs/build.yaml").to_string(),
+                    source: "github.com/thulasi-ram/scarab-ci//libs/build.yaml@test".into(),
+                },
+            )]),
+            ..Default::default()
+        },
+    )
+    .expect("the build library compiles");
+    let lib_step = &ir.steps[0];
+    assert_eq!(lib_step.id, "image/image");
+    let rendered = scarab_pipeline::render(
+        scarab_pipeline::Templates {
+            image: &lib_step.image,
+            command: &lib_step.command,
+            env: &lib_step.env,
+        },
+        lib_step.scope.as_ref(),
+        &lib_step.matrix_values,
+        scarab_pipeline::Facts::Launch {
+            params: &Default::default(),
+            declared: &[],
+            results: &Default::default(),
+            event: &Default::default(),
+        },
+    )
+    .expect("the build library's Step renders");
     let step = StepRun {
         run: RunId(run_id.clone()),
         step: StepId("image".into()),
@@ -1870,9 +1909,9 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         gate_kind: None,
     };
     let spec = StepSpec {
-        image: String::new(),
-        command: vec![],
-        env: vec![],
+        image: rendered.image,
+        command: rendered.command,
+        env: rendered.env,
         secrets: vec![],
         run_as_root: false,
         add_capabilities: vec![],
@@ -1882,16 +1921,19 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
-        sandbox: None,
-        registry_auth: None,
-        build: Some(scarab_engine::BuildConfig {
-            context: ".".into(),
-            dockerfile: "Dockerfile".into(),
-            image: image.clone(),
-            push: true,
-            insecure_push: true, // the local test registry is plain HTTP
+        sandbox: Some(scarab_engine::SandboxConfig {
+            sandbox: scarab_pipeline::Sandbox::RootlessBuildkit,
+            org: "acme".into(),
+            library: "ab".repeat(32),
+        }),
+        // The local test registry takes pushes with no credential: nothing
+        // resolves, so nothing is mounted.
+        registry_auth: Some(scarab_engine::RegistryAuthConfig {
+            owner: "acme".into(),
+            name: "app".into(),
             ..Default::default()
         }),
+        build: None,
         artifacts: vec![],
         placement_profiles: vec![],
         resources: Default::default(),
@@ -1903,6 +1945,11 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         matrix_values: Default::default(),
         scope: None,
     };
+    assert!(lib_step.registry_auth);
+    assert_eq!(
+        lib_step.sandbox(),
+        Some(scarab_pipeline::Sandbox::RootlessBuildkit)
+    );
     let h = exec.launch(&step, &spec).await.expect("launch build");
     let terminal = poll_to_terminal(&exec, &h, 300).await;
     assert_eq!(terminal, Some(ExecState::Succeeded), "build step succeeds");

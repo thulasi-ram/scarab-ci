@@ -33,9 +33,20 @@ pub async fn render_launch_spec(
     if let Err(why) = known_ir_version(ir.as_ref()) {
         return Ok(Err(why));
     }
+    // A spec stored as a `build` Step, a kind the ADR-0018 amendment of
+    // 2026-11-12 removed, keeps its old fields only to be refused here.
+    if spec.build.is_some() {
+        return Ok(Err(
+            "this Step was stored as a `build` Step, a kind this server no longer runs \
+             (ADR-0018, amendment of 2026-11-12); build with `invoke: lib:thulasi-ram/build` \
+             in the Pipeline, which an org admin installs and trusts for the build sandbox, \
+             and start a new Run"
+                .to_string(),
+        ));
+    }
     // A spec stored as a `clone` Step, a kind ADR-0076 §9 removed, decodes
     // with no image and nothing to run instead.
-    if spec.image.is_empty() && spec.build.is_none() {
+    if spec.image.is_empty() {
         return Ok(Err(
             "this Step has no image to run: it was stored as a `clone` Step, a kind this \
              server no longer runs (ADR-0076 §9); start a new Run, which checks out with \

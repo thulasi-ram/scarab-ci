@@ -33,6 +33,9 @@
 #   context     the build context, relative to the workspace (default ".")
 #   dockerfile  the Dockerfile, relative to the context (default "Dockerfile")
 #   push        push the image after building (default false)
+#   insecure_push
+#               push over plain HTTP, to a registry with no TLS (default
+#               false); for a test or development registry only
 #   build_args  one KEY=VALUE per line, each passed as a build argument
 #   cache       the layer cache: none, registry or s3 (default none)
 #   cache_ref   for cache: registry, the image reference that holds the cache
@@ -63,6 +66,11 @@ interface:
       required: false
       default: false
       description: push the image after building
+    - name: insecure_push
+      type: boolean
+      required: false
+      default: false
+      description: push over plain HTTP, for a test or development registry with no TLS
     - name: build_args
       type: string
       required: false
@@ -112,6 +120,7 @@ steps:
       - [SCARAB_BUILD_CONTEXT, "${{ inputs.context }}"]
       - [SCARAB_BUILD_DOCKERFILE, "${{ inputs.dockerfile }}"]
       - [SCARAB_BUILD_PUSH, "${{ inputs.push }}"]
+      - [SCARAB_BUILD_INSECURE_PUSH, "${{ inputs.insecure_push }}"]
       - [SCARAB_BUILD_ARGS, "${{ inputs.build_args }}"]
       - [SCARAB_BUILD_CACHE, "${{ inputs.cache }}"]
       - [SCARAB_BUILD_CACHE_REF, "${{ inputs.cache_ref }}"]
@@ -165,6 +174,11 @@ steps:
           true | false) ;;
           *) fail "push must be true or false, not $push" ;;
         esac
+        insecure=${SCARAB_BUILD_INSECURE_PUSH-false}
+        case "$insecure" in
+          true | false) ;;
+          *) fail "insecure_push must be true or false, not $insecure" ;;
+        esac
         set -- build --frontend dockerfile.v0 \
           --local "context=$ctx" --local "dockerfile=$ctx" --opt "filename=$df"
         while IFS= read -r line; do
@@ -207,7 +221,11 @@ steps:
             ;;
           *) fail "cache must be none, registry or s3" ;;
         esac
-        set -- "$@" --output "type=image,name=$image,push=$push"
+        output="type=image,name=$image,push=$push"
+        if [ "$push" = true ] && [ "$insecure" = true ]; then
+          output="$output,registry.insecure=true"
+        fi
+        set -- "$@" --output "$output"
         # The digest is the Step's `image` result when Scarab collects
         # results (/scarab/results exists).
         if [ -d /scarab/results ]; then

@@ -287,7 +287,6 @@ use an image that has one, or ask for `run_as_root`.
 
 Some steps are **kinds** with no image that the engine runs on your behalf (you set no `image`/`command`):
 
-- **`build: { image: ..., push: true }`**: a rootless BuildKit image build.
 - **`gate: manual`**: a durable approval/wait point (see [Environments & gates](#environments--gates)).
 - **`invoke: file:.scarab/lib/...`**: reuse at compile time (see [Reuse: `invoke`](#reuse-invoke)).
 
@@ -315,6 +314,85 @@ the same on GitHub and Forgejo.
 
 The `clone` step kind is gone. A `clone:` step fails the pipeline check with a message that names
 `invoke: lib:thulasi-ram/clone`.
+
+### Building an image
+
+Scarab's build library, `lib:thulasi-ram/build`, builds an image from the Run's workspace with
+rootless BuildKit and pushes it when you ask. An org admin installs it and trusts its source for the
+build sandbox; no org has it until then
+([Install Scarab's build library](/scarab-ci/usage/libraries/#install-scarabs-build-library)).
+
+```yaml
+- id: checkout
+  invoke: lib:thulasi-ram/clone
+
+- id: image
+  invoke: lib:thulasi-ram/build
+  needs: [checkout]
+  with:
+    image: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/app:${{ event.sha }}
+    context: services/api
+    push: true
+    build_args: |
+      VERSION=${{ event.sha }}
+    cache: registry
+    cache_ref: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/app-cache:main
+
+- id: deploy
+  image: alpine:3.20
+  needs: [image]
+  env: [[BUILT, "${{ outputs.image.image }}"]]
+  command: [sh, -c, 'echo "built: $BUILT"']
+```
+
+The library's one step is `image/image`, and `needs: [image]` reaches it. Its inputs:
+
+| Input | Default | What it is |
+|---|---|---|
+| `image` | (required) | The image reference to build, such as `ghcr.io/acme/app:1.2.0`. No `,`. |
+| `context` | `.` | The build context, relative to the workspace. No absolute path, no `..`, no `,`. |
+| `dockerfile` | `Dockerfile` | The Dockerfile, relative to the context, with the same rules. |
+| `push` | `false` | Push the image after building it. |
+| `build_args` | empty | Build arguments, one `KEY=VALUE` per line. No `,` in a value. |
+| `cache` | `none` | Where BuildKit imports and exports its layer cache: `none`, `registry` or `s3`. |
+| `cache_ref` | empty | For `cache: registry`, the image reference that holds the cache. |
+| `cache_bucket` | empty | For `cache: s3`, the bucket. |
+| `cache_region` | empty | For `cache: s3`, the bucket's region. |
+| `cache_name` | empty | For `cache: s3`, the cache's name in the bucket; BuildKit's default when empty. |
+| `insecure_push` | `false` | Push over plain HTTP. For a test or development registry with no TLS only. |
+
+`outputs.image.image` is what BuildKit wrote with `--metadata-file`: a JSON object whose
+`containerimage.digest` is the digest of the image it built. In `env:` it becomes that object's
+compact JSON text.
+
+- **The registry credential.** The step asks for `registry_auth: true`. Each time it launches,
+  Scarab resolves the `REGISTRY_AUTH` secret (Repo scope, then Org scope) and mounts it as
+  `/scarab/registry/config.json`, with `DOCKER_CONFIG` pointing at that directory. It is never an
+  environment variable. With no `REGISTRY_AUTH` secret, the step gets the credential the forge
+  derives for its own registry (GHCR, the Forgejo package registry), and only when the org also
+  trusts the library's source with forge credentials. With neither, the build runs anonymously:
+  public base images still pull, and a push fails at the registry.
+- **A fork pull request** gets no registry credential, so its build cannot push to a registry
+  that needs one.
+- **Paths stay in the workspace.** The inputs are checked against their rules when the Pipeline
+  compiles and again when the step launches. The step then resolves the context and the
+  Dockerfile and stops before BuildKit runs if either leads outside `/workspace`, through a
+  symlink committed in the repository for example.
+- **The sandbox.** The step runs as uid 1000, not privileged, with seccomp and AppArmor
+  unconfined, which rootless BuildKit needs. Only a step from an installed library whose source
+  the org trusts for the build sandbox gets it; a step written in your Pipeline file never does.
+  A placement profile on the invoke step is not carried onto it, and a sandboxed step may not
+  have `secrets:`.
+- **Other architectures.** BuildKit builds for the architecture of the node it runs on. To build
+  for another one, install a copy of `libs/build.yaml` under another name (`acme/build-arm64`)
+  whose step names the placement profile for those nodes (`placement_profiles: [arm64]`), trust
+  that copy's source for the build sandbox, and invoke one build per architecture, each pushing
+  its own tag. A later step can join the
+  tags into one multi-architecture image with a tool such as `crane index append`.
+
+The `build` step kind is gone. A `build:` step fails the pipeline check with a message that names
+`invoke: lib:thulasi-ram/build`. The local executor refuses the build library's step; it needs the
+Kubernetes executor.
 
 ### Forge credentials: `forge_token`
 
@@ -561,9 +639,9 @@ A step can also list the results it writes, with `results: [tag, build]`. The li
 declaration, not a filter: a step that declares nothing still publishes every file it writes.
 
 Beyond writing the file, capture needs no setup in the pipeline: on Kubernetes a trusted per-Pod egress sidecar
-drains the step's results back to the control plane. A `build:` step
-emits an `image` result natively (BuildKit writes `--metadata-file /scarab/results/image.json`);
-its author writes nothing.
+drains the step's results back to the control plane. The build library's step
+publishes an `image` result (BuildKit writes `--metadata-file /scarab/results/image.json`);
+its caller writes nothing.
 
 ### The trap: a bare filename publishes nothing, and the step still goes green
 
