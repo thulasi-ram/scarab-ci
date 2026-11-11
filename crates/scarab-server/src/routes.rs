@@ -630,6 +630,7 @@ pub(crate) fn governed_routes() -> Routes {
             resync_connection,
         )
         .get("/v1/connections/{id}/preflight", connection_preflight)
+        .get("/v1/forges/github/app", github_app_info)
         .get("/v1/connections/{id}/available-repos", available_repos)
         .get("/v1/orgs/{org}/repos", org_repos)
         .post(

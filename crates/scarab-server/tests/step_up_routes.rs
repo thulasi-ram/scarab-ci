@@ -560,6 +560,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "CJ-W",
     ),
     ("GET", "/v1/connections/{id}/preflight", "read", "READ"),
+    ("GET", "/v1/forges/github/app", "read", "READ"),
     (
         "GET",
         "/v1/connections/{id}/available-repos",

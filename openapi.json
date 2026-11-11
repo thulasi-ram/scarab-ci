@@ -836,6 +836,37 @@
         ]
       }
     },
+    "/v1/forges/github/app": {
+      "get": {
+        "tags": [],
+        "summary": "The GitHub App this server runs and the page it is installed from",
+        "description": "A live GitHub call each time; it answers 200 with a reason, not an error,\nwhen the call fails, so the dialog can still show its steps.",
+        "operationId": "github_app_info",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubAppDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "requires Administer on an org"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/me": {
       "get": {
         "tags": [
@@ -11109,6 +11140,33 @@
               "null"
             ],
             "description": "Why — a timer elapsing, an expiry, a rejection's reason."
+          }
+        }
+      },
+      "GithubAppDto": {
+        "type": "object",
+        "description": "How this server takes GitHub connections: whether it runs a GitHub App,\nand the page that App is installed from.",
+        "required": [
+          "app_mode"
+        ],
+        "properties": {
+          "app_mode": {
+            "type": "boolean",
+            "description": "The server runs in GitHub App mode (`SCARAB_GITHUB_APP_ID` is set), so\ninstalling the App on an account registers that account's connection.\n`false`: GitHub connections cannot be added from the web UI."
+          },
+          "install_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where an admin installs the App (`https://github.com/apps/<slug>/installations/new`).\n`None` when not in App mode, or when GitHub could not be asked."
+          },
+          "unavailable_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why `install_url` is missing in App mode: the App key does not resolve,\nor GitHub answered with an error."
           }
         }
       },

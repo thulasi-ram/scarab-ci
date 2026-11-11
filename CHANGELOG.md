@@ -18,6 +18,14 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Enhancement
+
+- **Add forge connection replaces Add Forgejo connection.** The button on an org's Connections
+  opens a dialog that asks which forge. For GitHub it lists the steps to install the App on the
+  org's account and links to the App's install page, which the server reads from GitHub through
+  the new `GET /v1/forges/github/app`; a server without a GitHub App says so. For Forgejo or
+  Codeberg it shows the instance URL and token form as before.
+
 ## [0.3.1] - 2026-11-11
 
 ### Breaking changes

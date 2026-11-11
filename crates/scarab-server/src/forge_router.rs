@@ -231,6 +231,24 @@ impl ForgeAdapters for RegistryForge {
     ) -> Result<Arc<dyn ForgePort>, ForgeError> {
         self.cached_adapter(conn).await
     }
+
+    /// The App's adapter, built like an unassigned installation connection's
+    /// (the shared `github-app` credential, no Org, no installation pinned).
+    async fn github_app(&self) -> Result<Option<Arc<dyn ForgePort>>, ForgeError> {
+        if self.github_app_id.is_none() {
+            return Ok(None);
+        }
+        let conn = ForgeConnection {
+            id: "github-app".into(),
+            kind: ForgeKind::GitHub,
+            base_url: crate::GITHUB_API_BASE.into(),
+            credential_ref: "github-app".into(),
+            org: None,
+            installation_id: None,
+            account_id: None,
+        };
+        self.cached_adapter(&conn).await.map(Some)
+    }
 }
 
 #[async_trait]

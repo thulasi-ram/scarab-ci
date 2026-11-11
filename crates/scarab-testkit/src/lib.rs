@@ -3803,6 +3803,16 @@ impl FakeForge {
         self
     }
 
+    /// Make `describe_capabilities` report this app page (GitHub's App
+    /// `html_url`) alongside whatever [`with_capabilities`](Self::with_capabilities)
+    /// set; the forge becomes introspectable if it was not.
+    pub fn with_app_page(self, page: &str) -> Self {
+        let mut caps = self.capabilities.lock().unwrap();
+        caps.get_or_insert_with(Default::default).app_page = Some(page.to_string());
+        drop(caps);
+        self
+    }
+
     /// Make [`register_webhook`](ForgePort::register_webhook) fail — models a
     /// credential the forge will not let administer hooks.
     pub fn failing_webhook(self, message: impl Into<String>) -> Self {

@@ -7708,7 +7708,7 @@ async fn ingest_event(
 }
 
 /// The API base every GitHub App installation connection talks to.
-const GITHUB_API_BASE: &str = "https://api.github.com";
+pub(crate) const GITHUB_API_BASE: &str = "https://api.github.com";
 
 /// Apply an installation delivery to the registry: installing the App
 /// registers its connection, serving the Org of the installation's account
@@ -12632,6 +12632,69 @@ async fn connection_preflight(
     }))
 }
 
+/// How this server takes GitHub connections: whether it runs a GitHub App,
+/// and the page that App is installed from.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GithubAppDto {
+    /// The server runs in GitHub App mode (`SCARAB_GITHUB_APP_ID` is set), so
+    /// installing the App on an account registers that account's connection.
+    /// `false`: GitHub connections cannot be added from the web UI.
+    pub app_mode: bool,
+    /// Where an admin installs the App (`https://github.com/apps/<slug>/installations/new`).
+    /// `None` when not in App mode, or when GitHub could not be asked.
+    pub install_url: Option<String>,
+    /// Why `install_url` is missing in App mode: the App key does not resolve,
+    /// or GitHub answered with an error.
+    pub unavailable_reason: Option<String>,
+}
+
+/// **The GitHub App's install page**, for the web UI's Add forge connection
+/// dialog: a GitHub connection is added by installing the App, and the server
+/// is the only one that can ask GitHub which App it is (`GET /app` with the
+/// App's key returns its `html_url`).
+///
+/// A live GitHub call each time; it answers 200 with a reason, not an error,
+/// when the call fails, so the dialog can still show its steps.
+#[utoipa::path(
+    get,
+    path = "/v1/forges/github/app",
+    summary = "The GitHub App this server runs and the page it is installed from",
+    responses(
+        (status = 200, body = GithubAppDto),
+        (status = 403, description = "requires Administer on an org")
+    )
+)]
+async fn github_app_info(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<GithubAppDto>, ApiError> {
+    connection_caller(&st, &headers).await?;
+    let none = |app_mode: bool, reason: Option<String>| GithubAppDto {
+        app_mode,
+        install_url: None,
+        unavailable_reason: reason,
+    };
+    let Some(adapters) = st.forge_adapters.as_ref() else {
+        return Ok(Json(none(false, None)));
+    };
+    let app = match adapters.github_app().await {
+        Ok(Some(app)) => app,
+        Ok(None) => return Ok(Json(none(false, None))),
+        Err(e) => return Ok(Json(none(true, Some(e.to_string())))),
+    };
+    Ok(Json(match app.describe_capabilities().await {
+        Ok(caps) => match caps.app_page {
+            Some(page) => GithubAppDto {
+                app_mode: true,
+                install_url: Some(format!("{page}/installations/new")),
+                unavailable_reason: None,
+            },
+            None => none(true, Some("GitHub did not return the App's page".into())),
+        },
+        Err(e) => none(true, Some(e.to_string())),
+    }))
+}
+
 /// Re-sync a connection against the forge (ADR-0060 part C): ask the forge which
 /// repos this credential reaches and report which of them are not enabled.
 ///
@@ -14338,6 +14401,7 @@ impl utoipa::Modify for StepUpResponses {
         assign_connection_org,
         resync_connection,
         connection_preflight,
+        github_app_info,
         available_repos,
         org_repos,
         bind_repo,
@@ -14448,6 +14512,7 @@ impl utoipa::Modify for StepUpResponses {
         BindRepoResultDto,
         ResyncResultDto,
         ConnectionPreflightDto,
+        GithubAppDto,
         CapabilityRequirementDto,
         GrantedPermissionDto,
         MeResponse,
