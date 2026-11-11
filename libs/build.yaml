@@ -1,0 +1,216 @@
+# Scarab's build library (ADR-0018, amendment of 2026-11-12): build an image
+# from the Run's workspace with rootless BuildKit, and push it when asked. An
+# org admin installs it like any library, from
+# github.com/thulasi-ram/scarab-ci//libs/build.yaml at a release commit, and
+# trusts that source for the build sandbox before any Run may use it.
+#
+#   - id: image
+#     invoke: lib:thulasi-ram/build
+#     needs: [checkout]
+#     with:
+#       image: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/app:${{ event.sha }}
+#       push: true
+#
+# Its one Step is `image/image`, and `${{ outputs.image.image }}` reads what
+# buildctl wrote with `--metadata-file` (the pushed digest is
+# `containerimage.digest`).
+#
+# The Step asks for `security: { sandbox: rootless-buildkit }`, which Run
+# creation admits only when the org trusts this file's source for the
+# sandbox, and for `registry_auth: true`: Scarab mounts the Run's registry
+# credential (the REGISTRY_AUTH secret at Repo scope, then Org scope, else the
+# forge's own registry credential when the org trusts this source with forge
+# credentials) at /scarab/registry/config.json and points DOCKER_CONFIG at it.
+# A fork pull request gets no registry credential.
+#
+# Every input reaches the script through an environment variable, never the
+# command. The script resolves the context and the Dockerfile with realpath
+# and refuses (exit 2) anything outside /workspace, so a symlink committed in
+# the repository cannot point BuildKit at the mounted credential.
+#
+# Inputs:
+#   image       the reference to build, e.g. ghcr.io/acme/app:1.2.0
+#   context     the build context, relative to the workspace (default ".")
+#   dockerfile  the Dockerfile, relative to the context (default "Dockerfile")
+#   push        push the image after building (default false)
+#   build_args  one KEY=VALUE per line, each passed as a build argument
+#   cache       the layer cache: none, registry or s3 (default none)
+#   cache_ref   for cache: registry, the image reference that holds the cache
+#   cache_bucket, cache_region, cache_name
+#               for cache: s3, where the cache is kept; S3 is reached with the
+#               Pod's own AWS identity, Scarab passes no credential
+kind: library
+interface:
+  inputs:
+    - name: image
+      type: string
+      validate: 'value.matches("^[a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?(@sha256:[a-f0-9]{64})?$")'
+      description: the image reference to build, with no ","
+    - name: context
+      type: string
+      required: false
+      default: "."
+      validate: 'value != "" && !value.matches("^/|(^|/)[.][.](/|$)|[,[:cntrl:]]")'
+      description: the build context, relative to the workspace, with no ".." and no ","
+    - name: dockerfile
+      type: string
+      required: false
+      default: Dockerfile
+      validate: 'value != "" && !value.matches("^/|(^|/)[.][.](/|$)|[,[:cntrl:]]")'
+      description: the Dockerfile, relative to the context, with no ".." and no ","
+    - name: push
+      type: boolean
+      required: false
+      default: false
+      description: push the image after building
+    - name: build_args
+      type: string
+      required: false
+      default: ""
+      validate: 'value == "" || value.matches("^([A-Za-z_][A-Za-z0-9_]*=[^,[:cntrl:]]*\n)*[A-Za-z_][A-Za-z0-9_]*=[^,[:cntrl:]]*\n?$")'
+      description: build arguments, one KEY=VALUE per line, with no "," in a value
+    - name: cache
+      type: choice
+      options: [none, registry, s3]
+      required: false
+      default: none
+      description: where BuildKit imports and exports its layer cache
+    - name: cache_ref
+      type: string
+      required: false
+      default: ""
+      validate: 'value == "" || value.matches("^[a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$")'
+      description: for cache registry, the image reference that holds the cache
+    - name: cache_bucket
+      type: string
+      required: false
+      default: ""
+      validate: 'value.matches("^([a-z0-9][a-z0-9.-]*[a-z0-9])?$")'
+      description: for cache s3, the bucket
+    - name: cache_region
+      type: string
+      required: false
+      default: ""
+      validate: 'value.matches("^[a-z0-9-]*$")'
+      description: for cache s3, the bucket's region
+    - name: cache_name
+      type: string
+      required: false
+      default: ""
+      validate: 'value.matches("^[A-Za-z0-9._/-]*$")'
+      description: for cache s3, the cache's name in the bucket (BuildKit's default when empty)
+  outputs: [image]
+steps:
+  - id: image
+    image: moby/buildkit:rootless@sha256:5987568f92dafbfb679879de59c1cd8d26597f5f6635c314e166164e2615870c
+    security: { sandbox: rootless-buildkit }
+    registry_auth: true
+    env:
+      # Rootless buildkitd cannot use the process sandbox.
+      - [BUILDKITD_FLAGS, --oci-worker-no-process-sandbox]
+      - [SCARAB_BUILD_IMAGE, "${{ inputs.image }}"]
+      - [SCARAB_BUILD_CONTEXT, "${{ inputs.context }}"]
+      - [SCARAB_BUILD_DOCKERFILE, "${{ inputs.dockerfile }}"]
+      - [SCARAB_BUILD_PUSH, "${{ inputs.push }}"]
+      - [SCARAB_BUILD_ARGS, "${{ inputs.build_args }}"]
+      - [SCARAB_BUILD_CACHE, "${{ inputs.cache }}"]
+      - [SCARAB_BUILD_CACHE_REF, "${{ inputs.cache_ref }}"]
+      - [SCARAB_BUILD_CACHE_BUCKET, "${{ inputs.cache_bucket }}"]
+      - [SCARAB_BUILD_CACHE_REGION, "${{ inputs.cache_region }}"]
+      - [SCARAB_BUILD_CACHE_NAME, "${{ inputs.cache_name }}"]
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        root=/workspace
+        fail() { echo "scarab: build refused: $*" >&2; exit 2; }
+        nl='
+        '
+        # Sets r to the resolved path. The `.` keeps a trailing newline in a
+        # directory name from being dropped by the command substitution.
+        resolve() {
+          r=$(realpath "$1" && echo .) || return 1
+          r=${r%.}
+          r=${r%"$nl"}
+        }
+        [ -d "$root" ] || fail "no workspace at $root"
+        cd "$root" || fail "cannot enter the workspace at $root"
+        resolve . || fail "cannot resolve the workspace at $root"
+        root=$r
+        ctx=${SCARAB_BUILD_CONTEXT-}
+        df=${SCARAB_BUILD_DOCKERFILE-}
+        [ -n "$ctx" ] || fail "no build context"
+        [ -n "$df" ] || fail "no dockerfile"
+        inside() {
+          case "$1" in
+            "$root" | "$root"/*) return 0 ;;
+            *) return 1 ;;
+          esac
+        }
+        [ -e "./$ctx" ] || fail "build context $ctx does not exist in the workspace"
+        resolve "./$ctx" || fail "cannot resolve build context $ctx"
+        inside "$r" || fail "build context $ctx resolves outside the workspace"
+        [ -e "./$ctx/$df" ] || fail "dockerfile $ctx/$df does not exist in the workspace"
+        resolve "./$ctx/$df" || fail "cannot resolve dockerfile $ctx/$df"
+        inside "$r" || fail "dockerfile $ctx/$df resolves outside the workspace"
+        # The inputs were checked against their `validate:` rules when the
+        # Step launched; the checks below hold the script to them too.
+        image=${SCARAB_BUILD_IMAGE-}
+        push=${SCARAB_BUILD_PUSH-false}
+        case "$image" in
+          "" | -* | *,*) fail "image $image is not an image reference" ;;
+        esac
+        case "$push" in
+          true | false) ;;
+          *) fail "push must be true or false, not $push" ;;
+        esac
+        set -- build --frontend dockerfile.v0 \
+          --local "context=$ctx" --local "dockerfile=$ctx" --opt "filename=$df"
+        while IFS= read -r line; do
+          [ -n "$line" ] || continue
+          key=${line%%=*}
+          [ "$key" != "$line" ] || fail "build arg $line is not KEY=VALUE"
+          case "$key" in
+            "" | [0-9]* | *[!A-Za-z0-9_]*) fail "build arg name $key is not a name" ;;
+          esac
+          case "$line" in
+            *,*) fail "build arg $key holds a ','" ;;
+          esac
+          set -- "$@" --opt "build-arg:$line"
+        done <<EOF
+        ${SCARAB_BUILD_ARGS-}
+        EOF
+        case "${SCARAB_BUILD_CACHE-none}" in
+          none | "") ;;
+          registry)
+            ref=${SCARAB_BUILD_CACHE_REF-}
+            case "$ref" in
+              "") fail "cache registry needs cache_ref" ;;
+              -* | *,*) fail "cache_ref $ref is not an image reference" ;;
+            esac
+            set -- "$@" --import-cache "type=registry,ref=$ref" \
+              --export-cache "type=registry,ref=$ref,mode=max"
+            ;;
+          s3)
+            bucket=${SCARAB_BUILD_CACHE_BUCKET-}
+            region=${SCARAB_BUILD_CACHE_REGION-}
+            name=${SCARAB_BUILD_CACHE_NAME-}
+            [ -n "$bucket" ] || fail "cache s3 needs cache_bucket"
+            [ -n "$region" ] || fail "cache s3 needs cache_region"
+            case "$bucket$region$name" in
+              *,*) fail "cache_bucket, cache_region and cache_name must not hold a ','" ;;
+            esac
+            s3="type=s3,region=$region,bucket=$bucket"
+            [ -z "$name" ] || s3="$s3,name=$name"
+            set -- "$@" --import-cache "$s3" --export-cache "$s3,mode=max"
+            ;;
+          *) fail "cache must be none, registry or s3" ;;
+        esac
+        set -- "$@" --output "type=image,name=$image,push=$push"
+        # The digest is the Step's `image` result when Scarab collects
+        # results (/scarab/results exists).
+        if [ -d /scarab/results ]; then
+          set -- "$@" --metadata-file /scarab/results/image.json
+        fi
+        exec /usr/bin/buildctl-daemonless.sh "$@"

@@ -656,6 +656,16 @@ pub struct StepSpec {
     /// refuses the Run when the Step may not have it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forge_token: Option<ForgeToken>,
+    /// The Step receives the Run's registry credential (ADR-0018, amendment
+    /// of 2026-11-12): resolved when each Attempt launches from the
+    /// `REGISTRY_AUTH` secret (Repo scope, then Org scope), else the
+    /// credential the forge derives for its own registry, and mounted as a
+    /// dockerconfigjson at `/scarab/registry/config.json` with
+    /// `DOCKER_CONFIG` pointing at it. Never an environment variable. A
+    /// fork pull request gets none, and the forge-derived credential reaches
+    /// only a Step whose library the org trusts with forge credentials.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub registry_auth: bool,
     /// If set, this is a **build** step (ADR-0018): a first-class rootless
     /// BuildKit image build. The engine runs the blessed BuildKit image
     /// (never the author's); the context/dockerfile are workspace-relative,
@@ -1131,6 +1141,21 @@ impl StepSpec {
     pub fn is_invoke(&self) -> bool {
         self.invoke.is_some()
     }
+
+    /// The sandbox this Step asks for (`security.sandbox`), if any.
+    pub fn sandbox(&self) -> Option<Sandbox> {
+        self.security.as_ref().and_then(|s| s.sandbox)
+    }
+
+    /// Whether the library that defines this Step (the last link of its
+    /// `origin`) is an installed library: `false` for a Step written in the
+    /// Pipeline file or in a `file:` library, which are the repository's own
+    /// code.
+    pub fn from_installed_library(&self) -> bool {
+        self.origin
+            .last()
+            .is_some_and(|link| link.kind == OriginKind::Library)
+    }
 }
 
 /// The privilege escalation a step requests above the hardened "restricted"
@@ -1152,12 +1177,41 @@ pub struct StepSecurity {
     /// node-escape hammer.
     #[serde(default, skip_serializing_if = "is_false")]
     pub privileged: bool,
+    /// The sandbox this Step runs in (ADR-0018, amendment of 2026-11-12).
+    /// Only a Step from an installed library may ask for one, and Run
+    /// creation admits it only when the org trusts that library's source
+    /// for the sandbox. It cannot be combined with `run_as_root`,
+    /// `add_capabilities` or `privileged`. Not an ADR-0039 grant:
+    /// [`is_baseline`](Self::is_baseline) does not count it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<Sandbox>,
 }
 
 impl StepSecurity {
     /// Does this request any escalation at all?
     pub fn is_baseline(&self) -> bool {
         !self.run_as_root && !self.privileged && self.add_capabilities.is_empty()
+    }
+}
+
+/// A sandbox a Step may run in (ADR-0018, amendment of 2026-11-12). Each
+/// value is a fixed Pod shape the executor applies; an author picks one by
+/// name and sets nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Sandbox {
+    /// What rootless BuildKit needs: uid 1000, not root, not privileged,
+    /// privilege escalation allowed (for the setuid `newuidmap`), seccomp
+    /// `Unconfined` and AppArmor `unconfined`.
+    #[serde(rename = "rootless-buildkit")]
+    RootlessBuildkit,
+}
+
+impl Sandbox {
+    /// The name an author writes, and the one Policies read.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Sandbox::RootlessBuildkit => "rootless-buildkit",
+        }
     }
 }
 
@@ -2756,6 +2810,7 @@ fn invoke_step_extra_fields(step: &StepSpec) -> Vec<&'static str> {
         ("gate_after", step.gate_after.is_some()),
         ("clone", step.clone.is_some()),
         ("forge_token", step.forge_token.is_some()),
+        ("registry_auth", step.registry_auth),
         ("build", step.build.is_some()),
         ("artifacts", !step.artifacts.is_empty()),
         ("inputs", step.inputs.is_some()),
@@ -4030,9 +4085,11 @@ fn invoke_output_scope(step: &mut StepSpec, exposed: &BTreeMap<String, Option<Ve
 /// unset: the library's own value wins (`resources` per field, `cpu_millis`
 /// and `memory_mib`). Its `when` becomes a [`Guard`] of each, read in the
 /// invoke Step's own scope. `env` never carries, and `placement_profiles`
-/// never carries onto a Step with `forge_token` (ADR-0076 §1): a placement
-/// profile is an arbitrary Pod patch, so a caller could otherwise place a
-/// trusted Step next to its own.
+/// never carries onto a Step with `forge_token`, `registry_auth` or a
+/// `security.sandbox` (ADR-0076 §1, ADR-0018 amendment of 2026-11-12): a
+/// placement profile is an arbitrary Pod patch, so a caller could otherwise
+/// place a trusted Step next to its own or change the Pod a sandboxed or
+/// credentialed Step runs in.
 fn carry_invoke_fields(invoke: &StepSpec, inst: &mut StepSpec) {
     if !inst.is_gate() {
         if inst.timeout.is_none() {
@@ -4044,7 +4101,11 @@ fn carry_invoke_fields(invoke: &StepSpec, inst: &mut StepSpec) {
         if inst.resources.memory_mib.is_none() {
             inst.resources.memory_mib = invoke.resources.memory_mib;
         }
-        if inst.placement_profiles.is_empty() && inst.forge_token.is_none() {
+        if inst.placement_profiles.is_empty()
+            && inst.forge_token.is_none()
+            && !inst.registry_auth
+            && inst.sandbox().is_none()
+        {
             inst.placement_profiles = invoke.placement_profiles.clone();
         }
     }
@@ -4117,17 +4178,18 @@ fn validate_interface(
         }
     }
 
-    // An input that reaches a Step with `forge_token` must be a value the
-    // library can check (ADR-0076 §2): a free string would let the caller
-    // write into a Step that holds a forge credential.
-    for (name, lib_step) in forge_token_input_reads(lib) {
+    // An input that reaches a Step with `forge_token`, `registry_auth` or a
+    // `security.sandbox` must be a value the library can check (ADR-0076 §2,
+    // ADR-0018 amendment of 2026-11-12): a free string would let the caller
+    // write into a Step that holds a credential or runs with seccomp off.
+    for (name, lib_step, what) in guarded_input_reads(lib) {
         let Some(p) = iface.inputs.iter().find(|p| p.name == name) else {
             continue; // an undeclared input is reported where it is read
         };
         if p.r#type == ParamType::String && p.validate.is_none() {
             diagnostics.push(format!(
                 "library `{key}`: input `{name}` reaches step `{lib_step}`, which has \
-                 `forge_token`; declare it as a `boolean`, a `number`, a `choice`, or a \
+                 {what}; declare it as a `boolean`, a `number`, a `choice`, or a \
                  `string` with a `validate:` rule"
             ));
         }
@@ -4255,12 +4317,31 @@ fn check_with(step: &StepSpec, what: &str, inputs: &[ParamSpec], diagnostics: &m
     }
 }
 
-/// Each `(input, step)` where a library Step with `forge_token` reads
+/// What a Step holds that its inputs must be checked for: `forge_token`,
+/// a `security.sandbox` or `registry_auth`, named as a message names it;
+/// `None` for a Step with none of them.
+fn guarded_by(step: &StepSpec) -> Option<&'static str> {
+    if step.forge_token.is_some() {
+        Some("`forge_token`")
+    } else if step.sandbox().is_some() {
+        Some("`security.sandbox`")
+    } else if step.registry_auth {
+        Some("`registry_auth`")
+    } else {
+        None
+    }
+}
+
+/// Each `(input, step, what)` where a library Step with `forge_token`, a
+/// sandbox or `registry_auth` ([`guarded_by`], named by `what`) reads
 /// `inputs.<input>` in its image, command or env, once per pair. A read of
 /// `inputs` whole counts as a read of every input.
-fn forge_token_input_reads(lib: &PipelineIr) -> BTreeSet<(String, String)> {
+fn guarded_input_reads(lib: &PipelineIr) -> BTreeSet<(String, String, &'static str)> {
     let mut out = BTreeSet::new();
-    for step in lib.steps.iter().filter(|s| s.forge_token.is_some()) {
+    for step in &lib.steps {
+        let Some(what) = guarded_by(step) else {
+            continue;
+        };
         let mut texts: Vec<&str> = vec![step.image.as_str()];
         texts.extend(step.command.iter().map(String::as_str));
         texts.extend(step.env.iter().map(|(_, v)| v.as_str()));
@@ -4272,11 +4353,11 @@ fn forge_token_input_reads(lib: &PipelineIr) -> BTreeSet<(String, String)> {
                 for r in reads.into_iter().filter(|r| r.var == "inputs") {
                     match r.first {
                         Some(name) => {
-                            out.insert((name, step.id.clone()));
+                            out.insert((name, step.id.clone(), what));
                         }
                         None => {
                             for p in &lib.interface.inputs {
-                                out.insert((p.name.clone(), step.id.clone()));
+                                out.insert((p.name.clone(), step.id.clone(), what));
                             }
                         }
                     }
@@ -5496,12 +5577,75 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 step.id
             ));
         }
-        // The image and command of a Step that holds a forge credential are
-        // written where the Step is written (ADR-0076 §2): a `${{ … }}` in
-        // either would let a value from outside (a caller's input, a Step's
-        // result, the trigger) choose what runs beside the token. Outside
-        // values reach it only through `env:`.
-        if step.forge_token.is_some() {
+        // The sandbox and the registry credential (ADR-0018, amendment of
+        // 2026-11-12) are for a Step that runs an image: a gate runs
+        // nothing, and a build step has its own BuildKit Pod.
+        if let Some(sandbox) = step.sandbox() {
+            if step.is_gate() || step.is_build() {
+                diagnostics.push(format!(
+                    "step `{}`: `security.sandbox` is only valid on a step that runs an image \
+                     (not a gate or build step)",
+                    step.id
+                ));
+            }
+            // The sandbox is a fixed Pod shape; an ADR-0039 grant would change
+            // it.
+            if let Some(sec) = &step.security {
+                if !sec.is_baseline() {
+                    diagnostics.push(format!(
+                        "step `{}`: `security.sandbox: {}` cannot be combined with \
+                         `run_as_root`, `add_capabilities` or `privileged`",
+                        step.id,
+                        sandbox.as_str()
+                    ));
+                }
+            }
+            // Which Steps may run in the sandbox is decided by where they are
+            // written: a Step in the Pipeline file, or in a `file:` library,
+            // is the repository's own code and would choose the command that
+            // runs with seccomp off. Run creation then checks that the org
+            // trusts the installed library's source for the sandbox.
+            if !step.from_installed_library() {
+                diagnostics.push(format!(
+                    "step `{}`: `security.sandbox` is only for a Step from an installed library \
+                     (`invoke: lib:<publisher>/<name>`); a Step written in the Pipeline file or \
+                     reached through `invoke: file:` never runs in the sandbox",
+                    step.id
+                ));
+            }
+            // A secret would sit in the container that runs with seccomp off
+            // and, with `registry_auth`, holds the registry credential.
+            if !step.secrets.is_empty() {
+                diagnostics.push(format!(
+                    "step `{}`: a step with `security.sandbox` must not set `secrets:`",
+                    step.id
+                ));
+            }
+        }
+        if step.registry_auth && (step.is_gate() || step.is_build()) {
+            diagnostics.push(format!(
+                "step `{}`: `registry_auth` is only valid on a step that runs an image (not a \
+                 gate or build step)",
+                step.id
+            ));
+        }
+        // The image and command of a Step that holds a forge credential, or
+        // runs in the sandbox, are written where the Step is written
+        // (ADR-0076 §2): a `${{ … }}` in either would let a value from
+        // outside (a caller's input, a Step's result, the trigger) choose
+        // what runs beside the token or with seccomp off. Outside values
+        // reach it only through `env:`.
+        let holder = if step.forge_token.is_some() {
+            Some(("`forge_token`", "a forge credential is mounted beside them"))
+        } else if step.sandbox().is_some() {
+            Some((
+                "`security.sandbox`",
+                "the Step runs with seccomp and AppArmor off",
+            ))
+        } else {
+            None
+        };
+        if let Some((holder, beside)) = holder {
             let mut templated: Vec<String> = Vec::new();
             if step.image.contains("${{") {
                 templated.push("`image`".to_string());
@@ -5513,7 +5657,7 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
             }
             for field in templated {
                 diagnostics.push(format!(
-                    "step `{}`: {field} holds `${{{{ … }}}}`, and the step has `forge_token`; \
+                    "step `{}`: {field} holds `${{{{ … }}}}`, and the step has {holder}; \
                      its image and command must be written out in full, and a value from an \
                      input, a result or the trigger may reach it only through `env:`",
                     step.id
@@ -5531,7 +5675,7 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 if !templated_env_name_ok(name) {
                     diagnostics.push(format!(
                         "step `{}`: env `{name}` holds `${{{{ … }}}}`, and the step has \
-                         `forge_token`; a value from an input, a result or the trigger may \
+                         {holder}; a value from an input, a result or the trigger may \
                          reach only an env name of the form `SCARAB_<NAME>` (upper-case \
                          letters, digits and `_`), because other names (`PATH`, \
                          `LD_PRELOAD`, `GIT_SSH_COMMAND`, …) can make the value run as code",
@@ -5540,7 +5684,7 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 } else if scarab_sets_env(name) {
                     diagnostics.push(format!(
                         "step `{}`: env `{name}` holds `${{{{ … }}}}`, and the step has \
-                         `forge_token`; Scarab sets `{name}` itself, so pick another \
+                         {holder}; Scarab sets `{name}` itself, so pick another \
                          `SCARAB_<NAME>`",
                         step.id
                     ));
@@ -5550,9 +5694,8 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
             // same key, and those may be the repository's own Steps.
             if step.cache.is_some() {
                 diagnostics.push(format!(
-                    "step `{}`: `cache` is not allowed on a step with `forge_token`: a cache \
-                     restores files other Steps saved, and a forge credential is mounted beside \
-                     them",
+                    "step `{}`: `cache` is not allowed on a step with {holder}: a cache \
+                     restores files other Steps saved, and {beside}",
                     step.id
                 ));
             }
@@ -9564,6 +9707,264 @@ mod tests {
             &libs(&[(".scarab/lib/ship.yaml", lib)]),
         );
         assert!(!plain.is_deploy());
+    }
+
+    // --- the build sandbox and registry credential (ADR-0018, 2026-11-12) ---
+
+    /// `libs/build.yaml`, as the release ships it.
+    const BUILD_LIBRARY: &str = include_str!("../../../libs/build.yaml");
+    const BUILD_SOURCE: &str =
+        "github.com/thulasi-ram/scarab-ci//libs/build.yaml@1111111111111111111111111111111111111111";
+
+    fn with_build_library() -> Libraries {
+        Libraries {
+            files: BTreeMap::new(),
+            installed: installed(&[("thulasi-ram/build", BUILD_SOURCE, BUILD_LIBRARY)]),
+            plugin_gates: Default::default(),
+        }
+    }
+
+    /// A one-Step library whose Step runs in the sandbox.
+    const SANDBOXED_LIB: &str = r#"
+        kind: library
+        steps:
+          - id: run
+            image: "moby/buildkit:rootless@sha256:5987568f92dafbfb679879de59c1cd8d26597f5f6635c314e166164e2615870c"
+            command: [buildctl-daemonless.sh, build]
+            security: { sandbox: rootless-buildkit }
+        "#;
+
+    /// The sandbox is a fixed Pod shape: an ADR-0039 grant beside it, or a
+    /// gate or build step asking for it, does not compile.
+    #[test]
+    fn the_sandbox_cannot_be_combined_with_a_grant_or_a_step_kind() {
+        for security in [
+            "{ sandbox: rootless-buildkit, run_as_root: true }",
+            "{ sandbox: rootless-buildkit, privileged: true }",
+            "{ sandbox: rootless-buildkit, add_capabilities: [NET_ADMIN] }",
+        ] {
+            let lib = SANDBOXED_LIB.replace("{ sandbox: rootless-buildkit }", security);
+            let libs = Libraries {
+                installed: installed(&[("acme/b", "github.com/acme/libs//b.yaml@0", lib.as_str())]),
+                ..Default::default()
+            };
+            let errs = library_errors("steps: [{ id: b, invoke: lib:acme/b }]", &libs);
+            assert!(
+                errs.iter().any(|e| e.starts_with("step `b/run`: ")
+                    && e.contains("cannot be combined with `run_as_root`")),
+                "{security}: {errs:?}"
+            );
+        }
+        let errs =
+            errors("steps: [{ id: g, gate: manual, security: { sandbox: rootless-buildkit } }]");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("`security.sandbox` is only valid on a step that runs")),
+            "{errs:?}"
+        );
+        let errs = errors(r#"steps: [{ id: b, build: { image: "a/b:1" }, registry_auth: true }]"#);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("`registry_auth` is only valid on a step that runs")),
+            "{errs:?}"
+        );
+        let err = parse_error(
+            "steps: [{ id: b, image: x, command: [y], security: { sandbox: privileged } }]",
+        );
+        assert!(err.contains("rootless-buildkit"), "{err}");
+    }
+
+    /// Only a Step from an installed library may run in the sandbox: the
+    /// same Step written in the Pipeline file, or reached through
+    /// `invoke: file:`, does not compile.
+    #[test]
+    fn the_sandbox_is_only_for_a_step_from_an_installed_library() {
+        let own = errors(
+            "steps: [{ id: b, image: x, command: [y], security: { sandbox: rootless-buildkit } }]",
+        );
+        assert!(
+            own.iter().any(|e| e.starts_with("step `b`: ")
+                && e.contains("only for a Step from an installed library")),
+            "{own:?}"
+        );
+        let file = errors_with(
+            "steps: [{ id: b, invoke: file:.scarab/lib/b.yaml }]",
+            &libs(&[(".scarab/lib/b.yaml", SANDBOXED_LIB)]),
+        );
+        assert!(
+            file.iter().any(|e| e.starts_with("step `b/run`: ")
+                && e.contains("only for a Step from an installed library")),
+            "{file:?}"
+        );
+        let libraries = Libraries {
+            installed: installed(&[("acme/b", "github.com/acme/libs//b.yaml@0", SANDBOXED_LIB)]),
+            ..Default::default()
+        };
+        let ir =
+            compile_with_libraries("steps: [{ id: b, invoke: lib:acme/b }]", &libraries).unwrap();
+        assert_eq!(ir.steps[0].sandbox(), Some(Sandbox::RootlessBuildkit));
+        // A library that reads a free string input into a sandboxed Step's
+        // env does not compile: the caller would write into it unchecked.
+        let free = SANDBOXED_LIB
+            .replace(
+                "        steps:",
+                "        interface: { inputs: [{ name: x, type: string }] }\n        steps:",
+            )
+            .replace(
+                "            security:",
+                "            env: [[SCARAB_X, \"${{ inputs.x }}\"]]\n            security:",
+            );
+        let libraries = Libraries {
+            installed: installed(&[("acme/b", "github.com/acme/libs//b.yaml@0", free.as_str())]),
+            ..Default::default()
+        };
+        let errs = library_errors(
+            "steps: [{ id: b, invoke: lib:acme/b, with: { x: y } }]",
+            &libraries,
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("input `x` reaches step `run`")
+                    && e.contains("`security.sandbox`")),
+            "{errs:?}"
+        );
+    }
+
+    /// `libs/build.yaml` installs and compiles; its Step is `image/image`,
+    /// runs in the sandbox with the registry credential, takes every input
+    /// through env, exposes the `image` result, and gets none of the
+    /// invoke's placement profiles.
+    #[test]
+    fn the_build_library_compiles_with_a_sandbox_and_the_registry_credential() {
+        check_installed_library("thulasi-ram/build", BUILD_LIBRARY, &BTreeMap::new())
+            .expect("libs/build.yaml installs");
+        let ir = compile_with_libraries(
+            r#"
+            on: { push: {} }
+            steps:
+              - { id: src, image: busybox, command: [echo] }
+              - id: image
+                invoke: lib:thulasi-ram/build
+                needs: [src]
+                placement_profiles: [big]
+                with:
+                  image: "registry.example/app:${{ event.sha }}"
+                  push: "true"
+                  build_args: "A=1\nB_2=two words\n"
+                  cache: registry
+                  cache_ref: registry.example/app-cache:main
+              - id: deploy
+                image: busybox
+                needs: [image]
+                env: [[IMG, "${{ outputs.image.image }}"]]
+            "#,
+            &with_build_library(),
+        )
+        .unwrap();
+        let step = ir.steps.iter().find(|s| s.id == "image/image").unwrap();
+        assert_eq!(step.sandbox(), Some(Sandbox::RootlessBuildkit));
+        assert!(step.registry_auth);
+        assert!(step.from_installed_library());
+        assert!(
+            step.placement_profiles.is_empty(),
+            "placement_profiles never carries onto a sandboxed Step"
+        );
+        assert!(step.image.contains("@sha256:"), "{}", step.image);
+        assert!(
+            step.command.iter().all(|c| !c.contains("${{")),
+            "no input in the command"
+        );
+    }
+
+    /// `registry_auth` alone also keeps an invoke's placement profiles off
+    /// its Step: a profile could change the Pod the credential is mounted in.
+    #[test]
+    fn placement_profiles_never_carry_onto_a_registry_auth_step() {
+        let lib = "steps: [{ id: push, image: alpine, command: [echo], registry_auth: true }]";
+        let ir = compile_with(
+            "steps: [{ id: p, invoke: file:.scarab/lib/p.yaml, placement_profiles: [big] }]",
+            &libs(&[(".scarab/lib/p.yaml", lib)]),
+        );
+        assert!(ir.steps[0].registry_auth);
+        assert!(ir.steps[0].placement_profiles.is_empty());
+    }
+
+    /// The build library's `validate:` rules, applied to literal `with:`
+    /// values at compile time (and to rendered templates at launch): a path
+    /// out of the workspace, a `..`, a `,` that would start a buildctl
+    /// option, and a build argument that is not `KEY=VALUE` are refused.
+    #[test]
+    fn the_build_library_refuses_inputs_that_leave_the_workspace_or_add_options() {
+        let refused = |input: &str, value: &str| {
+            let yaml = format!(
+                "steps:\n  - id: image\n    invoke: lib:thulasi-ram/build\n    with:\n      \
+                 image: registry.example/app:1\n      {input}: {}\n",
+                serde_json::to_string(value).unwrap()
+            );
+            let errs = library_errors(&yaml, &with_build_library());
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains(&format!("input `{input}` for library"))),
+                "{input}={value:?} passed: {errs:?}"
+            );
+        };
+        for path in [
+            "/scarab/registry",
+            "..",
+            "ctx/..",
+            "./x/../..",
+            "ctx,dockerfile=/scarab/registry",
+            "a\tb",
+            "",
+        ] {
+            refused("context", path);
+            refused("dockerfile", path);
+        }
+        for image in [
+            "registry.example/app:1,push=true",
+            "registry.example/app:1 --output type=local",
+            "--help",
+            "a/b:tag=1",
+            "Registry.example/App:1",
+        ] {
+            refused("image", image);
+        }
+        for args in [
+            "1BAD=x",
+            "A=1,push=true",
+            "A",
+            "A=1\n\nB=2",
+            "A B=1",
+            "A=1\tx",
+            "A=1\n--opt=x",
+        ] {
+            refused("build_args", args);
+        }
+        refused("cache", "gha");
+        refused("cache_ref", "registry.example/c:1,mode=max");
+        refused("cache_bucket", "b,ucket");
+        refused("cache_region", "us-east-1,x");
+        refused("cache_name", "n,ame");
+
+        // What the rules let through.
+        let ok = compile_with_libraries(
+            r#"
+            steps:
+              - id: image
+                invoke: lib:thulasi-ram/build
+                with:
+                  image: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/app:v1.2.3
+                  context: docker/clone
+                  dockerfile: build/Dockerfile
+                  build_args: "VERSION=1.2.3\nNOTE=a b=c"
+                  cache: s3
+                  cache_bucket: acme-cache
+                  cache_region: ap-south-1
+                  cache_name: app/main
+            "#,
+            &with_build_library(),
+        );
+        assert!(ok.is_ok(), "{ok:?}");
     }
 
     // --- the clone library replaces the clone kind (ADR-0076 §9) ------------

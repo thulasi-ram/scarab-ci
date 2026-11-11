@@ -240,7 +240,12 @@ function TrustedSources(props: { org: string }) {
   const data = () => (libs.error ? undefined : libs());
   const rows = () => {
     const d = data();
-    return d ? trustedSourceRows(d.trusted_sources, d.installations) : [];
+    return d
+      ? trustedSourceRows(
+          d.trusted_sources.filter((t) => t.grant === "forge_credentials"),
+          d.installations,
+        )
+      : [];
   };
   return (
     <Show when={data()}>

@@ -43,7 +43,7 @@ use scarab_engine::ports::{ExecHandle, ExecState, LogChunks};
 use scarab_engine::{Db, ExecError, Executor, ForgeCredential, StepRun, StepSpec};
 use scarab_forge::{ForgeConnectionStore, ForgeKind, ForgePort, RepoRef};
 use scarab_pipeline::{ForgeToken, PipelineIr};
-use scarab_policy::library::LibraryStore;
+use scarab_policy::library::{LibraryStore, TrustGrant};
 
 /// Derive the credential-free clone URL for a repo from its connection
 /// (ADR-0045 §Token delivery: the URL NEVER carries a credential).
@@ -179,7 +179,7 @@ pub async fn forge_token_refusals(
     // that only ever refuses more.
     let mints = forge.mints_repo_tokens(repo).await.unwrap_or(false);
     let trusted_sources = match libraries {
-        Some(l) => trusted_sources(l, org).await?,
+        Some(l) => trusted_sources(l, org, TrustGrant::ForgeCredentials).await?,
         None => BTreeSet::new(),
     };
     for step in asking {
@@ -227,11 +227,12 @@ pub async fn forge_token_refusals(
 }
 
 /// The content hash of the library version `step` was written in, when the
-/// org trusts that library with long-lived forge credentials: the library
-/// that defines it (the last link of its `origin`) is stored in the org,
-/// and was fetched from a source the org trusts. A
-/// Step written in the Pipeline file, or in a `file:` library, is the
-/// repository's own code: `None`.
+/// org trusts that library with what `trusted_sources` were read for: the
+/// library that defines it (the last link of its `origin`) is stored in the
+/// org, and was fetched from a source in `trusted_sources`. A library that
+/// invokes another passes on none of its trust. A Step written in the
+/// Pipeline file, or in a `file:` library, is the repository's own code:
+/// `None`.
 async fn trusted_library_step(
     step: &scarab_pipeline::StepSpec,
     libraries: Option<&dyn LibraryStore>,
@@ -254,9 +255,9 @@ async fn trusted_library_step(
     )
 }
 
-/// Whether the org trusts the library version `hash` with long-lived forge
-/// credentials: it is stored in the org, and was fetched from a source in
-/// `trusted_sources`.
+/// Whether the org trusts the library version `hash` with what
+/// `trusted_sources` were read for: it is stored in the org, and was fetched
+/// from a source in `trusted_sources`.
 async fn library_trusted(
     libraries: &dyn LibraryStore,
     org: &str,
@@ -273,18 +274,114 @@ async fn library_trusted(
     Ok(trusted_sources.contains(scarab_policy::library::trust_key(&version.source)))
 }
 
-/// The org's trusted sources, as [`library_trusted`] reads them.
+/// The sources the org trusts with `grant`, as [`library_trusted`] reads
+/// them.
 async fn trusted_sources(
     libraries: &dyn LibraryStore,
     org: &str,
+    grant: TrustGrant,
 ) -> Result<BTreeSet<String>, String> {
     Ok(libraries
         .trusted_sources(org)
         .await
         .map_err(|e| format!("library store: {e}"))?
         .into_iter()
+        .filter(|t| t.grant == grant)
         .map(|t| t.source)
         .collect())
+}
+
+/// What Run creation decided about a Run's sandboxed Steps (ADR-0018,
+/// amendment of 2026-11-12).
+#[derive(Debug, Default)]
+pub struct SandboxAdmission {
+    /// Each Step that may not run in the sandbox it asks for, and why.
+    pub refusals: Vec<String>,
+    /// Each sandboxed Step that may, with the content hash of the library
+    /// version whose source the org trusts for the sandbox.
+    pub trusted: BTreeMap<String, String>,
+}
+
+/// Decide each Step of `ir` that asks for a `security.sandbox`, a
+/// PolicyInvariant like the forge credential's: the Step gets the sandbox
+/// only when the library that defines it (the last link of its `origin`) is
+/// an installation whose source the org trusts for the sandbox. Trust for
+/// forge credentials does not count. A Step from the Pipeline file or a
+/// `file:` library never gets it (the compiler refuses it as well). A store
+/// failure is an `Err`: no Run.
+pub async fn sandbox_refusals(
+    libraries: Option<&dyn LibraryStore>,
+    org: &str,
+    ir: &PipelineIr,
+) -> Result<SandboxAdmission, String> {
+    let mut out = SandboxAdmission::default();
+    let asking: Vec<&scarab_pipeline::StepSpec> =
+        ir.steps.iter().filter(|s| s.sandbox().is_some()).collect();
+    if asking.is_empty() {
+        return Ok(out);
+    }
+    let trusted = match libraries {
+        Some(l) => trusted_sources(l, org, TrustGrant::BuildSandbox).await?,
+        None => BTreeSet::new(),
+    };
+    for step in asking {
+        let sandbox = step.sandbox().map(|s| s.as_str()).unwrap_or_default();
+        match trusted_library_step(step, libraries, org, &trusted).await? {
+            Some(hash) => {
+                out.trusted.insert(step.id.clone(), hash);
+            }
+            None => {
+                let from = match step.origin.last() {
+                    Some(link) if link.kind == scarab_pipeline::OriginKind::Library => {
+                        format!(
+                            "its library `lib:{}` comes from {}, a source the org `{org}` does                              not trust for the build sandbox; an org admin trusts it under Org                              settings > Libraries",
+                            link.name,
+                            link.source
+                                .as_deref()
+                                .map(|s| format!("`{}`", scarab_policy::library::trust_key(s)))
+                                .unwrap_or_else(|| "an unknown source".to_string())
+                        )
+                    }
+                    _ => "it is the repository's own Step, which never runs in the sandbox"
+                        .to_string(),
+                };
+                out.refusals.push(format!(
+                    "step `{}` asks for `security.sandbox: {sandbox}`, and {from}",
+                    step.id
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The Steps of `ir` with `registry_auth` that may receive the
+/// forge-derived registry credential, each with the content hash of its
+/// library version: the org trusts that library's source with forge
+/// credentials. The credential can write packages, so a Step from the
+/// Pipeline file, a `file:` library or an untrusted library gets only a
+/// `REGISTRY_AUTH` secret, or nothing. Not a refusal.
+pub async fn registry_forge_libraries(
+    libraries: Option<&dyn LibraryStore>,
+    org: &str,
+    ir: &PipelineIr,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    let asking: Vec<&scarab_pipeline::StepSpec> =
+        ir.steps.iter().filter(|s| s.registry_auth).collect();
+    if asking.is_empty() {
+        return Ok(out);
+    }
+    let trusted = match libraries {
+        Some(l) => trusted_sources(l, org, TrustGrant::ForgeCredentials).await?,
+        None => BTreeSet::new(),
+    };
+    for step in asking {
+        if let Some(hash) = trusted_library_step(step, libraries, org, &trusted).await? {
+            out.insert(step.id.clone(), hash);
+        }
+    }
+    Ok(out)
 }
 
 /// An [`Executor`] decorator that mints a Step's forge credential when it
@@ -376,7 +473,8 @@ impl ForgeCredentialExecutor {
         };
         let org = &config.owner;
         let trusted = async {
-            let sources = trusted_sources(libraries.as_ref(), org).await?;
+            let sources =
+                trusted_sources(libraries.as_ref(), org, TrustGrant::ForgeCredentials).await?;
             library_trusted(libraries.as_ref(), org, hash, &sources).await
         }
         .await
@@ -521,12 +619,10 @@ impl ForgeCredentialExecutor {
         Ok(trigger.is_some_and(|(event, _)| event["fork"].as_bool() == Some(true)))
     }
 
-    /// The registry auth for a build step (ADR-0018 amendment), in precedence
-    /// order: the scoped `REGISTRY_AUTH` secret (repo scope, org fallback —
-    /// a dockerconfigjson), else the forge-derived credential for the forge's
-    /// own registry (only when it can serve the image's registry host).
-    /// Missing auth degrades to an anonymous build — public pulls keep
-    /// working; a push fails at the registry with a clear auth error.
+    /// The registry auth for a build step (ADR-0018 amendment): see
+    /// [`resolve_registry_auth`](Self::resolve_registry_auth). The
+    /// forge-derived credential only when it is for the image's registry
+    /// host.
     async fn registry_auth(
         &self,
         build: &scarab_engine::BuildConfig,
@@ -536,17 +632,41 @@ impl ForgeCredentialExecutor {
             // secrets: no registry credential, whatever the scopes hold.
             return (None, None);
         }
-        if build.repo_owner.is_empty() {
+        self.resolve_registry_auth(
+            &build.repo_owner,
+            &build.repo_name,
+            true,
+            Some(&build.image),
+        )
+        .await
+    }
+
+    /// A Run's registry credential (ADR-0018 amendments of 2026-07-17 and
+    /// 2026-11-12), in precedence order: the scoped `REGISTRY_AUTH` secret
+    /// (Repo scope, then Org scope; a dockerconfigjson), else, when
+    /// `forge_derived` allows it, the credential the forge derives for its
+    /// own registry (for a build step, only when `image` is on that
+    /// registry's host). A Run with no repository (`owner` empty) gets none.
+    /// Missing auth degrades to an anonymous build: public pulls keep
+    /// working, and a push fails at the registry with its auth error.
+    async fn resolve_registry_auth(
+        &self,
+        owner: &str,
+        name: &str,
+        forge_derived: bool,
+        image: Option<&str>,
+    ) -> (Option<String>, Option<scarab_engine::RegistryCredential>) {
+        if owner.is_empty() {
             return (None, None); // inline dev run: no scope, no forge context
         }
         if let Some(secrets) = &self.secrets {
             for scope in [
                 scarab_secrets::SecretScope::Repo {
-                    org: build.repo_owner.clone(),
-                    repo: build.repo_name.clone(),
+                    org: owner.to_string(),
+                    repo: name.to_string(),
                 },
                 scarab_secrets::SecretScope::Org {
-                    org: build.repo_owner.clone(),
+                    org: owner.to_string(),
                 },
             ] {
                 if let Ok(secret) = secrets.get(&scope, "REGISTRY_AUTH").await {
@@ -556,21 +676,111 @@ impl ForgeCredentialExecutor {
                 }
             }
         }
+        if !forge_derived {
+            return (None, None);
+        }
         let repo = RepoRef {
-            owner: build.repo_owner.clone(),
-            name: build.repo_name.clone(),
+            owner: owner.to_string(),
+            name: name.to_string(),
         };
         match self.forge.registry_credential(&repo).await {
-            Ok(Some(cred)) if build.image.starts_with(&format!("{}/", cred.registry)) => (
-                None,
-                Some(scarab_engine::RegistryCredential {
-                    registry: cred.registry,
-                    username: cred.username,
-                    token: cred.token,
-                }),
-            ),
+            Ok(Some(cred))
+                if image.is_none_or(|i| i.starts_with(&format!("{}/", cred.registry))) =>
+            {
+                (
+                    None,
+                    Some(scarab_engine::RegistryCredential {
+                        registry: cred.registry,
+                        username: cred.username,
+                        token: cred.token,
+                    }),
+                )
+            }
             _ => (None, None),
         }
+    }
+
+    /// Whether the org `org` still trusts the library version `hash` with
+    /// `grant`. `None` when this server has no library store to ask.
+    async fn library_still_trusted(
+        &self,
+        org: &str,
+        hash: &str,
+        grant: TrustGrant,
+    ) -> Result<Option<bool>, ExecError> {
+        let Some((_, libraries)) = &self.libraries else {
+            return Ok(None);
+        };
+        async {
+            let sources = trusted_sources(libraries.as_ref(), org, grant).await?;
+            library_trusted(libraries.as_ref(), org, hash, &sources).await
+        }
+        .await
+        .map(Some)
+        .map_err(ExecError::Other)
+    }
+
+    /// Why a Step may not launch in its sandbox (ADR-0018, amendment of
+    /// 2026-11-12), or `None` when it may: the org still trusts the source
+    /// of the library version Run creation admitted it from for the build
+    /// sandbox. Revoking the trust stops retries, reruns and re-drives.
+    async fn sandbox_refusal(
+        &self,
+        config: &scarab_engine::SandboxConfig,
+    ) -> Result<Option<String>, ExecError> {
+        let sandbox = config.sandbox.as_str();
+        Ok(
+            match self
+                .library_still_trusted(&config.org, &config.library, TrustGrant::BuildSandbox)
+                .await?
+            {
+                Some(true) => None,
+                Some(false) => Some(format!(
+                    "the step asks for `security.sandbox: {sandbox}`, and the org `{}` no \
+                     longer trusts the source of the library version it is from ({}) for the \
+                     build sandbox; nothing was launched",
+                    config.org, config.library
+                )),
+                None => Some(format!(
+                    "the step asks for `security.sandbox: {sandbox}`, and this server has no \
+                     library store to check that the org still trusts its library for the \
+                     build sandbox; nothing was launched"
+                )),
+            },
+        )
+    }
+
+    /// A `registry_auth` Step's credential for this launch (ADR-0018,
+    /// amendment of 2026-11-12): none for a fork pull request (the stored
+    /// lock, or the Run's recorded trigger) or a Run locked out of its
+    /// Environment's secrets; else the `REGISTRY_AUTH` secret, or the
+    /// forge-derived credential when the org still trusts the Step's
+    /// library with forge credentials.
+    async fn step_registry_auth(
+        &self,
+        step: &StepRun,
+        config: &scarab_engine::RegistryAuthConfig,
+    ) -> Result<scarab_engine::RegistryAuthConfig, ExecError> {
+        let mut out = config.clone();
+        out.registry_auth_json = None;
+        out.derived_auth = None;
+        if config.locked_out || self.run_is_fork_pr(step).await? {
+            out.locked_out = true;
+            return Ok(out);
+        }
+        let forge_derived = match &config.forge_library {
+            Some(hash) => self
+                .library_still_trusted(&config.owner, hash, TrustGrant::ForgeCredentials)
+                .await?
+                .unwrap_or(false),
+            None => false,
+        };
+        let (json, derived) = self
+            .resolve_registry_auth(&config.owner, &config.name, forge_derived, None)
+            .await;
+        out.registry_auth_json = json;
+        out.derived_auth = derived;
+        Ok(out)
     }
 }
 
@@ -618,7 +828,11 @@ impl Executor for ForgeCredentialExecutor {
         // yank check for every other Step is SecretInjecting's.
         // Environment re-admission (ADR-0071 §2) likewise comes before the
         // credential here, not only in SecretInjecting.
-        if spec.build.is_some() || spec.forge_token.is_some() {
+        if spec.build.is_some()
+            || spec.forge_token.is_some()
+            || spec.sandbox.is_some()
+            || spec.registry_auth.is_some()
+        {
             self.ensure_not_yanked(step).await?;
             if let Some((db, governance)) = &self.governance {
                 // The `step.admit` decision is recorded by SecretInjecting;
@@ -637,6 +851,25 @@ impl Executor for ForgeCredentialExecutor {
                 .await?;
             }
         }
+        // A sandboxed Step (ADR-0018, amendment of 2026-11-12): the org must
+        // still trust its library for the sandbox, checked before any
+        // credential is asked for.
+        if let Some(sandbox) = &spec.sandbox {
+            if let Some(reason) = self.sandbox_refusal(sandbox).await? {
+                return Err(ExecError::Refused(reason));
+            }
+        }
+        // A `registry_auth` Step: its registry credential, in memory only.
+        let with_registry;
+        let spec = match &spec.registry_auth {
+            Some(config) => {
+                let mut enriched = spec.clone();
+                enriched.registry_auth = Some(self.step_registry_auth(step, config).await?);
+                with_registry = enriched;
+                &with_registry
+            }
+            None => spec,
+        };
         // A build step (ADR-0018): resolve its registry auth in memory only —
         // the stored spec never carries a credential.
         if let Some(build) = &spec.build {

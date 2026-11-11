@@ -424,6 +424,24 @@
        }
       },
       {
+       "doc": "The sandbox the Step asks for (`security.sandbox`), e.g. `rootless-buildkit`. Absent when it asks for none, and from inputs recorded before it existed.",
+       "max_len": 1024,
+       "name": "sandbox",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "The Step asks for the Run's registry credential (`registry_auth: true`). Absent from inputs recorded before it existed, so a rule reads it as `has(step.registry_auth) && step.registry_auth`.",
+       "max_len": 1024,
+       "name": "registry_auth",
+       "optional": true,
+       "ty": {
+        "kind": "bool"
+       }
+      },
+      {
        "doc": "The Step uses the Environment's authority (ADR-0075 \u00a75).",
        "max_len": 1024,
        "name": "uses_environment_authority",
@@ -798,6 +816,24 @@
        "ty": {
         "kind": "enum",
         "of": "ForgeToken"
+       }
+      },
+      {
+       "doc": "The sandbox the Step asks for (`security.sandbox`), e.g. `rootless-buildkit`. Absent when it asks for none, and from inputs recorded before it existed.",
+       "max_len": 1024,
+       "name": "sandbox",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "The Step asks for the Run's registry credential (`registry_auth: true`). Absent from inputs recorded before it existed, so a rule reads it as `has(step.registry_auth) && step.registry_auth`.",
+       "max_len": 1024,
+       "name": "registry_auth",
+       "optional": true,
+       "ty": {
+        "kind": "bool"
        }
       },
       {

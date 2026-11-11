@@ -108,10 +108,25 @@ const fullLibraries: S["OrgLibrariesDto"] = {
     },
   ],
   trusted_sources: [
-    { source: CLONE_SRC.replace(/@.*/, ""), trusted_by: "a.kim", trusted_at: ago(20 * day) },
-    { source: "github.com/acme/scarab-libs//git-tag.yaml", trusted_by: "a.kim", trusted_at: ago(3 * day) },
+    {
+      source: CLONE_SRC.replace(/@.*/, ""),
+      grant: "forge_credentials",
+      trusted_by: "a.kim",
+      trusted_at: ago(20 * day),
+    },
+    {
+      source: "github.com/acme/scarab-libs//git-tag.yaml",
+      grant: "forge_credentials",
+      trusted_by: "a.kim",
+      trusted_at: ago(3 * day),
+    },
     // No installation comes from it now: the list page keeps it.
-    { source: "github.com/acme/scarab-libs//release-notes.yaml", trusted_by: "j.lee", trusted_at: ago(40 * day) },
+    {
+      source: "github.com/acme/scarab-libs//release-notes.yaml",
+      grant: "forge_credentials",
+      trusted_by: "j.lee",
+      trusted_at: ago(40 * day),
+    },
   ],
 };
 
@@ -450,8 +465,13 @@ export function libraryRoute(
   if (/^\/v1\/orgs\/[^/]+\/library-trust$/.test(p)) {
     // Echo a trust, without the commit; persist nothing.
     if (method === "POST") {
-      const req = JSON.parse(body || "{}") as { source?: string };
-      return json({ source: (req.source ?? "").replace(/@.*/, ""), trusted_by: "a.kim", trusted_at: now });
+      const req = JSON.parse(body || "{}") as { source?: string; grant?: string };
+      return json({
+        source: (req.source ?? "").replace(/@.*/, ""),
+        grant: req.grant ?? "forge_credentials",
+        trusted_by: "a.kim",
+        trusted_at: now,
+      });
     }
     if (method === "DELETE") return new Response(null, { status: 204 });
   }

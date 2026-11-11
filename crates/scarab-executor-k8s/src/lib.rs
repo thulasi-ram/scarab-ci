@@ -617,17 +617,18 @@ impl K8sExecutor {
         }
     }
 
-    /// Upsert the per-Pod Secret carrying a build step's registry
-    /// dockerconfigjson (ADR-0018): mounted read-only as `DOCKER_CONFIG`
-    /// (tmpfs) — the credential is never in env, argv, or the stored spec.
-    /// Owner-referenced to the Pod; re-drives refresh it.
+    /// Upsert the per-Pod Secret carrying a build step's, or a
+    /// `registry_auth` Step's, registry dockerconfigjson (ADR-0018): mounted
+    /// read-only as `DOCKER_CONFIG` (tmpfs) — the credential is never in
+    /// env, argv, or the stored spec. Owner-referenced to the Pod; re-drives
+    /// refresh it.
     async fn ensure_registry_secret(
         &self,
         pod_name: &str,
         pod: &Pod,
         spec: &StepSpec,
     ) -> Result<(), ExecError> {
-        let Some(config_json) = spec.build.as_ref().and_then(registry_dockerconfig) else {
+        let Some(config_json) = step_registry_dockerconfig(spec) else {
             return Ok(());
         };
         let client = self.client.clone().ok_or(ExecError::Unavailable)?;
@@ -2764,6 +2765,7 @@ impl Executor for K8sExecutor {
         // specs stored before the Pipeline compiler checked them (git-bug
         // df660b6), before any Pod exists.
         build_is_launchable(spec, self.workspace_cas.is_some()).map_err(ExecError::Launch)?;
+        sandbox_is_launchable(spec).map_err(ExecError::Launch)?;
 
         // Re-attach: if the Pod already exists (a prior launch we may not have
         // observed completing), adopt it instead of creating a duplicate.
@@ -4314,6 +4316,28 @@ pub fn build_is_launchable(spec: &StepSpec, workspace: bool) -> Result<(), Strin
     Ok(())
 }
 
+/// Whether a sandboxed Step may launch (ADR-0018, amendment of 2026-11-12):
+/// the sandbox is a fixed Pod shape, so a stored spec that also carries an
+/// ADR-0039 grant (`run_as_root`, capabilities, `privileged`) is refused
+/// rather than merged. The compiler refuses the combination; this covers a
+/// spec that reached the executor another way. Not sandboxed: `Ok`.
+pub fn sandbox_is_launchable(spec: &StepSpec) -> Result<(), String> {
+    let Some(sandbox) = &spec.sandbox else {
+        return Ok(());
+    };
+    if spec.run_as_root || spec.privileged || !spec.add_capabilities.is_empty() {
+        return Err(format!(
+            "step refused: `security.sandbox: {}` cannot be combined with `run_as_root`, \
+             `add_capabilities` or `privileged`",
+            sandbox.sandbox.as_str()
+        ));
+    }
+    if spec.build.is_some() {
+        return Err("step refused: a build step has its own sandbox".to_string());
+    }
+    Ok(())
+}
+
 /// The fetcher init container (ADR-0061 s3-feed). Its token rides the shared
 /// [`workspace_token_volume`], which the caller adds to the Pod exactly once
 /// — the egress helper mounts the same volume for the drain (s3-drain).
@@ -4757,6 +4781,34 @@ pub fn build_pod(
             buildctl_args(build, egress.is_some()),
         )
     } else {
+        // A `registry_auth` Step (ADR-0018, amendment of 2026-11-12): the
+        // credential resolved at launch, as the same tmpfs file a build step
+        // gets, with `DOCKER_CONFIG` pointing at its directory. Never env.
+        if spec
+            .registry_auth
+            .as_ref()
+            .is_some_and(|r| r.registry_auth_json.is_some() || r.derived_auth.is_some())
+        {
+            env.push(EnvVar {
+                name: "DOCKER_CONFIG".into(),
+                value: Some(REGISTRY_AUTH_MOUNT_PATH.to_string()),
+                value_from: None,
+            });
+            step_mounts.push(VolumeMount {
+                name: REGISTRY_AUTH_VOLUME.to_string(),
+                mount_path: REGISTRY_AUTH_MOUNT_PATH.to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            });
+            registry_volume = Some(Volume {
+                name: REGISTRY_AUTH_VOLUME.to_string(),
+                secret: Some(k8s_openapi::api::core::v1::SecretVolumeSource {
+                    secret_name: Some(registry_secret_name(name)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
         (image, command, Vec::new())
     };
 
@@ -4791,7 +4843,9 @@ pub fn build_pod(
         command: (!command.is_empty()).then_some(command),
         args: (!args.is_empty()).then_some(args),
         env: Some(env),
-        security_context: Some(if spec.build.is_some() {
+        // A build step and a `rootless-buildkit` sandbox get the same
+        // context (ADR-0018, amendment of 2026-11-12).
+        security_context: Some(if spec.build.is_some() || spec.sandbox.is_some() {
             build_security_context()
         } else {
             step_security_context(spec)
@@ -4849,7 +4903,7 @@ pub fn build_pod(
         volumes.push(v);
     }
     let mut annotations = std::collections::BTreeMap::new();
-    if spec.build.is_some() {
+    if spec.build.is_some() || spec.sandbox.is_some() {
         // AppArmor unconfined for rootless buildkit (user-namespace worker).
         annotations.insert(
             format!("container.apparmor.security.beta.kubernetes.io/{STEP_CONTAINER}"),
@@ -5870,13 +5924,31 @@ fn build_security_context() -> SecurityContext {
     }
 }
 
-/// The dockerconfigjson for a build Pod (ADR-0018): the scoped secret's JSON
-/// verbatim when present, else synthesized from the forge-derived credential.
-fn registry_dockerconfig(build: &scarab_engine::BuildConfig) -> Option<String> {
-    if let Some(json) = &build.registry_auth_json {
+/// The dockerconfigjson for a build Pod or a `registry_auth` Step's Pod
+/// (ADR-0018), if the launch resolved one.
+fn step_registry_dockerconfig(spec: &StepSpec) -> Option<String> {
+    if let Some(build) = &spec.build {
+        return registry_dockerconfig(
+            build.registry_auth_json.as_ref(),
+            build.derived_auth.as_ref(),
+        );
+    }
+    spec.registry_auth
+        .as_ref()
+        .and_then(|r| registry_dockerconfig(r.registry_auth_json.as_ref(), r.derived_auth.as_ref()))
+}
+
+/// A registry dockerconfigjson (ADR-0018): the scoped secret's JSON
+/// verbatim when present, else synthesized from the forge-derived
+/// credential, which names only that credential's registry.
+fn registry_dockerconfig(
+    json: Option<&String>,
+    derived: Option<&scarab_engine::RegistryCredential>,
+) -> Option<String> {
+    if let Some(json) = json {
         return Some(json.clone());
     }
-    build.derived_auth.as_ref().map(|cred| {
+    derived.map(|cred| {
         use base64::Engine;
         let auth = base64::engine::general_purpose::STANDARD
             .encode(format!("{}:{}", cred.username, cred.token));
@@ -6601,6 +6673,8 @@ mod tests {
             workspace_outputs: vec![],
             cache: None,
             forge_token: None,
+            sandbox: None,
+            registry_auth: None,
             build: None,
             artifacts: vec![],
             placement_profiles: vec![],
@@ -6818,6 +6892,8 @@ mod tests {
             workspace_outputs: vec![],
             cache: None,
             forge_token: None,
+            sandbox: None,
+            registry_auth: None,
             build: None,
             artifacts: vec![],
             placement_profiles: vec![],
@@ -7982,12 +8058,370 @@ mod tests {
         );
 
         // The synthesized dockerconfigjson carries the derived credential.
-        let json = registry_dockerconfig(&build).unwrap();
+        let json = registry_dockerconfig(
+            build.registry_auth_json.as_ref(),
+            build.derived_auth.as_ref(),
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(parsed["auths"]["registry.example"]["auth"].is_string());
         // A scoped secret takes precedence, verbatim.
         build.registry_auth_json = Some("{\"auths\":{}}".into());
-        assert_eq!(registry_dockerconfig(&build).unwrap(), "{\"auths\":{}}");
+        assert_eq!(
+            registry_dockerconfig(
+                build.registry_auth_json.as_ref(),
+                build.derived_auth.as_ref()
+            )
+            .unwrap(),
+            "{\"auths\":{}}"
+        );
+    }
+
+    fn sandbox_config() -> scarab_engine::SandboxConfig {
+        scarab_engine::SandboxConfig {
+            sandbox: scarab_pipeline::Sandbox::RootlessBuildkit,
+            org: "acme".into(),
+            library: "ab".repeat(32),
+        }
+    }
+
+    /// ADR-0018 (amendment of 2026-11-12): a `rootless-buildkit` sandbox
+    /// gives the Step the Pod shape a build step has (uid 1000, not root,
+    /// not privileged, seccomp and AppArmor unconfined) and runs the Step's
+    /// own image and command, with its own env.
+    #[test]
+    fn a_sandboxed_step_gets_the_rootless_buildkit_pod_shape() {
+        let step = step_with_attempt("run-1", "image/image", "a1");
+        let mut spec = busybox();
+        spec.image = "moby/buildkit:rootless@sha256:abc".into();
+        spec.command = vec!["/bin/sh".into(), "-c".into(), "exit 0".into()];
+        spec.sandbox = Some(sandbox_config());
+        let pod = build_pod(
+            "scarab-image-a1",
+            "ns",
+            &step,
+            &spec,
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            true,
+            Some(&sample_fetch()),
+        );
+        let c = &pod.spec.as_ref().unwrap().containers[0];
+        assert_eq!(
+            c.image.as_deref(),
+            Some("moby/buildkit:rootless@sha256:abc")
+        );
+        let sc = c.security_context.as_ref().unwrap();
+        assert_eq!(sc.privileged, Some(false));
+        assert_eq!(sc.run_as_non_root, Some(true));
+        assert_eq!(sc.run_as_user, Some(1000));
+        assert_eq!(sc.allow_privilege_escalation, Some(true));
+        assert_eq!(
+            sc.seccomp_profile.as_ref().map(|p| p.type_.as_str()),
+            Some("Unconfined")
+        );
+        assert!(sc.capabilities.is_none(), "{sc:?}");
+        assert_eq!(
+            pod.metadata
+                .annotations
+                .as_ref()
+                .unwrap()
+                .get(&format!(
+                    "container.apparmor.security.beta.kubernetes.io/{STEP_CONTAINER}"
+                ))
+                .map(String::as_str),
+            Some("unconfined")
+        );
+        // The Step's own env reaches it, unlike a build step's.
+        assert!(c.env.as_ref().unwrap().iter().any(|e| e.name == "FOO"));
+
+        // Without the sandbox: the restricted baseline, no annotation.
+        spec.sandbox = None;
+        let pod = build_pod(
+            "scarab-image-a1",
+            "ns",
+            &step,
+            &spec,
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            true,
+            Some(&sample_fetch()),
+        );
+        let sc = pod.spec.as_ref().unwrap().containers[0]
+            .security_context
+            .clone()
+            .unwrap();
+        assert_eq!(
+            sc.seccomp_profile.map(|p| p.type_),
+            Some("RuntimeDefault".to_string())
+        );
+        assert!(pod
+            .metadata
+            .annotations
+            .as_ref()
+            .is_none_or(|a| a.keys().all(|k| !k.contains("apparmor"))));
+    }
+
+    /// A stored sandboxed spec that also carries an ADR-0039 grant is
+    /// refused at launch rather than merged into the sandbox's Pod shape.
+    #[test]
+    fn a_sandbox_with_a_grant_is_refused_at_launch() {
+        let mut spec = busybox();
+        spec.sandbox = Some(sandbox_config());
+        assert_eq!(sandbox_is_launchable(&spec), Ok(()));
+        let grants: [fn(&mut StepSpec); 3] = [
+            |s| s.run_as_root = true,
+            |s| s.privileged = true,
+            |s| s.add_capabilities = vec!["NET_ADMIN".into()],
+        ];
+        for grant in grants {
+            let mut s = spec.clone();
+            grant(&mut s);
+            assert!(sandbox_is_launchable(&s)
+                .unwrap_err()
+                .contains("cannot be combined"));
+        }
+        assert_eq!(sandbox_is_launchable(&busybox()), Ok(()));
+    }
+
+    /// ADR-0018 (amendment of 2026-11-12): a `registry_auth` Step's
+    /// credential is a file on a read-only Secret volume at
+    /// /scarab/registry with `DOCKER_CONFIG` pointing there; no env value
+    /// carries it. With nothing resolved there is no mount.
+    #[test]
+    fn a_registry_auth_step_gets_the_credential_as_a_file_never_env() {
+        let step = step_with_attempt("run-1", "image/image", "a1");
+        let mut spec = busybox();
+        spec.registry_auth = Some(scarab_engine::RegistryAuthConfig {
+            owner: "acme".into(),
+            name: "web".into(),
+            registry_auth_json: Some(r#"{"auths":{"registry.corp":{"auth":"c2VrcmV0"}}}"#.into()),
+            ..Default::default()
+        });
+        let pod = build_pod(
+            "scarab-image-a1",
+            "ns",
+            &step,
+            &spec,
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            false,
+            None,
+        );
+        let c = &pod.spec.as_ref().unwrap().containers[0];
+        let env = c.env.as_ref().unwrap();
+        assert_eq!(
+            env.iter()
+                .find(|e| e.name == "DOCKER_CONFIG")
+                .and_then(|e| e.value.clone()),
+            Some(REGISTRY_AUTH_MOUNT_PATH.to_string())
+        );
+        assert!(
+            env.iter().all(|e| e
+                .value
+                .as_deref()
+                .is_none_or(|v| !v.contains("c2VrcmV0") && !v.contains("auths"))
+                && e.value_from.is_none()),
+            "no env carries the credential: {env:?}"
+        );
+        let m = c
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == REGISTRY_AUTH_VOLUME)
+            .unwrap();
+        assert_eq!(m.mount_path, REGISTRY_AUTH_MOUNT_PATH);
+        assert_eq!(m.read_only, Some(true));
+        let v = pod
+            .spec
+            .as_ref()
+            .unwrap()
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == REGISTRY_AUTH_VOLUME)
+            .unwrap();
+        assert_eq!(
+            v.secret.as_ref().unwrap().secret_name.as_deref(),
+            Some("scarab-image-a1-registry")
+        );
+        assert_eq!(
+            step_registry_dockerconfig(&spec).as_deref(),
+            Some(r#"{"auths":{"registry.corp":{"auth":"c2VrcmV0"}}}"#)
+        );
+        // Not a build step: the Step keeps its own image and command, and
+        // the restricted baseline.
+        assert_eq!(c.image.as_deref(), Some("busybox:latest"));
+        assert_eq!(
+            c.security_context
+                .as_ref()
+                .unwrap()
+                .seccomp_profile
+                .as_ref()
+                .map(|p| p.type_.as_str()),
+            Some("RuntimeDefault")
+        );
+
+        // Locked out, or nothing resolved: no mount and no DOCKER_CONFIG.
+        spec.registry_auth = Some(scarab_engine::RegistryAuthConfig {
+            owner: "acme".into(),
+            name: "web".into(),
+            locked_out: true,
+            ..Default::default()
+        });
+        let pod = build_pod(
+            "scarab-image-a1",
+            "ns",
+            &step,
+            &spec,
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            false,
+            None,
+        );
+        let c = &pod.spec.as_ref().unwrap().containers[0];
+        assert!(c
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|e| e.name != "DOCKER_CONFIG"));
+        assert!(c
+            .volume_mounts
+            .as_ref()
+            .is_none_or(|m| m.iter().all(|m| m.name != REGISTRY_AUTH_VOLUME)));
+        assert_eq!(step_registry_dockerconfig(&spec), None);
+    }
+
+    /// The script `libs/build.yaml` runs, as the compiler hands it to the
+    /// executor, pointed at a temp workspace and a stub
+    /// `buildctl-daemonless.sh` that records its args. Returns the temp dir
+    /// (workspace at `workspace/`, a `registry/` beside it standing in for
+    /// the credential mount) and a runner giving `(exit code, reached
+    /// buildctl)` for a context, a dockerfile and build args.
+    #[cfg(unix)]
+    fn build_library_harness() -> (
+        tempfile::TempDir,
+        impl Fn(&str, &str, &str) -> (Option<i32>, bool),
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let lib = include_str!("../../../libs/build.yaml");
+        let ir = scarab_pipeline::compile_with_libraries(
+            "steps:\n  - id: image\n    invoke: lib:thulasi-ram/build\n    with: { image: registry.example/app:1 }\n",
+            &scarab_pipeline::Libraries {
+                installed: std::collections::BTreeMap::from([(
+                    "thulasi-ram/build".to_string(),
+                    scarab_pipeline::InstalledLibrary {
+                        content: lib.to_string(),
+                        source: "github.com/thulasi-ram/scarab-ci//libs/build.yaml@1".into(),
+                    },
+                )]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let command = &ir.steps[0].command;
+        assert_eq!(command[..2], ["/bin/sh", "-c"]);
+        let script = command[2].clone();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let ws = base.join("workspace");
+        let outside = base.join("registry");
+        for d in [&ws, &outside] {
+            std::fs::create_dir(d).unwrap();
+        }
+        std::fs::write(ws.join("Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(outside.join("config.json"), "{}").unwrap();
+        let record = base.join("called");
+        let stub = base.join("buildctl-daemonless.sh");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pinned = format!("root={WORKSPACE_MOUNT_PATH}\n");
+        let buildctl = "exec /usr/bin/buildctl-daemonless.sh ";
+        assert!(script.contains(&pinned) && script.contains(buildctl));
+        let script = script
+            .replace(&pinned, &format!("root='{}'\n", ws.display()))
+            .replace(buildctl, &format!("exec '{}' ", stub.display()));
+        let run = move |context: &str, dockerfile: &str, args: &str| {
+            let _ = std::fs::remove_file(&record);
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", &script, "scarab-build"])
+                .current_dir(&base)
+                .env("SCARAB_BUILD_IMAGE", "registry.example/app:1")
+                .env("SCARAB_BUILD_PUSH", "false")
+                .env("SCARAB_BUILD_CONTEXT", context)
+                .env("SCARAB_BUILD_DOCKERFILE", dockerfile)
+                .env("SCARAB_BUILD_ARGS", args)
+                .env("SCARAB_BUILD_CACHE", "none")
+                .output()
+                .unwrap();
+            (out.status.code(), record.exists())
+        };
+        (tmp, run)
+    }
+
+    /// The build library keeps PR #179's guard (git-bug df660b6): a context
+    /// or Dockerfile that resolves outside the workspace exits 2 before
+    /// buildctl runs, and so does a bad build argument; `.` and
+    /// `Dockerfile` reach buildctl with each build argument as one
+    /// `--opt build-arg:` value.
+    #[cfg(unix)]
+    #[test]
+    fn the_build_library_script_refuses_symlinks_out_of_the_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, run) = build_library_harness();
+        let base = tmp.path().canonicalize().unwrap();
+        let ws = base.join("workspace");
+        symlink(base.join("registry"), ws.join("ctx")).unwrap();
+        std::fs::create_dir(ws.join("df")).unwrap();
+        symlink(base.join("registry/config.json"), ws.join("df/Dockerfile")).unwrap();
+        symlink("../registry", ws.join("rel")).unwrap();
+
+        assert_eq!(
+            run(".", "Dockerfile", "A=1\nB=two words\n"),
+            (Some(0), true)
+        );
+        let called = std::fs::read_to_string(base.join("called")).unwrap();
+        let called: Vec<&str> = called.lines().collect();
+        assert_eq!(called[0], "build");
+        for want in [
+            "context=.",
+            "dockerfile=.",
+            "filename=Dockerfile",
+            "build-arg:A=1",
+            "build-arg:B=two words",
+            "type=image,name=registry.example/app:1,push=false",
+        ] {
+            assert!(called.contains(&want), "{want}: {called:?}");
+        }
+        for (context, dockerfile) in [
+            ("ctx", "config.json"),
+            ("df", "Dockerfile"),
+            ("rel", "config.json"),
+            ("/abs", "Dockerfile"),
+            ("..", "Dockerfile"),
+        ] {
+            assert_eq!(
+                run(context, dockerfile, ""),
+                (Some(2), false),
+                "{context}/{dockerfile}"
+            );
+        }
+        for args in ["1A=x", "A", "A=1,push=true", "A-B=1"] {
+            assert_eq!(run(".", "Dockerfile", args), (Some(2), false), "{args:?}");
+        }
     }
 
     #[test]

@@ -27,6 +27,8 @@ fn spec() -> StepSpec {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],

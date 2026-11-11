@@ -140,6 +140,8 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: Some(build.clone()),
         artifacts: vec![],
         placement_profiles: vec![],

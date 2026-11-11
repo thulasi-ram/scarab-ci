@@ -133,10 +133,21 @@ export function trustKey(source: string): string {
  *  by default, whoever publishes it. */
 export function trustNote(
   l: { source: string },
-  trusted: { source: string; trusted_by: string }[],
+  trusted: { source: string; trusted_by: string; grant?: string }[],
 ): string | null {
-  const t = trusted.find((t) => t.source === trustKey(l.source));
+  const t = trusted.find((t) => t.source === trustKey(l.source) && isForgeTrust(t));
   return t ? `Source trusted with forge credentials by ${t.trusted_by}.` : null;
+}
+
+/** What a trust grant gives, as a sentence reads it. */
+export function grantLabel(grant: string | undefined): string {
+  return grant === "build_sandbox" ? "the build sandbox" : "forge credentials";
+}
+
+/** Whether a trust record grants forge credentials. A record with no grant
+ *  is one: that was the only grant before the build sandbox. */
+export function isForgeTrust(t: { grant?: string }): boolean {
+  return (t.grant ?? "forge_credentials") === "forge_credentials";
 }
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
@@ -349,7 +360,7 @@ export type Chip = { label: string; tone: ChipTone; title: string };
  *  whether its source is trusted with forge credentials. */
 export function libraryChips(
   l: { source: string; yanked?: { reason: string; yanked_by: string } | null },
-  trusted: { source: string; trusted_by: string }[],
+  trusted: { source: string; trusted_by: string; grant?: string }[],
 ): Chip[] {
   const out: Chip[] = [];
   if (l.yanked) {
@@ -365,6 +376,14 @@ export function libraryChips(
           title: "No Step from this source receives a long-lived forge token until the org trusts the source.",
         },
   );
+  const sandbox = trusted.find((t) => t.source === trustKey(l.source) && t.grant === "build_sandbox");
+  if (sandbox) {
+    out.push({
+      label: "build sandbox",
+      tone: "ok",
+      title: `Source trusted with the build sandbox by ${sandbox.trusted_by}.`,
+    });
+  }
   return out;
 }
 

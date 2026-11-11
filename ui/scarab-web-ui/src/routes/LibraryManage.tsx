@@ -5,7 +5,8 @@
 //
 // It holds everything done to the installation: its version and source,
 // Upgrade (the install dialog with the source filled in, then the review
-// page), trust in its source with forge credentials, yanking the installed
+// page), trust in its source with forge credentials and with the build
+// sandbox (each given on its own), yanking the installed
 // version, the yanked versions of this library with Lift yank on each, and
 // Remove, which asks for the name to be typed. Trusting and lifting a yank
 // ask for a step-up; stopping trust, yanking and removing tighten and ask
@@ -28,6 +29,7 @@ import {
   yankLibrary,
   type LibraryInstallation,
   type OrgLibraries,
+  type TrustGrant,
 } from "../api/client";
 import {
   impactRunLabel,
@@ -36,6 +38,7 @@ import {
   libraryManageHref,
   parseLibraryKey,
   shortHash,
+  grantLabel,
   trustKey,
   versionLabel,
   yankButtonLabel,
@@ -191,10 +194,13 @@ function Installation(props: {
   onRemoved: () => void;
 }) {
   const l = () => props.lib;
-  const trust = () => props.libs.trusted_sources.find((t) => t.source === trustKey(l().source));
+  const trustOf = (grant: TrustGrant) =>
+    props.libs.trusted_sources.find((t) => t.source === trustKey(l().source) && t.grant === grant);
+  const trust = () => trustOf("forge_credentials");
+  const sandboxTrust = () => trustOf("build_sandbox");
   const [upgrading, setUpgrading] = createSignal(false);
-  const [trusting, setTrusting] = createSignal(false);
-  const [untrusting, setUntrusting] = createSignal(false);
+  const [trusting, setTrusting] = createSignal<TrustGrant | null>(null);
+  const [untrusting, setUntrusting] = createSignal<TrustGrant | null>(null);
   const [yanking, setYanking] = createSignal(false);
   const [removing, setRemoving] = createSignal(false);
 
@@ -241,12 +247,12 @@ function Installation(props: {
           <Show
             when={trust()}
             fallback={
-              <button class="btn btn-ghost btn-sm" onClick={() => setTrusting(true)}>
+              <button class="btn btn-ghost btn-sm" onClick={() => setTrusting("forge_credentials")}>
                 <Icon icon="key-round" size={14} /> Trust source
               </button>
             }
           >
-            <button class="btn btn-ghost btn-sm" onClick={() => setUntrusting(true)}>
+            <button class="btn btn-ghost btn-sm" onClick={() => setUntrusting("forge_credentials")}>
               Stop trusting
             </button>
           </Show>
@@ -260,6 +266,41 @@ function Installation(props: {
             <Show
               when={trust()}
               fallback="Not trusted. A Step from this library that asks for forge_token does not receive a long-lived token."
+            >
+              {(t) => (
+                <span title={absTime(t().trusted_at)}>
+                  Trusted by <span class="mono">{t().trusted_by}</span> · {relTime(t().trusted_at)}. It holds
+                  across upgrades from the same file.
+                </span>
+              )}
+            </Show>
+          </dd>
+        </dl>
+      </Section>
+
+      <Section
+        title="Build sandbox"
+        foot={
+          <Show
+            when={sandboxTrust()}
+            fallback={
+              <button class="btn btn-ghost btn-sm" onClick={() => setTrusting("build_sandbox")}>
+                <Icon icon="key-round" size={14} /> Trust source
+              </button>
+            }
+          >
+            <button class="btn btn-ghost btn-sm" onClick={() => setUntrusting("build_sandbox")}>
+              Stop trusting
+            </button>
+          </Show>
+        }
+      >
+        <dl class="kv">
+          <dt>Trust</dt>
+          <dd>
+            <Show
+              when={sandboxTrust()}
+              fallback="Not trusted. A Run with a Step from this library that asks for security.sandbox is refused."
             >
               {(t) => (
                 <span title={absTime(t().trusted_at)}>
@@ -388,43 +429,61 @@ function Installation(props: {
         </ConfirmDestructive>
       </Show>
       <Show when={trusting()}>
-        <ConfirmAction
-          eyebrow={`${props.org} · libraries`}
-          title="Trust this source with forge credentials?"
-          purpose={<span class="mono">{trustKey(l().source)}</span>}
-          confirmLabel="Trust source"
-          onConfirm={async () => {
-            await trustLibrarySource(props.org, trustKey(l().source));
-            props.onDone(`${trustKey(l().source)} is trusted with forge credentials.`);
-          }}
-          onClose={() => setTrusting(false)}
-        >
-          <p>
-            A Step from any version installed from this file that asks for{" "}
-            <span class="mono">forge_token</span> may receive a long-lived token of a Forgejo or
-            GitHub PAT connection. Trust holds across upgrades from the same file; review each
-            upgrade's diff. This asks you to confirm with your passkey.
-          </p>
-        </ConfirmAction>
+        {(grant) => (
+          <ConfirmAction
+            eyebrow={`${props.org} · libraries`}
+            title={`Trust this source with ${grantLabel(grant())}?`}
+            purpose={<span class="mono">{trustKey(l().source)}</span>}
+            confirmLabel="Trust source"
+            onConfirm={async () => {
+              await trustLibrarySource(props.org, trustKey(l().source), grant());
+              props.onDone(`${trustKey(l().source)} is trusted with ${grantLabel(grant())}.`);
+            }}
+            onClose={() => setTrusting(null)}
+          >
+            <Show
+              when={grant() === "build_sandbox"}
+              fallback={
+                <p>
+                  A Step from any version installed from this file that asks for{" "}
+                  <span class="mono">forge_token</span> may receive a long-lived token of a Forgejo or
+                  GitHub PAT connection, and a Step with <span class="mono">registry_auth</span> the
+                  forge's registry credential. Trust holds across upgrades from the same file; review
+                  each upgrade's diff. This asks you to confirm with your passkey.
+                </p>
+              }
+            >
+              <p>
+                A Step from any version installed from this file may run with{" "}
+                <span class="mono">security.sandbox</span>: seccomp and AppArmor off, as rootless
+                BuildKit needs. It does not trust the source with forge credentials. Trust holds
+                across upgrades from the same file; review each upgrade's diff. This asks you to
+                confirm with your passkey.
+              </p>
+            </Show>
+          </ConfirmAction>
+        )}
       </Show>
       <Show when={untrusting()}>
-        <ConfirmAction
-          eyebrow={`${props.org} · libraries`}
-          title="Stop trusting this source?"
-          purpose={<span class="mono">{trustKey(l().source)}</span>}
-          confirmLabel="Stop trusting"
-          danger
-          onConfirm={async () => {
-            await untrustLibrarySource(props.org, trustKey(l().source));
-            props.onDone(`${trustKey(l().source)} is no longer trusted with forge credentials.`);
-          }}
-          onClose={() => setUntrusting(false)}
-        >
-          <p>
-            Runs created from now on refuse a Step from this source that asks for a long-lived forge
-            token.
-          </p>
-        </ConfirmAction>
+        {(grant) => (
+          <ConfirmAction
+            eyebrow={`${props.org} · libraries`}
+            title="Stop trusting this source?"
+            purpose={<span class="mono">{trustKey(l().source)}</span>}
+            confirmLabel="Stop trusting"
+            danger
+            onConfirm={async () => {
+              await untrustLibrarySource(props.org, trustKey(l().source), grant());
+              props.onDone(`${trustKey(l().source)} is no longer trusted with ${grantLabel(grant())}.`);
+            }}
+            onClose={() => setUntrusting(null)}
+          >
+            <p>
+              Runs created from now on refuse a Step from this source that needs{" "}
+              {grantLabel(grant())}, and so does each launch of a Run created before.
+            </p>
+          </ConfirmAction>
+        )}
       </Show>
     </>
   );

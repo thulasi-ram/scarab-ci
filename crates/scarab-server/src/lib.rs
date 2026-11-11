@@ -1757,6 +1757,7 @@ impl From<DispatchError> for ApiError {
             | DispatchError::PolicyDenied { .. }
             | DispatchError::LibraryYanked(_)
             | DispatchError::ForgeToken(_)
+            | DispatchError::Sandbox(_)
             | DispatchError::MissingApprovalGate(_)) => ApiError::Denied(refused.to_string()),
             other => ApiError::BadRequest(other.to_string()),
         }
@@ -1888,6 +1889,15 @@ async fn create_run(
         // (add-capabilities/privileged) are rejected fail-closed — but the
         // self-service `run_as_root` grant is honored (it stays inside the
         // caps-dropped, unprivileged sandbox). The hardened floor always applies.
+        // The sandbox is admitted from an installed library the org trusts
+        // (ADR-0018, amendment of 2026-11-12); an inline run has neither.
+        if step.security.as_ref().is_some_and(|s| s.sandbox.is_some()) {
+            return Err(ApiError::BadRequest(format!(
+                "step `{}`: `security.sandbox` is only for a Step from an installed library \
+                 the org trusts for it, and an inline run has none",
+                step.id
+            )));
+        }
         let admitted = admit_step_grants(None, step.security.as_ref(), &step.image, false)
             .map_err(|v| {
                 ApiError::BadRequest(format!(
@@ -1922,6 +1932,8 @@ async fn create_run(
             // project-namespaced — the scheduler would disable it anyway.
             cache: None,
             forge_token: None,
+            sandbox: None,
+            registry_auth: None,
             build: None,
             artifacts: vec![],
             placement_profiles: step.placement_profiles.clone(),
@@ -5128,6 +5140,7 @@ pub(crate) async fn trigger_runs_from_files(
             Admission::Refused(
                 ref refusal @ (AdmissionRefusal::EventField { ref messages }
                 | AdmissionRefusal::ForgeToken { ref messages }
+                | AdmissionRefusal::Sandbox { ref messages }
                 | AdmissionRefusal::MissingApprovalGate { ref messages }),
             ) => {
                 let reason = admission_refusal_message(refusal, &repo.owner, &repo.name);
@@ -5324,6 +5337,9 @@ enum AdmissionRefusal {
     /// A Step asks for a forge credential it may not have (ADR-0076 §9), a
     /// PolicyInvariant like a yank.
     ForgeToken { messages: Vec<String> },
+    /// A Step asks for a sandbox its library is not trusted for (ADR-0018,
+    /// amendment of 2026-11-12), a PolicyInvariant like a yank.
+    Sandbox { messages: Vec<String> },
     /// Steps use the Environment's authority with no `manual` gate upstream,
     /// and the Environment, which has approvers, refuses such a Run instead
     /// of adding a gate (missing-gate mode `refuse`, ADR-0078 §3).
@@ -5339,6 +5355,13 @@ struct AdmittedFacts<'a> {
     /// library is trusted, each with that library's content hash: they
     /// consume no workspace.
     trusted_only: &'a std::collections::BTreeMap<String, String>,
+    /// Steps admitted to their sandbox, each with the content hash of the
+    /// library version the org trusts for it.
+    sandbox: &'a std::collections::BTreeMap<String, String>,
+    /// `registry_auth` Steps that may receive the forge-derived registry
+    /// credential, each with the content hash of the library version the
+    /// org trusts with forge credentials.
+    registry_forge: &'a std::collections::BTreeMap<String, String>,
     /// The Run's cache scope ([`run_cache_scope`]); `None` turns its Cache
     /// off.
     cache_scope: Option<scarab_engine::CacheScope>,
@@ -5593,6 +5616,7 @@ async fn admit_and_create_run(
             AdmissionRefusal::LibraryYanked { messages } => ("yanked", messages),
             AdmissionRefusal::EventField { messages } => ("event_field", messages),
             AdmissionRefusal::ForgeToken { messages } => ("forge_token", messages),
+            AdmissionRefusal::Sandbox { messages } => ("sandbox", messages),
             AdmissionRefusal::MissingApprovalGate { messages } => ("approval_gate", messages),
         };
         if !kind.is_empty() {
@@ -5856,12 +5880,29 @@ async fn admit_unrecorded(
             messages: tokens.refusals,
         }));
     }
+    // ADR-0018 (amendment of 2026-11-12): a sandboxed Step's library must be
+    // trusted for the sandbox, and a `registry_auth` Step gets the
+    // forge-derived credential only from a library trusted with forge
+    // credentials. Fixed checks, before any Policy is consulted.
+    let sandbox = forge_token::sandbox_refusals(ports.libraries, &repo.owner, ir)
+        .await
+        .map_err(|e| TriggerError::Db(DbError::Other(e)))?;
+    if !sandbox.refusals.is_empty() {
+        return Ok(Admission::Refused(AdmissionRefusal::Sandbox {
+            messages: sandbox.refusals,
+        }));
+    }
+    let registry_forge = forge_token::registry_forge_libraries(ports.libraries, &repo.owner, ir)
+        .await
+        .map_err(|e| TriggerError::Db(DbError::Other(e)))?;
 
     let now = clock.now().await;
     let run = run_id_for(event, path);
     let admitted = AdmittedFacts {
         event: &facts,
         trusted_only: &tokens.trusted_only,
+        sandbox: &sandbox.trusted,
+        registry_forge: &registry_forge,
         cache_scope: run_cache_scope(forge, event, ir, &gov).await,
     };
     // Rendered before the Policies are consulted: a key that cannot be
@@ -6384,6 +6425,10 @@ pub enum DispatchError {
     /// A Step asks for a forge credential it may not have (ADR-0076 §9).
     #[error("{}", forge_token_message(.0))]
     ForgeToken(Vec<String>),
+    /// A Step asks for a sandbox its library is not trusted for (ADR-0018,
+    /// amendment of 2026-11-12).
+    #[error("{}", sandbox_message(.0))]
+    Sandbox(Vec<String>),
     /// Steps use the Environment's authority with no `manual` gate upstream,
     /// and the Environment refuses such a Run (ADR-0078 §3).
     #[error("{}", .0.join("; "))]
@@ -6413,6 +6458,7 @@ fn admission_refusal_message(refusal: &AdmissionRefusal, org: &str, project: &st
         AdmissionRefusal::LibraryYanked { messages } => library_yanked_message(messages),
         AdmissionRefusal::EventField { messages } => event_field_message(messages),
         AdmissionRefusal::ForgeToken { messages } => forge_token_message(messages),
+        AdmissionRefusal::Sandbox { messages } => sandbox_message(messages),
         AdmissionRefusal::MissingApprovalGate { messages } => messages.join("; "),
     }
 }
@@ -6427,6 +6473,13 @@ fn event_field_message(messages: &[String]) -> String {
 fn forge_token_message(messages: &[String]) -> String {
     format!(
         "this Run asks for a forge credential it may not have: {}",
+        messages.join("; ")
+    )
+}
+
+fn sandbox_message(messages: &[String]) -> String {
+    format!(
+        "this Run asks for a sandbox it may not have: {}",
         messages.join("; ")
     )
 }
@@ -6677,6 +6730,7 @@ pub async fn dispatch_run(
         AdmissionRefusal::LibraryYanked { messages } => DispatchError::LibraryYanked(messages),
         AdmissionRefusal::EventField { messages } => DispatchError::EventField(messages),
         AdmissionRefusal::ForgeToken { messages } => DispatchError::ForgeToken(messages),
+        AdmissionRefusal::Sandbox { messages } => DispatchError::Sandbox(messages),
         AdmissionRefusal::MissingApprovalGate { messages } => {
             DispatchError::MissingApprovalGate(messages)
         }
@@ -7203,6 +7257,36 @@ async fn write_run_from_ir(
                 tracing::warn!(step = %step.id, %reason, "step will fail when it launches");
             }
             let trusted_library = admitted.trusted_only.get(&step.id).cloned();
+            // The sandbox (ADR-0018, amendment of 2026-11-12), as admission
+            // decided it, with the library whose trust each launch checks
+            // again. Admission refused the Run if a sandboxed Step had none.
+            let sandbox = match (step.sandbox(), admitted.sandbox.get(&step.id)) {
+                (Some(sandbox), Some(library)) => Some(scarab_engine::SandboxConfig {
+                    sandbox,
+                    org: event.repo().map(|r| r.owner.clone()).unwrap_or_default(),
+                    library: library.clone(),
+                }),
+                (Some(_), None) => {
+                    return Err(TriggerError::Pipeline(format!(
+                        "step `{}`: its sandbox was not admitted",
+                        step.id
+                    )))
+                }
+                (None, _) => None,
+            };
+            // The registry credential: a fork pull request's Pipeline is read
+            // at the PR head, so like a Run locked out of its Environment it
+            // gets none at any launch.
+            let registry_auth = step
+                .registry_auth
+                .then(|| scarab_engine::RegistryAuthConfig {
+                    owner: event.repo().map(|r| r.owner.clone()).unwrap_or_default(),
+                    name: event.repo().map(|r| r.name.clone()).unwrap_or_default(),
+                    locked_out: locked_out || event.is_fork_pr(),
+                    forge_library: admitted.registry_forge.get(&step.id).cloned(),
+                    registry_auth_json: None,
+                    derived_auth: None,
+                });
             let admitted = admit_step_grants(
                 gov.privilege_grant_scope(),
                 step.security.as_ref(),
@@ -7285,6 +7369,8 @@ async fn write_run_from_ir(
                         credential: None,
                     })
                 }),
+                sandbox,
+                registry_auth,
                 build,
                 artifacts: step.artifacts.clone(),
                 placement_profiles: step.placement_profiles.clone(),
@@ -14722,6 +14808,7 @@ impl utoipa::Modify for StepUpResponses {
         run_origin::RenderedSpecDto,
         run_origin::StepOriginDto,
         libraries::TrustedSourceDto,
+        libraries::TrustGrantDto,
         libraries::TrustSourceRequest,
         policies::PolicyDto,
         policies::PolicyVersionDto,

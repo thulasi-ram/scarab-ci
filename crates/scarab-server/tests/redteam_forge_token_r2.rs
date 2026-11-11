@@ -111,6 +111,7 @@ async fn install_in(
         libs.trust_source(&TrustedSource {
             org: org.into(),
             source: scarab_policy::library::trust_key(source).into(),
+            grant: scarab_policy::library::TrustGrant::ForgeCredentials,
             trusted_by: "amy".into(),
             trusted_at: 2,
             step_up_ref: Some("su-1".into()),

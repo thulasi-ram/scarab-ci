@@ -610,6 +610,8 @@ async fn published_artifacts_are_durably_indexed_in_postgres() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         // The feature: this step publishes artifacts of record (ADR-0052).
         artifacts: vec!["dist/*".into()],

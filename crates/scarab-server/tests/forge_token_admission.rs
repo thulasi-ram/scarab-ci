@@ -145,6 +145,7 @@ async fn trust(libs: &InMemoryLibraries, source: &str) {
     libs.trust_source(&TrustedSource {
         org: "acme".into(),
         source: scarab_policy::library::trust_key(source).into(),
+        grant: scarab_policy::library::TrustGrant::ForgeCredentials,
         trusted_by: "amy".into(),
         trusted_at: 2,
         step_up_ref: Some("su-1".into()),
@@ -448,6 +449,7 @@ async fn trust_follows_the_source_across_upgrades() {
     libs.trust_source(&TrustedSource {
         org: "acme".into(),
         source: "github.com/acme/libs//pusher.yaml".into(),
+        grant: scarab_policy::library::TrustGrant::ForgeCredentials,
         trusted_by: "amy".into(),
         trusted_at: 2,
         step_up_ref: Some("su-1".into()),
@@ -479,9 +481,13 @@ async fn trust_follows_the_source_across_upgrades() {
 
     // Untrusting refuses again.
     install(&libs, "acme", "pusher", &v2, &at('2')).await;
-    libs.untrust_source("acme", "github.com/acme/libs//pusher.yaml")
-        .await
-        .unwrap();
+    libs.untrust_source(
+        "acme",
+        "github.com/acme/libs//pusher.yaml",
+        scarab_policy::library::TrustGrant::ForgeCredentials,
+    )
+    .await
+    .unwrap();
     assert!(
         refused_reason(&trigger(&db, &forge, ports(), &push()).await).contains("step `sync/git`")
     );

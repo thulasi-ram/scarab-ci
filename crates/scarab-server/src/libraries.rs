@@ -26,7 +26,7 @@ use scarab_engine::DbError;
 use scarab_identity::Action;
 use scarab_policy::library::{
     content_hash, valid_segment, LibraryInstallation, LibraryStore, LibraryStoreError,
-    LibraryVersion, LibraryYank, NewInstallation, Replaces, TrustedSource,
+    LibraryVersion, LibraryYank, NewInstallation, Replaces, TrustGrant, TrustedSource,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -101,17 +101,52 @@ pub struct LibraryInstallationDto {
 pub struct OrgLibrariesDto {
     pub installations: Vec<LibraryInstallationDto>,
     pub yanks: Vec<LibraryYankDto>,
-    /// The library sources this org trusts with long-lived forge credentials
-    /// (ADR-0076 §9). No library is trusted without one.
+    /// The library sources this org trusts, one entry per source and grant
+    /// (ADR-0076 §9, ADR-0018 amendment of 2026-11-12). No library is
+    /// trusted without one.
     pub trusted_sources: Vec<TrustedSourceDto>,
 }
 
-/// A library source the org trusts with long-lived forge credentials
-/// (ADR-0076 §9). Trust holds across upgrades from the same source.
+/// What an org's trust in a library source grants. Each is trusted on its
+/// own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustGrantDto {
+    /// A Step from the source may receive a long-lived forge credential,
+    /// and the forge-derived registry credential.
+    #[default]
+    ForgeCredentials,
+    /// A Step from the source may run in a `security.sandbox`.
+    BuildSandbox,
+}
+
+impl From<TrustGrantDto> for TrustGrant {
+    fn from(g: TrustGrantDto) -> Self {
+        match g {
+            TrustGrantDto::ForgeCredentials => TrustGrant::ForgeCredentials,
+            TrustGrantDto::BuildSandbox => TrustGrant::BuildSandbox,
+        }
+    }
+}
+
+impl From<TrustGrant> for TrustGrantDto {
+    fn from(g: TrustGrant) -> Self {
+        match g {
+            TrustGrant::ForgeCredentials => TrustGrantDto::ForgeCredentials,
+            TrustGrant::BuildSandbox => TrustGrantDto::BuildSandbox,
+        }
+    }
+}
+
+/// A library source the org trusts with one grant (ADR-0076 §9, ADR-0018
+/// amendment of 2026-11-12). Trust holds across upgrades from the same
+/// source.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TrustedSourceDto {
     /// `<host>/<owner>/<repo>//<path>`, without a commit.
     pub source: String,
+    /// What the trust grants.
+    pub grant: TrustGrantDto,
     pub trusted_by: String,
     pub trusted_at: i64,
 }
@@ -160,13 +195,17 @@ impl crate::people::ShowsPeople for OrgLibrariesDto {
     }
 }
 
-/// `DELETE …/library-trust?source=…`.
+/// `DELETE …/library-trust?source=…&grant=…`.
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct UntrustSourceQuery {
     /// The trusted source, `<host>/<owner>/<repo>//<path>`.
     #[serde(default)]
     pub source: Option<String>,
+    /// The grant to remove; `forge_credentials` when omitted. The source's
+    /// other grants stay.
+    #[serde(default)]
+    pub grant: Option<TrustGrantDto>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -174,6 +213,9 @@ pub struct TrustSourceRequest {
     /// `<host>/<owner>/<repo>//<path>`; an `@<commit>` is dropped, since
     /// trust is for every version from the source.
     pub source: String,
+    /// What the trust grants; `forge_credentials` when omitted.
+    #[serde(default)]
+    pub grant: TrustGrantDto,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -629,6 +671,7 @@ pub(crate) async fn get_library_installation(
 fn trusted_dto(t: &TrustedSource) -> TrustedSourceDto {
     TrustedSourceDto {
         source: t.source.clone(),
+        grant: t.grant.into(),
         trusted_by: t.trusted_by.clone(),
         trusted_at: t.trusted_at,
     }
@@ -646,16 +689,19 @@ fn trust_source_key(source: &str) -> Result<String, ApiError> {
     Ok(key)
 }
 
-/// Trust a library source with long-lived forge credentials (ADR-0076 §9):
-/// a Step from a library installed from it may receive a Forgejo or GitHub
-/// PAT connection's token. Trust holds across upgrades from the same
-/// source. Needs a step-up: it loosens. Administer on the org.
+/// Trust a library source with one grant. With `forge_credentials` (the
+/// default; ADR-0076 §9), a Step from a library installed from it may
+/// receive a Forgejo or GitHub PAT connection's token and the forge-derived
+/// registry credential. With `build_sandbox` (ADR-0018, amendment of
+/// 2026-11-12), such a Step may run in a `security.sandbox`. One grant does
+/// not give the other. Trust holds across upgrades from the same source.
+/// Needs a step-up: it loosens. Administer on the org.
 #[utoipa::path(
     post,
     path = "/v1/orgs/{org}/library-trust",
     params(("org" = String, Path, description = "org")),
     request_body = TrustSourceRequest,
-    summary = "Trust a library source with forge credentials (ADR-0076 §9)",
+    summary = "Trust a library source with forge credentials or the build sandbox",
     responses(
         (status = 200, body = TrustedSourceDto),
         (status = 400, description = "not a library source"),
@@ -679,31 +725,41 @@ pub(crate) async fn trust_library_source(
         .trust_source(&TrustedSource {
             org,
             source,
+            grant: body.grant.into(),
             trusted_by: by.clone(),
             trusted_at: now,
             step_up_ref: guard.and_then(|Extension(g)| g.confirmation_id()),
         })
         .await
         .map_err(store_api_error)?;
-    tracing::warn!(org = %t.org, source = %t.source, by = %by, "library source trusted with forge credentials");
+    tracing::warn!(
+        org = %t.org,
+        source = %t.source,
+        grant = t.grant.as_str(),
+        by = %by,
+        "library source trusted with {}",
+        t.grant.describe()
+    );
     Ok(Json(
         crate::people::shown(st.identities.as_deref(), trusted_dto(&t)).await,
     ))
 }
 
-/// Stop trusting a library source with forge credentials. It tightens: no
-/// step-up. Runs created after it refuse a Step from that source asking for
-/// a long-lived token. Administer on the org.
+/// Stop trusting a library source with one grant (`forge_credentials` when
+/// `grant` is omitted); its other grants stay. It tightens: no step-up.
+/// Runs created after it refuse a Step from that source that needs the
+/// grant, and each launch of an existing Run checks it again. Administer
+/// on the org.
 #[utoipa::path(
     delete,
     path = "/v1/orgs/{org}/library-trust",
     params(("org" = String, Path, description = "org"), UntrustSourceQuery),
-    summary = "Stop trusting a library source with forge credentials (ADR-0076 §9)",
+    summary = "Stop trusting a library source with forge credentials or the build sandbox",
     responses(
         (status = 204, description = "no longer trusted"),
         (status = 400, description = "no `source`, or not a library source"),
         (status = 403, description = "not an org admin"),
-        (status = 404, description = "not trusted, or libraries not configured")
+        (status = 404, description = "not trusted with that grant, or libraries not configured")
     )
 )]
 pub(crate) async fn untrust_library_source(
@@ -719,7 +775,7 @@ pub(crate) async fn untrust_library_source(
         .ok_or_else(|| ApiError::BadRequest("name the trusted `source`".into()))?;
     let source = trust_source_key(source)?;
     store(&st)?
-        .untrust_source(&org, &source)
+        .untrust_source(&org, &source, q.grant.unwrap_or_default().into())
         .await
         .map_err(store_api_error)?
         .ok_or(ApiError::NotFound)?;

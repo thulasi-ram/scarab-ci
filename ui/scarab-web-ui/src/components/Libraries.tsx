@@ -15,7 +15,7 @@
 // trust does not.
 import { createResource, createSignal, For, Show } from "solid-js";
 import { A } from "@solidjs/router";
-import { listLibraries, untrustLibrarySource, unyankLibrary } from "../api/client";
+import { listLibraries, untrustLibrarySource, unyankLibrary, type TrustedSource } from "../api/client";
 import {
   libraryChips,
   libraryId,
@@ -23,6 +23,7 @@ import {
   removedLibraryYanks,
   shortHash,
   strayTrust,
+  grantLabel,
   versionLabel,
 } from "../libraries";
 import { relTime, absTime } from "../fmt";
@@ -41,7 +42,7 @@ export default function Libraries(props: { org: string }) {
   const [installing, setInstalling] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [notice, setNotice] = createSignal<string | null>(null);
-  const [untrusting, setUntrusting] = createSignal<string | null>(null);
+  const [untrusting, setUntrusting] = createSignal<TrustedSource | null>(null);
   const reload = () => setEpoch((e) => e + 1);
 
   const data = () => (libs.error ? undefined : libs());
@@ -197,14 +198,14 @@ export default function Libraries(props: { org: string }) {
                       <div class="tok-head">
                         <span class="mono lib-src">{t.source}</span>
                         <span class="oenv-actions">
-                          <button class="btn btn-ghost btn-sm" onClick={() => setUntrusting(t.source)}>
+                          <button class="btn btn-ghost btn-sm" onClick={() => setUntrusting(t)}>
                             Stop trusting
                           </button>
                         </span>
                       </div>
                       <div class="tok-facts" title={absTime(t.trusted_at)}>
                         <span>
-                          trusted by {t.trusted_by} · {relTime(t.trusted_at)}
+                          {grantLabel(t.grant)} · trusted by {t.trusted_by} · {relTime(t.trusted_at)}
                         </span>
                       </div>
                     </li>
@@ -229,24 +230,24 @@ export default function Libraries(props: { org: string }) {
         <InstallLibraryDialog org={props.org} onClose={() => setInstalling(false)} />
       </Show>
       <Show when={untrusting()}>
-        {(src) => (
+        {(t) => (
           <ConfirmAction
             eyebrow={`${props.org} · libraries`}
             title="Stop trusting this source?"
-            purpose={<span class="mono">{src()}</span>}
+            purpose={<span class="mono">{t().source}</span>}
             confirmLabel="Stop trusting"
             danger
             onConfirm={async () => {
-              await untrustLibrarySource(props.org, src());
+              await untrustLibrarySource(props.org, t().source, t().grant);
               setError(null);
-              setNotice(`${src()} is no longer trusted with forge credentials.`);
+              setNotice(`${t().source} is no longer trusted with ${grantLabel(t().grant)}.`);
               reload();
             }}
             onClose={() => setUntrusting(null)}
           >
             <p>
-              Runs created from now on refuse a Step from this source that asks for a long-lived
-              forge token.
+              Runs created from now on refuse a Step from this source that needs{" "}
+              {grantLabel(t().grant)}.
             </p>
           </ConfirmAction>
         )}

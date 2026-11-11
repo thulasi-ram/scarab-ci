@@ -480,6 +480,7 @@ async fn rbac_an_admin_of_one_org_cannot_read_or_change_anothers_libraries() {
     let globex_trust = scarab_policy::library::TrustedSource {
         org: "globex".into(),
         source: "github.com/globex/libs//deploy.yaml".into(),
+        grant: scarab_policy::library::TrustGrant::ForgeCredentials,
         trusted_by: "seed".into(),
         trusted_at: 1,
         step_up_ref: None,

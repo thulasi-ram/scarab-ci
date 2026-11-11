@@ -57,6 +57,8 @@ fn step(id: &str) -> Step {
         placement_profiles: strings(&[]),
         deploy: false,
         forge_token: Some(ForgeToken::Read),
+        sandbox: None,
+        registry_auth: None,
         uses_environment_authority: false,
         origin: cap(vec![]),
         upstream_gates: cap(vec![]),

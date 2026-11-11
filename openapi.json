@@ -3268,7 +3268,7 @@
         "tags": [
           "Libraries"
         ],
-        "summary": "Trust a library source with forge credentials (ADR-0076 §9)",
+        "summary": "Trust a library source with forge credentials or the build sandbox",
         "operationId": "trust_library_source",
         "parameters": [
           {
@@ -3335,7 +3335,7 @@
         "tags": [
           "Libraries"
         ],
-        "summary": "Stop trusting a library source with forge credentials (ADR-0076 §9)",
+        "summary": "Stop trusting a library source with forge credentials or the build sandbox",
         "operationId": "untrust_library_source",
         "parameters": [
           {
@@ -3355,6 +3355,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "grant",
+            "in": "query",
+            "description": "The grant to remove; `forge_credentials` when omitted. The source's\nother grants stay.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/TrustGrantDto"
+            }
           }
         ],
         "responses": {
@@ -3368,7 +3377,7 @@
             "description": "not an org admin"
           },
           "404": {
-            "description": "not trusted, or libraries not configured"
+            "description": "not trusted with that grant, or libraries not configured"
           }
         },
         "security": [
@@ -12102,7 +12111,7 @@
             "items": {
               "$ref": "#/components/schemas/TrustedSourceDto"
             },
-            "description": "The library sources this org trusts with long-lived forge credentials\n(ADR-0076 §9). No library is trusted without one."
+            "description": "The library sources this org trusts, one entry per source and grant\n(ADR-0076 §9, ADR-0018 amendment of 2026-11-12). No library is\ntrusted without one."
           },
           "yanks": {
             "type": "array",
@@ -15718,12 +15727,24 @@
           "created"
         ]
       },
+      "TrustGrantDto": {
+        "type": "string",
+        "description": "What an org's trust in a library source grants. Each is trusted on its\nown.",
+        "enum": [
+          "forge_credentials",
+          "build_sandbox"
+        ]
+      },
       "TrustSourceRequest": {
         "type": "object",
         "required": [
           "source"
         ],
         "properties": {
+          "grant": {
+            "$ref": "#/components/schemas/TrustGrantDto",
+            "description": "What the trust grants; `forge_credentials` when omitted."
+          },
           "source": {
             "type": "string",
             "description": "`<host>/<owner>/<repo>//<path>`; an `@<commit>` is dropped, since\ntrust is for every version from the source."
@@ -15732,13 +15753,18 @@
       },
       "TrustedSourceDto": {
         "type": "object",
-        "description": "A library source the org trusts with long-lived forge credentials\n(ADR-0076 §9). Trust holds across upgrades from the same source.",
+        "description": "A library source the org trusts with one grant (ADR-0076 §9, ADR-0018\namendment of 2026-11-12). Trust holds across upgrades from the same\nsource.",
         "required": [
           "source",
+          "grant",
           "trusted_by",
           "trusted_at"
         ],
         "properties": {
+          "grant": {
+            "$ref": "#/components/schemas/TrustGrantDto",
+            "description": "What the trust grants."
+          },
           "source": {
             "type": "string",
             "description": "`<host>/<owner>/<repo>//<path>`, without a commit."

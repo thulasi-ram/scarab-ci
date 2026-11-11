@@ -523,6 +523,8 @@ fn step_admit_input(
                 scarab_pipeline::ForgeToken::Read => rc::ForgeToken::Read,
                 scarab_pipeline::ForgeToken::Write => rc::ForgeToken::Write,
             }),
+            sandbox: s.sandbox().map(|x| x.as_str().to_string()),
+            registry_auth: Some(s.registry_auth),
             uses_environment_authority: rc::uses_environment_authority(ir, s),
             origin: rc::origin_of(&s.origin, &what).map_err(|e| e.to_string())?,
         },

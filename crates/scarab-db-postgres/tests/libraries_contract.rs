@@ -9,7 +9,7 @@ use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_policy::library::{
     content_hash, LibraryStore, LibraryStoreError, LibraryVersion, LibraryYank, NewInstallation,
-    Replaces, TrustedSource,
+    Replaces, TrustGrant, TrustedSource,
 };
 use scarab_testkit::InMemoryLibraries;
 
@@ -128,38 +128,69 @@ async fn ids(store: &dyn LibraryStore) {
 }
 
 async fn trust(store: &dyn LibraryStore) {
-    let t = |by: &str, at: i64| TrustedSource {
+    const SRC: &str = "github.com/acme/libs//push.yaml";
+    let t = |grant: TrustGrant, by: &str, at: i64| TrustedSource {
         org: "acme".into(),
-        source: "github.com/acme/libs//push.yaml".into(),
+        source: SRC.into(),
+        grant,
         trusted_by: by.into(),
         trusted_at: at,
         step_up_ref: Some("su-1".into()),
     };
+    let forge = |by, at| t(TrustGrant::ForgeCredentials, by, at);
+    let sandbox = |by, at| t(TrustGrant::BuildSandbox, by, at);
     assert!(store.trusted_sources("acme").await.unwrap().is_empty());
-    assert_eq!(store.trust_source(&t("amy", 1)).await.unwrap(), t("amy", 1));
-    // Trusting again keeps the first record.
-    assert_eq!(store.trust_source(&t("bob", 2)).await.unwrap(), t("amy", 1));
+    assert_eq!(
+        store.trust_source(&forge("amy", 1)).await.unwrap(),
+        forge("amy", 1)
+    );
+    // Trusting again with the same grant keeps the first record.
+    assert_eq!(
+        store.trust_source(&forge("bob", 2)).await.unwrap(),
+        forge("amy", 1)
+    );
     assert_eq!(
         store.trusted_sources("acme").await.unwrap(),
-        vec![t("amy", 1)]
+        vec![forge("amy", 1)]
+    );
+    // Another grant for the same source is its own record.
+    assert_eq!(
+        store.trust_source(&sandbox("bob", 3)).await.unwrap(),
+        sandbox("bob", 3)
+    );
+    assert_eq!(
+        store.trusted_sources("acme").await.unwrap(),
+        vec![sandbox("bob", 3), forge("amy", 1)]
     );
     assert!(
         store.trusted_sources("globex").await.unwrap().is_empty(),
         "per org"
     );
+    // Removing one grant keeps the other.
     assert_eq!(
         store
-            .untrust_source("acme", "github.com/acme/libs//push.yaml")
+            .untrust_source("acme", SRC, TrustGrant::ForgeCredentials)
             .await
             .unwrap(),
-        Some(t("amy", 1))
+        Some(forge("amy", 1))
     );
     assert_eq!(
         store
-            .untrust_source("acme", "github.com/acme/libs//push.yaml")
+            .untrust_source("acme", SRC, TrustGrant::ForgeCredentials)
             .await
             .unwrap(),
         None
+    );
+    assert_eq!(
+        store.trusted_sources("acme").await.unwrap(),
+        vec![sandbox("bob", 3)]
+    );
+    assert_eq!(
+        store
+            .untrust_source("acme", SRC, TrustGrant::BuildSandbox)
+            .await
+            .unwrap(),
+        Some(sandbox("bob", 3))
     );
     assert!(store.trusted_sources("acme").await.unwrap().is_empty());
 }

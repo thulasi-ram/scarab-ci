@@ -21,7 +21,7 @@ use sqlx::Row;
 use scarab_pipeline::InstalledLibrary;
 use scarab_policy::library::{
     LibraryInstallation, LibraryStore, LibraryStoreError, LibraryVersion, LibraryYank,
-    NewInstallation, Replaces, TrustedSource,
+    NewInstallation, Replaces, TrustGrant, TrustedSource,
 };
 
 use crate::PostgresDb;
@@ -480,24 +480,27 @@ impl LibraryStore for PostgresDb {
 
     async fn trusted_sources(&self, org: &str) -> Result<Vec<TrustedSource>, LibraryStoreError> {
         let rows = sqlx::query(
-            "SELECT org, source, trusted_by, trusted_at, step_up_ref \
-             FROM library_trusted_sources WHERE org = $1 ORDER BY source COLLATE \"C\"",
+            "SELECT org, source, trust_grant, trusted_by, trusted_at, step_up_ref \
+             FROM library_trusted_sources WHERE org = $1 \
+             ORDER BY source COLLATE \"C\", trust_grant COLLATE \"C\"",
         )
         .bind(org)
         .fetch_all(self.pool())
         .await
         .map_err(store_err)?;
-        Ok(rows.iter().map(trusted_from_row).collect())
+        rows.iter().map(trusted_from_row).collect()
     }
 
     async fn trust_source(&self, t: &TrustedSource) -> Result<TrustedSource, LibraryStoreError> {
         sqlx::query(
             "INSERT INTO library_trusted_sources \
-               (org, source, trusted_by, trusted_at, step_up_ref) \
-             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (org, source) DO NOTHING",
+               (org, source, trust_grant, trusted_by, trusted_at, step_up_ref) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (org, source, trust_grant) DO NOTHING",
         )
         .bind(&t.org)
         .bind(&t.source)
+        .bind(t.grant.as_str())
         .bind(&t.trusted_by)
         .bind(t.trusted_at)
         .bind(&t.step_up_ref)
@@ -505,41 +508,50 @@ impl LibraryStore for PostgresDb {
         .await
         .map_err(store_err)?;
         let row = sqlx::query(
-            "SELECT org, source, trusted_by, trusted_at, step_up_ref \
-             FROM library_trusted_sources WHERE org = $1 AND source = $2",
+            "SELECT org, source, trust_grant, trusted_by, trusted_at, step_up_ref \
+             FROM library_trusted_sources \
+             WHERE org = $1 AND source = $2 AND trust_grant = $3",
         )
         .bind(&t.org)
         .bind(&t.source)
+        .bind(t.grant.as_str())
         .fetch_one(self.pool())
         .await
         .map_err(store_err)?;
-        Ok(trusted_from_row(&row))
+        trusted_from_row(&row)
     }
 
     async fn untrust_source(
         &self,
         org: &str,
         source: &str,
+        grant: TrustGrant,
     ) -> Result<Option<TrustedSource>, LibraryStoreError> {
         let row = sqlx::query(
-            "DELETE FROM library_trusted_sources WHERE org = $1 AND source = $2 \
-             RETURNING org, source, trusted_by, trusted_at, step_up_ref",
+            "DELETE FROM library_trusted_sources \
+             WHERE org = $1 AND source = $2 AND trust_grant = $3 \
+             RETURNING org, source, trust_grant, trusted_by, trusted_at, step_up_ref",
         )
         .bind(org)
         .bind(source)
+        .bind(grant.as_str())
         .fetch_optional(self.pool())
         .await
         .map_err(store_err)?;
-        Ok(row.as_ref().map(trusted_from_row))
+        row.as_ref().map(trusted_from_row).transpose()
     }
 }
 
-fn trusted_from_row(r: &PgRow) -> TrustedSource {
-    TrustedSource {
+fn trusted_from_row(r: &PgRow) -> Result<TrustedSource, LibraryStoreError> {
+    let grant: String = r.get("trust_grant");
+    Ok(TrustedSource {
         org: r.get("org"),
         source: r.get("source"),
+        grant: TrustGrant::parse(&grant).ok_or_else(|| {
+            LibraryStoreError::Store(format!("unknown library trust grant `{grant}`"))
+        })?,
         trusted_by: r.get("trusted_by"),
         trusted_at: r.get("trusted_at"),
         step_up_ref: r.get("step_up_ref"),
-    }
+    })
 }

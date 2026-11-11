@@ -726,6 +726,16 @@ pub struct StepSpec {
     /// Attempt launches and never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forge_token: Option<ForgeTokenConfig>,
+    /// The sandbox Run creation admitted for this Step (ADR-0018, amendment
+    /// of 2026-11-12), with the library the org trusted for it. Each launch
+    /// checks the org still trusts that library's source for the sandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxConfig>,
+    /// The registry credential this Step receives (ADR-0018, amendment of
+    /// 2026-11-12), as Run creation decided it. The credential itself is
+    /// resolved when each Attempt launches and never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_auth: Option<RegistryAuthConfig>,
     /// Set when this is a **build** step (ADR-0018): the engine runs rootless
     /// BuildKit with this context instead of an authored image/command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1097,6 +1107,55 @@ pub struct BuildConfig {
     /// (ADR-0018 amendment: zero-config GHCR/Forgejo push). Filled at LAUNCH,
     /// **never serialized**; used only when no scoped `REGISTRY_AUTH` secret
     /// resolves. Delivered to the Pod as a mounted dockerconfigjson, never env.
+    #[serde(skip)]
+    pub derived_auth: Option<RegistryCredential>,
+}
+
+/// A Step's sandbox (ADR-0018, amendment of 2026-11-12), as Run creation
+/// admitted it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    pub sandbox: scarab_pipeline::Sandbox,
+    /// The org whose trust admitted it: the Run's repository owner.
+    pub org: String,
+    /// The content hash of the library version that defines the Step (the
+    /// last link of its `origin`), whose source the org trusted for the
+    /// sandbox at Run creation.
+    pub library: String,
+}
+
+/// A Step's registry credential (ADR-0018, amendment of 2026-11-12): what
+/// Run creation decided, and the credential resolved for one Attempt's
+/// launch. Mounted as a dockerconfigjson file, never an environment
+/// variable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryAuthConfig {
+    /// The Run's repository: what the scoped `REGISTRY_AUTH` secret resolves
+    /// against and what the forge derives its credential for. Empty for a
+    /// Run with no repository, which gets no credential.
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub name: String,
+    /// A fork pull request, or a Run locked out of its Environment's
+    /// secrets: no credential at any launch. Each launch also reads the
+    /// Run's recorded trigger.
+    #[serde(default)]
+    pub locked_out: bool,
+    /// The content hash of the library version that defines the Step, when
+    /// the org trusted its source with forge credentials at Run creation:
+    /// only then may the Step receive the forge-derived credential, and each
+    /// launch checks the trust again. `None`: a `REGISTRY_AUTH` secret or
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge_library: Option<String>,
+    /// A scoped `REGISTRY_AUTH` secret's dockerconfigjson, resolved at
+    /// LAUNCH — **never serialized**. Takes precedence over
+    /// [`derived_auth`](Self::derived_auth).
+    #[serde(skip)]
+    pub registry_auth_json: Option<String>,
+    /// The forge-derived credential for the forge's own registry, resolved
+    /// at LAUNCH — **never serialized**.
     #[serde(skip)]
     pub derived_auth: Option<RegistryCredential>,
 }

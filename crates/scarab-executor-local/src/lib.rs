@@ -251,6 +251,24 @@ impl Executor for LocalExecutor {
                     .into(),
             ));
         }
+        // A sandbox is a Pod shape (ADR-0018, amendment of 2026-11-12), and a
+        // registry credential is a file mounted into one container: a host
+        // process has neither boundary.
+        if let Some(sandbox) = &spec.sandbox {
+            return Err(ExecError::Launch(format!(
+                "a step with `security.sandbox: {}` requires the k8s executor; the local \
+                 backend runs host processes and has no sandbox",
+                sandbox.sandbox.as_str()
+            )));
+        }
+        if spec.registry_auth.is_some() {
+            return Err(ExecError::Launch(
+                "a step with `registry_auth` requires the k8s executor (the credential is \
+                 mounted as a file into the step's own container); the local backend cannot \
+                 deliver it"
+                    .into(),
+            ));
+        }
         // Sidecar services (ADR-0058) co-locate an author-supplied container image
         // in the step's Pod (localhost-reachable, restricted baseline). The
         // host-process backend runs a bare command, not a container image, so it

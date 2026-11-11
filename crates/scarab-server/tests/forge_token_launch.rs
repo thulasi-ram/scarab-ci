@@ -54,6 +54,8 @@ fn token_spec(access: ForgeToken) -> StepSpec {
             trusted_library: None,
             credential: None,
         }),
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -187,6 +189,7 @@ async fn trusted_library(libs: &InMemoryLibraries) -> String {
     libs.trust_source(&TrustedSource {
         org: "acme".into(),
         source: TRUSTED.into(),
+        grant: scarab_policy::library::TrustGrant::ForgeCredentials,
         trusted_by: "amy".into(),
         trusted_at: 2,
         step_up_ref: Some("su-1".into()),
@@ -262,7 +265,13 @@ async fn a_launch_after_the_trust_is_removed_mints_nothing() {
     let libs = Arc::new(InMemoryLibraries::new());
     let mut spec = token_spec(ForgeToken::Read);
     spec.forge_token.as_mut().unwrap().trusted_library = Some(trusted_library(&libs).await);
-    libs.untrust_source("acme", TRUSTED).await.unwrap();
+    libs.untrust_source(
+        "acme",
+        TRUSTED,
+        scarab_policy::library::TrustGrant::ForgeCredentials,
+    )
+    .await
+    .unwrap();
     let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone())
         .with_libraries(Arc::new(InMemoryDb::new()), libs.clone());
     let err = exec
@@ -322,6 +331,7 @@ async fn a_clone_library_launch_gets_the_long_lived_token_only_once_its_source_i
     libs.trust_source(&TrustedSource {
         org: "acme".into(),
         source: scarab_policy::library::trust_key(CLONE_LIBRARY_SOURCE).into(),
+        grant: scarab_policy::library::TrustGrant::ForgeCredentials,
         trusted_by: "amy".into(),
         trusted_at: 2,
         step_up_ref: Some("su-1".into()),
@@ -382,6 +392,8 @@ fn build_spec(image: &str) -> StepSpec {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: Some(BuildConfig {
             context: ".".into(),
             dockerfile: "Dockerfile".into(),

@@ -1197,6 +1197,7 @@ async fn a_yanked_forge_token_or_build_step_mints_no_credential() {
     libs.trust_source(&scarab_policy::library::TrustedSource {
         org: "acme".into(),
         source: "github.com/acme/libs//sourced.yaml".into(),
+        grant: scarab_policy::library::TrustGrant::ForgeCredentials,
         trusted_by: "amy".into(),
         trusted_at: 1,
         step_up_ref: None,
