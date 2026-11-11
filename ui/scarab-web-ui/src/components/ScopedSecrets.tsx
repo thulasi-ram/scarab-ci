@@ -1,11 +1,11 @@
 // Secret CRUD at ONE scope: list names, add, replace, delete. Values are
 // write-only: the API never returns them, so there is nothing to reveal.
 //
-// The org scope in Organization settings › Secrets uses it: New secret at the
-// top right, and one row per name with Replace (the same dialog with the name
-// filled in) and Delete, which asks for the name to be typed. A repository's
-// Secrets tab has its own key list (SecretKeyList), which shares the New
-// secret dialog below.
+// The org scope in Organization settings › Secrets uses it. It looks like a
+// repository's Secrets tab (SecretKeyList): the count in the header, New
+// secret on the right of the bar, and one full-width list with a row per name,
+// its edit (the same dialog with the name filled in) and delete, which asks
+// for the name to be typed. SecretKeyList shares the New secret dialog below.
 import { createResource, createSignal, For, Show, type JSX } from "solid-js";
 import { listSecrets, putSecret, deleteSecret, type SecretScope } from "../api/client";
 import Icon from "./Icon";
@@ -20,6 +20,8 @@ export default function ScopedSecrets(props: {
   title: string;
   /** Shown when the scope holds nothing yet. */
   emptyLabel?: string;
+  /** Each row's summary: where a value at this scope applies. */
+  summary?: string;
   /** More for the note under the list, after the sentence on values. */
   note?: JSX.Element;
 }) {
@@ -33,39 +35,59 @@ export default function ScopedSecrets(props: {
   const [deleting, setDeleting] = createSignal<string | null>(null);
   const where = () => (props.scope.repo ? `${props.scope.org}/${props.scope.repo}` : props.scope.org);
 
+  const count = () => names()?.length ?? 0;
+
   return (
     <div class="panel">
       <div class="panel-h">
         <span>{props.title}</span>
-        <button class="btn btn-primary btn-sm" onClick={() => setEditing("")}>
-          <Icon icon="plus" size={14} /> New secret
-        </button>
+        <Show when={count() > 0}>
+          <span class="tok-count">{count()}</span>
+        </Show>
       </div>
       <div class="secrets-body">
+        <div class="skey-bar">
+          <button class="btn btn-primary btn-sm" type="button" onClick={() => setEditing("")}>
+            <Icon icon="plus" size={14} /> New secret
+          </button>
+        </div>
         <Show when={names.error}>
           <p class="error">Could not load the secrets.</p>
         </Show>
         <Show when={!names.loading} fallback={<p class="empty">loading…</p>}>
           <Show
-            when={(names()?.length ?? 0) > 0}
+            when={count() > 0}
             fallback={
               <Show when={!names.error}>
                 <p class="empty">{props.emptyLabel ?? "No secrets at this scope."}</p>
               </Show>
             }
           >
-            <ul class="secret-list" aria-label="Secrets">
+            <ul class="skey-list skey-list-flat" aria-label="Secrets">
               <For each={names()}>
                 {(name) => (
-                  <li class="secret-row">
-                    <Icon icon="key-round" size={15} />
-                    <code class="mono">{name}</code>
-                    <span class="oenv-actions">
-                      <button class="btn btn-ghost btn-sm" onClick={() => setEditing(name)}>
-                        Replace
+                  <li class="skey skey-row">
+                    <Icon icon="key-round" size={14} />
+                    <code class="mono skey-name">{name}</code>
+                    <Show when={props.summary}>
+                      <span class="skey-sum">{props.summary}</span>
+                    </Show>
+                    <span class="skey-acts">
+                      <button
+                        class="btn btn-ghost btn-sm"
+                        type="button"
+                        aria-label={`Edit ${name}`}
+                        onClick={() => setEditing(name)}
+                      >
+                        edit
                       </button>
-                      <button class="btn btn-danger btn-sm" onClick={() => setDeleting(name)}>
-                        Delete
+                      <button
+                        class="btn btn-ghost btn-sm"
+                        type="button"
+                        aria-label={`Delete ${name}`}
+                        onClick={() => setDeleting(name)}
+                      >
+                        delete
                       </button>
                     </span>
                   </li>
@@ -73,10 +95,10 @@ export default function ScopedSecrets(props: {
               </For>
             </ul>
           </Show>
-          <p class="subtle">
+          <p class="subtle skey-legend">
             <small>
-              <Icon icon="key-round" size={12} /> Values are never shown. Setting a name again
-              replaces it. {props.note}
+              Encrypted at rest and never displayed: you can overwrite a value but not read it
+              back. Setting a name again replaces it. {props.note}
             </small>
           </p>
         </Show>
