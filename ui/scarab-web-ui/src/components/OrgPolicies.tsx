@@ -33,6 +33,7 @@ import { absTime, relTime } from "../fmt";
 import Icon from "./Icon";
 import Modal, { ModalMessage } from "./Modal";
 import { Field, Textarea } from "./Field";
+import Pill from "./Pill";
 
 /** The window the list's counts cover. */
 const WINDOW_DAYS = 7;
@@ -107,11 +108,11 @@ export default function OrgPolicies(props: { org: string }) {
                             <A class="tok-name mono oenv-link" href={policyEditHref(props.org, p.id)}>
                               {p.name}
                             </A>
-                            <span class="tok-role mono">{p.policy.checkpoint}</span>
+                            <Pill tone="copper">{p.policy.checkpoint}</Pill>
                             <Show when={p.policy.mode === "audit"}>
-                              <span class="tok-role" title="Its denies are recorded, not enforced">
+                              <Pill tone="copper" title="Its denies are recorded, not enforced">
                                 audit
-                              </span>
+                              </Pill>
                             </Show>
                             <span class="oenv-actions">
                               <Show when={p.policy.mode === "audit"}>

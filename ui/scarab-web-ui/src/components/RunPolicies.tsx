@@ -15,6 +15,7 @@ import {
   type RunDecisionView,
 } from "../policies";
 import { absTime, relTime } from "../fmt";
+import Pill from "./Pill";
 
 export default function RunPolicies(props: { runId: string; live: boolean }) {
   const [tick, setTick] = createSignal(0);
@@ -54,7 +55,7 @@ function DecisionRow(props: { view: RunDecisionView }) {
   return (
     <li class="tok">
       <div class="tok-head">
-        <span class={`tok-role ${v().verdict === "denied" ? "pol-denied" : ""}`}>{v().verdict}</span>
+        <Pill tone={v().verdict === "denied" ? "danger" : "copper"}>{v().verdict}</Pill>
         <span class="mono">{v().checkpoint}</span>
         <Show when={v().step}>
           {(step) => (

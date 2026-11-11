@@ -38,6 +38,7 @@ import { relTime, absTime } from "../fmt";
 import Icon from "./Icon";
 import Modal, { ModalMessage } from "./Modal";
 import { Field, Input } from "./Field";
+import Pill from "./Pill";
 
 export default function OrgEnvironments(props: { org: string }) {
   const nav = useNavigate();
@@ -140,9 +141,9 @@ function EnvironmentRow(props: { org: string; env: OrgEnvironment }) {
           )}
         </Show>
         <Show when={unprotectedButOpen(env())}>
-          <span class="tok-role" title="Projects may deploy here and no org-wide rule protects it, only each project's own overlay">
+          <Pill tone="copper" title="Projects may deploy here and no org-wide rule protects it, only each project's own overlay">
             permissive baseline
-          </span>
+          </Pill>
         </Show>
         <span class="oenv-actions">
           <A class="btn btn-ghost btn-sm" href={environmentHref(props.org, env().name)}>

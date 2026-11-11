@@ -99,7 +99,7 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   await expect(page.getByText("Artifacts", { exact: true })).toBeVisible();
   await expect(page.getByRole("link", { name: "scarab-dist.tar.gz" })).toBeVisible();
   await expect(page.getByText("build@a3")).toBeVisible();
-  await expect(page.getByText("Of record", { exact: true })).toBeVisible();
+  await expect(page.getByText("of record", { exact: true })).toBeVisible();
 });
 
 // The ENVIRONMENT GATE run in src/mock.ts: a deploy into production with a

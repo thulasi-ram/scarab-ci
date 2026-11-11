@@ -14,6 +14,7 @@ import { isGateOpen, type GateStatus } from "../gates";
 import { layoutGroups, type DagCell, type OriginLink } from "../dag-layout";
 import { shortHash } from "../libraries";
 import Icon from "./Icon";
+import Pill from "./Pill";
 
 export type DagStep = {
   id: string;
@@ -516,7 +517,7 @@ export default function Dag(props: {
                       </span>
                       <span class="gh">{shortHash(cell.group.content_hash)}</span>
                       <Show when={cell.group.yanked}>
-                        <span class="gy">yanked</span>
+                        <Pill tone="danger" look="dotted">yanked</Pill>
                       </Show>
                     </div>
                     <Cols cols={cell.cols} />

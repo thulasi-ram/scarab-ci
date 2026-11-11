@@ -74,6 +74,7 @@ import ConfirmDestructive from "../components/ConfirmDestructive";
 import Modal, { ModalMessage } from "../components/Modal";
 import { Checkbox, Field, Input, Select } from "../components/Field";
 import { splitList } from "../environment-overlays";
+import Pill from "../components/Pill";
 
 /**
  * The settings frame around one Environment's page, with the org and name
@@ -275,7 +276,7 @@ function ProjectsPanel(props: {
                       <div class="tok-head">
                         <span class="tok-name mono">{p.project}</span>
                         <Show when={!p.eligible}>
-                          <span class="tok-role">not eligible</span>
+                          <Pill tone="copper">not eligible</Pill>
                         </Show>
                         <span class="oenv-actions">
                           {props.actions({ project: p.project, hasGrant: !!p.privilege_grant })}
@@ -382,9 +383,9 @@ function EditForm(props: {
           <span>Environment</span>
           <span class="oenv-actions">
             <Show when={isPermissive(props.env.protection)}>
-              <span class="tok-role" title="No org-wide rule protects this place yet, only each project's own overlay">
+              <Pill tone="copper" title="No org-wide rule protects this place yet, only each project's own overlay">
                 permissive baseline
-              </span>
+              </Pill>
             </Show>
             <span class="subtle" title={absTime(props.env.updated_at)}>
               changed by <span class="mono">{props.env.updated_by}</span> · {relTime(props.env.updated_at)}

@@ -91,12 +91,12 @@ import { absTime, relTime } from "../fmt";
 import { decodeParam, orgHref } from "../settings-nav";
 import { SettingsCrumbs, SettingsFrame } from "./Settings";
 import { Section } from "./LibraryManage";
-import { BADGE } from "../components/Plugins";
 import Chips from "../components/Chips";
 import Icon from "../components/Icon";
 import ConfirmDestructive, { ConfirmAction } from "../components/ConfirmDestructive";
 import { Checkbox, Field, Input, Select, Textarea } from "../components/Field";
 import Modal, { ModalMessage, ModalSection } from "../components/Modal";
+import Pill from "../components/Pill";
 
 /** `/orgs/:org/settings/plugins/:id/manage`. */
 export default function PluginManage() {
@@ -256,7 +256,7 @@ function Installation(props: {
           </Show>
           <dt>Runtime</dt>
           <dd title={runtime().title}>
-            <span class={BADGE[runtime().tone]}>{runtime().label}</span>
+            <Pill tone={runtime().tone} look="solid">{runtime().label}</Pill>
             <Show when={p().runtime_message}>
               <span class="plg-msg"> {p().runtime_message}</span>
             </Show>
@@ -589,7 +589,7 @@ function BrokerJournal(props: { org: string; installation: string }) {
                         {relTime(e.started_at)}
                       </td>
                       <td>
-                        <span class={BADGE[v.tone]}>{v.phase}</span>
+                        <Pill tone={v.tone} look="solid">{v.phase}</Pill>
                       </td>
                       <td class="mono">{e.method}</td>
                       <td class="mono plg-journal-path">{v.path}</td>
@@ -725,9 +725,9 @@ function ConnectionRow(props: {
       <span class="mono" title="Every request the plugin sends on this connection goes here, and nowhere else.">
         {c().base_url ?? "no destination"}
       </span>
-      <span class={BADGE[badge().tone]} title={badge().title}>
+      <Pill tone={badge().tone} look="solid" title={badge().title}>
         {badge().label}
-      </span>
+      </Pill>
       <Show when={c().ca_pem}>
         <span class="subtle" title="These CA certificates are the only trust anchors for this destination.">
           <Icon icon="shield-check" size={12} /> custom CA

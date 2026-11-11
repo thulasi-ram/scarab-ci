@@ -29,6 +29,7 @@ import ConfirmDestructive from "./ConfirmDestructive";
 import { Field, Input } from "./Field";
 import Modal, { ModalMessage } from "./Modal";
 import SecurityEventTable from "./SecurityEventTable";
+import Pill from "./Pill";
 
 export default function SecuritySettings() {
   const location = useLocation();
@@ -208,12 +209,9 @@ export default function SecuritySettings() {
                             <span class="tok-name">{p.label}</span>
                             <For each={passkeyBadges(p)}>
                               {(b) => (
-                                <span
-                                  class="tok-state"
-                                  classList={{ "tok-revoked": b.tone === "danger" }}
-                                >
+                                <Pill tone={b.tone === "danger" ? "danger" : "plain"} look="dotted">
                                   {b.text}
-                                </span>
+                                </Pill>
                               )}
                             </For>
                             <button

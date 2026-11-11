@@ -65,6 +65,7 @@ import { environmentLabel, nameBeside, shownName } from "../org-environments";
 import { refusalSummary } from "../compile-errors";
 import { fireOutcome, isScheduled, pipelineShortName, scheduledRunsHref } from "../schedules";
 import ponderIdle from "../../../brand/ascii/generated/ponder-ponder.json";
+import Pill from "../components/Pill";
 
 type Tab = "runs" | "schedules" | "environments" | "secrets" | "settings";
 type StatusFilter = "all" | "running" | "failed" | "refused";
@@ -327,9 +328,9 @@ export default function RepoView() {
           <HomeCrumb size={20} sepClass="crumb-head-sep" />
           <RepoCrumb org={org()} repo={repo()} />
           <Show when={unreachable()}>
-            <span class="repo-unreachable-tag" title={UNREACHABLE_NOTE}>
+            <Pill tone="warn" look="dashed" class="repo-unreachable-tag" title={UNREACHABLE_NOTE}>
               unreachable
-            </span>
+            </Pill>
           </Show>
         </h1>
       </div>

@@ -72,6 +72,7 @@ import FormSection from "../components/FormSection";
 import ConfirmDestructive from "../components/ConfirmDestructive";
 import Icon from "../components/Icon";
 import { Checkbox, Field, Input, Select } from "../components/Field";
+import Pill from "../components/Pill";
 
 /** The most rules a Policy holds (the server's cap). */
 const MAX_RULES = 32;
@@ -420,7 +421,7 @@ function EditForm(props: { org: string; stored?: PolicyRecord; onSaved: () => vo
                 <div class="pol-rule">
                   <div class="pol-rule-h">
                     <span>Rule {i + 1}</span>
-                    <span class="tok-role">deny</span>
+                    <Pill tone="copper">deny</Pill>
                     <Show when={form().rules.length > 1}>
                       <button
                         class="btn btn-ghost btn-sm oenv-actions"
@@ -705,9 +706,9 @@ function ReplayResult(props: { org: string; result: PolicyReplayResult }) {
                 <div class="tok-head">
                   <span class="mono">{VERDICT_LABEL[c.before] ?? c.before}</span>
                   <Icon icon="chevron-right" size={12} />
-                  <span class={`tok-role ${c.after === "deny" ? "pol-denied" : ""}`}>
+                  <Pill tone={c.after === "deny" ? "danger" : "copper"}>
                     {VERDICT_LABEL[c.after] ?? c.after}
-                  </span>
+                  </Pill>
                   <Show when={c.project}>
                     <span class="mono">{c.project}</span>
                   </Show>
@@ -769,12 +770,12 @@ function History(props: { org: string; id: string }) {
                       <div class="tok-head">
                         <span class="tok-name mono">version {v.version}</span>
                         <Show when={v.deleted}>
-                          <span class="tok-role pol-denied">deleted</span>
+                          <Pill tone="danger">deleted</Pill>
                         </Show>
                         <Show when={v.step_up_ref}>
-                          <span class="tok-role" title={`step-up ${v.step_up_ref}`}>
+                          <Pill tone="copper" title={`step-up ${v.step_up_ref}`}>
                             confirmed with a passkey
-                          </span>
+                          </Pill>
                         </Show>
                         <span class="mono subtle">{v.author}</span>
                         <span class="subtle" title={absTime(v.at)}>
@@ -848,9 +849,9 @@ function Decisions(props: { org: string; id: string }) {
                   {(d) => (
                     <li class="tok">
                       <div class="tok-head">
-                        <span class={`tok-role ${d.outcome === "denied" ? "pol-denied" : ""}`}>
+                        <Pill tone={d.outcome === "denied" ? "danger" : "copper"}>
                           {RUN_OUTCOME_LABEL[d.outcome]}
-                        </span>
+                        </Pill>
                         <span class="mono">{d.checkpoint}</span>
                         <Show when={d.project}>
                           <span class="mono">{d.project}</span>

@@ -22,6 +22,7 @@ import { HomeCrumb, RepoCrumb } from "../components/PageCrumbs";
 import { Checkbox, Input } from "../components/Field";
 import SearchSelect from "../components/SearchSelect";
 import Doodle from "../components/Doodle";
+import Pill from "../components/Pill";
 
 // Re-run hands the prior run's frozen params through router state.
 // The run-status API carries params but not the pipeline/ref, so the launcher
@@ -286,7 +287,7 @@ export default function RunPipeline() {
                     >
                       <Icon icon={p.error ? "bug" : "workflow"} size={15} />
                       <span class="mono rp-pipe-name">{p.name}</span>
-                      <Show when={p.api}><span class="rp-tag">API</span></Show>
+                      <Show when={p.api}><Pill tone="copper">API</Pill></Show>
                       <Show when={p.error}>
                         <span class="rp-pipe-err">failed to parse — {p.error}</span>
                       </Show>
@@ -428,7 +429,7 @@ function Field(props: {
     <div class={`field rp-field ${props.error ? "has-err" : ""}`}>
       <span class="field-label rp-field-label">
         <span class="mono">{spec.name}</span>
-        <span class="rp-type">{spec.type}</span>
+        <Pill tone="muted">{spec.type}</Pill>
         <Show when={spec.required} fallback={<span class="rp-opt">optional</span>}>
           <span class="rp-req" title="required">★ required</span>
         </Show>

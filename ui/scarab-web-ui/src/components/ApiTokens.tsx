@@ -62,6 +62,7 @@ import Icon from "./Icon";
 import Modal, { ModalMessage, ModalSection } from "./Modal";
 import ConfirmDestructive from "./ConfirmDestructive";
 import { Field, Input, Select } from "./Field";
+import Pill from "./Pill";
 
 /** The lifetime a token gets unless someone says otherwise. A quarter: long
  * enough that rotating is not a weekly chore, short enough that an abandoned
@@ -228,7 +229,7 @@ function TokenRow(props: { token: ApiToken; showOwner?: boolean; onRevoke: () =>
       </Show>
       <td>
         <span class="mono">{scopeLabel(t())}</span>{" "}
-        <span class="tok-role">up to {t().role}</span>
+        <Pill tone="copper">up to {t().role}</Pill>
       </td>
       <td class="nw" title={t().last_used_at ? absTime(t().last_used_at!) : undefined}>
         {t().last_used_at ? relTime(t().last_used_at!) : "never"}

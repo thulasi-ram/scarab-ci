@@ -19,6 +19,7 @@ import Icon from "./Icon";
 import Modal from "./Modal";
 import ConfirmDestructive from "./ConfirmDestructive";
 import EventLog from "./EventLog";
+import Pill from "./Pill";
 
 export default function OrgSecurity(props: { org: string }) {
   const [summary, { refetch: refetchSummary }] = createResource(() => props.org, getOrgSecuritySummary);
@@ -196,7 +197,7 @@ function PickMember(props: {
                 <span class="tok-name">{m.name}</span>
                 <span class="tok-scope mono">{m.handle}</span>
                 <Show when={m.noPasskey}>
-                  <span class="tok-state tok-expired">no passkey</span>
+                  <Pill tone="muted" look="dotted">no passkey</Pill>
                 </Show>
               </label>
             )}

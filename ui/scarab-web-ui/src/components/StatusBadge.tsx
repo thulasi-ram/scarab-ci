@@ -4,19 +4,23 @@
 // dead_lettered (the operator signal) and cancelled render with the danger
 // style; suspended (waiting on a gate) renders as in-motion. Unknown statuses
 // fall back to skipped.
+import Pill, { type PillTone } from "./Pill";
 
-const CLASS_OF: Record<string, string> = {
-  succeeded: "succeeded",
-  failed: "failed",
-  dead_lettered: "failed",
-  cancelled: "failed",
-  running: "running",
-  pending: "pending",
-  suspended: "pending",
-  skipped: "skipped",
+const TONE_OF: Record<string, PillTone> = {
+  succeeded: "ok",
+  failed: "danger",
+  dead_lettered: "danger",
+  cancelled: "danger",
+  running: "motion",
+  pending: "motion",
+  suspended: "motion",
+  skipped: "muted",
 };
 
 export default function StatusBadge(props: { status: string }) {
-  const cls = () => CLASS_OF[props.status] ?? "skipped";
-  return <span class={`badge badge-${cls()}`}>{props.status}</span>;
+  return (
+    <Pill tone={TONE_OF[props.status] ?? "muted"} look="solid">
+      {props.status}
+    </Pill>
+  );
 }

@@ -23,6 +23,7 @@ import Icon from "../components/Icon";
 import RunBars from "../components/RunBars";
 import AsciiScene from "../components/AsciiScene";
 import dungroller from "../../../brand/ascii/generated/dungroller-bare.json";
+import Pill from "../components/Pill";
 
 const runHref = (r: RunSummary) => `/${r.org ?? "api"}/${r.project ?? "unknown"}/runs/${r.id}`;
 const tenant = (r: RunSummary) => (r.org && r.project ? `${r.org}/${r.project}` : null);
@@ -179,7 +180,7 @@ export default function Repos() {
               <For each={inbox()}>
                 {(r) => (
                   <div class="inbox-row" onClick={() => nav(runHref(r))}>
-                    <span class="inbox-verb verb-approve">{inboxVerb(r)}</span>
+                    <Pill tone="ok" class="inbox-verb">{inboxVerb(r)}</Pill>
                     <span class="inbox-what">
                       <span class="inbox-msg">
                         {inboxVerb(r)} gate — run <span class="sha mono">{shortId(r.id)}</span>
