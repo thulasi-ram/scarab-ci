@@ -517,6 +517,11 @@ impl ForgeCredentialExecutor {
         &self,
         build: &scarab_engine::BuildConfig,
     ) -> (Option<String>, Option<scarab_engine::RegistryCredential>) {
+        if build.locked_out {
+            // A fork pull request, or a Run locked out of its Environment's
+            // secrets: no registry credential, whatever the scopes hold.
+            return (None, None);
+        }
         if build.repo_owner.is_empty() {
             return (None, None); // inline dev run: no scope, no forge context
         }
@@ -626,6 +631,10 @@ impl Executor for ForgeCredentialExecutor {
             if let Some(b) = enriched.build.as_mut() {
                 b.registry_auth_json = auth_json;
                 b.derived_auth = derived;
+                // Stored false at Run creation; kept false here too.
+                if b.locked_out {
+                    b.push = false;
+                }
             }
             return self.inner.launch(step, &enriched).await;
         }

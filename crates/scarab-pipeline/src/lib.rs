@@ -1522,6 +1522,58 @@ pub struct BuildSpec {
     pub push: bool,
 }
 
+/// What is wrong with a `build` step's context, dockerfile and image, one
+/// message per problem; empty when they may be built (git-bug df660b6).
+///
+/// The context and dockerfile become `buildctl` local sources in a container
+/// that also holds the registry credential, so they must stay inside the
+/// workspace: relative, with no `..` component and no control character. An
+/// empty context or dockerfile is the default (`.`, `Dockerfile`). The image
+/// is one field of `buildctl --output`, which is comma-separated, so it must
+/// be an OCI image reference and carry no `,`. Checked when the Pipeline
+/// compiles and again when the step launches, for specs stored before this
+/// check existed.
+pub fn build_target_problems(context: &str, dockerfile: &str, image: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (field, path) in [("build.context", context), ("build.dockerfile", dockerfile)] {
+        if path.is_empty() {
+            continue;
+        }
+        if path.starts_with('/') {
+            problems.push(format!(
+                "`{field}` must be a path relative to the workspace, not `{}`",
+                path.escape_debug()
+            ));
+        }
+        if path.split('/').any(|part| part == "..") {
+            problems.push(format!(
+                "`{field}` must not contain a `..` path component: `{}`",
+                path.escape_debug()
+            ));
+        }
+        if path.chars().any(char::is_control) {
+            problems.push(format!(
+                "`{field}` must not contain a control character: `{}`",
+                path.escape_debug()
+            ));
+        }
+    }
+    if image.is_empty() {
+        problems.push("a build step must name the `image:` to build".to_string());
+    } else if image.contains("${{") {
+        problems.push(format!(
+            "`build.image` `{}`: templates are not supported in `build.image` yet",
+            image.escape_debug()
+        ));
+    } else if image.contains(',') || !crate::oci::is_image_reference(image) {
+        problems.push(format!(
+            "`build.image` `{}` is not an image reference",
+            image.escape_debug()
+        ));
+    }
+    problems
+}
+
 /// A step's opt-in retry policy (ADR-0020 syntax, ADR-0047 semantics).
 ///
 /// ⚠ **At-least-once warning** (surfaced verbatim to authors): *retry re-runs
@@ -5559,11 +5611,8 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         // the author names no image/command and needs no privilege (rootless
         // by construction).
         if let Some(build) = &step.build {
-            if build.image.is_empty() {
-                diagnostics.push(format!(
-                    "step `{}`: a build step must name the `image:` to build",
-                    step.id
-                ));
+            for problem in build_target_problems(&build.context, &build.dockerfile, &build.image) {
+                diagnostics.push(format!("step `{}`: {problem}", step.id));
             }
             if !step.image.is_empty() || !step.command.is_empty() {
                 diagnostics.push(format!(
@@ -5576,6 +5625,25 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 diagnostics.push(format!(
                     "step `{}`: a build step is rootless by construction — it must not request \
                      privilege escalation",
+                    step.id
+                ));
+            }
+            // The build container holds the registry credential and runs the
+            // repository's Dockerfile: env such as `PATH` or `LD_PRELOAD`
+            // would choose what code runs there, and a secret would sit beside
+            // the credential (git-bug df660b6).
+            if !step.env.is_empty() {
+                diagnostics.push(format!(
+                    "step `{}`: a build step must not set `env:`; build options come from \
+                     `build:` (build args are not supported yet)",
+                    step.id
+                ));
+            }
+            if !step.secrets.is_empty() {
+                diagnostics.push(format!(
+                    "step `{}`: a build step must not set `secrets:`; they would sit in the \
+                     container that holds the registry credential and runs the repository's \
+                     Dockerfile",
                     step.id
                 ));
             }
@@ -10074,6 +10142,97 @@ mod tests {
         );
         assert!(
             err.iter().any(|d| d.contains("mutually exclusive")),
+            "{err:?}"
+        );
+    }
+
+    /// git-bug df660b6: the context and dockerfile stay inside the workspace
+    /// (the registry credential is mounted beside it), and the image is one
+    /// image reference (it is a field of the comma-separated `--output`).
+    #[test]
+    fn build_context_dockerfile_and_image_are_checked() {
+        let ir = compile(
+            r#"
+            steps:
+              - id: image
+                build:
+                  context: docker/clone
+                  dockerfile: build/Dockerfile
+                  image: ghcr.io/acme/app:v1
+            "#,
+        );
+        assert!(ir.steps[0].is_build());
+
+        for (build, expect) in [
+            (
+                r#"{ context: /scarab/registry, image: "a/b:1" }"#,
+                "`build.context` must be a path relative to the workspace",
+            ),
+            (
+                r#"{ context: "ctx/../..", image: "a/b:1" }"#,
+                "`build.context` must not contain a `..` path component",
+            ),
+            (
+                r#"{ context: "a\tb", image: "a/b:1" }"#,
+                "`build.context` must not contain a control character",
+            ),
+            (
+                r#"{ dockerfile: /scarab/registry/config.json, image: "a/b:1" }"#,
+                "`build.dockerfile` must be a path relative to the workspace",
+            ),
+            (
+                r#"{ dockerfile: "../Dockerfile", image: "a/b:1" }"#,
+                "`build.dockerfile` must not contain a `..` path component",
+            ),
+            (
+                r#"{ image: "a/b:1,push=true,registry.insecure=true" }"#,
+                "is not an image reference",
+            ),
+            (r#"{ image: "a b" }"#, "is not an image reference"),
+            (
+                r#"{ image: "ghcr.io/acme/app:${{ event.sha }}" }"#,
+                "templates are not supported in `build.image` yet",
+            ),
+        ] {
+            let err = errors(&format!("steps: [{{ id: image, build: {build} }}]"));
+            assert!(
+                err.iter()
+                    .any(|d| d.starts_with("step `image`: ") && d.contains(expect)),
+                "{build}: {err:?}"
+            );
+        }
+    }
+
+    /// git-bug df660b6: a build step's container holds the registry
+    /// credential, so it takes no authored env and no secrets.
+    #[test]
+    fn build_step_refuses_env_and_secrets() {
+        let err = errors(
+            r#"
+            steps:
+              - id: image
+                build: { image: "ghcr.io/a/b:1" }
+                env: [[LD_PRELOAD, /workspace/evil.so]]
+            "#,
+        );
+        assert!(
+            err.iter().any(|d| d.starts_with("step `image`: ")
+                && d.contains("must not set `env:`")
+                && d.contains("build options come from `build:`")),
+            "{err:?}"
+        );
+
+        let err = errors(
+            r#"
+            steps:
+              - id: image
+                build: { image: "ghcr.io/a/b:1" }
+                secrets: [NPM_TOKEN]
+            "#,
+        );
+        assert!(
+            err.iter()
+                .any(|d| d.starts_with("step `image`: ") && d.contains("must not set `secrets:`")),
             "{err:?}"
         );
     }

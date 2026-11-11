@@ -494,6 +494,40 @@ async fn inline_dev_builds_get_no_auth() {
     assert_eq!(enriched.derived_auth, None);
 }
 
+/// git-bug a75eacb: a build locked out at Run creation (a fork pull request,
+/// or a Run locked out of its Environment's secrets) launches with no
+/// registry credential, though a Repo `REGISTRY_AUTH` secret and a
+/// forge-derived credential are both available, and does not push.
+#[tokio::test]
+async fn a_locked_out_build_gets_no_registry_credential() {
+    let secrets = Arc::new(FakeSecrets::new().with_secret(
+        &SecretScope::Repo {
+            org: "acme".into(),
+            repo: "web".into(),
+        },
+        "REGISTRY_AUTH",
+        br#"{"auths":{"registry.corp":{"auth":"eDp5"}}}"#,
+    ));
+    let forge = Arc::new(FakeForge::new().with_registry_credential(
+        scarab_forge::RegistryCredential {
+            registry: "ghcr.io".into(),
+            username: "x-access-token".into(),
+            token: "derived".into(),
+        },
+    ));
+    let inner = Arc::new(FakeExecutor::new());
+    let exec = ForgeCredentialExecutor::new(inner.clone(), forge).with_secrets(secrets);
+    let mut spec = build_spec("ghcr.io/acme/web:1");
+    let build = spec.build.as_mut().unwrap();
+    build.locked_out = true;
+    build.push = false;
+    let handle = exec.launch(&step_run("image"), &spec).await.unwrap();
+    let enriched = inner.launched_spec(&handle).unwrap().build.unwrap();
+    assert_eq!(enriched.registry_auth_json, None);
+    assert_eq!(enriched.derived_auth, None);
+    assert!(!enriched.push);
+}
+
 // ---------------------------------------------------------------------------
 // Environment re-admission before any credential (git-bug 66c0368).
 // ---------------------------------------------------------------------------
