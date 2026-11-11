@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1794429374,"nonce":"rcDGOwtcXX1s+fa0HRoCNfHJiCc=","title":"pod_fence trusts the Pod's own env for the drain fence","was":"pod_fence trusts the Pod's own env for the drain fence"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1794429374,"nonce":"gC0eNgGc8l7unWvVLrivsIG2XiE=","added":["security","area:executor","type:bug"],"removed":null}]}
