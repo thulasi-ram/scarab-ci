@@ -483,12 +483,16 @@ impl LibraryStore for PostgresDb {
         // every other grant is a row of `library_source_grants` (migration
         // 0095).
         let rows = sqlx::query(
-            "SELECT org, source, 'forge_credentials' AS trust_grant, trusted_by, trusted_at, \
-                    step_up_ref \
-             FROM library_trusted_sources WHERE org = $1 \
-             UNION ALL \
-             SELECT org, source, trust_grant, trusted_by, trusted_at, step_up_ref \
-             FROM library_source_grants WHERE org = $1 \
+            // Postgres refuses an expression (COLLATE) in a UNION's own
+            // ORDER BY, so the union is ordered from outside.
+            "SELECT * FROM ( \
+                SELECT org, source, 'forge_credentials' AS trust_grant, trusted_by, trusted_at, \
+                       step_up_ref \
+                FROM library_trusted_sources WHERE org = $1 \
+                UNION ALL \
+                SELECT org, source, trust_grant, trusted_by, trusted_at, step_up_ref \
+                FROM library_source_grants WHERE org = $1 \
+             ) t \
              ORDER BY source COLLATE \"C\", trust_grant COLLATE \"C\"",
         )
         .bind(org)
