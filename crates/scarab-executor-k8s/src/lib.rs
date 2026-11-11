@@ -7590,7 +7590,10 @@ mod tests {
         assert_eq!(c.image.as_deref(), Some("moby/buildkit:rootless"));
         let command = c.command.as_ref().unwrap();
         assert_eq!(command[..2], ["/bin/sh", "-c"]);
-        assert_eq!(command[2], BUILD_GUARD);
+        // Every `$` in a Pod command is written as `$$`, which the kubelet
+        // reduces back to `$` (scarab_k8s_expansion), so the shell runs
+        // BUILD_GUARD as written.
+        assert_eq!(command[2], BUILD_GUARD.replace('$', "$$"));
         assert_eq!(command[3], "scarab-build");
         assert_eq!(command.len(), 4);
         let args = c.args.as_ref().unwrap().join(" ");
