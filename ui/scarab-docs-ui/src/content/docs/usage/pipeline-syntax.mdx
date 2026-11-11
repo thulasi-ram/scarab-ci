@@ -871,7 +871,7 @@ if the run's target environment permits raw overlays; otherwise the run is rejec
 profile for anything static. Even where raw overlays are permitted, an overlay cannot set or delete the Pod's
 `metadata.name`, `generateName`, `namespace`, `ownerReferences` or `finalizers`, or labels and annotations
 under `app.kubernetes.io/`, `scarab.io/` or `scarab.dev/`: Scarab uses them to find, route to and clean up the Pod.
-Apart from Scarab's own containers and volumes (below), the rest of the Pod spec is not checked. An overlay can ask for privileged containers, host mounts, the
+Apart from Scarab's own containers, volumes, mounts and env (below), the rest of the Pod spec is not checked. An overlay can ask for privileged containers, host mounts, the
 host network, or a ServiceAccount token. Step Pods run in Scarab's own namespace by default, so that can
 be Scarab's ServiceAccount. Permit raw overlays only on an Environment whose pipeline authors you trust
 with that.
@@ -916,10 +916,18 @@ wiring. If the baseline, a profile or an overlay names or removes one, Scarab do
 the Pod, and the launch error names the container and the layer. A container with a new name,
 such as an extra init container, is allowed.
 
-Scarab's volumes are guarded the same way: a layer may not name, remove or replace a volume Scarab
-created (results, workspace, forge token, registry auth, OIDC token, secrets), and may not change
-a mount Scarab set on the step container, such as `/workspace`. A volume with a new name, and a
-mount at a new path, are allowed.
+Scarab's volumes, mounts and env are guarded the same way. A layer may not:
+
+- name, remove or replace a volume Scarab created (results, workspace, forge token, registry auth,
+  OIDC token, secrets), or mount one in a container it adds or at a new path on the step container;
+- change a mount Scarab set on the step container, such as `/workspace` (`/workspace/` and
+  `//workspace` count as the same path);
+- set or remove an env variable the step container was built with, such as `SCARAB_ATTEMPT` or
+  one from the step's own `env:`.
+
+A volume with a new name, a mount at a new path and an env variable with a new name are allowed.
+Kubernetes' patch directives (`$patch`, `$retainKeys` and other keys starting with `$`) are not
+supported: a layer that uses one is refused.
 
 Step Pods, service Pods and debug Pods do not mount a Kubernetes ServiceAccount token
 (`automountServiceAccountToken: false`), so code in a step cannot call the Kubernetes API with the
