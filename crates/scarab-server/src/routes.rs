@@ -130,6 +130,7 @@ pub(crate) fn governed_routes() -> Routes {
         .get("/v1/auth/providers", auth_providers)
         .post("/v1/auth/logout", &ops::AUTH_LOGOUT, logout)
         .get("/v1/me", me)
+        .get("/v1/about", about)
         .post(
             "/v1/me/identities/link",
             &ops::IDENTITY_LINK,

@@ -18,15 +18,15 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
-### Enhancement
-
-- **Pills are sized from their text, and every breadcrumb starts at home.** Status, state and
-  role pills, the org page's repository states and the dashboard's inbox verbs all use the Mono
-  text style on a 20px pill, so none is taller than the line beside it (they were up to 28px, some
-  in the larger semibold Label style). The repository, run, Run pipeline, organization and
-  settings page headings start with `/`, a link to the dashboard: `/ › acme/orders-api › #22`.
-
 ## [0.3.2] - 2026-11-11
+
+### Features
+
+- **About Scarab.** The user menu's new entry opens `/about`: the server's version, the commit it
+  was built from, when it started, its role and executor, whether sign-in, the GitHub App and
+  plugins are on, and links to the release notes, docs, API description and source. It reads the
+  new `GET /v1/about`; image.yml records the commit in the server image
+  ([About Scarab](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#about-scarab)).
 
 ### Enhancement
 
@@ -40,6 +40,11 @@ release.yml uses that version's section as the GitHub Release text. See
 - **Org secrets look like a repository's Secrets tab.** The org's Settings › Secrets shows its
   count in the header, New secret above the list, and one full-width list with a row per name and
   its **edit** and **delete** (they were **Replace** and **Delete**, on rows capped at 520px).
+- **Pills are sized from their text, and every breadcrumb starts at home.** Status, state and
+  role pills, the org page's repository states and the dashboard's inbox verbs all use the Mono
+  text style on a 20px pill, so none is taller than the line beside it (they were up to 28px, some
+  in the larger semibold Label style). The repository, run, Run pipeline, organization and
+  settings page headings start with `/`, a link to the dashboard: `/ › acme/orders-api › #22`.
 
 ## [0.3.1] - 2026-11-11
 

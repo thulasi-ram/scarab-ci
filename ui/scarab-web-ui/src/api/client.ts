@@ -1766,6 +1766,18 @@ export type GithubApp = components["schemas"]["GithubAppDto"];
  * is a live call: the Add forge connection dialog asks only when GitHub is
  * picked.
  */
+export type About = components["schemas"]["AboutDto"];
+
+/** The server's version, build commit and how it runs, for the About page
+ *  (`GET /v1/about`). */
+export async function aboutServer(): Promise<About> {
+  const { data, error, response } = await api.GET("/v1/about");
+  if (error || !data) {
+    throw new Error(errorText(error) || `could not read the server's version (${response.status})`);
+  }
+  return data;
+}
+
 export async function githubAppInfo(): Promise<GithubApp> {
   const { data, error, response } = await api.GET("/v1/forges/github/app");
   if (error || !data) {

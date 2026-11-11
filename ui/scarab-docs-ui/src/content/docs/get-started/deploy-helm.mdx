@@ -284,6 +284,15 @@ server checks every request.
 Settings › Appearance picks the palette, **Emerald** or **Mono** (greys), and light or dark mode.
 Both choices are kept in your browser, so they apply to you on that browser only.
 
+### About Scarab
+
+**About Scarab** in the user menu opens `/about`: the server's version, the git commit it was
+built from (with a link to it on GitHub), when the server started, its role, where steps run, and
+whether sign-in, the GitHub App and plugins are on. It links the release notes for that version,
+the docs, the API description (`/openapi.json`) and the source code. Copy the version and commit
+from it when you report a problem. The page reads `GET /v1/about`, which any signed-in user may
+call. A server built outside the release workflow, such as a local build, has no commit to show.
+
 ## Key values
 
 Every key in this table exists in `values.yaml`:

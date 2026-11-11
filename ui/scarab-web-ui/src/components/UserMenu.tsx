@@ -90,6 +90,10 @@ export default function UserMenu() {
                 </A>
               )}
             </For>
+            <A href="/about" class="um-item um-link" role="menuitem" onClick={() => setOpen(false)}>
+              <Icon icon="info" size={14} />
+              About Scarab
+            </A>
             {/* Says what the click DOES, not what the theme currently is — the
                 top-bar toggle it replaces could lean on a sun/moon crossfade
                 to carry that, and a text row cannot. Leaves the menu open, so

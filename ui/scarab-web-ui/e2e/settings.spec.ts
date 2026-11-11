@@ -91,6 +91,31 @@ test("the user menu links each settings page, the org one to the org in view", a
   expect(errors).toEqual([]);
 });
 
+test("About Scarab in the user menu opens the server's version, commit and links", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  await page.locator("button.avatar").click();
+  await page.getByRole("menu").getByRole("menuitem", { name: "About Scarab" }).click();
+  await expect(page).toHaveURL(/\/about$/);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/About Scarab$/);
+  const server = page.getByRole("definition").filter({ hasText: "0.3.2" }).first();
+  await expect(server).toBeVisible();
+  // The commit links to GitHub, shortened to 12 characters.
+  await expect(page.getByRole("link", { name: "720f3eec4b1d" })).toHaveAttribute(
+    "href",
+    "https://github.com/thulasi-ram/scarab-ci/commit/720f3eec4b1d9a6e2c5f8b7a0d3e6f9a1b4c7d0e",
+  );
+  await expect(page.getByRole("link", { name: "Scarab 0.3.2 on GitHub" })).toHaveAttribute(
+    "href",
+    "https://github.com/thulasi-ram/scarab-ci/releases/tag/v0.3.2",
+  );
+  await expect(page.getByText("Kubernetes: one Pod per step")).toBeVisible();
+  // Not an Account settings section: the settings sidebar does not list it.
+  await page.goto("/settings/profile");
+  await expect(page.getByRole("link", { name: "About", exact: true })).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
 test("the org dropdown is there with one org, and on a narrow screen sits above the section list", async ({ page }) => {
   await page.goto("/orgs/acme/settings/members?admin_orgs=acme");
   const pick = page.getByRole("combobox", { name: "Organization" });

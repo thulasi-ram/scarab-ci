@@ -48,6 +48,7 @@ import {
   Trash2,
   X,
   Copy,
+  Info,
 } from "lucide";
 
 // IconNode = Array<[tagName, attributes]>.
@@ -102,6 +103,8 @@ const ICONS: Record<string, IconNode> = {
   x: X as IconNode,
   // Duplicating an Environment.
   copy: Copy as IconNode,
+  // The About page and its user-menu entry.
+  info: Info as IconNode,
 };
 
 export function iconNode(name: string): IconNode | undefined {
