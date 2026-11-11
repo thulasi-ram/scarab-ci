@@ -7062,8 +7062,8 @@ async fn write_run_from_ir(
                 project: repo.name.clone(),
                 environment: environment.clone(),
                 // ADR-0037: persist the *symbolic* ref, because gate-approval-time
-                // admission re-runs `ProtectionRules::admits` (allowed_refs +
-                // approvers) against this value and deployment history records it.
+                // admission re-checks the Environment's allowed_refs and
+                // approvers against this value and deployment history records it.
                 // A SHA here would silently break the second allowed_refs check
                 // (the gate would never release under a non-empty allowed_refs).
                 // Refless deploy events fall back to the read ref.
@@ -14719,39 +14719,23 @@ fn step_status_name(s: StepStatus) -> &'static str {
 mod grant_admission_tests {
     use super::{admit_k8s_overlay, admit_step_grants};
     use scarab_pipeline::StepSecurity;
-    use scarab_project::{
-        migrate_legacy_environment, Environment, EnvironmentProjectPrivilegeGrant, ImageGrant,
-        ProtectionRules,
-    };
-    use scarab_secrets::SecretScope;
+    use scarab_project::{EnvironmentProjectPrivilegeGrant, ImageGrant};
 
-    /// What ADR-0071 §10 step 5 makes of a legacy environment's privileges:
-    /// the Project's grant (or none). Admission decides against it now, so
-    /// these cases are ported by migrating their legacy rules — the
-    /// assertions are the pre-ADR-0071 ones, unchanged.
-    fn grant(p: &ProtectionRules) -> Option<EnvironmentProjectPrivilegeGrant> {
-        let legacy = Environment {
-            name: "prod".into(),
-            protection: p.clone(),
-        };
-        migrate_legacy_environment("acme", "web", &legacy).1
+    /// `web`'s privilege grant in `prod`.
+    fn grant(
+        privileged_images: Vec<ImageGrant>,
+        permit_k8s_overlay: bool,
+    ) -> EnvironmentProjectPrivilegeGrant {
+        EnvironmentProjectPrivilegeGrant {
+            org: "acme".into(),
+            environment: "prod".into(),
+            project: "web".into(),
+            privileged_images,
+            permit_k8s_overlay,
+        }
     }
 
     const IMG: &str = "ghcr.io/acme/deployer@sha256:aaaa";
-
-    fn rules(images: Vec<ImageGrant>) -> ProtectionRules {
-        ProtectionRules {
-            approvers: vec![],
-            wait_timer: 0,
-            allowed_refs: vec![],
-            concurrency: 1,
-            secret_scope: SecretScope::Org { org: "acme".into() },
-            oidc_subject: String::new(),
-            privileged_images: images,
-            permit_k8s_overlay: false,
-            require_reason: false,
-        }
-    }
 
     #[test]
     fn k8s_overlay_none_is_always_admitted_as_none() {
@@ -14770,7 +14754,8 @@ mod grant_admission_tests {
     #[test]
     fn k8s_overlay_rejected_when_environment_does_not_permit() {
         let overlay = serde_json::json!({"spec": {"schedulerName": "x"}});
-        let g = grant(&rules(vec![]));
+        // The Project holds no grant in the Environment.
+        let g: Option<EnvironmentProjectPrivilegeGrant> = None;
         let err = admit_k8s_overlay(Some(g.as_ref()), Some(&overlay)).unwrap_err();
         assert!(err.join("; ").contains("permit_k8s_overlay"));
     }
@@ -14778,19 +14763,16 @@ mod grant_admission_tests {
     #[test]
     fn k8s_overlay_admitted_when_environment_permits() {
         let overlay = serde_json::json!({"spec": {"schedulerName": "x"}});
-        let mut p = rules(vec![]);
-        p.permit_k8s_overlay = true;
+        let g = Some(grant(vec![], true));
         assert_eq!(
-            admit_k8s_overlay(Some(grant(&p).as_ref()), Some(&overlay)).unwrap(),
+            admit_k8s_overlay(Some(g.as_ref()), Some(&overlay)).unwrap(),
             Some(overlay)
         );
     }
 
     /// A permitting grant, for the reserved-key cases below.
     fn permitting() -> Option<EnvironmentProjectPrivilegeGrant> {
-        let mut p = rules(vec![]);
-        p.permit_k8s_overlay = true;
-        grant(&p)
+        Some(grant(vec![], true))
     }
 
     /// git-bug da0af59 item 2: the Helm Services select on
@@ -14911,12 +14893,15 @@ mod grant_admission_tests {
             privileged: true,
             ..Default::default()
         };
-        let p = rules(vec![ImageGrant {
-            image_digest: "sha256:aaaa".into(),
-            privileged: true,
-            capabilities: vec![],
-        }]);
-        let g = admit_step_grants(Some(grant(&p).as_ref()), Some(&sec), IMG, false).unwrap();
+        let p = Some(grant(
+            vec![ImageGrant {
+                image_digest: "sha256:aaaa".into(),
+                privileged: true,
+                capabilities: vec![],
+            }],
+            false,
+        ));
+        let g = admit_step_grants(Some(p.as_ref()), Some(&sec), IMG, false).unwrap();
         assert!(g.privileged);
     }
 }

@@ -5,22 +5,19 @@
 //! function that folds a baseline and an overlay into the rules admission
 //! enforces ([`effective_protection`]).
 //!
-//! Since sub-slice c2 this is what **admission reads**: the server resolves a
-//! Deploy Run's [`DeployGovernance`] through an
-//! [`EnvironmentGovernanceStore`] (one consistent read), refuses an unknown
-//! Environment or an ineligible Project before the Run exists, and enforces
-//! [`EffectiveProtection`] and the Project's
-//! [`EnvironmentProjectPrivilegeGrant`]. The per-Project ADR-0037
-//! [`Environment`] and its [`ProtectionRules`] survive only as the **legacy**
-//! shape the migration reads (and the golden tests pin it against).
+//! This is what **admission reads**: the server resolves a Deploy Run's
+//! [`DeployGovernance`] through an [`EnvironmentGovernanceStore`] (one
+//! consistent read), refuses an unknown Environment or an ineligible Project
+//! before the Run exists, and enforces [`EffectiveProtection`] and the
+//! Project's [`EnvironmentProjectPrivilegeGrant`].
 //!
 //! [`OrgEnvironment`]: crate::OrgEnvironment
 
 use async_trait::async_trait;
 
 use crate::{
-    admit_grants_against_whitelist, glob_match, AdmittedGrants, Environment, GrantRequest,
-    ImageGrant, OrgEnvironment, OrgEnvironmentError,
+    admit_grants_against_whitelist, glob_match, AdmittedGrants, GrantRequest, ImageGrant,
+    OrgEnvironment, OrgEnvironmentError,
 };
 
 /// The protection rules an Environment's admin sets as its **baseline**, and
@@ -34,8 +31,8 @@ use crate::{
 /// tightens nothing holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EnvironmentProtectionRules {
-    /// Principals who approve a deploy. Every one must approve (AND, like
-    /// [`ProtectionRules::approvers`]) unless the baseline's
+    /// Principals who approve a deploy. Every one must approve (AND) unless
+    /// the baseline's
     /// [`ApprovalGateRules::required_approvals`] says how many.
     pub approvers: Vec<String>,
     /// Ref globs (`*` wildcards) a deploy's symbolic ref must match. Empty
@@ -283,10 +280,10 @@ pub struct EnvironmentProjectPrivilegeGrant {
 impl EnvironmentProjectPrivilegeGrant {
     /// The ADR-0039 grant decision for a step of a Deploy Run that admission
     /// has already governed by an Environment, given the Project's grant
-    /// there, if any. **Identical** to [`ProtectionRules::admit_grants`] over
-    /// the grant's whitelist — the two share one body — with `None` deciding
-    /// exactly as an empty whitelist did: self-service `run-as-root` only,
-    /// every governed grant refused. (No Environment at all is the caller's
+    /// there, if any, against the grant's whitelist (see
+    /// `admit_grants_against_whitelist` for the rules). `None` decides as an
+    /// empty whitelist: self-service `run-as-root` only, every governed grant
+    /// refused. (No Environment at all is the caller's
     /// separate "governed grants require a target Environment" refusal.)
     pub fn admit_grants(
         grant: Option<&Self>,
@@ -430,8 +427,7 @@ impl EffectiveProtection {
     /// The allowed-refs check at Run creation (ADR-0037), given the event's
     /// symbolic ref if it has one (`Event::protection_ref`). An event with
     /// **no** symbolic ref (cron, comment, upstream) is admitted only where
-    /// refs are unrestricted — **fail-closed**, exactly as the server's
-    /// `admit_and_create_run` decides on [`ProtectionRules`] today.
+    /// refs are unrestricted — **fail-closed**.
     pub fn admits_protection_ref(&self, protection_ref: Option<&str>) -> bool {
         match protection_ref {
             Some(git_ref) => self.ref_allowed(git_ref),
@@ -441,8 +437,7 @@ impl EffectiveProtection {
 
     /// Whether a deploy from `git_ref` carrying `approvals` may proceed: the
     /// ref is allowed and every required approver approved. Returns every
-    /// violation (empty = admitted), worded as [`ProtectionRules::admits`]
-    /// words them, so a blocked gate reads the same after the migration.
+    /// violation (empty = admitted).
     pub fn admits(&self, git_ref: &str, approvals: &[String]) -> Result<(), Vec<String>> {
         let mut violations = Vec::new();
         if !self.ref_allowed(git_ref) {
@@ -513,10 +508,9 @@ impl EffectiveProtection {
         (approvers, self.approval_gate.required_approvals)
     }
 
-    /// The `require_reason` guardrail (ADR-0057 §3), with
-    /// [`ProtectionRules::admits_reason`]'s semantics and wording: a human
-    /// dispatch (`manual`/`api`) with no non-blank reason is blocked; every
-    /// other trigger is exempt.
+    /// The `require_reason` guardrail (ADR-0057 §3): a human dispatch
+    /// (`manual`/`api`) with no non-blank reason is blocked; every other
+    /// trigger is exempt.
     pub fn admits_reason(
         &self,
         is_human_dispatch: bool,
@@ -530,57 +524,6 @@ impl EffectiveProtection {
             Ok(())
         }
     }
-}
-
-/// Turn one Project's ADR-0037 [`Environment`] into what replaces it
-/// (ADR-0071 §10 steps 2, 3 and 5): that Project's overlay over the new org
-/// Environment of the same name, and its privilege grant if it had any
-/// privilege to carry.
-///
-/// - **Overlay**: approvers, allowed refs, wait timer and `require_reason`
-///   carried verbatim, so over the **permissive** baseline the migration
-///   creates, the Project's effective rules decide exactly as its old rules
-///   did.
-/// - **Concurrency is dropped** (step 3). The UI stored 1 for every
-///   Environment and nothing ever read it.
-/// - **Grant** only when the old whitelist is non-empty or raw overlays were
-///   permitted (step 5); otherwise `None`, which
-///   [`EnvironmentProjectPrivilegeGrant::admit_grants`] decides exactly as
-///   the empty whitelist did.
-///
-/// The old secret scope and OIDC subject are not carried: both are canonical
-/// coordinates the server derives, never stored decisions (ADR-0071 §6, §11).
-pub fn migrate_legacy_environment(
-    org: &str,
-    project: &str,
-    legacy: &Environment,
-) -> (
-    EnvironmentProjectOverlay,
-    Option<EnvironmentProjectPrivilegeGrant>,
-) {
-    let old = &legacy.protection;
-    let overlay = EnvironmentProjectOverlay {
-        org: org.to_string(),
-        environment: legacy.name.clone(),
-        project: project.to_string(),
-        rules: EnvironmentProtectionRules {
-            approvers: old.approvers.clone(),
-            allowed_refs: old.allowed_refs.clone(),
-            wait_timer_s: old.wait_timer,
-            require_reason: old.require_reason,
-            approval_gate: ApprovalGateRules::default(),
-        },
-    };
-    let grant = (!old.privileged_images.is_empty() || old.permit_k8s_overlay).then(|| {
-        EnvironmentProjectPrivilegeGrant {
-            org: org.to_string(),
-            environment: legacy.name.clone(),
-            project: project.to_string(),
-            privileged_images: old.privileged_images.clone(),
-            permit_k8s_overlay: old.permit_k8s_overlay,
-        }
-    });
-    (overlay, grant)
 }
 
 /// Everything admission needs to decide one Project's Deploy Run into one
@@ -986,9 +929,7 @@ pub trait EnvironmentGovernanceStore: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ProtectionRules;
     use proptest::prelude::*;
-    use scarab_secrets::SecretScope;
 
     fn strings(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|s| s.to_string()).collect()
@@ -1008,27 +949,6 @@ mod tests {
             environment: "prod".into(),
             project: "payments".into(),
             rules,
-        }
-    }
-
-    fn legacy(protection: ProtectionRules) -> Environment {
-        Environment {
-            name: "prod".into(),
-            protection,
-        }
-    }
-
-    fn legacy_rules() -> ProtectionRules {
-        ProtectionRules {
-            approvers: Vec::new(),
-            wait_timer: 0,
-            allowed_refs: Vec::new(),
-            concurrency: 1,
-            secret_scope: SecretScope::Org { org: "acme".into() },
-            oidc_subject: String::new(),
-            privileged_images: Vec::new(),
-            permit_k8s_overlay: false,
-            require_reason: false,
         }
     }
 
@@ -1334,59 +1254,11 @@ mod tests {
         )));
     }
 
-    // --- migrate_legacy_environment ---------------------------------------
-
-    #[test]
-    fn migration_carries_rules_drops_concurrency_and_keys_the_overlay() {
-        let mut p = legacy_rules();
-        p.approvers = strings(&["alice"]);
-        p.allowed_refs = strings(&["main"]);
-        p.wait_timer = 90;
-        p.concurrency = 1;
-        p.require_reason = true;
-        let (o, g) = migrate_legacy_environment("acme", "payments", &legacy(p));
-        assert_eq!(
-            o,
-            EnvironmentProjectOverlay {
-                org: "acme".into(),
-                environment: "prod".into(),
-                project: "payments".into(),
-                rules: EnvironmentProtectionRules {
-                    approvers: strings(&["alice"]),
-                    // A bare `main` is carried verbatim: it never matched a
-                    // symbolic ref before, and must not start to now.
-                    allowed_refs: strings(&["main"]),
-                    wait_timer_s: 90,
-                    require_reason: true,
-                    approval_gate: ApprovalGateRules::default(),
-                },
-            }
-        );
-        assert_eq!(g, None);
-    }
-
-    #[test]
-    fn migration_makes_a_grant_only_when_there_is_a_privilege_to_carry() {
-        let mut p = legacy_rules();
-        p.permit_k8s_overlay = true;
-        let (_, g) = migrate_legacy_environment("acme", "payments", &legacy(p.clone()));
-        assert_eq!(g, Some(grant(Vec::new(), true)));
-
-        p.permit_k8s_overlay = false;
-        p.privileged_images = vec![ImageGrant {
-            image_digest: "sha256:aaaa".into(),
-            privileged: false,
-            capabilities: strings(&["NET_ADMIN"]),
-        }];
-        let (_, g) = migrate_legacy_environment("acme", "payments", &legacy(p.clone()));
-        assert_eq!(g, Some(grant(p.privileged_images.clone(), false)));
-    }
-
     // --- properties --------------------------------------------------------
 
     /// Ref globs and symbolic refs from a small universe that collides often:
     /// exact, prefix-globbed, tag, PR, catch-all and a bare `main` (which
-    /// matches no symbolic ref, a shape real legacy rows carry).
+    /// matches no symbolic ref).
     const PATTERNS: &[&str] = &[
         "refs/heads/main",
         "refs/heads/*",
@@ -1408,68 +1280,6 @@ mod tests {
     ];
     const PEOPLE: &[&str] = &["alice", "bob", "carol"];
 
-    /// Every trigger kind, as the two facts admission reads from its event:
-    /// whether it carries a symbolic ref (`Event::protection_ref`) and
-    /// whether it is a human dispatch (the server's `manual`/`api` match).
-    #[derive(Debug, Clone, Copy)]
-    enum Trigger {
-        Push,
-        PullRequest,
-        Tag,
-        Release,
-        Manual,
-        Api,
-        Comment,
-        Cron,
-        Upstream,
-    }
-    const TRIGGERS: &[Trigger] = &[
-        Trigger::Push,
-        Trigger::PullRequest,
-        Trigger::Tag,
-        Trigger::Release,
-        Trigger::Manual,
-        Trigger::Api,
-        Trigger::Comment,
-        Trigger::Cron,
-        Trigger::Upstream,
-    ];
-
-    impl Trigger {
-        fn protection_ref(self, git_ref: &str) -> Option<&str> {
-            match self {
-                Trigger::Comment | Trigger::Cron | Trigger::Upstream => None,
-                _ => Some(git_ref),
-            }
-        }
-        fn is_human_dispatch(self) -> bool {
-            matches!(self, Trigger::Manual | Trigger::Api)
-        }
-    }
-
-    /// Today's run-creation ref check, verbatim from the server's
-    /// `admit_and_create_run`: the oracle the migration must reproduce.
-    fn legacy_admits_protection_ref(p: &ProtectionRules, protection_ref: Option<&str>) -> bool {
-        match protection_ref {
-            Some(r) => p.ref_allowed(r),
-            None => p.allowed_refs.is_empty(),
-        }
-    }
-
-    /// Every subset of [`PEOPLE`], as an approval set.
-    fn all_approval_sets() -> Vec<Vec<String>> {
-        (0..1u32 << PEOPLE.len())
-            .map(|mask| {
-                PEOPLE
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| mask & (1 << i) != 0)
-                    .map(|(_, p)| p.to_string())
-                    .collect()
-            })
-            .collect()
-    }
-
     fn pick(universe: &'static [&'static str], max: usize) -> impl Strategy<Value = Vec<String>> {
         prop::collection::vec(prop::sample::select(universe), 0..=max)
             .prop_map(|xs| xs.into_iter().map(str::to_string).collect())
@@ -1489,71 +1299,6 @@ mod tests {
 
     fn project_overlay() -> impl Strategy<Value = EnvironmentProjectOverlay> {
         protection_rules().prop_map(overlay)
-    }
-
-    const DIGESTS: &[&str] = &["sha256:aaaa", "sha256:bbbb"];
-    const IMAGES: &[&str] = &[
-        "ghcr.io/acme/x@sha256:aaaa",
-        "ghcr.io/acme/x@sha256:bbbb",
-        "ghcr.io/acme/x:v1",
-    ];
-    const CAPS: &[&str] = &["NET_ADMIN", "SYS_ADMIN"];
-
-    fn image_grants() -> impl Strategy<Value = Vec<ImageGrant>> {
-        prop::collection::vec(
-            (prop::sample::select(DIGESTS), any::<bool>(), pick(CAPS, 2)).prop_map(
-                |(d, privileged, capabilities)| ImageGrant {
-                    image_digest: d.to_string(),
-                    privileged,
-                    capabilities,
-                },
-            ),
-            0..3,
-        )
-    }
-
-    /// Legacy rules covering every field a stored row can hold, including
-    /// the stored-but-unread concurrency and the old privilege fields.
-    fn legacy_protection_rules() -> impl Strategy<Value = ProtectionRules> {
-        (
-            pick(PEOPLE, 4),
-            0u32..120,
-            pick(PATTERNS, 3),
-            0u32..4,
-            image_grants(),
-            any::<bool>(),
-            any::<bool>(),
-        )
-            .prop_map(
-                |(approvers, wait_timer, allowed_refs, concurrency, images, k8s, reason)| {
-                    ProtectionRules {
-                        approvers,
-                        wait_timer,
-                        allowed_refs,
-                        concurrency,
-                        privileged_images: images,
-                        permit_k8s_overlay: k8s,
-                        require_reason: reason,
-                        ..legacy_rules()
-                    }
-                },
-            )
-    }
-
-    fn grant_request() -> impl Strategy<Value = GrantRequest> {
-        (any::<bool>(), pick(CAPS, 2), any::<bool>()).prop_map(
-            |(run_as_root, add_capabilities, privileged)| GrantRequest {
-                run_as_root,
-                add_capabilities,
-                privileged,
-            },
-        )
-    }
-
-    fn sorted(mut v: Vec<String>) -> Vec<String> {
-        v.sort();
-        v.dedup();
-        v
     }
 
     proptest! {
@@ -1606,64 +1351,6 @@ mod tests {
             prop_assert!(with.approvers.iter().all(|a| seen.insert(a)), "duplicate approver");
             prop_assert!(with.wait_timer_s >= without.wait_timer_s);
             prop_assert!(!without.require_reason || with.require_reason);
-        }
-
-        /// ADR-0071 §10 **migration equivalence**: over the permissive
-        /// baseline the migration creates, a Project's migrated overlay and
-        /// grant decide every admission question exactly as its old
-        /// `ProtectionRules` did — for every ref × approval set × trigger
-        /// kind × reason, and every grant request.
-        #[test]
-        fn a_migrated_environment_decides_exactly_as_it_did_before(
-            old in legacy_protection_rules(),
-            grant_requests in prop::collection::vec(
-                (grant_request(), prop::sample::select(IMAGES), any::<bool>()),
-                1..6,
-            ),
-        ) {
-            let (o, g) = migrate_legacy_environment("acme", "payments", &legacy(old.clone()));
-            let e = effective_protection(&EnvironmentProtectionRules::default(), Some(&o));
-
-            for &r in REFS {
-                prop_assert_eq!(e.ref_allowed(r), old.ref_allowed(r), "{}", r);
-                for approvals in all_approval_sets() {
-                    let (now, before) = (e.admits(r, &approvals), old.admits(r, &approvals));
-                    prop_assert_eq!(now.is_ok(), before.is_ok(), "{} {:?}", r, approvals);
-                    // Same violations, modulo a legacy row that listed an
-                    // approver twice (it reported the miss twice).
-                    prop_assert_eq!(
-                        sorted(now.err().unwrap_or_default()),
-                        sorted(before.err().unwrap_or_default())
-                    );
-                }
-                for &trigger in TRIGGERS {
-                    let protection_ref = trigger.protection_ref(r);
-                    prop_assert_eq!(
-                        e.admits_protection_ref(protection_ref),
-                        legacy_admits_protection_ref(&old, protection_ref),
-                        "{:?} {}", trigger, r
-                    );
-                    for has_reason in [false, true] {
-                        prop_assert_eq!(
-                            e.admits_reason(trigger.is_human_dispatch(), has_reason),
-                            old.admits_reason(trigger.is_human_dispatch(), has_reason),
-                            "{:?} reason={}", trigger, has_reason
-                        );
-                    }
-                }
-            }
-
-            for (req, image, locked_out) in &grant_requests {
-                prop_assert_eq!(
-                    EnvironmentProjectPrivilegeGrant::admit_grants(g.as_ref(), req, image, *locked_out),
-                    old.admit_grants(req, image, *locked_out)
-                );
-            }
-            prop_assert_eq!(
-                EnvironmentProjectPrivilegeGrant::permits_k8s_overlay(g.as_ref()),
-                old.permit_k8s_overlay
-            );
-            prop_assert_eq!(e.wait_timer_s, old.wait_timer);
         }
 
         /// The fail-open regression ADR-0071 §3 names: baseline

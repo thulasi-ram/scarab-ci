@@ -1,24 +1,21 @@
 //! [`InMemoryEnvironmentGovernance`]: the org-level Environment governance
 //! store (ADR-0071) without Postgres, for hermetic server tests.
 //!
-//! Its seeding helper [`with_migrated_legacy_environment`] does to one legacy
-//! per-Project environment exactly what migration 0057's backfill did to a
-//! legacy per-Project row (ADR-0071 §10 steps 1, 2, 5, 6): so a
-//! test written against the per-Project `ProtectionRules` keeps its setup in
-//! that vocabulary and is ported by changing only the store it hands the
-//! server — never its assertions.
+//! Its seeding helper [`with_project_overlay`] gives one Project an overlay
+//! over an Environment's permissive baseline and makes the Project eligible
+//! for it, which is all a test of one Project's deploy rules needs.
 //!
-//! [`with_migrated_legacy_environment`]: InMemoryEnvironmentGovernance::with_migrated_legacy_environment
+//! [`with_project_overlay`]: InMemoryEnvironmentGovernance::with_project_overlay
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use scarab_project::{
-    migrate_legacy_environment, DeployGovernance, Environment, EnvironmentCascadeDeletion,
-    EnvironmentGovernanceStore, EnvironmentNameClaim, EnvironmentProjectEligibility,
-    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
-    EnvironmentProtectionRules, ImageGrant, OrgEnvironment, OrgEnvironmentError,
+    DeployGovernance, EnvironmentCascadeDeletion, EnvironmentGovernanceStore, EnvironmentNameClaim,
+    EnvironmentProjectEligibility, EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant,
+    EnvironmentProjectRecord, EnvironmentProtectionRules, ImageGrant, OrgEnvironment,
+    OrgEnvironmentError,
 };
 
 type EnvironmentKey = (String, String);
@@ -101,8 +98,7 @@ fn not_found(org: &str, environment: &str) -> OrgEnvironmentError {
     }
 }
 
-/// A new Environment as the migration (and the c-min API) creates one:
-/// permissive baseline.
+/// A new Environment as the API creates one: permissive baseline.
 fn new_environment(
     org: &str,
     name: &str,
@@ -141,27 +137,26 @@ impl InMemoryEnvironmentGovernance {
         self
     }
 
-    /// Seed what ADR-0071 §10 makes of `project`'s legacy per-Project
-    /// `legacy` environment: the org Environment of that name (created
-    /// permissive if missing — step 1), `project` added to its eligibility
-    /// by exact name unless it is already all-projects (step 6), and the
-    /// Project's migrated overlay and, if it carried privileges, its grant
-    /// ([`migrate_legacy_environment`], steps 2, 3, 5).
-    pub fn with_migrated_legacy_environment(
+    /// Give `project` the overlay `rules` over Environment `environment`,
+    /// replacing any it had. The Environment is created with the permissive
+    /// baseline if missing, and `project` is added to its eligibility by
+    /// exact name unless it already admits every Project.
+    pub fn with_project_overlay(
         self,
         org: &str,
         project: &str,
-        legacy: &Environment,
+        environment: &str,
+        rules: EnvironmentProtectionRules,
     ) -> Self {
         {
             let mut state = self.state.lock().unwrap();
             let env = state
                 .environments
-                .entry((org.to_string(), legacy.name.clone()))
+                .entry((org.to_string(), environment.to_string()))
                 .or_insert_with(|| {
                     new_environment(
                         org,
-                        &legacy.name,
+                        environment,
                         EnvironmentProjectEligibility::Projects(Vec::new()),
                     )
                 });
@@ -171,17 +166,20 @@ impl InMemoryEnvironmentGovernance {
                     projects.sort();
                 }
             }
-            let (overlay, grant) = migrate_legacy_environment(org, project, legacy);
-            let key = (org.to_string(), legacy.name.clone(), project.to_string());
-            state.overlays.insert(key.clone(), overlay);
-            match grant {
-                Some(grant) => {
-                    state.grants.insert(key, grant);
-                }
-                None => {
-                    state.grants.remove(&key);
-                }
-            }
+            let overlay = EnvironmentProjectOverlay {
+                org: org.to_string(),
+                environment: environment.to_string(),
+                project: project.to_string(),
+                rules,
+            };
+            state.overlays.insert(
+                (
+                    org.to_string(),
+                    environment.to_string(),
+                    project.to_string(),
+                ),
+                overlay,
+            );
         }
         self
     }

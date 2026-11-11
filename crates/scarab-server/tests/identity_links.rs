@@ -24,8 +24,7 @@ use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::Db;
 use scarab_identity::{IdentityStore, ProviderIdentity, RbacStore, Role, Scope};
-use scarab_project::{EnvironmentGovernanceStore, ProtectionRules};
-use scarab_secrets::SecretScope;
+use scarab_project::EnvironmentGovernanceStore;
 use scarab_server::config::OAuthConfig;
 use scarab_server::oauth::OAuthAuthenticator;
 use scarab_server::{router, AppState, LogService};
@@ -291,24 +290,19 @@ async fn linking_proves_and_merges_an_imported_account_without_email() {
         .await
         .unwrap();
     // ADR-0071: admission reads approvers from the org Environment's overlay
-    // for `web` (what the migration made of these legacy rules) and from the
-    // baseline. Seed both to name `ada-gh`, so the fold must rewrite them.
-    let legacy_rules = ProtectionRules {
-        approvers: vec![ada_gh.clone()],
-        wait_timer: 0,
-        allowed_refs: vec![],
-        concurrency: 1,
-        secret_scope: SecretScope::EnvironmentProject {
-            org: "acme".into(),
-            project: "web".into(),
-            environment: "prod".into(),
+    // for `web` and from the baseline. Seed both to name `ada-gh`, so the
+    // fold must rewrite them.
+    common::governance::seed_project_overlay(
+        &pg,
+        "acme",
+        "web",
+        "prod",
+        scarab_project::EnvironmentProtectionRules {
+            approvers: vec![ada_gh.clone()],
+            ..Default::default()
         },
-        oidc_subject: "scarab:org/acme/repo/web/env/prod".into(),
-        privileged_images: vec![],
-        permit_k8s_overlay: false,
-        require_reason: false,
-    };
-    common::governance::seed_migrated_environment(&pg, "acme", "web", "prod", legacy_rules).await;
+    )
+    .await;
     pg.put_environment_protection(
         "acme",
         "prod",

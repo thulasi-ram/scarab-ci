@@ -22,34 +22,16 @@ use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
 use common::fresh_db;
-use common::governance::seed_migrated_environment;
+use common::governance::seed_project_overlay;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::Db;
-use scarab_project::{ProtectionRules, SecretCoverageStore};
+use scarab_project::SecretCoverageStore;
 use scarab_secrets::{SecretProvider, SecretScope};
 use scarab_server::{router, AppState, LogService};
 use scarab_testkit::{FakeClock, FakeSecrets, InMemoryObjectStore};
 
 const ORG: &str = "acme";
 const REPO: &str = "web";
-
-fn env_rules(environment: &str) -> ProtectionRules {
-    ProtectionRules {
-        approvers: Vec::new(),
-        wait_timer: 0,
-        allowed_refs: Vec::new(),
-        concurrency: 1,
-        secret_scope: SecretScope::EnvironmentProject {
-            org: ORG.into(),
-            project: REPO.into(),
-            environment: environment.into(),
-        },
-        oidc_subject: format!("scarab:{ORG}/{REPO}/{environment}"),
-        privileged_images: Vec::new(),
-        permit_k8s_overlay: false,
-        require_reason: false,
-    }
-}
 
 struct Harness {
     app: axum::Router,
@@ -63,9 +45,8 @@ async fn harness(pg: Arc<PostgresDb>, environments: &[&str]) -> Harness {
     pg.migrate().await.unwrap();
     for name in environments {
         // ADR-0071: the matrix's columns are the org Environments this
-        // Project may deploy into — seeded as the migration leaves a legacy
-        // per-repo environment.
-        seed_migrated_environment(&pg, ORG, REPO, name, env_rules(name)).await;
+        // Project may deploy into.
+        seed_project_overlay(&pg, ORG, REPO, name, Default::default()).await;
     }
     let secrets = Arc::new(FakeSecrets::new());
     let db: Arc<dyn Db> = pg.clone();

@@ -406,19 +406,25 @@ async fn a_token_review_naming_another_namespace_or_service_account_proves_nothi
     let Some(w) = world(PIPELINE, None, true).await else {
         return;
     };
-    let cases = [
+    let mut cases = vec![
         // The installation's SA name, but outside the plugin namespace.
         ("default", format!("plugin-{}", w.prod_id)),
         ("kube-system", format!("plugin-{}", w.prod_id)),
         // In the namespace, but not an installation's SA.
         (NAMESPACE, "default".to_string()),
-        (NAMESPACE, format!("plugin-{}", w.prod_id.to_uppercase())),
         (NAMESPACE, format!("plugin-{}x", w.prod_id)),
         (NAMESPACE, format!("x-plugin-{}", w.prod_id)),
         (NAMESPACE, "plugin-".to_string()),
         // A well-formed id of no installation.
         (NAMESPACE, format!("plugin-{}", "0".repeat(w.prod_id.len()))),
     ];
+    // The id differing only in case. An id is random lowercase hex, so about
+    // one in 110 has no letter and no uppercase form: then this would name
+    // the installation's own SA, which is admitted.
+    let upper = w.prod_id.to_uppercase();
+    if upper != w.prod_id {
+        cases.push((NAMESPACE, format!("plugin-{upper}")));
+    }
     for (ns, sa) in cases {
         let mut st = state(w.pg.clone(), w.clock.clone());
         st = st.with_plugin_api_tokens(Arc::new(Fixed(VerifiedServiceAccount {

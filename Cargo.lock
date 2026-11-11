@@ -2971,9 +2971,7 @@ dependencies = [
  "async-trait",
  "proptest",
  "scarab-forge",
- "scarab-secrets",
  "serde",
- "serde_json",
  "thiserror",
 ]
 

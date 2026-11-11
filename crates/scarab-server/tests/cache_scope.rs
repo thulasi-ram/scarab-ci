@@ -10,8 +10,6 @@
 
 use scarab_engine::{CacheScope, Db, RunId};
 use scarab_forge::{Event, RepoRef};
-use scarab_project::{Environment, ProtectionRules};
-use scarab_secrets::SecretScope;
 use scarab_server::trigger_run_from_event;
 use scarab_testkit::{FakeClock, FakeForge, InMemoryDb, InMemoryEnvironmentGovernance};
 
@@ -82,27 +80,11 @@ fn pull_request(number: u64) -> Event {
 }
 
 fn prod() -> InMemoryEnvironmentGovernance {
-    InMemoryEnvironmentGovernance::new().with_migrated_legacy_environment(
+    InMemoryEnvironmentGovernance::new().with_project_overlay(
         "acme",
         "web",
-        &Environment {
-            name: "prod".into(),
-            protection: ProtectionRules {
-                approvers: vec![],
-                wait_timer: 0,
-                allowed_refs: vec![],
-                concurrency: 1,
-                secret_scope: SecretScope::EnvironmentProject {
-                    org: "acme".into(),
-                    project: "web".into(),
-                    environment: "prod".into(),
-                },
-                oidc_subject: "scarab:acme/web/prod".into(),
-                privileged_images: Vec::new(),
-                permit_k8s_overlay: false,
-                require_reason: false,
-            },
-        },
+        "prod",
+        Default::default(),
     )
 }
 

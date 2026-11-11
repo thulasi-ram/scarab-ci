@@ -2,21 +2,18 @@
 //!
 //! Pure domain crate (ADR-0046, CONTEXT §4.5). A [`Project`] is Scarab's
 //! **governed unit of CI** — the aggregate root beneath an [`Org`] that binds
-//! a source (a `RepoRef` on a forge) to its governance ([`Environment`]s with
-//! [`ProtectionRules`], the privilege whitelist, the secret scope) and owns
-//! the pipelines and runs produced from that source. There is **no separate
-//! governed "Repo" entity** — a Project *is* the governed repo (1:1 with a
-//! `RepoRef` in v1). Depends only on the pure `scarab-secrets` and
-//! `scarab-forge` crates — no infra.
+//! a source (a `RepoRef` on a forge) to its governance (the org-level
+//! [`OrgEnvironment`]s it may deploy into, its overlay and privilege grant in
+//! each, the secret scope) and owns the pipelines and runs produced from that
+//! source. There is **no separate governed "Repo" entity** — a Project *is*
+//! the governed repo (1:1 with a `RepoRef` in v1). Depends only on the pure
+//! `scarab-forge` crate — no infra.
 
 use async_trait::async_trait;
 use scarab_forge::RepoRef;
-use scarab_secrets::SecretScope;
 use serde::{Deserialize, Serialize};
 
-/// The org-level Environment (ADR-0071). Since the full migration (c-full c2)
-/// it alone governs Deploy Runs; the per-Project [`Environment`] below is the
-/// legacy shape the migration reads.
+/// The org-level Environment (ADR-0071), which governs Deploy Runs.
 mod org_environment;
 pub use org_environment::{
     duplicate_display_name, normalize_display_name, validate_org_environment_display_name,
@@ -26,13 +23,12 @@ pub use org_environment::{
 };
 
 /// The org-level Environment's governance model and its pure resolution
-/// (ADR-0071 §2, §3, §8, §10): baseline, tighten-only overlay, eligibility,
-/// per-Project privilege grant, the migration from the per-Project
-/// [`Environment`], and the store admission reads them through.
+/// (ADR-0071 §2, §3, §8): baseline, tighten-only overlay, eligibility,
+/// per-Project privilege grant, and the store admission reads them through.
 mod environment_governance;
 pub use environment_governance::{
-    effective_protection, migrate_legacy_environment, AllowedRefConstraint, ApprovalGateRules,
-    DeployGovernance, EffectiveProtection, EnvironmentCascadeDeletion, EnvironmentGovernanceStore,
+    effective_protection, AllowedRefConstraint, ApprovalGateRules, DeployGovernance,
+    EffectiveProtection, EnvironmentCascadeDeletion, EnvironmentGovernanceStore,
     EnvironmentNameClaim, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
     EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord, EnvironmentProtectionRules,
     MissingGateMode, DEFAULT_MAX_APPROVAL_AGE_S,
@@ -58,9 +54,9 @@ pub struct Org {
 /// Scarab's **governed unit of CI** and the aggregate root beneath an [`Org`]
 /// (ADR-0046, CONTEXT §4.5): binds a **source** (a [`RepoRef`] on a forge,
 /// resolved via a `ForgeConnection`) to its **governance** — the
-/// [`Environment`]s with their [`ProtectionRules`], privilege whitelist and
-/// secret scope — and owns the pipelines and runs produced from that source.
-/// RBAC is enforced at Project scope.
+/// [`OrgEnvironment`]s it may deploy into, its overlay and privilege grant in
+/// each, and its secret scope — and owns the pipelines and runs produced from
+/// that source. RBAC is enforced at Project scope.
 ///
 /// **1 Project : 1 RepoRef** in v1 (monorepo per-subdir governance is
 /// deferred to an optional path scope). The Project's natural key is
@@ -73,9 +69,6 @@ pub struct Project {
     pub org: String,
     /// The forge coordinate this Project governs (1:1 in v1).
     pub repo: RepoRef,
-    /// The Project's deployment environments with their protection rules.
-    #[serde(default)]
-    pub environments: Vec<Environment>,
 }
 
 impl Project {
@@ -86,72 +79,7 @@ impl Project {
     }
 }
 
-/// A deployment environment with its protection rules — the **legacy**
-/// per-Project ADR-0037 shape. Since ADR-0071's migration (c-full c2) nothing
-/// admits a Run by it: the migration turned each one into an
-/// [`EnvironmentProjectOverlay`] (and, where it carried privileges, an
-/// [`EnvironmentProjectPrivilegeGrant`]) via [`migrate_legacy_environment`].
-/// Kept as the oracle the migration's golden tests decide against.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Environment {
-    pub name: String,
-    pub protection: ProtectionRules,
-}
-
-/// Guardrails that gate deployments into an [`Environment`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProtectionRules {
-    /// Principals whose approval is required before a run may proceed.
-    pub approvers: Vec<String>,
-    /// A mandatory wait timer (seconds) before proceeding.
-    pub wait_timer: u32,
-    /// Git refs allowed to deploy to this environment (glob patterns).
-    pub allowed_refs: Vec<String>,
-    /// Max concurrent deployments into this environment.
-    pub concurrency: u32,
-    /// The secret scope exposed to runs targeting this environment. This is
-    /// canonical — fully determined by the environment's `(org, repo, name)`
-    /// coordinate — so the server stamps it on write; callers need not (and
-    /// cannot meaningfully) supply it. Defaulted here so an API body may omit it.
-    #[serde(default = "canonical_scope_placeholder")]
-    pub secret_scope: SecretScope,
-    /// The OIDC subject claim minted for runs into this environment. Likewise
-    /// canonical and server-stamped on write; defaulted so a body may omit it.
-    #[serde(default)]
-    pub oidc_subject: String,
-    /// The privilege whitelist (ADR-0039): which image **digests** may use which
-    /// *governed* grants (`add-capabilities`, `privileged`) in this environment.
-    /// Written only with the Administer capability (separation of duties).
-    /// `run-as-root` is self-service and never appears here.
-    #[serde(default)]
-    pub privileged_images: Vec<ImageGrant>,
-    /// Whether steps targeting this environment may set a raw `k8s_overlay`
-    /// (ADR-0055): the governed placement escape hatch. **Off by default
-    /// (fail-closed)** — a raw overlay carries no authority and is admitted only
-    /// where an admin has opted in. Administer-only, like the privilege whitelist.
-    #[serde(default)]
-    pub permit_k8s_overlay: bool,
-    /// Whether a **human dispatch** (`manual`/`api`) into this environment must
-    /// carry a reason (ADR-0057 §3). **Off by default (`#[serde(default)]` =
-    /// fail-open)** so existing environments are unaffected; Administer-only to
-    /// set, like the privilege whitelist (separation of duties). Enforced at the
-    /// admission gate ([`admits_reason`](ProtectionRules::admits_reason)), not the
-    /// dispatch endpoint. Push/PR/tag/release/cron/upstream are exempt — they carry
-    /// their own intrinsic headline or are machine-initiated.
-    #[serde(default)]
-    pub require_reason: bool,
-}
-
-/// A stand-in [`SecretScope`] used only as the serde default for
-/// [`ProtectionRules::secret_scope`] when a request body omits it. The value is
-/// always overwritten with the canonical env-scoped scope on write, so it never
-/// escapes as-is — it exists purely so `SecretScope` (which has no `Default`)
-/// can be defaulted at the field level.
-fn canonical_scope_placeholder() -> SecretScope {
-    SecretScope::Org { org: String::new() }
-}
-
-/// A per-image entry in an [`Environment`]'s privilege whitelist (ADR-0039): the
+/// A per-image entry in a privilege whitelist (ADR-0039): the
 /// *governed* grants a specific image **digest** may use. Governed grants are
 /// digest-keyed — a mutable tag is a supply-chain hole, so the bytes an admin
 /// approved are pinned exactly.
@@ -191,102 +119,21 @@ pub struct AdmittedGrants {
     pub privileged: bool,
 }
 
-impl ProtectionRules {
-    /// Decide whether a deployment from `git_ref`, carrying `approvals` (the set
-    /// of principals who have approved), may proceed — the guardrails enforced at
-    /// admission (ADR-0024, 0011). Returns every violation (empty = admitted):
-    ///
-    /// - **allowed refs**: if `allowed_refs` is non-empty, `git_ref` must match
-    ///   one of its globs (`*` wildcards).
-    /// - **approvers**: every required approver must appear in `approvals`.
-    ///
-    /// The `wait_timer` and `concurrency` rules are enforced elsewhere (a timer
-    /// gate and a concurrency group, respectively) and are not re-checked here.
-    pub fn admits(&self, git_ref: &str, approvals: &[String]) -> Result<(), Vec<String>> {
-        let mut violations = Vec::new();
-
-        if !self.ref_allowed(git_ref) {
-            violations.push(format!("ref `{git_ref}` is not allowed to deploy here"));
-        }
-        for approver in &self.approvers {
-            if !approvals.iter().any(|a| a == approver) {
-                violations.push(format!("missing required approval from `{approver}`"));
-            }
-        }
-
-        if violations.is_empty() {
-            Ok(())
-        } else {
-            Err(violations)
-        }
-    }
-
-    /// Whether `git_ref` is permitted to deploy here — the allowed-refs half of
-    /// [`admits`], checked on its own at run creation (ADR-0037) so a disallowed
-    /// ref is rejected even when the environment has no approver gate. An empty
-    /// `allowed_refs` permits any ref.
-    pub fn ref_allowed(&self, git_ref: &str) -> bool {
-        self.allowed_refs.is_empty() || self.allowed_refs.iter().any(|p| glob_match(p, git_ref))
-    }
-
-    /// The `require_reason` guardrail (ADR-0057 §3), enforced at the admission gate
-    /// beside [`admits`](Self::admits) — a third guardrail like `approvers` /
-    /// `allowed_refs`. Returns every violation (empty = admitted), so a blocked run
-    /// surfaces exactly like a missing approval.
-    ///
-    /// A run is blocked **iff** `require_reason` is set, the trigger is a
-    /// human-initiated dispatch (`is_human_dispatch` — `manual`/`api`), and it
-    /// carries no reason (`has_reason == false`). Push / pull_request / tag /
-    /// release / cron / upstream are exempt (`is_human_dispatch == false`): they
-    /// carry their own intrinsic headline or are machine-initiated, so there is no
-    /// operator to prompt. An environment without `require_reason` never blocks
-    /// (fail-open — existing environments are unaffected).
-    ///
-    /// `has_reason` is the caller's "reason is present and non-blank" signal
-    /// (`Event::trigger_title().is_some()` on the manual/api arm, per slice C).
-    pub fn admits_reason(
-        &self,
-        is_human_dispatch: bool,
-        has_reason: bool,
-    ) -> Result<(), Vec<String>> {
-        if self.require_reason && is_human_dispatch && !has_reason {
-            Err(vec![
-                "a reason is required to dispatch a run into this environment".to_string(),
-            ])
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Compute the privilege grant-set admitted for a step running `image` in this
-    /// environment (ADR-0039), **fail-closed**. Returns the blessed set, or every
-    /// violation (a non-empty error must reject the step, never downgrade it):
-    ///
-    /// - **`run-as-root`** is *self-service*: admitted iff requested. Root inside
-    ///   the hardened (caps-dropped, priv-esc-off, seccomp) sandbox does not escape,
-    ///   so it needs no whitelist. Not suppressed by `locked_out`.
-    /// - **`add-capabilities` / `privileged`** are *governed*: admitted only if
-    ///   `image` is pinned to a **digest** that has a whitelist entry granting them.
-    ///   A digest-less image, an un-whitelisted digest, or a capability outside the
-    ///   entry's allow-list is a violation.
-    /// - **`locked_out`** (fork-PR, ADR-0037) forbids *all governed* grants outright;
-    ///   self-service run-as-root is unaffected.
-    pub fn admit_grants(
-        &self,
-        req: &GrantRequest,
-        image: &str,
-        locked_out: bool,
-    ) -> Result<AdmittedGrants, Vec<String>> {
-        admit_grants_against_whitelist(&self.privileged_images, req, image, locked_out)
-    }
-}
-
-/// The ADR-0039 grant decision against one privilege whitelist — the body
-/// [`ProtectionRules::admit_grants`] and ADR-0071's
-/// [`EnvironmentProjectPrivilegeGrant::admit_grants`] share, so the per-Project
-/// grant that replaces the per-Project whitelist decides **identically** by
-/// construction (ADR-0071 §8, §10 step 5) rather than by a copy kept in step.
-/// See [`ProtectionRules::admit_grants`] for the rules.
+/// The ADR-0039 grant decision for a step running `image` against one
+/// privilege `whitelist`, **fail-closed**: the body of
+/// [`EnvironmentProjectPrivilegeGrant::admit_grants`]. Returns the blessed
+/// set, or every violation (a non-empty error must reject the step, never
+/// downgrade it):
+///
+/// - **`run-as-root`** is *self-service*: admitted iff requested. Root inside
+///   the hardened (caps-dropped, priv-esc-off, seccomp) sandbox does not escape,
+///   so it needs no whitelist. Not suppressed by `locked_out`.
+/// - **`add-capabilities` / `privileged`** are *governed*: admitted only if
+///   `image` is pinned to a **digest** that has a whitelist entry granting them.
+///   A digest-less image, an un-whitelisted digest, or a capability outside the
+///   entry's allow-list is a violation.
+/// - **`locked_out`** (fork-PR, ADR-0037) forbids *all governed* grants outright;
+///   self-service run-as-root is unaffected.
 fn admit_grants_against_whitelist(
     whitelist: &[ImageGrant],
     req: &GrantRequest,
@@ -444,17 +291,23 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn rules(approvers: &[&str], allowed_refs: &[&str]) -> ProtectionRules {
-        ProtectionRules {
+    /// An Environment baseline with these approvers and allowed refs.
+    fn rules(approvers: &[&str], allowed_refs: &[&str]) -> EnvironmentProtectionRules {
+        EnvironmentProtectionRules {
             approvers: approvers.iter().map(|s| s.to_string()).collect(),
-            wait_timer: 0,
             allowed_refs: allowed_refs.iter().map(|s| s.to_string()).collect(),
-            concurrency: 1,
-            secret_scope: SecretScope::Org { org: "acme".into() },
-            oidc_subject: String::new(),
-            privileged_images: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    /// A Project's privilege grant with this whitelist.
+    fn grant(privileged_images: Vec<ImageGrant>) -> EnvironmentProjectPrivilegeGrant {
+        EnvironmentProjectPrivilegeGrant {
+            org: "acme".into(),
+            environment: "prod".into(),
+            project: "web".into(),
+            privileged_images,
             permit_k8s_overlay: false,
-            require_reason: false,
         }
     }
 
@@ -481,20 +334,20 @@ mod tests {
 
     #[test]
     fn admits_when_ref_allowed_and_approvals_present() {
-        let r = rules(&["alice"], &["refs/heads/main"]);
+        let r = effective_protection(&rules(&["alice"], &["refs/heads/main"]), None);
         assert!(r.admits("refs/heads/main", &["alice".into()]).is_ok());
     }
 
     #[test]
     fn rejects_disallowed_ref() {
-        let r = rules(&[], &["refs/heads/main"]);
+        let r = effective_protection(&rules(&[], &["refs/heads/main"]), None);
         let err = r.admits("refs/heads/dev", &[]).unwrap_err();
         assert!(err.iter().any(|v| v.contains("not allowed")));
     }
 
     #[test]
     fn rejects_missing_approver() {
-        let r = rules(&["alice", "bob"], &["*"]);
+        let r = effective_protection(&rules(&["alice", "bob"], &["*"]), None);
         let err = r.admits("refs/heads/main", &["alice".into()]).unwrap_err();
         assert!(err.iter().any(|v| v.contains("bob")));
         // Both present → admitted.
@@ -505,7 +358,7 @@ mod tests {
 
     #[test]
     fn empty_allowed_refs_permits_any_ref() {
-        let r = rules(&[], &[]);
+        let r = effective_protection(&rules(&[], &[]), None);
         assert!(r.admits("refs/heads/whatever", &[]).is_ok());
     }
 
@@ -513,8 +366,9 @@ mod tests {
 
     #[test]
     fn require_reason_blocks_an_empty_reason_human_dispatch() {
-        let mut r = rules(&[], &[]);
-        r.require_reason = true;
+        let mut b = rules(&[], &[]);
+        b.require_reason = true;
+        let r = effective_protection(&b, None);
         // manual/api with no reason → blocked, violation reads like a gate miss.
         let err = r.admits_reason(true, false).unwrap_err();
         assert!(err.iter().any(|v| v.contains("reason is required")));
@@ -522,15 +376,17 @@ mod tests {
 
     #[test]
     fn require_reason_admits_a_human_dispatch_that_carries_a_reason() {
-        let mut r = rules(&[], &[]);
-        r.require_reason = true;
+        let mut b = rules(&[], &[]);
+        b.require_reason = true;
+        let r = effective_protection(&b, None);
         assert!(r.admits_reason(true, true).is_ok());
     }
 
     #[test]
     fn require_reason_exempts_non_human_triggers_regardless() {
-        let mut r = rules(&[], &[]);
-        r.require_reason = true;
+        let mut b = rules(&[], &[]);
+        b.require_reason = true;
+        let r = effective_protection(&b, None);
         // A push (is_human_dispatch == false) is never blocked, reason or not.
         assert!(r.admits_reason(false, false).is_ok());
         assert!(r.admits_reason(false, true).is_ok());
@@ -539,43 +395,23 @@ mod tests {
     #[test]
     fn require_reason_off_never_blocks() {
         // Fail-open: existing environments (require_reason unset) are unaffected.
-        let r = rules(&[], &[]);
+        let r = effective_protection(&rules(&[], &[]), None);
         assert!(!r.require_reason);
         assert!(r.admits_reason(true, false).is_ok());
-    }
-
-    #[test]
-    fn require_reason_defaults_off_and_round_trips() {
-        // The jsonb-backed protection blob (scarab-db-postgres) relies on
-        // `#[serde(default)]`: a pre-ADR-0057 environment omits the key and must
-        // deserialize with `require_reason == false` (fail-open, no migration).
-        let legacy = serde_json::json!({
-            "approvers": [],
-            "wait_timer": 0,
-            "allowed_refs": [],
-            "concurrency": 1,
-            "secret_scope": { "Org": { "org": "acme" } },
-            "oidc_subject": ""
-        });
-        let p: ProtectionRules = serde_json::from_value(legacy).unwrap();
-        assert!(!p.require_reason);
-
-        // And an explicit `true` round-trips through serde (the storage path).
-        let mut set = rules(&[], &[]);
-        set.require_reason = true;
-        let back: ProtectionRules =
-            serde_json::from_value(serde_json::to_value(&set).unwrap()).unwrap();
-        assert!(back.require_reason);
     }
 
     // --- ADR-0039 grants ---------------------------------------------------
 
     #[test]
     fn run_as_root_is_self_service_no_whitelist_needed() {
-        let r = rules(&[], &[]); // empty whitelist
-        let g = r
-            .admit_grants(&req(true, &[], false), "busybox:latest", false)
-            .unwrap();
+        let r = grant(vec![]); // empty whitelist
+        let g = EnvironmentProjectPrivilegeGrant::admit_grants(
+            Some(&r),
+            &req(true, &[], false),
+            "busybox:latest",
+            false,
+        )
+        .unwrap();
         assert!(g.run_as_root);
         assert!(!g.privileged);
         assert!(g.add_capabilities.is_empty());
@@ -583,96 +419,127 @@ mod tests {
 
     #[test]
     fn run_as_root_survives_fork_lockout() {
-        let r = rules(&[], &[]);
+        let r = grant(vec![]);
         // Even locked out (fork PR), self-service root is fine — it cannot escape.
-        let g = r
-            .admit_grants(&req(true, &[], false), "busybox:latest", true)
-            .unwrap();
+        let g = EnvironmentProjectPrivilegeGrant::admit_grants(
+            Some(&r),
+            &req(true, &[], false),
+            "busybox:latest",
+            true,
+        )
+        .unwrap();
         assert!(g.run_as_root);
     }
 
     #[test]
     fn privileged_rejected_without_whitelist() {
-        let r = rules(&[], &[]);
-        let err = r
-            .admit_grants(&req(false, &[], true), IMG, false)
-            .unwrap_err();
+        let r = grant(vec![]);
+        let err = EnvironmentProjectPrivilegeGrant::admit_grants(
+            Some(&r),
+            &req(false, &[], true),
+            IMG,
+            false,
+        )
+        .unwrap_err();
         assert!(err.iter().any(|v| v.contains("not whitelisted")));
     }
 
     #[test]
     fn privileged_rejected_when_image_not_digest_pinned() {
-        let mut r = rules(&[], &[]);
-        r.privileged_images = vec![ImageGrant {
+        let r = grant(vec![ImageGrant {
             image_digest: DIGEST.into(),
             privileged: true,
             capabilities: vec![],
-        }];
+        }]);
         // Same repo, but pinned by tag not digest → fail closed.
-        let err = r
-            .admit_grants(&req(false, &[], true), "ghcr.io/acme/deployer:v1", false)
-            .unwrap_err();
+        let err = EnvironmentProjectPrivilegeGrant::admit_grants(
+            Some(&r),
+            &req(false, &[], true),
+            "ghcr.io/acme/deployer:v1",
+            false,
+        )
+        .unwrap_err();
         assert!(err.iter().any(|v| v.contains("not pinned to a digest")));
     }
 
     #[test]
     fn privileged_granted_for_whitelisted_digest() {
-        let mut r = rules(&[], &[]);
-        r.privileged_images = vec![ImageGrant {
+        let r = grant(vec![ImageGrant {
             image_digest: DIGEST.into(),
             privileged: true,
             capabilities: vec![],
-        }];
-        let g = r.admit_grants(&req(false, &[], true), IMG, false).unwrap();
+        }]);
+        let g = EnvironmentProjectPrivilegeGrant::admit_grants(
+            Some(&r),
+            &req(false, &[], true),
+            IMG,
+            false,
+        )
+        .unwrap();
         assert!(g.privileged);
     }
 
     #[test]
     fn governed_grants_forbidden_for_fork_prs() {
-        let mut r = rules(&[], &[]);
-        r.privileged_images = vec![ImageGrant {
+        let r = grant(vec![ImageGrant {
             image_digest: DIGEST.into(),
             privileged: true,
             capabilities: vec!["NET_ADMIN".into()],
-        }];
+        }]);
         // Whitelisted digest, but locked_out (fork) → still rejected.
-        let err = r
-            .admit_grants(&req(false, &[], true), IMG, true)
-            .unwrap_err();
+        let err = EnvironmentProjectPrivilegeGrant::admit_grants(
+            Some(&r),
+            &req(false, &[], true),
+            IMG,
+            true,
+        )
+        .unwrap_err();
         assert!(err.iter().any(|v| v.contains("locked out")));
     }
 
     #[test]
     fn capabilities_bounded_by_whitelist() {
-        let mut r = rules(&[], &[]);
-        r.privileged_images = vec![ImageGrant {
+        let r = grant(vec![ImageGrant {
             image_digest: DIGEST.into(),
             privileged: false,
             capabilities: vec!["NET_ADMIN".into()],
-        }];
+        }]);
         // Requested cap is whitelisted → admitted.
-        let g = r
-            .admit_grants(&req(false, &["NET_ADMIN"], false), IMG, false)
-            .unwrap();
+        let g = EnvironmentProjectPrivilegeGrant::admit_grants(
+            Some(&r),
+            &req(false, &["NET_ADMIN"], false),
+            IMG,
+            false,
+        )
+        .unwrap();
         assert_eq!(g.add_capabilities, vec!["NET_ADMIN".to_string()]);
         assert!(!g.privileged);
         // A cap outside the allow-list → rejected (fail closed).
-        let err = r
-            .admit_grants(&req(false, &["SYS_ADMIN"], false), IMG, false)
-            .unwrap_err();
+        let err = EnvironmentProjectPrivilegeGrant::admit_grants(
+            Some(&r),
+            &req(false, &["SYS_ADMIN"], false),
+            IMG,
+            false,
+        )
+        .unwrap_err();
         assert!(err.iter().any(|v| v.contains("SYS_ADMIN")));
     }
 
     #[test]
     fn privileged_granted_but_not_requested_stays_off() {
-        let mut r = rules(&[], &[]);
-        r.privileged_images = vec![ImageGrant {
+        let r = grant(vec![ImageGrant {
             image_digest: DIGEST.into(),
             privileged: true,
             capabilities: vec![],
-        }];
+        }]);
         // Grant is a ceiling, not a default: request nothing → nothing escalates.
-        let g = r.admit_grants(&req(false, &[], false), IMG, false).unwrap();
+        let g = EnvironmentProjectPrivilegeGrant::admit_grants(
+            Some(&r),
+            &req(false, &[], false),
+            IMG,
+            false,
+        )
+        .unwrap();
         assert!(!g.privileged);
         assert!(!g.run_as_root);
     }

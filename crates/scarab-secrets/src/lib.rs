@@ -42,7 +42,8 @@ pub enum SecretScope {
     /// `env:{org}/{project}/{environment}`, also the AEAD associated data),
     /// so no stored ciphertext moves and no value changes visibility. The
     /// serde aliases read the old wire form (`Environment`, `repo`) — the
-    /// shape every pre-ADR-0071 stored `ProtectionRules.secret_scope` holds.
+    /// shape every per-repo environment stored as its secret scope before
+    /// ADR-0071.
     #[serde(alias = "Environment")]
     EnvironmentProject {
         org: String,
@@ -305,8 +306,8 @@ mod tests {
 
     #[test]
     fn the_old_environment_wire_form_still_deserialises() {
-        // Every pre-ADR-0071 `ProtectionRules.secret_scope` was stored as
-        // `Environment { org, repo, environment }` (ADR-0071 §6 rename).
+        // Before ADR-0071, every per-repo environment stored its secret scope
+        // as `Environment { org, repo, environment }` (ADR-0071 §6 rename).
         let old: SecretScope = serde_json::from_value(serde_json::json!({
             "Environment": { "org": "acme", "repo": "web", "environment": "prod" }
         }))
