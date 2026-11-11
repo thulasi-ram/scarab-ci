@@ -3268,7 +3268,7 @@
         "tags": [
           "Libraries"
         ],
-        "summary": "Trust a library source with forge credentials or the build sandbox",
+        "summary": "Trust a library source with forge credentials, the build sandbox or the registry credential",
         "operationId": "trust_library_source",
         "parameters": [
           {
@@ -3335,7 +3335,7 @@
         "tags": [
           "Libraries"
         ],
-        "summary": "Stop trusting a library source with forge credentials or the build sandbox",
+        "summary": "Stop trusting a library source with one grant or all of them",
         "operationId": "untrust_library_source",
         "parameters": [
           {
@@ -3359,7 +3359,7 @@
           {
             "name": "grant",
             "in": "query",
-            "description": "The grant to remove; `forge_credentials` when omitted. The source's\nother grants stay.",
+            "description": "The grant to remove; every grant of the source when omitted (a\nclient from before grants existed means the source's whole trust).\nNamed, the source's other grants stay.",
             "required": false,
             "schema": {
               "$ref": "#/components/schemas/TrustGrantDto"
@@ -3377,7 +3377,7 @@
             "description": "not an org admin"
           },
           "404": {
-            "description": "not trusted with that grant, or libraries not configured"
+            "description": "not trusted with that grant (with any, when none is named), or libraries not configured"
           }
         },
         "security": [
@@ -15732,7 +15732,8 @@
         "description": "What an org's trust in a library source grants. Each is trusted on its\nown.",
         "enum": [
           "forge_credentials",
-          "build_sandbox"
+          "build_sandbox",
+          "registry_credential"
         ]
       },
       "TrustSourceRequest": {

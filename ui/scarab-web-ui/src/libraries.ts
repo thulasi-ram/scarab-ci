@@ -141,7 +141,17 @@ export function trustNote(
 
 /** What a trust grant gives, as a sentence reads it. */
 export function grantLabel(grant: string | undefined): string {
-  return grant === "build_sandbox" ? "the build sandbox" : "forge credentials";
+  if (grant === "build_sandbox") return "the build sandbox";
+  if (grant === "registry_credential") return "the registry credential";
+  return "forge credentials";
+}
+
+/** What stopping trust with `grant` does, as the confirm dialog says it. */
+export function untrustEffect(grant: string | undefined): string {
+  if (grant === "registry_credential") {
+    return "From now on a Step from this source with registry_auth gets no registry credential, in new Runs and at each launch of a Run created before.";
+  }
+  return `Runs created from now on refuse a Step from this source that needs ${grantLabel(grant)}, and so does each launch of a Run created before.`;
 }
 
 /** Whether a trust record grants forge credentials. A record with no grant
@@ -382,6 +392,14 @@ export function libraryChips(
       label: "build sandbox",
       tone: "ok",
       title: `Source trusted with the build sandbox by ${sandbox.trusted_by}.`,
+    });
+  }
+  const registry = trusted.find((t) => t.source === trustKey(l.source) && t.grant === "registry_credential");
+  if (registry) {
+    out.push({
+      label: "registry credential",
+      tone: "ok",
+      title: `Source trusted with the registry credential by ${registry.trusted_by}.`,
     });
   }
   return out;

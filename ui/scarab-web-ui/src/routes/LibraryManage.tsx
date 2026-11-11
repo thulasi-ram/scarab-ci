@@ -16,7 +16,7 @@
 // ones. A yank keeps its version, so the yanked versions table lists earlier
 // versions too: every yank of this `<publisher>/<name>`, read from the org's
 // yanks, the installed version's marked.
-import { createMemo, createResource, createSignal, For, Show, type JSX } from "solid-js";
+import { createMemo, createResource, createSignal, For, Match, Show, Switch, type JSX } from "solid-js";
 import { A, Navigate, useNavigate, useParams } from "@solidjs/router";
 import {
   getLibraryInstallation,
@@ -39,6 +39,7 @@ import {
   parseLibraryKey,
   shortHash,
   grantLabel,
+  untrustEffect,
   trustKey,
   versionLabel,
   yankButtonLabel,
@@ -198,6 +199,7 @@ function Installation(props: {
     props.libs.trusted_sources.find((t) => t.source === trustKey(l().source) && t.grant === grant);
   const trust = () => trustOf("forge_credentials");
   const sandboxTrust = () => trustOf("build_sandbox");
+  const registryTrust = () => trustOf("registry_credential");
   const [upgrading, setUpgrading] = createSignal(false);
   const [trusting, setTrusting] = createSignal<TrustGrant | null>(null);
   const [untrusting, setUntrusting] = createSignal<TrustGrant | null>(null);
@@ -301,6 +303,41 @@ function Installation(props: {
             <Show
               when={sandboxTrust()}
               fallback="Not trusted. A Run with a Step from this library that asks for security.sandbox is refused."
+            >
+              {(t) => (
+                <span title={absTime(t().trusted_at)}>
+                  Trusted by <span class="mono">{t().trusted_by}</span> · {relTime(t().trusted_at)}. It holds
+                  across upgrades from the same file.
+                </span>
+              )}
+            </Show>
+          </dd>
+        </dl>
+      </Section>
+
+      <Section
+        title="Registry credential"
+        foot={
+          <Show
+            when={registryTrust()}
+            fallback={
+              <button class="btn btn-ghost btn-sm" onClick={() => setTrusting("registry_credential")}>
+                <Icon icon="key-round" size={14} /> Trust source
+              </button>
+            }
+          >
+            <button class="btn btn-ghost btn-sm" onClick={() => setUntrusting("registry_credential")}>
+              Stop trusting
+            </button>
+          </Show>
+        }
+      >
+        <dl class="kv">
+          <dt>Trust</dt>
+          <dd>
+            <Show
+              when={registryTrust()}
+              fallback="Not trusted. A Step from this library with registry_auth runs with no registry credential."
             >
               {(t) => (
                 <span title={absTime(t().trusted_at)}>
@@ -441,26 +478,37 @@ function Installation(props: {
             }}
             onClose={() => setTrusting(null)}
           >
-            <Show
-              when={grant() === "build_sandbox"}
-              fallback={
+            <Switch>
+              <Match when={grant() === "build_sandbox"}>
+                <p>
+                  A Step from any version installed from this file may run with{" "}
+                  <span class="mono">security.sandbox</span>: seccomp and AppArmor off, as rootless
+                  BuildKit needs. It does not trust the source with anything else. Trust holds across
+                  upgrades from the same file; review each upgrade's diff. This asks you to confirm
+                  with your passkey.
+                </p>
+              </Match>
+              <Match when={grant() === "registry_credential"}>
+                <p>
+                  A Step from any version installed from this file with{" "}
+                  <span class="mono">registry_auth</span> may receive the org's or repository's{" "}
+                  <span class="mono">REGISTRY_AUTH</span> secret, and the forge's registry credential
+                  if the source is also trusted with forge credentials. Trust holds across upgrades
+                  from the same file; review each upgrade's diff. This asks you to confirm with your
+                  passkey.
+                </p>
+              </Match>
+              <Match when={grant() === "forge_credentials"}>
                 <p>
                   A Step from any version installed from this file that asks for{" "}
                   <span class="mono">forge_token</span> may receive a long-lived token of a Forgejo or
-                  GitHub PAT connection, and a Step with <span class="mono">registry_auth</span> the
-                  forge's registry credential. Trust holds across upgrades from the same file; review
-                  each upgrade's diff. This asks you to confirm with your passkey.
+                  GitHub PAT connection, and, if the source is also trusted with the registry
+                  credential, a Step with <span class="mono">registry_auth</span> the forge's registry
+                  credential. Trust holds across upgrades from the same file; review each upgrade's
+                  diff. This asks you to confirm with your passkey.
                 </p>
-              }
-            >
-              <p>
-                A Step from any version installed from this file may run with{" "}
-                <span class="mono">security.sandbox</span>: seccomp and AppArmor off, as rootless
-                BuildKit needs. It does not trust the source with forge credentials. Trust holds
-                across upgrades from the same file; review each upgrade's diff. This asks you to
-                confirm with your passkey.
-              </p>
-            </Show>
+              </Match>
+            </Switch>
           </ConfirmAction>
         )}
       </Show>
@@ -478,10 +526,7 @@ function Installation(props: {
             }}
             onClose={() => setUntrusting(null)}
           >
-            <p>
-              Runs created from now on refuse a Step from this source that needs{" "}
-              {grantLabel(grant())}, and so does each launch of a Run created before.
-            </p>
+            <p>{untrustEffect(grant())}</p>
           </ConfirmAction>
         )}
       </Show>

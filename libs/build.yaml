@@ -21,7 +21,10 @@
 # credential (the REGISTRY_AUTH secret at Repo scope, then Org scope, else the
 # forge's own registry credential when the org trusts this source with forge
 # credentials) at /scarab/registry/config.json and points DOCKER_CONFIG at it.
-# A fork pull request gets no registry credential.
+# A fork pull request gets no registry credential, and Scarab tells the
+# Step it runs for one with SCARAB_FORK_PR=true: the script then neither
+# pushes nor exports the layer cache, whatever the inputs say (it still
+# imports the cache). Without SCARAB_FORK_PR it does the same.
 #
 # Every input reaches the script through an environment variable, never the
 # command. The script resolves the context and the Dockerfile with realpath
@@ -179,6 +182,15 @@ steps:
           true | false) ;;
           *) fail "insecure_push must be true or false, not $insecure" ;;
         esac
+        # Scarab sets SCARAB_FORK_PR on every launch of this Step; a value
+        # other than `false` (none included) is a fork pull request's build,
+        # which never pushes or writes the shared cache.
+        fork=true
+        [ "${SCARAB_FORK_PR-}" = false ] && fork=false
+        if [ "$fork" = true ]; then
+          [ "$push" = false ] || echo "scarab: a fork pull request's build does not push" >&2
+          push=false
+        fi
         set -- build --frontend dockerfile.v0 \
           --local "context=$ctx" --local "dockerfile=$ctx" --opt "filename=$df"
         while IFS= read -r line; do
@@ -203,8 +215,8 @@ steps:
               "") fail "cache registry needs cache_ref" ;;
               -* | *,*) fail "cache_ref $ref is not an image reference" ;;
             esac
-            set -- "$@" --import-cache "type=registry,ref=$ref" \
-              --export-cache "type=registry,ref=$ref,mode=max"
+            set -- "$@" --import-cache "type=registry,ref=$ref"
+            [ "$fork" = true ] || set -- "$@" --export-cache "type=registry,ref=$ref,mode=max"
             ;;
           s3)
             bucket=${SCARAB_BUILD_CACHE_BUCKET-}
@@ -217,7 +229,8 @@ steps:
             esac
             s3="type=s3,region=$region,bucket=$bucket"
             [ -z "$name" ] || s3="$s3,name=$name"
-            set -- "$@" --import-cache "$s3" --export-cache "$s3,mode=max"
+            set -- "$@" --import-cache "$s3"
+            [ "$fork" = true ] || set -- "$@" --export-cache "$s3,mode=max"
             ;;
           *) fail "cache must be none, registry or s3" ;;
         esac

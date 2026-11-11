@@ -1193,18 +1193,24 @@ async fn a_yanked_forge_token_or_registry_auth_step_mints_no_credential() {
     let libs = Arc::new(InMemoryLibraries::new());
     seed(libs.as_ref(), "acme", "acme", "sourced", SOURCED).await;
     // The org trusts the library's source with its long-lived forge token
-    // (ADR-0076 §9), so the forge-token Step is admitted and the
-    // `registry_auth` Step may receive the forge-derived credential.
-    libs.trust_source(&scarab_policy::library::TrustedSource {
-        org: "acme".into(),
-        source: "github.com/acme/libs//sourced.yaml".into(),
-        grant: scarab_policy::library::TrustGrant::ForgeCredentials,
-        trusted_by: "amy".into(),
-        trusted_at: 1,
-        step_up_ref: None,
-    })
-    .await
-    .unwrap();
+    // (ADR-0076 §9) and with the registry credential, so the forge-token
+    // Step is admitted and the `registry_auth` Step may receive the
+    // forge-derived credential.
+    for grant in [
+        scarab_policy::library::TrustGrant::ForgeCredentials,
+        scarab_policy::library::TrustGrant::RegistryCredential,
+    ] {
+        libs.trust_source(&scarab_policy::library::TrustedSource {
+            org: "acme".into(),
+            source: "github.com/acme/libs//sourced.yaml".into(),
+            grant,
+            trusted_by: "amy".into(),
+            trusted_at: 1,
+            step_up_ref: None,
+        })
+        .await
+        .unwrap();
+    }
 
     // Both Runs are created before the yank; a Run created after it is
     // refused at creation.

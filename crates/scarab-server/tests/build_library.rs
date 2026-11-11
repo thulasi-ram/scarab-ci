@@ -193,13 +193,14 @@ async fn run_create_admits_the_sandbox_only_from_a_source_trusted_for_it() {
     // Trust for the sandbox does not trust the library with forge
     // credentials: no forge-derived registry credential.
     let auth = spec.registry_auth.expect("registry_auth");
-    assert_eq!(auth.forge_library, None);
+    assert_eq!((auth.library, auth.forge_library), (None, None));
     assert!(!auth.locked_out);
     assert_eq!((auth.owner.as_str(), auth.name.as_str()), ("acme", "web"));
 }
 
-/// Trusted with both grants, the Step may receive the forge-derived
-/// credential too. A fork pull request is admitted to build, and its
+/// Trusted with the registry credential, the Step may receive one; with
+/// forge credentials too, the forge-derived one. Forge credentials alone
+/// give it neither. A fork pull request is admitted to build, and its
 /// registry credential is locked out.
 #[tokio::test]
 async fn forge_credentials_reach_registry_auth_only_by_their_own_grant_and_never_a_fork() {
@@ -208,6 +209,14 @@ async fn forge_credentials_reach_registry_auth_only_by_their_own_grant_and_never
     let out = trigger(&db, &libs, &push()).await;
     assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
     let auth = stored(&db, &out.runs[0]).await.registry_auth.unwrap();
+    assert_eq!((auth.library, auth.forge_library), (None, None));
+
+    trust(&libs, TrustGrant::RegistryCredential).await;
+    let db = InMemoryDb::new();
+    let out = trigger(&db, &libs, &push()).await;
+    assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
+    let auth = stored(&db, &out.runs[0]).await.registry_auth.unwrap();
+    assert_eq!(auth.library, Some(content_hash(BUILD)));
     assert_eq!(auth.forge_library, Some(content_hash(BUILD)));
     assert!(!auth.locked_out);
 
@@ -267,6 +276,7 @@ fn library_spec(forge_library: bool) -> StepSpec {
             owner: "acme".into(),
             name: "web".into(),
             locked_out: false,
+            library: Some(content_hash(BUILD)),
             forge_library: forge_library.then(|| content_hash(BUILD)),
             registry_auth_json: None,
             derived_auth: None,
@@ -371,7 +381,8 @@ async fn a_launch_is_refused_once_the_sandbox_trust_is_revoked() {
 /// does, until the trust is revoked.
 #[tokio::test]
 async fn registry_auth_resolves_the_secret_and_the_forge_credential_only_by_trust() {
-    let libs = Arc::new(build_library(&[TrustGrant::BuildSandbox]).await);
+    let libs =
+        Arc::new(build_library(&[TrustGrant::BuildSandbox, TrustGrant::RegistryCredential]).await);
 
     let inner = Arc::new(FakeExecutor::new());
     let exec = executor(inner.clone(), libs.clone(), repo_secret(), false).await;
@@ -421,8 +432,14 @@ async fn registry_auth_resolves_the_secret_and_the_forge_credential_only_by_trus
 // Attack: a fork pull request Run whose stored spec was not locked out (stored before the lock existed, or written by hand) launches a registry_auth Step with a REGISTRY_AUTH secret and a trusted library. Safe outcome: the launch reads the Run's recorded trigger (`fork: true`) and resolves no credential.
 #[tokio::test]
 async fn a_fork_pull_request_gets_no_registry_credential_at_launch() {
-    let libs =
-        Arc::new(build_library(&[TrustGrant::BuildSandbox, TrustGrant::ForgeCredentials]).await);
+    let libs = Arc::new(
+        build_library(&[
+            TrustGrant::BuildSandbox,
+            TrustGrant::RegistryCredential,
+            TrustGrant::ForgeCredentials,
+        ])
+        .await,
+    );
     let inner = Arc::new(FakeExecutor::new());
     let exec = executor(inner.clone(), libs.clone(), repo_secret(), true).await;
     let handle = exec.launch(&step_run(), &library_spec(true)).await.unwrap();
@@ -445,8 +462,14 @@ async fn a_fork_pull_request_gets_no_registry_credential_at_launch() {
 /// asked for. A Run with no repository (an inline dev Run) gets neither.
 #[tokio::test]
 async fn the_registry_auth_secret_takes_precedence_and_a_run_with_no_repository_gets_none() {
-    let libs =
-        Arc::new(build_library(&[TrustGrant::BuildSandbox, TrustGrant::ForgeCredentials]).await);
+    let libs = Arc::new(
+        build_library(&[
+            TrustGrant::BuildSandbox,
+            TrustGrant::RegistryCredential,
+            TrustGrant::ForgeCredentials,
+        ])
+        .await,
+    );
     let inner = Arc::new(FakeExecutor::new());
     let exec = executor(inner.clone(), libs.clone(), repo_secret(), false).await;
     let handle = exec.launch(&step_run(), &library_spec(true)).await.unwrap();
@@ -466,4 +489,282 @@ async fn the_registry_auth_secret_takes_precedence_and_a_run_with_no_repository_
     let handle = exec.launch(&step_run(), &spec).await.unwrap();
     let auth = inner.launched_spec(&handle).unwrap().registry_auth.unwrap();
     assert_eq!((auth.registry_auth_json, auth.derived_auth), (None, None));
+}
+
+/// Revoking the source's registry-credential trust stops the next launch
+/// from receiving the `REGISTRY_AUTH` secret, though the Run was admitted
+/// with it.
+#[tokio::test]
+async fn a_launch_after_the_registry_credential_trust_is_revoked_gets_no_credential() {
+    let libs =
+        Arc::new(build_library(&[TrustGrant::BuildSandbox, TrustGrant::RegistryCredential]).await);
+    libs.untrust_source(
+        "acme",
+        trust_key(BUILD_SOURCE),
+        TrustGrant::RegistryCredential,
+    )
+    .await
+    .unwrap();
+    let inner = Arc::new(FakeExecutor::new());
+    let exec = executor(inner.clone(), libs, repo_secret(), false).await;
+    let handle = exec
+        .launch(&step_run(), &library_spec(false))
+        .await
+        .unwrap();
+    let auth = inner.launched_spec(&handle).unwrap().registry_auth.unwrap();
+    assert_eq!((auth.registry_auth_json, auth.derived_auth), (None, None));
+}
+
+// ---------------------------------------------------------------------------
+// Histories an attacker would try
+// ---------------------------------------------------------------------------
+
+/// Stores and installs `content` in `acme` as `lib:<publisher>/<name>`,
+/// fetched from `source`.
+async fn install(
+    libs: &InMemoryLibraries,
+    publisher: &str,
+    name: &str,
+    source: &str,
+    content: &str,
+) {
+    libs.put_version(&LibraryVersion {
+        org: "acme".into(),
+        content_hash: content_hash(content),
+        content: content.into(),
+        source: source.into(),
+        publisher: publisher.into(),
+        name: name.into(),
+        fetched_by: "amy".into(),
+        fetched_at: 1,
+    })
+    .await
+    .unwrap();
+    libs.install(
+        &NewInstallation {
+            org: "acme".into(),
+            publisher: publisher.into(),
+            name: name.into(),
+            content_hash: content_hash(content),
+            installed_by: "amy".into(),
+            installed_at: 1,
+            step_up_ref: None,
+        },
+        &Replaces::Nothing,
+    )
+    .await
+    .unwrap();
+}
+
+async fn trust_sandbox(libs: &InMemoryLibraries, source: &str) {
+    libs.trust_source(&TrustedSource {
+        org: "acme".into(),
+        source: trust_key(source).into(),
+        grant: TrustGrant::BuildSandbox,
+        trusted_by: "amy".into(),
+        trusted_at: 2,
+        step_up_ref: Some("su-1".into()),
+    })
+    .await
+    .unwrap();
+}
+
+/// Triggers a push Run of the Pipeline `yaml`.
+async fn trigger_yaml(db: &dyn Db, libs: &InMemoryLibraries, yaml: &str) -> TriggerOutcome {
+    let forge = FakeForge::new()
+        .with_file(".scarab/ci.yaml", yaml)
+        .with_commit("refs/heads/main", SHA);
+    trigger_runs_from_event(
+        &forge,
+        db,
+        &FakeClock::new(1_000),
+        AdmissionPorts::default().with_libraries(libs),
+        &push(),
+    )
+    .await
+    .unwrap()
+}
+
+/// A one-Step library whose Step runs its own command in the sandbox.
+const OWN_COMMAND_IN_THE_SANDBOX: &str = r#"kind: library
+steps:
+  - id: run
+    image: "moby/buildkit:rootless@sha256:5987568f92dafbfb679879de59c1cd8d26597f5f6635c314e166164e2615870c"
+    command: [/bin/sh, -c, id]
+    security: { sandbox: rootless-buildkit }
+"#;
+
+const TRUSTED_SOURCE: &str =
+    "github.com/acme/libs//outer.yaml@1111111111111111111111111111111111111111";
+const UNTRUSTED_SOURCE: &str =
+    "github.com/evil/libs//inner.yaml@2222222222222222222222222222222222222222";
+
+// Attack: a library from a source the org trusts for the sandbox invokes one from a source it does not, whose Step runs its own command in the sandbox. Safe outcome: trust is not passed on; Run creation refuses the Run naming the inner library, and admits it once that source is trusted too.
+#[tokio::test]
+async fn a_trusted_library_does_not_pass_its_sandbox_trust_to_a_library_it_invokes() {
+    let libs = InMemoryLibraries::new();
+    install(
+        &libs,
+        "evil",
+        "inner",
+        UNTRUSTED_SOURCE,
+        OWN_COMMAND_IN_THE_SANDBOX,
+    )
+    .await;
+    install(
+        &libs,
+        "acme",
+        "outer",
+        TRUSTED_SOURCE,
+        "kind: library\nsteps:\n  - id: inner\n    invoke: lib:evil/inner\n",
+    )
+    .await;
+    trust_sandbox(&libs, TRUSTED_SOURCE).await;
+    let yaml = "on: { push: {} }\nsteps:\n  - id: b\n    invoke: lib:acme/outer\n";
+
+    let db = InMemoryDb::new();
+    let out = trigger_yaml(&db, &libs, yaml).await;
+    assert!(out.runs.is_empty(), "{:?}", out.runs);
+    let reason = &out.refused[0].reason;
+    assert!(
+        reason.contains("lib:evil/inner")
+            && reason.contains("does not trust for the build sandbox"),
+        "{reason}"
+    );
+
+    trust_sandbox(&libs, UNTRUSTED_SOURCE).await;
+    let db = InMemoryDb::new();
+    let out = trigger_yaml(&db, &libs, yaml).await;
+    assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
+}
+
+// Attack: an untrusted library wraps a trusted one and adds a sandboxed Step of its own beside the invoke, hoping the trusted library's admission covers the Run. Safe outcome: each Step is decided by the library that defines it; the Run is refused naming the wrapper, not the trusted library.
+#[tokio::test]
+async fn an_untrusted_wrapper_gets_no_sandbox_for_its_own_step_beside_a_trusted_invoke() {
+    let libs = InMemoryLibraries::new();
+    install(
+        &libs,
+        "acme",
+        "outer",
+        TRUSTED_SOURCE,
+        OWN_COMMAND_IN_THE_SANDBOX,
+    )
+    .await;
+    let wrapper =
+        format!("{OWN_COMMAND_IN_THE_SANDBOX}  - id: trusted\n    invoke: lib:acme/outer\n");
+    install(&libs, "evil", "wrap", UNTRUSTED_SOURCE, &wrapper).await;
+    trust_sandbox(&libs, TRUSTED_SOURCE).await;
+
+    let db = InMemoryDb::new();
+    let out = trigger_yaml(
+        &db,
+        &libs,
+        "on: { push: {} }\nsteps:\n  - id: w\n    invoke: lib:evil/wrap\n",
+    )
+    .await;
+    assert!(out.runs.is_empty(), "{:?}", out.runs);
+    let reason = &out.refused[0].reason;
+    assert!(
+        reason.contains("step `w/run`") && reason.contains("lib:evil/wrap"),
+        "{reason}"
+    );
+    assert!(!reason.contains("lib:acme/outer"), "{reason}");
+}
+
+// Attack: a Step written in the Pipeline file sets `registry_auth: true` with its own command (`cat /scarab/registry/config.json`) in a Run with no Environment, where `secrets:` resolves nothing, to read the org's `REGISTRY_AUTH` secret. Safe outcome: the secret reaches no Step the repository wrote; the launch resolves no credential.
+#[tokio::test]
+async fn the_registry_auth_secret_does_not_reach_a_step_written_in_the_pipeline_file() {
+    let libs = InMemoryLibraries::new();
+    let db = InMemoryDb::new();
+    let out = trigger_yaml(
+        &db,
+        &libs,
+        "on: { push: {} }\nsteps:\n  - id: leak\n    image: alpine\n    command: [cat, /scarab/registry/config.json]\n    registry_auth: true\n",
+    )
+    .await;
+    assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
+    let leak = StepId("leak".into());
+    let spec = db
+        .step_spec(&out.runs[0], &leak)
+        .await
+        .unwrap()
+        .expect("the Pipeline's own Step");
+    // Never the forge-derived credential: no library defines the Step.
+    assert_eq!(
+        spec.registry_auth
+            .as_ref()
+            .and_then(|a| a.forge_library.clone()),
+        None
+    );
+
+    let inner = Arc::new(FakeExecutor::new());
+    let exec = executor(inner.clone(), Arc::new(libs), repo_secret(), false).await;
+    let step = StepRun {
+        step: leak,
+        ..step_run()
+    };
+    let handle = exec.launch(&step, &spec).await.unwrap();
+    let launched = inner.launched_spec(&handle).unwrap();
+    assert_eq!(
+        launched.registry_auth.and_then(|a| a.registry_auth_json),
+        None,
+        "a Pipeline-file Step with its own command received the REGISTRY_AUTH secret"
+    );
+}
+
+// Attack: a fork pull request, whose Pipeline is read at the PR head, calls the build library with `push: true` (to a registry that takes anonymous pushes, or one a placement profile's init container logs in to). The removed `build` kind forced `push` off for a fork. Safe outcome: the Step launches with SCARAB_FORK_PR=true, which the library's script reads to neither push nor export its cache (`a_fork_pull_request_build_neither_pushes_nor_exports_the_cache` in scarab-executor-k8s); the rendered `push` input stays what the caller wrote, so the decision is Scarab's, not the Pipeline's.
+#[tokio::test]
+async fn a_fork_pull_request_build_does_not_push() {
+    let libs = build_library(&[TrustGrant::BuildSandbox]).await;
+    let db = InMemoryDb::new();
+    let out = trigger(&db, &libs, &fork_pr()).await;
+    assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
+    let step = StepId("image/image".into());
+    let spec = stored(&db, &out.runs[0]).await;
+    let rendered = scarab_engine::render::render_launch_spec(&db, &out.runs[0], &step, spec)
+        .await
+        .unwrap()
+        .expect("the fork's build Step renders");
+    let env = |spec: &StepSpec, name: &str| {
+        spec.env
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, value)| value.clone())
+    };
+
+    // The launch decorator, over a Run whose recorded trigger is a fork pull
+    // request: the stored lock and the trigger both say so.
+    let inner = Arc::new(FakeExecutor::new());
+    let exec = executor(inner.clone(), Arc::new(libs), FakeSecrets::new(), true).await;
+    let handle = exec.launch(&step_run(), &rendered).await.unwrap();
+    let launched = inner.launched_spec(&handle).unwrap();
+    assert_eq!(
+        env(&launched, "SCARAB_FORK_PR").as_deref(),
+        Some("true"),
+        "a fork pull request's build is not told it is one"
+    );
+    assert!(launched.registry_auth.unwrap().locked_out);
+
+    // A push Run's build is told it is not one, from both sources.
+    let libs = build_library(&[TrustGrant::BuildSandbox]).await;
+    let inner = Arc::new(FakeExecutor::new());
+    let exec = executor(inner.clone(), Arc::new(libs), FakeSecrets::new(), false).await;
+    let handle = exec
+        .launch(&step_run(), &library_spec(false))
+        .await
+        .unwrap();
+    let launched = inner.launched_spec(&handle).unwrap();
+    assert_eq!(env(&launched, "SCARAB_FORK_PR").as_deref(), Some("false"));
+
+    // A spec stored without the lock (or written by hand) is still told,
+    // from the Run's recorded trigger.
+    let libs = build_library(&[TrustGrant::BuildSandbox]).await;
+    let inner = Arc::new(FakeExecutor::new());
+    let exec = executor(inner.clone(), Arc::new(libs), FakeSecrets::new(), true).await;
+    let handle = exec
+        .launch(&step_run(), &library_spec(false))
+        .await
+        .unwrap();
+    let launched = inner.launched_spec(&handle).unwrap();
+    assert_eq!(env(&launched, "SCARAB_FORK_PR").as_deref(), Some("true"));
 }

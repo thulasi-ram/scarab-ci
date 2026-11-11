@@ -1908,10 +1908,17 @@ async fn the_build_library_builds_and_pushes_to_a_local_registry() {
         needs: vec![StepId("checkout".into())],
         gate_kind: None,
     };
+    // What the server's launch decorator adds for a sandboxed Step: this is
+    // not a fork pull request's build, so it pushes.
+    let mut env = rendered.env;
+    env.push((
+        scarab_pipeline::FORK_PR_ENV.to_string(),
+        "false".to_string(),
+    ));
     let spec = StepSpec {
         image: rendered.image,
         command: rendered.command,
-        env: rendered.env,
+        env,
         secrets: vec![],
         run_as_root: false,
         add_capabilities: vec![],

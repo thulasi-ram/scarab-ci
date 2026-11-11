@@ -51,6 +51,52 @@ contract_test!(
     ids
 );
 
+/// Migration 0095 is expand-only: a server from before it reads trust with
+/// forge credentials from `library_trusted_sources` alone. A source trusted
+/// only for the build sandbox or the registry credential is not in that
+/// table, so such a server never reads it as trust with forge credentials,
+/// and a forge-credentials trust is still a row there.
+#[tokio::test]
+async fn a_source_without_forge_trust_is_absent_from_the_table_old_servers_read() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    let t = |source: &str, grant: TrustGrant| TrustedSource {
+        org: "acme".into(),
+        source: source.into(),
+        grant,
+        trusted_by: "amy".into(),
+        trusted_at: 1,
+        step_up_ref: None,
+    };
+    for (source, grant) in [
+        ("github.com/acme/libs//build.yaml", TrustGrant::BuildSandbox),
+        (
+            "github.com/acme/libs//build.yaml",
+            TrustGrant::RegistryCredential,
+        ),
+        (
+            "github.com/acme/libs//clone.yaml",
+            TrustGrant::ForgeCredentials,
+        ),
+    ] {
+        db.trust_source(&t(source, grant)).await.unwrap();
+    }
+    // The query a server from before migration 0095 runs.
+    let old: Vec<String> = sqlx::query_scalar(
+        "SELECT source FROM library_trusted_sources WHERE org = $1 ORDER BY source",
+    )
+    .bind("acme")
+    .fetch_all(&tdb.pool)
+    .await
+    .unwrap();
+    assert_eq!(old, vec!["github.com/acme/libs//clone.yaml".to_string()]);
+    tdb.cleanup().await;
+}
+
 /// A first install mints an id, unique across orgs; an upgrade keeps it; a
 /// removal and a new install get a new one. A lookup by id finds only the
 /// org's own installation.
@@ -139,6 +185,7 @@ async fn trust(store: &dyn LibraryStore) {
     };
     let forge = |by, at| t(TrustGrant::ForgeCredentials, by, at);
     let sandbox = |by, at| t(TrustGrant::BuildSandbox, by, at);
+    let registry = |by, at| t(TrustGrant::RegistryCredential, by, at);
     assert!(store.trusted_sources("acme").await.unwrap().is_empty());
     assert_eq!(
         store.trust_source(&forge("amy", 1)).await.unwrap(),
@@ -159,8 +206,16 @@ async fn trust(store: &dyn LibraryStore) {
         sandbox("bob", 3)
     );
     assert_eq!(
+        store.trust_source(&registry("cat", 4)).await.unwrap(),
+        registry("cat", 4)
+    );
+    assert_eq!(
+        store.trust_source(&registry("dan", 5)).await.unwrap(),
+        registry("cat", 4)
+    );
+    assert_eq!(
         store.trusted_sources("acme").await.unwrap(),
-        vec![sandbox("bob", 3), forge("amy", 1)]
+        vec![sandbox("bob", 3), forge("amy", 1), registry("cat", 4)]
     );
     assert!(
         store.trusted_sources("globex").await.unwrap().is_empty(),
@@ -183,7 +238,7 @@ async fn trust(store: &dyn LibraryStore) {
     );
     assert_eq!(
         store.trusted_sources("acme").await.unwrap(),
-        vec![sandbox("bob", 3)]
+        vec![sandbox("bob", 3), registry("cat", 4)]
     );
     assert_eq!(
         store
@@ -191,6 +246,13 @@ async fn trust(store: &dyn LibraryStore) {
             .await
             .unwrap(),
         Some(sandbox("bob", 3))
+    );
+    assert_eq!(
+        store
+            .untrust_source("acme", SRC, TrustGrant::RegistryCredential)
+            .await
+            .unwrap(),
+        Some(registry("cat", 4))
     );
     assert!(store.trusted_sources("acme").await.unwrap().is_empty());
 }

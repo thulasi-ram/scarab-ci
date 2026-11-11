@@ -958,7 +958,8 @@ export async function unyankLibrary(org: string, hash: string): Promise<void> {
 }
 
 /** Trust a library source with `grant` (`POST …/library-trust`): long-lived
- *  forge credentials by default, or the build sandbox. The commit is
+ *  forge credentials by default, the build sandbox or the registry
+ *  credential. The commit is
  *  dropped: trust holds for every version from the source. Asks for a
  *  step-up. */
 export async function trustLibrarySource(
@@ -975,7 +976,7 @@ export async function trustLibrarySource(
 }
 
 /** Stop trusting a library source with `grant` (`DELETE
- *  …/library-trust?source=&grant=`); its other grant stays. */
+ *  …/library-trust?source=&grant=`); its other grants stay. */
 export async function untrustLibrarySource(
   org: string,
   source: string,

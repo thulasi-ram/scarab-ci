@@ -113,11 +113,15 @@ pub struct OrgLibrariesDto {
 #[serde(rename_all = "snake_case")]
 pub enum TrustGrantDto {
     /// A Step from the source may receive a long-lived forge credential,
-    /// and the forge-derived registry credential.
+    /// and, with `registry_credential` too, the forge-derived registry
+    /// credential.
     #[default]
     ForgeCredentials,
     /// A Step from the source may run in a `security.sandbox`.
     BuildSandbox,
+    /// A Step from the source with `registry_auth` may receive the Run's
+    /// registry credential.
+    RegistryCredential,
 }
 
 impl From<TrustGrantDto> for TrustGrant {
@@ -125,6 +129,7 @@ impl From<TrustGrantDto> for TrustGrant {
         match g {
             TrustGrantDto::ForgeCredentials => TrustGrant::ForgeCredentials,
             TrustGrantDto::BuildSandbox => TrustGrant::BuildSandbox,
+            TrustGrantDto::RegistryCredential => TrustGrant::RegistryCredential,
         }
     }
 }
@@ -134,6 +139,7 @@ impl From<TrustGrant> for TrustGrantDto {
         match g {
             TrustGrant::ForgeCredentials => TrustGrantDto::ForgeCredentials,
             TrustGrant::BuildSandbox => TrustGrantDto::BuildSandbox,
+            TrustGrant::RegistryCredential => TrustGrantDto::RegistryCredential,
         }
     }
 }
@@ -202,8 +208,9 @@ pub struct UntrustSourceQuery {
     /// The trusted source, `<host>/<owner>/<repo>//<path>`.
     #[serde(default)]
     pub source: Option<String>,
-    /// The grant to remove; `forge_credentials` when omitted. The source's
-    /// other grants stay.
+    /// The grant to remove; every grant of the source when omitted (a
+    /// client from before grants existed means the source's whole trust).
+    /// Named, the source's other grants stay.
     #[serde(default)]
     pub grant: Option<TrustGrantDto>,
 }
@@ -691,17 +698,19 @@ fn trust_source_key(source: &str) -> Result<String, ApiError> {
 
 /// Trust a library source with one grant. With `forge_credentials` (the
 /// default; ADR-0076 §9), a Step from a library installed from it may
-/// receive a Forgejo or GitHub PAT connection's token and the forge-derived
-/// registry credential. With `build_sandbox` (ADR-0018, amendment of
-/// 2026-11-12), such a Step may run in a `security.sandbox`. One grant does
-/// not give the other. Trust holds across upgrades from the same source.
+/// receive a Forgejo or GitHub PAT connection's token. With `build_sandbox`
+/// (ADR-0018, amendment of 2026-11-12), such a Step may run in a
+/// `security.sandbox`; with `registry_credential`, a `registry_auth` Step
+/// may receive the Run's registry credential (the forge-derived one only
+/// with `forge_credentials` too). One grant does not give another. Trust
+/// holds across upgrades from the same source.
 /// Needs a step-up: it loosens. Administer on the org.
 #[utoipa::path(
     post,
     path = "/v1/orgs/{org}/library-trust",
     params(("org" = String, Path, description = "org")),
     request_body = TrustSourceRequest,
-    summary = "Trust a library source with forge credentials or the build sandbox",
+    summary = "Trust a library source with forge credentials, the build sandbox or the registry credential",
     responses(
         (status = 200, body = TrustedSourceDto),
         (status = 400, description = "not a library source"),
@@ -745,8 +754,9 @@ pub(crate) async fn trust_library_source(
     ))
 }
 
-/// Stop trusting a library source with one grant (`forge_credentials` when
-/// `grant` is omitted); its other grants stay. It tightens: no step-up.
+/// Stop trusting a library source with one grant, or with every grant when
+/// `grant` is omitted; a named grant leaves the others. It tightens: no
+/// step-up.
 /// Runs created after it refuse a Step from that source that needs the
 /// grant, and each launch of an existing Run checks it again. Administer
 /// on the org.
@@ -754,12 +764,12 @@ pub(crate) async fn trust_library_source(
     delete,
     path = "/v1/orgs/{org}/library-trust",
     params(("org" = String, Path, description = "org"), UntrustSourceQuery),
-    summary = "Stop trusting a library source with forge credentials or the build sandbox",
+    summary = "Stop trusting a library source with one grant or all of them",
     responses(
         (status = 204, description = "no longer trusted"),
         (status = 400, description = "no `source`, or not a library source"),
         (status = 403, description = "not an org admin"),
-        (status = 404, description = "not trusted with that grant, or libraries not configured")
+        (status = 404, description = "not trusted with that grant (with any, when none is named), or libraries not configured")
     )
 )]
 pub(crate) async fn untrust_library_source(
@@ -774,11 +784,26 @@ pub(crate) async fn untrust_library_source(
         .as_deref()
         .ok_or_else(|| ApiError::BadRequest("name the trusted `source`".into()))?;
     let source = trust_source_key(source)?;
-    store(&st)?
-        .untrust_source(&org, &source, q.grant.unwrap_or_default().into())
-        .await
-        .map_err(store_api_error)?
-        .ok_or(ApiError::NotFound)?;
+    let store = store(&st)?;
+    let grants: Vec<TrustGrant> = match q.grant {
+        Some(grant) => vec![grant.into()],
+        None => vec![
+            TrustGrant::ForgeCredentials,
+            TrustGrant::BuildSandbox,
+            TrustGrant::RegistryCredential,
+        ],
+    };
+    let mut removed = false;
+    for grant in grants {
+        removed |= store
+            .untrust_source(&org, &source, grant)
+            .await
+            .map_err(store_api_error)?
+            .is_some();
+    }
+    if !removed {
+        return Err(ApiError::NotFound);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

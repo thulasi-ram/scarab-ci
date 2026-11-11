@@ -1097,10 +1097,16 @@ pub struct RegistryAuthConfig {
     #[serde(default)]
     pub locked_out: bool,
     /// The content hash of the library version that defines the Step, when
-    /// the org trusted its source with forge credentials at Run creation:
-    /// only then may the Step receive the forge-derived credential, and each
-    /// launch checks the trust again. `None`: a `REGISTRY_AUTH` secret or
-    /// nothing.
+    /// the org trusted its source with the registry credential at Run
+    /// creation: only then may the Step receive any credential, and each
+    /// launch checks the trust again. `None` (a Step written in the Pipeline
+    /// file, a `file:` library, or an untrusted library): no credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library: Option<String>,
+    /// The same library version, when the org also trusted its source with
+    /// forge credentials at Run creation: only then may the Step receive the
+    /// forge-derived credential, and each launch checks both trusts again.
+    /// `None`: a `REGISTRY_AUTH` secret or nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forge_library: Option<String>,
     /// A scoped `REGISTRY_AUTH` secret's dockerconfigjson, resolved at

@@ -5358,10 +5358,10 @@ struct AdmittedFacts<'a> {
     /// Steps admitted to their sandbox, each with the content hash of the
     /// library version the org trusts for it.
     sandbox: &'a std::collections::BTreeMap<String, String>,
-    /// `registry_auth` Steps that may receive the forge-derived registry
-    /// credential, each with the content hash of the library version the
-    /// org trusts with forge credentials.
-    registry_forge: &'a std::collections::BTreeMap<String, String>,
+    /// `registry_auth` Steps that may receive the registry credential, and
+    /// those that may receive the forge-derived one, each with the content
+    /// hash of the library version the org trusts for it.
+    registry: &'a forge_token::RegistryAdmission,
     /// The Run's cache scope ([`run_cache_scope`]); `None` turns its Cache
     /// off.
     cache_scope: Option<scarab_engine::CacheScope>,
@@ -5881,9 +5881,10 @@ async fn admit_unrecorded(
         }));
     }
     // ADR-0018 (amendment of 2026-11-12): a sandboxed Step's library must be
-    // trusted for the sandbox, and a `registry_auth` Step gets the
-    // forge-derived credential only from a library trusted with forge
-    // credentials. Fixed checks, before any Policy is consulted.
+    // trusted for the sandbox, a `registry_auth` Step gets a registry
+    // credential only from a library trusted with it, and the forge-derived
+    // one only from a library trusted with forge credentials too. Fixed
+    // checks, before any Policy is consulted.
     let sandbox = forge_token::sandbox_refusals(ports.libraries, &repo.owner, ir)
         .await
         .map_err(|e| TriggerError::Db(DbError::Other(e)))?;
@@ -5892,7 +5893,7 @@ async fn admit_unrecorded(
             messages: sandbox.refusals,
         }));
     }
-    let registry_forge = forge_token::registry_forge_libraries(ports.libraries, &repo.owner, ir)
+    let registry = forge_token::registry_libraries(ports.libraries, &repo.owner, ir)
         .await
         .map_err(|e| TriggerError::Db(DbError::Other(e)))?;
 
@@ -5902,7 +5903,7 @@ async fn admit_unrecorded(
         event: &facts,
         trusted_only: &tokens.trusted_only,
         sandbox: &sandbox.trusted,
-        registry_forge: &registry_forge,
+        registry: &registry,
         cache_scope: run_cache_scope(forge, event, ir, &gov).await,
     };
     // Rendered before the Policies are consulted: a key that cannot be
@@ -7283,7 +7284,8 @@ async fn write_run_from_ir(
                     owner: event.repo().map(|r| r.owner.clone()).unwrap_or_default(),
                     name: event.repo().map(|r| r.name.clone()).unwrap_or_default(),
                     locked_out: locked_out || event.is_fork_pr(),
-                    forge_library: admitted.registry_forge.get(&step.id).cloned(),
+                    library: admitted.registry.library.get(&step.id).cloned(),
+                    forge_library: admitted.registry.forge.get(&step.id).cloned(),
                     registry_auth_json: None,
                     derived_auth: None,
                 });

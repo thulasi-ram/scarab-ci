@@ -27,8 +27,9 @@
 #      …/library-trust), so a Step of the library receives the connection's
 #      long-lived token: the stack has no GitHub App to mint one per Run;
 #      and trusts build.yaml's source for the build sandbox, so its Step may
-#      run rootless BuildKit. The build library is not trusted with forge
-#      credentials: no pipeline of the stack pushes to the Forgejo registry.
+#      run rootless BuildKit. The build library is not trusted with the
+#      registry credential or forge credentials: no pipeline of the stack
+#      pushes.
 #
 # The calls carry no credential: dev and e2e modes run SCARAB_DEV_INSECURE,
 # so step-up is off. Idempotent.

@@ -365,15 +365,20 @@ The library's one step is `image/image`, and `needs: [image]` reaches it. Its in
 `containerimage.digest` is the digest of the image it built. In `env:` it becomes that object's
 compact JSON text.
 
-- **The registry credential.** The step asks for `registry_auth: true`. Each time it launches,
-  Scarab resolves the `REGISTRY_AUTH` secret (Repo scope, then Org scope) and mounts it as
+- **The registry credential.** The step asks for `registry_auth: true`. It receives a credential
+  only when the org trusts the library's source with the registry credential
+  ([Libraries](/scarab-ci/usage/libraries/#trusting-a-library-with-the-registry-credential)); a
+  step written in your Pipeline file never receives one. Each time it launches, Scarab resolves
+  the `REGISTRY_AUTH` secret (Repo scope, then Org scope) and mounts it as
   `/scarab/registry/config.json`, with `DOCKER_CONFIG` pointing at that directory. It is never an
-  environment variable. With no `REGISTRY_AUTH` secret, the step gets the credential the forge
-  derives for its own registry (GHCR, the Forgejo package registry), and only when the org also
-  trusts the library's source with forge credentials. With neither, the build runs anonymously:
-  public base images still pull, and a push fails at the registry.
-- **A fork pull request** gets no registry credential, so its build cannot push to a registry
-  that needs one.
+  environment variable, and Scarab replaces it with `***` in the step's log. With no
+  `REGISTRY_AUTH` secret, the step gets the credential the forge derives for its own registry
+  (GHCR, the Forgejo package registry), and only when the org also trusts the library's source
+  with forge credentials. With neither, the build runs anonymously: public base images still
+  pull, and a push fails at the registry.
+- **A fork pull request** gets no registry credential, and Scarab sets `SCARAB_FORK_PR=true` on
+  the step, so the build neither pushes nor exports its layer cache, whatever `push` says. It
+  still imports the cache. No Pipeline or library may set `SCARAB_FORK_PR`.
 - **Paths stay in the workspace.** The inputs are checked against their rules when the Pipeline
   compiles and again when the step launches. The step then resolves the context and the
   Dockerfile and stops before BuildKit runs if either leads outside `/workspace`, through a
@@ -384,8 +389,7 @@ compact JSON text.
   A sandboxed step may not have `secrets:`.
 - **Other architectures.** BuildKit builds for the architecture of the node it runs on, and the
   invoke step's `placement_profiles` carries onto the library's step. Invoke the library once per
-  architecture, each naming the profile for those nodes and pushing its own tag, then join the
-  tags into one image:
+  architecture, each naming the profile for those nodes and pushing its own tag:
 
   ```yaml
   - id: amd64
@@ -396,16 +400,14 @@ compact JSON text.
     invoke: lib:thulasi-ram/build
     placement_profiles: [arm64]
     with: { image: "ghcr.io/acme/app:${{ event.sha }}-arm64", push: true }
-  - id: manifest
-    image: ghcr.io/acme/crane@sha256:…   # crane and a shell, with a numeric USER
-    needs: [amd64, arm64]
-    registry_auth: true                  # crane reads DOCKER_CONFIG
-    env: [[SHA, "${{ event.sha }}"]]
-    command: [sh, -c, 'crane index append -t "ghcr.io/acme/app:$SHA" -m "ghcr.io/acme/app:$SHA-amd64" -m "ghcr.io/acme/app:$SHA-arm64"']
   ```
 
-  `docker buildx imagetools create` does the same join. An org Policy over
-  `steps[].placement_profiles` and `steps[].origin` can restrict which profiles a build may name.
+  Joining the tags into one multi-architecture image (`crane index append`,
+  `docker buildx imagetools create`) pushes to the registry, so that step needs the registry
+  credential too, which only a step from a trusted library receives. Scarab has no library for
+  it yet; until it does, the join step comes from a library of your own whose source the org
+  trusts with the registry credential. An org Policy over `steps[].placement_profiles` and
+  `steps[].origin` can restrict which profiles a build may name.
 
 The `build` step kind is gone. A `build:` step fails the pipeline check with a message that names
 `invoke: lib:thulasi-ram/build`. The local executor refuses the build library's step; it needs the

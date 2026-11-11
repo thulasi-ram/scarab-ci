@@ -449,13 +449,21 @@ pub const RETIRED_DEPLOYMENTS: &str = "deployments are no longer recorded by Sca
     (ADR-0074); mark the step `deploy: true` and wait for your CD tool in a step (for \
     example `argocd app wait`)";
 
+/// The env Scarab sets on a sandboxed Step at each launch (ADR-0018,
+/// amendment of 2026-11-12): `true` for a fork pull request, or a Run locked
+/// out of its Environment's secrets, else `false`, read from the Run's stored
+/// lock and its recorded trigger. A build library stops pushing and
+/// exporting its cache when it is `true`. No Step may set it.
+pub const FORK_PR_ENV: &str = "SCARAB_FORK_PR";
+
 /// The env names Scarab itself sets in a Step's Pod or process: the
 /// executors' fence, results, artifacts, OIDC and workspace variables, and
 /// one `SCARAB_PARAM_<NAME>` per input (ADR-0008). A Step's own `env:`
 /// entry under one of these names would be overwritten or would overwrite
 /// Scarab's, so a templated value may not use one on a `forge_token` Step.
 /// `scarab-executor-k8s` checks that every `SCARAB_*` name it sets is here.
-pub const SCARAB_SET_ENV: [&str; 10] = [
+pub const SCARAB_SET_ENV: [&str; 11] = [
+    FORK_PR_ENV,
     "SCARAB_RUN",
     "SCARAB_STEP",
     "SCARAB_ATTEMPT",
@@ -5480,6 +5488,15 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         if step.build.is_some() {
             diagnostics.push(format!("step `{}`: {RETIRED_BUILD}", step.id));
         }
+        // Whether the Run is a fork pull request is Scarab's to say: a Step
+        // that set it could turn a fork's build into one that pushes.
+        if step.env.iter().any(|(name, _)| name == FORK_PR_ENV) {
+            diagnostics.push(format!(
+                "step `{}`: env `{FORK_PR_ENV}` is set by Scarab when a sandboxed step \
+                 launches; a Pipeline or library may not set it",
+                step.id
+            ));
+        }
         // A forge credential is for a Step that runs a Pod with an image the
         // Pipeline names: a gate runs nothing (ADR-0076 §9).
         if step.forge_token.is_some() && step.is_gate() {
@@ -9867,6 +9884,85 @@ mod tests {
             let ok = compile_with_libraries(&yaml, &with_build_library());
             assert!(ok.is_ok(), "{path:?}: {ok:?}");
         }
+    }
+
+    // Attack: a branch name (git allows `,` and `=`) templated into the build library's `image` and `cache_ref` adds buildctl output options when the Step launches. Safe outcome: the rendered value fails the input's `validate:` rule and the launch is refused; a plain branch renders.
+    #[test]
+    fn the_build_library_refuses_a_branch_name_that_adds_buildctl_options_at_launch() {
+        let ir = compile_with_libraries(
+            r#"
+            on: { push: {} }
+            steps:
+              - id: image
+                invoke: lib:thulasi-ram/build
+                with:
+                  image: "registry.example/app:${{ event.branch }}"
+                  cache: registry
+                  cache_ref: "registry.example/cache:${{ event.branch }}"
+            "#,
+            &with_build_library(),
+        )
+        .unwrap();
+        let step = ir.steps.iter().find(|s| s.id == "image/image").unwrap();
+        let launch = |branch: &str| {
+            let event = json!({ "branch": branch });
+            render(
+                Templates {
+                    image: &step.image,
+                    command: &step.command,
+                    env: &step.env,
+                },
+                step.scope.as_ref(),
+                &step.matrix_values,
+                Facts::Launch {
+                    params: &BTreeMap::new(),
+                    declared: &[],
+                    results: &Results::new(),
+                    event: event.as_object().unwrap(),
+                },
+            )
+            .map(|r| r.env.into_iter().collect::<BTreeMap<_, _>>())
+        };
+        for branch in [
+            "main,push=true",
+            "main,registry.insecure=true",
+            "main,mode=max",
+            "a b",
+            "main\n--opt",
+            "x=y",
+        ] {
+            assert!(launch(branch).is_err(), "{branch:?} rendered");
+        }
+        let env = launch("main").unwrap();
+        assert_eq!(env["SCARAB_BUILD_IMAGE"], "registry.example/app:main");
+        assert_eq!(env["SCARAB_BUILD_CACHE_REF"], "registry.example/cache:main");
+    }
+
+    /// No Pipeline or library Step may set the env Scarab uses to tell a
+    /// sandboxed Step it runs for a fork pull request.
+    #[test]
+    fn no_step_may_set_the_fork_pull_request_env() {
+        let errs = errors(
+            "steps: [{ id: s, image: busybox, command: [echo], env: [[SCARAB_FORK_PR, \"false\"]] }]",
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.starts_with("step `s`: env `SCARAB_FORK_PR`")),
+            "{errs:?}"
+        );
+        let lib = SANDBOXED_LIB.replace(
+            "            security:",
+            "            env: [[SCARAB_FORK_PR, \"false\"]]\n            security:",
+        );
+        let libraries = Libraries {
+            installed: installed(&[("acme/b", "github.com/acme/libs//b.yaml@0", lib.as_str())]),
+            ..Default::default()
+        };
+        let errs = library_errors("steps: [{ id: b, invoke: lib:acme/b }]", &libraries);
+        assert!(
+            errs.iter().any(|e| e.contains("env `SCARAB_FORK_PR`")),
+            "{errs:?}"
+        );
     }
 
     // --- the clone library replaces the clone kind (ADR-0076 §9) ------------

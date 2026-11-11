@@ -23,19 +23,31 @@ release.yml uses that version's section as the GitHub Release text. See
 - **The `build` step kind is removed; build images with `lib:thulasi-ram/build`.** A Pipeline with
   a `build:` step fails to compile, with a message naming the library, until the step is
   rewritten as `invoke: lib:thulasi-ram/build` with the same `image`, `context`, `dockerfile` and
-  `push` under `with:`. `${{ outputs.<step>.image }}` reads the same result. Nothing is installed
-  in an org by default, so before upgrading an org admin installs
-  `github.com/thulasi-ram/scarab-ci//libs/build.yaml` at a release commit as
-  `thulasi-ram/build` and trusts that source for the build sandbox (the new `build_sandbox` grant
-  of `/library-trust`, or **Build sandbox › Trust source** on the library's page); without that
-  trust, a Run that builds is refused. To push to the forge's own registry with no
-  `REGISTRY_AUTH` secret, the source must also be trusted with forge credentials. A step of a Run
+  `push` under `with:`. `${{ outputs.<step>.image }}` reads the same result. A step of a Run
   created before the upgrade that was stored as a `build` step fails when it would launch, with
-  a message naming the library. The library adds build arguments, a registry or S3 layer cache, a
+  a message naming the library. Nothing is installed in an org by default, so after upgrading
+  the server, an org admin:
+  1. installs `github.com/thulasi-ram/scarab-ci//libs/build.yaml` at a release commit as
+     `thulasi-ram/build`;
+  2. trusts that source for the build sandbox (the new `build_sandbox` grant of
+     `POST /v1/orgs/{org}/library-trust`, or **Build sandbox › Trust source** on the library's
+     page);
+  3. if the builds push or pull private base images, trusts it with the registry credential too
+     (`registry_credential`), so its step receives the `REGISTRY_AUTH` secret; to push to the
+     forge's own registry with no `REGISTRY_AUTH` secret, also with forge credentials.
+
+  Between the upgrade and step 2, every Run that builds an image is refused. Upgrade every
+  server replica first: a server from before this release ignores a request's `grant` and
+  records trust with forge credentials, so never send `grant` to one. A fork pull request's build neither pushes nor
+  exports its layer cache. The library adds build arguments, a registry or S3 layer cache, a
   BuildKit image pinned by digest and templates in `image` (such as `${{ event.sha }}`)
   ([Building an image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#building-an-image),
   [Install Scarab's build library](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#install-scarabs-build-library),
   [ADR-0018](https://github.com/thulasi-ram/scarab-ci/blob/main/docs/adr/0018-image-building.md)).
+- **`DELETE /v1/orgs/{org}/library-trust` with no `grant` removes every grant of the source.**
+  Name `grant` to remove one. Trust with forge credentials stays where it was; migration 0095
+  only adds a table (`library_source_grants`) for the new grants, so a server from before it
+  keeps working against the migrated database.
 
 ### Enhancement
 

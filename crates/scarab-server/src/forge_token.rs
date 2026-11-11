@@ -355,31 +355,54 @@ pub async fn sandbox_refusals(
     Ok(out)
 }
 
-/// The Steps of `ir` with `registry_auth` that may receive the
-/// forge-derived registry credential, each with the content hash of its
-/// library version: the org trusts that library's source with forge
-/// credentials. The credential can write packages, so a Step from the
-/// Pipeline file, a `file:` library or an untrusted library gets only a
-/// `REGISTRY_AUTH` secret, or nothing. Not a refusal.
-pub async fn registry_forge_libraries(
+/// What Run creation decided about a Run's `registry_auth` Steps (ADR-0018,
+/// amendment of 2026-11-12). Not a refusal: a Step that may have no
+/// credential runs without one, and a push it makes fails at the registry.
+#[derive(Debug, Default)]
+pub struct RegistryAdmission {
+    /// Each Step that may receive the Run's registry credential, with the
+    /// content hash of the library version that defines it: the org trusts
+    /// that library's source with the registry credential. A Step written in
+    /// the Pipeline file, in a `file:` library or in an untrusted library
+    /// runs its repository's own command, so it never gets one.
+    pub library: BTreeMap<String, String>,
+    /// Those of them that may receive the forge-derived credential too: the
+    /// org also trusts the source with forge credentials. The credential can
+    /// write packages.
+    pub forge: BTreeMap<String, String>,
+}
+
+/// Decide each Step of `ir` with `registry_auth` ([`RegistryAdmission`]).
+/// A store failure is an `Err`: no Run.
+pub async fn registry_libraries(
     libraries: Option<&dyn LibraryStore>,
     org: &str,
     ir: &PipelineIr,
-) -> Result<BTreeMap<String, String>, String> {
-    let mut out = BTreeMap::new();
+) -> Result<RegistryAdmission, String> {
+    let mut out = RegistryAdmission::default();
     let asking: Vec<&scarab_pipeline::StepSpec> =
         ir.steps.iter().filter(|s| s.registry_auth).collect();
     if asking.is_empty() {
         return Ok(out);
     }
-    let trusted = match libraries {
-        Some(l) => trusted_sources(l, org, TrustGrant::ForgeCredentials).await?,
-        None => BTreeSet::new(),
+    let (registry, forge) = match libraries {
+        Some(l) => (
+            trusted_sources(l, org, TrustGrant::RegistryCredential).await?,
+            trusted_sources(l, org, TrustGrant::ForgeCredentials).await?,
+        ),
+        None => (BTreeSet::new(), BTreeSet::new()),
     };
     for step in asking {
-        if let Some(hash) = trusted_library_step(step, libraries, org, &trusted).await? {
-            out.insert(step.id.clone(), hash);
+        let Some(hash) = trusted_library_step(step, libraries, org, &registry).await? else {
+            continue;
+        };
+        if trusted_library_step(step, libraries, org, &forge)
+            .await?
+            .is_some()
+        {
+            out.forge.insert(step.id.clone(), hash.clone());
         }
+        out.library.insert(step.id.clone(), hash);
     }
     Ok(out)
 }
@@ -413,6 +436,9 @@ pub struct ForgeCredentialExecutor {
     clock: Arc<dyn scarab_engine::Clock>,
     /// Principals: a recorded approver set compares as ids (ADR-0080 §3).
     identities: Option<Arc<dyn scarab_identity::IdentityStore>>,
+    /// The log pipeline's redactor: a resolved registry credential is
+    /// registered with it before the Step launches.
+    logs: Option<Arc<crate::LogService>>,
 }
 
 impl ForgeCredentialExecutor {
@@ -426,7 +452,15 @@ impl ForgeCredentialExecutor {
             minted: Mutex::new(HashMap::new()),
             clock: Arc::new(crate::SystemClock),
             identities: None,
+            logs: None,
         }
+    }
+
+    /// Register each registry credential resolved at launch with `logs`'
+    /// redactor, so a Step that prints it shows `***`.
+    pub fn with_logs(mut self, logs: Arc<crate::LogService>) -> Self {
+        self.logs = Some(logs);
+        self
     }
 
     /// Compare recorded approver sets as Principal ids (ADR-0080 §3).
@@ -728,10 +762,13 @@ impl ForgeCredentialExecutor {
 
     /// A `registry_auth` Step's credential for this launch (ADR-0018,
     /// amendment of 2026-11-12): none for a fork pull request (the stored
-    /// lock, or the Run's recorded trigger) or a Run locked out of its
-    /// Environment's secrets; else the `REGISTRY_AUTH` secret, or the
+    /// lock, or the Run's recorded trigger), a Run locked out of its
+    /// Environment's secrets, or a Step whose library the org no longer
+    /// trusts with the registry credential (or never did: a Step the
+    /// repository wrote); else the `REGISTRY_AUTH` secret, or the
     /// forge-derived credential when the org still trusts the Step's
-    /// library with forge credentials.
+    /// library with forge credentials too. Each value is registered with
+    /// the log redactor.
     async fn step_registry_auth(
         &self,
         step: &StepRun,
@@ -744,6 +781,16 @@ impl ForgeCredentialExecutor {
             out.locked_out = true;
             return Ok(out);
         }
+        let Some(library) = &config.library else {
+            return Ok(out);
+        };
+        if self
+            .library_still_trusted(&config.owner, library, TrustGrant::RegistryCredential)
+            .await?
+            != Some(true)
+        {
+            return Ok(out);
+        }
         let forge_derived = match &config.forge_library {
             Some(hash) => self
                 .library_still_trusted(&config.owner, hash, TrustGrant::ForgeCredentials)
@@ -754,10 +801,55 @@ impl ForgeCredentialExecutor {
         let (json, derived) = self
             .resolve_registry_auth(&config.owner, &config.name, forge_derived)
             .await;
+        if let Some(logs) = &self.logs {
+            for value in registry_secret_values(json.as_deref(), derived.as_ref()) {
+                logs.register_secret(value.as_bytes());
+            }
+        }
         out.registry_auth_json = json;
         out.derived_auth = derived;
         Ok(out)
     }
+}
+
+/// The values in a registry credential that a log must never show: the
+/// dockerconfigjson itself, each `auth`, `password`, `identitytoken` and
+/// `registrytoken` in it, and the password half of each decoded `auth`; or
+/// the forge-derived token and the `auth` Scarab builds from it.
+fn registry_secret_values(
+    json: Option<&str>,
+    derived: Option<&scarab_engine::RegistryCredential>,
+) -> Vec<String> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut out = Vec::new();
+    if let Some(json) = json {
+        out.push(json.to_string());
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+        if let Some(auths) = parsed.get("auths").and_then(|a| a.as_object()) {
+            for entry in auths.values() {
+                for key in ["auth", "password", "identitytoken", "registrytoken"] {
+                    if let Some(v) = entry.get(key).and_then(|v| v.as_str()) {
+                        out.push(v.to_string());
+                    }
+                }
+                let decoded = entry
+                    .get("auth")
+                    .and_then(|v| v.as_str())
+                    .and_then(|a| b64.decode(a).ok())
+                    .and_then(|d| String::from_utf8(d).ok());
+                if let Some((_, password)) = decoded.as_deref().and_then(|d| d.split_once(':')) {
+                    out.push(password.to_string());
+                }
+            }
+        }
+    }
+    if let Some(cred) = derived {
+        out.push(cred.token.clone());
+        out.push(b64.encode(format!("{}:{}", cred.username, cred.token)));
+    }
+    out.retain(|v| !v.is_empty());
+    out
 }
 
 #[async_trait]
@@ -833,15 +925,32 @@ impl Executor for ForgeCredentialExecutor {
             }
         }
         // A `registry_auth` Step: its registry credential, in memory only.
+        // A sandboxed Step: whether it runs for a fork pull request (or a
+        // Run locked out of its Environment's secrets), as `SCARAB_FORK_PR`,
+        // so a build library does not push or export its cache for one.
         let with_registry;
-        let spec = match &spec.registry_auth {
-            Some(config) => {
-                let mut enriched = spec.clone();
+        let spec = if spec.registry_auth.is_some() || spec.sandbox.is_some() {
+            let mut enriched = spec.clone();
+            if let Some(config) = &spec.registry_auth {
                 enriched.registry_auth = Some(self.step_registry_auth(step, config).await?);
-                with_registry = enriched;
-                &with_registry
             }
-            None => spec,
+            if spec.sandbox.is_some() {
+                let fork = enriched
+                    .registry_auth
+                    .as_ref()
+                    .is_some_and(|r| r.locked_out)
+                    || self.run_is_fork_pr(step).await?;
+                enriched
+                    .env
+                    .retain(|(name, _)| name != scarab_pipeline::FORK_PR_ENV);
+                enriched
+                    .env
+                    .push((scarab_pipeline::FORK_PR_ENV.to_string(), fork.to_string()));
+            }
+            with_registry = enriched;
+            &with_registry
+        } else {
+            spec
         };
         let Some(config) = &spec.forge_token else {
             return self.inner.launch(step, spec).await;

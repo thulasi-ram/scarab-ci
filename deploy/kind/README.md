@@ -195,7 +195,8 @@ a passkey, which it used to do with plain curl (`just stack seed dogfood
 checklist` prints it again). On an existing database it compares the clone
 and build libraries installed in the org with `libs/clone.yaml` and
 `libs/build.yaml` in the checkout (read with `psql` in the Postgres Pod) and
-prints the step for each one that differs:
+prints the step for each one that differs, and prints step 5 whenever the
+build library's source is not trusted for the build sandbox:
 
 1. Sign in at `http://localhost:<port>` as the Owner and enroll a passkey in
    Settings > Security. Every new database needs a new one.
@@ -212,11 +213,13 @@ prints the step for each one that differs:
    instead.
 4. Org settings > Libraries > Install: fetch
    `github.com/thulasi-ram/scarab-ci//libs/build.yaml@<commit>` the same way
-   and install it as `thulasi-ram/build`, then trust its source,
-   `github.com/thulasi-ram/scarab-ci//libs/build.yaml`, for the build sandbox
-   in Org settings > Libraries. The dogfood pipeline's `build` step invokes
-   it. It does not push, so the source needs no trust with forge credentials.
-5. To call the API, issue a token in Org settings > API tokens.
+   and install it as `thulasi-ram/build`. The dogfood pipeline's `build` step
+   invokes it.
+5. On the build library's page, trust its source,
+   `github.com/thulasi-ram/scarab-ci//libs/build.yaml`, for the build sandbox.
+   The dogfood build does not push, so the source needs no trust with the
+   registry credential or forge credentials.
+6. To call the API, issue a token in Org settings > API tokens.
 
 To check that the member is refused an admin action, sign in as the member and
 open Org settings > Members, or `PUT` a binding with the member's API token:
@@ -542,8 +545,8 @@ pushed first.
   with forge credentials through `/library-trust`, so its Step receives the
   connection's token. It installs `build.yaml` the same way as
   `lib:thulasi-ram/build` and trusts that source for the build sandbox, so its
-  Step may run rootless BuildKit. The build library is not trusted with forge
-  credentials: no pipeline of the stack pushes to the Forgejo registry.
+  Step may run rootless BuildKit. The build library is not trusted with the
+  registry credential or forge credentials: no pipeline of the stack pushes.
   `just stack up` runs it for `SCARAB_DEV_ORG`; `just test e2e` runs it for
   `scarab-admin`, the org of the forge_token cases.
 - The forgejo-onboarding case installs `notify.yaml` from the same repository
@@ -551,7 +554,7 @@ pushed first.
   from `acme/scarab-libs` (`libs.sh connection acme`).
 
 Dogfood mode installs the clone and build libraries from github.com by hand
-(steps 3 and 4 of its checklist above), as a real install against GitHub
+(steps 3 to 5 of its checklist above), as a real install against GitHub
 does. Chaos mode installs nothing.
 
 ## CI

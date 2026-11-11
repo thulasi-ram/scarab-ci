@@ -87,13 +87,14 @@ library_step() { # $1 the step's number, $2 the library's name
        stack runs against real GitHub). If another version is installed,
        this upgrades it.
 TXT
-  if [ "$2" = build ]; then
-    cat <<TXT
-       Then trust github.com/thulasi-ram/scarab-ci//libs/build.yaml for the
-       build sandbox (Org settings > Libraries), or Runs that build an image
-       are refused.
+}
+build_source=github.com/thulasi-ram/scarab-ci//libs/build.yaml
+trust_step() { # $1 the step's number
+  cat <<TXT
+    $1. Org settings > Libraries > thulasi-ram/build > Build sandbox: trust
+       $build_source, or Runs that build an image are refused. The dogfood
+       pipeline does not push, so it needs no registry-credential trust.
 TXT
-  fi
 }
 
 if [ "${1:-}" = --checklist ]; then
@@ -108,7 +109,8 @@ if [ "${1:-}" = --checklist ]; then
 TXT
   library_step 3 clone
   library_step 4 build
-  echo "    5. To use the API, issue a token in Org settings > API tokens."
+  trust_step 5
+  echo "    6. To use the API, issue a token in Org settings > API tokens."
 else
   # Each installed version's content hash (SHA-256 of the file, ADR-0076),
   # read with psql in the Postgres Pod, against libs/<name>.yaml here. The
@@ -135,4 +137,18 @@ else
       echo "warning: could not read the $name library installed in $org; check Org settings > Libraries" >&2
     fi
   done
+  # The build library's source needs the build-sandbox grant whatever version
+  # is installed: checked on its own, not only when the version differs.
+  if have="$(printf '%s\n' "SELECT count(*) FROM library_source_grants
+      WHERE org = :'org' AND source = :'source' AND trust_grant = 'build_sandbox';" \
+    | kc exec -i -n "$ns" deploy/scarab-postgres -- \
+        psql -U scarab -d scarab_dogfood -v ON_ERROR_STOP=1 -v org="$org" \
+          -v source="$build_source" -tA)"; then
+    if [ "$have" = 0 ]; then
+      echo "==> $org does not trust $build_source for the build sandbox (needs a passkey confirmation)"
+      trust_step "$step"
+    fi
+  else
+    echo "warning: could not read the trust of $build_source in $org; check Org settings > Libraries" >&2
+  fi
 fi

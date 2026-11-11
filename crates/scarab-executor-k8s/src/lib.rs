@@ -7742,6 +7742,7 @@ mod tests {
                 ("SCARAB_BUILD_DOCKERFILE", "Dockerfile"),
                 ("SCARAB_BUILD_ARGS", ""),
                 ("SCARAB_BUILD_CACHE", "none"),
+                ("SCARAB_FORK_PR", "false"),
             ] {
                 cmd.env(name, value);
             }
@@ -7913,6 +7914,59 @@ mod tests {
         std::fs::create_dir(ws.join("a b")).unwrap();
         std::fs::write(ws.join("a b/-f"), "FROM scratch\n").unwrap();
         assert_eq!(at("a b", "-f"), (Some(0), true));
+    }
+
+    /// A fork pull request's build (SCARAB_FORK_PR=true, which Scarab sets on
+    /// every launch of a sandboxed Step, or any value but `false`) does
+    /// not push, whatever `push` says, and imports the layer cache without
+    /// exporting it.
+    #[cfg(unix)]
+    #[test]
+    fn a_fork_pull_request_build_neither_pushes_nor_exports_the_cache() {
+        let (tmp, run) = build_library_harness();
+        let called = || std::fs::read_to_string(tmp.path().join("called")).unwrap();
+        for fork in ["true", ""] {
+            for (cache, import) in [
+                ("registry", "type=registry,ref=registry.example/cache:main"),
+                ("s3", "type=s3,region=ap-south-1,bucket=acme-cache"),
+            ] {
+                assert_eq!(
+                    run(&[
+                        ("SCARAB_FORK_PR", fork),
+                        ("SCARAB_BUILD_PUSH", "true"),
+                        ("SCARAB_BUILD_CACHE", cache),
+                        ("SCARAB_BUILD_CACHE_REF", "registry.example/cache:main"),
+                        ("SCARAB_BUILD_CACHE_BUCKET", "acme-cache"),
+                        ("SCARAB_BUILD_CACHE_REGION", "ap-south-1"),
+                    ]),
+                    (Some(0), true),
+                    "fork={fork:?} cache={cache}"
+                );
+                let argv = called();
+                let argv: Vec<&str> = argv.lines().collect();
+                assert!(
+                    argv.contains(&"type=image,name=registry.example/app:1,push=false"),
+                    "fork={fork:?}: {argv:?}"
+                );
+                assert!(argv.contains(&import), "fork={fork:?}: {argv:?}");
+                assert!(
+                    !argv.contains(&"--export-cache"),
+                    "fork={fork:?} exports the cache: {argv:?}"
+                );
+            }
+        }
+        // Not a fork: it pushes and exports.
+        assert_eq!(
+            run(&[
+                ("SCARAB_BUILD_PUSH", "true"),
+                ("SCARAB_BUILD_CACHE", "registry"),
+                ("SCARAB_BUILD_CACHE_REF", "registry.example/cache:main"),
+            ]),
+            (Some(0), true)
+        );
+        let argv = called();
+        assert!(argv.contains("push=true"), "{argv}");
+        assert!(argv.contains("--export-cache"), "{argv}");
     }
 
     /// `insecure_push` adds `registry.insecure=true` to the output only when

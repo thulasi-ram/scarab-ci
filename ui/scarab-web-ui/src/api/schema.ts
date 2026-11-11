@@ -1013,9 +1013,9 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Trust a library source with forge credentials or the build sandbox */
+        /** Trust a library source with forge credentials, the build sandbox or the registry credential */
         post: operations["trust_library_source"];
-        /** Stop trusting a library source with forge credentials or the build sandbox */
+        /** Stop trusting a library source with one grant or all of them */
         delete: operations["untrust_library_source"];
         options?: never;
         head?: never;
@@ -6098,7 +6098,7 @@ export interface components {
          *     own.
          * @enum {string}
          */
-        TrustGrantDto: "forge_credentials" | "build_sandbox";
+        TrustGrantDto: "forge_credentials" | "build_sandbox" | "registry_credential";
         TrustSourceRequest: {
             /** @description What the trust grants; `forge_credentials` when omitted. */
             grant?: components["schemas"]["TrustGrantDto"];
@@ -8945,8 +8945,9 @@ export interface operations {
                 /** @description The trusted source, `<host>/<owner>/<repo>//<path>`. */
                 source?: string;
                 /**
-                 * @description The grant to remove; `forge_credentials` when omitted. The source's
-                 *     other grants stay.
+                 * @description The grant to remove; every grant of the source when omitted (a
+                 *     client from before grants existed means the source's whole trust).
+                 *     Named, the source's other grants stay.
                  */
                 grant?: components["schemas"]["TrustGrantDto"];
             };
@@ -8980,7 +8981,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not trusted with that grant, or libraries not configured */
+            /** @description not trusted with that grant (with any, when none is named), or libraries not configured */
             404: {
                 headers: {
                     [name: string]: unknown;

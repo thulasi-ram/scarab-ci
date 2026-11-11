@@ -889,9 +889,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // delivered as files on tmpfs.
             let executor: Arc<dyn Executor> = Arc::new(
                 scarab_server::forge_token::ForgeCredentialExecutor::new(executor, forge.clone())
-                    // Build-step registry auth (ADR-0018): scoped REGISTRY_AUTH
-                    // secret first, forge-derived credential as fallback.
+                    // A `registry_auth` Step's credential (ADR-0018): scoped
+                    // REGISTRY_AUTH secret first, forge-derived credential as
+                    // fallback, each value registered with the log redactor.
                     .with_secrets(secrets.clone())
+                    .with_logs(logs.clone())
                     // A yanked library Step is refused before its forge
                     // credential or registry auth is asked for (ADR-0076 §6).
                     .with_libraries(db.clone(), pg.clone())

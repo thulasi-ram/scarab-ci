@@ -118,9 +118,14 @@ pub enum TrustGrant {
     /// A Step from the source may run in a `security.sandbox`.
     BuildSandbox,
     /// A Step from the source may receive a long-lived forge credential
-    /// (ADR-0076 §9), and the forge-derived registry credential.
+    /// (ADR-0076 §9), and, with [`RegistryCredential`](Self::RegistryCredential)
+    /// too, the forge-derived registry credential.
     #[default]
     ForgeCredentials,
+    /// A Step from the source with `registry_auth` may receive the Run's
+    /// registry credential: the `REGISTRY_AUTH` secret, or the forge-derived
+    /// one when the source is trusted with forge credentials too.
+    RegistryCredential,
 }
 
 impl TrustGrant {
@@ -129,6 +134,7 @@ impl TrustGrant {
         match self {
             TrustGrant::ForgeCredentials => "forge_credentials",
             TrustGrant::BuildSandbox => "build_sandbox",
+            TrustGrant::RegistryCredential => "registry_credential",
         }
     }
 
@@ -137,6 +143,7 @@ impl TrustGrant {
         match s {
             "forge_credentials" => Some(TrustGrant::ForgeCredentials),
             "build_sandbox" => Some(TrustGrant::BuildSandbox),
+            "registry_credential" => Some(TrustGrant::RegistryCredential),
             _ => None,
         }
     }
@@ -146,6 +153,7 @@ impl TrustGrant {
         match self {
             TrustGrant::ForgeCredentials => "forge credentials",
             TrustGrant::BuildSandbox => "the build sandbox",
+            TrustGrant::RegistryCredential => "the registry credential",
         }
     }
 }

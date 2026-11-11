@@ -479,9 +479,16 @@ impl LibraryStore for PostgresDb {
     }
 
     async fn trusted_sources(&self, org: &str) -> Result<Vec<TrustedSource>, LibraryStoreError> {
+        // Trust with forge credentials is a row of `library_trusted_sources`;
+        // every other grant is a row of `library_source_grants` (migration
+        // 0095).
         let rows = sqlx::query(
-            "SELECT org, source, trust_grant, trusted_by, trusted_at, step_up_ref \
+            "SELECT org, source, 'forge_credentials' AS trust_grant, trusted_by, trusted_at, \
+                    step_up_ref \
              FROM library_trusted_sources WHERE org = $1 \
+             UNION ALL \
+             SELECT org, source, trust_grant, trusted_by, trusted_at, step_up_ref \
+             FROM library_source_grants WHERE org = $1 \
              ORDER BY source COLLATE \"C\", trust_grant COLLATE \"C\"",
         )
         .bind(org)
@@ -492,32 +499,61 @@ impl LibraryStore for PostgresDb {
     }
 
     async fn trust_source(&self, t: &TrustedSource) -> Result<TrustedSource, LibraryStoreError> {
-        sqlx::query(
-            "INSERT INTO library_trusted_sources \
-               (org, source, trust_grant, trusted_by, trusted_at, step_up_ref) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT (org, source, trust_grant) DO NOTHING",
-        )
-        .bind(&t.org)
-        .bind(&t.source)
-        .bind(t.grant.as_str())
-        .bind(&t.trusted_by)
-        .bind(t.trusted_at)
-        .bind(&t.step_up_ref)
-        .execute(self.pool())
-        .await
-        .map_err(store_err)?;
-        let row = sqlx::query(
-            "SELECT org, source, trust_grant, trusted_by, trusted_at, step_up_ref \
-             FROM library_trusted_sources \
-             WHERE org = $1 AND source = $2 AND trust_grant = $3",
-        )
-        .bind(&t.org)
-        .bind(&t.source)
-        .bind(t.grant.as_str())
-        .fetch_one(self.pool())
-        .await
-        .map_err(store_err)?;
+        let row = match t.grant {
+            TrustGrant::ForgeCredentials => {
+                sqlx::query(
+                    "INSERT INTO library_trusted_sources \
+                       (org, source, trusted_by, trusted_at, step_up_ref) \
+                     VALUES ($1, $2, $3, $4, $5) ON CONFLICT (org, source) DO NOTHING",
+                )
+                .bind(&t.org)
+                .bind(&t.source)
+                .bind(&t.trusted_by)
+                .bind(t.trusted_at)
+                .bind(&t.step_up_ref)
+                .execute(self.pool())
+                .await
+                .map_err(store_err)?;
+                sqlx::query(
+                    "SELECT org, source, 'forge_credentials' AS trust_grant, trusted_by, \
+                            trusted_at, step_up_ref \
+                     FROM library_trusted_sources WHERE org = $1 AND source = $2",
+                )
+                .bind(&t.org)
+                .bind(&t.source)
+                .fetch_one(self.pool())
+                .await
+                .map_err(store_err)?
+            }
+            grant => {
+                sqlx::query(
+                    "INSERT INTO library_source_grants \
+                       (org, source, trust_grant, trusted_by, trusted_at, step_up_ref) \
+                     VALUES ($1, $2, $3, $4, $5, $6) \
+                     ON CONFLICT (org, source, trust_grant) DO NOTHING",
+                )
+                .bind(&t.org)
+                .bind(&t.source)
+                .bind(grant.as_str())
+                .bind(&t.trusted_by)
+                .bind(t.trusted_at)
+                .bind(&t.step_up_ref)
+                .execute(self.pool())
+                .await
+                .map_err(store_err)?;
+                sqlx::query(
+                    "SELECT org, source, trust_grant, trusted_by, trusted_at, step_up_ref \
+                     FROM library_source_grants \
+                     WHERE org = $1 AND source = $2 AND trust_grant = $3",
+                )
+                .bind(&t.org)
+                .bind(&t.source)
+                .bind(grant.as_str())
+                .fetch_one(self.pool())
+                .await
+                .map_err(store_err)?
+            }
+        };
         trusted_from_row(&row)
     }
 
@@ -527,14 +563,23 @@ impl LibraryStore for PostgresDb {
         source: &str,
         grant: TrustGrant,
     ) -> Result<Option<TrustedSource>, LibraryStoreError> {
-        let row = sqlx::query(
-            "DELETE FROM library_trusted_sources \
-             WHERE org = $1 AND source = $2 AND trust_grant = $3 \
-             RETURNING org, source, trust_grant, trusted_by, trusted_at, step_up_ref",
-        )
-        .bind(org)
-        .bind(source)
-        .bind(grant.as_str())
+        let row = match grant {
+            TrustGrant::ForgeCredentials => sqlx::query(
+                "DELETE FROM library_trusted_sources WHERE org = $1 AND source = $2 \
+                 RETURNING org, source, 'forge_credentials' AS trust_grant, trusted_by, \
+                           trusted_at, step_up_ref",
+            )
+            .bind(org)
+            .bind(source),
+            grant => sqlx::query(
+                "DELETE FROM library_source_grants \
+                 WHERE org = $1 AND source = $2 AND trust_grant = $3 \
+                 RETURNING org, source, trust_grant, trusted_by, trusted_at, step_up_ref",
+            )
+            .bind(org)
+            .bind(source)
+            .bind(grant.as_str()),
+        }
         .fetch_optional(self.pool())
         .await
         .map_err(store_err)?;

@@ -24,6 +24,7 @@ import {
   shortHash,
   strayTrust,
   grantLabel,
+  untrustEffect,
   versionLabel,
 } from "../libraries";
 import { relTime, absTime } from "../fmt";
@@ -245,10 +246,7 @@ export default function Libraries(props: { org: string }) {
             }}
             onClose={() => setUntrusting(null)}
           >
-            <p>
-              Runs created from now on refuse a Step from this source that needs{" "}
-              {grantLabel(t().grant)}.
-            </p>
+            <p>{untrustEffect(t().grant)}</p>
           </ConfirmAction>
         )}
       </Show>

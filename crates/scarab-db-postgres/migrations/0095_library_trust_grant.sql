@@ -1,23 +1,23 @@
--- What an org's trust in a library source grants (ADR-0018, amendment of
--- 2026-11-12). Until now a row meant one thing: Steps from the source may
--- receive a long-lived forge credential. A row now names its grant:
+-- The trust grants an org gives a library source beside forge credentials
+-- (ADR-0018, amendment of 2026-11-12):
 --
---   * forge_credentials: that meaning, kept for every existing row;
---   * build_sandbox: Steps from the source may run in a `security.sandbox`.
+--   * build_sandbox: Steps from the source may run in a `security.sandbox`;
+--   * registry_credential: Steps from the source may receive the Run's
+--     registry credential (`registry_auth`).
 --
--- Each grant is trusted on its own, so the key becomes (org, source, grant):
--- trusting a source with forge credentials does not trust it with the
--- sandbox, and the reverse.
---
--- Contract step (ADR-0003): a binary from before this migration inserts with
--- `ON CONFLICT (org, source)`, which no longer names a unique constraint, and
--- deletes every grant of a source when it means one. It cannot run against a
--- database migrated past here.
+-- Each grant is trusted on its own. `library_trusted_sources` keeps its one
+-- meaning, trust with forge credentials, and its key: this migration only
+-- adds a table, so a server from before it keeps reading and writing forge
+-- trust as it did, and never sees a grant it does not know (ADR-0003,
+-- expand only).
 
-ALTER TABLE library_trusted_sources
-    ADD COLUMN trust_grant TEXT NOT NULL DEFAULT 'forge_credentials'
-        CHECK (trust_grant IN ('forge_credentials', 'build_sandbox'));
-
-ALTER TABLE library_trusted_sources DROP CONSTRAINT library_trusted_sources_pkey;
-
-ALTER TABLE library_trusted_sources ADD PRIMARY KEY (org, source, trust_grant);
+CREATE TABLE library_source_grants (
+    org         TEXT   NOT NULL,
+    source      TEXT   NOT NULL,
+    trust_grant TEXT   NOT NULL
+        CHECK (trust_grant IN ('build_sandbox', 'registry_credential')),
+    trusted_by  TEXT   NOT NULL,
+    trusted_at  BIGINT NOT NULL,
+    step_up_ref TEXT,
+    PRIMARY KEY (org, source, trust_grant)
+);
