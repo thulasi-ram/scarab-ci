@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1794428077,"nonce":"1/0zxuyH0JwEHKPF1LyiCxCITuM=","title":"build: does a RUN step reach /scarab/registry via /proc without BuildKit's process sandbox (Yama scope 0)? prove the guard in the real image","was":"x"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1794428077,"nonce":"A+OCAd4BgBFCg7ts2cfMRo6KfKY=","added":["type:bug","security","area:executor"],"removed":null}]}
