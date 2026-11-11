@@ -22,6 +22,7 @@ import { me } from "../session";
 import DisableRepository from "../components/DisableRepository";
 import Doodle from "../components/Doodle";
 import Icon from "../components/Icon";
+import { HomeCrumb } from "../components/PageCrumbs";
 
 /** Repositories per page. */
 const PER_PAGE = 25;
@@ -98,7 +99,10 @@ export default function OrgPage() {
       <Doodle icon="boxes" size={230} rotate={10} opacity={0.16} top="52px" right="48px" />
 
       <div class="page-head">
-        <h1>{org()}</h1>
+        <h1 class="crumb-head">
+          <HomeCrumb size={20} sepClass="crumb-head-sep" />
+          <span>{org()}</span>
+        </h1>
       </div>
       <div class="page-toolbar">
         <Show when={administers()}>

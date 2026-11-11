@@ -10,7 +10,6 @@
 // re-adoptions are witnessed.
 import { createSignal, createEffect, createResource, onMount, onCleanup, For, Show } from "solid-js";
 import { A, useParams, useNavigate } from "@solidjs/router";
-import { orgPageHref } from "../org-page";
 import {
   getRun,
   fetchEvents,
@@ -79,6 +78,7 @@ import { forgeCommitUrl, forgePrUrl } from "../forge";
 import StatusBadge from "../components/StatusBadge";
 import RunPolicies from "../components/RunPolicies";
 import Icon from "../components/Icon";
+import { HomeCrumb, RepoCrumb } from "../components/PageCrumbs";
 import Doodle from "../components/Doodle";
 import Dag, { type DagStep, type DagService, type DagControls } from "../components/Dag";
 import VersionDropdown, { type VersionRow } from "../components/VersionDropdown";
@@ -748,9 +748,8 @@ export default function RunDetail() {
             <div class="run-head">
               <span class={`sdot lg ${r().status}`} />
               <h1 class="crumb-head">
-                <A href={orgPageHref(org())} class="crumb-head-org">{org()}</A>
-                <Icon icon="chevron-right" size={20} class="crumb-head-sep" />
-                <A href={`/${org()}/${repo()}`} class="crumb-head-link">{repo()}</A>
+                <HomeCrumb size={20} sepClass="crumb-head-sep" />
+                <RepoCrumb org={org()} repo={repo()} link />
                 <Icon icon="chevron-right" size={20} class="crumb-head-sep" />
                 {/* The per-repo run number `#N` is the human handle (ADR-0057);
                     fall back to the short internal id for untenanted runs. */}

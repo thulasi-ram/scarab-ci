@@ -49,6 +49,7 @@ import { forgeCommitUrl, forgePrUrl } from "../forge";
 import TriggerCell from "../components/TriggerCell";
 import RunNumber from "../components/RunNumber";
 import Icon from "../components/Icon";
+import { HomeCrumb, RepoCrumb } from "../components/PageCrumbs";
 import SearchSelect from "../components/SearchSelect";
 import PrincipalSearch from "../components/PrincipalSearch";
 import Modal, { ModalMessage, ModalSection } from "../components/Modal";
@@ -322,12 +323,9 @@ export default function RepoView() {
       <Doodle icon="workflow" size={230} rotate={12} opacity={0.16} top="52px" right="48px" />
 
       <div class="page-head">
-        <h1>
-          <A href={orgPageHref(org())} class="head-org" title={`${org()}: repositories and recent runs`}>
-            {org()}
-          </A>
-          <span class="head-org">/</span>
-          {repo()}
+        <h1 class="crumb-head">
+          <HomeCrumb size={20} sepClass="crumb-head-sep" />
+          <RepoCrumb org={org()} repo={repo()} />
           <Show when={unreachable()}>
             <span class="repo-unreachable-tag" title={UNREACHABLE_NOTE}>
               unreachable
