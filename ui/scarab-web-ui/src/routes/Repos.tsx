@@ -24,6 +24,7 @@ import RunBars from "../components/RunBars";
 import AsciiScene from "../components/AsciiScene";
 import dungroller from "../../../brand/ascii/generated/dungroller-bare.json";
 import Pill from "../components/Pill";
+import { HomeCrumb } from "../components/PageCrumbs";
 
 const runHref = (r: RunSummary) => `/${r.org ?? "api"}/${r.project ?? "unknown"}/runs/${r.id}`;
 const tenant = (r: RunSummary) => (r.org && r.project ? `${r.org}/${r.project}` : null);
@@ -150,8 +151,14 @@ export default function Repos() {
     <>
       <section class="page">
         <div class="page-head">
-          <h1>Dashboard</h1>
+          <h1 class="crumb-head">
+            <HomeCrumb size={20} sepClass="crumb-head-sep" />
+            <span>Dashboard</span>
+          </h1>
         </div>
+        {/* Empty, like a repository's when it has no action: the row keeps the
+            first block at the height of the tabs on the other pages. */}
+        <div class="page-toolbar" />
 
         <Show when={runs.error || projects.error}>
           <p class="error">

@@ -27,6 +27,13 @@ release.yml uses that version's section as the GitHub Release text. See
   delivery (migration `0094`, filled on the next delivery) and `ConnectionDto` gains
   `account_login`, `account_id` and `installation_id`.
 
+### Bug Fixes
+
+- **The Dashboard lines up with every other page.** Its heading is now `/ › Dashboard`, on the same
+  line as the other pages' breadcrumbs, and its first block ("Waiting on you" or the "All clear"
+  card, which sat 8px under the heading) starts at the height of a repository's tabs. So does the
+  organization page's Overview, which sat 14px lower.
+
 ### Documentation
 
 - **Links in the design pages work.** CONTEXT and the ADRs link to each other by repo path, which
