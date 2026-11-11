@@ -91,7 +91,9 @@ administer (`?org=<org>` narrows it to one).
   **New organization…** at the bottom of the org dropdown (`/orgs/_new`), name the org and add its
   Forgejo connection, or call `POST /v1/connections` with an `org` field. After that, the org's
   own admins add more under its **Settings › Connections**. For GitHub, install the App on the
-  account instead: the installation registers the connection and the org.
+  account instead: the installation registers the connection and the org. The page asks which
+  forge, and for GitHub lists the install steps with a link to the App's install page; **Check
+  for the organization** opens the org the installation created.
 - **An org name** is not empty, is at most 100 characters, and has no `/`, spaces or control
   characters. It is not `.` or `..`, does not start with `_` (those names are Scarab's own), and
   is not one of `settings`, `orgs`, `account` or `security`: a project's page is

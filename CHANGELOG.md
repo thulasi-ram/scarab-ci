@@ -24,7 +24,9 @@ release.yml uses that version's section as the GitHub Release text. See
   opens a dialog that asks which forge. For GitHub it lists the steps to install the App on the
   org's account and links to the App's install page, which the server reads from GitHub through
   the new `GET /v1/forges/github/app`; a server without a GitHub App says so. For Forgejo or
-  Codeberg it shows the instance URL and token form as before.
+  Codeberg it shows the instance URL and token form as before. The New organization page asks
+  the same question; after a GitHub install, **Check for the organization** opens the org the
+  installation created.
 
 ## [0.3.1] - 2026-11-11
 

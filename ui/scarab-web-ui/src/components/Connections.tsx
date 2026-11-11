@@ -23,9 +23,12 @@
 //   (`NewOrgConnection`), which shows the same form with a field for the
 //   org's name.
 //
-// Add forge connection asks which forge first. For GitHub it shows the steps
-// to install the App, with a link to the App's install page that the server
-// asks GitHub for (`GET /v1/forges/github/app`); for Forgejo, the form.
+// Add forge connection and the New organization page both ask which forge
+// first. For GitHub they show the steps to install the App, with a link to the
+// App's install page that the server asks GitHub for
+// (`GET /v1/forges/github/app`); for Forgejo, the form. On New organization,
+// Check for the organization asks `/v1/me` again and opens the org the
+// installation created.
 //
 // Repositories are opt-in for both, and they are enabled and disabled in one
 // place: the org page (`/orgs/<org>`), which pages and filters them. A
@@ -196,6 +199,40 @@ export default function Connections(props: { org: string }) {
  */
 export function NewOrgConnection() {
   const nav = useNavigate();
+  const [forge, setForge] = createSignal<Forge | null>(null);
+  const [app] = createResource(
+    () => (forge() === "github" ? true : undefined),
+    () => githubAppInfo(),
+  );
+  // The orgs the caller had when the page opened: an installation that
+  // created an org shows up as one more, once `/v1/me` is asked again.
+  const before = new Set(me()?.admin_orgs ?? []);
+  const [checking, setChecking] = createSignal(false);
+  const [notYet, setNotYet] = createSignal(false);
+  const check = async () => {
+    setChecking(true);
+    setNotYet(false);
+    try {
+      await refetchMe();
+      void refetchWaiting();
+      const added = (me()?.admin_orgs ?? []).filter((o) => !before.has(o));
+      if (added.length === 1) nav(orgHref(added[0]!, FIRST_ORG_SECTION));
+      else setNotYet(true);
+    } finally {
+      setChecking(false);
+    }
+  };
+  const fj = forgejoForm({
+    first: 2,
+    Sec: FormSection,
+    onSaved: async (org) => {
+      // The new org is in `admin_orgs` only once `/v1/me` is asked again.
+      // Then its home section, which is its Connections.
+      await refetchMe();
+      nav(orgHref(org, FIRST_ORG_SECTION));
+    },
+  });
+
   return (
     <div class="panel">
       <div class="panel-h"><span>First forge connection</span></div>
@@ -204,20 +241,37 @@ export function NewOrgConnection() {
           An organization in Scarab is a forge account: the user or organization that owns the
           repositories. It is created by its first connection.
         </p>
-        <p class="subtle">
-          <small>
-            For GitHub, install the Scarab App on the account instead. The installation registers
-            the connection and the organization.
-          </small>
-        </p>
-        <ForgejoConnectionForm
-          onSaved={async (org) => {
-            // The new org is in `admin_orgs` only once `/v1/me` is asked again.
-            // Then its home section, which is its Connections.
-            await refetchMe();
-            nav(orgHref(org, FIRST_ORG_SECTION));
-          }}
-        />
+        <div class="conn-form">
+          <FormSection n={1} title="Forge">
+            <ForgePicker value={forge()} onPick={setForge} disabled={fj.saving()} />
+          </FormSection>
+          <Show when={forge() === "forgejo"}>
+            {fj.sections}
+            <Show when={fj.error()}>
+              <p class="error">{fj.error()}</p>
+            </Show>
+            <div class="modal-actions">{fj.add}</div>
+          </Show>
+          <Show when={forge() === "github"}>
+            <FormSection n={2} title="Install the App">
+              <GithubInstallSteps app={app()} loading={app.loading} failed={!!app.error} />
+            </FormSection>
+            <Show when={notYet()}>
+              <p class="subtle">
+                No new organization yet. GitHub sends the installation within a few seconds. If the
+                connection is listed under Waiting for an organization, assign it there.
+              </p>
+            </Show>
+            <div class="modal-actions">
+              <a class="btn btn-ghost" href={CONNECTIONS_DOCS} target="_blank" rel="noreferrer">
+                Docs
+              </a>
+              <button class="btn btn-primary" type="button" disabled={checking()} onClick={() => void check()}>
+                {checking() ? "Checking…" : "Check for the organization"}
+              </button>
+            </div>
+          </Show>
+        </div>
       </div>
     </div>
   );
@@ -237,7 +291,7 @@ const CONNECTIONS_DOCS =
  * - **Forgejo / Codeberg**: the instance URL and token form.
  */
 function AddForgeConnection(props: { org: string; onDone: () => void; onCancel: () => void }) {
-  const [forge, setForge] = createSignal<"github" | "forgejo" | null>(null);
+  const [forge, setForge] = createSignal<Forge | null>(null);
   // Asked once, when GitHub is first picked: it is a live call to GitHub.
   const [app] = createResource(
     () => (forge() === "github" ? true : undefined),
@@ -245,11 +299,6 @@ function AddForgeConnection(props: { org: string; onDone: () => void; onCancel: 
   );
   const fj = forgejoForm({ org: props.org, first: 2, Sec: ModalSection, onSaved: props.onDone });
   const busy = () => forge() === "forgejo" && fj.saving();
-
-  const choices = [
-    { id: "github" as const, name: "GitHub", how: "Install the Scarab App on the account" },
-    { id: "forgejo" as const, name: "Forgejo or Codeberg", how: "Instance URL and an access token" },
-  ];
 
   return (
     <Modal
@@ -279,26 +328,7 @@ function AddForgeConnection(props: { org: string; onDone: () => void; onCancel: 
       }
     >
       <ModalSection n={1} title="Forge">
-        <div class="sec-pick" role="radiogroup" aria-label="Forge">
-          <For each={choices}>
-            {(c) => (
-              <label classList={{ on: forge() === c.id }}>
-                <input
-                  type="radio"
-                  name="add-conn-forge"
-                  value={c.id}
-                  checked={forge() === c.id}
-                  disabled={busy()}
-                  onChange={() => setForge(c.id)}
-                />
-                <span class="conn-forge">
-                  <span class="tok-name">{c.name}</span>
-                  <span class="subtle">{c.how}</span>
-                </span>
-              </label>
-            )}
-          </For>
-        </div>
+        <ForgePicker value={forge()} onPick={setForge} disabled={busy()} />
       </ModalSection>
       <Show when={forge() === "forgejo"}>{fj.sections}</Show>
       <Show when={forge() === "github"}>
@@ -310,10 +340,43 @@ function AddForgeConnection(props: { org: string; onDone: () => void; onCancel: 
   );
 }
 
-/** The steps that add a GitHub connection: install the App on the org's
- *  account, then come back and enable repositories. */
+type Forge = "github" | "forgejo";
+
+/** Which forge a new connection is on. */
+function ForgePicker(props: { value: Forge | null; onPick: (f: Forge) => void; disabled?: boolean }) {
+  const choices: { id: Forge; name: string; how: string }[] = [
+    { id: "github", name: "GitHub", how: "Install the Scarab App on the account" },
+    { id: "forgejo", name: "Forgejo or Codeberg", how: "Instance URL and an access token" },
+  ];
+  return (
+    <div class="sec-pick" role="radiogroup" aria-label="Forge">
+      <For each={choices}>
+        {(c) => (
+          <label classList={{ on: props.value === c.id }}>
+            <input
+              type="radio"
+              name="add-conn-forge"
+              value={c.id}
+              checked={props.value === c.id}
+              disabled={props.disabled}
+              onChange={() => props.onPick(c.id)}
+            />
+            <span class="conn-forge">
+              <span class="tok-name">{c.name}</span>
+              <span class="subtle">{c.how}</span>
+            </span>
+          </label>
+        )}
+      </For>
+    </div>
+  );
+}
+
+/** The steps that add a GitHub connection: install the App on the account,
+ *  then come back and enable repositories. With `org`, the account is that
+ *  org's; without it (New organization), the installation creates the org. */
 function GithubInstallSteps(props: {
-  org: string;
+  org?: string;
   app: GithubApp | undefined;
   loading: boolean;
   failed: boolean;
@@ -357,20 +420,45 @@ function GithubInstallSteps(props: {
             </span>
           </Show>
         </li>
-        <li>
-          Pick the account <b class="mono">{props.org}</b>. The connection serves only repositories
-          that account owns.
-        </li>
-        <li>Choose all repositories or only the ones Scarab may build, then Install.</li>
-        <li>
-          Come back here and press Done. The installation registers the connection, and it is
-          listed on this page.
-        </li>
-        <li>
-          Enable the repositories Scarab should build on the{" "}
-          <A href={orgPageHref(props.org)}>organization page</A>. Installing the
-          App enables none of them.
-        </li>
+        <Show
+          when={props.org}
+          fallback={
+            <>
+              <li>
+                Pick the account that owns the repositories. The installation creates the
+                organization in Scarab, with the account's name.
+              </li>
+              <li>Choose all repositories or only the ones Scarab may build, then Install.</li>
+              <li>
+                Come back here and press Check for the organization. It opens the new
+                organization's Connections.
+              </li>
+              <li>
+                Enable the repositories Scarab should build on the organization page. Installing
+                the App enables none of them.
+              </li>
+            </>
+          }
+        >
+          {(org) => (
+            <>
+              <li>
+                Pick the account <b class="mono">{org()}</b>. The connection serves only
+                repositories that account owns.
+              </li>
+              <li>Choose all repositories or only the ones Scarab may build, then Install.</li>
+              <li>
+                Come back here and press Done. The installation registers the connection, and it
+                is listed on this page.
+              </li>
+              <li>
+                Enable the repositories Scarab should build on the{" "}
+                <A href={orgPageHref(org())}>organization page</A>. Installing the App enables none
+                of them.
+              </li>
+            </>
+          )}
+        </Show>
       </ol>
     </Show>
   );
@@ -468,20 +556,6 @@ function forgejoForm(props: {
     </button>
   );
   return { sections, add, saving, error };
-}
-
-/** The Forgejo form on a page (the New organization page). */
-function ForgejoConnectionForm(props: { onSaved: (org: string) => void | Promise<void> }) {
-  const f = forgejoForm({ first: 1, Sec: FormSection, onSaved: props.onSaved });
-  return (
-    <div class="conn-form">
-      {f.sections}
-      <Show when={f.error()}>
-        <p class="error">{f.error()}</p>
-      </Show>
-      <div class="modal-actions">{f.add}</div>
-    </div>
-  );
 }
 
 /**

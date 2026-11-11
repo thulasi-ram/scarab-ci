@@ -1074,7 +1074,20 @@ test("a global admin makes a new org from the org dropdown and lands on its conn
   const nav = page.getByRole("navigation", { name: "Settings" });
   await expect(nav.getByText("Organization settings", { exact: true })).toBeVisible();
   await expect(nav.getByRole("link")).toHaveCount(0);
-  await expect(page.getByText(/install the Scarab App on the account/)).toBeVisible();
+  // The page asks which forge. GitHub lists the install steps with the App's
+  // install page; the org comes from the installation, so there is no form.
+  await page.getByRole("radio", { name: /GitHub/ }).check();
+  await expect(page.getByRole("link", { name: "Install on GitHub →" })).toHaveAttribute(
+    "href",
+    "https://github.com/apps/scarab-ci/installations/new",
+  );
+  await expect(page.getByText(/creates the organization in Scarab/)).toBeVisible();
+  await expect(page.locator("#conn-org")).toHaveCount(0);
+  // Nothing installed yet: checking says so and stays on the page.
+  await page.getByRole("button", { name: "Check for the organization" }).click();
+  await expect(page.getByText(/No new organization yet/)).toBeVisible();
+  await expect(page).toHaveURL(/\/orgs\/_new$/);
+  await page.getByRole("radio", { name: /Forgejo or Codeberg/ }).check();
   const add = page.getByRole("button", { name: "Add connection" });
   await expect(add).toBeDisabled();
   await page.locator("#conn-org").fill("initech");
