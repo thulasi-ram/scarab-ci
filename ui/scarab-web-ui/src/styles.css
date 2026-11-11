@@ -2052,7 +2052,6 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   font: var(--t-label);
   color: var(--soft-white); margin: 30px 0 11px;
 }
-.dash-label:first-of-type { margin-top: 8px; }
 .dash-label .count { color: var(--sage); }
 
 /* Representative/prototype tag — a dashed gold edge, never a fill (§edges). */
@@ -2086,11 +2085,15 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 
 /* ---- all-clear (calm state) ---- */
 .allclear {
-  display: flex; align-items: center; gap: 15px; margin-top: 8px;
+  display: flex; align-items: center; gap: 15px;
   padding: 20px 22px; border: 1px solid var(--border); border-radius: var(--radius-lg);
   background: var(--emerald-surface);
 }
 .allclear .ac-ico { color: var(--ok-ink); flex: none; }
+/* The dashboard has no toolbar row under its heading, so whatever comes first
+   (the inbox, the all-clear card, the loading line or an error) starts one
+   section gap below it, the same in every state. */
+.page-head.dash-head + * { margin-top: 30px; }
 
 /* State-moment beetle: an idle/failed pose stands in for an empty list.
    The caption sits DIRECTLY under the art — it reads as the beetle's own line,
