@@ -1908,7 +1908,7 @@ async fn create_run(
             })?;
         // ADR-0055: a raw k8s_overlay carries no authority. An inline API run
         // targets no Environment, so any overlay is rejected fail-closed.
-        let k8s_overlay = admit_k8s_overlay(None, step.k8s_overlay.as_ref())
+        let k8s_overlay = admit_k8s_overlay(None, step.k8s_overlay.as_ref(), false)
             .map_err(|v| ApiError::BadRequest(format!("step `{}`: {}", step.id, v.join("; "))))?;
         let spec = StepSpec {
             image: step.image.clone(),
@@ -6781,13 +6781,6 @@ fn admit_step_grants(
     }
 }
 
-/// Admit a step's raw `k8s_overlay` (ADR-0055) against the target Environment.
-/// A raw overlay carries no authority — mirroring a governed grant
-/// ([`admit_step_grants`]), it is honored only where the Project's privilege
-/// grant in the target Environment sets `permit_k8s_overlay` (ADR-0071 §8),
-/// else the run is rejected **fail-closed**. An inline API run (no
-/// Environment) therefore never gets one. Returns the overlay to persist (or
-/// `None`).
 /// Translate an authored `cache:` (ADR-0065 s1) into the launch spec's
 /// [`scarab_engine::CacheConfig`]. Only the authored halves cross here —
 /// `key`/`restore` are launch-time enrichment the scheduler owns.
@@ -6802,12 +6795,30 @@ fn cache_config(step: &scarab_pipeline::StepSpec) -> Option<scarab_engine::Cache
     })
 }
 
+/// Admit a step's raw `k8s_overlay` (ADR-0055) against the target Environment.
+/// A raw overlay carries no authority — mirroring a governed grant
+/// ([`admit_step_grants`]), it is honored only where the Project's privilege
+/// grant in the target Environment sets `permit_k8s_overlay` (ADR-0071 §8),
+/// else the run is rejected **fail-closed**. An inline API run (no
+/// Environment) therefore never gets one. Returns the overlay to persist (or
+/// `None`).
+///
+/// `locked_out` is the same value the privilege grants are admitted with: a
+/// fork pull request's Run, or a Run locked out of its Environment, is
+/// refused any overlay before the grant is read. Its author controls the
+/// Pipeline, so a permitting grant does not extend to it.
 fn admit_k8s_overlay(
     grant_scope: PrivilegeGrantScope<'_>,
     overlay: Option<&serde_json::Value>,
+    locked_out: bool,
 ) -> Result<Option<serde_json::Value>, Vec<String>> {
     match overlay {
         None => Ok(None),
+        Some(_) if locked_out => Err(vec![
+            "a fork pull request's Run (or a Run locked out of its Environment) may not use \
+             `k8s_overlay`"
+                .to_string(),
+        ]),
         Some(o)
             if scarab_project::EnvironmentProjectPrivilegeGrant::permits_k8s_overlay(
                 grant_scope.flatten(),
@@ -7359,6 +7370,7 @@ async fn write_run_from_ir(
                 k8s_overlay: admit_k8s_overlay(
                     gov.privilege_grant_scope(),
                     step.k8s_overlay.as_ref(),
+                    locked_out,
                 )
                 .map_err(|v| {
                     TriggerError::Pipeline(format!("step `{}`: {}", step.id, v.join("; ")))
@@ -15011,13 +15023,13 @@ mod grant_admission_tests {
 
     #[test]
     fn k8s_overlay_none_is_always_admitted_as_none() {
-        assert_eq!(admit_k8s_overlay(None, None).unwrap(), None);
+        assert_eq!(admit_k8s_overlay(None, None, false).unwrap(), None);
     }
 
     #[test]
     fn k8s_overlay_rejected_without_environment() {
         let overlay = serde_json::json!({"spec": {"schedulerName": "x"}});
-        let err = admit_k8s_overlay(None, Some(&overlay)).unwrap_err();
+        let err = admit_k8s_overlay(None, Some(&overlay), false).unwrap_err();
         assert!(err
             .join("; ")
             .contains("requires a target Environment that permits"));
@@ -15028,7 +15040,7 @@ mod grant_admission_tests {
         let overlay = serde_json::json!({"spec": {"schedulerName": "x"}});
         // The Project holds no grant in the Environment.
         let g: Option<EnvironmentProjectPrivilegeGrant> = None;
-        let err = admit_k8s_overlay(Some(g.as_ref()), Some(&overlay)).unwrap_err();
+        let err = admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false).unwrap_err();
         assert!(err.join("; ").contains("permit_k8s_overlay"));
     }
 
@@ -15037,9 +15049,24 @@ mod grant_admission_tests {
         let overlay = serde_json::json!({"spec": {"schedulerName": "x"}});
         let g = Some(grant(vec![], true));
         assert_eq!(
-            admit_k8s_overlay(Some(g.as_ref()), Some(&overlay)).unwrap(),
+            admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false).unwrap(),
             Some(overlay)
         );
+    }
+
+    /// A fork pull request's Run (or one locked out of its Environment) is
+    /// refused an overlay even where the grant permits overlays: its author
+    /// controls the Pipeline.
+    #[test]
+    fn k8s_overlay_refused_when_locked_out_even_when_environment_permits() {
+        let overlay = serde_json::json!({"spec": {"serviceAccountName": "pusher"}});
+        let g = Some(grant(vec![], true));
+        let err = admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), true)
+            .unwrap_err()
+            .join("; ");
+        assert!(err.contains("fork pull request"), "{err}");
+        // No overlay asked: nothing to refuse.
+        assert_eq!(admit_k8s_overlay(Some(g.as_ref()), None, true).unwrap(), None);
     }
 
     /// A permitting grant, for the reserved-key cases below.
@@ -15063,7 +15090,7 @@ mod grant_admission_tests {
             ] {
                 for value in [serde_json::json!("x"), serde_json::Value::Null] {
                     let overlay = serde_json::json!({"metadata": {field: {key: value}}});
-                    let err = admit_k8s_overlay(Some(g.as_ref()), Some(&overlay))
+                    let err = admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false)
                         .expect_err(&format!("{field} `{key}` = {value} must be refused"))
                         .join("; ");
                     assert!(
@@ -15086,7 +15113,7 @@ mod grant_admission_tests {
             serde_json::json!({"metadata": {"annotations": null}}),
         ] {
             assert!(
-                admit_k8s_overlay(Some(g.as_ref()), Some(&overlay)).is_err(),
+                admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false).is_err(),
                 "{overlay} must be refused"
             );
         }
@@ -15106,7 +15133,7 @@ mod grant_admission_tests {
                 serde_json::Value::Null,
             ] {
                 let overlay = serde_json::json!({"metadata": {field: value}});
-                let err = admit_k8s_overlay(Some(g.as_ref()), Some(&overlay))
+                let err = admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false)
                     .expect_err(&format!("metadata.{field} = {value} must be refused"))
                     .join("; ");
                 assert!(err.contains(&format!("metadata.{field}")), "{field}: {err}");
@@ -15126,7 +15153,7 @@ mod grant_admission_tests {
             "spec": {"nodeSelector": {"pool": "ci"}}
         });
         assert_eq!(
-            admit_k8s_overlay(Some(g.as_ref()), Some(&overlay)).unwrap(),
+            admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false).unwrap(),
             Some(overlay)
         );
     }
