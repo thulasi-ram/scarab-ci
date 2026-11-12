@@ -14998,7 +14998,10 @@ mod grant_admission_tests {
             .join("; ");
         assert!(err.contains("fork pull request"), "{err}");
         // No overlay asked: nothing to refuse.
-        assert_eq!(admit_k8s_overlay(Some(g.as_ref()), None, true).unwrap(), None);
+        assert_eq!(
+            admit_k8s_overlay(Some(g.as_ref()), None, true).unwrap(),
+            None
+        );
     }
 
     /// A permitting grant, for the reserved-key cases below.
