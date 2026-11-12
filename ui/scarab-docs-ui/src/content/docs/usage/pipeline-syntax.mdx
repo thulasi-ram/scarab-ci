@@ -378,7 +378,7 @@ Its inputs:
 | `cache_bucket` | empty | For `cache: s3`, the bucket. |
 | `cache_region` | empty | For `cache: s3`, the bucket's region. |
 | `cache_name` | empty | For `cache: s3`, the cache's name in the bucket; BuildKit's default when empty. |
-| `insecure_push` | `false` | Push over plain HTTP. For a test or development registry with no TLS only. |
+| `insecure_push` | `false` | Push over plain HTTP. For a test or development registry with no TLS only. crane then also skips TLS verification, so the push Step refuses it (exit 2) when it holds a registry login. |
 
 Its outputs:
 

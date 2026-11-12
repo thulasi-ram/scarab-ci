@@ -8223,6 +8223,8 @@ mod tests {
             let _ = std::fs::remove_file(&record);
             let mut cmd = std::process::Command::new("/bin/sh");
             cmd.args(["-c", &script, "scarab-push"]).current_dir(&base);
+            // No registry login unless a case gives one.
+            cmd.env_remove("DOCKER_CONFIG");
             for (name, value) in [
                 ("SCARAB_BUILD_IMAGE", "registry.example/app:1"),
                 ("SCARAB_BUILD_PUSH", "true"),
@@ -8254,8 +8256,10 @@ mod tests {
 
     /// The push Step pushes the layout to the image with crane, writes the
     /// pushed reference as its `push` result, and removes the layout so
-    /// later Steps do not receive it. `insecure_push` adds `--insecure`,
-    /// and anything but `true` or `false` is refused.
+    /// later Steps do not receive it. `insecure_push` adds `--insecure`
+    /// when the Step holds no registry login, is refused (exit 2) when it
+    /// holds one, since `--insecure` also skips TLS verification, and
+    /// anything but `true` or `false` is refused.
     #[cfg(unix)]
     #[test]
     fn the_push_step_pushes_the_layout_and_reports_the_digest() {
@@ -8288,6 +8292,20 @@ mod tests {
             (Some(0), true)
         );
         assert_eq!(called().lines().last(), Some("--insecure"));
+        // A registry login at $DOCKER_CONFIG/config.json (the credential
+        // mount, or a profile's /ecr-login): refused before crane runs.
+        write_layout(&ws);
+        let login = base.join("registry").display().to_string();
+        assert_eq!(
+            run(&[
+                ("SCARAB_BUILD_INSECURE_PUSH", "true"),
+                ("DOCKER_CONFIG", login.as_str()),
+            ]),
+            (Some(2), false)
+        );
+        // The same login without insecure_push pushes.
+        assert_eq!(run(&[("DOCKER_CONFIG", login.as_str())]), (Some(0), true));
+        assert_ne!(called().lines().last(), Some("--insecure"));
         write_layout(&ws);
         assert_eq!(
             run(&[("SCARAB_BUILD_INSECURE_PUSH", "yes")]),
