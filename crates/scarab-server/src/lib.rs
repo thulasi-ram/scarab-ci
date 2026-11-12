@@ -6817,8 +6817,8 @@ fn k8s_overlay_reserved_prefix_list() -> String {
 }
 
 /// One refusal per reserved key the overlay touches under `metadata.labels`
-/// or `metadata.annotations`. The overlay is an RFC-7386 merge patch, so a
-/// `null` deletes the key: a `null` (or non-object) `metadata`, `labels` or
+/// or `metadata.annotations`. The overlay's objects merge as in an RFC-7386
+/// merge patch, so a `null` deletes the key: a `null` (or non-object) `metadata`, `labels` or
 /// `annotations` replaces the whole map, reserved keys included, and is
 /// refused too. Empty when the overlay leaves every reserved key alone.
 fn k8s_overlay_reserved_keys(overlay: &serde_json::Value) -> Vec<String> {
