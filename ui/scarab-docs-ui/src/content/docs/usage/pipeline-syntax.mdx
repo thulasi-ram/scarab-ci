@@ -1151,8 +1151,10 @@ An operator marks a profile `registry_auth_only: true` when it grants push acces
 only to a step with `registry_auth` that the launch found eligible for a registry credential: a
 step from a library your org trusts with the registry credential, in a Run that is not a fork pull
 request or locked out of its Environment's secrets. It applies whether or not a credential
-resolves. Named on any other step it fails that step's launch; on a `registry_auth` step the
-launch did not find eligible it is left out. A marked profile cannot be the
+resolves, so a profile that logs in itself works with no `REGISTRY_AUTH` secret
+([Pushing images to Amazon ECR](/scarab-ci/usage/pushing-to-ecr/)). Named on any other step it
+fails that step's launch; on a `registry_auth` step the launch did not find eligible it is left
+out. A marked profile cannot be the
 `default` ([Building an image](#building-an-image) shows the map form that routes one to the push
 step).
 

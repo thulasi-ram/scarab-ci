@@ -2803,6 +2803,7 @@ dependencies = [
  "scarab-workspace-client",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tar",
  "tempfile",
  "tokio",
