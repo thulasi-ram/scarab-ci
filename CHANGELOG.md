@@ -18,6 +18,15 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **A step waiting for an autoscaled node no longer fails at once.** On a cluster whose node
+  pools scale to zero (Karpenter, Cluster Autoscaler), the scheduler calls every Pod that needs a
+  new node Unschedulable until the node joins; Scarab failed such a step within a second, and
+  its retries were spent before the autoscaler launched a node. A step Pod now waits up to
+  `SCARAB_UNSCHEDULABLE_GRACE_SECS` (chart value `scarab.unschedulableGraceSecs`, default 300)
+  for a node, then fails with the scheduler's message as before. `0` keeps the old behaviour.
+
 ## [0.4.0] - 2026-11-12
 
 ### Breaking changes

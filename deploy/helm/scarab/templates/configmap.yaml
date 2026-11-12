@@ -81,6 +81,9 @@ data:
   {{- with .Values.scarab.stepTimeoutSecs }}
   SCARAB_STEP_TIMEOUT_SECS: {{ . | quote }}
   {{- end }}
+  {{- if ne (toString .Values.scarab.unschedulableGraceSecs) "" }}
+  SCARAB_UNSCHEDULABLE_GRACE_SECS: {{ .Values.scarab.unschedulableGraceSecs | quote }}
+  {{- end }}
   {{- with .Values.scarab.projectRunCap }}
   SCARAB_PROJECT_RUN_CAP: {{ . | quote }}
   {{- end }}
