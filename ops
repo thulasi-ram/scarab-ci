@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1794462711,"nonce":"px+jxnSfKDVn0A/WIDXbjig9Xhs=","title":"build: read-only pull credential for the build Step (private base images), separate from the push credential","was":"x"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1794462712,"nonce":"oM4/FnCE+JH47dFt/xNocfMygQ0=","added":["type:enhancement","area:build","security"],"removed":null}]}
