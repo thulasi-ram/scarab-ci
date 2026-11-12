@@ -37,6 +37,9 @@ tracing = { workspace = true }
 scarab-workspace-client = { workspace = true }
 
 [dev-dependencies]
+# The ECR docs page's placement profile is parsed from its chart-values YAML
+# as written (git-bug ace8135), the way the server parses the placement file.
+serde_yaml = { workspace = true }
 scarab-storage-s3 = { workspace = true }
 # The live orphan-Pod teardown regression (tests/cluster.rs) drives the REAL
 # executor through the engine's supersede-teardown path over the in-memory Db.

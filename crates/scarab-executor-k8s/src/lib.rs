@@ -7086,6 +7086,253 @@ mod tests {
         assert!(!parsed.profiles[1].registry_auth_only);
     }
 
+    /// The "Pushing images to Amazon ECR" docs page, read whole: the tests
+    /// below prove the page's own `ecr-push` profile (git-bug ace8135).
+    const ECR_PAGE: &str =
+        include_str!("../../../ui/scarab-docs-ui/src/content/docs/usage/pushing-to-ecr.mdx");
+
+    /// The page's chart values (the one `yaml` block with a top-level
+    /// `scarab:` key), with `scarab.placement` parsed as the server parses
+    /// `SCARAB_PLACEMENT_CONFIG_FILE`: the chart renders that key into the
+    /// file verbatim.
+    fn ecr_page_placement() -> PlacementConfig {
+        let mut values = Vec::new();
+        let mut block: Option<String> = None;
+        for line in ECR_PAGE.lines() {
+            match (&mut block, line.trim_start()) {
+                (None, "```yaml") => block = Some(String::new()),
+                (Some(_), "```") => values.push(block.take().unwrap()),
+                (Some(b), _) => {
+                    b.push_str(line);
+                    b.push('\n');
+                }
+                (None, _) => {}
+            }
+        }
+        let chart: Vec<serde_yaml::Value> = values
+            .iter()
+            .map(|b| serde_yaml::from_str::<serde_yaml::Value>(b).unwrap())
+            .filter(|v| v.get("scarab").is_some())
+            .collect();
+        assert_eq!(chart.len(), 1, "one chart-values block on the page");
+        let placement: PlacementConfig =
+            serde_yaml::from_value(chart[0]["scarab"]["placement"].clone())
+                .expect("the page's placement values parse as the server's config");
+        assert_eq!(placement.validate(), Ok(()));
+        placement
+    }
+
+    /// The build library's push Step as the page sets it up: it needs the
+    /// build Step's workspace, runs as root, asks for `registry_auth`, names
+    /// `ecr-push`, and its launch found it eligible with no credential
+    /// resolved (no `REGISTRY_AUTH` secret, no forge trust).
+    fn ecr_push_step() -> StepSpec {
+        let mut spec = full_spec();
+        spec.run_as_root = true;
+        spec.placement_profiles = vec!["ecr-push".into()];
+        spec.registry_auth = Some(scarab_engine::RegistryAuthConfig {
+            owner: "acme".into(),
+            name: "web".into(),
+            library: Some("ab".repeat(32)),
+            credential_eligible: true,
+            ..Default::default()
+        });
+        spec
+    }
+
+    /// git-bug ace8135: the page's `ecr-push` profile is marked
+    /// `registry_auth_only`, passes the placement guards on an eligible push
+    /// Step's Pod, and gives it the ServiceAccount, the login init container
+    /// after Scarab's own (as uid 0, the push Step's uid), the memory volume,
+    /// the read-only mount and `DOCKER_CONFIG` on the step container, and an
+    /// IRSA skip annotation naming every container Scarab built, while
+    /// Scarab's containers, volumes and the step container's own wiring are
+    /// as built.
+    #[test]
+    fn the_ecr_push_profile_from_the_docs_applies_to_an_eligible_push_step() {
+        let placement = ecr_page_placement();
+        let profile = placement.profile("ecr-push").expect("the page's profile");
+        assert!(profile.registry_auth_only && !profile.default);
+
+        let spec = ecr_push_step();
+        let built = full_pod_for(&spec);
+        let before = built.spec.clone().unwrap();
+        let after_pod = apply_placement(built.clone(), "image/push", &spec, &placement)
+            .expect("the docs page's profile passes the placement guards");
+        let after = after_pod.spec.clone().unwrap();
+
+        assert_eq!(
+            after.service_account_name.as_deref(),
+            Some("scarab-ecr-push")
+        );
+        assert_eq!(after.automount_service_account_token, Some(false));
+
+        // `ecr-login` runs after every init container Scarab added, and
+        // each of those is unchanged.
+        let mut want_inits = init_names(&before);
+        for ours in [
+            RESULTS_EGRESS_CONTAINER,
+            WORKSPACE_INIT_CONTAINER,
+            WORKSPACE_EGRESS_CONTAINER,
+        ] {
+            assert!(want_inits.contains(&ours.to_string()), "{want_inits:?}");
+        }
+        want_inits.push("ecr-login".into());
+        assert_eq!(init_names(&after), want_inits);
+        let inits_after = after.init_containers.as_ref().unwrap();
+        for c in before.init_containers.as_ref().unwrap() {
+            assert_eq!(
+                inits_after.iter().find(|a| a.name == c.name),
+                Some(c),
+                "Scarab's init container `{}` changed",
+                c.name
+            );
+        }
+        let login = inits_after.last().unwrap();
+        assert_eq!(login.name, "ecr-login");
+        let mounts = login.volume_mounts.as_ref().unwrap();
+        assert_eq!(mounts.len(), 1, "the login mounts only its own volume");
+        assert_eq!(mounts[0].mount_path, "/ecr-login");
+        let login_sc = login.security_context.as_ref().unwrap();
+        let (b, a) = (step_container(&before), step_container(&after));
+        assert_eq!(
+            login_sc.run_as_user,
+            b.security_context.as_ref().unwrap().run_as_user,
+            "the login writes its 0600 file as the push Step's uid"
+        );
+        assert_eq!(login_sc.run_as_user, Some(0));
+        assert_eq!(
+            login_sc.capabilities.as_ref().unwrap().drop,
+            Some(vec!["ALL".to_string()])
+        );
+
+        // Scarab's volumes are as built; the memory-backed volume is added.
+        let vols_after = after.volumes.as_ref().unwrap();
+        for v in before.volumes.as_ref().unwrap() {
+            assert!(
+                vols_after.contains(v),
+                "Scarab's volume `{}` changed",
+                v.name
+            );
+        }
+        let ecr = vols_after.iter().find(|v| v.name == "ecr-login").unwrap();
+        assert_eq!(
+            ecr.empty_dir.as_ref().unwrap().medium.as_deref(),
+            Some("Memory")
+        );
+
+        // The step container keeps its image, command, security context and
+        // every built env and mount; the profile adds the mount and
+        // DOCKER_CONFIG, and Scarab mounted no registry credential.
+        assert_eq!(a.image, b.image);
+        assert_eq!(a.command, b.command);
+        assert_eq!(a.security_context, b.security_context);
+        let env_after = a.env.as_ref().unwrap();
+        for e in b.env.as_ref().unwrap() {
+            assert!(env_after.contains(e), "built env `{}` changed", e.name);
+        }
+        assert!(b
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|e| e.name != "DOCKER_CONFIG"));
+        assert_eq!(
+            env_after
+                .iter()
+                .find(|e| e.name == "DOCKER_CONFIG")
+                .and_then(|e| e.value.as_deref()),
+            Some("/ecr-login")
+        );
+        let mut want_mounts = b.volume_mounts.clone().unwrap();
+        assert!(want_mounts
+            .iter()
+            .all(|m| m.mount_path != REGISTRY_AUTH_MOUNT_PATH));
+        want_mounts.push(VolumeMount {
+            name: "ecr-login".into(),
+            mount_path: "/ecr-login".into(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(a.volume_mounts.as_ref(), Some(&want_mounts));
+        assert_eq!(after.containers.len(), 1);
+
+        // The IRSA skip annotation names every container Scarab built, so
+        // only `ecr-login` gets the role; Scarab's own annotations are kept.
+        let ann_before = built.metadata.annotations.clone().unwrap_or_default();
+        let ann_after = after_pod.metadata.annotations.clone().unwrap();
+        for (k, v) in &ann_before {
+            assert_eq!(ann_after.get(k), Some(v), "annotation `{k}` changed");
+        }
+        let skipped: Vec<&str> = ann_after
+            .get("eks.amazonaws.com/skip-containers")
+            .expect("the skip annotation")
+            .split(',')
+            .collect();
+        let mut built_names = init_names(&before);
+        built_names.extend(before.containers.iter().map(|c| c.name.clone()));
+        for name in &built_names {
+            assert!(skipped.contains(&name.as_str()), "`{name}` gets the role");
+        }
+        assert!(!skipped.contains(&"ecr-login"));
+        // The page's table lists the same containers.
+        for name in &built_names {
+            assert!(ECR_PAGE.contains(&format!("| `{name}` |")), "{name}");
+        }
+    }
+
+    /// The page's warning: where the launch resolved a registry credential
+    /// for the push Step (a `REGISTRY_AUTH` secret, or the forge-derived
+    /// one), Scarab sets `DOCKER_CONFIG` itself, and the `ecr-push` profile
+    /// is refused at launch, naming the variable and the profile.
+    #[test]
+    fn the_ecr_push_profile_from_the_docs_is_refused_where_scarab_mounts_a_registry_credential() {
+        let placement = ecr_page_placement();
+        for derived in [false, true] {
+            let mut spec = ecr_push_step();
+            let auth = spec.registry_auth.as_mut().unwrap();
+            if derived {
+                auth.derived_auth = Some(scarab_engine::RegistryCredential {
+                    registry: "ghcr.io".into(),
+                    username: "x-access-token".into(),
+                    token: "t".into(),
+                });
+            } else {
+                auth.registry_auth_json = Some(r#"{"auths":{}}"#.into());
+            }
+            let err =
+                apply_placement(full_pod_for(&spec), "image/push", &spec, &placement).unwrap_err();
+            assert!(
+                err.contains("placement_profile `ecr-push`") && err.contains("`DOCKER_CONFIG`"),
+                "{derived}: {err}"
+            );
+        }
+    }
+
+    // Attack: an author names the page's `ecr-push` profile on the build library's sandboxed build Step (a Dockerfile RUN shares buildkitd's PID namespace), or on a fork's push Step. Safe outcome: the build Step's launch fails naming the profile; on the fork's push Step the profile is left out, so the Pod never runs as the push ServiceAccount.
+    #[test]
+    fn the_ecr_push_profile_from_the_docs_never_reaches_the_build_step_or_a_fork() {
+        let placement = ecr_page_placement();
+        let mut build = full_spec();
+        build.sandbox = Some(sandbox_config());
+        build.placement_profiles = vec!["ecr-push".into()];
+        let err =
+            apply_placement(full_pod_for(&build), "image/image", &build, &placement).unwrap_err();
+        assert!(
+            err.contains("`ecr-push`") && err.contains("step `image/image`"),
+            "{err}"
+        );
+
+        let mut fork = ecr_push_step();
+        let auth = fork.registry_auth.as_mut().unwrap();
+        auth.locked_out = true;
+        auth.credential_eligible = false;
+        let pod = apply_placement(full_pod_for(&fork), "image/push", &fork, &placement).unwrap();
+        let ps = pod.spec.unwrap();
+        assert_eq!(ps.service_account_name, None);
+        assert!(!init_names(&ps).contains(&"ecr-login".to_string()));
+    }
+
     #[test]
     fn placement_baseline_is_stamped_on_every_pod() {
         let spec = busybox(); // no placement fields at all
