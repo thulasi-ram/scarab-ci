@@ -383,7 +383,8 @@ Its outputs:
   object's compact JSON text.
 - `outputs.image.push` is set only when the image was pushed: `{"ref": "<repository>@sha256:…",
   "digest": "sha256:…"}`, as crane reported the push. When nothing was pushed (`push: false`,
-  or a fork pull request) it is empty.
+  or a fork pull request) there is no such result, and a step that reads it fails before it
+  launches, so read it only where the image is pushed.
 
 - **The registry credential.** Only the push step asks for `registry_auth: true`. It receives a
   credential only when the org trusts the library's source with the registry credential
