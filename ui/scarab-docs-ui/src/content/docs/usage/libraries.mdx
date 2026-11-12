@@ -214,6 +214,8 @@ Settings › Libraries (**Trust source**), or with the API:
 
 ```sh
 curl -X POST "$SCARAB/v1/orgs/acme/library-trust" \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $SCARAB_TOKEN" \
   -d '{"source": "github.com/thulasi-ram/scarab-ci//libs/clone.yaml", "grant": "forge_credentials"}'
 ```
 
@@ -245,6 +247,8 @@ with the API:
 
 ```sh
 curl -X POST "$SCARAB/v1/orgs/acme/library-trust" \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $SCARAB_TOKEN" \
   -d '{"source": "github.com/thulasi-ram/scarab-ci//libs/build.yaml", "grant": "build_sandbox"}'
 ```
 
@@ -266,6 +270,8 @@ needs the source trusted with forge credentials as well. No source is trusted by
 
 ```sh
 curl -X POST "$SCARAB/v1/orgs/acme/library-trust" \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $SCARAB_TOKEN" \
   -d '{"source": "github.com/thulasi-ram/scarab-ci//libs/build.yaml", "grant": "registry_credential"}'
 ```
 
