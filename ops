@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1794463301,"nonce":"TDF374lnGURWqOvslfSQ2r8tZ08=","title":"build: push Step should check the layout's digest against the build Step's BuildKit metadata","was":"x"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1794463301,"nonce":"GS2tX+PyRvx2X803t80jkkCCQJ0=","added":["type:enhancement"],"removed":null}]}
