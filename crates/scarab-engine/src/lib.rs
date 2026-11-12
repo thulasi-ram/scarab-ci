@@ -1118,6 +1118,15 @@ pub struct RegistryAuthConfig {
     /// at LAUNCH — **never serialized**.
     #[serde(skip)]
     pub derived_auth: Option<RegistryCredential>,
+    /// Set at LAUNCH, only once the launch found the Step may receive a
+    /// credential: not a fork pull request, not locked out, and its library
+    /// still trusted with the registry credential. `registry_auth` alone does
+    /// not mean this: a Step written in the Pipeline file, or from an
+    /// untrusted library, has it with no library. The executor applies a
+    /// `registry_auth_only` placement profile only when it is set. Never
+    /// stored, so a stored spec never carries it.
+    #[serde(skip)]
+    pub credential_eligible: bool,
 }
 
 /// The in-memory half of a derived registry credential (mirrors the forge

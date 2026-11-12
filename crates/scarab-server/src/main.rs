@@ -684,6 +684,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => PlacementConfig::default(),
     };
+    placement
+        .validate()
+        .map_err(|e| format!("invalid placement config: {e}"))?;
 
     // Declarative connections (ADR-0060 part D): the `connections:` block is
     // ALREADY parsed, validated and credential-resolved by the config gate — so

@@ -1898,6 +1898,16 @@ pub struct PlacementProfile {
     /// change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub k8s: Option<serde_json::Value>,
+    /// The profile carries a registry credential (a ServiceAccount with a
+    /// push role, an init container that logs in): the executor applies it
+    /// only to a Step with `registry_auth` whose credential the launch
+    /// resolved (a trusted library, not a fork). Named on any other Step it
+    /// fails the launch; on a `registry_auth` Step that gets no credential
+    /// it is left out. An author names profiles, so this, not a Policy, is
+    /// what keeps a push credential off a Step that runs repository code.
+    /// It cannot be the `default` profile. Absent: `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub registry_auth_only: bool,
 }
 
 /// A **RetentionProfile** (ADR-0065 s2, git-bug 82c5775): an operator-owned,
@@ -4319,12 +4329,14 @@ fn invoke_output_scope(step: &mut StepSpec, exposed: &BTreeMap<String, Option<Ve
 /// Step holding a long-lived forge token next to its own. It does carry onto
 /// a Step with `registry_auth` or a `security.sandbox` (ADR-0018 amendment of
 /// 2026-11-12): profiles are written by the operator and an author can only
-/// name one, a build for another architecture needs that architecture's
-/// nodes, and an org Policy over `steps[].placement_profiles` and
-/// `steps[].origin` decides which Runs may name which profile. Written as a
-/// map from library Step id, each Step gets only its own entry, so a profile
-/// that carries a push credential reaches the Step that pushes and no other.
-/// `lib_step` is the Step's id in the library.
+/// name one, and a build for another architecture needs that architecture's
+/// nodes. A profile that carries a registry credential is marked
+/// [`PlacementProfile::registry_auth_only`] by the operator, and the executor
+/// refuses to apply it to any Step but a `registry_auth` Step whose
+/// credential the launch resolved; so a list naming one fails the sandboxed
+/// build Step, and the author writes the map form instead. Written as a map
+/// from library Step id, each Step gets only its own entry. `lib_step` is the
+/// Step's id in the library.
 fn carry_invoke_fields(invoke: &StepSpec, lib_step: &str, inst: &mut StepSpec) {
     if !inst.is_gate() {
         if inst.timeout.is_none() {
@@ -6952,11 +6964,13 @@ mod tests {
                 name: "arm64".into(),
                 default: false,
                 k8s: None,
+                registry_auth_only: false,
             },
             PlacementProfile {
                 name: "big".into(),
                 default: true,
                 k8s: None,
+                registry_auth_only: false,
             },
         ];
         assert_eq!(

@@ -777,6 +777,7 @@ impl ForgeCredentialExecutor {
         let mut out = config.clone();
         out.registry_auth_json = None;
         out.derived_auth = None;
+        out.credential_eligible = false;
         if config.locked_out || self.run_is_fork_pr(step).await? {
             out.locked_out = true;
             return Ok(out);
@@ -791,6 +792,10 @@ impl ForgeCredentialExecutor {
         {
             return Ok(out);
         }
+        // Not a fork, not locked out, and the library is still trusted with
+        // the registry credential: a placement profile that carries one may
+        // apply (`registry_auth_only`), whether or not a secret resolves.
+        out.credential_eligible = true;
         let forge_derived = match &config.forge_library {
             Some(hash) => self
                 .library_still_trusted(&config.owner, hash, TrustGrant::ForgeCredentials)

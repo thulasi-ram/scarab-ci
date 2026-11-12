@@ -7288,6 +7288,8 @@ async fn write_run_from_ir(
                     forge_library: admitted.registry.forge.get(&step.id).cloned(),
                     registry_auth_json: None,
                     derived_auth: None,
+                    // Decided at each launch, never at Run creation.
+                    credential_eligible: false,
                 });
             let admitted = admit_step_grants(
                 gov.privilege_grant_scope(),

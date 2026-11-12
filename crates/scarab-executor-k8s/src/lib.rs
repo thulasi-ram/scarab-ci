@@ -163,6 +163,22 @@ pub struct PlacementConfig {
 }
 
 impl PlacementConfig {
+    /// The checks the server makes when it loads the config: a profile that
+    /// carries a registry credential (`registry_auth_only`) cannot be the
+    /// `default`, which a Step gets without naming any.
+    pub fn validate(&self) -> Result<(), String> {
+        for p in &self.profiles {
+            if p.default && p.registry_auth_only {
+                return Err(format!(
+                    "placement profile `{}` sets both `default` and `registry_auth_only`; a \
+                     profile that carries a registry credential cannot be the default",
+                    p.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn profile(&self, name: &str) -> Option<&scarab_pipeline::PlacementProfile> {
         // The shared named-registry lookup (ADR-0065 consequence): two
         // operator profile types exist now, so the machinery lives in
@@ -2789,7 +2805,8 @@ impl Executor for K8sExecutor {
         // ADR-0055: stamp the baseline, merge the named PlacementProfiles + the
         // governed k8s_overlay, and apply requested resources — fallible because a
         // named profile might not exist in the registry (fail-closed).
-        let pod = apply_placement(pod, spec, &self.placement).map_err(ExecError::Launch)?;
+        let pod =
+            apply_placement(pod, &step.step.0, spec, &self.placement).map_err(ExecError::Launch)?;
         match pods.create(&PostParams::default(), &pod).await {
             Ok(created) => {
                 self.ensure_step_secrets(&name, &created, step, spec)
@@ -5120,11 +5137,14 @@ pub fn build_pod(
 /// RFC-7386 merge-patches (objects merge recursively; arrays/scalars replace).
 ///
 /// Returns `Err` if a step names a PlacementProfile absent from the registry —
-/// fail-closed, never a silently mis-scheduled Pod. A no-op (returns the Pod
-/// unchanged) when there is no baseline, no profile, no overlay and no resources,
-/// preserving the pre-0055 behavior exactly.
+/// fail-closed, never a silently mis-scheduled Pod — or names a
+/// `registry_auth_only` profile without asking for `registry_auth` (see
+/// [`registry_auth_only_applies`]). A no-op (returns the Pod unchanged) when
+/// there is no baseline, no profile, no overlay and no resources, preserving
+/// the pre-0055 behavior exactly. `step` names the Step in an error.
 fn apply_placement(
     mut pod: Pod,
+    step: &str,
     spec: &StepSpec,
     placement: &PlacementConfig,
 ) -> Result<Pod, String> {
@@ -5158,6 +5178,9 @@ fn apply_placement(
         let profile = placement
             .profile(name)
             .ok_or_else(|| format!("unknown placement_profile `{name}` (not in the registry)"))?;
+        if profile.registry_auth_only && !registry_auth_only_applies(step, name, spec)? {
+            continue;
+        }
         if let Some(k8s) = &profile.k8s {
             json_merge(&mut overlay, k8s);
         }
@@ -5176,6 +5199,39 @@ fn apply_placement(
             .map_err(|e| format!("pod decode after overlay merge: {e}"))?;
     }
     Ok(pod)
+}
+
+/// Whether a `registry_auth_only` profile (one that carries a registry
+/// credential, such as a ServiceAccount with a push role) applies to `spec`.
+/// An author names profiles, so the operator's marker is what keeps such a
+/// profile off a Step that runs repository code:
+///
+/// - a Step without `registry_auth` (a run Step, the build library's
+///   sandboxed build Step) may not name it: `Err`, which fails the launch;
+/// - a `registry_auth` Step whose launch resolved no credential (a fork pull
+///   request, a Run locked out of its Environment, a Step from the Pipeline
+///   file or an untrusted library) runs without it: `Ok(false)`, so a fork's
+///   push Step still succeeds and pushes nothing;
+/// - a `registry_auth` Step the launch found eligible gets it: `Ok(true)`.
+fn registry_auth_only_applies(step: &str, name: &str, spec: &StepSpec) -> Result<bool, String> {
+    match &spec.registry_auth {
+        None => Err(format!(
+            "placement profile `{name}` carries a registry credential and applies only to a \
+             step with `registry_auth`; step `{step}` has none. Name it only for the step that \
+             pushes (for an invoke, `placement_profiles: {{ push: [{name}] }}`)"
+        )),
+        Some(auth) if !auth.credential_eligible => {
+            tracing::info!(
+                %step,
+                profile = %name,
+                "placement profile left out: it carries a registry credential, and this launch \
+                 resolved none for the step (a fork pull request, a locked-out Run, or a step \
+                 its library's trust does not cover)"
+            );
+            Ok(false)
+        }
+        Some(_) => Ok(true),
+    }
 }
 
 /// RFC-7386 JSON merge-patch: objects merge recursively; a `null` in the patch
@@ -6467,6 +6523,7 @@ mod tests {
             name: name.into(),
             default: false,
             k8s: Some(k8s),
+            registry_auth_only: false,
         }
     }
 
@@ -6484,6 +6541,125 @@ mod tests {
         )
     }
 
+    /// A registry with `ecr-push`, a profile that carries a registry
+    /// credential (a ServiceAccount with a push role), marked
+    /// `registry_auth_only`.
+    fn with_push_profile() -> PlacementConfig {
+        let mut push = profile(
+            "ecr-push",
+            serde_json::json!({"spec": {"serviceAccountName": "ecr-pusher"}}),
+        );
+        push.registry_auth_only = true;
+        PlacementConfig {
+            profiles: vec![push],
+            ..Default::default()
+        }
+    }
+
+    fn service_account(pod: Pod) -> Option<String> {
+        pod.spec.unwrap().service_account_name
+    }
+
+    // Attack: an author names the operator's push-credential profile on a Step that runs repository code: a plain run Step, or (through an invoke's list form, or a map aimed at `image`) the build library's sandboxed build Step, where a Dockerfile RUN shares buildkitd's PID namespace. Safe outcome: the launch fails naming the profile and the Step; the profile is never merged.
+    #[test]
+    fn a_registry_auth_only_profile_fails_a_step_without_registry_auth() {
+        let placement = with_push_profile();
+        let mut run = busybox();
+        run.placement_profiles = vec!["ecr-push".into()];
+        let mut sandboxed = run.clone();
+        sandboxed.sandbox = Some(sandbox_config());
+        for (id, spec) in [("steal", &run), ("image/image", &sandboxed)] {
+            let err = apply_placement(pod_for(spec), id, spec, &placement).unwrap_err();
+            assert!(
+                err.contains("`ecr-push`")
+                    && err.contains(&format!("step `{id}`"))
+                    && err.contains("registry_auth"),
+                "{err}"
+            );
+        }
+    }
+
+    /// A `registry_auth` Step gets the marked profile only when its launch
+    /// resolved a credential for it. A fork pull request's push Step (and a
+    /// locked-out Run's, and one from the Pipeline file or an untrusted
+    /// library) runs without the profile and does not fail, so its build
+    /// stays green and pushes nothing; a trusted push Step gets it.
+    #[test]
+    fn a_registry_auth_only_profile_applies_only_to_an_eligible_push_step() {
+        let placement = with_push_profile();
+        let mut push = busybox();
+        push.placement_profiles = vec!["ecr-push".into()];
+        push.registry_auth = Some(scarab_engine::RegistryAuthConfig {
+            owner: "acme".into(),
+            name: "web".into(),
+            locked_out: true,
+            ..Default::default()
+        });
+        let pod = apply_placement(pod_for(&push), "image/push", &push, &placement)
+            .expect("a fork's push Step launches");
+        assert_eq!(service_account(pod), None, "the profile is left out");
+
+        let auth = push.registry_auth.as_mut().unwrap();
+        auth.locked_out = false;
+        auth.library = Some("ab".repeat(32));
+        auth.credential_eligible = true;
+        let pod = apply_placement(pod_for(&push), "image/push", &push, &placement).unwrap();
+        assert_eq!(service_account(pod).as_deref(), Some("ecr-pusher"));
+    }
+
+    // Attack: a fork pull request's Pipeline (read at the PR head) adds its own Step that names the push-credential profile, with and without `registry_auth: true`, as Run creation stores it. Safe outcome: without `registry_auth` the launch fails; with it, the launch decorator resolves no credential for a Pipeline-file Step, so the profile is left out and the Step never runs with the ServiceAccount.
+    #[test]
+    fn a_fork_authors_step_never_gets_a_registry_auth_only_profile() {
+        let placement = with_push_profile();
+        let ir = scarab_pipeline::compile_yaml(
+            "steps:\n  - { id: steal, image: alpine, command: [cat, /var/run/secrets/eks.amazonaws.com/serviceaccount/token], placement_profiles: [ecr-push] }\n  - { id: steal2, image: alpine, command: [cat], registry_auth: true, placement_profiles: [ecr-push] }\n",
+        )
+        .unwrap();
+        let stored = |id: &str| {
+            let s = ir.steps.iter().find(|s| s.id == id).unwrap();
+            let mut spec = busybox();
+            spec.placement_profiles = s.placement_profiles.compiled().unwrap().to_vec();
+            // As Run creation stores it for a fork, and the launch decorator
+            // passes it on: locked out, no library, not eligible.
+            spec.registry_auth = s.registry_auth.then(|| scarab_engine::RegistryAuthConfig {
+                owner: "acme".into(),
+                name: "web".into(),
+                locked_out: true,
+                ..Default::default()
+            });
+            spec
+        };
+        let steal = stored("steal");
+        assert!(apply_placement(pod_for(&steal), "steal", &steal, &placement).is_err());
+        let steal2 = stored("steal2");
+        let pod = apply_placement(pod_for(&steal2), "steal2", &steal2, &placement).unwrap();
+        assert_eq!(service_account(pod), None);
+    }
+
+    /// A profile that carries a registry credential cannot be the default:
+    /// the server refuses the config when it loads it.
+    #[test]
+    fn a_default_registry_auth_only_profile_is_refused() {
+        let mut placement = with_push_profile();
+        assert_eq!(placement.validate(), Ok(()));
+        placement.profiles[0].default = true;
+        assert!(placement
+            .validate()
+            .unwrap_err()
+            .contains("`ecr-push` sets both `default` and `registry_auth_only`"));
+        // In the operator's file the marker is a plain key, `false` when absent.
+        let parsed: PlacementConfig = serde_json::from_value(serde_json::json!({
+            "profiles": [
+                { "name": "ecr-push", "registry_auth_only": true,
+                  "k8s": { "spec": { "serviceAccountName": "x" } } },
+                { "name": "big" }
+            ]
+        }))
+        .unwrap();
+        assert!(parsed.profiles[0].registry_auth_only);
+        assert!(!parsed.profiles[1].registry_auth_only);
+    }
+
     #[test]
     fn placement_baseline_is_stamped_on_every_pod() {
         let spec = busybox(); // no placement fields at all
@@ -6495,7 +6671,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let ps = apply_placement(pod_for(&spec), &spec, &placement)
+        let ps = apply_placement(pod_for(&spec), "s", &spec, &placement)
             .unwrap()
             .spec
             .unwrap();
@@ -6522,7 +6698,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let ps = apply_placement(pod_for(&spec), &spec, &placement)
+        let ps = apply_placement(pod_for(&spec), "s", &spec, &placement)
             .unwrap()
             .spec
             .unwrap();
@@ -6546,7 +6722,7 @@ mod tests {
             cpu_millis: Some(8000),
             memory_mib: Some(16384),
         };
-        let ps = apply_placement(pod_for(&spec), &spec, &PlacementConfig::default())
+        let ps = apply_placement(pod_for(&spec), "s", &spec, &PlacementConfig::default())
             .unwrap()
             .spec
             .unwrap();
@@ -6570,7 +6746,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let ps = apply_placement(pod_for(&spec), &spec, &placement)
+        let ps = apply_placement(pod_for(&spec), "s", &spec, &placement)
             .unwrap()
             .spec
             .unwrap();
@@ -6586,7 +6762,8 @@ mod tests {
     fn unknown_placement_profile_is_fail_closed() {
         let mut spec = busybox();
         spec.placement_profiles = vec!["ghost".into()];
-        let err = apply_placement(pod_for(&spec), &spec, &PlacementConfig::default()).unwrap_err();
+        let err =
+            apply_placement(pod_for(&spec), "s", &spec, &PlacementConfig::default()).unwrap_err();
         assert!(
             err.contains("unknown placement_profile `ghost`"),
             "got: {err}"
@@ -6601,7 +6778,7 @@ mod tests {
             baseline: Some(serde_json::json!({"spec":{"schedulerName":"default-sched"}})),
             ..Default::default()
         };
-        let ps = apply_placement(pod_for(&spec), &spec, &placement)
+        let ps = apply_placement(pod_for(&spec), "s", &spec, &placement)
             .unwrap()
             .spec
             .unwrap();
@@ -6613,9 +6790,10 @@ mod tests {
         let spec = busybox();
         let pod = pod_for(&spec);
         let before = serde_json::to_value(&pod).unwrap();
-        let after =
-            serde_json::to_value(apply_placement(pod, &spec, &PlacementConfig::default()).unwrap())
-                .unwrap();
+        let after = serde_json::to_value(
+            apply_placement(pod, "s", &spec, &PlacementConfig::default()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(before, after);
     }
 

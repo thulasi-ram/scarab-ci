@@ -327,6 +327,7 @@ fn push_spec(forge_library: bool) -> StepSpec {
             forge_library: forge_library.then(|| content_hash(BUILD)),
             registry_auth_json: None,
             derived_auth: None,
+            credential_eligible: false,
         }),
         ..build_spec()
     }
@@ -433,6 +434,10 @@ async fn registry_auth_resolves_the_secret_and_the_forge_credential_only_by_trus
         Some(REGISTRY_AUTH)
     );
     assert_eq!(auth.derived_auth, None);
+    assert!(
+        auth.credential_eligible,
+        "trusted, not a fork: a registry_auth_only placement profile may apply"
+    );
     // Never stored, never serialized.
     let wire = serde_json::to_string(&inner.launched_spec(&handle).unwrap()).unwrap();
     assert!(!wire.contains("eDp5"), "{wire}");
@@ -492,6 +497,10 @@ async fn a_fork_pull_request_gets_no_registry_credential_at_launch() {
     let auth = inner.launched_spec(&handle).unwrap().registry_auth.unwrap();
     assert_eq!((auth.registry_auth_json, auth.derived_auth), (None, None));
     assert!(auth.locked_out);
+    assert!(
+        !auth.credential_eligible,
+        "a fork's push Step gets no registry_auth_only placement profile"
+    );
 
     // The stored lock alone refuses it too.
     let inner = Arc::new(FakeExecutor::new());
@@ -562,6 +571,7 @@ async fn a_launch_after_the_registry_credential_trust_is_revoked_gets_no_credent
         .unwrap();
     let auth = inner.launched_spec(&handle).unwrap().registry_auth.unwrap();
     assert_eq!((auth.registry_auth_json, auth.derived_auth), (None, None));
+    assert!(!auth.credential_eligible, "trust revoked: not eligible");
 }
 
 // ---------------------------------------------------------------------------
@@ -754,9 +764,13 @@ async fn the_registry_auth_secret_does_not_reach_a_step_written_in_the_pipeline_
     };
     let handle = exec.launch(&step, &spec).await.unwrap();
     let launched = inner.launched_spec(&handle).unwrap();
+    let auth = launched.registry_auth.expect("registry_auth");
+    assert!(
+        !auth.credential_eligible,
+        "a Pipeline-file Step is eligible for a registry_auth_only placement profile"
+    );
     assert_eq!(
-        launched.registry_auth.and_then(|a| a.registry_auth_json),
-        None,
+        auth.registry_auth_json, None,
         "a Pipeline-file Step with its own command received the REGISTRY_AUTH secret"
     );
 }
