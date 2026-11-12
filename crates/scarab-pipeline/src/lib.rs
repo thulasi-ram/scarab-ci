@@ -10645,7 +10645,7 @@ mod tests {
     // Attack: a library's push Step (registry_auth, no sandbox) passes a caller's input into its command or into an env name a program runs as code (`LD_PRELOAD`), so the caller picks what runs beside the registry credential. Safe outcome: the same rule as a sandboxed or forge_token Step; the image and command are written in full and a templated value reaches only a `SCARAB_<NAME>` env.
     #[test]
     fn a_registry_auth_step_takes_outside_values_only_through_scarab_env() {
-        let lib = "kind: library\ninterface: { inputs: [{ name: x, type: string }] }\nsteps:\n  - id: push\n    image: alpine\n    registry_auth: true\n    command: [sh, -c, \"${{ inputs.x }}\"]\n    env: [[LD_PRELOAD, \"${{ inputs.x }}\"], [SCARAB_X, \"${{ inputs.x }}\"]]\n";
+        let lib = "kind: library\ninterface: { inputs: [{ name: x, type: string, validate: 'value.matches(\"^[a-z]+$\")' }] }\nsteps:\n  - id: push\n    image: alpine\n    registry_auth: true\n    command: [sh, -c, \"${{ inputs.x }}\"]\n    env: [[LD_PRELOAD, \"${{ inputs.x }}\"], [SCARAB_X, \"${{ inputs.x }}\"]]\n";
         let libraries = Libraries {
             installed: installed(&[("acme/p", "github.com/acme/libs//p.yaml@0", lib)]),
             ..Default::default()
