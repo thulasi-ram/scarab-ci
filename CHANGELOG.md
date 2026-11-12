@@ -18,6 +18,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-13
+
 ### Breaking changes
 
 - **A library has one name, and Pipelines write `lib:<name>`.** The name is parts of letters,
@@ -66,7 +68,9 @@ release.yml uses that version's section as the GitHub Release text. See
   new node Unschedulable until the node joins; Scarab failed such a step within a second, and
   its retries were spent before the autoscaler launched a node. A step Pod now waits up to
   `SCARAB_UNSCHEDULABLE_GRACE_SECS` (chart value `scarab.unschedulableGraceSecs`, default 300)
-  for a node, then fails with the scheduler's message as before. `0` keeps the old behaviour.
+  for a node, then fails with the scheduler's message as before; each automatic retry waits again.
+  The most it accepts is 1800, the engine's own limit for an attempt that has not started. `0`
+  keeps the old behaviour.
 
 ## [0.4.0] - 2026-11-12
 
@@ -1370,7 +1374,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/thulasi-ram/scarab-ci/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.3.0...v0.3.1
