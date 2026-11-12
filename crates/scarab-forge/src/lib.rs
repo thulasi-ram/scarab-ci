@@ -2363,6 +2363,129 @@ mod tests {
         );
     }
 
+    /// A push that deleted, created or force-moved its ref, or lists no
+    /// commits, has no trustworthy file list: each says why, so a `when:` that
+    /// reads the list runs and the Run's log names the reason.
+    #[test]
+    fn a_deleted_new_forced_or_empty_push_has_unknown_paths_and_says_why() {
+        let zero = "0000000000000000000000000000000000000000";
+        let push = |extra: serde_json::Value| {
+            let mut p = serde_json::json!({
+                "before": "1111111111111111111111111111111111111111",
+                "after": "2222222222222222222222222222222222222222",
+                "total_commits": 1,
+                "commits": [{"added": ["README.md"]}],
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                p[k] = v.clone();
+            }
+            p
+        };
+        let cases = [
+            (serde_json::json!({"deleted": true}), PathsUnknown::Deleted),
+            (serde_json::json!({"after": zero}), PathsUnknown::Deleted),
+            (
+                serde_json::json!({"created": true}),
+                PathsUnknown::NewBranch,
+            ),
+            (serde_json::json!({"before": zero}), PathsUnknown::NewBranch),
+            (serde_json::json!({"forced": true}), PathsUnknown::Forced),
+            (serde_json::json!({"commits": []}), PathsUnknown::NoCommits),
+            (
+                serde_json::json!({"commits": null}),
+                PathsUnknown::NoCommits,
+            ),
+        ];
+        for (extra, want) in cases {
+            for cap in [None, Some(20)] {
+                assert_eq!(
+                    push_changed_paths(&push(extra.clone()), cap),
+                    ChangedPaths::Unknown(want),
+                    "{extra} with cap {cap:?}"
+                );
+            }
+        }
+        // GitHub (a cap, no total): reaching the cap means the list may be cut.
+        let two = serde_json::json!({"commits": [{"added": ["a"]}, {"added": ["b"]}]});
+        assert_eq!(
+            push_changed_paths(&push(two.clone()), Some(2)),
+            ChangedPaths::Unknown(PathsUnknown::Truncated)
+        );
+        assert_eq!(
+            push_changed_paths(&push(two), Some(20)),
+            ChangedPaths::Known(vec!["a".into(), "b".into()]),
+            "under the cap, a smaller total does not cut the list"
+        );
+        assert_eq!(
+            push_changed_paths(&push(serde_json::json!({"total_commits": 5})), Some(20)),
+            ChangedPaths::Unknown(PathsUnknown::Truncated),
+            "a total above the listed commits means some are missing"
+        );
+        assert_eq!(
+            push_changed_paths(&push(serde_json::json!({"total_commits": 1})), Some(20)),
+            ChangedPaths::Known(vec!["README.md".into()])
+        );
+        assert!(!is_zero_sha(""), "an absent sha is not a zero sha");
+    }
+
+    /// Each reason is the text the Run's event log shows; none is empty, no
+    /// two read the same, and the two with a number name it.
+    #[test]
+    fn every_unknown_paths_reason_is_its_own_sentence() {
+        let all = [
+            PathsUnknown::NotGiven,
+            PathsUnknown::NotFetched,
+            PathsUnknown::NewBranch,
+            PathsUnknown::Forced,
+            PathsUnknown::Deleted,
+            PathsUnknown::NoCommits,
+            PathsUnknown::Truncated,
+            PathsUnknown::TooMany,
+            PathsUnknown::ForgeError,
+            PathsUnknown::TimedOut,
+        ];
+        let reasons: std::collections::BTreeSet<String> =
+            all.iter().map(PathsUnknown::reason).collect();
+        assert_eq!(reasons.len(), all.len(), "{reasons:?}");
+        assert!(reasons.iter().all(|r| !r.trim().is_empty()));
+        assert!(PathsUnknown::TooMany
+            .reason()
+            .contains(&CHANGED_PATHS_MAX.to_string()));
+        assert!(PathsUnknown::TimedOut
+            .reason()
+            .contains(&format!("{PULL_REQUEST_FILES_TIMEOUT_SECS} seconds")));
+    }
+
+    /// A pull request's paths come from the forge's files API, asked later,
+    /// so the event itself says they were not fetched; a tag carries none.
+    #[test]
+    fn only_a_push_carries_its_own_changed_paths() {
+        let pr = Event::PullRequest {
+            actor: "octocat".into(),
+            actor_id: String::new(),
+            repo: repo(),
+            number: 1,
+            head: "2222222222222222222222222222222222222222".into(),
+            title: "t".into(),
+            base: "main".into(),
+            fork: false,
+        };
+        assert_eq!(
+            pr.changed_paths(),
+            ChangedPaths::Unknown(PathsUnknown::NotFetched)
+        );
+        let tag = Event::Tag {
+            actor: "octocat".into(),
+            actor_id: String::new(),
+            repo: repo(),
+            tag: "v1".into(),
+        };
+        assert_eq!(
+            tag.changed_paths(),
+            ChangedPaths::Unknown(PathsUnknown::NotGiven)
+        );
+    }
+
     #[test]
     fn pull_request_title_and_base_are_excluded_from_context_map() {
         // Security boundary (ADR-0057 §2, Q6/Q7): a PR's title (fork-PR titles are
