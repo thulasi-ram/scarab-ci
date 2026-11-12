@@ -7333,6 +7333,32 @@ mod tests {
         assert!(!init_names(&ps).contains(&"ecr-login".to_string()));
     }
 
+    /// The marker holds when the marked profile is named after an unmarked
+    /// one on a run Step, when it is named twice, and on a push Step whose
+    /// library trust was revoked after Run creation (the stored library hash
+    /// is still there; the launch found the Step not eligible).
+    #[test]
+    fn the_marker_holds_for_a_second_profile_and_a_revoked_trust() {
+        let mut placement = ecr_page_placement();
+        placement.profiles.push(profile(
+            "plain",
+            serde_json::json!({"spec": {"nodeSelector": {"pool": "x"}}}),
+        ));
+        for names in [vec!["plain", "ecr-push"], vec!["ecr-push", "ecr-push"]] {
+            let mut run = full_spec();
+            run.placement_profiles = names.iter().map(|n| n.to_string()).collect();
+            assert!(apply_placement(full_pod_for(&run), "steal", &run, &placement).is_err());
+        }
+        let mut revoked = ecr_push_step();
+        revoked.placement_profiles = vec!["plain".into(), "ecr-push".into()];
+        revoked.registry_auth.as_mut().unwrap().credential_eligible = false;
+        let pod =
+            apply_placement(full_pod_for(&revoked), "image/push", &revoked, &placement).unwrap();
+        let ps = pod.spec.unwrap();
+        assert_eq!(ps.service_account_name, None);
+        assert!(!init_names(&ps).contains(&"ecr-login".to_string()));
+    }
+
     #[test]
     fn placement_baseline_is_stamped_on_every_pod() {
         let spec = busybox(); // no placement fields at all
