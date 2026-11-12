@@ -29,7 +29,6 @@ import {
 } from "../libraries";
 import { relTime, absTime } from "../fmt";
 import Chips from "./Chips";
-import Doodle from "./Doodle";
 import Icon from "./Icon";
 import InstallLibraryDialog from "./LibraryInstall";
 import { ConfirmAction } from "./ConfirmDestructive";
@@ -93,27 +92,11 @@ export default function Libraries(props: { org: string }) {
             <Show
               when={rows().length > 0}
               fallback={
-                <div class="lib-well">
-                  <Doodle icon="package" size={104} opacity={0.3} />
-                  <div class="lib-empty">
-                    <div class="t1">
-                      <Icon icon="package" size={14} /> No libraries installed
-                    </div>
-                    <p class="t2">
-                      A Pipeline uses an installed library with{" "}
-                      <span class="mono">invoke: lib:&lt;publisher&gt;/&lt;name&gt;</span>. To install
-                      one, choose Install library and enter its source: a file in a git repository at
-                      a full commit id, such as{" "}
-                      <span class="mono">github.com/acme/scarab-libs//deploy-helm.yaml@&lt;commit&gt;</span>.
-                      You read the file before it is installed.
-                    </p>
-                    <p class="t2">
-                      A Pipeline checks out its repository through a library too. Scarab's clone
-                      library installs the same way, from{" "}
-                      <span class="mono">github.com/thulasi-ram/scarab-ci//libs/clone.yaml@&lt;commit&gt;</span>.
-                    </p>
-                  </div>
-                </div>
+                <p class="empty">
+                  No libraries installed. A library is a file of Steps that a Pipeline runs with{" "}
+                  <span class="mono">invoke: lib:&lt;publisher&gt;/&lt;name&gt;</span>. To install one,
+                  choose Install library and enter the file and the branch, tag or commit to read it at.
+                </p>
               }
             >
               <div class="table-scroll">
