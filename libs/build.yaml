@@ -30,21 +30,30 @@
 #                forge credentials) at /scarab/registry/config.json and points
 #                DOCKER_CONFIG at it, when the org trusts this source with the
 #                registry credential. It runs no code from the repository, and
-#                it removes the layout, so later Steps do not receive it.
+#                it removes the layout from its own workspace, so a Step that
+#                needs only the invoke does not receive it. A Step that reads
+#                `outputs.image.image` needs the build Step too and receives
+#                the layout through the build Step's workspace: read
+#                `outputs.image.push.digest` instead, or limit what it
+#                receives with `inputs:`.
 #
 # Outputs:
-#   ${{ outputs.image.image }}  what buildctl wrote with `--metadata-file`; its
-#                               `containerimage.digest` is the digest of the
-#                               image built, and of the image pushed, since
-#                               crane pushes the layout's manifest unchanged.
 #   ${{ outputs.image.push }}   only when the image was pushed:
 #                               {"ref": "<repository>@sha256:…", "digest":
-#                               "sha256:…"}, as crane reported the push.
+#                               "sha256:…"}, as crane reported the push. Deploy
+#                               by this digest.
+#   ${{ outputs.image.image }}  what buildctl wrote with `--metadata-file`; its
+#                               `containerimage.digest` is the digest of the
+#                               image built. crane pushes the layout's manifest
+#                               unchanged, so it is also the pushed digest
+#                               unless the Dockerfile changed the layout after
+#                               BuildKit wrote it (a RUN shares the build Pod).
 #
-# A fork pull request gets no registry credential, and Scarab tells both Steps
-# they run for one with SCARAB_FORK_PR=true: the build Step then exports no
-# layer cache and writes no layout, and the push Step pushes nothing, whatever
-# the inputs say. A missing SCARAB_FORK_PR is treated the same way.
+# A fork pull request, or a Run locked out of its Environment's secrets, gets
+# no registry credential, and Scarab tells both Steps so with
+# SCARAB_FORK_PR=true: the build Step then exports no layer cache and writes
+# no layout, and the push Step pushes nothing, whatever the inputs say. A
+# missing SCARAB_FORK_PR is treated the same way.
 #
 # Every input reaches the scripts through an environment variable, never the
 # command. The build Step resolves the context and the Dockerfile with
@@ -60,10 +69,15 @@
 # example); Scarab passes no credential.
 #
 # Placement: an invoke's `placement_profiles` list reaches both Steps. A map
-# routes profiles per Step, so a profile that logs in to the registry reaches
-# only the push Step:
+# routes profiles per Step:
 #
 #     placement_profiles: { image: [arm64-builders, build-cache], push: [ecr-push] }
+#
+# An operator marks a profile that grants push access `registry_auth_only`.
+# Scarab applies it only to this library's push Step, and only when the
+# launch resolved a credential for it; named on the build Step (through the
+# list form, for one) it fails the build. So route such a profile with the
+# map form.
 #
 # Inputs:
 #   image       the reference to build, e.g. ghcr.io/acme/app:1.2.0
@@ -206,11 +220,13 @@ steps:
         esac
         # Scarab sets SCARAB_FORK_PR on every launch of this Step; a value
         # other than `false` (none included) is a fork pull request's build,
-        # which never writes the shared cache and is never pushed.
+        # or a Run locked out of its Environment's secrets, which never writes
+        # the shared cache and is never pushed.
         fork=true
         [ "${SCARAB_FORK_PR-}" = false ] && fork=false
         if [ "$fork" = true ]; then
-          [ "$push" = false ] || echo "scarab: a fork pull request's build is not pushed" >&2
+          [ "$push" = false ] ||
+            echo "scarab: not pushed: this Run is a fork pull request's, or is locked out of its Environment's secrets" >&2
           push=false
         fi
         set -- build --frontend dockerfile.v0 \
@@ -312,12 +328,13 @@ steps:
           *) fail "insecure_push must be true or false, not $insecure" ;;
         esac
         # The layout is the build's output for this Step alone: it is removed
-        # whenever this Step succeeds, so later Steps do not receive it. rm
+        # from this Step's workspace whenever this Step succeeds, so a Step
+        # that needs only this one does not receive it. rm
         # removes a symlink at .scarab-build, never its target. A layout that
         # cannot be removed is reported and does not fail a push that worked.
         clean() {
           rm -rf ./.scarab-build ||
-            echo "scarab: could not remove .scarab-build; later steps receive it" >&2
+            echo "scarab: could not remove .scarab-build; steps that need this one receive it" >&2
         }
         if [ "$push" = false ]; then
           clean
@@ -325,10 +342,11 @@ steps:
           exit 0
         fi
         # Scarab sets SCARAB_FORK_PR on every launch of this Step; a value
-        # other than `false` (none included) is a fork pull request's build.
+        # other than `false` (none included) is a fork pull request's build,
+        # or a Run locked out of its Environment's secrets.
         if [ "${SCARAB_FORK_PR-}" != false ]; then
           clean
-          echo "scarab: a fork pull request's build is not pushed"
+          echo "scarab: not pushed: this Run is a fork pull request's, or is locked out of its Environment's secrets"
           exit 0
         fi
         # Steps before this one ran repository code in this workspace, and

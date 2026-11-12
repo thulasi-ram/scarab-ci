@@ -545,7 +545,9 @@ pub fn retired_build(step: &RetiredBuild<'_>) -> String {
     let _ = writeln!(out, "      with: {{ {} }}", with.join(", "));
     let _ = write!(
         out,
-        "An org admin must first install lib:thulasi-ram/build and trust it for the build \
+        "The old step's `env`, `retry` and `artifacts` are not carried over: an invoke step \
+         does not take them. The library cannot pull a private base image yet.\n\
+         An org admin must first install lib:thulasi-ram/build and trust it for the build \
          sandbox, and with the registry credential to push: see {BUILD_LIBRARY_DOCS}"
     );
     out
@@ -11239,6 +11241,8 @@ steps:
              placement_profiles: [arm64, big]\n      \
              invoke: lib:thulasi-ram/build\n      with: { image: \"ghcr.io/acme/app:${{ event.sha }}\", \
              context: services/api, dockerfile: Dockerfile.prod, push: true }\n\
+             The old step's `env`, `retry` and `artifacts` are not carried over: an invoke \
+             step does not take them. The library cannot pull a private base image yet.\n\
              An org admin must first install lib:thulasi-ram/build and trust it for the build \
              sandbox, and with the registry credential to push: see \
              https://thulasi-ram.github.io/scarab-ci/usage/libraries/#install-scarabs-build-library"
