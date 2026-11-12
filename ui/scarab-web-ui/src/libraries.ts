@@ -12,9 +12,25 @@ import { libraryReviewHref, orgHref } from "./settings-nav";
 const SEGMENT = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$/;
 const COMMIT = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
 
+/** Why `location` is not `<host>/<owner>/<repo>//<path>` with a path
+ *  `file` accepts, or `null`. */
+function locationError(location: string, file: { ext: RegExp; example: string; hint: string }): string | null {
+  const split = location.indexOf("//");
+  if (split < 0) return `Separate the repository from the file with //: github.com/acme/${file.example}.`;
+  const repo = location.slice(0, split).split("/");
+  const path = location.slice(split + 2);
+  if (repo.length !== 3 || !repo[0]!.includes(".") || !SEGMENT.test(repo[1]!) || !SEGMENT.test(repo[2]!)) {
+    return "The repository is <host>/<owner>/<repo>, for example github.com/acme/scarab-libs.";
+  }
+  if (!file.ext.test(path) || path.split("/").some((p) => p === "" || p === "." || p === "..")) {
+    return file.hint;
+  }
+  return null;
+}
+
 /** Why `source` is not `<host>/<owner>/<repo>//<path>@<commit>` with a
  *  path `file` accepts, or `null`. An empty field is not an error yet. The
- *  library form and the plugin manifest form both read sources this way. */
+ *  plugin manifest form reads sources this way. */
 export function pinnedSourceError(
   source: string,
   file: { ext: RegExp; example: string; hint: string },
@@ -27,27 +43,46 @@ export function pinnedSourceError(
   if (!COMMIT.test(commit)) {
     return "Pin the source to a full commit id (40 lowercase hex characters); a branch or tag can move after you review it.";
   }
-  const location = s.slice(0, at);
-  const split = location.indexOf("//");
-  if (split < 0) return `Separate the repository from the file with //: github.com/acme/${file.example}@<commit>.`;
-  const repo = location.slice(0, split).split("/");
-  const path = location.slice(split + 2);
-  if (repo.length !== 3 || !repo[0]!.includes(".") || !SEGMENT.test(repo[1]!) || !SEGMENT.test(repo[2]!)) {
-    return "The repository is <host>/<owner>/<repo>, for example github.com/acme/scarab-libs.";
-  }
-  if (!file.ext.test(path) || path.split("/").some((p) => p === "" || p === "." || p === "..")) {
-    return file.hint;
-  }
+  return locationError(s.slice(0, at), { ...file, example: `${file.example}@<commit>` });
+}
+
+const LIBRARY_FILE = {
+  ext: /\.ya?ml$/,
+  example: "libs//deploy.yaml",
+  hint: "The file is a repo-relative .yaml path.",
+};
+
+/** A library source split at its `@`: the file, and the branch, tag or
+ *  commit after the `@` (empty when there is none). A file path holds no
+ *  `@`, so the first one starts the ref. */
+export function splitSource(source: string): { source: string; ref: string } {
+  const s = source.trim().replace(/^https:\/\//, "");
+  const at = s.indexOf("@");
+  return at < 0 ? { source: s, ref: "" } : { source: s.slice(0, at), ref: s.slice(at + 1).trim() };
+}
+
+/** Why `source` is not a library's file, `<host>/<owner>/<repo>//<path>`,
+ *  or `null`. An empty field is not an error yet. A `…@<ref>` is read as
+ *  the file and its ref. */
+export function sourceError(source: string): string | null {
+  const s = splitSource(source).source;
+  if (s === "") return null;
+  return locationError(s, LIBRARY_FILE);
+}
+
+/** Why `ref` cannot name a branch, tag or commit, or `null`. An empty field
+ *  is not an error yet. */
+export function refError(ref: string): string | null {
+  const r = ref.trim();
+  if (r === "") return null;
+  if (r.length > 255) return "A ref is at most 255 characters.";
+  if (/[\s\x00-\x1f\x7f]/.test(r)) return "A ref has no spaces or control characters.";
   return null;
 }
 
-/** Why `source` is not a library source, or `null`. */
-export function sourceError(source: string): string | null {
-  return pinnedSourceError(source, {
-    ext: /\.ya?ml$/,
-    example: "libs//deploy.yaml",
-    hint: "The file is a repo-relative .yaml path.",
-  });
+/** Whether `ref` is a full commit id, which needs no lookup. */
+export function isFullCommit(ref: string): boolean {
+  return COMMIT.test(ref.trim());
 }
 
 /** Why `segment` cannot be a publisher or name, or `null` (empty = default). */
@@ -58,7 +93,10 @@ export function segmentError(segment: string): string | null {
 
 /** The fetch form as the dialog holds it. */
 export type FetchForm = {
+  /** `<host>/<owner>/<repo>//<path>`; a `…@<ref>` here stands for `ref`. */
   source: string;
+  /** A branch, tag or commit. Empty = the one after `@` in `source`. */
+  ref: string;
   /** A ForgeConnection id; empty = fetch anonymously from a public forge. */
   connection: string;
   /** Empty = the source's owner. */
@@ -68,9 +106,12 @@ export type FetchForm = {
 };
 
 /** What `POST …/libraries/fetch` carries — structurally the generated
- *  `FetchLibraryRequest`. */
+ *  `FetchLibraryRequest`. A full commit goes in `source` after `@`; a
+ *  branch or tag goes in `ref`, and the server reads it at the commit it
+ *  points to now. */
 export type FetchBody = {
   source: string;
+  ref?: string;
   connection?: string;
   publisher?: string;
   name?: string;
@@ -80,11 +121,15 @@ export type FetchBody = {
 export function toFetchBody(
   form: FetchForm,
 ): { body: FetchBody; error?: undefined } | { body?: undefined; error: string } {
-  const source = form.source.trim();
-  if (!source) return { error: "A source is required." };
-  const problem = sourceError(source) ?? segmentError(form.publisher.trim()) ?? segmentError(form.name.trim());
+  const split = splitSource(form.source);
+  const location = split.source;
+  const ref = form.ref.trim() || split.ref;
+  if (!location) return { error: "A source is required." };
+  if (!ref) return { error: "A branch, tag or commit is required." };
+  const problem =
+    sourceError(location) ?? refError(ref) ?? segmentError(form.publisher.trim()) ?? segmentError(form.name.trim());
   if (problem) return { error: problem };
-  const body: FetchBody = { source };
+  const body: FetchBody = isFullCommit(ref) ? { source: `${location}@${ref}` } : { source: location, ref };
   if (form.connection.trim()) body.connection = form.connection.trim();
   if (form.publisher.trim()) body.publisher = form.publisher.trim();
   if (form.name.trim()) body.name = form.name.trim();
@@ -325,7 +370,7 @@ export function inputsChange(oldContent: string, newContent: string): string {
  *  upgrade from `source`. */
 export function reviewHref(
   org: string,
-  p: { source?: string; publisher?: string; name?: string; connection?: string },
+  p: { source?: string; ref?: string; publisher?: string; name?: string; connection?: string },
 ): string {
   const q = new URLSearchParams();
   for (const [k, v] of Object.entries(p)) if (v) q.set(k, v);

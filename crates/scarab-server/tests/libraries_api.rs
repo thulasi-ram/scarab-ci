@@ -437,6 +437,108 @@ async fn a_private_source_must_belong_to_the_org() {
     assert!(h.http.asked().is_empty(), "no anonymous fetch was made");
 }
 
+/// A branch or tag is read at the commit it points to now, and the stored
+/// version names that commit: anonymously through the forge's commits list,
+/// or through the org's connection. A full commit as `ref` needs no lookup.
+#[tokio::test]
+async fn a_branch_or_tag_is_pinned_to_its_commit_when_fetched() {
+    let h = harness_with(
+        FakeForge::new()
+            .with_file("deploy.yaml", V2)
+            .with_commit("release/2", C2),
+        InMemoryLibraries::new(),
+    );
+    github_connection(&h.db, "gh", Some("acme")).await;
+    h.http.serve_url(
+        "https://api.github.com/repos/acme/libs/commits?sha=v1.0&per_page=1",
+        &format!(r#"[{{"sha":"{C1}","commit":{{"message":"one"}}}}]"#),
+    );
+    h.http
+        .serve_url(&raw("acme", "libs", C1, "deploy.yaml"), V1);
+
+    let (st, b) = fetch(
+        &h,
+        json!({ "source": "github.com/acme/libs//deploy.yaml", "ref": "v1.0" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(
+        b["source"],
+        format!("github.com/acme/libs//deploy.yaml@{C1}")
+    );
+    assert_eq!(b["content_hash"], content_hash(V1));
+
+    let (st, b) = fetch(
+        &h,
+        json!({ "source": "github.com/acme/libs//deploy.yaml", "ref": "release/2", "connection": "gh" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(
+        b["source"],
+        format!("github.com/acme/libs//deploy.yaml@{C2}")
+    );
+
+    let asked = h.http.asked().len();
+    let (st, b) = fetch(
+        &h,
+        json!({ "source": "github.com/acme/libs//deploy.yaml", "ref": C1 }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(h.http.asked().len(), asked + 1, "only the file is read");
+
+    // A ref in the source and another as `ref`: refused, nothing read.
+    let (st, b) = fetch(
+        &h,
+        json!({ "source": format!("github.com/acme/libs//deploy.yaml@{C1}"), "ref": "main" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    let (st, _) = fetch(
+        &h,
+        json!({ "source": "github.com/acme/libs//deploy.yaml", "ref": "my branch" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+/// The org's connection cannot reach the repository (a GitHub App not
+/// installed on it answers 404). A public file is still read, anonymously;
+/// a file that is not public either is refused with both reasons.
+#[tokio::test]
+async fn a_connection_without_access_still_reads_a_public_source() {
+    let forge = FakeForge::new();
+    forge.set_read_error(Some("404 Not Found: {\"message\":\"Not Found\"}"));
+    let h = harness_with(forge, InMemoryLibraries::new());
+    github_connection(&h.db, "gh", Some("acme")).await;
+    h.http
+        .serve_url(&raw("acme", "libs", C1, "deploy.yaml"), V1);
+
+    let (st, b) = fetch(
+        &h,
+        json!({ "source": format!("github.com/acme/libs//deploy.yaml@{C1}"), "connection": "gh" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["content_hash"], content_hash(V1));
+    assert_eq!(
+        b["source"],
+        format!("github.com/acme/libs//deploy.yaml@{C1}")
+    );
+
+    let (st, b) = fetch(
+        &h,
+        json!({ "source": format!("github.com/acme/private//deploy.yaml@{C1}"), "connection": "gh" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    let msg = b.as_str().unwrap();
+    assert!(msg.contains("connection `gh` could not read"), "{msg}");
+    assert!(msg.contains("404 Not Found"), "{msg}");
+    assert!(msg.contains("give connection `gh` access"), "{msg}");
+}
+
 #[tokio::test]
 async fn yank_needs_a_reason_and_unyank_lifts_it() {
     let h = harness();

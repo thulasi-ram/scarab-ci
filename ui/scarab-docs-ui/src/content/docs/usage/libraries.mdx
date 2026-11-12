@@ -22,17 +22,21 @@ fetches anything, and the org decides when a library changes.
 
 ## Install a library
 
-Settings › Libraries › **Install library**, or the API. **Install library** asks for a **source**,
-a file in a git repository at a full commit id, and **Fetch and review** opens the review page
-(`/orgs/<org>/settings/libraries/review`), which every library goes through, Scarab's own
-included.
+Settings › Libraries › **Install library**, or the API. **Install library** asks for a **file**
+in a git repository and a **ref**, a branch, tag or commit, and **Fetch and review** opens the
+review page (`/orgs/<org>/settings/libraries/review`), which every library goes through, Scarab's
+own included.
 
 ```
-github.com/acme/scarab-libs//deploy-helm.yaml@8c2f4e1a9d7b3c5e0f6a2b8d4c1e7f9a3b5d2c6e
+File  github.com/acme/scarab-libs//deploy-helm.yaml
+Ref   v1.4.0
 ```
 
-The part before `//` is the repository and the part after it is the file. A branch or tag is
-refused, because it can point somewhere else after you review it.
+The part before `//` is the repository and the part after it is the file. Scarab reads a branch or
+tag at the commit it points to when you fetch, and the review page shows that commit. The
+installation is pinned to that commit and to the content you reviewed: a branch that moves later
+changes nothing until you upgrade. The API takes the same two fields, `source` and `ref`, or a
+`source` that ends in `@<full commit id>`.
 
 Installing takes two steps:
 
@@ -65,7 +69,9 @@ connection, is read without credentials, over https only, from public addresses 
 redirects and a 1 MiB limit. Any other host is refused. For a private repository, pick a
 connection of the installing org, and Scarab reads the file through it. A connection of another
 org, or one with no org yet, is refused, and through a GitHub App connection Scarab reads only
-repositories your org owns. See [Forge connections](/scarab-ci/get-started/deploy-helm/#forge-connections).
+repositories your org owns. When the connection cannot reach the repository (a GitHub App that is
+not installed on it, for example), Scarab reads the file without credentials instead, which works
+for a public repository; for a private one, give the connection access to it. See [Forge connections](/scarab-ci/get-started/deploy-helm/#forge-connections).
 
 ## Upgrade
 
@@ -117,22 +123,13 @@ It is the file `libs/clone.yaml` in Scarab's repository, and an org admin instal
 other library. Scarab installs no library into an org by itself, a new org included, and gives
 no library more trust because Scarab published it.
 
-1. Find the commit of a Scarab release tag. The source needs the full 40-character commit id;
-   a tag name is refused:
-
-   ```sh
-   git ls-remote https://github.com/thulasi-ram/scarab-ci 'refs/tags/v0.3.0^{}'
-   # 630461e6457dc4ec9dfcda164e791d424fc416ab	refs/tags/v0.3.0^{}
-   ```
-
-   Use a release tag's commit: each Scarab release checks that the file at its tag pins a
-   published scarab-clone image by digest.
-2. Settings › Libraries › **Install library**, with the source
-   `github.com/thulasi-ram/scarab-ci//libs/clone.yaml@<commit>`. Scarab reads it from github.com
-   without credentials.
-3. Review the file and install it as `lib:thulasi-ram/clone` (the defaults: the publisher is the
+1. Settings › Libraries › **Install library**, with the file
+   `github.com/thulasi-ram/scarab-ci//libs/clone.yaml` and a Scarab release tag as the ref, such
+   as `v0.4.0`. Use a release tag: each Scarab release checks that the file at its tag pins a
+   published scarab-clone image by digest. Scarab reads it from github.com without credentials.
+2. Review the file and install it as `lib:thulasi-ram/clone` (the defaults: the publisher is the
    repository's owner, the name is the file name). Confirm with your passkey.
-4. On a Forgejo or GitHub token connection, also trust its source with forge credentials
+3. On a Forgejo or GitHub token connection, also trust its source with forge credentials
    ([below](#trusting-a-library-with-forge-credentials)). Without that, a Run that invokes it is
    refused with the reason. On a GitHub App connection this step is not needed.
 
@@ -148,8 +145,8 @@ mirror's source instead.
 and holds no registry credential, and `push` pushes and holds it. Install it the same way as the
 clone library, then give its source the trust its steps need:
 
-1. Settings › Libraries › **Install library**, with the source
-   `github.com/thulasi-ram/scarab-ci//libs/build.yaml@<commit>`, the commit of a Scarab release tag.
+1. Settings › Libraries › **Install library**, with the file
+   `github.com/thulasi-ram/scarab-ci//libs/build.yaml` and a Scarab release tag as the ref.
 2. Review the file and install it as `lib:thulasi-ram/build`. Confirm with your passkey.
 3. Trust its source for the build sandbox
    ([below](#trusting-a-library-for-the-build-sandbox)). Without that, a Run that invokes it is

@@ -3610,7 +3610,16 @@ export interface components {
             name?: string | null;
             /** @description Defaults to the source's owner. */
             publisher?: string | null;
-            /** @description `<host>/<owner>/<repo>//<path>@<commit>`. */
+            /**
+             * @description A branch, tag or commit, for a `source` with no `@<commit>`. Scarab
+             *     reads the file at the commit it points to now; the stored version and
+             *     the answer's `source` name that commit.
+             */
+            ref?: string | null;
+            /**
+             * @description `<host>/<owner>/<repo>//<path>@<commit>`, or `<host>/<owner>/<repo>//<path>`
+             *     with `ref`.
+             */
             source: string;
         };
         /** @description `POST /v1/orgs/{org}/plugin-fetch`. */

@@ -10918,9 +10918,16 @@
             ],
             "description": "Defaults to the source's owner."
           },
+          "ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A branch, tag or commit, for a `source` with no `@<commit>`. Scarab\nreads the file at the commit it points to now; the stored version and\nthe answer's `source` name that commit."
+          },
           "source": {
             "type": "string",
-            "description": "`<host>/<owner>/<repo>//<path>@<commit>`."
+            "description": "`<host>/<owner>/<repo>//<path>@<commit>`, or `<host>/<owner>/<repo>//<path>`\nwith `ref`."
           }
         }
       },

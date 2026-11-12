@@ -32,7 +32,10 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::{authorize_scoped, connection_adapter, rbac_scope, ApiError, AppState};
-use crate::library_fetch::{anonymous_url, KnownForges, LibrarySource};
+use crate::library_fetch::{
+    anonymous_commit_url, anonymous_url, commit_from_list, is_full_commit, ref_error, KnownForges,
+    LibrarySource,
+};
 use crate::step_up::GuardCtx;
 
 /// The longest yank reason kept.
@@ -227,8 +230,14 @@ pub struct TrustSourceRequest {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct FetchLibraryRequest {
-    /// `<host>/<owner>/<repo>//<path>@<commit>`.
+    /// `<host>/<owner>/<repo>//<path>@<commit>`, or `<host>/<owner>/<repo>//<path>`
+    /// with `ref`.
     pub source: String,
+    /// A branch, tag or commit, for a `source` with no `@<commit>`. Scarab
+    /// reads the file at the commit it points to now; the stored version and
+    /// the answer's `source` name that commit.
+    #[serde(default, rename = "ref")]
+    pub git_ref: Option<String>,
     /// A ForgeConnection id, for a private repository. Omitted: fetched
     /// anonymously over https.
     #[serde(default)]
@@ -495,7 +504,180 @@ fn connection_web_host(conn: &scarab_forge::ForgeConnection) -> Option<String> {
     })
 }
 
-/// Reads `src`: anonymously, or through `connection` under the org rule.
+/// Why an anonymous read did not work: refused (a host Scarab does not
+/// read from, an address that is not public) or failed.
+struct AnonError {
+    denied: bool,
+    message: String,
+}
+
+impl AnonError {
+    fn into_api(self) -> ApiError {
+        if self.denied {
+            ApiError::Denied(self.message)
+        } else {
+            ApiError::BadRequest(self.message)
+        }
+    }
+}
+
+/// Reads `url` with the anonymous fetcher.
+async fn anonymous_get(st: &AppState, url: &str) -> Result<Vec<u8>, AnonError> {
+    let fetcher = st.library_fetcher.as_ref().ok_or_else(|| AnonError {
+        denied: true,
+        message: "anonymous library fetches are not configured on this Scarab; pick a \
+                  connection"
+            .into(),
+    })?;
+    fetcher.get(url).await.map_err(|e| match e {
+        crate::library_fetch::FetchError::Refused(message) => AnonError {
+            denied: true,
+            message,
+        },
+        crate::library_fetch::FetchError::Failed(message) => AnonError {
+            denied: false,
+            message,
+        },
+    })
+}
+
+/// Reads `src` without credentials.
+async fn read_anonymously(st: &AppState, src: &LibrarySource) -> Result<Vec<u8>, AnonError> {
+    let known = known_forges(st).await.map_err(|_| AnonError {
+        denied: false,
+        message: "the forge connections could not be listed".into(),
+    })?;
+    let url = anonymous_url(src, &known).map_err(|message| AnonError {
+        denied: true,
+        message,
+    })?;
+    anonymous_get(st, &url).await
+}
+
+/// The commit `git_ref` points to in `src`'s repository, asked without
+/// credentials.
+async fn resolve_anonymously(
+    st: &AppState,
+    src: &LibrarySource,
+    git_ref: &str,
+) -> Result<String, AnonError> {
+    let known = known_forges(st).await.map_err(|_| AnonError {
+        denied: false,
+        message: "the forge connections could not be listed".into(),
+    })?;
+    let url = anonymous_commit_url(src, git_ref, &known).map_err(|message| AnonError {
+        denied: true,
+        message,
+    })?;
+    let body = anonymous_get(st, &url).await?;
+    commit_from_list(&body, git_ref).map_err(|message| AnonError {
+        denied: false,
+        message,
+    })
+}
+
+/// The connection `id` as a forge adapter, once the org rule (git-bug
+/// 19b0a45) allows it to read `src` for `org`: a private source is read
+/// only through a connection of the installing org, and only from that
+/// org's own repositories. A connection that does not exist and one of
+/// another org answer the same, so the ids of other orgs' connections
+/// cannot be probed from here.
+async fn org_connection_forge(
+    st: &AppState,
+    org: &str,
+    src: &LibrarySource,
+    id: &str,
+) -> Result<std::sync::Arc<dyn scarab_forge::ForgePort>, ApiError> {
+    let not_ours = || {
+        ApiError::Denied(format!(
+            "connection `{id}` does not belong to org `{org}`, so `{}/{}` cannot be \
+             read through it for `{org}`; install it from a public source, or through \
+             a connection of `{org}`",
+            src.owner, src.repo
+        ))
+    };
+    let connections = st.connections.as_deref().ok_or_else(not_ours)?;
+    let conn = connections
+        .get_connection(id)
+        .await
+        .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?
+        .filter(|c| c.org.as_deref() == Some(org))
+        .ok_or_else(not_ours)?;
+    if connection_web_host(&conn).as_deref() != Some(src.host.as_str()) {
+        return Err(ApiError::BadRequest(format!(
+            "connection `{id}` serves {}, not {}",
+            connection_web_host(&conn).unwrap_or_default(),
+            src.host
+        )));
+    }
+    // A connection of the org reaches what its credential reaches; it
+    // reads for the org only the org's own repositories.
+    if src.owner != org {
+        return Err(ApiError::Denied(format!(
+            "`{}/{}` is not owned by org `{org}`; a connection of `{org}` reads only \
+             `{org}`'s repositories, so install it from a public source",
+            src.owner, src.repo
+        )));
+    }
+    connection_adapter(st, &conn).await
+}
+
+/// What connection `id` could not do (`what`, `why`), then the same
+/// without credentials: its answer when that worked, or both reasons. A
+/// connection that cannot reach a public repository (a GitHub App not
+/// installed on it) still installs from it, as it would with no connection.
+fn or_anonymous<T>(
+    id: &str,
+    what: &str,
+    why: String,
+    anonymous: Result<T, AnonError>,
+) -> Result<T, ApiError> {
+    anonymous.map_err(|a| {
+        ApiError::BadRequest(format!(
+            "connection `{id}` could not read {what} ({why}), and it could not be read without \
+             credentials either ({}); if the repository is private, give connection `{id}` \
+             access to it",
+            a.message
+        ))
+    })
+}
+
+/// The commit `git_ref` points to now in `src`'s repository: through
+/// `connection` under the org rule, or anonymously.
+pub(crate) async fn resolve_ref(
+    st: &AppState,
+    org: &str,
+    src: &LibrarySource,
+    git_ref: &str,
+    connection: Option<&str>,
+) -> Result<String, ApiError> {
+    if let Some(problem) = ref_error(git_ref) {
+        return Err(ApiError::BadRequest(problem));
+    }
+    if is_full_commit(git_ref) {
+        return Ok(git_ref.to_string());
+    }
+    let Some(id) = connection else {
+        return resolve_anonymously(st, src, git_ref)
+            .await
+            .map_err(AnonError::into_api);
+    };
+    let forge = org_connection_forge(st, org, src, id).await?;
+    let why = match forge.latest_commit(&src.repo_ref(), git_ref).await {
+        Ok(c) if is_full_commit(&c.sha) => return Ok(c.sha),
+        Ok(c) => format!("the forge named `{}`, not a full commit id", c.sha),
+        Err(e) => e.to_string(),
+    };
+    or_anonymous(
+        id,
+        &format!("ref `{git_ref}` of {}/{}/{}", src.host, src.owner, src.repo),
+        why,
+        resolve_anonymously(st, src, git_ref).await,
+    )
+}
+
+/// Reads `src`: anonymously, or through `connection` under the org rule,
+/// and anonymously when the connection cannot read it.
 pub(crate) async fn read_source(
     st: &AppState,
     org: &str,
@@ -503,62 +685,23 @@ pub(crate) async fn read_source(
     connection: Option<&str>,
 ) -> Result<String, ApiError> {
     let bytes = match connection {
-        None => {
-            let url = anonymous_url(src, &known_forges(st).await?).map_err(ApiError::Denied)?;
-            let fetcher = st.library_fetcher.as_ref().ok_or_else(|| {
-                ApiError::Conflict(
-                    "anonymous library fetches are not configured on this Scarab; pick a \
-                     connection"
-                        .into(),
-                )
-            })?;
-            fetcher.get(&url).await.map_err(|e| match e {
-                crate::library_fetch::FetchError::Refused(m) => ApiError::Denied(m),
-                crate::library_fetch::FetchError::Failed(m) => ApiError::BadRequest(m),
-            })?
-        }
+        None => read_anonymously(st, src)
+            .await
+            .map_err(AnonError::into_api)?,
         Some(id) => {
-            // The org rule (git-bug 19b0a45): a private source is read only
-            // through a connection of the installing org, and only from that
-            // org's own repositories. A connection that does not exist and
-            // one of another org answer the same, so the ids of other orgs'
-            // connections cannot be probed from here.
-            let not_ours = || {
-                ApiError::Denied(format!(
-                    "connection `{id}` does not belong to org `{org}`, so `{}/{}` cannot be \
-                     read through it for `{org}`; install it from a public source, or through \
-                     a connection of `{org}`",
-                    src.owner, src.repo
-                ))
-            };
-            let connections = st.connections.as_deref().ok_or_else(not_ours)?;
-            let conn = connections
-                .get_connection(id)
-                .await
-                .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?
-                .filter(|c| c.org.as_deref() == Some(org))
-                .ok_or_else(not_ours)?;
-            if connection_web_host(&conn).as_deref() != Some(src.host.as_str()) {
-                return Err(ApiError::BadRequest(format!(
-                    "connection `{id}` serves {}, not {}",
-                    connection_web_host(&conn).unwrap_or_default(),
-                    src.host
-                )));
-            }
-            // A connection of the org reaches what its credential reaches; it
-            // reads for the org only the org's own repositories.
-            if src.owner != org {
-                return Err(ApiError::Denied(format!(
-                    "`{}/{}` is not owned by org `{org}`; a connection of `{org}` reads only \
-                     `{org}`'s repositories, so install it from a public source",
-                    src.owner, src.repo
-                )));
-            }
-            let forge = connection_adapter(st, &conn).await?;
-            forge
+            let forge = org_connection_forge(st, org, src, id).await?;
+            match forge
                 .read_file_at_ref(&src.repo_ref(), &src.commit, &src.path)
                 .await
-                .map_err(|e| ApiError::BadRequest(format!("reading {src}: {e}")))?
+            {
+                Ok(bytes) => bytes,
+                Err(e) => or_anonymous(
+                    id,
+                    &src.to_string(),
+                    e.to_string(),
+                    read_anonymously(st, src).await,
+                )?,
+            }
         }
     };
     if bytes.len() > scarab_pipeline::MAX_SOURCE_BYTES {
@@ -838,7 +981,16 @@ pub(crate) async fn fetch_library(
     let by = org_caller(&st, &headers, &org, Action::Administer).await?;
     super::refuse_reserved_org(&org, "install a library")?;
     let store = store(&st)?;
-    let src = LibrarySource::parse(&body.source).map_err(ApiError::BadRequest)?;
+    let src = match body.git_ref.as_deref().map(str::trim) {
+        None => LibrarySource::parse(&body.source).map_err(ApiError::BadRequest)?,
+        Some(git_ref) => {
+            let unpinned =
+                LibrarySource::parse_unpinned(&body.source).map_err(ApiError::BadRequest)?;
+            let commit =
+                resolve_ref(&st, &org, &unpinned, git_ref, body.connection.as_deref()).await?;
+            unpinned.at(&commit).map_err(ApiError::BadRequest)?
+        }
+    };
     let publisher = body.publisher.clone().unwrap_or_else(|| src.owner.clone());
     let name = body.name.clone().unwrap_or_else(|| src.default_name());
     check_names(&publisher, &name)?;

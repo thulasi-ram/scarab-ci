@@ -13,7 +13,9 @@ import {
   versionLabel,
   yanksOfLibrary,
   shortHash,
+  refError,
   sourceError,
+  splitSource,
   toFetchBody,
   yankReasonError,
 } from "./libraries";
@@ -21,35 +23,58 @@ import {
 const C = "0123456789abcdef0123456789abcdef01234567";
 
 describe("sourceError", () => {
-  it("accepts a commit-pinned source and refuses one that could move", () => {
-    expect(sourceError(`github.com/acme/libs//deploy/helm.yaml@${C}`)).toBeNull();
+  it("reads the file, with or without a ref after @", () => {
+    expect(sourceError("github.com/acme/libs//deploy/helm.yaml")).toBeNull();
     expect(sourceError(`https://github.com/acme/libs//x.yml@${C}`)).toBeNull();
+    expect(sourceError("github.com/acme/libs//x.yaml@main")).toBeNull();
     expect(sourceError("")).toBeNull();
-    expect(sourceError("github.com/acme/libs//x.yaml@main")).toMatch(/full commit id/);
-    expect(sourceError("github.com/acme/libs//x.yaml")).toMatch(/commit/);
-    expect(sourceError(`github.com/acme/libs/x.yaml@${C}`)).toMatch(/\/\//);
-    expect(sourceError(`github.com/acme//x.yaml@${C}`)).toMatch(/<host>\/<owner>\/<repo>/);
-    expect(sourceError(`github.com/acme/libs//../x.yaml@${C}`)).toMatch(/repo-relative/);
-    expect(sourceError(`github.com/acme/libs//x.sh@${C}`)).toMatch(/\.yaml/);
+    expect(sourceError("github.com/acme/libs/x.yaml")).toMatch(/\/\//);
+    expect(sourceError("github.com/acme//x.yaml")).toMatch(/<host>\/<owner>\/<repo>/);
+    expect(sourceError("github.com/acme/libs//../x.yaml")).toMatch(/repo-relative/);
+    expect(sourceError("github.com/acme/libs//x.sh")).toMatch(/\.yaml/);
+  });
+});
+
+describe("splitSource and refError", () => {
+  it("splits at the first @, since a ref may hold one and a file may not", () => {
+    expect(splitSource(` https://github.com/acme/libs//d.yaml@release@2 `)).toEqual({
+      source: "github.com/acme/libs//d.yaml",
+      ref: "release@2",
+    });
+    expect(splitSource("github.com/acme/libs//d.yaml")).toEqual({ source: "github.com/acme/libs//d.yaml", ref: "" });
+  });
+  it("refuses a ref with spaces", () => {
+    expect(refError("feature/x")).toBeNull();
+    expect(refError("")).toBeNull();
+    expect(refError("my branch")).toMatch(/spaces/);
   });
 });
 
 describe("toFetchBody", () => {
-  it("sends only what was filled in", () => {
+  const blank = { source: "", ref: "", connection: "", publisher: "", name: "" };
+  it("pins a full commit in the source and sends a branch or tag as ref", () => {
+    expect(toFetchBody({ ...blank, source: " github.com/acme/libs//d.yaml ", ref: C })).toEqual({
+      body: { source: `github.com/acme/libs//d.yaml@${C}` },
+    });
+    expect(toFetchBody({ ...blank, source: "github.com/acme/libs//d.yaml", ref: "v1.2.0" })).toEqual({
+      body: { source: "github.com/acme/libs//d.yaml", ref: "v1.2.0" },
+    });
+    // A review link from before the Ref field: the commit after @.
+    expect(toFetchBody({ ...blank, source: `github.com/acme/libs//d.yaml@${C}` })).toEqual({
+      body: { source: `github.com/acme/libs//d.yaml@${C}` },
+    });
     expect(
-      toFetchBody({ source: ` github.com/acme/libs//d.yaml@${C} `, connection: "", publisher: "", name: "" }),
-    ).toEqual({ body: { source: `github.com/acme/libs//d.yaml@${C}` } });
-    expect(
-      toFetchBody({ source: `github.com/acme/libs//d.yaml@${C}`, connection: "gh", publisher: "platform", name: "helm" }),
+      toFetchBody({ source: "github.com/acme/libs//d.yaml", ref: "main", connection: "gh", publisher: "platform", name: "helm" }),
     ).toEqual({
-      body: { source: `github.com/acme/libs//d.yaml@${C}`, connection: "gh", publisher: "platform", name: "helm" },
+      body: { source: "github.com/acme/libs//d.yaml", ref: "main", connection: "gh", publisher: "platform", name: "helm" },
     });
   });
-  it("refuses an empty source or a bad name", () => {
-    expect(toFetchBody({ source: "", connection: "", publisher: "", name: "" }).error).toMatch(/required/);
-    expect(
-      toFetchBody({ source: `github.com/acme/libs//d.yaml@${C}`, connection: "", publisher: "-x", name: "" }).error,
-    ).toMatch(/not a valid name/);
+  it("refuses an empty source or ref, or a bad name", () => {
+    expect(toFetchBody(blank).error).toMatch(/source is required/);
+    expect(toFetchBody({ ...blank, source: "github.com/acme/libs//d.yaml" }).error).toMatch(/branch, tag or commit/);
+    expect(toFetchBody({ ...blank, source: "github.com/acme/libs//d.yaml", ref: "main", publisher: "-x" }).error).toMatch(
+      /not a valid name/,
+    );
     expect(segmentError("thulasi-ram")).toBeNull();
   });
 });

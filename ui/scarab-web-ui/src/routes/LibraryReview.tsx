@@ -1,7 +1,8 @@
 // Install or upgrade a library: a page of its own inside the settings frame
 // (Libraries marked in the sidebar), so a second reviewer can be sent its
 // URL. The URL's query names the source (the Install library dialog builds
-// it); the page fetches it (the server reads it at its commit, checks it
+// it); the page fetches it (the server reads it at its commit, or at the
+// commit a branch or tag points to now, checks it
 // compiles as a closed library and stores it) and shows what it is: the
 // facts and checks on one label and value grid, then the file, or the
 // side-by-side diff from the installed version. Install, in the footer row,
@@ -20,8 +21,10 @@ import {
   libraryManageHref,
   numberDiff,
   reviewChecks,
+  isFullCommit,
   shortHash,
   sideBySide,
+  splitSource,
   toFetchBody,
   type FetchForm,
   type SideCell,
@@ -63,6 +66,7 @@ function Review(props: { org: string }) {
   // (Change source, a shared link) fetches again.
   const form = createMemo<FetchForm>(() => ({
     source: one(search.source),
+    ref: one(search.ref),
     connection: one(search.connection),
     publisher: one(search.publisher),
     name: one(search.name),
@@ -117,6 +121,8 @@ function Review(props: { org: string }) {
     const n = f?.name || form().name;
     return p && n ? `lib:${p}/${n}` : "Review a library";
   };
+  /** The branch, tag or commit the URL asks for. */
+  const askedRef = () => form().ref.trim() || splitSource(form().source).ref;
   const connectionLabel = () => {
     const c = form().connection;
     if (!c) return "none: read anonymously";
@@ -169,6 +175,20 @@ function Review(props: { org: string }) {
               <dd class="m">{title().startsWith("lib:") ? title() : "the repository owner / the file name"}</dd>
               <dt>Source</dt>
               <dd class="m">{fetched()?.source ?? form().source}</dd>
+              <Show when={askedRef() && !isFullCommit(askedRef())}>
+                <dt>Ref</dt>
+                <dd>
+                  <span class="mono">{askedRef()}</span>
+                  <Show when={fetched()}>
+                    {(f) => (
+                      <>
+                        {" "}
+                        at <span class="lib-hash">{shortHash(splitSource(f().source).ref)}</span> when fetched
+                      </>
+                    )}
+                  </Show>
+                </dd>
+              </Show>
               <dt>Connection</dt>
               <dd>{connectionLabel()}</dd>
               <Show when={fetched()}>

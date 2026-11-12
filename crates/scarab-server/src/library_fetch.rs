@@ -157,6 +157,30 @@ impl LibrarySource {
         })
     }
 
+    /// Parses a source with no commit, `[https://]<host>/<owner>/<repo>//<path>`,
+    /// to be pinned once its ref is resolved: `commit` is empty until then.
+    pub fn parse_unpinned(raw: &str) -> Result<Self, String> {
+        let text = raw.trim();
+        if text.contains('@') {
+            return Err(
+                "give the branch, tag or commit either after `@` in the source or as `ref`, \
+                 not both"
+                    .into(),
+            );
+        }
+        let mut src = Self::parse(&format!("{text}@{}", "0".repeat(40)))?;
+        src.commit.clear();
+        Ok(src)
+    }
+
+    /// The source pinned at `commit`, a full commit id.
+    pub fn at(&self, commit: &str) -> Result<Self, String> {
+        Self::parse(&format!(
+            "{}/{}/{}//{}@{commit}",
+            self.host, self.owner, self.repo, self.path
+        ))
+    }
+
     /// The default `<name>`: the file name without its extension.
     pub fn default_name(&self) -> String {
         let file = self.path.rsplit('/').next().unwrap_or(&self.path);
@@ -190,6 +214,82 @@ pub fn https_host(url: &str) -> Option<String> {
     parsed.host_str().map(str::to_ascii_lowercase)
 }
 
+/// Why `git_ref` cannot name a branch, tag or commit, or `None`.
+pub fn ref_error(git_ref: &str) -> Option<String> {
+    if git_ref.is_empty() || git_ref.len() > 255 {
+        return Some("a ref is 1 to 255 characters".into());
+    }
+    if git_ref.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Some(format!(
+            "`{git_ref}` is not a ref: it has spaces or control characters"
+        ));
+    }
+    None
+}
+
+/// Whether `s` is a full commit id: 40 or 64 lowercase hex characters.
+pub fn is_full_commit(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64)
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The forge API URL that names the commit `git_ref` points to in `src`'s
+/// repository, read anonymously, or why there is none. The answer is a
+/// JSON array whose first entry's `sha` is the commit
+/// ([`commit_from_list`]). The ref is one query value.
+pub fn anonymous_commit_url(
+    src: &LibrarySource,
+    git_ref: &str,
+    known: &KnownForges,
+) -> Result<String, String> {
+    let r = scarab_forge::encode_url_component(git_ref);
+    if src.host == "github.com" {
+        return Ok(format!(
+            "https://api.github.com/repos/{}/{}/commits?sha={r}&per_page=1",
+            src.owner, src.repo
+        ));
+    }
+    for base in &known.forgejo_bases {
+        if https_host(base).as_deref() == Some(src.host.as_str()) {
+            return Ok(format!(
+                "{}/api/v1/repos/{}/{}/commits?sha={r}&limit=1&stat=false&verification=false&files=false",
+                base.trim_end_matches('/'),
+                src.owner,
+                src.repo
+            ));
+        }
+    }
+    Err(unknown_host(src))
+}
+
+/// The commit a commits-list answer names first, or why there is none.
+pub fn commit_from_list(body: &[u8], git_ref: &str) -> Result<String, String> {
+    let v: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| format!("the forge's answer for ref `{git_ref}` is not JSON: {e}"))?;
+    let sha = v
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("sha"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("the forge names no commit for ref `{git_ref}`"))?;
+    if !is_full_commit(sha) {
+        return Err(format!(
+            "the forge named `{sha}` for ref `{git_ref}`, which is not a full commit id"
+        ));
+    }
+    Ok(sha.to_string())
+}
+
+fn unknown_host(src: &LibrarySource) -> String {
+    format!(
+        "`{}` is not a forge this Scarab knows: an anonymous install reads from github.com or \
+         from the https base URL of a Forgejo connection; to read from elsewhere, pick a \
+         connection that can reach it",
+        src.host
+    )
+}
+
 /// The URL Scarab reads `src` from anonymously, or why it will not.
 pub fn anonymous_url(src: &LibrarySource, known: &KnownForges) -> Result<String, String> {
     if src.host == "github.com" {
@@ -210,12 +310,7 @@ pub fn anonymous_url(src: &LibrarySource, known: &KnownForges) -> Result<String,
             ));
         }
     }
-    Err(format!(
-        "`{}` is not a forge this Scarab knows: an anonymous install reads from github.com or \
-         from the https base URL of a Forgejo connection; to read from elsewhere, pick a \
-         connection that can reach it",
-        src.host
-    ))
+    Err(unknown_host(src))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -321,6 +416,8 @@ pub struct HttpsFetcher {
 impl HttpsFetcher {
     pub fn new() -> Result<Self, String> {
         let client = reqwest::Client::builder()
+            // api.github.com refuses a request with no User-Agent.
+            .user_agent("scarab")
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
@@ -483,6 +580,32 @@ mod tests {
         let other =
             LibrarySource::parse(&format!("metadata.google.internal/a/b//x.yaml@{C40}")).unwrap();
         assert!(anonymous_url(&other, &known).is_err());
+    }
+
+    #[test]
+    fn a_ref_is_looked_up_as_one_query_value_on_a_known_forge() {
+        let known = KnownForges {
+            forgejo_bases: vec!["https://git.example.com/".into()],
+        };
+        let fj = LibrarySource::parse_unpinned("git.example.com/acme/libs//x.yaml").unwrap();
+        assert_eq!(
+            anonymous_commit_url(&fj, "feature/a&b#c", &known).unwrap(),
+            "https://git.example.com/api/v1/repos/acme/libs/commits?sha=feature%2Fa%26b%23c\
+             &limit=1&stat=false&verification=false&files=false"
+        );
+        let other = LibrarySource::parse_unpinned("metadata.google.internal/a/b//x.yaml").unwrap();
+        assert!(anonymous_commit_url(&other, "main", &known).is_err());
+        assert!(
+            LibrarySource::parse_unpinned(&format!("git.example.com/a/b//x.yaml@{C40}")).is_err()
+        );
+
+        let sha = commit_from_list(format!(r#"[{{"sha":"{C40}"}}]"#).as_bytes(), "main").unwrap();
+        assert_eq!(
+            fj.at(&sha).unwrap().to_string(),
+            format!("git.example.com/acme/libs//x.yaml@{C40}")
+        );
+        assert!(commit_from_list(b"[]", "main").is_err());
+        assert!(commit_from_list(br#"[{"sha":"abc"}]"#, "main").is_err());
     }
 
     #[test]
