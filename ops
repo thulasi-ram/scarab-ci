@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1794468958,"nonce":"UpxznYOiNFZkWIWIRZFbyO7tSbA=","title":"placement: service sidecars (service-N) would get the IRSA role if services ever reach a registry_auth_only Step","was":"x"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1794468958,"nonce":"IlhbhaaHDR3KDeKDH6XcdUtyAoE=","added":["type:enhancement","area:executor","security"],"removed":null}]}
