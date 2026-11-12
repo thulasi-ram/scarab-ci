@@ -154,7 +154,7 @@ scarab:
   #             pool: ci-large
   #     - name: ecr-push       # carries a registry credential (a push role):
   #       registry_auth_only: true   # applied only to a `registry_auth` step
-  #       k8s:                 # that may receive a credential; named on
+  #       k8s:                 # the launch found eligible for one; named on
   #         spec:              # any other step it fails the launch. Cannot be
   #           serviceAccountName: ecr-pusher   # combined with `default: true`.
   #

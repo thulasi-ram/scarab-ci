@@ -75,8 +75,10 @@
 #
 # An operator marks a profile that grants push access `registry_auth_only`.
 # Scarab applies it only to this library's push Step, and only when the
-# launch resolved a credential for it; named on the build Step (through the
-# list form, for one) it fails the build. So route such a profile with the
+# launch found that Step eligible for a credential (not a fork pull request,
+# not locked out, this library still trusted), whether or not a credential
+# resolves; named on the build Step (through the list form, for one) it
+# fails the build. So route such a profile with the
 # map form.
 #
 # Inputs:
@@ -86,7 +88,9 @@
 #   push        push the image after building (default false)
 #   insecure_push
 #               push over plain HTTP, to a registry with no TLS (default
-#               false); for a test or development registry only
+#               false); for a test or development registry only. crane
+#               then skips TLS verification too, so the push Step refuses
+#               it (exit 2) when it holds a registry login
 #   build_args  one KEY=VALUE per line, each passed as a build argument
 #   cache       the layer cache: none or s3 (default none)
 #   cache_bucket, cache_region, cache_name
@@ -364,6 +368,13 @@ steps:
         odd=$(find "$layout" ! -type f ! -type d | head -n 1)
         [ -z "$odd" ] ||
           fail "the image layout holds $odd, which is not a regular file or a directory"
+        # crane's --insecure also skips TLS verification, so a registry
+        # login (the credential mount, or a profile's /ecr-login) would go
+        # to whoever answers at the image's host.
+        if [ "$insecure" = true ] && [ -e "${DOCKER_CONFIG-}/config.json" ]; then
+          echo "scarab: insecure_push is refused when the step holds a registry login" >&2
+          exit 2
+        fi
         set -- push "$layout" "$image"
         [ "$insecure" = false ] || set -- "$@" --insecure
         ref=$(crane "$@")

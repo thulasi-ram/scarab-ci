@@ -378,7 +378,7 @@ Its inputs:
 | `cache_bucket` | empty | For `cache: s3`, the bucket. |
 | `cache_region` | empty | For `cache: s3`, the bucket's region. |
 | `cache_name` | empty | For `cache: s3`, the cache's name in the bucket; BuildKit's default when empty. |
-| `insecure_push` | `false` | Push over plain HTTP. For a test or development registry with no TLS only. |
+| `insecure_push` | `false` | Push over plain HTTP. For a test or development registry with no TLS only. crane then also skips TLS verification, so the push Step refuses it (exit 2) when it holds a registry login. |
 
 Its outputs:
 
@@ -431,10 +431,10 @@ Its outputs:
   placement and the S3 cache identity reach only the build step. An operator marks a profile
   that grants push access (a ServiceAccount with a push role, an init container that logs in)
   `registry_auth_only`. Scarab applies a marked profile only to a step with `registry_auth` that
-  may receive a credential, which here is the push step of a Run that is not a fork. Named
-  on any other step it fails that step's launch, so a list that holds one fails the build step:
-  route it with the map form. On a fork's push step it is left out, and the step pushes
-  nothing.
+  the launch found eligible for a credential, which here is the push step of a Run that is not a
+  fork. Named on any other step it fails that step's launch, so a list that holds one fails the
+  build step: route it with the map form. On a fork's push step it is left out, and the step
+  pushes nothing.
 
   ```yaml
   - id: image
@@ -1096,12 +1096,12 @@ both `serviceAccountName` and `automountServiceAccountToken: true`.
 
 An operator marks a profile `registry_auth_only: true` when it grants push access to a registry
 (a ServiceAccount with a push role, an init container that logs in). Scarab applies such a profile
-only to a step with `registry_auth` that may receive a registry credential: a step from a
-library your org trusts with the registry credential, in a Run that is not a fork pull request or
-locked out of its Environment's secrets. It applies whether or not a credential resolves, so a
-profile that logs in itself works with no `REGISTRY_AUTH` secret
+only to a step with `registry_auth` that the launch found eligible for a registry credential: a
+step from a library your org trusts with the registry credential, in a Run that is not a fork pull
+request or locked out of its Environment's secrets. It applies whether or not a credential
+resolves, so a profile that logs in itself works with no `REGISTRY_AUTH` secret
 ([Pushing images to Amazon ECR](/scarab-ci/usage/pushing-to-ecr/)). Named on any other step it
-fails that step's launch; on a `registry_auth` step that may not receive a credential it is left
+fails that step's launch; on a `registry_auth` step the launch did not find eligible it is left
 out. A marked profile cannot be the
 `default` ([Building an image](#building-an-image) shows the map form that routes one to the push
 step).

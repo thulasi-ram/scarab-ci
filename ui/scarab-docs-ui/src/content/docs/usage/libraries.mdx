@@ -164,8 +164,8 @@ clone library, then give its source the trust its steps need:
 5. If a placement profile grants push access (a ServiceAccount with a push role, say), the
    operator marks it `registry_auth_only: true`, and Pipelines route it to the push step with
    `placement_profiles: { push: [<profile>] }`. Scarab applies a marked profile only to that step,
-   and only when the step may receive a registry credential (step 4, in a Run that is not a fork
-   pull request), whether or not a `REGISTRY_AUTH` secret exists
+   and only when the launch found that step eligible for a registry credential (step 4, in a Run
+   that is not a fork pull request), whether or not a `REGISTRY_AUTH` secret exists
    ([Placement & resources](/scarab-ci/usage/pipeline-syntax/#placement--resources)).
 
 The push step runs as root, because crane's image has no other user, so an org Policy that denies
@@ -214,6 +214,8 @@ Settings › Libraries (**Trust source**), or with the API:
 
 ```sh
 curl -X POST "$SCARAB/v1/orgs/acme/library-trust" \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $SCARAB_TOKEN" \
   -d '{"source": "github.com/thulasi-ram/scarab-ci//libs/clone.yaml", "grant": "forge_credentials"}'
 ```
 
@@ -245,6 +247,8 @@ with the API:
 
 ```sh
 curl -X POST "$SCARAB/v1/orgs/acme/library-trust" \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $SCARAB_TOKEN" \
   -d '{"source": "github.com/thulasi-ram/scarab-ci//libs/build.yaml", "grant": "build_sandbox"}'
 ```
 
@@ -266,6 +270,8 @@ needs the source trusted with forge credentials as well. No source is trusted by
 
 ```sh
 curl -X POST "$SCARAB/v1/orgs/acme/library-trust" \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $SCARAB_TOKEN" \
   -d '{"source": "github.com/thulasi-ram/scarab-ci//libs/build.yaml", "grant": "registry_credential"}'
 ```
 

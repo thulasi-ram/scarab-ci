@@ -99,9 +99,9 @@ release.yml uses that version's section as the GitHub Release text. See
   ([Reuse: `invoke`](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#reuse-invoke)).
 - **A placement profile that grants push access can be kept to the step that pushes.** An
   operator marks it `registry_auth_only: true` in the placement config. Scarab applies it only to
-  a step with `registry_auth` whose launch resolved a registry credential (a step from a library
-  the org trusts with the registry credential, in a Run that is not a fork pull request or locked
-  out). Named on any other step, the build library's build step included, it fails that step's
+  a step with `registry_auth` that the launch found eligible for a registry credential (a step
+  from a library the org trusts with the registry credential, in a Run that is not a fork pull
+  request or locked out), whether or not a credential resolves. Named on any other step, the build library's build step included, it fails that step's
   launch; on a fork's push step it is left out. A marked profile cannot be `default`; the server
   refuses that config at boot
   ([Placement & resources](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#placement--resources)).
