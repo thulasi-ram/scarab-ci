@@ -806,8 +806,10 @@ pub struct StepSpec {
     /// onto the step's Pod. Empty = the operator's `default` profile. The author
     /// **names profiles**, never raw k8s — so a pipeline carries no cluster
     /// topology (a bounded name-only reference) and no Kubernetes primitives.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub placement_profiles: Vec<String>,
+    /// An invoke step may name them per library Step instead
+    /// ([`PlacementProfiles::PerStep`]); a compiled Step holds a list.
+    #[serde(default, skip_serializing_if = "PlacementProfiles::is_empty")]
+    pub placement_profiles: PlacementProfiles,
     /// Requested compute resources (ADR-0055): exact `cpu`/`memory`, applied to the
     /// step container's requests/limits. Deliberately **not** named `size` tiers —
     /// state the specifics.
@@ -1614,6 +1616,138 @@ pub struct Matrix {
 /// here; evaluated by the [`cel`] submodule).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct When(pub String);
+
+/// A Step's `placement_profiles` (ADR-0055): the [`PlacementProfile`] names
+/// it runs on. Written as a list on any Step. An invoke step may instead
+/// write a map from a Step id of the library it invokes to that Step's list
+/// (`{ image: [arm64], push: [ecr-push] }`), so each library Step gets its
+/// own profiles; inlining resolves the map, and a compiled Step always holds
+/// a list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementProfiles {
+    /// The same profiles for the Step, or for every Step an invoke inlines.
+    List(Vec<String>),
+    /// An invoke step's profiles per library Step id.
+    PerStep(BTreeMap<String, Vec<String>>),
+}
+
+impl Default for PlacementProfiles {
+    fn default() -> Self {
+        PlacementProfiles::List(Vec::new())
+    }
+}
+
+impl From<Vec<String>> for PlacementProfiles {
+    fn from(list: Vec<String>) -> Self {
+        PlacementProfiles::List(list)
+    }
+}
+
+impl PlacementProfiles {
+    /// No profile is named, in either form.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            PlacementProfiles::List(l) => l.is_empty(),
+            PlacementProfiles::PerStep(m) => m.is_empty(),
+        }
+    }
+
+    /// The list a Step runs on. A map (which only an invoke step holds
+    /// before inlining) names no profile for the invoke step itself.
+    pub fn as_list(&self) -> &[String] {
+        match self {
+            PlacementProfiles::List(l) => l,
+            PlacementProfiles::PerStep(_) => &[],
+        }
+    }
+
+    /// Every profile name written, in either form.
+    pub fn names(&self) -> impl Iterator<Item = &String> {
+        let (list, map) = match self {
+            PlacementProfiles::List(l) => (Some(l), None),
+            PlacementProfiles::PerStep(m) => (None, Some(m)),
+        };
+        list.into_iter()
+            .flatten()
+            .chain(map.into_iter().flat_map(|m| m.values().flatten()))
+    }
+
+    /// The profiles an invoke step gives the library Step `lib_step` (its
+    /// id in the library, or a nested invoke's inlined `<id>/…`): the whole
+    /// list, or the map's entry for the Step's id in the library.
+    fn for_library_step(&self, lib_step: &str) -> &[String] {
+        match self {
+            PlacementProfiles::List(l) => l,
+            PlacementProfiles::PerStep(m) => {
+                let id = lib_step.split('/').next().unwrap_or(lib_step);
+                m.get(id).map(Vec::as_slice).unwrap_or(&[])
+            }
+        }
+    }
+}
+
+impl PartialEq<Vec<String>> for PlacementProfiles {
+    fn eq(&self, other: &Vec<String>) -> bool {
+        matches!(self, PlacementProfiles::List(l) if l == other)
+    }
+}
+
+impl PartialEq<Vec<&str>> for PlacementProfiles {
+    fn eq(&self, other: &Vec<&str>) -> bool {
+        matches!(self, PlacementProfiles::List(l) if l == other)
+    }
+}
+
+impl Serialize for PlacementProfiles {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            PlacementProfiles::List(l) => l.serialize(serializer),
+            PlacementProfiles::PerStep(m) => m.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PlacementProfiles {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// Dispatched on the shape, so an error names what was wrong inside
+        /// the list or the map.
+        struct FormVisitor;
+        impl<'de> serde::de::Visitor<'de> for FormVisitor {
+            type Value = PlacementProfiles;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(
+                    "a list of placement profile names, or (on an invoke step) a map from a \
+                     library step id to such a list",
+                )
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<PlacementProfiles, A::Error> {
+                Vec::<String>::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    .map(PlacementProfiles::List)
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<PlacementProfiles, A::Error> {
+                // An empty map names nothing, as an empty list does, and is
+                // read as one so it serializes back to the same value.
+                BTreeMap::<String, Vec<String>>::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )
+                .map(|m| {
+                    if m.is_empty() {
+                        PlacementProfiles::default()
+                    } else {
+                        PlacementProfiles::PerStep(m)
+                    }
+                })
+            }
+        }
+        deserializer.deserialize_any(FormVisitor)
+    }
+}
 
 /// A **PlacementProfile** (ADR-0055): an operator-owned, cluster-scoped named
 /// bundle mapping a `name` → concrete Kubernetes placement (nodeSelector /
@@ -3168,6 +3302,26 @@ fn inline_level(
                 }
             }
         }
+        // A per-Step map names the library's own Step ids; a key naming
+        // none would place nothing, so it is refused. A Step that keeps its
+        // own profiles, a gate and a `forge_token` Step take none from it.
+        if let PlacementProfiles::PerStep(map) = &step.placement_profiles {
+            for (key, names) in map {
+                if !lib.steps.iter().any(|s| &s.id == key) {
+                    diagnostics.push(format!(
+                        "step `{}`: `placement_profiles` names step `{key}`, which library \
+                         `{label}` does not have",
+                        step.id
+                    ));
+                }
+                if names.iter().any(|p| p.trim().is_empty()) {
+                    diagnostics.push(format!(
+                        "step `{}`: `placement_profiles.{key}` contains an empty profile name",
+                        step.id
+                    ));
+                }
+            }
+        }
         // This library is the outermost link so far of every Step it
         // inlines: the nested levels already recorded theirs.
         let link = OriginEntry {
@@ -3217,7 +3371,7 @@ fn inline_level(
                 if (step.deploy || lib.deploy) && !inst.is_gate() {
                     inst.deploy = true;
                 }
-                carry_invoke_fields(inv, &mut inst);
+                carry_invoke_fields(inv, &ls.id, &mut inst);
                 // Entry seam: a library root inherits the invoke step's upstreams;
                 // an internal need is namespaced.
                 inst.needs = if ls.needs.0.is_empty() {
@@ -4018,8 +4172,11 @@ fn invoke_output_scope(step: &mut StepSpec, exposed: &BTreeMap<String, Option<Ve
 /// 2026-11-12): profiles are written by the operator and an author can only
 /// name one, a build for another architecture needs that architecture's
 /// nodes, and an org Policy over `steps[].placement_profiles` and
-/// `steps[].origin` decides which Runs may name which profile.
-fn carry_invoke_fields(invoke: &StepSpec, inst: &mut StepSpec) {
+/// `steps[].origin` decides which Runs may name which profile. Written as a
+/// map from library Step id, each Step gets only its own entry, so a profile
+/// that carries a push credential reaches the Step that pushes and no other.
+/// `lib_step` is the Step's id in the library.
+fn carry_invoke_fields(invoke: &StepSpec, lib_step: &str, inst: &mut StepSpec) {
     if !inst.is_gate() {
         if inst.timeout.is_none() {
             inst.timeout = invoke.timeout;
@@ -4031,7 +4188,12 @@ fn carry_invoke_fields(invoke: &StepSpec, inst: &mut StepSpec) {
             inst.resources.memory_mib = invoke.resources.memory_mib;
         }
         if inst.placement_profiles.is_empty() && inst.forge_token.is_none() {
-            inst.placement_profiles = invoke.placement_profiles.clone();
+            inst.placement_profiles = PlacementProfiles::List(
+                invoke
+                    .placement_profiles
+                    .for_library_step(lib_step)
+                    .to_vec(),
+            );
         }
     }
 }
@@ -5558,12 +5720,12 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 step.id
             ));
         }
-        // The image and command of a Step that holds a forge credential, or
-        // runs in the sandbox, are written where the Step is written
-        // (ADR-0076 §2): a `${{ … }}` in either would let a value from
-        // outside (a caller's input, a Step's result, the trigger) choose
-        // what runs beside the token or with seccomp off. Outside values
-        // reach it only through `env:`.
+        // The image and command of a Step that holds a forge or registry
+        // credential, or runs in the sandbox, are written where the Step is
+        // written (ADR-0076 §2): a `${{ … }}` in either would let a value
+        // from outside (a caller's input, a Step's result, the trigger)
+        // choose what runs beside the credential or with seccomp off.
+        // Outside values reach it only through `env:`.
         let holder = if step.forge_token.is_some() {
             Some(("`forge_token`", "a forge credential is mounted beside them"))
         } else if step.sandbox().is_some() {
@@ -5633,9 +5795,18 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         // Placement (ADR-0055): profile names must be non-empty, and a raw
         // `k8s_overlay`, if present, must be a JSON object (a pod-spec fragment) —
         // never a scalar/array — so it can strategic-merge onto the Pod.
-        if step.placement_profiles.iter().any(|p| p.trim().is_empty()) {
+        if step.placement_profiles.names().any(|p| p.trim().is_empty()) {
             diagnostics.push(format!(
                 "step `{}`: `placement_profiles` contains an empty profile name",
+                step.id
+            ));
+        }
+        // Inlining resolves an invoke step's map, so a map left here was
+        // written on a Step that invokes nothing.
+        if matches!(step.placement_profiles, PlacementProfiles::PerStep(_)) {
+            diagnostics.push(format!(
+                "step `{}`: `placement_profiles` may be a map from step id only on an invoke \
+                 step; write a list of profile names",
                 step.id
             ));
         }
@@ -9778,6 +9949,179 @@ mod tests {
         assert!(step("p/push").registry_auth);
         assert_eq!(step("p/push").placement_profiles, vec!["big".to_string()]);
         assert_eq!(step("p/own").placement_profiles, vec!["amd64".to_string()]);
+    }
+
+    /// A library with a build-like Step, a pushing Step, a Step with its own
+    /// profiles and a nested invoke, for the per-Step form.
+    fn per_step_libs() -> BTreeMap<String, String> {
+        libs(&[
+            (
+                ".scarab/lib/p.yaml",
+                "steps:\n  - { id: image, image: alpine, command: [echo] }\n  - { id: push, image: alpine, command: [echo], registry_auth: true, needs: [image] }\n  - { id: own, image: alpine, command: [echo], placement_profiles: [amd64] }\n  - { id: inner, invoke: file:.scarab/lib/q.yaml }\n",
+            ),
+            (
+                ".scarab/lib/q.yaml",
+                "steps:\n  - { id: leaf, image: alpine, command: [echo] }\n",
+            ),
+        ])
+    }
+
+    /// The list form gives every inlined Step the same profiles, as before
+    /// the map form existed.
+    #[test]
+    fn a_placement_profile_list_on_an_invoke_reaches_every_inlined_step() {
+        let ir = compile_with(
+            "steps: [{ id: p, invoke: file:.scarab/lib/p.yaml, placement_profiles: [big, fast] }]",
+            &per_step_libs(),
+        );
+        let step = |id: &str| ir.steps.iter().find(|s| s.id == id).unwrap();
+        for id in ["p/image", "p/push", "p/inner/leaf"] {
+            assert_eq!(step(id).placement_profiles, vec!["big", "fast"], "{id}");
+        }
+        assert_eq!(step("p/own").placement_profiles, vec!["amd64"]);
+    }
+
+    /// The map form gives each library Step only its own entry: the push
+    /// profile reaches the pushing Step and not the build, a Step with no
+    /// entry gets none, a nested invoke's Steps take its entry, and a Step
+    /// that names its own keeps them.
+    #[test]
+    fn a_placement_profile_map_on_an_invoke_routes_each_list_to_its_step() {
+        let ir = compile_with(
+            r#"
+            steps:
+              - id: p
+                invoke: file:.scarab/lib/p.yaml
+                placement_profiles:
+                  image: [arm64-builders, build-cache]
+                  push: [ecr-push]
+                  own: [ignored]
+                  inner: [small]
+            "#,
+            &per_step_libs(),
+        );
+        let step = |id: &str| ir.steps.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(
+            step("p/image").placement_profiles,
+            vec!["arm64-builders", "build-cache"]
+        );
+        assert_eq!(step("p/push").placement_profiles, vec!["ecr-push"]);
+        assert_eq!(step("p/own").placement_profiles, vec!["amd64"]);
+        assert_eq!(step("p/inner/leaf").placement_profiles, vec!["small"]);
+        // Every compiled Step holds a list, which is what a Policy reads.
+        assert!(ir
+            .steps
+            .iter()
+            .all(|s| matches!(s.placement_profiles, PlacementProfiles::List(_))));
+
+        let ir = compile_with(
+            "steps: [{ id: p, invoke: file:.scarab/lib/p.yaml, placement_profiles: { push: [ecr-push] } }]",
+            &per_step_libs(),
+        );
+        let step = |id: &str| ir.steps.iter().find(|s| s.id == id).unwrap();
+        assert!(step("p/image").placement_profiles.is_empty());
+        assert!(step("p/inner/leaf").placement_profiles.is_empty());
+        assert_eq!(step("p/push").placement_profiles, vec!["ecr-push"]);
+    }
+
+    /// A key that names no Step of the library is an error naming the key;
+    /// so is an empty profile name in an entry, and the map form on a Step
+    /// that invokes nothing.
+    #[test]
+    fn a_placement_profile_map_refuses_unknown_steps_and_empty_names() {
+        let errs = errors_with(
+            "steps: [{ id: p, invoke: file:.scarab/lib/p.yaml, placement_profiles: { pushh: [ecr-push] } }]",
+            &per_step_libs(),
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("step `p`")
+                && e.contains("names step `pushh`")
+                && e.contains("does not have")),
+            "{errs:?}"
+        );
+        // A nested invoke's inlined id is not a key; its invoke step id is.
+        let errs = errors_with(
+            "steps: [{ id: p, invoke: file:.scarab/lib/p.yaml, placement_profiles: { inner/leaf: [x] } }]",
+            &per_step_libs(),
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("names step `inner/leaf`")),
+            "{errs:?}"
+        );
+        let errs = errors_with(
+            r#"steps: [{ id: p, invoke: file:.scarab/lib/p.yaml, placement_profiles: { push: ["", x] } }]"#,
+            &per_step_libs(),
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("`placement_profiles.push` contains an empty profile name")),
+            "{errs:?}"
+        );
+        let errs = errors("steps: [{ id: a, image: busybox, placement_profiles: { a: [x] } }]");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("step `a`") && e.contains("only on an invoke step")),
+            "{errs:?}"
+        );
+    }
+
+    /// A `forge_token` Step receives no placement profile from its invoke,
+    /// in either form, even when the map names it.
+    #[test]
+    fn a_forge_token_step_gets_no_placement_profile_in_either_form() {
+        let lib = "steps:\n  - { id: git, image: alpine, command: [echo], forge_token: read }\n  - { id: other, image: alpine, command: [echo] }\n";
+        let libraries = Libraries {
+            installed: installed(&[(
+                "acme/git",
+                "github.com/acme/libs//git.yaml@1111111111111111111111111111111111111111",
+                lib,
+            )]),
+            ..Default::default()
+        };
+        for form in ["[big]", "{ git: [big], other: [big] }"] {
+            let ir = compile_with_libraries(
+                &format!("steps: [{{ id: c, invoke: lib:acme/git, placement_profiles: {form} }}]"),
+                &libraries,
+            )
+            .unwrap();
+            let step = |id: &str| ir.steps.iter().find(|s| s.id == id).unwrap();
+            assert!(step("c/git").placement_profiles.is_empty(), "{form}");
+            assert_eq!(step("c/other").placement_profiles, vec!["big"], "{form}");
+        }
+    }
+
+    /// The map form reads back as written, and a compiled IR holding only
+    /// lists round-trips through JSON unchanged.
+    #[test]
+    fn placement_profiles_round_trip_in_both_forms() {
+        let step: StepSpec = serde_yaml::from_str(
+            "{ id: p, invoke: file:x.yaml, placement_profiles: { push: [ecr-push], image: [a, b] } }",
+        )
+        .unwrap();
+        assert_eq!(
+            step.placement_profiles,
+            PlacementProfiles::PerStep(BTreeMap::from([
+                ("image".to_string(), vec!["a".to_string(), "b".to_string()]),
+                ("push".to_string(), vec!["ecr-push".to_string()]),
+            ]))
+        );
+        let json = serde_json::to_string(&step).unwrap();
+        assert!(
+            json.contains(r#""placement_profiles":{"image":["a","b"],"push":["ecr-push"]}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<StepSpec>(&json).unwrap(), step);
+
+        let ir = compile_with(
+            "steps: [{ id: p, invoke: file:.scarab/lib/p.yaml, placement_profiles: { push: [ecr-push] } }]",
+            &per_step_libs(),
+        );
+        let json = serde_json::to_string(&ir).unwrap();
+        assert_eq!(serde_json::from_str::<PipelineIr>(&json).unwrap(), ir);
+        assert!(
+            serde_yaml::from_str::<StepSpec>("{ id: a, image: b, placement_profiles: oops }")
+                .is_err()
+        );
     }
 
     /// The build library's `validate:` rules, applied to literal `with:`

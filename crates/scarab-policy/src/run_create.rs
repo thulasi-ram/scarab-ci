@@ -542,7 +542,11 @@ pub fn input_from_pipeline(
                 &what,
                 "secrets",
             )?),
-            placement_profiles: capped(s.placement_profiles.clone(), &what, "placement profiles")?,
+            placement_profiles: capped(
+                s.placement_profiles.as_list().to_vec(),
+                &what,
+                "placement profiles",
+            )?,
             deploy: s.deploy || ir.deploy,
             forge_token: s.forge_token.map(|t| match t {
                 scarab_pipeline::ForgeToken::Read => ForgeToken::Read,

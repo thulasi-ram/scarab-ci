@@ -7346,7 +7346,7 @@ async fn write_run_from_ir(
                 registry_auth,
                 build: None,
                 artifacts: step.artifacts.clone(),
-                placement_profiles: step.placement_profiles.clone(),
+                placement_profiles: step.placement_profiles.as_list().to_vec(),
                 resources: step.resources.clone(),
                 k8s_overlay: admit_k8s_overlay(
                     gov.privilege_grant_scope(),
