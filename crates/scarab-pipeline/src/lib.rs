@@ -4334,8 +4334,8 @@ fn invoke_output_scope(step: &mut StepSpec, exposed: &BTreeMap<String, Option<Ve
 /// name one, and a build for another architecture needs that architecture's
 /// nodes. A profile that carries a registry credential is marked
 /// [`PlacementProfile::registry_auth_only`] by the operator, and the executor
-/// refuses to apply it to any Step but a `registry_auth` Step whose
-/// credential the launch resolved; so a list naming one fails the sandboxed
+/// refuses to apply it to any Step but a `registry_auth` Step the launch
+/// found eligible for a credential; so a list naming one fails the sandboxed
 /// build Step, and the author writes the map form instead. Written as a map
 /// from library Step id, each Step gets only its own entry. `lib_step` is the
 /// Step's id in the library.

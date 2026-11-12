@@ -75,8 +75,10 @@
 #
 # An operator marks a profile that grants push access `registry_auth_only`.
 # Scarab applies it only to this library's push Step, and only when the
-# launch resolved a credential for it; named on the build Step (through the
-# list form, for one) it fails the build. So route such a profile with the
+# launch found that Step eligible for a credential (not a fork pull request,
+# not locked out, this library still trusted), whether or not a credential
+# resolves; named on the build Step (through the list form, for one) it
+# fails the build. So route such a profile with the
 # map form.
 #
 # Inputs:

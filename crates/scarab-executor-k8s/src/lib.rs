@@ -5208,11 +5208,12 @@ fn apply_placement(
 ///
 /// - a Step without `registry_auth` (a run Step, the build library's
 ///   sandboxed build Step) may not name it: `Err`, which fails the launch;
-/// - a `registry_auth` Step whose launch resolved no credential (a fork pull
-///   request, a Run locked out of its Environment, a Step from the Pipeline
-///   file or an untrusted library) runs without it: `Ok(false)`, so a fork's
-///   push Step still succeeds and pushes nothing;
-/// - a `registry_auth` Step the launch found eligible gets it: `Ok(true)`.
+/// - a `registry_auth` Step the launch did not find eligible for a
+///   credential (a fork pull request, a Run locked out of its Environment, a
+///   Step from the Pipeline file or an untrusted library) runs without it:
+///   `Ok(false)`, so a fork's push Step still succeeds and pushes nothing;
+/// - a `registry_auth` Step the launch found eligible for a credential gets
+///   it, whether or not a credential resolved: `Ok(true)`.
 fn registry_auth_only_applies(step: &str, name: &str, spec: &StepSpec) -> Result<bool, String> {
     match &spec.registry_auth {
         None => Err(format!(
@@ -5225,8 +5226,8 @@ fn registry_auth_only_applies(step: &str, name: &str, spec: &StepSpec) -> Result
                 %step,
                 profile = %name,
                 "placement profile left out: it carries a registry credential, and this launch \
-                 resolved none for the step (a fork pull request, a locked-out Run, or a step \
-                 its library's trust does not cover)"
+                 did not find the step eligible for one (a fork pull request, a locked-out Run, \
+                 or a step its library's trust does not cover)"
             );
             Ok(false)
         }
@@ -6579,8 +6580,8 @@ mod tests {
         }
     }
 
-    /// A `registry_auth` Step gets the marked profile only when its launch
-    /// resolved a credential for it. A fork pull request's push Step (and a
+    /// A `registry_auth` Step gets the marked profile only when the launch
+    /// found it eligible for a credential. A fork pull request's push Step (and a
     /// locked-out Run's, and one from the Pipeline file or an untrusted
     /// library) runs without the profile and does not fail, so its build
     /// stays green and pushes nothing; a trusted push Step gets it.
