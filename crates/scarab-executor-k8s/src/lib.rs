@@ -2760,6 +2760,10 @@ impl Executor for K8sExecutor {
             self.workspace_fetch.as_ref(),
         )
         .map_err(ExecError::Launch)?;
+        // A build step's context, dockerfile and image, checked again for
+        // specs stored before the Pipeline compiler checked them (git-bug
+        // df660b6), before any Pod exists.
+        build_is_launchable(spec, self.workspace_cas.is_some()).map_err(ExecError::Launch)?;
 
         // Re-attach: if the Pod already exists (a prior launch we may not have
         // observed completing), adopt it instead of creating a duplicate.
@@ -4276,6 +4280,40 @@ pub fn workspace_feed_is_satisfiable(
     Ok(())
 }
 
+/// Whether a build step may launch (git-bug df660b6). Its context,
+/// dockerfile and image must pass the rule the Pipeline compiler applies, and
+/// the Pod must have a workspace: without one the build container's working
+/// directory is the image's, and a relative context could reach the
+/// registry credential mounted in the same container. Not a build step:
+/// `Ok`.
+///
+/// Pure, so the rule is testable without a cluster.
+pub fn build_is_launchable(spec: &StepSpec, workspace: bool) -> Result<(), String> {
+    let Some(build) = &spec.build else {
+        return Ok(());
+    };
+    let problems =
+        scarab_pipeline::build_target_problems(&build.context, &build.dockerfile, &build.image);
+    if !problems.is_empty() {
+        return Err(format!("build step refused: {}", problems.join("; ")));
+    }
+    if !spec.secrets.is_empty() {
+        return Err(
+            "build step refused: it names `secrets:`, which would sit in the container \
+             that holds the registry credential and runs the repository's Dockerfile"
+                .to_string(),
+        );
+    }
+    if !workspace {
+        return Err(
+            "build step refused: it builds from the workspace, and this executor \
+             runs no workspace flow"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// The fetcher init container (ADR-0061 s3-feed). Its token rides the shared
 /// [`workspace_token_volume`], which the caller adds to the Pod exactly once
 /// — the egress helper mounts the same volume for the drain (s3-drain).
@@ -4510,8 +4548,14 @@ pub fn build_pod(
         .map(|a| a.id.0.clone())
         .unwrap_or_else(|| "0".to_string());
 
-    let mut env: Vec<EnvVar> = spec
-        .env
+    // A build container holds the registry credential and runs the
+    // repository's Dockerfile, so authored env (`PATH`, `LD_PRELOAD`) would
+    // choose what code runs beside the credential. The Pipeline compiler
+    // refuses `env:` on a build step; a spec stored before that check, and
+    // the `SCARAB_PARAM_*` values rendered at launch, are dropped here. Only
+    // the env Scarab sets below reaches a build container.
+    let authored_env: &[(String, String)] = if spec.build.is_some() { &[] } else { &spec.env };
+    let mut env: Vec<EnvVar> = authored_env
         .iter()
         .map(|(k, v)| EnvVar {
             name: k.clone(),
@@ -4668,6 +4712,17 @@ pub fn build_pod(
     // the egress sidecar is present.
     let mut registry_volume: Option<Volume> = None;
     let (image, command, args) = if let Some(build) = &spec.build {
+        // The guard reads the context and dockerfile from these.
+        env.push(EnvVar {
+            name: BUILD_CONTEXT_ENV.into(),
+            value: Some(build.context.clone()),
+            value_from: None,
+        });
+        env.push(EnvVar {
+            name: BUILD_DOCKERFILE_ENV.into(),
+            value: Some(build.dockerfile.clone()),
+            value_from: None,
+        });
         env.push(EnvVar {
             // Rootless buildkitd cannot use the process sandbox.
             name: "BUILDKITD_FLAGS".into(),
@@ -4698,7 +4753,7 @@ pub fn build_pod(
         }
         (
             BUILDKIT_IMAGE.to_string(),
-            vec!["buildctl-daemonless.sh".to_string()],
+            build_guard_command(),
             buildctl_args(build, egress.is_some()),
         )
     } else {
@@ -5695,6 +5750,78 @@ const OIDC_TOKEN_KEY: &str = "token";
 /// The per-Pod Secret carrying the OIDC token.
 fn oidc_secret_name(pod_name: &str) -> String {
     format!("{pod_name}-oidc")
+}
+
+/// Env vars carrying a build step's context and dockerfile to
+/// [`BUILD_GUARD`]. They are passed as values, never written into the script.
+const BUILD_CONTEXT_ENV: &str = "SCARAB_BUILD_CONTEXT";
+const BUILD_DOCKERFILE_ENV: &str = "SCARAB_BUILD_DOCKERFILE";
+
+/// The script a build container runs before `buildctl-daemonless.sh`
+/// (git-bug df660b6).
+///
+/// The registry credential is mounted in the same container, at
+/// [`REGISTRY_AUTH_MOUNT_PATH`]. The Pipeline compiler and the launch check
+/// refuse an absolute or `..` context or dockerfile, but a symlink committed
+/// in the repository (`ctx -> /scarab/registry`, or a Dockerfile pointing at
+/// the credential) passes those checks and is only seen here, once the
+/// workspace exists. So the guard resolves the workspace root, the context and
+/// `<context>/<dockerfile>`, refuses (exit 2) when either is outside the
+/// root, and then runs `buildctl-daemonless.sh` with the buildctl args, which
+/// it receives as `"$@"`. A Pod with no workspace fails here too, because
+/// `/workspace` does not exist.
+///
+/// POSIX sh: the image is Alpine, with busybox `sh` and `realpath`. A path is
+/// checked to exist before `realpath` resolves it, because `realpath`
+/// implementations differ on missing paths. `/bin/sh` and
+/// `/usr/bin/buildctl-daemonless.sh` are named by path, where the image puts
+/// them; `realpath` is found on the image's `PATH`, which authored env cannot
+/// change (see [`build_pod`]).
+const BUILD_GUARD: &str = r#"set -eu
+root=/workspace
+fail() { echo "scarab: build refused: $*" >&2; exit 2; }
+nl='
+'
+# Sets r to the resolved path. The `.` keeps a trailing newline in a
+# directory name from being dropped by the command substitution.
+resolve() {
+  r=$(realpath "$1" && echo .) || return 1
+  r=${r%.}
+  r=${r%"$nl"}
+}
+[ -d "$root" ] || fail "no workspace at $root"
+cd "$root" || fail "cannot enter the workspace at $root"
+resolve . || fail "cannot resolve the workspace at $root"
+root=$r
+ctx=${SCARAB_BUILD_CONTEXT-}
+df=${SCARAB_BUILD_DOCKERFILE-}
+[ -n "$ctx" ] || fail "no build context"
+[ -n "$df" ] || fail "no dockerfile"
+inside() {
+  case "$1" in
+    "$root" | "$root"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+[ -e "./$ctx" ] || fail "build context $ctx does not exist in the workspace"
+resolve "./$ctx" || fail "cannot resolve build context $ctx"
+inside "$r" || fail "build context $ctx resolves outside the workspace"
+[ -e "./$ctx/$df" ] || fail "dockerfile $ctx/$df does not exist in the workspace"
+resolve "./$ctx/$df" || fail "cannot resolve dockerfile $ctx/$df"
+inside "$r" || fail "dockerfile $ctx/$df resolves outside the workspace"
+exec /usr/bin/buildctl-daemonless.sh "$@"
+"#;
+
+/// The build container's command: [`BUILD_GUARD`] under `sh -c`, with
+/// `scarab-build` as `$0`, so the container's args (the buildctl args) are
+/// the guard's `"$@"`.
+fn build_guard_command() -> Vec<String> {
+    vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        BUILD_GUARD.to_string(),
+        "scarab-build".to_string(),
+    ]
 }
 
 /// The `buildctl` args a build step compiles to (ADR-0018). With the egress
@@ -7431,6 +7558,7 @@ mod tests {
             repo_name: "app".into(),
             push: true,
             insecure_push: false,
+            locked_out: false,
             registry_auth_json: None,
             derived_auth: None,
         }
@@ -7460,10 +7588,14 @@ mod tests {
         let c = &pod.spec.as_ref().unwrap().containers[0];
 
         assert_eq!(c.image.as_deref(), Some("moby/buildkit:rootless"));
-        assert_eq!(
-            c.command.as_ref().unwrap(),
-            &vec!["buildctl-daemonless.sh".to_string()]
-        );
+        let command = c.command.as_ref().unwrap();
+        assert_eq!(command[..2], ["/bin/sh", "-c"]);
+        // Every `$` in a Pod command is written as `$$`, which the kubelet
+        // reduces back to `$` (scarab_k8s_expansion), so the shell runs
+        // BUILD_GUARD as written.
+        assert_eq!(command[2], BUILD_GUARD.replace('$', "$$"));
+        assert_eq!(command[3], "scarab-build");
+        assert_eq!(command.len(), 4);
         let args = c.args.as_ref().unwrap().join(" ");
         assert!(args.contains("--frontend dockerfile.v0"), "{args}");
         assert!(args.contains("filename=Dockerfile"), "{args}");
@@ -7506,6 +7638,292 @@ mod tests {
             .unwrap()
             .iter()
             .any(|i| i.name == WORKSPACE_INIT_CONTAINER));
+    }
+
+    /// git-bug df660b6: the guard gets the context and dockerfile as env
+    /// values, authored env (`PATH`, `LD_PRELOAD`, a `SCARAB_BUILD_*` name)
+    /// never reaches the build container, and the buildctl args are what
+    /// they were before the guard.
+    #[test]
+    fn build_pod_drops_authored_env_and_hands_the_guard_its_paths() {
+        let step = step_with_attempt("run-1", "image", "a1");
+        let mut spec = busybox();
+        spec.image = String::new();
+        spec.command = vec![];
+        spec.env = vec![
+            ("SCARAB_BUILD_CONTEXT".into(), ".".into()),
+            ("PATH".into(), "/workspace/bin".into()),
+            ("LD_PRELOAD".into(), "/workspace/evil.so".into()),
+        ];
+        let mut build = sample_build();
+        build.context = "docker/clone".into();
+        build.dockerfile = "build/Dockerfile".into();
+        spec.build = Some(build.clone());
+        let pod = build_pod(
+            "scarab-image-a1",
+            "ns",
+            &step,
+            &spec,
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            true,
+            Some(&sample_fetch()),
+        );
+        let c = &pod.spec.as_ref().unwrap().containers[0];
+        let env = c.env.as_ref().unwrap();
+        let values = |name: &str| -> Vec<Option<&str>> {
+            env.iter()
+                .filter(|e| e.name == name)
+                .map(|e| e.value.as_deref())
+                .collect()
+        };
+        assert_eq!(values("SCARAB_BUILD_CONTEXT"), [Some("docker/clone")]);
+        assert_eq!(
+            values("SCARAB_BUILD_DOCKERFILE"),
+            [Some("build/Dockerfile")]
+        );
+        // Authored env never reaches the build container; Scarab's own does.
+        assert!(values("PATH").is_empty() && values("LD_PRELOAD").is_empty());
+        for name in [
+            "BUILDKITD_FLAGS",
+            "SCARAB_RUN",
+            "SCARAB_STEP",
+            "SCARAB_ATTEMPT",
+        ] {
+            assert_eq!(values(name).len(), 1, "{name}");
+        }
+        assert!(
+            !BUILD_GUARD.contains("docker/clone") && !BUILD_GUARD.contains("build/Dockerfile"),
+            "paths are never written into the script"
+        );
+        assert_eq!(
+            c.args.as_ref().unwrap(),
+            &vec![
+                "build".to_string(),
+                "--frontend".into(),
+                "dockerfile.v0".into(),
+                "--local".into(),
+                "context=docker/clone".into(),
+                "--local".into(),
+                "dockerfile=docker/clone".into(),
+                "--opt".into(),
+                "filename=build/Dockerfile".into(),
+                "--output".into(),
+                "type=image,name=registry.example/app:1.0,push=true".into(),
+            ]
+        );
+        assert_eq!(c.working_dir.as_deref(), Some(WORKSPACE_MOUNT_PATH));
+    }
+
+    /// git-bug df660b6: a stored spec from before the compiler checked
+    /// build paths is refused at launch, and so is a build with no
+    /// workspace.
+    #[test]
+    fn build_is_launchable_refuses_paths_outside_the_workspace_and_no_workspace() {
+        let mut spec = busybox();
+        spec.build = Some(sample_build());
+        assert_eq!(build_is_launchable(&spec, true), Ok(()));
+        assert!(build_is_launchable(&spec, false)
+            .unwrap_err()
+            .contains("workspace"));
+        assert_eq!(build_is_launchable(&busybox(), false), Ok(()));
+        let mut with_secret = spec.clone();
+        with_secret.secrets = vec![scarab_pipeline::SecretRef::file("NPM_TOKEN")];
+        assert!(build_is_launchable(&with_secret, true)
+            .unwrap_err()
+            .contains("secrets"));
+
+        for (context, dockerfile, image) in [
+            ("/scarab/registry", "Dockerfile", "registry.example/app:1.0"),
+            ("ctx/..", "Dockerfile", "registry.example/app:1.0"),
+            (
+                ".",
+                "/scarab/registry/config.json",
+                "registry.example/app:1.0",
+            ),
+            (".", "../Dockerfile", "registry.example/app:1.0"),
+            (".", "Dockerfile", "registry.example/app:1.0,push=true"),
+        ] {
+            let mut build = sample_build();
+            build.context = context.into();
+            build.dockerfile = dockerfile.into();
+            build.image = image.into();
+            spec.build = Some(build);
+            let err = build_is_launchable(&spec, true).unwrap_err();
+            assert!(err.starts_with("build step refused: "), "{err}");
+        }
+    }
+
+    /// git-bug df660b6: `.` and `Dockerfile` reach buildctl with the args
+    /// unchanged; a symlinked context or Dockerfile pointing outside the
+    /// workspace exits 2 and never reaches it.
+    #[cfg(unix)]
+    #[test]
+    fn build_guard_refuses_symlinks_out_of_the_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, run) = build_guard_harness();
+        let base = tmp.path().canonicalize().unwrap();
+        let ws = base.join("workspace");
+        let outside = base.join("registry");
+        symlink(&outside, ws.join("ctx")).unwrap();
+        std::fs::create_dir(ws.join("df")).unwrap();
+        symlink(outside.join("config.json"), ws.join("df/Dockerfile")).unwrap();
+
+        assert_eq!(run(".", "Dockerfile"), (Some(0), true));
+        assert_eq!(
+            std::fs::read_to_string(base.join("called")).unwrap(),
+            "build\n--opt\na b\n",
+            "the stub gets the args unchanged"
+        );
+        for (context, dockerfile) in [("ctx", "config.json"), ("df", "Dockerfile")] {
+            assert_eq!(
+                run(context, dockerfile),
+                (Some(2), false),
+                "{context}/{dockerfile}"
+            );
+        }
+    }
+
+    /// A temp workspace beside a `registry` directory standing in for the
+    /// credential mount, and [`BUILD_GUARD`] pointed at them and at a stub
+    /// `buildctl-daemonless.sh` that writes its args, one per line, to
+    /// `called`. Returns the temp dir (workspace at `workspace/`, outside at
+    /// `registry/`) and a runner giving `(exit code, reached buildctl)` for a
+    /// context and dockerfile; the runner passes `build --opt "a b"`.
+    #[cfg(unix)]
+    fn build_guard_harness() -> (
+        tempfile::TempDir,
+        impl Fn(&str, &str) -> (Option<i32>, bool),
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let ws = base.join("workspace");
+        let outside = base.join("registry");
+        for d in [&ws, &outside] {
+            std::fs::create_dir(d).unwrap();
+        }
+        std::fs::write(ws.join("Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(outside.join("config.json"), "{}").unwrap();
+        std::fs::write(outside.join("Dockerfile"), "FROM scratch\n").unwrap();
+        let record = base.join("called");
+        let stub = base.join("buildctl-daemonless.sh");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pinned = format!("root={WORKSPACE_MOUNT_PATH}\n");
+        let buildctl = "exec /usr/bin/buildctl-daemonless.sh ";
+        assert!(BUILD_GUARD.contains(&pinned) && BUILD_GUARD.contains(buildctl));
+        let guard = BUILD_GUARD
+            .replace(&pinned, &format!("root='{}'\n", ws.display()))
+            .replace(buildctl, &format!("exec '{}' ", stub.display()));
+        let run = move |context: &str, dockerfile: &str| {
+            let _ = std::fs::remove_file(&record);
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", &guard, "scarab-build", "build", "--opt", "a b"])
+                .current_dir(&base)
+                .env(BUILD_CONTEXT_ENV, context)
+                .env(BUILD_DOCKERFILE_ENV, dockerfile)
+                .output()
+                .unwrap();
+            (out.status.code(), record.exists())
+        };
+        (tmp, run)
+    }
+
+    // Attack: reach the credential mount through a relative symlink chain, a symlinked parent directory, a symlink to an in-workspace directory whose Dockerfile links out, or a Dockerfile path through a symlinked directory. Safe outcome: exit 2, buildctl never runs.
+    #[cfg(unix)]
+    #[test]
+    fn build_guard_refuses_symlink_chains_and_symlinked_parents() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, run) = build_guard_harness();
+        let ws = tmp.path().join("workspace");
+        std::fs::create_dir(tmp.path().join("registry/sub")).unwrap();
+        // a -> b -> ../registry, both relative.
+        symlink("b", ws.join("a")).unwrap();
+        symlink("../registry", ws.join("b")).unwrap();
+        // inner -> real (inside); real/Dockerfile -> ../../registry/config.json.
+        std::fs::create_dir(ws.join("real")).unwrap();
+        symlink("../../registry/config.json", ws.join("real/Dockerfile")).unwrap();
+        symlink("real", ws.join("inner")).unwrap();
+        // deep/x -> ../../registry, then the path walks on through it.
+        std::fs::create_dir(ws.join("deep")).unwrap();
+        symlink("../../registry", ws.join("deep/x")).unwrap();
+
+        for (context, dockerfile) in [
+            ("a", "config.json"),
+            ("a", "Dockerfile"),
+            ("b/sub", "../Dockerfile"),
+            ("deep/x/sub", "../config.json"),
+            ("inner", "Dockerfile"),
+            ("./inner/.", "Dockerfile"),
+            (".", "b/Dockerfile"),
+            (".", "deep/x/config.json"),
+            ("deep", "x/Dockerfile"),
+        ] {
+            assert_eq!(
+                run(context, dockerfile),
+                (Some(2), false),
+                "{context} / {dockerfile}"
+            );
+        }
+        assert_eq!(run(".", "Dockerfile"), (Some(0), true));
+    }
+
+    // Attack: a symlink to a directory outside the workspace whose path only starts with the workspace's (`/workspace-evil`, `/workspace<newline>`: `$(realpath)` drops the trailing newline, so the context resolves to the root's own spelling). Safe outcome: exit 2, buildctl never runs.
+    #[cfg(unix)]
+    #[test]
+    fn build_guard_refuses_lookalike_workspace_roots() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, run) = build_guard_harness();
+        let ws = tmp.path().join("workspace");
+        for (link, name) in [("sib", "workspace-evil"), ("nl", "workspace\n")] {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("Dockerfile"), "FROM scratch\n").unwrap();
+            symlink(format!("../{name}"), ws.join(link)).unwrap();
+            assert_eq!(run(link, "Dockerfile"), (Some(2), false), "{link}");
+        }
+    }
+
+    // Attack: a context or dockerfile the shell could expand or read as an option (`*` matching a symlink out, `-n`, `$(...)`, a name with spaces), so the guard checks one path and buildctl gets another. Safe outcome: each is taken as a literal path; the ones that do not exist exit 2 and the literal directory builds.
+    #[cfg(unix)]
+    #[test]
+    fn build_guard_takes_paths_literally() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, run) = build_guard_harness();
+        let ws = tmp.path().join("workspace");
+        std::fs::create_dir(ws.join("only")).unwrap();
+        symlink("../../registry", ws.join("only/evil")).unwrap();
+        for (context, dockerfile) in [
+            ("*", "Dockerfile"),
+            ("only/*", "Dockerfile"),
+            ("-n", "Dockerfile"),
+            ("$(echo only/evil)", "Dockerfile"),
+            ("`echo only/evil`", "Dockerfile"),
+            (".", "only/*/Dockerfile"),
+            (". only/evil", "Dockerfile"),
+        ] {
+            assert_eq!(
+                run(context, dockerfile),
+                (Some(2), false),
+                "{context} / {dockerfile}"
+            );
+        }
+        std::fs::create_dir(ws.join("a b")).unwrap();
+        std::fs::write(ws.join("a b/-f"), "FROM scratch\n").unwrap();
+        assert_eq!(run("a b", "-f"), (Some(0), true));
     }
 
     #[test]

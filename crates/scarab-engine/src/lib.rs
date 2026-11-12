@@ -1081,6 +1081,12 @@ pub struct BuildConfig {
     /// only; never authored, set by the composition/test harness.
     #[serde(default)]
     pub insecure_push: bool,
+    /// A fork pull request, or a Run locked out of its Environment's
+    /// secrets: it never pushes and gets no registry credential at launch.
+    /// Decided at Run creation and stored with the spec; checked again at
+    /// launch.
+    #[serde(default)]
+    pub locked_out: bool,
     /// A scoped `REGISTRY_AUTH` secret's dockerconfigjson, resolved at
     /// LAUNCH — **never serialized**; mounted verbatim as the Pod's docker
     /// config (tmpfs), never env (ADR-0018/0037). Takes precedence over

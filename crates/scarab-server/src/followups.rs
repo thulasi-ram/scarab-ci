@@ -182,7 +182,7 @@ async fn upstream_event(db: &dyn Db, msg: &OutboxMessage) -> Result<Option<Event
     let Some(pipeline) = db.run_pipeline(run).await? else {
         return Ok(None);
     };
-    let Some((trigger, actor)) = trigger_of(db, run).await? else {
+    let Some((trigger, actor)) = crate::run_trigger(db, run).await? else {
         return Ok(None);
     };
     // A fork pull request's Run never starts a follow-up.
@@ -227,19 +227,6 @@ async fn upstream_event(db: &dyn Db, msg: &OutboxMessage) -> Result<Option<Event
         actor: actor.unwrap_or_default(),
         chain,
     }))
-}
-
-/// The trigger context (`event`) a Run was created from, and its actor.
-async fn trigger_of(db: &dyn Db, run: &RunId) -> Result<Option<(Value, Option<String>)>, DbError> {
-    for e in db.events(run).await? {
-        if let EventPayload::Raw(v) = &e.kind {
-            if v["trigger"]["event"].is_object() {
-                let actor = v["actor"].as_str().map(str::to_string);
-                return Ok(Some((v["trigger"]["event"].clone(), actor)));
-            }
-        }
-    }
-    Ok(None)
 }
 
 /// The follow-up files recorded when the Run was created, if they were.
