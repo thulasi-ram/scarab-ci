@@ -1,6 +1,10 @@
 {
-  "latest": "v0.3",
+  "latest": "v0.4",
   "versions": [
+    {
+      "version": "v0.4",
+      "tag": "v0.4.0"
+    },
     {
       "version": "v0.3",
       "tag": "v0.3.2"

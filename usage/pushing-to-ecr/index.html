@@ -1,0 +1,939 @@
+<!DOCTYPE html><html lang="en" dir="ltr" data-theme="dark" data-has-toc data-has-sidebar class="astro-vdxcvpsm"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Pushing images to Amazon ECR | Scarab</title><link rel="canonical" href="https://thulasi-ram.github.io/scarab-ci/usage/pushing-to-ecr/"/><link rel="sitemap" href="/scarab-ci/sitemap-index.xml"/><link rel="icon" href="/scarab-ci/favicon.ico" sizes="32x32"/><link rel="apple-touch-icon" href="/scarab-ci/apple-touch-icon.png"/><link rel="shortcut icon" href="/scarab-ci/favicon.svg" type="image/svg+xml"/><meta name="generator" content="Astro v7.0.9"/><meta name="generator" content="Starlight v0.41.3"/><meta property="og:title" content="Pushing images to Amazon ECR"/><meta property="og:type" content="article"/><meta property="og:url" content="https://thulasi-ram.github.io/scarab-ci/usage/pushing-to-ecr/"/><meta property="og:locale" content="en"/><meta property="og:description" content="Push images built with Scarab's build library to Amazon ECR on EKS, with an IAM role on a ServiceAccount of its own and a placement profile that logs in to ECR only for the library's push step."/><meta property="og:site_name" content="Scarab"/><meta name="twitter:card" content="summary_large_image"/><meta name="description" content="Push images built with Scarab's build library to Amazon ECR on EKS, with an IAM role on a ServiceAccount of its own and a placement profile that logs in to ECR only for the library's push step."/><script>
+	window.StarlightThemeProvider = (() => {
+		const storedTheme =
+			typeof localStorage !== 'undefined' && localStorage.getItem('starlight-theme');
+		const theme =
+			storedTheme ||
+			(window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+		document.documentElement.dataset.theme = theme === 'light' ? 'light' : 'dark';
+		return {
+			updatePickers(theme = storedTheme || 'auto') {
+				document.querySelectorAll('starlight-theme-select').forEach((picker) => {
+					const select = picker.querySelector('select');
+					if (select) select.value = theme;
+					/** @type {HTMLTemplateElement | null} */
+					const tmpl = document.querySelector(`#theme-icons`);
+					const newIcon = tmpl && tmpl.content.querySelector('.' + theme);
+					if (newIcon) {
+						const oldIcon = picker.querySelector('svg.label-icon');
+						if (oldIcon) {
+							oldIcon.replaceChildren(...newIcon.cloneNode(true).childNodes);
+						}
+					}
+				});
+			},
+		};
+	})();
+</script><template id="theme-icons"><svg aria-hidden="true" class="light astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M5 12a1 1 0 0 0-1-1H3a1 1 0 0 0 0 2h1a1 1 0 0 0 1-1Zm.64 5-.71.71a1 1 0 0 0 0 1.41 1 1 0 0 0 1.41 0l.71-.71A1 1 0 0 0 5.64 17ZM12 5a1 1 0 0 0 1-1V3a1 1 0 0 0-2 0v1a1 1 0 0 0 1 1Zm5.66 2.34a1 1 0 0 0 .7-.29l.71-.71a1 1 0 1 0-1.41-1.41l-.66.71a1 1 0 0 0 0 1.41 1 1 0 0 0 .66.29Zm-12-.29a1 1 0 0 0 1.41 0 1 1 0 0 0 0-1.41l-.71-.71a1.004 1.004 0 1 0-1.43 1.41l.73.71ZM21 11h-1a1 1 0 0 0 0 2h1a1 1 0 0 0 0-2Zm-2.64 6A1 1 0 0 0 17 18.36l.71.71a1 1 0 0 0 1.41 0 1 1 0 0 0 0-1.41l-.76-.66ZM12 6.5a5.5 5.5 0 1 0 5.5 5.5A5.51 5.51 0 0 0 12 6.5Zm0 9a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Zm0 3.5a1 1 0 0 0-1 1v1a1 1 0 0 0 2 0v-1a1 1 0 0 0-1-1Z"/></svg><svg aria-hidden="true" class="dark astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21.64 13a1 1 0 0 0-1.05-.14 8.049 8.049 0 0 1-3.37.73 8.15 8.15 0 0 1-8.14-8.1 8.59 8.59 0 0 1 .25-2A1 1 0 0 0 8 2.36a10.14 10.14 0 1 0 14 11.69 1 1 0 0 0-.36-1.05Zm-9.5 6.69A8.14 8.14 0 0 1 7.08 5.22v.27a10.15 10.15 0 0 0 10.14 10.14 9.784 9.784 0 0 0 2.1-.22 8.11 8.11 0 0 1-7.18 4.32v-.04Z"/></svg><svg aria-hidden="true" class="auto astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21 14h-1V7a3 3 0 0 0-3-3H7a3 3 0 0 0-3 3v7H3a1 1 0 0 0-1 1v2a3 3 0 0 0 3 3h14a3 3 0 0 0 3-3v-2a1 1 0 0 0-1-1ZM6 7a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v7H6V7Zm14 10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-1h16v1Z"/></svg></template><link rel="stylesheet" href="/scarab-ci/_astro/print.ehPL0gv-.css" media="print"><link rel="stylesheet" href="/scarab-ci/_astro/middleware.C9ShZQcF.css"><link rel="stylesheet" href="/scarab-ci/_astro/index.BdeWKgqi.css"><script type="module" src="/scarab-ci/_astro/page.B2uBVZjk.js"></script><style>.doodle{z-index:0;width:var(--doodle-size);height:var(--doodle-size);opacity:var(--doodle-opacity);transform:rotate(var(--doodle-rotate)) translateY(0);pointer-events:none;user-select:none;will-change:transform;position:absolute}.doodle svg{width:100%;height:100%;display:block}.sl-markdown-content{z-index:1;position:relative}
+</style></head><body class="astro-vdxcvpsm"><a class="sl-skip-link astro-vxeigawq" href="#_top">Skip to content</a><div data-slot="layout" class="astro-6hobpl37"><header class="astro-6hobpl37"><div class="container-wrapper px-6 astro-6hobpl37"><div class="container astro-6hobpl37"><button class="show-modal astro-w34sq3kk" popovertargetaction="toggle" popovertarget="drawer"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="astro-w34sq3kk"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 9h16.5m-16.5 6.75h16.5" class="astro-w34sq3kk"></path></svg><span class="sr-only astro-w34sq3kk">Toggle Menu</span></button><div class="site-title-wrapper astro-sycd25p5"><a href="/scarab-ci/" class="site-title astro-lygsa2fc"><img class="light:sl-hidden logo astro-lygsa2fc" alt="Scarab" src="/scarab-ci/_astro/scarab-dark.CS8ICdjI.svg" width="480" height="328"><img class="dark:sl-hidden logo astro-lygsa2fc" alt="Scarab" src="/scarab-ci/_astro/scarab.4XhTotfC.svg" width="480" height="328"><span class="title-text astro-lygsa2fc">Scarab</span></a><nav class="nav-bar astro-tahnhu4v"><a class="astro-tahnhu4v" href="/scarab-ci/get-started/overview/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Get Started</a><a class="astro-tahnhu4v" href="/scarab-ci/usage/pipeline-syntax/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Usage</a><a class="astro-tahnhu4v" href="/scarab-ci/reference/api/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">References</a><a class="astro-tahnhu4v" href="https://demo-scarab.ahiravan.dev/" target="_blank" rel="noopener" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Demo</a></nav></div><div class="header-right astro-sycd25p5"><site-search class="astro-sycd25p5 astro-goos2lhy" data-translations="{&quot;placeholder&quot;:&quot;Search&quot;}"><button data-open-modal disabled aria-label="Search" aria-keyshortcuts="Control+K" class="astro-goos2lhy"><span aria-hidden="true" class="astro-goos2lhy">Search</span><kbd class="sl-hidden md:sl-flex astro-goos2lhy" style="display: none;"><kbd class="astro-goos2lhy">Ctrl</kbd><kbd class="astro-goos2lhy">K</kbd></kbd></button><dialog style="padding:0" aria-label="Search" class="astro-goos2lhy"><div class="dialog-frame sl-flex astro-goos2lhy"><button data-close-modal class="sl-flex md:sl-hidden astro-goos2lhy">Cancel</button><div class="search-container astro-goos2lhy"><div id="starlight__search" class="astro-goos2lhy"></div></div></div></dialog></site-search><script>
+    (() => {
+        const openBtn = document.querySelector('button[data-open-modal]');
+        const shortcut = openBtn?.querySelector('kbd');
+        if (!openBtn || !(shortcut instanceof HTMLElement)) {
+            return;
+        }
+        const updateShortcutDisplay = () => {
+            shortcut.style.setProperty(
+                'display',
+                matchMedia('(min-width: 40rem)').matches ? 'flex' : 'none',
+                'important'
+            );
+        };
+        const platformKey = shortcut.querySelector('kbd');
+        // eslint-disable-next-line regexp/no-unused-capturing-group
+        if (platformKey && /(Mac|iPhone|iPod|iPad)/i.test(navigator.platform)) {
+            platformKey.textContent = '⌘';
+            openBtn.setAttribute('aria-keyshortcuts', 'Meta+K');
+        }
+        updateShortcutDisplay();
+        matchMedia('(min-width: 40rem)').addEventListener('change', updateShortcutDisplay);
+    })();
+</script><script type="module" src="/scarab-ci/_astro/Search.astro_astro_type_script_index_0_lang.BNSpSyix.js"></script><nav class="header-nav astro-sycd25p5"><div class="astro-sycd25p5"><a href="https://github.com/thulasi-ram/scarab-ci" rel="me" class="sl-flex button astro-bs4vfkht" data-variant="ghost"><span class="sr-only astro-bs4vfkht">GitHub</span><svg aria-hidden="true" class="astro-bs4vfkht astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M12 .3a12 12 0 0 0-3.8 23.38c.6.12.83-.26.83-.57L9 21.07c-3.34.72-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.08-.74.09-.73.09-.73 1.2.09 1.83 1.24 1.83 1.24 1.08 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.14-.3-.54-1.52.1-3.18 0 0 1-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.64 1.66.24 2.88.12 3.18a4.65 4.65 0 0 1 1.23 3.22c0 4.61-2.8 5.63-5.48 5.92.42.36.81 1.1.81 2.22l-.01 3.29c0 .31.2.69.82.57A12 12 0 0 0 12 .3Z"/></svg></a></div><div class="astro-sycd25p5"><starlight-theme-lucode-select class="astro-7vkpjdjh"><button aria-label="Select theme" aria-live="polite" class="sl-flex button astro-7vkpjdjh" title="Select theme" data-variant="ghost"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="sun astro-7vkpjdjh"><circle cx="12" cy="12" r="4" class="astro-7vkpjdjh"></circle><path d="M12 2v2" class="astro-7vkpjdjh"></path><path d="M12 20v2" class="astro-7vkpjdjh"></path><path d="m4.93 4.93 1.41 1.41" class="astro-7vkpjdjh"></path><path d="m17.66 17.66 1.41 1.41" class="astro-7vkpjdjh"></path><path d="M2 12h2" class="astro-7vkpjdjh"></path><path d="M20 12h2" class="astro-7vkpjdjh"></path><path d="m6.34 17.66-1.41 1.41" class="astro-7vkpjdjh"></path><path d="m19.07 4.93-1.41 1.41" class="astro-7vkpjdjh"></path></svg><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="moon astro-7vkpjdjh"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" class="astro-7vkpjdjh"> </path></svg><span class="sr-only astro-7vkpjdjh">Toggle theme</span></button></starlight-theme-lucode-select><script>
+    // eslint-disable-next-line no-undef
+    StarlightThemeProvider.updatePickers();
+</script><script type="module">var e=`starlight-theme`;function t(e){return e===`auto`||e===`dark`||e===`light`?e:`auto`}function n(){return t(typeof localStorage<`u`&&localStorage.getItem(e))}function r(t){typeof localStorage<`u`&&localStorage.setItem(e,t===`light`||t===`dark`?t:``)}function i(){return matchMedia(`(prefers-color-scheme: light)`).matches?`light`:`dark`}function a(e){StarlightThemeProvider.updatePickers(e),document.documentElement.dataset.theme=e===`auto`?i():e,r(e)}matchMedia(`(prefers-color-scheme: light)`).addEventListener(`change`,()=>{n()===`auto`&&a(`auto`)}),customElements.define(`starlight-theme-lucode-select`,class extends HTMLElement{constructor(){super(),a(n());let e=this.querySelector(`button`);e?.addEventListener(`click`,()=>{let n=t(document.documentElement.dataset.theme),r=n===`dark`?`light`:n===`light`?`dark`:`auto`;a(r),e?.setAttribute(`aria-label`,`${r} theme`)})}});</script></div><div class="astro-sycd25p5"><script type="module">var e=class extends HTMLElement{constructor(){super();let e=this.querySelector(`select`);e&&(e.addEventListener(`change`,e=>{e.currentTarget instanceof HTMLSelectElement&&(window.location.pathname=e.currentTarget.value)}),window.addEventListener(`pageshow`,t=>{if(!t.persisted)return;let n=e.querySelector(`option[selected]`)?.index;n!==e.selectedIndex&&(e.selectedIndex=n??0)}))}};customElements.define(`starlight-lang-select`,e);</script></div></nav></div><scarab-version-select data-root="/scarab-ci/" data-base="/scarab-ci/" data-version="v0.4" hidden="true" class="astro-jcjov46q"><button type="button" class="vs-button astro-jcjov46q" aria-expanded="false" aria-controls="vs-list" aria-label="Documentation version: v0.4"><span class="vs-current astro-jcjov46q">v0.4</span><svg class="vs-caret astro-jcjov46q" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="m6 9 6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="astro-jcjov46q"></path></svg></button><ul id="vs-list" class="vs-list astro-jcjov46q" aria-label="Documentation versions" hidden></ul></scarab-version-select><script type="module" src="/scarab-ci/_astro/VersionSelect.astro_astro_type_script_index_0_lang.C1oNf8LR.js"></script></div></div></header><main class="astro-6hobpl37"><div class="container-wrapper astro-6hobpl37"><div class="container container-wrapper-main astro-6hobpl37"><aside class="aside astro-6hobpl37"><div class="sidebar astro-5xeag62i"><div class="sidebar-border-gradient astro-5xeag62i"></div><div class="sidebar-spacer astro-5xeag62i"></div><div class="sidebar-fade-top astro-5xeag62i"></div><div class="container-sidebar astro-5xeag62i"><div class="sidebar-entries astro-5xeag62i"><div class="container-sidebar-entry astro-k3wmqijo"><h4 class="entry-title astro-k3wmqijo">Get Started</h4><div class="container-group-link astro-k3wmqijo"><a href="/scarab-ci/get-started/overview/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Overview</span></a><a href="/scarab-ci/get-started/deploy-helm/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Installation</span></a><a href="/scarab-ci/get-started/run-locally/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Run locally</span></a><a href="/scarab-ci/get-started/local-development/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Local Development</span></a></div></div><div class="container-sidebar-entry astro-k3wmqijo"><h4 class="entry-title astro-k3wmqijo">Usage</h4><div class="container-group-link astro-k3wmqijo"><a href="/scarab-ci/usage/pipeline-syntax/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Pipeline Syntax</span></a><a href="/scarab-ci/usage/libraries/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Libraries</span></a><a href="/scarab-ci/usage/secrets/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Secrets</span></a><a href="/scarab-ci/usage/api-tokens/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">API tokens</span></a><a href="/scarab-ci/usage/environments/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Environments</span></a><a href="/scarab-ci/usage/policies/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Policies</span></a><a href="/scarab-ci/usage/deploying-with-argo-cd/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Deploying with Argo CD</span></a><a href="/scarab-ci/usage/pushing-to-ecr/" aria-current="page" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Pushing to Amazon ECR</span></a><a href="/scarab-ci/usage/environment-variables/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Environment Variables</span></a></div></div><div class="container-sidebar-entry astro-k3wmqijo"><h4 class="entry-title astro-k3wmqijo">References</h4><div class="container-group-link astro-k3wmqijo"><a href="/scarab-ci/reference/api/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">API</span></a><div class="container-sidebar-entry astro-k3wmqijo"><h4 class="entry-title astro-k3wmqijo">ADR</h4><div class="container-group-link astro-k3wmqijo"><a href="/scarab-ci/tech/adr/0001-ci-as-durable-execution/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0001. CI as durable execution</span></a><a href="/scarab-ci/tech/adr/0002-durability-model/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0002. Durability model: durable DAG orchestrator + at-least-once steps</span></a><a href="/scarab-ci/tech/adr/0003-durability-substrate-postgres/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0003. Durability layer: build our own, DBOS-style on Postgres (Rust)</span></a><a href="/scarab-ci/tech/adr/0004-execution-topology/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0004. Execution topology: pod-per-step + content-addressed workspace</span></a><a href="/scarab-ci/tech/adr/0005-tenancy-and-k8s-only/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0005. Tenancy &amp; deployment; Kubernetes as the only backend</span></a><a href="/scarab-ci/tech/adr/0006-pipeline-ontology/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0006. Pipeline model: flat recursive DAG</span></a><a href="/scarab-ci/tech/adr/0007-data-passing-model/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0007. Data-passing model: Workspace / Result / Artifact / Cache</span></a><a href="/scarab-ci/tech/adr/0008-step-contract/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0008. Step contract: OCI image + convention + built-in kinds</span></a><a href="/scarab-ci/tech/adr/0009-dsl-ir-yaml-cel/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0009. DSL: typed Pipeline IR + YAML frontend + CEL</span></a><a href="/scarab-ci/tech/adr/0010-forge-integration/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0010. Forge integration: agnostic core, OIDC identity, in-repo config</span></a><a href="/scarab-ci/tech/adr/0011-durable-scheduler/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0011. Scheduling: durable admission control</span></a><a href="/scarab-ci/tech/adr/0012-api-surface/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0012. API surface: REST/OpenAPI + SSE + internal gRPC</span></a><a href="/scarab-ci/tech/adr/0013-history-and-observability/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0013. History &amp; observability: state tables + append-only event log</span></a><a href="/scarab-ci/tech/adr/0014-secrets/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0014. Secrets: envelope-encrypted PG + pluggable providers</span></a><a href="/scarab-ci/tech/adr/0015-supply-chain-oidc/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0015. Supply-chain: Scarab as OIDC issuer + provenance-by-construction</span></a><a href="/scarab-ci/tech/adr/0016-code-architecture/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0016. Code architecture: hexagonal + adapter crates + converged binary</span></a><a href="/scarab-ci/tech/adr/0017-testing-strategy/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0017. Correctness &amp; testing strategy</span></a><a href="/scarab-ci/tech/adr/0018-image-building/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0018. Container image building: rootless BuildKit</span></a><a href="/scarab-ci/tech/adr/0019-local-execution/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0019. Local execution: executor-local behind the Executor port</span></a><a href="/scarab-ci/tech/adr/0020-retry-and-failure/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0020. Retry &amp; failure taxonomy</span></a><a href="/scarab-ci/tech/adr/0021-double-effect-fencing/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0021. Double-effect hazard: fencing tokens + idempotency contract</span></a><a href="/scarab-ci/tech/adr/0022-upgrades-and-versioning/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0022. Upgrades &amp; schema evolution: version-tolerant from day one</span></a><a href="/scarab-ci/tech/adr/0023-dag-shape/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0023. DAG shape: static matrix v1, dynamic reserved</span></a><a href="/scarab-ci/tech/adr/0024-environments/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0024. Environments: a built-in entity with protection rules</span></a><a href="/scarab-ci/tech/adr/0025-cross-pipeline-orchestration/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0025. Cross-pipeline orchestration: nest vs trigger</span></a><a href="/scarab-ci/tech/adr/0026-resource-and-placement/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0026. Resource &amp; placement model</span></a><a href="/scarab-ci/tech/adr/0027-restart-semantics/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0027. Restart semantics: content-addressed smart invalidation</span></a><a href="/scarab-ci/tech/adr/0028-ui-stack/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0028. UI stack: SolidJS + TS + generated client</span></a><a href="/scarab-ci/tech/adr/0029-workspace-cas/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0029. Workspace content-addressing: per-file merkle CAS</span></a><a href="/scarab-ci/tech/adr/0030-operational-defaults/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0030. Operational defaults</span></a><a href="/scarab-ci/tech/adr/0031-pure-computation-deps/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0031. Purity means no I/O, not no dependencies: pure-computation crates allowed</span></a><a href="/scarab-ci/tech/adr/0032-slices-3-5-implementation-decisions/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0032. Slice 3–5 implementation decisions (forge, identity, scheduler, gates, secrets, OIDC, BuildKit)</span></a><a href="/scarab-ci/tech/adr/0033-transitive-skip/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0033. Transitive skip: a guarded-off step skips its descendants</span></a><a href="/scarab-ci/tech/adr/0034-external-gate-token/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0034. External-gate release: HMAC token</span></a><a href="/scarab-ci/tech/adr/0035-explicit-outputs/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0035. Explicit workspace `outputs:`</span></a><a href="/scarab-ci/tech/adr/0036-local-execution-dev-backend/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0036. Local execution: a non-production dev/CLI backend (amends 0005)</span></a><a href="/scarab-ci/tech/adr/0037-environment-governance/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0037. Environment governance: scoped secrets, approval-as-gate, admission at point-of-use</span></a><a href="/scarab-ci/tech/adr/0038-invoke-and-local-reuse/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0038. `invoke` is compile-time inlining; local reuse via `.scarab/lib`, third-party reuse via OCI images</span></a><a href="/scarab-ci/tech/adr/0039-privileged-images/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0039. Privileged step images: hardened baseline + governed capability grants per Environment</span></a><a href="/scarab-ci/tech/adr/0040-documentation-site/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0040. Documentation site: Astro Starlight, in-repo, DESIGN.md-branded</span></a><a href="/scarab-ci/tech/adr/0041-named-results-and-interpolation/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0041. Named step results + launch-time interpolation (`${{ outputs.&lt;id&gt;.&lt;name&gt; }}`)</span></a><a href="/scarab-ci/tech/adr/0042-trusted-egress-sidecar/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0042. Trusted per-Pod egress sidecar → fence-scoped results API → Postgres</span></a><a href="/scarab-ci/tech/adr/0043-launch-parameters-and-manual-dispatch/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0043. Launch parameters + manual dispatch as a repo-aware trigger</span></a><a href="/scarab-ci/tech/adr/0044-protection-ref-vs-read-ref/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0044. Branch protection matches a symbolic ref, not the commit SHA</span></a><a href="/scarab-ci/tech/adr/0045-source-provisioning/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0045. Source provisioning: the `clone` step kind</span></a><a href="/scarab-ci/tech/adr/0046-forge-auth-and-multi-adapter/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0046. Forge auth is adapter-internal; GitHub + Forgejo adapters in v1</span></a><a href="/scarab-ci/tech/adr/0047-retry-classification-and-attempt-model/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0047. Retry classification, attempt/fence model, and dead-letter (implements 0020)</span></a><a href="/scarab-ci/tech/adr/0048-fail-closed-startup/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0048. Fail-closed startup: validated config, boot refusal, mandatory Postgres</span></a><a href="/scarab-ci/tech/adr/0049-identity-and-access/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0049. Identity &amp; access: forge-agnostic authn, Scarab-native RBAC</span></a><a href="/scarab-ci/tech/adr/0050-retention-and-gc/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0050. Retention &amp; GC: mark-sweep CAS, lifecycle-keyed eligibility</span></a><a href="/scarab-ci/tech/adr/0051-multi-replica-operation/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0051. Multi-replica operation: tail lease, replica-agnostic SSE, shared OIDC key</span></a><a href="/scarab-ci/tech/adr/0052-artifacts/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0052. Artifacts: a dedicated per-run store, convention-emitted</span></a><a href="/scarab-ci/tech/adr/0053-observability-and-lifecycle/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0053. Observability &amp; lifecycle: metrics, structured logs, readiness, graceful shutdown</span></a><a href="/scarab-ci/tech/adr/0054-product-surface-serving/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0054. Product surface: embedded UI, run cancellation, API/CLI truthfulness</span></a><a href="/scarab-ci/tech/adr/0055-placement-profiles/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0055. Placement profiles: named profiles + baseline + governed `k8s_overlay`</span></a><a href="/scarab-ci/tech/adr/0056-run-takes-and-attempt-grain-evidence/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0056. Run Takes and attempt-grain evidence</span></a><a href="/scarab-ci/tech/adr/0057-run-provenance-trigger-context/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0057. Run provenance: trigger context and origin details</span></a><a href="/scarab-ci/tech/adr/0058-runtime-service-containers/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0058. Runtime service containers: co-located Sidecar (default) + Run-scoped Shared (opt-in)</span></a><a href="/scarab-ci/tech/adr/0059-tick-fault-isolation/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0059. Per-run tick fault isolation + bounded per-run failures</span></a><a href="/scarab-ci/tech/adr/0060-org-settings-connections-and-secret-management/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0060. Org settings: connection lifecycle, org/env secret editing, IaC-or-UI connections</span></a><a href="/scarab-ci/tech/adr/0061-workspace-data-path/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0061. Workspace data path: workspace service + node driver, lazy materialisation</span></a><a href="/scarab-ci/tech/adr/0062-workspace-export-lazy-without-node-driver/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0062. Workspace export: lazy materialisation without a node driver</span></a><a href="/scarab-ci/tech/adr/0063-step-logs-on-the-data-depot/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0063. Step logs live on the Data Depot, and the workspace service is renamed</span></a><a href="/scarab-ci/tech/adr/0064-durability-tiering-and-the-write-path/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0064. Durability tiering and the write path: warm-first, flush before `Succeeded`, and durability comes from the backing store</span></a><a href="/scarab-ci/tech/adr/0065-retention-cache-and-rederivation/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0065. Retention, Cache, and re-derivation: keep less, recompute on request, and let the operator tune it</span></a><a href="/scarab-ci/tech/adr/0066-the-depot-is-a-cache/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0066. The Depot is a cache: HA, warm-only, and what each costs</span></a><a href="/scarab-ci/tech/adr/0067-the-pack-is-the-record/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0067. The pack is the record: mandatory dependencies, a direct write path, and a self-describing bucket</span></a><a href="/scarab-ci/tech/adr/0068-the-infra-observer/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0068. The infra observer: narrating why a step has no logs</span></a><a href="/scarab-ci/tech/adr/0069-identity-links/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0069. Identity links: one Principal, many provider identities, pinned by immutable id</span></a><a href="/scarab-ci/tech/adr/0070-deployments-as-a-vendor-neutral-record/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0070. Deployments as a vendor-neutral record: what is live, not who approved</span></a><a href="/scarab-ci/tech/adr/0071-org-level-environments/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0071. Org-level Environments: a place that decides who may deploy into it</span></a><a href="/scarab-ci/tech/adr/0072-plugins-a-governed-extension-point/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0072. Plugins: a second, governed extension point beside Steps</span></a><a href="/scarab-ci/tech/adr/0073-step-up-confirmation/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0073. Step-up confirmation: a human confirms the exact action with a passkey</span></a><a href="/scarab-ci/tech/adr/0074-deployments-leave-core/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0074. Deployments leave core: Scarab governs the Run that deploys, the CD tool owns what is live</span></a><a href="/scarab-ci/tech/adr/0075-policy-engine/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0075. One policy engine for every governance rule: typed settings and CEL compile to a Policy IR</span></a><a href="/scarab-ci/tech/adr/0076-libraries-and-plugins-through-invoke/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0076. Libraries and plugins through `invoke`: installed YAML libraries, plugins as Principals that resolve gates</span></a><a href="/scarab-ci/tech/adr/0077-end-to-end-fault-and-agent-driven-testing/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0077. End-to-end, fault and agent-driven testing: one invariant checker, a few fault scenarios on a throwaway cluster, and a red-team agent that only writes tests</span></a><a href="/scarab-ci/tech/adr/0078-the-environment-adds-its-approval-gate/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0078. The Environment adds its approval gate</span></a><a href="/scarab-ci/tech/adr/0079-scarab-authority-needs-scarab-proof/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0079. Scarab-native authority moves only on Scarab-level proof</span></a><a href="/scarab-ci/tech/adr/0080-principals-have-an-internal-id/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0080. Principals have an internal id; the readable id becomes the handle</span></a><a href="/scarab-ci/tech/adr/readme/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Architecture Decision Records</span></a></div></div><a href="/scarab-ci/tech/context/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Thesis &amp; language (CONTEXT)</span></a></div></div></div><div class="sidebar-fade-bottom astro-5xeag62i"></div></div></div></aside><script type="module">var e=document.getElementById(`starlight__sidebar`),t=e?.querySelector(`sl-sidebar-state-persist`),n=`sl-sidebar-state`,r=()=>{let r=[],i=t?.dataset.hash||``;try{let e=sessionStorage.getItem(n),t=JSON.parse(e||`{}`);Array.isArray(t.open)&&t.hash===i&&(r=t.open)}catch{}return{hash:i,open:r,scroll:e?.scrollTop||0}},i=e=>{try{sessionStorage.setItem(n,JSON.stringify(e))}catch{}},a=()=>i(r()),o=(e,t)=>{let n=r();n.open[t]=e,i(n)};t?.addEventListener(`click`,e=>{if(!(e.target instanceof Element))return;let t=e.target.closest(`summary`)?.closest(`details`);if(!t)return;let n=t.querySelector(`sl-sidebar-restore`),r=parseInt(n?.dataset.index||``);isNaN(r)||o(!t.open,r)}),addEventListener(`visibilitychange`,()=>{document.visibilityState===`hidden`&&a()}),addEventListener(`pageHide`,a);</script><main class="container-main astro-c4hhlov6" data-slot="docs"><div class="main astro-c4hhlov6"><main data-pagefind-body class="astro-vdxcvpsm" lang="en" dir="ltr"><scarab-version-notice data-root="/scarab-ci/" data-base="/scarab-ci/" data-version="v0.4" data-pagefind-ignore="true" hidden="true" class="astro-lnhkisss">You are reading the docs for <strong class="astro-lnhkisss">v0.4</strong>. <a href="/scarab-ci/" class="astro-lnhkisss">The latest release is <span data-latest class="astro-lnhkisss"></span> →</a></scarab-version-notice><script type="module" src="/scarab-ci/_astro/VersionBanner.astro_astro_type_script_index_0_lang.BpoAoKxa.js"></script><div data-slot="doc-title" class="astro-5dl4r4d3"><div data-slot="doc-title-header" class="astro-5dl4r4d3"><h1 id="_top" class="astro-5dl4r4d3">Pushing images to Amazon ECR</h1><div data-slot="doc-title-actions" class="astro-5dl4r4d3"><a data-slot="button" data-size="icon-md" href="/scarab-ci/usage/deploying-with-argo-cd/" class="astro-i6idhh3o link-button secondary astro-5dl4r4d3"><svg aria-hidden="true" class="astro-5dl4r4d3 astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M17 11H9.41l3.3-3.29a1.004 1.004 0 1 0-1.42-1.42l-5 5a1 1 0 0 0-.21.33 1 1 0 0 0 0 .76 1 1 0 0 0 .21.33l5 5a1.002 1.002 0 0 0 1.639-.325 1 1 0 0 0-.219-1.095L9.41 13H17a1 1 0 0 0 0-2Z"/></svg></a><a data-slot="button" data-size="icon-md" href="/scarab-ci/usage/environment-variables/" class="astro-i6idhh3o link-button secondary astro-5dl4r4d3"><svg aria-hidden="true" class="astro-5dl4r4d3 astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M17.92 11.62a1.001 1.001 0 0 0-.21-.33l-5-5a1.003 1.003 0 1 0-1.42 1.42l3.3 3.29H7a1 1 0 0 0 0 2h7.59l-3.3 3.29a1.002 1.002 0 0 0 .325 1.639 1 1 0 0 0 1.095-.219l5-5a1 1 0 0 0 .21-.33 1 1 0 0 0 0-.76Z"/></svg></a></div></div><p slot="doc-title-description" class="astro-5dl4r4d3">Push images built with Scarab&#39;s build library to Amazon ECR on EKS, with an IAM role on a ServiceAccount of its own and a placement profile that logs in to ECR only for the library&#39;s push step.</p><!--  --></div><div class="markdown-wrapper astro-q6e3s5kt"><div class="sl-markdown-content astro-q6e3s5kt"><span class="doodle" aria-hidden="true" data-parallax="0.15" style="--doodle-size:200px;--doodle-rotate:-8deg;--doodle-opacity:0.18;top:7rem;right:-2rem;"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40" fill="#c0873f">
+  <circle cx="19.5" cy="1.5" r="0.18"/>
+  <circle cx="20.5" cy="1.5" r="0.18"/>
+  <circle cx="17.5" cy="2.5" r="0.18"/>
+  <circle cx="18.5" cy="2.5" r="0.18"/>
+  <circle cx="19.5" cy="2.5" r="0.18"/>
+  <circle cx="20.5" cy="2.5" r="0.18"/>
+  <circle cx="21.5" cy="2.5" r="0.18"/>
+  <circle cx="22.5" cy="2.5" r="0.18"/>
+  <circle cx="15.5" cy="3.5" r="0.18"/>
+  <circle cx="16.5" cy="3.5" r="0.18"/>
+  <circle cx="17.5" cy="3.5" r="0.18"/>
+  <circle cx="18.5" cy="3.5" r="0.18"/>
+  <circle cx="19.5" cy="3.5" r="0.18"/>
+  <circle cx="20.5" cy="3.5" r="0.18"/>
+  <circle cx="21.5" cy="3.5" r="0.18"/>
+  <circle cx="22.5" cy="3.5" r="0.18"/>
+  <circle cx="23.5" cy="3.5" r="0.18"/>
+  <circle cx="24.5" cy="3.5" r="0.18"/>
+  <circle cx="13.5" cy="4.5" r="0.18"/>
+  <circle cx="14.5" cy="4.5" r="0.18"/>
+  <circle cx="15.5" cy="4.5" r="0.18"/>
+  <circle cx="16.5" cy="4.5" r="0.18"/>
+  <circle cx="17.5" cy="4.5" r="0.18"/>
+  <circle cx="18.5" cy="4.5" r="0.18"/>
+  <circle cx="19.5" cy="4.5" r="0.18"/>
+  <circle cx="20.5" cy="4.5" r="0.18"/>
+  <circle cx="21.5" cy="4.5" r="0.18"/>
+  <circle cx="22.5" cy="4.5" r="0.18"/>
+  <circle cx="23.5" cy="4.5" r="0.18"/>
+  <circle cx="24.5" cy="4.5" r="0.18"/>
+  <circle cx="25.5" cy="4.5" r="0.18"/>
+  <circle cx="26.5" cy="4.5" r="0.18"/>
+  <circle cx="12.5" cy="5.5" r="0.18"/>
+  <circle cx="13.5" cy="5.5" r="0.18"/>
+  <circle cx="14.5" cy="5.5" r="0.18"/>
+  <circle cx="15.5" cy="5.5" r="0.18"/>
+  <circle cx="16.5" cy="5.5" r="0.18"/>
+  <circle cx="17.5" cy="5.5" r="0.18"/>
+  <circle cx="18.5" cy="5.5" r="0.18"/>
+  <circle cx="21.5" cy="5.5" r="0.18"/>
+  <circle cx="22.5" cy="5.5" r="0.18"/>
+  <circle cx="23.5" cy="5.5" r="0.18"/>
+  <circle cx="24.5" cy="5.5" r="0.18"/>
+  <circle cx="25.5" cy="5.5" r="0.18"/>
+  <circle cx="26.5" cy="5.5" r="0.18"/>
+  <circle cx="27.5" cy="5.5" r="0.18"/>
+  <circle cx="10.5" cy="6.5" r="0.18"/>
+  <circle cx="11.5" cy="6.5" r="0.18"/>
+  <circle cx="12.5" cy="6.5" r="0.18"/>
+  <circle cx="13.5" cy="6.5" r="0.18"/>
+  <circle cx="14.5" cy="6.5" r="0.18"/>
+  <circle cx="15.5" cy="6.5" r="0.18"/>
+  <circle cx="16.5" cy="6.5" r="0.18"/>
+  <circle cx="23.5" cy="6.5" r="0.18"/>
+  <circle cx="24.5" cy="6.5" r="0.18"/>
+  <circle cx="25.5" cy="6.5" r="0.18"/>
+  <circle cx="26.5" cy="6.5" r="0.18"/>
+  <circle cx="27.5" cy="6.5" r="0.18"/>
+  <circle cx="28.5" cy="6.5" r="0.18"/>
+  <circle cx="29.5" cy="6.5" r="0.18"/>
+  <circle cx="8.5" cy="7.5" r="0.18"/>
+  <circle cx="9.5" cy="7.5" r="0.18"/>
+  <circle cx="10.5" cy="7.5" r="0.18"/>
+  <circle cx="11.5" cy="7.5" r="0.18"/>
+  <circle cx="12.5" cy="7.5" r="0.18"/>
+  <circle cx="13.5" cy="7.5" r="0.18"/>
+  <circle cx="14.5" cy="7.5" r="0.18"/>
+  <circle cx="15.5" cy="7.5" r="0.18"/>
+  <circle cx="16.5" cy="7.5" r="0.18"/>
+  <circle cx="24.5" cy="7.5" r="0.18"/>
+  <circle cx="25.5" cy="7.5" r="0.18"/>
+  <circle cx="26.5" cy="7.5" r="0.18"/>
+  <circle cx="27.5" cy="7.5" r="0.18"/>
+  <circle cx="28.5" cy="7.5" r="0.18"/>
+  <circle cx="29.5" cy="7.5" r="0.18"/>
+  <circle cx="30.5" cy="7.5" r="0.18"/>
+  <circle cx="31.5" cy="7.5" r="0.18"/>
+  <circle cx="6.5" cy="8.5" r="0.18"/>
+  <circle cx="7.5" cy="8.5" r="0.18"/>
+  <circle cx="8.5" cy="8.5" r="0.18"/>
+  <circle cx="9.5" cy="8.5" r="0.18"/>
+  <circle cx="10.5" cy="8.5" r="0.18"/>
+  <circle cx="11.5" cy="8.5" r="0.18"/>
+  <circle cx="12.5" cy="8.5" r="0.18"/>
+  <circle cx="13.5" cy="8.5" r="0.18"/>
+  <circle cx="14.5" cy="8.5" r="0.18"/>
+  <circle cx="15.5" cy="8.5" r="0.18"/>
+  <circle cx="16.5" cy="8.5" r="0.18"/>
+  <circle cx="17.5" cy="8.5" r="0.18"/>
+  <circle cx="18.5" cy="8.5" r="0.18"/>
+  <circle cx="26.5" cy="8.5" r="0.18"/>
+  <circle cx="27.5" cy="8.5" r="0.18"/>
+  <circle cx="28.5" cy="8.5" r="0.18"/>
+  <circle cx="29.5" cy="8.5" r="0.18"/>
+  <circle cx="30.5" cy="8.5" r="0.18"/>
+  <circle cx="31.5" cy="8.5" r="0.18"/>
+  <circle cx="32.5" cy="8.5" r="0.18"/>
+  <circle cx="33.5" cy="8.5" r="0.18"/>
+  <circle cx="5.5" cy="9.5" r="0.18"/>
+  <circle cx="6.5" cy="9.5" r="0.18"/>
+  <circle cx="7.5" cy="9.5" r="0.18"/>
+  <circle cx="8.5" cy="9.5" r="0.18"/>
+  <circle cx="9.5" cy="9.5" r="0.18"/>
+  <circle cx="10.5" cy="9.5" r="0.18"/>
+  <circle cx="11.5" cy="9.5" r="0.18"/>
+  <circle cx="13.5" cy="9.5" r="0.18"/>
+  <circle cx="14.5" cy="9.5" r="0.18"/>
+  <circle cx="15.5" cy="9.5" r="0.18"/>
+  <circle cx="16.5" cy="9.5" r="0.18"/>
+  <circle cx="17.5" cy="9.5" r="0.18"/>
+  <circle cx="18.5" cy="9.5" r="0.18"/>
+  <circle cx="19.5" cy="9.5" r="0.18"/>
+  <circle cx="28.5" cy="9.5" r="0.18"/>
+  <circle cx="29.5" cy="9.5" r="0.18"/>
+  <circle cx="30.5" cy="9.5" r="0.18"/>
+  <circle cx="31.5" cy="9.5" r="0.18"/>
+  <circle cx="32.5" cy="9.5" r="0.18"/>
+  <circle cx="33.5" cy="9.5" r="0.18"/>
+  <circle cx="34.5" cy="9.5" r="0.18"/>
+  <circle cx="4.5" cy="10.5" r="0.18"/>
+  <circle cx="5.5" cy="10.5" r="0.18"/>
+  <circle cx="6.5" cy="10.5" r="0.18"/>
+  <circle cx="7.5" cy="10.5" r="0.18"/>
+  <circle cx="8.5" cy="10.5" r="0.18"/>
+  <circle cx="9.5" cy="10.5" r="0.18"/>
+  <circle cx="15.5" cy="10.5" r="0.18"/>
+  <circle cx="16.5" cy="10.5" r="0.18"/>
+  <circle cx="17.5" cy="10.5" r="0.18"/>
+  <circle cx="18.5" cy="10.5" r="0.18"/>
+  <circle cx="19.5" cy="10.5" r="0.18"/>
+  <circle cx="20.5" cy="10.5" r="0.18"/>
+  <circle cx="21.5" cy="10.5" r="0.18"/>
+  <circle cx="30.5" cy="10.5" r="0.18"/>
+  <circle cx="31.5" cy="10.5" r="0.18"/>
+  <circle cx="32.5" cy="10.5" r="0.18"/>
+  <circle cx="33.5" cy="10.5" r="0.18"/>
+  <circle cx="34.5" cy="10.5" r="0.18"/>
+  <circle cx="35.5" cy="10.5" r="0.18"/>
+  <circle cx="3.5" cy="11.5" r="0.18"/>
+  <circle cx="4.5" cy="11.5" r="0.18"/>
+  <circle cx="5.5" cy="11.5" r="0.18"/>
+  <circle cx="6.5" cy="11.5" r="0.18"/>
+  <circle cx="7.5" cy="11.5" r="0.18"/>
+  <circle cx="8.5" cy="11.5" r="0.18"/>
+  <circle cx="16.5" cy="11.5" r="0.18"/>
+  <circle cx="17.5" cy="11.5" r="0.18"/>
+  <circle cx="18.5" cy="11.5" r="0.18"/>
+  <circle cx="19.5" cy="11.5" r="0.18"/>
+  <circle cx="20.5" cy="11.5" r="0.18"/>
+  <circle cx="21.5" cy="11.5" r="0.18"/>
+  <circle cx="22.5" cy="11.5" r="0.18"/>
+  <circle cx="23.5" cy="11.5" r="0.18"/>
+  <circle cx="31.5" cy="11.5" r="0.18"/>
+  <circle cx="32.5" cy="11.5" r="0.18"/>
+  <circle cx="33.5" cy="11.5" r="0.18"/>
+  <circle cx="34.5" cy="11.5" r="0.18"/>
+  <circle cx="35.5" cy="11.5" r="0.18"/>
+  <circle cx="36.5" cy="11.5" r="0.18"/>
+  <circle cx="3.5" cy="12.5" r="0.18"/>
+  <circle cx="4.5" cy="12.5" r="0.18"/>
+  <circle cx="5.5" cy="12.5" r="0.18"/>
+  <circle cx="6.5" cy="12.5" r="0.18"/>
+  <circle cx="7.5" cy="12.5" r="0.18"/>
+  <circle cx="8.5" cy="12.5" r="0.18"/>
+  <circle cx="9.5" cy="12.5" r="0.18"/>
+  <circle cx="10.5" cy="12.5" r="0.18"/>
+  <circle cx="18.5" cy="12.5" r="0.18"/>
+  <circle cx="19.5" cy="12.5" r="0.18"/>
+  <circle cx="20.5" cy="12.5" r="0.18"/>
+  <circle cx="21.5" cy="12.5" r="0.18"/>
+  <circle cx="22.5" cy="12.5" r="0.18"/>
+  <circle cx="23.5" cy="12.5" r="0.18"/>
+  <circle cx="24.5" cy="12.5" r="0.18"/>
+  <circle cx="25.5" cy="12.5" r="0.18"/>
+  <circle cx="29.5" cy="12.5" r="0.18"/>
+  <circle cx="30.5" cy="12.5" r="0.18"/>
+  <circle cx="31.5" cy="12.5" r="0.18"/>
+  <circle cx="32.5" cy="12.5" r="0.18"/>
+  <circle cx="33.5" cy="12.5" r="0.18"/>
+  <circle cx="34.5" cy="12.5" r="0.18"/>
+  <circle cx="35.5" cy="12.5" r="0.18"/>
+  <circle cx="36.5" cy="12.5" r="0.18"/>
+  <circle cx="3.5" cy="13.5" r="0.18"/>
+  <circle cx="4.5" cy="13.5" r="0.18"/>
+  <circle cx="5.5" cy="13.5" r="0.18"/>
+  <circle cx="6.5" cy="13.5" r="0.18"/>
+  <circle cx="7.5" cy="13.5" r="0.18"/>
+  <circle cx="8.5" cy="13.5" r="0.18"/>
+  <circle cx="9.5" cy="13.5" r="0.18"/>
+  <circle cx="10.5" cy="13.5" r="0.18"/>
+  <circle cx="11.5" cy="13.5" r="0.18"/>
+  <circle cx="20.5" cy="13.5" r="0.18"/>
+  <circle cx="21.5" cy="13.5" r="0.18"/>
+  <circle cx="22.5" cy="13.5" r="0.18"/>
+  <circle cx="23.5" cy="13.5" r="0.18"/>
+  <circle cx="24.5" cy="13.5" r="0.18"/>
+  <circle cx="25.5" cy="13.5" r="0.18"/>
+  <circle cx="26.5" cy="13.5" r="0.18"/>
+  <circle cx="27.5" cy="13.5" r="0.18"/>
+  <circle cx="28.5" cy="13.5" r="0.18"/>
+  <circle cx="29.5" cy="13.5" r="0.18"/>
+  <circle cx="30.5" cy="13.5" r="0.18"/>
+  <circle cx="31.5" cy="13.5" r="0.18"/>
+  <circle cx="32.5" cy="13.5" r="0.18"/>
+  <circle cx="33.5" cy="13.5" r="0.18"/>
+  <circle cx="34.5" cy="13.5" r="0.18"/>
+  <circle cx="35.5" cy="13.5" r="0.18"/>
+  <circle cx="36.5" cy="13.5" r="0.18"/>
+  <circle cx="3.5" cy="14.5" r="0.18"/>
+  <circle cx="4.5" cy="14.5" r="0.18"/>
+  <circle cx="5.5" cy="14.5" r="0.18"/>
+  <circle cx="6.5" cy="14.5" r="0.18"/>
+  <circle cx="7.5" cy="14.5" r="0.18"/>
+  <circle cx="8.5" cy="14.5" r="0.18"/>
+  <circle cx="9.5" cy="14.5" r="0.18"/>
+  <circle cx="10.5" cy="14.5" r="0.18"/>
+  <circle cx="11.5" cy="14.5" r="0.18"/>
+  <circle cx="12.5" cy="14.5" r="0.18"/>
+  <circle cx="13.5" cy="14.5" r="0.18"/>
+  <circle cx="22.5" cy="14.5" r="0.18"/>
+  <circle cx="23.5" cy="14.5" r="0.18"/>
+  <circle cx="24.5" cy="14.5" r="0.18"/>
+  <circle cx="25.5" cy="14.5" r="0.18"/>
+  <circle cx="26.5" cy="14.5" r="0.18"/>
+  <circle cx="27.5" cy="14.5" r="0.18"/>
+  <circle cx="28.5" cy="14.5" r="0.18"/>
+  <circle cx="29.5" cy="14.5" r="0.18"/>
+  <circle cx="30.5" cy="14.5" r="0.18"/>
+  <circle cx="31.5" cy="14.5" r="0.18"/>
+  <circle cx="32.5" cy="14.5" r="0.18"/>
+  <circle cx="33.5" cy="14.5" r="0.18"/>
+  <circle cx="34.5" cy="14.5" r="0.18"/>
+  <circle cx="35.5" cy="14.5" r="0.18"/>
+  <circle cx="36.5" cy="14.5" r="0.18"/>
+  <circle cx="3.5" cy="15.5" r="0.18"/>
+  <circle cx="4.5" cy="15.5" r="0.18"/>
+  <circle cx="5.5" cy="15.5" r="0.18"/>
+  <circle cx="6.5" cy="15.5" r="0.18"/>
+  <circle cx="8.5" cy="15.5" r="0.18"/>
+  <circle cx="9.5" cy="15.5" r="0.18"/>
+  <circle cx="10.5" cy="15.5" r="0.18"/>
+  <circle cx="11.5" cy="15.5" r="0.18"/>
+  <circle cx="12.5" cy="15.5" r="0.18"/>
+  <circle cx="13.5" cy="15.5" r="0.18"/>
+  <circle cx="14.5" cy="15.5" r="0.18"/>
+  <circle cx="15.5" cy="15.5" r="0.18"/>
+  <circle cx="23.5" cy="15.5" r="0.18"/>
+  <circle cx="24.5" cy="15.5" r="0.18"/>
+  <circle cx="25.5" cy="15.5" r="0.18"/>
+  <circle cx="26.5" cy="15.5" r="0.18"/>
+  <circle cx="27.5" cy="15.5" r="0.18"/>
+  <circle cx="28.5" cy="15.5" r="0.18"/>
+  <circle cx="29.5" cy="15.5" r="0.18"/>
+  <circle cx="30.5" cy="15.5" r="0.18"/>
+  <circle cx="31.5" cy="15.5" r="0.18"/>
+  <circle cx="33.5" cy="15.5" r="0.18"/>
+  <circle cx="34.5" cy="15.5" r="0.18"/>
+  <circle cx="35.5" cy="15.5" r="0.18"/>
+  <circle cx="36.5" cy="15.5" r="0.18"/>
+  <circle cx="3.5" cy="16.5" r="0.18"/>
+  <circle cx="4.5" cy="16.5" r="0.18"/>
+  <circle cx="5.5" cy="16.5" r="0.18"/>
+  <circle cx="6.5" cy="16.5" r="0.18"/>
+  <circle cx="10.5" cy="16.5" r="0.18"/>
+  <circle cx="11.5" cy="16.5" r="0.18"/>
+  <circle cx="12.5" cy="16.5" r="0.18"/>
+  <circle cx="13.5" cy="16.5" r="0.18"/>
+  <circle cx="14.5" cy="16.5" r="0.18"/>
+  <circle cx="15.5" cy="16.5" r="0.18"/>
+  <circle cx="16.5" cy="16.5" r="0.18"/>
+  <circle cx="17.5" cy="16.5" r="0.18"/>
+  <circle cx="22.5" cy="16.5" r="0.18"/>
+  <circle cx="23.5" cy="16.5" r="0.18"/>
+  <circle cx="24.5" cy="16.5" r="0.18"/>
+  <circle cx="25.5" cy="16.5" r="0.18"/>
+  <circle cx="26.5" cy="16.5" r="0.18"/>
+  <circle cx="27.5" cy="16.5" r="0.18"/>
+  <circle cx="28.5" cy="16.5" r="0.18"/>
+  <circle cx="29.5" cy="16.5" r="0.18"/>
+  <circle cx="33.5" cy="16.5" r="0.18"/>
+  <circle cx="34.5" cy="16.5" r="0.18"/>
+  <circle cx="35.5" cy="16.5" r="0.18"/>
+  <circle cx="36.5" cy="16.5" r="0.18"/>
+  <circle cx="3.5" cy="17.5" r="0.18"/>
+  <circle cx="4.5" cy="17.5" r="0.18"/>
+  <circle cx="5.5" cy="17.5" r="0.18"/>
+  <circle cx="6.5" cy="17.5" r="0.18"/>
+  <circle cx="12.5" cy="17.5" r="0.18"/>
+  <circle cx="13.5" cy="17.5" r="0.18"/>
+  <circle cx="14.5" cy="17.5" r="0.18"/>
+  <circle cx="15.5" cy="17.5" r="0.18"/>
+  <circle cx="16.5" cy="17.5" r="0.18"/>
+  <circle cx="17.5" cy="17.5" r="0.18"/>
+  <circle cx="18.5" cy="17.5" r="0.18"/>
+  <circle cx="21.5" cy="17.5" r="0.18"/>
+  <circle cx="22.5" cy="17.5" r="0.18"/>
+  <circle cx="23.5" cy="17.5" r="0.18"/>
+  <circle cx="24.5" cy="17.5" r="0.18"/>
+  <circle cx="25.5" cy="17.5" r="0.18"/>
+  <circle cx="26.5" cy="17.5" r="0.18"/>
+  <circle cx="27.5" cy="17.5" r="0.18"/>
+  <circle cx="33.5" cy="17.5" r="0.18"/>
+  <circle cx="34.5" cy="17.5" r="0.18"/>
+  <circle cx="35.5" cy="17.5" r="0.18"/>
+  <circle cx="36.5" cy="17.5" r="0.18"/>
+  <circle cx="3.5" cy="18.5" r="0.18"/>
+  <circle cx="4.5" cy="18.5" r="0.18"/>
+  <circle cx="5.5" cy="18.5" r="0.18"/>
+  <circle cx="6.5" cy="18.5" r="0.18"/>
+  <circle cx="14.5" cy="18.5" r="0.18"/>
+  <circle cx="15.5" cy="18.5" r="0.18"/>
+  <circle cx="16.5" cy="18.5" r="0.18"/>
+  <circle cx="17.5" cy="18.5" r="0.18"/>
+  <circle cx="18.5" cy="18.5" r="0.18"/>
+  <circle cx="19.5" cy="18.5" r="0.18"/>
+  <circle cx="20.5" cy="18.5" r="0.18"/>
+  <circle cx="21.5" cy="18.5" r="0.18"/>
+  <circle cx="22.5" cy="18.5" r="0.18"/>
+  <circle cx="23.5" cy="18.5" r="0.18"/>
+  <circle cx="24.5" cy="18.5" r="0.18"/>
+  <circle cx="25.5" cy="18.5" r="0.18"/>
+  <circle cx="33.5" cy="18.5" r="0.18"/>
+  <circle cx="34.5" cy="18.5" r="0.18"/>
+  <circle cx="35.5" cy="18.5" r="0.18"/>
+  <circle cx="36.5" cy="18.5" r="0.18"/>
+  <circle cx="3.5" cy="19.5" r="0.18"/>
+  <circle cx="4.5" cy="19.5" r="0.18"/>
+  <circle cx="5.5" cy="19.5" r="0.18"/>
+  <circle cx="6.5" cy="19.5" r="0.18"/>
+  <circle cx="15.5" cy="19.5" r="0.18"/>
+  <circle cx="16.5" cy="19.5" r="0.18"/>
+  <circle cx="17.5" cy="19.5" r="0.18"/>
+  <circle cx="18.5" cy="19.5" r="0.18"/>
+  <circle cx="19.5" cy="19.5" r="0.18"/>
+  <circle cx="20.5" cy="19.5" r="0.18"/>
+  <circle cx="21.5" cy="19.5" r="0.18"/>
+  <circle cx="22.5" cy="19.5" r="0.18"/>
+  <circle cx="23.5" cy="19.5" r="0.18"/>
+  <circle cx="24.5" cy="19.5" r="0.18"/>
+  <circle cx="33.5" cy="19.5" r="0.18"/>
+  <circle cx="34.5" cy="19.5" r="0.18"/>
+  <circle cx="35.5" cy="19.5" r="0.18"/>
+  <circle cx="36.5" cy="19.5" r="0.18"/>
+  <circle cx="3.5" cy="20.5" r="0.18"/>
+  <circle cx="4.5" cy="20.5" r="0.18"/>
+  <circle cx="5.5" cy="20.5" r="0.18"/>
+  <circle cx="6.5" cy="20.5" r="0.18"/>
+  <circle cx="17.5" cy="20.5" r="0.18"/>
+  <circle cx="18.5" cy="20.5" r="0.18"/>
+  <circle cx="19.5" cy="20.5" r="0.18"/>
+  <circle cx="20.5" cy="20.5" r="0.18"/>
+  <circle cx="21.5" cy="20.5" r="0.18"/>
+  <circle cx="22.5" cy="20.5" r="0.18"/>
+  <circle cx="33.5" cy="20.5" r="0.18"/>
+  <circle cx="34.5" cy="20.5" r="0.18"/>
+  <circle cx="35.5" cy="20.5" r="0.18"/>
+  <circle cx="36.5" cy="20.5" r="0.18"/>
+  <circle cx="3.5" cy="21.5" r="0.18"/>
+  <circle cx="4.5" cy="21.5" r="0.18"/>
+  <circle cx="5.5" cy="21.5" r="0.18"/>
+  <circle cx="6.5" cy="21.5" r="0.18"/>
+  <circle cx="18.5" cy="21.5" r="0.18"/>
+  <circle cx="19.5" cy="21.5" r="0.18"/>
+  <circle cx="20.5" cy="21.5" r="0.18"/>
+  <circle cx="21.5" cy="21.5" r="0.18"/>
+  <circle cx="33.5" cy="21.5" r="0.18"/>
+  <circle cx="34.5" cy="21.5" r="0.18"/>
+  <circle cx="35.5" cy="21.5" r="0.18"/>
+  <circle cx="36.5" cy="21.5" r="0.18"/>
+  <circle cx="3.5" cy="22.5" r="0.18"/>
+  <circle cx="4.5" cy="22.5" r="0.18"/>
+  <circle cx="5.5" cy="22.5" r="0.18"/>
+  <circle cx="6.5" cy="22.5" r="0.18"/>
+  <circle cx="18.5" cy="22.5" r="0.18"/>
+  <circle cx="19.5" cy="22.5" r="0.18"/>
+  <circle cx="20.5" cy="22.5" r="0.18"/>
+  <circle cx="21.5" cy="22.5" r="0.18"/>
+  <circle cx="33.5" cy="22.5" r="0.18"/>
+  <circle cx="34.5" cy="22.5" r="0.18"/>
+  <circle cx="35.5" cy="22.5" r="0.18"/>
+  <circle cx="36.5" cy="22.5" r="0.18"/>
+  <circle cx="3.5" cy="23.5" r="0.18"/>
+  <circle cx="4.5" cy="23.5" r="0.18"/>
+  <circle cx="5.5" cy="23.5" r="0.18"/>
+  <circle cx="6.5" cy="23.5" r="0.18"/>
+  <circle cx="18.5" cy="23.5" r="0.18"/>
+  <circle cx="19.5" cy="23.5" r="0.18"/>
+  <circle cx="20.5" cy="23.5" r="0.18"/>
+  <circle cx="21.5" cy="23.5" r="0.18"/>
+  <circle cx="33.5" cy="23.5" r="0.18"/>
+  <circle cx="34.5" cy="23.5" r="0.18"/>
+  <circle cx="35.5" cy="23.5" r="0.18"/>
+  <circle cx="36.5" cy="23.5" r="0.18"/>
+  <circle cx="3.5" cy="24.5" r="0.18"/>
+  <circle cx="4.5" cy="24.5" r="0.18"/>
+  <circle cx="5.5" cy="24.5" r="0.18"/>
+  <circle cx="6.5" cy="24.5" r="0.18"/>
+  <circle cx="18.5" cy="24.5" r="0.18"/>
+  <circle cx="19.5" cy="24.5" r="0.18"/>
+  <circle cx="20.5" cy="24.5" r="0.18"/>
+  <circle cx="21.5" cy="24.5" r="0.18"/>
+  <circle cx="33.5" cy="24.5" r="0.18"/>
+  <circle cx="34.5" cy="24.5" r="0.18"/>
+  <circle cx="35.5" cy="24.5" r="0.18"/>
+  <circle cx="36.5" cy="24.5" r="0.18"/>
+  <circle cx="3.5" cy="25.5" r="0.18"/>
+  <circle cx="4.5" cy="25.5" r="0.18"/>
+  <circle cx="5.5" cy="25.5" r="0.18"/>
+  <circle cx="6.5" cy="25.5" r="0.18"/>
+  <circle cx="18.5" cy="25.5" r="0.18"/>
+  <circle cx="19.5" cy="25.5" r="0.18"/>
+  <circle cx="20.5" cy="25.5" r="0.18"/>
+  <circle cx="21.5" cy="25.5" r="0.18"/>
+  <circle cx="33.5" cy="25.5" r="0.18"/>
+  <circle cx="34.5" cy="25.5" r="0.18"/>
+  <circle cx="35.5" cy="25.5" r="0.18"/>
+  <circle cx="36.5" cy="25.5" r="0.18"/>
+  <circle cx="3.5" cy="26.5" r="0.18"/>
+  <circle cx="4.5" cy="26.5" r="0.18"/>
+  <circle cx="5.5" cy="26.5" r="0.18"/>
+  <circle cx="6.5" cy="26.5" r="0.18"/>
+  <circle cx="18.5" cy="26.5" r="0.18"/>
+  <circle cx="19.5" cy="26.5" r="0.18"/>
+  <circle cx="20.5" cy="26.5" r="0.18"/>
+  <circle cx="21.5" cy="26.5" r="0.18"/>
+  <circle cx="33.5" cy="26.5" r="0.18"/>
+  <circle cx="34.5" cy="26.5" r="0.18"/>
+  <circle cx="35.5" cy="26.5" r="0.18"/>
+  <circle cx="36.5" cy="26.5" r="0.18"/>
+  <circle cx="3.5" cy="27.5" r="0.18"/>
+  <circle cx="4.5" cy="27.5" r="0.18"/>
+  <circle cx="5.5" cy="27.5" r="0.18"/>
+  <circle cx="6.5" cy="27.5" r="0.18"/>
+  <circle cx="18.5" cy="27.5" r="0.18"/>
+  <circle cx="19.5" cy="27.5" r="0.18"/>
+  <circle cx="20.5" cy="27.5" r="0.18"/>
+  <circle cx="21.5" cy="27.5" r="0.18"/>
+  <circle cx="33.5" cy="27.5" r="0.18"/>
+  <circle cx="34.5" cy="27.5" r="0.18"/>
+  <circle cx="35.5" cy="27.5" r="0.18"/>
+  <circle cx="36.5" cy="27.5" r="0.18"/>
+  <circle cx="3.5" cy="28.5" r="0.18"/>
+  <circle cx="4.5" cy="28.5" r="0.18"/>
+  <circle cx="5.5" cy="28.5" r="0.18"/>
+  <circle cx="6.5" cy="28.5" r="0.18"/>
+  <circle cx="7.5" cy="28.5" r="0.18"/>
+  <circle cx="8.5" cy="28.5" r="0.18"/>
+  <circle cx="18.5" cy="28.5" r="0.18"/>
+  <circle cx="19.5" cy="28.5" r="0.18"/>
+  <circle cx="20.5" cy="28.5" r="0.18"/>
+  <circle cx="21.5" cy="28.5" r="0.18"/>
+  <circle cx="31.5" cy="28.5" r="0.18"/>
+  <circle cx="32.5" cy="28.5" r="0.18"/>
+  <circle cx="33.5" cy="28.5" r="0.18"/>
+  <circle cx="34.5" cy="28.5" r="0.18"/>
+  <circle cx="35.5" cy="28.5" r="0.18"/>
+  <circle cx="36.5" cy="28.5" r="0.18"/>
+  <circle cx="4.5" cy="29.5" r="0.18"/>
+  <circle cx="5.5" cy="29.5" r="0.18"/>
+  <circle cx="6.5" cy="29.5" r="0.18"/>
+  <circle cx="7.5" cy="29.5" r="0.18"/>
+  <circle cx="8.5" cy="29.5" r="0.18"/>
+  <circle cx="9.5" cy="29.5" r="0.18"/>
+  <circle cx="18.5" cy="29.5" r="0.18"/>
+  <circle cx="19.5" cy="29.5" r="0.18"/>
+  <circle cx="20.5" cy="29.5" r="0.18"/>
+  <circle cx="21.5" cy="29.5" r="0.18"/>
+  <circle cx="30.5" cy="29.5" r="0.18"/>
+  <circle cx="31.5" cy="29.5" r="0.18"/>
+  <circle cx="32.5" cy="29.5" r="0.18"/>
+  <circle cx="33.5" cy="29.5" r="0.18"/>
+  <circle cx="34.5" cy="29.5" r="0.18"/>
+  <circle cx="35.5" cy="29.5" r="0.18"/>
+  <circle cx="5.5" cy="30.5" r="0.18"/>
+  <circle cx="6.5" cy="30.5" r="0.18"/>
+  <circle cx="7.5" cy="30.5" r="0.18"/>
+  <circle cx="8.5" cy="30.5" r="0.18"/>
+  <circle cx="9.5" cy="30.5" r="0.18"/>
+  <circle cx="10.5" cy="30.5" r="0.18"/>
+  <circle cx="11.5" cy="30.5" r="0.18"/>
+  <circle cx="18.5" cy="30.5" r="0.18"/>
+  <circle cx="19.5" cy="30.5" r="0.18"/>
+  <circle cx="20.5" cy="30.5" r="0.18"/>
+  <circle cx="21.5" cy="30.5" r="0.18"/>
+  <circle cx="28.5" cy="30.5" r="0.18"/>
+  <circle cx="29.5" cy="30.5" r="0.18"/>
+  <circle cx="30.5" cy="30.5" r="0.18"/>
+  <circle cx="31.5" cy="30.5" r="0.18"/>
+  <circle cx="32.5" cy="30.5" r="0.18"/>
+  <circle cx="33.5" cy="30.5" r="0.18"/>
+  <circle cx="34.5" cy="30.5" r="0.18"/>
+  <circle cx="6.5" cy="31.5" r="0.18"/>
+  <circle cx="7.5" cy="31.5" r="0.18"/>
+  <circle cx="8.5" cy="31.5" r="0.18"/>
+  <circle cx="9.5" cy="31.5" r="0.18"/>
+  <circle cx="10.5" cy="31.5" r="0.18"/>
+  <circle cx="11.5" cy="31.5" r="0.18"/>
+  <circle cx="12.5" cy="31.5" r="0.18"/>
+  <circle cx="13.5" cy="31.5" r="0.18"/>
+  <circle cx="18.5" cy="31.5" r="0.18"/>
+  <circle cx="19.5" cy="31.5" r="0.18"/>
+  <circle cx="20.5" cy="31.5" r="0.18"/>
+  <circle cx="21.5" cy="31.5" r="0.18"/>
+  <circle cx="26.5" cy="31.5" r="0.18"/>
+  <circle cx="27.5" cy="31.5" r="0.18"/>
+  <circle cx="28.5" cy="31.5" r="0.18"/>
+  <circle cx="29.5" cy="31.5" r="0.18"/>
+  <circle cx="30.5" cy="31.5" r="0.18"/>
+  <circle cx="31.5" cy="31.5" r="0.18"/>
+  <circle cx="32.5" cy="31.5" r="0.18"/>
+  <circle cx="33.5" cy="31.5" r="0.18"/>
+  <circle cx="8.5" cy="32.5" r="0.18"/>
+  <circle cx="9.5" cy="32.5" r="0.18"/>
+  <circle cx="10.5" cy="32.5" r="0.18"/>
+  <circle cx="11.5" cy="32.5" r="0.18"/>
+  <circle cx="12.5" cy="32.5" r="0.18"/>
+  <circle cx="13.5" cy="32.5" r="0.18"/>
+  <circle cx="14.5" cy="32.5" r="0.18"/>
+  <circle cx="15.5" cy="32.5" r="0.18"/>
+  <circle cx="18.5" cy="32.5" r="0.18"/>
+  <circle cx="19.5" cy="32.5" r="0.18"/>
+  <circle cx="20.5" cy="32.5" r="0.18"/>
+  <circle cx="21.5" cy="32.5" r="0.18"/>
+  <circle cx="24.5" cy="32.5" r="0.18"/>
+  <circle cx="25.5" cy="32.5" r="0.18"/>
+  <circle cx="26.5" cy="32.5" r="0.18"/>
+  <circle cx="27.5" cy="32.5" r="0.18"/>
+  <circle cx="28.5" cy="32.5" r="0.18"/>
+  <circle cx="29.5" cy="32.5" r="0.18"/>
+  <circle cx="30.5" cy="32.5" r="0.18"/>
+  <circle cx="31.5" cy="32.5" r="0.18"/>
+  <circle cx="10.5" cy="33.5" r="0.18"/>
+  <circle cx="11.5" cy="33.5" r="0.18"/>
+  <circle cx="12.5" cy="33.5" r="0.18"/>
+  <circle cx="13.5" cy="33.5" r="0.18"/>
+  <circle cx="14.5" cy="33.5" r="0.18"/>
+  <circle cx="15.5" cy="33.5" r="0.18"/>
+  <circle cx="16.5" cy="33.5" r="0.18"/>
+  <circle cx="18.5" cy="33.5" r="0.18"/>
+  <circle cx="19.5" cy="33.5" r="0.18"/>
+  <circle cx="20.5" cy="33.5" r="0.18"/>
+  <circle cx="21.5" cy="33.5" r="0.18"/>
+  <circle cx="23.5" cy="33.5" r="0.18"/>
+  <circle cx="24.5" cy="33.5" r="0.18"/>
+  <circle cx="25.5" cy="33.5" r="0.18"/>
+  <circle cx="26.5" cy="33.5" r="0.18"/>
+  <circle cx="27.5" cy="33.5" r="0.18"/>
+  <circle cx="28.5" cy="33.5" r="0.18"/>
+  <circle cx="29.5" cy="33.5" r="0.18"/>
+  <circle cx="12.5" cy="34.5" r="0.18"/>
+  <circle cx="13.5" cy="34.5" r="0.18"/>
+  <circle cx="14.5" cy="34.5" r="0.18"/>
+  <circle cx="15.5" cy="34.5" r="0.18"/>
+  <circle cx="16.5" cy="34.5" r="0.18"/>
+  <circle cx="17.5" cy="34.5" r="0.18"/>
+  <circle cx="18.5" cy="34.5" r="0.18"/>
+  <circle cx="19.5" cy="34.5" r="0.18"/>
+  <circle cx="20.5" cy="34.5" r="0.18"/>
+  <circle cx="21.5" cy="34.5" r="0.18"/>
+  <circle cx="22.5" cy="34.5" r="0.18"/>
+  <circle cx="23.5" cy="34.5" r="0.18"/>
+  <circle cx="24.5" cy="34.5" r="0.18"/>
+  <circle cx="25.5" cy="34.5" r="0.18"/>
+  <circle cx="26.5" cy="34.5" r="0.18"/>
+  <circle cx="27.5" cy="34.5" r="0.18"/>
+  <circle cx="13.5" cy="35.5" r="0.18"/>
+  <circle cx="14.5" cy="35.5" r="0.18"/>
+  <circle cx="15.5" cy="35.5" r="0.18"/>
+  <circle cx="16.5" cy="35.5" r="0.18"/>
+  <circle cx="17.5" cy="35.5" r="0.18"/>
+  <circle cx="18.5" cy="35.5" r="0.18"/>
+  <circle cx="19.5" cy="35.5" r="0.18"/>
+  <circle cx="20.5" cy="35.5" r="0.18"/>
+  <circle cx="21.5" cy="35.5" r="0.18"/>
+  <circle cx="22.5" cy="35.5" r="0.18"/>
+  <circle cx="23.5" cy="35.5" r="0.18"/>
+  <circle cx="24.5" cy="35.5" r="0.18"/>
+  <circle cx="25.5" cy="35.5" r="0.18"/>
+  <circle cx="26.5" cy="35.5" r="0.18"/>
+  <circle cx="15.5" cy="36.5" r="0.18"/>
+  <circle cx="16.5" cy="36.5" r="0.18"/>
+  <circle cx="17.5" cy="36.5" r="0.18"/>
+  <circle cx="18.5" cy="36.5" r="0.18"/>
+  <circle cx="19.5" cy="36.5" r="0.18"/>
+  <circle cx="20.5" cy="36.5" r="0.18"/>
+  <circle cx="21.5" cy="36.5" r="0.18"/>
+  <circle cx="22.5" cy="36.5" r="0.18"/>
+  <circle cx="23.5" cy="36.5" r="0.18"/>
+  <circle cx="24.5" cy="36.5" r="0.18"/>
+  <circle cx="17.5" cy="37.5" r="0.18"/>
+  <circle cx="18.5" cy="37.5" r="0.18"/>
+  <circle cx="19.5" cy="37.5" r="0.18"/>
+  <circle cx="20.5" cy="37.5" r="0.18"/>
+  <circle cx="21.5" cy="37.5" r="0.18"/>
+  <circle cx="22.5" cy="37.5" r="0.18"/>
+  <circle cx="19.5" cy="38.5" r="0.18"/>
+  <circle cx="20.5" cy="38.5" r="0.18"/>
+</svg>
+</span><script type="module">var e=window.matchMedia(`(prefers-reduced-motion: reduce)`).matches,t=Array.from(document.querySelectorAll(`.doodle`));if(!e&&t.length){let e=new IntersectionObserver(t=>{for(let n of t){if(!n.isIntersecting)continue;let t=n.target,r=t.style.getPropertyValue(`--doodle-opacity`)||`0.08`;t.style.opacity=`0`,t.style.transition=`opacity 1.2s ease`,requestAnimationFrame(()=>{t.style.opacity=r}),e.unobserve(n.target)}},{threshold:.15});t.forEach(t=>e.observe(t));let n=!1;window.addEventListener(`scroll`,()=>{n||(n=!0,requestAnimationFrame(()=>{let e=window.scrollY;for(let n of t){let t=Number(n.dataset.parallax??0);t&&n.style.setProperty(`transform`,`rotate(var(--doodle-rotate)) translateY(${(-e*t).toFixed(1)}px)`)}n=!1}))},{passive:!0})}</script>
+<p>Scarab’s build library, <code dir="auto">lib:thulasi-ram/build</code>, pushes with a dockerconfigjson: the
+<code dir="auto">REGISTRY_AUTH</code> secret of the repository or its org, or the credential the forge derives for its own
+registry (see <a href="/scarab-ci/usage/pipeline-syntax/#building-an-image">Building an image</a>). An Amazon
+ECR password does not fit in a stored secret: <code dir="auto">aws ecr get-login-password</code> returns one that is
+valid for 12 hours (AWS’s limit), so a saved <code dir="auto">REGISTRY_AUTH</code> stops working the same day.</p>
+<p>On EKS the password can come from an IAM role on a Kubernetes ServiceAccount instead. An init
+container in the library’s push step’s Pod logs in to ECR each time the Pod starts and writes a
+fresh password for crane. Scarab stores no ECR
+credential. The setup has four parts:</p>
+<ol>
+<li>An IAM role that may push to named repositories, on a ServiceAccount of its own,
+<code dir="auto">scarab-ecr-push</code>.</li>
+<li>A placement profile, <code dir="auto">ecr-push</code>, marked <code dir="auto">registry_auth_only: true</code>, that runs the push step’s
+Pod as that ServiceAccount and adds an init container that writes the ECR login for crane.</li>
+<li>The build library installed, and its source trusted for the build sandbox and with the
+registry credential.</li>
+<li>A Pipeline that routes <code dir="auto">ecr-push</code> to the library’s push step only.</li>
+</ol>
+<p>This page uses IAM Roles for Service Accounts (IRSA). EKS Pod Identity is covered at the end of
+part 1. The AWS details (IAM actions, trust policies, the IRSA webhook) are AWS’s; we name them so
+you know what to look up, and the AWS docs are the reference for each.</p>
+<p>We have not run this flow on EKS. Scarab’s tests cover the page’s blocks only: that they parse
+and compile, how Run creation admits them, and how the profile merges into the push step’s Pod.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="before-you-start-the-serviceaccount-every-step-shares">Before you start: the ServiceAccount every step shares</h2><a class="sl-anchor-link" href="#before-you-start-the-serviceaccount-every-step-shares"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Before you start: the ServiceAccount every step shares”</span></a></div>
+<p>Scarab sets no <code dir="auto">serviceAccountName</code> on a step Pod, so the Pod runs as the <code dir="auto">default</code> ServiceAccount
+of the namespace steps run in (<code dir="auto">scarab.namespace</code> in the chart, else the release’s namespace),
+unless the <a href="/scarab-ci/usage/pipeline-syntax/#placement--resources">placement baseline</a> sets one.
+Scarab also sets <code dir="auto">automountServiceAccountToken: false</code>, so a step gets no Kubernetes API token.</p>
+<p>The IRSA webhook mounts its own AWS token into the Pods of an annotated ServiceAccount, and
+<code dir="auto">automountServiceAccountToken</code> does not turn that off. So an IAM role on the ServiceAccount every
+step shares reaches every step of every Project: a test step in any repository could push images
+with it. Take it off before you go on:</p>
+<ul>
+<li>the <code dir="auto">eks.amazonaws.com/role-arn</code> annotation on the step namespace’s <code dir="auto">default</code> ServiceAccount
+(<code dir="auto">kubectl -n &lt;namespace&gt; get serviceaccount default -o yaml</code>);</li>
+<li>a <code dir="auto">serviceAccountName</code> in the chart’s <code dir="auto">scarab.placement.baseline</code>, if you set one;</li>
+<li>an EKS Pod Identity association for that namespace and ServiceAccount
+(<code dir="auto">aws eks list-pod-identity-associations --cluster-name &lt;cluster&gt; --namespace &lt;namespace&gt;</code>).</li>
+</ul>
+<p>The chart’s own <code dir="auto">serviceAccount.annotations</code> (the server’s role for its S3 bucket) are on the
+server’s ServiceAccount. Step Pods use it only if a baseline or profile names it.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="1-the-iam-role-and-the-serviceaccount">1. The IAM role and the ServiceAccount</h2><a class="sl-anchor-link" href="#1-the-iam-role-and-the-serviceaccount"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “1. The IAM role and the ServiceAccount”</span></a></div>
+<p>Give the role only what a push needs, on the repositories you name. A starting point, to check
+against the AWS docs for ECR’s push actions:</p>
+<div class="expressive-code"><link rel="stylesheet" href="/scarab-ci/_astro/ec.v4551.css"><script type="module" src="/scarab-ci/_astro/ec.0vx5m.js"></script><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="json"><code><div class="ec-line"><div class="code"><span style="--0:#D6DEEB;--1:#403F53">{</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#7FDBCA;--1:#096E72">"Version"</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">2012-10-17</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#7FDBCA;--1:#096E72">"Statement"</span><span style="--0:#D6DEEB;--1:#403F53">: [</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">    </span></span><span style="--0:#D6DEEB;--1:#403F53">{ </span><span style="--0:#7FDBCA;--1:#096E72">"Effect"</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">Allow</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">, </span><span style="--0:#7FDBCA;--1:#096E72">"Action"</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ecr:GetAuthorizationToken</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">, </span><span style="--0:#7FDBCA;--1:#096E72">"Resource"</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">*</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53"> },</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">    </span></span><span style="--0:#D6DEEB;--1:#403F53">{</span></div></div><div class="ec-line"><div class="code"><span class="indent">      </span><span style="--0:#7FDBCA;--1:#096E72">"Effect"</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">Allow</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span></div></div><div class="ec-line"><div class="code"><span class="indent">      </span><span style="--0:#7FDBCA;--1:#096E72">"Action"</span><span style="--0:#D6DEEB;--1:#403F53">: [</span></div></div><div class="ec-line"><div class="code"><span class="indent">        </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ecr:BatchCheckLayerAvailability</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span></div></div><div class="ec-line"><div class="code"><span class="indent">        </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ecr:BatchGetImage</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span></div></div><div class="ec-line"><div class="code"><span class="indent">        </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ecr:GetDownloadUrlForLayer</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span></div></div><div class="ec-line"><div class="code"><span class="indent">        </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ecr:InitiateLayerUpload</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span></div></div><div class="ec-line"><div class="code"><span class="indent">        </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ecr:UploadLayerPart</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span></div></div><div class="ec-line"><div class="code"><span class="indent">        </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ecr:CompleteLayerUpload</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span></div></div><div class="ec-line"><div class="code"><span class="indent">        </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ecr:PutImage</span><span style="--0:#D9F5DD;--1:#111111">"</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">      </span></span><span style="--0:#D6DEEB;--1:#403F53">],</span></div></div><div class="ec-line"><div class="code"><span class="indent">      </span><span style="--0:#7FDBCA;--1:#096E72">"Resource"</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">arn:aws:ecr:eu-west-1:444455556666:repository/app</span><span style="--0:#D9F5DD;--1:#111111">"</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">    </span></span><span style="--0:#D6DEEB;--1:#403F53">}</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">  </span></span><span style="--0:#D6DEEB;--1:#403F53">]</span></div></div><div class="ec-line"><div class="code"><span style="--0:#D6DEEB;--1:#403F53">}</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="{  &quot;Version&quot;: &quot;2012-10-17&quot;,  &quot;Statement&quot;: [    { &quot;Effect&quot;: &quot;Allow&quot;, &quot;Action&quot;: &quot;ecr:GetAuthorizationToken&quot;, &quot;Resource&quot;: &quot;*&quot; },    {      &quot;Effect&quot;: &quot;Allow&quot;,      &quot;Action&quot;: [        &quot;ecr:BatchCheckLayerAvailability&quot;,        &quot;ecr:BatchGetImage&quot;,        &quot;ecr:GetDownloadUrlForLayer&quot;,        &quot;ecr:InitiateLayerUpload&quot;,        &quot;ecr:UploadLayerPart&quot;,        &quot;ecr:CompleteLayerUpload&quot;,        &quot;ecr:PutImage&quot;      ],      &quot;Resource&quot;: &quot;arn:aws:ecr:eu-west-1:444455556666:repository/app&quot;    }  ]}"><div></div></button></div></figure></div>
+<p>The role’s trust policy names your cluster’s OIDC provider and the subject
+<code dir="auto">system:serviceaccount:&lt;namespace&gt;:scarab-ecr-push</code> (see “IAM roles for service accounts” in the
+AWS docs). Then create the ServiceAccount in the namespace step Pods run in:</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="yaml"><code><div class="ec-line"><div class="code"><span style="--0:#7FDBCA;--1:#111111">apiVersion</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">v1</span></div></div><div class="ec-line"><div class="code"><span style="--0:#7FDBCA;--1:#111111">kind</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">ServiceAccount</span></div></div><div class="ec-line"><div class="code"><span style="--0:#7FDBCA;--1:#111111">metadata</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#7FDBCA;--1:#111111">name</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">scarab-ecr-push</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#7FDBCA;--1:#111111">namespace</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">scarab</span><span style="--0:#D6DEEB;--1:#403F53">          </span><span style="--0:#919F9F;--1:#5F636F"># the namespace step Pods run in</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#7FDBCA;--1:#111111">annotations</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">eks.amazonaws.com/role-arn</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">arn:aws:iam::111122223333:role/scarab-ecr-push</span></div></div><div class="ec-line"><div class="code"><span style="--0:#7FDBCA;--1:#111111">automountServiceAccountToken</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#FF6A83;--1:#A24848">false</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="apiVersion: v1kind: ServiceAccountmetadata:  name: scarab-ecr-push  namespace: scarab          # the namespace step Pods run in  annotations:    eks.amazonaws.com/role-arn: arn:aws:iam::111122223333:role/scarab-ecr-pushautomountServiceAccountToken: false"><div></div></button></div></figure></div>
+<p>The ServiceAccount must exist before a Run uses the profile: Kubernetes refuses to create a Pod
+that names a ServiceAccount it does not have, and the push step fails to launch.</p>
+<p><strong>A registry in another AWS account.</strong> If the role is in account <code dir="auto">111122223333</code> and the
+repository in <code dir="auto">444455556666</code>, the repository’s own policy in <code dir="auto">444455556666</code> must also allow the
+role’s ARN the push actions above (see “Private repository policies” in the AWS docs). We have not
+tested a cross-account push.</p>
+<p><strong>EKS Pod Identity.</strong> Instead of the annotation, create a Pod Identity association for the
+namespace and <code dir="auto">scarab-ecr-push</code> (see the AWS docs). The profile below is the same. We have not
+checked whether Pod Identity honours the <code dir="auto">eks.amazonaws.com/skip-containers</code> annotation the
+profile sets. If it does not, every container in the push step’s Pod gets the role’s credentials,
+and the role’s permissions are the only limit.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="2-the-placement-profile">2. The placement profile</h2><a class="sl-anchor-link" href="#2-the-placement-profile"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “2. The placement profile”</span></a></div>
+<p>An operator defines placement profiles in the chart’s values, under <code dir="auto">scarab.placement</code> (see
+<a href="/scarab-ci/usage/pipeline-syntax/#placement--resources">Placement &amp; resources</a>). This one runs the
+Pod as <code dir="auto">scarab-ecr-push</code>, logs in to ECR in an init container, and points crane at the login:</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="yaml"><code><div class="ec-line"><div class="code"><span style="--0:#7FDBCA;--1:#111111">scarab</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#7FDBCA;--1:#111111">placement</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">profiles</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">      </span></span><span style="--0:#D6DEEB;--1:#403F53">- </span><span style="--0:#7FDBCA;--1:#111111">name</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">ecr-push</span></div></div><div class="ec-line"><div class="code"><span class="indent">        </span><span style="--0:#7FDBCA;--1:#111111">registry_auth_only</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#FF6A83;--1:#A24848">true</span></div></div><div class="ec-line"><div class="code"><span class="indent">        </span><span style="--0:#7FDBCA;--1:#111111">k8s</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">          </span><span style="--0:#7FDBCA;--1:#111111">metadata</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">            </span><span style="--0:#7FDBCA;--1:#111111">annotations</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">              </span><span style="--0:#7FDBCA;--1:#111111">eks.amazonaws.com/skip-containers</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">step,scarab-results-egress,scarab-workspace-init,scarab-workspace-egress</span></div></div><div class="ec-line"><div class="code"><span class="indent">          </span><span style="--0:#7FDBCA;--1:#111111">spec</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">            </span><span style="--0:#7FDBCA;--1:#111111">serviceAccountName</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">scarab-ecr-push</span></div></div><div class="ec-line"><div class="code"><span class="indent">            </span><span style="--0:#7FDBCA;--1:#111111">volumes</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">              </span></span><span style="--0:#D6DEEB;--1:#403F53">- </span><span style="--0:#7FDBCA;--1:#111111">name</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">ecr-login</span></div></div><div class="ec-line"><div class="code"><span class="indent">                </span><span style="--0:#7FDBCA;--1:#111111">emptyDir</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">                  </span><span style="--0:#7FDBCA;--1:#111111">medium</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">Memory</span></div></div><div class="ec-line"><div class="code"><span class="indent">                  </span><span style="--0:#7FDBCA;--1:#111111">sizeLimit</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">1Mi</span></div></div><div class="ec-line"><div class="code"><span class="indent">            </span><span style="--0:#7FDBCA;--1:#111111">initContainers</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">              </span></span><span style="--0:#D6DEEB;--1:#403F53">- </span><span style="--0:#7FDBCA;--1:#111111">name</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">ecr-login</span></div></div><div class="ec-line"><div class="code"><span class="indent">                </span><span style="--0:#7FDBCA;--1:#111111">image</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">public.ecr.aws/aws-cli/aws-cli@sha256:&lt;digest&gt;</span></div></div><div class="ec-line"><div class="code"><span class="indent">                </span><span style="--0:#7FDBCA;--1:#111111">command</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">                  </span></span><span style="--0:#D6DEEB;--1:#403F53">- </span><span style="--0:#ECC48D;--1:#3B61B0">/bin/sh</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">                  </span></span><span style="--0:#D6DEEB;--1:#403F53">- </span><span style="--0:#ECC48D;--1:#3B61B0">-c</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">                  </span></span><span style="--0:#D6DEEB;--1:#403F53">- </span><span style="--0:#C792EA;--1:#8844AE">|</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#ECC48D;--1:#3B61B0">                    </span></span><span style="--0:#ECC48D;--1:#3B61B0">set -eu</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#ECC48D;--1:#3B61B0">                    </span></span><span style="--0:#ECC48D;--1:#3B61B0">umask 077</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#ECC48D;--1:#3B61B0">                    </span></span><span style="--0:#ECC48D;--1:#3B61B0">pw=$(aws ecr get-login-password --region "$ECR_REGION")</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#ECC48D;--1:#3B61B0">                    </span></span><span style="--0:#ECC48D;--1:#3B61B0">auth=$(printf 'AWS:%s' "$pw" | base64 | tr -d '\n')</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#ECC48D;--1:#3B61B0">                    </span></span><span style="--0:#ECC48D;--1:#3B61B0">printf '{"auths":{"%s":{"auth":"%s"}}}' "$ECR_REGISTRY" "$auth" &gt; /ecr-login/config.json</span></div></div><div class="ec-line"><div class="code"><span class="indent">                </span><span style="--0:#7FDBCA;--1:#111111">env</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">                  </span></span><span style="--0:#D6DEEB;--1:#403F53">- </span><span style="--0:#7FDBCA;--1:#111111">name</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">ECR_REGISTRY</span></div></div><div class="ec-line"><div class="code"><span class="indent">                    </span><span style="--0:#7FDBCA;--1:#111111">value</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">444455556666.dkr.ecr.eu-west-1.amazonaws.com</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">                  </span></span><span style="--0:#D6DEEB;--1:#403F53">- </span><span style="--0:#7FDBCA;--1:#111111">name</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">ECR_REGION</span></div></div><div class="ec-line"><div class="code"><span class="indent">                    </span><span style="--0:#7FDBCA;--1:#111111">value</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">eu-west-1</span></div></div><div class="ec-line"><div class="code"><span class="indent">                </span><span style="--0:#7FDBCA;--1:#111111">securityContext</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">                  </span><span style="--0:#7FDBCA;--1:#111111">runAsUser</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#F78C6C;--1:#AA0982">0</span></div></div><div class="ec-line"><div class="code"><span class="indent">                  </span><span style="--0:#7FDBCA;--1:#111111">runAsNonRoot</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#FF6A83;--1:#A24848">false</span></div></div><div class="ec-line"><div class="code"><span class="indent">                  </span><span style="--0:#7FDBCA;--1:#111111">allowPrivilegeEscalation</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#FF6A83;--1:#A24848">false</span></div></div><div class="ec-line"><div class="code"><span class="indent">                  </span><span style="--0:#7FDBCA;--1:#111111">capabilities</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">                    </span><span style="--0:#7FDBCA;--1:#111111">drop</span><span style="--0:#D6DEEB;--1:#403F53">: [</span><span style="--0:#ECC48D;--1:#3B61B0">ALL</span><span style="--0:#D6DEEB;--1:#403F53">]</span></div></div><div class="ec-line"><div class="code"><span class="indent">                  </span><span style="--0:#7FDBCA;--1:#111111">seccompProfile</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">                    </span><span style="--0:#7FDBCA;--1:#111111">type</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">RuntimeDefault</span></div></div><div class="ec-line"><div class="code"><span class="indent">                </span><span style="--0:#7FDBCA;--1:#111111">volumeMounts</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">                  </span></span><span style="--0:#D6DEEB;--1:#403F53">- </span><span style="--0:#7FDBCA;--1:#111111">name</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">ecr-login</span></div></div><div class="ec-line"><div class="code"><span class="indent">                    </span><span style="--0:#7FDBCA;--1:#111111">mountPath</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">/ecr-login</span></div></div><div class="ec-line"><div class="code"><span class="indent">            </span><span style="--0:#7FDBCA;--1:#111111">containers</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">              </span></span><span style="--0:#D6DEEB;--1:#403F53">- </span><span style="--0:#7FDBCA;--1:#111111">name</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">step</span></div></div><div class="ec-line"><div class="code"><span class="indent">                </span><span style="--0:#7FDBCA;--1:#111111">env</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">                  </span></span><span style="--0:#D6DEEB;--1:#403F53">- </span><span style="--0:#7FDBCA;--1:#111111">name</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">DOCKER_CONFIG</span></div></div><div class="ec-line"><div class="code"><span class="indent">                    </span><span style="--0:#7FDBCA;--1:#111111">value</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">/ecr-login</span></div></div><div class="ec-line"><div class="code"><span class="indent">                </span><span style="--0:#7FDBCA;--1:#111111">volumeMounts</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">                  </span></span><span style="--0:#D6DEEB;--1:#403F53">- </span><span style="--0:#7FDBCA;--1:#111111">name</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">ecr-login</span></div></div><div class="ec-line"><div class="code"><span class="indent">                    </span><span style="--0:#7FDBCA;--1:#111111">mountPath</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">/ecr-login</span></div></div><div class="ec-line"><div class="code"><span class="indent">                    </span><span style="--0:#7FDBCA;--1:#111111">readOnly</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#FF6A83;--1:#A24848">true</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="scarab:  placement:    profiles:      - name: ecr-push        registry_auth_only: true        k8s:          metadata:            annotations:              eks.amazonaws.com/skip-containers: step,scarab-results-egress,scarab-workspace-init,scarab-workspace-egress          spec:            serviceAccountName: scarab-ecr-push            volumes:              - name: ecr-login                emptyDir:                  medium: Memory                  sizeLimit: 1Mi            initContainers:              - name: ecr-login                image: public.ecr.aws/aws-cli/aws-cli@sha256:<digest>                command:                  - /bin/sh                  - -c                  - |                    set -eu                    umask 077                    pw=$(aws ecr get-login-password --region &quot;$ECR_REGION&quot;)                    auth=$(printf &#x27;AWS:%s&#x27; &quot;$pw&quot; | base64 | tr -d &#x27;\n&#x27;)                    printf &#x27;{&quot;auths&quot;:{&quot;%s&quot;:{&quot;auth&quot;:&quot;%s&quot;}}}&#x27; &quot;$ECR_REGISTRY&quot; &quot;$auth&quot; > /ecr-login/config.json                env:                  - name: ECR_REGISTRY                    value: 444455556666.dkr.ecr.eu-west-1.amazonaws.com                  - name: ECR_REGION                    value: eu-west-1                securityContext:                  runAsUser: 0                  runAsNonRoot: false                  allowPrivilegeEscalation: false                  capabilities:                    drop: [ALL]                  seccompProfile:                    type: RuntimeDefault                volumeMounts:                  - name: ecr-login                    mountPath: /ecr-login            containers:              - name: step                env:                  - name: DOCKER_CONFIG                    value: /ecr-login                volumeMounts:                  - name: ecr-login                    mountPath: /ecr-login                    readOnly: true"><div></div></button></div></figure></div>
+<p>What each part does:</p>
+<ul>
+<li><code dir="auto">registry_auth_only: true</code> keeps the profile off every step except the build library’s push
+step (<a href="#what-the-marker-does">below</a>). Leave <code dir="auto">default</code> unset: the server refuses to boot with a
+profile that sets both.</li>
+<li><code dir="auto">serviceAccountName: scarab-ecr-push</code> gives the Pod the role. <code dir="auto">automountServiceAccountToken</code>
+stays <code dir="auto">false</code>, so no container gets a Kubernetes API token.</li>
+<li><code dir="auto">eks.amazonaws.com/skip-containers</code> names the containers the IRSA webhook should not give the
+role to (<a href="#which-containers-get-the-role">below</a>). Only <code dir="auto">ecr-login</code> gets it.</li>
+<li><code dir="auto">ecr-login</code> runs <code dir="auto">aws ecr get-login-password</code> and writes a dockerconfigjson to
+<code dir="auto">/ecr-login/config.json</code>, on a memory-backed volume. Pin the image by a digest you have checked.
+Kubernetes leaves a <code dir="auto">$(...)</code> that is not a variable reference unchanged, so the shell gets the
+command as written.</li>
+<li><code dir="auto">DOCKER_CONFIG=/ecr-login</code> on the push step’s container is where crane looks for its login.
+The push step runs as uid 0 with every capability dropped, so it can read only a file uid 0
+owns or one its groups may read. <code dir="auto">ecr-login</code> runs as uid 0 too and writes the file with mode
+<code dir="auto">0600</code>, so crane can read it. No other container mounts the volume.</li>
+</ul>
+<p>Scarab merges a profile onto the Pod it built with a strategic merge, and refuses a profile that
+changes its own containers, volumes, mounts or env. This one adds only things with names and paths
+of their own: the <code dir="auto">ecr-login</code> init container (it runs after Scarab’s own init containers, so after
+the workspace is fetched), the <code dir="auto">ecr-login</code> volume, the <code dir="auto">/ecr-login</code> mount and the <code dir="auto">DOCKER_CONFIG</code>
+variable.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="where-the-login-goes-and-what-must-not-be-configured">Where the login goes, and what must not be configured</h3><a class="sl-anchor-link" href="#where-the-login-goes-and-what-must-not-be-configured"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Where the login goes, and what must not be configured”</span></a></div>
+<p>The push step asks for <code dir="auto">registry_auth: true</code>. When its launch resolves a registry credential,
+Scarab mounts it at <code dir="auto">/scarab/registry/config.json</code> and sets <code dir="auto">DOCKER_CONFIG=/scarab/registry</code> on
+the step itself. The profile then sets an env variable Scarab already set, so Scarab does not
+create the Pod and the push step fails to launch, with an error that names <code dir="auto">DOCKER_CONFIG</code> and the
+profile. Each launch resolves, in this order:</p>
+<ol>
+<li>a <code dir="auto">REGISTRY_AUTH</code> secret at Repo scope, then at Org scope;</li>
+<li>with neither, the credential the forge derives for its own registry, only when the org trusts
+the library’s source with forge credentials. A GitHub connection to github.com (for GHCR) and a
+Forgejo connection both derive one.</li>
+</ol>
+<p>So for a Project that pushes to ECR:</p>
+<ul>
+<li>keep <code dir="auto">REGISTRY_AUTH</code> out of the repository’s secrets and the org’s secrets;</li>
+<li>do not trust the build library’s source with forge credentials;</li>
+<li>do trust it with the registry credential (part 3). The profile applies only to a push step the
+launch found eligible for a credential, whether or not one resolves.</li>
+</ul>
+<p>Pushing to GHCR and to ECR from the same org is not supported yet: an org secret or the forge trust
+that GHCR needs makes every ECR push in that org fail to launch (git-bug 1bc87d1).</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="3-trust-the-build-library">3. Trust the build library</h2><a class="sl-anchor-link" href="#3-trust-the-build-library"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “3. Trust the build library”</span></a></div>
+<p>Install <code dir="auto">lib:thulasi-ram/build</code> and trust its source for the build sandbox, as
+<a href="/scarab-ci/usage/libraries/#install-scarabs-build-library">Libraries</a> describes. Then trust the
+same source with the registry credential:</p>
+<div class="expressive-code"><figure class="frame is-terminal not-content"><figcaption class="header"><span class="title"></span><span class="sr-only">Terminal window</span></figcaption><pre data-language="sh"><code><div class="ec-line"><div class="code"><span style="--0:#82AAFF;--1:#3B61B0">curl</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">-X</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">POST</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C5E478;--1:#3B61B0">$SCARAB</span><span style="--0:#ECC48D;--1:#984E4D">/v1/orgs/acme/library-trust</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#F78C6C;--1:#AA0982">\</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#82AAFF;--1:#3B61B0">-H</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">'</span><span style="--0:#ECC48D;--1:#984E4D">Content-Type: application/json</span><span style="--0:#D9F5DD;--1:#111111">'</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#F78C6C;--1:#AA0982">\</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#82AAFF;--1:#3B61B0">-H</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#ECC48D;--1:#984E4D">Authorization: Bearer </span><span style="--0:#C5E478;--1:#3B61B0">$SCARAB_TOKEN</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#F78C6C;--1:#AA0982">\</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#82AAFF;--1:#3B61B0">-d</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">'</span><span style="--0:#ECC48D;--1:#984E4D">{"source": "github.com/thulasi-ram/scarab-ci//libs/build.yaml", "grant": "registry_credential"}</span><span style="--0:#D9F5DD;--1:#111111">'</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="curl -X POST &quot;$SCARAB/v1/orgs/acme/library-trust&quot; \  -H &#x27;Content-Type: application/json&#x27; \  -H &quot;Authorization: Bearer $SCARAB_TOKEN&quot; \  -d &#x27;{&quot;source&quot;: &quot;github.com/thulasi-ram/scarab-ci//libs/build.yaml&quot;, &quot;grant&quot;: &quot;registry_credential&quot;}&#x27;"><div></div></button></div></figure></div>
+<p>Without that trust, <code dir="auto">ecr-push</code> is left out of the push step, and crane pushes with no login, which
+ECR refuses.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="4-the-pipeline">4. The Pipeline</h2><a class="sl-anchor-link" href="#4-the-pipeline"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “4. The Pipeline”</span></a></div>
+<p>Route <code dir="auto">ecr-push</code> to the push step with the map form of <code dir="auto">placement_profiles</code>. Profiles for the
+build (node pools, the S3 cache identity) go under <code dir="auto">image</code>:</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="yaml"><code><div class="ec-line"><div class="code"><span style="--0:#FF6A83;--1:#A24848">on</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#7FDBCA;--1:#111111">push</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">when</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#ECC48D;--1:#984E4D">event.branch == 'main'</span><span style="--0:#D9F5DD;--1:#111111">"</span></div></div><div class="ec-line"><div class="code"><span style="--0:#7FDBCA;--1:#111111">steps</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">  </span></span><span style="--0:#D6DEEB;--1:#403F53">- </span><span style="--0:#7FDBCA;--1:#111111">id</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">checkout</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">invoke</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">lib:thulasi-ram/clone</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">  </span></span><span style="--0:#D6DEEB;--1:#403F53">- </span><span style="--0:#7FDBCA;--1:#111111">id</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">image</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">invoke</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">lib:thulasi-ram/build</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">needs</span><span style="--0:#D6DEEB;--1:#403F53">: [</span><span style="--0:#ECC48D;--1:#3B61B0">checkout</span><span style="--0:#D6DEEB;--1:#403F53">]</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">placement_profiles</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">      </span><span style="--0:#7FDBCA;--1:#111111">image</span><span style="--0:#D6DEEB;--1:#403F53">: [</span><span style="--0:#ECC48D;--1:#3B61B0">build-cache</span><span style="--0:#D6DEEB;--1:#403F53">]</span></div></div><div class="ec-line"><div class="code"><span class="indent">      </span><span style="--0:#7FDBCA;--1:#111111">push</span><span style="--0:#D6DEEB;--1:#403F53">: [</span><span style="--0:#ECC48D;--1:#3B61B0">ecr-push</span><span style="--0:#D6DEEB;--1:#403F53">]</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">with</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">      </span><span style="--0:#7FDBCA;--1:#111111">image</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#ECC48D;--1:#984E4D">444455556666.dkr.ecr.eu-west-1.amazonaws.com/app:${{ event.sha }}</span><span style="--0:#D9F5DD;--1:#111111">"</span></div></div><div class="ec-line"><div class="code"><span class="indent">      </span><span style="--0:#7FDBCA;--1:#111111">push</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#FF6A83;--1:#A24848">true</span></div></div><div class="ec-line"><div class="code"><span class="indent">      </span><span style="--0:#7FDBCA;--1:#111111">cache</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">s3</span></div></div><div class="ec-line"><div class="code"><span class="indent">      </span><span style="--0:#7FDBCA;--1:#111111">cache_bucket</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">acme-buildkit-cache</span></div></div><div class="ec-line"><div class="code"><span class="indent">      </span><span style="--0:#7FDBCA;--1:#111111">cache_region</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">eu-west-1</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="on:  push:    when: &quot;event.branch == &#x27;main&#x27;&quot;steps:  - id: checkout    invoke: lib:thulasi-ram/clone  - id: image    invoke: lib:thulasi-ram/build    needs: [checkout]    placement_profiles:      image: [build-cache]      push: [ecr-push]    with:      image: &quot;444455556666.dkr.ecr.eu-west-1.amazonaws.com/app:${{ event.sha }}&quot;      push: true      cache: s3      cache_bucket: acme-buildkit-cache      cache_region: eu-west-1"><div></div></button></div></figure></div>
+<p>Never name <code dir="auto">ecr-push</code> for the build step, or in a plain list (<code dir="auto">placement_profiles: [ecr-push]</code>),
+which reaches both steps: the build step’s launch fails. The build step runs your Dockerfile, and a
+<code dir="auto">RUN</code> shares BuildKit’s PID namespace, so it could read anything the build step holds.</p>
+<p>Each Attempt’s Pod logs in again, so a Run started days after the setup gets a password minted for
+it, and a retry gets a new one.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="what-the-marker-does">What the marker does</h2><a class="sl-anchor-link" href="#what-the-marker-does"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “What the marker does”</span></a></div>
+<p>Pipeline authors name profiles, so without <code dir="auto">registry_auth_only</code> any step could ask for
+<code dir="auto">ecr-push</code>. With it, Scarab decides at each launch, before it merges the profile:</p>
+<ul>
+<li><strong>The build library’s push step</strong>, in a Run that is not a fork pull request and not locked out
+of its Environment’s secrets, from a library source the org trusted with the registry credential
+when the Run was created and still trusts: the profile applies.</li>
+<li><strong>The same push step otherwise</strong>: the profile is left out, and the server logs that it was. A
+fork pull request’s push step pushes nothing and succeeds. Without the trust, crane pushes with
+no login and ECR refuses the push.</li>
+<li><strong>Any step without <code dir="auto">registry_auth</code></strong>, such as the build step or a step a fork pull request adds
+to the Pipeline file: the launch fails, and the error names the profile and the step.</li>
+<li><strong>A step written in the Pipeline file with <code dir="auto">registry_auth: true</code></strong>: it comes from no library, so
+the profile is left out.</li>
+</ul>
+<p>These checks are about the step, not about who wrote the Pipeline: anyone who can push to a
+branch the Pipeline triggers on can push images through the push step. Limit that with branch
+protection on the forge, or with a Policy.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="which-containers-get-the-role">Which containers get the role</h2><a class="sl-anchor-link" href="#which-containers-get-the-role"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Which containers get the role”</span></a></div>
+<p>The IRSA webhook adds the role’s environment variables and token to every container and init
+container in a Pod whose ServiceAccount has the annotation, except the ones the Pod’s
+<code dir="auto">eks.amazonaws.com/skip-containers</code> annotation names (see the webhook’s README). The push step’s Pod
+has these containers:</p>
+<table>
+<thead>
+<tr>
+<th>Container</th>
+<th>What it is</th>
+<th>Gets the role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">ecr-login</code></td>
+<td>the profile’s init container</td>
+<td>yes</td>
+</tr>
+<tr>
+<td><code dir="auto">step</code></td>
+<td>crane, which pushes</td>
+<td>no: it needs only the login file</td>
+</tr>
+<tr>
+<td><code dir="auto">scarab-results-egress</code></td>
+<td>Scarab’s results sidecar (when the server collects results)</td>
+<td>no</td>
+</tr>
+<tr>
+<td><code dir="auto">scarab-workspace-init</code></td>
+<td>Scarab’s workspace fetch</td>
+<td>no</td>
+</tr>
+<tr>
+<td><code dir="auto">scarab-workspace-egress</code></td>
+<td>Scarab’s workspace drain</td>
+<td>no</td>
+</tr>
+</tbody>
+</table>
+<p>If the annotation names only <code dir="auto">step</code>, Scarab’s three containers get the role too. They run Scarab’s
+images, not your code, but the role’s token is then in four containers instead of one. The build
+step’s Pod does not run as <code dir="auto">scarab-ecr-push</code>, so nothing in it gets the role.</p>
+<p>We have not tested <code dir="auto">skip-containers</code> on an EKS cluster (git-bug a501c6e). Check it on yours
+(<a href="#check-that-it-works">below</a>).</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="an-org-policy-optional">An org Policy (optional)</h2><a class="sl-anchor-link" href="#an-org-policy-optional"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “An org Policy (optional)”</span></a></div>
+<p>The marker decides which step gets the profile. A Policy at <code dir="auto">run.create</code> can also decide which Runs
+may name it, for example only Runs on <code dir="auto">main</code>. Write it under <strong>Organization settings › Policies</strong>
+(see <a href="/scarab-ci/usage/policies/">Policies</a>), or paste it:</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="yaml"><code><div class="ec-line"><div class="code"><span style="--0:#7FDBCA;--1:#111111">kind</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">policy</span></div></div><div class="ec-line"><div class="code"><span style="--0:#7FDBCA;--1:#111111">name</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">ecr-push</span></div></div><div class="ec-line"><div class="code"><span style="--0:#7FDBCA;--1:#111111">checkpoint</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">run.create</span></div></div><div class="ec-line"><div class="code"><span style="--0:#7FDBCA;--1:#111111">mode</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">enforce</span></div></div><div class="ec-line"><div class="code"><span style="--0:#7FDBCA;--1:#111111">rules</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">  </span></span><span style="--0:#D6DEEB;--1:#403F53">- </span><span style="--0:#7FDBCA;--1:#111111">when</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#C792EA;--1:#8844AE">&gt;-</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#ECC48D;--1:#3B61B0">      </span></span><span style="--0:#ECC48D;--1:#3B61B0">steps.exists(s, 'ecr-push' in s.placement_profiles)</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#ECC48D;--1:#3B61B0">      </span></span><span style="--0:#ECC48D;--1:#3B61B0">&amp;&amp; !(!trigger.fork &amp;&amp; has(trigger.ref) &amp;&amp; trigger.ref == 'refs/heads/main')</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">effect</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">deny</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">message</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#ECC48D;--1:#984E4D">Only Runs on main, not from a fork, may name the ecr-push placement profile.</span><span style="--0:#D9F5DD;--1:#111111">"</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">  </span></span><span style="--0:#D6DEEB;--1:#403F53">- </span><span style="--0:#7FDBCA;--1:#111111">when</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#C792EA;--1:#8844AE">&gt;-</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#ECC48D;--1:#3B61B0">      </span></span><span style="--0:#ECC48D;--1:#3B61B0">steps.exists(s, 'ecr-push' in s.placement_profiles</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#ECC48D;--1:#3B61B0">      </span></span><span style="--0:#ECC48D;--1:#3B61B0">&amp;&amp; !s.origin.exists(o, o.kind == 'library' &amp;&amp; has(o.source)</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#ECC48D;--1:#3B61B0">      </span></span><span style="--0:#ECC48D;--1:#3B61B0">&amp;&amp; o.source.startsWith('github.com/thulasi-ram/scarab-ci//libs/build.yaml@')))</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">effect</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">deny</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">message</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#ECC48D;--1:#984E4D">Only the build library's steps may name the ecr-push placement profile.</span><span style="--0:#D9F5DD;--1:#111111">"</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="kind: policyname: ecr-pushcheckpoint: run.createmode: enforcerules:  - when: >-      steps.exists(s, &#x27;ecr-push&#x27; in s.placement_profiles)      &amp;&amp; !(!trigger.fork &amp;&amp; has(trigger.ref) &amp;&amp; trigger.ref == &#x27;refs/heads/main&#x27;)    effect: deny    message: &quot;Only Runs on main, not from a fork, may name the ecr-push placement profile.&quot;  - when: >-      steps.exists(s, &#x27;ecr-push&#x27; in s.placement_profiles      &amp;&amp; !s.origin.exists(o, o.kind == &#x27;library&#x27; &amp;&amp; has(o.source)      &amp;&amp; o.source.startsWith(&#x27;github.com/thulasi-ram/scarab-ci//libs/build.yaml@&#x27;)))    effect: deny    message: &quot;Only the build library&#x27;s steps may name the ecr-push placement profile.&quot;"><div></div></button></div></figure></div>
+<ul>
+<li>The first rule refuses a Run that names <code dir="auto">ecr-push</code> unless it is on <code dir="auto">refs/heads/main</code> and not
+from a fork. A Run with no ref (a comment trigger) is refused too. A refused Run is not created
+at all, so keep the push in a Pipeline that triggers only on <code dir="auto">main</code>, as in part 4, and build pull
+requests in another Pipeline.</li>
+<li>The second rule refuses, when the Run is created, a step the launch would fail anyway: one that
+names <code dir="auto">ecr-push</code> and does not come from the build library. It matches the library by the source
+it was installed from, since the name is chosen at install.</li>
+<li>To limit the profile to an Environment instead, use
+<code dir="auto">has(pipeline.environment) &amp;&amp; pipeline.environment == 'production'</code> in place of the ref check.</li>
+<li>The editor starts a new Policy in <code dir="auto">audit</code> mode. Run <strong>Try it on recent decisions</strong> before you
+move it to <code dir="auto">enforce</code>.</li>
+</ul>
+<p>Neither the marker nor the Policy covers a step’s <code dir="auto">k8s_overlay</code>, which can set
+<code dir="auto">serviceAccountName: scarab-ecr-push</code> itself. A fork pull request’s Run is refused any overlay.
+Other authors can still set one on an Environment that permits raw overlays (git-bug 24a3126), so
+keep that off for the Projects that build images.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="hardening-the-push-role">Hardening the push role</h2><a class="sl-anchor-link" href="#hardening-the-push-role"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Hardening the push role”</span></a></div>
+<p>The push step’s container holds an ECR password for up to 12 hours, and <code dir="auto">ecr-login</code> holds the
+role’s own AWS token while it runs. Some ways to limit what a copy of either is worth:</p>
+<ul>
+<li>
+<p><strong>One push role per Environment.</strong> Give each Environment its own ServiceAccount, role and marked
+profile (<code dir="auto">ecr-push-staging</code>, <code dir="auto">ecr-push-production</code>), each role limited to the repositories that
+Environment ships, and add a Policy rule that refuses each profile outside its Environment.</p>
+</li>
+<li>
+<p><strong>No <code dir="auto">ecr:*</code>, and no repository creation.</strong> List the actions in part 1, on named repository
+ARNs. Leave out <code dir="auto">ecr:CreateRepository</code>, <code dir="auto">ecr:DeleteRepository</code>, <code dir="auto">ecr:SetRepositoryPolicy</code>,
+<code dir="auto">ecr:PutLifecyclePolicy</code> and the other actions that change a repository.</p>
+</li>
+<li>
+<p><strong>Only from inside your VPC.</strong> Reach ECR through VPC interface endpoints (<code dir="auto">ecr.api</code> and
+<code dir="auto">ecr.dkr</code>, plus the S3 gateway endpoint ECR stores layers in), and add an <code dir="auto">aws:SourceVpce</code> (or
+<code dir="auto">aws:SourceVpc</code>) condition to the push role’s policy, so a credential copied out of the cluster
+fails elsewhere:</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="json"><code><div class="ec-line"><div class="code"><span style="--0:#D6DEEB;--1:#403F53">{</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#7FDBCA;--1:#096E72">"Version"</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">2012-10-17</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#7FDBCA;--1:#096E72">"Statement"</span><span style="--0:#D6DEEB;--1:#403F53">: [</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">    </span></span><span style="--0:#D6DEEB;--1:#403F53">{</span></div></div><div class="ec-line"><div class="code"><span class="indent">      </span><span style="--0:#7FDBCA;--1:#096E72">"Effect"</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">Allow</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span></div></div><div class="ec-line"><div class="code"><span class="indent">      </span><span style="--0:#7FDBCA;--1:#096E72">"Action"</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ecr:GetAuthorizationToken</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span></div></div><div class="ec-line"><div class="code"><span class="indent">      </span><span style="--0:#7FDBCA;--1:#096E72">"Resource"</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">*</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span></div></div><div class="ec-line"><div class="code"><span class="indent">      </span><span style="--0:#7FDBCA;--1:#096E72">"Condition"</span><span style="--0:#D6DEEB;--1:#403F53">: { </span><span style="--0:#7FDBCA;--1:#096E72">"StringEquals"</span><span style="--0:#D6DEEB;--1:#403F53">: { </span><span style="--0:#7FDBCA;--1:#096E72">"aws:SourceVpce"</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">vpce-0123456789abcdef0</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53"> } }</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">    </span></span><span style="--0:#D6DEEB;--1:#403F53">},</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">    </span></span><span style="--0:#D6DEEB;--1:#403F53">{</span></div></div><div class="ec-line"><div class="code"><span class="indent">      </span><span style="--0:#7FDBCA;--1:#096E72">"Effect"</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">Allow</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span></div></div><div class="ec-line"><div class="code"><span class="indent">      </span><span style="--0:#7FDBCA;--1:#096E72">"Action"</span><span style="--0:#D6DEEB;--1:#403F53">: [</span></div></div><div class="ec-line"><div class="code"><span class="indent">        </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ecr:BatchCheckLayerAvailability</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span></div></div><div class="ec-line"><div class="code"><span class="indent">        </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ecr:BatchGetImage</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span></div></div><div class="ec-line"><div class="code"><span class="indent">        </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ecr:GetDownloadUrlForLayer</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span></div></div><div class="ec-line"><div class="code"><span class="indent">        </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ecr:InitiateLayerUpload</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span></div></div><div class="ec-line"><div class="code"><span class="indent">        </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ecr:UploadLayerPart</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span></div></div><div class="ec-line"><div class="code"><span class="indent">        </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ecr:CompleteLayerUpload</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span></div></div><div class="ec-line"><div class="code"><span class="indent">        </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ecr:PutImage</span><span style="--0:#D9F5DD;--1:#111111">"</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">      </span></span><span style="--0:#D6DEEB;--1:#403F53">],</span></div></div><div class="ec-line"><div class="code"><span class="indent">      </span><span style="--0:#7FDBCA;--1:#096E72">"Resource"</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">arn:aws:ecr:eu-west-1:444455556666:repository/app</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span></div></div><div class="ec-line"><div class="code"><span class="indent">      </span><span style="--0:#7FDBCA;--1:#096E72">"Condition"</span><span style="--0:#D6DEEB;--1:#403F53">: { </span><span style="--0:#7FDBCA;--1:#096E72">"StringEquals"</span><span style="--0:#D6DEEB;--1:#403F53">: { </span><span style="--0:#7FDBCA;--1:#096E72">"aws:SourceVpce"</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">vpce-0fedcba9876543210</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53"> } }</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">    </span></span><span style="--0:#D6DEEB;--1:#403F53">}</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">  </span></span><span style="--0:#D6DEEB;--1:#403F53">]</span></div></div><div class="ec-line"><div class="code"><span style="--0:#D6DEEB;--1:#403F53">}</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="{  &quot;Version&quot;: &quot;2012-10-17&quot;,  &quot;Statement&quot;: [    {      &quot;Effect&quot;: &quot;Allow&quot;,      &quot;Action&quot;: &quot;ecr:GetAuthorizationToken&quot;,      &quot;Resource&quot;: &quot;*&quot;,      &quot;Condition&quot;: { &quot;StringEquals&quot;: { &quot;aws:SourceVpce&quot;: &quot;vpce-0123456789abcdef0&quot; } }    },    {      &quot;Effect&quot;: &quot;Allow&quot;,      &quot;Action&quot;: [        &quot;ecr:BatchCheckLayerAvailability&quot;,        &quot;ecr:BatchGetImage&quot;,        &quot;ecr:GetDownloadUrlForLayer&quot;,        &quot;ecr:InitiateLayerUpload&quot;,        &quot;ecr:UploadLayerPart&quot;,        &quot;ecr:CompleteLayerUpload&quot;,        &quot;ecr:PutImage&quot;      ],      &quot;Resource&quot;: &quot;arn:aws:ecr:eu-west-1:444455556666:repository/app&quot;,      &quot;Condition&quot;: { &quot;StringEquals&quot;: { &quot;aws:SourceVpce&quot;: &quot;vpce-0fedcba9876543210&quot; } }    }  ]}"><div></div></button></div></figure></div>
+<p>We have not tested this. Check in the AWS docs, and on your registry, that ECR evaluates the
+condition for pushes made with the password from <code dir="auto">get-login-password</code>, not only for ECR API
+calls made with the role’s own credentials.</p>
+</li>
+</ul>
+<div class="sl-heading-wrapper level-h2"><h2 id="costs-and-limits">Costs and limits</h2><a class="sl-anchor-link" href="#costs-and-limits"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Costs and limits”</span></a></div>
+<ul>
+<li><strong>The image moves through the workspace.</strong> The build step writes the image as an OCI layout to
+the workspace, and the push step receives it from there, so a large image costs a transfer
+through the Data Depot.</li>
+<li><strong>No private base images yet.</strong> The build step holds no registry credential, so BuildKit pulls
+only public base images. A role on the build step’s Pod does not change that: BuildKit logs in
+to a registry with a docker config, not with AWS credentials.</li>
+<li><strong>The push step runs as root</strong>, because crane’s image has no other user. An org Policy that
+denies run-as-root refuses every Run that invokes the build library.</li>
+<li><strong>The layer cache is S3 only</strong>, reached with the build step’s own identity. Give it a role of its
+own on the build step’s profile (<code dir="auto">build-cache</code> in part 4), limited to the cache bucket. Never put
+the push role there: a Dockerfile <code dir="auto">RUN</code> can read what the build step holds, so anyone who can
+change the Dockerfile can use the cache role. That also means they can write the cache that later
+builds import.</li>
+<li><strong>GHCR and ECR in one org</strong> are not supported yet: see
+<a href="#where-the-login-goes-and-what-must-not-be-configured">Where the login goes</a> (git-bug 1bc87d1).</li>
+</ul>
+<div class="sl-heading-wrapper level-h2"><h2 id="check-that-it-works">Check that it works</h2><a class="sl-anchor-link" href="#check-that-it-works"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Check that it works”</span></a></div>
+<p>This flow has not been run on EKS: the tests cover parsing, compiling, admission and the Pod merge
+only. Check each of these on your cluster before you rely on it.</p>
+<ul>
+<li>
+<p>The push step’s Pod runs as the ServiceAccount:
+<code dir="auto">kubectl -n &lt;namespace&gt; get pod &lt;pod&gt; -o jsonpath='{.spec.serviceAccountName}'</code>.</p>
+</li>
+<li>
+<p>The login worked: <code dir="auto">kubectl -n &lt;namespace&gt; logs &lt;pod&gt; -c ecr-login</code>. If it fails, the push step’s
+container does not start and the step fails.</p>
+</li>
+<li>
+<p>Only <code dir="auto">ecr-login</code> has the role: this lists each container with the names of its env variables,
+and only <code dir="auto">ecr-login</code> should show <code dir="auto">AWS_ROLE_ARN</code>:</p>
+<div class="expressive-code"><figure class="frame is-terminal not-content"><figcaption class="header"><span class="title"></span><span class="sr-only">Terminal window</span></figcaption><pre data-language="sh"><code><div class="ec-line"><div class="code"><span style="--0:#82AAFF;--1:#3B61B0">kubectl</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">-n</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">&lt;namespace&gt;</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">get</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">pod</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">&lt;pod&gt;</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">-o</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">jsonpath=</span><span style="--0:#D9F5DD;--1:#111111">'</span><span style="--0:#ECC48D;--1:#984E4D">{range .spec.initContainers[*]}{.name}{": "}{.env[*].name}{"\n"}{end}{range .spec.containers[*]}{.name}{": "}{.env[*].name}{"\n"}{end}</span><span style="--0:#D9F5DD;--1:#111111">'</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="kubectl -n <namespace> get pod <pod> -o jsonpath=&#x27;{range .spec.initContainers[*]}{.name}{&quot;: &quot;}{.env[*].name}{&quot;\n&quot;}{end}{range .spec.containers[*]}{.name}{&quot;: &quot;}{.env[*].name}{&quot;\n&quot;}{end}&#x27;"><div></div></button></div></figure></div>
+</li>
+<li>
+<p>The push step’s log shows <code dir="auto">scarab: pushed &lt;repository&gt;@sha256:…</code>, and
+<code dir="auto">${{ outputs.image.push.digest }}</code> holds the digest.</p>
+</li>
+</ul>
+<div class="sl-heading-wrapper level-h2"><h2 id="references">References</h2><a class="sl-anchor-link" href="#references"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “References”</span></a></div>
+<ul>
+<li><a href="/scarab-ci/usage/pipeline-syntax/#building-an-image">Pipeline syntax: building an image</a></li>
+<li><a href="/scarab-ci/usage/pipeline-syntax/#placement--resources">Pipeline syntax: placement &amp; resources</a></li>
+<li><a href="/scarab-ci/usage/libraries/#install-scarabs-build-library">Libraries: install Scarab’s build library</a></li>
+<li><a href="/scarab-ci/usage/policies/">Policies</a></li>
+<li><a href="/scarab-ci/tech/adr/0018-image-building/">ADR-0018, Container image building</a></li>
+<li><a href="/scarab-ci/tech/adr/0055-placement-profiles/">ADR-0055, Placement profiles</a></li>
+<li><a href="/scarab-ci/tech/adr/0075-policy-engine/">ADR-0075, Policy engine</a></li>
+</ul></div></div><!-- footer --><footer class="astro-l3glpecf"><div class="pagination-links print:hidden astro-urgzmesl"><a class="prev astro-urgzmesl" href="/scarab-ci/usage/deploying-with-argo-cd/" rel="prev"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="astro-urgzmesl"><path d="m15 18-6-6 6-6" class="astro-urgzmesl"></path></svg>Deploying with Argo CD</a><a class="next astro-urgzmesl" href="/scarab-ci/usage/environment-variables/" rel="next">Environment Variables<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="astro-urgzmesl"><path d="m9 18 6-6-6-6" class="astro-urgzmesl"></path></svg></a></div></footer></main></div><div class="toc astro-c4hhlov6"><div class="astro-zfomn2we"><starlight-toc data-min-h="2" data-max-h="3" class="astro-3zcp52y7"><nav aria-labelledby="starlight__on-this-page" class="astro-3zcp52y7"><p id="starlight__on-this-page" class="astro-3zcp52y7">On this page</p><ul style="--depth: 0;" class="astro-2faeg4pj"><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#_top" style="--depth: 0;" class="astro-2faeg4pj">Overview</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#before-you-start-the-serviceaccount-every-step-shares" style="--depth: 0;" class="astro-2faeg4pj">Before you start: the ServiceAccount every step shares</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#1-the-iam-role-and-the-serviceaccount" style="--depth: 0;" class="astro-2faeg4pj">1. The IAM role and the ServiceAccount</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#2-the-placement-profile" style="--depth: 0;" class="astro-2faeg4pj">2. The placement profile</a><ul style="--depth: 1;" class="astro-2faeg4pj"><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#where-the-login-goes-and-what-must-not-be-configured" style="--depth: 1;" class="astro-2faeg4pj">Where the login goes, and what must not be configured</a></li></ul></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#3-trust-the-build-library" style="--depth: 0;" class="astro-2faeg4pj">3. Trust the build library</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#4-the-pipeline" style="--depth: 0;" class="astro-2faeg4pj">4. The Pipeline</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#what-the-marker-does" style="--depth: 0;" class="astro-2faeg4pj">What the marker does</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#which-containers-get-the-role" style="--depth: 0;" class="astro-2faeg4pj">Which containers get the role</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#an-org-policy-optional" style="--depth: 0;" class="astro-2faeg4pj">An org Policy (optional)</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#hardening-the-push-role" style="--depth: 0;" class="astro-2faeg4pj">Hardening the push role</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#costs-and-limits" style="--depth: 0;" class="astro-2faeg4pj">Costs and limits</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#check-that-it-works" style="--depth: 0;" class="astro-2faeg4pj">Check that it works</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#references" style="--depth: 0;" class="astro-2faeg4pj">References</a></li></ul></nav></starlight-toc><script type="module">var e=class extends HTMLElement{_current=this.querySelector(`a[aria-current="true"]`);minH=Number.parseInt(this.dataset.minH||`2`,10);maxH=Number.parseInt(this.dataset.maxH||`3`,10);set current(e){e!==this._current&&(this._current&&this._current.removeAttribute(`aria-current`),e.setAttribute(`aria-current`,`true`),this._current=e)}onIdle=e=>(window.requestIdleCallback||(e=>setTimeout(e,1)))(e);constructor(){super(),this.onIdle(()=>this.init())}init=()=>{let e=[...this.querySelectorAll(`a`)],t=e=>{if(e instanceof HTMLHeadingElement){if(e.id===`_top`)return!0;let t=e.tagName[1];if(t){let e=Number.parseInt(t,10);if(e>=this.minH&&e<=this.maxH)return!0}}return!1},n=e=>{if(!e)return null;let r=e;for(;e;){if(t(e))return e;for(e=e.previousElementSibling;e?.lastElementChild;)e=e.lastElementChild;let r=n(e);if(r)return r}return n(r.parentElement)},r=t=>{for(let{isIntersecting:r,target:i}of t){if(!r)continue;let t=n(i);if(!t)continue;let a=e.find(e=>e.hash===`#${encodeURIComponent(t.id)}`);if(a){this.current=a;break}}},i=document.querySelectorAll(`main [id], main [id] ~ *, main .content > *`),a,o=()=>{a||(a=new IntersectionObserver(r,{rootMargin:this.getRootMargin()}),i.forEach(e=>a.observe(e)))};o();let s;window.addEventListener(`resize`,()=>{a&&=(a.disconnect(),void 0),clearTimeout(s),s=setTimeout(()=>this.onIdle(o),200)})};getRootMargin(){let e=(document.querySelector(`header`)?.getBoundingClientRect().height||0)+(this.querySelector(`summary`)?.getBoundingClientRect().height||0)+32;return`-${e}px 0% ${e+53-document.documentElement.clientHeight}px`}};customElements.define(`starlight-toc`,e);</script></div></div></main></div></div></main><footer class="astro-6hobpl37"><div data-slot="footer-text" class="astro-6hobpl37">Scarab — a CI engine for Kubernetes: forge-native, on a durable core. Themed with <a href="https://github.com/lucas-labs/lucode-starlight-theme">Lucode Starlight</a>.</div></footer></div><div popover="auto" id="drawer" class="astro-cn5bvrke"><button class="sheet-overlay astro-cn5bvrke" popovertarget="drawer" popovertargetaction="hide"></button><div class="content astro-cn5bvrke"><div class="header astro-cn5bvrke"><button class="drag-icon astro-cn5bvrke" popovertarget="drawer" popovertargetaction="hide"><span class="astro-cn5bvrke"></span></button></div><div class="body astro-cn5bvrke"><div class="links-nav astro-cn5bvrke"><a href="/scarab-ci/get-started/overview/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Get Started</a><a href="/scarab-ci/usage/pipeline-syntax/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Usage</a><a href="/scarab-ci/reference/api/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">References</a><a href="https://demo-scarab.ahiravan.dev/" target="_blank" rel="noopener" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Demo</a></div><div class="links-docs astro-cn5bvrke"><div class="container-sidebar-entry astro-cn5bvrke"><h4 class="entry-title astro-cn5bvrke">Get Started</h4><a href="/scarab-ci/get-started/overview/" class="astro-cn5bvrke" data-active="false">Overview</a><a href="/scarab-ci/get-started/deploy-helm/" class="astro-cn5bvrke" data-active="false">Installation</a><a href="/scarab-ci/get-started/run-locally/" class="astro-cn5bvrke" data-active="false">Run locally</a><a href="/scarab-ci/get-started/local-development/" class="astro-cn5bvrke" data-active="false">Local Development</a></div><div class="container-sidebar-entry astro-cn5bvrke"><h4 class="entry-title astro-cn5bvrke">Usage</h4><a href="/scarab-ci/usage/pipeline-syntax/" class="astro-cn5bvrke" data-active="false">Pipeline Syntax</a><a href="/scarab-ci/usage/libraries/" class="astro-cn5bvrke" data-active="false">Libraries</a><a href="/scarab-ci/usage/secrets/" class="astro-cn5bvrke" data-active="false">Secrets</a><a href="/scarab-ci/usage/api-tokens/" class="astro-cn5bvrke" data-active="false">API tokens</a><a href="/scarab-ci/usage/environments/" class="astro-cn5bvrke" data-active="false">Environments</a><a href="/scarab-ci/usage/policies/" class="astro-cn5bvrke" data-active="false">Policies</a><a href="/scarab-ci/usage/deploying-with-argo-cd/" class="astro-cn5bvrke" data-active="false">Deploying with Argo CD</a><a href="/scarab-ci/usage/pushing-to-ecr/" class="astro-cn5bvrke" data-active="true">Pushing to Amazon ECR</a><a href="/scarab-ci/usage/environment-variables/" class="astro-cn5bvrke" data-active="false">Environment Variables</a></div><div class="container-sidebar-entry astro-cn5bvrke"><h4 class="entry-title astro-cn5bvrke">References</h4><a href="/scarab-ci/reference/api/" class="astro-cn5bvrke" data-active="false">API</a><a href="/scarab-ci/tech/context/" class="astro-cn5bvrke" data-active="false">Thesis &amp; language (CONTEXT)</a></div></div></div></div></div><script type="module">var e=document.getElementById(`drawer`);e&&e.addEventListener(`toggle`,e=>{let t=e.newState===`open`;document.documentElement.style.overflow=t?`hidden`:``,document.body.style.overflow=t?`hidden`:``});</script></body></html>
