@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1794463300,"nonce":"jEOMljY2YGtLJqg9MfCnAoV8QhU=","title":"build: run the push Step as non-root (crane image with a numeric non-root USER, or Steps get run_as_user)","was":"x"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1794463300,"nonce":"Dy++/a48Zu9XqX4rWXVZB62uxXM=","added":["type:enhancement"],"removed":null}]}
