@@ -142,10 +142,11 @@ mirror's source instead.
 
 ## Install Scarab's build library
 
-`lib:thulasi-ram/build` builds an image with rootless BuildKit
+`lib:thulasi-ram/build` builds an image with rootless BuildKit and pushes it with crane
 ([Building an image](/scarab-ci/usage/pipeline-syntax/#building-an-image)). It is the file
-`libs/build.yaml` in Scarab's repository. Install it the same way as the clone library, then give
-its source the trust its step needs:
+`libs/build.yaml` in Scarab's repository. It has two steps: `image` builds in the build sandbox
+and holds no registry credential, and `push` pushes and holds it. Install it the same way as the
+clone library, then give its source the trust its steps need:
 
 1. Settings › Libraries › **Install library**, with the source
    `github.com/thulasi-ram/scarab-ci//libs/build.yaml@<commit>`, the commit of a Scarab release tag.
@@ -153,16 +154,18 @@ its source the trust its step needs:
 3. Trust its source for the build sandbox
    ([below](#trusting-a-library-for-the-build-sandbox)). Without that, a Run that invokes it is
    refused with the reason.
-4. To push, or to pull private base images, trust its source with the registry credential
-   ([below](#trusting-a-library-with-the-registry-credential)), so its step receives the
-   `REGISTRY_AUTH` secret. Without that it builds anonymously. To push to the forge's own registry
-   (GHCR, the Forgejo package registry) with no `REGISTRY_AUTH` secret, also trust its source with
-   forge credentials ([below](#trusting-a-library-with-forge-credentials)).
+4. To push, trust its source with the registry credential
+   ([below](#trusting-a-library-with-the-registry-credential)), so its push step receives the
+   `REGISTRY_AUTH` secret. Without that the push runs anonymously and fails at a registry that
+   needs a login. To push to the forge's own registry (GHCR, the Forgejo package registry) with
+   no `REGISTRY_AUTH` secret, also trust its source with forge credentials
+   ([below](#trusting-a-library-with-forge-credentials)). The build step never receives a
+   credential, so it pulls only public base images.
 
-The library pins the rootless BuildKit image by digest. A newer BuildKit is a new version of the
-file: upgrade the installation, and trust carries over because the source is the same. To run a
-different builder, or BuildKit with other flags, install your own library and trust its source
-instead. It gets the sandbox on the same terms as Scarab's.
+The library pins the rootless BuildKit image and the crane image by digest. A newer BuildKit or
+crane is a new version of the file: upgrade the installation, and trust carries over because the
+source is the same. To run a different builder, or BuildKit with other flags, install your own
+library and trust its source instead. It gets the sandbox on the same terms as Scarab's.
 
 **Upgrading from the `build` step kind.** The release that ships this library removes the
 `build:` step kind, with no release in between that accepts both. A Pipeline with a `build:` step
@@ -180,8 +183,12 @@ step:
   with: { context: ., dockerfile: Dockerfile, image: ghcr.io/acme/app:1.2.0, push: true }
 ```
 
-`${{ outputs.image.image }}` reads the same result as before. A step of a Run created before the
-upgrade that has not launched yet fails when it would launch, with a message naming the library.
+`${{ outputs.image.image }}` reads the same result as before: BuildKit's metadata, whose
+`containerimage.digest` is the image's digest. `${{ outputs.image.push }}` is new: the pushed
+reference and digest, set only when the image was pushed. `cache: registry` is gone, because
+writing a registry cache needs the push credential in the build step; use `cache: s3` or no
+cache. A step of a Run created before the upgrade that has not launched yet fails when it would
+launch, with a message naming the library.
 
 ## Trusting a library with forge credentials
 

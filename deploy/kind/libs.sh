@@ -26,10 +26,11 @@
 #   3. trusts clone.yaml's source with forge credentials (POST
 #      …/library-trust), so a Step of the library receives the connection's
 #      long-lived token: the stack has no GitHub App to mint one per Run;
-#      and trusts build.yaml's source for the build sandbox, so its Step may
-#      run rootless BuildKit. The build library is not trusted with the
-#      registry credential or forge credentials: no pipeline of the stack
-#      pushes.
+#      and trusts build.yaml's source for the build sandbox, so its build
+#      Step may run rootless BuildKit. The build library is not trusted with
+#      the registry credential or forge credentials: no pipeline of the stack
+#      pushes, so its push Step exits without pushing (it still pulls the
+#      crane image the library pins).
 #
 # The calls carry no credential: dev and e2e modes run SCARAB_DEV_INSECURE,
 # so step-up is off. Idempotent.

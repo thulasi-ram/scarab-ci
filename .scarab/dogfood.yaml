@@ -275,13 +275,17 @@ steps:
   # + resources (ADR-0055). An org admin installs the build library and trusts
   # its source for the build sandbox (deploy/kind/libs.sh does both in the
   # dev and e2e modes; seed.sh lists them for dogfood). The Pipeline names
-  # what to build; the library's Step runs BuildKit. `docker/clone` is a REAL
-  # self-contained context — a small alpine image with no cargo build in it,
-  # so this leg stays fast; `dockerfile` is resolved inside the context dir.
-  # The Step is `build/image`, and other steps need `build`.
+  # what to build; the library's `build/image` Step runs BuildKit with no
+  # registry credential, and its `build/push` Step pushes with crane. With
+  # push "false" the build writes no image layout and the push Step exits
+  # without pushing. `docker/clone` is a REAL self-contained context — a
+  # small alpine image with no cargo build in it, so this leg stays fast;
+  # `dockerfile` is resolved inside the context dir. Other steps need
+  # `build`, which reaches `build/push`.
   #
-  # NOTE: `placement_profiles` here would carry onto the library's Step; it is
-  # left off, so the Step runs with the operator's `default` profile.
+  # NOTE: `placement_profiles` here would carry onto both of the library's
+  # Steps (a map, `{ image: [...], push: [...] }`, routes them per Step); it
+  # is left off, so both run with the operator's `default` profile.
   - id: build
     needs: [lint, test]
     invoke: lib:thulasi-ram/build

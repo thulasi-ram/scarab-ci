@@ -93,7 +93,8 @@ trust_step() { # $1 the step's number
   cat <<TXT
     $1. Org settings > Libraries > thulasi-ram/build > Build sandbox: trust
        $build_source, or Runs that build an image are refused. The dogfood
-       pipeline does not push, so it needs no registry-credential trust.
+       pipeline does not push (the library's push Step exits without
+       pushing), so it needs no registry-credential trust.
 TXT
 }
 

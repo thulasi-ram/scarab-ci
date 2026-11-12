@@ -214,11 +214,12 @@ build library's source is not trusted for the build sandbox:
 4. Org settings > Libraries > Install: fetch
    `github.com/thulasi-ram/scarab-ci//libs/build.yaml@<commit>` the same way
    and install it as `thulasi-ram/build`. The dogfood pipeline's `build` step
-   invokes it.
+   invokes it: `build/image` builds and `build/push` pushes.
 5. On the build library's page, trust its source,
    `github.com/thulasi-ram/scarab-ci//libs/build.yaml`, for the build sandbox.
-   The dogfood build does not push, so the source needs no trust with the
-   registry credential or forge credentials.
+   The dogfood build does not push (its push Step exits without pushing), so
+   the source needs no trust with the registry credential or forge
+   credentials.
 6. To call the API, issue a token in Org settings > API tokens.
 
 To check that the member is refused an admin action, sign in as the member and
@@ -545,8 +546,10 @@ pushed first.
   with forge credentials through `/library-trust`, so its Step receives the
   connection's token. It installs `build.yaml` the same way as
   `lib:thulasi-ram/build` and trusts that source for the build sandbox, so its
-  Step may run rootless BuildKit. The build library is not trusted with the
-  registry credential or forge credentials: no pipeline of the stack pushes.
+  build Step may run rootless BuildKit. The build library is not trusted with
+  the registry credential or forge credentials: no pipeline of the stack
+  pushes, so its push Step exits without pushing. Both Steps pull the images
+  the library pins by digest (BuildKit from Docker Hub, crane from gcr.io).
   `just stack up` runs it for `SCARAB_DEV_ORG`; `just test e2e` runs it for
   `scarab-admin`, the org of the forge_token cases.
 - The forgejo-onboarding case installs `notify.yaml` from the same repository
