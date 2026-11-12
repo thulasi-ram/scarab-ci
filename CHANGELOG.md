@@ -28,7 +28,10 @@ release.yml uses that version's section as the GitHub Release text. See
   default to `lib:thulasi-ram::scarab-ci::clone` and `lib:thulasi-ram::scarab-ci::build`.
   Migration `0096` joins every stored publisher and name into `<publisher>/<name>`: an
   installation made before it keeps its id, its version and its yanks, and Pipelines that invoke
-  `lib:thulasi-ram/clone` keep compiling. A server from before `0096` cannot run against the
+  `lib:thulasi-ram/clone` keep compiling. Docs, the compiler's hints and this repository's own
+  Pipelines now name `lib:thulasi-ram::scarab-ci::clone`: an org that installed the clone or build
+  library before keeps it as `thulasi-ram/clone` or `thulasi-ram/build`, so either keep invoking
+  that name or install it again under the new one. A server from before `0096` cannot run against the
   migrated database, so stop every old replica before the new one starts (the chart's default
   `Recreate` strategy does this). The API changes with it:
   - `POST /v1/orgs/{org}/libraries/fetch` no longer takes `publisher`; `name`, when given, is

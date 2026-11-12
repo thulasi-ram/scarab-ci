@@ -24,6 +24,7 @@ import {
   isFullCommit,
   shortHash,
   sideBySide,
+  defaultLibraryName,
   splitSource,
   toFetchBody,
   type FetchForm,
@@ -36,6 +37,15 @@ import { me } from "../session";
 import { SettingsCrumbs, SettingsFrame } from "./Settings";
 
 const one = (v: string | string[] | undefined) => (Array.isArray(v) ? v[0] ?? "" : v ?? "");
+
+/** The name a review link names. A link from before libraries had one
+ *  name carries `publisher` and `name` (empty = the file name): the
+ *  installation they named is `<publisher>/<name>` now. */
+function legacyName(publisher: string, name: string, source: string): string {
+  if (!publisher) return name;
+  const stem = defaultLibraryName(splitSource(source).source)?.split("::").pop() ?? "";
+  return `${publisher}/${name || stem}`;
+}
 
 /** `/orgs/:org/settings/libraries/review`, in the settings frame, which shows
  *  it only to an admin of the org. */
@@ -68,7 +78,7 @@ function Review(props: { org: string }) {
     source: one(search.source),
     ref: one(search.ref),
     connection: one(search.connection),
-    name: one(search.name),
+    name: legacyName(one(search.publisher), one(search.name), one(search.source)),
   }));
   const request = createMemo(() => {
     const body = toFetchBody(form()).body;

@@ -12,7 +12,7 @@
 //!   `(org, content_hash)`; the hash is SHA-256 of the content, lowercase hex,
 //!   the same hash the compiler records in a Step's `origin`.
 //! - A **LibraryInstallation** names the version the org uses under one
-//!   library name ([`valid_library_name`]). Installing and upgrading take the hash the caller
+//!   library name ([`library_name_error`]). Installing and upgrading take the hash the caller
 //!   expects to replace, so an upgrade confirmed against one diff cannot
 //!   replace a version someone else installed in between.
 //! - A **yank** refuses a version in one org (§6). [`yank_refusals`] is the
@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use scarab_pipeline::{InstalledLibrary, OriginEntry, OriginKind};
 
-pub use scarab_pipeline::{library_name_error, valid_library_name, LIBRARY_NAME_RULE};
+pub use scarab_pipeline::{library_name_error, LIBRARY_NAME_RULE};
 
 /// One library file as fetched into an org.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

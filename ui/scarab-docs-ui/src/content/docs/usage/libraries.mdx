@@ -62,7 +62,7 @@ curl -X POST "$SCARAB/v1/orgs/acme/library-installations" \
 `<owner>::<repo>::<file>`, the file name without `.yaml` or `.yml`: the file above installs as
 `acme::scarab-libs::deploy-helm`. You can type another name at install, such as `deploy-helm` or
 `platform/helm`. A name is parts of letters, digits, `.`, `_` and `-`, joined by `::` or `/`, each
-part starting with a letter, digit or `_`, at most 200 characters; it is case-sensitive. When the
+part starting with a letter, digit or `_`, at most 255 bytes; it is case-sensitive. When the
 default does not fit that rule (a file name starting with `.` or `-`), the fetch asks you for a
 name. Each name names one installation in the org. A name says nothing about where the library
 came from: the installation records its source, and Policies match on the source. The

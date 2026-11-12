@@ -1,9 +1,8 @@
 #!/bin/sh
-# The clone library's entrypoint (ADR-0076 §9,
-# `lib:thulasi-ram::scarab-ci::clone`): SHA-pinned git clone into the
-# workspace, credential-free .git/config (token via GIT_ASKPASS from tmpfs),
-# opt-in submodules/LFS, and the config-scrub guard before handing the tree to
-# the CAS snapshot.
+# The clone library's entrypoint (ADR-0076 §9, `lib:thulasi-ram/clone`):
+# SHA-pinned git clone into the workspace, credential-free .git/config (token
+# via GIT_ASKPASS from tmpfs), opt-in submodules/LFS, and the config-scrub
+# guard before handing the tree to the CAS snapshot.
 #
 # Credential scope: the token is offered only for SCARAB_CLONE_URL's own
 # repository over https (see scarab-askpass). Submodules are fetched with no

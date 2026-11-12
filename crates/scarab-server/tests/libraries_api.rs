@@ -575,6 +575,23 @@ async fn a_branch_or_tag_is_pinned_to_its_commit_when_fetched() {
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
+    for bad in ["..", "main\u{202e}x"] {
+        let (st, b) = fetch(
+            &h,
+            json!({ "source": "github.com/acme/libs//deploy.yaml", "ref": bad }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad:?}: {b}");
+    }
+    // A client from before libraries had one name sends `publisher`: refused,
+    // never installed under the bare `name`.
+    let (st, _) = fetch(
+        &h,
+        json!({ "source": format!("github.com/acme/libs//deploy.yaml@{C1}"), "publisher": "acme", "name": "deploy" }),
+    )
+    .await;
+    assert!(st.is_client_error(), "{st}");
+    assert_ne!(st, StatusCode::OK);
 }
 
 /// The org's connection cannot reach the repository (a GitHub App not

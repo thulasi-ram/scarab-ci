@@ -10895,7 +10895,8 @@
             "type": "string",
             "description": "`<host>/<owner>/<repo>//<path>@<commit>`, or `<host>/<owner>/<repo>//<path>`\nwith `ref`."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "FetchPluginManifestRequest": {
         "type": "object",
@@ -11388,7 +11389,8 @@
             ],
             "description": "The hash installed now (an upgrade), or omitted for a first install."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "InstallPluginRequest": {
         "type": "object",

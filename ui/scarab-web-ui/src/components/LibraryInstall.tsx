@@ -52,18 +52,18 @@ export default function InstallLibraryDialog(props: {
   // Whether the Name is someone's own: then the File no longer changes it.
   const [nameTyped, setNameTyped] = createSignal(!!props.initial?.name || !!props.upgrade);
   const set = (k: keyof FetchForm, v: string) => setForm((f) => ({ ...f, [k]: v }));
-  // A pasted `…@<ref>` fills both fields.
+  // A `…@<ref>` typed or pasted into File stays there: the fetch reads the
+  // ref after the `@` when Ref is empty, and the Name follows the file.
   const setSource = (v: string) => {
-    const s = splitSource(v);
-    setForm((f) => {
-      const next = s.ref ? { ...f, source: s.source, ref: s.ref } : { ...f, source: v };
-      return nameTyped() ? next : { ...next, name: defaultLibraryName(next.source) ?? "" };
-    });
+    setForm((f) =>
+      nameTyped() ? { ...f, source: v } : { ...f, source: v, name: defaultLibraryName(splitSource(v).source) ?? "" },
+    );
   };
-  // Clearing the Name hands it back to the File.
+  // An emptied Name follows the File again from its next change; sent
+  // empty, the server gives the same default.
   const setName = (v: string) => {
     setNameTyped(v.trim() !== "");
-    set("name", v.trim() === "" ? defaultLibraryName(form().source) ?? "" : v);
+    set("name", v);
   };
   const built = () => toFetchBody(form());
   const go = () => {
@@ -149,7 +149,7 @@ export default function InstallLibraryDialog(props: {
           <Input
             mono
             readOnly={props.upgrade}
-            placeholder="<owner>::<repo>::<file name>"
+            placeholder={defaultLibraryName(splitSource(form().source).source) ?? "<owner>::<repo>::<file name>"}
             value={form().name}
             onValue={setName}
           />

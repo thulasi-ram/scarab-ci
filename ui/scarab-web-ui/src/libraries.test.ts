@@ -47,6 +47,8 @@ describe("splitSource and refError", () => {
     expect(refError("feature/x")).toBeNull();
     expect(refError("")).toBeNull();
     expect(refError("my branch")).toMatch(/spaces/);
+    expect(refError("..")).toMatch(/not a ref/);
+    expect(refError("main\u202ex")).toMatch(/printable ASCII/);
   });
 });
 

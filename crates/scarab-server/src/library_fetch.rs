@@ -113,11 +113,7 @@ impl LibrarySource {
         let (location, commit) = text
             .rsplit_once('@')
             .ok_or_else(|| format!("{shape}: the commit is missing"))?;
-        if !(commit.len() == 40 || commit.len() == 64)
-            || !commit
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
+        if !is_full_commit(commit) {
             return Err(format!(
                 "{shape}: `{commit}` is not a full commit id (40 or 64 lowercase hex \
                  characters); a branch or tag can move after you review the library"
@@ -181,10 +177,13 @@ impl LibrarySource {
 
     /// The source pinned at `commit`, a full commit id.
     pub fn at(&self, commit: &str) -> Result<Self, String> {
-        Self::parse(&format!(
-            "{}/{}/{}//{}@{commit}",
-            self.host, self.owner, self.repo, self.path
-        ))
+        if !is_full_commit(commit) {
+            return Err(format!("{} is not a full commit id", shown(commit)));
+        }
+        Ok(Self {
+            commit: commit.to_string(),
+            ..self.clone()
+        })
     }
 
     /// The default library name: `<owner>::<repo>::<stem>`, the stem being
@@ -229,10 +228,14 @@ pub fn ref_error(git_ref: &str) -> Option<String> {
     if git_ref.is_empty() || git_ref.len() > 255 {
         return Some("a ref is 1 to 255 characters".into());
     }
-    if git_ref.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    if !git_ref.bytes().all(|b| b.is_ascii_graphic()) {
         return Some(format!(
-            "`{git_ref}` is not a ref: it has spaces or control characters"
+            "{} is not a ref: a ref is printable ASCII with no spaces",
+            shown(git_ref)
         ));
+    }
+    if git_ref == "." || git_ref == ".." {
+        return Some(format!("`{git_ref}` is not a ref"));
     }
     None
 }
@@ -285,10 +288,19 @@ pub fn commit_from_list(body: &[u8], git_ref: &str) -> Result<String, String> {
         .ok_or_else(|| format!("the forge names no commit for ref `{git_ref}`"))?;
     if !is_full_commit(sha) {
         return Err(format!(
-            "the forge named `{sha}` for ref `{git_ref}`, which is not a full commit id"
+            "the forge named {} for ref `{git_ref}`, which is not a full commit id",
+            shown(sha)
         ));
     }
     Ok(sha.to_string())
+}
+
+/// `s` as an error message shows text from outside: escaped, quoted, and
+/// cut to 80 characters, so a forge's answer cannot flood or reorder it.
+pub fn shown(s: &str) -> String {
+    let head: String = s.chars().take(80).collect();
+    let more = if s.chars().count() > 80 { "…" } else { "" };
+    format!("`{}{more}`", head.escape_debug())
 }
 
 fn unknown_host(src: &LibrarySource) -> String {

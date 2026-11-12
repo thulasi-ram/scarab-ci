@@ -76,7 +76,8 @@ export function refError(ref: string): string | null {
   const r = ref.trim();
   if (r === "") return null;
   if (r.length > 255) return "A ref is at most 255 characters.";
-  if (/[\s\x00-\x1f\x7f]/.test(r)) return "A ref has no spaces or control characters.";
+  if (!/^[\x21-\x7e]+$/.test(r)) return "A ref is printable ASCII with no spaces.";
+  if (r === "." || r === "..") return `"${r}" is not a ref.`;
   return null;
 }
 

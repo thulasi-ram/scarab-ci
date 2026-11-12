@@ -229,6 +229,7 @@ pub struct TrustSourceRequest {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FetchLibraryRequest {
     /// `<host>/<owner>/<repo>//<path>@<commit>`, or `<host>/<owner>/<repo>//<path>`
     /// with `ref`.
@@ -271,6 +272,7 @@ pub struct FetchedLibraryDto {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct InstallLibraryRequest {
     /// The library name to install under, as `invoke: lib:<name>` writes it.
     pub name: String,
@@ -504,50 +506,83 @@ fn connection_web_host(conn: &scarab_forge::ForgeConnection) -> Option<String> {
 /// Why an anonymous read did not work: refused (a host Scarab does not
 /// read from, an address that is not public) or failed.
 struct AnonError {
-    denied: bool,
+    kind: AnonKind,
     message: String,
 }
 
+/// What an [`AnonError`] answers when nothing else is tried: a refusal
+/// (403), a failed read (400), no anonymous fetcher here (409), or the
+/// connection list not read (500).
+enum AnonKind {
+    Denied,
+    Failed,
+    Unconfigured,
+    Store,
+}
+
 impl AnonError {
-    fn into_api(self) -> ApiError {
-        if self.denied {
-            ApiError::Denied(self.message)
-        } else {
-            ApiError::BadRequest(self.message)
+    fn new(kind: AnonKind, message: impl Into<String>) -> Self {
+        AnonError {
+            kind,
+            message: message.into(),
         }
+    }
+
+    fn into_api(self) -> ApiError {
+        match self.kind {
+            AnonKind::Denied => ApiError::Denied(self.message),
+            AnonKind::Failed => ApiError::BadRequest(self.message),
+            AnonKind::Unconfigured => ApiError::Conflict(self.message),
+            AnonKind::Store => ApiError::Db(DbError::Other(self.message)),
+        }
+    }
+}
+
+/// The forges an anonymous fetch may reach, as an [`AnonError`] on failure.
+async fn anonymous_forges(st: &AppState) -> Result<KnownForges, AnonError> {
+    known_forges(st)
+        .await
+        .map_err(|_| AnonError::new(AnonKind::Store, "the forge connections could not be listed"))
+}
+
+/// `message` with a hint when api.github.com refused an anonymous request:
+/// it allows 60 an hour from one address.
+fn github_limit_hint(url: &str, message: String) -> String {
+    if url.starts_with("https://api.github.com/")
+        && (message.contains(" 403") || message.contains(" 429"))
+    {
+        format!(
+            "{message} (api.github.com allows 60 requests an hour without credentials: give \
+             a full commit id as the ref, or pick a connection that can read the repository)"
+        )
+    } else {
+        message
     }
 }
 
 /// Reads `url` with the anonymous fetcher.
 async fn anonymous_get(st: &AppState, url: &str) -> Result<Vec<u8>, AnonError> {
-    let fetcher = st.library_fetcher.as_ref().ok_or_else(|| AnonError {
-        denied: true,
-        message: "anonymous library fetches are not configured on this Scarab; pick a \
-                  connection"
-            .into(),
+    let fetcher = st.library_fetcher.as_ref().ok_or_else(|| {
+        AnonError::new(
+            AnonKind::Unconfigured,
+            "anonymous library fetches are not configured on this Scarab; pick a connection",
+        )
     })?;
     fetcher.get(url).await.map_err(|e| match e {
-        crate::library_fetch::FetchError::Refused(message) => AnonError {
-            denied: true,
-            message,
-        },
-        crate::library_fetch::FetchError::Failed(message) => AnonError {
-            denied: false,
-            message,
-        },
+        crate::library_fetch::FetchError::Refused(message) => {
+            AnonError::new(AnonKind::Denied, message)
+        }
+        crate::library_fetch::FetchError::Failed(message) => {
+            AnonError::new(AnonKind::Failed, github_limit_hint(url, message))
+        }
     })
 }
 
 /// Reads `src` without credentials.
 async fn read_anonymously(st: &AppState, src: &LibrarySource) -> Result<Vec<u8>, AnonError> {
-    let known = known_forges(st).await.map_err(|_| AnonError {
-        denied: false,
-        message: "the forge connections could not be listed".into(),
-    })?;
-    let url = anonymous_url(src, &known).map_err(|message| AnonError {
-        denied: true,
-        message,
-    })?;
+    let known = anonymous_forges(st).await?;
+    let url =
+        anonymous_url(src, &known).map_err(|message| AnonError::new(AnonKind::Denied, message))?;
     anonymous_get(st, &url).await
 }
 
@@ -558,19 +593,11 @@ async fn resolve_anonymously(
     src: &LibrarySource,
     git_ref: &str,
 ) -> Result<String, AnonError> {
-    let known = known_forges(st).await.map_err(|_| AnonError {
-        denied: false,
-        message: "the forge connections could not be listed".into(),
-    })?;
-    let url = anonymous_commit_url(src, git_ref, &known).map_err(|message| AnonError {
-        denied: true,
-        message,
-    })?;
+    let known = anonymous_forges(st).await?;
+    let url = anonymous_commit_url(src, git_ref, &known)
+        .map_err(|message| AnonError::new(AnonKind::Denied, message))?;
     let body = anonymous_get(st, &url).await?;
-    commit_from_list(&body, git_ref).map_err(|message| AnonError {
-        denied: false,
-        message,
-    })
+    commit_from_list(&body, git_ref).map_err(|message| AnonError::new(AnonKind::Failed, message))
 }
 
 /// The connection `id` as a forge adapter, once the org rule (git-bug
@@ -632,8 +659,8 @@ fn or_anonymous<T>(
     anonymous.map_err(|a| {
         ApiError::BadRequest(format!(
             "connection `{id}` could not read {what} ({why}), and it could not be read without \
-             credentials either ({}); if the repository is private, give connection `{id}` \
-             access to it",
+             credentials either ({}); check the path and ref, and if the repository is private, \
+             give connection `{id}` access to it",
             a.message
         ))
     })
@@ -718,15 +745,15 @@ async fn check_compiles(
     name: &str,
     content: &str,
 ) -> Result<(), ApiError> {
-    let qualified = name.to_string();
     let mut installed = store
         .installed_for_compile(org)
         .await
         .map_err(store_api_error)?;
-    installed.remove(&qualified);
+    installed.remove(name);
     let content = content.to_string();
+    let owned_name = name.to_string();
     let checked = tokio::task::spawn_blocking(move || {
-        scarab_pipeline::check_installed_library(&qualified, &content, &installed)
+        scarab_pipeline::check_installed_library(&owned_name, &content, &installed)
     })
     .await
     .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;

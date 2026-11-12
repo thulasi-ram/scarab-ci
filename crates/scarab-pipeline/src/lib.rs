@@ -2760,7 +2760,7 @@ pub const LIBRARY_NAME_MAX: usize = 255;
 
 /// The library name rule, as messages state it.
 pub const LIBRARY_NAME_RULE: &str = "a library name is parts of letters, digits, `.`, `_` and \
-    `-`, joined by `::` or `/`, each part starting with a letter, digit or `_`, at most 200 \
+    `-`, joined by `::` or `/`, each part starting with a letter, digit or `_`, at most 255 \
     bytes in all";
 
 /// Why `name` is not a library name, or `None` when it is one. The one rule
@@ -2785,11 +2785,6 @@ pub fn library_name_error(name: &str) -> Option<String> {
     } else {
         Some(LIBRARY_NAME_RULE.to_string())
     }
-}
-
-/// Whether `name` is a library name ([`library_name_error`]).
-pub fn valid_library_name(name: &str) -> bool {
-    library_name_error(name).is_none()
 }
 
 /// The parts of a library name, split on `/` and `::`. A lone `:` stays in
