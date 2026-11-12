@@ -925,28 +925,27 @@ impl Executor for ForgeCredentialExecutor {
             }
         }
         // A `registry_auth` Step: its registry credential, in memory only.
-        // A sandboxed Step: whether it runs for a fork pull request (or a
-        // Run locked out of its Environment's secrets), as `SCARAB_FORK_PR`,
-        // so a build library does not push or export its cache for one.
+        // A sandboxed or `registry_auth` Step: whether it runs for a fork
+        // pull request (or a Run locked out of its Environment's secrets), as
+        // `SCARAB_FORK_PR`, so a build library neither exports its cache from
+        // the build Step nor pushes from the push Step for one.
         let with_registry;
         let spec = if spec.registry_auth.is_some() || spec.sandbox.is_some() {
             let mut enriched = spec.clone();
             if let Some(config) = &spec.registry_auth {
                 enriched.registry_auth = Some(self.step_registry_auth(step, config).await?);
             }
-            if spec.sandbox.is_some() {
-                let fork = enriched
-                    .registry_auth
-                    .as_ref()
-                    .is_some_and(|r| r.locked_out)
-                    || self.run_is_fork_pr(step).await?;
-                enriched
-                    .env
-                    .retain(|(name, _)| name != scarab_pipeline::FORK_PR_ENV);
-                enriched
-                    .env
-                    .push((scarab_pipeline::FORK_PR_ENV.to_string(), fork.to_string()));
-            }
+            let fork = enriched
+                .registry_auth
+                .as_ref()
+                .is_some_and(|r| r.locked_out)
+                || self.run_is_fork_pr(step).await?;
+            enriched
+                .env
+                .retain(|(name, _)| name != scarab_pipeline::FORK_PR_ENV);
+            enriched
+                .env
+                .push((scarab_pipeline::FORK_PR_ENV.to_string(), fork.to_string()));
             with_registry = enriched;
             &with_registry
         } else {
