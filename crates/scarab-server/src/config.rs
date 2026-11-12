@@ -639,6 +639,11 @@ pub struct Config {
     /// declares no `timeout:`. A default is mandatory — it closes the
     /// "hung Pod wedges the run forever" hole.
     pub step_timeout_secs: u32,
+    /// `SCARAB_UNSCHEDULABLE_GRACE_SECS`: how long a k8s step Pod the
+    /// scheduler calls Unschedulable stays Pending before it fails (git-bug
+    /// 1166c30), so a node pool scaled to zero has time to launch a node.
+    /// Default 300; `0` fails such a Pod at once.
+    pub unschedulable_grace_secs: u32,
     /// `SCARAB_PROJECT_RUN_CAP`: the most Runs of one project that may be
     /// `Running` at once (ADR-0011). `None` (unset or `0`) = no cap.
     pub project_run_cap: Option<u32>,
@@ -1360,6 +1365,14 @@ pub enum ConfigError {
     InvalidProjectRunCap(String),
 
     #[error(
+        "SCARAB_UNSCHEDULABLE_GRACE_SECS is set but invalid (got {0:?}) — want 0 to 1800: \
+         the seconds a k8s step Pod the scheduler calls Unschedulable waits for a node \
+         before it fails; 0 fails it at once. The engine fails an attempt that has not \
+         started 30 minutes after it was claimed, so a longer wait would never be reached."
+    )]
+    InvalidUnschedulableGrace(String),
+
+    #[error(
         "{0} is set but invalid (got {1:?}) — want a non-negative integer: the wsfetch \
          helper resource axes (ticket 16a7768) are millicpu / MiB, applied requests==limits \
          to both helper containers of every workspace Step Pod; 0 opts the axis out."
@@ -1651,6 +1664,17 @@ impl Config {
             None => 3_600,
         };
 
+        let unschedulable_grace_secs =
+            match env("SCARAB_UNSCHEDULABLE_GRACE_SECS").filter(|v| !v.trim().is_empty()) {
+                Some(v) => v
+                    .trim()
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|s| *s <= scarab_engine::scheduler::PROVISIONING_DEADLINE_SECS)
+                    .ok_or(ConfigError::InvalidUnschedulableGrace(v))?,
+                None => scarab_executor_k8s::DEFAULT_UNSCHEDULABLE_GRACE_SECS,
+            };
+
         let project_run_cap = match env("SCARAB_PROJECT_RUN_CAP").filter(|v| !v.trim().is_empty()) {
             Some(v) => match v.trim().parse::<u32>() {
                 Ok(0) => None,
@@ -1795,6 +1819,7 @@ impl Config {
             master_key_warnings,
             dev_insecure,
             step_timeout_secs,
+            unschedulable_grace_secs,
             project_run_cap,
             public_url,
             ui_url,
@@ -1989,6 +2014,10 @@ impl Config {
             format!(
                 "step timeout default: {}s (ADR-0047; per-step `timeout:` overrides)",
                 self.step_timeout_secs,
+            ),
+            format!(
+                "unschedulable grace: {}s (a k8s step Pod waits this long for a node)",
+                self.unschedulable_grace_secs,
             ),
             format!("public url: {} (run deep-links, ADR-0046)", self.public_url),
             if self.ui_url == self.public_url.trim_end_matches('/') {

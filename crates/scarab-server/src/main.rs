@@ -802,6 +802,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(mut exec) => {
                     exec = exec
                         .with_default_step_timeout_secs(config.step_timeout_secs)
+                        .with_unschedulable_grace_secs(config.unschedulable_grace_secs)
                         // Workspace flow (ADR-0029/0045): materialize `needs`
                         // into /workspace, snapshot it back after the step.
                         // This is the drain's READ half (tiered, falls through
