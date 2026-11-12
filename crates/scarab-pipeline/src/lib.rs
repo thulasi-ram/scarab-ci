@@ -1770,6 +1770,20 @@ impl PlacementProfiles {
         }
     }
 
+    /// The list a compiled Step runs on. Inlining resolves every map, so a
+    /// map here means a Step was not compiled; the caller refuses it rather
+    /// than run the Step on no profile.
+    pub fn compiled(&self) -> Result<&[String], String> {
+        match self {
+            PlacementProfiles::List(l) => Ok(l),
+            PlacementProfiles::PerStep(_) => Err(
+                "`placement_profiles` is still a map from step id, which only an invoke step \
+                 may hold before it is inlined"
+                    .to_string(),
+            ),
+        }
+    }
+
     /// Every profile name written, in either form.
     pub fn names(&self) -> impl Iterator<Item = &String> {
         let (list, map) = match self {
@@ -1788,7 +1802,10 @@ impl PlacementProfiles {
         match self {
             PlacementProfiles::List(l) => l,
             PlacementProfiles::PerStep(m) => {
-                let id = lib_step.split('/').next().unwrap_or(lib_step);
+                // The id as the library writes it: before a nested invoke's
+                // `/` or a matrix coordinate's `[` (whose values may hold
+                // `/`), whichever comes first.
+                let id = lib_step.split(['/', '[']).next().unwrap_or(lib_step);
                 m.get(id).map(Vec::as_slice).unwrap_or(&[])
             }
         }
@@ -3424,12 +3441,27 @@ fn inline_level(
         // own profiles, a gate and a `forge_token` Step take none from it.
         if let PlacementProfiles::PerStep(map) = &step.placement_profiles {
             for (key, names) in map {
-                if !lib.steps.iter().any(|s| &s.id == key) {
-                    diagnostics.push(format!(
+                match lib.steps.iter().find(|s| &s.id == key) {
+                    None => diagnostics.push(format!(
                         "step `{}`: `placement_profiles` names step `{key}`, which library \
                          `{label}` does not have",
                         step.id
-                    ));
+                    )),
+                    Some(target) if target.forge_token.is_some() => diagnostics.push(format!(
+                        "step `{}`: `placement_profiles` names step `{key}` of library \
+                         `{label}`, which has `forge_token`; an invoke gives such a step no \
+                         placement profile",
+                        step.id
+                    )),
+                    Some(target) if !target.placement_profiles.is_empty() => {
+                        diagnostics.push(format!(
+                            "step `{}`: `placement_profiles` names step `{key}` of library \
+                             `{label}`, which sets its own placement profiles; the library's \
+                             own value wins, so these would never apply",
+                            step.id
+                        ))
+                    }
+                    Some(_) => {}
                 }
                 if names.iter().any(|p| p.trim().is_empty()) {
                     diagnostics.push(format!(
@@ -10205,7 +10237,7 @@ mod tests {
     /// The map form gives each library Step only its own entry: the push
     /// profile reaches the pushing Step and not the build, a Step with no
     /// entry gets none, a nested invoke's Steps take its entry, and a Step
-    /// that names its own keeps them.
+    /// that names its own (and so may not be a key) keeps them.
     #[test]
     fn a_placement_profile_map_on_an_invoke_routes_each_list_to_its_step() {
         let ir = compile_with(
@@ -10216,7 +10248,6 @@ mod tests {
                 placement_profiles:
                   image: [arm64-builders, build-cache]
                   push: [ecr-push]
-                  own: [ignored]
                   inner: [small]
             "#,
             &per_step_libs(),
@@ -10243,6 +10274,42 @@ mod tests {
         assert!(step("p/image").placement_profiles.is_empty());
         assert!(step("p/inner/leaf").placement_profiles.is_empty());
         assert_eq!(step("p/push").placement_profiles, vec!["ecr-push"]);
+    }
+
+    /// A map entry for a nested invoke reaches every Step it inlines, also
+    /// when the nested invoke has a matrix whose values hold `/` (its copies
+    /// are `inner[arch=linux/amd64]/leaf`).
+    #[test]
+    fn a_placement_profile_map_reaches_a_matrixed_nested_invoke() {
+        let libs = libs(&[
+            (
+                ".scarab/lib/p.yaml",
+                "steps:\n  - id: inner\n    invoke: file:.scarab/lib/q.yaml\n    matrix: { dimensions: { arch: [linux/amd64, linux/arm64] } }\n",
+            ),
+            (
+                ".scarab/lib/q.yaml",
+                "steps:\n  - { id: leaf, image: alpine, command: [echo] }\n",
+            ),
+        ]);
+        let ir = compile_with(
+            "steps: [{ id: p, invoke: file:.scarab/lib/p.yaml, placement_profiles: { inner: [small] } }]",
+            &libs,
+        );
+        let leaves: Vec<&StepSpec> = ir
+            .steps
+            .iter()
+            .filter(|s| s.id.starts_with("p/inner"))
+            .collect();
+        assert_eq!(
+            leaves.len(),
+            2,
+            "{:?}",
+            ir.steps.iter().map(|s| &s.id).collect::<Vec<_>>()
+        );
+        for leaf in leaves {
+            assert!(leaf.id.contains("linux/"), "{}", leaf.id);
+            assert_eq!(leaf.placement_profiles, vec!["small"], "{}", leaf.id);
+        }
     }
 
     /// A key that names no Step of the library is an error naming the key;
@@ -10278,6 +10345,16 @@ mod tests {
                 .any(|e| e.contains("`placement_profiles.push` contains an empty profile name")),
             "{errs:?}"
         );
+        // A key naming a Step that sets its own profiles would never apply.
+        let errs = errors_with(
+            "steps: [{ id: p, invoke: file:.scarab/lib/p.yaml, placement_profiles: { own: [x] } }]",
+            &per_step_libs(),
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("names step `own`") && e.contains("sets its own")),
+            "{errs:?}"
+        );
         let errs = errors("steps: [{ id: a, image: busybox, placement_profiles: { a: [x] } }]");
         assert!(
             errs.iter()
@@ -10287,7 +10364,7 @@ mod tests {
     }
 
     /// A `forge_token` Step receives no placement profile from its invoke,
-    /// in either form, even when the map names it.
+    /// in either form, and a map that names it is refused.
     #[test]
     fn a_forge_token_step_gets_no_placement_profile_in_either_form() {
         let lib = "steps:\n  - { id: git, image: alpine, command: [echo], forge_token: read }\n  - { id: other, image: alpine, command: [echo] }\n";
@@ -10299,7 +10376,7 @@ mod tests {
             )]),
             ..Default::default()
         };
-        for form in ["[big]", "{ git: [big], other: [big] }"] {
+        for form in ["[big]", "{ other: [big] }"] {
             let ir = compile_with_libraries(
                 &format!("steps: [{{ id: c, invoke: lib:acme/git, placement_profiles: {form} }}]"),
                 &libraries,
@@ -10309,6 +10386,16 @@ mod tests {
             assert!(step("c/git").placement_profiles.is_empty(), "{form}");
             assert_eq!(step("c/other").placement_profiles, vec!["big"], "{form}");
         }
+        // A map key naming the `forge_token` Step is an error, not a drop.
+        let errs = library_errors(
+            "steps: [{ id: c, invoke: lib:acme/git, placement_profiles: { git: [big] } }]",
+            &libraries,
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("names step `git`") && e.contains("`forge_token`")),
+            "{errs:?}"
+        );
     }
 
     /// The map form reads back as written, and a compiled IR holding only

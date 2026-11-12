@@ -7346,7 +7346,13 @@ async fn write_run_from_ir(
                 registry_auth,
                 build: None,
                 artifacts: step.artifacts.clone(),
-                placement_profiles: step.placement_profiles.as_list().to_vec(),
+                // A compiled Step holds a list; a map left by a Step that
+                // was not inlined refuses the Run, never runs it on no profile.
+                placement_profiles: step
+                    .placement_profiles
+                    .compiled()
+                    .map_err(|e| TriggerError::Pipeline(format!("step `{}`: {e}", step.id)))?
+                    .to_vec(),
                 resources: step.resources.clone(),
                 k8s_overlay: admit_k8s_overlay(
                     gov.privilege_grant_scope(),

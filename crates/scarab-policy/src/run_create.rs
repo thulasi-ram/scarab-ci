@@ -542,8 +542,13 @@ pub fn input_from_pipeline(
                 &what,
                 "secrets",
             )?),
+            // A compiled Step holds a list; a map left by a Step that was not
+            // inlined is refused, never read as no profile.
             placement_profiles: capped(
-                s.placement_profiles.as_list().to_vec(),
+                s.placement_profiles
+                    .compiled()
+                    .map_err(|e| CapExceeded(format!("{}: {e}", what())))?
+                    .to_vec(),
                 &what,
                 "placement profiles",
             )?,
