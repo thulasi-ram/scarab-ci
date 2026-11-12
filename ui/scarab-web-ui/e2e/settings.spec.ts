@@ -662,15 +662,16 @@ test("Install library opens a dialog, and its source is reviewed on its own page
   const dialog = page.getByRole("dialog");
   const go = dialog.getByRole("button", { name: "Fetch and review" });
   await expect(go).toBeDisabled();
-  await dialog
-    .getByRole("textbox", { name: "Source" })
-    .fill("github.com/acme/scarab-libs//deploy-helm.yaml@d41f07b29c3e8a6f5b1d0c9e7a2f4b8c6d3e1a90");
+  await dialog.getByRole("textbox", { name: "File" }).fill("github.com/acme/scarab-libs//deploy-helm.yaml");
+  await expect(go).toBeDisabled();
+  await dialog.getByRole("textbox", { name: "Ref" }).fill("v1.4.0");
   // The Name follows the file until someone types one.
   const name = dialog.getByRole("textbox", { name: "Name", exact: true });
   await expect(name).toHaveValue("acme::scarab-libs::deploy-helm");
   await expect(dialog.getByText("invoke: lib:acme::scarab-libs::deploy-helm")).toBeVisible();
   await go.click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/review\?source=/);
+  await expect(page).toHaveURL(/ref=v1\.4\.0/);
   // The mock answers every fetch with an upgrade of deploy-helm.
   await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Libraries\s*lib:acme::scarab-libs::deploy-helm$/);
   await expect(page.getByText("5d1e0c7a9b3f → 0c4e7b2a91f5")).toBeVisible();
@@ -700,7 +701,8 @@ test("a library's manage page holds its version, trust, yank and remove", async 
   // Upgrade opens the install dialog with the installed source in it.
   await page.getByRole("button", { name: "Upgrade" }).click();
   const upgrade = page.getByRole("dialog");
-  await expect(upgrade.getByRole("textbox", { name: "Source" })).toHaveValue(/http-probe\.yaml@8c2f4e1a/);
+  await expect(upgrade.getByRole("textbox", { name: "File" })).toHaveValue(/http-probe\.yaml$/);
+  await expect(upgrade.getByRole("textbox", { name: "Ref" })).toHaveValue(/^8c2f4e1a/);
   await upgrade.getByRole("button", { name: "Cancel" }).click();
 
   // Remove asks for the name to be typed, then goes back to the list.
