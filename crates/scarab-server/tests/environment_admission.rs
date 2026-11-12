@@ -84,6 +84,7 @@ fn push() -> Event {
         r#ref: "refs/heads/main".into(),
         after: "1234567890abcdef1234567890abcdef12345678".into(),
         message: "ship it".into(),
+        changed_paths: Default::default(),
     }
 }
 

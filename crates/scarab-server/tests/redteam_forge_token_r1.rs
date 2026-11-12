@@ -48,6 +48,7 @@ fn push_to(r#ref: &str) -> Event {
         r#ref: r#ref.into(),
         after: SHA.into(),
         message: "ship it".into(),
+        changed_paths: Default::default(),
     }
 }
 

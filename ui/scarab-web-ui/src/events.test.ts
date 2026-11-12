@@ -216,6 +216,24 @@ describe("RunDeadLettered", () => {
   });
 });
 
+describe("Raw note", () => {
+  const note = ev(11, {
+    Raw: {
+      note: "changed paths unknown: new branch; the path filter in `when:` was not applied (on.push)",
+    },
+  });
+
+  it("renders the note line as a warning; other Raw payloads keep their tag", () => {
+    expect(describeEvent(note)).toBe(
+      "changed paths unknown: new branch; the path filter in `when:` was not applied (on.push)",
+    );
+    expect(eventCategory(note)).toBe("warning");
+    const trigger = ev(12, { Raw: { trigger: { event: { kind: "push" } } } });
+    expect(describeEvent(trigger)).toBe("Raw");
+    expect(eventCategory(trigger)).toBe("info");
+  });
+});
+
 describe("RunCreationFailed", () => {
   const failed = ev(10, {
     RunCreationFailed: { reason: "pipeline error: step `checkout`: a clone step needs a sha" },

@@ -2107,6 +2107,83 @@ fn run_pipeline_name(ir: &scarab_pipeline::PipelineIr, path: &str) -> String {
     ir.name.clone().unwrap_or_else(|| bare_pipeline_name(path))
 }
 
+/// The paths pull request `number` changes, from the forge's files API
+/// (git-bug 418f55e), waiting at most
+/// [`PULL_REQUEST_FILES_TIMEOUT_SECS`](scarab_forge::PULL_REQUEST_FILES_TIMEOUT_SECS).
+/// A failed or slow request is "unknown", never a refused trigger: the `when:` that wanted the paths counts as true, and the Run
+/// says why.
+async fn pull_request_paths(
+    forge: &dyn scarab_forge::ForgePort,
+    repo: &scarab_forge::RepoRef,
+    number: u64,
+) -> scarab_forge::ChangedPaths {
+    use scarab_forge::{ChangedPaths, PathsUnknown};
+    let wait = std::time::Duration::from_secs(scarab_forge::PULL_REQUEST_FILES_TIMEOUT_SECS);
+    let Ok(answer) = tokio::time::timeout(wait, forge.pull_request_files(repo, number)).await
+    else {
+        tracing::warn!(
+            org = %repo.owner,
+            project = %repo.name,
+            pull_request = number,
+            "listing a pull request's files timed out; its changed paths are unknown"
+        );
+        return ChangedPaths::Unknown(PathsUnknown::TimedOut);
+    };
+    match answer {
+        Ok(Some(files)) => ChangedPaths::from_paths(files),
+        Ok(None) => ChangedPaths::Unknown(PathsUnknown::TooMany),
+        Err(e) => {
+            tracing::warn!(
+                org = %repo.owner,
+                project = %repo.name,
+                pull_request = number,
+                error = %e,
+                "listing a pull request's files failed; its changed paths are unknown"
+            );
+            ChangedPaths::Unknown(PathsUnknown::ForgeError)
+        }
+    }
+}
+
+/// Record on `run` that a `when:` needed `event.changed_paths` while they
+/// were unknown, and so counted as true (git-bug 418f55e): one line in the
+/// Run's event log naming the reason and where, so a path filter that was
+/// not applied is never silent. Nothing is recorded when the paths are known
+/// or no `when:` needed them. Best effort, like the follow-up record.
+pub(crate) async fn record_path_filter_note(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    run: &RunId,
+    ir: &scarab_pipeline::PipelineIr,
+    kind: &str,
+    ctx: &serde_json::Value,
+    paths: &scarab_forge::ChangedPaths,
+) {
+    let scarab_forge::ChangedPaths::Unknown(why) = paths else {
+        return;
+    };
+    let places = match scarab_pipeline::changed_paths_unapplied(ir, kind, ctx) {
+        Ok(p) if !p.is_empty() => p,
+        _ => return,
+    };
+    let note = format!(
+        "changed paths unknown: {}; the path filter in `when:` was not applied ({})",
+        why.reason(),
+        places.join(", ")
+    );
+    let recorded = db
+        .append_event(&EventKind {
+            version: EVENT_VERSION,
+            run: run.clone(),
+            kind: EventPayload::Raw(serde_json::json!({ "note": note })),
+            at: clock.now().await,
+        })
+        .await;
+    if let Err(e) = recorded {
+        tracing::warn!(run = %run.0, error = %e, "recording a Run's path filter note failed");
+    }
+}
+
 /// Record on `run` the files among `files` whose `on: upstream:` follows
 /// the pipeline `name`, so its `run_finished` reads only those (none: no
 /// forge read at all). Best effort: without the record, the follow-up
@@ -4966,7 +5043,11 @@ pub(crate) async fn trigger_runs_from_files(
         return Ok(TriggerOutcome::default());
     };
     let git_ref = config_ref(event);
-    let ctx = event.context();
+    // `event.changed_paths` (git-bug 418f55e): a push carries its own; a
+    // pull request's are asked of the forge once, and only when a Pipeline
+    // reads them.
+    let mut ctx = event.when_context();
+    let mut paths = event.changed_paths();
     let kind = event.trigger_kind();
     let mut outcome = TriggerOutcome::default();
     // The org's installed libraries, read once for the whole delivery.
@@ -5000,10 +5081,30 @@ pub(crate) async fn trigger_runs_from_files(
         )
         .await?;
 
-        let matched = scarab_pipeline::matches_trigger(&ir, kind.as_str(), &ctx)
-            .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
-        if !matched {
+        // The trigger is matched first, with a pull request's paths not yet
+        // asked for (unknown), so a Pipeline whose trigger does not match
+        // (another kind, a false branch test) costs no files request. Only a
+        // match that may have rested on the unknown paths asks, once per
+        // delivery, and is decided again with the answer.
+        let trigger_matches = |ctx: &serde_json::Value| {
+            scarab_pipeline::matches_trigger(&ir, kind.as_str(), ctx)
+                .map_err(|e| TriggerError::Pipeline(e.to_string()))
+        };
+        if !trigger_matches(&ctx)? {
             continue;
+        }
+        if let (
+            scarab_forge::ChangedPaths::Unknown(scarab_forge::PathsUnknown::NotFetched),
+            scarab_forge::Event::PullRequest { number, .. },
+        ) = (&paths, event)
+        {
+            if scarab_pipeline::reads_changed_paths(&ir, kind.as_str()) {
+                paths = pull_request_paths(forge, repo, *number).await;
+                paths.apply_to(&mut ctx);
+                if !trigger_matches(&ctx)? {
+                    continue;
+                }
+            }
         }
         // A chain of follow-ups stops at a pipeline already in it (a loop)
         // and at its length cap; either is a refused Run.
@@ -5052,6 +5153,7 @@ pub(crate) async fn trigger_runs_from_files(
             .await?
         {
             Admission::Created(run) => {
+                record_path_filter_note(db, clock, &run, &ir, kind.as_str(), &ctx, &paths).await;
                 if complete {
                     let at = clock.now().await;
                     record_followups(db, &run, &run_pipeline_name(&ir, path), files, at).await;
@@ -6645,7 +6747,20 @@ pub async fn dispatch_run(
     )
     .await?
     {
-        Admission::Created(run) => return Ok(run),
+        Admission::Created(run) => {
+            let kind = kind.trigger_kind();
+            record_path_filter_note(
+                db,
+                clock,
+                &run,
+                &ir,
+                kind.as_str(),
+                &ctx,
+                &event.changed_paths(),
+            )
+            .await;
+            return Ok(run);
+        }
         Admission::Refused(refusal) => refusal,
     };
     let repo = event

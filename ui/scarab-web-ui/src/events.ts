@@ -56,6 +56,11 @@ export function describeEvent(e: RunEvent): string {
     // The run's creation failed partway; the reason is the creation error.
     case "RunCreationFailed":
       return `Run creation failed — ${s(v.reason)}`;
+    // A plain line the server wrote when it created the run, such as why a
+    // path filter in `when:` was not applied. Other Raw payloads (the trigger,
+    // the follow-up list) keep their tag.
+    case "Raw":
+      return typeof v.note === "string" ? v.note : tag;
     default:
       return tag;
   }
@@ -188,6 +193,10 @@ export function eventCategory(e: RunEvent): EventCat {
     case "RunDeadLettered":
     case "RunCreationFailed":
       return "err";
+    // A note says something did not happen as written (a path filter that
+    // could not be applied): a warning, since nothing failed.
+    case "Raw":
+      return typeof v.note === "string" ? "warning" : "info";
     // Everything else — including the ADR-0061 s5 snapshot pin/unpin — is `info`.
     // Those two used to have their own arms returning `info`, which was dead code
     // AND untestable: no input could tell the arm from this fall-through, so the

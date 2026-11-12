@@ -324,7 +324,19 @@ pub async fn dispatch_cron(
         )
         .await?
         {
-            Admission::Created(run) => Ok(FireOutcome::Run(run.0)),
+            Admission::Created(run) => {
+                crate::record_path_filter_note(
+                    db,
+                    clock,
+                    &run,
+                    &ir,
+                    "cron",
+                    &ctx,
+                    &event.changed_paths(),
+                )
+                .await;
+                Ok(FireOutcome::Run(run.0))
+            }
             // Recorded by admission, except a branch-scoped Environment that
             // does not admit the default branch, which is the rule working.
             Admission::Refused(_) => Ok(FireOutcome::Refused),

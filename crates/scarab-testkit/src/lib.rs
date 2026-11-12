@@ -3606,9 +3606,46 @@ pub struct FakeForge {
     /// When set, `read_file_at_ref` fails with this [`Api`](ForgeError::Api)
     /// error (a timeout or a `5xx`, not "no such file").
     read_error: Mutex<Option<String>>,
+    /// What [`pull_request_files`](ForgePort::pull_request_files) answers,
+    /// per pull request number. A number with no entry answers
+    /// `Unsupported`; `Err` answers that [`Api`](ForgeError::Api) error.
+    pr_files: Mutex<HashMap<u64, Result<Option<Vec<String>>, String>>>,
+    /// How many `pull_request_files` calls were made: a Pipeline that does not
+    /// read `event.changed_paths` must cost none.
+    pr_files_calls: Mutex<usize>,
+    /// How long `pull_request_files` takes to answer: a slow forge.
+    pr_files_delay: Mutex<Option<std::time::Duration>>,
 }
 
 impl FakeForge {
+    /// Seed the paths pull request `number` changes.
+    pub fn set_pr_files(&self, number: u64, paths: &[&str]) {
+        self.pr_files.lock().unwrap().insert(
+            number,
+            Ok(Some(paths.iter().map(|p| p.to_string()).collect())),
+        );
+    }
+
+    /// Make pull request `number`'s files answer as the forge does past
+    /// [`CHANGED_PATHS_MAX`](scarab_forge::CHANGED_PATHS_MAX) (`Ok(None)`), or
+    /// fail with `error`.
+    pub fn set_pr_files_unknown(&self, number: u64, error: Option<&str>) {
+        self.pr_files
+            .lock()
+            .unwrap()
+            .insert(number, error.map_or(Ok(None), |e| Err(e.to_string())));
+    }
+
+    /// Make `pull_request_files` take `delay` before it answers.
+    pub fn set_pr_files_delay(&self, delay: std::time::Duration) {
+        *self.pr_files_delay.lock().unwrap() = Some(delay);
+    }
+
+    /// How many `pull_request_files` calls were made.
+    pub fn pr_files_calls(&self) -> usize {
+        *self.pr_files_calls.lock().unwrap()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -4149,6 +4186,24 @@ pub fn fake_commit_sha(r#ref: &str) -> String {
 
 #[async_trait]
 impl ForgePort for FakeForge {
+    async fn pull_request_files(
+        &self,
+        _repo: &RepoRef,
+        number: u64,
+    ) -> Result<Option<Vec<String>>, ForgeError> {
+        self.check_rate_limit()?;
+        *self.pr_files_calls.lock().unwrap() += 1;
+        let delay = *self.pr_files_delay.lock().unwrap();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        match self.pr_files.lock().unwrap().get(&number) {
+            Some(Ok(paths)) => Ok(paths.clone()),
+            Some(Err(e)) => Err(ForgeError::Api(e.clone())),
+            None => Err(ForgeError::Unsupported("listing pull request files".into())),
+        }
+    }
+
     async fn default_branch(&self, _repo: &RepoRef) -> Result<String, ForgeError> {
         self.check_rate_limit()?;
         let name = self.default_branch.lock().unwrap().clone();

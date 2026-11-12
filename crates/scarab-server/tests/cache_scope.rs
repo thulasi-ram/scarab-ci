@@ -63,6 +63,7 @@ fn push(branch: &str) -> Event {
         r#ref: format!("refs/heads/{branch}"),
         after: "1234567890abcdef1234567890abcdef12345678".into(),
         message: "subject".into(),
+        changed_paths: Default::default(),
     }
 }
 

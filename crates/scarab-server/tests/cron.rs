@@ -83,6 +83,7 @@ impl H {
             r#ref: format!("refs/heads/{branch}"),
             after: sha.into(),
             message: String::new(),
+            changed_paths: Default::default(),
         };
         let files = schedules::read_pipeline_files(self.forge.as_ref(), &repo(), sha)
             .await

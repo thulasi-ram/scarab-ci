@@ -195,6 +195,7 @@ async fn world_with(pipeline: &str) -> Option<World> {
         r#ref: "refs/heads/main".into(),
         after: SHA.into(),
         message: "bump payments-api".into(),
+        changed_paths: Default::default(),
     };
     let ports = AdmissionPorts {
         plugins: Some(pg.as_ref()),
