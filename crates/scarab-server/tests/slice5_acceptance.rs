@@ -133,7 +133,11 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
         },
     )
     .expect("the build library compiles");
-    let lib_step = &ir.steps[0];
+    let lib_step = ir.steps.iter().find(|s| s.id == "image/image").unwrap();
+    assert!(
+        !lib_step.registry_auth,
+        "the build Step holds no credential"
+    );
     let build_step = StepRun::new(run.clone(), StepId("image/image".into()));
     let build_spec = scarab_engine::StepSpec {
         image: lib_step.image.clone(),

@@ -9895,50 +9895,116 @@ mod tests {
         );
     }
 
-    /// `libs/build.yaml` installs and compiles; its Step is `image/image`,
-    /// runs in the sandbox with the registry credential, takes every input
-    /// through env, exposes the `image` result, and gets the invoke's
-    /// placement profiles.
+    /// `libs/build.yaml` installs and compiles to two Steps: `image/image`
+    /// builds in the sandbox and holds no registry credential, and
+    /// `image/push` needs it, holds the credential, has no sandbox and runs
+    /// as root (crane's image has no other user). Both take every input
+    /// through env; the invoke exposes both results; a list of placement
+    /// profiles reaches both Steps and a map routes each list to its Step.
     #[test]
-    fn the_build_library_compiles_with_a_sandbox_and_the_registry_credential() {
+    fn the_build_library_compiles_to_a_credential_free_build_and_a_push() {
         check_installed_library("thulasi-ram/build", BUILD_LIBRARY, &BTreeMap::new())
             .expect("libs/build.yaml installs");
-        let ir = compile_with_libraries(
-            r#"
-            on: { push: {} }
+        let compile = |placement: &str| {
+            compile_with_libraries(
+                &format!(
+                    r#"
+            on: {{ push: {{}} }}
             steps:
-              - { id: src, image: busybox, command: [echo] }
+              - {{ id: src, image: busybox, command: [echo] }}
               - id: image
                 invoke: lib:thulasi-ram/build
                 needs: [src]
-                placement_profiles: [arm64]
+                placement_profiles: {placement}
                 with:
-                  image: "registry.example/app:${{ event.sha }}"
+                  image: "registry.example/app:${{{{ event.sha }}}}"
                   push: "true"
                   build_args: "A=1\nB_2=two words\n"
-                  cache: registry
-                  cache_ref: registry.example/app-cache:main
+                  cache: s3
+                  cache_bucket: acme-cache
+                  cache_region: ap-south-1
               - id: deploy
                 image: busybox
                 needs: [image]
-                env: [[IMG, "${{ outputs.image.image }}"]]
-            "#,
-            &with_build_library(),
-        )
-        .unwrap();
-        let step = ir.steps.iter().find(|s| s.id == "image/image").unwrap();
-        assert_eq!(step.sandbox(), Some(Sandbox::RootlessBuildkit));
-        assert!(step.registry_auth);
-        assert!(step.from_installed_library());
+                env:
+                  - [BUILT, "${{{{ outputs.image.image }}}}"]
+                  - [PUSHED, "${{{{ outputs.image.push }}}}"]
+            "#
+                ),
+                &with_build_library(),
+            )
+            .unwrap()
+        };
+        let ir = compile("[arm64]");
+        let step = |id: &str| ir.steps.iter().find(|s| s.id == id).unwrap().clone();
+        let (build, push) = (step("image/image"), step("image/push"));
+        assert_eq!(build.sandbox(), Some(Sandbox::RootlessBuildkit));
+        assert!(!build.registry_auth, "the build Step holds no credential");
+        assert!(push.registry_auth);
+        assert_eq!(push.sandbox(), None);
+        assert!(push.security.as_ref().is_some_and(|s| s.run_as_root));
+        assert_eq!(push.needs.0, vec!["image/image".to_string()]);
+        assert_eq!(build.needs.0, vec!["src".to_string()]);
+        for s in [&build, &push] {
+            assert!(s.from_installed_library());
+            assert!(s.image.contains("@sha256:"), "{}", s.image);
+            assert!(
+                s.command.iter().all(|c| !c.contains("${{")),
+                "no input in the command of {}",
+                s.id
+            );
+            assert_eq!(
+                s.placement_profiles,
+                vec!["arm64"],
+                "a per-architecture build runs on the profile its invoke names"
+            );
+        }
+        assert!(push
+            .image
+            .starts_with("gcr.io/go-containerregistry/crane:debug@sha256:"));
+        let mut needs = step("deploy").needs.0;
+        needs.sort();
         assert_eq!(
-            step.placement_profiles,
-            vec!["arm64".to_string()],
-            "a per-architecture build runs on the profile its invoke names"
+            needs,
+            ["image/image", "image/push"],
+            "a reader of both outputs needs both Steps"
         );
-        assert!(step.image.contains("@sha256:"), "{}", step.image);
-        assert!(
-            step.command.iter().all(|c| !c.contains("${{")),
-            "no input in the command"
+
+        let ir = compile("{ image: [arm64-builders, build-cache], push: [ecr-push] }");
+        let step = |id: &str| ir.steps.iter().find(|s| s.id == id).unwrap().clone();
+        assert_eq!(
+            step("image/image").placement_profiles,
+            vec!["arm64-builders", "build-cache"]
+        );
+        assert_eq!(step("image/push").placement_profiles, vec!["ecr-push"]);
+    }
+
+    /// The build library never asks BuildKit for an insecure entitlement:
+    /// `security.insecure` (a RUN with every capability) needs
+    /// `--allow-insecure-entitlement` on buildkitd and `--allow` on
+    /// buildctl, and a Dockerfile RUN would then be root in the build Pod.
+    /// Only the push Step asks for the registry credential.
+    #[test]
+    fn the_build_library_asks_for_no_insecure_entitlement_and_one_credential() {
+        for word in ["security.insecure", "--allow", "allow-insecure-entitlement"] {
+            assert!(
+                !BUILD_LIBRARY.contains(word),
+                "libs/build.yaml mentions {word}"
+            );
+        }
+        let lib: PipelineIr = serde_yaml::from_str(BUILD_LIBRARY).unwrap();
+        let by_id = |id: &str| lib.steps.iter().find(|s| s.id == id).unwrap();
+        assert!(!by_id("image").registry_auth);
+        assert_eq!(by_id("image").sandbox(), Some(Sandbox::RootlessBuildkit));
+        assert!(by_id("push").registry_auth);
+        assert_eq!(by_id("push").sandbox(), None);
+        assert_eq!(
+            lib.steps
+                .iter()
+                .filter(|s| s.registry_auth || s.sandbox().is_some())
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            ["image", "push"]
         );
     }
 
@@ -10200,7 +10266,8 @@ mod tests {
             refused("build_args", args);
         }
         refused("cache", "gha");
-        refused("cache_ref", "registry.example/c:1,mode=max");
+        // A registry cache needs the push credential in the build Step.
+        refused("cache", "registry");
         refused("cache_bucket", "b,ucket");
         refused("cache_region", "us-east-1,x");
         refused("cache_name", "n,ame");
@@ -10236,7 +10303,7 @@ mod tests {
         }
     }
 
-    // Attack: a branch name (git allows `,` and `=`) templated into the build library's `image` and `cache_ref` adds buildctl output options when the Step launches. Safe outcome: the rendered value fails the input's `validate:` rule and the launch is refused; a plain branch renders.
+    // Attack: a branch name (git allows `,` and `=`) templated into the build library's `image` and `cache_name` adds buildctl output options to the build Step, or crane arguments to the push Step, when it launches. Safe outcome: the rendered value fails the input's `validate:` rule and the launch of either Step is refused; a plain branch renders.
     #[test]
     fn the_build_library_refuses_a_branch_name_that_adds_buildctl_options_at_launch() {
         let ir = compile_with_libraries(
@@ -10247,14 +10314,17 @@ mod tests {
                 invoke: lib:thulasi-ram/build
                 with:
                   image: "registry.example/app:${{ event.branch }}"
-                  cache: registry
-                  cache_ref: "registry.example/cache:${{ event.branch }}"
+                  push: "true"
+                  cache: s3
+                  cache_bucket: acme-cache
+                  cache_region: ap-south-1
+                  cache_name: "app/${{ event.branch }}"
             "#,
             &with_build_library(),
         )
         .unwrap();
-        let step = ir.steps.iter().find(|s| s.id == "image/image").unwrap();
-        let launch = |branch: &str| {
+        let launch = |id: &str, branch: &str| {
+            let step = ir.steps.iter().find(|s| s.id == id).unwrap();
             let event = json!({ "branch": branch });
             render(
                 Templates {
@@ -10273,19 +10343,24 @@ mod tests {
             )
             .map(|r| r.env.into_iter().collect::<BTreeMap<_, _>>())
         };
-        for branch in [
-            "main,push=true",
-            "main,registry.insecure=true",
-            "main,mode=max",
-            "a b",
-            "main\n--opt",
-            "x=y",
-        ] {
-            assert!(launch(branch).is_err(), "{branch:?} rendered");
+        for id in ["image/image", "image/push"] {
+            for branch in [
+                "main,push=true",
+                "main,registry.insecure=true",
+                "main,mode=max",
+                "a b",
+                "main\n--opt",
+                "x=y",
+            ] {
+                assert!(launch(id, branch).is_err(), "{id}: {branch:?} rendered");
+            }
         }
-        let env = launch("main").unwrap();
+        let env = launch("image/image", "main").unwrap();
         assert_eq!(env["SCARAB_BUILD_IMAGE"], "registry.example/app:main");
-        assert_eq!(env["SCARAB_BUILD_CACHE_REF"], "registry.example/cache:main");
+        assert_eq!(env["SCARAB_BUILD_CACHE_NAME"], "app/main");
+        let env = launch("image/push", "main").unwrap();
+        assert_eq!(env["SCARAB_BUILD_IMAGE"], "registry.example/app:main");
+        assert_eq!(env["SCARAB_BUILD_PUSH"], "true");
     }
 
     /// No Pipeline or library Step may set the env Scarab uses to tell a

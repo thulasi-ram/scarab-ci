@@ -11,25 +11,59 @@
 #       image: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/app:${{ event.sha }}
 #       push: true
 #
-# Its one Step is `image/image`, and `${{ outputs.image.image }}` reads what
-# buildctl wrote with `--metadata-file` (the pushed digest is
-# `containerimage.digest`).
+# It has two Steps, and `needs: [image]` reaches the second:
 #
-# The Step asks for `security: { sandbox: rootless-buildkit }`, which Run
-# creation admits only when the org trusts this file's source for the
-# sandbox, and for `registry_auth: true`: Scarab mounts the Run's registry
-# credential (the REGISTRY_AUTH secret at Repo scope, then Org scope, else the
-# forge's own registry credential when the org trusts this source with forge
-# credentials) at /scarab/registry/config.json and points DOCKER_CONFIG at it.
-# A fork pull request gets no registry credential, and Scarab tells the
-# Step it runs for one with SCARAB_FORK_PR=true: the script then neither
-# pushes nor exports the layer cache, whatever the inputs say (it still
-# imports the cache). Without SCARAB_FORK_PR it does the same.
+#   image/image  builds. It asks for `security: { sandbox: rootless-buildkit }`,
+#                which Run creation admits only when the org trusts this
+#                file's source for the sandbox. It holds no registry
+#                credential: BuildKit runs with --oci-worker-no-process-sandbox,
+#                so a Dockerfile RUN shares buildkitd's PID namespace and could
+#                read anything the Step holds. When the image is to be pushed
+#                it writes the image as an OCI image layout at
+#                /workspace/.scarab-build/oci, which reaches the push Step
+#                through the workspace (a large image costs Data Depot
+#                transfer). Otherwise it keeps the image in BuildKit.
+#   image/push   pushes the layout with crane. It asks for `registry_auth: true`:
+#                Scarab mounts the Run's registry credential (the REGISTRY_AUTH
+#                secret at Repo scope, then Org scope, else the forge's own
+#                registry credential when the org trusts this source with
+#                forge credentials) at /scarab/registry/config.json and points
+#                DOCKER_CONFIG at it, when the org trusts this source with the
+#                registry credential. It runs no code from the repository, and
+#                it removes the layout, so later Steps do not receive it.
 #
-# Every input reaches the script through an environment variable, never the
-# command. The script resolves the context and the Dockerfile with realpath
-# and refuses (exit 2) anything outside /workspace, so a symlink committed in
-# the repository cannot point BuildKit at the mounted credential.
+# Outputs:
+#   ${{ outputs.image.image }}  what buildctl wrote with `--metadata-file`; its
+#                               `containerimage.digest` is the digest of the
+#                               image built, and of the image pushed, since
+#                               crane pushes the layout's manifest unchanged.
+#   ${{ outputs.image.push }}   only when the image was pushed:
+#                               {"ref": "<repository>@sha256:…", "digest":
+#                               "sha256:…"}, as crane reported the push.
+#
+# A fork pull request gets no registry credential, and Scarab tells both Steps
+# they run for one with SCARAB_FORK_PR=true: the build Step then exports no
+# layer cache and writes no layout, and the push Step pushes nothing, whatever
+# the inputs say. A missing SCARAB_FORK_PR is treated the same way.
+#
+# Every input reaches the scripts through an environment variable, never the
+# command. The build Step resolves the context and the Dockerfile with
+# realpath and refuses (exit 2) anything outside /workspace. The push Step
+# refuses (exit 2) a layout that resolves outside /workspace or holds a
+# symlink, or anything else that is not a regular file or a directory: a
+# Step before it, or a Dockerfile RUN, could plant a symlink to
+# /scarab/registry/config.json, and crane would upload its target as a blob.
+#
+# The layer cache is `none` or `s3`. A registry cache is not offered: writing
+# one needs the push credential in the build Step. S3 is reached with the
+# build Pod's own identity (a placement profile's ServiceAccount, for
+# example); Scarab passes no credential.
+#
+# Placement: an invoke's `placement_profiles` list reaches both Steps. A map
+# routes profiles per Step, so a profile that logs in to the registry reaches
+# only the push Step:
+#
+#     placement_profiles: { image: [arm64-builders, build-cache], push: [ecr-push] }
 #
 # Inputs:
 #   image       the reference to build, e.g. ghcr.io/acme/app:1.2.0
@@ -40,11 +74,9 @@
 #               push over plain HTTP, to a registry with no TLS (default
 #               false); for a test or development registry only
 #   build_args  one KEY=VALUE per line, each passed as a build argument
-#   cache       the layer cache: none, registry or s3 (default none)
-#   cache_ref   for cache: registry, the image reference that holds the cache
+#   cache       the layer cache: none or s3 (default none)
 #   cache_bucket, cache_region, cache_name
-#               for cache: s3, where the cache is kept; S3 is reached with the
-#               Pod's own AWS identity, Scarab passes no credential
+#               for cache: s3, where the cache is kept
 kind: library
 interface:
   inputs:
@@ -82,16 +114,10 @@ interface:
       description: build arguments, one KEY=VALUE per line, with no "," in a value
     - name: cache
       type: choice
-      options: [none, registry, s3]
+      options: [none, s3]
       required: false
       default: none
       description: where BuildKit imports and exports its layer cache
-    - name: cache_ref
-      type: string
-      required: false
-      default: ""
-      validate: 'value == "" || value.matches("^[a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$")'
-      description: for cache registry, the image reference that holds the cache
     - name: cache_bucket
       type: string
       required: false
@@ -110,12 +136,11 @@ interface:
       default: ""
       validate: 'value.matches("^[A-Za-z0-9._/-]*$")'
       description: for cache s3, the cache's name in the bucket (BuildKit's default when empty)
-  outputs: [image]
+  outputs: [image, push]
 steps:
   - id: image
     image: moby/buildkit:rootless@sha256:5987568f92dafbfb679879de59c1cd8d26597f5f6635c314e166164e2615870c
     security: { sandbox: rootless-buildkit }
-    registry_auth: true
     env:
       # Rootless buildkitd cannot use the process sandbox.
       - [BUILDKITD_FLAGS, --oci-worker-no-process-sandbox]
@@ -123,10 +148,8 @@ steps:
       - [SCARAB_BUILD_CONTEXT, "${{ inputs.context }}"]
       - [SCARAB_BUILD_DOCKERFILE, "${{ inputs.dockerfile }}"]
       - [SCARAB_BUILD_PUSH, "${{ inputs.push }}"]
-      - [SCARAB_BUILD_INSECURE_PUSH, "${{ inputs.insecure_push }}"]
       - [SCARAB_BUILD_ARGS, "${{ inputs.build_args }}"]
       - [SCARAB_BUILD_CACHE, "${{ inputs.cache }}"]
-      - [SCARAB_BUILD_CACHE_REF, "${{ inputs.cache_ref }}"]
       - [SCARAB_BUILD_CACHE_BUCKET, "${{ inputs.cache_bucket }}"]
       - [SCARAB_BUILD_CACHE_REGION, "${{ inputs.cache_region }}"]
       - [SCARAB_BUILD_CACHE_NAME, "${{ inputs.cache_name }}"]
@@ -150,6 +173,10 @@ steps:
         cd "$root" || fail "cannot enter the workspace at $root"
         resolve . || fail "cannot resolve the workspace at $root"
         root=$r
+        # The push Step reads the image from here. Whatever an earlier Step
+        # left at this path (a symlink included) is removed first; rm does
+        # not follow a symlink it removes.
+        rm -rf ./.scarab-build
         ctx=${SCARAB_BUILD_CONTEXT-}
         df=${SCARAB_BUILD_DOCKERFILE-}
         [ -n "$ctx" ] || fail "no build context"
@@ -177,18 +204,13 @@ steps:
           true | false) ;;
           *) fail "push must be true or false, not $push" ;;
         esac
-        insecure=${SCARAB_BUILD_INSECURE_PUSH-false}
-        case "$insecure" in
-          true | false) ;;
-          *) fail "insecure_push must be true or false, not $insecure" ;;
-        esac
         # Scarab sets SCARAB_FORK_PR on every launch of this Step; a value
         # other than `false` (none included) is a fork pull request's build,
-        # which never pushes or writes the shared cache.
+        # which never writes the shared cache and is never pushed.
         fork=true
         [ "${SCARAB_FORK_PR-}" = false ] && fork=false
         if [ "$fork" = true ]; then
-          [ "$push" = false ] || echo "scarab: a fork pull request's build does not push" >&2
+          [ "$push" = false ] || echo "scarab: a fork pull request's build is not pushed" >&2
           push=false
         fi
         set -- build --frontend dockerfile.v0 \
@@ -209,15 +231,6 @@ steps:
         EOF
         case "${SCARAB_BUILD_CACHE-none}" in
           none | "") ;;
-          registry)
-            ref=${SCARAB_BUILD_CACHE_REF-}
-            case "$ref" in
-              "") fail "cache registry needs cache_ref" ;;
-              -* | *,*) fail "cache_ref $ref is not an image reference" ;;
-            esac
-            set -- "$@" --import-cache "type=registry,ref=$ref"
-            [ "$fork" = true ] || set -- "$@" --export-cache "type=registry,ref=$ref,mode=max"
-            ;;
           s3)
             bucket=${SCARAB_BUILD_CACHE_BUCKET-}
             region=${SCARAB_BUILD_CACHE_REGION-}
@@ -232,16 +245,127 @@ steps:
             set -- "$@" --import-cache "$s3"
             [ "$fork" = true ] || set -- "$@" --export-cache "$s3,mode=max"
             ;;
-          *) fail "cache must be none, registry or s3" ;;
+          *) fail "cache must be none or s3" ;;
         esac
-        output="type=image,name=$image,push=$push"
-        if [ "$push" = true ] && [ "$insecure" = true ]; then
-          output="$output,registry.insecure=true"
+        # An image to push leaves this Step as an OCI image layout in the
+        # workspace; one that is not pushed stays in BuildKit, so it costs no
+        # workspace transfer. Both use OCI media types.
+        if [ "$push" = true ]; then
+          mkdir ./.scarab-build
+          set -- "$@" --output "type=oci,dest=$root/.scarab-build/oci,tar=false"
+        else
+          set -- "$@" --output "type=image,name=$image,push=false,oci-mediatypes=true"
         fi
-        set -- "$@" --output "$output"
         # The digest is the Step's `image` result when Scarab collects
         # results (/scarab/results exists).
         if [ -d /scarab/results ]; then
           set -- "$@" --metadata-file /scarab/results/image.json
         fi
         exec /usr/bin/buildctl-daemonless.sh "$@"
+  - id: push
+    image: gcr.io/go-containerregistry/crane:debug@sha256:e78770b31258a3846f878036d9c1f63fbe4c871f9f56990bf77fd95c013e3c1b
+    needs: [image]
+    registry_auth: true
+    # The image runs as uid 0 and has no non-root user; the Step runs no
+    # repository code, and the baseline's dropped capabilities still apply.
+    security: { run_as_root: true }
+    env:
+      - [SCARAB_BUILD_IMAGE, "${{ inputs.image }}"]
+      - [SCARAB_BUILD_PUSH, "${{ inputs.push }}"]
+      - [SCARAB_BUILD_INSECURE_PUSH, "${{ inputs.insecure_push }}"]
+    command:
+      - /busybox/sh
+      - -c
+      - |
+        set -eu
+        root=/workspace
+        fail() { echo "scarab: push refused: $*" >&2; exit 2; }
+        nl='
+        '
+        resolve() {
+          r=$(realpath "$1" && echo .) || return 1
+          r=${r%.}
+          r=${r%"$nl"}
+        }
+        inside() {
+          case "$1" in
+            "$root" | "$root"/*) return 0 ;;
+            *) return 1 ;;
+          esac
+        }
+        [ -d "$root" ] || fail "no workspace at $root"
+        cd "$root" || fail "cannot enter the workspace at $root"
+        resolve . || fail "cannot resolve the workspace at $root"
+        root=$r
+        image=${SCARAB_BUILD_IMAGE-}
+        push=${SCARAB_BUILD_PUSH-false}
+        insecure=${SCARAB_BUILD_INSECURE_PUSH-false}
+        case "$image" in
+          "" | -* | *,*) fail "image $image is not an image reference" ;;
+        esac
+        case "$push" in
+          true | false) ;;
+          *) fail "push must be true or false, not $push" ;;
+        esac
+        case "$insecure" in
+          true | false) ;;
+          *) fail "insecure_push must be true or false, not $insecure" ;;
+        esac
+        # The layout is the build's output for this Step alone: it is removed
+        # whenever this Step succeeds, so later Steps do not receive it. rm
+        # removes a symlink at .scarab-build, never its target. A layout that
+        # cannot be removed is reported and does not fail a push that worked.
+        clean() {
+          rm -rf ./.scarab-build ||
+            echo "scarab: could not remove .scarab-build; later steps receive it" >&2
+        }
+        if [ "$push" = false ]; then
+          clean
+          echo "scarab: push is false; nothing is pushed"
+          exit 0
+        fi
+        # Scarab sets SCARAB_FORK_PR on every launch of this Step; a value
+        # other than `false` (none included) is a fork pull request's build.
+        if [ "${SCARAB_FORK_PR-}" != false ]; then
+          clean
+          echo "scarab: a fork pull request's build is not pushed"
+          exit 0
+        fi
+        # Steps before this one ran repository code in this workspace, and
+        # so did the Dockerfile. crane would upload what a symlink in the
+        # layout points at (/scarab/registry/config.json, for one), so the
+        # layout must be plain directories and regular files, inside the
+        # workspace.
+        [ ! -L ./.scarab-build ] && [ -d ./.scarab-build ] ||
+          fail ".scarab-build is not a directory the build step wrote"
+        [ ! -L ./.scarab-build/oci ] && [ -d ./.scarab-build/oci ] ||
+          fail "no image layout at .scarab-build/oci"
+        resolve ./.scarab-build/oci || fail "cannot resolve the image layout"
+        inside "$r" || fail "the image layout resolves outside the workspace"
+        layout=$r
+        odd=$(find "$layout" ! -type f ! -type d | head -n 1)
+        [ -z "$odd" ] ||
+          fail "the image layout holds $odd, which is not a regular file or a directory"
+        set -- push "$layout" "$image"
+        [ "$insecure" = false ] || set -- "$@" --insecure
+        ref=$(crane "$@")
+        digest=${ref##*@}
+        hex=${digest#sha256:}
+        case "$ref$digest" in
+          *[!A-Za-z0-9._:/@-]*) echo "scarab: crane reported $ref" >&2; exit 1 ;;
+        esac
+        case "$digest" in
+          sha256:*) ;;
+          *) echo "scarab: crane reported $ref, with no digest" >&2; exit 1 ;;
+        esac
+        case "$hex" in
+          *[!0-9a-f]*) echo "scarab: crane reported $ref" >&2; exit 1 ;;
+        esac
+        [ "${#hex}" -eq 64 ] || { echo "scarab: crane reported $ref" >&2; exit 1; }
+        echo "scarab: pushed $ref"
+        # The pushed reference is the Step's `push` result when Scarab
+        # collects results (/scarab/results exists).
+        if [ -d /scarab/results ]; then
+          printf '{"ref":"%s","digest":"%s"}' "$ref" "$digest" > /scarab/results/push.json
+        fi
+        clean

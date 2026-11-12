@@ -1,5 +1,7 @@
 //! ADR-0018 (amendment of 2026-11-12): the build library and the two
-//! primitives it uses.
+//! primitives it uses. The library has two Steps: `image/image` builds in
+//! the sandbox and holds no registry credential, and `image/push` pushes
+//! with `registry_auth: true` and no sandbox.
 //!
 //! - `security: { sandbox: rootless-buildkit }` is admitted at Run creation
 //!   only when the library that defines the Step is installed from a source
@@ -145,8 +147,9 @@ async fn trigger(db: &dyn Db, libs: &InMemoryLibraries, event: &Event) -> Trigge
     .unwrap()
 }
 
-async fn stored(db: &InMemoryDb, run: &RunId) -> StepSpec {
-    db.step_spec(run, &StepId("image/image".into()))
+/// The stored spec of the build library's Step `id` (`image` or `push`).
+async fn stored(db: &InMemoryDb, run: &RunId, id: &str) -> StepSpec {
+    db.step_spec(run, &StepId(format!("image/{id}")))
         .await
         .unwrap()
         .expect("the build library's Step")
@@ -180,7 +183,7 @@ async fn run_create_admits_the_sandbox_only_from_a_source_trusted_for_it() {
     let libs = build_library(&[TrustGrant::BuildSandbox]).await;
     let out = trigger(&db, &libs, &push()).await;
     assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
-    let spec = stored(&db, &out.runs[0]).await;
+    let spec = stored(&db, &out.runs[0], "image").await;
     assert_eq!(
         spec.sandbox,
         Some(SandboxConfig {
@@ -190,9 +193,17 @@ async fn run_create_admits_the_sandbox_only_from_a_source_trusted_for_it() {
         })
     );
     assert!(spec.placement_profiles.is_empty());
-    // Trust for the sandbox does not trust the library with forge
-    // credentials: no forge-derived registry credential.
-    let auth = spec.registry_auth.expect("registry_auth");
+    assert_eq!(
+        spec.registry_auth, None,
+        "the build Step holds no credential"
+    );
+    // The push Step runs no sandbox. Trust for the sandbox does not trust
+    // the library with forge credentials: no forge-derived registry
+    // credential.
+    let push = stored(&db, &out.runs[0], "push").await;
+    assert_eq!(push.sandbox, None);
+    assert!(push.run_as_root);
+    let auth = push.registry_auth.expect("registry_auth");
     assert_eq!((auth.library, auth.forge_library), (None, None));
     assert!(!auth.locked_out);
     assert_eq!((auth.owner.as_str(), auth.name.as_str()), ("acme", "web"));
@@ -208,22 +219,33 @@ async fn forge_credentials_reach_registry_auth_only_by_their_own_grant_and_never
     let db = InMemoryDb::new();
     let out = trigger(&db, &libs, &push()).await;
     assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
-    let auth = stored(&db, &out.runs[0]).await.registry_auth.unwrap();
+    let auth = stored(&db, &out.runs[0], "push")
+        .await
+        .registry_auth
+        .unwrap();
     assert_eq!((auth.library, auth.forge_library), (None, None));
 
     trust(&libs, TrustGrant::RegistryCredential).await;
     let db = InMemoryDb::new();
     let out = trigger(&db, &libs, &push()).await;
     assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
-    let auth = stored(&db, &out.runs[0]).await.registry_auth.unwrap();
+    let auth = stored(&db, &out.runs[0], "push")
+        .await
+        .registry_auth
+        .unwrap();
     assert_eq!(auth.library, Some(content_hash(BUILD)));
     assert_eq!(auth.forge_library, Some(content_hash(BUILD)));
     assert!(!auth.locked_out);
+    // Every grant given, the build Step still holds no credential.
+    assert_eq!(stored(&db, &out.runs[0], "image").await.registry_auth, None);
 
     let db = InMemoryDb::new();
     let out = trigger(&db, &libs, &fork_pr()).await;
     assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
-    let auth = stored(&db, &out.runs[0]).await.registry_auth.unwrap();
+    let auth = stored(&db, &out.runs[0], "push")
+        .await
+        .registry_auth
+        .unwrap();
     assert!(
         auth.locked_out,
         "a fork pull request gets no registry credential"
@@ -234,10 +256,11 @@ async fn forge_credentials_reach_registry_auth_only_by_their_own_grant_and_never
 // Launch
 // ---------------------------------------------------------------------------
 
-fn step_run() -> StepRun {
+/// Run `r1`'s build library Step `id` (`image` or `push`), running.
+fn step_run(id: &str) -> StepRun {
     StepRun {
         run: RunId("r1".into()),
-        step: StepId("image/image".into()),
+        step: StepId(format!("image/{id}")),
         status: StepStatus::Running,
         attempts: vec![Attempt {
             id: AttemptId("a1".into()),
@@ -251,9 +274,9 @@ fn step_run() -> StepRun {
     }
 }
 
-/// What Run creation stores for the build library's Step, trusted with
-/// forge credentials when `forge_library`.
-fn library_spec(forge_library: bool) -> StepSpec {
+/// What Run creation stores for the build library's build Step: the
+/// sandbox, and no registry credential.
+fn build_spec() -> StepSpec {
     StepSpec {
         image: "moby/buildkit:rootless@sha256:abc".into(),
         command: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
@@ -272,15 +295,7 @@ fn library_spec(forge_library: bool) -> StepSpec {
             org: "acme".into(),
             library: content_hash(BUILD),
         }),
-        registry_auth: Some(RegistryAuthConfig {
-            owner: "acme".into(),
-            name: "web".into(),
-            locked_out: false,
-            library: Some(content_hash(BUILD)),
-            forge_library: forge_library.then(|| content_hash(BUILD)),
-            registry_auth_json: None,
-            derived_auth: None,
-        }),
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -292,6 +307,28 @@ fn library_spec(forge_library: bool) -> StepSpec {
         uses: Vec::new(),
         matrix_values: Default::default(),
         scope: None,
+    }
+}
+
+/// What Run creation stores for the build library's push Step, trusted
+/// with forge credentials when `forge_library`: the registry credential,
+/// and no sandbox.
+fn push_spec(forge_library: bool) -> StepSpec {
+    StepSpec {
+        image: "gcr.io/go-containerregistry/crane:debug@sha256:abc".into(),
+        command: vec!["/busybox/sh".into(), "-c".into(), "exit 0".into()],
+        run_as_root: true,
+        sandbox: None,
+        registry_auth: Some(RegistryAuthConfig {
+            owner: "acme".into(),
+            name: "web".into(),
+            locked_out: false,
+            library: Some(content_hash(BUILD)),
+            forge_library: forge_library.then(|| content_hash(BUILD)),
+            registry_auth_json: None,
+            derived_auth: None,
+        }),
+        ..build_spec()
     }
 }
 
@@ -351,7 +388,7 @@ async fn a_launch_is_refused_once_the_sandbox_trust_is_revoked() {
     let libs = Arc::new(build_library(&[TrustGrant::BuildSandbox]).await);
     let inner = Arc::new(FakeExecutor::new());
     let exec = executor(inner.clone(), libs.clone(), FakeSecrets::new(), false).await;
-    exec.launch(&step_run(), &library_spec(false))
+    exec.launch(&step_run("image"), &build_spec())
         .await
         .expect("trusted for the sandbox: launches");
 
@@ -363,7 +400,7 @@ async fn a_launch_is_refused_once_the_sandbox_trust_is_revoked() {
     let inner = Arc::new(FakeExecutor::new());
     let exec = executor(inner.clone(), libs, FakeSecrets::new(), false).await;
     let err = exec
-        .launch(&step_run(), &library_spec(false))
+        .launch(&step_run("image"), &build_spec())
         .await
         .unwrap_err()
         .to_string();
@@ -387,7 +424,7 @@ async fn registry_auth_resolves_the_secret_and_the_forge_credential_only_by_trus
     let inner = Arc::new(FakeExecutor::new());
     let exec = executor(inner.clone(), libs.clone(), repo_secret(), false).await;
     let handle = exec
-        .launch(&step_run(), &library_spec(false))
+        .launch(&step_run("push"), &push_spec(false))
         .await
         .unwrap();
     let auth = inner.launched_spec(&handle).unwrap().registry_auth.unwrap();
@@ -404,7 +441,7 @@ async fn registry_auth_resolves_the_secret_and_the_forge_credential_only_by_trus
     let inner = Arc::new(FakeExecutor::new());
     let exec = executor(inner.clone(), libs.clone(), FakeSecrets::new(), false).await;
     let handle = exec
-        .launch(&step_run(), &library_spec(false))
+        .launch(&step_run("push"), &push_spec(false))
         .await
         .unwrap();
     let auth = inner.launched_spec(&handle).unwrap().registry_auth.unwrap();
@@ -413,7 +450,10 @@ async fn registry_auth_resolves_the_secret_and_the_forge_credential_only_by_trus
     // Admitted as trusted, but the trust is gone by this launch.
     let inner = Arc::new(FakeExecutor::new());
     let exec = executor(inner.clone(), libs.clone(), FakeSecrets::new(), false).await;
-    let handle = exec.launch(&step_run(), &library_spec(true)).await.unwrap();
+    let handle = exec
+        .launch(&step_run("push"), &push_spec(true))
+        .await
+        .unwrap();
     let auth = inner.launched_spec(&handle).unwrap().registry_auth.unwrap();
     assert_eq!(auth.derived_auth, None);
 
@@ -421,7 +461,10 @@ async fn registry_auth_resolves_the_secret_and_the_forge_credential_only_by_trus
     trust(&libs, TrustGrant::ForgeCredentials).await;
     let inner = Arc::new(FakeExecutor::new());
     let exec = executor(inner.clone(), libs, FakeSecrets::new(), false).await;
-    let handle = exec.launch(&step_run(), &library_spec(true)).await.unwrap();
+    let handle = exec
+        .launch(&step_run("push"), &push_spec(true))
+        .await
+        .unwrap();
     let auth = inner.launched_spec(&handle).unwrap().registry_auth.unwrap();
     assert_eq!(
         auth.derived_auth.map(|c| (c.registry, c.token)),
@@ -442,7 +485,10 @@ async fn a_fork_pull_request_gets_no_registry_credential_at_launch() {
     );
     let inner = Arc::new(FakeExecutor::new());
     let exec = executor(inner.clone(), libs.clone(), repo_secret(), true).await;
-    let handle = exec.launch(&step_run(), &library_spec(true)).await.unwrap();
+    let handle = exec
+        .launch(&step_run("push"), &push_spec(true))
+        .await
+        .unwrap();
     let auth = inner.launched_spec(&handle).unwrap().registry_auth.unwrap();
     assert_eq!((auth.registry_auth_json, auth.derived_auth), (None, None));
     assert!(auth.locked_out);
@@ -450,9 +496,9 @@ async fn a_fork_pull_request_gets_no_registry_credential_at_launch() {
     // The stored lock alone refuses it too.
     let inner = Arc::new(FakeExecutor::new());
     let exec = executor(inner.clone(), libs, repo_secret(), false).await;
-    let mut spec = library_spec(true);
+    let mut spec = push_spec(true);
     spec.registry_auth.as_mut().unwrap().locked_out = true;
-    let handle = exec.launch(&step_run(), &spec).await.unwrap();
+    let handle = exec.launch(&step_run("push"), &spec).await.unwrap();
     let auth = inner.launched_spec(&handle).unwrap().registry_auth.unwrap();
     assert_eq!((auth.registry_auth_json, auth.derived_auth), (None, None));
 }
@@ -472,7 +518,10 @@ async fn the_registry_auth_secret_takes_precedence_and_a_run_with_no_repository_
     );
     let inner = Arc::new(FakeExecutor::new());
     let exec = executor(inner.clone(), libs.clone(), repo_secret(), false).await;
-    let handle = exec.launch(&step_run(), &library_spec(true)).await.unwrap();
+    let handle = exec
+        .launch(&step_run("push"), &push_spec(true))
+        .await
+        .unwrap();
     let auth = inner.launched_spec(&handle).unwrap().registry_auth.unwrap();
     assert_eq!(
         auth.registry_auth_json.as_deref().map(str::as_bytes),
@@ -482,11 +531,11 @@ async fn the_registry_auth_secret_takes_precedence_and_a_run_with_no_repository_
 
     let inner = Arc::new(FakeExecutor::new());
     let exec = executor(inner.clone(), libs, repo_secret(), false).await;
-    let mut spec = library_spec(true);
+    let mut spec = push_spec(true);
     let config = spec.registry_auth.as_mut().unwrap();
     config.owner = String::new();
     config.name = String::new();
-    let handle = exec.launch(&step_run(), &spec).await.unwrap();
+    let handle = exec.launch(&step_run("push"), &spec).await.unwrap();
     let auth = inner.launched_spec(&handle).unwrap().registry_auth.unwrap();
     assert_eq!((auth.registry_auth_json, auth.derived_auth), (None, None));
 }
@@ -508,7 +557,7 @@ async fn a_launch_after_the_registry_credential_trust_is_revoked_gets_no_credent
     let inner = Arc::new(FakeExecutor::new());
     let exec = executor(inner.clone(), libs, repo_secret(), false).await;
     let handle = exec
-        .launch(&step_run(), &library_spec(false))
+        .launch(&step_run("push"), &push_spec(false))
         .await
         .unwrap();
     let auth = inner.launched_spec(&handle).unwrap().registry_auth.unwrap();
@@ -701,7 +750,7 @@ async fn the_registry_auth_secret_does_not_reach_a_step_written_in_the_pipeline_
     let exec = executor(inner.clone(), Arc::new(libs), repo_secret(), false).await;
     let step = StepRun {
         step: leak,
-        ..step_run()
+        ..step_run("push")
     };
     let handle = exec.launch(&step, &spec).await.unwrap();
     let launched = inner.launched_spec(&handle).unwrap();
@@ -712,59 +761,59 @@ async fn the_registry_auth_secret_does_not_reach_a_step_written_in_the_pipeline_
     );
 }
 
-// Attack: a fork pull request, whose Pipeline is read at the PR head, calls the build library with `push: true` (to a registry that takes anonymous pushes, or one a placement profile's init container logs in to). The removed `build` kind forced `push` off for a fork. Safe outcome: the Step launches with SCARAB_FORK_PR=true, which the library's script reads to neither push nor export its cache (`a_fork_pull_request_build_neither_pushes_nor_exports_the_cache` in scarab-executor-k8s); the rendered `push` input stays what the caller wrote, so the decision is Scarab's, not the Pipeline's.
+// Attack: a fork pull request, whose Pipeline is read at the PR head, calls the build library with `push: true` (to a registry that takes anonymous pushes, or one a placement profile's init container logs in to). The removed `build` kind forced `push` off for a fork. Safe outcome: both Steps launch with SCARAB_FORK_PR=true, which the build Step reads to write no layout and export no cache, and the push Step reads to push nothing (`the_build_step_writes_a_layout_only_for_a_push_and_never_for_a_fork` and `the_push_step_does_not_push_when_not_asked_or_for_a_fork` in scarab-executor-k8s); the rendered `push` input stays what the caller wrote, so the decision is Scarab's, not the Pipeline's.
 #[tokio::test]
 async fn a_fork_pull_request_build_does_not_push() {
-    let libs = build_library(&[TrustGrant::BuildSandbox]).await;
-    let db = InMemoryDb::new();
-    let out = trigger(&db, &libs, &fork_pr()).await;
-    assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
-    let step = StepId("image/image".into());
-    let spec = stored(&db, &out.runs[0]).await;
-    let rendered = scarab_engine::render::render_launch_spec(&db, &out.runs[0], &step, spec)
-        .await
-        .unwrap()
-        .expect("the fork's build Step renders");
     let env = |spec: &StepSpec, name: &str| {
         spec.env
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, value)| value.clone())
     };
+    for id in ["image", "push"] {
+        let libs = build_library(&[TrustGrant::BuildSandbox]).await;
+        let db = InMemoryDb::new();
+        let out = trigger(&db, &libs, &fork_pr()).await;
+        assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
+        let step = StepId(format!("image/{id}"));
+        let spec = stored(&db, &out.runs[0], id).await;
+        let rendered = scarab_engine::render::render_launch_spec(&db, &out.runs[0], &step, spec)
+            .await
+            .unwrap()
+            .expect("the fork's Step renders");
+        assert_eq!(env(&rendered, "SCARAB_BUILD_PUSH").as_deref(), Some("true"));
 
-    // The launch decorator, over a Run whose recorded trigger is a fork pull
-    // request: the stored lock and the trigger both say so.
-    let inner = Arc::new(FakeExecutor::new());
-    let exec = executor(inner.clone(), Arc::new(libs), FakeSecrets::new(), true).await;
-    let handle = exec.launch(&step_run(), &rendered).await.unwrap();
-    let launched = inner.launched_spec(&handle).unwrap();
-    assert_eq!(
-        env(&launched, "SCARAB_FORK_PR").as_deref(),
-        Some("true"),
-        "a fork pull request's build is not told it is one"
-    );
-    assert!(launched.registry_auth.unwrap().locked_out);
+        // The launch decorator, over a Run whose recorded trigger is a fork
+        // pull request: the stored lock and the trigger both say so.
+        let inner = Arc::new(FakeExecutor::new());
+        let exec = executor(inner.clone(), Arc::new(libs), FakeSecrets::new(), true).await;
+        let handle = exec.launch(&step_run(id), &rendered).await.unwrap();
+        let launched = inner.launched_spec(&handle).unwrap();
+        assert_eq!(
+            env(&launched, "SCARAB_FORK_PR").as_deref(),
+            Some("true"),
+            "{id}: a fork pull request's Step is not told it is one"
+        );
+        if id == "push" {
+            assert!(launched.registry_auth.unwrap().locked_out);
+        }
+    }
 
-    // A push Run's build is told it is not one, from both sources.
-    let libs = build_library(&[TrustGrant::BuildSandbox]).await;
-    let inner = Arc::new(FakeExecutor::new());
-    let exec = executor(inner.clone(), Arc::new(libs), FakeSecrets::new(), false).await;
-    let handle = exec
-        .launch(&step_run(), &library_spec(false))
-        .await
-        .unwrap();
-    let launched = inner.launched_spec(&handle).unwrap();
-    assert_eq!(env(&launched, "SCARAB_FORK_PR").as_deref(), Some("false"));
-
-    // A spec stored without the lock (or written by hand) is still told,
-    // from the Run's recorded trigger.
-    let libs = build_library(&[TrustGrant::BuildSandbox]).await;
-    let inner = Arc::new(FakeExecutor::new());
-    let exec = executor(inner.clone(), Arc::new(libs), FakeSecrets::new(), true).await;
-    let handle = exec
-        .launch(&step_run(), &library_spec(false))
-        .await
-        .unwrap();
-    let launched = inner.launched_spec(&handle).unwrap();
-    assert_eq!(env(&launched, "SCARAB_FORK_PR").as_deref(), Some("true"));
+    // A push Run's Steps are told they are not one, and a spec stored
+    // without the lock (or written by hand) is still told, from the Run's
+    // recorded trigger.
+    for (id, spec) in [("image", build_spec()), ("push", push_spec(false))] {
+        for fork in [false, true] {
+            let libs = build_library(&[TrustGrant::BuildSandbox]).await;
+            let inner = Arc::new(FakeExecutor::new());
+            let exec = executor(inner.clone(), Arc::new(libs), FakeSecrets::new(), fork).await;
+            let handle = exec.launch(&step_run(id), &spec).await.unwrap();
+            let launched = inner.launched_spec(&handle).unwrap();
+            assert_eq!(
+                env(&launched, "SCARAB_FORK_PR").as_deref(),
+                Some(if fork { "true" } else { "false" }),
+                "{id} fork={fork}"
+            );
+        }
+    }
 }

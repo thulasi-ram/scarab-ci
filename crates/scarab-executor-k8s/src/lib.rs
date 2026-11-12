@@ -7669,21 +7669,10 @@ mod tests {
         );
     }
 
-    /// The script `libs/build.yaml` runs, as the compiler hands it to the
-    /// executor, pointed at a temp workspace and a stub
-    /// `buildctl-daemonless.sh` that records its args, one per line, in
-    /// `called`. Returns the temp dir (workspace at `workspace/`, a
-    /// `registry/` beside it standing in for the credential mount) and a
-    /// runner giving `(exit code, reached buildctl)` for the given
-    /// `SCARAB_BUILD_*` values; the ones not given are the library's
-    /// defaults, with image `registry.example/app:1`.
+    /// The `/bin/sh -c` script of `libs/build.yaml`'s Step `id` (`image` or
+    /// `push`), as the compiler hands it to the executor.
     #[cfg(unix)]
-    fn build_library_harness() -> (
-        tempfile::TempDir,
-        impl Fn(&[(&str, &str)]) -> (Option<i32>, bool),
-    ) {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn build_library_script(id: &str) -> String {
         let lib = include_str!("../../../libs/build.yaml");
         let ir = scarab_pipeline::compile_with_libraries(
             "steps:\n  - id: image\n    invoke: lib:thulasi-ram/build\n    with: { image: registry.example/app:1 }\n",
@@ -7699,10 +7688,35 @@ mod tests {
             },
         )
         .unwrap();
-        let command = &ir.steps[0].command;
-        assert_eq!(command[..2], ["/bin/sh", "-c"]);
-        let script = command[2].clone();
+        let step = ir
+            .steps
+            .iter()
+            .find(|s| s.id == format!("image/{id}"))
+            .unwrap();
+        let command = &step.command;
+        assert_eq!(command.len(), 3, "{command:?}");
+        assert!(
+            command[0].ends_with("/sh") && command[1] == "-c",
+            "{command:?}"
+        );
+        command[2].clone()
+    }
 
+    /// The build Step's script from `libs/build.yaml`, pointed at a temp
+    /// workspace and a stub `buildctl-daemonless.sh` that records its args,
+    /// one per line, in `called`. Returns the temp dir (workspace at
+    /// `workspace/`, a `registry/` beside it standing in for a credential
+    /// mount) and a runner giving `(exit code, reached buildctl)` for the
+    /// given `SCARAB_BUILD_*` values; the ones not given are the library's
+    /// defaults, with image `registry.example/app:1`.
+    #[cfg(unix)]
+    fn build_library_harness() -> (
+        tempfile::TempDir,
+        impl Fn(&[(&str, &str)]) -> (Option<i32>, bool),
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = build_library_script("image");
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().canonicalize().unwrap();
         let ws = base.join("workspace");
@@ -7737,7 +7751,6 @@ mod tests {
             for (name, value) in [
                 ("SCARAB_BUILD_IMAGE", "registry.example/app:1"),
                 ("SCARAB_BUILD_PUSH", "false"),
-                ("SCARAB_BUILD_INSECURE_PUSH", "false"),
                 ("SCARAB_BUILD_CONTEXT", "."),
                 ("SCARAB_BUILD_DOCKERFILE", "Dockerfile"),
                 ("SCARAB_BUILD_ARGS", ""),
@@ -7799,7 +7812,7 @@ mod tests {
             "filename=Dockerfile",
             "build-arg:A=1",
             "build-arg:B=two words",
-            "type=image,name=registry.example/app:1,push=false",
+            "type=image,name=registry.example/app:1,push=false,oci-mediatypes=true",
         ] {
             assert!(called.contains(&want), "{want}: {called:?}");
         }
@@ -7916,97 +7929,293 @@ mod tests {
         assert_eq!(at("a b", "-f"), (Some(0), true));
     }
 
-    /// A fork pull request's build (SCARAB_FORK_PR=true, which Scarab sets on
-    /// every launch of a sandboxed Step, or any value but `false`) does
-    /// not push, whatever `push` says, and imports the layer cache without
-    /// exporting it.
+    /// The build Step writes an image to push as an OCI layout at
+    /// `.scarab-build/oci` in the workspace, after removing whatever an
+    /// earlier Step left there (a symlink included, never its target). A
+    /// fork pull request's build (SCARAB_FORK_PR=true, which Scarab sets on
+    /// every launch of the Step, or any value but `false`) writes no layout,
+    /// whatever `push` says, and imports the layer cache without exporting
+    /// it. An image not pushed stays in BuildKit.
     #[cfg(unix)]
     #[test]
-    fn a_fork_pull_request_build_neither_pushes_nor_exports_the_cache() {
+    fn the_build_step_writes_a_layout_only_for_a_push_and_never_for_a_fork() {
+        use std::os::unix::fs::symlink;
+
         let (tmp, run) = build_library_harness();
-        let called = || std::fs::read_to_string(tmp.path().join("called")).unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let ws = base.join("workspace");
+        let called = || std::fs::read_to_string(base.join("called")).unwrap();
+        let s3 = [
+            ("SCARAB_BUILD_CACHE", "s3"),
+            ("SCARAB_BUILD_CACHE_BUCKET", "acme-cache"),
+            ("SCARAB_BUILD_CACHE_REGION", "ap-south-1"),
+        ];
+        let import = "type=s3,region=ap-south-1,bucket=acme-cache";
+        let kept = "type=image,name=registry.example/app:1,push=false,oci-mediatypes=true";
         for fork in ["true", ""] {
-            for (cache, import) in [
-                ("registry", "type=registry,ref=registry.example/cache:main"),
-                ("s3", "type=s3,region=ap-south-1,bucket=acme-cache"),
-            ] {
-                assert_eq!(
-                    run(&[
-                        ("SCARAB_FORK_PR", fork),
-                        ("SCARAB_BUILD_PUSH", "true"),
-                        ("SCARAB_BUILD_CACHE", cache),
-                        ("SCARAB_BUILD_CACHE_REF", "registry.example/cache:main"),
-                        ("SCARAB_BUILD_CACHE_BUCKET", "acme-cache"),
-                        ("SCARAB_BUILD_CACHE_REGION", "ap-south-1"),
-                    ]),
-                    (Some(0), true),
-                    "fork={fork:?} cache={cache}"
-                );
-                let argv = called();
-                let argv: Vec<&str> = argv.lines().collect();
-                assert!(
-                    argv.contains(&"type=image,name=registry.example/app:1,push=false"),
-                    "fork={fork:?}: {argv:?}"
-                );
-                assert!(argv.contains(&import), "fork={fork:?}: {argv:?}");
-                assert!(
-                    !argv.contains(&"--export-cache"),
-                    "fork={fork:?} exports the cache: {argv:?}"
-                );
-            }
+            symlink(base.join("registry"), ws.join(".scarab-build")).unwrap();
+            let mut given = vec![("SCARAB_FORK_PR", fork), ("SCARAB_BUILD_PUSH", "true")];
+            given.extend(s3);
+            assert_eq!(run(&given), (Some(0), true), "fork={fork:?}");
+            let argv = called();
+            let argv: Vec<&str> = argv.lines().collect();
+            assert!(argv.contains(&kept), "fork={fork:?}: {argv:?}");
+            assert!(argv.contains(&import), "fork={fork:?}: {argv:?}");
+            assert!(
+                !argv.contains(&"--export-cache"),
+                "fork={fork:?} exports the cache: {argv:?}"
+            );
+            assert!(
+                std::fs::symlink_metadata(ws.join(".scarab-build")).is_err(),
+                "fork={fork:?}: the planted symlink is removed"
+            );
+            assert!(
+                base.join("registry/config.json").exists(),
+                "never its target"
+            );
         }
-        // Not a fork: it pushes and exports.
-        assert_eq!(
-            run(&[
-                ("SCARAB_BUILD_PUSH", "true"),
-                ("SCARAB_BUILD_CACHE", "registry"),
-                ("SCARAB_BUILD_CACHE_REF", "registry.example/cache:main"),
-            ]),
-            (Some(0), true)
-        );
+        // Not a fork, pushing: the layout and the cache export.
+        let mut given = vec![("SCARAB_BUILD_PUSH", "true")];
+        given.extend(s3);
+        assert_eq!(run(&given), (Some(0), true));
         let argv = called();
-        assert!(argv.contains("push=true"), "{argv}");
-        assert!(argv.contains("--export-cache"), "{argv}");
+        let argv: Vec<&str> = argv.lines().collect();
+        let layout = format!("type=oci,dest={}/.scarab-build/oci,tar=false", ws.display());
+        assert!(argv.contains(&layout.as_str()), "{argv:?}");
+        assert!(argv.contains(&"--export-cache"), "{argv:?}");
+        assert!(ws.join(".scarab-build").is_dir());
+        assert!(
+            !argv.iter().any(|a| a.starts_with("type=image")),
+            "{argv:?}"
+        );
+        // Not pushing: no layout.
+        assert_eq!(run(&s3), (Some(0), true));
+        assert!(called().lines().any(|a| a == kept));
+        assert!(!ws.join(".scarab-build").exists());
+        // A registry cache is gone: it needs the push credential here.
+        assert_eq!(run(&[("SCARAB_BUILD_CACHE", "registry")]), (Some(2), false));
     }
 
-    /// `insecure_push` adds `registry.insecure=true` to the output only when
-    /// the image is pushed, and anything but `true` or `false` is refused.
+    /// The push Step's script from `libs/build.yaml`, pointed at a temp
+    /// workspace holding the layout the build Step writes, a temp results
+    /// directory, and a stub `crane` that records its args, one per line, in
+    /// `called` and prints the reference crane prints. Returns the temp dir
+    /// (workspace at `workspace/`, results at `results/`, a `registry/`
+    /// beside them standing in for the credential mount) and a runner giving
+    /// `(exit code, reached crane)` for the given values; the ones not given
+    /// push `registry.example/app:1` from a non-fork Run.
+    #[cfg(unix)]
+    fn push_library_harness() -> (
+        tempfile::TempDir,
+        impl Fn(&[(&str, &str)]) -> (Option<i32>, bool),
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = build_library_script("push");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let ws = base.join("workspace");
+        let results = base.join("results");
+        let outside = base.join("registry");
+        for d in [&ws, &results, &outside] {
+            std::fs::create_dir(d).unwrap();
+        }
+        std::fs::write(outside.join("config.json"), "{}").unwrap();
+        let record = base.join("called");
+        let stub = base.join("crane");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho registry.example/app@sha256:{}\n",
+                record.display(),
+                "ab".repeat(32)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pinned = format!("root={WORKSPACE_MOUNT_PATH}\n");
+        let crane = "ref=$(crane \"$@\")";
+        assert!(script.contains(&pinned) && script.contains(crane));
+        assert!(script.contains("/scarab/results"));
+        let script = script
+            .replace(&pinned, &format!("root='{}'\n", ws.display()))
+            .replace(crane, &format!("ref=$('{}' \"$@\")", stub.display()))
+            .replace("/scarab/results", &results.display().to_string());
+        let run = move |given: &[(&str, &str)]| {
+            let _ = std::fs::remove_file(&record);
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.args(["-c", &script, "scarab-push"]).current_dir(&base);
+            for (name, value) in [
+                ("SCARAB_BUILD_IMAGE", "registry.example/app:1"),
+                ("SCARAB_BUILD_PUSH", "true"),
+                ("SCARAB_BUILD_INSECURE_PUSH", "false"),
+                ("SCARAB_FORK_PR", "false"),
+            ] {
+                cmd.env(name, value);
+            }
+            for (name, value) in given {
+                cmd.env(name, value);
+            }
+            let out = cmd.output().unwrap();
+            (out.status.code(), record.exists())
+        };
+        (tmp, run)
+    }
+
+    /// Writes the layout the build Step leaves in `ws`: plain directories
+    /// and regular files.
+    #[cfg(unix)]
+    fn write_layout(ws: &std::path::Path) {
+        let blobs = ws.join(".scarab-build/oci/blobs/sha256");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(ws.join(".scarab-build/oci/ingest")).unwrap();
+        std::fs::write(ws.join(".scarab-build/oci/oci-layout"), "{}").unwrap();
+        std::fs::write(ws.join(".scarab-build/oci/index.json"), "{}").unwrap();
+        std::fs::write(blobs.join("ab".repeat(32)), "{}").unwrap();
+    }
+
+    /// The push Step pushes the layout to the image with crane, writes the
+    /// pushed reference as its `push` result, and removes the layout so
+    /// later Steps do not receive it. `insecure_push` adds `--insecure`,
+    /// and anything but `true` or `false` is refused.
     #[cfg(unix)]
     #[test]
-    fn the_build_library_pushes_insecurely_only_when_asked() {
-        let (tmp, run) = build_library_harness();
-        let called = || std::fs::read_to_string(tmp.path().join("called")).unwrap();
-        let output = |push: &str, insecure: &str| {
-            assert_eq!(
-                run(&[
-                    ("SCARAB_BUILD_PUSH", push),
-                    ("SCARAB_BUILD_INSECURE_PUSH", insecure),
-                ]),
-                (Some(0), true),
-                "push={push} insecure={insecure}"
-            );
-            called()
-                .lines()
-                .find(|l| l.starts_with("type=image,"))
-                .unwrap()
-                .to_string()
-        };
+    fn the_push_step_pushes_the_layout_and_reports_the_digest() {
+        let (tmp, run) = push_library_harness();
+        let base = tmp.path().canonicalize().unwrap();
+        let ws = base.join("workspace");
+        let called = || std::fs::read_to_string(base.join("called")).unwrap();
+
+        write_layout(&ws);
+        assert_eq!(run(&[]), (Some(0), true));
+        let layout = ws.join(".scarab-build/oci").display().to_string();
         assert_eq!(
-            output("true", "true"),
-            "type=image,name=registry.example/app:1,push=true,registry.insecure=true"
+            called().lines().collect::<Vec<_>>(),
+            ["push", layout.as_str(), "registry.example/app:1"]
         );
+        let result: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(base.join("results/push.json")).unwrap())
+                .unwrap();
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        assert_eq!(result["digest"], digest.as_str());
         assert_eq!(
-            output("true", "false"),
-            "type=image,name=registry.example/app:1,push=true"
+            result["ref"],
+            format!("registry.example/app@{digest}").as_str()
         );
+        assert!(!ws.join(".scarab-build").exists(), "the layout is removed");
+
+        write_layout(&ws);
         assert_eq!(
-            output("false", "true"),
-            "type=image,name=registry.example/app:1,push=false"
+            run(&[("SCARAB_BUILD_INSECURE_PUSH", "true")]),
+            (Some(0), true)
         );
+        assert_eq!(called().lines().last(), Some("--insecure"));
+        write_layout(&ws);
         assert_eq!(
             run(&[("SCARAB_BUILD_INSECURE_PUSH", "yes")]),
             (Some(2), false)
         );
+        // No layout to push is a failure, not a silent success.
+        std::fs::remove_dir_all(ws.join(".scarab-build")).unwrap();
+        assert_eq!(run(&[]), (Some(2), false));
+    }
+
+    /// With `push: false`, or for a fork pull request (SCARAB_FORK_PR is
+    /// `true`, or any value but `false`), the push Step exits 0 without
+    /// running crane, and still removes the layout.
+    #[cfg(unix)]
+    #[test]
+    fn the_push_step_does_not_push_when_not_asked_or_for_a_fork() {
+        let (tmp, run) = push_library_harness();
+        let ws = tmp.path().canonicalize().unwrap().join("workspace");
+        for given in [
+            &[("SCARAB_BUILD_PUSH", "false")][..],
+            &[("SCARAB_FORK_PR", "true")][..],
+            &[("SCARAB_FORK_PR", "")][..],
+        ] {
+            write_layout(&ws);
+            assert_eq!(run(given), (Some(0), false), "{given:?}");
+            assert!(!ws.join(".scarab-build").exists(), "{given:?}");
+        }
+    }
+
+    // Attack: a Step before the push Step (or a Dockerfile RUN, which shares the build Pod) plants a symlink in the layout, or replaces the layout or its directory with a symlink, pointing at the credential mount, so crane uploads /scarab/registry/config.json as a blob; or plants a FIFO that hangs crane. Safe outcome: exit 2 before crane runs, and the credential file is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn the_push_step_refuses_a_layout_with_a_symlink_or_outside_the_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, run) = push_library_harness();
+        let base = tmp.path().canonicalize().unwrap();
+        let ws = base.join("workspace");
+        let secret = base.join("registry/config.json");
+        let blobs = ws.join(".scarab-build/oci/blobs/sha256");
+        let reset = || {
+            let _ = std::fs::remove_file(ws.join(".scarab-build"));
+            let _ = std::fs::remove_dir_all(ws.join(".scarab-build"));
+            write_layout(&ws);
+        };
+        let plants: [(&str, Box<dyn Fn()>); 6] = [
+            (
+                "a blob that links to the credential",
+                Box::new(|| symlink(&secret, blobs.join("cd".repeat(32))).unwrap()),
+            ),
+            (
+                "index.json that links to the credential",
+                Box::new(|| {
+                    std::fs::remove_file(ws.join(".scarab-build/oci/index.json")).unwrap();
+                    symlink(
+                        "../../../registry/config.json",
+                        ws.join(".scarab-build/oci/index.json"),
+                    )
+                    .unwrap();
+                }),
+            ),
+            (
+                "a blobs directory that links out",
+                Box::new(|| {
+                    std::fs::remove_dir_all(ws.join(".scarab-build/oci/blobs")).unwrap();
+                    symlink(base.join("registry"), ws.join(".scarab-build/oci/blobs")).unwrap();
+                }),
+            ),
+            (
+                "an oci directory that links out",
+                Box::new(|| {
+                    std::fs::remove_dir_all(ws.join(".scarab-build/oci")).unwrap();
+                    symlink(base.join("registry"), ws.join(".scarab-build/oci")).unwrap();
+                }),
+            ),
+            (
+                ".scarab-build linking outside the workspace",
+                Box::new(|| {
+                    std::fs::remove_dir_all(ws.join(".scarab-build")).unwrap();
+                    let out = base.join("elsewhere");
+                    let _ = std::fs::remove_dir_all(&out);
+                    write_layout(&out);
+                    symlink(out.join(".scarab-build"), ws.join(".scarab-build")).unwrap();
+                }),
+            ),
+            (
+                "a FIFO in the layout",
+                Box::new(|| {
+                    let fifo = blobs.join("ef".repeat(32));
+                    let ok = std::process::Command::new("mkfifo")
+                        .arg(&fifo)
+                        .status()
+                        .unwrap()
+                        .success();
+                    assert!(ok, "mkfifo");
+                }),
+            ),
+        ];
+        for (what, plant) in &plants {
+            reset();
+            plant();
+            assert_eq!(run(&[]), (Some(2), false), "{what}");
+            assert_eq!(std::fs::read_to_string(&secret).unwrap(), "{}", "{what}");
+        }
+        reset();
+        assert_eq!(run(&[]), (Some(0), true), "the clean layout pushes");
     }
 
     #[test]
