@@ -12,7 +12,7 @@
 //! token) and the clone library installed from its source on the in-cluster
 //! Forgejo (deploy/kind/libs.sh), with that source trusted:
 //!
-//! - `ci` clones the private repository through `lib:thulasi-ram/clone` and a
+//! - `ci` clones the private repository through `lib:thulasi-ram::scarab-ci::clone` and a
 //!   later Step reads a file from it;
 //! - `own` asks for `forge_token` in its own Step and is refused at creation;
 //! - `sub` clones with submodules, and its submodule (another private repo on
@@ -101,7 +101,7 @@ async fn a_private_repo_clones_with_the_forge_token_and_nothing_else_gets_it() {
         .as_array()
         .into_iter()
         .flatten()
-        .find(|i| i["publisher"] == "thulasi-ram" && i["name"] == "clone")
+        .find(|i| i["name"] == "thulasi-ram::scarab-ci::clone")
         .cloned()
         .unwrap_or_else(|| panic!("clone is not installed: {libs:#}"));
     assert_eq!(clone["content_hash"], clone_hash.as_str(), "{clone:#}");

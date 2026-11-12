@@ -431,14 +431,14 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "NG",
     ),
     (
-        "PUT",
-        "/v1/orgs/{org}/libraries/{publisher}/{name}",
+        "POST",
+        "/v1/orgs/{org}/library-installations",
         "library.install",
         "CJ-W",
     ),
     (
         "DELETE",
-        "/v1/orgs/{org}/libraries/{publisher}/{name}",
+        "/v1/orgs/{org}/library-installations/{id}",
         "library.remove",
         "EX",
     ),
@@ -1099,8 +1099,8 @@ fn well_formed(r: &scarab_server::RouteEntry) -> (String, Option<Value>) {
         ),
         ("POST", "/v1/connections/{id}/repos") => Some(json!({"owner": "acme", "name": "web"})),
         ("PUT", "/v1/connections/{id}/org") => Some(json!({"org": "acme"})),
-        ("PUT", "/v1/orgs/{org}/libraries/{publisher}/{name}") => {
-            Some(json!({"content_hash": "a".repeat(64)}))
+        ("POST", "/v1/orgs/{org}/library-installations") => {
+            Some(json!({"name": "acme::libs::deploy", "content_hash": "a".repeat(64)}))
         }
         ("POST", "/v1/orgs/{org}/environments/{env}/duplicate") => {
             Some(json!({"name": "prod-copy"}))

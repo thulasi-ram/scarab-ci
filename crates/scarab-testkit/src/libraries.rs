@@ -17,9 +17,9 @@ use scarab_policy::library::{
 struct State {
     /// (org, hash) → version.
     versions: BTreeMap<(String, String), LibraryVersion>,
-    /// (org, publisher, name) → the installation's id and the installation,
-    /// without the version's fields.
-    installations: BTreeMap<(String, String, String), (String, NewInstallation)>,
+    /// (org, name) → the installation's id and the installation, without the
+    /// version's fields.
+    installations: BTreeMap<(String, String), (String, NewInstallation)>,
     /// How many ids were minted: the next id is this, in 10 hex. Postgres
     /// mints random ids; a fake needs only distinct ones.
     minted: u64,
@@ -37,7 +37,6 @@ impl State {
         LibraryInstallation {
             id: id.clone(),
             org: i.org.clone(),
-            publisher: i.publisher.clone(),
             name: i.name.clone(),
             content_hash: i.content_hash.clone(),
             source: v.source.clone(),
@@ -94,7 +93,7 @@ impl LibraryStore for InMemoryLibraries {
         {
             return Err(LibraryStoreError::UnknownVersion(new.content_hash.clone()));
         }
-        let key = (new.org.clone(), new.publisher.clone(), new.name.clone());
+        let key = (new.org.clone(), new.name.clone());
         let current = st
             .installations
             .get(&key)
@@ -124,13 +123,12 @@ impl LibraryStore for InMemoryLibraries {
     async fn installation(
         &self,
         org: &str,
-        publisher: &str,
         name: &str,
     ) -> Result<Option<LibraryInstallation>, LibraryStoreError> {
         let st = self.state.lock().unwrap();
         Ok(st
             .installations
-            .get(&(org.to_string(), publisher.to_string(), name.to_string()))
+            .get(&(org.to_string(), name.to_string()))
             .map(|i| st.full(i)))
     }
 
@@ -142,7 +140,7 @@ impl LibraryStore for InMemoryLibraries {
         Ok(st
             .installations
             .iter()
-            .filter(|((o, _, _), _)| o == org)
+            .filter(|((o, _), _)| o == org)
             .map(|(_, i)| st.full(i))
             .collect())
     }
@@ -155,11 +153,11 @@ impl LibraryStore for InMemoryLibraries {
         Ok(st
             .installations
             .iter()
-            .filter(|((o, _, _), _)| o == org)
-            .map(|((_, p, n), (_, i))| {
+            .filter(|((o, _), _)| o == org)
+            .map(|((_, n), (_, i))| {
                 let v = &st.versions[&(i.org.clone(), i.content_hash.clone())];
                 (
-                    format!("{p}/{n}"),
+                    n.clone(),
                     InstalledLibrary {
                         content: v.content.clone(),
                         source: v.source.clone(),
@@ -172,13 +170,15 @@ impl LibraryStore for InMemoryLibraries {
     async fn remove(
         &self,
         org: &str,
-        publisher: &str,
-        name: &str,
+        id: &str,
     ) -> Result<Option<LibraryInstallation>, LibraryStoreError> {
         let mut st = self.state.lock().unwrap();
-        let removed =
-            st.installations
-                .remove(&(org.to_string(), publisher.to_string(), name.to_string()));
+        let key = st
+            .installations
+            .iter()
+            .find(|((o, _), (i, _))| o == org && i == id)
+            .map(|(k, _)| k.clone());
+        let removed = key.and_then(|k| st.installations.remove(&k));
         Ok(removed.map(|i| st.full(&i)))
     }
 

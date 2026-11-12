@@ -79,7 +79,7 @@ describe("invocation groups", () => {
 
   it("lays out each invocation as one unit, its Steps inside, nested for an inner one", () => {
     const steps = [
-      { id: "checkout/git", needs: [], origin: [lib("thulasi-ram/clone", "c")] },
+      { id: "checkout/git", needs: [], origin: [lib("thulasi-ram::scarab-ci::clone", "c")] },
       { id: "test", needs: ["checkout/git"] },
       { id: "build", needs: ["checkout/git"] },
       { id: "ship/render", needs: ["test", "build"], origin: [lib("acme/deploy-helm", "d")] },

@@ -68,7 +68,6 @@ function Review(props: { org: string }) {
     source: one(search.source),
     ref: one(search.ref),
     connection: one(search.connection),
-    publisher: one(search.publisher),
     name: one(search.name),
   }));
   const request = createMemo(() => {
@@ -89,7 +88,8 @@ function Review(props: { org: string }) {
     setInstalling(true);
     setError(null);
     try {
-      const done = await installLibrary(props.org, f.publisher, f.name, {
+      const done = await installLibrary(props.org, {
+        name: f.name,
         content_hash: f.content_hash,
         replaces: f.current?.content_hash ?? null,
       });
@@ -117,9 +117,8 @@ function Review(props: { org: string }) {
   };
   const title = () => {
     const f = fetched();
-    const p = f?.publisher || form().publisher;
     const n = f?.name || form().name;
-    return p && n ? `lib:${p}/${n}` : "Review a library";
+    return n ? `lib:${n}` : "Review a library";
   };
   /** The branch, tag or commit the URL asks for. */
   const askedRef = () => form().ref.trim() || splitSource(form().source).ref;
@@ -172,7 +171,7 @@ function Review(props: { org: string }) {
             </div>
             <dl class="kv">
               <dt>Library</dt>
-              <dd class="m">{title().startsWith("lib:") ? title() : "the repository owner / the file name"}</dd>
+              <dd class="m">{title().startsWith("lib:") ? title() : "<owner>::<repo>::<file name>"}</dd>
               <dt>Source</dt>
               <dd class="m">{fetched()?.source ?? form().source}</dd>
               <Show when={askedRef() && !isFullCommit(askedRef())}>

@@ -969,7 +969,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/orgs/{org}/libraries/{publisher}/{name}": {
+    "/v1/orgs/{org}/library-installations": {
         parameters: {
             query?: never;
             header?: never;
@@ -977,11 +977,10 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
+        put?: never;
         /** Install or upgrade a library (ADR-0076 §4) */
-        put: operations["install_library"];
-        post?: never;
-        /** Remove an installed library (ADR-0076 §4) */
-        delete: operations["remove_library"];
+        post: operations["install_library"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -998,7 +997,8 @@ export interface paths {
         get: operations["get_library_installation"];
         put?: never;
         post?: never;
-        delete?: never;
+        /** Remove an installed library (ADR-0076 §4) */
+        delete: operations["remove_library"];
         options?: never;
         head?: never;
         patch?: never;
@@ -3083,7 +3083,7 @@ export interface components {
              *     `other`.
              */
             kind: string;
-            /** @description For a library Step: the library (`<publisher>/<name>` or a path). */
+            /** @description For a library Step: the library (its installed name or a path). */
             library?: string | null;
             /** @description For a library Step: its id inside the library. */
             library_step?: string | null;
@@ -3606,10 +3606,13 @@ export interface components {
              *     anonymously over https.
              */
             connection?: string | null;
-            /** @description Defaults to the file name without its extension. */
+            /**
+             * @description The library name, as `invoke: lib:<name>` will write it: parts of
+             *     letters, digits, `.`, `_` and `-`, joined by `::` or `/`, each part
+             *     starting with a letter, digit or `_`. Defaults to
+             *     `<owner>::<repo>::<file name without its extension>`.
+             */
             name?: string | null;
-            /** @description Defaults to the source's owner. */
-            publisher?: string | null;
             /**
              * @description A branch, tag or commit, for a `source` with no `@<commit>`. Scarab
              *     reads the file at the commit it points to now; the stored version and
@@ -3677,7 +3680,6 @@ export interface components {
              */
             diff: string;
             name: string;
-            publisher: string;
             source: string;
         };
         /** @description A plugin manifest read for review. Nothing is stored or installed. */
@@ -3865,6 +3867,8 @@ export interface components {
         InstallLibraryRequest: {
             /** @description A version fetched into this org. */
             content_hash: string;
+            /** @description The library name to install under, as `invoke: lib:<name>` writes it. */
+            name: string;
             /** @description The hash installed now (an upgrade), or omitted for a first install. */
             replaces?: string | null;
         };
@@ -3920,8 +3924,8 @@ export interface components {
             /** Format: int64 */
             installed_at: number;
             installed_by: string;
+            /** @description The library name, as `invoke: lib:<name>` writes it. */
             name: string;
-            publisher: string;
             source: string;
             yanked?: null | components["schemas"]["LibraryYankDto"];
         };
@@ -3929,9 +3933,8 @@ export interface components {
             /** @description The Runs a yank with `cancel_runs` cancelled. Omitted otherwise. */
             cancelled_runs?: string[];
             content_hash: string;
+            /** @description The library name the yanked version was fetched for. */
             name: string;
-            /** @description The library the yanked version was fetched for, `<publisher>/<name>`. */
-            publisher: string;
             reason: string;
             /** @description The git source the version was fetched from, pinned to its commit. */
             source: string;
@@ -4316,7 +4319,7 @@ export interface components {
              */
             kind: string;
             /**
-             * @description A repo-relative path (`file`), `<publisher>/<name>` (`library`) or the
+             * @description A repo-relative path (`file`), the library name (`library`) or the
              *     plugin installation and gate (`plugin`).
              */
             name: string;
@@ -5565,7 +5568,7 @@ export interface components {
         /** @description A library version a Run uses that is yanked in its org. */
         RunYankDto: {
             content_hash: string;
-            /** @description `<publisher>/<name>`. */
+            /** @description The library name, as `invoke: lib:<name>` writes it. */
             name: string;
             reason: string;
             /** @description The Steps of the Run inlined from it. */
@@ -8755,10 +8758,6 @@ export interface operations {
             path: {
                 /** @description org */
                 org: string;
-                /** @description publisher */
-                publisher: string;
-                /** @description library name */
-                name: string;
             };
             cookie?: never;
         };
@@ -8815,45 +8814,6 @@ export interface operations {
             };
         };
     };
-    remove_library: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description org */
-                org: string;
-                /** @description publisher */
-                publisher: string;
-                /** @description library name */
-                name: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description removed */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description not an org admin */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description not installed, or libraries not configured */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
     get_library_installation: {
         parameters: {
             query?: never;
@@ -8877,6 +8837,43 @@ export interface operations {
                 };
             };
             /** @description no read access to the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no installation with this id in the org, or libraries not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    remove_library: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
             403: {
                 headers: {
                     [name: string]: unknown;

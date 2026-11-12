@@ -3,8 +3,9 @@
 //! **Install is two calls.** `POST …/libraries/fetch` reads the source,
 //! checks it compiles as a closed library, stores it as a LibraryVersion and
 //! returns it with the diff from the version installed under the same name.
-//! `PUT …/libraries/{publisher}/{name}` installs a stored version by hash,
-//! naming the hash it replaces, so what is installed is what the admin read.
+//! `POST …/library-installations` installs a stored version by hash under a
+//! name, naming the hash it replaces, so what is installed is what the admin
+//! read.
 //! The install needs a step-up (it loosens); the fetch installs nothing.
 //!
 //! **Private sources.** A fetch through a ForgeConnection is allowed only
@@ -25,7 +26,7 @@ use axum::{Extension, Json};
 use scarab_engine::DbError;
 use scarab_identity::Action;
 use scarab_policy::library::{
-    content_hash, valid_segment, LibraryInstallation, LibraryStore, LibraryStoreError,
+    content_hash, library_name_error, LibraryInstallation, LibraryStore, LibraryStoreError,
     LibraryVersion, LibraryYank, NewInstallation, Replaces, TrustGrant, TrustedSource,
 };
 use serde::{Deserialize, Serialize};
@@ -48,8 +49,7 @@ const MAX_REASON_BYTES: usize = 2_000;
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LibraryYankDto {
     pub content_hash: String,
-    /// The library the yanked version was fetched for, `<publisher>/<name>`.
-    pub publisher: String,
+    /// The library name the yanked version was fetched for.
     pub name: String,
     /// The git source the version was fetched from, pinned to its commit.
     pub source: String,
@@ -90,7 +90,7 @@ pub struct LibraryInstallationDto {
     /// 10 lowercase hex, minted at the first install and kept by upgrades.
     /// What the settings page's URL carries.
     pub id: String,
-    pub publisher: String,
+    /// The library name, as `invoke: lib:<name>` writes it.
     pub name: String,
     pub content_hash: String,
     pub source: String,
@@ -242,10 +242,10 @@ pub struct FetchLibraryRequest {
     /// anonymously over https.
     #[serde(default)]
     pub connection: Option<String>,
-    /// Defaults to the source's owner.
-    #[serde(default)]
-    pub publisher: Option<String>,
-    /// Defaults to the file name without its extension.
+    /// The library name, as `invoke: lib:<name>` will write it: parts of
+    /// letters, digits, `.`, `_` and `-`, joined by `::` or `/`, each part
+    /// starting with a letter, digit or `_`. Defaults to
+    /// `<owner>::<repo>::<file name without its extension>`.
     #[serde(default)]
     pub name: Option<String>,
 }
@@ -258,7 +258,6 @@ pub struct InstalledVersionDto {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct FetchedLibraryDto {
-    pub publisher: String,
     pub name: String,
     pub content_hash: String,
     pub source: String,
@@ -273,6 +272,8 @@ pub struct FetchedLibraryDto {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct InstallLibraryRequest {
+    /// The library name to install under, as `invoke: lib:<name>` writes it.
+    pub name: String,
     /// A version fetched into this org.
     pub content_hash: String,
     /// The hash installed now (an upgrade), or omitted for a first install.
@@ -339,23 +340,20 @@ fn check_hash(h: &str) -> Result<(), ApiError> {
     }
 }
 
-fn check_names(publisher: &str, name: &str) -> Result<(), ApiError> {
-    for s in [publisher, name] {
-        if !valid_segment(s) {
-            return Err(ApiError::BadRequest(format!(
-                "`{s}` is not a library publisher or name: use letters, digits, `.`, `_` and \
-                 `-`, not starting with `.` or `-`"
-            )));
-        }
+fn check_name(name: &str) -> Result<(), ApiError> {
+    match library_name_error(name) {
+        None => Ok(()),
+        Some(why) => Err(ApiError::BadRequest(format!(
+            "`{}` is not a library name: {why}",
+            name.escape_debug()
+        ))),
     }
-    Ok(())
 }
 
-/// `publisher`, `name`, `source`: of the yanked version.
-fn yank_dto(y: &LibraryYank, publisher: &str, name: &str, source: &str) -> LibraryYankDto {
+/// `name`, `source`: of the yanked version.
+fn yank_dto(y: &LibraryYank, name: &str, source: &str) -> LibraryYankDto {
     LibraryYankDto {
         content_hash: y.content_hash.clone(),
-        publisher: publisher.to_string(),
         name: name.to_string(),
         source: source.to_string(),
         reason: y.reason.clone(),
@@ -368,7 +366,6 @@ fn yank_dto(y: &LibraryYank, publisher: &str, name: &str, source: &str) -> Libra
 fn installation_dto(i: &LibraryInstallation, yanks: &[LibraryYank]) -> LibraryInstallationDto {
     LibraryInstallationDto {
         id: i.id.clone(),
-        publisher: i.publisher.clone(),
         name: i.name.clone(),
         content_hash: i.content_hash.clone(),
         source: i.source.clone(),
@@ -377,7 +374,7 @@ fn installation_dto(i: &LibraryInstallation, yanks: &[LibraryYank]) -> LibraryIn
         yanked: yanks
             .iter()
             .find(|y| y.content_hash == i.content_hash)
-            .map(|y| yank_dto(y, &i.publisher, &i.name, &i.source)),
+            .map(|y| yank_dto(y, &i.name, &i.source)),
     }
 }
 
@@ -398,7 +395,7 @@ async fn described_yank(
                 y.content_hash, y.org
             )))
         })?;
-    Ok(yank_dto(y, &v.publisher, &v.name, &v.source))
+    Ok(yank_dto(y, &v.name, &v.source))
 }
 
 /// A line diff of `old` to `new`: common lines start with a space, removed
@@ -713,16 +710,15 @@ pub(crate) async fn read_source(
     String::from_utf8(bytes).map_err(|_| ApiError::BadRequest(format!("{src} is not UTF-8")))
 }
 
-/// Checks `content` compiles as `lib:<publisher>/<name>` in `org`, in place
-/// of whatever is installed under that name.
+/// Checks `content` compiles as `lib:<name>` in `org`, in place of whatever
+/// is installed under that name.
 async fn check_compiles(
     store: &dyn LibraryStore,
     org: &str,
-    publisher: &str,
     name: &str,
     content: &str,
 ) -> Result<(), ApiError> {
-    let qualified = format!("{publisher}/{name}");
+    let qualified = name.to_string();
     let mut installed = store
         .installed_for_compile(org)
         .await
@@ -736,7 +732,7 @@ async fn check_compiles(
     .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
     checked.map_err(|d| {
         ApiError::BadRequest(format!(
-            "the file cannot be installed as `lib:{publisher}/{name}`:\n  - {}",
+            "the file cannot be installed as `lib:{name}`:\n  - {}",
             d.join("\n  - ")
         ))
     })
@@ -991,13 +987,26 @@ pub(crate) async fn fetch_library(
             unpinned.at(&commit).map_err(ApiError::BadRequest)?
         }
     };
-    let publisher = body.publisher.clone().unwrap_or_else(|| src.owner.clone());
-    let name = body.name.clone().unwrap_or_else(|| src.default_name());
-    check_names(&publisher, &name)?;
+    let name = match body.name.as_deref() {
+        Some(name) => {
+            check_name(name)?;
+            name.to_string()
+        }
+        None => {
+            let name = src.default_name();
+            if let Some(why) = library_name_error(&name) {
+                return Err(ApiError::BadRequest(format!(
+                    "the default name `{name}` (`<owner>::<repo>::<file name>`) is not a \
+                     library name ({why}); name the library with `name`"
+                )));
+            }
+            name
+        }
+    };
     let content = read_source(&st, &org, &src, body.connection.as_deref()).await?;
     super::note_org(&st, &org).await?;
     let hash = content_hash(&content);
-    check_compiles(store, &org, &publisher, &name, &content).await?;
+    check_compiles(store, &org, &name, &content).await?;
     let now = st.clock.now().await.0;
     let stored = store
         .put_version(&LibraryVersion {
@@ -1005,7 +1014,6 @@ pub(crate) async fn fetch_library(
             content_hash: hash.clone(),
             content: content.clone(),
             source: src.to_string(),
-            publisher: publisher.clone(),
             name: name.clone(),
             fetched_by: by,
             fetched_at: now,
@@ -1022,7 +1030,7 @@ pub(crate) async fn fetch_library(
         tracing::warn!(org = %org, error = %e, "pruning fetched library versions failed");
     }
     let current = store
-        .installation(&org, &publisher, &name)
+        .installation(&org, &name)
         .await
         .map_err(store_api_error)?;
     let diff = match &current {
@@ -1038,7 +1046,6 @@ pub(crate) async fn fetch_library(
         None => String::new(),
     };
     Ok(Json(FetchedLibraryDto {
-        publisher,
         name,
         content_hash: stored.content_hash,
         source: stored.source,
@@ -1051,18 +1058,13 @@ pub(crate) async fn fetch_library(
     }))
 }
 
-/// Install or upgrade `lib:<publisher>/<name>` to a fetched version. Needs a
-/// step-up: installing and upgrading loosen (ADR-0076 §4). `replaces` must
-/// be the hash installed now, or omitted when nothing is. Administer on the
-/// org.
+/// Install or upgrade `lib:<name>` to a fetched version. Needs a step-up:
+/// installing and upgrading loosen (ADR-0076 §4). `replaces` must be the
+/// hash installed now, or omitted when nothing is. Administer on the org.
 #[utoipa::path(
-    put,
-    path = "/v1/orgs/{org}/libraries/{publisher}/{name}",
-    params(
-        ("org" = String, Path, description = "org"),
-        ("publisher" = String, Path, description = "publisher"),
-        ("name" = String, Path, description = "library name")
-    ),
+    post,
+    path = "/v1/orgs/{org}/library-installations",
+    params(("org" = String, Path, description = "org")),
     request_body = InstallLibraryRequest,
     summary = "Install or upgrade a library (ADR-0076 §4)",
     responses(
@@ -1077,12 +1079,13 @@ pub(crate) async fn install_library(
     State(st): State<AppState>,
     guard: Option<Extension<GuardCtx>>,
     headers: HeaderMap,
-    Path((org, publisher, name)): Path<(String, String, String)>,
+    Path(org): Path<String>,
     Json(body): Json<InstallLibraryRequest>,
 ) -> Result<Json<LibraryInstallationDto>, ApiError> {
     let by = org_caller(&st, &headers, &org, Action::Administer).await?;
     super::refuse_reserved_org(&org, "install a library")?;
-    check_names(&publisher, &name)?;
+    let name = body.name;
+    check_name(&name)?;
     check_hash(&body.content_hash)?;
     let store = store(&st)?;
     super::note_org(&st, &org).await?;
@@ -1095,7 +1098,7 @@ pub(crate) async fn install_library(
         })?;
     // Checked again: the org's other libraries may have changed since the
     // fetch, and a version fetched under another name is installed here.
-    check_compiles(store, &org, &publisher, &name, &version.content).await?;
+    check_compiles(store, &org, &name, &version.content).await?;
     let replaces = match body.replaces {
         Some(h) => Replaces::Version(h),
         None => Replaces::Nothing,
@@ -1105,7 +1108,6 @@ pub(crate) async fn install_library(
         .install(
             &NewInstallation {
                 org: org.clone(),
-                publisher,
                 name,
                 content_hash: version.content_hash,
                 installed_by: by,
@@ -1126,32 +1128,32 @@ pub(crate) async fn install_library(
     ))
 }
 
-/// Remove an installation. Pipelines that invoke it then fail to compile,
-/// never in the middle of a Run. Removing tightens: no step-up. Administer
-/// on the org.
+/// Remove an installation, by its id. Pipelines that invoke it then fail to
+/// compile, never in the middle of a Run. Removing tightens: no step-up.
+/// Administer on the org. An id of another org's installation is not found.
 #[utoipa::path(
     delete,
-    path = "/v1/orgs/{org}/libraries/{publisher}/{name}",
+    path = "/v1/orgs/{org}/library-installations/{id}",
     params(
         ("org" = String, Path, description = "org"),
-        ("publisher" = String, Path, description = "publisher"),
-        ("name" = String, Path, description = "library name")
+        ("id" = String, Path, description = "installation id")
     ),
     summary = "Remove an installed library (ADR-0076 §4)",
     responses(
         (status = 204, description = "removed"),
         (status = 403, description = "not an org admin"),
-        (status = 404, description = "not installed, or libraries not configured")
+        (status = 404, description = "no installation with this id in the org, or libraries not configured")
     )
 )]
 pub(crate) async fn remove_library(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Path((org, publisher, name)): Path<(String, String, String)>,
+    Path((org, id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     org_caller(&st, &headers, &org, Action::Administer).await?;
-    store(&st)?
-        .remove(&org, &publisher, &name)
+    let store = store(&st)?;
+    store
+        .remove(&org, &id)
         .await
         .map_err(store_api_error)?
         .ok_or(ApiError::NotFound)?;

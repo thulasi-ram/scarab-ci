@@ -119,10 +119,10 @@ describe("review checks", () => {
     expect(inputsChange(OLD, NEW)).toBe("adds timeout; no input removed");
     expect(inputsChange(NEW, OLD)).toBe("removes timeout");
     expect(inputsChange(OLD, OLD)).toBe("no input added or removed");
-    const content = `${NEW}\n  - id: smoke\n    invoke: lib:acme/http-probe\n  - id: x\n    image: busybox\n    forge_token: true`;
-    const checks = reviewChecks(content, [{ publisher: "acme", name: "http-probe", content_hash: "2c8f61d0a9e4ffff" }]);
+    const content = `${NEW}\n  - id: smoke\n    invoke: lib:acme::scarab-libs::http-probe\n  - id: x\n    image: busybox\n    forge_token: true`;
+    const checks = reviewChecks(content, [{ name: "acme::scarab-libs::http-probe", content_hash: "2c8f61d0a9e4ffff" }]);
     expect(checks.map((c) => c.tone)).toEqual(["ok", "ok", "warn", "warn"]);
-    expect(checks[1]!.text).toBe("Invokes lib:acme/http-probe, installed here at 2c8f61d0a9e4");
+    expect(checks[1]!.text).toBe("Invokes lib:acme::scarab-libs::http-probe, installed here at 2c8f61d0a9e4");
     expect(checks[2]!.text).toBe("Not pinned by digest: busybox");
     expect(checks.at(-1)!.text).toMatch(/only if this source is trusted/);
     const clean = reviewChecks(OLD, []);
@@ -130,8 +130,8 @@ describe("review checks", () => {
   });
   it("links the review page with what is known", () => {
     expect(reviewHref("acme", {})).toBe("/orgs/acme/settings/libraries/review");
-    expect(reviewHref("acme", { source: "s@c", publisher: "acme", name: "", connection: undefined })).toBe(
-      "/orgs/acme/settings/libraries/review?source=s%40c&publisher=acme",
+    expect(reviewHref("acme", { source: "s@c", name: "acme::x", ref: "", connection: undefined })).toBe(
+      "/orgs/acme/settings/libraries/review?source=s%40c&name=acme%3A%3Ax",
     );
   });
 });

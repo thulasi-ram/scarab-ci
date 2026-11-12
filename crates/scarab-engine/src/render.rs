@@ -48,7 +48,7 @@ pub async fn render_launch_spec(
         return Ok(Err(
             "this Step has no image to run: it was stored as a `clone` Step, a kind this \
              server no longer runs (ADR-0076 §9); start a new Run, which checks out with \
-             `invoke: lib:thulasi-ram/clone`"
+             `invoke: lib:thulasi-ram::scarab-ci::clone`"
                 .to_string(),
         ));
     }

@@ -50,8 +50,14 @@ impl std::fmt::Display for LibrarySource {
     }
 }
 
+/// An owner or repository name in a source: `[A-Za-z0-9._-]`, not starting
+/// with `.` or `-`, at most 100 bytes.
 fn segment_ok(s: &str) -> bool {
-    scarab_policy::library::valid_segment(s)
+    !s.is_empty()
+        && s.len() <= 100
+        && !s.starts_with(['.', '-'])
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 fn host_ok(h: &str) -> bool {
@@ -181,12 +187,16 @@ impl LibrarySource {
         ))
     }
 
-    /// The default `<name>`: the file name without its extension.
+    /// The default library name: `<owner>::<repo>::<stem>`, the stem being
+    /// the file name without its `.yaml` or `.yml`. It may fail the name
+    /// rule (a stem starting with `.` or `-`); the caller checks.
     pub fn default_name(&self) -> String {
         let file = self.path.rsplit('/').next().unwrap_or(&self.path);
-        file.trim_end_matches(".yaml")
-            .trim_end_matches(".yml")
-            .to_string()
+        let stem = file
+            .strip_suffix(".yaml")
+            .or_else(|| file.strip_suffix(".yml"))
+            .unwrap_or(file);
+        format!("{}::{}::{stem}", self.owner, self.repo)
     }
 
     pub fn repo_ref(&self) -> scarab_forge::RepoRef {
@@ -529,7 +539,9 @@ mod tests {
         let src = LibrarySource::parse(&raw).unwrap();
         assert_eq!(src.owner, "acme");
         assert_eq!(src.path, "deploy/helm.yaml");
-        assert_eq!(src.default_name(), "helm");
+        assert_eq!(src.default_name(), "acme::scarab-libs::helm");
+        let yml = LibrarySource::parse(&format!("github.com/acme/libs//x.yaml.yml@{C40}")).unwrap();
+        assert_eq!(yml.default_name(), "acme::libs::x.yaml");
         assert_eq!(src.to_string(), raw);
         assert_eq!(
             LibrarySource::parse(&format!("https://{raw}")).unwrap(),

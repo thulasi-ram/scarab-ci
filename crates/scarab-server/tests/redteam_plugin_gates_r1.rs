@@ -564,8 +564,7 @@ async fn yanked_world() -> Option<World> {
         content_hash: content_hash(MIXED_LIB),
         content: MIXED_LIB.into(),
         source: format!("github.com/acme/libs//deploy.yaml@{}", "1".repeat(40)),
-        publisher: "acme".into(),
-        name: "deploy".into(),
+        name: "acme/deploy".into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
     })
@@ -574,8 +573,7 @@ async fn yanked_world() -> Option<World> {
     libs.install(
         &NewInstallation {
             org: "acme".into(),
-            publisher: "acme".into(),
-            name: "deploy".into(),
+            name: "acme/deploy".into(),
             content_hash: content_hash(MIXED_LIB),
             installed_by: "amy".into(),
             installed_at: 1,

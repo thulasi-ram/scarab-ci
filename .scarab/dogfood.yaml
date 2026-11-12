@@ -119,10 +119,10 @@ services:
 
 steps:
   # --- checkout (ADR-0076 §9): Scarab's clone library ------------------------
-  # An org admin installs `lib:thulasi-ram/clone`; its Step is `checkout/git`, and
-  # `needs: [checkout]` reaches it across the invoke.
+  # An org admin installs `lib:thulasi-ram::scarab-ci::clone`; its Step is
+  # `checkout/git`, and `needs: [checkout]` reaches it across the invoke.
   - id: checkout
-    invoke: lib:thulasi-ram/clone
+    invoke: lib:thulasi-ram::scarab-ci::clone
 
   # --- ordinary step + run_as_root grant (ADR-0039) + timeout (ADR-0047) ----
   # The stock rust image is USER root, so opt into the self-service run-as-root
@@ -271,7 +271,7 @@ steps:
     artifacts:
       - "*.txt"
 
-  # --- build (ADR-0018): rootless BuildKit through lib:thulasi-ram/build ----
+  # --- build (ADR-0018): rootless BuildKit, lib:thulasi-ram::scarab-ci::build -
   # + resources (ADR-0055). An org admin installs the build library and trusts
   # its source for the build sandbox (deploy/kind/libs.sh does both in the
   # dev and e2e modes; seed.sh lists them for dogfood). The Pipeline names
@@ -288,7 +288,7 @@ steps:
   # is left off, so both run with the operator's `default` profile.
   - id: build
     needs: [lint, test]
-    invoke: lib:thulasi-ram/build
+    invoke: lib:thulasi-ram::scarab-ci::build
     with:
       context: docker/clone
       dockerfile: Dockerfile

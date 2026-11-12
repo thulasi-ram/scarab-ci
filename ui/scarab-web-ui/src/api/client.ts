@@ -893,31 +893,29 @@ export async function fetchLibrary(
   return data;
 }
 
-/** Install or upgrade to a fetched version (`PUT …/libraries/{publisher}/{name}`).
+/** Install or upgrade to a fetched version (`POST …/library-installations`).
  *  Asks for a step-up. */
 export async function installLibrary(
   org: string,
-  publisher: string,
-  name: string,
   body: components["schemas"]["InstallLibraryRequest"],
 ): Promise<LibraryInstallation> {
-  const { data, error, response } = await api.PUT("/v1/orgs/{org}/libraries/{publisher}/{name}", {
-    params: { path: { org, publisher, name } },
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/library-installations", {
+    params: { path: { org } },
     body,
   });
   if (error || !data) {
-    throw new Error(errorText(error) || `could not install lib:${publisher}/${name} (${response.status})`);
+    throw new Error(errorText(error) || `could not install lib:${body.name} (${response.status})`);
   }
   return data;
 }
 
-/** Remove an installation (`DELETE …/libraries/{publisher}/{name}`). */
-export async function removeLibrary(org: string, publisher: string, name: string): Promise<void> {
-  const { error, response } = await api.DELETE("/v1/orgs/{org}/libraries/{publisher}/{name}", {
-    params: { path: { org, publisher, name } },
+/** Remove an installation by its id (`DELETE …/library-installations/{id}`). */
+export async function removeLibrary(org: string, l: { id: string; name: string }): Promise<void> {
+  const { error, response } = await api.DELETE("/v1/orgs/{org}/library-installations/{id}", {
+    params: { path: { org, id: l.id } },
   });
   if (!response.ok) {
-    throw new Error(errorText(error) || `could not remove lib:${publisher}/${name} (${response.status})`);
+    throw new Error(errorText(error) || `could not remove lib:${l.name} (${response.status})`);
   }
 }
 

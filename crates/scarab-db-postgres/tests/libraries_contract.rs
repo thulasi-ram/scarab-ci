@@ -161,7 +161,7 @@ async fn ids(store: &dyn LibraryStore) {
     );
 
     // Removed, the id names nothing; installed again, it gets a new one.
-    store.remove("acme", "acme", "deploy").await.unwrap();
+    store.remove("acme", &acme.id).await.unwrap();
     assert_eq!(
         store.installation_by_id("acme", &acme.id).await.unwrap(),
         None
@@ -263,8 +263,7 @@ fn version(org: &str, content: &str, source: &str) -> LibraryVersion {
         content_hash: content_hash(content),
         content: content.into(),
         source: source.into(),
-        publisher: "acme".into(),
-        name: "deploy".into(),
+        name: "acme::libs::deploy".into(),
         fetched_by: "user:amy".into(),
         fetched_at: 1_000,
     }
@@ -273,8 +272,7 @@ fn version(org: &str, content: &str, source: &str) -> LibraryVersion {
 fn install(org: &str, hash: &str, at: i64) -> NewInstallation {
     NewInstallation {
         org: org.into(),
-        publisher: "acme".into(),
-        name: "deploy".into(),
+        name: "acme::libs::deploy".into(),
         content_hash: hash.into(),
         installed_by: "user:amy".into(),
         installed_at: at,
@@ -356,7 +354,10 @@ async fn installs(store: &dyn LibraryStore) {
         LibraryStoreError::Conflict
     );
     assert_eq!(
-        store.installation("acme", "acme", "deploy").await.unwrap(),
+        store
+            .installation("acme", "acme::libs::deploy")
+            .await
+            .unwrap(),
         None
     );
 
@@ -366,7 +367,7 @@ async fn installs(store: &dyn LibraryStore) {
         .unwrap();
     assert_eq!(i.content_hash, v1.content_hash);
     assert_eq!(i.source, v1.source);
-    assert_eq!(i.qualified_name(), "acme/deploy");
+    assert_eq!(i.name, "acme::libs::deploy");
     assert_eq!(i.step_up_ref.as_deref(), Some("su-1"));
 
     // A second first install is a conflict, as is an upgrade from a version
@@ -390,7 +391,10 @@ async fn installs(store: &dyn LibraryStore) {
     );
     // Neither conflict changed what is installed.
     assert_eq!(
-        store.installation("acme", "acme", "deploy").await.unwrap(),
+        store
+            .installation("acme", "acme::libs::deploy")
+            .await
+            .unwrap(),
         Some(i.clone())
     );
     let up = store
@@ -405,8 +409,8 @@ async fn installs(store: &dyn LibraryStore) {
 
     let compiled = store.installed_for_compile("acme").await.unwrap();
     assert_eq!(compiled.len(), 1);
-    assert_eq!(compiled["acme/deploy"].content, V2);
-    assert_eq!(compiled["acme/deploy"].source, v2.source);
+    assert_eq!(compiled["acme::libs::deploy"].content, V2);
+    assert_eq!(compiled["acme::libs::deploy"].source, v2.source);
     assert!(store
         .installed_for_compile("globex")
         .await
@@ -415,10 +419,10 @@ async fn installs(store: &dyn LibraryStore) {
 
     assert_eq!(store.installations("acme").await.unwrap(), vec![up.clone()]);
     assert_eq!(
-        store.remove("acme", "acme", "deploy").await.unwrap(),
-        Some(up)
+        store.remove("acme", &up.id).await.unwrap(),
+        Some(up.clone())
     );
-    assert_eq!(store.remove("acme", "acme", "deploy").await.unwrap(), None);
+    assert_eq!(store.remove("acme", &up.id).await.unwrap(), None);
     assert!(store.installations("acme").await.unwrap().is_empty());
     // The version stays, so Runs that used it still show what they ran.
     assert!(store
@@ -501,11 +505,11 @@ async fn prune_never_installed(store: &dyn LibraryStore) {
         .await
         .unwrap();
     // 1: installed once, then removed. 2: yanked. 3: just fetched again.
-    store
+    let first = store
         .install(&install("acme", &hashes[0], 10), &Replaces::Nothing)
         .await
         .unwrap();
-    store.remove("acme", "acme", "deploy").await.unwrap();
+    store.remove("acme", &first.id).await.unwrap();
     store
         .yank(&LibraryYank {
             org: "acme".into(),

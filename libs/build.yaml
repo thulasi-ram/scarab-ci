@@ -5,7 +5,7 @@
 # trusts that source for the build sandbox before any Run may use it.
 #
 #   - id: image
-#     invoke: lib:thulasi-ram/build
+#     invoke: lib:thulasi-ram::scarab-ci::build
 #     needs: [checkout]
 #     with:
 #       image: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/app:${{ event.sha }}

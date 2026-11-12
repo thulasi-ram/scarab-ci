@@ -205,16 +205,16 @@ build library's source is not trusted for the build sandbox:
 3. Org settings > Libraries > Install: fetch
    `github.com/thulasi-ram/scarab-ci//libs/clone.yaml@<commit>` (the commit
    seed.sh prints: the last pushed commit that changed the file), review it and
-   install it as `thulasi-ram/clone`. It runs the published `scarab-clone`
-   image the file pins. Nothing is installed in a new org without this step.
+   install it under its default name, `thulasi-ram::scarab-ci::clone`. It runs
+   the published `scarab-clone` image the file pins. Nothing is installed in a new org without this step.
    GitHub App mode mints the forge token per Run, so the source needs no
    trust. Dogfood runs against real GitHub, so installing from github.com is
    expected here; the dev and e2e modes install from the in-cluster Forgejo
    instead.
 4. Org settings > Libraries > Install: fetch
    `github.com/thulasi-ram/scarab-ci//libs/build.yaml@<commit>` the same way
-   and install it as `thulasi-ram/build`. The dogfood pipeline's `build` step
-   invokes it: `build/image` builds and `build/push` pushes.
+   and install it under its default name, `thulasi-ram::scarab-ci::build`. The
+   dogfood pipeline's `build` step invokes it: `build/image` builds and `build/push` pushes.
 5. On the build library's page, trust its source,
    `github.com/thulasi-ram/scarab-ci//libs/build.yaml`, for the build sandbox.
    The dogfood build does not push (its push Step exits without pushing), so
@@ -542,11 +542,12 @@ pushed first.
 - `libs.sh install <org>` makes a Forgejo connection for the org (replacing
   one an earlier run left: `forgejo.sh` revokes the previous token), fetches
   `scarab-forgejo.scarab.svc.cluster.local/<org>/scarab-libs//clone.yaml@<commit>`
-  through it, installs it as `lib:thulasi-ram/clone`, and trusts that source
-  with forge credentials through `/library-trust`, so its Step receives the
-  connection's token. It installs `build.yaml` the same way as
-  `lib:thulasi-ram/build` and trusts that source for the build sandbox, so its
-  build Step may run rootless BuildKit. The build library is not trusted with
+  through it, installs it as `lib:thulasi-ram::scarab-ci::clone` (named in the
+  request: the default would be `<org>::scarab-libs::clone`), and trusts that
+  source with forge credentials through `/library-trust`, so its Step receives
+  the connection's token. It installs `build.yaml` the same way as
+  `lib:thulasi-ram::scarab-ci::build` and trusts that source for the build
+  sandbox, so its build Step may run rootless BuildKit. The build library is not trusted with
   the registry credential or forge credentials: no pipeline of the stack
   pushes, so its push Step exits without pushing. Both Steps pull the images
   the library pins by digest (BuildKit from Docker Hub, crane from gcr.io).

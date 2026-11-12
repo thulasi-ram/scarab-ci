@@ -12,7 +12,7 @@ An org admin installs a library once, and every Pipeline in the org can use it:
 ```yaml
 steps:
   - id: ship
-    invoke: lib:acme/deploy-helm
+    invoke: lib:acme::scarab-libs::deploy-helm
     with: { release: web }
 ```
 
@@ -23,13 +23,14 @@ fetches anything, and the org decides when a library changes.
 ## Install a library
 
 Settings › Libraries › **Install library**, or the API. **Install library** asks for a **file**
-in a git repository and a **ref**, a branch, tag or commit, and **Fetch and review** opens the
-review page (`/orgs/<org>/settings/libraries/review`), which every library goes through, Scarab's
-own included.
+in a git repository, a **ref** (a branch, tag or commit) and a **name**, and **Fetch and review**
+opens the review page (`/orgs/<org>/settings/libraries/review`), which every library goes
+through, Scarab's own included.
 
 ```
 File  github.com/acme/scarab-libs//deploy-helm.yaml
 Ref   v1.4.0
+Name  acme::scarab-libs::deploy-helm
 ```
 
 The part before `//` is the repository and the part after it is the file. Scarab reads a branch or
@@ -51,15 +52,19 @@ Installing takes two steps:
 ```sh
 curl -X POST "$SCARAB/v1/orgs/acme/libraries/fetch" \
   -d '{"source": "github.com/acme/scarab-libs//deploy-helm.yaml@8c2f…"}'
-# → {"publisher": "acme", "name": "deploy-helm", "content_hash": "5d1e…", "content": "…"}
+# → {"name": "acme::scarab-libs::deploy-helm", "content_hash": "5d1e…", "content": "…"}
 
-curl -X PUT "$SCARAB/v1/orgs/acme/libraries/acme/deploy-helm" \
-  -d '{"content_hash": "5d1e…"}'
+curl -X POST "$SCARAB/v1/orgs/acme/library-installations" \
+  -d '{"name": "acme::scarab-libs::deploy-helm", "content_hash": "5d1e…"}'
 ```
 
-**The name.** Pipelines name a library `lib:<publisher>/<name>`. The publisher defaults to the
-repository's owner and the name to the file name, and you can change both at install. Each
-publisher and name names one installation in the org. A name says nothing about where the library
+**The name.** Pipelines name a library `lib:<name>`. The name defaults to
+`<owner>::<repo>::<file>`, the file name without `.yaml` or `.yml`: the file above installs as
+`acme::scarab-libs::deploy-helm`. You can type another name at install, such as `deploy-helm` or
+`platform/helm`. A name is parts of letters, digits, `.`, `_` and `-`, joined by `::` or `/`, each
+part starting with a letter, digit or `_`, at most 200 characters; it is case-sensitive. When the
+default does not fit that rule (a file name starting with `.` or `-`), the fetch asks you for a
+name. Each name names one installation in the org. A name says nothing about where the library
 came from: the installation records its source, and Policies match on the source. The
 libraries allowed and blocked lists, under **Libraries** › **Library policies**, are such rules:
 see [Library and plugin policies](/scarab-ci/usage/policies/#library-and-plugin-policies).
@@ -89,7 +94,7 @@ it.
 ## Remove
 
 **Remove** deletes the installation. It needs no passkey. Pipelines that invoke it then fail to
-compile with "`lib:acme/deploy-helm` is not installed in this org"; Runs already created keep their
+compile with "`lib:acme::scarab-libs::deploy-helm` is not installed in this org"; Runs already created keep their
 Steps. The stored version stays, so those Runs still show what they ran.
 
 ## Yank a version
@@ -117,7 +122,7 @@ curl -X POST "$SCARAB/v1/orgs/acme/library-yanks" \
 
 ## Install Scarab's clone library
 
-`lib:thulasi-ram/clone` checks out the Run's repository
+`lib:thulasi-ram::scarab-ci::clone` checks out the Run's repository
 ([Checking out the repository](/scarab-ci/usage/pipeline-syntax/#checking-out-the-repository)).
 It is the file `libs/clone.yaml` in Scarab's repository, and an org admin installs it like any
 other library. Scarab installs no library into an org by itself, a new org included, and gives
@@ -127,19 +132,21 @@ no library more trust because Scarab published it.
    `github.com/thulasi-ram/scarab-ci//libs/clone.yaml` and a Scarab release tag as the ref, such
    as `v0.4.0`. Use a release tag: each Scarab release checks that the file at its tag pins a
    published scarab-clone image by digest. Scarab reads it from github.com without credentials.
-2. Review the file and install it as `lib:thulasi-ram/clone` (the defaults: the publisher is the
-   repository's owner, the name is the file name). Confirm with your passkey.
+2. Keep the default name, `thulasi-ram::scarab-ci::clone` (the repository's owner and name and
+   the file name), which is the name Scarab's docs and errors use. Review the file and install
+   it. Confirm with your passkey.
 3. On a Forgejo or GitHub token connection, also trust its source with forge credentials
    ([below](#trusting-a-library-with-forge-credentials)). Without that, a Run that invokes it is
    refused with the reason. On a GitHub App connection this step is not needed.
 
 The library pins the scarab-clone image by digest. To run checkouts from a mirror's image, install
-a copy of `libs/clone.yaml` that pins the mirror's image, under the same name, and trust the
-mirror's source instead.
+a copy of `libs/clone.yaml` that pins the mirror's image, and trust the mirror's source instead.
+Its default name names the mirror's repository; type `thulasi-ram::scarab-ci::clone` as the name
+to keep Pipelines unchanged.
 
 ## Install Scarab's build library
 
-`lib:thulasi-ram/build` builds an image with rootless BuildKit and pushes it with crane
+`lib:thulasi-ram::scarab-ci::build` builds an image with rootless BuildKit and pushes it with crane
 ([Building an image](/scarab-ci/usage/pipeline-syntax/#building-an-image)). It is the file
 `libs/build.yaml` in Scarab's repository. It has two steps: `image` builds in the build sandbox
 and holds no registry credential, and `push` pushes and holds it. Install it the same way as the
@@ -147,7 +154,8 @@ clone library, then give its source the trust its steps need:
 
 1. Settings › Libraries › **Install library**, with the file
    `github.com/thulasi-ram/scarab-ci//libs/build.yaml` and a Scarab release tag as the ref.
-2. Review the file and install it as `lib:thulasi-ram/build`. Confirm with your passkey.
+2. Keep the default name, `thulasi-ram::scarab-ci::build`. Review the file and install it.
+   Confirm with your passkey.
 3. Trust its source for the build sandbox
    ([below](#trusting-a-library-for-the-build-sandbox)). Without that, a Run that invokes it is
    refused with the reason.
@@ -186,7 +194,7 @@ written from the step's own `build:`, `needs`, `when`, `timeout`, `resources` an
 
 # after
 - id: image
-  invoke: lib:thulasi-ram/build
+  invoke: lib:thulasi-ram::scarab-ci::build
   with: { context: ., dockerfile: Dockerfile, image: ghcr.io/acme/app:1.2.0, push: true }
 ```
 

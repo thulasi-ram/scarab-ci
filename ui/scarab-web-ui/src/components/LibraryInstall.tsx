@@ -5,17 +5,30 @@
 // tag at the commit it points to when fetched, and the review page shows
 // that commit. Upgrade opens the same dialog with the installed source
 // filled in: change the ref and fetch.
+//
+// The Name field starts as `<owner>::<repo>::<file name>`, the name the
+// server gives when none is sent, and follows the File field until someone
+// types a name of their own. An upgrade keeps the installed name.
 import { createResource, createSignal, For, Show } from "solid-js";
 import { useNavigate } from "@solidjs/router";
 import { listConnections } from "../api/client";
-import { refError, reviewHref, sourceError, splitSource, toFetchBody, type FetchForm } from "../libraries";
+import {
+  defaultLibraryName,
+  libraryNameError,
+  refError,
+  reviewHref,
+  sourceError,
+  splitSource,
+  toFetchBody,
+  type FetchForm,
+} from "../libraries";
 import Icon from "./Icon";
 import Modal, { ModalSection } from "./Modal";
 import { Field, Input, Select } from "./Field";
 
 export default function InstallLibraryDialog(props: {
   org: string;
-  /** Prefilled fields: an upgrade's source, publisher and name. */
+  /** Prefilled fields: an upgrade's source and name. */
   initial?: Partial<FetchForm>;
   /** Upgrading an installed library: the name is fixed. */
   upgrade?: boolean;
@@ -31,17 +44,26 @@ export default function InstallLibraryDialog(props: {
   const start = splitSource(props.initial?.source ?? "");
   const [form, setForm] = createSignal<FetchForm>({
     connection: "",
-    publisher: "",
-    name: "",
     ...props.initial,
+    name: props.initial?.name || defaultLibraryName(start.source) || "",
     source: start.source,
     ref: props.initial?.ref || start.ref,
   });
+  // Whether the Name is someone's own: then the File no longer changes it.
+  const [nameTyped, setNameTyped] = createSignal(!!props.initial?.name || !!props.upgrade);
   const set = (k: keyof FetchForm, v: string) => setForm((f) => ({ ...f, [k]: v }));
   // A pasted `…@<ref>` fills both fields.
   const setSource = (v: string) => {
     const s = splitSource(v);
-    setForm((f) => (s.ref ? { ...f, source: s.source, ref: s.ref } : { ...f, source: v }));
+    setForm((f) => {
+      const next = s.ref ? { ...f, source: s.source, ref: s.ref } : { ...f, source: v };
+      return nameTyped() ? next : { ...next, name: defaultLibraryName(next.source) ?? "" };
+    });
+  };
+  // Clearing the Name hands it back to the File.
+  const setName = (v: string) => {
+    setNameTyped(v.trim() !== "");
+    set("name", v.trim() === "" ? defaultLibraryName(form().source) ?? "" : v);
   };
   const built = () => toFetchBody(form());
   const go = () => {
@@ -54,7 +76,7 @@ export default function InstallLibraryDialog(props: {
   return (
     <Modal
       eyebrow={`${props.org} · libraries`}
-      title={props.upgrade ? `Upgrade lib:${form().publisher}/${form().name}` : "Install library"}
+      title={props.upgrade ? `Upgrade lib:${form().name}` : "Install library"}
       purpose={
         props.upgrade
           ? "Give the branch, tag or commit to upgrade to. The next page shows the diff from the installed version."
@@ -114,32 +136,36 @@ export default function InstallLibraryDialog(props: {
           </Select>
         </Field>
       </ModalSection>
-      <Show when={!props.upgrade}>
-        <ModalSection n={2} title="Name (optional)">
-          <div class="lib-pair">
-            <Field label="Publisher" help="Default: the repository owner.">
-              <Input mono placeholder="the repository owner" value={form().publisher} onValue={(v) => set("publisher", v)} />
-            </Field>
-            <Field label="Name" help="Default: the file name.">
-              <Input mono placeholder="the file name" value={form().name} onValue={(v) => set("name", v)} />
-            </Field>
-          </div>
-          <p class="f-help">
-            Pipelines name it{" "}
-            <span class="mono">
-              lib:{form().publisher || "<owner>"}/{form().name || "<file>"}
-            </span>
-            .
-          </p>
-        </ModalSection>
-      </Show>
+      <ModalSection n={2} title="Name">
+        <Field
+          label="Name"
+          error={props.upgrade ? null : libraryNameError(form().name.trim())}
+          help={
+            props.upgrade
+              ? "An upgrade keeps the installed name."
+              : "Parts of letters, digits, ., _ and -, joined by :: or /. Default: <owner>::<repo>::<file name>."
+          }
+        >
+          <Input
+            mono
+            readOnly={props.upgrade}
+            placeholder="<owner>::<repo>::<file name>"
+            value={form().name}
+            onValue={setName}
+          />
+        </Field>
+        <p class="f-help">
+          Pipelines write <span class="mono">invoke: lib:{form().name.trim() || "<name>"}</span>.
+        </p>
+      </ModalSection>
       <Show
         when={
           built().error &&
           form().source.trim() !== "" &&
           form().ref.trim() !== "" &&
           !sourceError(form().source) &&
-          !refError(form().ref)
+          !refError(form().ref) &&
+          !libraryNameError(form().name.trim())
         }
       >
         <p class="error">{built().error}</p>

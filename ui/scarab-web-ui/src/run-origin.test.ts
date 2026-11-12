@@ -63,7 +63,7 @@ describe("yanked versions on the Run page", () => {
     { id: "charts/git", needs: ["test"], status: "failed" },
     { id: "ship/helm", needs: ["charts/git"], status: "not_run" },
   ];
-  const y = { name: "thulasi-ram/clone", content_hash: "a3c9e1f7b5d2".repeat(5) + "abcd", reason: "writes the token to the log", yanked_at: 0, steps: ["checkout/git", "charts/git"] };
+  const y = { name: "thulasi-ram::scarab-ci::clone", content_hash: "a3c9e1f7b5d2".repeat(5) + "abcd", reason: "writes the token to the log", yanked_at: 0, steps: ["checkout/git", "charts/git"] };
 
   it("finds a Rerun that would launch a Step from a yanked version", () => {
     expect([...rerunScope("test", steps)]).toEqual(["test", "charts/git", "ship/helm"]);

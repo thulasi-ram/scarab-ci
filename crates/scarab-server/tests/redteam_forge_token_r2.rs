@@ -73,7 +73,7 @@ fn long_lived(files: &[(&str, &str)]) -> FakeForge {
         .with_commit("refs/heads/main", SHA)
 }
 
-/// `content` installed in `org` as `thulasi-ram/clone` from `source`; with
+/// `content` installed in `org` as `thulasi-ram::scarab-ci::clone` from `source`; with
 /// `trusted`, `org` also trusts that source.
 async fn install_in(
     libs: &InMemoryLibraries,
@@ -87,8 +87,7 @@ async fn install_in(
         content_hash: content_hash(content),
         content: content.into(),
         source: source.into(),
-        publisher: "thulasi-ram".into(),
-        name: "clone".into(),
+        name: "thulasi-ram::scarab-ci::clone".into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
     })
@@ -97,8 +96,7 @@ async fn install_in(
     libs.install(
         &NewInstallation {
             org: org.into(),
-            publisher: "thulasi-ram".into(),
-            name: "clone".into(),
+            name: "thulasi-ram::scarab-ci::clone".into(),
             content_hash: content_hash(content),
             installed_by: "amy".into(),
             installed_at: 1,
@@ -207,7 +205,7 @@ const CHECKOUT_YAML: &str = r#"
 on:
   push: {}
 steps:
-  - { id: checkout, invoke: lib:thulasi-ram/clone }
+  - { id: checkout, invoke: lib:thulasi-ram::scarab-ci::clone }
 "#;
 
 /// ATTACK: the trusted clone version a Run was admitted with is yanked
@@ -356,7 +354,7 @@ async fn rt2_an_inline_api_run_cannot_store_a_forge_token() {
                 "command": ["sh", "-c", "cat /scarab/secrets/forge-token"],
                 "forge_token": { "access": "read", "owner": "acme", "name": "web",
                                  "trusted_library": content_hash(CLONE) },
-                "origin": [{ "kind": "library", "name": "thulasi-ram/clone",
+                "origin": [{ "kind": "library", "name": "thulasi-ram::scarab-ci::clone",
                              "source": CLONE_SOURCE, "content_hash": content_hash(CLONE) }]
             }]
         }
@@ -396,7 +394,7 @@ on:
 steps:
   - { id: prep, image: busybox, results: [sub] }
   - id: checkout
-    invoke: lib:thulasi-ram/clone
+    invoke: lib:thulasi-ram::scarab-ci::clone
     needs: [prep]
     with: { submodules: "${{ outputs.prep.sub }}" }
 "#;

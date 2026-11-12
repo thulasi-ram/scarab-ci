@@ -21,8 +21,11 @@
 #      in dev mode such a connection is kept and used, and the install is
 #      skipped with a warning when its token no longer reads the source.
 #   2. fetches `<host>/<org>/scarab-libs//clone.yaml@<commit>` through it,
-#      installs it as `lib:thulasi-ram/clone` (or upgrades what is there),
-#      and does the same for build.yaml as `lib:thulasi-ram/build`,
+#      installs it as `lib:thulasi-ram::scarab-ci::clone` (or upgrades what
+#      is there), and does the same for build.yaml as
+#      `lib:thulasi-ram::scarab-ci::build`. The name is given: the default
+#      would be `<org>::scarab-libs::clone`, and the stack's pipelines invoke
+#      the name an install from github.com/thulasi-ram/scarab-ci gets,
 #   3. trusts clone.yaml's source with forge credentials (POST
 #      …/library-trust), so a Step of the library receives the connection's
 #      long-lived token: the stack has no GitHub App to mint one per Run;
@@ -67,7 +70,7 @@ scarab_addr   # base
 # json EXPR: evaluate EXPR over the JSON on stdin (`d`).
 json() { python3 -I -c "import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1], {'d': d}))" "$1"; }
 
-# post/put/delete PATH [BODY]: the API, failing loudly with the server's text.
+# post/delete PATH [BODY]: the API, failing loudly with the server's text.
 call() { # METHOD PATH [BODY]
   local out code
   out="$(mktemp "$state/libs-call.XXXXXX")"
@@ -120,17 +123,19 @@ if [ "$cmd" = connection ]; then
   exit 0
 fi
 
-# install_lib NAME GRANT: fetch NAME.yaml from the seeded repo through the
-# connection, install it as lib:thulasi-ram/NAME (or upgrade what is there),
-# and trust its source with GRANT (forge_credentials or build_sandbox).
+# install_lib FILE GRANT: fetch FILE.yaml from the seeded repo through the
+# connection, install it as lib:thulasi-ram::scarab-ci::FILE (or upgrade what
+# is there), and trust its source with GRANT (forge_credentials or
+# build_sandbox).
 install_lib() {
-  local name="$1" grant="$2" source fetched hash current replaces
-  source="$host/$org/$libs_repo//$name.yaml@$commit"
-  echo "==> installing lib:thulasi-ram/$name into $org from $source"
+  local file="$1" grant="$2" name source fetched hash current replaces
+  name="thulasi-ram::scarab-ci::$file"
+  source="$host/$org/$libs_repo//$file.yaml@$commit"
+  echo "==> installing lib:$name into $org from $source"
   if ! fetched="$(call POST "/v1/orgs/$org/libraries/fetch" \
-        "{\"source\":\"$source\",\"connection\":\"$conn\",\"publisher\":\"thulasi-ram\",\"name\":\"$name\"}")"; then
+        "{\"source\":\"$source\",\"connection\":\"$conn\",\"name\":\"$name\"}")"; then
     if [ "$mode" = dev ]; then
-      echo "warning: could not read $source through connection $conn; the $name library is not installed in $org" >&2
+      echo "warning: could not read $source through connection $conn; the $file library is not installed in $org" >&2
       return 0
     fi
     die "could not read $source"
@@ -140,8 +145,8 @@ install_lib() {
   if [ "$current" != "$hash" ]; then
     replaces=null
     [ -z "$current" ] || replaces="\"$current\""
-    call PUT "/v1/orgs/$org/libraries/thulasi-ram/$name" \
-      "{\"content_hash\":\"$hash\",\"replaces\":$replaces}" >/dev/null
+    call POST "/v1/orgs/$org/library-installations" \
+      "{\"name\":\"$name\",\"content_hash\":\"$hash\",\"replaces\":$replaces}" >/dev/null
     echo "    installed ${hash:0:12}"
   else
     echo "    ${hash:0:12} is installed already"

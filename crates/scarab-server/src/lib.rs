@@ -2498,7 +2498,7 @@ pub struct CompileErrorDto {
     /// The Step in the Pipeline file; for a library Step, the invoke Step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<String>,
-    /// For a library Step: the library (`<publisher>/<name>` or a path).
+    /// For a library Step: the library (its installed name or a path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub library: Option<String>,
     /// For a library Step: its id inside the library.

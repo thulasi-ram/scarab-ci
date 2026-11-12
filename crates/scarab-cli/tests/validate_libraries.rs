@@ -62,8 +62,7 @@ async fn serve() -> String {
             content_hash: content_hash(DEPLOY),
             content: DEPLOY.into(),
             source: format!("github.com/acme/libs//deploy.yaml@{}", "1".repeat(40)),
-            publisher: "acme".into(),
-            name: "deploy".into(),
+            name: "acme/deploy".into(),
             fetched_by: "amy".into(),
             fetched_at: 1,
         })
@@ -73,8 +72,7 @@ async fn serve() -> String {
         .install(
             &NewInstallation {
                 org: "acme".into(),
-                publisher: "acme".into(),
-                name: "deploy".into(),
+                name: "acme/deploy".into(),
                 content_hash: content_hash(DEPLOY),
                 installed_by: "amy".into(),
                 installed_at: 1,

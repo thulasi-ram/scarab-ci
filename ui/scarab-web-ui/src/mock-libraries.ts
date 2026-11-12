@@ -41,8 +41,7 @@ const KANIKO = h("7e2b9a4c1d08");
 const KANIKO_SRC = "git.acme.dev/platform/scarab-libs//kaniko-build.yaml@0d9e6c2b7a15f3e1d9c7b5a3f1e9d7c5b3a1f9e7";
 const KANIKO_YANK = {
   content_hash: KANIKO,
-  publisher: "platform",
-  name: "kaniko-build",
+  name: "platform::scarab-libs::kaniko-build",
   source: KANIKO_SRC,
   reason: "pins kaniko v1.23.0, which prints registry credentials when a push fails",
   yanked_by: "a.kim",
@@ -53,7 +52,7 @@ const YANK_REASON =
   "scarab-clone 0.4.0 writes the forge token to the log when a fetch fails; upgrade to b4d0f2a8c6e3 (v0.4.1)";
 
 // ── Settings › Libraries ─────────────────────────────────────────────────
-const installation = (o: Partial<S["LibraryInstallationDto"]> & Pick<S["LibraryInstallationDto"], "id" | "publisher" | "name" | "content_hash" | "source">): S["LibraryInstallationDto"] => ({
+const installation = (o: Partial<S["LibraryInstallationDto"]> & Pick<S["LibraryInstallationDto"], "id" | "name" | "content_hash" | "source">): S["LibraryInstallationDto"] => ({
   installed_by: "a.kim",
   installed_at: ago(6 * day),
   yanked: null,
@@ -64,19 +63,17 @@ const fullLibraries: S["OrgLibrariesDto"] = {
   installations: [
     installation({
       id: "3e81c0a9f2",
-      publisher: "thulasi-ram",
-      name: "clone",
+      name: "thulasi-ram::scarab-ci::clone",
       content_hash: CLONE,
       source: CLONE_SRC,
       installed_at: ago(20 * day),
     }),
-    installation({ id: "b72d4f1e06", publisher: "acme", name: "deploy-helm", content_hash: HELM, source: HELM_SRC }),
-    installation({ id: "5c09e3a7d4", publisher: "acme", name: "http-probe", content_hash: PROBE, source: "github.com/acme/scarab-libs//http-probe.yaml@8c2f4e1a9d7b3c5e0f6a2b8d4c1e7f9a3b5d2c6e", installed_by: "j.lee" }),
-    installation({ id: "e4a61b8c39", publisher: "acme", name: "git-tag", content_hash: h("6a0d3e9f2b17"), source: "github.com/acme/scarab-libs//git-tag.yaml@51c3b8e0f2a4d6c8e0b2a4c6e8f0a2b4c6d8e0f2", installed_at: ago(3 * day) }),
+    installation({ id: "b72d4f1e06", name: "acme::scarab-libs::deploy-helm", content_hash: HELM, source: HELM_SRC }),
+    installation({ id: "5c09e3a7d4", name: "acme::scarab-libs::http-probe", content_hash: PROBE, source: "github.com/acme/scarab-libs//http-probe.yaml@8c2f4e1a9d7b3c5e0f6a2b8d4c1e7f9a3b5d2c6e", installed_by: "j.lee" }),
+    installation({ id: "e4a61b8c39", name: "acme::scarab-libs::git-tag", content_hash: h("6a0d3e9f2b17"), source: "github.com/acme/scarab-libs//git-tag.yaml@51c3b8e0f2a4d6c8e0b2a4c6e8f0a2b4c6d8e0f2", installed_at: ago(3 * day) }),
     installation({
       id: "91d7f05b2c",
-      publisher: "platform",
-      name: "kaniko-build",
+      name: "platform::scarab-libs::kaniko-build",
       content_hash: KANIKO,
       source: KANIKO_SRC,
       installed_by: "j.lee",
@@ -89,8 +86,7 @@ const fullLibraries: S["OrgLibrariesDto"] = {
     // An earlier version of an installed library: on deploy-helm's manage page.
     {
       content_hash: h("91f03ac2d7e5"),
-      publisher: "acme",
-      name: "deploy-helm",
+      name: "acme::scarab-libs::deploy-helm",
       source: HELM_OLD_SRC,
       reason: "ran helm without --atomic; a failed upgrade left payments-api half rolled out",
       yanked_by: "a.kim",
@@ -99,8 +95,7 @@ const fullLibraries: S["OrgLibrariesDto"] = {
     // A library no longer installed: the list page keeps its yank.
     {
       content_hash: h("c7a1e05f3b92"),
-      publisher: "acme",
-      name: "slack-notify",
+      name: "acme::scarab-libs::slack-notify",
       source: "github.com/acme/scarab-libs//slack-notify.yaml@6e2a9c4f1b8d3e7a0c5f2b9d4e6a1c8f3b7d0e52",
       reason: "printed the Slack webhook URL in the Step log",
       yanked_by: "j.lee",
@@ -165,7 +160,7 @@ steps:
       - [IMAGE, "\${{ inputs.image }}"]
   - id: smoke
     needs: [helm]
-    invoke: lib:acme/http-probe
+    invoke: lib:acme::scarab-libs::http-probe
     with: { url: "https://\${{ inputs.release }}.internal.acme.dev/healthz" }`;
 const NEW = `kind: library
 interface:
@@ -191,7 +186,7 @@ steps:
       - [HELM_MAX_HISTORY, "20"]
   - id: smoke
     needs: [helm]
-    invoke: lib:acme/http-probe
+    invoke: lib:acme::scarab-libs::http-probe
     with: { url: "https://\${{ inputs.release }}.internal.acme.dev/healthz" }`;
 
 /** The server's line diff (LCS), as `line_diff` writes it. */
@@ -215,8 +210,7 @@ function lineDiff(a: string, b: string): string {
 }
 
 const fetchedUpgrade: S["FetchedLibraryDto"] = {
-  publisher: "acme",
-  name: "deploy-helm",
+  name: "acme::scarab-libs::deploy-helm",
   content_hash: HELM_NEW,
   source: HELM_NEW_SRC,
   content: NEW,
@@ -253,8 +247,8 @@ const runBase = (id: string, n: number, status: string, pipeline: string, title:
   steps,
 });
 
-const cloneO = (y = false) => [lib("thulasi-ram/clone", y ? CLONE : CLONE_NEW, CLONE_SRC, y)];
-const helmO = [lib("acme/deploy-helm", HELM, HELM_SRC)];
+const cloneO = (y = false) => [lib("thulasi-ram::scarab-ci::clone", y ? CLONE : CLONE_NEW, CLONE_SRC, y)];
+const helmO = [lib("acme::scarab-libs::deploy-helm", HELM, HELM_SRC)];
 
 const libRun = runBase(LIB_RUN_ID, 421, "running", "deploy", "Bump chart to 1.8.2", [
   step({ id: "checkout/git", status: "succeeded", origin: cloneO(), attempt_list: [attempt(6)] }),
@@ -266,12 +260,12 @@ const libRun = runBase(LIB_RUN_ID, 421, "running", "deploy", "Bump chart to 1.8.
     id: "ship/smoke/probe",
     status: "pending",
     needs: ["ship/helm"],
-    origin: [...helmO, lib("acme/http-probe", PROBE, "github.com/acme/scarab-libs//http-probe.yaml@8c2f4e1a9d7b3c5e0f6a2b8d4c1e7f9a3b5d2c6e")],
+    origin: [...helmO, lib("acme::scarab-libs::http-probe", PROBE, "github.com/acme/scarab-libs//http-probe.yaml@8c2f4e1a9d7b3c5e0f6a2b8d4c1e7f9a3b5d2c6e")],
   }),
 ]);
 
 const yankDetail =
-  "step `charts/git` uses `lib:thulasi-ram/clone` version a3c9e1f7b5d2, which an org admin yanked: " + YANK_REASON;
+  "step `charts/git` uses `lib:thulasi-ram::scarab-ci::clone` version a3c9e1f7b5d2, which an org admin yanked: " + YANK_REASON;
 const yankRun: RunStatusDto = {
   ...runBase(YANK_RUN_ID, 96, "failed", "deploy", "Pin the payments chart", [
     step({ id: "checkout/git", status: "succeeded", origin: cloneO(true), attempt_list: [attempt(12)] }),
@@ -279,7 +273,7 @@ const yankRun: RunStatusDto = {
     step({ id: "charts/git", status: "failed", needs: ["test"], origin: cloneO(true), attempt_list: [attempt(10, "failed", { failure: "config", detail: yankDetail })] }),
     step({ id: "ship/helm", status: "pending", needs: ["charts/git"], origin: helmO }),
   ]),
-  yanked_libraries: [{ name: "thulasi-ram/clone", content_hash: CLONE, reason: YANK_REASON, yanked_by: "a.kim", yanked_at: ago(11 * min), steps: ["checkout/git", "charts/git"] }],
+  yanked_libraries: [{ name: "thulasi-ram::scarab-ci::clone", content_hash: CLONE, reason: YANK_REASON, yanked_by: "a.kim", yanked_at: ago(11 * min), steps: ["checkout/git", "charts/git"] }],
 };
 
 function pluginRun(): RunStatusDto {
@@ -396,7 +390,7 @@ const refused: S["RefusedRunDto"][] = [
     reason_kind: "yanked",
     message: "this Run uses a yanked library: " + yankDetail,
     created_at: ago(40 * min),
-    errors: [{ kind: "other", message: "`checkout/git` uses `lib:thulasi-ram/clone` a3c9e1f7b5d2, which is yanked: " + YANK_REASON }],
+    errors: [{ kind: "other", message: "`checkout/git` uses `lib:thulasi-ram::scarab-ci::clone` a3c9e1f7b5d2, which is yanked: " + YANK_REASON }],
   },
 ];
 
@@ -412,14 +406,14 @@ const compileErrors: S["CompileErrorDto"][] = [
   {
     kind: "command_value",
     step: "ship",
-    library: "acme/deploy-helm",
+    library: "acme::scarab-libs::deploy-helm",
     library_step: "helm",
     command_index: 4,
     read: "${{ inputs.release }}",
     input: "release",
     bound: "${{ inputs.service }}",
     message:
-      "library `acme/deploy-helm`, step `helm`: `command[4]` reads `${{ inputs.release }}`, which step `ship` binds with `with.release: ${{ inputs.service }}`, a value from outside the Pipeline that is not of a fixed shape (a `choice`, boolean or number input, or `event.sha`, `event.number`, `event.issue`, `event.fork` or `event.kind`); Scarab puts no such value into a command. Pass it in `env:` (`env: [[VALUE, \"${{ inputs.release }}\"]]`) and read it from the environment (`\"$VALUE\"` in a shell script)",
+      "library `acme::scarab-libs::deploy-helm`, step `helm`: `command[4]` reads `${{ inputs.release }}`, which step `ship` binds with `with.release: ${{ inputs.service }}`, a value from outside the Pipeline that is not of a fixed shape (a `choice`, boolean or number input, or `event.sha`, `event.number`, `event.issue`, `event.fork` or `event.kind`); Scarab puts no such value into a command. Pass it in `env:` (`env: [[VALUE, \"${{ inputs.release }}\"]]`) and read it from the environment (`\"$VALUE\"` in a shell script)",
   },
 ];
 refused[0]!.errors = compileErrors;
@@ -434,23 +428,21 @@ export function libraryRoute(
   let m: RegExpMatchArray | null;
   if (/^\/v1\/orgs\/[^/]+\/libraries$/.test(p)) return json(orgLibraries());
   if ((m = p.match(/^\/v1\/orgs\/[^/]+\/library-installations\/([^/]+)$/))) {
+    // Remove answers 204 and keeps nothing.
+    if (method === "DELETE") return new Response(null, { status: 204 });
     const id = decodeURIComponent(m[1]!);
     const found = orgLibraries().installations.find((l) => l.id === id);
     return found ? json(found) : new Response("not found", { status: 404 });
   }
   if (/^\/v1\/orgs\/[^/]+\/libraries\/fetch$/.test(p)) return json(fetchedUpgrade);
-  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/libraries\/([^/]+)\/([^/]+)$/))) {
-    // Install echoes the reviewed version as installed now; remove answers
-    // 204. Nothing is kept.
-    if (method === "DELETE") return new Response(null, { status: 204 });
-    const req = JSON.parse(body || "{}") as { content_hash?: string };
-    const publisher = decodeURIComponent(m[1]!);
-    const name = decodeURIComponent(m[2]!);
-    const was = fullLibraries.installations.find((l) => l.publisher === publisher && l.name === name);
+  if (/^\/v1\/orgs\/[^/]+\/library-installations$/.test(p) && method === "POST") {
+    // Install echoes the reviewed version as installed now. Nothing is kept.
+    const req = JSON.parse(body || "{}") as { name?: string; content_hash?: string };
+    const name = req.name ?? "acme::scarab-libs::deploy-helm";
+    const was = fullLibraries.installations.find((l) => l.name === name);
     return json(
       installation({
         id: was?.id ?? "0a6f2d9e41",
-        publisher,
         name,
         content_hash: req.content_hash ?? HELM_NEW,
         source: req.content_hash === HELM_NEW ? HELM_NEW_SRC : (was?.source ?? HELM_NEW_SRC),
@@ -478,8 +470,7 @@ export function libraryRoute(
   if (/^\/v1\/orgs\/[^/]+\/library-yanks$/.test(p) && method === "POST") {
     return json({
       content_hash: CLONE,
-      publisher: "thulasi-ram",
-      name: "clone",
+      name: "thulasi-ram::scarab-ci::clone",
       source: CLONE_SRC,
       reason: YANK_REASON,
       yanked_by: "a.kim",

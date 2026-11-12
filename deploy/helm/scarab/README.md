@@ -275,7 +275,7 @@ a step with `registry_auth` that the launch found eligible for a credential (a
 step from a library the org trusts with the registry credential, not a fork pull
 request);
 named on any other step it fails that step's launch, and on a fork's push step it
-is left out. For `lib:thulasi-ram/build`, route it to the push step:
+is left out. For `lib:thulasi-ram::scarab-ci::build`, route it to the push step:
 `placement_profiles: { image: [arm64], push: [ecr-push] }`. A marked profile
 cannot also be `default: true`; the server refuses that config at boot.
 

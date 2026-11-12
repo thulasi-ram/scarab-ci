@@ -395,7 +395,7 @@ fn clone_credential() -> Option<scarab_engine::ForgeCredential> {
         })
 }
 
-/// What `lib:thulasi-ram/clone` renders for its `git` Step (ADR-0076 §9):
+/// What `lib:thulasi-ram::scarab-ci::clone` renders for its `git` Step (ADR-0076 §9):
 /// the clone image, the clone's env, and a forge credential.
 fn clone_env(sha: &str, depth: &str) -> Vec<(String, String)> {
     [
@@ -1812,7 +1812,7 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
     exec.cancel(&h).await.expect("cleanup");
 }
 
-/// LIVE `lib:thulasi-ram/build` (ADR-0018, amendment of 2026-11-12): the
+/// LIVE `lib:thulasi-ram::scarab-ci::build` (ADR-0018, amendment of 2026-11-12): the
 /// library's two Steps, compiled from `libs/build.yaml` and rendered as the
 /// scheduler renders them. The build Step runs in the `rootless-buildkit`
 /// sandbox with no registry credential and writes a trivial image, built
@@ -1863,12 +1863,12 @@ async fn the_build_library_builds_and_pushes_to_a_local_registry() {
     // scheduler renders them at launch.
     let ir = scarab_pipeline::compile_with_libraries(
         &format!(
-            "steps:\n  - id: image\n    invoke: lib:thulasi-ram/build\n    with:\n      \
+            "steps:\n  - id: image\n    invoke: lib:thulasi-ram::scarab-ci::build\n    with:\n      \
              image: {image}\n      push: \"true\"\n      insecure_push: \"true\"\n"
         ),
         &scarab_pipeline::Libraries {
             installed: std::collections::BTreeMap::from([(
-                "thulasi-ram/build".to_string(),
+                "thulasi-ram::scarab-ci::build".to_string(),
                 scarab_pipeline::InstalledLibrary {
                     content: include_str!("../../../libs/build.yaml").to_string(),
                     source: "github.com/thulasi-ram/scarab-ci//libs/build.yaml@test".into(),

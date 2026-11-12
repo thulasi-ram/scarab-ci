@@ -83,8 +83,7 @@ async fn installed(content: &str) -> InMemoryLibraries {
         content_hash: content_hash(content),
         content: content.into(),
         source: source(),
-        publisher: "acme".into(),
-        name: "deploy".into(),
+        name: "acme/deploy".into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
     })
@@ -93,8 +92,7 @@ async fn installed(content: &str) -> InMemoryLibraries {
     libs.install(
         &NewInstallation {
             org: "acme".into(),
-            publisher: "acme".into(),
-            name: "deploy".into(),
+            name: "acme/deploy".into(),
             content_hash: content_hash(content),
             installed_by: "amy".into(),
             installed_at: 1,
@@ -494,8 +492,7 @@ async fn an_installation_is_read_by_its_id_in_its_own_org_only() {
             content_hash: content_hash(DEPLOY),
             content: DEPLOY.into(),
             source: source(),
-            publisher: "acme".into(),
-            name: "deploy".into(),
+            name: "acme/deploy".into(),
             fetched_by: "amy".into(),
             fetched_at: 1,
         })
@@ -506,8 +503,7 @@ async fn an_installation_is_read_by_its_id_in_its_own_org_only() {
         .install(
             &NewInstallation {
                 org: "globex".into(),
-                publisher: "acme".into(),
-                name: "deploy".into(),
+                name: "acme/deploy".into(),
                 content_hash: content_hash(DEPLOY),
                 installed_by: "amy".into(),
                 installed_at: 1,
@@ -534,8 +530,7 @@ async fn an_installation_is_read_by_its_id_in_its_own_org_only() {
     .await;
     assert_eq!(st, StatusCode::OK, "{one}");
     assert_eq!(one["id"], id);
-    assert_eq!(one["publisher"], "acme");
-    assert_eq!(one["name"], "deploy");
+    assert_eq!(one["name"], "acme/deploy");
     assert_eq!(one["yanked"]["reason"], "writes the token to the log");
 
     // globex's id names nothing in acme, and acme's nothing in globex.

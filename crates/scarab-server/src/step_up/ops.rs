@@ -385,15 +385,11 @@ fn short_hash(h: &str) -> String {
 }
 
 /// `library.install`: the library by its Pipeline name and the org,
-/// `lib:acme/deploy-helm in acme`, and the version change first
+/// `lib:acme::scarab-libs::deploy-helm in acme`, and the version change first
 /// (`version = 5d1e0c7a9b3f → 0c4e7b2a91f5`), then the full hashes.
 pub fn describe_library_install(op: &Op, input: &OpInput) -> OpSummary {
     let generic = describe_generic(op, input);
-    let (Some(org), Some(publisher), Some(name)) = (
-        input.param("org"),
-        input.param("publisher"),
-        input.param("name"),
-    ) else {
+    let (Some(org), Some(name)) = (input.param("org"), input.body_str("/name")) else {
         return generic;
     };
     let new = input.body_str("/content_hash").unwrap_or_default();
@@ -405,7 +401,7 @@ pub fn describe_library_install(op: &Op, input: &OpInput) -> OpSummary {
     changes.extend(generic.changes);
     OpSummary {
         operation: generic.operation,
-        target: escape_invisible(&format!("lib:{publisher}/{name} in {org}")),
+        target: escape_invisible(&format!("lib:{name} in {org}")),
         changes,
     }
 }
@@ -1548,12 +1544,7 @@ pub static LIBRARY_INSTALL: Op = op(
     ADMIN,
     OrgOf::Path("org"),
     &[],
-    &[
-        "path:org",
-        "path:publisher",
-        "path:name",
-        "body:/content_hash",
-    ],
+    &["path:org", "body:/name", "body:/content_hash"],
 )
 .describe_with(describe_library_install);
 pub static LIBRARY_REMOVE: Op = op(
@@ -1564,7 +1555,7 @@ pub static LIBRARY_REMOVE: Op = op(
     ADMIN,
     OrgOf::Path("org"),
     &[],
-    &["path:org", "path:publisher", "path:name"],
+    &["path:org", "path:id"],
 );
 pub static LIBRARY_YANK: Op = op(
     "library.yank",
@@ -1680,15 +1671,12 @@ mod tests {
             "5d1e0c7a9b3f".repeat(5) + "abcd",
             "0c4e7b2a91f5".repeat(5) + "abcd",
         );
-        let mut i = input(json!({ "content_hash": new, "replaces": old }));
-        i.params = vec![
-            ("org".into(), "acme".into()),
-            ("publisher".into(), "acme".into()),
-            ("name".into(), "deploy-helm".into()),
-        ];
+        let name = "acme::scarab-libs::deploy-helm";
+        let mut i = input(json!({ "name": name, "content_hash": new, "replaces": old }));
+        i.params = vec![("org".into(), "acme".into())];
         let s = LIBRARY_INSTALL.summary(&i);
         assert_eq!(s.operation, "Install or upgrade a library");
-        assert_eq!(s.target, "lib:acme/deploy-helm in acme");
+        assert_eq!(s.target, "lib:acme::scarab-libs::deploy-helm in acme");
         assert_eq!(s.changes[0], "version = 5d1e0c7a9b3f → 0c4e7b2a91f5");
         assert!(
             s.changes.contains(&format!("content_hash = {new}")),
@@ -1696,7 +1684,7 @@ mod tests {
             s.changes
         );
 
-        i.body = json!({ "content_hash": new });
+        i.body = json!({ "name": name, "content_hash": new });
         let s = LIBRARY_INSTALL.summary(&i);
         assert_eq!(
             s.changes[0],

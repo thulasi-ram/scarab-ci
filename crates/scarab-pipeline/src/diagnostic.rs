@@ -31,7 +31,7 @@ pub struct Diagnostic {
     /// The Step in the Pipeline file: for a library Step, the invoke Step
     /// that inlined it.
     pub step: Option<String>,
-    /// For a library Step: the library, `<publisher>/<name>` or a file path.
+    /// For a library Step: the installed library's name or a file path.
     pub library: Option<String>,
     /// For a library Step: its id inside the library.
     pub library_step: Option<String>,

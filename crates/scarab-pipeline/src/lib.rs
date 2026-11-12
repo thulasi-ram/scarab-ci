@@ -434,7 +434,7 @@ const GATE_KINDS: [&str; 4] = ["manual", "timer", "external", "plugin"];
 /// The Pipeline check's answer to a `clone:` Step, removed by ADR-0076 §9:
 /// it names the library that replaces it.
 pub const RETIRED_CLONE: &str = "the `clone` Step kind was removed (ADR-0076 §9); check out \
-    the repository with `invoke: lib:thulasi-ram/clone`, and set `depth`, `submodules` and \
+    the repository with `invoke: lib:thulasi-ram::scarab-ci::clone`, and set `depth`, `submodules` and \
     `lfs` under `with:`";
 
 /// The docs section an org admin follows to install the build library.
@@ -541,13 +541,13 @@ pub fn retired_build(step: &RetiredBuild<'_>) -> String {
             list(step.placement_profiles)
         );
     }
-    let _ = writeln!(out, "      invoke: lib:thulasi-ram/build");
+    let _ = writeln!(out, "      invoke: lib:thulasi-ram::scarab-ci::build");
     let _ = writeln!(out, "      with: {{ {} }}", with.join(", "));
     let _ = write!(
         out,
         "The old step's `env`, `retry` and `artifacts` are not carried over: an invoke step \
          does not take them. The library cannot pull a private base image yet.\n\
-         An org admin must first install lib:thulasi-ram/build and trust it for the build \
+         An org admin must first install lib:thulasi-ram::scarab-ci::build and trust it for the build \
          sandbox, and with the registry credential to push: see {BUILD_LIBRARY_DOCS}"
     );
     out
@@ -772,7 +772,7 @@ pub struct StepSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment: Option<serde_json::Value>,
     /// Removed by ADR-0076 §9: the `clone` Step kind, replaced by `invoke:
-    /// lib:thulasi-ram/clone`. Kept as raw data only so the Pipeline check
+    /// lib:thulasi-ram::scarab-ci::clone`. Kept as raw data only so the Pipeline check
     /// can refuse it with [`RETIRED_CLONE`] instead of an unknown-field
     /// error. Nothing reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -792,7 +792,7 @@ pub struct StepSpec {
     #[serde(default, skip_serializing_if = "is_false")]
     pub registry_auth: bool,
     /// Removed by the ADR-0018 amendment of 2026-11-12: the `build` Step
-    /// kind, replaced by `invoke: lib:thulasi-ram/build`. Kept as raw data
+    /// kind, replaced by `invoke: lib:thulasi-ram::scarab-ci::build`. Kept as raw data
     /// only so the Pipeline check can refuse it with [`retired_build`]
     /// instead of an unknown-field error. Nothing reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -800,7 +800,7 @@ pub struct StepSpec {
     /// If set, this is an **invoke** step (ADR-0038, ADR-0076 §1): the library
     /// it inlines *at compile time*, named with a prefix: `file:<path>` (a
     /// repo-relative library file, read at the caller's ref; no absolute
-    /// paths, no `..`, no remote forms), `lib:<publisher>/<name>` (a library
+    /// paths, no `..`, no remote forms), `lib:<name>` (a library
     /// installed in the org) or `plugin:<installation>/<gate>` (not available
     /// yet). The step launches nothing itself; [`compile_with_libraries`]
     /// flattens the library's steps into the caller's DAG, id-namespaced by
@@ -1219,7 +1219,7 @@ pub enum OriginKind {
 pub struct OriginEntry {
     pub kind: OriginKind,
     /// For a `file` link, the repo-relative library path; for a `library`
-    /// link, the installed `<publisher>/<name>`.
+    /// link, the installed library name.
     pub name: String,
     /// Where an installed library comes from (its git source and commit);
     /// `None` for a `file` link. Policies match a library by this, since the
@@ -2084,7 +2084,7 @@ pub struct Libraries {
     /// `file:` targets: repo-relative path → source, read at the caller's
     /// ref. [`invoke_refs`] lists the paths to read.
     pub files: BTreeMap<String, String>,
-    /// `lib:` targets: `<publisher>/<name>` → the library installed in the
+    /// `lib:` targets: `<name>` → the library installed in the
     /// caller's org. A name missing here is "not installed in this org".
     pub installed: BTreeMap<String, InstalledLibrary>,
     /// `plugin:` targets: `<installation>/<gate>` → a gate a plugin
@@ -2656,7 +2656,7 @@ enum InvokeTarget {
     /// `file:<path>`: a library file in the repository, by its normalized
     /// repo-relative path.
     File(String),
-    /// `lib:<publisher>/<name>`: a library installed in the caller's org.
+    /// `lib:<name>`: a library installed in the caller's org.
     Lib(String),
     /// `plugin:<installation>/<gate>`: a gate a plugin resolves. Parsed, and
     /// refused until plugin gates exist (ADR-0076 §7).
@@ -2712,14 +2712,17 @@ fn parse_invoke_target(raw: &str) -> Result<InvokeTarget, String> {
             format!("`invoke: {text}` needs a prefix: write `invoke: file:{text}`")
         } else {
             format!(
-                "`invoke: {text}` needs a prefix: `file:<path>`, `lib:<publisher>/<name>` or \
+                "`invoke: {text}` needs a prefix: `file:<path>`, `lib:<name>` or \
                  `plugin:<installation>/<gate>`"
             )
         });
     };
     match prefix {
         "file" => resolve_lib_path(rest).map(InvokeTarget::File),
-        "lib" => two_segment_name(rest, "lib", "<publisher>/<name>").map(InvokeTarget::Lib),
+        "lib" => match library_name_error(rest) {
+            None => Ok(InvokeTarget::Lib(rest.to_string())),
+            Some(why) => Err(format!("`invoke: lib:{rest}` must be `lib:<name>`: {why}")),
+        },
         "plugin" => {
             two_segment_name(rest, "plugin", "<installation>/<gate>").map(InvokeTarget::Plugin)
         }
@@ -2752,6 +2755,64 @@ fn two_segment_name(rest: &str, prefix: &str, shape: &str) -> Result<String, Str
     }
 }
 
+/// The longest library name, in bytes.
+pub const LIBRARY_NAME_MAX: usize = 255;
+
+/// The library name rule, as messages state it.
+pub const LIBRARY_NAME_RULE: &str = "a library name is parts of letters, digits, `.`, `_` and \
+    `-`, joined by `::` or `/`, each part starting with a letter, digit or `_`, at most 200 \
+    bytes in all";
+
+/// Why `name` is not a library name, or `None` when it is one. The one rule
+/// for the name in `invoke: lib:<name>` and for the name an org installs a
+/// library under: 1 to [`LIBRARY_NAME_MAX`] ASCII bytes, split into parts on
+/// `::` and `/`, every part non-empty and matching
+/// `[A-Za-z0-9_][A-Za-z0-9._-]*`. So no leading or trailing separator, no
+/// empty part, no lone `:`, and no whitespace, quotes or other punctuation.
+/// Case-sensitive; a name is stored as written.
+pub fn library_name_error(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some(format!("the name is empty; {LIBRARY_NAME_RULE}"));
+    }
+    if name.len() > LIBRARY_NAME_MAX {
+        return Some(format!(
+            "the name is {} bytes, longer than {LIBRARY_NAME_MAX}",
+            name.len()
+        ));
+    }
+    if library_name_parts(name).all(library_name_part_ok) {
+        None
+    } else {
+        Some(LIBRARY_NAME_RULE.to_string())
+    }
+}
+
+/// Whether `name` is a library name ([`library_name_error`]).
+pub fn valid_library_name(name: &str) -> bool {
+    library_name_error(name).is_none()
+}
+
+/// The parts of a library name, split on `/` and `::`. A lone `:` stays in
+/// its part, where [`library_name_error`] refuses it.
+fn library_name_parts(name: &str) -> impl Iterator<Item = &str> {
+    name.split('/').flat_map(|p| p.split("::"))
+}
+
+fn library_name_part_ok(part: &str) -> bool {
+    let mut bytes = part.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// The last part of a library name, after its last `::` or `/`: `clone` for
+/// `thulasi-ram::scarab-ci::clone`.
+pub fn library_name_last_part(name: &str) -> &str {
+    let after_slash = name.rsplit('/').next().unwrap_or(name);
+    after_slash.rsplit("::").next().unwrap_or(after_slash)
+}
+
 /// Normalize and safety-check the repo-relative path of an `invoke: file:`
 /// target (ADR-0038), returning the canonical key used to look its source up
 /// in [`Libraries::files`].
@@ -2768,7 +2829,7 @@ fn resolve_lib_path(raw: &str) -> Result<String, String> {
     // Cross-repo / remote forms (`scheme://…`, `github.com/org/repo//lib@sha`).
     if path.contains("://") || path.contains('@') {
         return Err(format!(
-            "invoke path `{raw}` looks like a cross-repo/remote reference — `invoke` is local-only; use `lib:<publisher>/<name>` for a library installed in your org"
+            "invoke path `{raw}` looks like a cross-repo/remote reference — `invoke` is local-only; use `lib:<name>` for a library installed in your org"
         ));
     }
     if path.starts_with('/') {
@@ -2995,7 +3056,7 @@ struct Frame {
     /// The target as written (`file:…`, `lib:…`): the cycle key.
     written: String,
     /// How messages name it: a file by its path, an installed library by
-    /// `lib:<publisher>/<name>`.
+    /// `lib:<name>`.
     label: String,
     /// An installed (`lib:`) library, which may invoke only `lib:` and
     /// `plugin:` targets (ADR-0076 §1).
@@ -3212,7 +3273,7 @@ fn inline_level(
             }
         }
         // Where the library comes from, and how messages name it: a file by
-        // its path, an installed library by `lib:<publisher>/<name>`.
+        // its path, an installed library by `lib:<name>`.
         let (src, kind, name, source, label) = match &target {
             InvokeTarget::File(key) => match libs.files.get(key) {
                 Some(src) => (src.as_str(), OriginKind::File, key, None, key.clone()),
@@ -4870,17 +4931,13 @@ fn expand_step(step: &StepSpec, work: &mut MatrixWork) -> Result<Vec<StepSpec>, 
 }
 
 /// Whether an invoke link is the clone library (ADR-0076 §9): an installed
-/// library named `clone`, under any publisher (`lib:thulasi-ram/clone`, or a
-/// mirror's). The missing-checkout lint reads it. A name proves nothing about
+/// library whose name's last part is `clone`
+/// (`lib:thulasi-ram::scarab-ci::clone`, or a mirror's). The missing-checkout lint reads it. A name proves nothing about
 /// where a library came from; this is a warning, and which Steps may hold a
 /// forge credential is decided at Run creation from the installation's
 /// content and source, never from its name.
 pub fn is_clone_library(link: &OriginEntry) -> bool {
-    link.kind == OriginKind::Library
-        && link
-            .name
-            .rsplit_once('/')
-            .is_some_and(|(_, name)| name == "clone")
+    link.kind == OriginKind::Library && library_name_last_part(&link.name) == "clone"
 }
 
 /// Validate a compiled [`PipelineIr`], returning **all** discovered problems at
@@ -4910,7 +4967,7 @@ pub fn lint(ir: &PipelineIr) -> Vec<String> {
         warnings.push(
             "pipeline triggers on push/pull_request but does not check out the repository — \
              its steps will run without source; add `- { id: checkout, invoke: \
-             lib:thulasi-ram/clone }` and depend on it via `needs`"
+             lib:thulasi-ram::scarab-ci::clone }` and depend on it via `needs`"
                 .to_string(),
         );
     }
@@ -5895,7 +5952,7 @@ fn validate_with(
             if !step.from_installed_library() {
                 diagnostics.push(format!(
                     "step `{}`: `security.sandbox` is only for a Step from an installed library \
-                     (`invoke: lib:<publisher>/<name>`); a Step written in the Pipeline file or \
+                     (`invoke: lib:<name>`); a Step written in the Pipeline file or \
                      reached through `invoke: file:` never runs in the sandbox",
                     step.id
                 ));
@@ -8368,6 +8425,60 @@ mod tests {
     }
 
     #[test]
+    fn library_names_follow_one_rule() {
+        for good in [
+            "thulasi-ram/clone",
+            "acme::scarab-libs::deploy-helm",
+            "deploy",
+            "acme::platform/helm",
+            "_x.y-z",
+            &"x".repeat(255),
+        ] {
+            assert_eq!(library_name_error(good), None, "{good}");
+        }
+        for bad in [
+            "",
+            "acme:x",
+            "::x",
+            "x::",
+            "x/",
+            "/x",
+            "a b",
+            "-x",
+            ".x",
+            "a::.b",
+            "a${x}",
+            "a//b",
+            "a::::b",
+            ":",
+            ":::",
+            "a:::b",
+            "a\tb",
+            "a\"b",
+            "a'b",
+            "a@b",
+            "a#b",
+            "a%b",
+            "a?b",
+            "a\\b",
+            "a~b",
+            "a,b",
+            "a{b",
+            "caf\u{e9}",
+            &"x".repeat(256),
+        ] {
+            assert!(library_name_error(bad).is_some(), "{bad:?}");
+        }
+        assert_eq!(
+            library_name_last_part("thulasi-ram::scarab-ci::clone"),
+            "clone"
+        );
+        assert_eq!(library_name_last_part("acme::platform/clone"), "clone");
+        assert_eq!(library_name_last_part("acme/x::clone"), "clone");
+        assert_eq!(library_name_last_part("clone"), "clone");
+    }
+
+    #[test]
     fn invoke_targets_are_refused_with_a_reason() {
         let libraries = Libraries {
             files: libs(&[(".scarab/lib/a.yaml", "steps: [{ id: a, image: busybox }]")]),
@@ -8379,17 +8490,24 @@ mod tests {
                 ".scarab/lib/a.yaml",
                 "`invoke: .scarab/lib/a.yaml` needs a prefix: write `invoke: file:.scarab/lib/a.yaml`",
             ),
-            ("../a.yaml", "needs a prefix: `file:<path>`, `lib:<publisher>/<name>`"),
+            ("../a.yaml", "needs a prefix: `file:<path>`, `lib:<name>`"),
             ("https://evil.example/x.yaml", "unknown prefix `https:`"),
             ("git:acme/x", "unknown prefix `git:`"),
             ("url:https://evil.example/x.yaml", "`url:` is reserved"),
             ("file:", "must not be empty"),
-            ("lib:acme", "must be `lib:<publisher>/<name>`"),
-            ("lib:acme/x/y", "must be `lib:<publisher>/<name>`"),
-            ("lib:/x", "must be `lib:<publisher>/<name>`"),
-            ("lib:-acme/x", "must be `lib:<publisher>/<name>`"),
-            ("lib:acme/.x", "must be `lib:<publisher>/<name>`"),
-            ("lib:ac me/x", "must be `lib:<publisher>/<name>`"),
+            ("lib:", "must be `lib:<name>`"),
+            ("lib:acme:x", "must be `lib:<name>`"),
+            ("lib:/x", "must be `lib:<name>`"),
+            ("lib:x/", "must be `lib:<name>`"),
+            ("lib:::x", "must be `lib:<name>`"),
+            ("lib:a//b", "must be `lib:<name>`"),
+            ("lib:-acme/x", "must be `lib:<name>`"),
+            ("lib:acme/.x", "must be `lib:<name>`"),
+            ("lib:a::.b", "must be `lib:<name>`"),
+            ("lib:ac me/x", "must be `lib:<name>`"),
+            ("lib:a${x}", "must be `lib:<name>`"),
+            ("lib:acme", "`lib:acme` is not installed in this org"),
+            ("lib:acme::x::y", "`lib:acme::x::y` is not installed in this org"),
             ("lib:acme/missing", "`lib:acme/missing` is not installed in this org"),
             ("plugin:argocd", "must be `plugin:<installation>/<gate>`"),
             ("plugin:argocd/wait-live", "is not a gate of a plugin installed in this org"),
@@ -10108,7 +10226,7 @@ mod tests {
     fn with_build_library() -> Libraries {
         Libraries {
             files: BTreeMap::new(),
-            installed: installed(&[("thulasi-ram/build", BUILD_SOURCE, BUILD_LIBRARY)]),
+            installed: installed(&[("thulasi-ram::scarab-ci::build", BUILD_SOURCE, BUILD_LIBRARY)]),
             plugin_gates: Default::default(),
         }
     }
@@ -10227,8 +10345,12 @@ mod tests {
     /// profiles reaches both Steps and a map routes each list to its Step.
     #[test]
     fn the_build_library_compiles_to_a_credential_free_build_and_a_push() {
-        check_installed_library("thulasi-ram/build", BUILD_LIBRARY, &BTreeMap::new())
-            .expect("libs/build.yaml installs");
+        check_installed_library(
+            "thulasi-ram::scarab-ci::build",
+            BUILD_LIBRARY,
+            &BTreeMap::new(),
+        )
+        .expect("libs/build.yaml installs");
         let compile = |placement: &str| {
             compile_with_libraries(
                 &format!(
@@ -10237,7 +10359,7 @@ mod tests {
             steps:
               - {{ id: src, image: busybox, command: [echo] }}
               - id: image
-                invoke: lib:thulasi-ram/build
+                invoke: lib:thulasi-ram::scarab-ci::build
                 needs: [src]
                 placement_profiles: {placement}
                 with:
@@ -10583,7 +10705,7 @@ mod tests {
     fn the_build_library_refuses_inputs_that_leave_the_workspace_or_add_options() {
         let refused = |input: &str, value: &str| {
             let yaml = format!(
-                "steps:\n  - id: image\n    invoke: lib:thulasi-ram/build\n    with:\n      \
+                "steps:\n  - id: image\n    invoke: lib:thulasi-ram::scarab-ci::build\n    with:\n      \
                  image: registry.example/app:1\n      {input}: {}\n",
                 serde_json::to_string(value).unwrap()
             );
@@ -10656,7 +10778,7 @@ mod tests {
             r#"
             steps:
               - id: image
-                invoke: lib:thulasi-ram/build
+                invoke: lib:thulasi-ram::scarab-ci::build
                 with:
                   image: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/app:v1.2.3
                   context: docker/clone
@@ -10673,7 +10795,7 @@ mod tests {
         // A `.` in a path is not a `..` component.
         for path in [".", "./", "./x", "x/./y", "x..y", "..x", "x.."] {
             let yaml = format!(
-                "steps:\n  - id: image\n    invoke: lib:thulasi-ram/build\n    with:\n      \
+                "steps:\n  - id: image\n    invoke: lib:thulasi-ram::scarab-ci::build\n    with:\n      \
                  image: registry.example/app:1\n      context: {}\n",
                 serde_json::to_string(path).unwrap()
             );
@@ -10690,7 +10812,7 @@ mod tests {
             on: { push: {} }
             steps:
               - id: image
-                invoke: lib:thulasi-ram/build
+                invoke: lib:thulasi-ram::scarab-ci::build
                 with:
                   image: "registry.example/app:${{ event.branch }}"
                   push: "true"
@@ -10810,7 +10932,7 @@ mod tests {
         Libraries {
             files: BTreeMap::new(),
             installed: installed(&[(
-                "thulasi-ram/clone",
+                "thulasi-ram::scarab-ci::clone",
                 "github.com/thulasi-ram/scarab-ci//libs/clone.yaml@1111111111111111111111111111111111111111",
                 CLONE_LIBRARY,
             )]),
@@ -10827,7 +10949,7 @@ mod tests {
             let errs = errors(yaml);
             assert!(
                 errs.iter().any(|e| e.contains("step `checkout`")
-                    && e.contains("invoke: lib:thulasi-ram/clone")),
+                    && e.contains("invoke: lib:thulasi-ram::scarab-ci::clone")),
                 "{errs:?}"
             );
         }
@@ -10840,7 +10962,7 @@ mod tests {
             on: { push: {} }
             steps:
               - id: checkout
-                invoke: lib:thulasi-ram/clone
+                invoke: lib:thulasi-ram::scarab-ci::clone
                 with: { depth: full, lfs: "true" }
                 timeout: 1800
                 placement_profiles: [big]
@@ -10879,7 +11001,7 @@ mod tests {
         let ir = compile("steps: [{ id: push, image: alpine/git, forge_token: write }]");
         assert_eq!(ir.steps[0].forge_token, Some(ForgeToken::Write));
         let errs = library_errors(
-            "steps: [{ id: c, invoke: lib:thulasi-ram/clone, forge_token: write }]",
+            "steps: [{ id: c, invoke: lib:thulasi-ram::scarab-ci::clone, forge_token: write }]",
             &with_clone(),
         );
         assert!(
@@ -11016,7 +11138,7 @@ mod tests {
     #[test]
     fn a_library_step_renders_the_runs_event_values() {
         let ir = compile_with_libraries(
-            "steps: [{ id: checkout, invoke: lib:thulasi-ram/clone }]",
+            "steps: [{ id: checkout, invoke: lib:thulasi-ram::scarab-ci::clone }]",
             &with_clone(),
         )
         .unwrap();
@@ -11315,7 +11437,7 @@ mod tests {
             let errs = errors(yaml);
             assert!(
                 errs.iter().any(|e| e.starts_with("step `image`: ")
-                    && e.contains("invoke: lib:thulasi-ram/build")),
+                    && e.contains("invoke: lib:thulasi-ram::scarab-ci::build")),
                 "{errs:?}"
             );
             assert!(
@@ -11331,7 +11453,7 @@ mod tests {
 on: { push: {} }
 steps:
   - id: checkout
-    invoke: lib:thulasi-ram/clone
+    invoke: lib:thulasi-ram::scarab-ci::clone
   - id: img
     needs: [checkout]
     when: "event.branch == 'main'"
@@ -11368,11 +11490,11 @@ steps:
              - id: img\n      needs: [checkout]\n      when: \"event.branch == 'main'\"\n      \
              timeout: 1800\n      resources: { cpu_millis: 2000, memory_mib: 4096 }\n      \
              placement_profiles: [arm64, big]\n      \
-             invoke: lib:thulasi-ram/build\n      with: { image: \"ghcr.io/acme/app:${{ event.sha }}\", \
+             invoke: lib:thulasi-ram::scarab-ci::build\n      with: { image: \"ghcr.io/acme/app:${{ event.sha }}\", \
              context: services/api, dockerfile: Dockerfile.prod, push: true }\n\
              The old step's `env`, `retry` and `artifacts` are not carried over: an invoke \
              step does not take them. The library cannot pull a private base image yet.\n\
-             An org admin must first install lib:thulasi-ram/build and trust it for the build \
+             An org admin must first install lib:thulasi-ram::scarab-ci::build and trust it for the build \
              sandbox, and with the registry credential to push: see \
              https://thulasi-ram.github.io/scarab-ci/usage/libraries/#install-scarabs-build-library"
         );
@@ -11464,7 +11586,7 @@ steps:
             r#"
             on: { push: {} }
             steps:
-              - { id: checkout, invoke: lib:thulasi-ram/clone }
+              - { id: checkout, invoke: lib:thulasi-ram::scarab-ci::clone }
               - { id: build, image: busybox, needs: [checkout] }
             "#,
             &with_clone(),
@@ -11856,7 +11978,10 @@ steps:
             .iter()
             // The library's build Step; its push Step names no context.
             .filter(|s| {
-                s.origin.iter().any(|l| l.name == "thulasi-ram/build") && s.id.ends_with("/image")
+                s.origin
+                    .iter()
+                    .any(|l| l.name == "thulasi-ram::scarab-ci::build")
+                    && s.id.ends_with("/image")
             })
         {
             builds += 1;

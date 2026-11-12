@@ -506,13 +506,13 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::LIBRARY_FETCH,
             lib::fetch_library,
         )
-        .put(
-            "/v1/orgs/{org}/libraries/{publisher}/{name}",
+        .post(
+            "/v1/orgs/{org}/library-installations",
             &ops::LIBRARY_INSTALL,
             lib::install_library,
         )
         .delete(
-            "/v1/orgs/{org}/libraries/{publisher}/{name}",
+            "/v1/orgs/{org}/library-installations/{id}",
             &ops::LIBRARY_REMOVE,
             lib::remove_library,
         )

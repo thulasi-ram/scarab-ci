@@ -94,7 +94,7 @@ export default function Libraries(props: { org: string }) {
               fallback={
                 <p class="empty">
                   No libraries installed. A library is a file of Steps that a Pipeline runs with{" "}
-                  <span class="mono">invoke: lib:&lt;publisher&gt;/&lt;name&gt;</span>. To install one,
+                  <span class="mono">invoke: lib:&lt;name&gt;</span>. To install one,
                   choose Install library and enter the file and the branch, tag or commit to read it at.
                 </p>
               }

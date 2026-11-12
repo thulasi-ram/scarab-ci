@@ -85,10 +85,43 @@ export function isFullCommit(ref: string): boolean {
   return COMMIT.test(ref.trim());
 }
 
-/** Why `segment` cannot be a publisher or name, or `null` (empty = default). */
-export function segmentError(segment: string): string | null {
-  if (segment === "" || SEGMENT.test(segment)) return null;
-  return `"${segment}" is not a valid name: letters, digits, ".", "_" and "-", not starting with "." or "-".`;
+/** The library name rule, as the server states it. */
+export const LIBRARY_NAME_RULE =
+  "a library name is parts of letters, digits, `.`, `_` and `-`, joined by `::` or `/`, each part starting with a letter, digit or `_`, at most 255 bytes in all";
+
+const NAME_PART = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
+
+/** Whether `name` is a library name: 1 to 255 ASCII bytes, split into parts
+ *  on `::` and `/`, every part starting with a letter, digit or `_` and
+ *  holding only letters, digits, `.`, `_` and `-`. The server's rule; it
+ *  checks again. */
+export function isLibraryName(name: string): boolean {
+  if (name.length === 0 || name.length > 255 || !/^[\x00-\x7f]*$/.test(name)) return false;
+  return name
+    .split("/")
+    .flatMap((p) => p.split("::"))
+    .every((part) => NAME_PART.test(part));
+}
+
+/** Why `name` is not a library name, or `null`. An empty field is not an
+ *  error: the fetch then uses the default name. */
+export function libraryNameError(name: string): string | null {
+  if (name === "" || isLibraryName(name)) return null;
+  return `"${name}" is not a library name: ${LIBRARY_NAME_RULE}.`;
+}
+
+/** The name a fetch gives a library when none is typed:
+ *  `<owner>::<repo>::<file name without .yaml or .yml>`, read from the
+ *  source field. `null` when the field does not name a file yet. */
+export function defaultLibraryName(source: string): string | null {
+  const s = splitSource(source).source;
+  const split = s.indexOf("//");
+  if (split < 0) return null;
+  const repo = s.slice(0, split).split("/");
+  const file = s.slice(split + 2).split("/").pop() ?? "";
+  if (repo.length !== 3 || !repo[1] || !repo[2] || !file) return null;
+  const stem = file.endsWith(".yaml") ? file.slice(0, -5) : file.endsWith(".yml") ? file.slice(0, -4) : file;
+  return stem ? `${repo[1]}::${repo[2]}::${stem}` : null;
 }
 
 /** The fetch form as the dialog holds it. */
@@ -99,9 +132,7 @@ export type FetchForm = {
   ref: string;
   /** A ForgeConnection id; empty = fetch anonymously from a public forge. */
   connection: string;
-  /** Empty = the source's owner. */
-  publisher: string;
-  /** Empty = the file name. */
+  /** Empty = `<owner>::<repo>::<file name>` (`defaultLibraryName`). */
   name: string;
 };
 
@@ -113,7 +144,6 @@ export type FetchBody = {
   source: string;
   ref?: string;
   connection?: string;
-  publisher?: string;
   name?: string;
 };
 
@@ -126,12 +156,10 @@ export function toFetchBody(
   const ref = form.ref.trim() || split.ref;
   if (!location) return { error: "A source is required." };
   if (!ref) return { error: "A branch, tag or commit is required." };
-  const problem =
-    sourceError(location) ?? refError(ref) ?? segmentError(form.publisher.trim()) ?? segmentError(form.name.trim());
+  const problem = sourceError(location) ?? refError(ref) ?? libraryNameError(form.name.trim());
   if (problem) return { error: problem };
   const body: FetchBody = isFullCommit(ref) ? { source: `${location}@${ref}` } : { source: location, ref };
   if (form.connection.trim()) body.connection = form.connection.trim();
-  if (form.publisher.trim()) body.publisher = form.publisher.trim();
   if (form.name.trim()) body.name = form.name.trim();
   return { body };
 }
@@ -322,14 +350,14 @@ export type ReviewCheck = { tone: "ok" | "info" | "warn"; text: string };
  *  library; these lines say what that means for this file. */
 export function reviewChecks(
   content: string,
-  installed: { publisher: string; name: string; content_hash: string }[],
+  installed: { name: string; content_hash: string }[],
 ): ReviewCheck[] {
   const out: ReviewCheck[] = [
     { tone: "ok", text: "Compiles as a library that invokes only installed lib: and plugin: targets" },
   ];
-  const invoked = [...new Set([...content.matchAll(/invoke:\s*["']?lib:([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+)/g)].map((m) => m[1]!))];
+  const invoked = [...new Set([...content.matchAll(/invoke:\s*["']?lib:([A-Za-z0-9._:/-]+)/g)].map((m) => m[1]!))];
   for (const id of invoked) {
-    const i = installed.find((x) => `${x.publisher}/${x.name}` === id);
+    const i = installed.find((x) => x.name === id);
     out.push(
       i
         ? { tone: "ok", text: `Invokes lib:${id}, installed here at ${shortHash(i.content_hash)}` }
@@ -370,7 +398,7 @@ export function inputsChange(oldContent: string, newContent: string): string {
  *  upgrade from `source`. */
 export function reviewHref(
   org: string,
-  p: { source?: string; ref?: string; publisher?: string; name?: string; connection?: string },
+  p: { source?: string; ref?: string; name?: string; connection?: string },
 ): string {
   const q = new URLSearchParams();
   for (const [k, v] of Object.entries(p)) if (v) q.set(k, v);
@@ -380,26 +408,9 @@ export function reviewHref(
 
 // --- Settings › Libraries list and each library's manage page ---
 
-/** How pipelines name an installation: `lib:<publisher>/<name>`. */
-export function libraryId(l: { publisher: string; name: string }): string {
-  return `lib:${l.publisher}/${l.name}`;
-}
-
-/** What `<publisher>~<name>` named in a manage page's URL before the URL
- *  carried the installation's id. Neither part can hold a `~` (see
- *  `segmentError`), so it splits back into the two. */
-export function libraryKey(l: { publisher: string; name: string }): string {
-  return `${l.publisher}~${l.name}`;
-}
-
-/** The publisher and name an old `<publisher>~<name>` segment holds, or
- *  `null`. The manage page turns one into the installation's id URL. */
-export function parseLibraryKey(key: string): { publisher: string; name: string } | null {
-  const parts = key.split("~");
-  if (parts.length !== 2) return null;
-  const [publisher, name] = parts as [string, string];
-  if (!publisher || !name || segmentError(publisher) || segmentError(name)) return null;
-  return { publisher, name };
+/** How pipelines name an installation: `lib:<name>`. */
+export function libraryId(l: { name: string }): string {
+  return `lib:${l.name}`;
 }
 
 /** The manage page of one installation in `org`, by its id. */
@@ -452,18 +463,17 @@ export function libraryChips(
 
 /** What a yank says about its version: the library it was fetched for and
  *  the pinned source. */
-type YankOf = { content_hash: string; publisher: string; name: string; yanked_at: number };
+type YankOf = { content_hash: string; name: string; yanked_at: number };
 
-/** Every yank of `lib`'s versions, newest first: the yanks of its
- *  `<publisher>/<name>`, and the installed version's whatever it was first
- *  fetched for. `installed` marks the installed version's. The manage page
+/** Every yank of `lib`'s versions, newest first: the yanks of its name, and
+ *  the installed version's whatever it was first fetched for. `installed` marks the installed version's. The manage page
  *  lists them. */
 export function yanksOfLibrary<Y extends YankOf>(
   yanks: readonly Y[],
-  lib: { publisher: string; name: string; content_hash: string },
+  lib: { name: string; content_hash: string },
 ): (Y & { installed: boolean })[] {
   return yanks
-    .filter((y) => y.content_hash === lib.content_hash || (y.publisher === lib.publisher && y.name === lib.name))
+    .filter((y) => y.content_hash === lib.content_hash || y.name === lib.name)
     .map((y) => ({ ...y, installed: y.content_hash === lib.content_hash }))
     .sort((a, b) => b.yanked_at - a.yanked_at);
 }
@@ -472,7 +482,7 @@ export function yanksOfLibrary<Y extends YankOf>(
  *  them, since no manage page does. */
 export function removedLibraryYanks<Y extends YankOf>(
   yanks: readonly Y[],
-  installed: readonly { publisher: string; name: string; content_hash: string }[],
+  installed: readonly { name: string; content_hash: string }[],
 ): Y[] {
   return yanks.filter((y) => !installed.some((i) => yanksOfLibrary([y], i).length > 0));
 }

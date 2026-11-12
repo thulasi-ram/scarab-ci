@@ -8961,10 +8961,10 @@ mod tests {
     fn build_library_script(id: &str) -> String {
         let lib = include_str!("../../../libs/build.yaml");
         let ir = scarab_pipeline::compile_with_libraries(
-            "steps:\n  - id: image\n    invoke: lib:thulasi-ram/build\n    with: { image: registry.example/app:1 }\n",
+            "steps:\n  - id: image\n    invoke: lib:thulasi-ram::scarab-ci::build\n    with: { image: registry.example/app:1 }\n",
             &scarab_pipeline::Libraries {
                 installed: std::collections::BTreeMap::from([(
-                    "thulasi-ram/build".to_string(),
+                    "thulasi-ram::scarab-ci::build".to_string(),
                     scarab_pipeline::InstalledLibrary {
                         content: lib.to_string(),
                         source: "github.com/thulasi-ram/scarab-ci//libs/build.yaml@1".into(),

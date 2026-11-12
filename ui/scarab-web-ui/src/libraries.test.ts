@@ -2,11 +2,11 @@ import { describe, it, expect } from "vitest";
 import {
   diffLines,
   libraryChips,
+  defaultLibraryName,
+  isLibraryName,
   libraryId,
-  libraryKey,
   libraryManageHref,
-  parseLibraryKey,
-  segmentError,
+  libraryNameError,
   removedLibraryYanks,
   strayTrust,
   trustedSourceRows,
@@ -51,7 +51,7 @@ describe("splitSource and refError", () => {
 });
 
 describe("toFetchBody", () => {
-  const blank = { source: "", ref: "", connection: "", publisher: "", name: "" };
+  const blank = { source: "", ref: "", connection: "", name: "" };
   it("pins a full commit in the source and sends a branch or tag as ref", () => {
     expect(toFetchBody({ ...blank, source: " github.com/acme/libs//d.yaml ", ref: C })).toEqual({
       body: { source: `github.com/acme/libs//d.yaml@${C}` },
@@ -64,18 +64,75 @@ describe("toFetchBody", () => {
       body: { source: `github.com/acme/libs//d.yaml@${C}` },
     });
     expect(
-      toFetchBody({ source: "github.com/acme/libs//d.yaml", ref: "main", connection: "gh", publisher: "platform", name: "helm" }),
+      toFetchBody({ source: "github.com/acme/libs//d.yaml", ref: "main", connection: "gh", name: "platform::helm" }),
     ).toEqual({
-      body: { source: "github.com/acme/libs//d.yaml", ref: "main", connection: "gh", publisher: "platform", name: "helm" },
+      body: { source: "github.com/acme/libs//d.yaml", ref: "main", connection: "gh", name: "platform::helm" },
     });
   });
   it("refuses an empty source or ref, or a bad name", () => {
     expect(toFetchBody(blank).error).toMatch(/source is required/);
     expect(toFetchBody({ ...blank, source: "github.com/acme/libs//d.yaml" }).error).toMatch(/branch, tag or commit/);
-    expect(toFetchBody({ ...blank, source: "github.com/acme/libs//d.yaml", ref: "main", publisher: "-x" }).error).toMatch(
-      /not a valid name/,
-    );
-    expect(segmentError("thulasi-ram")).toBeNull();
+    for (const name of ["-x", "a b", "x${y}", "a:b"]) {
+      expect(toFetchBody({ ...blank, source: "github.com/acme/libs//d.yaml", ref: "main", name }).error).toMatch(
+        /is not a library name: a library name is parts of letters/,
+      );
+    }
+    expect(libraryNameError("")).toBeNull();
+  });
+});
+
+describe("the library name rule", () => {
+  it("takes parts joined by :: or /", () => {
+    for (const good of [
+      "thulasi-ram::scarab-ci::clone",
+      "acme::scarab-libs::deploy-helm",
+      "deploy",
+      "acme::platform/helm",
+      "_x.y-z",
+      "x".repeat(255),
+    ]) {
+      expect(isLibraryName(good), good).toBe(true);
+    }
+  });
+  it("refuses an empty part, a lone colon, a leading . or -, and punctuation", () => {
+    for (const bad of [
+      "",
+      "acme:x",
+      "::x",
+      "x::",
+      "x/",
+      "/x",
+      "a b",
+      "-x",
+      "a::.b",
+      "a${x}",
+      "a//b",
+      "a::::b",
+      ":",
+      ":::",
+      "a:::b",
+      'a"b',
+      "a'b",
+      "a@b",
+      "a#b",
+      "a%b",
+      "a?b",
+      "a\\b",
+      "a~b",
+      "a,b",
+      "a\tb",
+      "caf\u00e9",
+      "x".repeat(256),
+    ]) {
+      expect(isLibraryName(bad), JSON.stringify(bad)).toBe(false);
+    }
+  });
+  it("defaults to <owner>::<repo>::<file name>", () => {
+    expect(defaultLibraryName("github.com/acme/scarab-libs//deploy-helm.yaml")).toBe("acme::scarab-libs::deploy-helm");
+    expect(defaultLibraryName(`https://github.com/acme/libs//ci/build.yml@${C}`)).toBe("acme::libs::build");
+    expect(defaultLibraryName("github.com/acme/libs//x.yaml.yml")).toBe("acme::libs::x.yaml");
+    expect(defaultLibraryName("github.com/acme/libs")).toBeNull();
+    expect(defaultLibraryName("")).toBeNull();
   });
 });
 
@@ -100,20 +157,9 @@ describe("lines", () => {
 
 describe("the list and manage pages", () => {
   it("names an installation in the URL by its id", () => {
-    const l = { id: "b72d4f1e06", publisher: "acme", name: "deploy-helm.v2" };
-    expect(libraryId(l)).toBe("lib:acme/deploy-helm.v2");
+    const l = { id: "b72d4f1e06", name: "acme::scarab-libs::deploy-helm.v2" };
+    expect(libraryId(l)).toBe("lib:acme::scarab-libs::deploy-helm.v2");
     expect(libraryManageHref("ac me", l)).toBe("/orgs/ac%20me/settings/libraries/b72d4f1e06/manage");
-  });
-  it("reads an old publisher~name segment back, to redirect it", () => {
-    const l = { publisher: "acme", name: "deploy-helm.v2" };
-    expect(libraryKey(l)).toBe("acme~deploy-helm.v2");
-    expect(parseLibraryKey(libraryKey(l))).toEqual(l);
-    expect(parseLibraryKey("b72d4f1e06")).toBeNull();
-  });
-  it("refuses a segment that is not a publisher and a name", () => {
-    for (const bad of ["acme", "acme~", "~x", "a~b~c", "acme~.x", "review"]) {
-      expect(parseLibraryKey(bad)).toBeNull();
-    }
   });
   it("tags a yanked version first, then whether its source is trusted", () => {
     const source = `github.com/acme/libs//x.yaml@${C}`;
@@ -125,18 +171,13 @@ describe("the list and manage pages", () => {
     expect(yanked[0]!.title).toBe("Yanked by j.lee: leaks a token");
   });
   it("lists every yank of a library on its page, the installed version's marked", () => {
-    const y = (content_hash: string, publisher: string, name: string, yanked_at: number) => ({
-      content_hash,
-      publisher,
-      name,
-      yanked_at,
-    });
-    const helm = { publisher: "acme", name: "helm", content_hash: "cc" };
+    const y = (content_hash: string, name: string, yanked_at: number) => ({ content_hash, name, yanked_at });
+    const helm = { name: "acme::helm", content_hash: "cc" };
     const yanks = [
-      y("aa", "acme", "helm", 1),
-      y("bb", "acme", "probe", 2),
-      // Installed as acme/helm, first fetched for another name.
-      y("cc", "acme", "helm-old", 3),
+      y("aa", "acme::helm", 1),
+      y("bb", "acme::probe", 2),
+      // Installed as acme::helm, first fetched for another name.
+      y("cc", "acme::helm-old", 3),
     ];
     expect(yanksOfLibrary(yanks, helm).map((x) => [x.content_hash, x.installed])).toEqual([
       ["cc", true],
@@ -146,9 +187,9 @@ describe("the list and manage pages", () => {
   });
   it("keeps on the list only the yanks and trust no installation holds", () => {
     const installed = [
-      { publisher: "acme", name: "x", content_hash: "aa", source: `github.com/acme/libs//x.yaml@${C}` },
+      { name: "acme::x", content_hash: "aa", source: `github.com/acme/libs//x.yaml@${C}` },
     ];
-    const yank = (content_hash: string, name: string) => ({ content_hash, publisher: "acme", name, yanked_at: 0 });
+    const yank = (content_hash: string, name: string) => ({ content_hash, name: `acme::${name}`, yanked_at: 0 });
     // An earlier version of an installed library is on its manage page, not here.
     expect(
       removedLibraryYanks([yank("aa", "x"), yank("a0", "x"), yank("bb", "gone")], installed).map((y) => y.content_hash),

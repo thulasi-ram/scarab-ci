@@ -83,20 +83,12 @@ fn minting(files: &[(&str, &str)]) -> FakeForge {
     long_lived(files).with_minted_tokens()
 }
 
-async fn install_in(
-    libs: &InMemoryLibraries,
-    org: &str,
-    publisher: &str,
-    name: &str,
-    content: &str,
-    source: &str,
-) {
+async fn install_in(libs: &InMemoryLibraries, org: &str, name: &str, content: &str, source: &str) {
     libs.put_version(&LibraryVersion {
         org: org.into(),
         content_hash: content_hash(content),
         content: content.into(),
         source: source.into(),
-        publisher: publisher.into(),
         name: name.into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
@@ -104,7 +96,7 @@ async fn install_in(
     .await
     .unwrap();
     let current = libs
-        .installation(org, publisher, name)
+        .installation(org, name)
         .await
         .unwrap()
         .map(|i| Replaces::Version(i.content_hash))
@@ -112,7 +104,6 @@ async fn install_in(
     libs.install(
         &NewInstallation {
             org: org.into(),
-            publisher: publisher.into(),
             name: name.into(),
             content_hash: content_hash(content),
             installed_by: "amy".into(),
@@ -125,14 +116,8 @@ async fn install_in(
     .unwrap();
 }
 
-async fn install(
-    libs: &InMemoryLibraries,
-    publisher: &str,
-    name: &str,
-    content: &str,
-    source: &str,
-) {
-    install_in(libs, "acme", publisher, name, content, source).await
+async fn install(libs: &InMemoryLibraries, name: &str, content: &str, source: &str) {
+    install_in(libs, "acme", name, content, source).await
 }
 
 async fn trust(libs: &InMemoryLibraries, source: &str) {
@@ -263,7 +248,7 @@ steps:
 async fn rt_a_file_library_forge_token_step_is_refused_on_a_long_lived_connection() {
     let db = InMemoryDb::new();
     let libs = InMemoryLibraries::new();
-    install(&libs, "thulasi-ram", "clone", CLONE, CLONE_SOURCE).await;
+    install(&libs, "thulasi-ram::scarab-ci::clone", CLONE, CLONE_SOURCE).await;
     trust(&libs, CLONE_SOURCE).await;
     let yaml = "on: { push: {} }\nsteps: [{ id: g, invoke: file:.scarab/lib/clone.yaml }]\n";
     // The file is even byte-identical to the clone library the org trusts.
@@ -299,11 +284,11 @@ const CHECKOUT_YAML: &str = r#"
 on:
   push: {}
 steps:
-  - { id: checkout, invoke: lib:thulasi-ram/clone }
+  - { id: checkout, invoke: lib:thulasi-ram::scarab-ci::clone }
 "#;
 
 /// ATTACK: the org installs a copy of clone.yaml under the clone library's
-/// publisher and name from a source it did not trust, while another org
+/// name from a source it did not trust, while another org
 /// trusts the clone library's own source and holds that very content.
 /// Neither the name, the content nor another org's trust may make it
 /// trusted.
@@ -311,12 +296,18 @@ steps:
 async fn rt_an_untrusted_copy_is_refused_even_when_another_org_trusts_the_clone_source() {
     let db = InMemoryDb::new();
     let libs = InMemoryLibraries::new();
-    install_in(&libs, "other", "thulasi-ram", "clone", CLONE, CLONE_SOURCE).await;
+    install_in(
+        &libs,
+        "other",
+        "thulasi-ram::scarab-ci::clone",
+        CLONE,
+        CLONE_SOURCE,
+    )
+    .await;
     trust_in(&libs, "other", CLONE_SOURCE).await;
     install(
         &libs,
-        "thulasi-ram",
-        "clone",
+        "thulasi-ram::scarab-ci::clone",
         CLONE,
         "github.com/mallory/scarab-ci//libs/clone.yaml@2222222222222222222222222222222222222222",
     )
@@ -361,7 +352,7 @@ async fn rt_a_caller_must_not_choose_the_image_of_a_trusted_token_step() {
     let db = InMemoryDb::new();
     let libs = InMemoryLibraries::new();
     let source = format!("github.com/acme/libs//git.yaml@{}", "1".repeat(40));
-    install(&libs, "acme", "git", IMAGE_FROM_INPUT, &source).await;
+    install(&libs, "acme/git", IMAGE_FROM_INPUT, &source).await;
     trust(&libs, "github.com/acme/libs//git.yaml").await;
     let yaml = r#"
 on:
@@ -410,7 +401,7 @@ on:
   push: {}
 steps:
   - id: checkout
-    invoke: lib:thulasi-ram/clone
+    invoke: lib:thulasi-ram::scarab-ci::clone
     placement_profiles: [evil]
     timeout: 60
 "#;
@@ -422,7 +413,7 @@ steps:
 async fn rt_the_invoke_step_carries_nothing_that_shapes_the_token_pod() {
     let db = InMemoryDb::new();
     let libs = InMemoryLibraries::new();
-    install(&libs, "thulasi-ram", "clone", CLONE, CLONE_SOURCE).await;
+    install(&libs, "thulasi-ram::scarab-ci::clone", CLONE, CLONE_SOURCE).await;
     trust(&libs, CLONE_SOURCE).await;
     let forge = long_lived(&[(".scarab/ci.yaml", CLONE_WITH_ENV)]);
     let out = trigger(
@@ -459,7 +450,7 @@ on:
 steps:
   - { id: prep, image: busybox, results: [depth] }
   - id: checkout
-    invoke: lib:thulasi-ram/clone
+    invoke: lib:thulasi-ram::scarab-ci::clone
     needs: [prep]
     with: { depth: "${{ outputs.prep.depth }}" }
 "#;
@@ -471,7 +462,7 @@ steps:
 async fn rt_a_repo_result_failing_validate_fails_the_token_step_before_any_mint() {
     let db = InMemoryDb::new();
     let libs = InMemoryLibraries::new();
-    install(&libs, "thulasi-ram", "clone", CLONE, CLONE_SOURCE).await;
+    install(&libs, "thulasi-ram::scarab-ci::clone", CLONE, CLONE_SOURCE).await;
     trust(&libs, CLONE_SOURCE).await;
     let forge = Arc::new(long_lived(&[(".scarab/ci.yaml", PREP_THEN_CLONE)]));
     let out = trigger(
@@ -528,7 +519,7 @@ steps:
 "#;
 
 /// ATTACK: no library is trusted for its name or its file name. A library
-/// that is not the clone library, installed as `thulasi-ram/clone` from a
+/// that is not the clone library, installed as `thulasi-ram::scarab-ci::clone` from a
 /// mirror path that ends in `clone.yaml`, must not get the long-lived token,
 /// while the org trusts the clone library's own source.
 #[tokio::test]
@@ -538,13 +529,12 @@ async fn rt_a_library_named_clone_from_a_path_ending_in_clone_yaml_is_not_truste
     trust(&libs, CLONE_SOURCE).await;
     install(
         &libs,
-        "thulasi-ram",
-        "clone",
+        "thulasi-ram::scarab-ci::clone",
         DEPLOY_LIB,
         "git.example.com/mirror/scarab-ci//libs/deploy/clone.yaml@1111111111111111111111111111111111111111",
     )
     .await;
-    let yaml = "on: { push: {} }\nsteps: [{ id: d, invoke: lib:thulasi-ram/clone }]\n";
+    let yaml = "on: { push: {} }\nsteps: [{ id: d, invoke: lib:thulasi-ram::scarab-ci::clone }]\n";
     let forge = long_lived(&[(".scarab/ci.yaml", yaml)]);
     let out = trigger(
         &db,
@@ -555,21 +545,21 @@ async fn rt_a_library_named_clone_from_a_path_ending_in_clone_yaml_is_not_truste
     .await;
     assert!(
         out.runs.is_empty(),
-        "a library named thulasi-ram/clone was trusted with the long-lived token for its name \
+        "a library named thulasi-ram::scarab-ci::clone was trusted with the long-lived token for its name \
          or because its source path ends in clone.yaml"
     );
     assert_eq!(forge.credential_calls(), 0);
 }
 
 /// ATTACK: trust is per source. The org trusts the clone library's source;
-/// an upgrade of `thulasi-ram/clone` to a version fetched from another
+/// an upgrade of `thulasi-ram::scarab-ci::clone` to a version fetched from another
 /// source must lose the trust, even when its content differs from the
 /// trusted version by one comment.
 #[tokio::test]
 async fn rt_an_upgrade_of_the_clone_library_from_another_source_loses_the_trust() {
     let db = InMemoryDb::new();
     let libs = InMemoryLibraries::new();
-    install(&libs, "thulasi-ram", "clone", CLONE, CLONE_SOURCE).await;
+    install(&libs, "thulasi-ram::scarab-ci::clone", CLONE, CLONE_SOURCE).await;
     trust(&libs, CLONE_SOURCE).await;
     let forge = long_lived(&[(".scarab/ci.yaml", CHECKOUT_YAML)]);
     let ports = || AdmissionPorts::default().with_libraries(&libs);
@@ -579,8 +569,7 @@ async fn rt_an_upgrade_of_the_clone_library_from_another_source_loses_the_trust(
     let upgraded = format!("{CLONE}# mirrored\n");
     install(
         &libs,
-        "thulasi-ram",
-        "clone",
+        "thulasi-ram::scarab-ci::clone",
         &upgraded,
         "github.com/mirror/scarab-ci//libs/clone.yaml@2222222222222222222222222222222222222222",
     )
@@ -622,8 +611,7 @@ async fn rt_look_alike_sources_do_not_match_a_trusted_source() {
         let libs = InMemoryLibraries::new();
         install(
             &libs,
-            "acme",
-            "pusher",
+            "acme/pusher",
             PUSHER,
             &format!("{source}@{}", "1".repeat(40)),
         )
