@@ -1,0 +1,439 @@
+---
+title: Pushing images to Amazon ECR
+description: Push images built with Scarab's build library to Amazon ECR on EKS, with an IAM role on a ServiceAccount of its own and a placement profile that logs in to ECR only for the library's push step.
+---
+
+import Doodle from '../../../components/Doodle.astro';
+
+<Doodle icon="package" size={200} rotate={-8} opacity={0.18} top="7rem" right="-2rem" />
+
+Scarab's build library, `lib:thulasi-ram/build`, pushes with a dockerconfigjson: the
+`REGISTRY_AUTH` secret of the repository or its org, or the credential the forge derives for its own
+registry (see [Building an image](/scarab-ci/usage/pipeline-syntax/#building-an-image)). An Amazon
+ECR password does not fit in a stored secret: `aws ecr get-login-password` returns one that is
+valid for 12 hours (AWS's limit), so a saved `REGISTRY_AUTH` stops working the same day.
+
+On EKS the password can come from an IAM role on a Kubernetes ServiceAccount instead. An init
+container in the library's push step's Pod logs in to ECR each time the Pod starts and writes a
+fresh password for crane. Scarab stores no ECR
+credential. The setup has four parts:
+
+1. An IAM role that may push to named repositories, on a ServiceAccount of its own,
+   `scarab-ecr-push`.
+2. A placement profile, `ecr-push`, marked `registry_auth_only: true`, that runs the push step's
+   Pod as that ServiceAccount and adds an init container that writes the ECR login for crane.
+3. The build library installed, and its source trusted for the build sandbox and with the
+   registry credential.
+4. A Pipeline that routes `ecr-push` to the library's push step only.
+
+This page uses IAM Roles for Service Accounts (IRSA). EKS Pod Identity is covered at the end of
+part 1. The AWS details (IAM actions, trust policies, the IRSA webhook) are AWS's; we name them so
+you know what to look up, and the AWS docs are the reference for each.
+
+## Before you start: the ServiceAccount every step shares
+
+Scarab sets no `serviceAccountName` on a step Pod, so the Pod runs as the `default` ServiceAccount
+of the namespace steps run in (`scarab.namespace` in the chart, else the release's namespace),
+unless the [placement baseline](/scarab-ci/usage/pipeline-syntax/#placement--resources) sets one.
+Scarab also sets `automountServiceAccountToken: false`, so a step gets no Kubernetes API token.
+
+The IRSA webhook mounts its own AWS token into the Pods of an annotated ServiceAccount, and
+`automountServiceAccountToken` does not turn that off. So an IAM role on the ServiceAccount every
+step shares reaches every step of every Project: a test step in any repository could push images
+with it. Take it off before you go on:
+
+- the `eks.amazonaws.com/role-arn` annotation on the step namespace's `default` ServiceAccount
+  (`kubectl -n <namespace> get serviceaccount default -o yaml`);
+- a `serviceAccountName` in the chart's `scarab.placement.baseline`, if you set one;
+- an EKS Pod Identity association for that namespace and ServiceAccount
+  (`aws eks list-pod-identity-associations --cluster-name <cluster> --namespace <namespace>`).
+
+The chart's own `serviceAccount.annotations` (the server's role for its S3 bucket) are on the
+server's ServiceAccount. Step Pods use it only if a baseline or profile names it.
+
+## 1. The IAM role and the ServiceAccount
+
+Give the role only what a push needs, on the repositories you name. A starting point, to check
+against the AWS docs for ECR's push actions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "ecr:GetAuthorizationToken", "Resource": "*" },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:PutImage"
+      ],
+      "Resource": "arn:aws:ecr:eu-west-1:444455556666:repository/app"
+    }
+  ]
+}
+```
+
+The role's trust policy names your cluster's OIDC provider and the subject
+`system:serviceaccount:<namespace>:scarab-ecr-push` (see "IAM roles for service accounts" in the
+AWS docs). Then create the ServiceAccount in the namespace step Pods run in:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: scarab-ecr-push
+  namespace: scarab          # the namespace step Pods run in
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::111122223333:role/scarab-ecr-push
+automountServiceAccountToken: false
+```
+
+The ServiceAccount must exist before a Run uses the profile: Kubernetes refuses to create a Pod
+that names a ServiceAccount it does not have, and the push step fails to launch.
+
+**A registry in another AWS account.** If the role is in account `111122223333` and the
+repository in `444455556666`, the repository's own policy in `444455556666` must also allow the
+role's ARN the push actions above (see "Private repository policies" in the AWS docs). We have not
+tested a cross-account push.
+
+**EKS Pod Identity.** Instead of the annotation, create a Pod Identity association for the
+namespace and `scarab-ecr-push` (see the AWS docs). The profile below is the same. We have not
+checked whether Pod Identity honours the `eks.amazonaws.com/skip-containers` annotation the
+profile sets. If it does not, every container in the push step's Pod gets the role's credentials,
+and the role's permissions are the only limit.
+
+## 2. The placement profile
+
+An operator defines placement profiles in the chart's values, under `scarab.placement` (see
+[Placement & resources](/scarab-ci/usage/pipeline-syntax/#placement--resources)). This one runs the
+Pod as `scarab-ecr-push`, logs in to ECR in an init container, and points crane at the login:
+
+```yaml
+scarab:
+  placement:
+    profiles:
+      - name: ecr-push
+        registry_auth_only: true
+        k8s:
+          metadata:
+            annotations:
+              eks.amazonaws.com/skip-containers: step,scarab-results-egress,scarab-workspace-init,scarab-workspace-egress
+          spec:
+            serviceAccountName: scarab-ecr-push
+            volumes:
+              - name: ecr-login
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 1Mi
+            initContainers:
+              - name: ecr-login
+                image: public.ecr.aws/aws-cli/aws-cli@sha256:<digest>
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    set -eu
+                    umask 077
+                    pw=$(aws ecr get-login-password --region "$ECR_REGION")
+                    auth=$(printf 'AWS:%s' "$pw" | base64 | tr -d '\n')
+                    printf '{"auths":{"%s":{"auth":"%s"}}}' "$ECR_REGISTRY" "$auth" > /ecr-login/config.json
+                env:
+                  - name: ECR_REGISTRY
+                    value: 444455556666.dkr.ecr.eu-west-1.amazonaws.com
+                  - name: ECR_REGION
+                    value: eu-west-1
+                securityContext:
+                  runAsUser: 0
+                  runAsNonRoot: false
+                  allowPrivilegeEscalation: false
+                  capabilities:
+                    drop: [ALL]
+                  seccompProfile:
+                    type: RuntimeDefault
+                volumeMounts:
+                  - name: ecr-login
+                    mountPath: /ecr-login
+            containers:
+              - name: step
+                env:
+                  - name: DOCKER_CONFIG
+                    value: /ecr-login
+                volumeMounts:
+                  - name: ecr-login
+                    mountPath: /ecr-login
+                    readOnly: true
+```
+
+What each part does:
+
+- `registry_auth_only: true` keeps the profile off every step except the build library's push
+  step ([below](#what-the-marker-does)). Leave `default` unset: the server refuses to boot with a
+  profile that sets both.
+- `serviceAccountName: scarab-ecr-push` gives the Pod the role. `automountServiceAccountToken`
+  stays `false`, so no container gets a Kubernetes API token.
+- `eks.amazonaws.com/skip-containers` names the containers the IRSA webhook should not give the
+  role to ([below](#which-containers-get-the-role)). Only `ecr-login` gets it.
+- `ecr-login` runs `aws ecr get-login-password` and writes a dockerconfigjson to
+  `/ecr-login/config.json`, on a memory-backed volume. Pin the image by a digest you have checked.
+  Kubernetes leaves a `$(...)` that is not a variable reference unchanged, so the shell gets the
+  command as written.
+- `DOCKER_CONFIG=/ecr-login` on the push step's container is where crane looks for its login.
+  The push step runs as uid 0 with every capability dropped, so it can read only a file uid 0
+  owns or one its groups may read. `ecr-login` runs as uid 0 too and writes the file with mode
+  `0600`, so crane can read it. No other container mounts the volume.
+
+Scarab merges a profile onto the Pod it built with a strategic merge, and refuses a profile that
+changes its own containers, volumes, mounts or env. This one adds only things with names and paths
+of their own: the `ecr-login` init container (it runs after Scarab's own init containers, so after
+the workspace is fetched), the `ecr-login` volume, the `/ecr-login` mount and the `DOCKER_CONFIG`
+variable.
+
+### Where the login goes, and what must not be configured
+
+The push step asks for `registry_auth: true`. When its launch resolves a registry credential,
+Scarab mounts it at `/scarab/registry/config.json` and sets `DOCKER_CONFIG=/scarab/registry` on
+the step itself. The profile then sets an env variable Scarab already set, so Scarab does not
+create the Pod and the push step fails to launch, with an error that names `DOCKER_CONFIG` and the
+profile. Each launch resolves, in this order:
+
+1. a `REGISTRY_AUTH` secret at Repo scope, then at Org scope;
+2. with neither, the credential the forge derives for its own registry, only when the org trusts
+   the library's source with forge credentials. A GitHub connection to github.com (for GHCR) and a
+   Forgejo connection both derive one.
+
+So for a Project that pushes to ECR:
+
+- keep `REGISTRY_AUTH` out of the repository's secrets and the org's secrets;
+- do not trust the build library's source with forge credentials;
+- do trust it with the registry credential (part 3). The profile applies only to a push step the
+  org trusts with a credential, whether or not one resolves.
+
+Pushing to GHCR and to ECR from the same org is not supported yet: an org secret or the forge trust
+that GHCR needs makes every ECR push in that org fail to launch (git-bug 1bc87d1).
+
+## 3. Trust the build library
+
+Install `lib:thulasi-ram/build` and trust its source for the build sandbox, as
+[Libraries](/scarab-ci/usage/libraries/#install-scarabs-build-library) describes. Then trust the
+same source with the registry credential:
+
+```sh
+curl -X POST "$SCARAB/v1/orgs/acme/library-trust" \
+  -d '{"source": "github.com/thulasi-ram/scarab-ci//libs/build.yaml", "grant": "registry_credential"}'
+```
+
+Without that trust, `ecr-push` is left out of the push step, and crane pushes with no login, which
+ECR refuses.
+
+## 4. The Pipeline
+
+Route `ecr-push` to the push step with the map form of `placement_profiles`. Profiles for the
+build (node pools, the S3 cache identity) go under `image`:
+
+```yaml
+on:
+  push:
+    when: "event.branch == 'main'"
+steps:
+  - id: checkout
+    invoke: lib:thulasi-ram/clone
+  - id: image
+    invoke: lib:thulasi-ram/build
+    needs: [checkout]
+    placement_profiles:
+      image: [build-cache]
+      push: [ecr-push]
+    with:
+      image: "444455556666.dkr.ecr.eu-west-1.amazonaws.com/app:${{ event.sha }}"
+      push: true
+      cache: s3
+      cache_bucket: acme-buildkit-cache
+      cache_region: eu-west-1
+```
+
+Never name `ecr-push` for the build step, or in a plain list (`placement_profiles: [ecr-push]`),
+which reaches both steps: the build step's launch fails. The build step runs your Dockerfile, and a
+`RUN` shares BuildKit's PID namespace, so it could read anything the build step holds.
+
+Each Attempt's Pod logs in again, so a Run started days after the setup gets a password minted for
+it, and a retry gets a new one.
+
+## What the marker does
+
+Pipeline authors name profiles, so without `registry_auth_only` any step could ask for
+`ecr-push`. With it, Scarab decides at each launch, before it merges the profile:
+
+- **The build library's push step**, in a Run that is not a fork pull request and not locked out
+  of its Environment's secrets, from a library source the org trusted with the registry credential
+  when the Run was created and still trusts: the profile applies.
+- **The same push step otherwise**: the profile is left out, and the server logs that it was. A
+  fork pull request's push step pushes nothing and succeeds. Without the trust, crane pushes with
+  no login and ECR refuses the push.
+- **Any step without `registry_auth`**, such as the build step or a step a fork pull request adds
+  to the Pipeline file: the launch fails, and the error names the profile and the step.
+- **A step written in the Pipeline file with `registry_auth: true`**: it comes from no library, so
+  the profile is left out.
+
+These checks are about the step, not about who wrote the Pipeline: anyone who can push to a
+branch the Pipeline triggers on can push images through the push step. Limit that with branch
+protection on the forge, or with a Policy.
+
+## Which containers get the role
+
+The IRSA webhook adds the role's environment variables and token to every container and init
+container in a Pod whose ServiceAccount has the annotation, except the ones the Pod's
+`eks.amazonaws.com/skip-containers` annotation names (see the webhook's README). The push step's Pod
+has these containers:
+
+| Container | What it is | Gets the role |
+|---|---|---|
+| `ecr-login` | the profile's init container | yes |
+| `step` | crane, which pushes | no: it needs only the login file |
+| `scarab-results-egress` | Scarab's results sidecar (when the server collects results) | no |
+| `scarab-workspace-init` | Scarab's workspace fetch | no |
+| `scarab-workspace-egress` | Scarab's workspace drain | no |
+
+If the annotation names only `step`, Scarab's three containers get the role too. They run Scarab's
+images, not your code, but the role's token is then in four containers instead of one. The build
+step's Pod does not run as `scarab-ecr-push`, so nothing in it gets the role.
+
+We have not tested `skip-containers` on an EKS cluster (git-bug a501c6e). Check it on yours
+([below](#check-that-it-works)).
+
+## An org Policy (optional)
+
+The marker decides which step gets the profile. A Policy at `run.create` can also decide which Runs
+may name it, for example only Runs on `main`. Write it under **Organization settings › Policies**
+(see [Policies](/scarab-ci/usage/policies/)), or paste it:
+
+```yaml
+kind: policy
+name: ecr-push
+checkpoint: run.create
+mode: enforce
+rules:
+  - when: >-
+      steps.exists(s, 'ecr-push' in s.placement_profiles)
+      && !(!trigger.fork && has(trigger.ref) && trigger.ref == 'refs/heads/main')
+    effect: deny
+    message: "Only Runs on main, not from a fork, may name the ecr-push placement profile."
+  - when: >-
+      steps.exists(s, 'ecr-push' in s.placement_profiles
+      && !s.origin.exists(o, o.kind == 'library' && has(o.source)
+      && o.source.startsWith('github.com/thulasi-ram/scarab-ci//libs/build.yaml@')))
+    effect: deny
+    message: "Only the build library's steps may name the ecr-push placement profile."
+```
+
+- The first rule refuses a Run that names `ecr-push` unless it is on `refs/heads/main` and not
+  from a fork. A Run with no ref (a comment trigger) is refused too. A refused Run is not created
+  at all, so keep the push in a Pipeline that triggers only on `main`, as in part 4, and build pull
+  requests in another Pipeline.
+- The second rule refuses, when the Run is created, a step the launch would fail anyway: one that
+  names `ecr-push` and does not come from the build library. It matches the library by the source
+  it was installed from, since the name is chosen at install.
+- To limit the profile to an Environment instead, use
+  `has(pipeline.environment) && pipeline.environment == 'production'` in place of the ref check.
+- The editor starts a new Policy in `audit` mode. Run **Try it on recent decisions** before you
+  move it to `enforce`.
+
+Neither the marker nor the Policy covers a step's `k8s_overlay`, which could set
+`serviceAccountName: scarab-ecr-push` itself. An overlay is admitted only on an Environment that
+permits raw overlays; keep that off for the Projects that build images.
+
+## Hardening the push role
+
+The push step's container holds an ECR password for up to 12 hours, and `ecr-login` holds the
+role's own AWS token while it runs. Some ways to limit what a copy of either is worth:
+
+- **One push role per Environment.** Give each Environment its own ServiceAccount, role and marked
+  profile (`ecr-push-staging`, `ecr-push-production`), each role limited to the repositories that
+  Environment ships, and add a Policy rule that refuses each profile outside its Environment.
+- **No `ecr:*`, and no repository creation.** List the actions in part 1, on named repository
+  ARNs. Leave out `ecr:CreateRepository`, `ecr:DeleteRepository`, `ecr:SetRepositoryPolicy`,
+  `ecr:PutLifecyclePolicy` and the other actions that change a repository.
+- **Only from inside your VPC.** Reach ECR through VPC interface endpoints (`ecr.api` and
+  `ecr.dkr`, plus the S3 gateway endpoint ECR stores layers in), and add an `aws:SourceVpce` (or
+  `aws:SourceVpc`) condition to the push role's policy, so a credential copied out of the cluster
+  fails elsewhere:
+
+  ```json
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": "ecr:GetAuthorizationToken",
+        "Resource": "*",
+        "Condition": { "StringEquals": { "aws:SourceVpce": "vpce-0123456789abcdef0" } }
+      },
+      {
+        "Effect": "Allow",
+        "Action": [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:BatchGetImage",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:InitiateLayerUpload",
+          "ecr:UploadLayerPart",
+          "ecr:CompleteLayerUpload",
+          "ecr:PutImage"
+        ],
+        "Resource": "arn:aws:ecr:eu-west-1:444455556666:repository/app",
+        "Condition": { "StringEquals": { "aws:SourceVpce": "vpce-0fedcba9876543210" } }
+      }
+    ]
+  }
+  ```
+
+  We have not tested this. Check in the AWS docs, and on your registry, that ECR evaluates the
+  condition for pushes made with the password from `get-login-password`, not only for ECR API
+  calls made with the role's own credentials.
+
+## Costs and limits
+
+- **The image moves through the workspace.** The build step writes the image as an OCI layout to
+  the workspace, and the push step receives it from there, so a large image costs a transfer
+  through the Data Depot.
+- **No private base images yet.** The build step holds no registry credential, so BuildKit pulls
+  only public base images. A role on the build step's Pod does not change that: BuildKit logs in
+  to a registry with a docker config, not with AWS credentials.
+- **The push step runs as root**, because crane's image has no other user. An org Policy that
+  denies run-as-root refuses every Run that invokes the build library.
+- **The layer cache is S3 only**, reached with the build step's own identity. Give it a role of its
+  own on the build step's profile (`build-cache` in part 4), limited to the cache bucket. Never put
+  the push role there: a Dockerfile `RUN` can read what the build step holds, so anyone who can
+  change the Dockerfile can use the cache role. That also means they can write the cache that later
+  builds import.
+- **GHCR and ECR in one org** are not supported yet: see
+  [Where the login goes](#where-the-login-goes-and-what-must-not-be-configured) (git-bug 1bc87d1).
+
+## Check that it works
+
+- The push step's Pod runs as the ServiceAccount:
+  `kubectl -n <namespace> get pod <pod> -o jsonpath='{.spec.serviceAccountName}'`.
+- The login worked: `kubectl -n <namespace> logs <pod> -c ecr-login`. If it fails, the push step's
+  container does not start and the step fails.
+- Only `ecr-login` has the role: this lists each container with the names of its env variables,
+  and only `ecr-login` should show `AWS_ROLE_ARN`:
+
+  ```sh
+  kubectl -n <namespace> get pod <pod> -o jsonpath='{range .spec.initContainers[*]}{.name}{": "}{.env[*].name}{"\n"}{end}{range .spec.containers[*]}{.name}{": "}{.env[*].name}{"\n"}{end}'
+  ```
+
+- The push step's log shows `scarab: pushed <repository>@sha256:…`, and
+  `${{ outputs.image.push.digest }}` holds the digest.
+
+## References
+
+- [Pipeline syntax: building an image](/scarab-ci/usage/pipeline-syntax/#building-an-image)
+- [Pipeline syntax: placement & resources](/scarab-ci/usage/pipeline-syntax/#placement--resources)
+- [Libraries: install Scarab's build library](/scarab-ci/usage/libraries/#install-scarabs-build-library)
+- [Policies](/scarab-ci/usage/policies/)
+- [ADR-0018, Container image building](/scarab-ci/tech/adr/0018-image-building/)
+- [ADR-0055, Placement profiles](/scarab-ci/tech/adr/0055-placement-profiles/)
+- [ADR-0075, Policy engine](/scarab-ci/tech/adr/0075-policy-engine/)
