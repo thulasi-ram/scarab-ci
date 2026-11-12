@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1794460316,"nonce":"45uRUng5HWXaapuS9Wo5mkVndDI=","title":"build: run rootless BuildKit with its process sandbox (hostUsers: false + procMount: Unmasked); live-test on EKS 1.35 AL2023 first","was":"x"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1794460317,"nonce":"4bgGaB4VVXzdIgziaZWbOQy2bcU=","added":["type:enhancement area:build security"],"removed":null}]}
