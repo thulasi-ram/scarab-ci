@@ -271,7 +271,7 @@ scarab:
 **Mark a profile that grants push access `registry_auth_only: true`.** Pipeline
 authors name profiles, so without the marker any step could ask for a
 ServiceAccount with a push role. With it, the server applies the profile only to
-a step with `registry_auth` whose launch resolved a credential (a step from a
+a step with `registry_auth` that may receive a registry credential (a step from a
 library the org trusts with the registry credential, not a fork pull request);
 named on any other step it fails that step's launch, and on a fork's push step it
 is left out. For `lib:thulasi-ram/build`, route it to the push step:

@@ -430,8 +430,8 @@ Its outputs:
   map from the library's step id to a list routes each list to its own step, so build-node
   placement and the S3 cache identity reach only the build step. An operator marks a profile
   that grants push access (a ServiceAccount with a push role, an init container that logs in)
-  `registry_auth_only`. Scarab applies a marked profile only to a step with `registry_auth` whose
-  launch resolved a credential, which here is the push step of a Run that is not a fork. Named
+  `registry_auth_only`. Scarab applies a marked profile only to a step with `registry_auth` that
+  may receive a credential, which here is the push step of a Run that is not a fork. Named
   on any other step it fails that step's launch, so a list that holds one fails the build step:
   route it with the map form. On a fork's push step it is left out, and the step pushes
   nothing.
@@ -1096,10 +1096,13 @@ both `serviceAccountName` and `automountServiceAccountToken: true`.
 
 An operator marks a profile `registry_auth_only: true` when it grants push access to a registry
 (a ServiceAccount with a push role, an init container that logs in). Scarab applies such a profile
-only to a step with `registry_auth` whose launch resolved a registry credential: a step from a
+only to a step with `registry_auth` that may receive a registry credential: a step from a
 library your org trusts with the registry credential, in a Run that is not a fork pull request or
-locked out of its Environment's secrets. Named on any other step it fails that step's launch; on
-a `registry_auth` step that resolved no credential it is left out. A marked profile cannot be the
+locked out of its Environment's secrets. It applies whether or not a credential resolves, so a
+profile that logs in itself works with no `REGISTRY_AUTH` secret
+([Pushing images to Amazon ECR](/scarab-ci/usage/pushing-to-ecr/)). Named on any other step it
+fails that step's launch; on a `registry_auth` step that may not receive a credential it is left
+out. A marked profile cannot be the
 `default` ([Building an image](#building-an-image) shows the map form that routes one to the push
 step).
 

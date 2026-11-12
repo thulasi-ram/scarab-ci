@@ -164,7 +164,8 @@ clone library, then give its source the trust its steps need:
 5. If a placement profile grants push access (a ServiceAccount with a push role, say), the
    operator marks it `registry_auth_only: true`, and Pipelines route it to the push step with
    `placement_profiles: { push: [<profile>] }`. Scarab applies a marked profile only to that step,
-   and only when its launch resolved a registry credential
+   and only when the step may receive a registry credential (step 4, in a Run that is not a fork
+   pull request), whether or not a `REGISTRY_AUTH` secret exists
    ([Placement & resources](/scarab-ci/usage/pipeline-syntax/#placement--resources)).
 
 The push step runs as root, because crane's image has no other user, so an org Policy that denies
