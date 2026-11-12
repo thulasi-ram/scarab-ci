@@ -126,6 +126,7 @@ async fn a_nul_in_a_commit_subject_is_stripped_from_the_headline() {
         r#ref: "refs/heads/main".into(),
         after: SHA.into(),
         message: "fix\u{0} the build\n\nbody".into(),
+        changed_paths: Default::default(),
     };
     let out = trigger_runs_from_event(
         &forge,

@@ -90,6 +90,7 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                     r#ref,
                     after,
                     message,
+                    changed_paths: scarab_forge::push_changed_paths(p, None),
                 })
             }
         }
@@ -779,6 +780,50 @@ impl ForgePort for ForgejoForge {
         normalize(&raw)
     }
 
+    /// `GET /repos/{o}/{r}/pulls/{index}/files`, walked to an empty page
+    /// ([`more_pages`]), or until [`CHANGED_PATHS_MAX`](scarab_forge::CHANGED_PATHS_MAX)
+    /// files. A walk that hits the page ceiling first is an error: the list
+    /// would not be whole.
+    async fn pull_request_files(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Option<Vec<String>>, ForgeError> {
+        let mut paths = Vec::new();
+        let mut files = 0usize;
+        let mut page = 1;
+        loop {
+            let url = self.url(&format!(
+                "/repos/{}/{}/pulls/{number}/files?page={page}&limit={PAGE}",
+                repo.owner, repo.name
+            ));
+            let body = ok_json(self.send(|| self.client.get(&url)).await?).await?;
+            let items = body
+                .as_array()
+                .ok_or_else(|| ForgeError::Api("pull request files: expected a list".into()))?;
+            files += items.len();
+            if files >= scarab_forge::CHANGED_PATHS_MAX {
+                return Ok(None);
+            }
+            for file in items {
+                for key in ["filename", "previous_filename"] {
+                    if let Some(p) = file.get(key).and_then(Value::as_str) {
+                        paths.push(p.to_string());
+                    }
+                }
+            }
+            if items.is_empty() {
+                return Ok(Some(paths));
+            }
+            if !more_pages(page, items.len()) {
+                return Err(ForgeError::Api(format!(
+                    "pull request files: more than {MAX_PAGES} pages"
+                )));
+            }
+            page += 1;
+        }
+    }
+
     async fn set_status(
         &self,
         repo: &RepoRef,
@@ -1004,6 +1049,10 @@ mod tests {
                 // Forgejo carries head_commit.message like GitHub — the Headline
                 // extractor takes its first line (ADR-0057).
                 message: "chore: bump deps\n\ndetails".into(),
+                // No commit list in this payload.
+                changed_paths: scarab_forge::ChangedPaths::Unknown(
+                    scarab_forge::PathsUnknown::NoCommits
+                ),
             }
         );
         let tag = json!({

@@ -95,6 +95,57 @@ on:
     when: "event.branch == 'main'"
 ```
 
+### Changed files: `event.changed_paths`
+
+A `when:` can read the files a push or pull request changed, as `event.changed_paths`: a sorted
+list of repository paths. This Pipeline builds an image only when something under
+`docker/ci-tools/` changed:
+
+```yaml
+on:
+  push:
+    when: event.changed_paths.exists(p, p.startsWith("docker/ci-tools/"))
+  pull_request:
+    when: event.changed_paths.exists(p, p.startsWith("docker/ci-tools/"))
+```
+
+Where the list comes from:
+
+- **push**: the `added`, `modified` and `removed` files of every commit in the webhook payload. A
+  renamed file is listed under both names.
+- **pull_request**: the forge's pull request files API, asked once per delivery and only when a
+  Pipeline whose `pull_request` trigger matches reads `event.changed_paths`. A repository that
+  does not use it makes no extra API calls. The list is the pull request's files when Scarab
+  handles the webhook, which can differ from the event's head commit if the pull request moved
+  since.
+- Every other trigger (`tag`, `release`, `comment`, `cron`, `manual`, `api`, `upstream`) has no
+  list.
+
+Sometimes the list is **unknown**: the trigger has none, the push created the branch or deleted
+it, the push was forced (detected on GitHub only), the payload lists only some of the pushed
+commits (GitHub lists at most 2048, Forgejo only the first few and the total), 3,000 or more files
+changed, or the forge's files API returned an error or did not answer within 5 seconds. Unknown is not the same as an empty list. While the list is unknown, a
+`when:` that needs it counts as true, so the Run starts, and the Run's activity log says why:
+
+```text
+changed paths unknown: new branch; the path filter in `when:` was not applied (on.push)
+```
+
+To a `when:`, the field is always there and only its value is unknown, so
+`has(event.changed_paths)` is true either way and cannot test for an unknown list.
+
+The rest of the expression still decides when it can: `event.branch == 'main' &&
+event.changed_paths.exists(…)` is false on another branch whether or not the list is known. A
+`when:` that does not read `event.changed_paths` is unaffected. The same rule applies to a step's
+`when:`: a step that needs an unknown list runs.
+
+Forced-push detection is GitHub only: Forgejo's push payload does not say whether a push was
+forced. For a forced push to Forgejo, the list holds the files of the commits the push added, not
+the files of commits it dropped.
+
+The list is not stored with the Run, and a template cannot read it: `${{ event.changed_paths }}`
+is a compile error, because anyone who can push chooses the paths.
+
 **Manual dispatch is opt-in**: a pipeline is dispatchable from the UI/API only if it declares
 `on: manual`. The trigger context also feeds each run's provenance and **Headline** (the trigger
 title shown against the run).
@@ -562,7 +613,8 @@ predicates).
 ## Conditions: `when`
 
 A `when:` CEL guard skips a step whose predicate is false; expressions read the run's context
-(e.g. `event`, and any `matrix` coordinate):
+(e.g. `event`, including [`event.changed_paths`](#changed-files-eventchanged_paths), and any
+`matrix` coordinate):
 
 ```yaml
 - id: deploy
@@ -845,7 +897,7 @@ written into a command and is checked against its shape again when the step laun
 
 `repo.clone_url` is at most 2048 bytes, `run` 64 and `kind` 32.
 
-`actor`, a comment's `body` and `schedule` are not readable, and neither is `${{ event }}` as a
+`actor`, a comment's `body`, `schedule` and `changed_paths` are not readable, and neither is `${{ event }}` as a
 whole: each is a compile error. The same holds for a `concurrency.group`, which renders against the
 same checked values. A group reads only `inputs` and `event`: it is fixed when the Run is created,
 before any step has run, so reading `outputs` is a compile error. A `when:` still sees the whole
@@ -1031,7 +1083,7 @@ if the run's target environment permits raw overlays; otherwise the run is rejec
 profile for anything static. Even where raw overlays are permitted, an overlay cannot set or delete the Pod's
 `metadata.name`, `generateName`, `namespace`, `ownerReferences` or `finalizers`, or labels and annotations
 under `app.kubernetes.io/`, `scarab.io/` or `scarab.dev/`: Scarab uses them to find, route to and clean up the Pod.
-The rest of the Pod spec is not checked. An overlay can ask for privileged containers, host mounts, the
+Apart from Scarab's own containers, volumes, mounts and env (below), the rest of the Pod spec is not checked. An overlay can ask for privileged containers, host mounts, the
 host network, or a ServiceAccount token. Step Pods run in Scarab's own namespace by default, so that can
 be Scarab's ServiceAccount. Permit raw overlays only on an Environment whose pipeline authors you trust
 with that.
@@ -1043,6 +1095,51 @@ with that.
     spec:
       schedulerName: my-scheduler
 ```
+
+The operator's baseline, each named profile in the order you list them, and then the
+`k8s_overlay` are merged onto the Pod one after another, with a Kubernetes strategic merge:
+
+- Objects merge key by key, and a `null` deletes a key.
+- Lists Kubernetes merges by a key are merged item by item: `containers`, `initContainers` and
+  `ephemeralContainers` by `name`; in a container, `env` by `name`, `volumeMounts` by `mountPath`,
+  `ports` by `containerPort` and `volumeDevices` by `devicePath`; `volumes` and
+  `imagePullSecrets` by `name`; `hostAliases` by `ip`; `topologySpreadConstraints` by
+  `topologyKey` and `whenUnsatisfiable`. An item with a new key is appended.
+- `tolerations` add up: a profile's tolerations are appended to the baseline's, and a toleration
+  already on the Pod is not added twice. Kubernetes replaces this list; Scarab does not, so a
+  profile cannot drop the baseline's tolerations.
+- Every other list replaces, as in Kubernetes. Node affinity terms are one of them.
+
+So an overlay can change one field of the step container and keep the rest:
+
+```yaml
+k8s_overlay:
+  spec:
+    containers:
+      - name: step
+        securityContext:
+          seccompProfile: { type: Unconfined }
+```
+
+The step container is the only container Scarab adds that a profile or overlay may name. The
+results sidecar (`scarab-results-egress`), the workspace containers (`scarab-workspace-init`,
+`scarab-workspace-egress`) and service sidecars (`service-0`, `service-1`, ...) carry Scarab's own
+wiring. If the baseline, a profile or an overlay names or removes one, Scarab does not create
+the Pod, and the launch error names the container and the layer. A container with a new name,
+such as an extra init container, is allowed.
+
+Scarab's volumes, mounts and env are guarded the same way. A layer may not:
+
+- name, remove or replace a volume Scarab created (results, workspace, forge token, registry auth,
+  OIDC token, secrets), or mount one in a container it adds or at a new path on the step container;
+- change a mount Scarab set on the step container, such as `/workspace` (`/workspace/` and
+  `//workspace` count as the same path);
+- set or remove an env variable the step container was built with, such as `SCARAB_ATTEMPT` or
+  one from the step's own `env:`.
+
+A volume with a new name, a mount at a new path and an env variable with a new name are allowed.
+Kubernetes' patch directives (`$patch`, `$retainKeys` and other keys starting with `$`) are not
+supported: a layer that uses one is refused.
 
 Step Pods, service Pods and debug Pods do not mount a Kubernetes ServiceAccount token
 (`automountServiceAccountToken: false`), so code in a step cannot call the Kubernetes API with the
