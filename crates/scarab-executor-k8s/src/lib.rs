@@ -196,6 +196,10 @@ pub struct K8sExecutor {
     results_egress: Option<ResultsEgress>,
     /// Global default step deadline in seconds (ADR-0047), applied when a step
     /// declares no `timeout:`. Default 1h.
+    /// How long a step Pod the scheduler calls Unschedulable stays
+    /// `Pending` before it fails (git-bug 1166c30): stamped on each Pod as
+    /// [`ANNOTATION_UNSCHEDULABLE_GRACE`] and read by the verdict.
+    unschedulable_grace_secs: u32,
     default_step_timeout_secs: u32,
     /// The workspace CAS (ADR-0029/0045). When wired, every step Pod gets the
     /// `/workspace` machinery: an init container that **fetches** the merged
@@ -261,6 +265,7 @@ impl K8sExecutor {
             namespace: namespace.into(),
             results_egress: None,
             default_step_timeout_secs: DEFAULT_STEP_TIMEOUT_SECS,
+            unschedulable_grace_secs: DEFAULT_UNSCHEDULABLE_GRACE_SECS,
             workspace_cas: None,
             workspace_fetch: None,
             workspace_depot: None,
@@ -276,6 +281,7 @@ impl K8sExecutor {
             namespace: namespace.into(),
             results_egress: None,
             default_step_timeout_secs: DEFAULT_STEP_TIMEOUT_SECS,
+            unschedulable_grace_secs: DEFAULT_UNSCHEDULABLE_GRACE_SECS,
             workspace_cas: None,
             workspace_fetch: None,
             workspace_depot: None,
@@ -344,6 +350,15 @@ impl K8sExecutor {
     /// Override the global default step deadline (ADR-0047).
     pub fn with_default_step_timeout_secs(mut self, secs: u32) -> Self {
         self.default_step_timeout_secs = secs;
+        self
+    }
+
+    /// How long a step Pod may stay Unschedulable before it fails
+    /// (git-bug 1166c30). A cluster autoscaler (Karpenter, Cluster
+    /// Autoscaler) marks every Pod that needs a new node Unschedulable until
+    /// the node joins; `0` fails such a Pod at once.
+    pub fn with_unschedulable_grace_secs(mut self, secs: u32) -> Self {
+        self.unschedulable_grace_secs = secs;
         self
     }
 
@@ -2617,6 +2632,8 @@ fn results_settled_state(pod: &Pod, now_secs: i64) -> ExecState {
     let draining = results_draining(pod);
     let overdue = draining && results_drain_overdue(pod, now_secs);
     match pod_state(pod) {
+        // Waiting for a node an autoscaler may still bring (git-bug 1166c30).
+        ExecState::Failed { .. } if unschedulable_within_grace(pod, now_secs) => ExecState::Pending,
         ExecState::Succeeded if draining && !overdue => ExecState::Running,
         ExecState::Running if overdue && step_terminated_exit(pod) == Some(0) => {
             ExecState::Succeeded
@@ -2807,6 +2824,7 @@ impl Executor for K8sExecutor {
         // named profile might not exist in the registry (fail-closed).
         let pod =
             apply_placement(pod, &step.step.0, spec, &self.placement).map_err(ExecError::Launch)?;
+        let pod = with_unschedulable_grace(pod, self.unschedulable_grace_secs);
         match pods.create(&PostParams::default(), &pod).await {
             Ok(created) => {
                 self.ensure_step_secrets(&name, &created, step, spec)
@@ -6700,6 +6718,71 @@ fn step_container_status(pod: &Pod) -> Option<&k8s_openapi::api::core::v1::Conta
 /// (`PodScheduled=False`). The Pod would otherwise sit Pending indefinitely;
 /// ADR-0047 treats it as never-started infra churn to self-heal via bounded
 /// auto-retry.
+/// The Pod annotation holding the seconds an Unschedulable step Pod waits
+/// before it fails (git-bug 1166c30). Absent or unreadable: `0`, so a Pod
+/// created before the setting existed fails as it did then.
+const ANNOTATION_UNSCHEDULABLE_GRACE: &str = "scarab.io/unschedulable-grace-secs";
+
+/// The default for [`K8sExecutor::with_unschedulable_grace_secs`]: long
+/// enough for Karpenter or Cluster Autoscaler to launch a node and for it to
+/// join (typically 30 to 90 seconds, more for a large instance), short
+/// enough that a Pod no node can ever hold fails within minutes.
+pub const DEFAULT_UNSCHEDULABLE_GRACE_SECS: u32 = 300;
+
+/// `pod` with its Unschedulable grace stamped on as
+/// [`ANNOTATION_UNSCHEDULABLE_GRACE`].
+fn with_unschedulable_grace(mut pod: Pod, secs: u32) -> Pod {
+    pod.metadata
+        .annotations
+        .get_or_insert_with(Default::default)
+        .insert(ANNOTATION_UNSCHEDULABLE_GRACE.to_string(), secs.to_string());
+    pod
+}
+
+/// Whether `pod` is still Pending only because the scheduler has no node
+/// for it yet, and its grace ([`ANNOTATION_UNSCHEDULABLE_GRACE`]) has not
+/// run out at `now_secs` (git-bug 1166c30). On an autoscaling cluster
+/// Unschedulable is the first state of every Pod that needs a new node, so
+/// failing it at once failed every Run on a node pool scaled to zero before
+/// the autoscaler could act. Counted from when `PodScheduled` turned False,
+/// else from the Pod's creation. A Pod Pending for another terminal reason
+/// (a failed workspace fetch, an unpullable image) is not held.
+fn unschedulable_within_grace(pod: &Pod, now_secs: i64) -> bool {
+    let phase = pod.status.as_ref().and_then(|s| s.phase.as_deref());
+    if !matches!(phase, None | Some("Pending"))
+        || is_unschedulable(pod).is_none()
+        || workspace_fetch_failed(pod).is_some()
+        || terminal_waiting_class(pod).is_some()
+    {
+        return false;
+    }
+    let grace = pod
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(ANNOTATION_UNSCHEDULABLE_GRACE))
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0);
+    if grace == 0 {
+        return false;
+    }
+    let since = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .into_iter()
+        .flatten()
+        .find(|c| c.type_ == "PodScheduled" && c.status == "False")
+        .and_then(|c| c.last_transition_time.as_ref())
+        .or(pod.metadata.creation_timestamp.as_ref())
+        .map(|t| t.0.as_second());
+    match since {
+        Some(since) => now_secs < since.saturating_add(i64::from(grace)),
+        // No time to count from: keep waiting; the step timeout bounds it.
+        None => true,
+    }
+}
+
 fn is_unschedulable(pod: &Pod) -> Option<String> {
     pod.status
         .as_ref()
@@ -13416,6 +13499,96 @@ mod tests {
                     ),
                 }
             );
+        }
+
+        /// git-bug 1166c30: on a node pool scaled to zero the scheduler calls
+        /// every new Pod Unschedulable until the autoscaler's node joins. The
+        /// Pod waits out its grace (counted from PodScheduled=False), then
+        /// fails with the scheduler's message as before. No grace stamped (a
+        /// Pod from before the setting) or a grace of 0 fails at once.
+        #[test]
+        fn an_unschedulable_pod_waits_out_its_grace_for_a_new_node() {
+            use k8s_openapi::api::core::v1::ContainerStateWaiting;
+            const NOW: i64 = 1_800_000_000;
+            let at = |s: i64| {
+                k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                    k8s_openapi::jiff::Timestamp::from_second(s).expect("valid timestamp"),
+                )
+            };
+            let waiting = |since: Option<i64>, grace: Option<&str>| {
+                let mut pod = Pod {
+                    status: Some(PodStatus {
+                        phase: Some("Pending".into()),
+                        conditions: Some(vec![PodCondition {
+                            type_: "PodScheduled".into(),
+                            status: "False".into(),
+                            reason: Some("Unschedulable".into()),
+                            message: Some(
+                                "0/9 nodes are available: 9 node(s) had untolerated taint(s)."
+                                    .into(),
+                            ),
+                            last_transition_time: since.map(at),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                pod.metadata.creation_timestamp = Some(at(NOW - 1_000));
+                if let Some(g) = grace {
+                    pod = with_unschedulable_grace(pod, 0);
+                    pod.metadata
+                        .annotations
+                        .as_mut()
+                        .unwrap()
+                        .insert(ANNOTATION_UNSCHEDULABLE_GRACE.into(), g.into());
+                }
+                pod
+            };
+            let failed = |s: ExecState| matches!(s, ExecState::Failed { .. });
+
+            // Within the grace: still Pending, through both verdict paths.
+            let fresh = waiting(Some(NOW - 30), Some("300"));
+            assert_eq!(results_settled_state(&fresh, NOW), ExecState::Pending);
+            assert_eq!(settled_state(&fresh, true, NOW), ExecState::Pending);
+            // Past it: the scheduler's message, as before.
+            match results_settled_state(&waiting(Some(NOW - 301), Some("300")), NOW) {
+                ExecState::Failed { cause, .. } => assert_eq!(
+                    cause.as_deref(),
+                    Some("Unschedulable: 0/9 nodes are available: 9 node(s) had untolerated taint(s).")
+                ),
+                other => panic!("expected Failed, got {other:?}"),
+            }
+            // No transition time: counted from the Pod's creation (NOW-1000).
+            assert!(failed(results_settled_state(
+                &waiting(None, Some("300")),
+                NOW
+            )));
+            assert_eq!(
+                results_settled_state(&waiting(None, Some("1200")), NOW),
+                ExecState::Pending
+            );
+            // No grace stamped, an unreadable one, or 0: fails at once.
+            for grace in [None, Some("soon"), Some("0")] {
+                assert!(
+                    failed(results_settled_state(&waiting(Some(NOW - 1), grace), NOW)),
+                    "{grace:?}"
+                );
+            }
+            // Another terminal Pending reason is not held by the grace.
+            let mut bad_image = waiting(Some(NOW - 1), Some("300"));
+            bad_image.status.as_mut().unwrap().container_statuses = Some(vec![ContainerStatus {
+                name: STEP_CONTAINER.into(),
+                state: Some(ContainerState {
+                    waiting: Some(ContainerStateWaiting {
+                        reason: Some("InvalidImageName".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]);
+            assert!(failed(results_settled_state(&bad_image, NOW)));
         }
 
         #[test]

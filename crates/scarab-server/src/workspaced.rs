@@ -10104,6 +10104,7 @@ mod tests {
             master_key_warnings: vec![],
             dev_insecure: false,
             step_timeout_secs: 3600,
+            unschedulable_grace_secs: 300,
             project_run_cap: None,
             public_url: "http://localhost:8080".into(),
             ui_url: "http://localhost:8080".into(),

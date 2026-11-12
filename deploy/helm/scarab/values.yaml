@@ -64,6 +64,12 @@ scarab:
   # Global default step deadline in seconds (ADR-0047). Empty => server
   # default (3600). Per-step `timeout:` always overrides.
   stepTimeoutSecs: ""
+  # Seconds a step Pod the scheduler calls Unschedulable waits for a node
+  # before the step fails. A cluster autoscaler (Karpenter, Cluster Autoscaler)
+  # marks every Pod that needs a new node Unschedulable until the node joins,
+  # so a node pool that scales to zero needs this. Empty => server default
+  # (300). "0" fails such a Pod at once (no autoscaler).
+  unschedulableGraceSecs: ""
   # The most Runs of one project (repository) that may be Running at once; the
   # rest wait Pending and start in priority order as Runs finish (ADR-0011).
   # A Run waiting on a gate is not counted. Empty or 0 => no cap (default).
