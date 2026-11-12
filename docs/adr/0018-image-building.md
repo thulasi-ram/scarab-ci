@@ -317,7 +317,7 @@ forge credentials. The release notes say each of these.
   large image costs a transfer through the Data Depot. An image that is not pushed stays in
   BuildKit and costs no transfer.
 - The build Step holds no credential, so it cannot pull private base images. A read-only pull
-  credential for the build Step is a follow-up.
+  credential for the build Step is a follow-up (e60d9fe).
 - The push Step runs as uid 0: the `crane:debug` image has no other user. It sets
   `security: { run_as_root: true }`, which ADR-0039 makes self-service. The rest of the
   baseline still applies: every capability dropped, not privileged, no privilege escalation,
