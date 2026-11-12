@@ -5130,18 +5130,24 @@ pub fn build_pod(
 }
 
 /// Apply the operator placement config + the step's requested placement to a
-/// freshly built Pod (ADR-0055). Overlay order (later wins): **baseline** → each
+/// freshly built Pod (ADR-0055). Layer order (later wins): **baseline** → each
 /// named **PlacementProfile** (in listed order) → the governed **`k8s_overlay`**.
 /// Container resources are applied to the step container from the step's
-/// `resources`, falling back per-field to the baseline default. Overlays are
-/// RFC-7386 merge-patches (objects merge recursively; arrays/scalars replace).
+/// `resources`, falling back per-field to the baseline default. Each layer is
+/// strategic-merged onto the Pod in turn (see [`strategic_merge`]): objects merge,
+/// the Pod's keyed lists (containers, env, volumes, …) merge item by item,
+/// tolerations accumulate, and every other list replaces.
 ///
-/// Returns `Err` if a step names a PlacementProfile absent from the registry —
-/// fail-closed, never a silently mis-scheduled Pod — or names a
-/// `registry_auth_only` profile without asking for `registry_auth` (see
-/// [`registry_auth_only_applies`]). A no-op (returns the Pod unchanged) when
-/// there is no baseline, no profile, no overlay and no resources, preserving
-/// the pre-0055 behavior exactly. `step` names the Step in an error.
+/// Returns `Err` if a step names a PlacementProfile absent from the registry; if
+/// a step names a `registry_auth_only` profile without asking for
+/// `registry_auth` (see [`registry_auth_only_applies`], checked before the
+/// profile is merged); or if a layer names or removes a container Scarab added
+/// to the Pod other than the step container (the results-egress sidecar, the
+/// workspace containers, service sidecars): those carry Scarab's own wiring.
+/// Fail-closed, never a silently mis-scheduled or mis-wired Pod. A no-op
+/// (returns the Pod unchanged) when there is no baseline, no profile, no overlay
+/// and no resources, preserving the pre-0055 behavior exactly. `step` names the
+/// Step in an error.
 fn apply_placement(
     mut pod: Pod,
     step: &str,
@@ -5169,10 +5175,10 @@ fn apply_placement(
         }
     }
 
-    // 2. Build the raw overlay: baseline → named profiles (in order) → k8s_overlay.
-    let mut overlay = serde_json::Value::Null;
+    // 2. The layers, in order: baseline → named profiles (in order) → k8s_overlay.
+    let mut layers: Vec<(String, &serde_json::Value)> = Vec::new();
     if let Some(base) = &placement.baseline {
-        json_merge(&mut overlay, base);
+        layers.push(("the placement baseline".to_string(), base));
     }
     for name in &spec.placement_profiles {
         let profile = placement
@@ -5182,21 +5188,33 @@ fn apply_placement(
             continue;
         }
         if let Some(k8s) = &profile.k8s {
-            json_merge(&mut overlay, k8s);
+            layers.push((format!("placement_profile `{name}`"), k8s));
         }
     }
     if let Some(o) = &spec.k8s_overlay {
-        json_merge(&mut overlay, o);
+        layers.push(("the step's k8s_overlay".to_string(), o));
+    }
+    layers.retain(|(_, layer)| !layer.is_null());
+    if layers.is_empty() {
+        return Ok(pod);
     }
 
-    // 3. Merge the overlay onto the Pod (no-op when empty). k8s_openapi serializes
-    // with the k8s JSON field names (nodeSelector, tolerations…), which is exactly
-    // what an operator writes into a baseline/profile/overlay.
-    if !overlay.is_null() {
-        let mut pod_value = serde_json::to_value(&pod).map_err(|e| format!("pod encode: {e}"))?;
-        json_merge(&mut pod_value, &overlay);
-        pod = serde_json::from_value(pod_value)
-            .map_err(|e| format!("pod decode after overlay merge: {e}"))?;
+    // 3. Merge each layer onto the Pod in turn. k8s_openapi serializes with the
+    // k8s JSON field names (nodeSelector, tolerations…), which is exactly what an
+    // operator writes into a baseline/profile/overlay. Applying the layers one at
+    // a time (rather than merging them into one overlay first) lets every check
+    // name the layer that tripped it.
+    let mut pod_value = serde_json::to_value(&pod).map_err(|e| format!("pod encode: {e}"))?;
+    let built = ScarabOwned::of(&pod_value);
+    for (source, layer) in &layers {
+        refuse_patch_directives(source, layer)?;
+        built.refuse_named_in(source, layer)?;
+        strategic_merge(&mut pod_value, layer, MergeAt::Pod);
+        built.check_kept(source, &pod_value)?;
+        // Decode after every layer, so a layer that leaves an invalid Pod is
+        // the one the error names.
+        pod = serde_json::from_value(pod_value.clone())
+            .map_err(|e| format!("{source} leaves a Pod that does not decode: {e}"))?;
     }
     Ok(pod)
 }
@@ -5234,21 +5252,429 @@ fn registry_auth_only_applies(step: &str, name: &str, spec: &StepSpec) -> Result
     }
 }
 
-/// RFC-7386 JSON merge-patch: objects merge recursively; a `null` in the patch
-/// deletes the key; every other value (scalar or array) replaces.
-fn json_merge(base: &mut serde_json::Value, patch: &serde_json::Value) {
-    use serde_json::Value;
-    match (base, patch) {
-        (Value::Object(b), Value::Object(p)) => {
-            for (k, v) in p {
-                if v.is_null() {
-                    b.remove(k);
-                } else {
-                    json_merge(b.entry(k.clone()).or_insert(Value::Null), v);
+/// Refuse a layer that holds a key starting with `$` anywhere: Kubernetes'
+/// strategic-merge directives (`$patch`, `$retainKeys`, `$deleteFromPrimitiveList`,
+/// …). [`strategic_merge`] does not support them, and merging one as a plain
+/// field would do something other than what its author meant.
+fn refuse_patch_directives(source: &str, layer: &serde_json::Value) -> Result<(), String> {
+    match layer {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                if key.starts_with('$') {
+                    return Err(format!(
+                        "{source} uses the patch directive `{key}`; Scarab's strategic merge \
+                         does not support `$` directives"
+                    ));
+                }
+                refuse_patch_directives(source, value)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .try_for_each(|item| refuse_patch_directives(source, item)),
+        _ => Ok(()),
+    }
+}
+
+/// What [`build_pod`] put in a step Pod that a placement layer may not change,
+/// taken from the Pod's JSON before any layer is merged: the containers Scarab
+/// added beside the step container, every volume, and the step container's
+/// env and mounts. They carry Scarab's own wiring (the results sidecar and its
+/// fence token, the workspace fetch and drain, the forge, registry, OIDC and
+/// secret mounts, and the `{run, step, attempt}` fence the drain reads off the
+/// step's env). A layer may merge onto the step container and add containers,
+/// volumes, env and mounts under new names and paths.
+struct ScarabOwned {
+    /// Every container in the built Pod, as (`spec` list field, name); the step
+    /// container is among them, so removing it is caught too.
+    containers: Vec<(&'static str, String)>,
+    /// The built Pod's `spec.volumes` items, as built.
+    volumes: Vec<serde_json::Value>,
+    /// The step container's `env` items, as built.
+    step_env: Vec<serde_json::Value>,
+    /// The step container's `volumeMounts` items, as built.
+    step_mounts: Vec<serde_json::Value>,
+    /// The step container's `volumeDevices` items, as built.
+    step_devices: Vec<serde_json::Value>,
+}
+
+impl ScarabOwned {
+    fn of(pod: &serde_json::Value) -> Self {
+        let containers = ["containers", "initContainers"]
+            .into_iter()
+            .flat_map(|field| {
+                json_items(pod, &format!("/spec/{field}"))
+                    .iter()
+                    .filter_map(|c| json_str(c, "name"))
+                    .map(move |name| (field, name.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let step = step_container_json(pod);
+        let step_items = |pointer: &str| {
+            step.map(|c| json_items(c, pointer).to_vec())
+                .unwrap_or_default()
+        };
+        ScarabOwned {
+            containers,
+            volumes: json_items(pod, "/spec/volumes").to_vec(),
+            step_env: step_items("/env"),
+            step_mounts: step_items("/volumeMounts"),
+            step_devices: step_items("/volumeDevices"),
+        }
+    }
+
+    fn is_scarab_volume(&self, name: &str) -> bool {
+        self.volumes
+            .iter()
+            .any(|v| json_str(v, "name") == Some(name))
+    }
+
+    /// Refuse a layer that names, before it is merged, something Scarab owns: a
+    /// container other than the step container (in `containers` or
+    /// `initContainers`), a volume in `spec.volumes`, or an env variable or a
+    /// mount path Scarab set on the step container. A strategic merge would
+    /// merge the layer's fields into it.
+    fn refuse_named_in(&self, source: &str, layer: &serde_json::Value) -> Result<(), String> {
+        for field in ["containers", "initContainers"] {
+            for name in json_items(layer, &format!("/spec/{field}"))
+                .iter()
+                .filter_map(|c| json_str(c, "name"))
+            {
+                // The step container is open to change, but only as itself:
+                // an init container named `step` is not it.
+                if field == "containers" && name == STEP_CONTAINER {
+                    continue;
+                }
+                if is_scarab_container_name(name) || self.containers.iter().any(|(_, n)| n == name)
+                {
+                    return Err(format!(
+                        "{source} names container `{name}` in `spec.{field}`; Scarab adds that \
+                         container to the step Pod, so a placement layer may not change it. \
+                         Only the `{STEP_CONTAINER}` container can be changed, and an added \
+                         container needs a name of its own"
+                    ));
                 }
             }
         }
-        (b, p) => *b = p.clone(),
+        for name in json_items(layer, "/spec/volumes")
+            .iter()
+            .filter_map(|v| json_str(v, "name"))
+        {
+            if self.is_scarab_volume(name) {
+                return Err(format!(
+                    "{source} names volume `{name}` in `spec.volumes`; Scarab created that \
+                     volume for the step Pod, so a placement layer may not change it. An \
+                     added volume needs a name of its own"
+                ));
+            }
+        }
+        // Every `step` entry in the layer, not only the first: a strategic
+        // merge applies each of them in turn.
+        for step in json_items(layer, "/spec/containers")
+            .iter()
+            .filter(|c| json_str(c, "name") == Some(STEP_CONTAINER))
+        {
+            for name in json_items(step, "/env")
+                .iter()
+                .filter_map(|e| json_str(e, "name"))
+            {
+                if self
+                    .step_env
+                    .iter()
+                    .any(|e| json_str(e, "name") == Some(name))
+                {
+                    return Err(format!(
+                        "{source} sets env `{name}` on the `{STEP_CONTAINER}` container; \
+                         Scarab or the step set it, so a placement layer may not change it. \
+                         An added variable needs a name of its own"
+                    ));
+                }
+            }
+            for path in json_items(step, "/volumeMounts")
+                .iter()
+                .filter_map(|m| json_str(m, "mountPath"))
+            {
+                let wanted = normalize_mount_path(path);
+                if let Some(ours) = self.step_mounts.iter().find(|m| {
+                    json_str(m, "mountPath").map(normalize_mount_path) == Some(wanted.clone())
+                }) {
+                    let volume = json_str(ours, "name").unwrap_or_default();
+                    return Err(format!(
+                        "{source} sets a volumeMount at `{path}` on the `{STEP_CONTAINER}` \
+                         container; Scarab mounts volume `{volume}` there, so a placement \
+                         layer may not change it. An added mount needs a path of its own"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// After a layer is merged, check that everything Scarab owns is still in
+    /// the Pod as built, and that no container reaches a Scarab volume it was
+    /// not built with. This catches what [`Self::refuse_named_in`] cannot see,
+    /// such as `volumes: null`, `env: null` or `initContainers: null`.
+    fn check_kept(&self, source: &str, pod: &serde_json::Value) -> Result<(), String> {
+        for (field, name) in &self.containers {
+            let kept = json_items(pod, &format!("/spec/{field}"))
+                .iter()
+                .any(|c| json_str(c, "name") == Some(name));
+            if !kept {
+                return Err(format!(
+                    "{source} removes container `{name}` from `spec.{field}`; Scarab adds \
+                     that container to the step Pod, and a placement layer may not remove it"
+                ));
+            }
+        }
+        let volumes = json_items(pod, "/spec/volumes");
+        if let Some(volume) = self.volumes.iter().find(|v| !volumes.contains(v)) {
+            let name = json_str(volume, "name").unwrap_or_default();
+            return Err(format!(
+                "{source} removes or changes volume `{name}`; Scarab created that volume \
+                 for the step Pod, and a placement layer may not change it"
+            ));
+        }
+        let step = step_container_json(pod);
+        let step_items = |pointer: &str| step.map(|c| json_items(c, pointer)).unwrap_or_default();
+        let env = step_items("/env");
+        if let Some(var) = self.step_env.iter().find(|e| !env.contains(e)) {
+            let name = json_str(var, "name").unwrap_or_default();
+            return Err(format!(
+                "{source} removes or changes env `{name}` on the `{STEP_CONTAINER}` \
+                 container; Scarab or the step set it, and a placement layer may not change it"
+            ));
+        }
+        // The step's mounts and devices of Scarab's volumes are exactly the
+        // built ones: none removed or changed, and none added at a new path.
+        for (field, ours) in [
+            ("volumeMounts", &self.step_mounts),
+            ("volumeDevices", &self.step_devices),
+        ] {
+            let now: Vec<&serde_json::Value> = step_items(&format!("/{field}"))
+                .iter()
+                .filter(|m| json_str(m, "name").is_some_and(|n| self.is_scarab_volume(n)))
+                .collect();
+            let same = now.len() == ours.len() && ours.iter().all(|m| now.contains(&m));
+            if !same {
+                return Err(format!(
+                    "{source} changes the `{STEP_CONTAINER}` container's `{field}` of \
+                     Scarab's volumes; Scarab set them, and a placement layer may not \
+                     remove, change or add one"
+                ));
+            }
+        }
+        // A container a layer added may not use a Scarab volume at all.
+        for field in ["containers", "initContainers", "ephemeralContainers"] {
+            for container in json_items(pod, &format!("/spec/{field}")) {
+                let name = json_str(container, "name").unwrap_or_default();
+                if self
+                    .containers
+                    .iter()
+                    .any(|(f, n)| *f == field && n == name)
+                {
+                    continue;
+                }
+                let reached = ["/volumeMounts", "/volumeDevices"]
+                    .iter()
+                    .flat_map(|p| json_items(container, p))
+                    .filter_map(|m| json_str(m, "name"))
+                    .find(|v| self.is_scarab_volume(v));
+                if let Some(volume) = reached {
+                    return Err(format!(
+                        "{source} adds container `{name}` in `spec.{field}` that mounts volume \
+                         `{volume}`; Scarab created that volume for its own containers, and \
+                         a container a placement layer adds may not use it"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A mount path with empty and `.` segments removed and no trailing `/`, so
+/// `/workspace/`, `//workspace` and `/./workspace` compare equal to
+/// `/workspace`.
+fn normalize_mount_path(path: &str) -> String {
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    let joined = segments.join("/");
+    if path.starts_with('/') {
+        format!("/{joined}")
+    } else {
+        joined
+    }
+}
+
+/// The array at `pointer` in `value`, or an empty slice when it is absent or not
+/// an array.
+fn json_items<'a>(value: &'a serde_json::Value, pointer: &str) -> &'a [serde_json::Value] {
+    value
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+/// The string field `key` of a JSON object, if it is one.
+fn json_str<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(serde_json::Value::as_str)
+}
+
+/// The step container's JSON in a Pod, or in a placement layer.
+fn step_container_json(pod: &serde_json::Value) -> Option<&serde_json::Value> {
+    json_items(pod, "/spec/containers")
+        .iter()
+        .find(|c| json_str(c, "name") == Some(STEP_CONTAINER))
+}
+
+/// Whether `name` is one Scarab gives a container it adds to a step Pod, whether
+/// or not this Pod has it: the results-egress sidecar (ADR-0042), the workspace
+/// fetcher and drain (ADR-0061), and the service sidecars (ADR-0058).
+fn is_scarab_container_name(name: &str) -> bool {
+    [
+        RESULTS_EGRESS_CONTAINER,
+        WORKSPACE_INIT_CONTAINER,
+        WORKSPACE_EGRESS_CONTAINER,
+    ]
+    .contains(&name)
+        || name
+            .strip_prefix(SERVICE_CONTAINER_PREFIX)
+            .is_some_and(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Where in a Pod a [`strategic_merge`] is working; it decides how a list merges.
+#[derive(Clone, Copy)]
+enum MergeAt {
+    /// The Pod object itself.
+    Pod,
+    /// The Pod's `spec`.
+    PodSpec,
+    /// One item of `containers`, `initContainers` or `ephemeralContainers`.
+    Container,
+    /// Anywhere else: every list there replaces.
+    Other,
+}
+
+/// How a list field merges in [`strategic_merge`].
+enum ListMerge {
+    /// The patch's list replaces the base's (RFC-7386, and Kubernetes' default).
+    Replace,
+    /// Items are matched on these fields (Kubernetes' `patchMergeKey`): a match
+    /// merges recursively at the given place, a new item is appended in order.
+    ByKey(&'static [&'static str], MergeAt),
+    /// The patch's items are appended, skipping exact duplicates.
+    Union,
+}
+
+/// The merge rule for list `field` at `at`, following the `patchMergeKey`s
+/// Kubernetes declares on the Pod fields a placement layer is likely to touch.
+fn list_merge(at: MergeAt, field: &str) -> ListMerge {
+    match (at, field) {
+        (MergeAt::PodSpec, "containers" | "initContainers" | "ephemeralContainers") => {
+            ListMerge::ByKey(&["name"], MergeAt::Container)
+        }
+        (MergeAt::PodSpec, "volumes" | "imagePullSecrets") => {
+            ListMerge::ByKey(&["name"], MergeAt::Other)
+        }
+        (MergeAt::PodSpec, "hostAliases") => ListMerge::ByKey(&["ip"], MergeAt::Other),
+        (MergeAt::PodSpec, "topologySpreadConstraints") => {
+            ListMerge::ByKey(&["topologyKey", "whenUnsatisfiable"], MergeAt::Other)
+        }
+        // This differs from Kubernetes on purpose: its strategic merge replaces
+        // `tolerations`. ADR-0055 §A makes the baseline's tolerations a fact
+        // about the cluster that every step Pod keeps (a pool's taint), so a
+        // profile that tolerates one more taint adds to them instead of
+        // dropping them.
+        (MergeAt::PodSpec, "tolerations") => ListMerge::Union,
+        (MergeAt::Container, "env") => ListMerge::ByKey(&["name"], MergeAt::Other),
+        (MergeAt::Container, "volumeMounts") => ListMerge::ByKey(&["mountPath"], MergeAt::Other),
+        (MergeAt::Container, "ports") => ListMerge::ByKey(&["containerPort"], MergeAt::Other),
+        (MergeAt::Container, "volumeDevices") => ListMerge::ByKey(&["devicePath"], MergeAt::Other),
+        _ => ListMerge::Replace,
+    }
+}
+
+/// A Kubernetes-style strategic merge of `patch` onto `base`, a Pod's JSON
+/// (ADR-0055 §D). Objects merge recursively and a `null` in the patch deletes
+/// the key, as in an RFC-7386 merge patch. Lists follow [`list_merge`]: the
+/// Pod's keyed lists merge item by item, `tolerations` is a union, and every
+/// other list (affinity terms among them) replaces, as Kubernetes does. A scalar
+/// replaces. The `$patch` directives are not supported.
+fn strategic_merge(base: &mut serde_json::Value, patch: &serde_json::Value, at: MergeAt) {
+    use serde_json::Value;
+    let Value::Object(patch) = patch else {
+        *base = patch.clone();
+        return;
+    };
+    if !base.is_object() {
+        *base = Value::Object(serde_json::Map::new());
+    }
+    let Value::Object(base) = base else {
+        return;
+    };
+    for (field, value) in patch {
+        if value.is_null() {
+            base.remove(field);
+            continue;
+        }
+        let rule = list_merge(at, field);
+        let slot = base.entry(field.clone()).or_insert(Value::Null);
+        if slot.is_null() && value.is_array() && !matches!(rule, ListMerge::Replace) {
+            *slot = Value::Array(Vec::new());
+        }
+        match (rule, slot, value) {
+            (ListMerge::ByKey(keys, item_at), Value::Array(items), Value::Array(patch_items)) => {
+                merge_keyed_list(items, patch_items, keys, item_at);
+            }
+            (ListMerge::Union, Value::Array(items), Value::Array(patch_items)) => {
+                for item in patch_items {
+                    if !item.is_null() && !items.contains(item) {
+                        items.push(item.clone());
+                    }
+                }
+            }
+            (_, slot, value) => {
+                let child = match (at, field.as_str()) {
+                    (MergeAt::Pod, "spec") => MergeAt::PodSpec,
+                    _ => MergeAt::Other,
+                };
+                strategic_merge(slot, value, child);
+            }
+        }
+    }
+}
+
+/// Merge `patch` into the keyed list `items`: an item whose `keys` all equal an
+/// existing item's merges into it; any other item is appended in order.
+fn merge_keyed_list(
+    items: &mut Vec<serde_json::Value>,
+    patch: &[serde_json::Value],
+    keys: &[&str],
+    item_at: MergeAt,
+) {
+    for item in patch.iter().filter(|i| !i.is_null()) {
+        let key: Option<Vec<&serde_json::Value>> = keys
+            .iter()
+            .map(|k| item.get(*k).filter(|v| !v.is_null()))
+            .collect();
+        let existing = key.and_then(|key| {
+            items
+                .iter()
+                .position(|it| keys.iter().zip(&key).all(|(k, v)| it.get(*k) == Some(*v)))
+        });
+        match existing {
+            Some(i) => strategic_merge(&mut items[i], item, item_at),
+            None => {
+                let mut added = serde_json::Value::Null;
+                strategic_merge(&mut added, item, item_at);
+                items.push(added);
+            }
+        }
     }
 }
 
@@ -6783,6 +7209,414 @@ mod tests {
             .spec
             .unwrap();
         assert_eq!(ps.scheduler_name.as_deref(), Some("mine"));
+    }
+
+    /// The fullest step Pod: the results sidecar, the workspace fetcher and
+    /// drain, and the workspace volumes and mounts on the step container.
+    fn full_pod_for(spec: &StepSpec) -> Pod {
+        let egress = ResultsEgress {
+            base_url: "http://scarab-server".into(),
+            token_secret: b"secret".to_vec(),
+            sidecar_image: "ghcr.io/acme/scarab-sidecar:1".into(),
+        };
+        let step = step_with_attempt("run-1", "s", "a1");
+        build_pod(
+            "scarab-x",
+            "ns",
+            &step,
+            spec,
+            Some(&egress),
+            DEFAULT_STEP_TIMEOUT_SECS,
+            true,
+            Some(&sample_fetch()),
+        )
+    }
+
+    fn full_spec() -> StepSpec {
+        let mut spec = busybox();
+        spec.workspace_inputs = vec!["tree-a".into()];
+        spec
+    }
+
+    fn step_container(ps: &k8s_openapi::api::core::v1::PodSpec) -> &Container {
+        ps.containers
+            .iter()
+            .find(|c| c.name == STEP_CONTAINER)
+            .expect("step container")
+    }
+
+    fn init_names(ps: &k8s_openapi::api::core::v1::PodSpec) -> Vec<String> {
+        ps.init_containers
+            .iter()
+            .flatten()
+            .map(|c| c.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn profile_tolerations_add_to_the_baseline_and_duplicates_appear_once() {
+        let pool = serde_json::json!(
+            {"key":"dedicated","operator":"Equal","value":"ci","effect":"NoSchedule"});
+        let arm = serde_json::json!(
+            {"key":"arch","operator":"Equal","value":"arm64","effect":"NoSchedule"});
+        let mut spec = busybox();
+        spec.placement_profiles = vec!["arm64".into()];
+        let placement = PlacementConfig {
+            baseline: Some(serde_json::json!({"spec":{"tolerations":[pool.clone()]}})),
+            profiles: vec![profile(
+                "arm64",
+                serde_json::json!({"spec":{"tolerations":[pool, arm]}}),
+            )],
+            ..Default::default()
+        };
+        let ps = apply_placement(pod_for(&spec), "s", &spec, &placement)
+            .unwrap()
+            .spec
+            .unwrap();
+        let values: Vec<_> = ps
+            .tolerations
+            .unwrap()
+            .into_iter()
+            .map(|t| t.value.unwrap_or_default())
+            .collect();
+        assert_eq!(values, vec!["ci".to_string(), "arm64".to_string()]);
+    }
+
+    #[test]
+    fn overlay_on_the_step_container_keeps_its_image_command_env_and_mounts() {
+        let mut spec = full_spec();
+        spec.k8s_overlay = Some(serde_json::json!({"spec":{"containers":[
+            {"name":"step","securityContext":{"seccompProfile":{"type":"Unconfined"}}}
+        ]}}));
+        let before = full_pod_for(&spec).spec.unwrap();
+        let after = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default())
+            .unwrap()
+            .spec
+            .unwrap();
+        let (b, a) = (step_container(&before), step_container(&after));
+        assert_eq!(a.image, b.image);
+        assert_eq!(a.command, b.command);
+        assert_eq!(a.args, b.args);
+        assert_eq!(a.env, b.env);
+        assert!(b.volume_mounts.as_ref().is_some_and(|m| !m.is_empty()));
+        assert_eq!(a.volume_mounts, b.volume_mounts);
+        let sc = a.security_context.as_ref().unwrap();
+        assert_eq!(sc.seccomp_profile.as_ref().unwrap().type_, "Unconfined");
+        // The rest of the step's hardened context is still there.
+        assert_eq!(sc.run_as_non_root, Some(true));
+        assert_eq!(after.containers.len(), 1);
+        assert_eq!(init_names(&after), init_names(&before));
+    }
+
+    #[test]
+    fn profile_adding_an_init_container_keeps_scarabs_containers_and_volumes() {
+        let mut spec = full_spec();
+        spec.placement_profiles = vec!["ecr".into()];
+        let placement = PlacementConfig {
+            profiles: vec![profile(
+                "ecr",
+                serde_json::json!({"spec":{
+                    "initContainers":[{"name":"ecr-login","image":"amazon/aws-cli:2"}],
+                    "volumes":[{"name":"ecr-creds","emptyDir":{}}],
+                    "containers":[{"name":"step","volumeMounts":[
+                        {"name":"ecr-creds","mountPath":"/ecr"}]}]
+                }}),
+            )],
+            ..Default::default()
+        };
+        let before = full_pod_for(&spec).spec.unwrap();
+        let after = apply_placement(full_pod_for(&spec), "s", &spec, &placement)
+            .unwrap()
+            .spec
+            .unwrap();
+
+        let mut want_inits = init_names(&before);
+        assert!(want_inits.contains(&RESULTS_EGRESS_CONTAINER.to_string()));
+        assert!(want_inits.contains(&WORKSPACE_INIT_CONTAINER.to_string()));
+        assert!(want_inits.contains(&WORKSPACE_EGRESS_CONTAINER.to_string()));
+        want_inits.push("ecr-login".into());
+        assert_eq!(init_names(&after), want_inits);
+
+        let vol_names = |ps: &k8s_openapi::api::core::v1::PodSpec| -> Vec<String> {
+            ps.volumes
+                .iter()
+                .flatten()
+                .map(|v| v.name.clone())
+                .collect()
+        };
+        let mut want_vols = vol_names(&before);
+        want_vols.push("ecr-creds".into());
+        assert_eq!(vol_names(&after), want_vols);
+
+        let mut want_mounts = step_container(&before).volume_mounts.clone().unwrap();
+        want_mounts.push(VolumeMount {
+            name: "ecr-creds".into(),
+            mount_path: "/ecr".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            step_container(&after).volume_mounts.as_ref(),
+            Some(&want_mounts)
+        );
+    }
+
+    #[test]
+    fn overlay_env_merges_by_name_on_the_step_container() {
+        // The baseline adds a variable to the step; the overlay replaces its
+        // value by name and adds one more. The step's built env is untouched.
+        let mut spec = busybox();
+        spec.k8s_overlay = Some(serde_json::json!({"spec":{"containers":[
+            {"name":"step","env":[
+                {"name":"HTTP_PROXY","value":"http://overlay:3128"},
+                {"name":"EXTRA","value":"1"}
+            ]}
+        ]}}));
+        let placement = PlacementConfig {
+            baseline: Some(serde_json::json!({"spec":{"containers":[
+                {"name":"step","env":[{"name":"HTTP_PROXY","value":"http://baseline:3128"}]}
+            ]}})),
+            ..Default::default()
+        };
+        let before = pod_for(&spec).spec.unwrap();
+        let after = apply_placement(pod_for(&spec), "s", &spec, &placement)
+            .unwrap()
+            .spec
+            .unwrap();
+        let env_before = step_container(&before).env.clone().unwrap();
+        let env_after = step_container(&after).env.clone().unwrap();
+        // The built names in the same order, then the added ones in order.
+        let names = |env: &[EnvVar]| env.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+        let mut want = names(&env_before);
+        want.extend(["HTTP_PROXY".to_string(), "EXTRA".to_string()]);
+        assert_eq!(names(&env_after), want);
+        let value = |name: &str| {
+            env_after
+                .iter()
+                .find(|e| e.name == name)
+                .and_then(|e| e.value.clone())
+        };
+        assert_eq!(value("HTTP_PROXY").as_deref(), Some("http://overlay:3128"));
+        assert_eq!(value("EXTRA").as_deref(), Some("1"));
+        for e in &env_before {
+            assert!(env_after.contains(e), "lost {}", e.name);
+        }
+    }
+
+    #[test]
+    fn a_layer_overriding_the_steps_fence_env_is_refused() {
+        let mut spec = full_spec();
+        spec.k8s_overlay = Some(serde_json::json!({"spec":{"containers":[
+            {"name":"step","env":[{"name":"SCARAB_ATTEMPT","value":"someone-else"}]}
+        ]}}));
+        let err = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default())
+            .unwrap_err();
+        assert!(err.contains("`SCARAB_ATTEMPT`"), "got: {err}");
+        assert!(err.contains("k8s_overlay"), "got: {err}");
+    }
+
+    #[test]
+    fn a_layer_naming_a_scarab_container_is_refused() {
+        for (field, name) in [
+            ("initContainers", RESULTS_EGRESS_CONTAINER),
+            ("initContainers", WORKSPACE_INIT_CONTAINER),
+        ] {
+            let mut spec = full_spec();
+            spec.k8s_overlay = Some(serde_json::json!({"spec":{
+                field: [{"name": name, "image": "evil:1"}]
+            }}));
+            let err = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default())
+                .unwrap_err();
+            assert!(err.contains(&format!("`{name}`")), "got: {err}");
+            assert!(err.contains("k8s_overlay"), "got: {err}");
+        }
+        // A profile naming the sidecar in `containers` is refused too, and the
+        // message names the profile.
+        let mut spec = full_spec();
+        spec.placement_profiles = vec!["p".into()];
+        let placement = PlacementConfig {
+            profiles: vec![profile(
+                "p",
+                serde_json::json!({"spec":{"containers":[
+                    {"name": RESULTS_EGRESS_CONTAINER, "image": "evil:1"}]}}),
+            )],
+            ..Default::default()
+        };
+        let err = apply_placement(full_pod_for(&spec), "s", &spec, &placement).unwrap_err();
+        assert!(err.contains(RESULTS_EGRESS_CONTAINER), "got: {err}");
+        assert!(err.contains("placement_profile `p`"), "got: {err}");
+    }
+
+    #[test]
+    fn a_layer_deleting_scarabs_init_containers_is_refused() {
+        let mut spec = full_spec();
+        spec.k8s_overlay = Some(serde_json::json!({"spec":{"initContainers": null}}));
+        let err = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default())
+            .unwrap_err();
+        assert!(err.contains("removes container"), "got: {err}");
+    }
+
+    #[test]
+    fn a_profile_redefining_a_scarab_volume_is_refused() {
+        let mut spec = full_spec();
+        spec.placement_profiles = vec!["host".into()];
+        let placement = PlacementConfig {
+            profiles: vec![profile(
+                "host",
+                serde_json::json!({"spec":{"volumes":[
+                    {"name": RESULTS_VOLUME, "hostPath": {"path": "/var/run"}}]}}),
+            )],
+            ..Default::default()
+        };
+        let err = apply_placement(full_pod_for(&spec), "s", &spec, &placement).unwrap_err();
+        assert!(err.contains(&format!("`{RESULTS_VOLUME}`")), "got: {err}");
+        assert!(err.contains("placement_profile `host`"), "got: {err}");
+    }
+
+    #[test]
+    fn a_layer_deleting_scarabs_volumes_is_refused() {
+        let mut spec = full_spec();
+        spec.k8s_overlay = Some(serde_json::json!({"spec":{"volumes": null}}));
+        let err = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default())
+            .unwrap_err();
+        assert!(err.contains("removes or changes volume"), "got: {err}");
+        assert!(err.contains("k8s_overlay"), "got: {err}");
+    }
+
+    #[test]
+    fn a_layer_remounting_a_scarab_mount_path_is_refused() {
+        for path in [
+            WORKSPACE_MOUNT_PATH.to_string(),
+            format!("{WORKSPACE_MOUNT_PATH}/"),
+            format!("/.{WORKSPACE_MOUNT_PATH}"),
+            format!("/{WORKSPACE_MOUNT_PATH}"),
+        ] {
+            let mut spec = full_spec();
+            spec.k8s_overlay = Some(serde_json::json!({"spec":{
+                "volumes":[{"name":"mine","emptyDir":{}}],
+                "containers":[{"name":"step","volumeMounts":[
+                    {"name":"mine","mountPath": path}]}]
+            }}));
+            let err = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default())
+                .unwrap_err();
+            assert!(err.contains(&format!("`{path}`")), "got: {err}");
+            assert!(err.contains(WORKSPACE_VOLUME), "got: {err}");
+        }
+    }
+
+    // Attack: the overlay mounts Scarab's workspace-token volume on the step
+    // container at a path of its own. Safe outcome: refused, the step never
+    // holds the workspace token.
+    #[test]
+    fn overlay_mounting_the_workspace_token_volume_on_the_step_is_refused() {
+        let mut spec = full_spec();
+        spec.k8s_overlay = Some(serde_json::json!({"spec":{"containers":[
+            {"name":"step","volumeMounts":[
+                {"name": WORKSPACE_TOKEN_VOLUME, "mountPath": "/tmp/token"}]}
+        ]}}));
+        let res = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default());
+        assert!(
+            res.is_err(),
+            "the step container mounts the workspace token"
+        );
+    }
+
+    // Attack: the overlay adds a container (or init container) of its own that
+    // mounts a volume Scarab created. Safe outcome: refused, only Scarab's
+    // containers mount Scarab's volumes.
+    #[test]
+    fn overlay_adding_a_container_that_mounts_a_scarab_volume_is_refused() {
+        for field in ["containers", "initContainers"] {
+            let mut spec = full_spec();
+            spec.k8s_overlay = Some(serde_json::json!({"spec":{
+                field: [{"name":"mine","image":"evil:1","volumeMounts":[
+                    {"name": WORKSPACE_TOKEN_VOLUME, "mountPath": "/t"}]}]
+            }}));
+            let res = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default());
+            assert!(
+                res.is_err(),
+                "an added `{field}` item mounts the workspace token"
+            );
+        }
+    }
+
+    // Attack: one layer lists the step container twice; the first entry is
+    // harmless and the second remounts a Scarab mount path. Safe outcome:
+    // refused, whichever entry carries the mount.
+    #[test]
+    fn a_second_step_entry_in_one_layer_remounting_a_scarab_path_is_refused() {
+        let mut spec = full_spec();
+        spec.k8s_overlay = Some(serde_json::json!({"spec":{
+            "volumes":[{"name":"mine","emptyDir":{}}],
+            "containers":[
+                {"name":"step"},
+                {"name":"step","volumeMounts":[
+                    {"name":"mine","mountPath": WORKSPACE_MOUNT_PATH}]}]
+        }}));
+        let err = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default())
+            .unwrap_err();
+        assert!(err.contains(WORKSPACE_MOUNT_PATH), "got: {err}");
+    }
+
+    // Attack: deletes and directives that do not name a Scarab container: a
+    // null `spec`, null `containers`, null mounts on the step, a `$patch`
+    // item, a list given as an object. Safe outcome: each is refused.
+    #[test]
+    fn null_deletes_and_patch_directives_do_not_remove_what_scarab_built() {
+        for overlay in [
+            serde_json::json!({"spec": null}),
+            serde_json::json!({"spec":{"containers": null}}),
+            serde_json::json!({"spec":{"containers":[{"name":"step","volumeMounts":null}]}}),
+            serde_json::json!({"spec":{"initContainers":{"$patch":"replace"}}}),
+            serde_json::json!({"spec":{"volumes":[
+                {"name": WORKSPACE_TOKEN_VOLUME, "$patch":"delete"}]}}),
+            serde_json::json!({"spec":{"initContainers":[
+                {"name": WORKSPACE_INIT_CONTAINER, "$patch":"delete"}]}}),
+            serde_json::json!({"spec":{"containers":[{"name":"service-0","image":"evil:1"}]}}),
+            serde_json::json!({"spec":{"containers":[{"name":"step","env":null}]}}),
+            serde_json::json!({"spec":{"volumes":[{"name":"mine","$patch":"delete"}]}}),
+        ] {
+            let mut spec = full_spec();
+            spec.k8s_overlay = Some(overlay.clone());
+            let res = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default());
+            assert!(res.is_err(), "accepted {overlay}");
+        }
+    }
+
+    #[test]
+    fn a_list_without_a_merge_key_still_replaces() {
+        let term = |v: &str| {
+            serde_json::json!({"matchExpressions":[
+                {"key":"pool","operator":"In","values":[v]}]})
+        };
+        let affinity = |v: &str| {
+            serde_json::json!({"spec":{"affinity":{"nodeAffinity":{
+                "requiredDuringSchedulingIgnoredDuringExecution":{
+                    "nodeSelectorTerms":[term(v)]}}}}})
+        };
+        let mut spec = busybox();
+        spec.k8s_overlay = Some(affinity("ci-large"));
+        let placement = PlacementConfig {
+            baseline: Some(affinity("ci")),
+            ..Default::default()
+        };
+        let ps = apply_placement(pod_for(&spec), "s", &spec, &placement)
+            .unwrap()
+            .spec
+            .unwrap();
+        let terms = ps
+            .affinity
+            .unwrap()
+            .node_affinity
+            .unwrap()
+            .required_during_scheduling_ignored_during_execution
+            .unwrap()
+            .node_selector_terms;
+        assert_eq!(terms.len(), 1);
+        let values = terms[0].match_expressions.as_ref().unwrap()[0]
+            .values
+            .clone()
+            .unwrap();
+        assert_eq!(values, vec!["ci-large".to_string()]);
     }
 
     #[test]

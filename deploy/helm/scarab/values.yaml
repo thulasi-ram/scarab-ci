@@ -129,8 +129,9 @@ scarab:
   # accepted; any other top-level key fails the render (the server itself would
   # silently ignore it, leaving every step Pod Pending).
   #
-  # `baseline` and each profile's `k8s` are POD fragments, merge-patched onto
-  # the whole Pod — so pod-spec fields go under `spec:`. A `tolerations:` placed
+  # `baseline` and each profile's `k8s` are POD fragments, strategic-merged onto
+  # the whole Pod — so pod-spec fields go under `spec:`. A profile's
+  # `tolerations` are added to the baseline's. A `tolerations:` placed
   # directly under `baseline:` would be dropped silently; the chart refuses it.
   #
   #   baseline:              # merged onto EVERY step Pod
