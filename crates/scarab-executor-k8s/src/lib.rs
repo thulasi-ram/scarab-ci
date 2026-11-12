@@ -196,11 +196,11 @@ pub struct K8sExecutor {
     results_egress: Option<ResultsEgress>,
     /// Global default step deadline in seconds (ADR-0047), applied when a step
     /// declares no `timeout:`. Default 1h.
+    default_step_timeout_secs: u32,
     /// How long a step Pod the scheduler calls Unschedulable stays
     /// `Pending` before it fails (git-bug 1166c30): stamped on each Pod as
     /// [`ANNOTATION_UNSCHEDULABLE_GRACE`] and read by the verdict.
     unschedulable_grace_secs: u32,
-    default_step_timeout_secs: u32,
     /// The workspace CAS (ADR-0029/0045). When wired, every step Pod gets the
     /// `/workspace` machinery: an init container that **fetches** the merged
     /// `needs` snapshots straight from the workspace service (ADR-0061 s3-feed),
@@ -6714,10 +6714,6 @@ fn step_container_status(pod: &Pod) -> Option<&k8s_openapi::api::core::v1::Conta
         .or_else(|| statuses.first())
 }
 
-/// True if the scheduler has verdict-ed the Pod `Unschedulable`
-/// (`PodScheduled=False`). The Pod would otherwise sit Pending indefinitely;
-/// ADR-0047 treats it as never-started infra churn to self-heal via bounded
-/// auto-retry.
 /// The Pod annotation holding the seconds an Unschedulable step Pod waits
 /// before it fails (git-bug 1166c30). Absent or unreadable: `0`, so a Pod
 /// created before the setting existed fails as it did then.
@@ -6778,11 +6774,16 @@ fn unschedulable_within_grace(pod: &Pod, now_secs: i64) -> bool {
         .map(|t| t.0.as_second());
     match since {
         Some(since) => now_secs < since.saturating_add(i64::from(grace)),
-        // No time to count from: keep waiting; the step timeout bounds it.
+        // No time to count from: keep waiting; the engine's provisioning
+        // deadline (30 minutes from claim) bounds it.
         None => true,
     }
 }
 
+/// True if the scheduler has verdict-ed the Pod `Unschedulable`
+/// (`PodScheduled=False`). The Pod would otherwise sit Pending indefinitely;
+/// ADR-0047 treats it as never-started infra churn to self-heal via bounded
+/// auto-retry, after [`unschedulable_within_grace`] stops holding it.
 fn is_unschedulable(pod: &Pod) -> Option<String> {
     pod.status
         .as_ref()
@@ -13536,12 +13537,8 @@ mod tests {
                 };
                 pod.metadata.creation_timestamp = Some(at(NOW - 1_000));
                 if let Some(g) = grace {
-                    pod = with_unschedulable_grace(pod, 0);
-                    pod.metadata
-                        .annotations
-                        .as_mut()
-                        .unwrap()
-                        .insert(ANNOTATION_UNSCHEDULABLE_GRACE.into(), g.into());
+                    pod.metadata.annotations =
+                        Some([(ANNOTATION_UNSCHEDULABLE_GRACE.into(), g.into())].into());
                 }
                 pod
             };

@@ -1365,9 +1365,10 @@ pub enum ConfigError {
     InvalidProjectRunCap(String),
 
     #[error(
-        "SCARAB_UNSCHEDULABLE_GRACE_SECS is set but invalid (got {0:?}) — want 0 to 86400: \
+        "SCARAB_UNSCHEDULABLE_GRACE_SECS is set but invalid (got {0:?}) — want 0 to 1800: \
          the seconds a k8s step Pod the scheduler calls Unschedulable waits for a node \
-         before it fails; 0 fails it at once."
+         before it fails; 0 fails it at once. The engine fails an attempt that has not \
+         started 30 minutes after it was claimed, so a longer wait would never be reached."
     )]
     InvalidUnschedulableGrace(String),
 
@@ -1669,7 +1670,7 @@ impl Config {
                     .trim()
                     .parse::<u32>()
                     .ok()
-                    .filter(|s| *s <= 86_400)
+                    .filter(|s| *s <= scarab_engine::scheduler::PROVISIONING_DEADLINE_SECS)
                     .ok_or(ConfigError::InvalidUnschedulableGrace(v))?,
                 None => scarab_executor_k8s::DEFAULT_UNSCHEDULABLE_GRACE_SECS,
             };
