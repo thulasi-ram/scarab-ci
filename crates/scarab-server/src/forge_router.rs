@@ -314,6 +314,17 @@ impl ForgePort for RegistryForge {
         )))
     }
 
+    async fn pull_request_files(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Option<Vec<String>>, ForgeError> {
+        self.adapter_for(repo)
+            .await?
+            .pull_request_files(repo, number)
+            .await
+    }
+
     async fn set_status(
         &self,
         repo: &RepoRef,

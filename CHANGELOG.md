@@ -90,6 +90,16 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Features
 
+- **Trigger on changed files.** A `when:` can read `event.changed_paths`, the files a push or
+  pull request changed, so `when: event.changed_paths.exists(p, p.startsWith("docker/ci-tools/"))`
+  starts a Run only when that directory changed. A push's list comes from its webhook payload, a
+  pull request's from the forge's files API, asked only when a Pipeline reads the field. When the
+  list is unknown (a new branch, a forced push, a cut commit list, 3,000 or more files, an API
+  error or a request slower than 5 seconds), a `when:` that needs it counts as true and the Run's
+  activity log says why. Forced-push detection is GitHub only: Forgejo's push payload does not
+  say whether a push was forced. See
+  [Changed files](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#changed-files-eventchanged_paths).
+
 - **An invoke step can route placement profiles per library step.** `placement_profiles` on an
   invoke step may be a map from a step id of the library to that step's list, such as
   `{ image: [arm64-builders], push: [ecr-push] }`. The list form applies to every inlined step as

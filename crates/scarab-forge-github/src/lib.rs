@@ -42,6 +42,19 @@ pub fn sign_hex(secret: &[u8], body: &[u8]) -> String {
     format!("sha256={}", to_hex(&mac.finalize().into_bytes()))
 }
 
+/// The most commits a GitHub push webhook lists (GitHub's documented cap). A
+/// payload listing this many may have been cut short, and it carries no total
+/// to compare with, so its changed paths are unknown (git-bug 418f55e).
+pub const GITHUB_PUSH_COMMITS_MAX: usize = 2048;
+
+/// The paths one entry of `GET /repos/{o}/{r}/pulls/{n}/files` names: its
+/// `filename`, and the `previous_filename` of a renamed file.
+fn pr_file_paths(file: &Value) -> impl Iterator<Item = String> + '_ {
+    ["filename", "previous_filename"]
+        .into_iter()
+        .filter_map(|k| file.get(k).and_then(Value::as_str).map(str::to_string))
+}
+
 /// Normalize a GitHub webhook delivery into the canonical [`Event`]. Pure: no
 /// I/O, so it exercises the full mapping in unit tests. Unknown/administrative
 /// events (e.g. `ping`) are reported as [`ForgeError::UnsupportedEvent`] for the
@@ -81,6 +94,10 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                     r#ref,
                     after,
                     message,
+                    changed_paths: scarab_forge::push_changed_paths(
+                        p,
+                        Some(GITHUB_PUSH_COMMITS_MAX),
+                    ),
                 })
             }
         }
@@ -1207,6 +1224,37 @@ impl ForgePort for GithubForge {
         normalize(&raw)
     }
 
+    /// `GET /repos/{o}/{r}/pulls/{n}/files`, 100 per page, following `Link`
+    /// until the last page or [`CHANGED_PATHS_MAX`](scarab_forge::CHANGED_PATHS_MAX)
+    /// files, which is also where GitHub itself stops listing.
+    async fn pull_request_files(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Option<Vec<String>>, ForgeError> {
+        let token = self.auth_token_for(repo).await?;
+        let mut paths = Vec::new();
+        let mut files = 0usize;
+        let mut next = Some(self.url(&format!(
+            "/repos/{}/{}/pulls/{number}/files?per_page=100",
+            repo.owner, repo.name
+        )));
+        while let Some(url) = next.take() {
+            let resp = self.send(|| self.client.get(&url), &token).await?;
+            next = next_link(resp.headers());
+            let page = ok_json(resp).await?;
+            let items = page
+                .as_array()
+                .ok_or_else(|| ForgeError::Api("pull request files: expected a list".into()))?;
+            files += items.len();
+            if files >= scarab_forge::CHANGED_PATHS_MAX {
+                return Ok(None);
+            }
+            paths.extend(items.iter().flat_map(pr_file_paths));
+        }
+        Ok(Some(paths))
+    }
+
     async fn set_status(
         &self,
         repo: &RepoRef,
@@ -1565,6 +1613,10 @@ mod tests {
                 // The full head-commit message is parsed onto the event; the
                 // Headline extractor (scarab-forge) later takes its first line.
                 message: "fix: handle empty input\n\nbody line".into(),
+                // No commit list in this payload.
+                changed_paths: scarab_forge::ChangedPaths::Unknown(
+                    scarab_forge::PathsUnknown::NoCommits
+                ),
             }
         );
         // A push to a tag ref normalizes to Tag.

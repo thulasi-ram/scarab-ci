@@ -6521,8 +6521,135 @@ pub fn matches_trigger(
     }
     match &filter.when {
         None => Ok(true),
-        Some(expr) => cel::eval_bool(expr, ctx),
+        Some(expr) => Ok(eval_when(expr, ctx)?.holds()),
     }
+}
+
+/// What a `when:` decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhenOutcome {
+    /// The expression decided, as written.
+    Decided(bool),
+    /// The expression needed `event.changed_paths` while it was unknown
+    /// (absent from the context), so it counts as true (git-bug 418f55e).
+    PathsUnknown,
+}
+
+impl WhenOutcome {
+    fn holds(self) -> bool {
+        !matches!(self, WhenOutcome::Decided(false))
+    }
+}
+
+/// Whether `ctx` carries `event.changed_paths`, i.e. they are known.
+fn changed_paths_known(ctx: &serde_json::Value) -> bool {
+    ctx.get("event")
+        .and_then(|e| e.get(event::CHANGED_PATHS))
+        .is_some()
+}
+
+/// `ctx` with `event.changed_paths` set to `value`.
+fn with_changed_paths(ctx: &serde_json::Value, value: serde_json::Value) -> serde_json::Value {
+    let mut out = ctx.clone();
+    if let Some(ev) = out.get_mut("event").and_then(|v| v.as_object_mut()) {
+        ev.insert(event::CHANGED_PATHS.into(), value);
+    }
+    out
+}
+
+/// Evaluate a `when:` against the trigger context `ctx` (git-bug 418f55e).
+///
+/// `event.changed_paths` is absent from `ctx` when the paths are unknown.
+/// To the `when:` the field is always there; only its value is unknown. A
+/// `when:` that reads it is evaluated with the field bound to `0`, a value
+/// that is not a list: `has(event.changed_paths)` and `"changed_paths" in
+/// event` are true, so neither can test for an unknown list, and every list
+/// operation on it is an error. When the rest of the expression decides
+/// alone (`event.branch == 'main' && …` on another branch is `false`, as
+/// CEL's `&&` and `||` absorb an error on one side), that answer stands.
+/// When the answer needed the list, the `when:` counts as true, so a Run is
+/// never skipped for want of it. An error that no list removes (the
+/// expression fails with `[]` and with `[""]` in its place) is reported as
+/// before.
+fn eval_when(expr: &str, ctx: &serde_json::Value) -> Result<WhenOutcome, PipelineError> {
+    if changed_paths_known(ctx) || !event::when_reads_changed_paths(expr) {
+        return cel::eval_bool(expr, ctx).map(WhenOutcome::Decided);
+    }
+    match cel::eval_bool(expr, &with_changed_paths(ctx, serde_json::json!(0))) {
+        Ok(b) => Ok(WhenOutcome::Decided(b)),
+        Err(e) => {
+            let some_list_decides = [serde_json::json!([]), serde_json::json!([""])]
+                .into_iter()
+                .any(|list| cel::eval_bool(expr, &with_changed_paths(ctx, list)).is_ok());
+            if some_list_decides {
+                Ok(WhenOutcome::PathsUnknown)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Whether a Run of `ir` for a trigger of `kind` would read
+/// `event.changed_paths`: in that trigger's `when:`, in a Step's `when:`, or
+/// in a `when:` an `invoke` Step written in the Pipeline file carries
+/// (git-bug 418f55e). The server asks a forge for a pull request's files only
+/// when this holds.
+pub fn reads_changed_paths(ir: &PipelineIr, kind: &str) -> bool {
+    let trigger = ir
+        .triggers
+        .0
+        .get(kind)
+        .and_then(|f| f.when.as_deref())
+        .is_some_and(event::when_reads_changed_paths);
+    trigger
+        || ir
+            .steps
+            .iter()
+            .any(|step| run_scope_whens(step).any(event::when_reads_changed_paths))
+}
+
+/// The `when:` expressions of `step` that evaluate against the trigger
+/// context: its own when written in the Pipeline file, or the guards of an
+/// inlined Step that were written there.
+fn run_scope_whens(step: &StepSpec) -> Box<dyn Iterator<Item = &str> + '_> {
+    if step.origin.is_empty() {
+        return Box::new(step.when.as_ref().map(|When(e)| e.as_str()).into_iter());
+    }
+    Box::new(step.guards.iter().filter_map(move |g| {
+        let scope = step.scope.as_ref()?.at(g.caller_hops)?;
+        matches!(scope.inputs, ScopeInputs::Run).then_some(g.when.as_str())
+    }))
+}
+
+/// Where a Run of `ir` for a trigger of `kind` counted a `when:` as true
+/// because it needed `event.changed_paths` while they were unknown: `on.<kind>`
+/// for the trigger, ``step `<id>` `` for a Step (git-bug 418f55e). Empty when
+/// the paths are known or no `when:` needed them. The server writes these
+/// into the Run's event log.
+pub fn changed_paths_unapplied(
+    ir: &PipelineIr,
+    kind: &str,
+    ctx: &serde_json::Value,
+) -> Result<Vec<String>, PipelineError> {
+    let mut out = Vec::new();
+    if changed_paths_known(ctx) || !reads_changed_paths(ir, kind) {
+        return Ok(out);
+    }
+    if let Some(expr) = ir.triggers.0.get(kind).and_then(|f| f.when.as_deref()) {
+        if eval_when(expr, ctx)? == WhenOutcome::PathsUnknown {
+            out.push(format!("on.{kind}"));
+        }
+    }
+    for step in &ir.steps {
+        for expr in run_scope_whens(step) {
+            if eval_when(expr, ctx)? == WhenOutcome::PathsUnknown {
+                out.push(format!("step `{}`", step.id));
+                break;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Return the members of a dependency cycle if one exists (edge: step -> each of
@@ -6604,7 +6731,7 @@ pub fn excluded_steps_with_params(
     for step in &ir.steps {
         let include = if step.origin.is_empty() {
             match &step.when {
-                Some(When(expr)) => cel::eval_bool(expr, ctx)?,
+                Some(When(expr)) => eval_when(expr, ctx)?.holds(),
                 None => true,
             }
         } else {
@@ -6638,7 +6765,7 @@ fn guards_hold(
         let holds = match scope.inputs {
             // Written in the Pipeline file: the trigger context, as a
             // Pipeline Step's own `when` reads.
-            ScopeInputs::Run => cel::eval_bool(&g.when, ctx)?,
+            ScopeInputs::Run => eval_when(&g.when, ctx)?.holds(),
             ScopeInputs::Bound(_) => render::guard_holds(&g.when, scope, params)
                 .map_err(|e| PipelineError::Cel(format!("step `{}`: {e}", step.id)))?,
         };
@@ -10867,6 +10994,8 @@ mod tests {
         for (field, want) in [
             ("event.actor", "may not read"),
             ("event.body", "may not read"),
+            // Free text from a push (git-bug 418f55e): a `when:` only.
+            ("event.changed_paths", "may not read"),
             ("event", "whole"),
             ("event.repo", "whole"),
         ] {
@@ -12237,5 +12366,198 @@ steps:
                  {MAX_INVOKE_EXPANSIONS}"
             )]
         );
+    }
+
+    /// git-bug 418f55e: `event.changed_paths` in a `when:`.
+    const PATH_FILTER: &str = r#"
+on:
+  push:
+    when: 'event.changed_paths.exists(p, p.startsWith("docker/ci-tools/"))'
+steps:
+  - { id: build, image: busybox }
+"#;
+
+    fn push_ctx(branch: &str, paths: Option<&[&str]>) -> serde_json::Value {
+        let mut ctx = json!({ "event": { "kind": "push", "branch": branch } });
+        if let Some(p) = paths {
+            ctx["event"]["changed_paths"] = json!(p);
+        }
+        ctx
+    }
+
+    #[test]
+    fn a_known_path_list_filters_the_trigger() {
+        let ir = compile(PATH_FILTER);
+        assert!(reads_changed_paths(&ir, "push"));
+        assert!(!matches_trigger(&ir, "push", &push_ctx("main", Some(&["README.md"]))).unwrap());
+        assert!(matches_trigger(
+            &ir,
+            "push",
+            &push_ctx("main", Some(&["README.md", "docker/ci-tools/Dockerfile"]))
+        )
+        .unwrap());
+        // An empty list is known: nothing changed under the directory.
+        assert!(!matches_trigger(&ir, "push", &push_ctx("main", Some(&[]))).unwrap());
+        assert!(
+            changed_paths_unapplied(&ir, "push", &push_ctx("main", Some(&[])))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_unknown_path_list_counts_a_when_that_needs_it_as_true() {
+        let ir = compile(PATH_FILTER);
+        let ctx = push_ctx("feat", None);
+        assert!(matches_trigger(&ir, "push", &ctx).unwrap());
+        assert_eq!(
+            changed_paths_unapplied(&ir, "push", &ctx).unwrap(),
+            vec!["on.push".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_rest_of_a_when_still_decides_alone_when_it_can() {
+        let ir = compile(
+            r#"
+on:
+  push:
+    when: 'event.branch == "main" && event.changed_paths.exists(p, p.startsWith("docker/"))'
+steps:
+  - { id: build, image: busybox }
+"#,
+        );
+        // Another branch: false whatever the paths are, so nothing was skipped
+        // for want of them.
+        assert!(!matches_trigger(&ir, "push", &push_ctx("feat", None)).unwrap());
+        assert!(
+            changed_paths_unapplied(&ir, "push", &push_ctx("feat", None))
+                .unwrap()
+                .is_empty()
+        );
+        // `main`: the answer needs the paths, so the trigger runs.
+        assert!(matches_trigger(&ir, "push", &push_ctx("main", None)).unwrap());
+        // An error that no path list removes is still an error. (With `||`,
+        // a list that makes the other side true absorbs the error, as it
+        // does when the list is known.)
+        let typo = compile(
+            r#"
+on:
+  push:
+    when: 'event.nope == "x" && event.changed_paths.size() >= 0'
+steps:
+  - { id: build, image: busybox }
+"#,
+        );
+        assert!(matches_trigger(&typo, "push", &push_ctx("main", None)).is_err());
+    }
+
+    #[test]
+    fn a_when_that_does_not_read_the_paths_is_unaffected() {
+        let ir = compile(
+            r#"
+on:
+  push:
+    when: "event.branch == 'main'"
+steps:
+  - { id: build, image: busybox }
+"#,
+        );
+        assert!(!reads_changed_paths(&ir, "push"));
+        assert!(!matches_trigger(&ir, "push", &push_ctx("feat", None)).unwrap());
+        assert!(
+            changed_paths_unapplied(&ir, "push", &push_ctx("feat", None))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_step_when_follows_the_same_rule() {
+        let ir = compile(
+            r#"
+on: { push: {} }
+steps:
+  - id: image
+    image: busybox
+    when: 'event.changed_paths.exists(p, p.startsWith("docker/ci-tools/"))'
+  - { id: test, image: busybox }
+"#,
+        );
+        assert!(reads_changed_paths(&ir, "push"));
+        let readme = push_ctx("main", Some(&["README.md"]));
+        assert_eq!(excluded_steps(&ir, &readme).unwrap(), vec!["image"]);
+        let unknown = push_ctx("main", None);
+        assert!(excluded_steps(&ir, &unknown).unwrap().is_empty());
+        assert_eq!(
+            changed_paths_unapplied(&ir, "push", &unknown).unwrap(),
+            vec!["step `image`".to_string()]
+        );
+    }
+
+    // Attack: a `when:` that tests for the field before reading it decides
+    // `false` on its own when the list is unknown (a new branch, a pull request
+    // with 3000 files), so the Pipeline is skipped with no note. Safe outcome:
+    // it counts as matched and is reported as not applied.
+    #[test]
+    fn a_presence_test_on_an_unknown_path_list_does_not_skip_the_trigger() {
+        for when in [
+            r#"has(event.changed_paths) && event.changed_paths.exists(p, p.startsWith("src/"))"#,
+            r#""changed_paths" in event && event.changed_paths.exists(p, p.startsWith("src/"))"#,
+        ] {
+            let ir = compile(&format!(
+                "on:\n  push:\n    when: '{when}'\nsteps:\n  - {{ id: scan, image: busybox }}\n"
+            ));
+            let ctx = push_ctx("feat", None);
+            assert!(
+                matches_trigger(&ir, "push", &ctx).unwrap_or(false),
+                "skipped silently: {when}"
+            );
+            assert_eq!(
+                changed_paths_unapplied(&ir, "push", &ctx).unwrap_or_default(),
+                vec!["on.push".to_string()],
+                "{when}"
+            );
+        }
+    }
+
+    // Attack: a `when:` that indexes the list fails on the empty probe list, so
+    // an unknown list turns the trigger into an error and the delivery stops
+    // there, before the Pipeline files after it. Safe outcome: it counts as
+    // matched, like any other `when:` that needs the list.
+    #[test]
+    fn a_when_that_indexes_an_unknown_path_list_still_matches() {
+        let ir = compile(
+            r#"
+on:
+  push:
+    when: 'event.changed_paths[0].startsWith("src/")'
+steps:
+  - { id: scan, image: busybox }
+"#,
+        );
+        let got = matches_trigger(&ir, "push", &push_ctx("feat", None));
+        assert!(matches!(got, Ok(true)), "got: {got:?}");
+    }
+
+    // Attack: make the list unknown (push a new branch) so that a `when:` which
+    // also restricts the branch counts as matched. Safe outcome: the branch
+    // test still decides, whichever side of `&&` it is written on.
+    #[test]
+    fn an_unknown_path_list_does_not_override_a_false_branch_test_on_either_side() {
+        for when in [
+            r#"event.changed_paths.exists(p, p.startsWith("deploy/")) && event.branch == "main""#,
+            r#"event.branch == "main" && event.changed_paths.exists(p, p.startsWith("deploy/"))"#,
+            r#"!(event.branch != "main" || !event.changed_paths.exists(p, p.startsWith("deploy/")))"#,
+        ] {
+            let ir = compile(&format!(
+                "on:\n  push:\n    when: '{when}'\nsteps:\n  - {{ id: deploy, image: busybox }}\n"
+            ));
+            assert!(
+                !matches_trigger(&ir, "push", &push_ctx("feat", None)).unwrap(),
+                "ran off main: {when}"
+            );
+            assert!(matches_trigger(&ir, "push", &push_ctx("main", None)).unwrap());
+        }
     }
 }

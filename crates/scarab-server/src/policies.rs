@@ -1269,6 +1269,7 @@ fn test_event(
             r#ref: needs_ref()?,
             after: sha,
             message: String::new(),
+            changed_paths: Default::default(),
         },
         TriggerKind::PullRequest => {
             let r = needs_ref()?;

@@ -89,6 +89,7 @@ fn push() -> Event {
         r#ref: "refs/heads/main".into(),
         after: SHA.into(),
         message: "m".into(),
+        changed_paths: Default::default(),
     }
 }
 
@@ -522,6 +523,7 @@ async fn a_linked_webhook_actor_is_the_run_create_principal() {
             r#ref,
             after,
             message,
+            changed_paths: Default::default(),
         },
         _ => unreachable!(),
     };

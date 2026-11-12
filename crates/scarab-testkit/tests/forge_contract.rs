@@ -32,6 +32,7 @@ async fn fake_forge_passes_the_port_contract() {
             r#ref: "refs/heads/main".into(),
             after: "cafe1234".into(),
             message: "initial commit".into(),
+            changed_paths: Default::default(),
         })
         .unwrap(),
     };
