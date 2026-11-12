@@ -1253,7 +1253,8 @@ function RefusedRow(props: { r: RefusedRun }) {
         <div class="rf">
           <div class="rf-what">
             <Icon icon={r().reason_kind === "compile" ? "circle-x" : "ban"} size={13} />
-            <span>{sum().what}</span>
+            {/* A message may hold a YAML snippet to paste: keep its lines. */}
+            <span style={{ "white-space": "pre-wrap" }}>{sum().what}</span>
             <Show when={sum().more > 0 && !all()}>
               <span class="why">
                 · {sum().more} more {sum().more === 1 ? "error" : "errors"}
@@ -1285,7 +1286,7 @@ function RefusedRow(props: { r: RefusedRun }) {
                 {(e) => (
                   <div class="rf-what">
                     <Icon icon="circle-x" size={13} />
-                    <span>{refusalSummary([e], e.message).what}</span>
+                    <span style={{ "white-space": "pre-wrap" }}>{refusalSummary([e], e.message).what}</span>
                   </div>
                 )}
               </For>

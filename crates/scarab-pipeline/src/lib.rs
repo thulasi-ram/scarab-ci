@@ -437,11 +437,119 @@ pub const RETIRED_CLONE: &str = "the `clone` Step kind was removed (ADR-0076 §9
     the repository with `invoke: lib:thulasi-ram/clone`, and set `depth`, `submodules` and \
     `lfs` under `with:`";
 
-/// The Pipeline check's answer to a `build:` Step, removed by the ADR-0018
-/// amendment of 2026-11-12: it names the library that replaces it.
-pub const RETIRED_BUILD: &str = "the `build` Step kind was removed (ADR-0018, amendment of \
-    2026-11-12); build an image with `invoke: lib:thulasi-ram/build`, and set `image`, \
-    `context`, `dockerfile` and `push` under `with:`";
+/// The docs section an org admin follows to install the build library.
+pub const BUILD_LIBRARY_DOCS: &str =
+    "https://thulasi-ram.github.io/scarab-ci/usage/libraries/#install-scarabs-build-library";
+
+/// What a `build:` Step, a kind the ADR-0018 amendment of 2026-11-12
+/// removed, was written with: the fields [`retired_build`] carries into the
+/// replacement it suggests. The Pipeline check fills it from the authored
+/// Step; a launch of a stored Step fills it from what was stored.
+#[derive(Debug, Clone, Default)]
+pub struct RetiredBuild<'a> {
+    /// The Step's id as written (a matrix coordinate removed).
+    pub id: &'a str,
+    /// The `build:` mapping, as written or stored (`image`, `context`,
+    /// `dockerfile`, `push`); other keys are left out.
+    pub build: Option<&'a serde_json::Value>,
+    pub needs: &'a [String],
+    pub when: Option<&'a str>,
+    pub timeout: Option<u32>,
+    pub resources: Option<&'a Resources>,
+    pub placement_profiles: &'a [String],
+}
+
+/// The answer to a `build:` Step, at the Pipeline check and when a Step
+/// stored as one would launch: the replacement invoke, written from the
+/// Step's own fields (a `${{ … }}` in them kept as written), and what an org
+/// admin does first. The same text in both places. The replacement is
+/// indented four spaces, so a reader that splits a compile error's list
+/// (`\n  - `, see [`diagnostic::diagnostics`]) keeps it in one diagnostic.
+pub fn retired_build(step: &RetiredBuild<'_>) -> String {
+    use std::fmt::Write as _;
+    // A value as YAML: a plain word stays plain, anything else is a JSON
+    // string, which YAML reads as a double-quoted scalar.
+    fn scalar(v: &str) -> String {
+        let plain = !v.is_empty()
+            && v.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._-/".contains(c))
+            && !matches!(v, "true" | "false" | "null" | "yes" | "no" | "on" | "off")
+            && v.parse::<f64>().is_err();
+        if plain {
+            v.to_string()
+        } else {
+            serde_json::to_string(v).unwrap_or_default()
+        }
+    }
+    fn list(items: &[String]) -> String {
+        let items: Vec<String> = items.iter().map(|i| scalar(i)).collect();
+        format!("[{}]", items.join(", "))
+    }
+    let mut with = Vec::new();
+    let field = |key: &str| step.build.and_then(|b| b.get(key));
+    match field("image") {
+        Some(serde_json::Value::String(v)) if !v.is_empty() => {
+            with.push(format!("image: {}", scalar(v)))
+        }
+        _ => with.push("image: <the image to build>".to_string()),
+    }
+    for key in ["context", "dockerfile"] {
+        if let Some(serde_json::Value::String(v)) = field(key) {
+            if !v.is_empty() {
+                with.push(format!("{key}: {}", scalar(v)));
+            }
+        }
+    }
+    match field("push") {
+        Some(serde_json::Value::Bool(true)) => with.push("push: true".to_string()),
+        Some(serde_json::Value::String(v)) if !v.is_empty() && v != "false" => {
+            with.push(format!("push: {}", scalar(v)))
+        }
+        _ => {}
+    }
+    let mut out = format!(
+        "step `{}`: the `build` step kind was removed; replace the step with:\n    - id: {}\n",
+        step.id,
+        scalar(step.id)
+    );
+    if !step.needs.is_empty() {
+        let _ = writeln!(out, "      needs: {}", list(step.needs));
+    }
+    if let Some(when) = step.when {
+        let _ = writeln!(
+            out,
+            "      when: {}",
+            serde_json::to_string(when).unwrap_or_default()
+        );
+    }
+    if let Some(timeout) = step.timeout {
+        let _ = writeln!(out, "      timeout: {timeout}");
+    }
+    if let Some(r) = step.resources {
+        let fields: Vec<String> = [("cpu_millis", r.cpu_millis), ("memory_mib", r.memory_mib)]
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|v| format!("{k}: {v}")))
+            .collect();
+        if !fields.is_empty() {
+            let _ = writeln!(out, "      resources: {{ {} }}", fields.join(", "));
+        }
+    }
+    if !step.placement_profiles.is_empty() {
+        let _ = writeln!(
+            out,
+            "      placement_profiles: {}",
+            list(step.placement_profiles)
+        );
+    }
+    let _ = writeln!(out, "      invoke: lib:thulasi-ram/build");
+    let _ = writeln!(out, "      with: {{ {} }}", with.join(", "));
+    let _ = write!(
+        out,
+        "An org admin must first install lib:thulasi-ram/build and trust it for the build \
+         sandbox, and with the registry credential to push: see {BUILD_LIBRARY_DOCS}"
+    );
+    out
+}
 
 /// The Pipeline check's answer to `deployment_requests` and `gate: deployment`,
 /// both removed by ADR-0074: it names what replaces them.
@@ -683,7 +791,7 @@ pub struct StepSpec {
     pub registry_auth: bool,
     /// Removed by the ADR-0018 amendment of 2026-11-12: the `build` Step
     /// kind, replaced by `invoke: lib:thulasi-ram/build`. Kept as raw data
-    /// only so the Pipeline check can refuse it with [`RETIRED_BUILD`]
+    /// only so the Pipeline check can refuse it with [`retired_build`]
     /// instead of an unknown-field error. Nothing reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<serde_json::Value>,
@@ -2121,6 +2229,14 @@ fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineErr
     // Inline `invoke:` steps first (ADR-0038): the result is a flat step list
     // with no invoke steps, over which matrix expansion and validation run
     // unchanged. A library's own matrices thus expand normally.
+    // A `build:` Step is refused with its replacement, which names the
+    // `needs` as written (`checkout`), not as compiled (`checkout/git`).
+    let written_build_needs: BTreeMap<String, Vec<String>> = authored
+        .steps
+        .iter()
+        .filter(|s| s.build.is_some())
+        .map(|s| (s.id.clone(), s.needs.0.clone()))
+        .collect();
     let authored_steps =
         inline_invokes(&authored.steps, libs).map_err(PipelineError::Validation)?;
 
@@ -2234,7 +2350,7 @@ fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineErr
             "the pipeline",
         )]));
     }
-    validate(&ir).map_err(PipelineError::Validation)?;
+    validate_with(&ir, &written_build_needs).map_err(PipelineError::Validation)?;
     Ok(ir)
 }
 
@@ -5597,6 +5713,16 @@ fn validate_output_reads(ir: &PipelineIr, diagnostics: &mut Vec<String>) {
 }
 
 pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
+    validate_with(ir, &BTreeMap::new())
+}
+
+/// [`validate`], given the `needs` each `build:` Step was written with
+/// (by id), for the replacement its diagnostic suggests; a Step not listed
+/// uses its compiled `needs`.
+fn validate_with(
+    ir: &PipelineIr,
+    written_build_needs: &BTreeMap<String, Vec<String>>,
+) -> Result<(), Vec<String>> {
     let mut diagnostics = Vec::new();
 
     if ir.ir_version > IR_VERSION_MAX {
@@ -5635,6 +5761,7 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         ids.insert(step.id.as_str());
     }
 
+    let mut retired_builds = BTreeSet::new();
     for step in &ir.steps {
         // Compile invariants: matrices and invokes are resolved away by now.
         if step.matrix.is_some() {
@@ -5647,9 +5774,31 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         if step.clone.is_some() {
             diagnostics.push(format!("step `{}`: {RETIRED_CLONE}", step.id));
         }
-        // So is the `build` kind (ADR-0018, amendment of 2026-11-12).
+        // So is the `build` kind (ADR-0018, amendment of 2026-11-12). Its
+        // answer is the replacement, and nothing else: the checks below
+        // would only report what a build Step never had (an image, say). A
+        // matrix's copies of one Step get one answer, under the id written.
         if step.build.is_some() {
-            diagnostics.push(format!("step `{}`: {RETIRED_BUILD}", step.id));
+            let id = if step.matrix_values.is_empty() {
+                step.id.as_str()
+            } else {
+                step.id.split('[').next().unwrap_or(&step.id)
+            };
+            if retired_builds.insert(id) {
+                diagnostics.push(retired_build(&RetiredBuild {
+                    id,
+                    build: step.build.as_ref(),
+                    needs: written_build_needs
+                        .get(id)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&step.needs.0),
+                    when: step.when.as_ref().map(|w| w.0.as_str()),
+                    timeout: step.timeout,
+                    resources: Some(&step.resources),
+                    placement_profiles: step.placement_profiles.as_list(),
+                }));
+            }
+            continue;
         }
         // Whether the Run is a fork pull request is Scarab's to say: a Step
         // that set it could turn a fork's build into one that pushes.
@@ -10942,6 +11091,113 @@ mod tests {
                 "{errs:?}"
             );
         }
+    }
+
+    /// A Pipeline as 0.3.2 accepted it, with every field a `build:` Step
+    /// could set there, written beside the clone library.
+    const PIPELINE_0_3_2: &str = r#"
+on: { push: {} }
+steps:
+  - id: checkout
+    invoke: lib:thulasi-ram/clone
+  - id: img
+    needs: [checkout]
+    when: "event.branch == 'main'"
+    timeout: 1800
+    retry: { on: failure, max: 2 }
+    placement_profiles: [arm64, big]
+    resources: { cpu_millis: 2000, memory_mib: 4096 }
+    env: [[FOO, bar]]
+    artifacts: ["*.txt"]
+    build:
+      image: "ghcr.io/acme/app:${{ event.sha }}"
+      context: services/api
+      dockerfile: Dockerfile.prod
+      push: true
+  - id: deploy
+    image: alpine:3.20
+    needs: [img]
+    env: [[BUILT, "${{ outputs.img.image }}"]]
+    command: [sh, -c, 'echo "$BUILT"']
+"#;
+
+    /// A 0.3.2 `build:` Step gets one diagnostic, and nothing else in the
+    /// Pipeline is reported: no unknown field, no missing image, no other
+    /// kind rule. It suggests the replacement from the Step's own fields
+    /// (the `needs` as written, the `${{ … }}` as written) and says what an
+    /// org admin does first.
+    #[test]
+    fn a_0_3_2_build_step_gets_only_its_replacement() {
+        let errs = library_errors(PIPELINE_0_3_2, &with_clone());
+        assert_eq!(errs.len(), 1, "{errs:#?}");
+        assert_eq!(
+            errs[0],
+            "step `img`: the `build` step kind was removed; replace the step with:\n    \
+             - id: img\n      needs: [checkout]\n      when: \"event.branch == 'main'\"\n      \
+             timeout: 1800\n      resources: { cpu_millis: 2000, memory_mib: 4096 }\n      \
+             placement_profiles: [arm64, big]\n      \
+             invoke: lib:thulasi-ram/build\n      with: { image: \"ghcr.io/acme/app:${{ event.sha }}\", \
+             context: services/api, dockerfile: Dockerfile.prod, push: true }\n\
+             An org admin must first install lib:thulasi-ram/build and trust it for the build \
+             sandbox, and with the registry credential to push: see \
+             https://thulasi-ram.github.io/scarab-ci/usage/libraries/#install-scarabs-build-library"
+        );
+        assert!(!errs[0].contains("ADR"), "{}", errs[0]);
+
+        // The suggestion pastes in: with it in place of the old Step, the
+        // Pipeline compiles against the build library, and the downstream
+        // read of `outputs.img.image` still resolves to its build Step.
+        // Indented four spaces in the message; two under `steps:` here.
+        let replacement: String = errs[0]
+            .lines()
+            .skip(1)
+            .take_while(|l| l.starts_with("    "))
+            .map(|l| format!("{}\n", &l[2..]))
+            .collect();
+        // The compile error's list keeps it as one diagnostic.
+        let listed = diagnostic::diagnostics(&PipelineError::Validation(errs.clone()).to_string());
+        assert_eq!(listed.len(), 1, "{listed:#?}");
+        assert_eq!(listed[0].step.as_deref(), Some("img"));
+        let start = PIPELINE_0_3_2.find("  - id: img").unwrap();
+        let end = PIPELINE_0_3_2.find("  - id: deploy").unwrap();
+        let pasted = format!(
+            "{}{replacement}{}",
+            &PIPELINE_0_3_2[..start],
+            &PIPELINE_0_3_2[end..]
+        );
+        let ir = compile_with_libraries(&pasted, &with_clone_and_build())
+            .unwrap_or_else(|e| panic!("{e:?}\n{pasted}"));
+        let build = ir.steps.iter().find(|s| s.id == "img/image").unwrap();
+        assert_eq!(build.needs.0, vec!["checkout/git".to_string()]);
+        assert_eq!(build.placement_profiles, vec!["arm64", "big"]);
+        assert_eq!(build.timeout, Some(1800));
+        assert_eq!(build.resources.cpu_millis, Some(2000));
+        let deploy = ir.steps.iter().find(|s| s.id == "deploy").unwrap();
+        assert!(deploy.needs.0.contains(&"img/image".to_string()));
+    }
+
+    /// The smallest `build:` Steps get one diagnostic each too: one with no
+    /// image says where to write it, and a matrix's copies share one, under
+    /// the id written.
+    #[test]
+    fn every_build_step_gets_one_diagnostic() {
+        let errs = errors("steps: [{ id: image, build: {} }]");
+        assert_eq!(errs.len(), 1, "{errs:#?}");
+        assert!(
+            errs[0].contains("with: { image: <the image to build> }"),
+            "{}",
+            errs[0]
+        );
+        let errs = errors(
+            "steps: [{ id: img, matrix: { dimensions: { arch: [amd64, arm64] } }, build: { image: \"a/b:1\", push: false } }]",
+        );
+        assert_eq!(errs.len(), 1, "{errs:#?}");
+        assert!(errs[0].starts_with("step `img`: "), "{}", errs[0]);
+        assert!(
+            errs[0].contains("with: { image: \"a/b:1\" }"),
+            "{}",
+            errs[0]
+        );
     }
 
     #[test]

@@ -169,8 +169,9 @@ library and trust its source instead. It gets the sandbox on the same terms as S
 
 **Upgrading from the `build` step kind.** The release that ships this library removes the
 `build:` step kind, with no release in between that accepts both. A Pipeline with a `build:` step
-fails to compile, with a message naming `invoke: lib:thulasi-ram/build`, until you rewrite the
-step:
+fails to compile until you rewrite the step. The error for each such step holds its replacement,
+written from the step's own `build:`, `needs`, `when`, `timeout`, `resources` and
+`placement_profiles`, ready to paste:
 
 ```yaml
 # before
@@ -188,7 +189,8 @@ step:
 reference and digest, set only when the image was pushed. `cache: registry` is gone, because
 writing a registry cache needs the push credential in the build step; use `cache: s3` or no
 cache. A step of a Run created before the upgrade that has not launched yet fails when it would
-launch, with a message naming the library.
+launch, and again on each retry or rerun, with the same replacement; start a new Run once the
+Pipeline is changed.
 
 ## Trusting a library with forge credentials
 
