@@ -213,6 +213,7 @@ fn push_to(r#ref: &str) -> Event {
         r#ref: r#ref.into(),
         after: SHA.into(),
         message: "release".into(),
+        changed_paths: Default::default(),
     }
 }
 
