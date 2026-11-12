@@ -23,6 +23,8 @@ fn spec(command: Vec<&str>) -> StepSpec {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -504,4 +506,124 @@ async fn a_run_from_a_newer_or_malformed_ir_version_is_not_launched() {
             "{ir}"
         );
     }
+}
+
+/// A Step stored as the `build` kind by 0.3.2, before the upgrade that
+/// removed it (ADR-0018, amendment of 2026-11-12), decodes and is not
+/// launched: it fails as a config failure with the replacement the Pipeline
+/// check suggests, written from what was stored (its `needs` as the Pipeline
+/// names them). A retry and a rerun of it fail the same way.
+#[tokio::test]
+async fn a_step_stored_as_the_build_kind_fails_naming_the_library() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-build".into());
+    let checkout = StepId("checkout/git".into());
+    let step = StepId("image".into());
+    db.create_run(&run, 99, 1, Timestamp(0)).await.unwrap();
+    db.store_run_ir(&run, &serde_json::json!({ "steps": [] }))
+        .await
+        .unwrap();
+    db.create_step_run(
+        &run,
+        &checkout,
+        Some(&spec(vec!["true"])),
+        &[],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
+    // The spec as 0.3.2 stored it: no image, no command, its build config.
+    let stored: StepSpec = serde_json::from_value(serde_json::json!({
+        "image": "",
+        "command": [],
+        "env": [],
+        "secrets": [],
+        "run_as_root": false,
+        "add_capabilities": [],
+        "privileged": false,
+        "timeout_seconds": 1800,
+        "workspace_inputs": [],
+        "workspace_outputs": [],
+        "placement_profiles": ["arm64"],
+        "build": {
+            "context": "services/api",
+            "dockerfile": "Dockerfile",
+            "image": "ghcr.io/acme/app:1",
+            "repo_owner": "acme",
+            "repo_name": "app",
+            "push": true,
+            "insecure_push": false,
+            "locked_out": false
+        }
+    }))
+    .expect("a 0.3.2 build spec decodes");
+    db.create_step_run(
+        &run,
+        &step,
+        Some(&stored),
+        std::slice::from_ref(&checkout),
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    for _ in 0..4 {
+        exec.script_outcome(ExecState::Succeeded);
+    }
+    let sched = Scheduler::new(&db, &clock, &exec, "scheduler-1");
+    let detail = || async {
+        let s = db
+            .steps_of_run(&run)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.step == step)
+            .unwrap();
+        assert_eq!(s.status, StepStatus::Failed);
+        let last = s.attempts.last().unwrap().clone();
+        assert_eq!(last.failure, Some(scarab_engine::FailureKind::Config));
+        (s.attempts.len(), last.failure_detail.unwrap_or_default())
+    };
+    for _ in 0..6 {
+        sched.tick(&run).await.expect("tick");
+    }
+    let (attempts, first) = detail().await;
+    assert!(
+        first.starts_with(
+            "step `image`: the `build` step kind was removed; replace the step with:\n    \
+             - id: image\n      needs: [checkout]\n      timeout: 1800\n      \
+             placement_profiles: [arm64]\n      invoke: lib:thulasi-ram/build\n      \
+             with: { image: \"ghcr.io/acme/app:1\", context: services/api, \
+             dockerfile: Dockerfile, push: true }\n"
+        ),
+        "{first}"
+    );
+    assert!(first.contains("start a new Run"), "{first}");
+    assert!(
+        exec.launched_spec(&ExecHandle("fake://run-build/image/a1".into()))
+            .is_none(),
+        "never launched"
+    );
+
+    // A retry of it, then a rerun: each fails before launching, with the
+    // same text.
+    scarab_engine::retry_step(&db, &clock, &run, &step, None)
+        .await
+        .expect("retry");
+    for _ in 0..6 {
+        sched.tick(&run).await.expect("tick");
+    }
+    let (retried, again) = detail().await;
+    assert!(retried > attempts, "the retry made an Attempt");
+    assert_eq!(again, first);
+    scarab_engine::rerun_step(&db, &clock, &run, &step, None)
+        .await
+        .expect("rerun");
+    for _ in 0..6 {
+        sched.tick(&run).await.expect("tick");
+    }
+    let (_, rerun) = detail().await;
+    assert_eq!(rerun, first);
+    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Failed));
 }

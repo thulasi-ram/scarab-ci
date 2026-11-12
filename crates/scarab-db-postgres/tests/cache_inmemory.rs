@@ -72,6 +72,8 @@ fn spec(cache: Option<CacheConfig>) -> StepSpec {
         workspace_outputs: vec![],
         cache,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],

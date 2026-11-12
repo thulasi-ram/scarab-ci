@@ -193,8 +193,10 @@ this machine only.
 On a fresh database, `up.sh` also prints a checklist of the steps that now need
 a passkey, which it used to do with plain curl (`just stack seed dogfood
 checklist` prints it again). On an existing database it compares the clone
-library installed in the org with `libs/clone.yaml` in the checkout (read with
-`psql` in the Postgres Pod) and prints step 3 when they differ:
+and build libraries installed in the org with `libs/clone.yaml` and
+`libs/build.yaml` in the checkout (read with `psql` in the Postgres Pod) and
+prints the step for each one that differs, and prints step 5 whenever the
+build library's source is not trusted for the build sandbox:
 
 1. Sign in at `http://localhost:<port>` as the Owner and enroll a passkey in
    Settings > Security. Every new database needs a new one.
@@ -209,7 +211,16 @@ library installed in the org with `libs/clone.yaml` in the checkout (read with
    trust. Dogfood runs against real GitHub, so installing from github.com is
    expected here; the dev and e2e modes install from the in-cluster Forgejo
    instead.
-4. To call the API, issue a token in Org settings > API tokens.
+4. Org settings > Libraries > Install: fetch
+   `github.com/thulasi-ram/scarab-ci//libs/build.yaml@<commit>` the same way
+   and install it as `thulasi-ram/build`. The dogfood pipeline's `build` step
+   invokes it: `build/image` builds and `build/push` pushes.
+5. On the build library's page, trust its source,
+   `github.com/thulasi-ram/scarab-ci//libs/build.yaml`, for the build sandbox.
+   The dogfood build does not push (its push Step exits without pushing), so
+   the source needs no trust with the registry credential or forge
+   credentials.
+6. To call the API, issue a token in Org settings > API tokens.
 
 To check that the member is refused an admin action, sign in as the member and
 open Org settings > Members, or `PUT` a binding with the member's API token:
@@ -523,7 +534,8 @@ pushed first.
   (`scarab-admin`), for `SCARAB_DEV_ORG` (default `thulasi-ram`) and for
   `PLUGIN_VERIFY_ORG` (default `acme`): `clone.yaml` (this checkout's
   `libs/clone.yaml` with its image pinned to `scarab-clone:dev`),
-  `notify.yaml` (`.scarab/lib/notify.yaml`) and `argocd/manifest.json`
+  `build.yaml` (`libs/build.yaml`), `notify.yaml` (`.scarab/lib/notify.yaml`)
+  and `argocd/manifest.json`
   (`crates/scarab-plugin-argocd/manifest.json`). An org reads a private source
   only through its own connection and only from its own repositories, so each
   org gets its own copy, owned by a Forgejo user of the org's name.
@@ -531,16 +543,22 @@ pushed first.
   one an earlier run left: `forgejo.sh` revokes the previous token), fetches
   `scarab-forgejo.scarab.svc.cluster.local/<org>/scarab-libs//clone.yaml@<commit>`
   through it, installs it as `lib:thulasi-ram/clone`, and trusts that source
-  through `/library-trust`, so its Step receives the connection's token.
+  with forge credentials through `/library-trust`, so its Step receives the
+  connection's token. It installs `build.yaml` the same way as
+  `lib:thulasi-ram/build` and trusts that source for the build sandbox, so its
+  build Step may run rootless BuildKit. The build library is not trusted with
+  the registry credential or forge credentials: no pipeline of the stack
+  pushes, so its push Step exits without pushing. Both Steps pull the images
+  the library pins by digest (BuildKit from Docker Hub, crane from gcr.io).
   `just stack up` runs it for `SCARAB_DEV_ORG`; `just test e2e` runs it for
   `scarab-admin`, the org of the forge_token cases.
 - The forgejo-onboarding case installs `notify.yaml` from the same repository
   through its own connection; `plugin-verify.sh` reads `argocd/manifest.json`
   from `acme/scarab-libs` (`libs.sh connection acme`).
 
-Dogfood mode installs the clone library from github.com by hand (step 3 of
-its checklist above), as a real install against GitHub does. Chaos mode
-installs nothing.
+Dogfood mode installs the clone and build libraries from github.com by hand
+(steps 3 to 5 of its checklist above), as a real install against GitHub
+does. Chaos mode installs nothing.
 
 ## CI
 

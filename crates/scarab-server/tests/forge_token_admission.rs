@@ -146,6 +146,7 @@ async fn trust(libs: &InMemoryLibraries, source: &str) {
     libs.trust_source(&TrustedSource {
         org: "acme".into(),
         source: scarab_policy::library::trust_key(source).into(),
+        grant: scarab_policy::library::TrustGrant::ForgeCredentials,
         trusted_by: "amy".into(),
         trusted_at: 2,
         step_up_ref: Some("su-1".into()),
@@ -449,6 +450,7 @@ async fn trust_follows_the_source_across_upgrades() {
     libs.trust_source(&TrustedSource {
         org: "acme".into(),
         source: "github.com/acme/libs//pusher.yaml".into(),
+        grant: scarab_policy::library::TrustGrant::ForgeCredentials,
         trusted_by: "amy".into(),
         trusted_at: 2,
         step_up_ref: Some("su-1".into()),
@@ -480,9 +482,13 @@ async fn trust_follows_the_source_across_upgrades() {
 
     // Untrusting refuses again.
     install(&libs, "acme", "pusher", &v2, &at('2')).await;
-    libs.untrust_source("acme", "github.com/acme/libs//pusher.yaml")
-        .await
-        .unwrap();
+    libs.untrust_source(
+        "acme",
+        "github.com/acme/libs//pusher.yaml",
+        scarab_policy::library::TrustGrant::ForgeCredentials,
+    )
+    .await
+    .unwrap();
     assert!(
         refused_reason(&trigger(&db, &forge, ports(), &push()).await).contains("step `sync/git`")
     );
@@ -511,46 +517,6 @@ async fn a_fork_pull_request_gets_read_even_if_write_is_asked() {
         stored_token(&db, &out.runs[0], "tag").await,
         Some(ForgeToken::Read)
     );
-}
-
-const BUILD_YAML: &str = r#"
-on:
-  push: {}
-  pull_request: {}
-steps:
-  - id: image
-    build: { image: "ghcr.io/acme/web:1", push: true }
-"#;
-
-/// git-bug a75eacb: a fork pull request's Pipeline is read at the PR head, so
-/// its author controls `push:`. An ungoverned fork pull request is admitted,
-/// and its build is stored locked out: no push, and no registry credential
-/// at launch. The same Pipeline on a push keeps its push.
-#[tokio::test]
-async fn a_fork_pull_request_build_is_stored_locked_out_and_never_pushes() {
-    let forge = long_lived(&[(".scarab/ci.yaml", BUILD_YAML)]);
-    let stored_build = |db: InMemoryDb, run: RunId| async move {
-        db.step_spec(&run, &StepId("image".into()))
-            .await
-            .unwrap()
-            .unwrap()
-            .build
-            .expect("a build step")
-    };
-
-    let db = InMemoryDb::new();
-    let out = trigger(&db, &forge, AdmissionPorts::default(), &fork_pr()).await;
-    assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
-    let build = stored_build(db, out.runs[0].clone()).await;
-    assert!(!build.push);
-    assert!(build.locked_out);
-
-    let db = InMemoryDb::new();
-    let out = trigger(&db, &forge, AdmissionPorts::default(), &push()).await;
-    assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
-    let build = stored_build(db, out.runs[0].clone()).await;
-    assert!(build.push);
-    assert!(!build.locked_out);
 }
 
 /// `write` on a Forgejo or PAT connection: refused, whoever asks.
@@ -928,6 +894,29 @@ async fn a_clone_step_fails_naming_the_library() {
     .unwrap_err();
     assert!(
         err.to_string().contains("invoke: lib:thulasi-ram/clone"),
+        "{err}"
+    );
+}
+
+/// A `build:` Step fails the Pipeline check naming the library (ADR-0018,
+/// amendment of 2026-11-12).
+#[tokio::test]
+async fn a_build_step_fails_naming_the_library() {
+    let db = InMemoryDb::new();
+    let yaml =
+        "on: { push: {} }\nsteps: [{ id: image, build: { image: \"ghcr.io/acme/web:1\" } }]\n";
+    let forge = long_lived(&[(".scarab/ci.yaml", yaml)]);
+    let err = trigger_runs_from_event(
+        &forge,
+        &db,
+        &FakeClock::new(1),
+        AdmissionPorts::default(),
+        &push(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("invoke: lib:thulasi-ram/build"),
         "{err}"
     );
 }

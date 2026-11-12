@@ -30,6 +30,15 @@ policy_struct! {
         /// `has(step.env_secrets) && 'NAME' in step.env_secrets`.
         pub env_secrets: Option<Capped<String, MAX_SECRETS>>,
         pub forge_token: Option<ForgeToken>,
+        /// The sandbox the Step asks for (`security.sandbox`), e.g.
+        /// `rootless-buildkit`. Absent when it asks for none, and from
+        /// inputs recorded before it existed.
+        pub sandbox: Option<String>,
+        /// The Step asks for the Run's registry credential
+        /// (`registry_auth: true`). Absent from inputs recorded before it
+        /// existed, so a rule reads it as
+        /// `has(step.registry_auth) && step.registry_auth`.
+        pub registry_auth: Option<bool>,
         /// The Step uses the Environment's authority (ADR-0075 §5).
         pub uses_environment_authority: bool,
         pub origin: Capped<Origin, MAX_ORIGIN>,

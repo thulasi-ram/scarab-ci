@@ -59,7 +59,7 @@ function ErrorRow(props: { e: CompileError }) {
       <Icon icon="circle-x" size={14} />
       <div class="ck-main">
         <div class="ck-what">
-          <Show when={e().kind !== "other"} fallback={<span>{e().message}</span>}>
+          <Show when={e().kind !== "other"} fallback={<span style={{ "white-space": "pre-wrap" }}>{e().message}</span>}>
             step <code class="c">{e().step}</code>
             <Show when={e().library}>
               {" "}

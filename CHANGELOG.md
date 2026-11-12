@@ -18,6 +18,76 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **The `build` step kind is removed; build images with `lib:thulasi-ram/build`.** A Pipeline with
+  a `build:` step fails to compile with one error for that step, which holds the replacement
+  written from the step's own fields, ready to paste:
+
+  ```yaml
+  # before (0.3.2)
+  - id: image
+    needs: [checkout]
+    build: { image: "ghcr.io/acme/app:${{ event.sha }}", context: ., dockerfile: Dockerfile, push: true }
+
+  # after
+  - id: image
+    needs: [checkout]
+    invoke: lib:thulasi-ram/build
+    with: { image: "ghcr.io/acme/app:${{ event.sha }}", context: ., dockerfile: Dockerfile, push: true }
+  ```
+
+  `needs`, `when`, `timeout`, `resources` and `placement_profiles` carry over as written;
+  `env`, `retry` and `artifacts` on the old step are not accepted on an invoke step and are left
+  out. `${{ outputs.image.image }}` reads the same result. A step of a Run created before the
+  upgrade that was stored as a `build` step fails when it would launch (and again on each retry
+  or rerun) with the same replacement, and the Run has to be started again. A Pipeline that fails
+  its check, such as one with an old `build:` step, creates no Run and posts no commit status yet:
+  look for the error in the repository's Runs list in Scarab. Nothing is installed in an org by
+  default, so after upgrading the server, an org admin:
+  1. installs `github.com/thulasi-ram/scarab-ci//libs/build.yaml` at a release commit as
+     `thulasi-ram/build`;
+  2. trusts that source for the build sandbox (the new `build_sandbox` grant of
+     `POST /v1/orgs/{org}/library-trust`, or **Build sandbox › Trust source** on the library's
+     page);
+  3. if the builds push, trusts it with the registry credential too (`registry_credential`), so
+     its push step receives the `REGISTRY_AUTH` secret; to push to the forge's own registry with
+     no `REGISTRY_AUTH` secret, also with forge credentials;
+  4. if a placement profile grants push access, has the operator mark it
+     `registry_auth_only: true` (see Features) and routes it to the push step with
+     `placement_profiles: { push: [<profile>] }`.
+
+  The push step runs as root (crane's image has no other user), so an org Policy that denies
+  run-as-root refuses every Run that builds an image.
+
+  Between the upgrade and step 2, every Run that builds an image is refused. Upgrade every
+  server replica first: a server from before this release ignores a request's `grant` and
+  records trust with forge credentials, so never send `grant` to one.
+
+  The library has two steps. `image/image` runs rootless BuildKit in the build sandbox and holds
+  no registry credential: BuildKit runs without its process sandbox, so a Dockerfile `RUN` could
+  read anything that step holds. An image to push is written as an OCI image layout into the
+  workspace, and `image/push` pushes it with crane (pinned by digest) after refusing a layout
+  that holds a symlink or leads outside the workspace. Pushing a large image therefore costs a
+  transfer through the Data Depot. The push step removes the layout from its own workspace, but a
+  step that reads `outputs.<id>.image` needs the build step too and receives the layout through
+  its workspace; deploy by `outputs.<id>.push.digest`, or limit the step with `inputs:`. The
+  build step cannot pull private base images. There is no
+  registry layer cache (`cache: registry`, `cache_ref`), because writing one needs the push
+  credential in the build step; the S3 cache stays, reached with the build Pod's own identity.
+  `${{ outputs.image.push }}` gives the pushed reference and digest. `containerimage.digest` in
+  `outputs.image.image` is the same digest unless the Dockerfile changed the layout after
+  BuildKit wrote it, so deploy by `push.digest`. A fork pull request's build, or a Run locked out
+  of its Environment's secrets, neither pushes nor exports its layer cache. The library adds build arguments, an S3 layer
+  cache, images pinned by digest and templates in `image` (such as `${{ event.sha }}`)
+  ([Building an image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#building-an-image),
+  [Install Scarab's build library](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#install-scarabs-build-library),
+  [ADR-0018](https://github.com/thulasi-ram/scarab-ci/blob/main/docs/adr/0018-image-building.md)).
+- **`DELETE /v1/orgs/{org}/library-trust` with no `grant` removes every grant of the source.**
+  Name `grant` to remove one. Trust with forge credentials stays where it was; migration 0095
+  only adds a table (`library_source_grants`) for the new grants, so a server from before it
+  keeps working against the migrated database.
+
 ### Features
 
 - **Trigger on changed files.** A `when:` can read `event.changed_paths`, the files a push or
@@ -29,6 +99,22 @@ release.yml uses that version's section as the GitHub Release text. See
   activity log says why. Forced-push detection is GitHub only: Forgejo's push payload does not
   say whether a push was forced. See
   [Changed files](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#changed-files-eventchanged_paths).
+
+- **An invoke step can route placement profiles per library step.** `placement_profiles` on an
+  invoke step may be a map from a step id of the library to that step's list, such as
+  `{ image: [arm64-builders], push: [ecr-push] }`. The list form applies to every inlined step as
+  before. A key that is not a step of the library, or names a step with `forge_token` or with its
+  own profiles, is a compile error, and a `forge_token` step still gets no profile from its
+  invoke. Compiled steps, and Policies, see one list per step
+  ([Reuse: `invoke`](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#reuse-invoke)).
+- **A placement profile that grants push access can be kept to the step that pushes.** An
+  operator marks it `registry_auth_only: true` in the placement config. Scarab applies it only to
+  a step with `registry_auth` that the launch found eligible for a registry credential (a step
+  from a library the org trusts with the registry credential, in a Run that is not a fork pull
+  request or locked out), whether or not a credential resolves. Named on any other step, the build library's build step included, it fails that step's
+  launch; on a fork's push step it is left out. A marked profile cannot be `default`; the server
+  refuses that config at boot
+  ([Placement & resources](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#placement--resources)).
 
 ### Enhancement
 

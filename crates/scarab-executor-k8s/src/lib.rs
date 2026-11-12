@@ -163,6 +163,22 @@ pub struct PlacementConfig {
 }
 
 impl PlacementConfig {
+    /// The checks the server makes when it loads the config: a profile that
+    /// carries a registry credential (`registry_auth_only`) cannot be the
+    /// `default`, which a Step gets without naming any.
+    pub fn validate(&self) -> Result<(), String> {
+        for p in &self.profiles {
+            if p.default && p.registry_auth_only {
+                return Err(format!(
+                    "placement profile `{}` sets both `default` and `registry_auth_only`; a \
+                     profile that carries a registry credential cannot be the default",
+                    p.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn profile(&self, name: &str) -> Option<&scarab_pipeline::PlacementProfile> {
         // The shared named-registry lookup (ADR-0065 consequence): two
         // operator profile types exist now, so the machinery lives in
@@ -617,17 +633,18 @@ impl K8sExecutor {
         }
     }
 
-    /// Upsert the per-Pod Secret carrying a build step's registry
-    /// dockerconfigjson (ADR-0018): mounted read-only as `DOCKER_CONFIG`
-    /// (tmpfs) — the credential is never in env, argv, or the stored spec.
-    /// Owner-referenced to the Pod; re-drives refresh it.
+    /// Upsert the per-Pod Secret carrying a `registry_auth` Step's registry
+    /// dockerconfigjson (ADR-0018, amendment of 2026-11-12): mounted
+    /// read-only as `DOCKER_CONFIG` (tmpfs) — the credential is never in
+    /// env, argv, or the stored spec. Owner-referenced to the Pod; re-drives
+    /// refresh it.
     async fn ensure_registry_secret(
         &self,
         pod_name: &str,
         pod: &Pod,
         spec: &StepSpec,
     ) -> Result<(), ExecError> {
-        let Some(config_json) = spec.build.as_ref().and_then(registry_dockerconfig) else {
+        let Some(config_json) = step_registry_dockerconfig(spec) else {
             return Ok(());
         };
         let client = self.client.clone().ok_or(ExecError::Unavailable)?;
@@ -2760,10 +2777,7 @@ impl Executor for K8sExecutor {
             self.workspace_fetch.as_ref(),
         )
         .map_err(ExecError::Launch)?;
-        // A build step's context, dockerfile and image, checked again for
-        // specs stored before the Pipeline compiler checked them (git-bug
-        // df660b6), before any Pod exists.
-        build_is_launchable(spec, self.workspace_cas.is_some()).map_err(ExecError::Launch)?;
+        sandbox_is_launchable(spec).map_err(ExecError::Launch)?;
 
         // Re-attach: if the Pod already exists (a prior launch we may not have
         // observed completing), adopt it instead of creating a duplicate.
@@ -2791,7 +2805,8 @@ impl Executor for K8sExecutor {
         // ADR-0055: stamp the baseline, merge the named PlacementProfiles + the
         // governed k8s_overlay, and apply requested resources — fallible because a
         // named profile might not exist in the registry (fail-closed).
-        let pod = apply_placement(pod, spec, &self.placement).map_err(ExecError::Launch)?;
+        let pod =
+            apply_placement(pod, &step.step.0, spec, &self.placement).map_err(ExecError::Launch)?;
         match pods.create(&PostParams::default(), &pod).await {
             Ok(created) => {
                 self.ensure_step_secrets(&name, &created, step, spec)
@@ -4280,36 +4295,29 @@ pub fn workspace_feed_is_satisfiable(
     Ok(())
 }
 
-/// Whether a build step may launch (git-bug df660b6). Its context,
-/// dockerfile and image must pass the rule the Pipeline compiler applies, and
-/// the Pod must have a workspace: without one the build container's working
-/// directory is the image's, and a relative context could reach the
-/// registry credential mounted in the same container. Not a build step:
-/// `Ok`.
-///
-/// Pure, so the rule is testable without a cluster.
-pub fn build_is_launchable(spec: &StepSpec, workspace: bool) -> Result<(), String> {
-    let Some(build) = &spec.build else {
+/// Whether a sandboxed Step may launch (ADR-0018, amendment of 2026-11-12):
+/// the sandbox is a fixed Pod shape, so a stored spec that also carries an
+/// ADR-0039 grant (`run_as_root`, capabilities, `privileged`) is refused
+/// rather than merged, and so is one that names `secrets:`, which would sit
+/// in the container that runs with seccomp off beside the registry
+/// credential. The compiler refuses both; this covers a spec that reached
+/// the executor another way. Not sandboxed: `Ok`.
+pub fn sandbox_is_launchable(spec: &StepSpec) -> Result<(), String> {
+    let Some(sandbox) = &spec.sandbox else {
         return Ok(());
     };
-    let problems =
-        scarab_pipeline::build_target_problems(&build.context, &build.dockerfile, &build.image);
-    if !problems.is_empty() {
-        return Err(format!("build step refused: {}", problems.join("; ")));
+    if spec.run_as_root || spec.privileged || !spec.add_capabilities.is_empty() {
+        return Err(format!(
+            "step refused: `security.sandbox: {}` cannot be combined with `run_as_root`, \
+             `add_capabilities` or `privileged`",
+            sandbox.sandbox.as_str()
+        ));
     }
     if !spec.secrets.is_empty() {
-        return Err(
-            "build step refused: it names `secrets:`, which would sit in the container \
-             that holds the registry credential and runs the repository's Dockerfile"
-                .to_string(),
-        );
-    }
-    if !workspace {
-        return Err(
-            "build step refused: it builds from the workspace, and this executor \
-             runs no workspace flow"
-                .to_string(),
-        );
+        return Err(format!(
+            "step refused: a step with `security.sandbox: {}` must not name `secrets:`",
+            sandbox.sandbox.as_str()
+        ));
     }
     Ok(())
 }
@@ -4548,14 +4556,8 @@ pub fn build_pod(
         .map(|a| a.id.0.clone())
         .unwrap_or_else(|| "0".to_string());
 
-    // A build container holds the registry credential and runs the
-    // repository's Dockerfile, so authored env (`PATH`, `LD_PRELOAD`) would
-    // choose what code runs beside the credential. The Pipeline compiler
-    // refuses `env:` on a build step; a spec stored before that check, and
-    // the `SCARAB_PARAM_*` values rendered at launch, are dropped here. Only
-    // the env Scarab sets below reaches a build container.
-    let authored_env: &[(String, String)] = if spec.build.is_some() { &[] } else { &spec.env };
-    let mut env: Vec<EnvVar> = authored_env
+    let mut env: Vec<EnvVar> = spec
+        .env
         .iter()
         .map(|(k, v)| EnvVar {
             name: k.clone(),
@@ -4706,59 +4708,31 @@ pub fn build_pod(
     }
     let (image, command) = (spec.image.clone(), spec.command.clone());
 
-    // Build steps (ADR-0018): rootless BuildKit (never the author's image),
-    // registry auth ONLY via a mounted dockerconfigjson (a per-Pod Secret —
-    // tmpfs), and the image digest emitted as the `image` step result when
-    // the egress sidecar is present.
+    // A `registry_auth` Step (ADR-0018, amendment of 2026-11-12): the
+    // credential resolved at launch, as a tmpfs file, with `DOCKER_CONFIG`
+    // pointing at its directory. Never env.
     let mut registry_volume: Option<Volume> = None;
-    let (image, command, args) = if let Some(build) = &spec.build {
-        // The guard reads the context and dockerfile from these.
+    if step_registry_dockerconfig(spec).is_some() {
         env.push(EnvVar {
-            name: BUILD_CONTEXT_ENV.into(),
-            value: Some(build.context.clone()),
+            name: "DOCKER_CONFIG".into(),
+            value: Some(REGISTRY_AUTH_MOUNT_PATH.to_string()),
             value_from: None,
         });
-        env.push(EnvVar {
-            name: BUILD_DOCKERFILE_ENV.into(),
-            value: Some(build.dockerfile.clone()),
-            value_from: None,
+        step_mounts.push(VolumeMount {
+            name: REGISTRY_AUTH_VOLUME.to_string(),
+            mount_path: REGISTRY_AUTH_MOUNT_PATH.to_string(),
+            read_only: Some(true),
+            ..Default::default()
         });
-        env.push(EnvVar {
-            // Rootless buildkitd cannot use the process sandbox.
-            name: "BUILDKITD_FLAGS".into(),
-            value: Some("--oci-worker-no-process-sandbox".into()),
-            value_from: None,
-        });
-        let has_auth = build.registry_auth_json.is_some() || build.derived_auth.is_some();
-        if has_auth {
-            env.push(EnvVar {
-                name: "DOCKER_CONFIG".into(),
-                value: Some(REGISTRY_AUTH_MOUNT_PATH.to_string()),
-                value_from: None,
-            });
-            step_mounts.push(VolumeMount {
-                name: REGISTRY_AUTH_VOLUME.to_string(),
-                mount_path: REGISTRY_AUTH_MOUNT_PATH.to_string(),
-                read_only: Some(true),
+        registry_volume = Some(Volume {
+            name: REGISTRY_AUTH_VOLUME.to_string(),
+            secret: Some(k8s_openapi::api::core::v1::SecretVolumeSource {
+                secret_name: Some(registry_secret_name(name)),
                 ..Default::default()
-            });
-            registry_volume = Some(Volume {
-                name: REGISTRY_AUTH_VOLUME.to_string(),
-                secret: Some(k8s_openapi::api::core::v1::SecretVolumeSource {
-                    secret_name: Some(registry_secret_name(name)),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            });
-        }
-        (
-            BUILDKIT_IMAGE.to_string(),
-            build_guard_command(),
-            buildctl_args(build, egress.is_some()),
-        )
-    } else {
-        (image, command, Vec::new())
-    };
+            }),
+            ..Default::default()
+        });
+    }
 
     // Per-attempt OIDC token (ADR-0015): tmpfs Secret mount + a pointer env
     // var. The token itself NEVER rides in env or argv.
@@ -4789,10 +4763,10 @@ pub fn build_pod(
         name: STEP_CONTAINER.to_string(),
         image: Some(image),
         command: (!command.is_empty()).then_some(command),
-        args: (!args.is_empty()).then_some(args),
         env: Some(env),
-        security_context: Some(if spec.build.is_some() {
-            build_security_context()
+        // A `rootless-buildkit` sandbox (ADR-0018, amendment of 2026-11-12).
+        security_context: Some(if spec.sandbox.is_some() {
+            sandbox_security_context()
         } else {
             step_security_context(spec)
         }),
@@ -4849,7 +4823,7 @@ pub fn build_pod(
         volumes.push(v);
     }
     let mut annotations = std::collections::BTreeMap::new();
-    if spec.build.is_some() {
+    if spec.sandbox.is_some() {
         // AppArmor unconfined for rootless buildkit (user-namespace worker).
         annotations.insert(
             format!("container.apparmor.security.beta.kubernetes.io/{STEP_CONTAINER}"),
@@ -5164,15 +5138,19 @@ pub fn build_pod(
 /// the Pod's keyed lists (containers, env, volumes, …) merge item by item,
 /// tolerations accumulate, and every other list replaces.
 ///
-/// Returns `Err` if a step names a PlacementProfile absent from the registry, or
-/// if a layer names or removes a container Scarab added to the Pod other than the
-/// step container (the results-egress sidecar, the workspace containers, service
-/// sidecars): those carry Scarab's own wiring. Fail-closed, never a silently
-/// mis-scheduled or mis-wired Pod. A no-op (returns the Pod unchanged) when there
-/// is no baseline, no profile, no overlay and no resources, preserving the
-/// pre-0055 behavior exactly.
+/// Returns `Err` if a step names a PlacementProfile absent from the registry; if
+/// a step names a `registry_auth_only` profile without asking for
+/// `registry_auth` (see [`registry_auth_only_applies`], checked before the
+/// profile is merged); or if a layer names or removes a container Scarab added
+/// to the Pod other than the step container (the results-egress sidecar, the
+/// workspace containers, service sidecars): those carry Scarab's own wiring.
+/// Fail-closed, never a silently mis-scheduled or mis-wired Pod. A no-op
+/// (returns the Pod unchanged) when there is no baseline, no profile, no overlay
+/// and no resources, preserving the pre-0055 behavior exactly. `step` names the
+/// Step in an error.
 fn apply_placement(
     mut pod: Pod,
+    step: &str,
     spec: &StepSpec,
     placement: &PlacementConfig,
 ) -> Result<Pod, String> {
@@ -5206,6 +5184,9 @@ fn apply_placement(
         let profile = placement
             .profile(name)
             .ok_or_else(|| format!("unknown placement_profile `{name}` (not in the registry)"))?;
+        if profile.registry_auth_only && !registry_auth_only_applies(step, name, spec)? {
+            continue;
+        }
         if let Some(k8s) = &profile.k8s {
             layers.push((format!("placement_profile `{name}`"), k8s));
         }
@@ -5236,6 +5217,40 @@ fn apply_placement(
             .map_err(|e| format!("{source} leaves a Pod that does not decode: {e}"))?;
     }
     Ok(pod)
+}
+
+/// Whether a `registry_auth_only` profile (one that carries a registry
+/// credential, such as a ServiceAccount with a push role) applies to `spec`.
+/// An author names profiles, so the operator's marker is what keeps such a
+/// profile off a Step that runs repository code:
+///
+/// - a Step without `registry_auth` (a run Step, the build library's
+///   sandboxed build Step) may not name it: `Err`, which fails the launch;
+/// - a `registry_auth` Step the launch did not find eligible for a
+///   credential (a fork pull request, a Run locked out of its Environment, a
+///   Step from the Pipeline file or an untrusted library) runs without it:
+///   `Ok(false)`, so a fork's push Step still succeeds and pushes nothing;
+/// - a `registry_auth` Step the launch found eligible for a credential gets
+///   it, whether or not a credential resolved: `Ok(true)`.
+fn registry_auth_only_applies(step: &str, name: &str, spec: &StepSpec) -> Result<bool, String> {
+    match &spec.registry_auth {
+        None => Err(format!(
+            "placement profile `{name}` carries a registry credential and applies only to a \
+             step with `registry_auth`; step `{step}` has none. Name it only for the step that \
+             pushes (for an invoke, `placement_profiles: {{ push: [{name}] }}`)"
+        )),
+        Some(auth) if !auth.credential_eligible => {
+            tracing::info!(
+                %step,
+                profile = %name,
+                "placement profile left out: it carries a registry credential, and this launch \
+                 did not find the step eligible for one (a fork pull request, a locked-out Run, \
+                 or a step its library's trust does not cover)"
+            );
+            Ok(false)
+        }
+        Some(_) => Ok(true),
+    }
 }
 
 /// Refuse a layer that holds a key starting with `$` anywhere: Kubernetes'
@@ -6151,8 +6166,6 @@ pub fn build_network_policy(
     }
 }
 
-/// The rootless BuildKit image used by a `kind: build` step (ADR-0018).
-const BUILDKIT_IMAGE: &str = "moby/buildkit:rootless";
 /// Where the registry dockerconfigjson is mounted (`DOCKER_CONFIG` points
 /// here); a per-Pod Secret volume — tmpfs on the node, never env (ADR-0018).
 const REGISTRY_AUTH_MOUNT_PATH: &str = "/scarab/registry";
@@ -6177,111 +6190,11 @@ fn oidc_secret_name(pod_name: &str) -> String {
     format!("{pod_name}-oidc")
 }
 
-/// Env vars carrying a build step's context and dockerfile to
-/// [`BUILD_GUARD`]. They are passed as values, never written into the script.
-const BUILD_CONTEXT_ENV: &str = "SCARAB_BUILD_CONTEXT";
-const BUILD_DOCKERFILE_ENV: &str = "SCARAB_BUILD_DOCKERFILE";
-
-/// The script a build container runs before `buildctl-daemonless.sh`
-/// (git-bug df660b6).
-///
-/// The registry credential is mounted in the same container, at
-/// [`REGISTRY_AUTH_MOUNT_PATH`]. The Pipeline compiler and the launch check
-/// refuse an absolute or `..` context or dockerfile, but a symlink committed
-/// in the repository (`ctx -> /scarab/registry`, or a Dockerfile pointing at
-/// the credential) passes those checks and is only seen here, once the
-/// workspace exists. So the guard resolves the workspace root, the context and
-/// `<context>/<dockerfile>`, refuses (exit 2) when either is outside the
-/// root, and then runs `buildctl-daemonless.sh` with the buildctl args, which
-/// it receives as `"$@"`. A Pod with no workspace fails here too, because
-/// `/workspace` does not exist.
-///
-/// POSIX sh: the image is Alpine, with busybox `sh` and `realpath`. A path is
-/// checked to exist before `realpath` resolves it, because `realpath`
-/// implementations differ on missing paths. `/bin/sh` and
-/// `/usr/bin/buildctl-daemonless.sh` are named by path, where the image puts
-/// them; `realpath` is found on the image's `PATH`, which authored env cannot
-/// change (see [`build_pod`]).
-const BUILD_GUARD: &str = r#"set -eu
-root=/workspace
-fail() { echo "scarab: build refused: $*" >&2; exit 2; }
-nl='
-'
-# Sets r to the resolved path. The `.` keeps a trailing newline in a
-# directory name from being dropped by the command substitution.
-resolve() {
-  r=$(realpath "$1" && echo .) || return 1
-  r=${r%.}
-  r=${r%"$nl"}
-}
-[ -d "$root" ] || fail "no workspace at $root"
-cd "$root" || fail "cannot enter the workspace at $root"
-resolve . || fail "cannot resolve the workspace at $root"
-root=$r
-ctx=${SCARAB_BUILD_CONTEXT-}
-df=${SCARAB_BUILD_DOCKERFILE-}
-[ -n "$ctx" ] || fail "no build context"
-[ -n "$df" ] || fail "no dockerfile"
-inside() {
-  case "$1" in
-    "$root" | "$root"/*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-[ -e "./$ctx" ] || fail "build context $ctx does not exist in the workspace"
-resolve "./$ctx" || fail "cannot resolve build context $ctx"
-inside "$r" || fail "build context $ctx resolves outside the workspace"
-[ -e "./$ctx/$df" ] || fail "dockerfile $ctx/$df does not exist in the workspace"
-resolve "./$ctx/$df" || fail "cannot resolve dockerfile $ctx/$df"
-inside "$r" || fail "dockerfile $ctx/$df resolves outside the workspace"
-exec /usr/bin/buildctl-daemonless.sh "$@"
-"#;
-
-/// The build container's command: [`BUILD_GUARD`] under `sh -c`, with
-/// `scarab-build` as `$0`, so the container's args (the buildctl args) are
-/// the guard's `"$@"`.
-fn build_guard_command() -> Vec<String> {
-    vec![
-        "/bin/sh".to_string(),
-        "-c".to_string(),
-        BUILD_GUARD.to_string(),
-        "scarab-build".to_string(),
-    ]
-}
-
-/// The `buildctl` args a build step compiles to (ADR-0018). With the egress
-/// sidecar present, the image digest is written to the results volume as the
-/// `image` result — the ImageArtifact of record (`containerimage.digest`).
-fn buildctl_args(build: &scarab_engine::BuildConfig, with_metadata: bool) -> Vec<String> {
-    let mut push_opt = format!("type=image,name={},push={}", build.image, build.push);
-    if build.push && build.insecure_push {
-        push_opt.push_str(",registry.insecure=true");
-    }
-    let mut args = vec![
-        "build".to_string(),
-        "--frontend".into(),
-        "dockerfile.v0".into(),
-        "--local".into(),
-        format!("context={}", build.context),
-        "--local".into(),
-        format!("dockerfile={}", build.context),
-        "--opt".into(),
-        format!("filename={}", build.dockerfile),
-        "--output".into(),
-        push_opt,
-    ];
-    if with_metadata {
-        args.push("--metadata-file".into());
-        args.push(format!("{RESULTS_MOUNT_PATH}/image.json"));
-    }
-    args
-}
-
-/// The security context of a build step: rootless BuildKit needs a non-root
-/// uid with an unconfined seccomp profile (user-namespace worker) — explicitly
-/// NOT privileged, and never the author's request (a build step cannot ask
-/// for escalation; the pipeline compiler rejects it).
-fn build_security_context() -> SecurityContext {
+/// The security context of a `rootless-buildkit` sandbox: rootless BuildKit
+/// needs a non-root uid with an unconfined seccomp profile (user-namespace
+/// worker), explicitly NOT privileged, and never the author's request (the
+/// compiler and [`sandbox_is_launchable`] refuse a grant beside it).
+fn sandbox_security_context() -> SecurityContext {
     SecurityContext {
         privileged: Some(false),
         allow_privilege_escalation: Some(true), // setuid newuidmap needs it
@@ -6295,40 +6208,30 @@ fn build_security_context() -> SecurityContext {
     }
 }
 
-/// The dockerconfigjson for a build Pod (ADR-0018): the scoped secret's JSON
-/// verbatim when present, else synthesized from the forge-derived credential.
-fn registry_dockerconfig(build: &scarab_engine::BuildConfig) -> Option<String> {
-    if let Some(json) = &build.registry_auth_json {
+/// The dockerconfigjson for a `registry_auth` Step's Pod (ADR-0018), if the
+/// launch resolved one.
+fn step_registry_dockerconfig(spec: &StepSpec) -> Option<String> {
+    spec.registry_auth
+        .as_ref()
+        .and_then(|r| registry_dockerconfig(r.registry_auth_json.as_ref(), r.derived_auth.as_ref()))
+}
+
+/// A registry dockerconfigjson (ADR-0018): the scoped secret's JSON
+/// verbatim when present, else synthesized from the forge-derived
+/// credential, which names only that credential's registry.
+fn registry_dockerconfig(
+    json: Option<&String>,
+    derived: Option<&scarab_engine::RegistryCredential>,
+) -> Option<String> {
+    if let Some(json) = json {
         return Some(json.clone());
     }
-    build.derived_auth.as_ref().map(|cred| {
+    derived.map(|cred| {
         use base64::Engine;
         let auth = base64::engine::general_purpose::STANDARD
             .encode(format!("{}:{}", cred.username, cred.token));
         serde_json::json!({ "auths": { cred.registry.clone(): { "auth": auth } } }).to_string()
     })
-}
-
-/// The image an image-build step produced, recorded as an Artifact of record
-/// (ADR-0018): the pushed reference and its content digest.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImageArtifact {
-    pub image: String,
-    pub digest: String,
-}
-
-/// Record a built image's digest as an [`ImageArtifact`].
-pub fn image_artifact(build: &scarab_engine::BuildConfig, digest: &str) -> ImageArtifact {
-    ImageArtifact {
-        image: build.image.clone(),
-        digest: digest.to_string(),
-    }
-}
-
-/// The idempotency key that neutralizes a double push of the same content
-/// (ADR-0021): pushing `image@digest` twice is one logical effect.
-pub fn push_fence(image: &str, digest: &str) -> String {
-    format!("push:{image}@{digest}")
 }
 
 /// Map a Pod's observed status to the domain [`ExecState`]. For a
@@ -7026,6 +6929,8 @@ mod tests {
             workspace_outputs: vec![],
             cache: None,
             forge_token: None,
+            sandbox: None,
+            registry_auth: None,
             build: None,
             artifacts: vec![],
             placement_profiles: vec![],
@@ -7045,6 +6950,7 @@ mod tests {
             name: name.into(),
             default: false,
             k8s: Some(k8s),
+            registry_auth_only: false,
         }
     }
 
@@ -7062,6 +6968,125 @@ mod tests {
         )
     }
 
+    /// A registry with `ecr-push`, a profile that carries a registry
+    /// credential (a ServiceAccount with a push role), marked
+    /// `registry_auth_only`.
+    fn with_push_profile() -> PlacementConfig {
+        let mut push = profile(
+            "ecr-push",
+            serde_json::json!({"spec": {"serviceAccountName": "ecr-pusher"}}),
+        );
+        push.registry_auth_only = true;
+        PlacementConfig {
+            profiles: vec![push],
+            ..Default::default()
+        }
+    }
+
+    fn service_account(pod: Pod) -> Option<String> {
+        pod.spec.unwrap().service_account_name
+    }
+
+    // Attack: an author names the operator's push-credential profile on a Step that runs repository code: a plain run Step, or (through an invoke's list form, or a map aimed at `image`) the build library's sandboxed build Step, where a Dockerfile RUN shares buildkitd's PID namespace. Safe outcome: the launch fails naming the profile and the Step; the profile is never merged.
+    #[test]
+    fn a_registry_auth_only_profile_fails_a_step_without_registry_auth() {
+        let placement = with_push_profile();
+        let mut run = busybox();
+        run.placement_profiles = vec!["ecr-push".into()];
+        let mut sandboxed = run.clone();
+        sandboxed.sandbox = Some(sandbox_config());
+        for (id, spec) in [("steal", &run), ("image/image", &sandboxed)] {
+            let err = apply_placement(pod_for(spec), id, spec, &placement).unwrap_err();
+            assert!(
+                err.contains("`ecr-push`")
+                    && err.contains(&format!("step `{id}`"))
+                    && err.contains("registry_auth"),
+                "{err}"
+            );
+        }
+    }
+
+    /// A `registry_auth` Step gets the marked profile only when the launch
+    /// found it eligible for a credential. A fork pull request's push Step (and a
+    /// locked-out Run's, and one from the Pipeline file or an untrusted
+    /// library) runs without the profile and does not fail, so its build
+    /// stays green and pushes nothing; a trusted push Step gets it.
+    #[test]
+    fn a_registry_auth_only_profile_applies_only_to_an_eligible_push_step() {
+        let placement = with_push_profile();
+        let mut push = busybox();
+        push.placement_profiles = vec!["ecr-push".into()];
+        push.registry_auth = Some(scarab_engine::RegistryAuthConfig {
+            owner: "acme".into(),
+            name: "web".into(),
+            locked_out: true,
+            ..Default::default()
+        });
+        let pod = apply_placement(pod_for(&push), "image/push", &push, &placement)
+            .expect("a fork's push Step launches");
+        assert_eq!(service_account(pod), None, "the profile is left out");
+
+        let auth = push.registry_auth.as_mut().unwrap();
+        auth.locked_out = false;
+        auth.library = Some("ab".repeat(32));
+        auth.credential_eligible = true;
+        let pod = apply_placement(pod_for(&push), "image/push", &push, &placement).unwrap();
+        assert_eq!(service_account(pod).as_deref(), Some("ecr-pusher"));
+    }
+
+    // Attack: a fork pull request's Pipeline (read at the PR head) adds its own Step that names the push-credential profile, with and without `registry_auth: true`, as Run creation stores it. Safe outcome: without `registry_auth` the launch fails; with it, the launch decorator resolves no credential for a Pipeline-file Step, so the profile is left out and the Step never runs with the ServiceAccount.
+    #[test]
+    fn a_fork_authors_step_never_gets_a_registry_auth_only_profile() {
+        let placement = with_push_profile();
+        let ir = scarab_pipeline::compile_yaml(
+            "steps:\n  - { id: steal, image: alpine, command: [cat, /var/run/secrets/eks.amazonaws.com/serviceaccount/token], placement_profiles: [ecr-push] }\n  - { id: steal2, image: alpine, command: [cat], registry_auth: true, placement_profiles: [ecr-push] }\n",
+        )
+        .unwrap();
+        let stored = |id: &str| {
+            let s = ir.steps.iter().find(|s| s.id == id).unwrap();
+            let mut spec = busybox();
+            spec.placement_profiles = s.placement_profiles.compiled().unwrap().to_vec();
+            // As Run creation stores it for a fork, and the launch decorator
+            // passes it on: locked out, no library, not eligible.
+            spec.registry_auth = s.registry_auth.then(|| scarab_engine::RegistryAuthConfig {
+                owner: "acme".into(),
+                name: "web".into(),
+                locked_out: true,
+                ..Default::default()
+            });
+            spec
+        };
+        let steal = stored("steal");
+        assert!(apply_placement(pod_for(&steal), "steal", &steal, &placement).is_err());
+        let steal2 = stored("steal2");
+        let pod = apply_placement(pod_for(&steal2), "steal2", &steal2, &placement).unwrap();
+        assert_eq!(service_account(pod), None);
+    }
+
+    /// A profile that carries a registry credential cannot be the default:
+    /// the server refuses the config when it loads it.
+    #[test]
+    fn a_default_registry_auth_only_profile_is_refused() {
+        let mut placement = with_push_profile();
+        assert_eq!(placement.validate(), Ok(()));
+        placement.profiles[0].default = true;
+        assert!(placement
+            .validate()
+            .unwrap_err()
+            .contains("`ecr-push` sets both `default` and `registry_auth_only`"));
+        // In the operator's file the marker is a plain key, `false` when absent.
+        let parsed: PlacementConfig = serde_json::from_value(serde_json::json!({
+            "profiles": [
+                { "name": "ecr-push", "registry_auth_only": true,
+                  "k8s": { "spec": { "serviceAccountName": "x" } } },
+                { "name": "big" }
+            ]
+        }))
+        .unwrap();
+        assert!(parsed.profiles[0].registry_auth_only);
+        assert!(!parsed.profiles[1].registry_auth_only);
+    }
+
     #[test]
     fn placement_baseline_is_stamped_on_every_pod() {
         let spec = busybox(); // no placement fields at all
@@ -7073,7 +7098,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let ps = apply_placement(pod_for(&spec), &spec, &placement)
+        let ps = apply_placement(pod_for(&spec), "s", &spec, &placement)
             .unwrap()
             .spec
             .unwrap();
@@ -7100,7 +7125,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let ps = apply_placement(pod_for(&spec), &spec, &placement)
+        let ps = apply_placement(pod_for(&spec), "s", &spec, &placement)
             .unwrap()
             .spec
             .unwrap();
@@ -7124,7 +7149,7 @@ mod tests {
             cpu_millis: Some(8000),
             memory_mib: Some(16384),
         };
-        let ps = apply_placement(pod_for(&spec), &spec, &PlacementConfig::default())
+        let ps = apply_placement(pod_for(&spec), "s", &spec, &PlacementConfig::default())
             .unwrap()
             .spec
             .unwrap();
@@ -7148,7 +7173,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let ps = apply_placement(pod_for(&spec), &spec, &placement)
+        let ps = apply_placement(pod_for(&spec), "s", &spec, &placement)
             .unwrap()
             .spec
             .unwrap();
@@ -7164,7 +7189,8 @@ mod tests {
     fn unknown_placement_profile_is_fail_closed() {
         let mut spec = busybox();
         spec.placement_profiles = vec!["ghost".into()];
-        let err = apply_placement(pod_for(&spec), &spec, &PlacementConfig::default()).unwrap_err();
+        let err =
+            apply_placement(pod_for(&spec), "s", &spec, &PlacementConfig::default()).unwrap_err();
         assert!(
             err.contains("unknown placement_profile `ghost`"),
             "got: {err}"
@@ -7179,7 +7205,7 @@ mod tests {
             baseline: Some(serde_json::json!({"spec":{"schedulerName":"default-sched"}})),
             ..Default::default()
         };
-        let ps = apply_placement(pod_for(&spec), &spec, &placement)
+        let ps = apply_placement(pod_for(&spec), "s", &spec, &placement)
             .unwrap()
             .spec
             .unwrap();
@@ -7244,7 +7270,7 @@ mod tests {
             )],
             ..Default::default()
         };
-        let ps = apply_placement(pod_for(&spec), &spec, &placement)
+        let ps = apply_placement(pod_for(&spec), "s", &spec, &placement)
             .unwrap()
             .spec
             .unwrap();
@@ -7264,7 +7290,7 @@ mod tests {
             {"name":"step","securityContext":{"seccompProfile":{"type":"Unconfined"}}}
         ]}}));
         let before = full_pod_for(&spec).spec.unwrap();
-        let after = apply_placement(full_pod_for(&spec), &spec, &PlacementConfig::default())
+        let after = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default())
             .unwrap()
             .spec
             .unwrap();
@@ -7300,7 +7326,7 @@ mod tests {
             ..Default::default()
         };
         let before = full_pod_for(&spec).spec.unwrap();
-        let after = apply_placement(full_pod_for(&spec), &spec, &placement)
+        let after = apply_placement(full_pod_for(&spec), "s", &spec, &placement)
             .unwrap()
             .spec
             .unwrap();
@@ -7353,7 +7379,7 @@ mod tests {
             ..Default::default()
         };
         let before = pod_for(&spec).spec.unwrap();
-        let after = apply_placement(pod_for(&spec), &spec, &placement)
+        let after = apply_placement(pod_for(&spec), "s", &spec, &placement)
             .unwrap()
             .spec
             .unwrap();
@@ -7383,8 +7409,8 @@ mod tests {
         spec.k8s_overlay = Some(serde_json::json!({"spec":{"containers":[
             {"name":"step","env":[{"name":"SCARAB_ATTEMPT","value":"someone-else"}]}
         ]}}));
-        let err =
-            apply_placement(full_pod_for(&spec), &spec, &PlacementConfig::default()).unwrap_err();
+        let err = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default())
+            .unwrap_err();
         assert!(err.contains("`SCARAB_ATTEMPT`"), "got: {err}");
         assert!(err.contains("k8s_overlay"), "got: {err}");
     }
@@ -7399,7 +7425,7 @@ mod tests {
             spec.k8s_overlay = Some(serde_json::json!({"spec":{
                 field: [{"name": name, "image": "evil:1"}]
             }}));
-            let err = apply_placement(full_pod_for(&spec), &spec, &PlacementConfig::default())
+            let err = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default())
                 .unwrap_err();
             assert!(err.contains(&format!("`{name}`")), "got: {err}");
             assert!(err.contains("k8s_overlay"), "got: {err}");
@@ -7416,7 +7442,7 @@ mod tests {
             )],
             ..Default::default()
         };
-        let err = apply_placement(full_pod_for(&spec), &spec, &placement).unwrap_err();
+        let err = apply_placement(full_pod_for(&spec), "s", &spec, &placement).unwrap_err();
         assert!(err.contains(RESULTS_EGRESS_CONTAINER), "got: {err}");
         assert!(err.contains("placement_profile `p`"), "got: {err}");
     }
@@ -7425,8 +7451,8 @@ mod tests {
     fn a_layer_deleting_scarabs_init_containers_is_refused() {
         let mut spec = full_spec();
         spec.k8s_overlay = Some(serde_json::json!({"spec":{"initContainers": null}}));
-        let err =
-            apply_placement(full_pod_for(&spec), &spec, &PlacementConfig::default()).unwrap_err();
+        let err = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default())
+            .unwrap_err();
         assert!(err.contains("removes container"), "got: {err}");
     }
 
@@ -7442,7 +7468,7 @@ mod tests {
             )],
             ..Default::default()
         };
-        let err = apply_placement(full_pod_for(&spec), &spec, &placement).unwrap_err();
+        let err = apply_placement(full_pod_for(&spec), "s", &spec, &placement).unwrap_err();
         assert!(err.contains(&format!("`{RESULTS_VOLUME}`")), "got: {err}");
         assert!(err.contains("placement_profile `host`"), "got: {err}");
     }
@@ -7451,8 +7477,8 @@ mod tests {
     fn a_layer_deleting_scarabs_volumes_is_refused() {
         let mut spec = full_spec();
         spec.k8s_overlay = Some(serde_json::json!({"spec":{"volumes": null}}));
-        let err =
-            apply_placement(full_pod_for(&spec), &spec, &PlacementConfig::default()).unwrap_err();
+        let err = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default())
+            .unwrap_err();
         assert!(err.contains("removes or changes volume"), "got: {err}");
         assert!(err.contains("k8s_overlay"), "got: {err}");
     }
@@ -7471,7 +7497,7 @@ mod tests {
                 "containers":[{"name":"step","volumeMounts":[
                     {"name":"mine","mountPath": path}]}]
             }}));
-            let err = apply_placement(full_pod_for(&spec), &spec, &PlacementConfig::default())
+            let err = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default())
                 .unwrap_err();
             assert!(err.contains(&format!("`{path}`")), "got: {err}");
             assert!(err.contains(WORKSPACE_VOLUME), "got: {err}");
@@ -7488,7 +7514,7 @@ mod tests {
             {"name":"step","volumeMounts":[
                 {"name": WORKSPACE_TOKEN_VOLUME, "mountPath": "/tmp/token"}]}
         ]}}));
-        let res = apply_placement(full_pod_for(&spec), &spec, &PlacementConfig::default());
+        let res = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default());
         assert!(
             res.is_err(),
             "the step container mounts the workspace token"
@@ -7506,7 +7532,7 @@ mod tests {
                 field: [{"name":"mine","image":"evil:1","volumeMounts":[
                     {"name": WORKSPACE_TOKEN_VOLUME, "mountPath": "/t"}]}]
             }}));
-            let res = apply_placement(full_pod_for(&spec), &spec, &PlacementConfig::default());
+            let res = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default());
             assert!(
                 res.is_err(),
                 "an added `{field}` item mounts the workspace token"
@@ -7527,8 +7553,8 @@ mod tests {
                 {"name":"step","volumeMounts":[
                     {"name":"mine","mountPath": WORKSPACE_MOUNT_PATH}]}]
         }}));
-        let err =
-            apply_placement(full_pod_for(&spec), &spec, &PlacementConfig::default()).unwrap_err();
+        let err = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default())
+            .unwrap_err();
         assert!(err.contains(WORKSPACE_MOUNT_PATH), "got: {err}");
     }
 
@@ -7552,7 +7578,7 @@ mod tests {
         ] {
             let mut spec = full_spec();
             spec.k8s_overlay = Some(overlay.clone());
-            let res = apply_placement(full_pod_for(&spec), &spec, &PlacementConfig::default());
+            let res = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default());
             assert!(res.is_err(), "accepted {overlay}");
         }
     }
@@ -7574,7 +7600,7 @@ mod tests {
             baseline: Some(affinity("ci")),
             ..Default::default()
         };
-        let ps = apply_placement(pod_for(&spec), &spec, &placement)
+        let ps = apply_placement(pod_for(&spec), "s", &spec, &placement)
             .unwrap()
             .spec
             .unwrap();
@@ -7599,9 +7625,10 @@ mod tests {
         let spec = busybox();
         let pod = pod_for(&spec);
         let before = serde_json::to_value(&pod).unwrap();
-        let after =
-            serde_json::to_value(apply_placement(pod, &spec, &PlacementConfig::default()).unwrap())
-                .unwrap();
+        let after = serde_json::to_value(
+            apply_placement(pod, "s", &spec, &PlacementConfig::default()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(before, after);
     }
 
@@ -7651,6 +7678,8 @@ mod tests {
             workspace_outputs: vec![],
             cache: None,
             forge_token: None,
+            sandbox: None,
+            registry_auth: None,
             build: None,
             artifacts: vec![],
             placement_profiles: vec![],
@@ -8382,116 +8411,25 @@ mod tests {
         }
     }
 
-    fn sample_build() -> scarab_engine::BuildConfig {
-        scarab_engine::BuildConfig {
-            context: ".".into(),
-            dockerfile: "Dockerfile".into(),
-            image: "registry.example/app:1.0".into(),
-            repo_owner: "acme".into(),
-            repo_name: "app".into(),
-            push: true,
-            insecure_push: false,
-            locked_out: false,
-            registry_auth_json: None,
-            derived_auth: None,
+    fn sandbox_config() -> scarab_engine::SandboxConfig {
+        scarab_engine::SandboxConfig {
+            sandbox: scarab_pipeline::Sandbox::RootlessBuildkit,
+            org: "acme".into(),
+            library: "ab".repeat(32),
         }
     }
 
+    /// ADR-0018 (amendment of 2026-11-12): a `rootless-buildkit` sandbox
+    /// gives the Step the Pod shape rootless BuildKit needs (uid 1000, not root,
+    /// not privileged, seccomp and AppArmor unconfined) and runs the Step's
+    /// own image and command, with its own env.
     #[test]
-    fn build_pod_is_rootless_buildkit_and_not_privileged() {
-        let step = step_with_attempt("run-1", "image", "a1");
+    fn a_sandboxed_step_gets_the_rootless_buildkit_pod_shape() {
+        let step = step_with_attempt("run-1", "image/image", "a1");
         let mut spec = busybox();
-        spec.image = String::new();
-        spec.command = vec![];
-        spec.build = Some(sample_build());
-        // A build step consumes its `needs` workspace like any other step, so it
-        // gets the ADR-0061 fetcher too — asserted at the bottom of this test.
-        spec.workspace_inputs = vec!["tree-from-clone".into()];
-        let fetch = sample_fetch();
-        let pod = build_pod(
-            "scarab-image-a1",
-            "ns",
-            &step,
-            &spec,
-            None,
-            DEFAULT_STEP_TIMEOUT_SECS,
-            true,
-            Some(&fetch),
-        );
-        let c = &pod.spec.as_ref().unwrap().containers[0];
-
-        assert_eq!(c.image.as_deref(), Some("moby/buildkit:rootless"));
-        let command = c.command.as_ref().unwrap();
-        assert_eq!(command[..2], ["/bin/sh", "-c"]);
-        // Every `$` in a Pod command is written as `$$`, which the kubelet
-        // reduces back to `$` (scarab_k8s_expansion), so the shell runs
-        // BUILD_GUARD as written.
-        assert_eq!(command[2], BUILD_GUARD.replace('$', "$$"));
-        assert_eq!(command[3], "scarab-build");
-        assert_eq!(command.len(), 4);
-        let args = c.args.as_ref().unwrap().join(" ");
-        assert!(args.contains("--frontend dockerfile.v0"), "{args}");
-        assert!(args.contains("filename=Dockerfile"), "{args}");
-        assert!(
-            args.contains("type=image,name=registry.example/app:1.0,push=true"),
-            "{args}"
-        );
-
-        // Rootless security posture: never privileged, non-root, unconfined seccomp.
-        let sc = c.security_context.as_ref().unwrap();
-        assert_eq!(sc.privileged, Some(false));
-        assert_eq!(sc.run_as_non_root, Some(true));
-        assert_eq!(sc.seccomp_profile.as_ref().unwrap().type_, "Unconfined");
-        // AppArmor unconfined annotation for the step container.
-        assert_eq!(
-            pod.metadata
-                .annotations
-                .as_ref()
-                .unwrap()
-                .get(&format!(
-                    "container.apparmor.security.beta.kubernetes.io/{STEP_CONTAINER}"
-                ))
-                .map(String::as_str),
-            Some("unconfined")
-        );
-        // No auth resolved => no registry mount, no DOCKER_CONFIG.
-        assert!(c
-            .env
-            .as_ref()
-            .unwrap()
-            .iter()
-            .all(|e| e.name != "DOCKER_CONFIG"));
-        // The build consumes its `needs` workspace like any step.
-        assert!(pod
-            .spec
-            .as_ref()
-            .unwrap()
-            .init_containers
-            .as_ref()
-            .unwrap()
-            .iter()
-            .any(|i| i.name == WORKSPACE_INIT_CONTAINER));
-    }
-
-    /// git-bug df660b6: the guard gets the context and dockerfile as env
-    /// values, authored env (`PATH`, `LD_PRELOAD`, a `SCARAB_BUILD_*` name)
-    /// never reaches the build container, and the buildctl args are what
-    /// they were before the guard.
-    #[test]
-    fn build_pod_drops_authored_env_and_hands_the_guard_its_paths() {
-        let step = step_with_attempt("run-1", "image", "a1");
-        let mut spec = busybox();
-        spec.image = String::new();
-        spec.command = vec![];
-        spec.env = vec![
-            ("SCARAB_BUILD_CONTEXT".into(), ".".into()),
-            ("PATH".into(), "/workspace/bin".into()),
-            ("LD_PRELOAD".into(), "/workspace/evil.so".into()),
-        ];
-        let mut build = sample_build();
-        build.context = "docker/clone".into();
-        build.dockerfile = "build/Dockerfile".into();
-        spec.build = Some(build.clone());
+        spec.image = "moby/buildkit:rootless@sha256:abc".into();
+        spec.command = vec!["/bin/sh".into(), "-c".into(), "exit 0".into()];
+        spec.sandbox = Some(sandbox_config());
         let pod = build_pod(
             "scarab-image-a1",
             "ns",
@@ -8503,134 +8441,295 @@ mod tests {
             Some(&sample_fetch()),
         );
         let c = &pod.spec.as_ref().unwrap().containers[0];
-        let env = c.env.as_ref().unwrap();
-        let values = |name: &str| -> Vec<Option<&str>> {
-            env.iter()
-                .filter(|e| e.name == name)
-                .map(|e| e.value.as_deref())
-                .collect()
-        };
-        assert_eq!(values("SCARAB_BUILD_CONTEXT"), [Some("docker/clone")]);
         assert_eq!(
-            values("SCARAB_BUILD_DOCKERFILE"),
-            [Some("build/Dockerfile")]
+            c.image.as_deref(),
+            Some("moby/buildkit:rootless@sha256:abc")
         );
-        // Authored env never reaches the build container; Scarab's own does.
-        assert!(values("PATH").is_empty() && values("LD_PRELOAD").is_empty());
-        for name in [
-            "BUILDKITD_FLAGS",
-            "SCARAB_RUN",
-            "SCARAB_STEP",
-            "SCARAB_ATTEMPT",
-        ] {
-            assert_eq!(values(name).len(), 1, "{name}");
-        }
-        assert!(
-            !BUILD_GUARD.contains("docker/clone") && !BUILD_GUARD.contains("build/Dockerfile"),
-            "paths are never written into the script"
-        );
+        let sc = c.security_context.as_ref().unwrap();
+        assert_eq!(sc.privileged, Some(false));
+        assert_eq!(sc.run_as_non_root, Some(true));
+        assert_eq!(sc.run_as_user, Some(1000));
+        assert_eq!(sc.allow_privilege_escalation, Some(true));
         assert_eq!(
-            c.args.as_ref().unwrap(),
-            &vec![
-                "build".to_string(),
-                "--frontend".into(),
-                "dockerfile.v0".into(),
-                "--local".into(),
-                "context=docker/clone".into(),
-                "--local".into(),
-                "dockerfile=docker/clone".into(),
-                "--opt".into(),
-                "filename=build/Dockerfile".into(),
-                "--output".into(),
-                "type=image,name=registry.example/app:1.0,push=true".into(),
-            ]
+            sc.seccomp_profile.as_ref().map(|p| p.type_.as_str()),
+            Some("Unconfined")
         );
-        assert_eq!(c.working_dir.as_deref(), Some(WORKSPACE_MOUNT_PATH));
+        assert!(sc.capabilities.is_none(), "{sc:?}");
+        assert_eq!(
+            pod.metadata
+                .annotations
+                .as_ref()
+                .unwrap()
+                .get(&format!(
+                    "container.apparmor.security.beta.kubernetes.io/{STEP_CONTAINER}"
+                ))
+                .map(String::as_str),
+            Some("unconfined")
+        );
+        // The Step's own env reaches it: a library's env, which the
+        // compiler holds to `SCARAB_<NAME>` names for templated values.
+        assert!(c.env.as_ref().unwrap().iter().any(|e| e.name == "FOO"));
+
+        // Without the sandbox: the restricted baseline, no annotation.
+        spec.sandbox = None;
+        let pod = build_pod(
+            "scarab-image-a1",
+            "ns",
+            &step,
+            &spec,
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            true,
+            Some(&sample_fetch()),
+        );
+        let sc = pod.spec.as_ref().unwrap().containers[0]
+            .security_context
+            .clone()
+            .unwrap();
+        assert_eq!(
+            sc.seccomp_profile.map(|p| p.type_),
+            Some("RuntimeDefault".to_string())
+        );
+        assert!(pod
+            .metadata
+            .annotations
+            .as_ref()
+            .is_none_or(|a| a.keys().all(|k| !k.contains("apparmor"))));
     }
 
-    /// git-bug df660b6: a stored spec from before the compiler checked
-    /// build paths is refused at launch, and so is a build with no
-    /// workspace.
+    /// A stored sandboxed spec that also carries an ADR-0039 grant is
+    /// refused at launch rather than merged into the sandbox's Pod shape,
+    /// and so is one that names a secret (git-bug df660b6: it would sit
+    /// beside the registry credential).
     #[test]
-    fn build_is_launchable_refuses_paths_outside_the_workspace_and_no_workspace() {
+    fn a_sandbox_with_a_grant_is_refused_at_launch() {
         let mut spec = busybox();
-        spec.build = Some(sample_build());
-        assert_eq!(build_is_launchable(&spec, true), Ok(()));
-        assert!(build_is_launchable(&spec, false)
-            .unwrap_err()
-            .contains("workspace"));
-        assert_eq!(build_is_launchable(&busybox(), false), Ok(()));
+        spec.sandbox = Some(sandbox_config());
+        assert_eq!(sandbox_is_launchable(&spec), Ok(()));
+        let grants: [fn(&mut StepSpec); 3] = [
+            |s| s.run_as_root = true,
+            |s| s.privileged = true,
+            |s| s.add_capabilities = vec!["NET_ADMIN".into()],
+        ];
+        for grant in grants {
+            let mut s = spec.clone();
+            grant(&mut s);
+            assert!(sandbox_is_launchable(&s)
+                .unwrap_err()
+                .contains("cannot be combined"));
+        }
         let mut with_secret = spec.clone();
         with_secret.secrets = vec![scarab_pipeline::SecretRef::file("NPM_TOKEN")];
-        assert!(build_is_launchable(&with_secret, true)
+        assert!(sandbox_is_launchable(&with_secret)
             .unwrap_err()
             .contains("secrets"));
-
-        for (context, dockerfile, image) in [
-            ("/scarab/registry", "Dockerfile", "registry.example/app:1.0"),
-            ("ctx/..", "Dockerfile", "registry.example/app:1.0"),
-            (
-                ".",
-                "/scarab/registry/config.json",
-                "registry.example/app:1.0",
-            ),
-            (".", "../Dockerfile", "registry.example/app:1.0"),
-            (".", "Dockerfile", "registry.example/app:1.0,push=true"),
-        ] {
-            let mut build = sample_build();
-            build.context = context.into();
-            build.dockerfile = dockerfile.into();
-            build.image = image.into();
-            spec.build = Some(build);
-            let err = build_is_launchable(&spec, true).unwrap_err();
-            assert!(err.starts_with("build step refused: "), "{err}");
-        }
+        assert_eq!(sandbox_is_launchable(&busybox()), Ok(()));
     }
 
-    /// git-bug df660b6: `.` and `Dockerfile` reach buildctl with the args
-    /// unchanged; a symlinked context or Dockerfile pointing outside the
-    /// workspace exits 2 and never reaches it.
-    #[cfg(unix)]
+    /// ADR-0018 (amendment of 2026-11-12): a `registry_auth` Step's
+    /// credential is a file on a read-only Secret volume at
+    /// /scarab/registry with `DOCKER_CONFIG` pointing there; no env value
+    /// carries it. With nothing resolved there is no mount.
     #[test]
-    fn build_guard_refuses_symlinks_out_of_the_workspace() {
-        use std::os::unix::fs::symlink;
-
-        let (tmp, run) = build_guard_harness();
-        let base = tmp.path().canonicalize().unwrap();
-        let ws = base.join("workspace");
-        let outside = base.join("registry");
-        symlink(&outside, ws.join("ctx")).unwrap();
-        std::fs::create_dir(ws.join("df")).unwrap();
-        symlink(outside.join("config.json"), ws.join("df/Dockerfile")).unwrap();
-
-        assert_eq!(run(".", "Dockerfile"), (Some(0), true));
-        assert_eq!(
-            std::fs::read_to_string(base.join("called")).unwrap(),
-            "build\n--opt\na b\n",
-            "the stub gets the args unchanged"
+    fn a_registry_auth_step_gets_the_credential_as_a_file_never_env() {
+        let step = step_with_attempt("run-1", "image/image", "a1");
+        let mut spec = busybox();
+        spec.registry_auth = Some(scarab_engine::RegistryAuthConfig {
+            owner: "acme".into(),
+            name: "web".into(),
+            registry_auth_json: Some(r#"{"auths":{"registry.corp":{"auth":"c2VrcmV0"}}}"#.into()),
+            ..Default::default()
+        });
+        let pod = build_pod(
+            "scarab-image-a1",
+            "ns",
+            &step,
+            &spec,
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            false,
+            None,
         );
-        for (context, dockerfile) in [("ctx", "config.json"), ("df", "Dockerfile")] {
-            assert_eq!(
-                run(context, dockerfile),
-                (Some(2), false),
-                "{context}/{dockerfile}"
-            );
-        }
+        let c = &pod.spec.as_ref().unwrap().containers[0];
+        let env = c.env.as_ref().unwrap();
+        assert_eq!(
+            env.iter()
+                .find(|e| e.name == "DOCKER_CONFIG")
+                .and_then(|e| e.value.clone()),
+            Some(REGISTRY_AUTH_MOUNT_PATH.to_string())
+        );
+        assert!(
+            env.iter().all(|e| e
+                .value
+                .as_deref()
+                .is_none_or(|v| !v.contains("c2VrcmV0") && !v.contains("auths"))
+                && e.value_from.is_none()),
+            "no env carries the credential: {env:?}"
+        );
+        let m = c
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == REGISTRY_AUTH_VOLUME)
+            .unwrap();
+        assert_eq!(m.mount_path, REGISTRY_AUTH_MOUNT_PATH);
+        assert_eq!(m.read_only, Some(true));
+        let v = pod
+            .spec
+            .as_ref()
+            .unwrap()
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == REGISTRY_AUTH_VOLUME)
+            .unwrap();
+        assert_eq!(
+            v.secret.as_ref().unwrap().secret_name.as_deref(),
+            Some("scarab-image-a1-registry")
+        );
+        assert_eq!(
+            step_registry_dockerconfig(&spec).as_deref(),
+            Some(r#"{"auths":{"registry.corp":{"auth":"c2VrcmV0"}}}"#)
+        );
+        // Without the sandbox the Step keeps the restricted baseline.
+        assert_eq!(c.image.as_deref(), Some("busybox:latest"));
+        assert_eq!(
+            c.security_context
+                .as_ref()
+                .unwrap()
+                .seccomp_profile
+                .as_ref()
+                .map(|p| p.type_.as_str()),
+            Some("RuntimeDefault")
+        );
+
+        // Locked out, or nothing resolved: no mount and no DOCKER_CONFIG.
+        spec.registry_auth = Some(scarab_engine::RegistryAuthConfig {
+            owner: "acme".into(),
+            name: "web".into(),
+            locked_out: true,
+            ..Default::default()
+        });
+        let pod = build_pod(
+            "scarab-image-a1",
+            "ns",
+            &step,
+            &spec,
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            false,
+            None,
+        );
+        let c = &pod.spec.as_ref().unwrap().containers[0];
+        assert!(c
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|e| e.name != "DOCKER_CONFIG"));
+        assert!(c
+            .volume_mounts
+            .as_ref()
+            .is_none_or(|m| m.iter().all(|m| m.name != REGISTRY_AUTH_VOLUME)));
+        assert_eq!(step_registry_dockerconfig(&spec), None);
+
+        // The forge-derived credential becomes a dockerconfigjson naming only
+        // its registry; a scoped REGISTRY_AUTH secret takes precedence,
+        // verbatim.
+        let derived = scarab_engine::RegistryCredential {
+            registry: "registry.example".into(),
+            username: "x-access-token".into(),
+            token: "sekret-registry-token".into(),
+        };
+        spec.registry_auth = Some(scarab_engine::RegistryAuthConfig {
+            owner: "acme".into(),
+            name: "web".into(),
+            derived_auth: Some(derived.clone()),
+            ..Default::default()
+        });
+        let json = step_registry_dockerconfig(&spec).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["auths"]["registry.example"]["auth"].is_string());
+        assert_eq!(parsed["auths"].as_object().unwrap().len(), 1);
+        let pod = build_pod(
+            "scarab-image-a1",
+            "ns",
+            &step,
+            &spec,
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            false,
+            None,
+        );
+        assert!(pod.spec.as_ref().unwrap().containers[0]
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|e| e.value.as_deref() != Some("sekret-registry-token")));
+        spec.registry_auth = Some(scarab_engine::RegistryAuthConfig {
+            owner: "acme".into(),
+            name: "web".into(),
+            registry_auth_json: Some("{\"auths\":{}}".into()),
+            derived_auth: Some(derived),
+            ..Default::default()
+        });
+        assert_eq!(
+            step_registry_dockerconfig(&spec).as_deref(),
+            Some("{\"auths\":{}}")
+        );
     }
 
-    /// A temp workspace beside a `registry` directory standing in for the
-    /// credential mount, and [`BUILD_GUARD`] pointed at them and at a stub
-    /// `buildctl-daemonless.sh` that writes its args, one per line, to
-    /// `called`. Returns the temp dir (workspace at `workspace/`, outside at
-    /// `registry/`) and a runner giving `(exit code, reached buildctl)` for a
-    /// context and dockerfile; the runner passes `build --opt "a b"`.
+    /// The `/bin/sh -c` script of `libs/build.yaml`'s Step `id` (`image` or
+    /// `push`), as the compiler hands it to the executor.
     #[cfg(unix)]
-    fn build_guard_harness() -> (
+    fn build_library_script(id: &str) -> String {
+        let lib = include_str!("../../../libs/build.yaml");
+        let ir = scarab_pipeline::compile_with_libraries(
+            "steps:\n  - id: image\n    invoke: lib:thulasi-ram/build\n    with: { image: registry.example/app:1 }\n",
+            &scarab_pipeline::Libraries {
+                installed: std::collections::BTreeMap::from([(
+                    "thulasi-ram/build".to_string(),
+                    scarab_pipeline::InstalledLibrary {
+                        content: lib.to_string(),
+                        source: "github.com/thulasi-ram/scarab-ci//libs/build.yaml@1".into(),
+                    },
+                )]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let step = ir
+            .steps
+            .iter()
+            .find(|s| s.id == format!("image/{id}"))
+            .unwrap();
+        let command = &step.command;
+        assert_eq!(command.len(), 3, "{command:?}");
+        assert!(
+            command[0].ends_with("/sh") && command[1] == "-c",
+            "{command:?}"
+        );
+        command[2].clone()
+    }
+
+    /// The build Step's script from `libs/build.yaml`, pointed at a temp
+    /// workspace and a stub `buildctl-daemonless.sh` that records its args,
+    /// one per line, in `called`. Returns the temp dir (workspace at
+    /// `workspace/`, a `registry/` beside it standing in for a credential
+    /// mount) and a runner giving `(exit code, reached buildctl)` for the
+    /// given `SCARAB_BUILD_*` values; the ones not given are the library's
+    /// defaults, with image `registry.example/app:1`.
+    #[cfg(unix)]
+    fn build_library_harness() -> (
         tempfile::TempDir,
-        impl Fn(&str, &str) -> (Option<i32>, bool),
+        impl Fn(&[(&str, &str)]) -> (Option<i32>, bool),
     ) {
         use std::os::unix::fs::PermissionsExt;
 
+        let script = build_library_script("image");
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().canonicalize().unwrap();
         let ws = base.join("workspace");
@@ -8654,31 +8753,113 @@ mod tests {
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         let pinned = format!("root={WORKSPACE_MOUNT_PATH}\n");
         let buildctl = "exec /usr/bin/buildctl-daemonless.sh ";
-        assert!(BUILD_GUARD.contains(&pinned) && BUILD_GUARD.contains(buildctl));
-        let guard = BUILD_GUARD
+        assert!(script.contains(&pinned) && script.contains(buildctl));
+        let script = script
             .replace(&pinned, &format!("root='{}'\n", ws.display()))
             .replace(buildctl, &format!("exec '{}' ", stub.display()));
-        let run = move |context: &str, dockerfile: &str| {
+        let run = move |given: &[(&str, &str)]| {
             let _ = std::fs::remove_file(&record);
-            let out = std::process::Command::new("/bin/sh")
-                .args(["-c", &guard, "scarab-build", "build", "--opt", "a b"])
-                .current_dir(&base)
-                .env(BUILD_CONTEXT_ENV, context)
-                .env(BUILD_DOCKERFILE_ENV, dockerfile)
-                .output()
-                .unwrap();
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.args(["-c", &script, "scarab-build"]).current_dir(&base);
+            for (name, value) in [
+                ("SCARAB_BUILD_IMAGE", "registry.example/app:1"),
+                ("SCARAB_BUILD_PUSH", "false"),
+                ("SCARAB_BUILD_CONTEXT", "."),
+                ("SCARAB_BUILD_DOCKERFILE", "Dockerfile"),
+                ("SCARAB_BUILD_ARGS", ""),
+                ("SCARAB_BUILD_CACHE", "none"),
+                ("SCARAB_FORK_PR", "false"),
+            ] {
+                cmd.env(name, value);
+            }
+            for (name, value) in given {
+                cmd.env(name, value);
+            }
+            let out = cmd.output().unwrap();
             (out.status.code(), record.exists())
         };
         (tmp, run)
     }
 
+    /// The library harness's runner for a context and a dockerfile.
+    #[cfg(unix)]
+    fn paths<'a>(
+        run: &'a impl Fn(&[(&str, &str)]) -> (Option<i32>, bool),
+    ) -> impl Fn(&str, &str) -> (Option<i32>, bool) + 'a {
+        move |context, dockerfile| {
+            run(&[
+                ("SCARAB_BUILD_CONTEXT", context),
+                ("SCARAB_BUILD_DOCKERFILE", dockerfile),
+            ])
+        }
+    }
+
+    /// The build library keeps PR #179's guard (git-bug df660b6): a context
+    /// or Dockerfile that resolves outside the workspace exits 2 before
+    /// buildctl runs, and so does a bad build argument; `.` and
+    /// `Dockerfile` reach buildctl with each build argument as one
+    /// `--opt build-arg:` value.
+    #[cfg(unix)]
+    #[test]
+    fn the_build_library_script_refuses_symlinks_out_of_the_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, run) = build_library_harness();
+        let base = tmp.path().canonicalize().unwrap();
+        let ws = base.join("workspace");
+        symlink(base.join("registry"), ws.join("ctx")).unwrap();
+        std::fs::create_dir(ws.join("df")).unwrap();
+        symlink(base.join("registry/config.json"), ws.join("df/Dockerfile")).unwrap();
+        symlink("../registry", ws.join("rel")).unwrap();
+
+        assert_eq!(
+            run(&[("SCARAB_BUILD_ARGS", "A=1\nB=two words\n")]),
+            (Some(0), true)
+        );
+        let called = std::fs::read_to_string(base.join("called")).unwrap();
+        let called: Vec<&str> = called.lines().collect();
+        assert_eq!(called[0], "build");
+        for want in [
+            "context=.",
+            "dockerfile=.",
+            "filename=Dockerfile",
+            "build-arg:A=1",
+            "build-arg:B=two words",
+            "type=image,name=registry.example/app:1,push=false,oci-mediatypes=true",
+        ] {
+            assert!(called.contains(&want), "{want}: {called:?}");
+        }
+        let at = paths(&run);
+        for (context, dockerfile) in [
+            ("ctx", "config.json"),
+            ("df", "Dockerfile"),
+            ("rel", "config.json"),
+            ("/abs", "Dockerfile"),
+            ("..", "Dockerfile"),
+        ] {
+            assert_eq!(
+                at(context, dockerfile),
+                (Some(2), false),
+                "{context}/{dockerfile}"
+            );
+        }
+        for args in ["1A=x", "A", "A=1,push=true", "A-B=1"] {
+            assert_eq!(
+                run(&[("SCARAB_BUILD_ARGS", args)]),
+                (Some(2), false),
+                "{args:?}"
+            );
+        }
+    }
+
     // Attack: reach the credential mount through a relative symlink chain, a symlinked parent directory, a symlink to an in-workspace directory whose Dockerfile links out, or a Dockerfile path through a symlinked directory. Safe outcome: exit 2, buildctl never runs.
     #[cfg(unix)]
     #[test]
-    fn build_guard_refuses_symlink_chains_and_symlinked_parents() {
+    fn the_build_library_script_refuses_symlink_chains_and_symlinked_parents() {
         use std::os::unix::fs::symlink;
 
-        let (tmp, run) = build_guard_harness();
+        let (tmp, run) = build_library_harness();
+        let at = paths(&run);
         let ws = tmp.path().join("workspace");
         std::fs::create_dir(tmp.path().join("registry/sub")).unwrap();
         // a -> b -> ../registry, both relative.
@@ -8704,38 +8885,40 @@ mod tests {
             ("deep", "x/Dockerfile"),
         ] {
             assert_eq!(
-                run(context, dockerfile),
+                at(context, dockerfile),
                 (Some(2), false),
                 "{context} / {dockerfile}"
             );
         }
-        assert_eq!(run(".", "Dockerfile"), (Some(0), true));
+        assert_eq!(at(".", "Dockerfile"), (Some(0), true));
     }
 
     // Attack: a symlink to a directory outside the workspace whose path only starts with the workspace's (`/workspace-evil`, `/workspace<newline>`: `$(realpath)` drops the trailing newline, so the context resolves to the root's own spelling). Safe outcome: exit 2, buildctl never runs.
     #[cfg(unix)]
     #[test]
-    fn build_guard_refuses_lookalike_workspace_roots() {
+    fn the_build_library_script_refuses_lookalike_workspace_roots() {
         use std::os::unix::fs::symlink;
 
-        let (tmp, run) = build_guard_harness();
+        let (tmp, run) = build_library_harness();
+        let at = paths(&run);
         let ws = tmp.path().join("workspace");
         for (link, name) in [("sib", "workspace-evil"), ("nl", "workspace\n")] {
             let dir = tmp.path().join(name);
             std::fs::create_dir(&dir).unwrap();
             std::fs::write(dir.join("Dockerfile"), "FROM scratch\n").unwrap();
             symlink(format!("../{name}"), ws.join(link)).unwrap();
-            assert_eq!(run(link, "Dockerfile"), (Some(2), false), "{link}");
+            assert_eq!(at(link, "Dockerfile"), (Some(2), false), "{link}");
         }
     }
 
-    // Attack: a context or dockerfile the shell could expand or read as an option (`*` matching a symlink out, `-n`, `$(...)`, a name with spaces), so the guard checks one path and buildctl gets another. Safe outcome: each is taken as a literal path; the ones that do not exist exit 2 and the literal directory builds.
+    // Attack: a context or dockerfile the shell could expand or read as an option (`*` matching a symlink out, `-n`, `$(...)`, a name with spaces), so the script checks one path and buildctl gets another. Safe outcome: each is taken as a literal path; the ones that do not exist exit 2 and the literal directory builds.
     #[cfg(unix)]
     #[test]
-    fn build_guard_takes_paths_literally() {
+    fn the_build_library_script_takes_paths_literally() {
         use std::os::unix::fs::symlink;
 
-        let (tmp, run) = build_guard_harness();
+        let (tmp, run) = build_library_harness();
+        let at = paths(&run);
         let ws = tmp.path().join("workspace");
         std::fs::create_dir(ws.join("only")).unwrap();
         symlink("../../registry", ws.join("only/evil")).unwrap();
@@ -8749,113 +8932,321 @@ mod tests {
             (". only/evil", "Dockerfile"),
         ] {
             assert_eq!(
-                run(context, dockerfile),
+                at(context, dockerfile),
                 (Some(2), false),
                 "{context} / {dockerfile}"
             );
         }
         std::fs::create_dir(ws.join("a b")).unwrap();
         std::fs::write(ws.join("a b/-f"), "FROM scratch\n").unwrap();
-        assert_eq!(run("a b", "-f"), (Some(0), true));
+        assert_eq!(at("a b", "-f"), (Some(0), true));
     }
 
+    /// The build Step writes an image to push as an OCI layout at
+    /// `.scarab-build/oci` in the workspace, after removing whatever an
+    /// earlier Step left there (a symlink included, never its target). A
+    /// fork pull request's build (SCARAB_FORK_PR=true, which Scarab sets on
+    /// every launch of the Step, or any value but `false`) writes no layout,
+    /// whatever `push` says, and imports the layer cache without exporting
+    /// it. An image not pushed stays in BuildKit.
+    #[cfg(unix)]
     #[test]
-    fn build_pod_mounts_registry_auth_and_never_puts_the_token_in_env() {
-        let step = step_with_attempt("run-1", "image", "a1");
-        let mut spec = busybox();
-        spec.image = String::new();
-        spec.command = vec![];
-        let mut build = sample_build();
-        build.derived_auth = Some(scarab_engine::RegistryCredential {
-            registry: "registry.example".into(),
-            username: "x-access-token".into(),
-            token: "sekret-registry-token".into(),
-        });
-        spec.build = Some(build.clone());
-        let pod = build_pod(
-            "scarab-image-a1",
-            "ns",
-            &step,
-            &spec,
-            None,
-            DEFAULT_STEP_TIMEOUT_SECS,
-            false,
-            None,
-        );
-        let c = &pod.spec.as_ref().unwrap().containers[0];
-        let env = c.env.as_ref().unwrap();
-        assert_eq!(
-            env.iter()
-                .find(|e| e.name == "DOCKER_CONFIG")
-                .and_then(|e| e.value.clone()),
-            Some("/scarab/registry".to_string())
-        );
-        // THE INVARIANT (ADR-0018/0037): the token rides ONLY in the mounted
-        // Secret — never in env.
-        assert!(env
-            .iter()
-            .all(|e| e.value.as_deref() != Some("sekret-registry-token")));
-        let m = c
-            .volume_mounts
-            .as_ref()
-            .unwrap()
-            .iter()
-            .find(|m| m.name == "scarab-registry-auth")
-            .unwrap();
-        assert_eq!(m.mount_path, "/scarab/registry");
-        assert_eq!(m.read_only, Some(true));
-        let vols = pod.spec.as_ref().unwrap().volumes.as_ref().unwrap();
-        let v = vols
-            .iter()
-            .find(|v| v.name == "scarab-registry-auth")
-            .unwrap();
-        assert_eq!(
-            v.secret.as_ref().unwrap().secret_name.as_deref(),
-            Some("scarab-image-a1-registry")
-        );
+    fn the_build_step_writes_a_layout_only_for_a_push_and_never_for_a_fork() {
+        use std::os::unix::fs::symlink;
 
-        // The synthesized dockerconfigjson carries the derived credential.
-        let json = registry_dockerconfig(&build).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed["auths"]["registry.example"]["auth"].is_string());
-        // A scoped secret takes precedence, verbatim.
-        build.registry_auth_json = Some("{\"auths\":{}}".into());
-        assert_eq!(registry_dockerconfig(&build).unwrap(), "{\"auths\":{}}");
-    }
-
-    #[test]
-    fn build_args_capture_the_digest_when_egress_is_present() {
-        let step = step_with_attempt("run-1", "image", "a1");
-        let mut spec = busybox();
-        spec.image = String::new();
-        spec.command = vec![];
-        spec.build = Some(sample_build());
-        let egress = ResultsEgress {
-            base_url: "http://scarab:8080".into(),
-            token_secret: b"k".to_vec(),
-            sidecar_image: "ghcr.io/scarab/egress:1".into(),
-        };
-        let pod = build_pod(
-            "scarab-image-a1",
-            "ns",
-            &step,
-            &spec,
-            Some(&egress),
-            DEFAULT_STEP_TIMEOUT_SECS,
-            false,
-            None,
-        );
-        let args = pod.spec.as_ref().unwrap().containers[0]
-            .args
-            .as_ref()
-            .unwrap()
-            .join(" ");
-        // The digest lands as the `image` result (ADR-0041/0042) — the
-        // ImageArtifact of record.
+        let (tmp, run) = build_library_harness();
+        let base = tmp.path().canonicalize().unwrap();
+        let ws = base.join("workspace");
+        let called = || std::fs::read_to_string(base.join("called")).unwrap();
+        let s3 = [
+            ("SCARAB_BUILD_CACHE", "s3"),
+            ("SCARAB_BUILD_CACHE_BUCKET", "acme-cache"),
+            ("SCARAB_BUILD_CACHE_REGION", "ap-south-1"),
+        ];
+        let import = "type=s3,region=ap-south-1,bucket=acme-cache";
+        let kept = "type=image,name=registry.example/app:1,push=false,oci-mediatypes=true";
+        for fork in ["true", ""] {
+            symlink(base.join("registry"), ws.join(".scarab-build")).unwrap();
+            let mut given = vec![("SCARAB_FORK_PR", fork), ("SCARAB_BUILD_PUSH", "true")];
+            given.extend(s3);
+            assert_eq!(run(&given), (Some(0), true), "fork={fork:?}");
+            let argv = called();
+            let argv: Vec<&str> = argv.lines().collect();
+            assert!(argv.contains(&kept), "fork={fork:?}: {argv:?}");
+            assert!(argv.contains(&import), "fork={fork:?}: {argv:?}");
+            assert!(
+                !argv.contains(&"--export-cache"),
+                "fork={fork:?} exports the cache: {argv:?}"
+            );
+            assert!(
+                std::fs::symlink_metadata(ws.join(".scarab-build")).is_err(),
+                "fork={fork:?}: the planted symlink is removed"
+            );
+            assert!(
+                base.join("registry/config.json").exists(),
+                "never its target"
+            );
+        }
+        // Not a fork, pushing: the layout and the cache export.
+        let mut given = vec![("SCARAB_BUILD_PUSH", "true")];
+        given.extend(s3);
+        assert_eq!(run(&given), (Some(0), true));
+        let argv = called();
+        let argv: Vec<&str> = argv.lines().collect();
+        let layout = format!("type=oci,dest={}/.scarab-build/oci,tar=false", ws.display());
+        assert!(argv.contains(&layout.as_str()), "{argv:?}");
+        assert!(argv.contains(&"--export-cache"), "{argv:?}");
+        assert!(ws.join(".scarab-build").is_dir());
         assert!(
-            args.contains("--metadata-file /scarab/results/image.json"),
-            "{args}"
+            !argv.iter().any(|a| a.starts_with("type=image")),
+            "{argv:?}"
         );
+        // Not pushing: no layout.
+        assert_eq!(run(&s3), (Some(0), true));
+        assert!(called().lines().any(|a| a == kept));
+        assert!(!ws.join(".scarab-build").exists());
+        // A registry cache is gone: it needs the push credential here.
+        assert_eq!(run(&[("SCARAB_BUILD_CACHE", "registry")]), (Some(2), false));
+    }
+
+    /// The push Step's script from `libs/build.yaml`, pointed at a temp
+    /// workspace holding the layout the build Step writes, a temp results
+    /// directory, and a stub `crane` that records its args, one per line, in
+    /// `called` and prints the reference crane prints. Returns the temp dir
+    /// (workspace at `workspace/`, results at `results/`, a `registry/`
+    /// beside them standing in for the credential mount) and a runner giving
+    /// `(exit code, reached crane)` for the given values; the ones not given
+    /// push `registry.example/app:1` from a non-fork Run.
+    #[cfg(unix)]
+    fn push_library_harness() -> (
+        tempfile::TempDir,
+        impl Fn(&[(&str, &str)]) -> (Option<i32>, bool),
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = build_library_script("push");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let ws = base.join("workspace");
+        let results = base.join("results");
+        let outside = base.join("registry");
+        for d in [&ws, &results, &outside] {
+            std::fs::create_dir(d).unwrap();
+        }
+        std::fs::write(outside.join("config.json"), "{}").unwrap();
+        let record = base.join("called");
+        let stub = base.join("crane");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho registry.example/app@sha256:{}\n",
+                record.display(),
+                "ab".repeat(32)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pinned = format!("root={WORKSPACE_MOUNT_PATH}\n");
+        let crane = "ref=$(crane \"$@\")";
+        assert!(script.contains(&pinned) && script.contains(crane));
+        assert!(script.contains("/scarab/results"));
+        let script = script
+            .replace(&pinned, &format!("root='{}'\n", ws.display()))
+            .replace(crane, &format!("ref=$('{}' \"$@\")", stub.display()))
+            .replace("/scarab/results", &results.display().to_string());
+        let run = move |given: &[(&str, &str)]| {
+            let _ = std::fs::remove_file(&record);
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.args(["-c", &script, "scarab-push"]).current_dir(&base);
+            // No registry login unless a case gives one.
+            cmd.env_remove("DOCKER_CONFIG");
+            for (name, value) in [
+                ("SCARAB_BUILD_IMAGE", "registry.example/app:1"),
+                ("SCARAB_BUILD_PUSH", "true"),
+                ("SCARAB_BUILD_INSECURE_PUSH", "false"),
+                ("SCARAB_FORK_PR", "false"),
+            ] {
+                cmd.env(name, value);
+            }
+            for (name, value) in given {
+                cmd.env(name, value);
+            }
+            let out = cmd.output().unwrap();
+            (out.status.code(), record.exists())
+        };
+        (tmp, run)
+    }
+
+    /// Writes the layout the build Step leaves in `ws`: plain directories
+    /// and regular files.
+    #[cfg(unix)]
+    fn write_layout(ws: &std::path::Path) {
+        let blobs = ws.join(".scarab-build/oci/blobs/sha256");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(ws.join(".scarab-build/oci/ingest")).unwrap();
+        std::fs::write(ws.join(".scarab-build/oci/oci-layout"), "{}").unwrap();
+        std::fs::write(ws.join(".scarab-build/oci/index.json"), "{}").unwrap();
+        std::fs::write(blobs.join("ab".repeat(32)), "{}").unwrap();
+    }
+
+    /// The push Step pushes the layout to the image with crane, writes the
+    /// pushed reference as its `push` result, and removes the layout so
+    /// later Steps do not receive it. `insecure_push` adds `--insecure`
+    /// when the Step holds no registry login, is refused (exit 2) when it
+    /// holds one, since `--insecure` also skips TLS verification, and
+    /// anything but `true` or `false` is refused.
+    #[cfg(unix)]
+    #[test]
+    fn the_push_step_pushes_the_layout_and_reports_the_digest() {
+        let (tmp, run) = push_library_harness();
+        let base = tmp.path().canonicalize().unwrap();
+        let ws = base.join("workspace");
+        let called = || std::fs::read_to_string(base.join("called")).unwrap();
+
+        write_layout(&ws);
+        assert_eq!(run(&[]), (Some(0), true));
+        let layout = ws.join(".scarab-build/oci").display().to_string();
+        assert_eq!(
+            called().lines().collect::<Vec<_>>(),
+            ["push", layout.as_str(), "registry.example/app:1"]
+        );
+        let result: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(base.join("results/push.json")).unwrap())
+                .unwrap();
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        assert_eq!(result["digest"], digest.as_str());
+        assert_eq!(
+            result["ref"],
+            format!("registry.example/app@{digest}").as_str()
+        );
+        assert!(!ws.join(".scarab-build").exists(), "the layout is removed");
+
+        write_layout(&ws);
+        assert_eq!(
+            run(&[("SCARAB_BUILD_INSECURE_PUSH", "true")]),
+            (Some(0), true)
+        );
+        assert_eq!(called().lines().last(), Some("--insecure"));
+        // A registry login at $DOCKER_CONFIG/config.json (the credential
+        // mount, or a profile's /ecr-login): refused before crane runs.
+        write_layout(&ws);
+        let login = base.join("registry").display().to_string();
+        assert_eq!(
+            run(&[
+                ("SCARAB_BUILD_INSECURE_PUSH", "true"),
+                ("DOCKER_CONFIG", login.as_str()),
+            ]),
+            (Some(2), false)
+        );
+        // The same login without insecure_push pushes.
+        assert_eq!(run(&[("DOCKER_CONFIG", login.as_str())]), (Some(0), true));
+        assert_ne!(called().lines().last(), Some("--insecure"));
+        write_layout(&ws);
+        assert_eq!(
+            run(&[("SCARAB_BUILD_INSECURE_PUSH", "yes")]),
+            (Some(2), false)
+        );
+        // No layout to push is a failure, not a silent success.
+        std::fs::remove_dir_all(ws.join(".scarab-build")).unwrap();
+        assert_eq!(run(&[]), (Some(2), false));
+    }
+
+    /// With `push: false`, or for a fork pull request (SCARAB_FORK_PR is
+    /// `true`, or any value but `false`), the push Step exits 0 without
+    /// running crane, and still removes the layout.
+    #[cfg(unix)]
+    #[test]
+    fn the_push_step_does_not_push_when_not_asked_or_for_a_fork() {
+        let (tmp, run) = push_library_harness();
+        let ws = tmp.path().canonicalize().unwrap().join("workspace");
+        for given in [
+            &[("SCARAB_BUILD_PUSH", "false")][..],
+            &[("SCARAB_FORK_PR", "true")][..],
+            &[("SCARAB_FORK_PR", "")][..],
+        ] {
+            write_layout(&ws);
+            assert_eq!(run(given), (Some(0), false), "{given:?}");
+            assert!(!ws.join(".scarab-build").exists(), "{given:?}");
+        }
+    }
+
+    // Attack: a Step before the push Step (or a Dockerfile RUN, which shares the build Pod) plants a symlink in the layout, or replaces the layout or its directory with a symlink, pointing at the credential mount, so crane uploads /scarab/registry/config.json as a blob; or plants a FIFO that hangs crane. Safe outcome: exit 2 before crane runs, and the credential file is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn the_push_step_refuses_a_layout_with_a_symlink_or_outside_the_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, run) = push_library_harness();
+        let base = tmp.path().canonicalize().unwrap();
+        let ws = base.join("workspace");
+        let secret = base.join("registry/config.json");
+        let blobs = ws.join(".scarab-build/oci/blobs/sha256");
+        let reset = || {
+            let _ = std::fs::remove_file(ws.join(".scarab-build"));
+            let _ = std::fs::remove_dir_all(ws.join(".scarab-build"));
+            write_layout(&ws);
+        };
+        let plants: [(&str, Box<dyn Fn()>); 6] = [
+            (
+                "a blob that links to the credential",
+                Box::new(|| symlink(&secret, blobs.join("cd".repeat(32))).unwrap()),
+            ),
+            (
+                "index.json that links to the credential",
+                Box::new(|| {
+                    std::fs::remove_file(ws.join(".scarab-build/oci/index.json")).unwrap();
+                    symlink(
+                        "../../../registry/config.json",
+                        ws.join(".scarab-build/oci/index.json"),
+                    )
+                    .unwrap();
+                }),
+            ),
+            (
+                "a blobs directory that links out",
+                Box::new(|| {
+                    std::fs::remove_dir_all(ws.join(".scarab-build/oci/blobs")).unwrap();
+                    symlink(base.join("registry"), ws.join(".scarab-build/oci/blobs")).unwrap();
+                }),
+            ),
+            (
+                "an oci directory that links out",
+                Box::new(|| {
+                    std::fs::remove_dir_all(ws.join(".scarab-build/oci")).unwrap();
+                    symlink(base.join("registry"), ws.join(".scarab-build/oci")).unwrap();
+                }),
+            ),
+            (
+                ".scarab-build linking outside the workspace",
+                Box::new(|| {
+                    std::fs::remove_dir_all(ws.join(".scarab-build")).unwrap();
+                    let out = base.join("elsewhere");
+                    let _ = std::fs::remove_dir_all(&out);
+                    write_layout(&out);
+                    symlink(out.join(".scarab-build"), ws.join(".scarab-build")).unwrap();
+                }),
+            ),
+            (
+                "a FIFO in the layout",
+                Box::new(|| {
+                    let fifo = blobs.join("ef".repeat(32));
+                    let ok = std::process::Command::new("mkfifo")
+                        .arg(&fifo)
+                        .status()
+                        .unwrap()
+                        .success();
+                    assert!(ok, "mkfifo");
+                }),
+            ),
+        ];
+        for (what, plant) in &plants {
+            reset();
+            plant();
+            assert_eq!(run(&[]), (Some(2), false), "{what}");
+            assert_eq!(std::fs::read_to_string(&secret).unwrap(), "{}", "{what}");
+        }
+        reset();
+        assert_eq!(run(&[]), (Some(0), true), "the clean layout pushes");
     }
 
     #[test]
@@ -9148,21 +9539,6 @@ mod tests {
         // No workspace flow => don't inject it.
         let off = env_of(false);
         assert!(val(&off, "GIT_CONFIG_COUNT").is_none());
-    }
-
-    #[test]
-    fn image_artifact_and_push_fence_record_the_digest() {
-        let build = sample_build();
-        let digest = "sha256:abc123";
-        let artifact = image_artifact(&build, digest);
-        assert_eq!(artifact.image, "registry.example/app:1.0");
-        assert_eq!(artifact.digest, digest);
-
-        // Idempotent push: the fence is keyed by content, so a re-push is one effect.
-        assert_eq!(
-            push_fence(&build.image, digest),
-            "push:registry.example/app:1.0@sha256:abc123"
-        );
     }
 
     #[test]

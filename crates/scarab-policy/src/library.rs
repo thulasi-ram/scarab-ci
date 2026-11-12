@@ -105,14 +105,72 @@ pub struct LibraryYank {
     pub yanked_at: i64,
 }
 
-/// A library source an org trusts with long-lived forge credentials
-/// (ADR-0076 §9). Keyed by the source without its commit ([`trust_key`]), so
-/// trust carries across upgrades from the same source.
+/// What an org's trust in a library source grants. Each is trusted on its
+/// own: trusting a source with forge credentials does not trust it with the
+/// build sandbox, and the reverse (ADR-0018, amendment of 2026-11-12). The
+/// variants are in the order of their names, so a store lists a source's
+/// grants in the same order whether it sorts the enum or the name.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustGrant {
+    /// A Step from the source may run in a `security.sandbox`.
+    BuildSandbox,
+    /// A Step from the source may receive a long-lived forge credential
+    /// (ADR-0076 §9), and, with [`RegistryCredential`](Self::RegistryCredential)
+    /// too, the forge-derived registry credential.
+    #[default]
+    ForgeCredentials,
+    /// A Step from the source with `registry_auth` may receive the Run's
+    /// registry credential: the `REGISTRY_AUTH` secret, or the forge-derived
+    /// one when the source is trusted with forge credentials too.
+    RegistryCredential,
+}
+
+impl TrustGrant {
+    /// The name the store and the API use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TrustGrant::ForgeCredentials => "forge_credentials",
+            TrustGrant::BuildSandbox => "build_sandbox",
+            TrustGrant::RegistryCredential => "registry_credential",
+        }
+    }
+
+    /// The grant named `s` ([`as_str`](Self::as_str)), if any.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "forge_credentials" => Some(TrustGrant::ForgeCredentials),
+            "build_sandbox" => Some(TrustGrant::BuildSandbox),
+            "registry_credential" => Some(TrustGrant::RegistryCredential),
+            _ => None,
+        }
+    }
+
+    /// How a message names what the grant trusts the source with.
+    pub fn describe(self) -> &'static str {
+        match self {
+            TrustGrant::ForgeCredentials => "forge credentials",
+            TrustGrant::BuildSandbox => "the build sandbox",
+            TrustGrant::RegistryCredential => "the registry credential",
+        }
+    }
+}
+
+/// A library source an org trusts with one [`TrustGrant`] (ADR-0076 §9,
+/// ADR-0018 amendment of 2026-11-12). Keyed by the org, the source without
+/// its commit ([`trust_key`]) and the grant, so trust carries across
+/// upgrades from the same source.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedSource {
     pub org: String,
     /// `<host>/<owner>/<repo>//<path>`, no `@<commit>`.
     pub source: String,
+    /// What the trust grants. A record stored before grants existed is
+    /// trust with forge credentials.
+    #[serde(default)]
+    pub grant: TrustGrant,
     pub trusted_by: String,
     pub trusted_at: i64,
     /// The StepUpConfirmation that approved it, when one was needed.
@@ -237,26 +295,29 @@ pub trait LibraryStore: Send + Sync {
         except: &str,
     ) -> Result<u64, LibraryStoreError>;
 
-    /// The sources the org trusts with long-lived forge credentials
-    /// (ADR-0076 §9), by source. A store that keeps none trusts none, which
-    /// only ever refuses more.
+    /// The sources the org trusts, each with what it grants (ADR-0076 §9,
+    /// ADR-0018 amendment of 2026-11-12), by source then grant. A store that
+    /// keeps none trusts none, which only ever refuses more.
     async fn trusted_sources(&self, _org: &str) -> Result<Vec<TrustedSource>, LibraryStoreError> {
         Ok(Vec::new())
     }
 
-    /// Trusts a source ([`trust_key`] form). Trusting a trusted source keeps
-    /// the first record and returns it.
+    /// Trusts a source ([`trust_key`] form) with `t.grant`. Trusting a
+    /// source already trusted with that grant keeps the first record and
+    /// returns it.
     async fn trust_source(&self, _t: &TrustedSource) -> Result<TrustedSource, LibraryStoreError> {
         Err(LibraryStoreError::Store(
             "this library store does not keep trusted sources".into(),
         ))
     }
 
-    /// Stops trusting a source; the record removed, or `None`.
+    /// Stops trusting a source with `grant`; the record removed, or `None`.
+    /// Its other grants stay.
     async fn untrust_source(
         &self,
         _org: &str,
         _source: &str,
+        _grant: TrustGrant,
     ) -> Result<Option<TrustedSource>, LibraryStoreError> {
         Ok(None)
     }

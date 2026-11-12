@@ -853,6 +853,9 @@ export type OrgLibraries = components["schemas"]["OrgLibrariesDto"];
 export type LibraryInstallation = components["schemas"]["LibraryInstallationDto"];
 export type FetchedLibrary = components["schemas"]["FetchedLibraryDto"];
 export type TrustedSource = components["schemas"]["TrustedSourceDto"];
+/** What trust in a library source grants: forge credentials, or the build
+ *  sandbox. Each is trusted on its own. */
+export type TrustGrant = components["schemas"]["TrustGrantDto"];
 
 /** The org's libraries (`GET …/libraries`); `null` = this server does not
  *  manage libraries (404). */
@@ -954,22 +957,33 @@ export async function unyankLibrary(org: string, hash: string): Promise<void> {
   if (!response.ok) throw new Error(errorText(error) || `could not lift the yank (${response.status})`);
 }
 
-/** Trust a library source with long-lived forge credentials (`POST
- *  …/library-trust`). The commit is dropped: trust holds for every version
- *  from the source. Asks for a step-up. */
-export async function trustLibrarySource(org: string, source: string): Promise<TrustedSource> {
+/** Trust a library source with `grant` (`POST …/library-trust`): long-lived
+ *  forge credentials by default, the build sandbox or the registry
+ *  credential. The commit is
+ *  dropped: trust holds for every version from the source. Asks for a
+ *  step-up. */
+export async function trustLibrarySource(
+  org: string,
+  source: string,
+  grant: TrustGrant = "forge_credentials",
+): Promise<TrustedSource> {
   const { data, error, response } = await api.POST("/v1/orgs/{org}/library-trust", {
     params: { path: { org } },
-    body: { source },
+    body: { source, grant },
   });
   if (error || !data) throw new Error(errorText(error) || `could not trust ${source} (${response.status})`);
   return data;
 }
 
-/** Stop trusting a library source (`DELETE …/library-trust?source=`). */
-export async function untrustLibrarySource(org: string, source: string): Promise<void> {
+/** Stop trusting a library source with `grant` (`DELETE
+ *  …/library-trust?source=&grant=`); its other grants stay. */
+export async function untrustLibrarySource(
+  org: string,
+  source: string,
+  grant: TrustGrant = "forge_credentials",
+): Promise<void> {
   const { error, response } = await api.DELETE("/v1/orgs/{org}/library-trust", {
-    params: { path: { org }, query: { source } },
+    params: { path: { org }, query: { source, grant } },
   });
   if (error) throw new Error(errorText(error) || `could not stop trusting ${source} (${response.status})`);
 }

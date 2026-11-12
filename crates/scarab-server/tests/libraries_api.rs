@@ -641,3 +641,55 @@ async fn there_is_no_defaults_retry_endpoint() {
     );
     assert!(h.http.asked().is_empty());
 }
+
+// Attack: a client written before grants existed trusts a source with no `grant` (it means forge credentials), and the source's library then asks for the build sandbox. Safe outcome: the trust is recorded as `forge_credentials` only; no `build_sandbox` entry appears.
+#[tokio::test]
+async fn a_trust_request_without_a_grant_does_not_grant_the_build_sandbox() {
+    let h = harness();
+    let (st, b) = call(
+        &h.app,
+        "POST",
+        "/v1/orgs/acme/library-trust",
+        Some(json!({ "source": format!("github.com/acme/libs//build.yaml@{C1}") })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["grant"], "forge_credentials", "{b}");
+    let (_, list) = call(&h.app, "GET", "/v1/orgs/acme/libraries", None).await;
+    let trusted = list["trusted_sources"].as_array().unwrap();
+    assert_eq!(trusted.len(), 1, "{list}");
+    assert!(
+        trusted.iter().all(|t| t["grant"] != "build_sandbox"),
+        "{list}"
+    );
+    // An unknown grant is refused, not read as some default.
+    let (st, b) = call(
+        &h.app,
+        "POST",
+        "/v1/orgs/acme/library-trust",
+        Some(json!({ "source": "github.com/acme/libs//build.yaml", "grant": "everything" })),
+    )
+    .await;
+    assert!(st.is_client_error(), "{st} {b}");
+}
+
+// Attack: a source is trusted with both grants; an admin revokes it with the DELETE a client from before grants existed sends (`?source=…`, no `grant`), gets 204, and the source keeps the build sandbox. Safe outcome: a revocation that names no grant removes every grant of the source.
+#[tokio::test]
+async fn untrusting_a_source_without_naming_a_grant_leaves_it_no_grant() {
+    let h = harness();
+    for grant in ["forge_credentials", "build_sandbox"] {
+        let (st, b) = call(
+            &h.app,
+            "POST",
+            "/v1/orgs/acme/library-trust",
+            Some(json!({ "source": "github.com/acme/libs//build.yaml", "grant": grant })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{grant}: {b}");
+    }
+    let uri = "/v1/orgs/acme/library-trust?source=github.com%2Facme%2Flibs%2F%2Fbuild.yaml";
+    let (st, _) = call(&h.app, "DELETE", uri, None).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (_, list) = call(&h.app, "GET", "/v1/orgs/acme/libraries", None).await;
+    assert_eq!(list["trusted_sources"], json!([]), "{list}");
+}

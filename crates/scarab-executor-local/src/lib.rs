@@ -242,12 +242,21 @@ impl Executor for LocalExecutor {
                     .into(),
             ));
         }
-        // Same contract for build steps (ADR-0018): rootless BuildKit is a
-        // Pod-shaped capability the host-process backend cannot honor.
-        if spec.build.is_some() {
+        // A sandbox is a Pod shape (ADR-0018, amendment of 2026-11-12), and a
+        // registry credential is a file mounted into one container: a host
+        // process has neither boundary.
+        if let Some(sandbox) = &spec.sandbox {
+            return Err(ExecError::Launch(format!(
+                "a step with `security.sandbox: {}` requires the k8s executor; the local \
+                 backend runs host processes and has no sandbox",
+                sandbox.sandbox.as_str()
+            )));
+        }
+        if spec.registry_auth.is_some() {
             return Err(ExecError::Launch(
-                "build steps require the k8s executor (rootless BuildKit, ADR-0018); \
-                 the local backend has no image-build support"
+                "a step with `registry_auth` requires the k8s executor (the credential is \
+                 mounted as a file into the step's own container); the local backend cannot \
+                 deliver it"
                     .into(),
             ));
         }

@@ -9,7 +9,7 @@ use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_policy::library::{
     content_hash, LibraryStore, LibraryStoreError, LibraryVersion, LibraryYank, NewInstallation,
-    Replaces, TrustedSource,
+    Replaces, TrustGrant, TrustedSource,
 };
 use scarab_testkit::InMemoryLibraries;
 
@@ -50,6 +50,52 @@ contract_test!(
     an_installation_keeps_its_id_and_is_found_by_it_in_its_org,
     ids
 );
+
+/// Migration 0095 is expand-only: a server from before it reads trust with
+/// forge credentials from `library_trusted_sources` alone. A source trusted
+/// only for the build sandbox or the registry credential is not in that
+/// table, so such a server never reads it as trust with forge credentials,
+/// and a forge-credentials trust is still a row there.
+#[tokio::test]
+async fn a_source_without_forge_trust_is_absent_from_the_table_old_servers_read() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    let t = |source: &str, grant: TrustGrant| TrustedSource {
+        org: "acme".into(),
+        source: source.into(),
+        grant,
+        trusted_by: "amy".into(),
+        trusted_at: 1,
+        step_up_ref: None,
+    };
+    for (source, grant) in [
+        ("github.com/acme/libs//build.yaml", TrustGrant::BuildSandbox),
+        (
+            "github.com/acme/libs//build.yaml",
+            TrustGrant::RegistryCredential,
+        ),
+        (
+            "github.com/acme/libs//clone.yaml",
+            TrustGrant::ForgeCredentials,
+        ),
+    ] {
+        db.trust_source(&t(source, grant)).await.unwrap();
+    }
+    // The query a server from before migration 0095 runs.
+    let old: Vec<String> = sqlx::query_scalar(
+        "SELECT source FROM library_trusted_sources WHERE org = $1 ORDER BY source",
+    )
+    .bind("acme")
+    .fetch_all(&tdb.pool)
+    .await
+    .unwrap();
+    assert_eq!(old, vec!["github.com/acme/libs//clone.yaml".to_string()]);
+    tdb.cleanup().await;
+}
 
 /// A first install mints an id, unique across orgs; an upgrade keeps it; a
 /// removal and a new install get a new one. A lookup by id finds only the
@@ -128,38 +174,85 @@ async fn ids(store: &dyn LibraryStore) {
 }
 
 async fn trust(store: &dyn LibraryStore) {
-    let t = |by: &str, at: i64| TrustedSource {
+    const SRC: &str = "github.com/acme/libs//push.yaml";
+    let t = |grant: TrustGrant, by: &str, at: i64| TrustedSource {
         org: "acme".into(),
-        source: "github.com/acme/libs//push.yaml".into(),
+        source: SRC.into(),
+        grant,
         trusted_by: by.into(),
         trusted_at: at,
         step_up_ref: Some("su-1".into()),
     };
+    let forge = |by, at| t(TrustGrant::ForgeCredentials, by, at);
+    let sandbox = |by, at| t(TrustGrant::BuildSandbox, by, at);
+    let registry = |by, at| t(TrustGrant::RegistryCredential, by, at);
     assert!(store.trusted_sources("acme").await.unwrap().is_empty());
-    assert_eq!(store.trust_source(&t("amy", 1)).await.unwrap(), t("amy", 1));
-    // Trusting again keeps the first record.
-    assert_eq!(store.trust_source(&t("bob", 2)).await.unwrap(), t("amy", 1));
+    assert_eq!(
+        store.trust_source(&forge("amy", 1)).await.unwrap(),
+        forge("amy", 1)
+    );
+    // Trusting again with the same grant keeps the first record.
+    assert_eq!(
+        store.trust_source(&forge("bob", 2)).await.unwrap(),
+        forge("amy", 1)
+    );
     assert_eq!(
         store.trusted_sources("acme").await.unwrap(),
-        vec![t("amy", 1)]
+        vec![forge("amy", 1)]
+    );
+    // Another grant for the same source is its own record.
+    assert_eq!(
+        store.trust_source(&sandbox("bob", 3)).await.unwrap(),
+        sandbox("bob", 3)
+    );
+    assert_eq!(
+        store.trust_source(&registry("cat", 4)).await.unwrap(),
+        registry("cat", 4)
+    );
+    assert_eq!(
+        store.trust_source(&registry("dan", 5)).await.unwrap(),
+        registry("cat", 4)
+    );
+    assert_eq!(
+        store.trusted_sources("acme").await.unwrap(),
+        vec![sandbox("bob", 3), forge("amy", 1), registry("cat", 4)]
     );
     assert!(
         store.trusted_sources("globex").await.unwrap().is_empty(),
         "per org"
     );
+    // Removing one grant keeps the other.
     assert_eq!(
         store
-            .untrust_source("acme", "github.com/acme/libs//push.yaml")
+            .untrust_source("acme", SRC, TrustGrant::ForgeCredentials)
             .await
             .unwrap(),
-        Some(t("amy", 1))
+        Some(forge("amy", 1))
     );
     assert_eq!(
         store
-            .untrust_source("acme", "github.com/acme/libs//push.yaml")
+            .untrust_source("acme", SRC, TrustGrant::ForgeCredentials)
             .await
             .unwrap(),
         None
+    );
+    assert_eq!(
+        store.trusted_sources("acme").await.unwrap(),
+        vec![sandbox("bob", 3), registry("cat", 4)]
+    );
+    assert_eq!(
+        store
+            .untrust_source("acme", SRC, TrustGrant::BuildSandbox)
+            .await
+            .unwrap(),
+        Some(sandbox("bob", 3))
+    );
+    assert_eq!(
+        store
+            .untrust_source("acme", SRC, TrustGrant::RegistryCredential)
+            .await
+            .unwrap(),
+        Some(registry("cat", 4))
     );
     assert!(store.trusted_sources("acme").await.unwrap().is_empty());
 }

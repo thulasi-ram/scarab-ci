@@ -338,7 +338,6 @@ use an image that has one, or ask for `run_as_root`.
 
 Some steps are **kinds** with no image that the engine runs on your behalf (you set no `image`/`command`):
 
-- **`build: { image: ..., push: true }`**: a rootless BuildKit image build.
 - **`gate: manual`**: a durable approval/wait point (see [Environments & gates](#environments--gates)).
 - **`invoke: file:.scarab/lib/...`**: reuse at compile time (see [Reuse: `invoke`](#reuse-invoke)).
 
@@ -366,6 +365,162 @@ the same on GitHub and Forgejo.
 
 The `clone` step kind is gone. A `clone:` step fails the pipeline check with a message that names
 `invoke: lib:thulasi-ram/clone`.
+
+### Building an image
+
+Scarab's build library, `lib:thulasi-ram/build`, builds an image from the Run's workspace with
+rootless BuildKit and pushes it when you ask. An org admin installs it and trusts its source for the
+build sandbox; no org has it until then
+([Install Scarab's build library](/scarab-ci/usage/libraries/#install-scarabs-build-library)).
+
+```yaml
+- id: checkout
+  invoke: lib:thulasi-ram/clone
+
+- id: image
+  invoke: lib:thulasi-ram/build
+  needs: [checkout]
+  with:
+    image: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/app:${{ event.sha }}
+    context: services/api
+    push: true
+    build_args: |
+      VERSION=${{ event.sha }}
+    cache: s3
+    cache_bucket: acme-buildkit-cache
+    cache_region: ap-south-1
+
+- id: deploy
+  image: alpine:3.20
+  needs: [image]
+  env: [[PUSHED, "${{ outputs.image.push }}"]]
+  command: [sh, -c, 'echo "pushed: $PUSHED"']
+```
+
+The library has two steps, and `needs: [image]` reaches the second:
+
+- `image/image` builds. It runs BuildKit in the build sandbox and holds no registry credential.
+  When the image is to be pushed, it writes the image as an OCI image layout to
+  `.scarab-build/oci` in the workspace, after removing anything an earlier step left at that path.
+  An image that is not pushed stays in BuildKit.
+- `image/push` needs `image/image` and pushes the layout with
+  [crane](https://github.com/google/go-containerregistry/tree/main/cmd/crane). It holds the
+  registry credential, runs no code from your repository, and removes the layout from its own
+  workspace when it is done, so a step that needs only `image` does not receive it. With
+  `push: false` it exits without pushing.
+
+A step that reads `outputs.image.image` needs the build step too, and so receives the layout
+through the build step's workspace. To deploy, read `outputs.image.push.digest`, which needs only
+the push step, or limit what the step receives with `inputs:`.
+
+The image travels from the build step to the push step through the workspace, so pushing a large
+image costs a transfer through the Data Depot. A build that does not push writes no layout.
+
+Its inputs:
+
+| Input | Default | What it is |
+|---|---|---|
+| `image` | (required) | The image reference to build, such as `ghcr.io/acme/app:1.2.0`. No `,`. |
+| `context` | `.` | The build context, relative to the workspace. No absolute path, no `..`, no `,`. |
+| `dockerfile` | `Dockerfile` | The Dockerfile, relative to the context, with the same rules. |
+| `push` | `false` | Push the image after building it. |
+| `build_args` | empty | Build arguments, one `KEY=VALUE` per line. No `,` in a value. |
+| `cache` | `none` | Where BuildKit imports and exports its layer cache: `none` or `s3`. |
+| `cache_bucket` | empty | For `cache: s3`, the bucket. |
+| `cache_region` | empty | For `cache: s3`, the bucket's region. |
+| `cache_name` | empty | For `cache: s3`, the cache's name in the bucket; BuildKit's default when empty. |
+| `insecure_push` | `false` | Push over plain HTTP. For a test or development registry with no TLS only. crane then also skips TLS verification, so the push Step refuses it (exit 2) when it holds a registry login. |
+
+Its outputs:
+
+- `outputs.image.push` is set only when the image was pushed: `{"ref": "<repository>@sha256:…",
+  "digest": "sha256:…"}`, as crane reported the push. Deploy by this digest. When nothing was
+  pushed (`push: false`, a fork pull request, or a Run locked out of its Environment's secrets)
+  there is no such result, and a step that reads it fails before it launches, so read it only
+  where the image is pushed.
+- `outputs.image.image` is what BuildKit wrote with `--metadata-file`: a JSON object whose
+  `containerimage.digest` is the digest of the image it built. crane pushes the layout's manifest
+  unchanged, so this is also the digest in the registry, unless the Dockerfile changed the layout
+  after BuildKit wrote it (a `RUN` shares the build step's Pod). In `env:` it becomes that
+  object's compact JSON text.
+
+- **The registry credential.** Only the push step asks for `registry_auth: true`. It receives a
+  credential only when the org trusts the library's source with the registry credential
+  ([Libraries](/scarab-ci/usage/libraries/#trusting-a-library-with-the-registry-credential)); a
+  step written in your Pipeline file never receives one. Each time it launches, Scarab resolves
+  the `REGISTRY_AUTH` secret (Repo scope, then Org scope) and mounts it as
+  `/scarab/registry/config.json`, with `DOCKER_CONFIG` pointing at that directory. It is never an
+  environment variable, and Scarab replaces it with `***` in the step's log. With no
+  `REGISTRY_AUTH` secret, the step gets the credential the forge derives for its own registry
+  (GHCR, the Forgejo package registry), and only when the org also trusts the library's source
+  with forge credentials. With neither, the build still runs and pulls public base images, and
+  the push fails at the registry. The build step never receives a credential: BuildKit runs
+  without its process sandbox, so a `RUN` in your Dockerfile could read anything the build step
+  holds. For the same reason the build step cannot pull private base images.
+- **No registry cache.** The library offers no `cache: registry`: writing a cache to a registry
+  needs the push credential in the build step. The S3 cache is reached with the build Pod's own
+  identity, such as a ServiceAccount a placement profile sets; Scarab passes no credential.
+- **A fork pull request**, or a Run locked out of its Environment's secrets, gets no registry
+  credential, and Scarab sets `SCARAB_FORK_PR=true` on both steps, so the build exports no layer
+  cache and writes no layout, and the push step pushes nothing, whatever `push` says. The build still imports the cache. No Pipeline or library may
+  set `SCARAB_FORK_PR`.
+- **Paths stay in the workspace.** The inputs are checked against their rules when the Pipeline
+  compiles and again when each step launches. The build step resolves the context and the
+  Dockerfile and stops before BuildKit runs if either leads outside `/workspace`, through a
+  symlink committed in the repository for example. The push step stops before crane runs if the
+  layout leads outside `/workspace` or holds a symlink, or anything that is not a regular file
+  or a directory: a step before it could plant a symlink to `/scarab/registry/config.json`,
+  which crane would upload.
+- **The sandbox.** The build step runs as uid 1000, not privileged, with seccomp and AppArmor
+  unconfined, which rootless BuildKit needs. Only a step from an installed library whose source
+  the org trusts for the build sandbox gets it; a step written in your Pipeline file never does.
+  A sandboxed step may not have `secrets:`. The push step runs in the default restricted Pod
+  shape, as root, because crane's image has no other user; an org Policy that denies run-as-root
+  therefore refuses every Run that invokes the library.
+- **Placement per step.** A list in the invoke step's `placement_profiles` reaches both steps. A
+  map from the library's step id to a list routes each list to its own step, so build-node
+  placement and the S3 cache identity reach only the build step. An operator marks a profile
+  that grants push access (a ServiceAccount with a push role, an init container that logs in)
+  `registry_auth_only`. Scarab applies a marked profile only to a step with `registry_auth` that
+  the launch found eligible for a credential, which here is the push step of a Run that is not a
+  fork. Named on any other step it fails that step's launch, so a list that holds one fails the
+  build step: route it with the map form. On a fork's push step it is left out, and the step
+  pushes nothing.
+
+  ```yaml
+  - id: image
+    invoke: lib:thulasi-ram/build
+    placement_profiles:
+      image: [arm64-builders, build-cache]
+      push: [ecr-push]
+    with: { image: "123456789012.dkr.ecr.ap-south-1.amazonaws.com/app:${{ event.sha }}", push: true }
+  ```
+
+- **Other architectures.** BuildKit builds for the architecture of the node it runs on. Invoke
+  the library once per architecture, each naming the profile for those nodes and pushing its own
+  tag:
+
+  ```yaml
+  - id: amd64
+    invoke: lib:thulasi-ram/build
+    placement_profiles: { image: [amd64], push: [ecr-push] }
+    with: { image: "ghcr.io/acme/app:${{ event.sha }}-amd64", push: true }
+  - id: arm64
+    invoke: lib:thulasi-ram/build
+    placement_profiles: { image: [arm64], push: [ecr-push] }
+    with: { image: "ghcr.io/acme/app:${{ event.sha }}-arm64", push: true }
+  ```
+
+  Joining the tags into one multi-architecture image (`crane index append`,
+  `docker buildx imagetools create`) pushes to the registry, so that step needs the registry
+  credential too, which only a step from a trusted library receives. Scarab has no library for
+  it yet; until it does, the join step comes from a library of your own whose source the org
+  trusts with the registry credential. A list of profiles still reaches both steps, which a
+  per-architecture build needs; keep the push profile in the map's `push` entry.
+
+The `build` step kind is gone. A `build:` step fails the pipeline check with one error that holds
+its replacement, an `invoke: lib:thulasi-ram/build` step written from the old step's fields. The local executor refuses the build library's build step; it
+needs the Kubernetes executor.
 
 ### Forge credentials: `forge_token`
 
@@ -561,7 +716,12 @@ the caller's scope when the library step launches, then checked against the inpu
 **What the invoke step carries.** An invoke step may set `needs`, `with`, `matrix`, `when`,
 `deploy`, `timeout`, `resources` and `placement_profiles`. Its `timeout`, `resources` and
 `placement_profiles` apply to each inlined step that leaves them unset (the library's own value
-wins), and never to a gate. `placement_profiles` never applies to a step with `forge_token`. Its `when` is ANDed with the `when` of every inlined step and gate.
+wins), and never to a gate. `placement_profiles` never applies to a step with `forge_token`.
+`placement_profiles` may be a list, which applies to every inlined step, or a map from a step id
+of the library to a list, which applies to that step only
+(`placement_profiles: { image: [arm64], push: [ecr-push] }`). A map key that is not a step of the
+library, or names a step with `forge_token` or with its own `placement_profiles`, is a compile
+error; a key naming a nested invoke applies to every step it inlines. Its `when` is ANDed with the `when` of every inlined step and gate.
 Any other field, `env` included, is a compile error on an invoke step.
 
 **Installed libraries are closed.** A `lib:` library may invoke only `lib:` and `plugin:`
@@ -613,9 +773,9 @@ A step can also list the results it writes, with `results: [tag, build]`. The li
 declaration, not a filter: a step that declares nothing still publishes every file it writes.
 
 Beyond writing the file, capture needs no setup in the pipeline: on Kubernetes a trusted per-Pod egress sidecar
-drains the step's results back to the control plane. A `build:` step
-emits an `image` result natively (BuildKit writes `--metadata-file /scarab/results/image.json`);
-its author writes nothing.
+drains the step's results back to the control plane. The build library's step
+publishes an `image` result (BuildKit writes `--metadata-file /scarab/results/image.json`);
+its caller writes nothing.
 
 ### The trap: a bare filename publishes nothing, and the step still goes green
 
@@ -985,6 +1145,16 @@ Step Pods, service Pods and debug Pods do not mount a Kubernetes ServiceAccount 
 (`automountServiceAccountToken: false`), so code in a step cannot call the Kubernetes API with the
 namespace's default ServiceAccount. A step that needs the API names a placement profile that sets
 both `serviceAccountName` and `automountServiceAccountToken: true`.
+
+An operator marks a profile `registry_auth_only: true` when it grants push access to a registry
+(a ServiceAccount with a push role, an init container that logs in). Scarab applies such a profile
+only to a step with `registry_auth` that the launch found eligible for a registry credential: a
+step from a library your org trusts with the registry credential, in a Run that is not a fork pull
+request or locked out of its Environment's secrets. It applies whether or not a credential
+resolves. Named on any other step it fails that step's launch; on a `registry_auth` step the
+launch did not find eligible it is left out. A marked profile cannot be the
+`default` ([Building an image](#building-an-image) shows the map form that routes one to the push
+step).
 
 ## Retries, timeouts & reruns
 

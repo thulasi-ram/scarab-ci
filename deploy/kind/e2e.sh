@@ -85,8 +85,10 @@ for _ in $(seq 1 30); do kc get serviceaccount default -n "$tns" >/dev/null 2>&1
 # so the node never pulls it (lib.sh's pull_image and load_image).
 pull_image postgres:16
 load_image postgres:16
-# The plain-HTTP registry the `kind: build` case pushes to and then reads the
-# tag list of, from inside the cluster.
+# The plain-HTTP registry the build library case
+# (the_build_library_builds_and_pushes_to_a_local_registry) pushes to, with
+# its `insecure_push` input, and then reads the tag list of, from inside the
+# cluster.
 echo "==> ensuring an in-cluster registry in namespace $tns"
 kc apply -n "$tns" -f - >/dev/null <<EOF
 apiVersion: apps/v1

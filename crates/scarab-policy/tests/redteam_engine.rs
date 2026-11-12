@@ -775,3 +775,17 @@ fn redteam_the_draft_reads_and_cost_are_reported_per_rule() {
     assert_eq!(c.reads, vec!["steps".to_string()]);
     assert!(c.cost > 0 && c.cost <= MAX_COST);
 }
+
+// Attack: a Step reaches the run.create input still holding `placement_profiles` as a map from step id (a bug that left an invoke un-inlined, or an IR written by hand), which reads as no profile, so a Policy over `steps[].placement_profiles` would see nothing to deny. Safe outcome: building the input refuses the Run.
+#[test]
+fn redteam_a_placement_profile_map_left_on_a_step_refuses_the_run() {
+    let mut ir = scarab_pipeline::compile_yaml("steps: [{ id: s, image: busybox }]").unwrap();
+    ir.steps[0].placement_profiles = scarab_pipeline::PlacementProfiles::PerStep(
+        std::collections::BTreeMap::from([("s".to_string(), vec!["ecr-push".to_string()])]),
+    );
+    let err = input_from_pipeline(&ir, facts()).unwrap_err().to_string();
+    assert!(
+        err.contains("Step `s`") && err.contains("still a map"),
+        "{err}"
+    );
+}

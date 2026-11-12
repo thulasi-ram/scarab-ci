@@ -51,6 +51,8 @@ async fn crash_mid_run_resumes_and_runs_step_exactly_once() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],

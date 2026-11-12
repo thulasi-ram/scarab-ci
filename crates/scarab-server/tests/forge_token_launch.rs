@@ -54,6 +54,8 @@ fn token_spec(access: ForgeToken) -> StepSpec {
             trusted_library: None,
             credential: None,
         }),
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -187,6 +189,7 @@ async fn trusted_library(libs: &InMemoryLibraries) -> String {
     libs.trust_source(&TrustedSource {
         org: "acme".into(),
         source: TRUSTED.into(),
+        grant: scarab_policy::library::TrustGrant::ForgeCredentials,
         trusted_by: "amy".into(),
         trusted_at: 2,
         step_up_ref: Some("su-1".into()),
@@ -262,7 +265,13 @@ async fn a_launch_after_the_trust_is_removed_mints_nothing() {
     let libs = Arc::new(InMemoryLibraries::new());
     let mut spec = token_spec(ForgeToken::Read);
     spec.forge_token.as_mut().unwrap().trusted_library = Some(trusted_library(&libs).await);
-    libs.untrust_source("acme", TRUSTED).await.unwrap();
+    libs.untrust_source(
+        "acme",
+        TRUSTED,
+        scarab_policy::library::TrustGrant::ForgeCredentials,
+    )
+    .await
+    .unwrap();
     let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone())
         .with_libraries(Arc::new(InMemoryDb::new()), libs.clone());
     let err = exec
@@ -322,6 +331,7 @@ async fn a_clone_library_launch_gets_the_long_lived_token_only_once_its_source_i
     libs.trust_source(&TrustedSource {
         org: "acme".into(),
         source: scarab_policy::library::trust_key(CLONE_LIBRARY_SOURCE).into(),
+        grant: scarab_policy::library::TrustGrant::ForgeCredentials,
         trusted_by: "amy".into(),
         trusted_at: 2,
         step_up_ref: Some("su-1".into()),
@@ -361,226 +371,29 @@ async fn steps_without_forge_token_pass_through_untouched() {
 }
 
 // ---------------------------------------------------------------------------
-// Build-step registry auth enrichment (ADR-0018 amendment).
+// A `registry_auth` Step (ADR-0018, amendment of 2026-11-12). Its credential
+// resolution is tested in `build_library.rs`.
 // ---------------------------------------------------------------------------
 
-use scarab_engine::BuildConfig;
-use scarab_secrets::SecretScope;
 use scarab_testkit::FakeSecrets;
 
-fn build_spec(image: &str) -> StepSpec {
-    StepSpec {
-        image: String::new(),
-        command: vec![],
-        env: vec![],
-        secrets: vec![],
-        run_as_root: false,
-        add_capabilities: vec![],
-        privileged: false,
-        timeout_seconds: None,
-        workspace_inputs: vec![],
-        workspace_outputs: vec![],
-        cache: None,
-        forge_token: None,
-        build: Some(BuildConfig {
-            context: ".".into(),
-            dockerfile: "Dockerfile".into(),
-            image: image.into(),
-            repo_owner: "acme".into(),
-            repo_name: "web".into(),
-            push: true,
-            ..Default::default()
-        }),
-        artifacts: vec![],
-        placement_profiles: vec![],
-        resources: Default::default(),
-        k8s_overlay: None,
-        oidc_token: None,
-        resolved_secrets: Default::default(),
-        services: Vec::new(),
-        uses: Vec::new(),
-        matrix_values: Default::default(),
-        scope: None,
-    }
-}
-
-#[tokio::test]
-async fn scoped_registry_auth_secret_takes_precedence_over_forge_derived() {
-    let inner = Arc::new(FakeExecutor::new());
-    let secrets = Arc::new(FakeSecrets::new().with_secret(
-        &SecretScope::Repo {
-            org: "acme".into(),
-            repo: "web".into(),
-        },
-        "REGISTRY_AUTH",
-        br#"{"auths":{"registry.corp":{"auth":"eDp5"}}}"#,
-    ));
-    let forge = Arc::new(FakeForge::new().with_registry_credential(
-        scarab_forge::RegistryCredential {
-            registry: "ghcr.io".into(),
-            username: "x-access-token".into(),
-            token: "derived".into(),
-        },
-    ));
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge).with_secrets(secrets);
-    let handle = exec
-        .launch(&step_run("image"), &build_spec("ghcr.io/acme/web:1"))
-        .await
-        .unwrap();
-    let enriched = inner.launched_spec(&handle).unwrap().build.unwrap();
-    assert_eq!(
-        enriched.registry_auth_json.as_deref(),
-        Some(r#"{"auths":{"registry.corp":{"auth":"eDp5"}}}"#),
-        "the scoped secret wins"
-    );
-    assert_eq!(enriched.derived_auth, None);
-}
-
-#[tokio::test]
-async fn forge_derived_credential_is_the_fallback_and_only_for_its_own_registry() {
-    let forge = Arc::new(FakeForge::new().with_registry_credential(
-        scarab_forge::RegistryCredential {
-            registry: "ghcr.io".into(),
-            username: "x-access-token".into(),
-            token: "derived".into(),
-        },
-    ));
-    let inner = Arc::new(FakeExecutor::new());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge)
-        .with_secrets(Arc::new(FakeSecrets::new())); // no scoped secret
-
-    // Pushing to the forge's own registry: derived credential applies.
-    let handle = exec
-        .launch(&step_run("image"), &build_spec("ghcr.io/acme/web:1"))
-        .await
-        .unwrap();
-    let enriched = inner.launched_spec(&handle).unwrap().build.unwrap();
-    assert_eq!(enriched.registry_auth_json, None);
-    let derived = enriched.derived_auth.expect("forge-derived credential");
-    assert_eq!(derived.registry, "ghcr.io");
-    assert_eq!(derived.token, "derived");
-
-    // Pushing elsewhere: the forge credential must NOT leak to a foreign
-    // registry — anonymous build instead.
-    let handle = exec
-        .launch(
-            &step_run("image2"),
-            &build_spec("registry.elsewhere/acme/web:1"),
-        )
-        .await
-        .unwrap();
-    let enriched = inner.launched_spec(&handle).unwrap().build.unwrap();
-    assert_eq!(enriched.registry_auth_json, None);
-    assert_eq!(enriched.derived_auth, None);
-}
-
-#[tokio::test]
-async fn inline_dev_builds_get_no_auth() {
-    let forge = Arc::new(FakeForge::new().with_registry_credential(
-        scarab_forge::RegistryCredential {
-            registry: "ghcr.io".into(),
-            username: "x".into(),
-            token: "t".into(),
-        },
-    ));
-    let inner = Arc::new(FakeExecutor::new());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge);
-    let mut spec = build_spec("ghcr.io/acme/web:1");
-    spec.build.as_mut().unwrap().repo_owner = String::new(); // no trigger repo
-    spec.build.as_mut().unwrap().repo_name = String::new();
-    let handle = exec.launch(&step_run("image"), &spec).await.unwrap();
-    let enriched = inner.launched_spec(&handle).unwrap().build.unwrap();
-    assert_eq!(enriched.registry_auth_json, None);
-    assert_eq!(enriched.derived_auth, None);
-}
-
-/// git-bug a75eacb: a build locked out at Run creation (a fork pull request,
-/// or a Run locked out of its Environment's secrets) launches with no
-/// registry credential, though a Repo `REGISTRY_AUTH` secret and a
-/// forge-derived credential are both available, and the launch turns its
-/// push off.
-#[tokio::test]
-async fn a_locked_out_build_gets_no_registry_credential() {
-    let secrets = Arc::new(FakeSecrets::new().with_secret(
-        &SecretScope::Repo {
-            org: "acme".into(),
-            repo: "web".into(),
-        },
-        "REGISTRY_AUTH",
-        br#"{"auths":{"registry.corp":{"auth":"eDp5"}}}"#,
-    ));
-    let forge = Arc::new(FakeForge::new().with_registry_credential(
-        scarab_forge::RegistryCredential {
-            registry: "ghcr.io".into(),
-            username: "x-access-token".into(),
-            token: "derived".into(),
-        },
-    ));
-    let inner = Arc::new(FakeExecutor::new());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge).with_secrets(secrets);
-    let mut spec = build_spec("ghcr.io/acme/web:1");
-    let build = spec.build.as_mut().unwrap();
-    build.locked_out = true;
-    let handle = exec.launch(&step_run("image"), &spec).await.unwrap();
-    let enriched = inner.launched_spec(&handle).unwrap().build.unwrap();
-    assert_eq!(enriched.registry_auth_json, None);
-    assert_eq!(enriched.derived_auth, None);
-    assert!(!enriched.push);
-}
-
-// Attack: a fork pull request Run created before the release stored its build with `push: true` and no `locked_out`; a retry or Rerun after the upgrade launches it. Safe outcome: the launch reads the Run's recorded trigger (`fork: true`), mounts no credential and does not push.
-#[tokio::test]
-async fn a_fork_pr_build_stored_before_locked_out_existed_gets_no_credential_on_relaunch() {
-    use scarab_engine::{EventKind, EventPayload, EVENT_VERSION};
-    use scarab_testkit::InMemoryEnvironmentGovernance;
-
-    let db = Arc::new(InMemoryDb::new());
-    let run = RunId("r1".into());
-    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
-    db.append_event(&EventKind {
-        version: EVENT_VERSION,
-        run: run.clone(),
-        kind: EventPayload::Raw(serde_json::json!({ "trigger": { "event": {
-            "kind": "pull_request", "fork": true, "number": 7,
-            "repo": { "owner": "acme", "name": "web" }, "sha": "abc123" } } })),
-        at: Timestamp(0),
-    })
-    .await
-    .unwrap();
-    let secrets = Arc::new(FakeSecrets::new().with_secret(
-        &SecretScope::Repo {
-            org: "acme".into(),
-            repo: "web".into(),
-        },
-        "REGISTRY_AUTH",
-        br#"{"auths":{"registry.corp":{"auth":"eDp5"}}}"#,
-    ));
-    let forge = Arc::new(FakeForge::new().with_registry_credential(
-        scarab_forge::RegistryCredential {
-            registry: "ghcr.io".into(),
-            username: "x-access-token".into(),
-            token: "derived".into(),
-        },
-    ));
-    let inner = Arc::new(FakeExecutor::new());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge)
-        .with_secrets(secrets)
-        .with_environment_governance(db.clone(), Arc::new(InMemoryEnvironmentGovernance::new()));
-    // What a pre-release server stored: `push` as authored, `locked_out` absent.
-    let spec = build_spec("ghcr.io/acme/web:1");
-    assert!(!spec.build.as_ref().unwrap().locked_out);
-    let handle = exec.launch(&step_run("image"), &spec).await.unwrap();
-    let enriched = inner.launched_spec(&handle).unwrap().build.unwrap();
-    assert_eq!(enriched.registry_auth_json, None, "REGISTRY_AUTH mounted");
-    assert_eq!(enriched.derived_auth, None, "forge credential mounted");
-    assert!(!enriched.push, "a fork pull request build pushed");
+fn registry_spec() -> StepSpec {
+    let mut spec = token_spec(ForgeToken::Read);
+    spec.forge_token = None;
+    spec.image = "moby/buildkit:rootless@sha256:abc".into();
+    spec.registry_auth = Some(scarab_engine::RegistryAuthConfig {
+        owner: "acme".into(),
+        name: "web".into(),
+        ..Default::default()
+    });
+    spec
 }
 
 // ---------------------------------------------------------------------------
 // Environment re-admission before any credential (git-bug 66c0368).
 // ---------------------------------------------------------------------------
 
-/// A forge-token Step and a build Step of a deploy Run whose Project the
+/// A forge-token Step and a `registry_auth` Step of a deploy Run whose Project the
 /// Environment no longer admits: in the production decorator order
 /// (ForgeCredential outermost, SecretInjecting inside), re-admission refuses
 /// the launch before a checkout token is minted or registry auth is fetched.
@@ -590,10 +403,7 @@ async fn a_refused_readmission_mints_no_credential() {
     use scarab_server::{LogService, SecretInjectingExecutor};
     use scarab_testkit::{InMemoryEnvironmentGovernance, InMemoryObjectStore};
 
-    for spec in [
-        token_spec(ForgeToken::Read),
-        build_spec("ghcr.io/acme/web:latest"),
-    ] {
+    for spec in [token_spec(ForgeToken::Read), registry_spec()] {
         let db = Arc::new(InMemoryDb::new());
         let run = RunId("r1".into());
         db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();

@@ -1162,8 +1162,8 @@ async fn an_authored_origin_with_an_unknown_field_is_still_refused() {
 // 7. A yanked Step mints no credential
 // ===========================================================================
 
-/// A library with a forge-token Step and a build Step, both roots.
-const SOURCED: &str = "kind: library\nsteps:\n  - { id: checkout, image: \"alpine/git@sha256:aaaa\", forge_token: read }\n  - { id: img, build: { image: \"ghcr.io/acme/web:1\" } }\n";
+/// A library with a forge-token Step and a `registry_auth` Step, both roots.
+const SOURCED: &str = "kind: library\nsteps:\n  - { id: checkout, image: \"alpine/git@sha256:aaaa\", forge_token: read }\n  - { id: img, image: \"moby/buildkit@sha256:bbbb\", command: [buildctl], registry_auth: true }\n";
 
 /// Runs the production chain over `run` with a fresh fake forge, and
 /// returns how many credentials the forge was asked for.
@@ -1186,24 +1186,32 @@ async fn credentials_asked(
 
 /// In production ForgeCredential is outermost: it mints the forge token and
 /// resolves registry auth before SecretInjecting's yank check refuses. A
-/// yanked forge-token or build Step must be refused before either is asked
-/// for.
+/// yanked forge-token or `registry_auth` Step must be refused before either
+/// is asked for.
 #[tokio::test]
-async fn a_yanked_forge_token_or_build_step_mints_no_credential() {
+async fn a_yanked_forge_token_or_registry_auth_step_mints_no_credential() {
     const CI: &str = "on:\n  push: {}\nsteps:\n  - { id: src, invoke: lib:acme/sourced }\n";
     let libs = Arc::new(InMemoryLibraries::new());
     seed(libs.as_ref(), "acme", "acme", "sourced", SOURCED).await;
     // The org trusts the library's source with its long-lived forge token
-    // (ADR-0076 §9), so the forge-token Step is admitted.
-    libs.trust_source(&scarab_policy::library::TrustedSource {
-        org: "acme".into(),
-        source: "github.com/acme/libs//sourced.yaml".into(),
-        trusted_by: "amy".into(),
-        trusted_at: 1,
-        step_up_ref: None,
-    })
-    .await
-    .unwrap();
+    // (ADR-0076 §9) and with the registry credential, so the forge-token
+    // Step is admitted and the `registry_auth` Step may receive the
+    // forge-derived credential.
+    for grant in [
+        scarab_policy::library::TrustGrant::ForgeCredentials,
+        scarab_policy::library::TrustGrant::RegistryCredential,
+    ] {
+        libs.trust_source(&scarab_policy::library::TrustedSource {
+            org: "acme".into(),
+            source: "github.com/acme/libs//sourced.yaml".into(),
+            grant,
+            trusted_by: "amy".into(),
+            trusted_at: 1,
+            step_up_ref: None,
+        })
+        .await
+        .unwrap();
+    }
 
     // Both Runs are created before the yank; a Run created after it is
     // refused at creation.

@@ -685,7 +685,12 @@ test("a library's manage page holds its version, trust, yank and remove", async 
   await expect(nav.getByRole("link", { name: "Libraries", exact: true })).toHaveAttribute("aria-current", "page");
   await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Libraries\s*lib:acme\/http-probe$/);
   await expect(page.getByText("untrusted source", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Trust source" })).toBeVisible();
+  // One trust panel per grant, each with its own Trust source button.
+  await expect(page.getByRole("button", { name: "Trust source" })).toHaveCount(3);
+  for (const grant of ["Forge credentials", "Build sandbox", "Registry credential"]) {
+    const panel = page.locator(".panel", { has: page.locator(".panel-h", { hasText: grant }) });
+    await expect(panel.getByRole("button", { name: "Trust source" })).toBeVisible();
+  }
   await expect(page.getByRole("button", { name: "Yank this version" })).toBeVisible();
 
   // Upgrade opens the install dialog with the installed source in it.

@@ -1013,9 +1013,9 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Trust a library source with forge credentials (ADR-0076 §9) */
+        /** Trust a library source with forge credentials, the build sandbox or the registry credential */
         post: operations["trust_library_source"];
-        /** Stop trusting a library source with forge credentials (ADR-0076 §9) */
+        /** Stop trusting a library source with one grant or all of them */
         delete: operations["untrust_library_source"];
         options?: never;
         head?: never;
@@ -4208,8 +4208,9 @@ export interface components {
         OrgLibrariesDto: {
             installations: components["schemas"]["LibraryInstallationDto"][];
             /**
-             * @description The library sources this org trusts with long-lived forge credentials
-             *     (ADR-0076 §9). No library is trusted without one.
+             * @description The library sources this org trusts, one entry per source and grant
+             *     (ADR-0076 §9, ADR-0018 amendment of 2026-11-12). No library is
+             *     trusted without one.
              */
             trusted_sources: components["schemas"]["TrustedSourceDto"][];
             yanks: components["schemas"]["LibraryYankDto"][];
@@ -6092,7 +6093,15 @@ export interface components {
          * @enum {string}
          */
         TokenSort: "last_used" | "use_count" | "created";
+        /**
+         * @description What an org's trust in a library source grants. Each is trusted on its
+         *     own.
+         * @enum {string}
+         */
+        TrustGrantDto: "forge_credentials" | "build_sandbox" | "registry_credential";
         TrustSourceRequest: {
+            /** @description What the trust grants; `forge_credentials` when omitted. */
+            grant?: components["schemas"]["TrustGrantDto"];
             /**
              * @description `<host>/<owner>/<repo>//<path>`; an `@<commit>` is dropped, since
              *     trust is for every version from the source.
@@ -6100,10 +6109,13 @@ export interface components {
             source: string;
         };
         /**
-         * @description A library source the org trusts with long-lived forge credentials
-         *     (ADR-0076 §9). Trust holds across upgrades from the same source.
+         * @description A library source the org trusts with one grant (ADR-0076 §9, ADR-0018
+         *     amendment of 2026-11-12). Trust holds across upgrades from the same
+         *     source.
          */
         TrustedSourceDto: {
+            /** @description What the trust grants. */
+            grant: components["schemas"]["TrustGrantDto"];
             /** @description `<host>/<owner>/<repo>//<path>`, without a commit. */
             source: string;
             /** Format: int64 */
@@ -8932,6 +8944,12 @@ export interface operations {
             query?: {
                 /** @description The trusted source, `<host>/<owner>/<repo>//<path>`. */
                 source?: string;
+                /**
+                 * @description The grant to remove; every grant of the source when omitted (a
+                 *     client from before grants existed means the source's whole trust).
+                 *     Named, the source's other grants stay.
+                 */
+                grant?: components["schemas"]["TrustGrantDto"];
             };
             header?: never;
             path: {
@@ -8963,7 +8981,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not trusted, or libraries not configured */
+            /** @description not trusted with that grant (with any, when none is named), or libraries not configured */
             404: {
                 headers: {
                     [name: string]: unknown;

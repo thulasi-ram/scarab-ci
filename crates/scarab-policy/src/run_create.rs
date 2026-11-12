@@ -162,6 +162,15 @@ policy_struct! {
         pub placement_profiles: Capped<String, MAX_PLACEMENT_PROFILES>,
         pub deploy: bool,
         pub forge_token: Option<ForgeToken>,
+        /// The sandbox the Step asks for (`security.sandbox`), e.g.
+        /// `rootless-buildkit`. Absent when it asks for none, and from
+        /// inputs recorded before it existed.
+        pub sandbox: Option<String>,
+        /// The Step asks for the Run's registry credential
+        /// (`registry_auth: true`). Absent from inputs recorded before it
+        /// existed, so a rule reads it as
+        /// `has(step.registry_auth) && step.registry_auth`.
+        pub registry_auth: Option<bool>,
         /// The Step uses the Environment's authority (ADR-0075 §5).
         pub uses_environment_authority: bool,
         /// Empty for a Step written in the Pipeline file itself.
@@ -533,12 +542,23 @@ pub fn input_from_pipeline(
                 &what,
                 "secrets",
             )?),
-            placement_profiles: capped(s.placement_profiles.clone(), &what, "placement profiles")?,
+            // A compiled Step holds a list; a map left by a Step that was not
+            // inlined is refused, never read as no profile.
+            placement_profiles: capped(
+                s.placement_profiles
+                    .compiled()
+                    .map_err(|e| CapExceeded(format!("{}: {e}", what())))?
+                    .to_vec(),
+                &what,
+                "placement profiles",
+            )?,
             deploy: s.deploy || ir.deploy,
             forge_token: s.forge_token.map(|t| match t {
                 scarab_pipeline::ForgeToken::Read => ForgeToken::Read,
                 scarab_pipeline::ForgeToken::Write => ForgeToken::Write,
             }),
+            sandbox: s.sandbox().map(|x| x.as_str().to_string()),
+            registry_auth: Some(s.registry_auth),
             uses_environment_authority: uses_environment_authority(ir, s),
             origin: origin_of(&s.origin, &what)?,
             upstream_gates: capped(upstream_gates, &what, "gates upstream of it")?,

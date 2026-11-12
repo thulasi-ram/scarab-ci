@@ -206,6 +206,8 @@ fn spec() -> StepSpec {
         matrix_values: Default::default(),
         scope: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
     }
 }
 

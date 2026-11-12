@@ -573,7 +573,7 @@ fn survived_carry_rules() {
         (
             g.timeout,
             g.resources.cpu_millis,
-            g.placement_profiles.len()
+            g.placement_profiles.as_list().len()
         ),
         (None, None, 0)
     );

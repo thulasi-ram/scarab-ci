@@ -33,9 +33,18 @@ pub async fn render_launch_spec(
     if let Err(why) = known_ir_version(ir.as_ref()) {
         return Ok(Err(why));
     }
+    // A spec stored as a `build` Step, a kind the ADR-0018 amendment of
+    // 2026-11-12 removed, keeps its old fields only to be refused here, with
+    // the replacement the Pipeline check suggests for it. A launch, a retry
+    // and a rerun of the Step all come through here.
+    if let Some(build) = &spec.build {
+        return Ok(Err(
+            retired_build_at_launch(db, run, step, build, &spec).await?
+        ));
+    }
     // A spec stored as a `clone` Step, a kind ADR-0076 §9 removed, decodes
     // with no image and nothing to run instead.
-    if spec.image.is_empty() && spec.build.is_none() {
+    if spec.image.is_empty() {
         return Ok(Err(
             "this Step has no image to run: it was stored as a `clone` Step, a kind this \
              server no longer runs (ADR-0076 §9); start a new Run, which checks out with \
@@ -183,4 +192,46 @@ pub(crate) async fn gate_declared_outputs(
         .and_then(|s| s.get("plugin_gate"))
         .and_then(|g| serde_json::from_value::<scarab_pipeline::PluginGateSpec>(g.clone()).ok())
         .map(|g| g.outputs))
+}
+
+/// The Pipeline check's answer to a `build:` Step
+/// ([`scarab_pipeline::retired_build`]), for a Step stored as one before the
+/// kind was removed, followed by what to do with this Run. Its `needs` are
+/// the stored ones written back as the Pipeline names them: an inlined
+/// `checkout/git` is `checkout`, a matrix copy `test[os=linux]` is `test`.
+async fn retired_build_at_launch(
+    db: &dyn Db,
+    run: &RunId,
+    step: &StepId,
+    build: &serde_json::Value,
+    spec: &StepSpec,
+) -> Result<String, DbError> {
+    let mut needs: Vec<String> = Vec::new();
+    if let Some(stored) = db
+        .steps_of_run(run)
+        .await?
+        .into_iter()
+        .find(|s| &s.step == step)
+    {
+        for need in stored.needs {
+            let written = need.0.split(['/', '[']).next().unwrap_or(&need.0);
+            if !written.is_empty() && !needs.iter().any(|n| n == written) {
+                needs.push(written.to_string());
+            }
+        }
+    }
+    let id = step.0.split('[').next().unwrap_or(&step.0);
+    let answer = scarab_pipeline::retired_build(&scarab_pipeline::RetiredBuild {
+        id,
+        build: Some(build),
+        needs: &needs,
+        when: None,
+        timeout: spec.timeout_seconds,
+        resources: Some(&spec.resources),
+        placement_profiles: &spec.placement_profiles,
+    });
+    Ok(format!(
+        "{answer}\nThis Run was created before the `build` step kind was removed, so its \
+         retries and reruns fail the same way; start a new Run once the Pipeline is changed."
+    ))
 }

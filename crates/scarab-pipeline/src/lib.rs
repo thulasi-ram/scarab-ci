@@ -437,11 +437,135 @@ pub const RETIRED_CLONE: &str = "the `clone` Step kind was removed (ADR-0076 §9
     the repository with `invoke: lib:thulasi-ram/clone`, and set `depth`, `submodules` and \
     `lfs` under `with:`";
 
+/// The docs section an org admin follows to install the build library.
+pub const BUILD_LIBRARY_DOCS: &str =
+    "https://thulasi-ram.github.io/scarab-ci/usage/libraries/#install-scarabs-build-library";
+
+/// What a `build:` Step, a kind the ADR-0018 amendment of 2026-11-12
+/// removed, was written with: the fields [`retired_build`] carries into the
+/// replacement it suggests. The Pipeline check fills it from the authored
+/// Step; a launch of a stored Step fills it from what was stored.
+#[derive(Debug, Clone, Default)]
+pub struct RetiredBuild<'a> {
+    /// The Step's id as written (a matrix coordinate removed).
+    pub id: &'a str,
+    /// The `build:` mapping, as written or stored (`image`, `context`,
+    /// `dockerfile`, `push`); other keys are left out.
+    pub build: Option<&'a serde_json::Value>,
+    pub needs: &'a [String],
+    pub when: Option<&'a str>,
+    pub timeout: Option<u32>,
+    pub resources: Option<&'a Resources>,
+    pub placement_profiles: &'a [String],
+}
+
+/// The answer to a `build:` Step, at the Pipeline check and when a Step
+/// stored as one would launch: the replacement invoke, written from the
+/// Step's own fields (a `${{ … }}` in them kept as written), and what an org
+/// admin does first. The same text in both places. The replacement is
+/// indented four spaces, so a reader that splits a compile error's list
+/// (`\n  - `, see [`diagnostic::diagnostics`]) keeps it in one diagnostic.
+pub fn retired_build(step: &RetiredBuild<'_>) -> String {
+    use std::fmt::Write as _;
+    // A value as YAML: a plain word stays plain, anything else is a JSON
+    // string, which YAML reads as a double-quoted scalar.
+    fn scalar(v: &str) -> String {
+        let plain = !v.is_empty()
+            && v.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._-/".contains(c))
+            && !matches!(v, "true" | "false" | "null" | "yes" | "no" | "on" | "off")
+            && v.parse::<f64>().is_err();
+        if plain {
+            v.to_string()
+        } else {
+            serde_json::to_string(v).unwrap_or_default()
+        }
+    }
+    fn list(items: &[String]) -> String {
+        let items: Vec<String> = items.iter().map(|i| scalar(i)).collect();
+        format!("[{}]", items.join(", "))
+    }
+    let mut with = Vec::new();
+    let field = |key: &str| step.build.and_then(|b| b.get(key));
+    match field("image") {
+        Some(serde_json::Value::String(v)) if !v.is_empty() => {
+            with.push(format!("image: {}", scalar(v)))
+        }
+        _ => with.push("image: <the image to build>".to_string()),
+    }
+    for key in ["context", "dockerfile"] {
+        if let Some(serde_json::Value::String(v)) = field(key) {
+            if !v.is_empty() {
+                with.push(format!("{key}: {}", scalar(v)));
+            }
+        }
+    }
+    match field("push") {
+        Some(serde_json::Value::Bool(true)) => with.push("push: true".to_string()),
+        Some(serde_json::Value::String(v)) if !v.is_empty() && v != "false" => {
+            with.push(format!("push: {}", scalar(v)))
+        }
+        _ => {}
+    }
+    let mut out = format!(
+        "step `{}`: the `build` step kind was removed; replace the step with:\n    - id: {}\n",
+        step.id,
+        scalar(step.id)
+    );
+    if !step.needs.is_empty() {
+        let _ = writeln!(out, "      needs: {}", list(step.needs));
+    }
+    if let Some(when) = step.when {
+        let _ = writeln!(
+            out,
+            "      when: {}",
+            serde_json::to_string(when).unwrap_or_default()
+        );
+    }
+    if let Some(timeout) = step.timeout {
+        let _ = writeln!(out, "      timeout: {timeout}");
+    }
+    if let Some(r) = step.resources {
+        let fields: Vec<String> = [("cpu_millis", r.cpu_millis), ("memory_mib", r.memory_mib)]
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|v| format!("{k}: {v}")))
+            .collect();
+        if !fields.is_empty() {
+            let _ = writeln!(out, "      resources: {{ {} }}", fields.join(", "));
+        }
+    }
+    if !step.placement_profiles.is_empty() {
+        let _ = writeln!(
+            out,
+            "      placement_profiles: {}",
+            list(step.placement_profiles)
+        );
+    }
+    let _ = writeln!(out, "      invoke: lib:thulasi-ram/build");
+    let _ = writeln!(out, "      with: {{ {} }}", with.join(", "));
+    let _ = write!(
+        out,
+        "The old step's `env`, `retry` and `artifacts` are not carried over: an invoke step \
+         does not take them. The library cannot pull a private base image yet.\n\
+         An org admin must first install lib:thulasi-ram/build and trust it for the build \
+         sandbox, and with the registry credential to push: see {BUILD_LIBRARY_DOCS}"
+    );
+    out
+}
+
 /// The Pipeline check's answer to `deployment_requests` and `gate: deployment`,
 /// both removed by ADR-0074: it names what replaces them.
 pub const RETIRED_DEPLOYMENTS: &str = "deployments are no longer recorded by Scarab \
     (ADR-0074); mark the step `deploy: true` and wait for your CD tool in a step (for \
     example `argocd app wait`)";
+
+/// The env Scarab sets on a sandboxed or `registry_auth` Step at each launch
+/// (ADR-0018, amendment of 2026-11-12): `true` for a fork pull request, or a
+/// Run locked out of its Environment's secrets, else `false`, read from the
+/// Run's stored lock and its recorded trigger. The build library's build
+/// Step stops exporting its cache, and its push Step stops pushing, when it
+/// is `true`. No Step may set it.
+pub const FORK_PR_ENV: &str = "SCARAB_FORK_PR";
 
 /// The env names Scarab itself sets in a Step's Pod or process: the
 /// executors' fence, results, artifacts, OIDC and workspace variables, and
@@ -449,7 +573,8 @@ pub const RETIRED_DEPLOYMENTS: &str = "deployments are no longer recorded by Sca
 /// entry under one of these names would be overwritten or would overwrite
 /// Scarab's, so a templated value may not use one on a `forge_token` Step.
 /// `scarab-executor-k8s` checks that every `SCARAB_*` name it sets is here.
-pub const SCARAB_SET_ENV: [&str; 10] = [
+pub const SCARAB_SET_ENV: [&str; 11] = [
+    FORK_PR_ENV,
     "SCARAB_RUN",
     "SCARAB_STEP",
     "SCARAB_ATTEMPT",
@@ -656,13 +781,22 @@ pub struct StepSpec {
     /// refuses the Run when the Step may not have it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forge_token: Option<ForgeToken>,
-    /// If set, this is a **build** step (ADR-0018): a first-class rootless
-    /// BuildKit image build. The engine runs the blessed BuildKit image
-    /// (never the author's); the context/dockerfile are workspace-relative,
-    /// so a build step normally `needs` the checkout. Image-less like
-    /// `gate`.
+    /// The Step receives the Run's registry credential (ADR-0018, amendment
+    /// of 2026-11-12): resolved when each Attempt launches from the
+    /// `REGISTRY_AUTH` secret (Repo scope, then Org scope), else the
+    /// credential the forge derives for its own registry, and mounted as a
+    /// dockerconfigjson at `/scarab/registry/config.json` with
+    /// `DOCKER_CONFIG` pointing at it. Never an environment variable. A
+    /// fork pull request gets none, and the forge-derived credential reaches
+    /// only a Step whose library the org trusts with forge credentials.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub registry_auth: bool,
+    /// Removed by the ADR-0018 amendment of 2026-11-12: the `build` Step
+    /// kind, replaced by `invoke: lib:thulasi-ram/build`. Kept as raw data
+    /// only so the Pipeline check can refuse it with [`retired_build`]
+    /// instead of an unknown-field error. Nothing reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build: Option<BuildSpec>,
+    pub build: Option<serde_json::Value>,
     /// If set, this is an **invoke** step (ADR-0038, ADR-0076 §1): the library
     /// it inlines *at compile time*, named with a prefix: `file:<path>` (a
     /// repo-relative library file, read at the caller's ref; no absolute
@@ -783,8 +917,10 @@ pub struct StepSpec {
     /// onto the step's Pod. Empty = the operator's `default` profile. The author
     /// **names profiles**, never raw k8s — so a pipeline carries no cluster
     /// topology (a bounded name-only reference) and no Kubernetes primitives.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub placement_profiles: Vec<String>,
+    /// An invoke step may name them per library Step instead
+    /// ([`PlacementProfiles::PerStep`]); a compiled Step holds a list.
+    #[serde(default, skip_serializing_if = "PlacementProfiles::is_empty")]
+    pub placement_profiles: PlacementProfiles,
     /// Requested compute resources (ADR-0055): exact `cpu`/`memory`, applied to the
     /// step container's requests/limits. Deliberately **not** named `size` tiers —
     /// state the specifics.
@@ -1120,16 +1256,26 @@ impl StepSpec {
         self.gate.as_deref() == Some("manual") && self.environment_approval_gate != Some(false)
     }
 
-    /// Is this a build step (ADR-0018 rootless image build)?
-    pub fn is_build(&self) -> bool {
-        self.build.is_some()
-    }
-
     /// Is this an image-less invoke step (a compile-time library inline point)?
     /// True only in authored YAML — [`compile_yaml_with_libs`] resolves every
     /// invoke step away, so a compiled IR never contains one.
     pub fn is_invoke(&self) -> bool {
         self.invoke.is_some()
+    }
+
+    /// The sandbox this Step asks for (`security.sandbox`), if any.
+    pub fn sandbox(&self) -> Option<Sandbox> {
+        self.security.as_ref().and_then(|s| s.sandbox)
+    }
+
+    /// Whether the library that defines this Step (the last link of its
+    /// `origin`) is an installed library: `false` for a Step written in the
+    /// Pipeline file or in a `file:` library, which are the repository's own
+    /// code.
+    pub fn from_installed_library(&self) -> bool {
+        self.origin
+            .last()
+            .is_some_and(|link| link.kind == OriginKind::Library)
     }
 }
 
@@ -1152,12 +1298,41 @@ pub struct StepSecurity {
     /// node-escape hammer.
     #[serde(default, skip_serializing_if = "is_false")]
     pub privileged: bool,
+    /// The sandbox this Step runs in (ADR-0018, amendment of 2026-11-12).
+    /// Only a Step from an installed library may ask for one, and Run
+    /// creation admits it only when the org trusts that library's source
+    /// for the sandbox. It cannot be combined with `run_as_root`,
+    /// `add_capabilities` or `privileged`. Not an ADR-0039 grant:
+    /// [`is_baseline`](Self::is_baseline) does not count it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<Sandbox>,
 }
 
 impl StepSecurity {
     /// Does this request any escalation at all?
     pub fn is_baseline(&self) -> bool {
         !self.run_as_root && !self.privileged && self.add_capabilities.is_empty()
+    }
+}
+
+/// A sandbox a Step may run in (ADR-0018, amendment of 2026-11-12). Each
+/// value is a fixed Pod shape the executor applies; an author picks one by
+/// name and sets nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Sandbox {
+    /// What rootless BuildKit needs: uid 1000, not root, not privileged,
+    /// privilege escalation allowed (for the setuid `newuidmap`), seccomp
+    /// `Unconfined` and AppArmor `unconfined`.
+    #[serde(rename = "rootless-buildkit")]
+    RootlessBuildkit,
+}
+
+impl Sandbox {
+    /// The name an author writes, and the one Policies read.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Sandbox::RootlessBuildkit => "rootless-buildkit",
+        }
     }
 }
 
@@ -1178,7 +1353,7 @@ fn is_false(b: &bool) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct ServiceSpec {
     /// The OCI image (e.g. `postgres:16`). Serde-defaulted so an absent image
-    /// surfaces as a validation diagnostic, not a parse error (cf. `BuildSpec`).
+    /// surfaces as a validation diagnostic, not a parse error.
     #[serde(default)]
     pub image: String,
     /// Optional command (entrypoint) override — the image default when empty.
@@ -1500,88 +1675,6 @@ pub struct CacheSpec {
     pub key: Vec<String>,
 }
 
-/// Configuration of a `build` step (ADR-0018): what to build and where to
-/// push. Registry credentials are NEVER authored here — they are a scoped
-/// `REGISTRY_AUTH` secret (ADR-0037) or derived from the forge connection.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BuildSpec {
-    /// Workspace-relative build context directory (default `.`).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub context: String,
-    /// Dockerfile name within the context (default `Dockerfile`).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub dockerfile: String,
-    /// The image reference to build (and push), e.g. `ghcr.io/acme/app:v1`.
-    /// Serde-defaulted so an absent tag surfaces as a validation diagnostic,
-    /// not a parse error.
-    #[serde(default)]
-    pub image: String,
-    /// Push the built image (default false — build-only validation).
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub push: bool,
-}
-
-/// What is wrong with a `build` step's context, dockerfile and image, one
-/// message per problem; empty when they may be built (git-bug df660b6).
-///
-/// The context and dockerfile become `buildctl` local sources in a container
-/// that also holds the registry credential, so they must stay inside the
-/// workspace: relative, with no `..` component and no control character. An
-/// empty context or dockerfile is the default (`.`, `Dockerfile`). The image
-/// is one field of `buildctl --output`, which is comma-separated, so it must
-/// be an OCI image reference and carry no `,`. Checked when the Pipeline
-/// compiles and again when the step launches, for specs stored before this
-/// check existed.
-pub fn build_target_problems(context: &str, dockerfile: &str, image: &str) -> Vec<String> {
-    let mut problems = Vec::new();
-    for (field, path) in [("build.context", context), ("build.dockerfile", dockerfile)] {
-        if path.is_empty() {
-            continue;
-        }
-        if path.starts_with('/') {
-            problems.push(format!(
-                "`{field}` must be a path relative to the workspace, not `{}`",
-                path.escape_debug()
-            ));
-        }
-        if path.split('/').any(|part| part == "..") {
-            problems.push(format!(
-                "`{field}` must not contain a `..` path component: `{}`",
-                path.escape_debug()
-            ));
-        }
-        // `buildctl` reads `--local` and `--opt` values as `key=value`; a
-        // comma could start a second field if its parser ever splits on it.
-        if path.contains(',') {
-            problems.push(format!(
-                "`{field}` must not contain a `,`: `{}`",
-                path.escape_debug()
-            ));
-        }
-        if path.chars().any(char::is_control) {
-            problems.push(format!(
-                "`{field}` must not contain a control character: `{}`",
-                path.escape_debug()
-            ));
-        }
-    }
-    if image.is_empty() {
-        problems.push("a build step must name the `image:` to build".to_string());
-    } else if image.contains("${{") {
-        problems.push(format!(
-            "`build.image` `{}`: templates are not supported in `build.image` yet",
-            image.escape_debug()
-        ));
-    } else if image.contains(',') || !crate::oci::is_image_reference(image) {
-        problems.push(format!(
-            "`build.image` `{}` is not an image reference",
-            image.escape_debug()
-        ));
-    }
-    problems
-}
-
 /// A step's opt-in retry policy (ADR-0020 syntax, ADR-0047 semantics).
 ///
 /// ⚠ **At-least-once warning** (surfaced verbatim to authors): *retry re-runs
@@ -1635,6 +1728,155 @@ pub struct Matrix {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct When(pub String);
 
+/// A Step's `placement_profiles` (ADR-0055): the [`PlacementProfile`] names
+/// it runs on. Written as a list on any Step. An invoke step may instead
+/// write a map from a Step id of the library it invokes to that Step's list
+/// (`{ image: [arm64], push: [ecr-push] }`), so each library Step gets its
+/// own profiles; inlining resolves the map, and a compiled Step always holds
+/// a list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementProfiles {
+    /// The same profiles for the Step, or for every Step an invoke inlines.
+    List(Vec<String>),
+    /// An invoke step's profiles per library Step id.
+    PerStep(BTreeMap<String, Vec<String>>),
+}
+
+impl Default for PlacementProfiles {
+    fn default() -> Self {
+        PlacementProfiles::List(Vec::new())
+    }
+}
+
+impl From<Vec<String>> for PlacementProfiles {
+    fn from(list: Vec<String>) -> Self {
+        PlacementProfiles::List(list)
+    }
+}
+
+impl PlacementProfiles {
+    /// No profile is named, in either form.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            PlacementProfiles::List(l) => l.is_empty(),
+            PlacementProfiles::PerStep(m) => m.is_empty(),
+        }
+    }
+
+    /// The list a Step runs on. A map (which only an invoke step holds
+    /// before inlining) names no profile for the invoke step itself.
+    pub fn as_list(&self) -> &[String] {
+        match self {
+            PlacementProfiles::List(l) => l,
+            PlacementProfiles::PerStep(_) => &[],
+        }
+    }
+
+    /// The list a compiled Step runs on. Inlining resolves every map, so a
+    /// map here means a Step was not compiled; the caller refuses it rather
+    /// than run the Step on no profile.
+    pub fn compiled(&self) -> Result<&[String], String> {
+        match self {
+            PlacementProfiles::List(l) => Ok(l),
+            PlacementProfiles::PerStep(_) => Err(
+                "`placement_profiles` is still a map from step id, which only an invoke step \
+                 may hold before it is inlined"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// Every profile name written, in either form.
+    pub fn names(&self) -> impl Iterator<Item = &String> {
+        let (list, map) = match self {
+            PlacementProfiles::List(l) => (Some(l), None),
+            PlacementProfiles::PerStep(m) => (None, Some(m)),
+        };
+        list.into_iter()
+            .flatten()
+            .chain(map.into_iter().flat_map(|m| m.values().flatten()))
+    }
+
+    /// The profiles an invoke step gives the library Step `lib_step` (its
+    /// id in the library, or a nested invoke's inlined `<id>/…`): the whole
+    /// list, or the map's entry for the Step's id in the library.
+    fn for_library_step(&self, lib_step: &str) -> &[String] {
+        match self {
+            PlacementProfiles::List(l) => l,
+            PlacementProfiles::PerStep(m) => {
+                // The id as the library writes it: before a nested invoke's
+                // `/` or a matrix coordinate's `[` (whose values may hold
+                // `/`), whichever comes first.
+                let id = lib_step.split(['/', '[']).next().unwrap_or(lib_step);
+                m.get(id).map(Vec::as_slice).unwrap_or(&[])
+            }
+        }
+    }
+}
+
+impl PartialEq<Vec<String>> for PlacementProfiles {
+    fn eq(&self, other: &Vec<String>) -> bool {
+        matches!(self, PlacementProfiles::List(l) if l == other)
+    }
+}
+
+impl PartialEq<Vec<&str>> for PlacementProfiles {
+    fn eq(&self, other: &Vec<&str>) -> bool {
+        matches!(self, PlacementProfiles::List(l) if l == other)
+    }
+}
+
+impl Serialize for PlacementProfiles {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            PlacementProfiles::List(l) => l.serialize(serializer),
+            PlacementProfiles::PerStep(m) => m.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PlacementProfiles {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// Dispatched on the shape, so an error names what was wrong inside
+        /// the list or the map.
+        struct FormVisitor;
+        impl<'de> serde::de::Visitor<'de> for FormVisitor {
+            type Value = PlacementProfiles;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(
+                    "a list of placement profile names, or (on an invoke step) a map from a \
+                     library step id to such a list",
+                )
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<PlacementProfiles, A::Error> {
+                Vec::<String>::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    .map(PlacementProfiles::List)
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<PlacementProfiles, A::Error> {
+                // An empty map names nothing, as an empty list does, and is
+                // read as one so it serializes back to the same value.
+                BTreeMap::<String, Vec<String>>::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )
+                .map(|m| {
+                    if m.is_empty() {
+                        PlacementProfiles::default()
+                    } else {
+                        PlacementProfiles::PerStep(m)
+                    }
+                })
+            }
+        }
+        deserializer.deserialize_any(FormVisitor)
+    }
+}
+
 /// A **PlacementProfile** (ADR-0055): an operator-owned, cluster-scoped named
 /// bundle mapping a `name` → concrete Kubernetes placement (nodeSelector /
 /// tolerations / runtimeClass / annotations — an *opaque overlay*). It lives in
@@ -1658,6 +1900,16 @@ pub struct PlacementProfile {
     /// change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub k8s: Option<serde_json::Value>,
+    /// The profile carries a registry credential (a ServiceAccount with a
+    /// push role, an init container that logs in): the executor applies it
+    /// only to a Step with `registry_auth` whose credential the launch
+    /// resolved (a trusted library, not a fork). Named on any other Step it
+    /// fails the launch; on a `registry_auth` Step that gets no credential
+    /// it is left out. An author names profiles, so this, not a Policy, is
+    /// what keeps a push credential off a Step that runs repository code.
+    /// It cannot be the `default` profile. Absent: `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub registry_auth_only: bool,
 }
 
 /// A **RetentionProfile** (ADR-0065 s2, git-bug 82c5775): an operator-owned,
@@ -2006,6 +2258,14 @@ fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineErr
     // Inline `invoke:` steps first (ADR-0038): the result is a flat step list
     // with no invoke steps, over which matrix expansion and validation run
     // unchanged. A library's own matrices thus expand normally.
+    // A `build:` Step is refused with its replacement, which names the
+    // `needs` as written (`checkout`), not as compiled (`checkout/git`).
+    let written_build_needs: BTreeMap<String, Vec<String>> = authored
+        .steps
+        .iter()
+        .filter(|s| s.build.is_some())
+        .map(|s| (s.id.clone(), s.needs.0.clone()))
+        .collect();
     let authored_steps =
         inline_invokes(&authored.steps, libs).map_err(PipelineError::Validation)?;
 
@@ -2119,7 +2379,7 @@ fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineErr
             "the pipeline",
         )]));
     }
-    validate(&ir).map_err(PipelineError::Validation)?;
+    validate_with(&ir, &written_build_needs).map_err(PipelineError::Validation)?;
     Ok(ir)
 }
 
@@ -2756,6 +3016,7 @@ fn invoke_step_extra_fields(step: &StepSpec) -> Vec<&'static str> {
         ("gate_after", step.gate_after.is_some()),
         ("clone", step.clone.is_some()),
         ("forge_token", step.forge_token.is_some()),
+        ("registry_auth", step.registry_auth),
         ("build", step.build.is_some()),
         ("artifacts", !step.artifacts.is_empty()),
         ("inputs", step.inputs.is_some()),
@@ -3187,6 +3448,41 @@ fn inline_level(
                 }
             }
         }
+        // A per-Step map names the library's own Step ids; a key naming
+        // none would place nothing, so it is refused. A Step that keeps its
+        // own profiles, a gate and a `forge_token` Step take none from it.
+        if let PlacementProfiles::PerStep(map) = &step.placement_profiles {
+            for (key, names) in map {
+                match lib.steps.iter().find(|s| &s.id == key) {
+                    None => diagnostics.push(format!(
+                        "step `{}`: `placement_profiles` names step `{key}`, which library \
+                         `{label}` does not have",
+                        step.id
+                    )),
+                    Some(target) if target.forge_token.is_some() => diagnostics.push(format!(
+                        "step `{}`: `placement_profiles` names step `{key}` of library \
+                         `{label}`, which has `forge_token`; an invoke gives such a step no \
+                         placement profile",
+                        step.id
+                    )),
+                    Some(target) if !target.placement_profiles.is_empty() => {
+                        diagnostics.push(format!(
+                            "step `{}`: `placement_profiles` names step `{key}` of library \
+                             `{label}`, which sets its own placement profiles; the library's \
+                             own value wins, so these would never apply",
+                            step.id
+                        ))
+                    }
+                    Some(_) => {}
+                }
+                if names.iter().any(|p| p.trim().is_empty()) {
+                    diagnostics.push(format!(
+                        "step `{}`: `placement_profiles.{key}` contains an empty profile name",
+                        step.id
+                    ));
+                }
+            }
+        }
         // This library is the outermost link so far of every Step it
         // inlines: the nested levels already recorded theirs.
         let link = OriginEntry {
@@ -3236,7 +3532,7 @@ fn inline_level(
                 if (step.deploy || lib.deploy) && !inst.is_gate() {
                     inst.deploy = true;
                 }
-                carry_invoke_fields(inv, &mut inst);
+                carry_invoke_fields(inv, &ls.id, &mut inst);
                 // Entry seam: a library root inherits the invoke step's upstreams;
                 // an internal need is namespaced.
                 inst.needs = if ls.needs.0.is_empty() {
@@ -4032,8 +4328,18 @@ fn invoke_output_scope(step: &mut StepSpec, exposed: &BTreeMap<String, Option<Ve
 /// invoke Step's own scope. `env` never carries, and `placement_profiles`
 /// never carries onto a Step with `forge_token` (ADR-0076 §1): a placement
 /// profile is an arbitrary Pod patch, so a caller could otherwise place a
-/// trusted Step next to its own.
-fn carry_invoke_fields(invoke: &StepSpec, inst: &mut StepSpec) {
+/// Step holding a long-lived forge token next to its own. It does carry onto
+/// a Step with `registry_auth` or a `security.sandbox` (ADR-0018 amendment of
+/// 2026-11-12): profiles are written by the operator and an author can only
+/// name one, and a build for another architecture needs that architecture's
+/// nodes. A profile that carries a registry credential is marked
+/// [`PlacementProfile::registry_auth_only`] by the operator, and the executor
+/// refuses to apply it to any Step but a `registry_auth` Step the launch
+/// found eligible for a credential; so a list naming one fails the sandboxed
+/// build Step, and the author writes the map form instead. Written as a map
+/// from library Step id, each Step gets only its own entry. `lib_step` is the
+/// Step's id in the library.
+fn carry_invoke_fields(invoke: &StepSpec, lib_step: &str, inst: &mut StepSpec) {
     if !inst.is_gate() {
         if inst.timeout.is_none() {
             inst.timeout = invoke.timeout;
@@ -4045,7 +4351,12 @@ fn carry_invoke_fields(invoke: &StepSpec, inst: &mut StepSpec) {
             inst.resources.memory_mib = invoke.resources.memory_mib;
         }
         if inst.placement_profiles.is_empty() && inst.forge_token.is_none() {
-            inst.placement_profiles = invoke.placement_profiles.clone();
+            inst.placement_profiles = PlacementProfiles::List(
+                invoke
+                    .placement_profiles
+                    .for_library_step(lib_step)
+                    .to_vec(),
+            );
         }
     }
 }
@@ -4117,17 +4428,18 @@ fn validate_interface(
         }
     }
 
-    // An input that reaches a Step with `forge_token` must be a value the
-    // library can check (ADR-0076 §2): a free string would let the caller
-    // write into a Step that holds a forge credential.
-    for (name, lib_step) in forge_token_input_reads(lib) {
+    // An input that reaches a Step with `forge_token`, `registry_auth` or a
+    // `security.sandbox` must be a value the library can check (ADR-0076 §2,
+    // ADR-0018 amendment of 2026-11-12): a free string would let the caller
+    // write into a Step that holds a credential or runs with seccomp off.
+    for (name, lib_step, what) in guarded_input_reads(lib) {
         let Some(p) = iface.inputs.iter().find(|p| p.name == name) else {
             continue; // an undeclared input is reported where it is read
         };
         if p.r#type == ParamType::String && p.validate.is_none() {
             diagnostics.push(format!(
                 "library `{key}`: input `{name}` reaches step `{lib_step}`, which has \
-                 `forge_token`; declare it as a `boolean`, a `number`, a `choice`, or a \
+                 {what}; declare it as a `boolean`, a `number`, a `choice`, or a \
                  `string` with a `validate:` rule"
             ));
         }
@@ -4255,12 +4567,31 @@ fn check_with(step: &StepSpec, what: &str, inputs: &[ParamSpec], diagnostics: &m
     }
 }
 
-/// Each `(input, step)` where a library Step with `forge_token` reads
+/// What a Step holds that its inputs must be checked for: `forge_token`,
+/// a `security.sandbox` or `registry_auth`, named as a message names it;
+/// `None` for a Step with none of them.
+fn guarded_by(step: &StepSpec) -> Option<&'static str> {
+    if step.forge_token.is_some() {
+        Some("`forge_token`")
+    } else if step.sandbox().is_some() {
+        Some("`security.sandbox`")
+    } else if step.registry_auth {
+        Some("`registry_auth`")
+    } else {
+        None
+    }
+}
+
+/// Each `(input, step, what)` where a library Step with `forge_token`, a
+/// sandbox or `registry_auth` ([`guarded_by`], named by `what`) reads
 /// `inputs.<input>` in its image, command or env, once per pair. A read of
 /// `inputs` whole counts as a read of every input.
-fn forge_token_input_reads(lib: &PipelineIr) -> BTreeSet<(String, String)> {
+fn guarded_input_reads(lib: &PipelineIr) -> BTreeSet<(String, String, &'static str)> {
     let mut out = BTreeSet::new();
-    for step in lib.steps.iter().filter(|s| s.forge_token.is_some()) {
+    for step in &lib.steps {
+        let Some(what) = guarded_by(step) else {
+            continue;
+        };
         let mut texts: Vec<&str> = vec![step.image.as_str()];
         texts.extend(step.command.iter().map(String::as_str));
         texts.extend(step.env.iter().map(|(_, v)| v.as_str()));
@@ -4272,11 +4603,11 @@ fn forge_token_input_reads(lib: &PipelineIr) -> BTreeSet<(String, String)> {
                 for r in reads.into_iter().filter(|r| r.var == "inputs") {
                     match r.first {
                         Some(name) => {
-                            out.insert((name, step.id.clone()));
+                            out.insert((name, step.id.clone(), what));
                         }
                         None => {
                             for p in &lib.interface.inputs {
-                                out.insert((p.name.clone(), step.id.clone()));
+                                out.insert((p.name.clone(), step.id.clone(), what));
                             }
                         }
                     }
@@ -4602,7 +4933,7 @@ pub fn lint(ir: &PipelineIr) -> Vec<String> {
         let images = std::iter::once(step.image.as_str())
             .chain(step.services.iter().map(|svc| svc.image.as_str()));
         for image in images {
-            // Empty (a gate, clone or build) or computed at launch: nothing
+            // Empty (a gate) or computed at launch: nothing
             // to check here.
             if image.is_empty() || image.contains("${{") || image.contains("@sha256:") {
                 continue;
@@ -5428,6 +5759,16 @@ fn validate_output_reads(ir: &PipelineIr, diagnostics: &mut Vec<String>) {
 }
 
 pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
+    validate_with(ir, &BTreeMap::new())
+}
+
+/// [`validate`], given the `needs` each `build:` Step was written with
+/// (by id), for the replacement its diagnostic suggests; a Step not listed
+/// uses its compiled `needs`.
+fn validate_with(
+    ir: &PipelineIr,
+    written_build_needs: &BTreeMap<String, Vec<String>>,
+) -> Result<(), Vec<String>> {
     let mut diagnostics = Vec::new();
 
     if ir.ir_version > IR_VERSION_MAX {
@@ -5466,6 +5807,7 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         ids.insert(step.id.as_str());
     }
 
+    let mut retired_builds = BTreeSet::new();
     for step in &ir.steps {
         // Compile invariants: matrices and invokes are resolved away by now.
         if step.matrix.is_some() {
@@ -5478,30 +5820,124 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         if step.clone.is_some() {
             diagnostics.push(format!("step `{}`: {RETIRED_CLONE}", step.id));
         }
-        // Step kinds are mutually exclusive: a step is a gate, a build, or an
-        // ordinary executed step — never two at once.
-        if step.gate.is_some() && step.build.is_some() {
+        // So is the `build` kind (ADR-0018, amendment of 2026-11-12). Its
+        // answer is the replacement, and nothing else: the checks below
+        // would only report what a build Step never had (an image, say). A
+        // matrix's copies of one Step get one answer, under the id written.
+        if step.build.is_some() {
+            let id = if step.matrix_values.is_empty() {
+                step.id.as_str()
+            } else {
+                step.id.split('[').next().unwrap_or(&step.id)
+            };
+            if retired_builds.insert(id) {
+                diagnostics.push(retired_build(&RetiredBuild {
+                    id,
+                    build: step.build.as_ref(),
+                    needs: written_build_needs
+                        .get(id)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&step.needs.0),
+                    when: step.when.as_ref().map(|w| w.0.as_str()),
+                    timeout: step.timeout,
+                    resources: Some(&step.resources),
+                    placement_profiles: step.placement_profiles.as_list(),
+                }));
+            }
+            continue;
+        }
+        // Whether the Run is a fork pull request is Scarab's to say: a Step
+        // that set it could turn a fork's build into one that pushes.
+        if step.env.iter().any(|(name, _)| name == FORK_PR_ENV) {
             diagnostics.push(format!(
-                "step `{}`: `gate` and `build` are mutually exclusive step kinds",
+                "step `{}`: env `{FORK_PR_ENV}` is set by Scarab when a sandboxed or \
+                 `registry_auth` step launches; a Pipeline or library may not set it",
                 step.id
             ));
         }
         // A forge credential is for a Step that runs a Pod with an image the
-        // Pipeline names: a gate runs nothing, and a build runs BuildKit,
-        // which reads its registry credential, not the forge's (ADR-0076 §9).
-        if step.forge_token.is_some() && (step.is_gate() || step.is_build()) {
+        // Pipeline names: a gate runs nothing (ADR-0076 §9).
+        if step.forge_token.is_some() && step.is_gate() {
             diagnostics.push(format!(
                 "step `{}`: `forge_token` is only valid on a step that runs an image (not a \
-                 gate or build step)",
+                 gate)",
                 step.id
             ));
         }
-        // The image and command of a Step that holds a forge credential are
-        // written where the Step is written (ADR-0076 §2): a `${{ … }}` in
-        // either would let a value from outside (a caller's input, a Step's
-        // result, the trigger) choose what runs beside the token. Outside
-        // values reach it only through `env:`.
-        if step.forge_token.is_some() {
+        // The sandbox and the registry credential (ADR-0018, amendment of
+        // 2026-11-12) are for a Step that runs an image: a gate runs
+        // nothing.
+        if let Some(sandbox) = step.sandbox() {
+            if step.is_gate() {
+                diagnostics.push(format!(
+                    "step `{}`: `security.sandbox` is only valid on a step that runs an image \
+                     (not a gate)",
+                    step.id
+                ));
+            }
+            // The sandbox is a fixed Pod shape; an ADR-0039 grant would change
+            // it.
+            if let Some(sec) = &step.security {
+                if !sec.is_baseline() {
+                    diagnostics.push(format!(
+                        "step `{}`: `security.sandbox: {}` cannot be combined with \
+                         `run_as_root`, `add_capabilities` or `privileged`",
+                        step.id,
+                        sandbox.as_str()
+                    ));
+                }
+            }
+            // Which Steps may run in the sandbox is decided by where they are
+            // written: a Step in the Pipeline file, or in a `file:` library,
+            // is the repository's own code and would choose the command that
+            // runs with seccomp off. Run creation then checks that the org
+            // trusts the installed library's source for the sandbox.
+            if !step.from_installed_library() {
+                diagnostics.push(format!(
+                    "step `{}`: `security.sandbox` is only for a Step from an installed library \
+                     (`invoke: lib:<publisher>/<name>`); a Step written in the Pipeline file or \
+                     reached through `invoke: file:` never runs in the sandbox",
+                    step.id
+                ));
+            }
+            // A secret would sit in the container that runs with seccomp off
+            // and, with `registry_auth`, holds the registry credential.
+            if !step.secrets.is_empty() {
+                diagnostics.push(format!(
+                    "step `{}`: a step with `security.sandbox` must not set `secrets:`",
+                    step.id
+                ));
+            }
+        }
+        if step.registry_auth && step.is_gate() {
+            diagnostics.push(format!(
+                "step `{}`: `registry_auth` is only valid on a step that runs an image (not a \
+                 gate)",
+                step.id
+            ));
+        }
+        // The image and command of a Step that holds a forge or registry
+        // credential, or runs in the sandbox, are written where the Step is
+        // written (ADR-0076 §2): a `${{ … }}` in either would let a value
+        // from outside (a caller's input, a Step's result, the trigger)
+        // choose what runs beside the credential or with seccomp off.
+        // Outside values reach it only through `env:`.
+        let holder = if step.forge_token.is_some() {
+            Some(("`forge_token`", "a forge credential is mounted beside them"))
+        } else if step.sandbox().is_some() {
+            Some((
+                "`security.sandbox`",
+                "the Step runs with seccomp and AppArmor off",
+            ))
+        } else if step.registry_auth {
+            Some((
+                "`registry_auth`",
+                "a registry credential is mounted beside them",
+            ))
+        } else {
+            None
+        };
+        if let Some((holder, beside)) = holder {
             let mut templated: Vec<String> = Vec::new();
             if step.image.contains("${{") {
                 templated.push("`image`".to_string());
@@ -5513,7 +5949,7 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
             }
             for field in templated {
                 diagnostics.push(format!(
-                    "step `{}`: {field} holds `${{{{ … }}}}`, and the step has `forge_token`; \
+                    "step `{}`: {field} holds `${{{{ … }}}}`, and the step has {holder}; \
                      its image and command must be written out in full, and a value from an \
                      input, a result or the trigger may reach it only through `env:`",
                     step.id
@@ -5531,7 +5967,7 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 if !templated_env_name_ok(name) {
                     diagnostics.push(format!(
                         "step `{}`: env `{name}` holds `${{{{ … }}}}`, and the step has \
-                         `forge_token`; a value from an input, a result or the trigger may \
+                         {holder}; a value from an input, a result or the trigger may \
                          reach only an env name of the form `SCARAB_<NAME>` (upper-case \
                          letters, digits and `_`), because other names (`PATH`, \
                          `LD_PRELOAD`, `GIT_SSH_COMMAND`, …) can make the value run as code",
@@ -5540,7 +5976,7 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 } else if scarab_sets_env(name) {
                     diagnostics.push(format!(
                         "step `{}`: env `{name}` holds `${{{{ … }}}}`, and the step has \
-                         `forge_token`; Scarab sets `{name}` itself, so pick another \
+                         {holder}; Scarab sets `{name}` itself, so pick another \
                          `SCARAB_<NAME>`",
                         step.id
                     ));
@@ -5550,9 +5986,8 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
             // same key, and those may be the repository's own Steps.
             if step.cache.is_some() {
                 diagnostics.push(format!(
-                    "step `{}`: `cache` is not allowed on a step with `forge_token`: a cache \
-                     restores files other Steps saved, and a forge credential is mounted beside \
-                     them",
+                    "step `{}`: `cache` is not allowed on a step with {holder}: a cache \
+                     restores files other Steps saved, and {beside}",
                     step.id
                 ));
             }
@@ -5561,9 +5996,18 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         // Placement (ADR-0055): profile names must be non-empty, and a raw
         // `k8s_overlay`, if present, must be a JSON object (a pod-spec fragment) —
         // never a scalar/array — so it can strategic-merge onto the Pod.
-        if step.placement_profiles.iter().any(|p| p.trim().is_empty()) {
+        if step.placement_profiles.names().any(|p| p.trim().is_empty()) {
             diagnostics.push(format!(
                 "step `{}`: `placement_profiles` contains an empty profile name",
+                step.id
+            ));
+        }
+        // Inlining resolves an invoke step's map, so a map left here was
+        // written on a Step that invokes nothing.
+        if matches!(step.placement_profiles, PlacementProfiles::PerStep(_)) {
+            diagnostics.push(format!(
+                "step `{}`: `placement_profiles` may be a map from step id only on an invoke \
+                 step; write a list of profile names",
                 step.id
             ));
         }
@@ -5577,11 +6021,11 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         }
         // Sidecar services (ADR-0058): a service co-locates in the *executed*
         // Step's Pod, so it is only meaningful on an ordinary step — never on a
-        // gate (no Pod) or a build (rootless BuildKit).
-        if !step.services.is_empty() && (step.is_gate() || step.is_build()) {
+        // gate (no Pod).
+        if !step.services.is_empty() && step.is_gate() {
             diagnostics.push(format!(
                 "step `{}`: `services` is only valid on an ordinary executed step \
-                 (not a gate or build step)",
+                 (not a gate)",
                 step.id
             ));
         }
@@ -5611,47 +6055,6 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 diagnostics.push(format!(
                     "step `{}`: `uses` names unknown shared service `{name}` \
                      (declare it under pipeline-level `services:`)",
-                    step.id
-                ));
-            }
-        }
-        // A build step runs the blessed rootless BuildKit image (ADR-0018):
-        // the author names no image/command and needs no privilege (rootless
-        // by construction).
-        if let Some(build) = &step.build {
-            for problem in build_target_problems(&build.context, &build.dockerfile, &build.image) {
-                diagnostics.push(format!("step `{}`: {problem}", step.id));
-            }
-            if !step.image.is_empty() || !step.command.is_empty() {
-                diagnostics.push(format!(
-                    "step `{}`: a build step runs the blessed BuildKit image — it must not \
-                     set an image or command",
-                    step.id
-                ));
-            }
-            if step.security.as_ref().is_some_and(|s| !s.is_baseline()) {
-                diagnostics.push(format!(
-                    "step `{}`: a build step is rootless by construction — it must not request \
-                     privilege escalation",
-                    step.id
-                ));
-            }
-            // The build container holds the registry credential and runs the
-            // repository's Dockerfile: env such as `PATH` or `LD_PRELOAD`
-            // would choose what code runs there, and a secret would sit beside
-            // the credential (git-bug df660b6).
-            if !step.env.is_empty() {
-                diagnostics.push(format!(
-                    "step `{}`: a build step must not set `env:`; build options come from \
-                     `build:` (build args are not supported yet)",
-                    step.id
-                ));
-            }
-            if !step.secrets.is_empty() {
-                diagnostics.push(format!(
-                    "step `{}`: a build step must not set `secrets:`; they would sit in the \
-                     container that holds the registry credential and runs the repository's \
-                     Dockerfile",
                     step.id
                 ));
             }
@@ -5772,7 +6175,7 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                         step.id
                     ));
                 }
-                if step.image.is_empty() && !step.is_build() && step.clone.is_none() {
+                if step.image.is_empty() && step.clone.is_none() && step.build.is_none() {
                     diagnostics.push(format!("step `{}`: missing image", step.id));
                 }
                 if step.gate_after.is_some() {
@@ -6690,11 +7093,13 @@ mod tests {
                 name: "arm64".into(),
                 default: false,
                 k8s: None,
+                registry_auth_only: false,
             },
             PlacementProfile {
                 name: "big".into(),
                 default: true,
                 k8s: None,
+                registry_auth_only: false,
             },
         ];
         assert_eq!(
@@ -9693,10 +10098,713 @@ mod tests {
         assert!(!plain.is_deploy());
     }
 
+    // --- the build sandbox and registry credential (ADR-0018, 2026-11-12) ---
+
+    /// `libs/build.yaml`, as the release ships it.
+    const BUILD_LIBRARY: &str = include_str!("../../../libs/build.yaml");
+    const BUILD_SOURCE: &str =
+        "github.com/thulasi-ram/scarab-ci//libs/build.yaml@1111111111111111111111111111111111111111";
+
+    fn with_build_library() -> Libraries {
+        Libraries {
+            files: BTreeMap::new(),
+            installed: installed(&[("thulasi-ram/build", BUILD_SOURCE, BUILD_LIBRARY)]),
+            plugin_gates: Default::default(),
+        }
+    }
+
+    /// A one-Step library whose Step runs in the sandbox.
+    const SANDBOXED_LIB: &str = r#"
+        kind: library
+        steps:
+          - id: run
+            image: "moby/buildkit:rootless@sha256:5987568f92dafbfb679879de59c1cd8d26597f5f6635c314e166164e2615870c"
+            command: [buildctl-daemonless.sh, build]
+            security: { sandbox: rootless-buildkit }
+        "#;
+
+    /// The sandbox is a fixed Pod shape: an ADR-0039 grant beside it, or a
+    /// gate asking for it or for `registry_auth`, does not compile.
+    #[test]
+    fn the_sandbox_cannot_be_combined_with_a_grant_or_a_step_kind() {
+        for security in [
+            "{ sandbox: rootless-buildkit, run_as_root: true }",
+            "{ sandbox: rootless-buildkit, privileged: true }",
+            "{ sandbox: rootless-buildkit, add_capabilities: [NET_ADMIN] }",
+        ] {
+            let lib = SANDBOXED_LIB.replace("{ sandbox: rootless-buildkit }", security);
+            let libs = Libraries {
+                installed: installed(&[("acme/b", "github.com/acme/libs//b.yaml@0", lib.as_str())]),
+                ..Default::default()
+            };
+            let errs = library_errors("steps: [{ id: b, invoke: lib:acme/b }]", &libs);
+            assert!(
+                errs.iter().any(|e| e.starts_with("step `b/run`: ")
+                    && e.contains("cannot be combined with `run_as_root`")),
+                "{security}: {errs:?}"
+            );
+        }
+        let errs =
+            errors("steps: [{ id: g, gate: manual, security: { sandbox: rootless-buildkit } }]");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("`security.sandbox` is only valid on a step that runs")),
+            "{errs:?}"
+        );
+        let errs = errors("steps: [{ id: g, gate: manual, registry_auth: true }]");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("`registry_auth` is only valid on a step that runs")),
+            "{errs:?}"
+        );
+        let err = parse_error(
+            "steps: [{ id: b, image: x, command: [y], security: { sandbox: privileged } }]",
+        );
+        assert!(err.contains("rootless-buildkit"), "{err}");
+    }
+
+    /// Only a Step from an installed library may run in the sandbox: the
+    /// same Step written in the Pipeline file, or reached through
+    /// `invoke: file:`, does not compile.
+    #[test]
+    fn the_sandbox_is_only_for_a_step_from_an_installed_library() {
+        let own = errors(
+            "steps: [{ id: b, image: x, command: [y], security: { sandbox: rootless-buildkit } }]",
+        );
+        assert!(
+            own.iter().any(|e| e.starts_with("step `b`: ")
+                && e.contains("only for a Step from an installed library")),
+            "{own:?}"
+        );
+        let file = errors_with(
+            "steps: [{ id: b, invoke: file:.scarab/lib/b.yaml }]",
+            &libs(&[(".scarab/lib/b.yaml", SANDBOXED_LIB)]),
+        );
+        assert!(
+            file.iter().any(|e| e.starts_with("step `b/run`: ")
+                && e.contains("only for a Step from an installed library")),
+            "{file:?}"
+        );
+        let libraries = Libraries {
+            installed: installed(&[("acme/b", "github.com/acme/libs//b.yaml@0", SANDBOXED_LIB)]),
+            ..Default::default()
+        };
+        let ir =
+            compile_with_libraries("steps: [{ id: b, invoke: lib:acme/b }]", &libraries).unwrap();
+        assert_eq!(ir.steps[0].sandbox(), Some(Sandbox::RootlessBuildkit));
+        // A library that reads a free string input into a sandboxed Step's
+        // env does not compile: the caller would write into it unchecked.
+        let free = SANDBOXED_LIB
+            .replace(
+                "        steps:",
+                "        interface: { inputs: [{ name: x, type: string }] }\n        steps:",
+            )
+            .replace(
+                "            security:",
+                "            env: [[SCARAB_X, \"${{ inputs.x }}\"]]\n            security:",
+            );
+        let libraries = Libraries {
+            installed: installed(&[("acme/b", "github.com/acme/libs//b.yaml@0", free.as_str())]),
+            ..Default::default()
+        };
+        let errs = library_errors(
+            "steps: [{ id: b, invoke: lib:acme/b, with: { x: y } }]",
+            &libraries,
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("input `x` reaches step `run`")
+                    && e.contains("`security.sandbox`")),
+            "{errs:?}"
+        );
+    }
+
+    /// `libs/build.yaml` installs and compiles to two Steps: `image/image`
+    /// builds in the sandbox and holds no registry credential, and
+    /// `image/push` needs it, holds the credential, has no sandbox and runs
+    /// as root (crane's image has no other user). Both take every input
+    /// through env; the invoke exposes both results; a list of placement
+    /// profiles reaches both Steps and a map routes each list to its Step.
+    #[test]
+    fn the_build_library_compiles_to_a_credential_free_build_and_a_push() {
+        check_installed_library("thulasi-ram/build", BUILD_LIBRARY, &BTreeMap::new())
+            .expect("libs/build.yaml installs");
+        let compile = |placement: &str| {
+            compile_with_libraries(
+                &format!(
+                    r#"
+            on: {{ push: {{}} }}
+            steps:
+              - {{ id: src, image: busybox, command: [echo] }}
+              - id: image
+                invoke: lib:thulasi-ram/build
+                needs: [src]
+                placement_profiles: {placement}
+                with:
+                  image: "registry.example/app:${{{{ event.sha }}}}"
+                  push: "true"
+                  build_args: "A=1\nB_2=two words\n"
+                  cache: s3
+                  cache_bucket: acme-cache
+                  cache_region: ap-south-1
+              - id: deploy
+                image: busybox
+                needs: [image]
+                env:
+                  - [BUILT, "${{{{ outputs.image.image }}}}"]
+                  - [PUSHED, "${{{{ outputs.image.push }}}}"]
+            "#
+                ),
+                &with_build_library(),
+            )
+            .unwrap()
+        };
+        let ir = compile("[arm64]");
+        let step = |id: &str| ir.steps.iter().find(|s| s.id == id).unwrap().clone();
+        let (build, push) = (step("image/image"), step("image/push"));
+        assert_eq!(build.sandbox(), Some(Sandbox::RootlessBuildkit));
+        assert!(!build.registry_auth, "the build Step holds no credential");
+        assert!(push.registry_auth);
+        assert_eq!(push.sandbox(), None);
+        assert!(push.security.as_ref().is_some_and(|s| s.run_as_root));
+        assert_eq!(push.needs.0, vec!["image/image".to_string()]);
+        assert_eq!(build.needs.0, vec!["src".to_string()]);
+        for s in [&build, &push] {
+            assert!(s.from_installed_library());
+            assert!(s.image.contains("@sha256:"), "{}", s.image);
+            assert!(
+                s.command.iter().all(|c| !c.contains("${{")),
+                "no input in the command of {}",
+                s.id
+            );
+            assert_eq!(
+                s.placement_profiles,
+                vec!["arm64"],
+                "a per-architecture build runs on the profile its invoke names"
+            );
+        }
+        assert!(push
+            .image
+            .starts_with("gcr.io/go-containerregistry/crane:debug@sha256:"));
+        let mut needs = step("deploy").needs.0;
+        needs.sort();
+        assert_eq!(
+            needs,
+            ["image/image", "image/push"],
+            "a reader of both outputs needs both Steps"
+        );
+
+        let ir = compile("{ image: [arm64-builders, build-cache], push: [ecr-push] }");
+        let step = |id: &str| ir.steps.iter().find(|s| s.id == id).unwrap().clone();
+        assert_eq!(
+            step("image/image").placement_profiles,
+            vec!["arm64-builders", "build-cache"]
+        );
+        assert_eq!(step("image/push").placement_profiles, vec!["ecr-push"]);
+    }
+
+    /// The build library never asks BuildKit for an insecure entitlement:
+    /// `security.insecure` (a RUN with every capability) needs
+    /// `--allow-insecure-entitlement` on buildkitd and `--allow` on
+    /// buildctl, and a Dockerfile RUN would then be root in the build Pod.
+    /// Only the push Step asks for the registry credential.
+    #[test]
+    fn the_build_library_asks_for_no_insecure_entitlement_and_one_credential() {
+        for word in ["security.insecure", "--allow", "allow-insecure-entitlement"] {
+            assert!(
+                !BUILD_LIBRARY.contains(word),
+                "libs/build.yaml mentions {word}"
+            );
+        }
+        let lib: PipelineIr = serde_yaml::from_str(BUILD_LIBRARY).unwrap();
+        let by_id = |id: &str| lib.steps.iter().find(|s| s.id == id).unwrap();
+        assert!(!by_id("image").registry_auth);
+        assert_eq!(by_id("image").sandbox(), Some(Sandbox::RootlessBuildkit));
+        assert!(by_id("push").registry_auth);
+        assert_eq!(by_id("push").sandbox(), None);
+        assert_eq!(
+            lib.steps
+                .iter()
+                .filter(|s| s.registry_auth || s.sandbox().is_some())
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            ["image", "push"]
+        );
+    }
+
+    /// An invoke's placement profiles carry onto a `registry_auth` Step, and
+    /// a library Step that names its own keeps them.
+    #[test]
+    fn placement_profiles_carry_onto_a_registry_auth_step_unless_it_names_its_own() {
+        let lib = "steps:\n  - { id: push, image: alpine, command: [echo], registry_auth: true }\n  - { id: own, image: alpine, command: [echo], registry_auth: true, placement_profiles: [amd64] }\n";
+        let ir = compile_with(
+            "steps: [{ id: p, invoke: file:.scarab/lib/p.yaml, placement_profiles: [big] }]",
+            &libs(&[(".scarab/lib/p.yaml", lib)]),
+        );
+        let step = |id: &str| ir.steps.iter().find(|s| s.id == id).unwrap();
+        assert!(step("p/push").registry_auth);
+        assert_eq!(step("p/push").placement_profiles, vec!["big".to_string()]);
+        assert_eq!(step("p/own").placement_profiles, vec!["amd64".to_string()]);
+    }
+
+    /// A library with a build-like Step, a pushing Step, a Step with its own
+    /// profiles and a nested invoke, for the per-Step form.
+    fn per_step_libs() -> BTreeMap<String, String> {
+        libs(&[
+            (
+                ".scarab/lib/p.yaml",
+                "steps:\n  - { id: image, image: alpine, command: [echo] }\n  - { id: push, image: alpine, command: [echo], registry_auth: true, needs: [image] }\n  - { id: own, image: alpine, command: [echo], placement_profiles: [amd64] }\n  - { id: inner, invoke: file:.scarab/lib/q.yaml }\n",
+            ),
+            (
+                ".scarab/lib/q.yaml",
+                "steps:\n  - { id: leaf, image: alpine, command: [echo] }\n",
+            ),
+        ])
+    }
+
+    /// The list form gives every inlined Step the same profiles, as before
+    /// the map form existed.
+    #[test]
+    fn a_placement_profile_list_on_an_invoke_reaches_every_inlined_step() {
+        let ir = compile_with(
+            "steps: [{ id: p, invoke: file:.scarab/lib/p.yaml, placement_profiles: [big, fast] }]",
+            &per_step_libs(),
+        );
+        let step = |id: &str| ir.steps.iter().find(|s| s.id == id).unwrap();
+        for id in ["p/image", "p/push", "p/inner/leaf"] {
+            assert_eq!(step(id).placement_profiles, vec!["big", "fast"], "{id}");
+        }
+        assert_eq!(step("p/own").placement_profiles, vec!["amd64"]);
+    }
+
+    /// The map form gives each library Step only its own entry: the push
+    /// profile reaches the pushing Step and not the build, a Step with no
+    /// entry gets none, a nested invoke's Steps take its entry, and a Step
+    /// that names its own (and so may not be a key) keeps them.
+    #[test]
+    fn a_placement_profile_map_on_an_invoke_routes_each_list_to_its_step() {
+        let ir = compile_with(
+            r#"
+            steps:
+              - id: p
+                invoke: file:.scarab/lib/p.yaml
+                placement_profiles:
+                  image: [arm64-builders, build-cache]
+                  push: [ecr-push]
+                  inner: [small]
+            "#,
+            &per_step_libs(),
+        );
+        let step = |id: &str| ir.steps.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(
+            step("p/image").placement_profiles,
+            vec!["arm64-builders", "build-cache"]
+        );
+        assert_eq!(step("p/push").placement_profiles, vec!["ecr-push"]);
+        assert_eq!(step("p/own").placement_profiles, vec!["amd64"]);
+        assert_eq!(step("p/inner/leaf").placement_profiles, vec!["small"]);
+        // Every compiled Step holds a list, which is what a Policy reads.
+        assert!(ir
+            .steps
+            .iter()
+            .all(|s| matches!(s.placement_profiles, PlacementProfiles::List(_))));
+
+        let ir = compile_with(
+            "steps: [{ id: p, invoke: file:.scarab/lib/p.yaml, placement_profiles: { push: [ecr-push] } }]",
+            &per_step_libs(),
+        );
+        let step = |id: &str| ir.steps.iter().find(|s| s.id == id).unwrap();
+        assert!(step("p/image").placement_profiles.is_empty());
+        assert!(step("p/inner/leaf").placement_profiles.is_empty());
+        assert_eq!(step("p/push").placement_profiles, vec!["ecr-push"]);
+    }
+
+    /// A map entry for a nested invoke reaches every Step it inlines, also
+    /// when the nested invoke has a matrix whose values hold `/` (its copies
+    /// are `inner[arch=linux/amd64]/leaf`).
+    #[test]
+    fn a_placement_profile_map_reaches_a_matrixed_nested_invoke() {
+        let libs = libs(&[
+            (
+                ".scarab/lib/p.yaml",
+                "steps:\n  - id: inner\n    invoke: file:.scarab/lib/q.yaml\n    matrix: { dimensions: { arch: [linux/amd64, linux/arm64] } }\n",
+            ),
+            (
+                ".scarab/lib/q.yaml",
+                "steps:\n  - { id: leaf, image: alpine, command: [echo] }\n",
+            ),
+        ]);
+        let ir = compile_with(
+            "steps: [{ id: p, invoke: file:.scarab/lib/p.yaml, placement_profiles: { inner: [small] } }]",
+            &libs,
+        );
+        let leaves: Vec<&StepSpec> = ir
+            .steps
+            .iter()
+            .filter(|s| s.id.starts_with("p/inner"))
+            .collect();
+        assert_eq!(
+            leaves.len(),
+            2,
+            "{:?}",
+            ir.steps.iter().map(|s| &s.id).collect::<Vec<_>>()
+        );
+        for leaf in leaves {
+            assert!(leaf.id.contains("linux/"), "{}", leaf.id);
+            assert_eq!(leaf.placement_profiles, vec!["small"], "{}", leaf.id);
+        }
+    }
+
+    /// A key that names no Step of the library is an error naming the key;
+    /// so is an empty profile name in an entry, and the map form on a Step
+    /// that invokes nothing.
+    #[test]
+    fn a_placement_profile_map_refuses_unknown_steps_and_empty_names() {
+        let errs = errors_with(
+            "steps: [{ id: p, invoke: file:.scarab/lib/p.yaml, placement_profiles: { pushh: [ecr-push] } }]",
+            &per_step_libs(),
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("step `p`")
+                && e.contains("names step `pushh`")
+                && e.contains("does not have")),
+            "{errs:?}"
+        );
+        // A nested invoke's inlined id is not a key; its invoke step id is.
+        let errs = errors_with(
+            "steps: [{ id: p, invoke: file:.scarab/lib/p.yaml, placement_profiles: { inner/leaf: [x] } }]",
+            &per_step_libs(),
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("names step `inner/leaf`")),
+            "{errs:?}"
+        );
+        let errs = errors_with(
+            r#"steps: [{ id: p, invoke: file:.scarab/lib/p.yaml, placement_profiles: { push: ["", x] } }]"#,
+            &per_step_libs(),
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("`placement_profiles.push` contains an empty profile name")),
+            "{errs:?}"
+        );
+        // A key naming a Step that sets its own profiles would never apply.
+        let errs = errors_with(
+            "steps: [{ id: p, invoke: file:.scarab/lib/p.yaml, placement_profiles: { own: [x] } }]",
+            &per_step_libs(),
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("names step `own`") && e.contains("sets its own")),
+            "{errs:?}"
+        );
+        let errs = errors("steps: [{ id: a, image: busybox, placement_profiles: { a: [x] } }]");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("step `a`") && e.contains("only on an invoke step")),
+            "{errs:?}"
+        );
+    }
+
+    /// A `forge_token` Step receives no placement profile from its invoke,
+    /// in either form, and a map that names it is refused.
+    #[test]
+    fn a_forge_token_step_gets_no_placement_profile_in_either_form() {
+        let lib = "steps:\n  - { id: git, image: alpine, command: [echo], forge_token: read }\n  - { id: other, image: alpine, command: [echo] }\n";
+        let libraries = Libraries {
+            installed: installed(&[(
+                "acme/git",
+                "github.com/acme/libs//git.yaml@1111111111111111111111111111111111111111",
+                lib,
+            )]),
+            ..Default::default()
+        };
+        for form in ["[big]", "{ other: [big] }"] {
+            let ir = compile_with_libraries(
+                &format!("steps: [{{ id: c, invoke: lib:acme/git, placement_profiles: {form} }}]"),
+                &libraries,
+            )
+            .unwrap();
+            let step = |id: &str| ir.steps.iter().find(|s| s.id == id).unwrap();
+            assert!(step("c/git").placement_profiles.is_empty(), "{form}");
+            assert_eq!(step("c/other").placement_profiles, vec!["big"], "{form}");
+        }
+        // A map key naming the `forge_token` Step is an error, not a drop.
+        let errs = library_errors(
+            "steps: [{ id: c, invoke: lib:acme/git, placement_profiles: { git: [big] } }]",
+            &libraries,
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("names step `git`") && e.contains("`forge_token`")),
+            "{errs:?}"
+        );
+    }
+
+    /// The map form reads back as written, and a compiled IR holding only
+    /// lists round-trips through JSON unchanged.
+    #[test]
+    fn placement_profiles_round_trip_in_both_forms() {
+        let step: StepSpec = serde_yaml::from_str(
+            "{ id: p, invoke: file:x.yaml, placement_profiles: { push: [ecr-push], image: [a, b] } }",
+        )
+        .unwrap();
+        assert_eq!(
+            step.placement_profiles,
+            PlacementProfiles::PerStep(BTreeMap::from([
+                ("image".to_string(), vec!["a".to_string(), "b".to_string()]),
+                ("push".to_string(), vec!["ecr-push".to_string()]),
+            ]))
+        );
+        let json = serde_json::to_string(&step).unwrap();
+        assert!(
+            json.contains(r#""placement_profiles":{"image":["a","b"],"push":["ecr-push"]}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<StepSpec>(&json).unwrap(), step);
+
+        let ir = compile_with(
+            "steps: [{ id: p, invoke: file:.scarab/lib/p.yaml, placement_profiles: { push: [ecr-push] } }]",
+            &per_step_libs(),
+        );
+        let json = serde_json::to_string(&ir).unwrap();
+        assert_eq!(serde_json::from_str::<PipelineIr>(&json).unwrap(), ir);
+        assert!(
+            serde_yaml::from_str::<StepSpec>("{ id: a, image: b, placement_profiles: oops }")
+                .is_err()
+        );
+    }
+
+    /// The build library's `validate:` rules, applied to literal `with:`
+    /// values at compile time (and to rendered templates at launch): a path
+    /// out of the workspace, a `..`, a `,` that would start a buildctl
+    /// option, and a build argument that is not `KEY=VALUE` are refused.
+    #[test]
+    fn the_build_library_refuses_inputs_that_leave_the_workspace_or_add_options() {
+        let refused = |input: &str, value: &str| {
+            let yaml = format!(
+                "steps:\n  - id: image\n    invoke: lib:thulasi-ram/build\n    with:\n      \
+                 image: registry.example/app:1\n      {input}: {}\n",
+                serde_json::to_string(value).unwrap()
+            );
+            let errs = library_errors(&yaml, &with_build_library());
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains(&format!("input `{input}` for library"))),
+                "{input}={value:?} passed: {errs:?}"
+            );
+        };
+        // Ported from the `build` kind's checks (git-bug df660b6): `.`- and
+        // `..`-spelled escapes, absolute paths and a `,` that could start a
+        // second buildctl source.
+        for path in [
+            "/scarab/registry",
+            "//scarab/registry",
+            "../scarab/registry",
+            "..",
+            "./..",
+            "ctx/..",
+            "x//..//",
+            "./x/../..",
+            "ctx,dockerfile=/scarab/registry",
+            "Dockerfile,context=/scarab/registry",
+            "a\tb",
+            "",
+        ] {
+            refused("context", path);
+            refused("dockerfile", path);
+        }
+        // An `image` that adds buildctl output options, a second flag or a
+        // shell word.
+        for image in [
+            "registry.example/app:1,push=true",
+            "registry.example/app:1,registry.insecure=true",
+            "registry.example/app:1 --output type=local",
+            "registry.example/app:1\n--opt",
+            "--help",
+            "-o",
+            "a/b:tag=1",
+            "a/b;id",
+            "$(id)",
+            "type=local",
+            "a/b:1\u{ff0c}push=true",
+            "ghcr.io/acme/app@sha256:abc,push=true",
+            "Registry.example/App:1",
+        ] {
+            refused("image", image);
+        }
+        for args in [
+            "1BAD=x",
+            "A=1,push=true",
+            "A",
+            "A=1\n\nB=2",
+            "A B=1",
+            "A=1\tx",
+            "A=1\n--opt=x",
+        ] {
+            refused("build_args", args);
+        }
+        refused("cache", "gha");
+        // A registry cache needs the push credential in the build Step.
+        refused("cache", "registry");
+        refused("cache_bucket", "b,ucket");
+        refused("cache_region", "us-east-1,x");
+        refused("cache_name", "n,ame");
+
+        // What the rules let through.
+        let ok = compile_with_libraries(
+            r#"
+            steps:
+              - id: image
+                invoke: lib:thulasi-ram/build
+                with:
+                  image: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/app:v1.2.3
+                  context: docker/clone
+                  dockerfile: build/Dockerfile
+                  build_args: "VERSION=1.2.3\nNOTE=a b=c"
+                  cache: s3
+                  cache_bucket: acme-cache
+                  cache_region: ap-south-1
+                  cache_name: app/main
+            "#,
+            &with_build_library(),
+        );
+        assert!(ok.is_ok(), "{ok:?}");
+        // A `.` in a path is not a `..` component.
+        for path in [".", "./", "./x", "x/./y", "x..y", "..x", "x.."] {
+            let yaml = format!(
+                "steps:\n  - id: image\n    invoke: lib:thulasi-ram/build\n    with:\n      \
+                 image: registry.example/app:1\n      context: {}\n",
+                serde_json::to_string(path).unwrap()
+            );
+            let ok = compile_with_libraries(&yaml, &with_build_library());
+            assert!(ok.is_ok(), "{path:?}: {ok:?}");
+        }
+    }
+
+    // Attack: a branch name (git allows `,` and `=`) templated into the build library's `image` and `cache_name` adds buildctl output options to the build Step, or crane arguments to the push Step, when it launches. Safe outcome: the rendered value fails the input's `validate:` rule and the launch of either Step is refused; a plain branch renders.
+    #[test]
+    fn the_build_library_refuses_a_branch_name_that_adds_buildctl_options_at_launch() {
+        let ir = compile_with_libraries(
+            r#"
+            on: { push: {} }
+            steps:
+              - id: image
+                invoke: lib:thulasi-ram/build
+                with:
+                  image: "registry.example/app:${{ event.branch }}"
+                  push: "true"
+                  cache: s3
+                  cache_bucket: acme-cache
+                  cache_region: ap-south-1
+                  cache_name: "app/${{ event.branch }}"
+            "#,
+            &with_build_library(),
+        )
+        .unwrap();
+        let launch = |id: &str, branch: &str| {
+            let step = ir.steps.iter().find(|s| s.id == id).unwrap();
+            let event = json!({ "branch": branch });
+            render(
+                Templates {
+                    image: &step.image,
+                    command: &step.command,
+                    env: &step.env,
+                },
+                step.scope.as_ref(),
+                &step.matrix_values,
+                Facts::Launch {
+                    params: &BTreeMap::new(),
+                    declared: &[],
+                    results: &Results::new(),
+                    event: event.as_object().unwrap(),
+                },
+            )
+            .map(|r| r.env.into_iter().collect::<BTreeMap<_, _>>())
+        };
+        for id in ["image/image", "image/push"] {
+            for branch in [
+                "main,push=true",
+                "main,registry.insecure=true",
+                "main,mode=max",
+                "a b",
+                "main\n--opt",
+                "x=y",
+            ] {
+                assert!(launch(id, branch).is_err(), "{id}: {branch:?} rendered");
+            }
+        }
+        let env = launch("image/image", "main").unwrap();
+        assert_eq!(env["SCARAB_BUILD_IMAGE"], "registry.example/app:main");
+        assert_eq!(env["SCARAB_BUILD_CACHE_NAME"], "app/main");
+        let env = launch("image/push", "main").unwrap();
+        assert_eq!(env["SCARAB_BUILD_IMAGE"], "registry.example/app:main");
+        assert_eq!(env["SCARAB_BUILD_PUSH"], "true");
+    }
+
+    /// No Pipeline or library Step may set the env Scarab uses to tell a
+    /// sandboxed Step it runs for a fork pull request.
+    #[test]
+    fn no_step_may_set_the_fork_pull_request_env() {
+        let errs = errors(
+            "steps: [{ id: s, image: busybox, command: [echo], env: [[SCARAB_FORK_PR, \"false\"]] }]",
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.starts_with("step `s`: env `SCARAB_FORK_PR`")),
+            "{errs:?}"
+        );
+        let lib = SANDBOXED_LIB.replace(
+            "            security:",
+            "            env: [[SCARAB_FORK_PR, \"false\"]]\n            security:",
+        );
+        let libraries = Libraries {
+            installed: installed(&[("acme/b", "github.com/acme/libs//b.yaml@0", lib.as_str())]),
+            ..Default::default()
+        };
+        let errs = library_errors("steps: [{ id: b, invoke: lib:acme/b }]", &libraries);
+        assert!(
+            errs.iter().any(|e| e.contains("env `SCARAB_FORK_PR`")),
+            "{errs:?}"
+        );
+    }
+
+    // Attack: a library's push Step (registry_auth, no sandbox) passes a caller's input into its command or into an env name a program runs as code (`LD_PRELOAD`), so the caller picks what runs beside the registry credential. Safe outcome: the same rule as a sandboxed or forge_token Step; the image and command are written in full and a templated value reaches only a `SCARAB_<NAME>` env.
+    #[test]
+    fn a_registry_auth_step_takes_outside_values_only_through_scarab_env() {
+        let lib = "kind: library\ninterface: { inputs: [{ name: x, type: string, validate: 'value.matches(\"^[a-z]+$\")' }] }\nsteps:\n  - id: push\n    image: alpine\n    registry_auth: true\n    command: [sh, -c, \"${{ inputs.x }}\"]\n    env: [[LD_PRELOAD, \"${{ inputs.x }}\"], [SCARAB_X, \"${{ inputs.x }}\"]]\n";
+        let libraries = Libraries {
+            installed: installed(&[("acme/p", "github.com/acme/libs//p.yaml@0", lib)]),
+            ..Default::default()
+        };
+        let errs = library_errors(
+            "steps: [{ id: p, invoke: lib:acme/p, with: { x: y } }]",
+            &libraries,
+        );
+        for want in ["`command[2]` holds", "env `LD_PRELOAD` holds"] {
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains(want) && e.contains("`registry_auth`")),
+                "{want}: {errs:?}"
+            );
+        }
+        assert!(
+            !errs.iter().any(|e| e.contains("env `SCARAB_X`")),
+            "{errs:?}"
+        );
+    }
+
     // --- the clone library replaces the clone kind (ADR-0076 §9) ------------
 
     /// `libs/clone.yaml`, as the release ships it.
     const CLONE_LIBRARY: &str = include_str!("../../../libs/clone.yaml");
+
+    /// The clone and build libraries, installed as an org installs them.
+    fn with_clone_and_build() -> Libraries {
+        let mut libraries = with_clone();
+        libraries.installed.extend(with_build_library().installed);
+        libraries
+    }
 
     fn with_clone() -> Libraries {
         Libraries {
@@ -9763,12 +10871,6 @@ mod tests {
     #[test]
     fn forge_token_is_for_a_step_that_runs_an_image() {
         let errs = errors("steps: [{ id: g, gate: manual, forge_token: read }]");
-        assert!(
-            errs.iter()
-                .any(|e| e.contains("`forge_token` is only valid")),
-            "{errs:?}"
-        );
-        let errs = errors(r#"steps: [{ id: b, build: { image: "a/b:1" }, forge_token: read }]"#);
         assert!(
             errs.iter()
                 .any(|e| e.contains("`forge_token` is only valid")),
@@ -10200,242 +11302,135 @@ mod tests {
         assert!(e.starts_with("`command[1]`"), "{e}");
     }
 
-    // --- build step kind (ADR-0018) -----------------------------------------
+    // --- the build kind is gone (ADR-0018, amendment of 2026-11-12) -------
 
+    /// A `build:` Step fails the Pipeline check naming the library that
+    /// replaces it, whatever its fields.
     #[test]
-    fn build_compiles_to_a_distinct_kind_with_defaults() {
-        let ir = compile(
-            r#"
-            steps:
-              - { id: checkout, image: alpine/git }
-              - id: image
-                needs: [checkout]
-                build:
-                  image: ghcr.io/acme/app:v1
-                  push: true
-            "#,
-        );
-        let image = &ir.steps[1];
-        assert!(image.is_build());
-        assert!(!image.is_gate());
-        let b = image.build.as_ref().unwrap();
-        assert_eq!(b.image, "ghcr.io/acme/app:v1");
-        assert!(b.push);
-        assert!(
-            b.context.is_empty() && b.dockerfile.is_empty(),
-            "defaults resolve at persist"
-        );
-    }
-
-    #[test]
-    fn build_step_rejects_image_command_privilege_and_missing_tag() {
-        // An authored image/command contradicts the blessed BuildKit image.
-        let err = errors(
-            r#"
-            steps:
-              - id: image
-                image: busybox
-                build: { image: "ghcr.io/a/b:1" }
-            "#,
-        );
-        assert!(
-            err.iter()
-                .any(|d| d.contains("must not") && d.contains("image")),
-            "{err:?}"
-        );
-
-        // The image to build is mandatory.
-        let err = errors(
-            r#"
-            steps:
-              - id: image
-                build: {}
-            "#,
-        );
-        assert!(
-            err.iter().any(|d| d.contains("must name the `image:`")),
-            "{err:?}"
-        );
-
-        // Build steps are rootless by construction — no escalation.
-        let err = errors(
-            r#"
-            steps:
-              - id: image
-                build: { image: "ghcr.io/a/b:1" }
-                security: { run_as_root: true }
-            "#,
-        );
-        assert!(err.iter().any(|d| d.contains("rootless")), "{err:?}");
-
-        // Kinds are mutually exclusive.
-        let err = errors(
-            r#"
-            steps:
-              - id: image
-                gate: manual
-                build: { image: "ghcr.io/a/b:1" }
-            "#,
-        );
-        assert!(
-            err.iter().any(|d| d.contains("mutually exclusive")),
-            "{err:?}"
-        );
-    }
-
-    /// git-bug df660b6: the context and dockerfile stay inside the workspace
-    /// (the registry credential is mounted beside it), and the image is one
-    /// image reference (it is a field of the comma-separated `--output`).
-    #[test]
-    fn build_context_dockerfile_and_image_are_checked() {
-        let ir = compile(
-            r#"
-            steps:
-              - id: image
-                build:
-                  context: docker/clone
-                  dockerfile: build/Dockerfile
-                  image: ghcr.io/acme/app:v1
-            "#,
-        );
-        assert!(ir.steps[0].is_build());
-
-        for (build, expect) in [
-            (
-                r#"{ context: /scarab/registry, image: "a/b:1" }"#,
-                "`build.context` must be a path relative to the workspace",
-            ),
-            (
-                r#"{ context: "ctx/../..", image: "a/b:1" }"#,
-                "`build.context` must not contain a `..` path component",
-            ),
-            (
-                r#"{ context: "a\tb", image: "a/b:1" }"#,
-                "`build.context` must not contain a control character",
-            ),
-            (
-                r#"{ dockerfile: /scarab/registry/config.json, image: "a/b:1" }"#,
-                "`build.dockerfile` must be a path relative to the workspace",
-            ),
-            (
-                r#"{ dockerfile: "../Dockerfile", image: "a/b:1" }"#,
-                "`build.dockerfile` must not contain a `..` path component",
-            ),
-            (
-                r#"{ image: "a/b:1,push=true,registry.insecure=true" }"#,
-                "is not an image reference",
-            ),
-            (r#"{ image: "a b" }"#, "is not an image reference"),
-            // A committed directory named `ctx,dockerfile=` must not become a
-            // second `--local` source if buildctl ever splits on `,`.
-            (
-                r#"{ context: "ctx,dockerfile=/scarab/registry", dockerfile: config.json, image: "a/b:1" }"#,
-                "`build.context` must not contain a `,`",
-            ),
-            (
-                r#"{ dockerfile: "Dockerfile,context=/scarab/registry", image: "a/b:1" }"#,
-                "`build.dockerfile` must not contain a `,`",
-            ),
-            (
-                r#"{ image: "ghcr.io/acme/app:${{ event.sha }}" }"#,
-                "templates are not supported in `build.image` yet",
-            ),
+    fn a_build_step_is_refused_naming_the_library() {
+        for yaml in [
+            "steps: [{ id: image, build: {} }]",
+            r#"steps: [{ id: image, build: { image: "ghcr.io/a/b:1", push: true } }]"#,
         ] {
-            let err = errors(&format!("steps: [{{ id: image, build: {build} }}]"));
+            let errs = errors(yaml);
             assert!(
-                err.iter()
-                    .any(|d| d.starts_with("step `image`: ") && d.contains(expect)),
-                "{build}: {err:?}"
+                errs.iter().any(|e| e.starts_with("step `image`: ")
+                    && e.contains("invoke: lib:thulasi-ram/build")),
+                "{errs:?}"
             );
-        }
-    }
-
-    // Attack: an `image:` that adds buildctl output options, a second flag or a shell word. Safe outcome: every one is refused as not an image reference.
-    #[test]
-    fn build_image_cannot_carry_buildctl_options() {
-        for image in [
-            "a/b:1,push=true",
-            "a/b:1,registry.insecure=true",
-            "a/b:1 --output type=local,dest=/scarab/registry",
-            "a/b:1\n--opt",
-            "--help",
-            "-o",
-            "a/b:tag=1",
-            "a/b;id",
-            "$(id)",
-            "a/b:1\u{0}",
-            "type=local",
-            "a/b:1\u{ff0c}push=true",
-            "ghcr.io/acme/app@sha256:abc,push=true",
-        ] {
-            let problems = build_target_problems(".", "Dockerfile", image);
             assert!(
-                problems.iter().any(|p| p.contains("`build.image`")),
-                "{image:?} passed: {problems:?}"
+                errs.iter().all(|e| !e.contains("missing image")),
+                "{errs:?}"
             );
         }
     }
 
-    // Attack: `.`-spelled and `..`-spelled escapes of the workspace (`./x/..`, `x/../..`, `./..`, a bare `..`, a trailing `/..`). Safe outcome: any `..` component is refused; `.` and `./x` are not.
+    /// A Pipeline as 0.3.2 accepted it, with every field a `build:` Step
+    /// could set there, written beside the clone library.
+    const PIPELINE_0_3_2: &str = r#"
+on: { push: {} }
+steps:
+  - id: checkout
+    invoke: lib:thulasi-ram/clone
+  - id: img
+    needs: [checkout]
+    when: "event.branch == 'main'"
+    timeout: 1800
+    retry: { on: failure, max: 2 }
+    placement_profiles: [arm64, big]
+    resources: { cpu_millis: 2000, memory_mib: 4096 }
+    env: [[FOO, bar]]
+    artifacts: ["*.txt"]
+    build:
+      image: "ghcr.io/acme/app:${{ event.sha }}"
+      context: services/api
+      dockerfile: Dockerfile.prod
+      push: true
+  - id: deploy
+    image: alpine:3.20
+    needs: [img]
+    env: [[BUILT, "${{ outputs.img.image }}"]]
+    command: [sh, -c, 'echo "$BUILT"']
+"#;
+
+    /// A 0.3.2 `build:` Step gets one diagnostic, and nothing else in the
+    /// Pipeline is reported: no unknown field, no missing image, no other
+    /// kind rule. It suggests the replacement from the Step's own fields
+    /// (the `needs` as written, the `${{ … }}` as written) and says what an
+    /// org admin does first.
     #[test]
-    fn build_paths_spelled_with_dots_stay_in_the_workspace() {
-        for path in [
-            "..",
-            "./..",
-            "./x/..",
-            "x/../..",
-            "x/..",
-            "x//..//",
-            "../scarab/registry",
-            "//scarab/registry",
-        ] {
-            for (context, dockerfile) in [(path, "Dockerfile"), (".", path)] {
-                assert!(
-                    !build_target_problems(context, dockerfile, "a/b:1").is_empty(),
-                    "context {context:?} dockerfile {dockerfile:?} passed"
-                );
-            }
-        }
-        for path in [".", "./", "./x", "x/./y", "x..y", "..x", "x.."] {
-            assert_eq!(
-                build_target_problems(path, "Dockerfile", "a/b:1"),
-                Vec::<String>::new(),
-                "{path:?}"
-            );
-        }
+    fn a_0_3_2_build_step_gets_only_its_replacement() {
+        let errs = library_errors(PIPELINE_0_3_2, &with_clone());
+        assert_eq!(errs.len(), 1, "{errs:#?}");
+        assert_eq!(
+            errs[0],
+            "step `img`: the `build` step kind was removed; replace the step with:\n    \
+             - id: img\n      needs: [checkout]\n      when: \"event.branch == 'main'\"\n      \
+             timeout: 1800\n      resources: { cpu_millis: 2000, memory_mib: 4096 }\n      \
+             placement_profiles: [arm64, big]\n      \
+             invoke: lib:thulasi-ram/build\n      with: { image: \"ghcr.io/acme/app:${{ event.sha }}\", \
+             context: services/api, dockerfile: Dockerfile.prod, push: true }\n\
+             The old step's `env`, `retry` and `artifacts` are not carried over: an invoke \
+             step does not take them. The library cannot pull a private base image yet.\n\
+             An org admin must first install lib:thulasi-ram/build and trust it for the build \
+             sandbox, and with the registry credential to push: see \
+             https://thulasi-ram.github.io/scarab-ci/usage/libraries/#install-scarabs-build-library"
+        );
+        assert!(!errs[0].contains("ADR"), "{}", errs[0]);
+
+        // The suggestion pastes in: with it in place of the old Step, the
+        // Pipeline compiles against the build library, and the downstream
+        // read of `outputs.img.image` still resolves to its build Step.
+        // Indented four spaces in the message; two under `steps:` here.
+        let replacement: String = errs[0]
+            .lines()
+            .skip(1)
+            .take_while(|l| l.starts_with("    "))
+            .map(|l| format!("{}\n", &l[2..]))
+            .collect();
+        // The compile error's list keeps it as one diagnostic.
+        let listed = diagnostic::diagnostics(&PipelineError::Validation(errs.clone()).to_string());
+        assert_eq!(listed.len(), 1, "{listed:#?}");
+        assert_eq!(listed[0].step.as_deref(), Some("img"));
+        let start = PIPELINE_0_3_2.find("  - id: img").unwrap();
+        let end = PIPELINE_0_3_2.find("  - id: deploy").unwrap();
+        let pasted = format!(
+            "{}{replacement}{}",
+            &PIPELINE_0_3_2[..start],
+            &PIPELINE_0_3_2[end..]
+        );
+        let ir = compile_with_libraries(&pasted, &with_clone_and_build())
+            .unwrap_or_else(|e| panic!("{e:?}\n{pasted}"));
+        let build = ir.steps.iter().find(|s| s.id == "img/image").unwrap();
+        assert_eq!(build.needs.0, vec!["checkout/git".to_string()]);
+        assert_eq!(build.placement_profiles, vec!["arm64", "big"]);
+        assert_eq!(build.timeout, Some(1800));
+        assert_eq!(build.resources.cpu_millis, Some(2000));
+        let deploy = ir.steps.iter().find(|s| s.id == "deploy").unwrap();
+        assert!(deploy.needs.0.contains(&"img/image".to_string()));
     }
 
-    /// git-bug df660b6: a build step's container holds the registry
-    /// credential, so it takes no authored env and no secrets.
+    /// The smallest `build:` Steps get one diagnostic each too: one with no
+    /// image says where to write it, and a matrix's copies share one, under
+    /// the id written.
     #[test]
-    fn build_step_refuses_env_and_secrets() {
-        let err = errors(
-            r#"
-            steps:
-              - id: image
-                build: { image: "ghcr.io/a/b:1" }
-                env: [[LD_PRELOAD, /workspace/evil.so]]
-            "#,
-        );
+    fn every_build_step_gets_one_diagnostic() {
+        let errs = errors("steps: [{ id: image, build: {} }]");
+        assert_eq!(errs.len(), 1, "{errs:#?}");
         assert!(
-            err.iter().any(|d| d.starts_with("step `image`: ")
-                && d.contains("must not set `env:`")
-                && d.contains("build options come from `build:`")),
-            "{err:?}"
+            errs[0].contains("with: { image: <the image to build> }"),
+            "{}",
+            errs[0]
         );
-
-        let err = errors(
-            r#"
-            steps:
-              - id: image
-                build: { image: "ghcr.io/a/b:1" }
-                secrets: [NPM_TOKEN]
-            "#,
+        let errs = errors(
+            "steps: [{ id: img, matrix: { dimensions: { arch: [amd64, arm64] } }, build: { image: \"a/b:1\", push: false } }]",
         );
+        assert_eq!(errs.len(), 1, "{errs:#?}");
+        assert!(errs[0].starts_with("step `img`: "), "{}", errs[0]);
         assert!(
-            err.iter()
-                .any(|d| d.starts_with("step `image`: ") && d.contains("must not set `secrets:`")),
-            "{err:?}"
+            errs[0].contains("with: { image: \"a/b:1\" }"),
+            "{}",
+            errs[0]
         );
     }
 
@@ -10787,7 +11782,7 @@ mod tests {
             dogfood,
             &Libraries {
                 files: libs(&[(".scarab/lib/notify.yaml", notify)]),
-                ..with_clone()
+                ..with_clone_and_build()
             },
         )
         .expect("the dogfood sample must compile");
@@ -10809,7 +11804,7 @@ mod tests {
         let notify = include_str!("../../../.scarab/lib/notify.yaml");
         let libraries = Libraries {
             files: libs(&[(".scarab/lib/notify.yaml", notify)]),
-            ..with_clone()
+            ..with_clone_and_build()
         };
         let ir = compile_with_libraries(dogfood, &libraries)
             .expect("the dogfood kitchen-sink sample must compile to IR");
@@ -10851,30 +11846,45 @@ mod tests {
 
         // The sample is not just a compile fixture — it is the LOCAL DOGFOOD
         // TARGET, dispatched against this repo, so the paths it names must
-        // actually exist here. Compilation cannot catch that: a `build:` naming
+        // actually exist here. Compilation cannot catch that: a build naming
         // an absent Dockerfile only fails in-cluster, after the expensive
         // lint/test legs it depends on have already run.
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        for step in ir.steps.iter() {
-            let Some(build) = step.build.as_ref() else {
-                continue;
+        let mut builds = 0;
+        for step in ir
+            .steps
+            .iter()
+            // The library's build Step; its push Step names no context.
+            .filter(|s| {
+                s.origin.iter().any(|l| l.name == "thulasi-ram/build") && s.id.ends_with("/image")
+            })
+        {
+            builds += 1;
+            let launched = launch(step, json!({}), json!({})).unwrap();
+            let env = |name: &str| {
+                launched
+                    .env
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| panic!("step `{}` sets no {name}", step.id))
             };
-            let context = repo.join(&build.context);
+            let (context_path, dockerfile) =
+                (env("SCARAB_BUILD_CONTEXT"), env("SCARAB_BUILD_DOCKERFILE"));
+            let context = repo.join(&context_path);
             assert!(
                 context.is_dir(),
-                "step `{}` builds context `{}`, which is not a directory in this repo",
+                "step `{}` builds context `{context_path}`, which is not a directory in this repo",
                 step.id,
-                build.context
             );
             // BuildKit resolves `filename` INSIDE the context dir.
             assert!(
-                context.join(&build.dockerfile).is_file(),
-                "step `{}` names dockerfile `{}`, absent from context `{}`",
+                context.join(&dockerfile).is_file(),
+                "step `{}` names dockerfile `{dockerfile}`, absent from context `{context_path}`",
                 step.id,
-                build.dockerfile,
-                build.context
             );
         }
+        assert_eq!(builds, 1, "the sample builds one image");
 
         // The results channel (ADR-0042) drains `/scarab/results/<name>.json`
         // and NOTHING else. A step that redirects into a bare
@@ -10952,10 +11962,6 @@ mod tests {
             (
                 "retry",
                 "steps: [{id: a, image: alpine, retry: {max: 2, onn: failure}}]\n",
-            ),
-            (
-                "build",
-                "steps: [{id: a, build: {image: x, dockerfle: D}}]\n",
             ),
             (
                 "cache",

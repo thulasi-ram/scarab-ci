@@ -261,7 +261,23 @@ scarab:
         k8s:
           spec:
             nodeSelector: { pool: ci-large }
+      - name: ecr-push   # a push role: only for a step that pushes
+        registry_auth_only: true
+        k8s:
+          spec:
+            serviceAccountName: ecr-pusher
 ```
+
+**Mark a profile that grants push access `registry_auth_only: true`.** Pipeline
+authors name profiles, so without the marker any step could ask for a
+ServiceAccount with a push role. With it, the server applies the profile only to
+a step with `registry_auth` that the launch found eligible for a credential (a
+step from a library the org trusts with the registry credential, not a fork pull
+request);
+named on any other step it fails that step's launch, and on a fork's push step it
+is left out. For `lib:thulasi-ram/build`, route it to the push step:
+`placement_profiles: { image: [arm64], push: [ecr-push] }`. A marked profile
+cannot also be `default: true`; the server refuses that config at boot.
 
 **`baseline` and `k8s` are Pod fragments, not pod-spec fragments.** They are
 strategic-merged onto the whole Pod, as Kubernetes does, so tolerations live

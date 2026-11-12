@@ -1,8 +1,8 @@
 //! Slice-5 ACCEPTANCE (ADR-0017, 0014, 0015, 0018): secrets + OIDC + BuildKit
 //! proven together. A step consumes an envelope-encrypted secret from *real*
 //! Postgres and it never reaches the logs; a run-scoped OIDC token verifies
-//! against the JWKS; and a build step compiles to a rootless-BuildKit Pod whose
-//! image digest is recorded as an artifact (the live build is #[ignore]-gated in
+//! against the JWKS; and the build library's Step compiles to a rootless-BuildKit
+//! Pod running the library's pinned image (the live build is #[ignore]-gated in
 //! the executor's cluster test). Skips cleanly without SCARAB_TEST_DATABASE_URL.
 
 mod common;
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::{Db, RunId, StepId, StepRun};
-use scarab_executor_k8s::{build_pod, image_artifact, DEFAULT_STEP_TIMEOUT_SECS};
+use scarab_executor_k8s::{build_pod, DEFAULT_STEP_TIMEOUT_SECS};
 use scarab_identity::{Claims, OidcIssuer};
 use scarab_secrets::{Secret, SecretProvider, SecretScope};
 use scarab_secrets_postgres::PostgresSecrets;
@@ -118,18 +118,30 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
     );
     assert_eq!(verified["run_id"], "run-1");
 
-    // --- 3. A build step compiles to a rootless-BuildKit Pod + records a digest. ---
-    let build = scarab_engine::BuildConfig {
-        context: "workspace".into(),
-        dockerfile: "Dockerfile".into(),
-        image: "registry.example/app:1.0".into(),
-        push: true,
-        ..Default::default()
-    };
-    let build_step = StepRun::new(run.clone(), StepId("image".into()));
+    // --- 3. The build library's Step compiles to a rootless-BuildKit Pod. ---
+    let ir = scarab_pipeline::compile_with_libraries(
+        "steps:\n  - id: image\n    invoke: lib:thulasi-ram/build\n    with: { image: registry.example/app:1.0, push: \"true\" }\n",
+        &scarab_pipeline::Libraries {
+            installed: std::collections::BTreeMap::from([(
+                "thulasi-ram/build".to_string(),
+                scarab_pipeline::InstalledLibrary {
+                    content: include_str!("../../../libs/build.yaml").to_string(),
+                    source: "github.com/thulasi-ram/scarab-ci//libs/build.yaml@1".into(),
+                },
+            )]),
+            ..Default::default()
+        },
+    )
+    .expect("the build library compiles");
+    let lib_step = ir.steps.iter().find(|s| s.id == "image/image").unwrap();
+    assert!(
+        !lib_step.registry_auth,
+        "the build Step holds no credential"
+    );
+    let build_step = StepRun::new(run.clone(), StepId("image/image".into()));
     let build_spec = scarab_engine::StepSpec {
-        image: String::new(),
-        command: vec![],
+        image: lib_step.image.clone(),
+        command: lib_step.command.clone(),
         env: vec![],
         secrets: vec![],
         run_as_root: false,
@@ -140,7 +152,15 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
-        build: Some(build.clone()),
+        sandbox: lib_step
+            .sandbox()
+            .map(|sandbox| scarab_engine::SandboxConfig {
+                sandbox,
+                org: "acme".into(),
+                library: "ab".repeat(32),
+            }),
+        registry_auth: None,
+        build: None,
         artifacts: vec![],
         placement_profiles: vec![],
         resources: Default::default(),
@@ -164,15 +184,14 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
         None,
     );
     let container = &pod.spec.as_ref().unwrap().containers[0];
-    assert_eq!(container.image.as_deref(), Some("moby/buildkit:rootless"));
-    assert_eq!(
-        container.security_context.as_ref().unwrap().privileged,
-        Some(false)
+    let image = container.image.as_deref().unwrap();
+    assert!(
+        image.starts_with("moby/buildkit:rootless@sha256:"),
+        "{image}"
     );
-
-    let artifact = image_artifact(&build, "sha256:deadbeef");
-    assert_eq!(artifact.image, "registry.example/app:1.0");
-    assert_eq!(artifact.digest, "sha256:deadbeef");
+    let sc = container.security_context.as_ref().unwrap();
+    assert_eq!(sc.privileged, Some(false));
+    assert_eq!(sc.run_as_non_root, Some(true));
 
     tdb.cleanup().await;
 }

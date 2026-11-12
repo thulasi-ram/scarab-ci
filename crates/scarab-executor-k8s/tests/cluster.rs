@@ -469,6 +469,8 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -539,6 +541,8 @@ async fn sleeping_step_is_killed_at_its_deadline() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -629,6 +633,8 @@ async fn log_stream_tails_pod_stdout() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -716,6 +722,8 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -930,6 +938,8 @@ async fn a_green_attempt_is_backed_by_a_durable_snapshot_at_the_instant_it_goes_
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -1110,6 +1120,8 @@ async fn a_missing_input_snapshot_fails_the_attempt_instead_of_hanging() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -1200,6 +1212,8 @@ async fn a_step_with_inputs_is_refused_when_no_workspace_service_is_configured()
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -1310,6 +1324,8 @@ async fn declared_outputs_publish_only_those_paths_through_the_cas() {
         workspace_outputs: outputs,
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -1458,6 +1474,8 @@ async fn clone_step_produces_a_source_workspace() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: clone_forge_token(),
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -1549,6 +1567,8 @@ async fn clone_step_produces_a_source_workspace() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -1623,6 +1643,8 @@ async fn clone_depth_full_exposes_history() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: clone_forge_token(),
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -1678,6 +1700,8 @@ async fn clone_depth_full_exposes_history() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -1751,6 +1775,8 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: clone_forge_token(),
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -1786,15 +1812,19 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
     exec.cancel(&h).await.expect("cleanup");
 }
 
-/// LIVE `kind: build` (ADR-0018): rootless BuildKit builds a trivial image
-/// from a CAS-materialized workspace and pushes it to a local in-cluster
-/// registry; a verification step then reads the registry's tag list.
-/// Needs a registry Service in the cluster (SCARAB_TEST_REGISTRY, e.g.
-/// `registry.default.svc.cluster.local:5000` — plain HTTP, hence
-/// insecure_push). `#[ignore]`d + SCARAB_TEST_KUBE gated.
+/// LIVE `lib:thulasi-ram/build` (ADR-0018, amendment of 2026-11-12): the
+/// library's two Steps, compiled from `libs/build.yaml` and rendered as the
+/// scheduler renders them. The build Step runs in the `rootless-buildkit`
+/// sandbox with no registry credential and writes a trivial image, built
+/// from a CAS-materialized workspace, as an OCI layout into its workspace;
+/// the push Step reads that workspace and pushes the layout with crane to a
+/// local in-cluster registry; a verification step then reads the
+/// registry's tag list. Needs a registry Service in the cluster (SCARAB_TEST_REGISTRY, e.g.
+/// `registry.default.svc.cluster.local:5000`, plain HTTP, hence the
+/// library's `insecure_push` input). `#[ignore]`d + SCARAB_TEST_KUBE gated.
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
-async fn build_step_builds_and_pushes_to_a_local_registry() {
+async fn the_build_library_builds_and_pushes_to_a_local_registry() {
     let ns = enter_tier();
     let registry = tier_var("SCARAB_TEST_REGISTRY");
     // The build step inherits its context as a workspace input, so the fetcher
@@ -1829,9 +1859,41 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         .0;
 
     let image = format!("{registry}/scarab-test:live");
-    let step = StepRun {
+    // The library's Steps as Run creation stores them, rendered as the
+    // scheduler renders them at launch.
+    let ir = scarab_pipeline::compile_with_libraries(
+        &format!(
+            "steps:\n  - id: image\n    invoke: lib:thulasi-ram/build\n    with:\n      \
+             image: {image}\n      push: \"true\"\n      insecure_push: \"true\"\n"
+        ),
+        &scarab_pipeline::Libraries {
+            installed: std::collections::BTreeMap::from([(
+                "thulasi-ram/build".to_string(),
+                scarab_pipeline::InstalledLibrary {
+                    content: include_str!("../../../libs/build.yaml").to_string(),
+                    source: "github.com/thulasi-ram/scarab-ci//libs/build.yaml@test".into(),
+                },
+            )]),
+            ..Default::default()
+        },
+    )
+    .expect("the build library compiles");
+    let lib_step = |id: &str| {
+        ir.steps
+            .iter()
+            .find(|s| s.id == format!("image/{id}"))
+            .expect("the build library's Step")
+    };
+    assert!(!lib_step("image").registry_auth);
+    assert_eq!(
+        lib_step("image").sandbox(),
+        Some(scarab_pipeline::Sandbox::RootlessBuildkit)
+    );
+    assert!(lib_step("push").registry_auth);
+    assert_eq!(lib_step("push").sandbox(), None);
+    let step_run = |id: &str, needs: Vec<StepId>| StepRun {
         run: RunId(run_id.clone()),
-        step: StepId("image".into()),
+        step: StepId(format!("image/{id}")),
         status: StepStatus::Running,
         attempts: vec![Attempt {
             id: AttemptId("a1".into()),
@@ -1840,44 +1902,95 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
             failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
-        needs: vec![StepId("checkout".into())],
+        needs,
         gate_kind: None,
     };
-    let spec = StepSpec {
-        image: String::new(),
-        command: vec![],
-        env: vec![],
-        secrets: vec![],
-        run_as_root: false,
-        add_capabilities: vec![],
-        privileged: false,
-        timeout_seconds: Some(600),
-        workspace_inputs: vec![root],
-        workspace_outputs: vec![],
-        cache: None,
-        forge_token: None,
-        build: Some(scarab_engine::BuildConfig {
-            context: ".".into(),
-            dockerfile: "Dockerfile".into(),
-            image: image.clone(),
-            push: true,
-            insecure_push: true, // the local test registry is plain HTTP
-            ..Default::default()
-        }),
-        artifacts: vec![],
-        placement_profiles: vec![],
-        resources: Default::default(),
-        k8s_overlay: None,
-        oidc_token: None,
-        resolved_secrets: Default::default(),
-        services: Vec::new(),
-        uses: Vec::new(),
-        matrix_values: Default::default(),
-        scope: None,
+    let spec = |id: &str, inputs: Vec<String>| {
+        let s = lib_step(id);
+        let rendered = scarab_pipeline::render(
+            scarab_pipeline::Templates {
+                image: &s.image,
+                command: &s.command,
+                env: &s.env,
+            },
+            s.scope.as_ref(),
+            &s.matrix_values,
+            scarab_pipeline::Facts::Launch {
+                params: &Default::default(),
+                declared: &[],
+                results: &Default::default(),
+                event: &Default::default(),
+            },
+        )
+        .expect("the build library's Step renders");
+        // What the server's launch decorator adds for a sandboxed or
+        // registry_auth Step: this is not a fork pull request's build, so
+        // it is pushed.
+        let mut env = rendered.env;
+        env.push((
+            scarab_pipeline::FORK_PR_ENV.to_string(),
+            "false".to_string(),
+        ));
+        StepSpec {
+            image: rendered.image,
+            command: rendered.command,
+            env,
+            secrets: vec![],
+            run_as_root: s.security.as_ref().is_some_and(|sec| sec.run_as_root),
+            add_capabilities: vec![],
+            privileged: false,
+            timeout_seconds: Some(600),
+            workspace_inputs: inputs,
+            workspace_outputs: vec![],
+            cache: None,
+            forge_token: None,
+            sandbox: s.sandbox().map(|sandbox| scarab_engine::SandboxConfig {
+                sandbox,
+                org: "acme".into(),
+                library: "ab".repeat(32),
+            }),
+            // The local test registry takes pushes with no credential:
+            // nothing resolves, so nothing is mounted.
+            registry_auth: s.registry_auth.then(|| scarab_engine::RegistryAuthConfig {
+                owner: "acme".into(),
+                name: "app".into(),
+                ..Default::default()
+            }),
+            build: None,
+            artifacts: vec![],
+            placement_profiles: vec![],
+            resources: Default::default(),
+            k8s_overlay: None,
+            oidc_token: None,
+            resolved_secrets: Default::default(),
+            services: Vec::new(),
+            uses: Vec::new(),
+            matrix_values: Default::default(),
+            scope: None,
+        }
     };
-    let h = exec.launch(&step, &spec).await.expect("launch build");
+
+    let build = step_run("image", vec![StepId("checkout".into())]);
+    let h = exec
+        .launch(&build, &spec("image", vec![root]))
+        .await
+        .expect("launch build");
     let terminal = poll_to_terminal(&exec, &h, 300).await;
     assert_eq!(terminal, Some(ExecState::Succeeded), "build step succeeds");
+    // The layout reaches the push Step through the build Step's workspace.
+    let built = exec
+        .output(&h)
+        .await
+        .expect("output")
+        .expect("the build Step published its workspace");
+
+    let push = step_run("push", vec![StepId("image/image".into())]);
+    let ph = exec
+        .launch(&push, &spec("push", vec![built]))
+        .await
+        .expect("launch push");
+    let terminal = poll_to_terminal(&exec, &ph, 300).await;
+    assert_eq!(terminal, Some(ExecState::Succeeded), "push step succeeds");
 
     // The push is observable: a verification step reads the registry's tag
     // list from inside the cluster.
@@ -1916,6 +2029,8 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -1940,6 +2055,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
     );
 
     exec.cancel(&vh).await.expect("cleanup verify");
+    exec.cancel(&ph).await.expect("cleanup push");
     exec.cancel(&h).await.expect("cleanup build");
 }
 
@@ -2027,6 +2143,8 @@ async fn results_sidecar_captures_a_named_result_end_to_end() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -2214,6 +2332,8 @@ async fn cancel_tears_down_a_running_pod() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -2313,6 +2433,8 @@ async fn artifacts_are_harvested_post_step() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec!["dist/*".into()], // the .tmp is NOT published
         placement_profiles: vec![],
@@ -2398,6 +2520,8 @@ async fn artifacts_are_harvested_from_a_failed_step() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec!["dist/*".into()],
         placement_profiles: vec![],
@@ -2466,6 +2590,8 @@ fn busybox_spec(cmd: &str, run_as_root: bool) -> StepSpec {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],
@@ -2811,6 +2937,8 @@ async fn fanin_collision_summary_survives_the_termination_log_as_uid_65532() {
         workspace_outputs: vec![],
         cache: None,
         forge_token: None,
+        sandbox: None,
+        registry_auth: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],

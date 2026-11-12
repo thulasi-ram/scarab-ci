@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Install Scarab's clone library into an org of the kind stack, as an org
-# admin installs any library, from the in-cluster Forgejo: no install reads
-# github.com.
+# Install Scarab's clone and build libraries into an org of the kind stack,
+# as an org admin installs any library, from the in-cluster Forgejo: no
+# install reads github.com.
 #
 #   deploy/kind/libs.sh install <org>     # dev and e2e modes (up.sh runs it)
 #   deploy/kind/libs.sh connection <org>  # print the id of <org>'s Forgejo
 #                                         # connection, made if needed
 #
 # deploy/kind/forgejo.sh seeds `<org>/scarab-libs` (clone.yaml pinned to the
-# locally built scarab-clone:dev image, notify.yaml, argocd/manifest.json) and
+# locally built scarab-clone:dev image, build.yaml, notify.yaml,
+# argocd/manifest.json) and
 # records its commit in .state/libs/<org>.commit. An org reads a private
 # source only through a connection of its own, and only its own
 # repositories, so this:
@@ -21,9 +22,15 @@
 #      skipped with a warning when its token no longer reads the source.
 #   2. fetches `<host>/<org>/scarab-libs//clone.yaml@<commit>` through it,
 #      installs it as `lib:thulasi-ram/clone` (or upgrades what is there),
-#   3. trusts that source (POST …/library-trust), so a Step of the library
-#      receives the connection's long-lived token: the stack has no GitHub
-#      App to mint one per Run.
+#      and does the same for build.yaml as `lib:thulasi-ram/build`,
+#   3. trusts clone.yaml's source with forge credentials (POST
+#      …/library-trust), so a Step of the library receives the connection's
+#      long-lived token: the stack has no GitHub App to mint one per Run;
+#      and trusts build.yaml's source for the build sandbox, so its build
+#      Step may run rootless BuildKit. The build library is not trusted with
+#      the registry credential or forge credentials: no pipeline of the stack
+#      pushes, so its push Step exits without pushing (it still pulls the
+#      crane image the library pins).
 #
 # The calls carry no credential: dev and e2e modes run SCARAB_DEV_INSECURE,
 # so step-up is off. Idempotent.
@@ -113,27 +120,38 @@ if [ "$cmd" = connection ]; then
   exit 0
 fi
 
-source="$host/$org/$libs_repo//clone.yaml@$commit"
-echo "==> installing lib:thulasi-ram/clone into $org from $source"
-if ! fetched="$(call POST "/v1/orgs/$org/libraries/fetch" \
-      "{\"source\":\"$source\",\"connection\":\"$conn\",\"publisher\":\"thulasi-ram\",\"name\":\"clone\"}")"; then
-  if [ "$mode" = dev ]; then
-    echo "warning: could not read $source through connection $conn; the clone library is not installed in $org" >&2
-    exit 0
+# install_lib NAME GRANT: fetch NAME.yaml from the seeded repo through the
+# connection, install it as lib:thulasi-ram/NAME (or upgrade what is there),
+# and trust its source with GRANT (forge_credentials or build_sandbox).
+install_lib() {
+  local name="$1" grant="$2" source fetched hash current replaces
+  source="$host/$org/$libs_repo//$name.yaml@$commit"
+  echo "==> installing lib:thulasi-ram/$name into $org from $source"
+  if ! fetched="$(call POST "/v1/orgs/$org/libraries/fetch" \
+        "{\"source\":\"$source\",\"connection\":\"$conn\",\"publisher\":\"thulasi-ram\",\"name\":\"$name\"}")"; then
+    if [ "$mode" = dev ]; then
+      echo "warning: could not read $source through connection $conn; the $name library is not installed in $org" >&2
+      return 0
+    fi
+    die "could not read $source"
   fi
-  die "could not read $source"
-fi
-hash="$(echo "$fetched" | json 'd["content_hash"]')"
-current="$(echo "$fetched" | json '(d.get("current") or {}).get("content_hash") or ""')"
-if [ "$current" != "$hash" ]; then
-  replaces=null
-  [ -z "$current" ] || replaces="\"$current\""
-  call PUT "/v1/orgs/$org/libraries/thulasi-ram/clone" \
-    "{\"content_hash\":\"$hash\",\"replaces\":$replaces}" >/dev/null
-  echo "    installed ${hash:0:12} (pins scarab-clone:dev)"
-else
-  echo "    ${hash:0:12} is installed already"
-fi
-# Trust is per source, without the commit: later seeds keep it.
-call POST "/v1/orgs/$org/library-trust" "{\"source\":\"${source%@*}\"}" >/dev/null
-echo "    trusted ${source%@*} with forge credentials"
+  hash="$(echo "$fetched" | json 'd["content_hash"]')"
+  current="$(echo "$fetched" | json '(d.get("current") or {}).get("content_hash") or ""')"
+  if [ "$current" != "$hash" ]; then
+    replaces=null
+    [ -z "$current" ] || replaces="\"$current\""
+    call PUT "/v1/orgs/$org/libraries/thulasi-ram/$name" \
+      "{\"content_hash\":\"$hash\",\"replaces\":$replaces}" >/dev/null
+    echo "    installed ${hash:0:12}"
+  else
+    echo "    ${hash:0:12} is installed already"
+  fi
+  # Trust is per source and grant, without the commit: later seeds keep it.
+  call POST "/v1/orgs/$org/library-trust" \
+    "{\"source\":\"${source%@*}\",\"grant\":\"$grant\"}" >/dev/null
+  echo "    trusted ${source%@*} with $grant"
+}
+
+# clone.yaml pins scarab-clone:dev.
+install_lib clone forge_credentials
+install_lib build build_sandbox

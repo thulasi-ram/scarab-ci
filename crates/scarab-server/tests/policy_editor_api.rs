@@ -63,6 +63,8 @@ fn step_admit_input(image: &str) -> Value {
             secrets: Capped::new(Vec::new()).unwrap(),
             env_secrets: None,
             forge_token: None,
+            sandbox: None,
+            registry_auth: None,
             uses_environment_authority: false,
             origin: Capped::new(Vec::new()).unwrap(),
         },
