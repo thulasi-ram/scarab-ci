@@ -648,6 +648,10 @@ machine, see <a href="/scarab-ci/get-started/local-development/">Local Developme
 <td>Global default step deadline (default 3600); per-step overridable via <code dir="auto">timeout:</code>. Counts from when the step process starts running.</td>
 </tr>
 <tr>
+<td><code dir="auto">SCARAB_UNSCHEDULABLE_GRACE_SECS</code></td>
+<td>Seconds a step Pod the Kubernetes scheduler calls Unschedulable waits for a node before the step fails (default 300; chart value <code dir="auto">scarab.unschedulableGraceSecs</code>). A cluster autoscaler such as Karpenter marks every Pod that needs a new node Unschedulable until the node joins, so a node pool that scales to zero needs it. After the wait the step fails with the scheduler’s message, and each automatic retry waits again. At most 1800: an attempt that has not started 30 minutes after it was claimed fails anyway. <code dir="auto">0</code> fails such a Pod at once.</td>
+</tr>
+<tr>
 <td><code dir="auto">SCARAB_PLACEMENT_CONFIG_FILE</code></td>
 <td>Path to the operator placement config: cluster baseline + PlacementProfile registry; a bad path/parse fails boot.</td>
 </tr>
