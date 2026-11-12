@@ -11725,7 +11725,10 @@ steps:
         for step in ir
             .steps
             .iter()
-            .filter(|s| s.origin.iter().any(|l| l.name == "thulasi-ram/build"))
+            // The library's build Step; its push Step names no context.
+            .filter(|s| {
+                s.origin.iter().any(|l| l.name == "thulasi-ram/build") && s.id.ends_with("/image")
+            })
         {
             builds += 1;
             let launched = launch(step, json!({}), json!({})).unwrap();
