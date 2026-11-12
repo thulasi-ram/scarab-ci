@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1794463300,"nonce":"0c0kPME9q5RZ8OWL4VJlz6qGHzg=","title":"forge: a Pipeline that fails its check (compile refusal) posts no commit status; required checks wait forever","was":"x"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1794463300,"nonce":"ZuzFifDvaQ+EZMORylsB05yf96w=","added":["type:bug"],"removed":null}]}
