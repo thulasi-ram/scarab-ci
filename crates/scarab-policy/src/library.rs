@@ -11,8 +11,8 @@
 //! - A **LibraryVersion** is one library file as fetched, keyed by
 //!   `(org, content_hash)`; the hash is SHA-256 of the content, lowercase hex,
 //!   the same hash the compiler records in a Step's `origin`.
-//! - A **LibraryInstallation** names the version the org uses for one
-//!   `<publisher>/<name>`. Installing and upgrading take the hash the caller
+//! - A **LibraryInstallation** names the version the org uses under one
+//!   library name ([`library_name_error`]). Installing and upgrading take the hash the caller
 //!   expects to replace, so an upgrade confirmed against one diff cannot
 //!   replace a version someone else installed in between.
 //! - A **yank** refuses a version in one org (§6). [`yank_refusals`] is the
@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 
 use scarab_pipeline::{InstalledLibrary, OriginEntry, OriginKind};
 
+pub use scarab_pipeline::{library_name_error, LIBRARY_NAME_RULE};
+
 /// One library file as fetched into an org.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryVersion {
@@ -38,14 +40,13 @@ pub struct LibraryVersion {
     /// The git source it was fetched from, pinned to a commit:
     /// `github.com/acme/scarab-libs//deploy-helm.yaml@<commit>`.
     pub source: String,
-    /// The `<publisher>/<name>` it was fetched for.
-    pub publisher: String,
+    /// The library name it was fetched for, as `invoke: lib:` names it.
     pub name: String,
     pub fetched_by: String,
     pub fetched_at: i64,
 }
 
-/// The version an org uses for one `<publisher>/<name>`.
+/// The version an org uses under one library name.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryInstallation {
     /// Store-minted when the library is first installed: 10 random
@@ -54,7 +55,7 @@ pub struct LibraryInstallation {
     #[serde(default)]
     pub id: String,
     pub org: String,
-    pub publisher: String,
+    /// The library name, as `invoke: lib:` names it.
     pub name: String,
     pub content_hash: String,
     /// The installed version's source.
@@ -65,18 +66,10 @@ pub struct LibraryInstallation {
     pub step_up_ref: Option<String>,
 }
 
-impl LibraryInstallation {
-    /// `<publisher>/<name>`, as `invoke: lib:` names it.
-    pub fn qualified_name(&self) -> String {
-        format!("{}/{}", self.publisher, self.name)
-    }
-}
-
 /// An install or upgrade.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewInstallation {
     pub org: String,
-    pub publisher: String,
     pub name: String,
     /// A version already stored in the org.
     pub content_hash: String,
@@ -214,7 +207,7 @@ pub trait LibraryStore: Send + Sync {
         content_hash: &str,
     ) -> Result<Option<LibraryVersion>, LibraryStoreError>;
 
-    /// Installs a stored version under `<publisher>/<name>`, if the current
+    /// Installs a stored version under `new.name`, if the current
     /// installation is what `replaces` says.
     async fn install(
         &self,
@@ -225,7 +218,6 @@ pub trait LibraryStore: Send + Sync {
     async fn installation(
         &self,
         org: &str,
-        publisher: &str,
         name: &str,
     ) -> Result<Option<LibraryInstallation>, LibraryStoreError>;
 
@@ -243,24 +235,25 @@ pub trait LibraryStore: Send + Sync {
             .find(|i| i.id == id))
     }
 
-    /// The org's installations by publisher, then name (bytewise).
+    /// The org's installations by name (bytewise).
     async fn installations(&self, org: &str)
         -> Result<Vec<LibraryInstallation>, LibraryStoreError>;
 
-    /// What the compiler resolves `lib:` against in `org`: each
-    /// `<publisher>/<name>` with its installed content and source.
+    /// What the compiler resolves `lib:` against in `org`: each library
+    /// name with its installed content and source.
     async fn installed_for_compile(
         &self,
         org: &str,
     ) -> Result<BTreeMap<String, InstalledLibrary>, LibraryStoreError>;
 
-    /// Removes an installation; the removed one, or `None`. Its version
-    /// stays stored, so Runs that used it still show what they ran.
+    /// Removes the installation with this id; the removed one, or `None`.
+    /// By id, so a remove never takes an installation made under the same
+    /// name after the caller looked. Its version stays stored, so Runs that
+    /// used it still show what they ran.
     async fn remove(
         &self,
         org: &str,
-        publisher: &str,
-        name: &str,
+        id: &str,
     ) -> Result<Option<LibraryInstallation>, LibraryStoreError>;
 
     /// Yanks a stored version. Yanking a yanked version keeps the first
@@ -365,17 +358,6 @@ pub fn content_hash(content: &str) -> String {
     out
 }
 
-/// Is `s` a library publisher or name: `[A-Za-z0-9._-]`, not starting with
-/// `.` or `-`, at most 100 bytes? The compiler's rule for each segment of
-/// `lib:<publisher>/<name>`.
-pub fn valid_segment(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 100
-        && !s.starts_with(['.', '-'])
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,14 +424,5 @@ mod tests {
             trust_key("github.com/acme/libs//git.yaml"),
             "github.com/acme/libs//git.yaml"
         );
-    }
-
-    #[test]
-    fn segments_follow_the_compiler() {
-        assert!(valid_segment("thulasi-ram"));
-        assert!(valid_segment("clone"));
-        for bad in ["", ".x", "-x", "a/b", "a b", &"x".repeat(101)] {
-            assert!(!valid_segment(bad), "{bad}");
-        }
     }
 }

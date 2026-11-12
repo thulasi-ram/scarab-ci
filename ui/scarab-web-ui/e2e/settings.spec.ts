@@ -650,10 +650,10 @@ test("Install library opens a dialog, and its source is reviewed on its own page
   await page.goto("/orgs/acme/settings/libraries");
   const table = page.getByRole("table", { name: "Installed libraries" });
   await expect(table.getByRole("row")).toHaveCount(6);
-  await expect(table.getByRole("row").filter({ hasText: "lib:platform/kaniko-build" })).toContainText("yanked");
+  await expect(table.getByRole("row").filter({ hasText: "lib:platform::scarab-libs::kaniko-build" })).toContainText("yanked");
   // A yank of a removed library and a trusted source that no installation
   // holds stay on the list.
-  await expect(page.getByRole("list", { name: "Yanks of removed libraries" })).toContainText("lib:acme/slack-notify");
+  await expect(page.getByRole("list", { name: "Yanks of removed libraries" })).toContainText("lib:acme::scarab-libs::slack-notify");
   await expect(page.getByRole("list", { name: "Trusted sources no library comes from now" })).toContainText(
     "release-notes.yaml",
   );
@@ -662,13 +662,18 @@ test("Install library opens a dialog, and its source is reviewed on its own page
   const dialog = page.getByRole("dialog");
   const go = dialog.getByRole("button", { name: "Fetch and review" });
   await expect(go).toBeDisabled();
-  await dialog
-    .getByRole("textbox", { name: "Source" })
-    .fill("github.com/acme/scarab-libs//deploy-helm.yaml@d41f07b29c3e8a6f5b1d0c9e7a2f4b8c6d3e1a90");
+  await dialog.getByRole("textbox", { name: "File" }).fill("github.com/acme/scarab-libs//deploy-helm.yaml");
+  await expect(go).toBeDisabled();
+  await dialog.getByRole("textbox", { name: "Ref" }).fill("v1.4.0");
+  // The Name follows the file until someone types one.
+  const name = dialog.getByRole("textbox", { name: "Name", exact: true });
+  await expect(name).toHaveValue("acme::scarab-libs::deploy-helm");
+  await expect(dialog.getByText("invoke: lib:acme::scarab-libs::deploy-helm")).toBeVisible();
   await go.click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/review\?source=/);
+  await expect(page).toHaveURL(/ref=v1\.4\.0/);
   // The mock answers every fetch with an upgrade of deploy-helm.
-  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Libraries\s*lib:acme\/deploy-helm$/);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Libraries\s*lib:acme::scarab-libs::deploy-helm$/);
   await expect(page.getByText("5d1e0c7a9b3f → 0c4e7b2a91f5")).toBeVisible();
   await page.getByRole("button", { name: "Upgrade", exact: true }).click();
   // The manage page's URL carries the installation's id.
@@ -679,11 +684,11 @@ test("Install library opens a dialog, and its source is reviewed on its own page
 test("a library's manage page holds its version, trust, yank and remove", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/libraries");
-  await page.getByRole("link", { name: "lib:acme/http-probe" }).click();
+  await page.getByRole("link", { name: "lib:acme::scarab-libs::http-probe" }).click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/5c09e3a7d4\/manage$/);
   const nav = page.getByRole("navigation", { name: "Settings" });
   await expect(nav.getByRole("link", { name: "Libraries", exact: true })).toHaveAttribute("aria-current", "page");
-  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Libraries\s*lib:acme\/http-probe$/);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Libraries\s*lib:acme::scarab-libs::http-probe$/);
   await expect(page.getByText("untrusted source", { exact: true })).toBeVisible();
   // One trust panel per grant, each with its own Trust source button.
   await expect(page.getByRole("button", { name: "Trust source" })).toHaveCount(3);
@@ -696,7 +701,8 @@ test("a library's manage page holds its version, trust, yank and remove", async 
   // Upgrade opens the install dialog with the installed source in it.
   await page.getByRole("button", { name: "Upgrade" }).click();
   const upgrade = page.getByRole("dialog");
-  await expect(upgrade.getByRole("textbox", { name: "Source" })).toHaveValue(/http-probe\.yaml@8c2f4e1a/);
+  await expect(upgrade.getByRole("textbox", { name: "File" })).toHaveValue(/http-probe\.yaml$/);
+  await expect(upgrade.getByRole("textbox", { name: "Ref" })).toHaveValue(/^8c2f4e1a/);
   await upgrade.getByRole("button", { name: "Cancel" }).click();
 
   // Remove asks for the name to be typed, then goes back to the list.
@@ -704,7 +710,7 @@ test("a library's manage page holds its version, trust, yank and remove", async 
   const remove = page.getByRole("dialog");
   const confirm = remove.getByRole("button", { name: "Remove library" });
   await expect(confirm).toBeDisabled();
-  await remove.getByRole("textbox").fill("lib:acme/http-probe");
+  await remove.getByRole("textbox").fill("lib:acme::scarab-libs::http-probe");
   await confirm.click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries$/);
   expect(errors).toEqual([]);
@@ -717,12 +723,12 @@ test("a library's yanked versions are on its manage page; the list keeps a remov
   // version and kaniko-build's installed one are on their own pages.
   const removed = page.getByRole("list", { name: "Yanks of removed libraries" });
   await expect(removed.getByRole("listitem")).toHaveCount(1);
-  await expect(removed).toContainText("lib:acme/slack-notify");
+  await expect(removed).toContainText("lib:acme::scarab-libs::slack-notify");
   await expect(removed).toContainText("slack-notify.yaml@6e2a9c4");
   await expect(removed.getByRole("button", { name: "Lift yank" })).toBeVisible();
 
   // deploy-helm is installed, not yanked, and an earlier version is.
-  await page.getByRole("link", { name: "lib:acme/deploy-helm" }).click();
+  await page.getByRole("link", { name: "lib:acme::scarab-libs::deploy-helm" }).click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/b72d4f1e06\/manage$/);
   const yanked = page.getByRole("table", { name: "Yanked versions" });
   await expect(yanked.getByRole("row")).toHaveCount(2);
@@ -749,7 +755,7 @@ test("Library policies list the sources trusted with the forge token, read-only"
   await expect(table.getByRole("row")).toHaveCount(4);
   const clone = table.getByRole("row").filter({ hasText: "libs/clone.yaml" });
   await expect(clone).toContainText("a.kim");
-  await expect(clone.getByRole("link", { name: "lib:thulasi-ram/clone" })).toHaveAttribute(
+  await expect(clone.getByRole("link", { name: "lib:thulasi-ram::scarab-ci::clone" })).toHaveAttribute(
     "href",
     "/orgs/acme/settings/libraries/3e81c0a9f2/manage",
   );
@@ -761,14 +767,8 @@ test("Library policies list the sources trusted with the forge token, read-only"
   expect(errors).toEqual([]);
 });
 
-test("a library's old publisher~name address goes on to its id address", async ({ page }) => {
+test("a library id that names no installation says so", async ({ page }) => {
   const errors = collectErrors(page);
-  await page.goto("/orgs/acme/settings/libraries/acme~http-probe/manage");
-  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/5c09e3a7d4\/manage$/);
-  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Libraries\s*lib:acme\/http-probe$/);
-  // A name that is not installed, and an id that names nothing, say so.
-  await page.goto("/orgs/acme/settings/libraries/acme~gone/manage");
-  await expect(page.getByText(/There is no library lib:acme\/gone installed in acme/)).toBeVisible();
   await page.goto("/orgs/acme/settings/libraries/0000000000/manage");
   await expect(page.getByText(/There is no library 0000000000 installed in acme/)).toBeVisible();
   expect(errors).toEqual([]);

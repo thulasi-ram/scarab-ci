@@ -70,15 +70,15 @@ fn forge(ci: &str) -> FakeForge {
         .with_commit("refs/heads/main", SHA)
 }
 
-async fn seed(libs: &dyn LibraryStore, org: &str, publisher: &str, name: &str, content: &str) {
-    libs.put_version(&version(org, publisher, name, content, 1))
+/// Installs `content` in `org` as `lib:acme/<name>`.
+async fn seed(libs: &dyn LibraryStore, org: &str, name: &str, content: &str) {
+    libs.put_version(&version(org, name, content, 1))
         .await
         .unwrap();
     libs.install(
         &NewInstallation {
             org: org.into(),
-            publisher: publisher.into(),
-            name: name.into(),
+            name: format!("acme/{name}"),
             content_hash: content_hash(content),
             installed_by: "seed".into(),
             installed_at: 1,
@@ -90,24 +90,24 @@ async fn seed(libs: &dyn LibraryStore, org: &str, publisher: &str, name: &str, c
     .unwrap();
 }
 
-fn version(org: &str, publisher: &str, name: &str, content: &str, at: i64) -> LibraryVersion {
+/// `content` fetched in `org` for `lib:acme/<name>`.
+fn version(org: &str, name: &str, content: &str, at: i64) -> LibraryVersion {
     LibraryVersion {
         org: org.into(),
         content_hash: content_hash(content),
         content: content.into(),
-        source: format!("github.com/{publisher}/libs//{name}.yaml@{C1}"),
-        publisher: publisher.into(),
-        name: name.into(),
+        source: format!("github.com/acme/libs//{name}.yaml@{C1}"),
+        name: format!("acme/{name}"),
         fetched_by: "amy".into(),
         fetched_at: at,
     }
 }
 
+/// An install of `content` in `org` as `lib:acme/<name>`.
 fn new_install(org: &str, name: &str, content: &str) -> NewInstallation {
     NewInstallation {
         org: org.into(),
-        publisher: "acme".into(),
-        name: name.into(),
+        name: format!("acme/{name}"),
         content_hash: content_hash(content),
         installed_by: "bob".into(),
         installed_at: 2,
@@ -208,7 +208,7 @@ async fn gate_refusal_survives_the_production_decorator_chain() {
     const CI: &str = "on:\n  push: {}\nsteps:\n  - { id: ship, invoke: lib:acme/deploy }\n";
     let db = Arc::new(InMemoryDb::new());
     let libs = Arc::new(InMemoryLibraries::new());
-    seed(libs.as_ref(), "acme", "acme", "deploy", TIMED).await;
+    seed(libs.as_ref(), "acme", "deploy", TIMED).await;
     let run = create_run(&db, libs.as_ref(), CI, "web").await;
     let clock = FakeClock::new(1_000);
     tick_prod(&db, libs.clone(), &clock, &run).await;
@@ -239,8 +239,8 @@ async fn gate_refusal_an_outer_yank_fails_a_gate_in_an_unyanked_inner_library() 
     const CI: &str = "on:\n  push: {}\nsteps:\n  - { id: ship, invoke: lib:acme/outer }\n";
     let db = Arc::new(InMemoryDb::new());
     let libs = Arc::new(InMemoryLibraries::new());
-    seed(libs.as_ref(), "acme", "acme", "inner", TIMED).await;
-    seed(libs.as_ref(), "acme", "acme", "outer", OUTER).await;
+    seed(libs.as_ref(), "acme", "inner", TIMED).await;
+    seed(libs.as_ref(), "acme", "outer", OUTER).await;
     let run = create_run(&db, libs.as_ref(), CI, "web").await;
     let clock = FakeClock::new(1_000);
     tick_prod(&db, libs.clone(), &clock, &run).await;
@@ -289,10 +289,9 @@ impl LibraryStore for YankedDown {
     async fn installation(
         &self,
         o: &str,
-        p: &str,
         n: &str,
     ) -> Result<Option<LibraryInstallation>, LibraryStoreError> {
-        self.0.installation(o, p, n).await
+        self.0.installation(o, n).await
     }
     async fn installations(&self, o: &str) -> Result<Vec<LibraryInstallation>, LibraryStoreError> {
         self.0.installations(o).await
@@ -306,10 +305,9 @@ impl LibraryStore for YankedDown {
     async fn remove(
         &self,
         o: &str,
-        p: &str,
         n: &str,
     ) -> Result<Option<LibraryInstallation>, LibraryStoreError> {
-        self.0.remove(o, p, n).await
+        self.0.remove(o, n).await
     }
     async fn yank(&self, y: &LibraryYank) -> Result<LibraryYank, LibraryStoreError> {
         self.0.yank(y).await
@@ -343,9 +341,9 @@ async fn gate_refusal_a_store_error_holds_the_gate_and_blocks_no_other_run() {
     const OTHER: &str = "kind: library\nsteps:\n  - { id: x, image: alpine@sha256:cccc }\n";
     let db = Arc::new(InMemoryDb::new());
     let libs = Arc::new(InMemoryLibraries::new());
-    seed(libs.as_ref(), "acme", "acme", "deploy", TIMED).await;
+    seed(libs.as_ref(), "acme", "deploy", TIMED).await;
     // An unrelated yank, so the check reads the IR and asks `yanked`.
-    seed(libs.as_ref(), "acme", "acme", "other", OTHER).await;
+    seed(libs.as_ref(), "acme", "other", OTHER).await;
     yank(libs.as_ref(), OTHER).await;
     let a = create_run(&db, libs.as_ref(), CI_A, "web").await;
     let clock = FakeClock::new(1_000);
@@ -733,15 +731,15 @@ async fn prune_a_review_pushed_past_the_bound_fails_closed() {
     assert!(a.libs.version("acme", &hashes[1]).await.unwrap().is_some());
     let (st, b) = call(
         &a.app,
-        "PUT",
-        "/v1/orgs/acme/libraries/acme/l0",
-        Some(json!({ "content_hash": hashes[0] })),
+        "POST",
+        "/v1/orgs/acme/library-installations",
+        Some(json!({ "name": "acme/l0", "content_hash": hashes[0] })),
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
     assert!(a
         .libs
-        .installation("acme", "acme", "l0")
+        .installation("acme", "acme/l0")
         .await
         .unwrap()
         .is_none());
@@ -756,12 +754,12 @@ async fn prune_contract(store: &dyn LibraryStore) {
     };
     for i in 1..=5 {
         store
-            .put_version(&version("acme", "acme", "x", &v(i), i))
+            .put_version(&version("acme", "x", &v(i), i))
             .await
             .unwrap();
     }
     store
-        .put_version(&version("globex", "acme", "x", &v(0), 0))
+        .put_version(&version("globex", "x", &v(0), 0))
         .await
         .unwrap();
     // v1 installed once, then removed.
@@ -769,7 +767,7 @@ async fn prune_contract(store: &dyn LibraryStore) {
         .install(&new_install("acme", "x", &v(1)), &Replaces::Nothing)
         .await
         .unwrap();
-    store.remove("acme", "acme", "x").await.unwrap();
+    store.remove("acme", "acme/x").await.unwrap();
     // v2 yanked, never installed.
     yank(store, &v(2)).await;
     // keep 1 → among never-installed, unyanked, not-except {v3, v4}: keep v4.
@@ -848,9 +846,7 @@ async fn prune_keeps_a_replaced_version_and_the_column_ships_with_the_table() {
             .unwrap()
         }
     };
-    pg.put_version(&version("acme", "acme", "x", V, 1))
-        .await
-        .unwrap();
+    pg.put_version(&version("acme", "x", V, 1)).await.unwrap();
     assert!(
         !installed_once(content_hash(V)).await,
         "a fetch is not an install"
@@ -863,9 +859,7 @@ async fn prune_keeps_a_replaced_version_and_the_column_ships_with_the_table() {
         "the install did not set it"
     );
     // Upgrade V → W, then a later fetch prunes.
-    pg.put_version(&version("acme", "acme", "x", W, 2))
-        .await
-        .unwrap();
+    pg.put_version(&version("acme", "x", W, 2)).await.unwrap();
     pg.install(
         &new_install("acme", "x", W),
         &Replaces::Version(content_hash(V)),
@@ -928,7 +922,7 @@ async fn pg_with_v0_installed() -> Option<(common::TestDb, Arc<scarab_db_postgre
     let pg = Arc::new(scarab_db_postgres::PostgresDb::with_pool(tdb.pool.clone()));
     pg.migrate().await.unwrap();
     for (i, c) in [V0, V1, V2].iter().enumerate() {
-        pg.put_version(&version("acme", "acme", "x", c, i as i64))
+        pg.put_version(&version("acme", "x", c, i as i64))
             .await
             .unwrap();
     }
@@ -949,7 +943,7 @@ async fn race_two_upgrades_naming_the_same_replaces() {
     let mut a = tdb.pool.begin().await.unwrap();
     sqlx::query(
         "UPDATE library_installations SET content_hash = $1 \
-         WHERE org = 'acme' AND publisher = 'acme' AND name = 'x' AND content_hash = $2",
+         WHERE org = 'acme' AND name = 'acme/x' AND content_hash = $2",
     )
     .bind(content_hash(V1))
     .bind(content_hash(V0))
@@ -968,7 +962,7 @@ async fn race_two_upgrades_naming_the_same_replaces() {
     let blocked = wait_blocked(&tdb.pool, "library_installations").await;
     a.commit().await.unwrap();
     let got = b.await.unwrap();
-    let now = pg.installation("acme", "acme", "x").await.unwrap().unwrap();
+    let now = pg.installation("acme", "acme/x").await.unwrap().unwrap();
     tdb.cleanup().await;
     assert!(
         blocked,
@@ -986,12 +980,10 @@ async fn race_an_upgrade_racing_a_remove_does_not_resurrect_it() {
         return;
     };
     let mut a = tdb.pool.begin().await.unwrap();
-    sqlx::query(
-        "DELETE FROM library_installations WHERE org = 'acme' AND publisher = 'acme' AND name = 'x'",
-    )
-    .execute(&mut *a)
-    .await
-    .unwrap();
+    sqlx::query("DELETE FROM library_installations WHERE org = 'acme' AND name = 'acme/x'")
+        .execute(&mut *a)
+        .await
+        .unwrap();
     let store = pg.clone();
     let b = tokio::spawn(async move {
         store
@@ -1004,7 +996,7 @@ async fn race_an_upgrade_racing_a_remove_does_not_resurrect_it() {
     let blocked = wait_blocked(&tdb.pool, "library_installations").await;
     a.commit().await.unwrap();
     let got = b.await.unwrap();
-    let now = pg.installation("acme", "acme", "x").await.unwrap();
+    let now = pg.installation("acme", "acme/x").await.unwrap();
     tdb.cleanup().await;
     assert!(blocked, "the interleaving was not built");
     assert_eq!(got.err(), Some(LibraryStoreError::Conflict));
@@ -1023,8 +1015,8 @@ async fn race_a_prune_racing_an_install_keeps_the_installed_version() {
     let mut a = tdb.pool.begin().await.unwrap();
     sqlx::query(
         "INSERT INTO library_installations \
-         (org, publisher, name, content_hash, installed_by, installed_at) \
-         VALUES ('acme', 'acme', 'y', $1, 'amy', 3)",
+         (org, name, content_hash, installed_by, installed_at) \
+         VALUES ('acme', 'acme/y', $1, 'amy', 3)",
     )
     .bind(content_hash(V2))
     .execute(&mut *a)
@@ -1081,7 +1073,7 @@ async fn race_an_install_racing_a_prune_fails_as_unknown_version() {
     let blocked = wait_blocked(&tdb.pool, "library_installations").await;
     a.commit().await.unwrap();
     let got = b.await.unwrap();
-    let now = pg.installation("acme", "acme", "y").await.unwrap();
+    let now = pg.installation("acme", "acme/y").await.unwrap();
     tdb.cleanup().await;
     assert!(blocked, "the interleaving was not built");
     assert!(
@@ -1103,7 +1095,7 @@ async fn stored_origin_with_an_unknown_field_still_answers_the_yank_check() {
     const CI: &str = "on:\n  push: {}\nsteps:\n  - { id: ship, invoke: lib:acme/deploy }\n";
     let db = Arc::new(InMemoryDb::new());
     let libs = Arc::new(InMemoryLibraries::new());
-    seed(libs.as_ref(), "acme", "acme", "deploy", DEPLOY).await;
+    seed(libs.as_ref(), "acme", "deploy", DEPLOY).await;
     let run = create_run(&db, libs.as_ref(), CI, "web").await;
     let mut ir = db.run_ir(&run).await.unwrap().unwrap();
     let mut links = 0;
@@ -1192,7 +1184,7 @@ async fn credentials_asked(
 async fn a_yanked_forge_token_or_registry_auth_step_mints_no_credential() {
     const CI: &str = "on:\n  push: {}\nsteps:\n  - { id: src, invoke: lib:acme/sourced }\n";
     let libs = Arc::new(InMemoryLibraries::new());
-    seed(libs.as_ref(), "acme", "acme", "sourced", SOURCED).await;
+    seed(libs.as_ref(), "acme", "sourced", SOURCED).await;
     // The org trusts the library's source with its long-lived forge token
     // (ADR-0076 §9) and with the registry credential, so the forge-token
     // Step is admitted and the `registry_auth` Step may receive the

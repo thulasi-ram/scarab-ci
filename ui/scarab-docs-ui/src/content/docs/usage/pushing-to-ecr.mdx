@@ -7,7 +7,7 @@ import Doodle from '../../../components/Doodle.astro';
 
 <Doodle icon="package" size={200} rotate={-8} opacity={0.18} top="7rem" right="-2rem" />
 
-Scarab's build library, `lib:thulasi-ram/build`, pushes with a dockerconfigjson: the
+Scarab's build library, `lib:thulasi-ram::scarab-ci::build`, pushes with a dockerconfigjson: the
 `REGISTRY_AUTH` secret of the repository or its org, or the credential the forge derives for its own
 registry (see [Building an image](/scarab-ci/usage/pipeline-syntax/#building-an-image)). An Amazon
 ECR password does not fit in a stored secret: `aws ecr get-login-password` returns one that is
@@ -221,7 +221,7 @@ that GHCR needs makes every ECR push in that org fail to launch (git-bug 1bc87d1
 
 ## 3. Trust the build library
 
-Install `lib:thulasi-ram/build` and trust its source for the build sandbox, as
+Install `lib:thulasi-ram::scarab-ci::build` and trust its source for the build sandbox, as
 [Libraries](/scarab-ci/usage/libraries/#install-scarabs-build-library) describes. Then trust the
 same source with the registry credential:
 
@@ -246,9 +246,9 @@ on:
     when: "event.branch == 'main'"
 steps:
   - id: checkout
-    invoke: lib:thulasi-ram/clone
+    invoke: lib:thulasi-ram::scarab-ci::clone
   - id: image
-    invoke: lib:thulasi-ram/build
+    invoke: lib:thulasi-ram::scarab-ci::build
     needs: [checkout]
     placement_profiles:
       image: [build-cache]

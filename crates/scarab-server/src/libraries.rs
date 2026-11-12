@@ -3,8 +3,9 @@
 //! **Install is two calls.** `POST …/libraries/fetch` reads the source,
 //! checks it compiles as a closed library, stores it as a LibraryVersion and
 //! returns it with the diff from the version installed under the same name.
-//! `PUT …/libraries/{publisher}/{name}` installs a stored version by hash,
-//! naming the hash it replaces, so what is installed is what the admin read.
+//! `POST …/library-installations` installs a stored version by hash under a
+//! name, naming the hash it replaces, so what is installed is what the admin
+//! read.
 //! The install needs a step-up (it loosens); the fetch installs nothing.
 //!
 //! **Private sources.** A fetch through a ForgeConnection is allowed only
@@ -25,14 +26,17 @@ use axum::{Extension, Json};
 use scarab_engine::DbError;
 use scarab_identity::Action;
 use scarab_policy::library::{
-    content_hash, valid_segment, LibraryInstallation, LibraryStore, LibraryStoreError,
+    content_hash, library_name_error, LibraryInstallation, LibraryStore, LibraryStoreError,
     LibraryVersion, LibraryYank, NewInstallation, Replaces, TrustGrant, TrustedSource,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::{authorize_scoped, connection_adapter, rbac_scope, ApiError, AppState};
-use crate::library_fetch::{anonymous_url, KnownForges, LibrarySource};
+use crate::library_fetch::{
+    anonymous_commit_url, anonymous_url, commit_from_list, is_full_commit, ref_error, KnownForges,
+    LibrarySource,
+};
 use crate::step_up::GuardCtx;
 
 /// The longest yank reason kept.
@@ -45,8 +49,7 @@ const MAX_REASON_BYTES: usize = 2_000;
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LibraryYankDto {
     pub content_hash: String,
-    /// The library the yanked version was fetched for, `<publisher>/<name>`.
-    pub publisher: String,
+    /// The library name the yanked version was fetched for.
     pub name: String,
     /// The git source the version was fetched from, pinned to its commit.
     pub source: String,
@@ -87,7 +90,7 @@ pub struct LibraryInstallationDto {
     /// 10 lowercase hex, minted at the first install and kept by upgrades.
     /// What the settings page's URL carries.
     pub id: String,
-    pub publisher: String,
+    /// The library name, as `invoke: lib:<name>` writes it.
     pub name: String,
     pub content_hash: String,
     pub source: String,
@@ -226,17 +229,24 @@ pub struct TrustSourceRequest {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FetchLibraryRequest {
-    /// `<host>/<owner>/<repo>//<path>@<commit>`.
+    /// `<host>/<owner>/<repo>//<path>@<commit>`, or `<host>/<owner>/<repo>//<path>`
+    /// with `ref`.
     pub source: String,
+    /// A branch, tag or commit, for a `source` with no `@<commit>`. Scarab
+    /// reads the file at the commit it points to now; the stored version and
+    /// the answer's `source` name that commit.
+    #[serde(default, rename = "ref")]
+    pub git_ref: Option<String>,
     /// A ForgeConnection id, for a private repository. Omitted: fetched
     /// anonymously over https.
     #[serde(default)]
     pub connection: Option<String>,
-    /// Defaults to the source's owner.
-    #[serde(default)]
-    pub publisher: Option<String>,
-    /// Defaults to the file name without its extension.
+    /// The library name, as `invoke: lib:<name>` will write it: parts of
+    /// letters, digits, `.`, `_` and `-`, joined by `::` or `/`, each part
+    /// starting with a letter, digit or `_`. Defaults to
+    /// `<owner>::<repo>::<file name without its extension>`.
     #[serde(default)]
     pub name: Option<String>,
 }
@@ -249,7 +259,6 @@ pub struct InstalledVersionDto {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct FetchedLibraryDto {
-    pub publisher: String,
     pub name: String,
     pub content_hash: String,
     pub source: String,
@@ -263,7 +272,10 @@ pub struct FetchedLibraryDto {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct InstallLibraryRequest {
+    /// The library name to install under, as `invoke: lib:<name>` writes it.
+    pub name: String,
     /// A version fetched into this org.
     pub content_hash: String,
     /// The hash installed now (an upgrade), or omitted for a first install.
@@ -330,23 +342,20 @@ fn check_hash(h: &str) -> Result<(), ApiError> {
     }
 }
 
-fn check_names(publisher: &str, name: &str) -> Result<(), ApiError> {
-    for s in [publisher, name] {
-        if !valid_segment(s) {
-            return Err(ApiError::BadRequest(format!(
-                "`{s}` is not a library publisher or name: use letters, digits, `.`, `_` and \
-                 `-`, not starting with `.` or `-`"
-            )));
-        }
+fn check_name(name: &str) -> Result<(), ApiError> {
+    match library_name_error(name) {
+        None => Ok(()),
+        Some(why) => Err(ApiError::BadRequest(format!(
+            "`{}` is not a library name: {why}",
+            name.escape_debug()
+        ))),
     }
-    Ok(())
 }
 
-/// `publisher`, `name`, `source`: of the yanked version.
-fn yank_dto(y: &LibraryYank, publisher: &str, name: &str, source: &str) -> LibraryYankDto {
+/// `name`, `source`: of the yanked version.
+fn yank_dto(y: &LibraryYank, name: &str, source: &str) -> LibraryYankDto {
     LibraryYankDto {
         content_hash: y.content_hash.clone(),
-        publisher: publisher.to_string(),
         name: name.to_string(),
         source: source.to_string(),
         reason: y.reason.clone(),
@@ -359,7 +368,6 @@ fn yank_dto(y: &LibraryYank, publisher: &str, name: &str, source: &str) -> Libra
 fn installation_dto(i: &LibraryInstallation, yanks: &[LibraryYank]) -> LibraryInstallationDto {
     LibraryInstallationDto {
         id: i.id.clone(),
-        publisher: i.publisher.clone(),
         name: i.name.clone(),
         content_hash: i.content_hash.clone(),
         source: i.source.clone(),
@@ -368,7 +376,7 @@ fn installation_dto(i: &LibraryInstallation, yanks: &[LibraryYank]) -> LibraryIn
         yanked: yanks
             .iter()
             .find(|y| y.content_hash == i.content_hash)
-            .map(|y| yank_dto(y, &i.publisher, &i.name, &i.source)),
+            .map(|y| yank_dto(y, &i.name, &i.source)),
     }
 }
 
@@ -389,7 +397,7 @@ async fn described_yank(
                 y.content_hash, y.org
             )))
         })?;
-    Ok(yank_dto(y, &v.publisher, &v.name, &v.source))
+    Ok(yank_dto(y, &v.name, &v.source))
 }
 
 /// A line diff of `old` to `new`: common lines start with a space, removed
@@ -495,7 +503,205 @@ fn connection_web_host(conn: &scarab_forge::ForgeConnection) -> Option<String> {
     })
 }
 
-/// Reads `src`: anonymously, or through `connection` under the org rule.
+/// Why an anonymous read did not work: refused (a host Scarab does not
+/// read from, an address that is not public) or failed.
+struct AnonError {
+    kind: AnonKind,
+    message: String,
+}
+
+/// What an [`AnonError`] answers when nothing else is tried: a refusal
+/// (403), a failed read (400), no anonymous fetcher here (409), or the
+/// connection list not read (500).
+enum AnonKind {
+    Denied,
+    Failed,
+    Unconfigured,
+    Store,
+}
+
+impl AnonError {
+    fn new(kind: AnonKind, message: impl Into<String>) -> Self {
+        AnonError {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    fn into_api(self) -> ApiError {
+        match self.kind {
+            AnonKind::Denied => ApiError::Denied(self.message),
+            AnonKind::Failed => ApiError::BadRequest(self.message),
+            AnonKind::Unconfigured => ApiError::Conflict(self.message),
+            AnonKind::Store => ApiError::Db(DbError::Other(self.message)),
+        }
+    }
+}
+
+/// The forges an anonymous fetch may reach, as an [`AnonError`] on failure.
+async fn anonymous_forges(st: &AppState) -> Result<KnownForges, AnonError> {
+    known_forges(st)
+        .await
+        .map_err(|_| AnonError::new(AnonKind::Store, "the forge connections could not be listed"))
+}
+
+/// `message` with a hint when api.github.com refused an anonymous request:
+/// it allows 60 an hour from one address.
+fn github_limit_hint(url: &str, message: String) -> String {
+    if url.starts_with("https://api.github.com/")
+        && (message.contains(" 403") || message.contains(" 429"))
+    {
+        format!(
+            "{message} (api.github.com allows 60 requests an hour without credentials: give \
+             a full commit id as the ref, or pick a connection that can read the repository)"
+        )
+    } else {
+        message
+    }
+}
+
+/// Reads `url` with the anonymous fetcher.
+async fn anonymous_get(st: &AppState, url: &str) -> Result<Vec<u8>, AnonError> {
+    let fetcher = st.library_fetcher.as_ref().ok_or_else(|| {
+        AnonError::new(
+            AnonKind::Unconfigured,
+            "anonymous library fetches are not configured on this Scarab; pick a connection",
+        )
+    })?;
+    fetcher.get(url).await.map_err(|e| match e {
+        crate::library_fetch::FetchError::Refused(message) => {
+            AnonError::new(AnonKind::Denied, message)
+        }
+        crate::library_fetch::FetchError::Failed(message) => {
+            AnonError::new(AnonKind::Failed, github_limit_hint(url, message))
+        }
+    })
+}
+
+/// Reads `src` without credentials.
+async fn read_anonymously(st: &AppState, src: &LibrarySource) -> Result<Vec<u8>, AnonError> {
+    let known = anonymous_forges(st).await?;
+    let url =
+        anonymous_url(src, &known).map_err(|message| AnonError::new(AnonKind::Denied, message))?;
+    anonymous_get(st, &url).await
+}
+
+/// The commit `git_ref` points to in `src`'s repository, asked without
+/// credentials.
+async fn resolve_anonymously(
+    st: &AppState,
+    src: &LibrarySource,
+    git_ref: &str,
+) -> Result<String, AnonError> {
+    let known = anonymous_forges(st).await?;
+    let url = anonymous_commit_url(src, git_ref, &known)
+        .map_err(|message| AnonError::new(AnonKind::Denied, message))?;
+    let body = anonymous_get(st, &url).await?;
+    commit_from_list(&body, git_ref).map_err(|message| AnonError::new(AnonKind::Failed, message))
+}
+
+/// The connection `id` as a forge adapter, once the org rule (git-bug
+/// 19b0a45) allows it to read `src` for `org`: a private source is read
+/// only through a connection of the installing org, and only from that
+/// org's own repositories. A connection that does not exist and one of
+/// another org answer the same, so the ids of other orgs' connections
+/// cannot be probed from here.
+async fn org_connection_forge(
+    st: &AppState,
+    org: &str,
+    src: &LibrarySource,
+    id: &str,
+) -> Result<std::sync::Arc<dyn scarab_forge::ForgePort>, ApiError> {
+    let not_ours = || {
+        ApiError::Denied(format!(
+            "connection `{id}` does not belong to org `{org}`, so `{}/{}` cannot be \
+             read through it for `{org}`; install it from a public source, or through \
+             a connection of `{org}`",
+            src.owner, src.repo
+        ))
+    };
+    let connections = st.connections.as_deref().ok_or_else(not_ours)?;
+    let conn = connections
+        .get_connection(id)
+        .await
+        .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?
+        .filter(|c| c.org.as_deref() == Some(org))
+        .ok_or_else(not_ours)?;
+    if connection_web_host(&conn).as_deref() != Some(src.host.as_str()) {
+        return Err(ApiError::BadRequest(format!(
+            "connection `{id}` serves {}, not {}",
+            connection_web_host(&conn).unwrap_or_default(),
+            src.host
+        )));
+    }
+    // A connection of the org reaches what its credential reaches; it
+    // reads for the org only the org's own repositories.
+    if src.owner != org {
+        return Err(ApiError::Denied(format!(
+            "`{}/{}` is not owned by org `{org}`; a connection of `{org}` reads only \
+             `{org}`'s repositories, so install it from a public source",
+            src.owner, src.repo
+        )));
+    }
+    connection_adapter(st, &conn).await
+}
+
+/// What connection `id` could not do (`what`, `why`), then the same
+/// without credentials: its answer when that worked, or both reasons. A
+/// connection that cannot reach a public repository (a GitHub App not
+/// installed on it) still installs from it, as it would with no connection.
+fn or_anonymous<T>(
+    id: &str,
+    what: &str,
+    why: String,
+    anonymous: Result<T, AnonError>,
+) -> Result<T, ApiError> {
+    anonymous.map_err(|a| {
+        ApiError::BadRequest(format!(
+            "connection `{id}` could not read {what} ({why}), and it could not be read without \
+             credentials either ({}); check the path and ref, and if the repository is private, \
+             give connection `{id}` access to it",
+            a.message
+        ))
+    })
+}
+
+/// The commit `git_ref` points to now in `src`'s repository: through
+/// `connection` under the org rule, or anonymously.
+pub(crate) async fn resolve_ref(
+    st: &AppState,
+    org: &str,
+    src: &LibrarySource,
+    git_ref: &str,
+    connection: Option<&str>,
+) -> Result<String, ApiError> {
+    if let Some(problem) = ref_error(git_ref) {
+        return Err(ApiError::BadRequest(problem));
+    }
+    if is_full_commit(git_ref) {
+        return Ok(git_ref.to_string());
+    }
+    let Some(id) = connection else {
+        return resolve_anonymously(st, src, git_ref)
+            .await
+            .map_err(AnonError::into_api);
+    };
+    let forge = org_connection_forge(st, org, src, id).await?;
+    let why = match forge.latest_commit(&src.repo_ref(), git_ref).await {
+        Ok(c) if is_full_commit(&c.sha) => return Ok(c.sha),
+        Ok(c) => format!("the forge named `{}`, not a full commit id", c.sha),
+        Err(e) => e.to_string(),
+    };
+    or_anonymous(
+        id,
+        &format!("ref `{git_ref}` of {}/{}/{}", src.host, src.owner, src.repo),
+        why,
+        resolve_anonymously(st, src, git_ref).await,
+    )
+}
+
+/// Reads `src`: anonymously, or through `connection` under the org rule,
+/// and anonymously when the connection cannot read it.
 pub(crate) async fn read_source(
     st: &AppState,
     org: &str,
@@ -503,62 +709,23 @@ pub(crate) async fn read_source(
     connection: Option<&str>,
 ) -> Result<String, ApiError> {
     let bytes = match connection {
-        None => {
-            let url = anonymous_url(src, &known_forges(st).await?).map_err(ApiError::Denied)?;
-            let fetcher = st.library_fetcher.as_ref().ok_or_else(|| {
-                ApiError::Conflict(
-                    "anonymous library fetches are not configured on this Scarab; pick a \
-                     connection"
-                        .into(),
-                )
-            })?;
-            fetcher.get(&url).await.map_err(|e| match e {
-                crate::library_fetch::FetchError::Refused(m) => ApiError::Denied(m),
-                crate::library_fetch::FetchError::Failed(m) => ApiError::BadRequest(m),
-            })?
-        }
+        None => read_anonymously(st, src)
+            .await
+            .map_err(AnonError::into_api)?,
         Some(id) => {
-            // The org rule (git-bug 19b0a45): a private source is read only
-            // through a connection of the installing org, and only from that
-            // org's own repositories. A connection that does not exist and
-            // one of another org answer the same, so the ids of other orgs'
-            // connections cannot be probed from here.
-            let not_ours = || {
-                ApiError::Denied(format!(
-                    "connection `{id}` does not belong to org `{org}`, so `{}/{}` cannot be \
-                     read through it for `{org}`; install it from a public source, or through \
-                     a connection of `{org}`",
-                    src.owner, src.repo
-                ))
-            };
-            let connections = st.connections.as_deref().ok_or_else(not_ours)?;
-            let conn = connections
-                .get_connection(id)
-                .await
-                .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?
-                .filter(|c| c.org.as_deref() == Some(org))
-                .ok_or_else(not_ours)?;
-            if connection_web_host(&conn).as_deref() != Some(src.host.as_str()) {
-                return Err(ApiError::BadRequest(format!(
-                    "connection `{id}` serves {}, not {}",
-                    connection_web_host(&conn).unwrap_or_default(),
-                    src.host
-                )));
-            }
-            // A connection of the org reaches what its credential reaches; it
-            // reads for the org only the org's own repositories.
-            if src.owner != org {
-                return Err(ApiError::Denied(format!(
-                    "`{}/{}` is not owned by org `{org}`; a connection of `{org}` reads only \
-                     `{org}`'s repositories, so install it from a public source",
-                    src.owner, src.repo
-                )));
-            }
-            let forge = connection_adapter(st, &conn).await?;
-            forge
+            let forge = org_connection_forge(st, org, src, id).await?;
+            match forge
                 .read_file_at_ref(&src.repo_ref(), &src.commit, &src.path)
                 .await
-                .map_err(|e| ApiError::BadRequest(format!("reading {src}: {e}")))?
+            {
+                Ok(bytes) => bytes,
+                Err(e) => or_anonymous(
+                    id,
+                    &src.to_string(),
+                    e.to_string(),
+                    read_anonymously(st, src).await,
+                )?,
+            }
         }
     };
     if bytes.len() > scarab_pipeline::MAX_SOURCE_BYTES {
@@ -570,30 +737,29 @@ pub(crate) async fn read_source(
     String::from_utf8(bytes).map_err(|_| ApiError::BadRequest(format!("{src} is not UTF-8")))
 }
 
-/// Checks `content` compiles as `lib:<publisher>/<name>` in `org`, in place
-/// of whatever is installed under that name.
+/// Checks `content` compiles as `lib:<name>` in `org`, in place of whatever
+/// is installed under that name.
 async fn check_compiles(
     store: &dyn LibraryStore,
     org: &str,
-    publisher: &str,
     name: &str,
     content: &str,
 ) -> Result<(), ApiError> {
-    let qualified = format!("{publisher}/{name}");
     let mut installed = store
         .installed_for_compile(org)
         .await
         .map_err(store_api_error)?;
-    installed.remove(&qualified);
+    installed.remove(name);
     let content = content.to_string();
+    let owned_name = name.to_string();
     let checked = tokio::task::spawn_blocking(move || {
-        scarab_pipeline::check_installed_library(&qualified, &content, &installed)
+        scarab_pipeline::check_installed_library(&owned_name, &content, &installed)
     })
     .await
     .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
     checked.map_err(|d| {
         ApiError::BadRequest(format!(
-            "the file cannot be installed as `lib:{publisher}/{name}`:\n  - {}",
+            "the file cannot be installed as `lib:{name}`:\n  - {}",
             d.join("\n  - ")
         ))
     })
@@ -838,14 +1004,36 @@ pub(crate) async fn fetch_library(
     let by = org_caller(&st, &headers, &org, Action::Administer).await?;
     super::refuse_reserved_org(&org, "install a library")?;
     let store = store(&st)?;
-    let src = LibrarySource::parse(&body.source).map_err(ApiError::BadRequest)?;
-    let publisher = body.publisher.clone().unwrap_or_else(|| src.owner.clone());
-    let name = body.name.clone().unwrap_or_else(|| src.default_name());
-    check_names(&publisher, &name)?;
+    let src = match body.git_ref.as_deref().map(str::trim) {
+        None => LibrarySource::parse(&body.source).map_err(ApiError::BadRequest)?,
+        Some(git_ref) => {
+            let unpinned =
+                LibrarySource::parse_unpinned(&body.source).map_err(ApiError::BadRequest)?;
+            let commit =
+                resolve_ref(&st, &org, &unpinned, git_ref, body.connection.as_deref()).await?;
+            unpinned.at(&commit).map_err(ApiError::BadRequest)?
+        }
+    };
+    let name = match body.name.as_deref() {
+        Some(name) => {
+            check_name(name)?;
+            name.to_string()
+        }
+        None => {
+            let name = src.default_name();
+            if let Some(why) = library_name_error(&name) {
+                return Err(ApiError::BadRequest(format!(
+                    "the default name `{name}` (`<owner>::<repo>::<file name>`) is not a \
+                     library name ({why}); name the library with `name`"
+                )));
+            }
+            name
+        }
+    };
     let content = read_source(&st, &org, &src, body.connection.as_deref()).await?;
     super::note_org(&st, &org).await?;
     let hash = content_hash(&content);
-    check_compiles(store, &org, &publisher, &name, &content).await?;
+    check_compiles(store, &org, &name, &content).await?;
     let now = st.clock.now().await.0;
     let stored = store
         .put_version(&LibraryVersion {
@@ -853,7 +1041,6 @@ pub(crate) async fn fetch_library(
             content_hash: hash.clone(),
             content: content.clone(),
             source: src.to_string(),
-            publisher: publisher.clone(),
             name: name.clone(),
             fetched_by: by,
             fetched_at: now,
@@ -870,7 +1057,7 @@ pub(crate) async fn fetch_library(
         tracing::warn!(org = %org, error = %e, "pruning fetched library versions failed");
     }
     let current = store
-        .installation(&org, &publisher, &name)
+        .installation(&org, &name)
         .await
         .map_err(store_api_error)?;
     let diff = match &current {
@@ -886,7 +1073,6 @@ pub(crate) async fn fetch_library(
         None => String::new(),
     };
     Ok(Json(FetchedLibraryDto {
-        publisher,
         name,
         content_hash: stored.content_hash,
         source: stored.source,
@@ -899,18 +1085,13 @@ pub(crate) async fn fetch_library(
     }))
 }
 
-/// Install or upgrade `lib:<publisher>/<name>` to a fetched version. Needs a
-/// step-up: installing and upgrading loosen (ADR-0076 §4). `replaces` must
-/// be the hash installed now, or omitted when nothing is. Administer on the
-/// org.
+/// Install or upgrade `lib:<name>` to a fetched version. Needs a step-up:
+/// installing and upgrading loosen (ADR-0076 §4). `replaces` must be the
+/// hash installed now, or omitted when nothing is. Administer on the org.
 #[utoipa::path(
-    put,
-    path = "/v1/orgs/{org}/libraries/{publisher}/{name}",
-    params(
-        ("org" = String, Path, description = "org"),
-        ("publisher" = String, Path, description = "publisher"),
-        ("name" = String, Path, description = "library name")
-    ),
+    post,
+    path = "/v1/orgs/{org}/library-installations",
+    params(("org" = String, Path, description = "org")),
     request_body = InstallLibraryRequest,
     summary = "Install or upgrade a library (ADR-0076 §4)",
     responses(
@@ -925,12 +1106,13 @@ pub(crate) async fn install_library(
     State(st): State<AppState>,
     guard: Option<Extension<GuardCtx>>,
     headers: HeaderMap,
-    Path((org, publisher, name)): Path<(String, String, String)>,
+    Path(org): Path<String>,
     Json(body): Json<InstallLibraryRequest>,
 ) -> Result<Json<LibraryInstallationDto>, ApiError> {
     let by = org_caller(&st, &headers, &org, Action::Administer).await?;
     super::refuse_reserved_org(&org, "install a library")?;
-    check_names(&publisher, &name)?;
+    let name = body.name;
+    check_name(&name)?;
     check_hash(&body.content_hash)?;
     let store = store(&st)?;
     super::note_org(&st, &org).await?;
@@ -943,7 +1125,7 @@ pub(crate) async fn install_library(
         })?;
     // Checked again: the org's other libraries may have changed since the
     // fetch, and a version fetched under another name is installed here.
-    check_compiles(store, &org, &publisher, &name, &version.content).await?;
+    check_compiles(store, &org, &name, &version.content).await?;
     let replaces = match body.replaces {
         Some(h) => Replaces::Version(h),
         None => Replaces::Nothing,
@@ -953,7 +1135,6 @@ pub(crate) async fn install_library(
         .install(
             &NewInstallation {
                 org: org.clone(),
-                publisher,
                 name,
                 content_hash: version.content_hash,
                 installed_by: by,
@@ -974,32 +1155,32 @@ pub(crate) async fn install_library(
     ))
 }
 
-/// Remove an installation. Pipelines that invoke it then fail to compile,
-/// never in the middle of a Run. Removing tightens: no step-up. Administer
-/// on the org.
+/// Remove an installation, by its id. Pipelines that invoke it then fail to
+/// compile, never in the middle of a Run. Removing tightens: no step-up.
+/// Administer on the org. An id of another org's installation is not found.
 #[utoipa::path(
     delete,
-    path = "/v1/orgs/{org}/libraries/{publisher}/{name}",
+    path = "/v1/orgs/{org}/library-installations/{id}",
     params(
         ("org" = String, Path, description = "org"),
-        ("publisher" = String, Path, description = "publisher"),
-        ("name" = String, Path, description = "library name")
+        ("id" = String, Path, description = "installation id")
     ),
     summary = "Remove an installed library (ADR-0076 §4)",
     responses(
         (status = 204, description = "removed"),
         (status = 403, description = "not an org admin"),
-        (status = 404, description = "not installed, or libraries not configured")
+        (status = 404, description = "no installation with this id in the org, or libraries not configured")
     )
 )]
 pub(crate) async fn remove_library(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Path((org, publisher, name)): Path<(String, String, String)>,
+    Path((org, id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     org_caller(&st, &headers, &org, Action::Administer).await?;
-    store(&st)?
-        .remove(&org, &publisher, &name)
+    let store = store(&st)?;
+    store
+        .remove(&org, &id)
         .await
         .map_err(store_api_error)?
         .ok_or(ApiError::NotFound)?;

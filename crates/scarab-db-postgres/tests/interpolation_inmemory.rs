@@ -593,7 +593,7 @@ async fn a_step_stored_as_the_build_kind_fails_naming_the_library() {
         first.starts_with(
             "step `image`: the `build` step kind was removed; replace the step with:\n    \
              - id: image\n      needs: [checkout]\n      timeout: 1800\n      \
-             placement_profiles: [arm64]\n      invoke: lib:thulasi-ram/build\n      \
+             placement_profiles: [arm64]\n      invoke: lib:thulasi-ram::scarab-ci::build\n      \
              with: { image: \"ghcr.io/acme/app:1\", context: services/api, \
              dockerfile: Dockerfile, push: true }\n"
         ),

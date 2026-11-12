@@ -1,7 +1,6 @@
 // One installed library's page, `/orgs/<org>/settings/libraries/<id>/manage`,
 // inside the settings frame with Libraries marked in the sidebar. The id is
-// the installation's; an upgrade keeps it. An old `<publisher>~<name>` URL is
-// sent on to the installation's id URL when that library is installed.
+// the installation's; an upgrade keeps it.
 //
 // It holds everything done to the installation: its version and source,
 // Upgrade (the install dialog with the source filled in, then the review
@@ -14,10 +13,10 @@
 //
 // The server keeps one version per installation and no history of earlier
 // ones. A yank keeps its version, so the yanked versions table lists earlier
-// versions too: every yank of this `<publisher>/<name>`, read from the org's
+// versions too: every yank of this library's name, read from the org's
 // yanks, the installed version's marked.
 import { createMemo, createResource, createSignal, For, Match, Show, Switch, type JSX } from "solid-js";
-import { A, Navigate, useNavigate, useParams } from "@solidjs/router";
+import { A, useNavigate, useParams } from "@solidjs/router";
 import {
   getLibraryInstallation,
   listLibraries,
@@ -35,8 +34,6 @@ import {
   impactRunLabel,
   libraryChips,
   libraryId,
-  libraryManageHref,
-  parseLibraryKey,
   shortHash,
   grantLabel,
   untrustEffect,
@@ -67,54 +64,9 @@ export default function LibraryManage() {
     <SettingsFrame kind="org" org={org()} section="libraries">
       {/* Keyed: another library in the URL is a new page. */}
       <Show when={key()} keyed>
-        {(_key) => <Manage org={org()} id={id()} />}
+        {(_key) => <ById org={org()} id={id()} />}
       </Show>
     </SettingsFrame>
-  );
-}
-
-function Manage(props: { org: string; id: string }) {
-  // A URL from before installations had ids names `<publisher>~<name>`.
-  const legacy = parseLibraryKey(props.id);
-  return (
-    <Show when={legacy} fallback={<ById org={props.org} id={props.id} />}>
-      {(l) => <Legacy org={props.org} segment={props.id} publisher={l().publisher} name={l().name} />}
-    </Show>
-  );
-}
-
-/** An old `<publisher>~<name>` URL: on to the installation's id URL. */
-function Legacy(props: { org: string; segment: string; publisher: string; name: string }) {
-  const back = () => orgHref(props.org, "libraries");
-  const [libs] = createResource(() => listLibraries(props.org));
-  const found = () =>
-    libs.error ? undefined : libs()?.installations.find((l) => l.publisher === props.publisher && l.name === props.name);
-  return (
-    <>
-      <SettingsCrumbs
-        trail={[{ label: "Libraries", href: back() }, { label: libraryId(props), mono: true }]}
-        sub={
-          <>
-            <span class="mono">{props.org}</span> · manage a library
-          </>
-        }
-      />
-      <Show when={!libs.error} fallback={<p class="error">Could not load the org's libraries.</p>}>
-        <Show when={!libs.loading} fallback={<p class="empty">loading…</p>}>
-          <Show
-            when={found()}
-            fallback={
-              <p class="empty">
-                There is no library <b class="mono">{libraryId(props)}</b> installed in {props.org}.{" "}
-                <A href={back()}>All libraries</A>
-              </p>
-            }
-          >
-            {(l) => <Navigate href={libraryManageHref(props.org, l())} />}
-          </Show>
-        </Show>
-      </Show>
-    </>
   );
 }
 
@@ -434,7 +386,7 @@ function Installation(props: {
         <InstallLibraryDialog
           org={props.org}
           upgrade
-          initial={{ source: l().source, publisher: l().publisher, name: l().name }}
+          initial={{ source: l().source, name: l().name }}
           onClose={() => setUpgrading(false)}
         />
       </Show>
@@ -457,7 +409,7 @@ function Installation(props: {
           name={libraryId(l())}
           confirmLabel="Remove library"
           onConfirm={async () => {
-            await removeLibrary(props.org, l().publisher, l().name);
+            await removeLibrary(props.org, l());
             props.onRemoved();
           }}
           onClose={() => setRemoving(false)}

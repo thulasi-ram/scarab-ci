@@ -16,6 +16,8 @@ use scarab_policy::library::LibraryStore;
 use sqlx::PgPool;
 
 const VERSION: i64 = 92;
+/// Migration 0096 drops the publisher column [`seed`] writes.
+const FREE_FORM_NAME: i64 = 96;
 
 async fn apply(pool: &PgPool, which: impl Fn(i64) -> bool) {
     for m in MIGRATOR.iter().filter(|m| which(m.version)) {
@@ -65,7 +67,7 @@ async fn every_installation_from_before_0092_gets_its_own_id() {
     seed(&pool, "acme", "deploy").await;
     seed(&pool, "acme", "build").await;
     seed(&pool, "globex", "deploy").await;
-    apply(&pool, |v| v >= VERSION).await;
+    apply(&pool, |v| (VERSION..FREE_FORM_NAME).contains(&v)).await;
 
     let db = PostgresDb::with_pool(pool.clone());
     let mut ids = BTreeSet::new();
@@ -89,12 +91,17 @@ async fn every_installation_from_before_0092_gets_its_own_id() {
     // A binary from before 0092 inserts without naming the column: the
     // default still mints an id.
     seed(&pool, "globex", "lint").await;
-    let lint = db
-        .installation("globex", "acme", "lint")
+    let lint = db.installation("globex", "lint").await.unwrap().unwrap();
+    assert_eq!(lint.id.len(), 10);
+    assert!(!ids.contains(&lint.id));
+
+    // 0096 keeps every id.
+    apply(&pool, |v| v >= FREE_FORM_NAME).await;
+    let after = db
+        .installation("globex", "acme/lint")
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(lint.id.len(), 10);
-    assert!(!ids.contains(&lint.id));
+    assert_eq!(after.id, lint.id);
     tdb.cleanup().await;
 }

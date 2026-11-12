@@ -272,7 +272,7 @@ on:
   push: {}
 steps:
   - id: checkout
-    invoke: lib:thulasi-ram/clone
+    invoke: lib:thulasi-ram::scarab-ci::clone
   - id: show
     image: busybox:latest
     security:
@@ -298,7 +298,7 @@ on:
   push: {}
 steps:
   - id: checkout
-    invoke: lib:thulasi-ram/clone
+    invoke: lib:thulasi-ram::scarab-ci::clone
     with: { submodules: true }
 YAML
 )"

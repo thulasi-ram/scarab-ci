@@ -2031,11 +2031,11 @@ impl Config {
             self.step_up_report(),
             if self.clone_image_ignored {
                 "SCARAB_CLONE_IMAGE is set and not read: checkouts run the image \
-                 `lib:thulasi-ram/clone` pins; to use a mirror, install a library version \
+                 `lib:thulasi-ram::scarab-ci::clone` pins; to use a mirror, install a library version \
                  that pins the mirror's image (ADR-0076 §9)"
                     .to_string()
             } else {
-                "checkout: `lib:thulasi-ram/clone` (ADR-0076 §9)".to_string()
+                "checkout: `lib:thulasi-ram::scarab-ci::clone` (ADR-0076 §9)".to_string()
             },
             format!(
                 "forge: registry-routed; github auth {} (ADR-0046)",

@@ -1,7 +1,8 @@
 // Install or upgrade a library: a page of its own inside the settings frame
 // (Libraries marked in the sidebar), so a second reviewer can be sent its
 // URL. The URL's query names the source (the Install library dialog builds
-// it); the page fetches it (the server reads it at its commit, checks it
+// it); the page fetches it (the server reads it at its commit, or at the
+// commit a branch or tag points to now, checks it
 // compiles as a closed library and stores it) and shows what it is: the
 // facts and checks on one label and value grid, then the file, or the
 // side-by-side diff from the installed version. Install, in the footer row,
@@ -20,8 +21,11 @@ import {
   libraryManageHref,
   numberDiff,
   reviewChecks,
+  isFullCommit,
   shortHash,
   sideBySide,
+  defaultLibraryName,
+  splitSource,
   toFetchBody,
   type FetchForm,
   type SideCell,
@@ -33,6 +37,15 @@ import { me } from "../session";
 import { SettingsCrumbs, SettingsFrame } from "./Settings";
 
 const one = (v: string | string[] | undefined) => (Array.isArray(v) ? v[0] ?? "" : v ?? "");
+
+/** The name a review link names. A link from before libraries had one
+ *  name carries `publisher` and `name` (empty = the file name): the
+ *  installation they named is `<publisher>/<name>` now. */
+function legacyName(publisher: string, name: string, source: string): string {
+  if (!publisher) return name;
+  const stem = defaultLibraryName(splitSource(source).source)?.split("::").pop() ?? "";
+  return `${publisher}/${name || stem}`;
+}
 
 /** `/orgs/:org/settings/libraries/review`, in the settings frame, which shows
  *  it only to an admin of the org. */
@@ -63,9 +76,9 @@ function Review(props: { org: string }) {
   // (Change source, a shared link) fetches again.
   const form = createMemo<FetchForm>(() => ({
     source: one(search.source),
+    ref: one(search.ref),
     connection: one(search.connection),
-    publisher: one(search.publisher),
-    name: one(search.name),
+    name: legacyName(one(search.publisher), one(search.name), one(search.source)),
   }));
   const request = createMemo(() => {
     const body = toFetchBody(form()).body;
@@ -85,7 +98,8 @@ function Review(props: { org: string }) {
     setInstalling(true);
     setError(null);
     try {
-      const done = await installLibrary(props.org, f.publisher, f.name, {
+      const done = await installLibrary(props.org, {
+        name: f.name,
         content_hash: f.content_hash,
         replaces: f.current?.content_hash ?? null,
       });
@@ -113,10 +127,11 @@ function Review(props: { org: string }) {
   };
   const title = () => {
     const f = fetched();
-    const p = f?.publisher || form().publisher;
     const n = f?.name || form().name;
-    return p && n ? `lib:${p}/${n}` : "Review a library";
+    return n ? `lib:${n}` : "Review a library";
   };
+  /** The branch, tag or commit the URL asks for. */
+  const askedRef = () => form().ref.trim() || splitSource(form().source).ref;
   const connectionLabel = () => {
     const c = form().connection;
     if (!c) return "none: read anonymously";
@@ -166,9 +181,23 @@ function Review(props: { org: string }) {
             </div>
             <dl class="kv">
               <dt>Library</dt>
-              <dd class="m">{title().startsWith("lib:") ? title() : "the repository owner / the file name"}</dd>
+              <dd class="m">{title().startsWith("lib:") ? title() : "<owner>::<repo>::<file name>"}</dd>
               <dt>Source</dt>
               <dd class="m">{fetched()?.source ?? form().source}</dd>
+              <Show when={askedRef() && !isFullCommit(askedRef())}>
+                <dt>Ref</dt>
+                <dd>
+                  <span class="mono">{askedRef()}</span>
+                  <Show when={fetched()}>
+                    {(f) => (
+                      <>
+                        {" "}
+                        at <span class="lib-hash">{shortHash(splitSource(f().source).ref)}</span> when fetched
+                      </>
+                    )}
+                  </Show>
+                </dd>
+              </Show>
               <dt>Connection</dt>
               <dd>{connectionLabel()}</dd>
               <Show when={fetched()}>

@@ -59,8 +59,8 @@ export default function App() {
       <Route path="/orgs/:org/settings/libraries/review" component={LibraryReview} />
       {/* One installed library or plugin, managed on its own page inside the
           settings frame. Six segments with static `libraries`/`plugins` and
-          `manage`, so they collide with no other route; a library is
-          `<publisher>~<name>`, a plugin installation its id. */}
+          `manage`, so they collide with no other route; each is named by
+          its installation id. */}
       <Route path="/orgs/:org/settings/libraries/:id/manage" component={LibraryManage} />
       <Route path="/orgs/:org/settings/plugins/:id/manage" component={PluginManage} />
       {/* One forge connection, inside the settings frame with Connections

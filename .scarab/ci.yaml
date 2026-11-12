@@ -31,7 +31,7 @@ on:
 
 steps:
   - id: checkout
-    invoke: lib:thulasi-ram/clone
+    invoke: lib:thulasi-ram::scarab-ci::clone
 
   - id: check
     image: rust:1-bookworm

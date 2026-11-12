@@ -3578,7 +3578,6 @@ h1, .crumb-head, .run-title {
 .sec-filter { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .sec-filter .input { max-width: 280px; }
 .evlog-filter .f { flex: 0 1 200px; }
-.lib-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .evlog-filter { align-items: flex-end; }
 .sec-chips { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
 .sec-chips li {
@@ -3800,23 +3799,9 @@ h1, .crumb-head, .run-title {
   --well-dot: rgba(255, 255, 255, .08);
   --inset: inset 0 1px 3px rgba(0, 0, 0, .6), inset 0 -1px 0 rgba(255, 255, 255, .05);
 }
-.lib-empty { display: grid; justify-items: center; gap: 6px; text-align: center; padding: 4px 12px 6px; }
-.lib-empty .t1 { display: flex; gap: 7px; align-items: center; font: var(--t-label); color: var(--soft-white); }
-.lib-empty .t1 svg { color: var(--muted-sage); }
-.lib-empty .t2 { margin: 0; color: var(--sage); max-width: 580px; }
-.lib-empty .acts { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-top: 6px; }
 .lib-errs { color: var(--muted-sage); }
 .lib-errs summary { cursor: pointer; font: var(--t-mono); }
 .lib-errs pre { margin: 6px 0 0; white-space: pre-wrap; text-align: left; font: var(--t-mono); color: var(--sage); }
-.lib-well {
-  border-radius: 5px; border: 1px dashed var(--border); box-shadow: var(--inset);
-  background-color: var(--well);
-  background-image: radial-gradient(var(--well-dot) 1px, transparent 1.4px);
-  background-size: 12px 12px;
-  padding: 22px 16px 26px; display: grid; justify-items: center;
-}
-.lib-well .btn-ghost { background: var(--emerald-surface); }
-.lib-well .doodle-in { width: 104px; height: 104px; opacity: .3; margin-bottom: 2px; }
 
 /* --- screen 3: yank impact --- */
 .yk-impact { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; display: grid; gap: 7px; background: var(--pine-deep); }
@@ -3866,8 +3851,6 @@ code.c { font: var(--t-mono); color: var(--copper); }
   .sbs { grid-template-columns: 1fr; }
 }.dnode.plugin { border-style: dashed; border-color: var(--border-copper); }
 .dnode.waiting { border-color: var(--warn); }
-.lib-well .doodle { position: static; display: block; margin-bottom: 2px; }
-.lib-well .doodle svg { width: 100%; height: 100%; }
 .dag-cols .dgroup .dag-cols { display: flex; }
 .yk-impact .runs a { color: var(--emerald); text-decoration: none; }
 .yk-impact .runs a:hover { text-decoration: underline; }

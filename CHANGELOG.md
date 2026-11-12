@@ -18,7 +18,48 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **A library has one name, and Pipelines write `lib:<name>`.** The name is parts of letters,
+  digits, `.`, `_` and `-`, joined by `::` or `/` (`acme::scarab-libs::deploy-helm`,
+  `platform/helm`, `deploy`), at most 255 bytes and case-sensitive. A name with a space, a quote,
+  a lone `:`, `$`, `{` or other punctuation is refused by the compiler and by the API. A fetch
+  with no `name` installs under `<owner>::<repo>::<file stem>`, so Scarab's own libraries now
+  default to `lib:thulasi-ram::scarab-ci::clone` and `lib:thulasi-ram::scarab-ci::build`.
+  Migration `0096` joins every stored publisher and name into `<publisher>/<name>`: an
+  installation made before it keeps its id, its version and its yanks, and Pipelines that invoke
+  `lib:thulasi-ram/clone` keep compiling. Docs, the compiler's hints and this repository's own
+  Pipelines now name `lib:thulasi-ram::scarab-ci::clone`: an org that installed the clone or build
+  library before keeps it as `thulasi-ram/clone` or `thulasi-ram/build`, so either keep invoking
+  that name or install it again under the new one. A server from before `0096` cannot run against the
+  migrated database, so stop every old replica before the new one starts (the chart's default
+  `Recreate` strategy does this). The API changes with it:
+  - `POST /v1/orgs/{org}/libraries/fetch` no longer takes `publisher`; `name`, when given, is
+    the whole name.
+  - `PUT /v1/orgs/{org}/libraries/{publisher}/{name}` is replaced by
+    `POST /v1/orgs/{org}/library-installations` with `{ "name", "content_hash", "replaces" }`.
+  - `DELETE /v1/orgs/{org}/libraries/{publisher}/{name}` is replaced by
+    `DELETE /v1/orgs/{org}/library-installations/{id}`, the id `GET` on that path takes.
+  - Fetched versions, installations and yanks drop `publisher`; `name` is the whole name.
+
+  See [Install a library](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#install-a-library).
+
+### Features
+
+- **Install a library at a branch, tag or commit.** **Install library** asks for the file and a
+  ref in two fields, and the fetch API takes `ref` beside a `source` with no `@<commit>`. Scarab
+  reads the file at the commit the ref points to when you fetch, and the review page and the
+  installation name that commit, so a branch that moves later changes nothing until you upgrade
+  ([Install a library](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#install-a-library)).
+
 ### Bug Fixes
+
+- **A connection that cannot reach a library's repository no longer blocks its install.**
+  Choosing an org connection that cannot read the repository (a GitHub App not installed on it
+  answers 404) refused the install, even for a public file that installs with no connection.
+  Scarab now reads the file, or looks up the ref, without credentials when the connection fails;
+  when that fails too, the error gives both reasons and says to give the connection access.
+  Plugin manifests are read the same way.
 
 - **A step waiting for an autoscaled node no longer fails at once.** On a cluster whose node
   pools scale to zero (Karpenter, Cluster Autoscaler), the scheduler calls every Pod that needs a

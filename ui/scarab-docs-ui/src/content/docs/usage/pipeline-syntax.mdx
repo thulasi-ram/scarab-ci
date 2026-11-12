@@ -63,7 +63,7 @@ on:
 
 steps:
   - id: checkout
-    invoke: lib:thulasi-ram/clone
+    invoke: lib:thulasi-ram::scarab-ci::clone
 
   - id: check
     image: rust:1-bookworm
@@ -343,7 +343,7 @@ Some steps are **kinds** with no image that the engine runs on your behalf (you 
 
 ### Checking out the repository
 
-Scarab's clone library, `lib:thulasi-ram/clone`, checks out the Run's repository at the commit
+Scarab's clone library, `lib:thulasi-ram::scarab-ci::clone`, checks out the Run's repository at the commit
 the Run is pinned to. An org admin installs it like any other library; no org has it until then
 ([Install Scarab's clone library](/scarab-ci/usage/libraries/#install-scarabs-clone-library)).
 On a Forgejo or GitHub token connection its source must also be trusted with forge credentials
@@ -351,12 +351,12 @@ On a Forgejo or GitHub token connection its source must also be trusted with for
 
 ```yaml
 - id: checkout
-  invoke: lib:thulasi-ram/clone          # depth 1, the Run's commit
+  invoke: lib:thulasi-ram::scarab-ci::clone   # depth 1, the Run's commit
 
 - id: full
-  invoke: lib:thulasi-ram/clone
+  invoke: lib:thulasi-ram::scarab-ci::clone
   with: { depth: full, submodules: true, lfs: true }
-  timeout: 1800                          # carried onto the library's step
+  timeout: 1800                               # carried onto the library's step
 ```
 
 `depth` is `"1"`, a number of commits, or `full`. The library's one step is `checkout/git`, and
@@ -364,21 +364,21 @@ On a Forgejo or GitHub token connection its source must also be trusted with for
 the same on GitHub and Forgejo.
 
 The `clone` step kind is gone. A `clone:` step fails the pipeline check with a message that names
-`invoke: lib:thulasi-ram/clone`.
+`invoke: lib:thulasi-ram::scarab-ci::clone`.
 
 ### Building an image
 
-Scarab's build library, `lib:thulasi-ram/build`, builds an image from the Run's workspace with
+Scarab's build library, `lib:thulasi-ram::scarab-ci::build`, builds an image from the Run's workspace with
 rootless BuildKit and pushes it when you ask. An org admin installs it and trusts its source for the
 build sandbox; no org has it until then
 ([Install Scarab's build library](/scarab-ci/usage/libraries/#install-scarabs-build-library)).
 
 ```yaml
 - id: checkout
-  invoke: lib:thulasi-ram/clone
+  invoke: lib:thulasi-ram::scarab-ci::clone
 
 - id: image
-  invoke: lib:thulasi-ram/build
+  invoke: lib:thulasi-ram::scarab-ci::build
   needs: [checkout]
   with:
     image: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/app:${{ event.sha }}
@@ -489,7 +489,7 @@ Its outputs:
 
   ```yaml
   - id: image
-    invoke: lib:thulasi-ram/build
+    invoke: lib:thulasi-ram::scarab-ci::build
     placement_profiles:
       image: [arm64-builders, build-cache]
       push: [ecr-push]
@@ -502,11 +502,11 @@ Its outputs:
 
   ```yaml
   - id: amd64
-    invoke: lib:thulasi-ram/build
+    invoke: lib:thulasi-ram::scarab-ci::build
     placement_profiles: { image: [amd64], push: [ecr-push] }
     with: { image: "ghcr.io/acme/app:${{ event.sha }}-amd64", push: true }
   - id: arm64
-    invoke: lib:thulasi-ram/build
+    invoke: lib:thulasi-ram::scarab-ci::build
     placement_profiles: { image: [arm64], push: [ecr-push] }
     with: { image: "ghcr.io/acme/app:${{ event.sha }}-arm64", push: true }
   ```
@@ -519,7 +519,7 @@ Its outputs:
   per-architecture build needs; keep the push profile in the map's `push` entry.
 
 The `build` step kind is gone. A `build:` step fails the pipeline check with one error that holds
-its replacement, an `invoke: lib:thulasi-ram/build` step written from the old step's fields. The local executor refuses the build library's build step; it
+its replacement, an `invoke: lib:thulasi-ram::scarab-ci::build` step written from the old step's fields. The local executor refuses the build library's build step; it
 needs the Kubernetes executor.
 
 ### Forge credentials: `forge_token`
@@ -659,14 +659,15 @@ The target always has a prefix that says where it comes from:
 | `invoke:` | Target |
 |---|---|
 | `file:<path>` | a library file in the repository, read at the caller's ref |
-| `lib:<publisher>/<name>` | a library installed in your org |
+| `lib:<name>` | a library installed in your org, such as `lib:acme::scarab-libs::deploy-helm` |
 | `plugin:<installation>/<gate>` | a gate a plugin installed in your org resolves ([Plugin gates](#plugin-gates)) |
 
 A `file:` path is repo-relative: no leading `/`, no `..`, and no remote or cross-repo forms
 (a library from elsewhere is installed in the org and invoked as `lib:`). A bare path is a compile error that tells you to add
 `file:`, and `url:` is refused: Scarab does not invoke from a URL. A `lib:` target resolves to the
 version your org installed ([Libraries](/scarab-ci/usage/libraries/)); a name the org has not
-installed fails with "`lib:<publisher>/<name>` is not installed in this org".
+installed fails with "`lib:<name>` is not installed in this org". The name is parts of letters,
+digits, `.`, `_` and `-`, joined by `::` or `/`, and is case-sensitive.
 
 A library is a YAML file marked `kind: library`. It has no `on:` triggers and never runs on its
 own: Scarab does not trigger it or list it for dispatch, even directly under `.scarab/`. It

@@ -10,8 +10,9 @@
 //! first-party clone library with its source already trusted by an admin.
 //! Then 0090 runs. `acme` gets one trust row and `globex` one per source,
 //! each without its `@<commit>`; `initech` gets none; `umbrella` keeps its
-//! admin's row. Installations are untouched. The store then reads the rows
-//! back through its own code. Skips cleanly when `SCARAB_TEST_DATABASE_URL`
+//! admin's row. Installations are untouched. Then the later migrations run
+//! (0096 joins publisher and name into one name), and the store reads the
+//! rows back through its own code. Skips cleanly when `SCARAB_TEST_DATABASE_URL`
 //! is unset.
 
 mod common;
@@ -22,6 +23,8 @@ use scarab_policy::library::{LibraryStore, TrustedSource};
 use sqlx::PgPool;
 
 const VERSION: i64 = 90;
+/// Migration 0096 drops the publisher column the raw queries here read.
+const FREE_FORM_NAME: i64 = 96;
 const BY: &str = "scarab:migration-0090";
 const C1: &str = "1111111111111111111111111111111111111111";
 const C2: &str = "2222222222222222222222222222222222222222";
@@ -200,7 +203,7 @@ async fn the_clone_librarys_trust_becomes_a_trusted_source_row_per_source() {
     .expect("seed defaults");
     let installed_before = installations(&pool).await;
 
-    apply(&pool, |v| v >= VERSION).await;
+    apply(&pool, |v| (VERSION..FREE_FORM_NAME).contains(&v)).await;
 
     let rows: Vec<(String, String, String, i64, Option<String>)> = sqlx::query_as(
         "SELECT org, source, trusted_by, trusted_at, step_up_ref FROM library_trusted_sources \
@@ -245,6 +248,7 @@ async fn the_clone_librarys_trust_becomes_a_trusted_source_row_per_source() {
     assert_eq!(first_party, 0, "library_versions.first_party is dropped");
 
     // The store works on the migrated schema.
+    apply(&pool, |v| v >= FREE_FORM_NAME).await;
     let db = PostgresDb::with_pool(pool.clone());
     let sources = |ts: Vec<TrustedSource>| -> Vec<String> {
         let mut s: Vec<String> = ts.into_iter().map(|t| t.source).collect();
@@ -265,7 +269,7 @@ async fn the_clone_librarys_trust_becomes_a_trusted_source_row_per_source() {
     assert_eq!(umbrella[0].trusted_by, "user:dana");
     let acme = db.installations("acme").await.unwrap();
     assert_eq!(acme.len(), 1);
-    assert_eq!(acme[0].qualified_name(), "thulasi-ram/clone");
+    assert_eq!(acme[0].name, "thulasi-ram/clone");
     assert_eq!(acme[0].content_hash, hash('b'));
     assert_eq!(acme[0].source, format!("{CLONE}@{C2}"));
     assert_eq!(db.installations("initech").await.unwrap().len(), 2);

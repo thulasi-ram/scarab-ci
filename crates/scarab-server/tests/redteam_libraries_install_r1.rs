@@ -388,14 +388,14 @@ fn lib_harness() -> LibHarness {
     LibHarness { h, libs, http }
 }
 
-async fn seed(libs: &InMemoryLibraries, org: &str, publisher: &str, name: &str, content: &str) {
+/// Installs `content` in `org` as `lib:acme/<name>`; the installation's id.
+async fn seed(libs: &InMemoryLibraries, org: &str, name: &str, content: &str) -> String {
     libs.put_version(&LibraryVersion {
         org: org.into(),
         content_hash: content_hash(content),
         content: content.into(),
-        source: format!("github.com/{publisher}/libs//{name}.yaml@{C1}"),
-        publisher: publisher.into(),
-        name: name.into(),
+        source: format!("github.com/acme/libs//{name}.yaml@{C1}"),
+        name: format!("acme/{name}"),
         fetched_by: "seed".into(),
         fetched_at: 1,
     })
@@ -404,8 +404,7 @@ async fn seed(libs: &InMemoryLibraries, org: &str, publisher: &str, name: &str, 
     libs.install(
         &NewInstallation {
             org: org.into(),
-            publisher: publisher.into(),
-            name: name.into(),
+            name: format!("acme/{name}"),
             content_hash: content_hash(content),
             installed_by: "seed".into(),
             installed_at: 1,
@@ -414,12 +413,13 @@ async fn seed(libs: &InMemoryLibraries, org: &str, publisher: &str, name: &str, 
         &Replaces::Nothing,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .id
 }
 
 /// Each library route of `org`, with a body that would succeed for an
-/// admin of it.
-fn org_routes(org: &str) -> Vec<(&'static str, String, Option<Value>)> {
+/// admin of it; `id` is an installation of `org`.
+fn org_routes(org: &str, id: &str) -> Vec<(&'static str, String, Option<Value>)> {
     let h = content_hash(DEPLOY);
     vec![
         ("GET", format!("/v1/orgs/{org}/libraries"), None),
@@ -429,13 +429,13 @@ fn org_routes(org: &str) -> Vec<(&'static str, String, Option<Value>)> {
             Some(json!({ "source": format!("github.com/{org}/libs//deploy.yaml@{C1}") })),
         ),
         (
-            "PUT",
-            format!("/v1/orgs/{org}/libraries/acme/other"),
-            Some(json!({ "content_hash": h })),
+            "POST",
+            format!("/v1/orgs/{org}/library-installations"),
+            Some(json!({ "name": "acme/other", "content_hash": h })),
         ),
         (
             "DELETE",
-            format!("/v1/orgs/{org}/libraries/acme/deploy"),
+            format!("/v1/orgs/{org}/library-installations/{id}"),
             None,
         ),
         (
@@ -466,7 +466,7 @@ fn org_routes(org: &str) -> Vec<(&'static str, String, Option<Value>)> {
 async fn rbac_an_admin_of_one_org_cannot_read_or_change_anothers_libraries() {
     let lh = lib_harness();
     let h = &lh.h;
-    seed(&lh.libs, "globex", "acme", "deploy", DEPLOY).await;
+    let id = seed(&lh.libs, "globex", "deploy", DEPLOY).await;
     lh.libs
         .yank(&LibraryYank {
             org: "globex".into(),
@@ -512,7 +512,7 @@ async fn rbac_an_admin_of_one_org_cannot_read_or_change_anothers_libraries() {
     let (st, b) = h.cookie("GET", "/v1/orgs/acme/libraries", None, &s).await;
     assert_eq!(st, StatusCode::OK, "{b}");
 
-    for (method, uri, body) in org_routes("globex") {
+    for (method, uri, body) in org_routes("globex", &id) {
         let (st, b) = h.cookie(method, &uri, body, &s).await;
         assert!(
             st == StatusCode::FORBIDDEN || st == StatusCode::NOT_FOUND,
@@ -526,7 +526,7 @@ async fn rbac_an_admin_of_one_org_cannot_read_or_change_anothers_libraries() {
     // Nothing changed in globex.
     assert!(lh
         .libs
-        .installation("globex", "acme", "deploy")
+        .installation("globex", "acme/deploy")
         .await
         .unwrap()
         .is_some());
@@ -546,7 +546,7 @@ async fn rbac_an_admin_of_one_org_cannot_read_or_change_anothers_libraries() {
 async fn stepup_loosening_library_routes_need_a_step_up_and_tightening_ones_do_not() {
     let lh = lib_harness();
     let h = &lh.h;
-    seed(&lh.libs, "acme", "acme", "deploy", DEPLOY).await;
+    let id = seed(&lh.libs, "acme", "deploy", DEPLOY).await;
     lh.http.serve(
         &format!("https://raw.githubusercontent.com/acme/libs/{C1}/deploy.yaml"),
         DEPLOY,
@@ -564,16 +564,16 @@ async fn stepup_loosening_library_routes_need_a_step_up_and_tightening_ones_do_n
     // Install under another name: needs a step-up.
     let (st, b) = h
         .cookie(
-            "PUT",
-            "/v1/orgs/acme/libraries/acme/other",
-            Some(json!({ "content_hash": hash })),
+            "POST",
+            "/v1/orgs/acme/library-installations",
+            Some(json!({ "name": "acme/other", "content_hash": hash })),
             &s,
         )
         .await;
     assert!(is_step_up(st, &b), "install: {st} {b}");
     assert!(lh
         .libs
-        .installation("acme", "acme", "other")
+        .installation("acme", "acme/other")
         .await
         .unwrap()
         .is_none());
@@ -629,14 +629,19 @@ async fn stepup_loosening_library_routes_need_a_step_up_and_tightening_ones_do_n
     assert_eq!(st, StatusCode::OK, "fetch: {b}");
     assert!(lh
         .libs
-        .installation("acme", "acme", "fetched")
+        .installation("acme", "fetched")
         .await
         .unwrap()
         .is_none());
 
     // Remove: no step-up.
     let (st, b) = h
-        .cookie("DELETE", "/v1/orgs/acme/libraries/acme/deploy", None, &s)
+        .cookie(
+            "DELETE",
+            &format!("/v1/orgs/acme/library-installations/{id}"),
+            None,
+            &s,
+        )
         .await;
     assert_eq!(st, StatusCode::NO_CONTENT, "remove: {b}");
 }
@@ -673,9 +678,9 @@ async fn fetch_in_one_org_stores_nothing_another_org_can_install() {
     assert_eq!(st, StatusCode::OK, "{b}");
     let (st, b) = call(
         &app,
-        "PUT",
-        "/v1/orgs/globex/libraries/acme/deploy",
-        Some(json!({ "content_hash": content_hash(DEPLOY) })),
+        "POST",
+        "/v1/orgs/globex/library-installations",
+        Some(json!({ "name": "acme/deploy", "content_hash": content_hash(DEPLOY) })),
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
@@ -794,8 +799,8 @@ async fn yank_of_an_inner_library_refuses_the_outer_chain() {
     const CI: &str = "on:\n  push: {}\nsteps:\n  - { id: ship, invoke: lib:acme/outer }\n";
     let db = Arc::new(InMemoryDb::new());
     let libs = Arc::new(InMemoryLibraries::new());
-    seed(&libs, "acme", "acme", "inner", DEPLOY).await;
-    seed(&libs, "acme", "acme", "outer", OUTER).await;
+    seed(&libs, "acme", "inner", DEPLOY).await;
+    seed(&libs, "acme", "outer", OUTER).await;
     let run = create_run(&db, &libs, CI).await;
     let clock = FakeClock::new(1_000);
     tick(&db, &libs, &clock, &run).await;
@@ -844,7 +849,7 @@ async fn yank_refuses_a_rerun_of_a_matrix_expanded_library_step() {
     const CI: &str = "on:\n  push: {}\nsteps:\n  - id: ship\n    invoke: lib:acme/deploy\n    matrix: { dimensions: { env: [a, b] } }\n";
     let db = Arc::new(InMemoryDb::new());
     let libs = Arc::new(InMemoryLibraries::new());
-    seed(&libs, "acme", "acme", "deploy", DEPLOY).await;
+    seed(&libs, "acme", "deploy", DEPLOY).await;
     let run = create_run(&db, &libs, CI).await;
     let steps: Vec<String> = db
         .steps_of_run(&run)
@@ -895,7 +900,7 @@ async fn yank_holds_a_timer_gate_from_a_yanked_version() {
     const CI: &str = "on:\n  push: {}\nsteps:\n  - { id: ship, invoke: lib:acme/deploy }\n";
     let db = Arc::new(InMemoryDb::new());
     let libs = Arc::new(InMemoryLibraries::new());
-    seed(&libs, "acme", "acme", "deploy", TIMED).await;
+    seed(&libs, "acme", "deploy", TIMED).await;
     let run = create_run(&db, &libs, CI).await;
     let clock = FakeClock::new(1_000);
     tick(&db, &libs, &clock, &run).await;
@@ -971,7 +976,7 @@ async fn yank_refuses_a_debug_pod_of_a_yanked_library_step() {
     const CI: &str = "on:\n  push: {}\nsteps:\n  - { id: ship, invoke: lib:acme/deploy }\n";
     let db = Arc::new(InMemoryDb::new());
     let libs = Arc::new(InMemoryLibraries::new());
-    seed(&libs, "acme", "acme", "deploy", DEPLOY).await;
+    seed(&libs, "acme", "deploy", DEPLOY).await;
     let run = create_run(&db, &libs, CI).await;
     let clock = Arc::new(FakeClock::new(1_000));
     {
@@ -1038,7 +1043,7 @@ async fn yank_refuses_a_debug_pod_of_a_yanked_library_step() {
 // 4. Concurrency (Postgres)
 // ===========================================================================
 
-/// Two first installs of one `<publisher>/<name>`, interleaved: B reads
+/// Two first installs of one library name, interleaved: B reads
 /// "nothing installed" while A's insert is uncommitted, then A commits.
 /// B named `replaces: nothing`, which is no longer true, so B must get a
 /// Conflict; installing over A without seeing A's diff is the race
@@ -1058,8 +1063,7 @@ async fn race_a_second_first_install_does_not_overwrite_the_first() {
             content_hash: content_hash(c),
             content: c.into(),
             source: format!("github.com/acme/libs//x.yaml@{C1}"),
-            publisher: "acme".into(),
-            name: "x".into(),
+            name: "acme/x".into(),
             fetched_by: "amy".into(),
             fetched_at: 1,
         })
@@ -1071,8 +1075,8 @@ async fn race_a_second_first_install_does_not_overwrite_the_first() {
     let mut a = tdb.pool.begin().await.unwrap();
     sqlx::query(
         "INSERT INTO library_installations \
-         (org, publisher, name, content_hash, installed_by, installed_at) \
-         VALUES ('acme', 'acme', 'x', $1, 'amy', 1)",
+         (org, name, content_hash, installed_by, installed_at) \
+         VALUES ('acme', 'acme/x', $1, 'amy', 1)",
     )
     .bind(content_hash(A))
     .execute(&mut *a)
@@ -1086,8 +1090,7 @@ async fn race_a_second_first_install_does_not_overwrite_the_first() {
             .install(
                 &NewInstallation {
                     org: "acme".into(),
-                    publisher: "acme".into(),
-                    name: "x".into(),
+                    name: "acme/x".into(),
                     content_hash: content_hash(B),
                     installed_by: "bob".into(),
                     installed_at: 2,
@@ -1116,7 +1119,7 @@ async fn race_a_second_first_install_does_not_overwrite_the_first() {
     }
     a.commit().await.unwrap();
     let got = b.await.unwrap();
-    let installed = pg.installation("acme", "acme", "x").await.unwrap().unwrap();
+    let installed = pg.installation("acme", "acme/x").await.unwrap().unwrap();
     tdb.cleanup().await;
     assert!(
         blocked,

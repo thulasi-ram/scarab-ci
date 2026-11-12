@@ -4,7 +4,7 @@
 # trusts that source before it receives a long-lived forge token.
 #
 #   - id: checkout
-#     invoke: lib:thulasi-ram/clone
+#     invoke: lib:thulasi-ram::scarab-ci::clone
 #     with: { depth: full, lfs: true }
 #
 # Its one Step is `checkout/git`; `needs: [checkout]` reaches it across the

@@ -43,7 +43,7 @@ on:
   pull_request: {}
 steps:
   - id: image
-    invoke: lib:thulasi-ram/build
+    invoke: lib:thulasi-ram::scarab-ci::build
     with:
       image: "ghcr.io/acme/web:${{ event.sha }}"
       push: "true"
@@ -96,8 +96,7 @@ async fn build_library(grants: &[TrustGrant]) -> InMemoryLibraries {
         content_hash: content_hash(BUILD),
         content: BUILD.into(),
         source: BUILD_SOURCE.into(),
-        publisher: "thulasi-ram".into(),
-        name: "build".into(),
+        name: "thulasi-ram::scarab-ci::build".into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
     })
@@ -106,8 +105,7 @@ async fn build_library(grants: &[TrustGrant]) -> InMemoryLibraries {
     libs.install(
         &NewInstallation {
             org: "acme".into(),
-            publisher: "thulasi-ram".into(),
-            name: "build".into(),
+            name: "thulasi-ram::scarab-ci::build".into(),
             content_hash: content_hash(BUILD),
             installed_by: "amy".into(),
             installed_at: 1,
@@ -579,21 +577,14 @@ async fn a_launch_after_the_registry_credential_trust_is_revoked_gets_no_credent
 // Histories an attacker would try
 // ---------------------------------------------------------------------------
 
-/// Stores and installs `content` in `acme` as `lib:<publisher>/<name>`,
-/// fetched from `source`.
-async fn install(
-    libs: &InMemoryLibraries,
-    publisher: &str,
-    name: &str,
-    source: &str,
-    content: &str,
-) {
+/// Stores and installs `content` in `acme` as `lib:<name>`, fetched from
+/// `source`.
+async fn install(libs: &InMemoryLibraries, name: &str, source: &str, content: &str) {
     libs.put_version(&LibraryVersion {
         org: "acme".into(),
         content_hash: content_hash(content),
         content: content.into(),
         source: source.into(),
-        publisher: publisher.into(),
         name: name.into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
@@ -603,7 +594,6 @@ async fn install(
     libs.install(
         &NewInstallation {
             org: "acme".into(),
-            publisher: publisher.into(),
             name: name.into(),
             content_hash: content_hash(content),
             installed_by: "amy".into(),
@@ -665,16 +655,14 @@ async fn a_trusted_library_does_not_pass_its_sandbox_trust_to_a_library_it_invok
     let libs = InMemoryLibraries::new();
     install(
         &libs,
-        "evil",
-        "inner",
+        "evil/inner",
         UNTRUSTED_SOURCE,
         OWN_COMMAND_IN_THE_SANDBOX,
     )
     .await;
     install(
         &libs,
-        "acme",
-        "outer",
+        "acme/outer",
         TRUSTED_SOURCE,
         "kind: library\nsteps:\n  - id: inner\n    invoke: lib:evil/inner\n",
     )
@@ -704,15 +692,14 @@ async fn an_untrusted_wrapper_gets_no_sandbox_for_its_own_step_beside_a_trusted_
     let libs = InMemoryLibraries::new();
     install(
         &libs,
-        "acme",
-        "outer",
+        "acme/outer",
         TRUSTED_SOURCE,
         OWN_COMMAND_IN_THE_SANDBOX,
     )
     .await;
     let wrapper =
         format!("{OWN_COMMAND_IN_THE_SANDBOX}  - id: trusted\n    invoke: lib:acme/outer\n");
-    install(&libs, "evil", "wrap", UNTRUSTED_SOURCE, &wrapper).await;
+    install(&libs, "evil/wrap", UNTRUSTED_SOURCE, &wrapper).await;
     trust_sandbox(&libs, TRUSTED_SOURCE).await;
 
     let db = InMemoryDb::new();

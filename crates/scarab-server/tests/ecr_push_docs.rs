@@ -151,14 +151,14 @@ fn the_page_pipeline_routes_ecr_push_only_to_the_build_librarys_push_step() {
     let libraries = Libraries {
         installed: BTreeMap::from([
             (
-                "thulasi-ram/build".to_string(),
+                "thulasi-ram::scarab-ci::build".to_string(),
                 InstalledLibrary {
                     content: BUILD.into(),
                     source: BUILD_SOURCE.into(),
                 },
             ),
             (
-                "thulasi-ram/clone".to_string(),
+                "thulasi-ram::scarab-ci::clone".to_string(),
                 InstalledLibrary {
                     content: CLONE.into(),
                     source: CLONE_SOURCE.into(),
@@ -236,7 +236,6 @@ async fn install(libs: &InMemoryLibraries, name: &str, content: &str, source: &s
         content_hash: content_hash(content),
         content: content.into(),
         source: source.into(),
-        publisher: "thulasi-ram".into(),
         name: name.into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
@@ -246,7 +245,6 @@ async fn install(libs: &InMemoryLibraries, name: &str, content: &str, source: &s
     libs.install(
         &NewInstallation {
             org: "acme".into(),
-            publisher: "thulasi-ram".into(),
             name: name.into(),
             content_hash: content_hash(content),
             installed_by: "amy".into(),
@@ -277,9 +275,9 @@ async fn trust(libs: &InMemoryLibraries, source: &str, grant: TrustGrant) {
 /// credential, not with forge credentials.
 async fn libraries() -> InMemoryLibraries {
     let libs = InMemoryLibraries::new();
-    install(&libs, "clone", CLONE, CLONE_SOURCE).await;
+    install(&libs, "thulasi-ram::scarab-ci::clone", CLONE, CLONE_SOURCE).await;
     trust(&libs, CLONE_SOURCE, TrustGrant::ForgeCredentials).await;
-    install(&libs, "build", BUILD, BUILD_SOURCE).await;
+    install(&libs, "thulasi-ram::scarab-ci::build", BUILD, BUILD_SOURCE).await;
     trust(&libs, BUILD_SOURCE, TrustGrant::BuildSandbox).await;
     trust(&libs, BUILD_SOURCE, TrustGrant::RegistryCredential).await;
     libs

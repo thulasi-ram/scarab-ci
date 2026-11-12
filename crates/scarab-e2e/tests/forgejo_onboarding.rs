@@ -264,8 +264,7 @@ async fn an_installed_library_runs_and_a_yank_refuses_its_rerun() {
             .json(&serde_json::json!({
                 "source": notify_source,
                 "connection": conn,
-                "publisher": "thulasi-ram",
-                "name": "notify",
+                "name": "thulasi-ram/notify",
             }))
             .send()
             .await
@@ -273,19 +272,22 @@ async fn an_installed_library_runs_and_a_yank_refuses_its_rerun() {
         "fetch library",
     )
     .await;
-    assert_eq!(fetched["publisher"], "thulasi-ram", "{fetched:#}");
-    assert_eq!(fetched["name"], "notify", "{fetched:#}");
+    assert_eq!(fetched["name"], "thulasi-ram/notify", "{fetched:#}");
     let hash = fetched["content_hash"].as_str().expect("hash").to_string();
     let current = fetched["current"]["content_hash"]
         .as_str()
         .map(str::to_string);
     if current.as_deref() != Some(hash.as_str()) {
         json_ok(
-            http.put(format!("{base}/v1/orgs/{org}/libraries/thulasi-ram/notify"))
-                .json(&serde_json::json!({ "content_hash": hash, "replaces": current }))
+            http.post(format!("{base}/v1/orgs/{org}/library-installations"))
+                .json(&serde_json::json!({
+                    "name": "thulasi-ram/notify",
+                    "content_hash": hash,
+                    "replaces": current,
+                }))
                 .send()
                 .await
-                .expect("PUT library"),
+                .expect("POST library-installations"),
             "install library",
         )
         .await;

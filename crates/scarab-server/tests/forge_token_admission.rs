@@ -44,7 +44,7 @@ on:
   push: {}
 steps:
   - { id: prep, image: busybox }
-  - { id: checkout, invoke: lib:thulasi-ram/clone, needs: [prep] }
+  - { id: checkout, invoke: lib:thulasi-ram::scarab-ci::clone, needs: [prep] }
   - { id: build, image: busybox, needs: [checkout] }
 "#;
 
@@ -99,20 +99,13 @@ fn minting(files: &[(&str, &str)]) -> FakeForge {
     long_lived(files).with_minted_tokens()
 }
 
-/// `content` installed in `acme` as `<publisher>/<name>` from `source`.
-async fn install(
-    libs: &InMemoryLibraries,
-    publisher: &str,
-    name: &str,
-    content: &str,
-    source: &str,
-) {
+/// `content` installed in `acme` as `<name>` from `source`.
+async fn install(libs: &InMemoryLibraries, name: &str, content: &str, source: &str) {
     libs.put_version(&LibraryVersion {
         org: "acme".into(),
         content_hash: content_hash(content),
         content: content.into(),
         source: source.into(),
-        publisher: publisher.into(),
         name: name.into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
@@ -120,7 +113,7 @@ async fn install(
     .await
     .unwrap();
     let current = libs
-        .installation("acme", publisher, name)
+        .installation("acme", name)
         .await
         .unwrap()
         .map(|i| Replaces::Version(i.content_hash))
@@ -128,7 +121,6 @@ async fn install(
     libs.install(
         &NewInstallation {
             org: "acme".into(),
-            publisher: publisher.into(),
             name: name.into(),
             content_hash: content_hash(content),
             installed_by: "amy".into(),
@@ -159,7 +151,7 @@ async fn trust(libs: &InMemoryLibraries, source: &str) {
 /// trusted by an org admin.
 async fn with_trusted_clone() -> InMemoryLibraries {
     let libs = InMemoryLibraries::new();
-    install(&libs, "thulasi-ram", "clone", CLONE, CLONE_SOURCE).await;
+    install(&libs, "thulasi-ram::scarab-ci::clone", CLONE, CLONE_SOURCE).await;
     trust(&libs, CLONE_SOURCE).await;
     libs
 }
@@ -352,7 +344,7 @@ async fn a_forge_token_step_on_an_http_connection_is_refused() {
 async fn the_clone_library_gets_no_long_lived_token_until_its_source_is_trusted() {
     let db = InMemoryDb::new();
     let libs = InMemoryLibraries::new();
-    install(&libs, "thulasi-ram", "clone", CLONE, CLONE_SOURCE).await;
+    install(&libs, "thulasi-ram::scarab-ci::clone", CLONE, CLONE_SOURCE).await;
     let forge = long_lived(&[(".scarab/ci.yaml", CHECKOUT_YAML)]);
     let reason = refused_reason(
         &trigger(
@@ -397,8 +389,7 @@ async fn a_clone_copy_from_an_untrusted_source_is_refused_a_long_lived_token() {
     trust(&libs, CLONE_SOURCE).await;
     install(
         &libs,
-        "thulasi-ram",
-        "clone",
+        "thulasi-ram::scarab-ci::clone",
         CLONE,
         "github.com/mallory/clone//libs/clone.yaml@2222222222222222222222222222222222222222",
     )
@@ -440,7 +431,7 @@ async fn trust_follows_the_source_across_upgrades() {
             commit.to_string().repeat(40)
         )
     };
-    install(&libs, "acme", "pusher", PUSHER, &at('1')).await;
+    install(&libs, "acme/pusher", PUSHER, &at('1')).await;
     let forge = long_lived(&[(".scarab/ci.yaml", PUSHER_YAML)]);
     let ports = || AdmissionPorts::default().with_libraries(&libs);
     assert!(
@@ -462,7 +453,7 @@ async fn trust_follows_the_source_across_upgrades() {
 
     // An upgrade from the same source keeps the trust.
     let v2 = format!("{PUSHER}    timeout: 60\n");
-    install(&libs, "acme", "pusher", &v2, &at('2')).await;
+    install(&libs, "acme/pusher", &v2, &at('2')).await;
     let out = trigger(&db, &forge, ports(), &push()).await;
     assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
 
@@ -470,8 +461,7 @@ async fn trust_follows_the_source_across_upgrades() {
     let v3 = format!("{PUSHER}    timeout: 90\n");
     install(
         &libs,
-        "acme",
-        "pusher",
+        "acme/pusher",
         &v3,
         &format!("github.com/mallory/libs//pusher.yaml@{}", "3".repeat(40)),
     )
@@ -481,7 +471,7 @@ async fn trust_follows_the_source_across_upgrades() {
     );
 
     // Untrusting refuses again.
-    install(&libs, "acme", "pusher", &v2, &at('2')).await;
+    install(&libs, "acme/pusher", &v2, &at('2')).await;
     libs.untrust_source(
         "acme",
         "github.com/acme/libs//pusher.yaml",
@@ -855,7 +845,8 @@ async fn a_bad_branch_refuses_only_the_pipelines_that_read_it() {
 async fn reading_event_sha_on_a_trigger_without_one_refuses_the_run() {
     let db = InMemoryDb::new();
     let libs = with_trusted_clone().await;
-    let yaml = "on: { tag: {} }\nsteps: [{ id: checkout, invoke: lib:thulasi-ram/clone }]\n";
+    let yaml =
+        "on: { tag: {} }\nsteps: [{ id: checkout, invoke: lib:thulasi-ram::scarab-ci::clone }]\n";
     let forge = long_lived(&[(".scarab/ci.yaml", yaml)]).with_commit("refs/tags/v1", SHA);
     let tag = Event::Tag {
         actor: "octocat".into(),
@@ -893,7 +884,8 @@ async fn a_clone_step_fails_naming_the_library() {
     .await
     .unwrap_err();
     assert!(
-        err.to_string().contains("invoke: lib:thulasi-ram/clone"),
+        err.to_string()
+            .contains("invoke: lib:thulasi-ram::scarab-ci::clone"),
         "{err}"
     );
 }
@@ -916,7 +908,8 @@ async fn a_build_step_fails_naming_the_library() {
     .await
     .unwrap_err();
     assert!(
-        err.to_string().contains("invoke: lib:thulasi-ram/build"),
+        err.to_string()
+            .contains("invoke: lib:thulasi-ram::scarab-ci::build"),
         "{err}"
     );
 }

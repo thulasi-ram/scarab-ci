@@ -738,7 +738,7 @@ pub struct StepSpec {
     pub registry_auth: Option<RegistryAuthConfig>,
     /// Set on a spec stored as a `build` Step, a kind the ADR-0018
     /// amendment of 2026-11-12 removed. Kept as raw data only so the launch
-    /// can refuse it naming `lib:thulasi-ram/build`; nothing else reads it.
+    /// can refuse it naming `lib:thulasi-ram::scarab-ci::build`; nothing else reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<serde_json::Value>,
     /// Artifact publication globs (ADR-0052): filters what the backend

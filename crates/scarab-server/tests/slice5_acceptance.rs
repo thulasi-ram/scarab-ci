@@ -120,10 +120,10 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
 
     // --- 3. The build library's Step compiles to a rootless-BuildKit Pod. ---
     let ir = scarab_pipeline::compile_with_libraries(
-        "steps:\n  - id: image\n    invoke: lib:thulasi-ram/build\n    with: { image: registry.example/app:1.0, push: \"true\" }\n",
+        "steps:\n  - id: image\n    invoke: lib:thulasi-ram::scarab-ci::build\n    with: { image: registry.example/app:1.0, push: \"true\" }\n",
         &scarab_pipeline::Libraries {
             installed: std::collections::BTreeMap::from([(
-                "thulasi-ram/build".to_string(),
+                "thulasi-ram::scarab-ci::build".to_string(),
                 scarab_pipeline::InstalledLibrary {
                     content: include_str!("../../../libs/build.yaml").to_string(),
                     source: "github.com/thulasi-ram/scarab-ci//libs/build.yaml@1".into(),

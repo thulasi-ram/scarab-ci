@@ -179,8 +179,7 @@ async fn trusted_library(libs: &InMemoryLibraries) -> String {
         content_hash: content_hash(content),
         content: content.into(),
         source: format!("{TRUSTED}@{}", "1".repeat(40)),
-        publisher: "acme".into(),
-        name: "git".into(),
+        name: "acme/git".into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
     })
@@ -311,8 +310,7 @@ async fn a_clone_library_launch_gets_the_long_lived_token_only_once_its_source_i
         content_hash: content_hash(CLONE_LIBRARY),
         content: CLONE_LIBRARY.into(),
         source: CLONE_LIBRARY_SOURCE.into(),
-        publisher: "thulasi-ram".into(),
-        name: "clone".into(),
+        name: "thulasi-ram::scarab-ci::clone".into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
     })

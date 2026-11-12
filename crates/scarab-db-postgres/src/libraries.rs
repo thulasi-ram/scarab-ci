@@ -1,5 +1,5 @@
 //! [`LibraryStore`] on Postgres (ADR-0076 §4, §6; migrations 0071, 0072,
-//! 0090).
+//! 0090, 0096).
 //!
 //! An install takes the installation row `FOR UPDATE` (or finds none),
 //! compares it with what the caller expects to replace, and writes in the
@@ -42,8 +42,7 @@ fn sqlstate(e: &sqlx::Error) -> Option<String> {
     }
 }
 
-const VERSION_COLUMNS: &str =
-    "org, content_hash, content, source, publisher, name, fetched_by, fetched_at";
+const VERSION_COLUMNS: &str = "org, content_hash, content, source, name, fetched_by, fetched_at";
 
 fn version_from_row(r: &PgRow) -> LibraryVersion {
     LibraryVersion {
@@ -51,7 +50,6 @@ fn version_from_row(r: &PgRow) -> LibraryVersion {
         content_hash: r.get("content_hash"),
         content: r.get("content"),
         source: r.get("source"),
-        publisher: r.get("publisher"),
         name: r.get("name"),
         fetched_by: r.get("fetched_by"),
         fetched_at: r.get("fetched_at"),
@@ -59,7 +57,7 @@ fn version_from_row(r: &PgRow) -> LibraryVersion {
 }
 
 /// An installation joined with its version.
-const INSTALLATION_SELECT: &str = "SELECT i.id, i.org, i.publisher, i.name, i.content_hash, \
+const INSTALLATION_SELECT: &str = "SELECT i.id, i.org, i.name, i.content_hash, \
      v.source, i.installed_by, i.installed_at, i.step_up_ref \
      FROM library_installations i \
      JOIN library_versions v ON v.org = i.org AND v.content_hash = i.content_hash";
@@ -68,7 +66,6 @@ fn installation_from_row(r: &PgRow) -> LibraryInstallation {
     LibraryInstallation {
         id: r.get("id"),
         org: r.get("org"),
-        publisher: r.get("publisher"),
         name: r.get("name"),
         content_hash: r.get("content_hash"),
         source: r.get("source"),
@@ -95,14 +92,13 @@ impl LibraryStore for PostgresDb {
     async fn put_version(&self, v: &LibraryVersion) -> Result<LibraryVersion, LibraryStoreError> {
         sqlx::query(&format!(
             "INSERT INTO library_versions ({VERSION_COLUMNS}) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT (org, content_hash) DO NOTHING"
         ))
         .bind(&v.org)
         .bind(&v.content_hash)
         .bind(&v.content)
         .bind(&v.source)
-        .bind(&v.publisher)
         .bind(&v.name)
         .bind(&v.fetched_by)
         .bind(v.fetched_at)
@@ -170,13 +166,11 @@ impl LibraryStore for PostgresDb {
                 for _ in 0..3 {
                     written = sqlx::query(
                         "INSERT INTO library_installations \
-                         (org, publisher, name, content_hash, installed_by, installed_at, \
-                          step_up_ref) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                         (org, name, content_hash, installed_by, installed_at, step_up_ref) \
+                         VALUES ($1, $2, $3, $4, $5, $6) \
                          ON CONFLICT (id) DO NOTHING",
                     )
                     .bind(&new.org)
-                    .bind(&new.publisher)
                     .bind(&new.name)
                     .bind(&new.content_hash)
                     .bind(&new.installed_by)
@@ -199,11 +193,10 @@ impl LibraryStore for PostgresDb {
             }
             Replaces::Version(h) => sqlx::query(
                 "UPDATE library_installations SET \
-                   content_hash = $4, installed_by = $5, installed_at = $6, step_up_ref = $7 \
-                 WHERE org = $1 AND publisher = $2 AND name = $3 AND content_hash = $8",
+                   content_hash = $3, installed_by = $4, installed_at = $5, step_up_ref = $6 \
+                 WHERE org = $1 AND name = $2 AND content_hash = $7",
             )
             .bind(&new.org)
-            .bind(&new.publisher)
             .bind(&new.name)
             .bind(&new.content_hash)
             .bind(&new.installed_by)
@@ -228,10 +221,9 @@ impl LibraryStore for PostgresDb {
         .await
         .map_err(store_err)?;
         let row = sqlx::query(&format!(
-            "{INSTALLATION_SELECT} WHERE i.org = $1 AND i.publisher = $2 AND i.name = $3"
+            "{INSTALLATION_SELECT} WHERE i.org = $1 AND i.name = $2"
         ))
         .bind(&new.org)
-        .bind(&new.publisher)
         .bind(&new.name)
         .fetch_one(&mut *tx)
         .await
@@ -248,14 +240,12 @@ impl LibraryStore for PostgresDb {
     async fn installation(
         &self,
         org: &str,
-        publisher: &str,
         name: &str,
     ) -> Result<Option<LibraryInstallation>, LibraryStoreError> {
         let row = sqlx::query(&format!(
-            "{INSTALLATION_SELECT} WHERE i.org = $1 AND i.publisher = $2 AND i.name = $3"
+            "{INSTALLATION_SELECT} WHERE i.org = $1 AND i.name = $2"
         ))
         .bind(org)
-        .bind(publisher)
         .bind(name)
         .fetch_optional(self.pool())
         .await
@@ -285,7 +275,7 @@ impl LibraryStore for PostgresDb {
     ) -> Result<Vec<LibraryInstallation>, LibraryStoreError> {
         let rows = sqlx::query(&format!(
             "{INSTALLATION_SELECT} WHERE i.org = $1 \
-             ORDER BY i.publisher COLLATE \"C\", i.name COLLATE \"C\""
+             ORDER BY i.name COLLATE \"C\""
         ))
         .bind(org)
         .fetch_all(self.pool())
@@ -299,7 +289,7 @@ impl LibraryStore for PostgresDb {
         org: &str,
     ) -> Result<BTreeMap<String, InstalledLibrary>, LibraryStoreError> {
         let rows = sqlx::query(
-            "SELECT i.publisher, i.name, v.content, v.source \
+            "SELECT i.name, v.content, v.source \
              FROM library_installations i \
              JOIN library_versions v ON v.org = i.org AND v.content_hash = i.content_hash \
              WHERE i.org = $1",
@@ -312,11 +302,7 @@ impl LibraryStore for PostgresDb {
             .iter()
             .map(|r| {
                 (
-                    format!(
-                        "{}/{}",
-                        r.get::<String, _>("publisher"),
-                        r.get::<String, _>("name")
-                    ),
+                    r.get::<String, _>("name"),
                     InstalledLibrary {
                         content: r.get("content"),
                         source: r.get("source"),
@@ -329,32 +315,26 @@ impl LibraryStore for PostgresDb {
     async fn remove(
         &self,
         org: &str,
-        publisher: &str,
-        name: &str,
+        id: &str,
     ) -> Result<Option<LibraryInstallation>, LibraryStoreError> {
         let mut tx = self.pool().begin().await.map_err(store_err)?;
         let row = sqlx::query(&format!(
-            "{INSTALLATION_SELECT} WHERE i.org = $1 AND i.publisher = $2 AND i.name = $3 \
-             FOR UPDATE OF i"
+            "{INSTALLATION_SELECT} WHERE i.org = $1 AND i.id = $2 FOR UPDATE OF i"
         ))
         .bind(org)
-        .bind(publisher)
-        .bind(name)
+        .bind(id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(store_err)?;
         let Some(row) = row else {
             return Ok(None);
         };
-        sqlx::query(
-            "DELETE FROM library_installations WHERE org = $1 AND publisher = $2 AND name = $3",
-        )
-        .bind(org)
-        .bind(publisher)
-        .bind(name)
-        .execute(&mut *tx)
-        .await
-        .map_err(store_err)?;
+        sqlx::query("DELETE FROM library_installations WHERE org = $1 AND id = $2")
+            .bind(org)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(store_err)?;
         tx.commit().await.map_err(store_err)?;
         Ok(Some(installation_from_row(&row)))
     }

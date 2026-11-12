@@ -166,7 +166,7 @@ pub struct OriginLinkDto {
     /// `file`, `library`, `plugin`, or `environment` for the gate an
     /// Environment added to the Run (ADR-0078 §2).
     pub kind: String,
-    /// A repo-relative path (`file`), `<publisher>/<name>` (`library`) or the
+    /// A repo-relative path (`file`), the library name (`library`) or the
     /// plugin installation and gate (`plugin`).
     pub name: String,
     /// Where an installed library comes from, at its commit.
@@ -182,7 +182,7 @@ pub struct OriginLinkDto {
 /// A library version a Run uses that is yanked in its org.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RunYankDto {
-    /// `<publisher>/<name>`.
+    /// The library name, as `invoke: lib:<name>` writes it.
     pub name: String,
     pub content_hash: String,
     pub reason: String,

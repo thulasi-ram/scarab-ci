@@ -28,7 +28,7 @@ export function layerSteps<T extends { id: string; needs: string[] }>(steps: T[]
   return cols.filter((c) => c && c.length);
 }
 
-// ── Invocation groups (ADR-0076) ───────────────────────────────────────────
+// ── Invocation groups ────────────────────────────────────────────────────
 // A Step inlined from a library (or a `file:` library) carries the invoke
 // chain it came through (`origin`, outermost first), and its id is the chain
 // of invoke Step ids joined by `/` (`ship/smoke/probe`). The DAG draws one
@@ -53,7 +53,7 @@ export type DagGroup = {
   label: string;
   /** `library` or `file`. */
   kind: string;
-  /** `<publisher>/<name>` or the file path. */
+  /** The installed library name or the file path. */
   name: string;
   content_hash: string;
   yanked: boolean;

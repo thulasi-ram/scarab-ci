@@ -3063,8 +3063,8 @@
         ]
       }
     },
-    "/v1/orgs/{org}/libraries/{publisher}/{name}": {
-      "put": {
+    "/v1/orgs/{org}/library-installations": {
+      "post": {
         "tags": [
           "Libraries"
         ],
@@ -3075,24 +3075,6 @@
             "name": "org",
             "in": "path",
             "description": "org",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "publisher",
-            "in": "path",
-            "description": "publisher",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "name",
-            "in": "path",
-            "description": "library name",
             "required": true,
             "schema": {
               "type": "string"
@@ -3151,61 +3133,6 @@
             "sessionCookie": []
           }
         ]
-      },
-      "delete": {
-        "tags": [
-          "Libraries"
-        ],
-        "summary": "Remove an installed library (ADR-0076 §4)",
-        "operationId": "remove_library",
-        "parameters": [
-          {
-            "name": "org",
-            "in": "path",
-            "description": "org",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "publisher",
-            "in": "path",
-            "description": "publisher",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "name",
-            "in": "path",
-            "description": "library name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "removed"
-          },
-          "403": {
-            "description": "not an org admin"
-          },
-          "404": {
-            "description": "not installed, or libraries not configured"
-          }
-        },
-        "security": [
-          {
-            "apiToken": []
-          },
-          {
-            "sessionCookie": []
-          }
-        ]
       }
     },
     "/v1/orgs/{org}/library-installations/{id}": {
@@ -3248,6 +3175,52 @@
           },
           "403": {
             "description": "no read access to the org"
+          },
+          "404": {
+            "description": "no installation with this id in the org, or libraries not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Libraries"
+        ],
+        "summary": "Remove an installed library (ADR-0076 §4)",
+        "operationId": "remove_library",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "installation id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "removed"
+          },
+          "403": {
+            "description": "not an org admin"
           },
           "404": {
             "description": "no installation with this id in the org, or libraries not configured"
@@ -9966,7 +9939,7 @@
               "string",
               "null"
             ],
-            "description": "For a library Step: the library (`<publisher>/<name>` or a path)."
+            "description": "For a library Step: the library (its installed name or a path)."
           },
           "library_step": {
             "type": [
@@ -10909,20 +10882,21 @@
               "string",
               "null"
             ],
-            "description": "Defaults to the file name without its extension."
+            "description": "The library name, as `invoke: lib:<name>` will write it: parts of\nletters, digits, `.`, `_` and `-`, joined by `::` or `/`, each part\nstarting with a letter, digit or `_`. Defaults to\n`<owner>::<repo>::<file name without its extension>`."
           },
-          "publisher": {
+          "ref": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Defaults to the source's owner."
+            "description": "A branch, tag or commit, for a `source` with no `@<commit>`. Scarab\nreads the file at the commit it points to now; the stored version and\nthe answer's `source` name that commit."
           },
           "source": {
             "type": "string",
-            "description": "`<host>/<owner>/<repo>//<path>@<commit>`."
+            "description": "`<host>/<owner>/<repo>//<path>@<commit>`, or `<host>/<owner>/<repo>//<path>`\nwith `ref`."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "FetchPluginManifestRequest": {
         "type": "object",
@@ -10983,7 +10957,6 @@
       "FetchedLibraryDto": {
         "type": "object",
         "required": [
-          "publisher",
           "name",
           "content_hash",
           "source",
@@ -11013,9 +10986,6 @@
             "description": "The change from `current`, one line per entry, each starting with\n`+`, `-` or a space. Empty when nothing is installed."
           },
           "name": {
-            "type": "string"
-          },
-          "publisher": {
             "type": "string"
           },
           "source": {
@@ -11400,12 +11370,17 @@
       "InstallLibraryRequest": {
         "type": "object",
         "required": [
+          "name",
           "content_hash"
         ],
         "properties": {
           "content_hash": {
             "type": "string",
             "description": "A version fetched into this org."
+          },
+          "name": {
+            "type": "string",
+            "description": "The library name to install under, as `invoke: lib:<name>` writes it."
           },
           "replaces": {
             "type": [
@@ -11414,7 +11389,8 @@
             ],
             "description": "The hash installed now (an upgrade), or omitted for a first install."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "InstallPluginRequest": {
         "type": "object",
@@ -11520,7 +11496,6 @@
         "type": "object",
         "required": [
           "id",
-          "publisher",
           "name",
           "content_hash",
           "source",
@@ -11543,10 +11518,8 @@
             "type": "string"
           },
           "name": {
-            "type": "string"
-          },
-          "publisher": {
-            "type": "string"
+            "type": "string",
+            "description": "The library name, as `invoke: lib:<name>` writes it."
           },
           "source": {
             "type": "string"
@@ -11568,7 +11541,6 @@
         "type": "object",
         "required": [
           "content_hash",
-          "publisher",
           "name",
           "source",
           "reason",
@@ -11587,11 +11559,8 @@
             "type": "string"
           },
           "name": {
-            "type": "string"
-          },
-          "publisher": {
             "type": "string",
-            "description": "The library the yanked version was fetched for, `<publisher>/<name>`."
+            "description": "The library name the yanked version was fetched for."
           },
           "reason": {
             "type": "string"
@@ -12305,7 +12274,7 @@
           },
           "name": {
             "type": "string",
-            "description": "A repo-relative path (`file`), `<publisher>/<name>` (`library`) or the\nplugin installation and gate (`plugin`)."
+            "description": "A repo-relative path (`file`), the library name (`library`) or the\nplugin installation and gate (`plugin`)."
           },
           "source": {
             "type": [
@@ -14734,7 +14703,7 @@
           },
           "name": {
             "type": "string",
-            "description": "`<publisher>/<name>`."
+            "description": "The library name, as `invoke: lib:<name>` writes it."
           },
           "reason": {
             "type": "string"

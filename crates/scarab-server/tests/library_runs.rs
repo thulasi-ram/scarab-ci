@@ -75,8 +75,7 @@ async fn installed(org: &str, content: &str) -> InMemoryLibraries {
         content_hash: content_hash(content),
         content: content.into(),
         source: source(),
-        publisher: "acme".into(),
-        name: "deploy".into(),
+        name: "acme/deploy".into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
     })
@@ -85,8 +84,7 @@ async fn installed(org: &str, content: &str) -> InMemoryLibraries {
     libs.install(
         &NewInstallation {
             org: org.into(),
-            publisher: "acme".into(),
-            name: "deploy".into(),
+            name: "acme/deploy".into(),
             content_hash: content_hash(content),
             installed_by: "amy".into(),
             installed_at: 1,

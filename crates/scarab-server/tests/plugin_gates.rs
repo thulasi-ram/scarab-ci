@@ -712,8 +712,7 @@ async fn a_gate_from_a_yanked_library_version_does_not_release() {
         content_hash: content_hash(GATED_LIB),
         content: GATED_LIB.into(),
         source: format!("github.com/acme/libs//deploy.yaml@{}", "1".repeat(40)),
-        publisher: "acme".into(),
-        name: "deploy".into(),
+        name: "acme/deploy".into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
     })
@@ -722,8 +721,7 @@ async fn a_gate_from_a_yanked_library_version_does_not_release() {
     libs.install(
         &NewInstallation {
             org: "acme".into(),
-            publisher: "acme".into(),
-            name: "deploy".into(),
+            name: "acme/deploy".into(),
             content_hash: content_hash(GATED_LIB),
             installed_by: "amy".into(),
             installed_at: 1,

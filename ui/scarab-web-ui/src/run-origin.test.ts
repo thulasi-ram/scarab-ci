@@ -63,7 +63,7 @@ describe("yanked versions on the Run page", () => {
     { id: "charts/git", needs: ["test"], status: "failed" },
     { id: "ship/helm", needs: ["charts/git"], status: "not_run" },
   ];
-  const y = { name: "thulasi-ram/clone", content_hash: "a3c9e1f7b5d2".repeat(5) + "abcd", reason: "writes the token to the log", yanked_at: 0, steps: ["checkout/git", "charts/git"] };
+  const y = { name: "thulasi-ram::scarab-ci::clone", content_hash: "a3c9e1f7b5d2".repeat(5) + "abcd", reason: "writes the token to the log", yanked_at: 0, steps: ["checkout/git", "charts/git"] };
 
   it("finds a Rerun that would launch a Step from a yanked version", () => {
     expect([...rerunScope("test", steps)]).toEqual(["test", "charts/git", "ship/helm"]);
@@ -75,7 +75,7 @@ describe("yanked versions on the Run page", () => {
 
   it("says what ran, what was refused and what to do", () => {
     const n = yankNote([y], steps, () => "14:05:02")!;
-    expect(n).toMatch(/^lib:thulasi-ram\/clone a3c9e1f7b5d2 was yanked at 14:05:02: writes the token to the log\./);
+    expect(n).toMatch(/^lib:thulasi-ram::scarab-ci::clone a3c9e1f7b5d2 was yanked at 14:05:02: writes the token to the log\./);
     expect(n).toMatch(/checkout\/git had run\./);
     expect(n).toMatch(/charts\/git was refused at launch\./);
     expect(n).toMatch(/Start a new run/);

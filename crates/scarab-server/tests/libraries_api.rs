@@ -87,6 +87,31 @@ async fn fetch(h: &H, body: Value) -> (StatusCode, Value) {
     call(&h.app, "POST", "/v1/orgs/acme/libraries/fetch", Some(body)).await
 }
 
+/// `POST …/library-installations` in `acme`.
+async fn install(h: &H, body: Value) -> (StatusCode, Value) {
+    call(
+        &h.app,
+        "POST",
+        "/v1/orgs/acme/library-installations",
+        Some(body),
+    )
+    .await
+}
+
+/// `DELETE …/library-installations/{id}` in `acme`.
+async fn remove(h: &H, id: &str) -> StatusCode {
+    call(
+        &h.app,
+        "DELETE",
+        &format!("/v1/orgs/acme/library-installations/{id}"),
+        None,
+    )
+    .await
+    .0
+}
+
+const DEPLOY: &str = "acme::libs::deploy";
+
 #[tokio::test]
 async fn install_then_upgrade_shows_the_diff_and_checks_what_it_replaces() {
     let h = harness();
@@ -101,21 +126,21 @@ async fn install_then_upgrade_shows_the_diff_and_checks_what_it_replaces() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v1}");
-    assert_eq!(v1["publisher"], "acme");
-    assert_eq!(v1["name"], "deploy");
+    assert_eq!(v1["name"], DEPLOY);
+    assert!(v1.get("publisher").is_none(), "{v1}");
     assert_eq!(v1["content_hash"], content_hash(V1));
     assert!(v1["current"].is_null());
     // Fetching installs nothing.
     assert!(h.store.installations("acme").await.unwrap().is_empty());
 
-    let (st, i) = call(
-        &h.app,
-        "PUT",
-        "/v1/orgs/acme/libraries/acme/deploy",
-        Some(json!({ "content_hash": content_hash(V1) })),
+    let (st, i) = install(
+        &h,
+        json!({ "name": DEPLOY, "content_hash": content_hash(V1) }),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{i}");
+    assert_eq!(i["name"], DEPLOY);
+    let id = i["id"].as_str().unwrap().to_string();
     assert_eq!(
         i["source"],
         format!("github.com/acme/libs//deploy.yaml@{C1}")
@@ -136,42 +161,37 @@ async fn install_then_upgrade_shows_the_diff_and_checks_what_it_replaces() {
     // An upgrade must name what it replaces: not naming it, or naming the
     // wrong version, is a conflict.
     for replaces in [Value::Null, json!(content_hash(V2))] {
-        let (st, b) = call(
-            &h.app,
-            "PUT",
-            "/v1/orgs/acme/libraries/acme/deploy",
-            Some(json!({ "content_hash": content_hash(V2), "replaces": replaces })),
+        let (st, b) = install(
+            &h,
+            json!({ "name": DEPLOY, "content_hash": content_hash(V2), "replaces": replaces }),
         )
         .await;
         assert_eq!(st, StatusCode::CONFLICT, "{b}");
     }
-    let (st, b) = call(
-        &h.app,
-        "PUT",
-        "/v1/orgs/acme/libraries/acme/deploy",
-        Some(json!({ "content_hash": content_hash(V2), "replaces": content_hash(V1) })),
+    let (st, b) = install(
+        &h,
+        json!({
+            "name": DEPLOY,
+            "content_hash": content_hash(V2),
+            "replaces": content_hash(V1)
+        }),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{b}");
     assert_eq!(b["content_hash"], content_hash(V2));
+    assert_eq!(b["id"], id, "an upgrade keeps the installation's id");
 
-    // Remove; a second remove is 404.
-    let (st, _) = call(
-        &h.app,
-        "DELETE",
-        "/v1/orgs/acme/libraries/acme/deploy",
-        None,
-    )
-    .await;
-    assert_eq!(st, StatusCode::NO_CONTENT);
-    let (st, _) = call(
-        &h.app,
-        "DELETE",
-        "/v1/orgs/acme/libraries/acme/deploy",
-        None,
-    )
-    .await;
-    assert_eq!(st, StatusCode::NOT_FOUND);
+    // Remove by id; a second remove is 404, and so is an id of no
+    // installation.
+    assert_eq!(remove(&h, &id).await, StatusCode::NO_CONTENT);
+    assert!(h
+        .store
+        .installation("acme", DEPLOY)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(remove(&h, &id).await, StatusCode::NOT_FOUND);
+    assert_eq!(remove(&h, "0123456789").await, StatusCode::NOT_FOUND);
 }
 
 /// Fetches store what an admin reviews, so each fetch keeps the org's
@@ -187,11 +207,9 @@ async fn fetches_keep_a_bounded_number_of_versions_never_installed() {
         json!({ "source": format!("github.com/acme/libs//deploy.yaml@{C1}") }),
     )
     .await;
-    let (st, b) = call(
-        &h.app,
-        "PUT",
-        "/v1/orgs/acme/libraries/acme/deploy",
-        Some(json!({ "content_hash": content_hash(V1) })),
+    let (st, b) = install(
+        &h,
+        json!({ "name": DEPLOY, "content_hash": content_hash(V1) }),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{b}");
@@ -227,35 +245,91 @@ async fn fetches_keep_a_bounded_number_of_versions_never_installed() {
         .await
         .unwrap()
         .is_some());
-    let (st, b) = call(
-        &h.app,
-        "PUT",
-        "/v1/orgs/acme/libraries/acme/deploy",
-        Some(json!({ "content_hash": last, "replaces": content_hash(V1) })),
+    let (st, b) = install(
+        &h,
+        json!({ "name": DEPLOY, "content_hash": last, "replaces": content_hash(V1) }),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{b}");
 }
 
+/// A fetch with no name names the library `<owner>::<repo>::<file stem>`;
+/// a fetch may name it anything the name rule allows, and the install
+/// takes the name it is given.
 #[tokio::test]
-async fn a_publisher_can_be_chosen_at_install() {
+async fn a_fetch_names_the_library_by_its_source_unless_given_a_name() {
+    let h = harness();
+    h.http
+        .serve_url(&raw("acme", "scarab-libs", C1, "ci/deploy-helm.yml"), V1);
+    let source = format!("github.com/acme/scarab-libs//ci/deploy-helm.yml@{C1}");
+    let (st, b) = fetch(&h, json!({ "source": source })).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["name"], "acme::scarab-libs::deploy-helm");
+
+    for name in ["platform/helm", "acme::platform/helm", "helm"] {
+        let (st, b) = fetch(&h, json!({ "source": source, "name": name })).await;
+        assert_eq!(st, StatusCode::OK, "{name}: {b}");
+        assert_eq!(b["name"], name);
+    }
+    let (st, i) = install(
+        &h,
+        json!({ "name": "acme::platform/helm", "content_hash": content_hash(V1) }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{i}");
+    assert_eq!(i["name"], "acme::platform/helm");
+    let (_, list) = call(&h.app, "GET", "/v1/orgs/acme/libraries", None).await;
+    assert_eq!(list["installations"][0]["name"], "acme::platform/helm");
+}
+
+/// A name outside the rule (a space, a template, a lone `:`, an empty
+/// part) is refused at fetch and at install, before anything is read or
+/// stored.
+#[tokio::test]
+async fn a_name_outside_the_rule_is_refused_at_fetch_and_install() {
     let h = harness();
     h.http
         .serve_url(&raw("acme", "libs", C1, "deploy.yaml"), V1);
-    let (st, b) = fetch(
-        &h,
-        json!({
-            "source": format!("github.com/acme/libs//deploy.yaml@{C1}"),
-            "publisher": "platform",
-            "name": "helm"
-        }),
-    )
-    .await;
+    let source = format!("github.com/acme/libs//deploy.yaml@{C1}");
+    let (st, b) = fetch(&h, json!({ "source": source })).await;
     assert_eq!(st, StatusCode::OK, "{b}");
-    assert_eq!(
-        (b["publisher"].as_str(), b["name"].as_str()),
-        (Some("platform"), Some("helm"))
+    let asked = h.http.asked().len();
+    for name in ["a b", "x${y}", "a:b", "a//b", "::x", "x/", "-x", ""] {
+        let (st, b) = fetch(&h, json!({ "source": source, "name": name })).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "fetch {name:?}: {b}");
+        assert!(
+            b.as_str()
+                .unwrap_or_default()
+                .contains("not a library name"),
+            "fetch {name:?}: {b}"
+        );
+        let (st, b) = install(
+            &h,
+            json!({ "name": name, "content_hash": content_hash(V1) }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "install {name:?}: {b}");
+    }
+    assert_eq!(h.http.asked().len(), asked, "a refused name reads nothing");
+    assert!(h.store.installations("acme").await.unwrap().is_empty());
+}
+
+/// A source whose default name fails the rule (a file name starting with
+/// `-`) is refused until the fetch names the library.
+#[tokio::test]
+async fn a_default_name_outside_the_rule_asks_for_a_name() {
+    let h = harness();
+    h.http
+        .serve_url(&raw("acme", "libs", C1, "-deploy.yaml"), V1);
+    let source = format!("github.com/acme/libs//-deploy.yaml@{C1}");
+    let (st, b) = fetch(&h, json!({ "source": source })).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    assert!(
+        b.as_str().unwrap_or_default().contains("name the library"),
+        "{b}"
     );
+    let (st, b) = fetch(&h, json!({ "source": source, "name": "acme::deploy" })).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
 }
 
 /// The SSRF rules: only a known forge, over https, is ever asked.
@@ -437,6 +511,125 @@ async fn a_private_source_must_belong_to_the_org() {
     assert!(h.http.asked().is_empty(), "no anonymous fetch was made");
 }
 
+/// A branch or tag is read at the commit it points to now, and the stored
+/// version names that commit: anonymously through the forge's commits list,
+/// or through the org's connection. A full commit as `ref` needs no lookup.
+#[tokio::test]
+async fn a_branch_or_tag_is_pinned_to_its_commit_when_fetched() {
+    let h = harness_with(
+        FakeForge::new()
+            .with_file("deploy.yaml", V2)
+            .with_commit("release/2", C2),
+        InMemoryLibraries::new(),
+    );
+    github_connection(&h.db, "gh", Some("acme")).await;
+    h.http.serve_url(
+        "https://api.github.com/repos/acme/libs/commits?sha=v1.0&per_page=1",
+        &format!(r#"[{{"sha":"{C1}","commit":{{"message":"one"}}}}]"#),
+    );
+    h.http
+        .serve_url(&raw("acme", "libs", C1, "deploy.yaml"), V1);
+
+    let (st, b) = fetch(
+        &h,
+        json!({ "source": "github.com/acme/libs//deploy.yaml", "ref": "v1.0" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(
+        b["source"],
+        format!("github.com/acme/libs//deploy.yaml@{C1}")
+    );
+    assert_eq!(b["content_hash"], content_hash(V1));
+
+    let (st, b) = fetch(
+        &h,
+        json!({ "source": "github.com/acme/libs//deploy.yaml", "ref": "release/2", "connection": "gh" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(
+        b["source"],
+        format!("github.com/acme/libs//deploy.yaml@{C2}")
+    );
+
+    let asked = h.http.asked().len();
+    let (st, b) = fetch(
+        &h,
+        json!({ "source": "github.com/acme/libs//deploy.yaml", "ref": C1 }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(h.http.asked().len(), asked + 1, "only the file is read");
+
+    // A ref in the source and another as `ref`: refused, nothing read.
+    let (st, b) = fetch(
+        &h,
+        json!({ "source": format!("github.com/acme/libs//deploy.yaml@{C1}"), "ref": "main" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    let (st, _) = fetch(
+        &h,
+        json!({ "source": "github.com/acme/libs//deploy.yaml", "ref": "my branch" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    for bad in ["..", "main\u{202e}x"] {
+        let (st, b) = fetch(
+            &h,
+            json!({ "source": "github.com/acme/libs//deploy.yaml", "ref": bad }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad:?}: {b}");
+    }
+    // A client from before libraries had one name sends `publisher`: refused,
+    // never installed under the bare `name`.
+    let (st, _) = fetch(
+        &h,
+        json!({ "source": format!("github.com/acme/libs//deploy.yaml@{C1}"), "publisher": "acme", "name": "deploy" }),
+    )
+    .await;
+    assert!(st.is_client_error(), "{st}");
+    assert_ne!(st, StatusCode::OK);
+}
+
+/// The org's connection cannot reach the repository (a GitHub App not
+/// installed on it answers 404). A public file is still read, anonymously;
+/// a file that is not public either is refused with both reasons.
+#[tokio::test]
+async fn a_connection_without_access_still_reads_a_public_source() {
+    let forge = FakeForge::new();
+    forge.set_read_error(Some("404 Not Found: {\"message\":\"Not Found\"}"));
+    let h = harness_with(forge, InMemoryLibraries::new());
+    github_connection(&h.db, "gh", Some("acme")).await;
+    h.http
+        .serve_url(&raw("acme", "libs", C1, "deploy.yaml"), V1);
+
+    let (st, b) = fetch(
+        &h,
+        json!({ "source": format!("github.com/acme/libs//deploy.yaml@{C1}"), "connection": "gh" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["content_hash"], content_hash(V1));
+    assert_eq!(
+        b["source"],
+        format!("github.com/acme/libs//deploy.yaml@{C1}")
+    );
+
+    let (st, b) = fetch(
+        &h,
+        json!({ "source": format!("github.com/acme/private//deploy.yaml@{C1}"), "connection": "gh" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    let msg = b.as_str().unwrap();
+    assert!(msg.contains("connection `gh` could not read"), "{msg}");
+    assert!(msg.contains("404 Not Found"), "{msg}");
+    assert!(msg.contains("give connection `gh` access"), "{msg}");
+}
+
 #[tokio::test]
 async fn yank_needs_a_reason_and_unyank_lifts_it() {
     let h = harness();
@@ -470,8 +663,7 @@ async fn yank_needs_a_reason_and_unyank_lifts_it() {
     // in the list could say which library it belongs to.
     let source = format!("github.com/acme/libs//deploy.yaml@{C1}");
     for y in [&b, &list["yanks"][0]] {
-        assert_eq!(y["publisher"], "acme", "{y}");
-        assert_eq!(y["name"], "deploy", "{y}");
+        assert_eq!(y["name"], DEPLOY, "{y}");
         assert_eq!(y["source"], source, "{y}");
     }
     let uri = format!("/v1/orgs/acme/library-yanks/{}", content_hash(V1));
@@ -553,16 +745,14 @@ async fn the_clone_library_installs_like_any_other_and_its_source_is_not_trusted
     h.http.serve(CLONE_LIBRARY_SOURCE, CLONE_LIBRARY);
     let (st, b) = fetch(&h, json!({ "source": CLONE_LIBRARY_SOURCE })).await;
     assert_eq!(st, StatusCode::OK, "{b}");
-    assert_eq!(
-        (b["publisher"].as_str(), b["name"].as_str()),
-        (Some("thulasi-ram"), Some("clone"))
-    );
+    assert_eq!(b["name"], "thulasi-ram::scarab-ci::clone");
     assert!(b.get("first_party").is_none(), "{b}");
-    let (st, i) = call(
-        &h.app,
-        "PUT",
-        "/v1/orgs/acme/libraries/thulasi-ram/clone",
-        Some(json!({ "content_hash": content_hash(CLONE_LIBRARY) })),
+    let (st, i) = install(
+        &h,
+        json!({
+            "name": "thulasi-ram::scarab-ci::clone",
+            "content_hash": content_hash(CLONE_LIBRARY)
+        }),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{i}");
@@ -591,9 +781,9 @@ async fn the_clone_library_installs_like_any_other_and_its_source_is_not_trusted
 }
 
 /// A fetch stores what it reads under the name the request gives, or the
-/// source's owner and file name: the clone library's content read from a
-/// mirror is not renamed to `thulasi-ram/clone`, and can be stored under
-/// any name.
+/// source's owner, repository and file name: the clone library's content
+/// read from a mirror is not renamed to `thulasi-ram::scarab-ci::clone`,
+/// and can be stored under any name.
 #[tokio::test]
 async fn the_clone_librarys_content_is_stored_under_the_name_the_fetch_gives() {
     let h = harness();
@@ -604,10 +794,7 @@ async fn the_clone_librarys_content_is_stored_under_the_name_the_fetch_gives() {
     let source = format!("github.com/mirrors/copies//x/checkout.yaml@{C1}");
     let (st, b) = fetch(&h, json!({ "source": source })).await;
     assert_eq!(st, StatusCode::OK, "{b}");
-    assert_eq!(
-        (b["publisher"].as_str(), b["name"].as_str()),
-        (Some("mirrors"), Some("checkout"))
-    );
+    assert_eq!(b["name"], "mirrors::copies::checkout");
     let (st, b) = fetch(&h, json!({ "source": source, "name": "deploy" })).await;
     assert_eq!(st, StatusCode::OK, "{b}");
     assert_eq!(b["name"], "deploy");
@@ -618,10 +805,7 @@ async fn the_clone_librarys_content_is_stored_under_the_name_the_fetch_gives() {
         .unwrap()
         .unwrap();
     assert_eq!(v.source, source);
-    assert_eq!(
-        (v.publisher.as_str(), v.name.as_str()),
-        ("mirrors", "checkout")
-    );
+    assert_eq!(v.name, "mirrors::copies::checkout");
 }
 
 /// The endpoint that retried the removed defaults install is gone.

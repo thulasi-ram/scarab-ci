@@ -83,15 +83,15 @@ library_step() { # $1 the step's number, $2 the library's name
   cat <<TXT
     $1. Org settings > Libraries > Install: fetch
        github.com/thulasi-ram/scarab-ci//libs/$2.yaml@${commit:-<commit>}
-       review it and install it as thulasi-ram/$2 (from github.com: this
-       stack runs against real GitHub). If another version is installed,
-       this upgrades it.
+       review it and install it under its default name,
+       thulasi-ram::scarab-ci::$2 (from github.com: this stack runs against
+       real GitHub). If another version is installed, this upgrades it.
 TXT
 }
 build_source=github.com/thulasi-ram/scarab-ci//libs/build.yaml
 trust_step() { # $1 the step's number
   cat <<TXT
-    $1. Org settings > Libraries > thulasi-ram/build > Build sandbox: trust
+    $1. Org settings > Libraries > thulasi-ram::scarab-ci::build > Build sandbox: trust
        $build_source, or Runs that build an image are refused. The dogfood
        pipeline does not push (the library's push Step exits without
        pushing), so it needs no registry-credential trust.
@@ -120,7 +120,7 @@ else
   for name in clone build; do
     want="$(shasum -a 256 "$here/../../libs/$name.yaml" | awk '{print $1}')"
     if have="$(printf '%s\n' "SELECT content_hash FROM library_installations
-        WHERE org = :'org' AND publisher = 'thulasi-ram' AND name = :'name';" \
+        WHERE org = :'org' AND name = 'thulasi-ram::scarab-ci::' || :'name';" \
       | kc exec -i -n "$ns" deploy/scarab-postgres -- \
           psql -U scarab -d scarab_dogfood -v ON_ERROR_STOP=1 -v org="$org" \
             -v name="$name" -tA)"; then
