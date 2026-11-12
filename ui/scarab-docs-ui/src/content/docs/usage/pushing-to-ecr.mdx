@@ -30,6 +30,9 @@ This page uses IAM Roles for Service Accounts (IRSA). EKS Pod Identity is covere
 part 1. The AWS details (IAM actions, trust policies, the IRSA webhook) are AWS's; we name them so
 you know what to look up, and the AWS docs are the reference for each.
 
+We have not run this flow on EKS. Scarab's tests cover the page's blocks only: that they parse
+and compile, how Run creation admits them, and how the profile merges into the push step's Pod.
+
 ## Before you start: the ServiceAccount every step shares
 
 Scarab sets no `serviceAccountName` on a step Pod, so the Pod runs as the `default` ServiceAccount
@@ -211,7 +214,7 @@ So for a Project that pushes to ECR:
 - keep `REGISTRY_AUTH` out of the repository's secrets and the org's secrets;
 - do not trust the build library's source with forge credentials;
 - do trust it with the registry credential (part 3). The profile applies only to a push step the
-  org trusts with a credential, whether or not one resolves.
+  launch found eligible for a credential, whether or not one resolves.
 
 Pushing to GHCR and to ECR from the same org is not supported yet: an org secret or the forge trust
 that GHCR needs makes every ECR push in that org fail to launch (git-bug 1bc87d1).
@@ -224,6 +227,8 @@ same source with the registry credential:
 
 ```sh
 curl -X POST "$SCARAB/v1/orgs/acme/library-trust" \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $SCARAB_TOKEN" \
   -d '{"source": "github.com/thulasi-ram/scarab-ci//libs/build.yaml", "grant": "registry_credential"}'
 ```
 
@@ -342,9 +347,10 @@ rules:
 - The editor starts a new Policy in `audit` mode. Run **Try it on recent decisions** before you
   move it to `enforce`.
 
-Neither the marker nor the Policy covers a step's `k8s_overlay`, which could set
-`serviceAccountName: scarab-ecr-push` itself. An overlay is admitted only on an Environment that
-permits raw overlays; keep that off for the Projects that build images.
+Neither the marker nor the Policy covers a step's `k8s_overlay`, which can set
+`serviceAccountName: scarab-ecr-push` itself. A fork pull request's Run is refused any overlay.
+Other authors can still set one on an Environment that permits raw overlays (git-bug 24a3126), so
+keep that off for the Projects that build images.
 
 ## Hardening the push role
 
@@ -413,6 +419,9 @@ role's own AWS token while it runs. Some ways to limit what a copy of either is 
   [Where the login goes](#where-the-login-goes-and-what-must-not-be-configured) (git-bug 1bc87d1).
 
 ## Check that it works
+
+This flow has not been run on EKS: the tests cover parsing, compiling, admission and the Pod merge
+only. Check each of these on your cluster before you rely on it.
 
 - The push step's Pod runs as the ServiceAccount:
   `kubectl -n <namespace> get pod <pod> -o jsonpath='{.spec.serviceAccountName}'`.
