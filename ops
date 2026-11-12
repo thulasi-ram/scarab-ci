@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1794460317,"nonce":"LYSrDfjGfbkWgGFWDPJvgmTBz5c=","title":"docs: recommend kernel.yama.ptrace_scope \u003e= 1 on step nodes (hardening only; not checked in code)","was":"x"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1794460317,"nonce":"VgjI2cp3OI5xBbgjkZEATN41g8A=","added":["type:docs area:build"],"removed":null}]}
