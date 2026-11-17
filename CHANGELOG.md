@@ -18,6 +18,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-17
+
 ### Bug Fixes
 
 - **A stuck scheduler loop no longer leaves Runs pending with nothing logged.** The loop that
@@ -1388,7 +1390,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/thulasi-ram/scarab-ci/compare/v0.3.1...v0.3.2
