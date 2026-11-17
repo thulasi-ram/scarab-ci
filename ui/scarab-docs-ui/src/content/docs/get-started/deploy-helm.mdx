@@ -316,6 +316,29 @@ Every key in this table exists in `values.yaml`:
 
 See `deploy/helm/scarab/README.md` and `values.yaml` for every value.
 
+### Health checks
+
+The server answers three health endpoints. The chart's probes use `/livez` and `/readyz`.
+
+| Endpoint | Answers 200 when | Probe |
+|----------|------------------|-------|
+| `/livez` | the process is up, and its scheduler is still making progress | liveness |
+| `/readyz` | the database and the object store answer | readiness |
+| `/healthz` | the process is up | none |
+
+The scheduler runs in a loop on each replica, and the replica that holds the scheduler lease
+starts Runs. A pass of the loop that makes no progress for 60 seconds is stopped, with a warning
+that names the part it was in, and the next pass starts; a pass over many Runs that keeps making
+progress runs as long as it needs. When the lease holder has made no progress for 90 seconds,
+`/livez` answers 503 with the reason, and Kubernetes restarts the Pod. Without this, Runs stayed
+pending with nothing logged until someone restarted it. `/livez` does not call the database: a
+database that answers with errors does not fail it, but one that stops answering stops the
+scheduler, and the Pod is restarted. If the loop stops for another reason (a panic), the server
+shuts down as it does on SIGTERM and exits with status 1.
+
+A `values.yaml` that sets the whole `livenessProbe.httpGet` keeps its own path; point it at
+`/livez` to get this check.
+
 ### Plugins
 
 `plugins.enabled` (default `false`) turns on the plugin runtime: a shared plugin namespace, the

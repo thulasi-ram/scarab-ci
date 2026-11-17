@@ -119,6 +119,7 @@ pub(crate) fn governed_routes() -> Routes {
     use crate::*;
     Routes::new()
         .get("/healthz", healthz)
+        .get("/livez", livez)
         .get("/readyz", readyz)
         .get("/metrics", metrics)
         .get("/openapi.json", openapi)

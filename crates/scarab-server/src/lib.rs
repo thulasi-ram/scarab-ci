@@ -223,6 +223,9 @@ pub struct AppState {
     /// Reads a library from a public forge (ADR-0076 §4). `None`: only
     /// installs through a ForgeConnection work.
     pub library_fetcher: Option<Arc<dyn library_fetch::AnonymousFetcher>>,
+    /// The converged driver's health (git-bug afa9f07), read by `/livez`.
+    /// `None` where this process runs no driver.
+    pub driver_health: Option<Arc<converged::DriverHealth>>,
     /// Org-level Environments (ADR-0071, MMP step 1). `None` disables
     /// `/v1/orgs/{org}/environments[/{env}]` (404).
     pub org_environments: Option<Arc<dyn scarab_project::OrgEnvironmentStore>>,
@@ -371,6 +374,7 @@ impl AppState {
             policies: None,
             libraries: None,
             library_fetcher: None,
+            driver_health: None,
             org_environments: None,
             plugins: None,
             broker_plugins: None,
@@ -476,6 +480,12 @@ impl AppState {
         libraries: Arc<dyn scarab_policy::library::LibraryStore>,
     ) -> Self {
         self.libraries = Some(libraries);
+        self
+    }
+
+    /// Report the converged driver's health on `/livez` (git-bug afa9f07).
+    pub fn with_driver_health(mut self, health: Arc<converged::DriverHealth>) -> Self {
+        self.driver_health = Some(health);
         self
     }
 
@@ -14294,6 +14304,23 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
+/// `GET /livez` (git-bug afa9f07): `/healthz`, and also 503 when this
+/// replica holds the scheduler lease but its converged driver has not
+/// made progress for [`converged::STALLED_AFTER`]. Runs then wait with
+/// nothing logged, and a restart is what clears it, so the chart's liveness
+/// probe asks here. No database call: a database that answers with errors
+/// does not fail it.
+#[utoipa::path(get, path = "/livez", summary = "Liveness: process up and its scheduler driver not stalled", responses((status = 200, description = "alive"), (status = 503, description = "this replica leads the scheduler and its driver has made no progress for 90 seconds")))]
+async fn livez(State(st): State<AppState>) -> Response {
+    if let Some(driver) = &st.driver_health {
+        if let Some(why) = driver.stalled(converged::STALLED_AFTER) {
+            tracing::warn!(why = %why, "/livez: the scheduler driver is stalled");
+            return (StatusCode::SERVICE_UNAVAILABLE, why).into_response();
+        }
+    }
+    (StatusCode::OK, "ok").into_response()
+}
+
 /// Serve the generated OpenAPI document.
 #[allow(clippy::unused_async)]
 async fn openapi() -> Json<utoipa::openapi::OpenApi> {
@@ -14394,7 +14421,10 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
         || path.contains("/tokens")
     {
         "Auth & Identity"
-    } else if matches!(path, "/healthz" | "/readyz" | "/metrics" | "/v1/about") {
+    } else if matches!(
+        path,
+        "/healthz" | "/livez" | "/readyz" | "/metrics" | "/v1/about"
+    ) {
         "System"
     } else if path.contains("/policies") || path.contains("/policy-") {
         // Before Runs: `/v1/runs/{id}/policy-decisions` is a Policy read.
@@ -14484,7 +14514,10 @@ fn is_public_path(path: &str) -> bool {
     path.starts_with("/webhooks/")
         || path.starts_with("/.well-known/")
         || path.starts_with("/v1/auth/")
-        || matches!(path, "/healthz" | "/readyz" | "/metrics" | "/openapi.json")
+        || matches!(
+            path,
+            "/healthz" | "/livez" | "/readyz" | "/metrics" | "/openapi.json"
+        )
 }
 
 /// Declares HOW to authenticate to this API — which `openapi.json` did not say
@@ -14626,6 +14659,7 @@ impl utoipa::Modify for StepUpResponses {
     modifiers(&TagGroups, &SecuritySchemes, &StepUpResponses),
     paths(
         healthz,
+        livez,
         readyz,
         metrics,
         jwks,

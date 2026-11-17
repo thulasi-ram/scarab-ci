@@ -650,17 +650,22 @@ resources:
   limits:
     memory: 512Mi
 
-# /healthz is a cheap static handler (crates/scarab-server/src/lib.rs).
+# /livez answers from memory, with no database call: 200 while the process
+# is up, 503 when this replica holds the scheduler lease and its scheduler
+# loop has made no progress for 90 seconds. Runs then wait with nothing
+# logged until the Pod restarts, so a liveness failure restarts it. A
+# database that answers with errors does not fail it. /healthz (process up
+# only) is still served for anything that probed it before.
 livenessProbe:
   httpGet:
-    path: /healthz
+    path: /livez
     port: http
   initialDelaySeconds: 5
   periodSeconds: 15
 readinessProbe:
   httpGet:
     # Readiness = can this replica serve (DB + store reachable, ADR-0053) —
-    # distinct from liveness (/healthz = process up).
+    # distinct from liveness (/livez).
     path: /readyz
     port: http
   initialDelaySeconds: 3

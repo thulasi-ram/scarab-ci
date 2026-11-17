@@ -27,6 +27,7 @@ use step_up_harness::*;
 /// (the ceremony endpoints), EX (tightening), NG (not governed).
 const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("GET", "/healthz", "read", "READ"),
+    ("GET", "/livez", "read", "READ"),
     ("GET", "/readyz", "read", "READ"),
     ("GET", "/metrics", "read", "READ"),
     ("GET", "/openapi.json", "read", "READ"),

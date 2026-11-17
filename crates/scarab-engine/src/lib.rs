@@ -31,9 +31,9 @@ pub use scheduler::{
     gate_released_at, pin_run_snapshots, plan_rerun, record_gate_approval, reject_gate,
     release_gate, releases_plugin_gate, rerun_step, rerun_step_widened, resolve_plugin_gate,
     retry_step, retry_step_widened, run_status_post_key, unpin_run_snapshots, wait_began_at,
-    AttemptTeardown, EnvironmentApproval, ExpiredInput, PlanReason, PlannedStep, PluginGateError,
-    PluginGateVerdict, RerunError, RerunPlan, Scheduler, SchedulerError, Supervision,
-    TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN, CANCEL_SERVICES,
+    AttemptTeardown, EnvironmentApproval, ExpiredInput, LeaderPulse, PlanReason, PlannedStep,
+    PluginGateError, PluginGateVerdict, RerunError, RerunPlan, Scheduler, SchedulerError,
+    Supervision, TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN, CANCEL_SERVICES,
     GATE_NO_LONGER_NEEDED, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS, PROVISIONING_DEADLINE_SECS,
     RUN_FINISHED, RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
 };

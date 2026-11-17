@@ -790,6 +790,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // state, reported loudly); the local backend needs nothing but a working
     // host (dev/CLI, ADR-0036).
     let mut driver_handle: Option<tokio::task::JoinHandle<()>> = None;
+    // The driver's health, shared with `/livez` (git-bug afa9f07).
+    let mut driver_health: Option<Arc<converged::DriverHealth>> = None;
     if config.role.runs_driver() {
         let executor: Option<Arc<dyn Executor>> = match config.executor {
             ExecutorKind::Local => {
@@ -915,6 +917,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             // Forge-status posting (ADR-0046): the registry-routed forge posts
             // Running/Succeeded/Failed commit statuses with run deep-links.
+            let health = Arc::new(converged::DriverHealth::new());
+            driver_health = Some(health.clone());
             driver_handle = Some(converged::spawn_driver(
                 db.clone(),
                 clock.clone(),
@@ -938,6 +942,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (config.step_timeout_secs as i64).saturating_mul(1000),
                 config.project_run_cap,
                 config.public_url.clone(),
+                health,
             ));
             tracing::info!("converged driver started");
         }
@@ -1017,6 +1022,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match scarab_server::library_fetch::HttpsFetcher::new() {
         Ok(f) => state = state.with_library_fetcher(Arc::new(f)),
         Err(e) => tracing::warn!(error = %e, "anonymous library fetches are off"),
+    }
+    if let Some(health) = driver_health.clone() {
+        state = state.with_driver_health(health);
     }
     // The rerun-widening oracle's strict handle (git-bug 4afaa3e amendment F1):
     // only exists when a Depot is configured — without one, `workspace_cas` IS
@@ -1429,11 +1437,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = handle.await;
     }
     tracing::info!("shutdown complete");
+    // The scheduler driver stopped (git-bug afa9f07): the drain above ran,
+    // and a non-zero exit tells Kubernetes this was a failure.
+    if converged::driver_has_stopped() {
+        std::process::exit(1);
+    }
 
     Ok(())
 }
 
-/// Resolves on SIGTERM (k8s rollout) or ctrl-c (dev).
+/// Resolves on SIGTERM (k8s rollout), ctrl-c (dev), or the converged
+/// driver stopping (git-bug afa9f07).
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -1449,6 +1463,7 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = term => {},
+        _ = converged::driver_stopped() => {},
     }
     tracing::info!("shutdown signal received — draining");
 }

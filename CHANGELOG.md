@@ -18,6 +18,20 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **A stuck scheduler loop no longer leaves Runs pending with nothing logged.** The loop that
+  starts Runs renews the scheduler lease as it works, and nothing bounded a pass: one call that
+  never returned stopped it, the lease stopped renewing, and on a single replica Runs stayed
+  pending until the Pod was restarted. A pass that makes no progress for 60 seconds is now stopped
+  with a warning that names the part it was in; a slow pass that keeps making progress is not. A
+  new liveness endpoint, `/livez`, answers 503 when this replica holds the scheduler lease and has
+  made no progress for 90 seconds, and the chart's liveness probe now uses it, so Kubernetes
+  restarts the Pod. If the loop stops (a panic), the server shuts down as on SIGTERM and exits
+  with status 1. A `values.yaml` that sets the whole `livenessProbe.httpGet` keeps its own path;
+  point it at `/livez` to get the check
+  ([Health checks](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#health-checks)).
+
 ## [0.4.1] - 2026-11-13
 
 ### Breaking changes
