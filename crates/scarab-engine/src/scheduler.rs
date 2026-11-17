@@ -2303,6 +2303,36 @@ impl Supervision {
     }
 }
 
+/// What the scheduler reports each time it asks for its lease (git-bug
+/// afa9f07): how many times it has asked, and whether this replica held the
+/// lease the last time. A leader asks for each Run's leader legs, so the
+/// count keeps moving while the scheduler works, slow or not, and stops
+/// when it is stuck. Holds no time: the driver reads it against its own
+/// clock.
+#[derive(Debug, Default)]
+pub struct LeaderPulse {
+    asks: std::sync::atomic::AtomicU64,
+    held: std::sync::atomic::AtomicBool,
+}
+
+impl LeaderPulse {
+    /// Record one ask for the lease, and whether it was held.
+    pub fn record(&self, held: bool) {
+        self.held.store(held, std::sync::atomic::Ordering::Relaxed);
+        self.asks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many times the lease has been asked for.
+    pub fn asks(&self) -> u64 {
+        self.asks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether this replica held the lease the last time it asked.
+    pub fn held(&self) -> bool {
+        self.held.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// One control-plane instance's per-run **tick health** (ADR-0059): for each
 /// run whose per-run tick work is currently failing, when this PROCESS first
 /// saw it fail. Drives the bound that turns a persistently poisoned run into an
@@ -2385,11 +2415,9 @@ pub struct Scheduler<'a> {
     /// aaf4e3e). Shared helpers pass it to the writes that fence on it, so
     /// the same helper is fenced in a leader leg and unfenced elsewhere.
     leader: Option<LeaderTerm>,
-    /// Set to whether this replica held the scheduler lease each time it
-    /// asked for it (git-bug afa9f07), when the driver passes one in: a
-    /// liveness check reads it, so a driver stuck after its last renewal
-    /// still reads as the leader.
-    leader_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Updated each time the scheduler lease is asked for (git-bug
+    /// afa9f07), when the driver passes one in. See [`LeaderPulse`].
+    leader_pulse: Option<std::sync::Arc<LeaderPulse>>,
 }
 
 impl<'a> Scheduler<'a> {
@@ -2408,7 +2436,7 @@ impl<'a> Scheduler<'a> {
             supervised: Supervision::new(),
             health: TickHealth::new(),
             leader: None,
-            leader_flag: None,
+            leader_pulse: None,
             cfg: Config {
                 lease_ttl_ms: 30_000,
                 outbox_batch: 16,
@@ -2459,11 +2487,11 @@ impl<'a> Scheduler<'a> {
         self
     }
 
-    /// Record in `flag`, each time the scheduler lease is asked for, whether
-    /// this replica holds it (git-bug afa9f07). The driver's liveness check
-    /// reads it.
-    pub fn with_leader_flag(mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
-        self.leader_flag = Some(flag);
+    /// Record in `pulse` each time the scheduler lease is asked for, and
+    /// whether this replica held it (git-bug afa9f07). The driver's
+    /// liveness check reads it.
+    pub fn with_leader_pulse(mut self, pulse: std::sync::Arc<LeaderPulse>) -> Self {
+        self.leader_pulse = Some(pulse);
         self
     }
 
@@ -2675,8 +2703,8 @@ impl<'a> Scheduler<'a> {
             .lease(SCHEDULER_LEASE, &self.owner, self.cfg.lease_ttl_ms)
             .await?;
         let held = lease.held_by(SCHEDULER_LEASE, &self.owner);
-        if let Some(flag) = &self.leader_flag {
-            flag.store(held.is_some(), std::sync::atomic::Ordering::Relaxed);
+        if let Some(pulse) = &self.leader_pulse {
+            pulse.record(held.is_some());
         }
         Ok(held)
     }
@@ -2704,7 +2732,7 @@ impl<'a> Scheduler<'a> {
             supervised: self.supervised.clone(),
             health: self.health.clone(),
             leader: Some(term),
-            leader_flag: self.leader_flag.clone(),
+            leader_pulse: self.leader_pulse.clone(),
         }
     }
 

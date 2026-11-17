@@ -14306,16 +14306,15 @@ async fn healthz() -> &'static str {
 
 /// `GET /livez` (git-bug afa9f07): `/healthz`, and also 503 when this
 /// replica holds the scheduler lease but its converged driver has not
-/// finished a cycle for [`converged::STALLED_AFTER_MS`]. Runs then wait with
+/// made progress for [`converged::STALLED_AFTER`]. Runs then wait with
 /// nothing logged, and a restart is what clears it, so the chart's liveness
-/// probe asks here. No database call: a database outage must not restart
-/// every replica.
-#[utoipa::path(get, path = "/livez", summary = "Liveness: process up and its scheduler driver not stalled", responses((status = 200, description = "alive"), (status = 503, description = "this replica leads the scheduler and its driver has stopped finishing cycles")))]
+/// probe asks here. No database call: a database that answers with errors
+/// does not fail it.
+#[utoipa::path(get, path = "/livez", summary = "Liveness: process up and its scheduler driver not stalled", responses((status = 200, description = "alive"), (status = 503, description = "this replica leads the scheduler and its driver has made no progress for 90 seconds")))]
 async fn livez(State(st): State<AppState>) -> Response {
     if let Some(driver) = &st.driver_health {
-        let now = st.clock.now().await.0;
-        if let Some(why) = driver.stalled(now, converged::STALLED_AFTER_MS) {
-            tracing::error!(why = %why, "/livez: the scheduler driver is stalled");
+        if let Some(why) = driver.stalled(converged::STALLED_AFTER) {
+            tracing::warn!(why = %why, "/livez: the scheduler driver is stalled");
             return (StatusCode::SERVICE_UNAVAILABLE, why).into_response();
         }
     }
@@ -14422,7 +14421,10 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
         || path.contains("/tokens")
     {
         "Auth & Identity"
-    } else if matches!(path, "/healthz" | "/readyz" | "/metrics" | "/v1/about") {
+    } else if matches!(
+        path,
+        "/healthz" | "/livez" | "/readyz" | "/metrics" | "/v1/about"
+    ) {
         "System"
     } else if path.contains("/policies") || path.contains("/policy-") {
         // Before Runs: `/v1/runs/{id}/policy-decisions` is a Policy read.
@@ -14512,7 +14514,10 @@ fn is_public_path(path: &str) -> bool {
     path.starts_with("/webhooks/")
         || path.starts_with("/.well-known/")
         || path.starts_with("/v1/auth/")
-        || matches!(path, "/healthz" | "/readyz" | "/metrics" | "/openapi.json")
+        || matches!(
+            path,
+            "/healthz" | "/livez" | "/readyz" | "/metrics" | "/openapi.json"
+        )
 }
 
 /// Declares HOW to authenticate to this API — which `openapi.json` did not say

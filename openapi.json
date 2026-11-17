@@ -63,7 +63,9 @@
     },
     "/livez": {
       "get": {
-        "tags": [],
+        "tags": [
+          "System"
+        ],
         "summary": "Liveness: process up and its scheduler driver not stalled",
         "operationId": "livez",
         "responses": {
@@ -71,17 +73,10 @@
             "description": "alive"
           },
           "503": {
-            "description": "this replica leads the scheduler and its driver has stopped finishing cycles"
+            "description": "this replica leads the scheduler and its driver has made no progress for 90 seconds"
           }
         },
-        "security": [
-          {
-            "apiToken": []
-          },
-          {
-            "sessionCookie": []
-          }
-        ]
+        "security": []
       }
     },
     "/metrics": {

@@ -7,13 +7,13 @@
 //! admit ready work → reconcile launch intents on the executor → advance runs to
 //! terminal. Each tick reads durable state, so it is crash-safe and idempotent.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use scarab_engine::{
-    Clock, Db, Executor, Scheduler, SchedulerError, ServiceStatus, StepStatus, Supervision,
-    TickHealth, WorkspaceSnapshots,
+    Clock, Db, Executor, LeaderPulse, Scheduler, SchedulerError, ServiceStatus, StepStatus,
+    Supervision, TickHealth, WorkspaceSnapshots,
 };
 use scarab_forge::ForgePort;
 
@@ -42,7 +42,7 @@ pub async fn tick_once(
     health: &TickHealth,
 ) -> Result<(), SchedulerError> {
     tick_cycle(
-        &DriverHealth::new(0),
+        &DriverHealth::new(),
         db,
         clock,
         executor,
@@ -95,7 +95,7 @@ async fn tick_cycle(
     // aborting the tick.
     driver.enter("scheduler tick");
     let mut scheduler =
-        Scheduler::new(&**db, &**clock, &**executor, owner).with_leader_flag(driver.leader_flag());
+        Scheduler::new(&**db, &**clock, &**executor, owner).with_leader_pulse(driver.pulse());
     if let Some(cap) = project_run_cap {
         scheduler = scheduler.with_project_run_cap(cap);
     }
@@ -293,7 +293,7 @@ pub fn spawn_driver(
         health,
     });
     let looping = tokio::spawn(async move {
-        drive(&driver, &clock, interval, CYCLE_DEADLINE, move || {
+        drive(&driver, interval, STALL_CUTOFF, move || {
             let ctx = ctx.clone();
             async move { ctx.run().await }
         })
@@ -303,12 +303,17 @@ pub fn spawn_driver(
     // pending with nothing logged (git-bug afa9f07): end the process, so
     // Kubernetes starts a new one. Aborting the returned handle at shutdown
     // aborts the loop with it and exits nothing.
+    // A driver that stops (a panic, or the loop returning) leaves runs
+    // pending with nothing logged (git-bug afa9f07): shut the process down
+    // through its graceful path, which then exits non-zero, so Kubernetes
+    // starts a new one. Aborting the returned handle at shutdown aborts the
+    // loop with it and signals nothing.
     tokio::spawn(supervise(looping, |why| {
         tracing::error!(
             why = %why,
-            "the converged scheduler driver stopped; exiting so the process restarts"
+            "the converged scheduler driver stopped; shutting down so the process restarts"
         );
-        std::process::exit(1);
+        signal_driver_stopped();
     }))
 }
 
@@ -354,107 +359,178 @@ impl CycleInputs {
     }
 }
 
-/// How long one driver cycle may take before it is cut off (git-bug
-/// afa9f07). Twice the scheduler lease TTL: a cycle over many runs fits, and
-/// a cycle stuck on a call that never returns no longer holds the loop.
-pub const CYCLE_DEADLINE: Duration = Duration::from_secs(60);
+/// How long a driver cycle may go without progress before it is cut off
+/// (git-bug afa9f07). Progress is the scheduler asking for its lease (it
+/// does for each Run's leader legs) or the cycle entering its next part,
+/// so a slow cycle over many Runs is never cut; one stuck on a call that
+/// never returns is.
+pub const STALL_CUTOFF: Duration = Duration::from_secs(60);
 
-/// How long a replica that holds the scheduler lease may go without
-/// finishing a cycle before `/livez` fails (git-bug afa9f07): three lease
-/// TTLs, so one cycle cut off at [`CYCLE_DEADLINE`] does not fail it and a
-/// second one does.
-pub const STALLED_AFTER_MS: i64 = 90_000;
+/// How long a replica that holds the scheduler lease may go without driver
+/// progress before `/livez` fails (git-bug afa9f07): three lease TTLs, so a
+/// stuck cycle is cut off at [`STALL_CUTOFF`] first, and a driver that is
+/// still stuck after that is restarted.
+pub const STALLED_AFTER: Duration = Duration::from_secs(90);
 
-/// What the converged driver is doing (git-bug afa9f07): when it last
-/// finished a cycle, which part of the cycle runs now, and whether this
-/// replica held the scheduler lease when it last asked for it. `/livez`
-/// reads it.
+/// How often the driver checks a running cycle for progress.
+const PROGRESS_CHECK: Duration = Duration::from_secs(1);
+
+/// What the converged driver is doing (git-bug afa9f07): when it last made
+/// progress, which part of the cycle runs now, and whether this replica
+/// held the scheduler lease when it last asked for it. `/livez` reads it.
+/// Times are monotonic, so a wall-clock step neither hides a stall nor
+/// fakes one.
 #[derive(Debug)]
 pub struct DriverHealth {
-    last_cycle_ms: AtomicI64,
-    leader: Arc<AtomicBool>,
+    pulse: Arc<LeaderPulse>,
     leg: Mutex<&'static str>,
+    legs_entered: AtomicU64,
+    progress: Mutex<Progress>,
+}
+
+#[derive(Debug)]
+struct Progress {
+    /// Lease asks plus parts entered, when progress was last seen.
+    mark: u64,
+    at: tokio::time::Instant,
 }
 
 impl DriverHealth {
-    /// A driver that has not run yet counts as having finished a cycle at
-    /// `now_ms`, so a process that just started is live.
-    pub fn new(now_ms: i64) -> Self {
+    /// A driver that has not run yet counts as having made progress now,
+    /// so a process that just started is live.
+    pub fn new() -> Self {
         DriverHealth {
-            last_cycle_ms: AtomicI64::new(now_ms),
-            leader: Arc::new(AtomicBool::new(false)),
+            pulse: Arc::new(LeaderPulse::default()),
             leg: Mutex::new("start"),
+            legs_entered: AtomicU64::new(0),
+            progress: Mutex::new(Progress {
+                mark: 0,
+                at: tokio::time::Instant::now(),
+            }),
         }
     }
 
     fn enter(&self, leg: &'static str) {
         *self.leg.lock().unwrap_or_else(|p| p.into_inner()) = leg;
+        self.legs_entered.fetch_add(1, Ordering::Relaxed);
     }
 
     fn leg(&self) -> &'static str {
         *self.leg.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn finished(&self, now_ms: i64) {
-        self.last_cycle_ms.store(now_ms, Ordering::Relaxed);
+    /// What the scheduler records each time it asks for its lease.
+    pub fn pulse(&self) -> Arc<LeaderPulse> {
+        self.pulse.clone()
     }
 
-    /// The flag the scheduler sets each time it asks for its lease.
-    pub fn leader_flag(&self) -> Arc<AtomicBool> {
-        self.leader.clone()
+    /// Notes any progress since the last look, and returns how long ago
+    /// progress was last seen.
+    fn observe(&self) -> Duration {
+        let mark = self.pulse.asks() + self.legs_entered.load(Ordering::Relaxed);
+        let now = tokio::time::Instant::now();
+        let mut p = self.progress.lock().unwrap_or_else(|p| p.into_inner());
+        if mark != p.mark {
+            p.mark = mark;
+            p.at = now;
+        }
+        now.saturating_duration_since(p.at)
     }
 
-    /// Why the driver counts as stalled at `now_ms`, or `None`: this
-    /// replica held the scheduler lease when it last asked, and no cycle has
-    /// finished for more than `stalled_after_ms`. A replica that does not
-    /// lead is never stalled here: another replica runs the scheduler.
-    pub fn stalled(&self, now_ms: i64, stalled_after_ms: i64) -> Option<String> {
-        if !self.leader.load(Ordering::Relaxed) {
+    /// Why the driver counts as stalled, or `None`: this replica held the
+    /// scheduler lease when it last asked, and the driver has made no
+    /// progress for more than `stalled_after`. A replica that does not lead
+    /// is never stalled here: another replica runs the scheduler.
+    pub fn stalled(&self, stalled_after: Duration) -> Option<String> {
+        let idle = self.observe();
+        if !self.pulse.held() || idle <= stalled_after {
             return None;
         }
-        let idle_ms = now_ms.saturating_sub(self.last_cycle_ms.load(Ordering::Relaxed));
-        (idle_ms > stalled_after_ms).then(|| {
-            format!(
-                "the scheduler driver holds the scheduler lease and has not finished a cycle \
-                 for {}s (last in: {})",
-                idle_ms / 1000,
-                self.leg()
-            )
-        })
+        Some(format!(
+            "the scheduler driver holds the scheduler lease and has made no progress for {}s \
+             (last in: {})",
+            idle.as_secs(),
+            self.leg()
+        ))
     }
 }
 
-/// Run `cycle` every `interval`, each run cut off at `deadline` (git-bug
-/// afa9f07). A cycle that finishes, with or without an error, marks the
-/// driver live; one cut off does not, and a WARN names the part it was in.
-/// Never returns.
+impl Default for DriverHealth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Run `cycle` every `interval` (git-bug afa9f07). A cycle that makes no
+/// progress for `stall_cutoff` is cut off with a WARN naming the part it
+/// was in, and the next cycle starts; a cycle that keeps making progress
+/// runs as long as it takes. Never returns.
 pub async fn drive<F>(
     driver: &DriverHealth,
-    clock: &Arc<dyn Clock>,
     interval: Duration,
-    deadline: Duration,
+    stall_cutoff: Duration,
     mut cycle: impl FnMut() -> F,
 ) where
     F: std::future::Future<Output = Result<(), SchedulerError>>,
 {
     loop {
         driver.enter("start");
-        match tokio::time::timeout(deadline, cycle()).await {
-            Ok(result) => {
-                if let Err(e) = result {
-                    tracing::warn!(error = %e, "converged driver tick failed");
+        let run = cycle();
+        tokio::pin!(run);
+        let mut check = tokio::time::interval(PROGRESS_CHECK);
+        loop {
+            tokio::select! {
+                result = &mut run => {
+                    if let Err(e) = result {
+                        tracing::warn!(error = %e, "converged driver tick failed");
+                    }
+                    break;
                 }
-                driver.finished(clock.now().await.0);
+                _ = check.tick() => {
+                    if driver.observe() > stall_cutoff {
+                        tracing::warn!(
+                            part = driver.leg(),
+                            stalled_secs = stall_cutoff.as_secs(),
+                            "a converged driver cycle made no progress within its limit; it was \
+                             cut off and the next cycle starts"
+                        );
+                        break;
+                    }
+                }
             }
-            Err(_) => tracing::warn!(
-                part = driver.leg(),
-                deadline_secs = deadline.as_secs(),
-                "a converged driver cycle did not finish within its deadline; it was cut \
-                 off and the next cycle starts"
-            ),
         }
         tokio::time::sleep(interval).await;
     }
+}
+
+static DRIVER_STOPPED: AtomicBool = AtomicBool::new(false);
+static DRIVER_STOPPED_NOTIFY: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Mark the driver stopped and wake every [`driver_stopped`] waiter.
+fn signal_driver_stopped() {
+    DRIVER_STOPPED.store(true, Ordering::SeqCst);
+    DRIVER_STOPPED_NOTIFY.notify_waiters();
+}
+
+/// Resolves once the converged driver has stopped (git-bug afa9f07); never
+/// in a process whose driver keeps running. `main` treats it as a shutdown
+/// signal.
+pub async fn driver_stopped() {
+    loop {
+        let notified = DRIVER_STOPPED_NOTIFY.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if DRIVER_STOPPED.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// Whether the converged driver stopped: `main` exits non-zero after its
+/// graceful shutdown when it did.
+pub fn driver_has_stopped() -> bool {
+    DRIVER_STOPPED.load(Ordering::SeqCst)
 }
 
 /// Wait for `task` to end, then call `on_end` with how it ended. Dropping
@@ -488,80 +564,83 @@ mod driver_tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    fn clock(at: i64) -> Arc<dyn Clock> {
-        Arc::new(scarab_testkit::FakeClock::new(at))
-    }
-
-    /// git-bug afa9f07: a cycle that never returns is cut off at its
-    /// deadline, the next cycle runs, and only a finished cycle marks the
-    /// driver live.
+    /// git-bug afa9f07: a cycle that makes no progress is cut off after
+    /// the stall cutoff and the next cycle runs; a cycle that keeps making
+    /// progress is never cut, however long it takes.
     #[tokio::test(start_paused = true)]
-    async fn a_cycle_that_hangs_is_cut_off_and_the_next_one_runs() {
-        let driver = DriverHealth::new(0);
-        let clock = clock(5_000);
+    async fn a_stuck_cycle_is_cut_off_and_a_slow_one_is_not() {
+        let driver = DriverHealth::new();
         let runs = AtomicUsize::new(0);
-        let looping = drive(
-            &driver,
-            &clock,
-            Duration::from_millis(500),
-            Duration::from_secs(60),
-            || {
-                let n = runs.fetch_add(1, Ordering::SeqCst);
-                let driver = &driver;
-                async move {
-                    if n == 0 {
+        let finished = AtomicUsize::new(0);
+        let looping = drive(&driver, Duration::from_millis(500), STALL_CUTOFF, || {
+            let n = runs.fetch_add(1, Ordering::SeqCst);
+            let (driver, finished) = (&driver, &finished);
+            async move {
+                match n {
+                    // Stuck: never returns, makes no progress.
+                    0 => {
                         driver.enter("forge status drain");
                         std::future::pending::<()>().await;
                     }
-                    Ok(())
+                    // Slow but working: 5 minutes, asking for the lease
+                    // every 10 seconds as a leader leg does.
+                    1 => {
+                        for _ in 0..30 {
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            driver.pulse().record(true);
+                        }
+                    }
+                    _ => return Ok(()),
                 }
-            },
-        );
+                // Reached only by the slow cycle: the stuck one never returns.
+                finished.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        });
         tokio::select! {
             () = looping => unreachable!("drive never returns"),
             () = async {
-                while runs.load(Ordering::SeqCst) < 2 {
+                while runs.load(Ordering::SeqCst) < 3 {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             } => {}
         }
-        assert!(runs.load(Ordering::SeqCst) >= 2, "the second cycle ran");
         assert_eq!(
-            driver.last_cycle_ms.load(Ordering::Relaxed),
-            5_000,
-            "it finished and counted"
+            finished.load(Ordering::SeqCst),
+            1,
+            "the slow cycle finished: it was not cut"
         );
     }
 
-    /// Liveness fails only for the lease holder whose cycles stopped.
-    #[test]
-    fn stalled_only_when_leader_and_no_cycle_finished_recently() {
-        let driver = DriverHealth::new(1_000);
+    /// `/livez` fails only for the lease holder that stopped making progress.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_only_for_a_leader_without_progress() {
+        let driver = DriverHealth::new();
+        tokio::time::advance(Duration::from_secs(300)).await;
+        assert_eq!(driver.stalled(STALLED_AFTER), None, "not the leader");
+
+        driver.pulse().record(true);
         assert_eq!(
-            driver.stalled(1_000_000, STALLED_AFTER_MS),
+            driver.stalled(STALLED_AFTER),
             None,
-            "not the leader"
-        );
-        driver.leader_flag().store(true, Ordering::Relaxed);
-        assert_eq!(
-            driver.stalled(1_000 + STALLED_AFTER_MS, STALLED_AFTER_MS),
-            None,
-            "at the bound"
+            "it just asked for the lease"
         );
         driver.enter("scheduler tick");
-        let why = driver
-            .stalled(1_000 + STALLED_AFTER_MS + 1_000, STALLED_AFTER_MS)
-            .expect("stalled");
+        assert_eq!(driver.stalled(STALLED_AFTER), None, "it entered a part");
+        tokio::time::advance(STALLED_AFTER).await;
+        assert_eq!(driver.stalled(STALLED_AFTER), None, "at the bound");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let why = driver.stalled(STALLED_AFTER).expect("stalled");
         assert!(
             why.contains("91s") && why.contains("scheduler tick"),
             "{why}"
         );
-        driver.finished(200_000);
-        assert_eq!(
-            driver.stalled(250_000, STALLED_AFTER_MS),
-            None,
-            "a cycle finished"
-        );
+
+        driver.pulse().record(true);
+        assert_eq!(driver.stalled(STALLED_AFTER), None, "progress again");
+        tokio::time::advance(Duration::from_secs(120)).await;
+        driver.pulse().record(false);
+        assert_eq!(driver.stalled(STALLED_AFTER), None, "lost the lease");
     }
 
     /// A driver task that panics or returns is reported; aborting the
@@ -589,5 +668,23 @@ mod driver_tests {
         assert!(watcher.await.unwrap_err().is_cancelled());
         // The inner task was aborted with it: its sender is dropped.
         assert!(started.await.is_err());
+    }
+
+    /// The stop signal wakes a waiter that started before it and resolves
+    /// at once for one that starts after.
+    #[tokio::test]
+    async fn driver_stopped_wakes_early_and_late_waiters() {
+        let early = tokio::spawn(driver_stopped());
+        tokio::task::yield_now().await;
+        assert!(!driver_has_stopped());
+        signal_driver_stopped();
+        tokio::time::timeout(Duration::from_secs(1), early)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), driver_stopped())
+            .await
+            .unwrap();
+        assert!(driver_has_stopped());
     }
 }

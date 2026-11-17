@@ -260,7 +260,7 @@ impl Plan {
 }
 
 /// Rank 4's longest hold after the takeover. Short on purpose: the chart's
-/// liveness probe (`/healthz` every 15 s, three failures) restarts a stopped
+/// liveness probe (`/livez` every 15 s, three failures) restarts a stopped
 /// server 30 to 45 s after it stops answering, and the lease TTL already
 /// takes 30 s of that.
 pub const HOLD_MAX_MS: u64 = 2_000;

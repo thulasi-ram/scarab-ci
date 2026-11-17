@@ -917,7 +917,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             // Forge-status posting (ADR-0046): the registry-routed forge posts
             // Running/Succeeded/Failed commit statuses with run deep-links.
-            let health = Arc::new(converged::DriverHealth::new(clock.now().await.0));
+            let health = Arc::new(converged::DriverHealth::new());
             driver_health = Some(health.clone());
             driver_handle = Some(converged::spawn_driver(
                 db.clone(),
@@ -1437,11 +1437,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = handle.await;
     }
     tracing::info!("shutdown complete");
+    // The scheduler driver stopped (git-bug afa9f07): the drain above ran,
+    // and a non-zero exit tells Kubernetes this was a failure.
+    if converged::driver_has_stopped() {
+        std::process::exit(1);
+    }
 
     Ok(())
 }
 
-/// Resolves on SIGTERM (k8s rollout) or ctrl-c (dev).
+/// Resolves on SIGTERM (k8s rollout), ctrl-c (dev), or the converged
+/// driver stopping (git-bug afa9f07).
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -1457,6 +1463,7 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = term => {},
+        _ = converged::driver_stopped() => {},
     }
     tracing::info!("shutdown signal received — draining");
 }

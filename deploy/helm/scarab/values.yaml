@@ -652,10 +652,10 @@ resources:
 
 # /livez answers from memory, with no database call: 200 while the process
 # is up, 503 when this replica holds the scheduler lease and its scheduler
-# driver has not finished a cycle for 90 seconds. Runs then wait with nothing
+# loop has made no progress for 90 seconds. Runs then wait with nothing
 # logged until the Pod restarts, so a liveness failure restarts it. A
-# database outage does not fail it. /healthz (process up only) is still
-# served for anything that probed it before.
+# database that answers with errors does not fail it. /healthz (process up
+# only) is still served for anything that probed it before.
 livenessProbe:
   httpGet:
     path: /livez
