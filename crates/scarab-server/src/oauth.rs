@@ -292,7 +292,13 @@ impl OAuthAuthenticator {
     pub fn new(cfg: OAuthConfig) -> Self {
         Self {
             cfg,
-            http: reqwest::Client::new(),
+            // A sign-in waits on these calls (token exchange, JWKS): a
+            // provider that hangs fails the sign-in instead of holding it.
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("build the sign-in HTTP client"),
             jwks: RwLock::new(HashMap::new()),
             identities: None,
         }

@@ -357,12 +357,24 @@ const MAX_HTTP_ATTEMPTS: u32 = 3;
 /// Cap a server-suggested `Retry-After` sleep.
 const MAX_BACKOFF_SECS: u64 = 60;
 
+/// The HTTP client for forge API calls: a request that hangs fails instead
+/// of holding the scheduler driver (git-bug afa9f07). The calls read small
+/// JSON documents and files, so a total cap is safe.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        // `Client::new()` panics on the same failure (no TLS backend).
+        .expect("build the forge HTTP client")
+}
+
 impl ForgejoForge {
     /// Construct against a Forgejo/Codeberg instance root with an access
     /// token. No network I/O until first use.
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: http_client(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token: token.into(),
             webhook_secret: None,

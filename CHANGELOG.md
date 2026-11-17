@@ -18,6 +18,30 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Enhancement
+
+- **`/livez` fails for any replica whose scheduler loop is stuck, not only the lease holder.** A
+  replica waiting to take over the scheduler lease that is itself stuck could not take over, and
+  nothing restarted it. A database that stops answering now restarts every replica, not only the
+  lease holder. See
+  [Health checks](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#health-checks).
+- **The scheduler loop's limits are settings.** `SCARAB_DRIVER_STALL_CUTOFF_SECS` (chart
+  `scarab.driverStallCutoffSecs`, default 60, from 30 to 3600) stops a pass with no progress, and
+  `SCARAB_DRIVER_STALLED_AFTER_SECS` (chart `scarab.driverStalledAfterSecs`, default 90, at least
+  the cutoff plus 30) fails `/livez`. Raise them when one call on your install takes longer than a
+  minute.
+- **The chart warns when the liveness probe checks `/healthz`.** A values file that sets the whole
+  `livenessProbe.httpGet` with the path `/healthz` does not get the stuck-loop check; `helm install`
+  and `helm upgrade` now say so.
+
+### Bug Fixes
+
+- **A Kubernetes or forge request that never answers now fails instead of hanging.** The
+  Kubernetes client had no read timeout and the GitHub and Forgejo clients had no timeout, so one
+  request whose response never arrived could hold the scheduler loop (git-bug afa9f07). Kubernetes
+  requests now fail after 30 seconds without response bytes; log tails and `exec` sessions are not
+  limited. Forge requests and sign-in requests to the login provider fail after 30 seconds in all.
+
 ## [0.4.2] - 2026-11-17
 
 ### Bug Fixes

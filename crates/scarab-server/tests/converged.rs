@@ -115,11 +115,11 @@ async fn background_driver_runs_a_pipeline_end_to_end() {
     assert_eq!(status["status"], "succeeded");
 }
 
-/// git-bug afa9f07: `/livez` answers 503, with the reason, only when this
-/// replica holds the scheduler lease and its driver has made no progress
-/// for `STALLED_AFTER`; `/healthz` stays a plain process check.
+/// git-bug afa9f07: `/livez` answers 503, with the reason, when this
+/// replica's driver has made no progress for its stalled-after limit,
+/// leader or not; `/healthz` stays a plain process check.
 #[tokio::test(start_paused = true)]
-async fn livez_fails_only_for_a_stalled_lease_holder() {
+async fn livez_fails_for_a_stalled_driver() {
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
     let clock: Arc<FakeClock> = Arc::new(FakeClock::new(1_000));
     let logs = Arc::new(LogService::new(
@@ -143,16 +143,51 @@ async fn livez_fails_only_for_a_stalled_lease_holder() {
         }
     };
 
-    // Not the lease holder: another replica runs the scheduler.
-    tokio::time::advance(Duration::from_secs(300)).await;
+    // A driver that just asked for the lease: live.
+    driver.pulse().record(false);
     assert_eq!(get("/livez").await.0, StatusCode::OK);
-    // The lease holder, just after it asked: live.
+    // A replica waiting to take over whose driver made no progress since.
+    tokio::time::advance(converged::STALLED_AFTER + Duration::from_secs(1)).await;
+    let (status, body) = get("/livez").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.contains("does not hold the scheduler lease"), "{body}");
+    // The lease holder: live after it asks, stalled without progress.
     driver.pulse().record(true);
     assert_eq!(get("/livez").await.0, StatusCode::OK);
-    // No progress since: stalled.
     tokio::time::advance(converged::STALLED_AFTER + Duration::from_secs(1)).await;
     let (status, body) = get("/livez").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(body.contains("holds the scheduler lease"), "{body}");
+    // The operator's limit, not the default, decides.
+    let driver = Arc::new(converged::DriverHealth::with_limits(
+        Duration::from_secs(120),
+        Duration::from_secs(300),
+    ));
+    let app = router(
+        AppState::new(
+            Arc::new(InMemoryDb::new()),
+            Arc::new(FakeClock::new(1_000)),
+            Arc::new(LogService::new(
+                Arc::new(InMemoryObjectStore::new()),
+                Arc::new(InMemoryDb::new()),
+            )),
+        )
+        .with_driver_health(driver.clone()),
+    );
+    tokio::time::advance(Duration::from_secs(200)).await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/livez")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "200s is under the 300s limit"
+    );
     assert_eq!(get("/healthz").await.0, StatusCode::OK);
 }

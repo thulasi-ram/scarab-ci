@@ -293,7 +293,8 @@ pub fn spawn_driver(
         health,
     });
     let looping = tokio::spawn(async move {
-        drive(&driver, interval, STALL_CUTOFF, move || {
+        let stall_cutoff = driver.stall_cutoff();
+        drive(&driver, interval, stall_cutoff, move || {
             let ctx = ctx.clone();
             async move { ctx.run().await }
         })
@@ -360,24 +361,38 @@ impl CycleInputs {
 }
 
 /// How long a driver cycle may go without progress before it is cut off
-/// (git-bug afa9f07). Progress is the scheduler asking for its lease (it
-/// does for each Run's leader legs) or the cycle entering its next part,
-/// so a slow cycle over many Runs is never cut; one stuck on a call that
-/// never returns is.
+/// (git-bug afa9f07), unless `SCARAB_DRIVER_STALL_CUTOFF_SECS` says
+/// otherwise. Progress is the scheduler asking for its lease (it does for
+/// each Run's leader legs) or the cycle entering its next part, so a slow
+/// cycle over many Runs is never cut; one stuck on a call that never
+/// returns is.
 pub const STALL_CUTOFF: Duration = Duration::from_secs(60);
 
-/// How long a replica that holds the scheduler lease may go without driver
-/// progress before `/livez` fails (git-bug afa9f07): three lease TTLs, so a
-/// stuck cycle is cut off at [`STALL_CUTOFF`] first, and a driver that is
-/// still stuck after that is restarted.
+/// How long a replica's driver may go without progress before `/livez`
+/// fails (git-bug afa9f07), unless `SCARAB_DRIVER_STALLED_AFTER_SECS` says
+/// otherwise: three lease TTLs, so a stuck cycle is cut off at
+/// [`STALL_CUTOFF`] first, and a driver that is still stuck after that is
+/// restarted.
 pub const STALLED_AFTER: Duration = Duration::from_secs(90);
+
+/// The smallest stall cutoff a setting may ask for: one scheduler lease
+/// TTL. A working leader asks for its lease more often than this.
+pub const MIN_STALL_CUTOFF_SECS: u64 = 30;
+
+/// How much longer than the stall cutoff `/livez` must wait: one lease TTL,
+/// so a cycle that is cut off and starts again is not also restarted.
+pub const MIN_STALLED_AFTER_MARGIN_SECS: u64 = 30;
+
+/// The largest either limit may be: an hour.
+pub const MAX_DRIVER_LIMIT_SECS: u64 = 3_600;
 
 /// How often the driver checks a running cycle for progress.
 const PROGRESS_CHECK: Duration = Duration::from_secs(1);
 
 /// What the converged driver is doing (git-bug afa9f07): when it last made
-/// progress, which part of the cycle runs now, and whether this replica
-/// held the scheduler lease when it last asked for it. `/livez` reads it.
+/// progress, which part of the cycle runs now, whether this replica held
+/// the scheduler lease when it last asked for it, and the two limits it is
+/// held to. `/livez` reads it.
 /// Times are monotonic, so a wall-clock step neither hides a stall nor
 /// fakes one.
 #[derive(Debug)]
@@ -386,6 +401,8 @@ pub struct DriverHealth {
     leg: Mutex<&'static str>,
     legs_entered: AtomicU64,
     progress: Mutex<Progress>,
+    stall_cutoff: Duration,
+    stalled_after: Duration,
 }
 
 #[derive(Debug)]
@@ -399,7 +416,16 @@ impl DriverHealth {
     /// A driver that has not run yet counts as having made progress now,
     /// so a process that just started is live.
     pub fn new() -> Self {
+        Self::with_limits(STALL_CUTOFF, STALLED_AFTER)
+    }
+
+    /// [`new`](Self::new) with the limits the operator set: a cycle with
+    /// no progress for `stall_cutoff` is cut off, and `/livez` fails after
+    /// `stalled_after` without progress.
+    pub fn with_limits(stall_cutoff: Duration, stalled_after: Duration) -> Self {
         DriverHealth {
+            stall_cutoff,
+            stalled_after,
             pulse: Arc::new(LeaderPulse::default()),
             leg: Mutex::new("start"),
             legs_entered: AtomicU64::new(0),
@@ -417,6 +443,16 @@ impl DriverHealth {
 
     fn leg(&self) -> &'static str {
         *self.leg.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// How long a cycle may go without progress before it is cut off.
+    pub fn stall_cutoff(&self) -> Duration {
+        self.stall_cutoff
+    }
+
+    /// How long the driver may go without progress before `/livez` fails.
+    pub fn stalled_after(&self) -> Duration {
+        self.stalled_after
     }
 
     /// What the scheduler records each time it asks for its lease.
@@ -437,18 +473,22 @@ impl DriverHealth {
         now.saturating_duration_since(p.at)
     }
 
-    /// Why the driver counts as stalled, or `None`: this replica held the
-    /// scheduler lease when it last asked, and the driver has made no
-    /// progress for more than `stalled_after`. A replica that does not lead
-    /// is never stalled here: another replica runs the scheduler.
+    /// Why the driver counts as stalled, or `None`: it has made no progress
+    /// for more than `stalled_after`. Every replica's driver runs a cycle
+    /// each interval, leader or not, so this holds for a replica waiting to
+    /// take the lease over too: a stuck one could not take over.
     pub fn stalled(&self, stalled_after: Duration) -> Option<String> {
         let idle = self.observe();
-        if !self.pulse.held() || idle <= stalled_after {
+        if idle <= stalled_after {
             return None;
         }
+        let role = if self.pulse.held() {
+            "holds the scheduler lease"
+        } else {
+            "does not hold the scheduler lease"
+        };
         Some(format!(
-            "the scheduler driver holds the scheduler lease and has made no progress for {}s \
-             (last in: {})",
+            "the scheduler driver {role} and has made no progress for {}s (last in: {})",
             idle.as_secs(),
             self.leg()
         ))
@@ -612,12 +652,16 @@ mod driver_tests {
         );
     }
 
-    /// `/livez` fails only for the lease holder that stopped making progress.
+    /// `/livez` fails for any replica whose driver stopped making progress,
+    /// leader or not.
     #[tokio::test(start_paused = true)]
-    async fn stalled_only_for_a_leader_without_progress() {
+    async fn stalled_for_any_replica_without_progress() {
         let driver = DriverHealth::new();
         tokio::time::advance(Duration::from_secs(300)).await;
-        assert_eq!(driver.stalled(STALLED_AFTER), None, "not the leader");
+        let why = driver
+            .stalled(STALLED_AFTER)
+            .expect("a stuck non-leader is stalled");
+        assert!(why.contains("does not hold the scheduler lease"), "{why}");
 
         driver.pulse().record(true);
         assert_eq!(
@@ -639,8 +683,9 @@ mod driver_tests {
         driver.pulse().record(true);
         assert_eq!(driver.stalled(STALLED_AFTER), None, "progress again");
         tokio::time::advance(Duration::from_secs(120)).await;
+        // Asking for the lease and not getting it is progress too.
         driver.pulse().record(false);
-        assert_eq!(driver.stalled(STALLED_AFTER), None, "lost the lease");
+        assert_eq!(driver.stalled(STALLED_AFTER), None, "asked, not granted");
     }
 
     /// A driver task that panics or returns is reported; aborting the

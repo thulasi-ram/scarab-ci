@@ -57,6 +57,16 @@ scarab-server is deployed as release "{{ .Release.Name }}" in namespace "{{ .Rel
      secrets.workspaceTokenSecret (any high-entropy string — and NOT the same
      value as secrets.resultsTokenSecret) to deploy it.
 {{- end }}
+{{- with .Values.livenessProbe }}{{ with .httpGet }}
+{{- if eq (toString .path) "/healthz" }}
+
+  ⚠  livenessProbe.httpGet.path is /healthz, which only checks that the
+     process is up. A scheduler loop that stops making progress then leaves
+     Runs pending until someone restarts the Pod. Set the path to /livez,
+     which also fails when the loop is stuck, or leave livenessProbe unset
+     to use the chart's default.
+{{- end }}
+{{- end }}{{ end }}
 
 Check health:
 

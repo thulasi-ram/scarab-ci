@@ -191,7 +191,14 @@ impl PlacementConfig {
 /// A Kubernetes-backed executor. Holds an optional client so the composition
 /// root can construct it without contacting an API server.
 pub struct K8sExecutor {
+    /// For request/response calls. From [`connect`](Self::connect) it has a
+    /// read timeout ([`KUBE_READ_TIMEOUT`]), so a call the API server never
+    /// answers fails instead of holding the scheduler driver (git-bug
+    /// afa9f07).
     client: Option<kube::Client>,
+    /// For log tails and exec/attach sessions, which can stay quiet for
+    /// minutes: the same connection settings with no read timeout.
+    stream_client: Option<kube::Client>,
     namespace: String,
     results_egress: Option<ResultsEgress>,
     /// Global default step deadline in seconds (ADR-0047), applied when a step
@@ -262,6 +269,7 @@ impl K8sExecutor {
     pub fn new(namespace: impl Into<String>) -> Self {
         Self {
             client: None,
+            stream_client: None,
             namespace: namespace.into(),
             results_egress: None,
             default_step_timeout_secs: DEFAULT_STEP_TIMEOUT_SECS,
@@ -277,6 +285,7 @@ impl K8sExecutor {
 
     pub fn with_client(namespace: impl Into<String>, client: kube::Client) -> Self {
         Self {
+            stream_client: Some(client.clone()),
             client: Some(client),
             namespace: namespace.into(),
             results_egress: None,
@@ -365,15 +374,36 @@ impl K8sExecutor {
     /// Connect a client from the ambient kube config (respects `KUBECONFIG`) —
     /// the dev harness points that at its kind cluster, never a prod context.
     pub async fn connect(namespace: impl Into<String>) -> Result<Self, ExecError> {
-        let client = kube::Client::try_default()
+        let config = kube::Config::infer()
             .await
             .map_err(|e| ExecError::Other(e.to_string()))?;
-        Ok(Self::with_client(namespace, client))
+        let stream =
+            kube::Client::try_from(config.clone()).map_err(|e| ExecError::Other(e.to_string()))?;
+        let mut requests = config;
+        requests.read_timeout = Some(KUBE_READ_TIMEOUT);
+        let client =
+            kube::Client::try_from(requests).map_err(|e| ExecError::Other(e.to_string()))?;
+        let mut executor = Self::with_client(namespace, client);
+        executor.stream_client = Some(stream);
+        Ok(executor)
     }
 
     fn pods(&self) -> Result<Api<Pod>, ExecError> {
         let client = self.client.clone().ok_or(ExecError::Unavailable)?;
         Ok(Api::namespaced(client, &self.namespace))
+    }
+
+    /// Pods through the client with no read timeout, for log tails and
+    /// exec/attach sessions.
+    fn stream_pods(&self) -> Result<Api<Pod>, ExecError> {
+        let client = self.stream_client.clone().ok_or(ExecError::Unavailable)?;
+        Ok(Api::namespaced(client, &self.namespace))
+    }
+
+    /// [`stream_pods`](Self::stream_pods), or `pods` when there is no
+    /// stream client.
+    fn stream_pods_or(&self, pods: &Api<Pod>) -> Api<Pod> {
+        self.stream_pods().unwrap_or_else(|_| pods.clone())
     }
 
     /// The most recent `Warning` Event about `pod`, as a bounded message — the
@@ -1350,6 +1380,8 @@ impl K8sExecutor {
         cmd: &str,
         stdin_bytes: Vec<u8>,
     ) -> Result<(), String> {
+        // No read timeout: the command can run quietly for minutes.
+        let pods = &self.stream_pods_or(pods);
         use tokio::io::AsyncWriteExt;
         let params = AttachParams::default()
             .container(container)
@@ -1442,6 +1474,8 @@ impl K8sExecutor {
         container: &str,
         cmd: &str,
     ) -> Result<Vec<u8>, String> {
+        // No read timeout: the command can run quietly for minutes.
+        let pods = &self.stream_pods_or(pods);
         use tokio::io::AsyncReadExt as _;
         let sentinel = stream_sentinel();
         let framed = framed_command(cmd, &sentinel);
@@ -1515,6 +1549,8 @@ impl K8sExecutor {
         output_globs: &[String],
         cache_dirs: &[String],
     ) -> (DrainExecOutcome, Option<String>) {
+        // No read timeout: the command can run quietly for minutes.
+        let pods = &self.stream_pods_or(pods);
         use tokio::io::AsyncReadExt as _;
         let mut cmd: Vec<String> = vec![
             "scarab-wsfetch".to_string(),
@@ -3361,7 +3397,7 @@ impl Executor for K8sExecutor {
     /// pipeline. Best-effort: if the Pod's log is not yet available (still Pending,
     /// container not started) this errors and the caller retries on a later tick.
     async fn log_stream(&self, step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        let pods = self.pods()?;
+        let pods = self.stream_pods()?;
         let name = pod_name(step);
         let params = LogParams {
             follow: true,
@@ -3388,7 +3424,7 @@ impl Executor for K8sExecutor {
         step: &StepRun,
         container: &str,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        let pods = self.pods()?;
+        let pods = self.stream_pods()?;
         let name = pod_name(step);
         let params = LogParams {
             follow: true,
@@ -3510,7 +3546,7 @@ impl Executor for K8sExecutor {
         &self,
         handle: &ExecHandle,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        let pods = self.pods()?;
+        let pods = self.stream_pods()?;
         let params = LogParams {
             follow: true,
             container: Some(SERVICE_POD_CONTAINER.to_string()),
@@ -3747,8 +3783,7 @@ impl K8sExecutor {
     /// primitive behind both live-attach and debug-pod. A TTY multiplexes
     /// stderr into stdout, so stderr must be off.
     async fn attach_pod(&self, pod: &str) -> Result<AttachIo, ExecError> {
-        let client = self.client.clone().ok_or(ExecError::Unavailable)?;
-        let pods: Api<Pod> = Api::namespaced(client, &self.namespace);
+        let pods = self.stream_pods()?;
         let params = AttachParams::default()
             .container(STEP_CONTAINER)
             .stdin(true)
@@ -6724,6 +6759,12 @@ const ANNOTATION_UNSCHEDULABLE_GRACE: &str = "scarab.io/unschedulable-grace-secs
 /// join (typically 30 to 90 seconds, more for a large instance), short
 /// enough that a Pod no node can ever hold fails within minutes.
 pub const DEFAULT_UNSCHEDULABLE_GRACE_SECS: u32 = 300;
+
+/// How long a kube API request may wait for the next bytes of its response
+/// before it fails (git-bug afa9f07). Kubernetes ends an ordinary request
+/// after 60 seconds on its side; a response that stops arriving for this
+/// long will not arrive. Log tails and exec sessions do not use it.
+pub const KUBE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// `pod` with its Unschedulable grace stamped on as
 /// [`ANNOTATION_UNSCHEDULABLE_GRACE`].

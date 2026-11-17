@@ -14305,15 +14305,16 @@ async fn healthz() -> &'static str {
 }
 
 /// `GET /livez` (git-bug afa9f07): `/healthz`, and also 503 when this
-/// replica holds the scheduler lease but its converged driver has not
-/// made progress for [`converged::STALLED_AFTER`]. Runs then wait with
-/// nothing logged, and a restart is what clears it, so the chart's liveness
-/// probe asks here. No database call: a database that answers with errors
-/// does not fail it.
-#[utoipa::path(get, path = "/livez", summary = "Liveness: process up and its scheduler driver not stalled", responses((status = 200, description = "alive"), (status = 503, description = "this replica leads the scheduler and its driver has made no progress for 90 seconds")))]
+/// replica's converged driver has made no progress for its stalled-after
+/// limit (`SCARAB_DRIVER_STALLED_AFTER_SECS`, default 90 seconds), whether
+/// or not it holds the scheduler lease. Runs then wait with nothing logged,
+/// or a replica waiting to take over could not, and a restart is what
+/// clears it, so the chart's liveness probe asks here. No database call: a
+/// database that answers with errors does not fail it.
+#[utoipa::path(get, path = "/livez", summary = "Liveness: process up and its scheduler driver not stalled", responses((status = 200, description = "alive"), (status = 503, description = "this replica's scheduler driver has made no progress for its stalled-after limit (default 90 seconds)")))]
 async fn livez(State(st): State<AppState>) -> Response {
     if let Some(driver) = &st.driver_health {
-        if let Some(why) = driver.stalled(converged::STALLED_AFTER) {
+        if let Some(why) = driver.stalled(driver.stalled_after()) {
             tracing::warn!(why = %why, "/livez: the scheduler driver is stalled");
             return (StatusCode::SERVICE_UNAVAILABLE, why).into_response();
         }

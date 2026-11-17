@@ -10105,6 +10105,8 @@ mod tests {
             dev_insecure: false,
             step_timeout_secs: 3600,
             unschedulable_grace_secs: 300,
+            driver_stall_cutoff_secs: 60,
+            driver_stalled_after_secs: 90,
             project_run_cap: None,
             public_url: "http://localhost:8080".into(),
             ui_url: "http://localhost:8080".into(),

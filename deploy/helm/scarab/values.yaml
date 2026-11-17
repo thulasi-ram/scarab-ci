@@ -72,6 +72,15 @@ scarab:
   # claimed fails anyway). "0" fails such a Pod at once (no autoscaler). Each
   # automatic retry of the step waits again.
   unschedulableGraceSecs: ""
+  # Scheduler loop limits. A pass of the loop that makes no progress for
+  # driverStallCutoffSecs is stopped with a warning naming the part it was
+  # in, and the next pass starts. When the loop has made no progress for
+  # driverStalledAfterSecs, /livez answers 503 and Kubernetes restarts the
+  # Pod. Empty => server defaults (60 and 90). The cutoff is 30 to 3600; the
+  # second is at least the cutoff plus 30, at most 3600. Raise them when one
+  # call (a slow Kubernetes API, a large forge status batch) takes longer.
+  driverStallCutoffSecs: ""
+  driverStalledAfterSecs: ""
   # The most Runs of one project (repository) that may be Running at once; the
   # rest wait Pending and start in priority order as Runs finish (ADR-0011).
   # A Run waiting on a gate is not counted. Empty or 0 => no cap (default).
