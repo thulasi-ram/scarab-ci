@@ -983,16 +983,25 @@ call. A server built outside the release workflow, such as a local build, has no
 </tbody>
 </table>
 <p>The scheduler runs in a loop on each replica, and the replica that holds the scheduler lease
-starts Runs. A pass of the loop that makes no progress for 60 seconds is stopped, with a warning
-that names the part it was in, and the next pass starts; a pass over many Runs that keeps making
-progress runs as long as it needs. When the lease holder has made no progress for 90 seconds,
-<code dir="auto">/livez</code> answers 503 with the reason, and Kubernetes restarts the Pod. Without this, Runs stayed
-pending with nothing logged until someone restarted it. <code dir="auto">/livez</code> does not call the database: a
-database that answers with errors does not fail it, but one that stops answering stops the
-scheduler, and the Pod is restarted. If the loop stops for another reason (a panic), the server
-shuts down as it does on SIGTERM and exits with status 1.</p>
+starts Runs; the others wait to take over if it stops. A pass of the loop that makes no progress
+for 60 seconds is stopped, with a warning that names the part it was in, and the next pass starts;
+a pass over many Runs that keeps making progress runs as long as it needs. When a replica’s loop
+has made no progress for 90 seconds, <code dir="auto">/livez</code> answers 503 with the reason, and Kubernetes restarts
+the Pod. This holds for every replica, not only the lease holder: a stuck replica could not take
+over the lease. Without this, Runs stayed pending with nothing logged until someone restarted the
+Pod. <code dir="auto">/livez</code> does not call the database: a database that answers with errors does not fail it,
+but one that stops answering stops the scheduler on every replica, and they are all restarted. If
+the loop stops for another reason (a panic), the server shuts down as it does on SIGTERM and exits
+with status 1.</p>
+<p>The two limits are settings, <code dir="auto">scarab.driverStallCutoffSecs</code> (default 60, from 30 to 3600) and
+<code dir="auto">scarab.driverStalledAfterSecs</code> (default 90, at least the cutoff plus 30). Raise them if one call
+on your install, such as a slow Kubernetes API or a large batch of forge statuses, takes longer
+than a minute: the warning names the part that was stopped.</p>
+<p>Calls to the Kubernetes API wait at most 30 seconds for a response before they fail, and calls to
+a forge (GitHub, Forgejo) at most 30 seconds in all; log tails and <code dir="auto">exec</code> sessions have no limit.</p>
 <p>A <code dir="auto">values.yaml</code> that sets the whole <code dir="auto">livenessProbe.httpGet</code> keeps its own path; point it at
-<code dir="auto">/livez</code> to get this check.</p>
+<code dir="auto">/livez</code> to get this check. When it is <code dir="auto">/healthz</code>, <code dir="auto">helm install</code> and <code dir="auto">helm upgrade</code> print a
+warning.</p>
 <div class="sl-heading-wrapper level-h3"><h3 id="plugins">Plugins</h3><a class="sl-anchor-link" href="#plugins"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Plugins”</span></a></div>
 <p><code dir="auto">plugins.enabled</code> (default <code dir="auto">false</code>) turns on the plugin runtime: a shared plugin namespace, the
 CredentialBroker and the RBAC they need. No built plugin capability acts on Scarab yet (ADR-0074),
