@@ -18,6 +18,17 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **A stuck scheduler loop no longer leaves Runs pending with nothing logged.** The loop that
+  starts Runs renews the scheduler lease once per pass, and nothing bounded a pass: one call that
+  never returned stopped it, the lease stopped renewing, and on a single replica Runs stayed
+  pending until the Pod was restarted. Each pass is now stopped after 60 seconds with a warning
+  that names the part that did not finish. A new liveness endpoint, `/livez`, answers 503 when
+  this replica holds the scheduler lease and has finished no pass for 90 seconds, and the chart's
+  liveness probe now uses it, so Kubernetes restarts the Pod. If the loop stops (a panic), the
+  process logs an error and exits.
+
 ## [0.4.1] - 2026-11-13
 
 ### Breaking changes

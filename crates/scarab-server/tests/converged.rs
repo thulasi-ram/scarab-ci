@@ -62,6 +62,7 @@ async fn background_driver_runs_a_pipeline_end_to_end() {
     let db_dyn: Arc<dyn Db> = db.clone();
     let clock_dyn: Arc<dyn Clock> = clock.clone();
     let exec_dyn: Arc<dyn Executor> = exec.clone();
+    let driver = Arc::new(converged::DriverHealth::new(0));
     let handle = converged::spawn_driver(
         db_dyn,
         clock_dyn,
@@ -75,6 +76,7 @@ async fn background_driver_runs_a_pipeline_end_to_end() {
         3_600_000,
         None,
         "http://scarab.test".to_string(),
+        driver.clone(),
     );
 
     // Wait for the driver to carry the run to Succeeded.
@@ -89,6 +91,20 @@ async fn background_driver_runs_a_pipeline_end_to_end() {
     .await;
     handle.abort();
     assert!(completed.is_ok(), "driver did not complete the run in time");
+    // git-bug afa9f07: the driver marked itself the scheduler lease holder
+    // and finished cycles, so a far-later clock reads stalled and a fresh
+    // one does not.
+    assert!(driver
+        .leader_flag()
+        .load(std::sync::atomic::Ordering::Relaxed));
+    let now = clock.now().await.0;
+    assert_eq!(driver.stalled(now, converged::STALLED_AFTER_MS), None);
+    assert!(driver
+        .stalled(
+            now + converged::STALLED_AFTER_MS + 1,
+            converged::STALLED_AFTER_MS
+        )
+        .is_some());
 
     // And the API reflects it.
     let resp = app
@@ -105,4 +121,44 @@ async fn background_driver_runs_a_pipeline_end_to_end() {
         .unwrap();
     let status: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(status["status"], "succeeded");
+}
+
+/// git-bug afa9f07: `/livez` answers 503, with the reason, only when this
+/// replica holds the scheduler lease and its driver has finished no cycle
+/// for `STALLED_AFTER_MS`; `/healthz` stays a plain process check.
+#[tokio::test]
+async fn livez_fails_only_for_a_stalled_lease_holder() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    let clock: Arc<FakeClock> =
+        Arc::new(FakeClock::new(1_000 + converged::STALLED_AFTER_MS + 5_000));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let driver = Arc::new(converged::DriverHealth::new(1_000));
+    let app = router(AppState::new(db, clock, logs).with_driver_health(driver.clone()));
+    let get = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+    };
+
+    // Not the lease holder: another replica runs the scheduler.
+    assert_eq!(get("/livez").await.0, StatusCode::OK);
+    driver
+        .leader_flag()
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let (status, body) = get("/livez").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.contains("holds the scheduler lease"), "{body}");
+    assert_eq!(get("/healthz").await.0, StatusCode::OK);
 }

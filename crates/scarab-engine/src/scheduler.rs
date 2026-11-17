@@ -2385,6 +2385,11 @@ pub struct Scheduler<'a> {
     /// aaf4e3e). Shared helpers pass it to the writes that fence on it, so
     /// the same helper is fenced in a leader leg and unfenced elsewhere.
     leader: Option<LeaderTerm>,
+    /// Set to whether this replica held the scheduler lease each time it
+    /// asked for it (git-bug afa9f07), when the driver passes one in: a
+    /// liveness check reads it, so a driver stuck after its last renewal
+    /// still reads as the leader.
+    leader_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl<'a> Scheduler<'a> {
@@ -2403,6 +2408,7 @@ impl<'a> Scheduler<'a> {
             supervised: Supervision::new(),
             health: TickHealth::new(),
             leader: None,
+            leader_flag: None,
             cfg: Config {
                 lease_ttl_ms: 30_000,
                 outbox_batch: 16,
@@ -2450,6 +2456,14 @@ impl<'a> Scheduler<'a> {
     /// like the first one and the dead-letter bound is never reached.
     pub fn with_tick_health(mut self, health: TickHealth) -> Self {
         self.health = health;
+        self
+    }
+
+    /// Record in `flag`, each time the scheduler lease is asked for, whether
+    /// this replica holds it (git-bug afa9f07). The driver's liveness check
+    /// reads it.
+    pub fn with_leader_flag(mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.leader_flag = Some(flag);
         self
     }
 
@@ -2660,7 +2674,11 @@ impl<'a> Scheduler<'a> {
             .db
             .lease(SCHEDULER_LEASE, &self.owner, self.cfg.lease_ttl_ms)
             .await?;
-        Ok(lease.held_by(SCHEDULER_LEASE, &self.owner))
+        let held = lease.held_by(SCHEDULER_LEASE, &self.owner);
+        if let Some(flag) = &self.leader_flag {
+            flag.store(held.is_some(), std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(held)
     }
 
     /// This scheduler as the leader of `term` (git-bug aaf4e3e): the copy a
@@ -2686,6 +2704,7 @@ impl<'a> Scheduler<'a> {
             supervised: self.supervised.clone(),
             health: self.health.clone(),
             leader: Some(term),
+            leader_flag: self.leader_flag.clone(),
         }
     }
 

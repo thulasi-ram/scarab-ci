@@ -61,6 +61,29 @@
         "security": []
       }
     },
+    "/livez": {
+      "get": {
+        "tags": [],
+        "summary": "Liveness: process up and its scheduler driver not stalled",
+        "operationId": "livez",
+        "responses": {
+          "200": {
+            "description": "alive"
+          },
+          "503": {
+            "description": "this replica leads the scheduler and its driver has stopped finishing cycles"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/metrics": {
       "get": {
         "tags": [
