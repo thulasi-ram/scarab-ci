@@ -84,6 +84,12 @@ data:
   {{- if ne (toString .Values.scarab.unschedulableGraceSecs) "" }}
   SCARAB_UNSCHEDULABLE_GRACE_SECS: {{ .Values.scarab.unschedulableGraceSecs | quote }}
   {{- end }}
+  {{- if ne (toString .Values.scarab.driverStallCutoffSecs) "" }}
+  SCARAB_DRIVER_STALL_CUTOFF_SECS: {{ .Values.scarab.driverStallCutoffSecs | quote }}
+  {{- end }}
+  {{- if ne (toString .Values.scarab.driverStalledAfterSecs) "" }}
+  SCARAB_DRIVER_STALLED_AFTER_SECS: {{ .Values.scarab.driverStalledAfterSecs | quote }}
+  {{- end }}
   {{- with .Values.scarab.projectRunCap }}
   SCARAB_PROJECT_RUN_CAP: {{ . | quote }}
   {{- end }}

@@ -47,6 +47,8 @@
 //! | `SCARAB_DEV_INSECURE` | env | `1`/`true`: downgrade the **security** hard-fails (KEK, auth) to loud boot warnings — dev only, never relaxes the Postgres requirement |
 //! | `SCARAB_STEP_UP` | env | step-up confirmation (ADR-0073). Unset/blank or `enforce` = **enforce** (production: crown-jewel operations need a passkey confirmation); any other value refuses boot — there is no `off` or `log` mode. Under `SCARAB_DEV_INSECURE=1` it is off unless explicitly `enforce` (local passkey testing). Enforce with OAuth login needs an `https` (or loopback) `SCARAB_PUBLIC_URL` |
 //! | `SCARAB_STEP_TIMEOUT_SECS` | env | global default step deadline (ADR-0047); default 3600 (1h), per-step overridable via `timeout:` |
+//! | `SCARAB_DRIVER_STALL_CUTOFF_SECS` | env | seconds a scheduler driver cycle may go without progress before it is cut off and the next starts (git-bug afa9f07); default 60, from 30 to 3600 |
+//! | `SCARAB_DRIVER_STALLED_AFTER_SECS` | env | seconds the scheduler driver may go without progress before `/livez` fails, so Kubernetes restarts the Pod; default 90 (or the cutoff plus 30 when that is more), at least the cutoff plus 30, at most 3600 |
 //! | `SCARAB_PROJECT_RUN_CAP` | env | how many of one project's Runs may be `Running` at once; the rest wait `Pending` (ADR-0011). Unset or `0` = no cap (default). A Run waiting on a gate is not counted |
 //! | `SCARAB_PUBLIC_URL` | env | Scarab's public base URL — the run deep-link every forge status carries (ADR-0046); default `http://localhost:8080` (dev) |
 //! | `SCARAB_UI_URL` | env | the URL people open the web UI at, when it is not `SCARAB_PUBLIC_URL` (a staging stack whose public hostname serves only `/webhooks/`). Three things are built from it: the OAuth callback (`{ui_url}/v1/auth/callback`), the passkey (WebAuthn) origin, and the step-up confirmation link. Webhook URLs and forge status links stay on `SCARAB_PUBLIC_URL`. Default `SCARAB_PUBLIC_URL`. An `http(s)` URL with no query or fragment; with step-up enforced it must be `https` or loopback `http`. Browsers refuse passkeys on an IP literal, so a local one is `http://localhost:<port>` |
@@ -644,6 +646,14 @@ pub struct Config {
     /// 1166c30), so a node pool scaled to zero has time to launch a node.
     /// Default 300; `0` fails such a Pod at once.
     pub unschedulable_grace_secs: u32,
+    /// `SCARAB_DRIVER_STALL_CUTOFF_SECS`: how long a scheduler driver cycle
+    /// may go without progress before it is cut off and the next starts
+    /// (git-bug afa9f07). Default 60, from 30 to 3600.
+    pub driver_stall_cutoff_secs: u64,
+    /// `SCARAB_DRIVER_STALLED_AFTER_SECS`: how long the driver may go
+    /// without progress before `/livez` fails and Kubernetes restarts the
+    /// Pod. Default 90; at least the cutoff plus 30, at most 3600.
+    pub driver_stalled_after_secs: u64,
     /// `SCARAB_PROJECT_RUN_CAP`: the most Runs of one project that may be
     /// `Running` at once (ADR-0011). `None` (unset or `0`) = no cap.
     pub project_run_cap: Option<u32>,
@@ -1373,6 +1383,21 @@ pub enum ConfigError {
     InvalidUnschedulableGrace(String),
 
     #[error(
+        "SCARAB_DRIVER_STALL_CUTOFF_SECS is set but invalid (got {0:?}) — want 30 to 3600: \
+         the seconds a scheduler driver cycle may go without progress before it is cut off. \
+         Under 30, one scheduler lease TTL, a working cycle could be cut."
+    )]
+    InvalidDriverStallCutoff(String),
+
+    #[error(
+        "SCARAB_DRIVER_STALLED_AFTER_SECS is set but invalid (got {0:?}) — want {1} to 3600: \
+         the seconds the scheduler driver may go without progress before /livez fails. It \
+         must be at least 30 more than the stall cutoff ({2}s), so a cycle that is cut off \
+         and starts again is not also restarted."
+    )]
+    InvalidDriverStalledAfter(String, u64, u64),
+
+    #[error(
         "{0} is set but invalid (got {1:?}) — want a non-negative integer: the wsfetch \
          helper resource axes (ticket 16a7768) are millicpu / MiB, applied requests==limits \
          to both helper containers of every workspace Step Pod; 0 opts the axis out."
@@ -1675,6 +1700,37 @@ impl Config {
                 None => scarab_executor_k8s::DEFAULT_UNSCHEDULABLE_GRACE_SECS,
             };
 
+        use crate::converged::{
+            MAX_DRIVER_LIMIT_SECS, MIN_STALLED_AFTER_MARGIN_SECS, MIN_STALL_CUTOFF_SECS,
+            STALLED_AFTER, STALL_CUTOFF,
+        };
+        let driver_stall_cutoff_secs =
+            match env("SCARAB_DRIVER_STALL_CUTOFF_SECS").filter(|v| !v.trim().is_empty()) {
+                Some(v) => v
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|s| (MIN_STALL_CUTOFF_SECS..=MAX_DRIVER_LIMIT_SECS).contains(s))
+                    .ok_or(ConfigError::InvalidDriverStallCutoff(v))?,
+                None => STALL_CUTOFF.as_secs(),
+            };
+        let min_stalled_after = driver_stall_cutoff_secs + MIN_STALLED_AFTER_MARGIN_SECS;
+        let driver_stalled_after_secs =
+            match env("SCARAB_DRIVER_STALLED_AFTER_SECS").filter(|v| !v.trim().is_empty()) {
+                Some(v) => v
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|s| (min_stalled_after..=MAX_DRIVER_LIMIT_SECS).contains(s))
+                    .ok_or(ConfigError::InvalidDriverStalledAfter(
+                        v,
+                        min_stalled_after,
+                        driver_stall_cutoff_secs,
+                    ))?,
+                // A raised cutoff raises the default with it.
+                None => STALLED_AFTER.as_secs().max(min_stalled_after),
+            };
+
         let project_run_cap = match env("SCARAB_PROJECT_RUN_CAP").filter(|v| !v.trim().is_empty()) {
             Some(v) => match v.trim().parse::<u32>() {
                 Ok(0) => None,
@@ -1820,6 +1876,8 @@ impl Config {
             dev_insecure,
             step_timeout_secs,
             unschedulable_grace_secs,
+            driver_stall_cutoff_secs,
+            driver_stalled_after_secs,
             project_run_cap,
             public_url,
             ui_url,
@@ -2018,6 +2076,11 @@ impl Config {
             format!(
                 "unschedulable grace: {}s (a k8s step Pod waits this long for a node)",
                 self.unschedulable_grace_secs,
+            ),
+            format!(
+                "driver limits: a cycle with no progress for {}s is cut off; /livez fails \
+                 after {}s",
+                self.driver_stall_cutoff_secs, self.driver_stalled_after_secs,
             ),
             format!("public url: {} (run deep-links, ADR-0046)", self.public_url),
             if self.ui_url == self.public_url.trim_end_matches('/') {
@@ -2490,6 +2553,57 @@ mod tests {
                 .find(|(key, _)| *key == k)
                 .map(|(_, v)| v.to_string())
         }
+    }
+
+    /// git-bug afa9f07: the driver limits default to 60s/90s, follow a
+    /// raised cutoff, and refuse values that would cut working cycles or
+    /// restart a cycle that was just cut off.
+    #[test]
+    fn driver_limits_default_and_refuse_unsafe_values() {
+        let url = Some("postgres://localhost/scarab");
+        let c = Config::resolve_from(&cli(url), dev_env(&[])).unwrap();
+        assert_eq!(
+            (c.driver_stall_cutoff_secs, c.driver_stalled_after_secs),
+            (60, 90)
+        );
+        let c = Config::resolve_from(
+            &cli(url),
+            dev_env(&[("SCARAB_DRIVER_STALL_CUTOFF_SECS", "120")]),
+        )
+        .unwrap();
+        assert_eq!(
+            (c.driver_stall_cutoff_secs, c.driver_stalled_after_secs),
+            (120, 150)
+        );
+        let c = Config::resolve_from(
+            &cli(url),
+            dev_env(&[
+                ("SCARAB_DRIVER_STALL_CUTOFF_SECS", "30"),
+                ("SCARAB_DRIVER_STALLED_AFTER_SECS", "600"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            (c.driver_stall_cutoff_secs, c.driver_stalled_after_secs),
+            (30, 600)
+        );
+
+        for bad in ["29", "0", "3601", "soon"] {
+            let env: &'static [(&str, &str)] =
+                Box::leak(Box::new([("SCARAB_DRIVER_STALL_CUTOFF_SECS", bad)]));
+            let err = Config::resolve_from(&cli(url), dev_env(env)).unwrap_err();
+            assert_eq!(err, ConfigError::InvalidDriverStallCutoff(bad.into()));
+        }
+        let err = Config::resolve_from(
+            &cli(url),
+            dev_env(&[("SCARAB_DRIVER_STALLED_AFTER_SECS", "89")]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidDriverStalledAfter("89".into(), 90, 60)
+        );
+        assert!(err.to_string().contains("at least 30 more"), "{err}");
     }
 
     #[test]

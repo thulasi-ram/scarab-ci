@@ -917,7 +917,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             // Forge-status posting (ADR-0046): the registry-routed forge posts
             // Running/Succeeded/Failed commit statuses with run deep-links.
-            let health = Arc::new(converged::DriverHealth::new());
+            let health = Arc::new(converged::DriverHealth::with_limits(
+                Duration::from_secs(config.driver_stall_cutoff_secs),
+                Duration::from_secs(config.driver_stalled_after_secs),
+            ));
             driver_health = Some(health.clone());
             driver_handle = Some(converged::spawn_driver(
                 db.clone(),

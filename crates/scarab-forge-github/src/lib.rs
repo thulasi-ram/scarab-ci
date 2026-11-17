@@ -489,12 +489,24 @@ fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// The HTTP client for forge API calls: a request that hangs fails instead
+/// of holding the scheduler driver (git-bug afa9f07). The calls read small
+/// JSON documents and files, so a total cap is safe.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        // `Client::new()` panics on the same failure (no TLS backend).
+        .expect("build the forge HTTP client")
+}
+
 impl GithubForge {
     /// Construct from a fixed auth token (PAT / pre-minted token) — the dev
     /// path; the HTTP client performs no network I/O until first use.
     pub fn new(token: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: http_client(),
             base_url: "https://api.github.com".into(),
             auth: Auth::Token(token.into()),
             installation: None,
@@ -507,7 +519,7 @@ impl GithubForge {
     /// access token, cached and refreshed adapter-internally.
     pub fn app(app: GithubApp) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: http_client(),
             base_url: "https://api.github.com".into(),
             auth: Auth::App {
                 app,

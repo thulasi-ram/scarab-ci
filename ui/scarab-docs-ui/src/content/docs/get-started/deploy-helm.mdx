@@ -327,17 +327,28 @@ The server answers three health endpoints. The chart's probes use `/livez` and `
 | `/healthz` | the process is up | none |
 
 The scheduler runs in a loop on each replica, and the replica that holds the scheduler lease
-starts Runs. A pass of the loop that makes no progress for 60 seconds is stopped, with a warning
-that names the part it was in, and the next pass starts; a pass over many Runs that keeps making
-progress runs as long as it needs. When the lease holder has made no progress for 90 seconds,
-`/livez` answers 503 with the reason, and Kubernetes restarts the Pod. Without this, Runs stayed
-pending with nothing logged until someone restarted it. `/livez` does not call the database: a
-database that answers with errors does not fail it, but one that stops answering stops the
-scheduler, and the Pod is restarted. If the loop stops for another reason (a panic), the server
-shuts down as it does on SIGTERM and exits with status 1.
+starts Runs; the others wait to take over if it stops. A pass of the loop that makes no progress
+for 60 seconds is stopped, with a warning that names the part it was in, and the next pass starts;
+a pass over many Runs that keeps making progress runs as long as it needs. When a replica's loop
+has made no progress for 90 seconds, `/livez` answers 503 with the reason, and Kubernetes restarts
+the Pod. This holds for every replica, not only the lease holder: a stuck replica could not take
+over the lease. Without this, Runs stayed pending with nothing logged until someone restarted the
+Pod. `/livez` does not call the database: a database that answers with errors does not fail it,
+but one that stops answering stops the scheduler on every replica, and they are all restarted. If
+the loop stops for another reason (a panic), the server shuts down as it does on SIGTERM and exits
+with status 1.
+
+The two limits are settings, `scarab.driverStallCutoffSecs` (default 60, from 30 to 3600) and
+`scarab.driverStalledAfterSecs` (default 90, at least the cutoff plus 30). Raise them if one call
+on your install, such as a slow Kubernetes API or a large batch of forge statuses, takes longer
+than a minute: the warning names the part that was stopped.
+
+Calls to the Kubernetes API wait at most 30 seconds for a response before they fail, and calls to
+a forge (GitHub, Forgejo) at most 30 seconds in all; log tails and `exec` sessions have no limit.
 
 A `values.yaml` that sets the whole `livenessProbe.httpGet` keeps its own path; point it at
-`/livez` to get this check.
+`/livez` to get this check. When it is `/healthz`, `helm install` and `helm upgrade` print a
+warning.
 
 ### Plugins
 

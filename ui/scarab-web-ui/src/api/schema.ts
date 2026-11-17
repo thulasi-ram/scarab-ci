@@ -6375,7 +6375,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description this replica leads the scheduler and its driver has made no progress for 90 seconds */
+            /** @description this replica's scheduler driver has made no progress for its stalled-after limit (default 90 seconds) */
             503: {
                 headers: {
                     [name: string]: unknown;
