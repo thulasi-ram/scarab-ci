@@ -372,10 +372,8 @@ rules:
 - The editor starts a new Policy in `audit` mode. Run **Try it on recent decisions** before you
   move it to `enforce`.
 
-Neither the marker nor the Policy covers a step's `k8s_overlay`, which can set
-`serviceAccountName: scarab-ecr-push` itself. A fork pull request's Run is refused any overlay.
-Other authors can still set one on an Environment that permits raw overlays (git-bug 24a3126), so
-keep that off for the Projects that build images.
+A step's `k8s_overlay` cannot set `serviceAccountName`, so it cannot reach `scarab-ecr-push`
+around the marker and the Policy.
 
 ## Hardening the push role
 
@@ -539,9 +537,7 @@ rules:
 
 A refused Run is not created. Build fork pull requests in a Pipeline that does not name
 `ecr-pull`; their builds fail at a `FROM` that names a private image. As with `ecr-push`, a step's
-`k8s_overlay` can set `serviceAccountName: scarab-ecr-pull` itself: a fork pull request's Run is
-refused any overlay, and other authors need an Environment that permits raw overlays (git-bug
-24a3126).
+`k8s_overlay` cannot set `serviceAccountName`, so it cannot reach `scarab-ecr-pull` either.
 
 We have not run this on EKS either, nor checked that BuildKit's `buildctl` reads `DOCKER_CONFIG`
 in the rootless image. Check that the build step's log shows the base image pulled.
