@@ -19,6 +19,7 @@ import {
   For,
   Show,
   onCleanup,
+  untrack,
   type JSX,
 } from "solid-js";
 import {
@@ -379,7 +380,38 @@ export default function StepPane(props: {
   const logKey = (step: string, attempt: string, c: number | null) =>
     `${step} ${attempt} ${c ?? "main"}`;
 
+  // A stream the server ends while its try is still running (the Pod has not
+  // started, or the connection dropped) is opened again after a pause, and
+  // once more when the try finishes, so the log is not left short. A reopened
+  // stream replays from the start: its first chunk replaces the buffer.
+  const REOPEN_MS = 2000;
+  const endedRunning = new Set<string>();
+  const reopenTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const replaying = new Set<string>();
+  const [streamGen, setStreamGen] = createSignal(0);
+  const reopen = (key: string) => {
+    clearTimeout(reopenTimers.get(key));
+    reopenTimers.delete(key);
+    endedRunning.delete(key);
+    streams.get(key)?.();
+    streams.delete(key);
+    replaying.add(key);
+    setEnded((prev) => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+    setStreamGen((n) => n + 1);
+  };
+  onCleanup(() => reopenTimers.forEach((t) => clearTimeout(t)));
+  // The attempt's outcome now, when that step is still the one in view.
+  const outcomeNow = (step: string, attempt: string): string | undefined =>
+    untrack(() =>
+      props.step?.id === step ? props.step.attempt_list?.find((x) => x.id === attempt)?.outcome : undefined,
+    );
+
   createEffect(() => {
+    void streamGen();
     const s = stepId();
     const a = scoped();
     const c = container();
@@ -387,10 +419,23 @@ export default function StepPane(props: {
     // version — never stream it; the Logs tab shows the not-run line instead.
     if (!s || !a || notRun() || tab() !== "logs") return;
     const key = logKey(s, a.id, c);
+    // Its stream ended while it ran and it has finished since: read it once more.
+    if (endedRunning.has(key) && a.outcome !== "running") {
+      reopen(key);
+      return;
+    }
     if (streams.has(key)) return;
     const onChunk = (t: string) =>
-      setBuffers((prev) => ({ ...prev, [key]: (prev[key] ?? "") + t + "\n" }));
-    const onEnd = () => setEnded((prev) => ({ ...prev, [key]: true }));
+      setBuffers((prev) => {
+        const kept = replaying.delete(key) ? "" : (prev[key] ?? "");
+        return { ...prev, [key]: kept + t + "\n" };
+      });
+    const onEnd = () => {
+      setEnded((prev) => ({ ...prev, [key]: true }));
+      if ((outcomeNow(s, a.id) ?? a.outcome) !== "running") return;
+      endedRunning.add(key);
+      if (!reopenTimers.has(key)) reopenTimers.set(key, setTimeout(() => reopen(key), REOPEN_MS));
+    };
     // Sidecar logs share the step's real attempt ids, so the attempt scoping is
     // identical — only the endpoint (`?sidecar=<index>`) differs.
     const close =

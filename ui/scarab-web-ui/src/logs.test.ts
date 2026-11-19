@@ -36,8 +36,14 @@ describe("logBodyState", () => {
   });
 
   it("says nothing was captured once the stream ended", () => {
-    expect(logBodyState({ text: undefined, ended: true, outcome: "running" })).toBe("none");
+    expect(logBodyState({ text: undefined, ended: true, outcome: undefined })).toBe("none");
     expect(logBodyState({ text: "\n", ended: true, outcome: "failed" })).toBe("none");
+  });
+
+  // Regression: a stream the server ended while the try still ran said "no
+  // log output was captured" for a try that went on to print.
+  it("keeps waiting while the try runs, even after its stream ended", () => {
+    expect(logBodyState({ text: undefined, ended: true, outcome: "running" })).toBe("waiting");
   });
 
   it("says nothing was captured for a finished try, even before the stream closes", () => {

@@ -17,11 +17,12 @@ export function levelOf(line: string): Level {
 
 /** What an attempt's log body shows when it has no lines yet:
  * - `output`  — there is output; render the lines.
- * - `waiting` — nothing yet, but more may come: the stream is open and the
- *               try is still running.
- * - `none`    — nothing came and nothing will: the stream ended, or the try
- *               has finished. The pane then says no output was captured and,
- *               for a failed try, why it failed.
+ * - `waiting` — nothing yet, but more may come: the try is still running
+ *               (even when its stream ended: the pane opens it again), or
+ *               the stream is open and the outcome is not known yet.
+ * - `none`    — nothing came and nothing will: the try has finished, or the
+ *               stream ended and the outcome is not known. The pane then says
+ *               no output was captured and, for a failed try, why it failed.
  * A try with no output used to show "waiting for output…" forever, so its
  * failure reason never appeared. */
 export type LogBodyState = "output" | "waiting" | "none";
@@ -35,6 +36,7 @@ export function logBodyState(opts: {
   outcome: string | undefined;
 }): LogBodyState {
   if ((opts.text ?? "").split("\n").some((l) => l.length > 0)) return "output";
+  if (opts.outcome === "running") return "waiting";
   if (opts.ended) return "none";
-  return opts.outcome === undefined || opts.outcome === "running" ? "waiting" : "none";
+  return opts.outcome === undefined ? "waiting" : "none";
 }
