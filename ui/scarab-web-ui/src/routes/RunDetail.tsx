@@ -805,11 +805,20 @@ export default function RunDetail() {
     setCancelling(true);
     try {
       await cancelRun(id());
-      await refresh();
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : "Could not cancel the run.");
     } finally {
       setCancelling(false);
     }
+    // Read the run again either way: a refused cancel may mean it already
+    // finished.
+    await refresh().catch(() => undefined);
   }
+  // A run that finished while the confirm was open has nothing to cancel.
+  createEffect(() => {
+    const r = run();
+    if (r && isTerminal(r.status)) setConfirmingCancel(null);
+  });
 
   // Run provenance lives in the event log's trigger event (a `Raw` payload).
   const triggerInfo = (): {

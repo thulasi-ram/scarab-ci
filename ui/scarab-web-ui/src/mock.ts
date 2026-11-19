@@ -2766,6 +2766,11 @@ function route(pathname: string, search: string, method: string, body = ""): Res
 
   // the RETRIES run
   if (p === `/v1/runs/${RETRIES_RUN_ID}`) return json(retriesRunStatus);
+  // Cancelling it ends it, for the rest of this page load.
+  if (method === "POST" && p === `/v1/runs/${RETRIES_RUN_ID}/cancel`) {
+    retriesRunStatus.status = "cancelled";
+    return json({}, { status: 202 });
+  }
   if (p === `/v1/runs/${RETRIES_RUN_ID}/events`)
     return new Response(retriesEventsBody, {
       status: 200,

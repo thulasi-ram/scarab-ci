@@ -1,7 +1,7 @@
 // The run header's ⋯ menu: Keep workspace snapshots (pin or unpin this run's
 // snapshots past the retention window) and Copy run ID. Keyboard reachable:
-// Enter or Space opens it on its first item, the arrow keys move, Escape
-// closes and returns focus to the button.
+// Enter or Space opens it on its first enabled item, the arrow keys move
+// between enabled items, Escape closes and returns focus to the button.
 import { createSignal, onCleanup, onMount, Show } from "solid-js";
 import type { RetentionInfo } from "../api/client";
 import { pinLabel, pinTitle } from "../snapshot-retention";
@@ -19,7 +19,8 @@ export default function RunMoreMenu(props: {
   let menu: HTMLDivElement | undefined;
   let copiedTimer: ReturnType<typeof setTimeout> | undefined;
 
-  const items = () => Array.from(menu?.querySelectorAll<HTMLButtonElement>("[role=menuitem]") ?? []);
+  const items = () =>
+    Array.from(menu?.querySelectorAll<HTMLButtonElement>("[role=menuitem]") ?? []).filter((b) => !b.disabled);
   const openMenu = () => {
     setOpen(true);
     queueMicrotask(() => items()[0]?.focus());

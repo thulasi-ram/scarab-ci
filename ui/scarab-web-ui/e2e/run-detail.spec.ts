@@ -414,3 +414,25 @@ test("a failed first read of the events keeps the URL's version and try", async 
   await expect(page).toHaveURL(/[?&]v=1(&|$)/);
   await expect(page).toHaveURL(/[?&]try=1(&|$)/);
 });
+
+test("Cancel run from the keyboard: the confirm opens on Keep running", async ({ page }) => {
+  await page.goto(`/acme/scarab/runs/${RETRIES_RUN_ID}`);
+  const trigger = page.locator(".rh-actions").getByRole("button", { name: "Cancel run" });
+  await trigger.focus();
+  await page.keyboard.press("Enter");
+  const dialog = page.getByRole("dialog", { name: "confirm cancel run" });
+  await expect(dialog.getByRole("button", { name: "Keep running" })).toBeFocused();
+  // Escape closes it and gives focus back to the button.
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await expect(trigger).toBeFocused();
+
+  await page.keyboard.press("Enter");
+  await expect(dialog.getByRole("button", { name: "Keep running" })).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(dialog.getByRole("button", { name: "Cancel run" })).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByText("cancelled", { exact: true })).toBeVisible();
+  await expect(page.locator(".rh-actions").getByRole("button", { name: /New run/ })).toBeVisible();
+});

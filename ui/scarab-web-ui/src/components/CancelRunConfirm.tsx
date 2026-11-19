@@ -2,8 +2,10 @@
 // cancel request is sent only from its confirm button, the same two-step
 // pattern Rerun and Retry use (RerunConfirm). It shares that popover's look
 // and its dismissal rules: Escape, a click outside, a scroll or a resize
-// closes it without cancelling.
-import { createEffect, onCleanup } from "solid-js";
+// closes it without cancelling. It opens with focus on "Keep running", the
+// choice that changes nothing, and gives focus back to the button that opened
+// it when it closes.
+import { createEffect, onCleanup, onMount } from "solid-js";
 import { Portal } from "solid-js/web";
 
 export default function CancelRunConfirm(props: {
@@ -14,6 +16,18 @@ export default function CancelRunConfirm(props: {
   onCancel: () => void;
 }) {
   let popEl: HTMLDivElement | undefined;
+  let keepBtn: HTMLButtonElement | undefined;
+  // The element that had focus when the popover opened: the Cancel run button.
+  const opener = typeof document !== "undefined" ? (document.activeElement as HTMLElement | null) : null;
+  onMount(() => keepBtn?.focus({ preventScroll: true }));
+  onCleanup(() => {
+    // Only when focus is still inside the popover (or nowhere): a click
+    // elsewhere already moved it where the user wanted.
+    const at = document.activeElement;
+    if (opener && opener.isConnected && (!at || at === document.body || popEl?.contains(at))) {
+      opener.focus({ preventScroll: true });
+    }
+  });
 
   createEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && props.onCancel();
@@ -52,7 +66,7 @@ export default function CancelRunConfirm(props: {
           run.
         </p>
         <div class="rc-actions">
-          <button type="button" class="btn btn-ghost btn-sm" onClick={() => props.onCancel()}>
+          <button type="button" class="btn btn-ghost btn-sm" ref={keepBtn} onClick={() => props.onCancel()}>
             Keep running
           </button>
           <button
