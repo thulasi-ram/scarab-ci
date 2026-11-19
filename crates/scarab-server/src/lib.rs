@@ -353,6 +353,13 @@ pub struct AppState {
     /// `SCARAB_DEV_INSECURE`; production wires
     /// [`with_step_up`](AppState::with_step_up) in `main.rs`.
     pub step_up: step_up::StepUpPolicy,
+    /// The label, annotation and toleration keys a step author's
+    /// `k8s_overlay` may set, from the operator's placement config
+    /// (`author_overlay`). Run admission checks an overlay against them, as
+    /// the k8s executor does before it creates the Pod. [`AppState::new`]
+    /// leaves the shipped default; `main.rs` wires the loaded config with
+    /// [`with_author_overlay`](AppState::with_author_overlay).
+    pub author_overlay: scarab_executor_k8s::AuthorOverlayConfig,
 }
 
 impl AppState {
@@ -404,7 +411,19 @@ impl AppState {
             credential_overrides: Arc::new(connections_config::CredentialOverrides::new()),
             snapshot_retention_days: DEFAULT_SNAPSHOT_RETENTION_DAYS,
             step_up: step_up::StepUpPolicy::Off,
+            author_overlay: scarab_executor_k8s::AuthorOverlayConfig::default(),
         }
+    }
+
+    /// The keys a step author's `k8s_overlay` may set
+    /// ([`AppState::author_overlay`]): the placement config's
+    /// `author_overlay`, the same lists the k8s executor applies.
+    pub fn with_author_overlay(
+        mut self,
+        allowed: scarab_executor_k8s::AuthorOverlayConfig,
+    ) -> Self {
+        self.author_overlay = allowed;
+        self
     }
 
     /// Enforce step-up confirmation (ADR-0073): every crown-jewel route needs
@@ -508,6 +527,7 @@ impl AppState {
             plugins: self.plugins.as_deref(),
             links: self.actor_links(),
             connections: self.connections.as_deref(),
+            author_overlay: Some(&self.author_overlay),
         }
     }
 
@@ -1993,8 +2013,10 @@ async fn create_run(
             })?;
         // ADR-0055: a raw k8s_overlay carries no authority. An inline API run
         // targets no Environment, so any overlay is rejected fail-closed.
-        let k8s_overlay = admit_k8s_overlay(None, step.k8s_overlay.as_ref(), false)
-            .map_err(|v| ApiError::BadRequest(format!("step `{}`: {}", step.id, v.join("; "))))?;
+        let k8s_overlay =
+            admit_k8s_overlay(None, step.k8s_overlay.as_ref(), false, &st.author_overlay).map_err(
+                |v| ApiError::BadRequest(format!("step `{}`: {}", step.id, v.join("; "))),
+            )?;
         let spec = StepSpec {
             image: step.image.clone(),
             command: step.command.clone(),
@@ -4875,6 +4897,9 @@ pub struct AdmissionPorts<'a> {
     /// computed from at Run creation (ADR-0076 §9). Unset: a repo is read
     /// from public github.com.
     pub connections: Option<&'a dyn scarab_forge::ForgeConnectionStore>,
+    /// The keys a step author's `k8s_overlay` may set (the placement
+    /// config's `author_overlay`). `None`: the shipped default.
+    pub author_overlay: Option<&'a scarab_executor_k8s::AuthorOverlayConfig>,
 }
 
 /// The stores that resolve a webhook actor to a Principal (ADR-0069): the
@@ -4979,6 +5004,7 @@ impl<'a> AdmissionPorts<'a> {
             plugins: None,
             links: ActorLinks::default(),
             connections: None,
+            author_overlay: None,
         }
     }
 
@@ -5538,6 +5564,9 @@ struct AdmittedFacts<'a> {
     /// The Run's cache scope ([`run_cache_scope`]); `None` turns its Cache
     /// off.
     cache_scope: Option<scarab_engine::CacheScope>,
+    /// The keys a step author's `k8s_overlay` may set
+    /// ([`AdmissionPorts::author_overlay`]).
+    author_overlay: &'a scarab_executor_k8s::AuthorOverlayConfig,
 }
 
 /// The cache scope a new Run gets (git-bug efcec77, 31a2533): its symbolic
@@ -6022,12 +6051,14 @@ async fn admit_unrecorded(
 
     let now = clock.now().await;
     let run = run_id_for(event, path);
+    let shipped_overlay_keys = scarab_executor_k8s::AuthorOverlayConfig::default();
     let admitted = AdmittedFacts {
         event: &facts,
         trusted_only: &tokens.trusted_only,
         sandbox: &sandbox.trusted,
         registry: &registry,
         cache_scope: run_cache_scope(forge, event, ir, &gov).await,
+        author_overlay: ports.author_overlay.unwrap_or(&shipped_overlay_keys),
     };
     // Rendered before the Policies are consulted: a key that cannot be
     // rendered refuses the Run before an allow decision naming it is
@@ -7023,8 +7054,9 @@ fn cache_config(step: &scarab_pipeline::StepSpec) -> Option<scarab_engine::Cache
 /// grant in the target Environment sets `permit_k8s_overlay` (ADR-0071 §8),
 /// else the run is rejected **fail-closed**. An inline API run (no
 /// Environment) therefore never gets one. A permitted overlay may still set
-/// only the fields in `scarab_executor_k8s::AUTHOR_OVERLAY_FIELDS`. Returns the
-/// overlay to persist (or `None`).
+/// only the fields in `scarab_executor_k8s::AUTHOR_OVERLAY_FIELDS` and the
+/// label, annotation and toleration keys `allowed` lists. Returns the overlay
+/// to persist (or `None`).
 ///
 /// `locked_out` is the same value the privilege grants are admitted with: a
 /// fork pull request's Run, or a Run locked out of its Environment, is
@@ -7034,6 +7066,7 @@ fn admit_k8s_overlay(
     grant_scope: PrivilegeGrantScope<'_>,
     overlay: Option<&serde_json::Value>,
     locked_out: bool,
+    allowed: &scarab_executor_k8s::AuthorOverlayConfig,
 ) -> Result<Option<serde_json::Value>, Vec<String>> {
     match overlay {
         None => Ok(None),
@@ -7049,7 +7082,7 @@ fn admit_k8s_overlay(
         {
             // The same allowlist the executor applies before it creates the
             // Pod (git-bug 24a3126): the author learns of a refusal here.
-            let refused = scarab_executor_k8s::author_overlay_refusals(o);
+            let refused = scarab_executor_k8s::author_overlay_refusals(o, allowed);
             if refused.is_empty() {
                 Ok(Some(o.clone()))
             } else {
@@ -7063,6 +7096,67 @@ fn admit_k8s_overlay(
                 .to_string(),
         ]),
     }
+}
+
+/// Admit one Step's privilege request ([`admit_step_grants`]) and its
+/// `k8s_overlay` ([`admit_k8s_overlay`]) under the Run's governance, against
+/// `image` as Run creation renders it. `Err` is the refusal, naming the Step.
+/// Run creation ([`write_run_from_ir`]) and the policy test
+/// ([`step_privilege_refusals`]) both decide through it.
+fn admit_step_privileges(
+    step: &scarab_pipeline::StepSpec,
+    gov: &RunGovernance,
+    image: &str,
+    allowed: &scarab_executor_k8s::AuthorOverlayConfig,
+) -> Result<(scarab_project::AdmittedGrants, Option<serde_json::Value>), String> {
+    let locked_out = gov.locked_out();
+    let grants = admit_step_grants(
+        gov.privilege_grant_scope(),
+        step.security.as_ref(),
+        image,
+        locked_out,
+    )
+    .map_err(|v| {
+        format!(
+            "step `{}`: privilege request rejected: {}",
+            step.id,
+            v.join("; ")
+        )
+    })?;
+    let overlay = admit_k8s_overlay(
+        gov.privilege_grant_scope(),
+        step.k8s_overlay.as_ref(),
+        locked_out,
+        allowed,
+    )
+    .map_err(|v| format!("step `{}`: {}", step.id, v.join("; ")))?;
+    Ok((grants, overlay))
+}
+
+/// What [`admit_step_privileges`] refuses across `ir`'s Steps (gates launch
+/// nothing and are skipped), each refusal naming its Step: the policy test
+/// reports them as the refusal Run creation would make (git-bug C5).
+pub(crate) fn step_privilege_refusals(
+    ir: &scarab_pipeline::PipelineIr,
+    gov: &RunGovernance,
+    params: &std::collections::BTreeMap<String, serde_json::Value>,
+    event: &serde_json::Map<String, serde_json::Value>,
+    allowed: &scarab_executor_k8s::AuthorOverlayConfig,
+) -> Vec<String> {
+    ir.steps
+        .iter()
+        .filter(|step| step.gate.is_none())
+        .filter_map(|step| {
+            let image = scarab_pipeline::preview_image(
+                &step.image,
+                step.scope.as_ref(),
+                &step.matrix_values,
+                params,
+                event,
+            );
+            admit_step_privileges(step, gov, &image, allowed).err()
+        })
+        .collect()
 }
 
 /// Durably materialize a compiled pipeline IR into a Run: store the IR on the
@@ -7445,28 +7539,18 @@ async fn write_run_from_ir(
                     // Decided at each launch, never at Run creation.
                     credential_eligible: false,
                 });
-            let admitted = admit_step_grants(
-                gov.privilege_grant_scope(),
-                step.security.as_ref(),
-                &image,
-                locked_out,
-            )
-            .map_err(|v| {
-                TriggerError::Pipeline(format!(
-                    "step `{}`: privilege request rejected: {}",
-                    step.id,
-                    v.join("; ")
-                ))
-            })?;
+            let (granted, k8s_overlay) =
+                admit_step_privileges(step, gov, &image, admitted.author_overlay)
+                    .map_err(TriggerError::Pipeline)?;
             let spec = StepSpec {
                 image: step.image.clone(),
                 command: step.command.clone(),
                 env: step.env.clone(),
                 secrets: step.secrets.clone(),
-                run_as_root: admitted.run_as_root,
+                run_as_root: granted.run_as_root,
                 run_as_user: step.security.as_ref().and_then(|s| s.non_root_uid()),
-                add_capabilities: admitted.add_capabilities,
-                privileged: admitted.privileged,
+                add_capabilities: granted.add_capabilities,
+                privileged: granted.privileged,
                 timeout_seconds: step.timeout,
                 workspace_inputs: vec![],
                 // Per-PATH output publishing (ADR-0007): the backend prunes the
@@ -7511,14 +7595,7 @@ async fn write_run_from_ir(
                     .map_err(|e| TriggerError::Pipeline(format!("step `{}`: {e}", step.id)))?
                     .to_vec(),
                 resources: step.resources.clone(),
-                k8s_overlay: admit_k8s_overlay(
-                    gov.privilege_grant_scope(),
-                    step.k8s_overlay.as_ref(),
-                    locked_out,
-                )
-                .map_err(|v| {
-                    TriggerError::Pipeline(format!("step `{}`: {}", step.id, v.join("; ")))
-                })?,
+                k8s_overlay,
                 oidc_token: None,
                 resolved_secrets: Default::default(),
                 // Sidecar services (ADR-0058) co-locate in this executed step's Pod.
@@ -15192,15 +15269,23 @@ mod grant_admission_tests {
 
     const IMG: &str = "ghcr.io/acme/deployer@sha256:aaaa";
 
+    /// The shipped `author_overlay` lists.
+    fn shipped() -> scarab_executor_k8s::AuthorOverlayConfig {
+        scarab_executor_k8s::AuthorOverlayConfig::default()
+    }
+
     #[test]
     fn k8s_overlay_none_is_always_admitted_as_none() {
-        assert_eq!(admit_k8s_overlay(None, None, false).unwrap(), None);
+        assert_eq!(
+            admit_k8s_overlay(None, None, false, &shipped()).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn k8s_overlay_rejected_without_environment() {
         let overlay = serde_json::json!({"spec": {"schedulerName": "x"}});
-        let err = admit_k8s_overlay(None, Some(&overlay), false).unwrap_err();
+        let err = admit_k8s_overlay(None, Some(&overlay), false, &shipped()).unwrap_err();
         assert!(err
             .join("; ")
             .contains("requires a target Environment that permits"));
@@ -15211,7 +15296,8 @@ mod grant_admission_tests {
         let overlay = serde_json::json!({"spec": {"schedulerName": "x"}});
         // The Project holds no grant in the Environment.
         let g: Option<EnvironmentProjectPrivilegeGrant> = None;
-        let err = admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false).unwrap_err();
+        let err =
+            admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false, &shipped()).unwrap_err();
         assert!(err.join("; ").contains("permit_k8s_overlay"));
     }
 
@@ -15220,7 +15306,7 @@ mod grant_admission_tests {
         let overlay = serde_json::json!({"spec": {"nodeSelector": {"pool": "ci"}}});
         let g = Some(grant(vec![], true));
         assert_eq!(
-            admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false).unwrap(),
+            admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false, &shipped()).unwrap(),
             Some(overlay)
         );
     }
@@ -15232,13 +15318,13 @@ mod grant_admission_tests {
     fn k8s_overlay_refused_when_locked_out_even_when_environment_permits() {
         let overlay = serde_json::json!({"spec": {"serviceAccountName": "pusher"}});
         let g = Some(grant(vec![], true));
-        let err = admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), true)
+        let err = admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), true, &shipped())
             .unwrap_err()
             .join("; ");
         assert!(err.contains("fork pull request"), "{err}");
         // No overlay asked: nothing to refuse.
         assert_eq!(
-            admit_k8s_overlay(Some(g.as_ref()), None, true).unwrap(),
+            admit_k8s_overlay(Some(g.as_ref()), None, true, &shipped()).unwrap(),
             None
         );
     }
@@ -15264,9 +15350,10 @@ mod grant_admission_tests {
             ] {
                 for value in [serde_json::json!("x"), serde_json::Value::Null] {
                     let overlay = serde_json::json!({"metadata": {field: {key: value}}});
-                    let err = admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false)
-                        .expect_err(&format!("{field} `{key}` = {value} must be refused"))
-                        .join("; ");
+                    let err =
+                        admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false, &shipped())
+                            .expect_err(&format!("{field} `{key}` = {value} must be refused"))
+                            .join("; ");
                     assert!(
                         err.contains("reserved") && err.contains(key),
                         "{field} `{key}`: {err}"
@@ -15287,7 +15374,7 @@ mod grant_admission_tests {
             serde_json::json!({"metadata": {"annotations": null}}),
         ] {
             assert!(
-                admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false).is_err(),
+                admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false, &shipped()).is_err(),
                 "{overlay} must be refused"
             );
         }
@@ -15313,7 +15400,7 @@ mod grant_admission_tests {
                 serde_json::Value::Null,
             ] {
                 let overlay = serde_json::json!({"metadata": {field: value}});
-                let err = admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false)
+                let err = admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false, &shipped())
                     .expect_err(&format!("metadata.{field} = {value} must be refused"))
                     .join("; ");
                 assert!(err.contains(&format!("metadata.{field}")), "{field}: {err}");
@@ -15321,9 +15408,10 @@ mod grant_admission_tests {
         }
     }
 
-    /// Unreserved metadata and the rest of the Pod still pass under the grant.
+    /// Unreserved metadata the operator lists and the rest of the Pod still
+    /// pass under the grant.
     #[test]
-    fn k8s_overlay_admits_unreserved_labels_and_placement_when_permitted() {
+    fn k8s_overlay_admits_listed_labels_and_placement_when_permitted() {
         let g = permitting();
         let overlay = serde_json::json!({
             "metadata": {
@@ -15332,10 +15420,53 @@ mod grant_admission_tests {
             },
             "spec": {"nodeSelector": {"pool": "ci"}}
         });
+        let allowed = scarab_executor_k8s::AuthorOverlayConfig {
+            label_keys: vec!["team".into(), "example.com/*".into()],
+            annotation_keys: vec!["note".into()],
+            toleration_keys: vec![],
+        };
         assert_eq!(
-            admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false).unwrap(),
+            admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false, &allowed).unwrap(),
             Some(overlay)
         );
+    }
+
+    /// RT-3: labels and annotations are operator-listed keys. Under the
+    /// shipped default a cloud-role annotation and a label a NetworkPolicy
+    /// may select on are refused at Run creation, naming the config key; once
+    /// listed they are admitted; a reserved key stays refused when its prefix
+    /// is listed.
+    #[test]
+    fn k8s_overlay_metadata_keys_need_the_operators_list() {
+        let g = permitting();
+        let annotation = serde_json::json!({"metadata":{"annotations":{
+            "iam.amazonaws.com/role":"arn:aws:iam::1:role/admin"}}});
+        let label = serde_json::json!({"metadata":{"labels":{"role":"db-client"}}});
+        for (overlay, config_key) in [
+            (&annotation, "author_overlay.annotation_keys"),
+            (&label, "author_overlay.label_keys"),
+        ] {
+            let err = admit_k8s_overlay(Some(g.as_ref()), Some(overlay), false, &shipped())
+                .expect_err(&format!("{overlay} must be refused"))
+                .join("; ");
+            assert!(err.contains(config_key), "{overlay}: {err}");
+        }
+        let allowed = scarab_executor_k8s::AuthorOverlayConfig {
+            label_keys: vec!["role".into(), "scarab.io/*".into()],
+            annotation_keys: vec!["iam.amazonaws.com/role".into()],
+            toleration_keys: vec![],
+        };
+        for overlay in [&annotation, &label] {
+            assert!(
+                admit_k8s_overlay(Some(g.as_ref()), Some(overlay), false, &allowed).is_ok(),
+                "{overlay} is listed"
+            );
+        }
+        let reserved = serde_json::json!({"metadata":{"labels":{"scarab.io/x":"1"}}});
+        let err = admit_k8s_overlay(Some(g.as_ref()), Some(&reserved), false, &allowed)
+            .unwrap_err()
+            .join("; ");
+        assert!(err.contains("reserved"), "{err}");
     }
 
     /// git-bug 24a3126 / 743545c: a permitting grant covers only the author
@@ -15385,7 +15516,7 @@ mod grant_admission_tests {
                 "spec.containers[step].securityContext",
             ),
         ] {
-            let err = admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false)
+            let err = admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false, &shipped())
                 .expect_err(&format!("{overlay} must be refused"))
                 .join("; ");
             assert!(err.contains(&format!("`{field}`")), "{overlay}: {err}");
@@ -15404,7 +15535,7 @@ mod grant_admission_tests {
                 "volumeMounts":[{"name":"scratch","mountPath":"/scratch"}]}]
         }});
         assert_eq!(
-            admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false).unwrap(),
+            admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false, &shipped()).unwrap(),
             Some(overlay)
         );
     }

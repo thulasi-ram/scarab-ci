@@ -1022,7 +1022,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The same credential-override table the forge router resolves through
         // (ADR-0060 part D), so the Settings health readout reports a
         // config-supplied credential as present rather than MISSING.
-        .with_credential_overrides(credential_overrides.clone());
+        .with_credential_overrides(credential_overrides.clone())
+        // The keys a step author's `k8s_overlay` may set: Run admission
+        // checks an overlay against the same lists the k8s executor applies.
+        .with_author_overlay(placement.author_overlay.clone());
     // Anonymous library fetches from public forges (ADR-0076 §4). A client
     // that cannot be built leaves only installs through a connection.
     match scarab_server::library_fetch::HttpsFetcher::new() {

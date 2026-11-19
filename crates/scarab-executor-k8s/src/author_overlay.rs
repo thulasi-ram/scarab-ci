@@ -12,9 +12,18 @@
 //! profile put there ([`refuse_changes`]). The operator's baseline and
 //! profiles are not limited by either rule.
 //!
+//! Labels, annotations and tolerations are open only key by key: the operator
+//! lists the keys an author may set in the placement config's
+//! `author_overlay` block ([`AuthorOverlayConfig`]), and the shipped default
+//! lists none. A label can put a Pod behind a Service or a NetworkPolicy, an
+//! annotation can ask a webhook for a cloud role or a sidecar, and a
+//! toleration lets the Pod onto a node pool the operator kept for something
+//! else.
+//!
 //! The server checks the list at Run creation, so the author sees the refusal
 //! there; the executor checks it again before it creates the Pod.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{list_merge, ListMerge, MergeAt, STEP_CONTAINER};
@@ -28,25 +37,27 @@ use super::{list_merge, ListMerge, MergeAt, STEP_CONTAINER};
 pub const AUTHOR_OVERLAY_FIELDS: &[(&str, &str)] = &[
     (
         "metadata.labels",
-        "labels for the cluster's own tooling; Scarab's and the chart's keys are reserved",
+        "only the keys the operator lists in `author_overlay.label_keys`; Scarab's and the \
+         chart's keys are reserved",
     ),
     (
         "metadata.annotations",
-        "annotations for the cluster's own tooling; Scarab's keys and the AppArmor and seccomp \
-         keys are reserved",
+        "only the keys the operator lists in `author_overlay.annotation_keys`; Scarab's keys and \
+         the AppArmor and seccomp keys are reserved",
     ),
     (
         "spec.nodeSelector",
         "picks nodes by label; it can only narrow where the Pod runs",
     ),
     (
-        "spec.affinity",
-        "picks nodes and neighbouring Pods for placement; it reads nothing from them",
+        "spec.affinity.nodeAffinity",
+        "picks nodes for placement; Pod affinity and anti-affinity are an operator's, in a \
+         placement profile",
     ),
     (
         "spec.tolerations",
-        "lets the Pod onto a tainted node pool; the list only grows, and a control-plane or \
-         keyless toleration is refused",
+        "only taints whose key the operator lists in `author_overlay.toleration_keys`; the list \
+         only grows, and a control-plane or keyless toleration is refused",
     ),
     (
         "spec.topologySpreadConstraints",
@@ -117,18 +128,135 @@ const RESERVED_ANNOTATION_PREFIXES: [&str; 3] = [
 /// nodes' taints.
 const RESERVED_TOLERATION_PREFIXES: [&str; 1] = ["node-role.kubernetes.io/"];
 
+/// The label keys an author's overlay may set when the operator's placement
+/// config has no `author_overlay.label_keys`: none. Written as in the config:
+/// an exact key, `prefix/*` for every key under a prefix, or `*` for every key
+/// without a prefix (`team`, `cost-center`). To ship a softer default, make
+/// this `&["*"]`.
+pub const DEFAULT_AUTHOR_LABEL_KEYS: &[&str] = &[];
+
+/// The `author_overlay` block of the operator's placement config: the label,
+/// annotation and toleration keys a step author's `k8s_overlay` may set. Each
+/// entry is an exact key, `prefix/*` (every key under that prefix) or `*`
+/// (every key without a prefix). A key not listed is refused. Keys under the
+/// reserved prefixes (Scarab's, the chart's, AppArmor and seccomp, the
+/// control-plane taints) are refused even when listed, and so is a toleration
+/// without a key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorOverlayConfig {
+    /// Label keys an author may set ([`DEFAULT_AUTHOR_LABEL_KEYS`] when
+    /// unset).
+    #[serde(default = "default_label_keys")]
+    pub label_keys: Vec<String>,
+    /// Annotation keys an author may set (none when unset).
+    #[serde(default)]
+    pub annotation_keys: Vec<String>,
+    /// Taint keys an author's toleration may name (none when unset).
+    #[serde(default)]
+    pub toleration_keys: Vec<String>,
+}
+
+fn default_label_keys() -> Vec<String> {
+    DEFAULT_AUTHOR_LABEL_KEYS
+        .iter()
+        .map(|k| (*k).to_string())
+        .collect()
+}
+
+impl Default for AuthorOverlayConfig {
+    fn default() -> Self {
+        AuthorOverlayConfig {
+            label_keys: default_label_keys(),
+            annotation_keys: Vec::new(),
+            toleration_keys: Vec::new(),
+        }
+    }
+}
+
+impl AuthorOverlayConfig {
+    /// A malformed entry: a `*` anywhere but alone or after the last `/`.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        for (field, keys) in self.lists() {
+            for key in keys {
+                let ok = match key.find('*') {
+                    None => !key.is_empty(),
+                    Some(at) => key == "*" || (at == key.len() - 1 && key.ends_with("/*")),
+                };
+                if !ok {
+                    return Err(format!(
+                        "placement config: `author_overlay.{field}` entry `{key}` is not a key, \
+                         `prefix/*` or `*`"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// An entry that has no effect because it names a reserved key.
+    pub(crate) fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (field, keys) in self.lists() {
+            let reserved: &[&str] = match field {
+                "label_keys" => &RESERVED_METADATA_PREFIXES,
+                "annotation_keys" => &[
+                    RESERVED_METADATA_PREFIXES[0],
+                    RESERVED_METADATA_PREFIXES[1],
+                    RESERVED_METADATA_PREFIXES[2],
+                    RESERVED_ANNOTATION_PREFIXES[0],
+                    RESERVED_ANNOTATION_PREFIXES[1],
+                    RESERVED_ANNOTATION_PREFIXES[2],
+                ],
+                _ => &RESERVED_TOLERATION_PREFIXES,
+            };
+            for key in keys {
+                let prefix = key.trim_end_matches('*');
+                if reserved.iter().any(|p| prefix.starts_with(p)) {
+                    out.push(format!(
+                        "placement config: `author_overlay.{field}` lists `{key}`, which covers \
+                         reserved keys; a step's overlay may still not set those"
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    fn lists(&self) -> [(&'static str, &Vec<String>); 3] {
+        [
+            ("label_keys", &self.label_keys),
+            ("annotation_keys", &self.annotation_keys),
+            ("toleration_keys", &self.toleration_keys),
+        ]
+    }
+}
+
+/// Whether `key` matches one of `allowed` (an exact key, `prefix/*`, or `*`
+/// for a key without a prefix).
+fn listed(allowed: &[String], key: &str) -> bool {
+    allowed.iter().any(|entry| match entry.as_str() {
+        "*" => !key.contains('/'),
+        e => match e.strip_suffix('*') {
+            Some(prefix) => prefix.ends_with('/') && key.starts_with(prefix),
+            None => e == key,
+        },
+    })
+}
+
 /// One refusal per field of `overlay` an author may not set, each naming the
-/// field's path. Empty when the overlay keeps to [`AUTHOR_OVERLAY_FIELDS`] and
-/// their extra checks. Shared by the server's admission and the executor.
-pub fn author_overlay_refusals(overlay: &Value) -> Vec<String> {
+/// field's path. Empty when the overlay keeps to [`AUTHOR_OVERLAY_FIELDS`],
+/// sets only the label, annotation and toleration keys `allowed` lists, and
+/// passes the other checks. Shared by the server's admission and the executor.
+pub fn author_overlay_refusals(overlay: &Value, allowed: &AuthorOverlayConfig) -> Vec<String> {
     let mut out = Vec::new();
     if !overlay.is_object() {
         out.push("`k8s_overlay` must be a mapping (a Pod fragment)".to_string());
         return out;
     }
     walk(overlay, "", &mut out);
-    check_metadata(overlay, &mut out);
-    check_tolerations(overlay, &mut out);
+    check_metadata(overlay, allowed, &mut out);
+    check_tolerations(overlay, allowed, &mut out);
     check_volumes_and_mounts(overlay, &mut out);
     out
 }
@@ -249,8 +377,9 @@ fn walk(value: &Value, path: &str, out: &mut Vec<String>) {
     }
 }
 
-/// Labels and annotations: each a mapping, and no reserved key set or deleted.
-fn check_metadata(overlay: &Value, out: &mut Vec<String>) {
+/// Labels and annotations: each a mapping, no reserved key set or deleted,
+/// and every key one the operator lists.
+fn check_metadata(overlay: &Value, allowed: &AuthorOverlayConfig, out: &mut Vec<String>) {
     let reserved = RESERVED_METADATA_PREFIXES
         .iter()
         .map(|p| format!("`{p}`"))
@@ -285,14 +414,28 @@ fn check_metadata(overlay: &Value, out: &mut Vec<String>) {
                     "`k8s_overlay` may not set the reserved `metadata.annotations` key `{key}`: \
                      it sets the step's AppArmor or seccomp profile"
                 ));
+            } else {
+                let (list, config_key) = if field == "labels" {
+                    (&allowed.label_keys, "label_keys")
+                } else {
+                    (&allowed.annotation_keys, "annotation_keys")
+                };
+                if !listed(list, key) {
+                    out.push(format!(
+                        "`k8s_overlay` may not set the `metadata.{field}` key `{key}`: the \
+                         operator has not listed it in the placement config's \
+                         `author_overlay.{config_key}`. An operator can list it, or set it in a \
+                         placement profile"
+                    ));
+                }
             }
         }
     }
 }
 
-/// No toleration without a key (it tolerates every taint) and none of a
-/// control-plane taint.
-fn check_tolerations(overlay: &Value, out: &mut Vec<String>) {
+/// No toleration without a key (it tolerates every taint), none of a
+/// control-plane taint, and every key one the operator lists.
+fn check_tolerations(overlay: &Value, allowed: &AuthorOverlayConfig, out: &mut Vec<String>) {
     let Some(items) = overlay
         .pointer("/spec/tolerations")
         .and_then(Value::as_array)
@@ -316,6 +459,12 @@ fn check_tolerations(overlay: &Value, out: &mut Vec<String>) {
                      keeps step Pods off the control-plane nodes"
                 ));
             }
+            Some(key) if !listed(&allowed.toleration_keys, key) => out.push(format!(
+                "`k8s_overlay` may not tolerate the taint `{key}` in `spec.tolerations`: the \
+                 operator has not listed it in the placement config's \
+                 `author_overlay.toleration_keys`. An operator can list it, or add the \
+                 toleration in a placement profile"
+            )),
             Some(_) => {}
         }
     }
@@ -379,6 +528,41 @@ fn check_volumes_and_mounts(overlay: &Value, out: &mut Vec<String>) {
             }
         }
     }
+}
+
+/// Refuse an author's overlay that names in `spec.volumes` a volume the Pod
+/// already holds (`before`: Scarab's, the placement baseline's or a placement
+/// profile's), or the same name twice. Volumes merge by name, so an item
+/// `{name, emptyDir: {}}` would merge into the operator's volume and leave it
+/// as it was, and the overlay's mount would then reach that volume.
+pub(crate) fn refuse_existing_volumes(before: &Value, overlay: &Value) -> Result<(), String> {
+    let names = |v: &Value| -> Vec<String> {
+        v.pointer("/spec/volumes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("name").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect()
+    };
+    let present = names(before);
+    let mut seen: Vec<String> = Vec::new();
+    for name in names(overlay) {
+        if present.contains(&name) {
+            return Err(format!(
+                "the step's `k8s_overlay` names volume `{name}` in `spec.volumes`; the Pod \
+                 already has a volume by that name (Scarab's, the placement baseline's or a \
+                 placement profile's). A volume the overlay adds needs a name of its own"
+            ));
+        }
+        if seen.contains(&name) {
+            return Err(format!(
+                "the step's `k8s_overlay` lists volume `{name}` twice in `spec.volumes`"
+            ));
+        }
+        seen.push(name);
+    }
+    Ok(())
 }
 
 /// Refuse an author's overlay that changed or removed anything in `before`, the

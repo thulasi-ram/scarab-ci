@@ -1390,7 +1390,9 @@ struct PipelineInput {
 /// admission makes before consulting Policies is a 400. A library or
 /// credential refusal (a yanked version, a forge credential, the build
 /// sandbox) comes from the same check Run creation runs
-/// (`library_admission`) and is returned to be answered as a deny. An input
+/// (`library_admission`), and so does a Step's privilege request or
+/// `k8s_overlay` refusal (`step_privilege_refusals`); each is returned to be
+/// answered as a deny. An input
 /// that cannot be built (a Run over a list or string cap) is an `Err`
 /// evaluated as admission evaluates it, with the Pipeline's plugin gates.
 async fn pipeline_input(
@@ -1460,6 +1462,17 @@ async fn pipeline_input(
         Err(crate::TriggerError::Db(e)) => return Err(ApiError::Db(e)),
         Err(e) => return Err(ApiError::Db(DbError::Other(e.to_string()))),
     };
+    // Then each Step's privilege request and `k8s_overlay`, through the
+    // function Run creation admits them with: a Run it would fail for
+    // either is a deny here too. Images render against the event values as
+    // Run creation renders them; the policy test supplies no launch
+    // parameters.
+    let refusal = refusal.or_else(|| {
+        let facts = crate::forge_token::event_facts(&event, None, &ir).unwrap_or_default();
+        let refused =
+            crate::step_privilege_refusals(&ir, &gov, &BTreeMap::new(), &facts, &st.author_overlay);
+        (!refused.is_empty()).then(|| refused.join("; "))
+    });
     let compiled = PolicyTestCompiledDto {
         steps: ir.steps.len(),
         ir_version: ir.ir_version,
