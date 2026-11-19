@@ -194,6 +194,116 @@ async fn install_then_upgrade_shows_the_diff_and_checks_what_it_replaces() {
     assert_eq!(remove(&h, "0123456789").await, StatusCode::NOT_FOUND);
 }
 
+/// 8c62098: trust is kept per source, not per commit, so an install gives
+/// the new version every credential grant its source holds. The fetch names
+/// them; the install must name exactly them in `carry_grants`, or it is
+/// refused with the grants named and nothing changes. A source with no
+/// credential grant needs no `carry_grants`, and refuses one. The build
+/// sandbox is not a credential and is never named.
+#[tokio::test]
+async fn an_install_names_the_credential_grants_its_source_carries_to_it() {
+    let h = harness();
+    h.http
+        .serve_url(&raw("acme", "libs", C1, "deploy.yaml"), V1);
+    h.http
+        .serve_url(&raw("acme", "libs", C2, "deploy.yaml"), V2);
+    let source = "github.com/acme/libs//deploy.yaml";
+
+    // No grant on the source: the fetch names none, and the install needs
+    // no `carry_grants`. Naming a grant the source does not hold is refused.
+    let (st, v1) = fetch(&h, json!({ "source": format!("{source}@{C1}") })).await;
+    assert_eq!(st, StatusCode::OK, "{v1}");
+    assert_eq!(v1["carried_grants"], json!([]), "{v1}");
+    let (st, b) = install(
+        &h,
+        json!({
+            "name": DEPLOY,
+            "content_hash": content_hash(V1),
+            "carry_grants": ["forge_credentials"]
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    assert!(b.to_string().contains("forge_credentials"), "{b}");
+    let (st, b) = install(
+        &h,
+        json!({ "name": DEPLOY, "content_hash": content_hash(V1) }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+
+    for grant in ["forge_credentials", "registry_credential", "build_sandbox"] {
+        let (st, b) = call(
+            &h.app,
+            "POST",
+            "/v1/orgs/acme/library-trust",
+            Some(json!({ "source": source, "grant": grant })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{grant}: {b}");
+    }
+
+    // The upgrade's fetch names the credential grants, not the sandbox.
+    let (st, v2) = fetch(&h, json!({ "source": format!("{source}@{C2}") })).await;
+    assert_eq!(st, StatusCode::OK, "{v2}");
+    assert_eq!(
+        v2["carried_grants"],
+        json!(["forge_credentials", "registry_credential"]),
+        "{v2}"
+    );
+
+    // Without `carry_grants`, with part of them, or with the sandbox too:
+    // refused, naming the grants, and the installed version stays.
+    let upgrade = |carry: Option<Value>| {
+        let mut body = json!({
+            "name": DEPLOY,
+            "content_hash": content_hash(V2),
+            "replaces": content_hash(V1)
+        });
+        if let Some(c) = carry {
+            body["carry_grants"] = c;
+        }
+        body
+    };
+    for carry in [
+        None,
+        Some(json!([])),
+        Some(json!(["registry_credential"])),
+        Some(json!([
+            "forge_credentials",
+            "registry_credential",
+            "build_sandbox"
+        ])),
+    ] {
+        let (st, b) = install(&h, upgrade(carry.clone())).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{carry:?}: {b}");
+        let text = b.to_string();
+        assert!(
+            text.contains("forge_credentials") && text.contains("registry_credential"),
+            "{carry:?}: {text}"
+        );
+        assert_eq!(
+            h.store
+                .installation("acme", DEPLOY)
+                .await
+                .unwrap()
+                .unwrap()
+                .content_hash,
+            content_hash(V1),
+            "{carry:?}"
+        );
+    }
+
+    // With exactly the grants, in any order: upgraded.
+    let (st, b) = install(
+        &h,
+        upgrade(Some(json!(["registry_credential", "forge_credentials"]))),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["content_hash"], content_hash(V2));
+}
+
 /// Fetches store what an admin reviews, so each fetch keeps the org's
 /// never-installed versions to a bound: past it the oldest go, the one just
 /// fetched and the installed one stay.

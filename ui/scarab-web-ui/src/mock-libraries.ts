@@ -216,6 +216,7 @@ const fetchedUpgrade: S["FetchedLibraryDto"] = {
   content: NEW,
   current: { content_hash: HELM, source: HELM_SRC },
   diff: lineDiff(OLD, NEW),
+  carried_grants: [],
 };
 
 // ── Runs ──────────────────────────────────────────────────────────────────

@@ -3726,6 +3726,14 @@ export interface components {
             source?: string | null;
         };
         FetchedLibraryDto: {
+            /**
+             * @description The credential grants (`forge_credentials`, `registry_credential`)
+             *     the org trusts this version's source with. Trust is kept per source,
+             *     not per commit, so installing this version gives it these grants:
+             *     the install must name them, exactly, in `carry_grants`. Empty when
+             *     the source holds none.
+             */
+            carried_grants: components["schemas"]["TrustGrantDto"][];
             content: string;
             content_hash: string;
             current?: null | components["schemas"]["InstalledVersionDto"];
@@ -3920,6 +3928,14 @@ export interface components {
             privileged?: boolean;
         };
         InstallLibraryRequest: {
+            /**
+             * @description The credential grants the version's source holds, which the version
+             *     gets once installed: exactly the fetch's `carried_grants`, in any
+             *     order. Required when the source holds any; a list that differs from
+             *     what the source holds now is refused with the grants named. Empty or
+             *     omitted when the source holds none.
+             */
+            carry_grants?: components["schemas"]["TrustGrantDto"][];
             /** @description A version fetched into this org. */
             content_hash: string;
             /** @description The library name to install under, as `invoke: lib:<name>` writes it. */
@@ -6201,7 +6217,8 @@ export interface components {
         /**
          * @description A library source the org trusts with one grant (ADR-0076 §9, ADR-0018
          *     amendment of 2026-11-12). Trust holds across upgrades from the same
-         *     source.
+         *     source; an install that would carry a credential grant to a new version
+         *     names it in `carry_grants`.
          */
         TrustedSourceDto: {
             /** @description What the trust grants. */
@@ -8878,7 +8895,7 @@ export interface operations {
                     "application/json": components["schemas"]["LibraryInstallationDto"];
                 };
             };
-            /** @description a bad name or hash, a version not fetched into this org, or one that no longer compiles here */
+            /** @description a bad name or hash, a version not fetched into this org, one that no longer compiles here, or `carry_grants` that are not the credential grants the source holds */
             400: {
                 headers: {
                     [name: string]: unknown;

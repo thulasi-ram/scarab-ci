@@ -386,7 +386,10 @@ fn short_hash(h: &str) -> String {
 
 /// `library.install`: the library by its Pipeline name and the org,
 /// `lib:acme::scarab-libs::deploy-helm in acme`, and the version change first
-/// (`version = 5d1e0c7a9b3f → 0c4e7b2a91f5`), then the full hashes.
+/// (`version = 5d1e0c7a9b3f → 0c4e7b2a91f5`), then the credential grants the
+/// new version gets from its source's trust when `carry_grants` names any
+/// (`credential grants carried to this version = forge_credentials`), then
+/// the full hashes.
 pub fn describe_library_install(op: &Op, input: &OpInput) -> OpSummary {
     let generic = describe_generic(op, input);
     let (Some(org), Some(name)) = (input.param("org"), input.body_str("/name")) else {
@@ -398,6 +401,22 @@ pub fn describe_library_install(op: &Op, input: &OpInput) -> OpSummary {
         None => format!("version = {} (nothing installed before)", short_hash(&new)),
     };
     let mut changes = vec![escape_invisible(&version)];
+    if let Some(Value::Array(grants)) = input.body.pointer("/carry_grants") {
+        if !grants.is_empty() {
+            let names: Vec<String> = grants
+                .iter()
+                .map(|g| {
+                    g.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| g.to_string())
+                })
+                .collect();
+            changes.push(escape_invisible(&format!(
+                "credential grants carried to this version = {}",
+                names.join(", ")
+            )));
+        }
+    }
     changes.extend(generic.changes);
     OpSummary {
         operation: generic.operation,
@@ -1682,6 +1701,26 @@ mod tests {
             s.changes.contains(&format!("content_hash = {new}")),
             "{:?}",
             s.changes
+        );
+
+        assert!(
+            !s.changes.iter().any(|c| c.starts_with("credential grants")),
+            "{:?}",
+            s.changes
+        );
+
+        // An upgrade that carries a credential grant to the new version
+        // says so right after the version change.
+        i.body = json!({
+            "name": name,
+            "content_hash": new,
+            "replaces": old,
+            "carry_grants": ["forge_credentials", "registry_credential"]
+        });
+        let s = LIBRARY_INSTALL.summary(&i);
+        assert_eq!(
+            s.changes[1],
+            "credential grants carried to this version = forge_credentials, registry_credential"
         );
 
         i.body = json!({ "name": name, "content_hash": new });
