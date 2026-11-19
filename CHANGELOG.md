@@ -81,6 +81,14 @@ release.yml uses that version's section as the GitHub Release text. See
   push step can read the `0600` login file it writes: an operator who set up that profile from the
   guide changes its `securityContext` and env to match. See
   [The placement profile](https://thulasi-ram.github.io/scarab-ci/usage/pushing-to-ecr/#2-the-placement-profile).
+- **A `run.create` Policy counts and sees services** (git-bug 328010f). While an enforced
+  `run.create` Policy applies, Run creation refuses a Run with more than 8 sidecar services on one
+  step, more than 32 shared services, or more than 4 grants on one service. A sidecar that runs as
+  root (`run_as_root: true` or `run_as_user: 0`) now puts `run-as-root` in its step's `grants`, so
+  a Policy that denies root now refuses Runs it passed before. To keep such a Run, allow the
+  service in the Policy by reading the step's `services`, or run the service as a non-root uid. The
+  Security entry below says why. See
+  [Policies: rules over services](https://thulasi-ram.github.io/scarab-ci/usage/policies/#rules-over-services).
 
 ### Security
 
@@ -147,10 +155,16 @@ release.yml uses that version's section as the GitHub Release text. See
   `run_as_user` and `grants`. `run_as_root` is true for `run_as_root: true` and for
   `run_as_user: 0`. A root sidecar also puts `run-as-root` in its step's `grants`, so a Policy
   written against step grants now refuses it; a root shared service belongs to no step, and a rule
-  reads the top-level `services` to see it. Decisions recorded before have neither field. A step
-  may have at most 8 sidecar services and a Run at most 32 shared services while a `run.create`
-  Policy applies. See
+  reads the top-level `services` to see it. Decisions recorded before have neither field.
+  Breaking changes above gives the limits on services and what an existing Policy now refuses. See
   [Policies: rules over services](https://thulasi-ram.github.io/scarab-ci/usage/policies/#rules-over-services).
+- **A server replica that reads a step's log redacts that step's secrets, even when another
+  replica launched the step.** The values to redact were held only in the memory of the replica
+  that launched the step. When another replica took over the log tail, as on any server roll while
+  a step ran, it stored the step's output as printed, secrets included. A replica now reads the
+  step's secret values and its registry credential from the step Pod's Secrets before it reads the
+  log. When it cannot read them, it reads no log and tries again later. See
+  [Run logs](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/#how-the-server-stores-a-log).
 
 ### Enhancement
 
@@ -230,12 +244,23 @@ release.yml uses that version's section as the GitHub Release text. See
 - **A short step keeps its logs** (git-bug 1dee2f3). The log tail read a step only while it was
   running, and waited 3 seconds after a read that found the Pod not ready. A step that started and
   finished inside that wait had no logs stored. The server now reads the log of each step, retried
-  attempt and service that stops running before its log was read in full, unless a replica already
-  stored it. That first read does not wait out the 3 second backoff, so a viewer whose stream
-  ended sees the output on the next load.
-- **Log output printed after a log tail broke part way is stored once** (git-bug de2bd9b). Before,
-  it was lost if the step ended before the tail retried, and a retry while the step ran stored the
-  earlier lines twice.
+  attempt and service that stops running before its log was read in full, and stores what follows
+  the part already stored, as the next entry describes. That first read does not wait out the 3
+  second backoff, so a viewer whose stream ended sees the output on the next load.
+- **Log output printed after a log tail broke part way is stored** (git-bug de2bd9b). Before, it
+  was lost if the step ended before the tail retried, and a retry while the step ran stored the
+  earlier lines twice. On a retry, and on the read after a step stops, the server now reads the
+  container's log from the start, redacts it as one stream, and compares it with the part already
+  stored. When the log begins with exactly that part, the server stores only what follows it.
+  When it does not (the kubelet rotated the log file, or the container restarted), the server
+  stores the line `scarab: the log source restarted; earlier lines may repeat` and then the whole
+  log it read, so no output is dropped and earlier lines may show twice. A secret value split
+  between two reads of the log, or between two chunks of one read, is redacted; each chunk used to
+  be redacted on its own. Each retry reads the stored part back from object storage to compare it.
+  Output the kubelet rotated away before the server read it is gone: the marker line says the
+  source restarted, and does not recover those lines. Two replicas that tail one step at the same
+  time can still store one replica's chunk under the other's index entry. See
+  [Run logs](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/#how-the-server-stores-a-log).
 - **A step whose Pod is refused at launch fails as a configuration error.** A refusal of the
   step's `k8s_overlay` when the Pod is built (a clash with the placement baseline or a profile, or
   a Run stored before a field left the list) was retried until the Run was dead-lettered. The step

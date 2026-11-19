@@ -76,3 +76,29 @@ first sends `event: truncated` with `{"skipped_bytes":N,"total_bytes":M}`. `even
 stored part of the log could not be read, and the stream ends after it.
 
 The stream sends each `\r\n` as `\n`. The raw download returns the stored bytes unchanged.
+
+## How the server stores a log
+
+A server replica reads each step's container log while the step runs and stores it in chunks.
+Before it stores anything, it replaces each of the step's secret values, and its registry
+credential, with `***`. It redacts the log as one stream, so a value split between two chunks of
+output is still replaced. A replica that did not launch the step (after a server roll, for
+example) reads the step's secret values from the step Pod's Secrets first; when it cannot read
+them, it reads no log and tries again later.
+
+When a read breaks part way, or the step stops before its log was read in full, the server reads
+the container's log again from the start and compares it with the part already stored:
+
+- When the log begins with exactly the stored part, the server stores only what follows it.
+- When it does not, because the kubelet rotated the log file or the container restarted, the
+  server stores this line and then the whole log it read:
+
+  ```text
+  scarab: the log source restarted; earlier lines may repeat
+  ```
+
+  No output is dropped, and lines stored before the marker may show again after it.
+
+Output the kubelet rotated away before the server read it is gone; the marker line does not
+recover it. Each of these reads also reads the stored part back from object storage to compare
+it, so a retry on a long log costs one read per stored chunk.
