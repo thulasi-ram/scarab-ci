@@ -402,6 +402,11 @@ pub async fn run(args: ValidateArgs) -> i32 {
             "trigger": trigger,
         }
     });
+    // The gates and warnings come from the local compile, so they print
+    // before the request: an unreachable server or a refused token still
+    // leaves the author with them.
+    print_approval_gates(&ir);
+    print_warnings(&ir);
     let api = crate::security::Api::new(&server, &args.token);
     let path = format!("/v1/orgs/{org}/policy-test");
     let answer = match api.post_json(&path, &body).await {
@@ -409,8 +414,6 @@ pub async fn run(args: ValidateArgs) -> i32 {
         Err(code) => return code,
     };
     print_compiled(&answer, &ir, &sources, &org);
-    print_approval_gates(&ir);
-    print_warnings(&ir);
     print_answer(&answer, &args.event, &git_ref)
 }
 
