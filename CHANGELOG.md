@@ -18,6 +18,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-20
+
 ### Breaking changes
 
 - **Step Pods run in a namespace of their own by default.** With the k8s executor, `rbac.create`
@@ -1800,7 +1802,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.4...v0.5.0
 [0.4.4]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.1...v0.4.2
