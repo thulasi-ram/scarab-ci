@@ -9,10 +9,10 @@
 // step and its keys, and each cell shows only its values. The graph is drawn
 // at 100% and scrolls inside the band; only a graph wider than the band
 // shrinks, to 75% at most. Clicking a node selects it.
-import { createSignal, onMount, onCleanup, createEffect, createMemo, For, Show } from "solid-js";
+import { createSignal, onMount, onCleanup, createEffect, createMemo, on, untrack, For, Index, Show } from "solid-js";
 import { isGateOpen, type GateStatus } from "../gates";
 import { layoutGroups, type DagCell, type OriginLink } from "../dag-layout";
-import { fitBand, matrixHeading, nodeMeta, segmentByMatrix } from "../run-page";
+import { columnNodeWidth, fitBand, matrixHeading, nodeMeta, segmentByMatrix } from "../run-page";
 import { shortHash } from "../libraries";
 import Icon from "./Icon";
 import Pill from "./Pill";
@@ -164,7 +164,14 @@ export default function Dag(props: {
   // Dependency layers: a step sits one column right of its deepest dependency,
   // and a library invocation's Steps sit in one box that is a unit of its
   // parent's layering. Pure, in dag-layout.ts.
-  const layers = () => layoutGroups(props.steps);
+  // Laid out again only when the graph's shape changes (ids, needs, where a
+  // step comes from), never on a status poll: the columns and nodes then stay
+  // mounted, and each node reads its step's latest state by id.
+  const shapeKey = createMemo(() =>
+    JSON.stringify(props.steps.map((s) => [s.id, s.needs, s.origin ?? null])),
+  );
+  const layers = createMemo(on(shapeKey, () => layoutGroups(untrack(() => props.steps))));
+  const stepById = createMemo(() => new Map(props.steps.map((s) => [s.id, s])));
 
   // A node's UNSCALED box in graph space (transform-invariant — see `offsetIn`).
   const boxOf = (el: HTMLElement) => {
@@ -396,30 +403,31 @@ export default function Dag(props: {
   // One Step node. A plugin gate is dashed and names its
   // plugin under its id.
   const StepNode = (p: { s: DagStep; label: string }) => {
-    const s = p.s;
-    const sel = () => props.selected === s.id;
-    const plugin = () => s.origin?.find((o) => o.kind === "plugin");
-    const m = () => meta(s);
+    // The step as of the latest poll; the node itself stays mounted.
+    const s = () => stepById().get(p.s.id) ?? p.s;
+    const sel = () => props.selected === p.s.id;
+    const plugin = () => s().origin?.find((o) => o.kind === "plugin");
+    const m = () => meta(s());
     return (
       <button
-        class={`dnode ${s.status} ${sel() ? "sel" : ""}`}
-        classList={{ reused: !!s.reused, plugin: !!plugin(), waiting: !!plugin() && isGateOpen(s) }}
-        ref={(el) => nodes.set(s.id, el)}
-        onClick={() => props.onSelect(s.id)}
+        class={`dnode ${s().status} ${sel() ? "sel" : ""}`}
+        classList={{ reused: !!s().reused, plugin: !!plugin(), waiting: !!plugin() && isGateOpen(s()) }}
+        ref={(el) => nodes.set(p.s.id, el)}
+        onClick={() => props.onSelect(p.s.id)}
         aria-pressed={sel()}
       >
-        <span class={`dring ${s.status}`}>
+        <span class={`dring ${s().status}`}>
           <span class="dring-core" />
         </span>
-        <span class="dnode-main" title={s.id}>
+        <span class="dnode-main" title={p.s.id}>
           <span class="dnode-id">{p.label}</span>
-          <span class={`dnode-meta ${m().tone ? `gnote ${m().tone}` : ""}`} title={s.note?.detail ?? m().text}>
+          <span class={`dnode-meta ${m().tone ? `gnote ${m().tone}` : ""}`} title={s().note?.detail ?? m().text}>
             {m().text}
           </span>
           <Show when={plugin()}>
             {(o) => <span class="dnode-origin">plugin:{o().name.split("/")[0]}</span>}
           </Show>
-          <Show when={s.addedBy}>
+          <Show when={s().addedBy}>
             {(label) => (
               <span class="dnode-origin" title="Not in the pipeline file: the environment added this approval gate">
                 {label()}
@@ -427,15 +435,15 @@ export default function Dag(props: {
             )}
           </Show>
         </span>
-        <Show when={s.gate}>
+        <Show when={s().gate}>
           <Icon icon="timer" size={12} class="dnode-gate" />
         </Show>
-        <Show when={s.deploy}>
+        <Show when={s().deploy}>
           <span class="dnode-gate" title="deploy step (`deploy: true`)">
             <Icon icon="rocket" size={12} />
           </span>
         </Show>
-        <Show when={s.status === "running"}>
+        <Show when={s().status === "running"}>
           <span class="dnode-prog" />
         </Show>
         {/* Docked SIDECARS: each of the step's own `services:` as a
@@ -443,21 +451,21 @@ export default function Dag(props: {
             never a floated peer with an edge. A chip is its own clickable
             target (stopPropagation); a `<span role=button>` because it nests
             inside the step's own `<button>`. */}
-        <Show when={s.services && s.services.length > 0}>
+        <Show when={(s().services?.length ?? 0) > 0}>
           <span class="dnode-sidecars">
-            <For each={s.services}>
+            <Index each={s().services}>
               {(svc) => {
-                const scSel = () => props.selected === s.id && props.sidecarFocus === svc.index;
+                const scSel = () => props.selected === p.s.id && props.sidecarFocus === svc().index;
                 const pick = (e: Event) => {
                   e.stopPropagation();
-                  props.onSelectSidecar?.(s.id, svc.index);
+                  props.onSelectSidecar?.(p.s.id, svc().index);
                 };
                 return (
                   <span
                     class={`dnode-sidecar ${scSel() ? "sel" : ""}`}
                     role="button"
                     tabindex="0"
-                    title={`sidecar · ${svc.image} (service-${svc.index}) — logs inside ${s.id}`}
+                    title={`sidecar · ${svc().image} (service-${svc().index}) — logs inside ${p.s.id}`}
                     onClick={pick}
                     onKeyDown={(e) => {
                       if (e.key === "Enter" || e.key === " ") {
@@ -467,11 +475,11 @@ export default function Dag(props: {
                     }}
                   >
                     <span class="sc-hex">⬡</span>
-                    <span class="sc-name">{shortImage(svc.image)}</span>
+                    <span class="sc-name">{shortImage(svc().image)}</span>
                   </span>
                 );
               }}
-            </For>
+            </Index>
           </span>
         </Show>
       </button>
@@ -482,11 +490,20 @@ export default function Dag(props: {
   // columns, nested for an inner invocation.
   // The cells of one matrix in a column sit under one heading naming the step
   // and its keys; each cell's node shows only its values.
+  // Each column's nodes are as wide as its longest label needs
+  // (`columnNodeWidth`), so a matrix cell's values fit on one line.
+  const colWidth = (col: DagCell<DagStep>[]): number =>
+    columnNodeWidth(
+      segmentByMatrix(col, (c) => (c.kind === "step" ? c.step.id : null)).flatMap((seg) =>
+        seg.items.filter((it) => it.item.kind === "step").map((it) => it.label),
+      ),
+      { minChars: 26 },
+    );
   const Cols = (p: { cols: DagCell<DagStep>[][] }) => (
     <div class="dag-cols">
       <For each={p.cols}>
         {(col) => (
-          <div class="dag-col">
+          <div class="dag-col" style={{ "--node-w": `${colWidth(col)}px` }}>
             <For each={segmentByMatrix(col, (c) => (c.kind === "step" ? c.step.id : null))}>
               {(seg) =>
                 seg.matrix ? (
@@ -598,23 +615,25 @@ export default function Dag(props: {
           <div class="dag-lane">
             <span class="dag-lane-label">Services</span>
             <div class="dag-lane-nodes">
-              <For each={props.services}>
-                {(sv) => {
-                  const selId = `service:${sv.name}`;
+              <For each={(props.services ?? []).map((x) => x.name)}>
+                {(name) => {
+                  // Keyed by name: the services list is re-read every 2s.
+                  const sv = () => props.services?.find((x) => x.name === name) ?? { name, status: "pending" };
+                  const selId = `service:${name}`;
                   const sel = () => props.selected === selId;
                   return (
                     <button
                       class={`dnode service ${sel() ? "sel" : ""}`}
                       ref={(el) => nodes.set(selId, el)}
                       onClick={() => props.onSelect(selId)}
-                      title={`${sv.name} — shared service · ${sv.status}`}
+                      title={`${name} — shared service · ${sv().status}`}
                     >
-                      <span class={`dring service ${sv.status}`}>
+                      <span class={`dring service ${sv().status}`}>
                         <span class="dring-core" />
                       </span>
-                      <span class="dnode-main" title={sv.name}>
-                        <span class="dnode-id">{sv.name}</span>
-                        <span class="dnode-meta">{svcMeta(sv)}</span>
+                      <span class="dnode-main" title={name}>
+                        <span class="dnode-id">{name}</span>
+                        <span class="dnode-meta">{svcMeta(sv())}</span>
                       </span>
                       <Icon icon="database" size={14} class="dnode-svc-ico" />
                     </button>

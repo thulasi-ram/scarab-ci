@@ -452,6 +452,27 @@ export function fitBand(o: {
   return { scale, bandH, pannable: o.contentW * scale > avail + 0.5 || fullH > o.maxH };
 }
 
+// ── Graph node width ────────────────────────────────────────────────────────
+
+/**
+ * The width of the nodes in one graph column: wide enough for the column's
+ * longest label on one line, so a label ends in an ellipsis only past `max`.
+ * Labels are in the 12px mono font, `charPx` a character (JetBrains Mono's
+ * advance is 0.6em); `chromePx` is the node's padding, border, status ring,
+ * gaps and gate icon. `minChars` keeps room for the meta line under the label
+ * ("waiting for a node · 1m10s"), which changes as the run goes and so does
+ * not size the node.
+ */
+export function columnNodeWidth(
+  labels: string[],
+  o: { charPx?: number; chromePx?: number; minChars?: number; min?: number; max?: number } = {},
+): number {
+  const charPx = o.charPx ?? 7.2;
+  const chrome = o.chromePx ?? 86;
+  const longest = labels.reduce((n, l) => Math.max(n, [...l].length), o.minChars ?? 0);
+  return Math.round(Math.min(o.max ?? 460, Math.max(o.min ?? 240, longest * charPx + chrome)));
+}
+
 // ── Step header ─────────────────────────────────────────────────────────────
 
 export type TryLike = {

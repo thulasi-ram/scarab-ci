@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   aboutDuration,
   clampRunUrl,
+  columnNodeWidth,
   compactDuration,
   defaultSelection,
   failureBox,
@@ -293,6 +294,20 @@ describe("nodeMeta", () => {
       text: "refused · yanked",
       tone: "failed",
     });
+  });
+});
+
+// Regression: "superhero-tools-common · aws-clus…" was cut at a fixed 320px.
+describe("columnNodeWidth", () => {
+  it("fits the column's longest label, between the minimum and the maximum", () => {
+    const w = columnNodeWidth(["superhero-tools-common · aws-post-cluster", "git"]);
+    expect(w).toBe(Math.round(41 * 7.2 + 86));
+    expect(columnNodeWidth(["git"])).toBe(240);
+    expect(columnNodeWidth(["x".repeat(200)])).toBe(460);
+  });
+
+  it("keeps room for the meta line", () => {
+    expect(columnNodeWidth(["git"], { minChars: 26 })).toBe(Math.round(26 * 7.2 + 86));
   });
 });
 

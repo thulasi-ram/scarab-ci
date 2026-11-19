@@ -2403,9 +2403,9 @@ h1, .crumb-head, .run-title {
   grid-template-columns: auto 1fr auto;
   align-items: center;
   gap: 10px;
-  /* Wide enough for a matrix cell's values ("treebo-production ·
-     aws-post-cluster") on one line. */
-  width: 320px;
+  /* Each column sets --node-w from its longest label (Dag.tsx
+     `columnNodeWidth`), so a matrix cell's values fit on one line. */
+  width: var(--node-w, 320px);
   padding: 10px 12px;
   border: 1px solid var(--terminal-line);
   border-radius: 3px;
@@ -3271,7 +3271,7 @@ h1, .crumb-head, .run-title {
 .dag-mx { display: flex; flex-direction: column; gap: 18px; }
 .dag-mxh {
   font: var(--t-mono); color: var(--terminal-dim);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 320px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: var(--node-w, 320px);
   margin-bottom: -10px;
 }
 .dag-mxh b { font: inherit; color: var(--terminal-ink); }
