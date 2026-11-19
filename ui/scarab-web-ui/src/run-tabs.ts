@@ -144,6 +144,29 @@ export function shownArtifacts<A extends ArtifactLike>(rows: A[], filter: Artifa
   return rows.filter((a) => (withRecord.has(a.name) ? a.of_record : newest.get(a.name) === a));
 }
 
+/** The rows in scope: one step's copies when the tab is narrowed to it, else
+ * all of them. Narrow BEFORE `shownArtifacts`: of record is decided per file
+ * name across the run, so a step whose file shares its name with another
+ * step's file of record would otherwise show nothing. */
+export function artifactsInScope<A extends ArtifactLike>(rows: A[], onlyStep: string | null): A[] {
+  return onlyStep === null ? rows : rows.filter((a) => a.step === onlyStep);
+}
+
+/** What a copy that is not of record says about itself: "earlier copy" when
+ * its try passed, "from a failed try" when it failed, and "from a try that did
+ * not finish" when the try was superseded or cancelled. `outcome` is the
+ * try's outcome when known; without it, a copy whose try did not pass reads
+ * as failed. */
+export function copyMark(
+  a: { succeeded: boolean },
+  outcome?: string | null,
+): { text: string; tone: "earlier" | "failed" } {
+  if (a.succeeded || outcome === "succeeded") return { text: "earlier copy", tone: "earlier" };
+  if (outcome === "superseded" || outcome === "cancelled")
+    return { text: "from a try that did not finish", tone: "failed" };
+  return { text: "from a failed try", tone: "failed" };
+}
+
 /** How many rows each filter shows. */
 export function artifactFilterCounts(rows: ArtifactLike[]): Record<ArtifactFilter, number> {
   return { record: shownArtifacts(rows, "record").length, all: rows.length };

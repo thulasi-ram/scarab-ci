@@ -8,9 +8,13 @@ import {
   activityView,
   artifactFilterCounts,
   artifactGroups,
+  artifactsInScope,
+  copyMark,
   foldTries,
   isTriggerEvent,
   nestedTries,
+  pluralNoun,
+  resolutionWords,
   shownArtifacts,
   triggerLine,
   tryDurationMs,
@@ -141,6 +145,26 @@ describe("artifacts", () => {
     expect(artifactGroups(rows, ["build", "test", "e2e"], "test")).toEqual([{ step: "test", rows: [rows[0], rows[1]] }]);
     expect(artifactGroups(rows, ["build"], "nothing")).toEqual([]);
   });
+
+  // Regression: narrowed to a step, the tab showed nothing (and the step
+  // header counted a file the tab did not list) when another step's file of
+  // the same name was the one of record.
+  it("narrows to a step before picking the copy of record", () => {
+    const two = [art("report.xml", "unit", "a1", false), art("report.xml", "e2e", "a1", true)];
+    const unit = artifactsInScope(two, "unit");
+    expect(shownArtifacts(unit, "record")).toEqual([two[0]]);
+    expect(artifactFilterCounts(unit)).toEqual({ record: 1, all: 1 });
+    expect(artifactFilterCounts(artifactsInScope(two, "e2e"))).toEqual({ record: 1, all: 1 });
+    expect(artifactsInScope(two, null)).toBe(two);
+  });
+
+  it("says why a copy is not of record", () => {
+    expect(copyMark({ succeeded: true })).toEqual({ text: "earlier copy", tone: "earlier" });
+    expect(copyMark({ succeeded: false }, "failed")).toEqual({ text: "from a failed try", tone: "failed" });
+    expect(copyMark({ succeeded: false }, "superseded").text).toBe("from a try that did not finish");
+    expect(copyMark({ succeeded: false }, "cancelled").text).toBe("from a try that did not finish");
+    expect(copyMark({ succeeded: false }).text).toBe("from a failed try");
+  });
 });
 
 describe("try tabs", () => {
@@ -167,6 +191,28 @@ describe("try tabs", () => {
     expect(tryWords(2, { outcome: "failed", failure: "timeout" })).toBe("Try 2 · failed: timed out");
     expect(tryWords(4, { outcome: "running" })).toBe("Try 4 · running");
     expect(tryWords(1, { outcome: "failed", failure: "gate" }, "Wait")).toBe("Wait 1 · failed: gate failed");
+  });
+
+  it("says how a gate's wait was resolved, for the wait the resolution closed", () => {
+    const wait = { id: "a2", outcome: "failed", failure: "gate" };
+    const rejected = { passed: false, reason: "not today", by: "a.kim", attempt: "a2" };
+    expect(tryWords(2, wait, "Wait", rejected)).toBe("Wait 2 · rejected by a.kim: not today");
+    expect(tryWords(2, { id: "a2", outcome: "succeeded" }, "Wait", { passed: true, by: "a.kim", attempt: "a2" })).toBe(
+      "Wait 2 · approved by a.kim",
+    );
+    expect(tryWords(2, wait, "Wait", { passed: false, reason: "expired after 1800s", attempt: "a2" })).toBe(
+      "Wait 2 · expired",
+    );
+    // Another wait's resolution, or one that names no one, leaves the outcome.
+    expect(tryWords(1, { id: "a1", outcome: "failed", failure: "gate" }, "Wait", rejected)).toBe(
+      "Wait 1 · failed: gate failed",
+    );
+    expect(resolutionWords({ passed: true, reason: "timer elapsed", attempt: "a1" })).toBeNull();
+  });
+
+  it("names the plural of a try or a wait", () => {
+    expect(pluralNoun("Try")).toBe("Tries");
+    expect(pluralNoun("Wait")).toBe("Waits");
   });
 
   it("measures a try from its start and finish, or to now while it runs", () => {

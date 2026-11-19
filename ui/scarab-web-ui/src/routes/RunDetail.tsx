@@ -95,7 +95,7 @@ import {
   type RunTabParam,
   type RunUrlState,
 } from "../run-page";
-import { activityView, triggerLine } from "../run-tabs";
+import { activityView, artifactFilterCounts, artifactsInScope, triggerLine } from "../run-tabs";
 import { relTime, absTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
 import { triggerIcon, triggerText } from "../trigger";
@@ -460,8 +460,10 @@ export default function RunDetail() {
   // Artifact copies visible in the version in view (pure, in takes.ts).
   const visibleArtifacts = (): Artifact[] => visibleArtifactsIn(artifacts() ?? [], takeView());
   const distinctNames = (rows: Artifact[]) => new Set(rows.map((a) => a.name)).size;
+  // The step header's count: what the Artifacts tab shows when narrowed to
+  // that step (one copy per file of that step).
   const stepArtifacts = (stepId: string | null): number =>
-    stepId ? distinctNames(visibleArtifacts().filter((a) => a.step === stepId)) : 0;
+    stepId ? artifactFilterCounts(artifactsInScope(visibleArtifacts(), stepId)).record : 0;
 
   let poll: ReturnType<typeof setInterval> | undefined;
 
@@ -1635,6 +1637,11 @@ export default function RunDetail() {
                 viewedTake={selectedTake()?.n ?? null}
                 onlyStep={artifactStep()}
                 onShowAll={() => setArtifactStep(null)}
+                outcomeOf={(step, attempt) =>
+                  stepList()
+                    .find((s) => s.id === step)
+                    ?.attempt_list?.find((a) => a.id === attempt)?.outcome
+                }
               />
             </Show>
             <Show when={runTab() === "activity"}>

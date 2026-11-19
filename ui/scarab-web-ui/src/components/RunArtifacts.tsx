@@ -6,7 +6,14 @@
 // link, the tab shows that step's files until "Show all".
 import { createSignal, For, Show } from "solid-js";
 import { artifactUrl, type Artifact } from "../api/client";
-import { artifactFilterCounts, artifactGroups, shownArtifacts, type ArtifactFilter } from "../run-tabs";
+import {
+  artifactFilterCounts,
+  artifactGroups,
+  artifactsInScope,
+  copyMark,
+  shownArtifacts,
+  type ArtifactFilter,
+} from "../run-tabs";
 import { stepDisplayName } from "../run-page";
 import { tryLabel, type AttemptPlace } from "../takes";
 import Icon from "./Icon";
@@ -31,10 +38,13 @@ export default function RunArtifacts(props: {
   /** Show only this step's files. */
   onlyStep: string | null;
   onShowAll: () => void;
+  /** The outcome of the try that wrote a copy, when the run knows it. */
+  outcomeOf?: (step: string, attempt: string) => string | undefined;
 }) {
   const [filter, setFilter] = createSignal<ArtifactFilter>("record");
-  const counts = () => artifactFilterCounts(props.artifacts);
-  const groups = () => artifactGroups(shownArtifacts(props.artifacts, filter()), props.stepOrder, props.onlyStep);
+  const inScope = () => artifactsInScope(props.artifacts, props.onlyStep);
+  const counts = () => artifactFilterCounts(inScope());
+  const groups = () => artifactGroups(shownArtifacts(inScope(), filter()), props.stepOrder);
 
   return (
     <div class="panel run-tab-panel">
@@ -99,11 +109,10 @@ export default function RunArtifacts(props: {
                     <span class="art-mark">
                       <Show
                         when={a.of_record}
-                        fallback={
-                          <span class={a.succeeded ? "art-earlier" : "art-failed"}>
-                            {a.succeeded ? "earlier copy" : "from a failed try"}
-                          </span>
-                        }
+                        fallback={(() => {
+                          const m = copyMark(a, a.step ? props.outcomeOf?.(a.step, a.attempt) : undefined);
+                          return <span class={m.tone === "earlier" ? "art-earlier" : "art-failed"}>{m.text}</span>;
+                        })()}
                       >
                         <span class="art-rec" title="the copy a download by name serves">
                           of record

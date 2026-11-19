@@ -73,6 +73,10 @@ export type TakeView = {
    * exact set the tries strip renders (so a carried-forward step shows none,
    * and a re-run step shows only THIS Take's tries, numbered per-Take). */
   windowAttempts: Record<string, string[]>;
+  /** Per-step latest attempt id started at any point up to this Take's
+   * boundary, earlier Takes included: what existed as of then. A step this
+   * Take reused keeps the attempt an earlier Take ran. */
+  asOf: Record<string, string>;
 };
 
 /** Replay the event log up to `take`'s boundary. Pure function of the log —
@@ -82,6 +86,7 @@ export function replayTake(events: RunEvent[], takes: Take[], take: Take): TakeV
   const frontier: Record<string, string> = {};
   const attempts: Record<string, number> = {};
   const windowAttempts: Record<string, string[]> = {};
+  const asOf: Record<string, string> = {};
   const inFlight = new Map<string, string>(); // step -> attempt currently running
 
   // This Take's window opens at the previous Take's closing boundary (0 for
@@ -108,6 +113,7 @@ export function replayTake(events: RunEvent[], takes: Take[], take: Take): TakeV
             attempts[step] = (attempts[step] ?? 0) + 1;
             (windowAttempts[step] ??= []).push(attempt);
           }
+          asOf[step] = attempt;
           inFlight.set(step, attempt);
           // Admission's ready→running claim is not a logged transition — the
           // attempt start IS the "running" fact; the verdict arrives as a
@@ -143,7 +149,7 @@ export function replayTake(events: RunEvent[], takes: Take[], take: Take): TakeV
     }
   }
 
-  return { status, frontier, attempts, windowAttempts };
+  return { status, frontier, attempts, windowAttempts, asOf };
 }
 
 /** The "of-record" attempt id for a step from its ordered attempt list: the one
@@ -396,14 +402,15 @@ export function stepTiming(
 
 /** Artifact versions visible in a view: on the latest view (`tv` null) all of
  * them, server flags intact. While time-traveling, only versions from attempts
- * that existed as of the boundary — and of-record is recomputed within that
+ * that existed as of the boundary, a step's earlier versions included (a step
+ * the version reused keeps its files) — and of-record is recomputed within that
  * horizon (the server's flag is latest-global). Extracted from RunDetail. */
 export function visibleArtifacts(all: Artifact[], tv: TakeView | null): Artifact[] {
   if (!tv) return all;
   const rows = all.filter((a) => {
     if (!a.step) return true; // a row from before artifacts carried provenance
-    const frontier = tv.frontier[a.step];
-    return frontier !== undefined && attemptN(a.attempt) <= attemptN(frontier);
+    const last = tv.asOf[a.step];
+    return last !== undefined && attemptN(a.attempt) <= attemptN(last);
   });
   const ofRecord = new Map<string, number>();
   rows.forEach((a, i) => {

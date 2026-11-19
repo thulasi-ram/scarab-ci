@@ -358,6 +358,34 @@ describe("visibleArtifacts", () => {
     expect(rows.map((r) => r.name)).toEqual(["old.tar"]);
   });
 
+  // Regression: an older version hid the files of every step it reused, since
+  // only steps that ran inside the version had a frontier.
+  it("time-travel: a step the version reused keeps its files, of record", () => {
+    const events = [
+      started(1000, "a", "a1"),
+      finished(2000, "a", "a1"),
+      started(3000, "c", "a1"),
+      finished(4000, "c", "a1"),
+      rerun(5000, "c", []),
+      started(6000, "c", "a2"),
+      finished(7000, "c", "a2"),
+      rerun(8000, "c", []),
+      started(9000, "c", "a3"),
+      finished(10000, "c", "a3"),
+    ];
+    const takes = deriveTakes(events);
+    const tv = replayTake(events, takes, takes[1]); // version 2 reran only c
+    const rows = visibleArtifacts(
+      [
+        art({ name: "a.tar", step: "a", attempt: "a1", of_record: true }),
+        art({ name: "c.tar", step: "c", attempt: "a2" }),
+        art({ name: "c.tar", step: "c", attempt: "a3", of_record: true }), // version 3
+      ],
+      tv,
+    );
+    expect(rows.map((r) => `${r.step}@${r.attempt}:${r.of_record}`)).toEqual(["a@a1:true", "c@a2:true"]);
+  });
+
   it("of-record within the horizon is the LAST succeeded version of each name", () => {
     const events = twoTakeRun();
     const takes = deriveTakes(events);
