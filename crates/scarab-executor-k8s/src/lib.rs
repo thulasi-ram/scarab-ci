@@ -9687,6 +9687,33 @@ mod tests {
         }
     }
 
+    // Attack: a build argument built from text someone else writes adds `BUILDKIT_SYNTAX=<image>` (in any case, on its own line or after a newline inside a value), so BuildKit pulls and runs a frontend image of that text's choosing; or a value carries a control character. Safe outcome: exit 2, buildctl never runs; a plain argument whose name only contains BUILDKIT still builds.
+    #[cfg(unix)]
+    #[test]
+    fn the_build_library_script_refuses_buildkit_build_args() {
+        let (_tmp, run) = build_library_harness();
+        for args in [
+            "BUILDKIT_SYNTAX=docker.io/evil/frontend:1",
+            "buildkit_syntax=docker.io/evil/frontend:1",
+            "BuildKit_Syntax=docker.io/evil/frontend:1",
+            "A=1\nBUILDKIT_SYNTAX=docker.io/evil/frontend:1\n",
+            "A=release notes\nBUILDKIT_CONTEXT_KEEP_GIT_DIR=1",
+            "BUILDKIT_=1",
+            "A=1\tB=2",
+            "A=1\rB=2",
+        ] {
+            assert_eq!(
+                run(&[("SCARAB_BUILD_ARGS", args)]),
+                (Some(2), false),
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            run(&[("SCARAB_BUILD_ARGS", "MY_BUILDKIT_SYNTAX=1\nBUILDKIT=1\n")]),
+            (Some(0), true)
+        );
+    }
+
     // Attack: reach the credential mount through a relative symlink chain, a symlinked parent directory, a symlink to an in-workspace directory whose Dockerfile links out, or a Dockerfile path through a symlinked directory. Safe outcome: exit 2, buildctl never runs.
     #[cfg(unix)]
     #[test]

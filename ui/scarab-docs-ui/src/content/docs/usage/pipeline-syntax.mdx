@@ -424,12 +424,18 @@ Its inputs:
 | `context` | `.` | The build context, relative to the workspace. No absolute path, no `..`, no `,`. |
 | `dockerfile` | `Dockerfile` | The Dockerfile, relative to the context, with the same rules. |
 | `push` | `false` | Push the image after building it. |
-| `build_args` | empty | Build arguments, one `KEY=VALUE` per line. No `,` in a value. |
+| `build_args` | empty | Build arguments, one `KEY=VALUE` per line. No `,` in a value, and no name that starts with `BUILDKIT_`. |
 | `cache` | `none` | Where BuildKit imports and exports its layer cache: `none` or `s3`. |
 | `cache_bucket` | empty | For `cache: s3`, the bucket. |
 | `cache_region` | empty | For `cache: s3`, the bucket's region. |
 | `cache_name` | empty | For `cache: s3`, the cache's name in the bucket; BuildKit's default when empty. |
 | `insecure_push` | `false` | Push over plain HTTP. For a test or development registry with no TLS only. crane then also skips TLS verification, so the push Step refuses it (exit 2) when it holds a registry login. |
+
+`build_args` refuses a name that starts with `BUILDKIT_`, in any case: BuildKit reads those
+arguments as settings, and `BUILDKIT_SYNTAX` names a frontend image that BuildKit pulls and runs.
+Don't build `build_args` from text that someone else writes, such as a step result that holds a
+commit message or a pull request title. Each line of that text becomes a build argument, which
+your Dockerfile can read and which BuildKit may act on.
 
 Its outputs:
 

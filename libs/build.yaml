@@ -91,7 +91,11 @@
 #               false); for a test or development registry only. crane
 #               then skips TLS verification too, so the push Step refuses
 #               it (exit 2) when it holds a registry login
-#   build_args  one KEY=VALUE per line, each passed as a build argument
+#   build_args  one KEY=VALUE per line, each passed as a build argument. A
+#               name starting BUILDKIT_ (in any case) is refused: BuildKit
+#               reads those as settings, and BUILDKIT_SYNTAX names a frontend
+#               image it pulls and runs. Do not build this input from text
+#               someone else writes (a commit message, a pull request title)
 #   cache       the layer cache: none or s3 (default none)
 #   cache_bucket, cache_region, cache_name
 #               for cache: s3, where the cache is kept
@@ -128,8 +132,8 @@ interface:
       type: string
       required: false
       default: ""
-      validate: 'value == "" || value.matches("^([A-Za-z_][A-Za-z0-9_]*=[^,[:cntrl:]]*\n)*[A-Za-z_][A-Za-z0-9_]*=[^,[:cntrl:]]*\n?$")'
-      description: build arguments, one KEY=VALUE per line, with no "," in a value
+      validate: 'value == "" || (value.matches("^([A-Za-z_][A-Za-z0-9_]*=[^,[:cntrl:]]*\n)*[A-Za-z_][A-Za-z0-9_]*=[^,[:cntrl:]]*\n?$") && !value.matches("(?i)(^|\n)buildkit_"))'
+      description: build arguments, one KEY=VALUE per line, with no "," in a value and no name starting BUILDKIT_
     - name: cache
       type: choice
       options: [none, s3]
@@ -241,9 +245,13 @@ steps:
           [ "$key" != "$line" ] || fail "build arg $line is not KEY=VALUE"
           case "$key" in
             "" | [0-9]* | *[!A-Za-z0-9_]*) fail "build arg name $key is not a name" ;;
+            # BuildKit reads BUILDKIT_* build args as settings; BUILDKIT_SYNTAX
+            # names a frontend image that it pulls and runs.
+            [Bb][Uu][Ii][Ll][Dd][Kk][Ii][Tt]_*) fail "build arg $key is refused: BuildKit reads BUILDKIT_* arguments as settings" ;;
           esac
           case "$line" in
             *,*) fail "build arg $key holds a ','" ;;
+            *[[:cntrl:]]*) fail "build arg $key holds a control character" ;;
           esac
           set -- "$@" --opt "build-arg:$line"
         done <<EOF

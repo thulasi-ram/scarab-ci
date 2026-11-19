@@ -10799,6 +10799,78 @@ mod tests {
         }
     }
 
+    // Attack: `build_args` built from free text (a prior step's result holding a commit message, say) carries a line `BUILDKIT_SYNTAX=<image>`, in any case, so BuildKit pulls and runs a frontend image the text chose. Safe outcome: the input's `validate:` refuses it, as a literal when the Pipeline compiles and as a template when the build Step launches; plain arguments still render.
+    #[test]
+    fn the_build_library_refuses_buildkit_build_args() {
+        for args in [
+            "BUILDKIT_SYNTAX=docker.io/evil/frontend:1",
+            "A=1\\nbuildkit_syntax=docker.io/evil/frontend:1\\n",
+        ] {
+            let errs = library_errors(
+                &format!(
+                    "steps:\n  - id: image\n    invoke: lib:thulasi-ram::scarab-ci::build\n    \
+                     with: {{ image: registry.example/app:1, build_args: \"{args}\" }}\n"
+                ),
+                &with_build_library(),
+            );
+            assert!(
+                errs.iter().any(|e| e.contains("build_args")),
+                "{args:?}: {errs:?}"
+            );
+        }
+        let ir = compile_with_libraries(
+            r#"
+            on: { push: {} }
+            steps:
+              - { id: meta, image: busybox, command: [echo] }
+              - id: image
+                invoke: lib:thulasi-ram::scarab-ci::build
+                needs: [meta]
+                with:
+                  image: registry.example/app:1
+                  build_args: "${{ outputs.meta.args }}"
+            "#,
+            &with_build_library(),
+        )
+        .unwrap();
+        let step = ir.steps.iter().find(|s| s.id == "image/image").unwrap();
+        let launch = |args: &str| {
+            let results = Results::from([(
+                "meta".to_string(),
+                BTreeMap::from([("args".to_string(), json!(args))]),
+            )]);
+            render(
+                Templates {
+                    image: &step.image,
+                    command: &step.command,
+                    env: &step.env,
+                },
+                step.scope.as_ref(),
+                &step.matrix_values,
+                Facts::Launch {
+                    params: &BTreeMap::new(),
+                    declared: &[],
+                    results: &results,
+                    event: &serde_json::Map::new(),
+                },
+            )
+            .map(|r| r.env.into_iter().collect::<BTreeMap<_, _>>())
+        };
+        for args in [
+            "BUILDKIT_SYNTAX=docker.io/evil/frontend:1",
+            "fix: typo\nBUILDKIT_SYNTAX=docker.io/evil/frontend:1",
+            "NOTES=fix typo\nBuildKit_Syntax=docker.io/evil/frontend:1\n",
+            "NOTES=fix typo\nBUILDKIT_SANDBOX_HOSTNAME=x",
+        ] {
+            assert!(launch(args).is_err(), "{args:?} rendered");
+        }
+        let env = launch("NOTES=fix typo\nMY_BUILDKIT_SYNTAX=1\n").unwrap();
+        assert_eq!(
+            env["SCARAB_BUILD_ARGS"],
+            "NOTES=fix typo\nMY_BUILDKIT_SYNTAX=1\n"
+        );
+    }
+
     // Attack: a branch name (git allows `,` and `=`) templated into the build library's `image` and `cache_name` adds buildctl output options to the build Step, or crane arguments to the push Step, when it launches. Safe outcome: the rendered value fails the input's `validate:` rule and the launch of either Step is refused; a plain branch renders.
     #[test]
     fn the_build_library_refuses_a_branch_name_that_adds_buildctl_options_at_launch() {

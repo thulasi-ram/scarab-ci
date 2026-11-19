@@ -18,6 +18,15 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Security
+
+- **The build library refuses a `build_args` name that starts with `BUILDKIT_`** (git-bug 410eed3).
+  BuildKit reads those arguments as settings, and `BUILDKIT_SYNTAX` names a frontend image that it
+  pulls and runs, so a `build_args` value built from text someone else writes could pick the
+  image. The input's `validate:` rule and the build step's script both refuse such a name in any
+  case, and the script also refuses a control character in a value. The docs now say not to build
+  `build_args` from free text. Install the library again from the release commit to get this.
+
 ### Enhancement
 
 - **The server warns at startup when `default_resources` sets one axis only.** With `cpu_millis`
