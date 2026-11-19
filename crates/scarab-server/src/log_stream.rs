@@ -184,8 +184,11 @@ pub struct LogStream {
     /// source (a tail cut can land inside a character).
     strip_lead: Option<Key>,
     /// Per source: a held-back newest chunk ending inside a character, as
-    /// (index length when held, passes held so far).
-    held: HashMap<Key, (u64, u32)>,
+    /// (index length when held, the pass it was first held in). Counted in
+    /// passes, not calls: one pass can read a source more than once.
+    held: HashMap<Key, (u64, u64)>,
+    /// Passes started so far: 0 is the opening replay, each live poll adds 1.
+    pass: u64,
     /// Per source that is not running: since when it has had nothing to send.
     quiet_since: HashMap<Key, Instant>,
     /// Chunk-index reads so far.
@@ -228,6 +231,7 @@ impl LogStream {
             index: None,
             strip_lead: None,
             held: HashMap::new(),
+            pass: 0,
             quiet_since: HashMap::new(),
             index_reads: 0,
             ends_cr: HashMap::new(),
@@ -371,6 +375,7 @@ impl LogStream {
         self.index = None;
         self.polled = true;
         self.sent_in_pass = false;
+        self.pass += 1;
     }
 
     /// The next batch of the current source, or `None` when it has nothing
@@ -468,12 +473,12 @@ impl LogStream {
             // The newest chunk of a running attempt ends inside a character:
             // send up to the last whole boundary and wait for the rest, for
             // at most HOLD_PASSES passes.
-            let held = self.held.entry(k.clone()).or_insert((end, 0));
+            let pass = self.pass;
+            let held = self.held.entry(k.clone()).or_insert((end, pass));
             if held.0 != end {
-                *held = (end, 0);
+                *held = (end, pass);
             }
-            if held.1 < HOLD_PASSES {
-                held.1 += 1;
+            if pass - held.1 < u64::from(HOLD_PASSES) {
                 let Some((len, n)) = whole_at else {
                     return Ok(None);
                 };

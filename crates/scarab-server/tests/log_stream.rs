@@ -636,6 +636,44 @@ async fn a_held_back_chunk_is_sent_after_two_passes() {
     }
 }
 
+/// The hold is counted in passes, not reads: a pass that sends the whole
+/// chunks before the cut one reads the source a second time, and that read
+/// does not count as a pass. With nothing appended, the first live poll still
+/// holds the chunk; the second sends it with the cut byte replaced.
+#[tokio::test(start_paused = true)]
+async fn a_held_back_chunk_waits_two_polls_after_whole_chunks_were_sent() {
+    let (db, logs) = live_store(
+        Some(RunStatus::Running),
+        &[(
+            "a1",
+            AttemptOutcome::Running,
+            vec![b"hello\n".to_vec(), vec![b'x', 0xE2]],
+        )],
+    )
+    .await;
+    let mut s = open_live(&db, &logs, Start::Full).await;
+    assert_eq!(
+        opening(&mut s).await,
+        [Item::Data {
+            id: "a1:1".into(),
+            text: "hello\n".into(),
+        }]
+    );
+    assert_eq!(
+        s.next(true).await.unwrap(),
+        Some(Item::Keepalive),
+        "held on the first poll"
+    );
+    assert_eq!(
+        s.next(true).await.unwrap(),
+        Some(Item::Data {
+            id: "a1:2".into(),
+            text: "x\u{FFFD}".into(),
+        }),
+        "sent on the second poll"
+    );
+}
+
 /// A finished attempt is not held back while the Run goes on: its last chunk,
 /// cut inside a character, is sent on the first pass.
 #[tokio::test(start_paused = true)]
