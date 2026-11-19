@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1795093069,"nonce":"UIIvL8xqY9SG6yxWu19kCngNwaw=","added":["area:ui","type:feat"],"removed":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1795095893,"nonce":"fz2gNv5bbKtvjSlYqaCb/CQKbYM=","message":"Fixed in PR #196 (merged 2026-11-19).","files":null}]}
