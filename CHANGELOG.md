@@ -45,7 +45,8 @@ release.yml uses that version's section as the GitHub Release text. See
     and tolerations of a GPU or spot pool taint. To allow a key, list it in the placement config
     (the chart value `scarab.placement.author_overlay`), for example
     `author_overlay: { label_keys: [team], annotation_keys: ["karpenter.sh/do-not-disrupt"], toleration_keys: [nvidia.com/gpu] }`.
-    Each entry is an exact key, `prefix/*`, or `*` for every key with no prefix. Keys under
+    Each entry is an exact key, `prefix/*` (a prefix with no `/` of its own), or `*` for every
+    key with no prefix. Keys under
     `scarab.io/`, `scarab.dev/` and `app.kubernetes.io/`, the AppArmor and seccomp annotations,
     `node-role.kubernetes.io/` taints and a toleration with an empty or missing key stay refused
     even when listed;
@@ -163,7 +164,10 @@ release.yml uses that version's section as the GitHub Release text. See
   that launched the step. When another replica took over the log tail, as on any server roll while
   a step ran, it stored the step's output as printed, secrets included. A replica now reads the
   step's secret values and its registry credential from the step Pod's Secrets before it reads the
-  log. When it cannot read them, it reads no log and tries again later. See
+  log. When it cannot read them, it reads no log and tries again later. When the step has ended
+  and its Secrets are deleted, the replica has no values; if the log then differs from the stored
+  part where that part holds `***`, the replica stores nothing more of that step's log and logs a
+  warning, instead of storing the value in clear. See
   [Run logs](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/#how-the-server-stores-a-log).
 
 ### Enhancement
@@ -252,7 +256,8 @@ release.yml uses that version's section as the GitHub Release text. See
   earlier lines twice. On a retry, and on the read after a step stops, the server now reads the
   container's log from the start, redacts it as one stream, and compares it with the part already
   stored. When the log begins with exactly that part, the server stores only what follows it.
-  When it does not (the kubelet rotated the log file, or the container restarted), the server
+  When it does not (the kubelet rotated the log file, the container restarted, or the step's
+  secret values changed), the server
   stores the line `scarab: the log source restarted; earlier lines may repeat` and then the whole
   log it read, so no output is dropped and earlier lines may show twice. A secret value split
   between two reads of the log, or between two chunks of one read, is redacted; each chunk used to
@@ -265,6 +270,25 @@ release.yml uses that version's section as the GitHub Release text. See
   step's `k8s_overlay` when the Pod is built (a clash with the placement baseline or a profile, or
   a Run stored before a field left the list) was retried until the Run was dead-lettered. The step
   now fails with the reason.
+- **A step whose `k8s_overlay` makes a Pod Kubernetes refuses fails as a configuration error.**
+  An overlay that keeps to the allowed fields can still be invalid to Kubernetes: a
+  `nodeSelector` value that is not a label value, a memory request above the limit, a volume name
+  in capitals. The launch error was retried for 5 minutes and then the Run was dead-lettered. When
+  Kubernetes refuses the Pod as invalid (400 or 422), Scarab now creates the Pod without the
+  overlay as a dry run; if that passes, the step fails with Kubernetes' message. If it fails too,
+  the operator's baseline or a profile is at fault and the launch error stays. A quota or
+  permission refusal (403) stays a launch error. See
+  [Placement & resources](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#placement--resources).
+- **Run creation refuses a placement profile the operator's config does not allow.**
+  With the k8s executor, a step that names a profile the registry does not hold, or a
+  `registry_auth_only` profile without `registry_auth`, was created and then failed at every
+  launch until the Run was dead-lettered. Run creation now refuses it, naming the step and the
+  profile, and for an unknown name the profiles the registry holds. `scarab validate --server` and
+  the policy test report the same refusal. A `registry_auth_only` profile on a step without
+  `registry_auth` that still reaches launch fails the step as a configuration error. A profile
+  removed after the Run was created stays a launch error, which a retry covers during a server
+  roll. See
+  [Placement & resources](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#placement--resources).
 - **The Run page's Activity tab words every step status change** (git-bug d390aa3). A change with
   no try read `running → ready`; it now reads "queued", "waiting to retry", "reset to run again",
   "needed again", "skipped because build failed", "skipped by its when: condition" or "passed
@@ -290,7 +314,9 @@ release.yml uses that version's section as the GitHub Release text. See
   refuses, got `outcome: allow` from `scarab validate --server` and was refused when created. The
   policy test now runs the same checks as Run creation and answers a deny with Run creation's
   reason, also returned as `refusal`. A server with no forge configured leaves the forge token
-  check out of the answer and logs that it did.
+  check out of the answer and logs that it did. For a manual, api or cron trigger the policy test
+  renders a step's image with the Pipeline's input defaults, as Run creation does, so an image
+  such as `reg/x@${{ inputs.digest }}` is checked against a privilege grant by its digest.
 
 ## [0.4.4] - 2026-11-19
 

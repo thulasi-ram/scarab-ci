@@ -90,14 +90,19 @@ When a read breaks part way, or the step stops before its log was read in full, 
 the container's log again from the start and compares it with the part already stored:
 
 - When the log begins with exactly the stored part, the server stores only what follows it.
-- When it does not, because the kubelet rotated the log file or the container restarted, the
-  server stores this line and then the whole log it read:
+- When it does not, because the kubelet rotated the log file, the container restarted, or the
+  step's secret values changed, the server stores this line and then the whole log it read:
 
   ```text
   scarab: the log source restarted; earlier lines may repeat
   ```
 
   No output is dropped, and lines stored before the marker may show again after it.
+
+A replica that has no values for the step, such as one that reads a step that has ended after
+its Secrets were deleted, may find the log differs from the stored part where the stored part
+holds `***`. Storing the log again would store that value in clear, so the replica stores nothing
+more of that step's log and logs a warning.
 
 Output the kubelet rotated away before the server read it is gone; the marker line does not
 recover it. Each of these reads also reads the stored part back from object storage to compare

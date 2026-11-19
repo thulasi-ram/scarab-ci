@@ -1208,6 +1208,12 @@ with `resources`:
   resources: { cpu_millis: 8000, memory_mib: 16384 }
 ```
 
+With the k8s executor, Scarab checks each name against the operator's profile registry when the
+Run is created. A name the registry does not hold refuses the Run, and the error names the step,
+the profile and the profiles the registry holds. `scarab validate --server` and the policy test
+report the same refusal. If the operator removes a profile after a Run was created, that Run's
+step fails to launch and is retried as a launch error.
+
 For a rare dynamic per-job Kubernetes need there is a governed `k8s_overlay` escape hatch: a raw
 pod-spec fragment merged last onto the Pod. Writing one grants nothing by itself: it is admitted only
 if the run's target environment permits raw overlays; otherwise the run is rejected (fail-closed). Prefer a named
@@ -1227,6 +1233,14 @@ set only these fields. Scarab refuses any other field when the Run is created, a
 its path. `scarab validate --server` and the policy test report the same refusals. The executor
 checks the same list again before it creates the Pod; an overlay refused there (after the
 operator changed the lists, for example) fails the step as a configuration error with the reason.
+
+An overlay that keeps to these fields can still make a Pod Kubernetes refuses, such as a
+`nodeSelector` value that is not a valid label value, or a memory request above the limit. When
+Kubernetes refuses the Pod as invalid, Scarab asks it whether the same Pod without the overlay is
+valid (a dry run, which creates nothing). If it is, the step fails as a configuration error with
+Kubernetes' message. If the Pod is invalid without the overlay too, the operator's baseline or a
+profile is at fault, and the launch is retried as a launch error. A refusal for quota or
+permissions is always a launch error.
 
 | Field | Why it is allowed |
 |-------|-------------------|
@@ -1255,7 +1269,9 @@ author_overlay:
 ```
 
 Each entry is an exact key, `prefix/*` for every key under that prefix, or `*` for every key with
-no prefix. Some keys stay refused even when listed: labels and annotations under `scarab.io/`,
+no prefix. An exact key matches only itself: `team` does not cover `team-admin`. A prefix holds no
+`/` of its own (`example.com/*`, not `example.com/x/*`), since a key has one `/` at most; the
+server refuses such an entry when it loads the config. Some keys stay refused even when listed: labels and annotations under `scarab.io/`,
 `scarab.dev/` and `app.kubernetes.io/`, the AppArmor and seccomp annotations, and tolerations of a
 `node-role.kubernetes.io/` taint or with an empty or missing `key`, which would let the Pod onto
 the control-plane nodes.
@@ -1336,9 +1352,10 @@ only to a step with `registry_auth` that the launch found eligible for a registr
 step from a library your org trusts with the registry credential, in a Run that is not a fork pull
 request or locked out of its Environment's secrets. It applies whether or not a credential
 resolves, so a profile that logs in itself works with no `REGISTRY_AUTH` secret
-([Pushing images to Amazon ECR](/scarab-ci/usage/pushing-to-ecr/)). Named on any other step it
-fails that step's launch; on a `registry_auth` step the launch did not find eligible it is left
-out. A marked profile cannot be the
+([Pushing images to Amazon ECR](/scarab-ci/usage/pushing-to-ecr/)). Named on a step without
+`registry_auth`, it refuses the Run when it is created (with the k8s executor), and the step fails
+as a configuration error if such a Run reaches launch; on a `registry_auth` step the launch did
+not find eligible it is left out. A marked profile cannot be the
 `default` ([Building an image](#building-an-image) shows the map form that routes one to the push
 step).
 
