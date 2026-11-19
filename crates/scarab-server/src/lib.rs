@@ -4672,7 +4672,7 @@ async fn debug_pod_step(
         .ok_or(ApiError::NotFound)?
         .clone();
     let step = StepId(step);
-    let (sr, image, snapshot) = debug_pod_plan(st.db.as_ref(), &run, &step).await?;
+    let (sr, image, resources, snapshot) = debug_pod_plan(st.db.as_ref(), &run, &step).await?;
     // ADR-0076 §6: a debug Pod runs the Step's image, so a Step inlined from
     // a yanked library version gets none, as a launch would not.
     refuse_yanked_step(&st, &run, &step, "no debug Pod starts").await?;
@@ -4685,7 +4685,7 @@ async fn debug_pod_step(
                 ))
                 .await;
             match launcher
-                .launch_debug(&sr, &image, snapshot.as_deref(), 3600)
+                .launch_debug(&sr, &image, &resources, snapshot.as_deref(), 3600)
                 .await
             {
                 Ok(dp) => {
@@ -4720,7 +4720,15 @@ async fn debug_pod_plan(
     db: &dyn Db,
     run: &RunId,
     step: &StepId,
-) -> Result<(scarab_engine::StepRun, String, Option<String>), ApiError> {
+) -> Result<
+    (
+        scarab_engine::StepRun,
+        String,
+        scarab_pipeline::Resources,
+        Option<String>,
+    ),
+    ApiError,
+> {
     let sr = db
         .steps_of_run(run)
         .await?
@@ -4737,7 +4745,7 @@ async fn debug_pod_plan(
             ApiError::BadRequest(format!("the step's image does not render: {reason}"))
         })?;
     let snapshot = db.step_output(run, step).await?;
-    Ok((sr, spec.image, snapshot))
+    Ok((sr, spec.image, spec.resources, snapshot))
 }
 
 /// In-repo directory holding pipeline definitions (ADR-0010). Every
@@ -15506,7 +15514,7 @@ mod debug_pod_tests {
         db.create_step_run(&run, &step, Some(&spec), &[], Timestamp(0))
             .await
             .unwrap();
-        let Ok((_, image, _)) = debug_pod_plan(&db, &run, &step).await else {
+        let Ok((_, image, _, _)) = debug_pod_plan(&db, &run, &step).await else {
             panic!("the debug Pod plan failed");
         };
         assert_eq!(image, "busybox:1.36-linux");
@@ -15525,7 +15533,7 @@ mod debug_pod_tests {
         match debug_pod_plan(&db, &run, &bad).await {
             Err(ApiError::BadRequest(m)) => assert!(m.contains("does not render"), "{m}"),
             Err(_) => panic!("expected a bad request"),
-            Ok((_, image, _)) => panic!("expected a refusal, got image {image}"),
+            Ok((_, image, _, _)) => panic!("expected a refusal, got image {image}"),
         }
     }
 }

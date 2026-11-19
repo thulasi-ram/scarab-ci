@@ -135,8 +135,9 @@ pub struct ResultsEgress {
     pub base_url: String,
     /// HMAC secret shared with the server; mints the per-step fence token.
     pub token_secret: Vec<u8>,
-    /// The sidecar image (a lightweight `scarab` CLI image; the CLI performs the
-    /// drain + confirmed POST). Kept configurable so the image is a deploy concern.
+    /// The sidecar image (sh + curl + jq; its entrypoint script performs the
+    /// drain + confirmed POST, see `docker/sidecar`). Kept configurable so the
+    /// image is a deploy concern.
     pub sidecar_image: String,
 }
 
@@ -3900,13 +3901,19 @@ pub struct DebugPod {
 /// workspace snapshot re-materialized at `/workspace` — running `sleep` so an
 /// operator can shell in. The debug Pod carries no hardened baseline (it runs as
 /// the image's own user, so any image can boot) and is not governed; it's a
-/// throwaway. Backends that can't reproduce return [`ExecError::Unavailable`].
+/// throwaway. `resources` is the step's own `resources`; the shell gets them
+/// the way the step container does, falling back per axis to the operator's
+/// `default_resources` (git-bug e8b5967). Placement layers (baseline, profiles,
+/// `k8s_overlay`) are not applied, so resources a layer set on the step Pod
+/// are not carried over. Backends that can't reproduce return
+/// [`ExecError::Unavailable`].
 #[async_trait]
 pub trait DebugLauncher: Send + Sync {
     async fn launch_debug(
         &self,
         step: &StepRun,
         image: &str,
+        resources: &scarab_pipeline::Resources,
         snapshot_root: Option<&str>,
         ttl_secs: u64,
     ) -> Result<DebugPod, ExecError>;
@@ -3920,6 +3927,7 @@ impl DebugLauncher for K8sExecutor {
         &self,
         step: &StepRun,
         image: &str,
+        resources: &scarab_pipeline::Resources,
         snapshot_root: Option<&str>,
         ttl_secs: u64,
     ) -> Result<DebugPod, ExecError> {
@@ -3973,6 +3981,7 @@ impl DebugLauncher for K8sExecutor {
             &self.namespace,
             step,
             image,
+            step_container_resources(resources, &self.placement.default_resources),
             ttl_secs,
             init_containers,
             volumes,
@@ -4023,13 +4032,16 @@ impl DebugLauncher for K8sExecutor {
 }
 
 /// The debug Pod (see [`DebugLauncher`]): `image` running `sleep ttl_secs` at
-/// `/workspace`, fed by `init_containers` (the workspace fetcher, when there is
-/// a snapshot to re-materialise) over `volumes`.
+/// `/workspace` with `shell_resources` (see [`step_container_resources`]), fed
+/// by `init_containers` (the workspace fetcher, when there is a snapshot to
+/// re-materialise) over `volumes`.
+#[allow(clippy::too_many_arguments)]
 fn build_debug_pod(
     name: &str,
     namespace: &str,
     step: &StepRun,
     image: &str,
+    shell_resources: Option<ResourceRequirements>,
     ttl_secs: u64,
     init_containers: Vec<Container>,
     volumes: Vec<Volume>,
@@ -4045,6 +4057,7 @@ fn build_debug_pod(
             mount_path: WORKSPACE_MOUNT_PATH.to_string(),
             ..Default::default()
         }]),
+        resources: shell_resources,
         ..Default::default()
     };
     let mut pod = Pod {
@@ -5248,22 +5261,15 @@ fn apply_placement(
     placement: &PlacementConfig,
 ) -> Result<Pod, String> {
     // 1. Container resources (typed) onto the step container, baseline-defaulted.
-    let cpu = spec
-        .resources
-        .cpu_millis
-        .or(placement.default_resources.cpu_millis);
-    let mem = spec
-        .resources
-        .memory_mib
-        .or(placement.default_resources.memory_mib);
-    if cpu.is_some() || mem.is_some() {
+    if let Some(resources) = step_container_resources(&spec.resources, &placement.default_resources)
+    {
         if let Some(pod_spec) = pod.spec.as_mut() {
             if let Some(c) = pod_spec
                 .containers
                 .iter_mut()
                 .find(|c| c.name == STEP_CONTAINER)
             {
-                c.resources = Some(resource_requirements(cpu, mem));
+                c.resources = Some(resources);
             }
         }
     }
@@ -5789,6 +5795,19 @@ fn resource_requirements(cpu_millis: Option<u32>, memory_mib: Option<u32>) -> Re
     }
 }
 
+/// The step container's resources: the step's own `resources`, each axis
+/// falling back to the operator's `default_resources` (ADR-0055). `None` when
+/// neither sets an axis, and the container then carries no resources. Used for
+/// the step container of a step Pod and the shell of a debug Pod.
+fn step_container_resources(
+    step: &scarab_pipeline::Resources,
+    defaults: &scarab_pipeline::Resources,
+) -> Option<ResourceRequirements> {
+    let cpu = step.cpu_millis.or(defaults.cpu_millis);
+    let mem = step.memory_mib.or(defaults.memory_mib);
+    (cpu.is_some() || mem.is_some()).then(|| resource_requirements(cpu, mem))
+}
+
 /// `ResourceRequirements` with a CPU request, an optional CPU limit, and a
 /// memory request and limit: the three fields a require-resource-limits
 /// admission policy checks (`requests.cpu`, `requests.memory`,
@@ -5939,8 +5958,9 @@ fn egress_sidecar(
             read_only: Some(true),
             ..results_mount.clone()
         }]),
-        // The sidecar image's entrypoint (the `scarab` CLI) performs the drain +
-        // confirmed POST on shutdown; the command is left to the image.
+        // The sidecar image's entrypoint (`scarab-results-egress.sh`, an sh +
+        // curl + jq script; see docker/sidecar) performs the drain + confirmed
+        // POST on shutdown; the command is left to the image.
         ..Default::default()
     }
 }
@@ -8986,6 +9006,7 @@ mod tests {
             "ns",
             &step,
             "busybox",
+            None,
             300,
             vec![],
             vec![workspace_token_volume("scarab-debug-x")],
@@ -9010,9 +9031,12 @@ mod tests {
     /// checkout Pod, because the containers Scarab adds carried no resources.
     /// Every container Scarab adds must set all three, on the fullest Step
     /// Pod (results sidecar, workspace fetcher, workspace egress helper), on
-    /// the checkout shape (workspace, no inputs) and on a debug Pod with a
-    /// snapshot to fetch. Sidecar services are the author's containers and
-    /// are not checked here.
+    /// the checkout shape (workspace, no inputs) and on a debug Pod's
+    /// workspace fetcher. The debug shell gets the step container's
+    /// resources: with the step's own cpu and the operator's default memory it
+    /// passes too, and with neither set it carries none (the step container's
+    /// behaviour). Sidecar services are the author's containers and are not
+    /// checked here.
     #[test]
     fn every_container_scarab_adds_sets_requests_and_a_memory_limit() {
         let egress = ResultsEgress {
@@ -9046,11 +9070,23 @@ mod tests {
             mount_path: WORKSPACE_MOUNT_PATH.to_string(),
             ..Default::default()
         };
+        // The step sets cpu, the operator's default resources set memory.
+        let shell_resources = step_container_resources(
+            &scarab_pipeline::Resources {
+                cpu_millis: Some(500),
+                memory_mib: None,
+            },
+            &scarab_pipeline::Resources {
+                cpu_millis: Some(250),
+                memory_mib: Some(1024),
+            },
+        );
         let debug_pod = build_debug_pod(
             "scarab-debug-x",
             "ns",
             &step,
             "busybox",
+            shell_resources.clone(),
             300,
             vec![workspace_fetch_container(
                 "scarab-debug-x",
@@ -9080,10 +9116,8 @@ mod tests {
             ),
             ("debug", debug_pod, vec![WORKSPACE_INIT_CONTAINER]),
         ] {
-            let scarab_added: Vec<&Container> = pod
-                .spec
-                .as_ref()
-                .unwrap()
+            let ps = pod.spec.as_ref().unwrap();
+            let scarab_added: Vec<&Container> = ps
                 .init_containers
                 .as_ref()
                 .unwrap()
@@ -9092,7 +9126,12 @@ mod tests {
                 .collect();
             let names: Vec<&str> = scarab_added.iter().map(|c| c.name.as_str()).collect();
             assert_eq!(names, expected, "{what}: the containers Scarab adds");
-            for c in scarab_added {
+            // The debug Pod's own containers (the shell) are checked too.
+            let debug_containers = (what == "debug").then_some(&ps.containers);
+            for c in scarab_added
+                .into_iter()
+                .chain(debug_containers.into_iter().flatten())
+            {
                 let res = c
                     .resources
                     .as_ref()
@@ -9108,6 +9147,37 @@ mod tests {
                 }
             }
         }
+
+        let shell = |resources: Option<ResourceRequirements>| {
+            build_debug_pod(
+                "scarab-debug-x",
+                "ns",
+                &step,
+                "busybox",
+                resources,
+                300,
+                vec![],
+                vec![],
+            )
+            .spec
+            .unwrap()
+            .containers
+            .remove(0)
+            .resources
+        };
+        let configured = shell(shell_resources).unwrap();
+        let requests = configured.requests.unwrap();
+        assert_eq!(requests.get("cpu"), Some(&Quantity("500m".into())));
+        assert_eq!(requests.get("memory"), Some(&Quantity("1024Mi".into())));
+        let unset = step_container_resources(
+            &scarab_pipeline::Resources::default(),
+            &scarab_pipeline::Resources::default(),
+        );
+        assert_eq!(
+            shell(unset),
+            None,
+            "nothing set: the shell has no resources"
+        );
     }
 
     /// The ADR-0061 workspace service, as a Step Pod is told about it.

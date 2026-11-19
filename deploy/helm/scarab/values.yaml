@@ -475,9 +475,22 @@ workspace:
   # clusters that enforce a require-resource-limits policy refuse a container
   # with no memory limit). The default limit is high on purpose: a 512Mi
   # default was rejected because it would OOM-kill a workspace holding one
-  # large file (e140121 review), and 4096Mi fits files up to about 3.5 GiB. It derives no budget; the wsfetch
-  # binary's own 256 MiB transfer budget applies. Set a value to get
-  # requests==limits and the derived budget. 0 = explicitly unset (same as "").
+  # large file (e140121 review), and 4096Mi fits files up to about 3.5 GiB.
+  # It derives no budget; the wsfetch binary's own 256 MiB transfer budget
+  # applies. Set a value to get requests==limits and the derived budget.
+  # 0 = explicitly unset (same as "").
+  #
+  # In a namespace that limits memory, the 4096Mi default has two effects: a
+  # LimitRange with a maximum container memory below 4Gi, or a maximum
+  # limit-to-request ratio below 64, refuses the Pod; a ResourceQuota on
+  # limits.memory counts the 4096Mi. Set a lower value here to fit either.
+  #
+  # These defaults cover Scarab's own helper containers only (with the
+  # results sidecar). The step container and a debug Pod's shell pass a
+  # require-resource-limits policy only when the step's `resources` or
+  # `scarab.placement`'s default_resources set both cpu_millis and
+  # memory_mib (each becomes the request and the limit). Service containers
+  # carry no resources yet, so such a policy refuses a step with services.
   helperMemoryMib: ""
   # Millicpu for the same two containers, requests==limits. "" = a 50m request
   # and no CPU limit (the default: a CPU limit throttles the drain's hashing,

@@ -953,6 +953,7 @@ async fn yank_refuses_a_debug_pod_of_a_yanked_library_step() {
             &self,
             step: &StepRun,
             image: &str,
+            _resources: &scarab_pipeline::Resources,
             _snapshot_root: Option<&str>,
             _ttl_secs: u64,
         ) -> Result<scarab_executor_k8s::DebugPod, ExecError> {
