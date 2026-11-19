@@ -201,20 +201,10 @@ export function artifactGroups<A extends ArtifactLike>(
 
 // ── Try tabs ────────────────────────────────────────────────────────────────
 
-/**
- * The try tabs: the newest `max` tries as tabs, newest first, and the rest in
- * an "Earlier tries" menu, also newest first. `selectedEarlier` says the
- * selected try is in the menu, so its trigger names it.
- */
-export function foldTries<T extends { id: string }>(
-  tries: T[],
-  selected: string | null,
-  max = 4,
-): { shown: T[]; earlier: T[]; selectedEarlier: boolean } {
-  const newest = [...tries].reverse();
-  const shown = newest.slice(0, max);
-  const earlier = newest.slice(max);
-  return { shown, earlier, selectedEarlier: selected !== null && earlier.some((t) => t.id === selected) };
+/** The try tabs' order: every try, newest first. The row scrolls sideways
+ * when they do not fit. */
+export function tabTries<T>(tries: T[]): T[] {
+  return [...tries].reverse();
 }
 
 /** "Tries", or "Waits" for a gate's tries. */

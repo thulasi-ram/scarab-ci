@@ -322,22 +322,19 @@ test("run tabs: the Activity filter hides cleared Pod conditions, Artifacts show
   await expect(page.locator(".art-row", { hasText: "e2e · try 1" })).toContainText("from a failed try");
 });
 
-test("try tabs: newest first, earlier tries in a menu, and tries nested in the List view", async ({ page }) => {
+test("try tabs: every try newest first in one row, and tries nested in the List view", async ({ page }) => {
   // e2e is step 2: six tries, the sixth passed.
   await page.goto(`/acme/scarab/runs/${RETRIES_RUN_ID}?step=2`);
   const sp = page.locator(".sp-head");
   await expect(sp).toContainText("Try 6 of 6");
   const tries = page.getByRole("tablist", { name: "Tries of this step" });
-  // The newest four as tabs, newest first; the rest in a menu.
-  await expect(tries.getByRole("tab")).toHaveCount(4);
+  // Every try is a tab, newest first; nothing folds into a menu.
+  await expect(tries.getByRole("tab")).toHaveCount(6);
   await expect(tries.getByRole("tab").first()).toContainText("Try 6 · passed");
   await expect(tries.getByRole("tab").first()).toContainText("of record");
-  await expect(tries.getByRole("tab").last()).toContainText("Try 3 · failed: timed out");
-  const earlier = page.getByRole("button", { name: /^Earlier tries \(2\)/ });
-  await earlier.click();
-  await page.getByRole("menuitemradio", { name: /Try 1/ }).click();
-  // The menu's trigger names the selected try.
-  await expect(page.getByRole("button", { name: "Try 1", exact: true })).toBeVisible();
+  await expect(tries.getByRole("tab").last()).toContainText("Try 1 · failed: step error");
+  await expect(page.getByRole("button", { name: /^Earlier tries/ })).toHaveCount(0);
+  await tries.getByRole("tab", { name: /Try 1 ·/ }).click();
   await expect(sp).toContainText("Try 1 of 6");
   await expect(page).toHaveURL(/[?&]try=1(&|$)/);
   await expect(page.locator(".sp-box")).toContainText("Not the latest try: try 6 passed");
@@ -347,7 +344,6 @@ test("try tabs: newest first, earlier tries in a menu, and tries nested in the L
   const unitTries = page.getByRole("tablist", { name: "Tries of this step" });
   await expect(unitTries.getByRole("tab")).toHaveCount(3);
   await expect(unitTries.getByRole("tab").first()).toContainText("retried by a.kim");
-  await expect(page.getByRole("button", { name: /^Earlier tries/ })).toHaveCount(0);
 
   // The List view nests each step's tries; a try row opens that try.
   await page.getByRole("button", { name: /^List/ }).click();
@@ -356,10 +352,12 @@ test("try tabs: newest first, earlier tries in a menu, and tries nested in the L
   await expect(sp).toContainText("Try 2 of 3");
   await expect(page).toHaveURL(/[?&]try=2(&|$)/);
 
-  // A narrow screen gets the dropdown instead of the tabs.
+  // A narrow screen keeps the same row; it scrolls sideways instead of
+  // turning into a dropdown.
   await page.setViewportSize({ width: 600, height: 900 });
-  await expect(page.getByRole("tablist", { name: "Tries of this step" })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: /^Try 2 of 3/ })).toBeVisible();
+  await expect(page.getByRole("tablist", { name: "Tries of this step" }).getByRole("tab")).toHaveCount(3);
+  await expect(page.getByRole("button", { name: /^Try 2 of 3/ })).toHaveCount(0);
+  await expect(sp).toContainText("Try 2 of 3");
 });
 
 // The page polls a live run every 1.2s and its clock ticks every second.

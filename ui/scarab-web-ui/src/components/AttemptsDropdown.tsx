@@ -3,7 +3,6 @@
 // 3 ▾", and whose menu lists every try newest first: its outcome and failure,
 // why it exists (first run, automatic retry, retried by someone) and when it
 // started, and how long it took. A gate's tries are its waits: "Wait 2 of 3".
-// The menu itself (`TryMenu`) also serves the try tabs' "Earlier tries" menu.
 // Page chrome, so it reads the page tokens, not the graph canvas ones.
 import { For, Show, createSignal, onCleanup, onMount, type JSX } from "solid-js";
 import { causeText, type FilmstripTry } from "../attempts";

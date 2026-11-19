@@ -2,8 +2,8 @@
 // the selected try ("Try 2 of 3"), what that try did ("✕ Failed after
 // 2m06s: step error"), a link to the step's artifacts and the step's actions
 // (Retry step, Rerun from here, Debug pod, handed in by the page). A step with
-// two or more tries gets a row of try tabs under the header; on a narrow
-// screen the header's "Try 2 of 3 ▾" dropdown picks instead. A box below
+// two or more tries gets a row of try tabs under the header, every try,
+// scrolling sideways when they do not fit. A box below
 // says why the try failed, what holds it back, or where a step that did not
 // run in this version was reused from. Every content tab (Logs, Results, Workspace) is
 // scoped to the selected try and says so; Outputs reads the try of record and
@@ -145,15 +145,9 @@ export default function StepPane(props: {
   reused?: boolean;
 }) {
   const [tab, setTab] = createSignal<PaneTab>(props.initialTab ?? "logs");
-  // Below 640px the try tabs do not fit: the header's dropdown picks instead.
-  const narrowQuery = typeof window !== "undefined" && window.matchMedia ? window.matchMedia("(max-width: 639px)") : null;
-  const [narrow, setNarrow] = createSignal(narrowQuery?.matches ?? false);
-  if (narrowQuery) {
-    const onNarrow = (e: MediaQueryListEvent) => setNarrow(e.matches);
-    narrowQuery.addEventListener("change", onNarrow);
-    onCleanup(() => narrowQuery.removeEventListener("change", onNarrow));
-  }
-  const tryTabs = () => props.tries.length > 1 && !narrow();
+  // Two or more tries get the try tabs (a row that scrolls sideways at every
+  // width); the header then names the selected try as text.
+  const tryTabs = () => props.tries.length > 1;
   createEffect(() => props.onTabChange?.(tab()));
   // A plugin gate opens on its Gate tab; any other step never
   // stays on one.

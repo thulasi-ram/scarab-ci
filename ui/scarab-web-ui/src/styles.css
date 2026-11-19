@@ -3428,11 +3428,13 @@ h1, .crumb-head, .run-title {
 .tl-still { color: var(--warn); }
 
 /* Try tabs under the step header. */
+/* Every try in one row, newest first; the row scrolls sideways when the
+   tries do not fit, at every width. */
 .trytabs {
-  display: flex; align-items: stretch; gap: 2px; overflow-x: auto;
+  display: flex; flex-wrap: nowrap; align-items: stretch; gap: 2px; overflow-x: auto;
   padding: 0 8px; border-bottom: 1px solid var(--border-soft);
 }
-.trytabs-list { display: flex; gap: 2px; }
+.trytabs .tt { flex: none; }
 .tt {
   display: flex; flex-direction: column; gap: 1px; text-align: left; white-space: nowrap;
   font: var(--t-label); color: var(--sage);
@@ -3453,9 +3455,6 @@ h1, .crumb-head, .run-title {
 .tt-g.muted { color: var(--muted-sage); }
 .tt-dur { font: var(--t-mono); color: var(--muted-sage); }
 .tt-rec { font: var(--t-mono); color: var(--ok-ink); border: 1px solid var(--ok-ink); border-radius: 8px; padding: 0 6px; }
-.trytabs .adrop { display: flex; }
-.tt.tt-more { flex-direction: row; align-items: center; gap: 6px; color: var(--emerald); }
-.tt.tt-more.on { color: var(--display-ink); }
 
 @media (max-width: 640px) {
   .rh-actions { margin-left: 0; }

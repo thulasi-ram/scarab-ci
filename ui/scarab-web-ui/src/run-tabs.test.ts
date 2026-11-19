@@ -10,12 +10,12 @@ import {
   artifactGroups,
   artifactsInScope,
   copyMark,
-  foldTries,
   isTriggerEvent,
   nestedTries,
   pluralNoun,
   resolutionWords,
   shownArtifacts,
+  tabTries,
   triggerLine,
   tryDurationMs,
   tryWords,
@@ -170,20 +170,9 @@ describe("artifacts", () => {
 describe("try tabs", () => {
   const tries = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `a${i + 1}` }));
 
-  it("shows every try newest first up to four", () => {
-    const f = foldTries(tries(3), "a1");
-    expect(f.shown.map((t) => t.id)).toEqual(["a3", "a2", "a1"]);
-    expect(f.earlier).toEqual([]);
-    expect(f.selectedEarlier).toBe(false);
-  });
-
-  it("folds the older tries into the menu past four", () => {
-    const f = foldTries(tries(6), "a6");
-    expect(f.shown.map((t) => t.id)).toEqual(["a6", "a5", "a4", "a3"]);
-    expect(f.earlier.map((t) => t.id)).toEqual(["a2", "a1"]);
-    expect(f.selectedEarlier).toBe(false);
-    expect(foldTries(tries(6), "a2").selectedEarlier).toBe(true);
-    expect(foldTries(tries(6), null).selectedEarlier).toBe(false);
+  it("lists every try newest first, however many there are", () => {
+    expect(tabTries(tries(6)).map((t) => t.id)).toEqual(["a6", "a5", "a4", "a3", "a2", "a1"]);
+    expect(tabTries(tries(1)).map((t) => t.id)).toEqual(["a1"]);
   });
 
   it("names a try's outcome", () => {
