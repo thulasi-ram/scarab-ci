@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1795124070,"nonce":"XubiS/9+TY+vj18fXuPxue0UyOM=","message":"Fixed in PR #199 (squash 48d462c2 on main), 2026-11-20; ships in 0.5.0.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1795124070,"nonce":"M9YLYGZ/ZT4ohHVfjlexpsQrM8Y=","status":2}]}
