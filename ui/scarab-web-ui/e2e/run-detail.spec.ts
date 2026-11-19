@@ -134,6 +134,10 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   await expect(page.getByRole("tab", { name: /^Artifacts 1/ })).toHaveAttribute("aria-selected", "true");
   await expect(page).toHaveURL(/[?&]tab=artifacts(&|$)/);
   await expect(page.getByText("Showing artifacts from build")).toBeVisible();
+  // The filter is in the URL by the step's index, and a reload keeps it.
+  await expect(page).toHaveURL(/[?&]from=1(&|$)/);
+  await page.reload();
+  await expect(page.getByText("Showing artifacts from build")).toBeVisible();
   await expect(page.getByRole("link", { name: "scarab-dist.tar.gz" })).toBeVisible();
   // The row names the try the way the try tabs count it: build's a3 is its
   // second try in the latest version.
@@ -142,6 +146,7 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   await expect(row.getByText("of record", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Show all" }).click();
   await expect(page.getByText("Showing artifacts from build")).toHaveCount(0);
+  await expect(page).not.toHaveURL(/[?&]from=/);
 });
 
 // The ENVIRONMENT GATE run in src/mock.ts: a deploy into production with a

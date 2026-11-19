@@ -137,7 +137,8 @@ export default function RunDetail() {
   // The URL's selection, read once: it beats the default selection on load.
   const urlInit: RunUrlState = parseRunUrl(searchParams);
   // The open run tab, and the step the Artifacts tab is narrowed to (set by a
-  // step header's "N artifacts" link, cleared by "Show all").
+  // step header's "N artifacts" link or the URL's `from`, cleared by "Show
+  // all").
   const [runTab, setRunTab] = createSignal<RunTab>(urlInit.tab ?? "pipeline");
   const [artifactStep, setArtifactStep] = createSignal<string | null>(null);
   const openArtifacts = (step: string | null) => {
@@ -509,6 +510,7 @@ export default function RunDetail() {
       triesOf: (i, v) => triesIn(i, v).length,
     });
     if (want.v !== undefined) setViewTake(want.v);
+    if (want.from !== undefined) setArtifactStep(status.steps[want.from]!.id);
     if (want.step !== undefined) {
       if (want.try !== undefined) pendingTry = triesIn(want.step, want.v ?? ts.length)[want.try - 1] ?? null;
       setSel(status.steps[want.step]!.id);
@@ -598,6 +600,11 @@ export default function RunDetail() {
     const st: RunUrlState = {};
     const rt = runTab();
     if (rt !== "pipeline") st.tab = rt;
+    const only = artifactStep();
+    if (rt === "artifacts" && only) {
+      const i = r.steps.findIndex((x) => x.id === only);
+      if (i >= 0) st.from = i;
+    }
     const pt = paneTabParam(paneTab());
     if (pt) st.ptab = pt;
     if (s?.startsWith(SERVICE_PREFIX)) {

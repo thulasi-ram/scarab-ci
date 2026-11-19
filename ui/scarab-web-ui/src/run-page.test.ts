@@ -200,6 +200,12 @@ describe("parseRunUrl", () => {
   it("takes the first of a repeated param", () => {
     expect(parseRunUrl({ step: ["2", "5"] })).toEqual({ step: 2 });
   });
+
+  it("reads the Artifacts step filter only with the Artifacts tab", () => {
+    expect(parseRunUrl({ tab: "artifacts", from: "2" })).toEqual({ tab: "artifacts", from: 2 });
+    expect(parseRunUrl({ from: "2" })).toEqual({});
+    expect(parseRunUrl({ tab: "artifacts", from: "build" })).toEqual({ tab: "artifacts" });
+  });
 });
 
 describe("clampRunUrl", () => {
@@ -228,6 +234,11 @@ describe("clampRunUrl", () => {
     expect(clampRunUrl({ step: 1, try: 3 }, ctx)).toEqual({ step: 1, try: 3 });
   });
 
+  it("drops an Artifacts step filter past the end", () => {
+    expect(clampRunUrl({ tab: "artifacts", from: 3 }, ctx)).toEqual({ tab: "artifacts", from: 3 });
+    expect(clampRunUrl({ tab: "artifacts", from: 4 }, ctx)).toEqual({ tab: "artifacts" });
+  });
+
   it("keeps a service until the list loads, then drops one past the end; a step wins", () => {
     expect(clampRunUrl({ service: 5 }, { ...ctx, services: null })).toEqual({ service: 5 });
     expect(clampRunUrl({ service: 5 }, ctx)).toEqual({});
@@ -244,11 +255,13 @@ describe("runUrlParams", () => {
       try: "2",
       tab: undefined,
       ptab: undefined,
+      from: undefined,
     });
+    expect(runUrlParams({ tab: "activity", from: 1 }).from).toBeUndefined();
   });
 
   it("round-trips through parseRunUrl", () => {
-    const s = { service: 1, v: 2, tab: "artifacts" as const, ptab: "workspace" as const };
+    const s = { service: 1, v: 2, tab: "artifacts" as const, ptab: "workspace" as const, from: 3 };
     const params = runUrlParams(s);
     expect(parseRunUrl(params)).toEqual(s);
   });

@@ -291,6 +291,8 @@ export type PaneTabParam = "results" | "workspace" | "outputs" | "source";
  * - `v`: the version in view, only when it is not the latest.
  * - `try`: the try number within that version, only when the user picked one.
  * - `tab`: the run tab (absent = pipeline); `ptab`: the step tab (absent = logs).
+ * - `from`: 0-based index into the run's steps whose files the Artifacts tab
+ *   shows; only with `tab=artifacts`.
  */
 export type RunUrlState = {
   step?: number;
@@ -299,6 +301,7 @@ export type RunUrlState = {
   try?: number;
   tab?: RunTabParam;
   ptab?: PaneTabParam;
+  from?: number;
 };
 
 type Params = Record<string, string | string[] | null | undefined>;
@@ -327,19 +330,22 @@ export function parseRunUrl(params: Params): RunUrlState {
   const tryN = nat(first(params.try), 1);
   const tab = first(params.tab);
   const ptab = first(params.ptab);
+  const from = nat(first(params.from), 0);
   if (step !== undefined) out.step = step;
   if (service !== undefined) out.service = service;
   if (v !== undefined) out.v = v;
   if (tryN !== undefined) out.try = tryN;
   if (tab && RUN_TABS.includes(tab)) out.tab = tab as RunTabParam;
   if (ptab && PANE_TABS.includes(ptab)) out.ptab = ptab as PaneTabParam;
+  if (from !== undefined && out.tab === "artifacts") out.from = from;
   return out;
 }
 
 /**
  * Drop every param that does not exist in this run: a step or service index
  * past the end, a version past the last (or the latest itself, which is the
- * absence of `v`), a try past the version's tries. A step wins over a service
+ * absence of `v`), a try past the version's tries, an Artifacts step filter
+ * past the end or without the Artifacts tab. A step wins over a service
  * when both are given. `services` null means the list has not loaded, so a
  * service index is kept for now.
  */
@@ -356,6 +362,7 @@ export function clampRunUrl(
   const out: RunUrlState = {};
   if (s.tab) out.tab = s.tab;
   if (s.ptab) out.ptab = s.ptab;
+  if (s.from !== undefined && s.tab === "artifacts" && s.from < ctx.steps) out.from = s.from;
   if (s.v !== undefined && s.v < ctx.versions) out.v = s.v;
   if (s.step !== undefined && s.step < ctx.steps) {
     out.step = s.step;
@@ -377,6 +384,7 @@ export function runUrlParams(s: RunUrlState): Record<string, string | undefined>
     try: s.step === undefined ? undefined : str(s.try),
     tab: s.tab,
     ptab: s.ptab,
+    from: s.tab === "artifacts" ? str(s.from) : undefined,
   };
 }
 
