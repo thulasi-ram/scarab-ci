@@ -445,10 +445,14 @@ Its outputs:
   there is no such result, and a step that reads it fails before it launches, so read it only
   where the image is pushed.
 - `outputs.image.image` is what BuildKit wrote with `--metadata-file`: a JSON object whose
-  `containerimage.digest` is the digest of the image it built. crane pushes the layout's manifest
-  unchanged, so this is also the digest in the registry, unless the Dockerfile changed the layout
-  after BuildKit wrote it (a `RUN` shares the build step's Pod). In `env:` it becomes that
-  object's compact JSON text.
+  `containerimage.digest` is the digest of the image it built. Before it pushes, the push step
+  checks that the layout's `index.json` names one manifest, that the manifest's file hashes to
+  that digest, and that the digest is the build step's `containerimage.digest`. It refuses
+  (exit 2) a layout that fails any of these, for example one that a process left behind by a
+  `RUN` rewrote after BuildKit wrote it, and fails if crane reports another digest, so this digest
+  and `outputs.image.push.digest` are the same. When the server collects no step results, there
+  is no `image` result to compare, and the push step checks only the layout. In `env:` this output
+  becomes that object's compact JSON text.
 
 - **The registry credential.** Only the push step asks for `registry_auth: true`. It receives a
   credential only when the org trusts the library's source with the registry credential

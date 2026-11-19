@@ -29,8 +29,11 @@
 #                registry credential when the org trusts this source with
 #                forge credentials) at /scarab/registry/config.json and points
 #                DOCKER_CONFIG at it, when the org trusts this source with the
-#                registry credential. It runs no code from the repository, and
-#                it removes the layout from its own workspace, so a Step that
+#                registry credential. It runs no code from the repository. It
+#                pushes the layout only when its manifest has the digest
+#                BuildKit reported to the build Step (passed through the build
+#                Step's `image` result), and it removes the layout from its
+#                own workspace, so a Step that
 #                needs only the invoke does not receive it. A Step that reads
 #                `outputs.image.image` needs the build Step too and receives
 #                the layout through the build Step's workspace: read
@@ -44,10 +47,10 @@
 #                               by this digest.
 #   ${{ outputs.image.image }}  what buildctl wrote with `--metadata-file`; its
 #                               `containerimage.digest` is the digest of the
-#                               image built. crane pushes the layout's manifest
-#                               unchanged, so it is also the pushed digest
-#                               unless the Dockerfile changed the layout after
-#                               BuildKit wrote it (a RUN shares the build Pod).
+#                               image built. When Scarab collects results, the
+#                               push Step pushes only a layout whose manifest
+#                               has that digest, and fails (exit 2) on any
+#                               other, so the two digests match.
 #
 # A fork pull request, or a Run locked out of its Environment's secrets, gets
 # no registry credential, and Scarab tells both Steps so with
@@ -301,6 +304,9 @@ steps:
       - [SCARAB_BUILD_IMAGE, "${{ inputs.image }}"]
       - [SCARAB_BUILD_PUSH, "${{ inputs.push }}"]
       - [SCARAB_BUILD_INSECURE_PUSH, "${{ inputs.insecure_push }}"]
+      # The digest BuildKit reported for the image it built (the build Step's
+      # `image` result), or empty when the build Step published no result.
+      - [SCARAB_BUILD_DIGEST, "${{ has(outputs.image) && has(outputs.image.image) && 'containerimage.digest' in outputs.image.image ? outputs.image.image['containerimage.digest'] : '' }}"]
     command:
       - /busybox/sh
       - -c
@@ -376,6 +382,33 @@ steps:
         odd=$(find "$layout" ! -type f ! -type d | head -n 1)
         [ -z "$odd" ] ||
           fail "the image layout holds $odd, which is not a regular file or a directory"
+        # The layout must hold the image the build Step built: a process a
+        # Dockerfile RUN left behind could rewrite it after BuildKit wrote it.
+        # Its index.json must name one manifest, that manifest's file must
+        # hash to its name, and, when Scarab collects results
+        # (/scarab/results exists), its digest must be the one BuildKit
+        # reported (the build Step's `image` result).
+        [ -f "$layout/index.json" ] || fail "the image layout has no index.json"
+        found=$(grep -o '"digest" *: *"sha256:[0-9a-f]\{64\}"' "$layout/index.json") || found=
+        case "$found" in
+          "" | *"$nl"*) fail "the image layout's index.json does not name exactly one image" ;;
+        esac
+        built=${found##*\"sha256:}
+        built=sha256:${built%\"}
+        blob=$layout/blobs/sha256/${built#sha256:}
+        [ -f "$blob" ] || fail "the image layout has no manifest $built"
+        sum=$(sha256sum < "$blob") || fail "cannot hash the manifest $built"
+        [ "sha256:${sum%% *}" = "$built" ] ||
+          fail "the manifest in the image layout does not hash to its digest $built"
+        want=${SCARAB_BUILD_DIGEST-}
+        if [ -n "$want" ]; then
+          [ "$want" = "$built" ] ||
+            fail "the image layout holds $built, but the build step built $want"
+        elif [ -d /scarab/results ]; then
+          fail "the build step reported no image digest (its image result has no containerimage.digest)"
+        else
+          echo "scarab: results are not collected, so the layout is not checked against the build step's digest" >&2
+        fi
         # crane's --insecure also skips TLS verification, so a registry
         # login (the credential mount, or a profile's /ecr-login) would go
         # to whoever answers at the image's host.
@@ -399,6 +432,10 @@ steps:
           *[!0-9a-f]*) echo "scarab: crane reported $ref" >&2; exit 1 ;;
         esac
         [ "${#hex}" -eq 64 ] || { echo "scarab: crane reported $ref" >&2; exit 1; }
+        if [ "$digest" != "$built" ]; then
+          echo "scarab: crane pushed $ref, but the image layout holds $built" >&2
+          exit 1
+        fi
         echo "scarab: pushed $ref"
         # The pushed reference is the Step's `push` result when Scarab
         # collects results (/scarab/results exists).

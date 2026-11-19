@@ -10871,6 +10871,68 @@ mod tests {
         );
     }
 
+    /// The push Step receives the digest BuildKit reported for the image the
+    /// build Step built (`containerimage.digest` in its `image` result) as
+    /// `SCARAB_BUILD_DIGEST`, and an empty value when the build Step
+    /// published no such result, so that the Step's script, not the
+    /// template, decides what a missing digest means.
+    #[test]
+    fn the_push_step_receives_the_digest_the_build_step_reported() {
+        let ir = compile_with_libraries(
+            "steps:\n  - id: image\n    invoke: lib:thulasi-ram::scarab-ci::build\n    \
+             with: { image: registry.example/app:1, push: \"true\" }\n",
+            &with_build_library(),
+        )
+        .unwrap();
+        let push = ir.steps.iter().find(|s| s.id == "image/push").unwrap();
+        assert_eq!(push.needs.0, vec!["image/image".to_string()]);
+        let launch = |results: &Results| {
+            render(
+                Templates {
+                    image: &push.image,
+                    command: &push.command,
+                    env: &push.env,
+                },
+                push.scope.as_ref(),
+                &push.matrix_values,
+                Facts::Launch {
+                    params: &BTreeMap::new(),
+                    declared: &[],
+                    results,
+                    event: &serde_json::Map::new(),
+                },
+            )
+            .unwrap()
+            .env
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()["SCARAB_BUILD_DIGEST"]
+                .clone()
+        };
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let built = |image: serde_json::Value| {
+            Results::from([(
+                "image/image".to_string(),
+                BTreeMap::from([("image".to_string(), image)]),
+            )])
+        };
+        assert_eq!(
+            launch(&built(json!({
+                "containerimage.digest": digest,
+                "containerimage.descriptor": { "digest": digest, "size": 2 },
+            }))),
+            digest
+        );
+        assert_eq!(launch(&built(json!({ "image.name": "x" }))), "");
+        assert_eq!(launch(&Results::new()), "");
+        assert_eq!(
+            launch(&Results::from([(
+                "image/image".to_string(),
+                BTreeMap::new()
+            )])),
+            ""
+        );
+    }
+
     // Attack: a branch name (git allows `,` and `=`) templated into the build library's `image` and `cache_name` adds buildctl output options to the build Step, or crane arguments to the push Step, when it launches. Safe outcome: the rendered value fails the input's `validate:` rule and the launch of either Step is refused; a plain branch renders.
     #[test]
     fn the_build_library_refuses_a_branch_name_that_adds_buildctl_options_at_launch() {

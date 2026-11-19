@@ -9871,14 +9871,23 @@ mod tests {
         assert_eq!(run(&[("SCARAB_BUILD_CACHE", "registry")]), (Some(2), false));
     }
 
+    /// The manifest [`write_layout`] puts in a layout, and its digest.
+    #[cfg(unix)]
+    const LAYOUT_MANIFEST: &str = "{}";
+    #[cfg(unix)]
+    const LAYOUT_DIGEST: &str =
+        "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+
     /// The push Step's script from `libs/build.yaml`, pointed at a temp
     /// workspace holding the layout the build Step writes, a temp results
     /// directory, and a stub `crane` that records its args, one per line, in
-    /// `called` and prints the reference crane prints. Returns the temp dir
+    /// `called` and prints the reference crane prints (with the layout's
+    /// digest, or `CRANE_DIGEST` when a case sets it). Returns the temp dir
     /// (workspace at `workspace/`, results at `results/`, a `registry/`
     /// beside them standing in for the credential mount) and a runner giving
     /// `(exit code, reached crane)` for the given values; the ones not given
-    /// push `registry.example/app:1` from a non-fork Run.
+    /// push `registry.example/app:1` from a non-fork Run whose build Step
+    /// reported the layout's digest.
     #[cfg(unix)]
     fn push_library_harness() -> (
         tempfile::TempDir,
@@ -9901,9 +9910,8 @@ mod tests {
         std::fs::write(
             &stub,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho registry.example/app@sha256:{}\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho registry.example/app@${{CRANE_DIGEST:-{LAYOUT_DIGEST}}}\n",
                 record.display(),
-                "ab".repeat(32)
             ),
         )
         .unwrap();
@@ -9926,6 +9934,7 @@ mod tests {
                 ("SCARAB_BUILD_IMAGE", "registry.example/app:1"),
                 ("SCARAB_BUILD_PUSH", "true"),
                 ("SCARAB_BUILD_INSECURE_PUSH", "false"),
+                ("SCARAB_BUILD_DIGEST", LAYOUT_DIGEST),
                 ("SCARAB_FORK_PR", "false"),
             ] {
                 cmd.env(name, value);
@@ -9939,16 +9948,43 @@ mod tests {
         (tmp, run)
     }
 
+    /// The `index.json` of a layout whose manifests are `digests`, written
+    /// the way BuildKit writes it.
+    #[cfg(unix)]
+    fn layout_index(digests: &[&str]) -> String {
+        let manifests: Vec<String> = digests
+            .iter()
+            .map(|d| {
+                format!(
+                    r#"{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{d}","size":2,"annotations":{{"org.opencontainers.image.ref.name":"1"}}}}"#
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{}]}}"#,
+            manifests.join(",")
+        )
+    }
+
     /// Writes the layout the build Step leaves in `ws`: plain directories
-    /// and regular files.
+    /// and regular files, with an index.json naming one manifest,
+    /// [`LAYOUT_MANIFEST`], stored under its digest [`LAYOUT_DIGEST`].
     #[cfg(unix)]
     fn write_layout(ws: &std::path::Path) {
         let blobs = ws.join(".scarab-build/oci/blobs/sha256");
         std::fs::create_dir_all(&blobs).unwrap();
         std::fs::create_dir_all(ws.join(".scarab-build/oci/ingest")).unwrap();
         std::fs::write(ws.join(".scarab-build/oci/oci-layout"), "{}").unwrap();
-        std::fs::write(ws.join(".scarab-build/oci/index.json"), "{}").unwrap();
-        std::fs::write(blobs.join("ab".repeat(32)), "{}").unwrap();
+        std::fs::write(
+            ws.join(".scarab-build/oci/index.json"),
+            layout_index(&[LAYOUT_DIGEST]),
+        )
+        .unwrap();
+        std::fs::write(
+            blobs.join(LAYOUT_DIGEST.trim_start_matches("sha256:")),
+            LAYOUT_MANIFEST,
+        )
+        .unwrap();
     }
 
     /// The push Step pushes the layout to the image with crane, writes the
@@ -9975,11 +10011,10 @@ mod tests {
         let result: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(base.join("results/push.json")).unwrap())
                 .unwrap();
-        let digest = format!("sha256:{}", "ab".repeat(32));
-        assert_eq!(result["digest"], digest.as_str());
+        assert_eq!(result["digest"], LAYOUT_DIGEST);
         assert_eq!(
             result["ref"],
-            format!("registry.example/app@{digest}").as_str()
+            format!("registry.example/app@{LAYOUT_DIGEST}").as_str()
         );
         assert!(!ws.join(".scarab-build").exists(), "the layout is removed");
 
@@ -10109,6 +10144,85 @@ mod tests {
         }
         reset();
         assert_eq!(run(&[]), (Some(0), true), "the clean layout pushes");
+    }
+
+    // Attack: a process a Dockerfile RUN left behind rewrites the layout after BuildKit wrote it, before the push Step reads it: index.json names another image (whose blob hashes right), the manifest blob is changed under its name, index.json names two images, or names none; or the build Step's digest is missing while results are collected. Safe outcome: exit 2 before crane runs, and no `push` result. If crane then reports a digest other than the layout's, the Step fails (exit 1) and writes no `push` result.
+    #[cfg(unix)]
+    #[test]
+    fn the_push_step_pushes_only_the_image_the_build_step_built() {
+        let (tmp, run) = push_library_harness();
+        let base = tmp.path().canonicalize().unwrap();
+        let ws = base.join("workspace");
+        let oci = ws.join(".scarab-build/oci");
+        let result = base.join("results/push.json");
+        // Another manifest, stored under its own digest: sha256("[]").
+        let other = "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945";
+        let other_blob = oci.join("blobs/sha256").join(other.trim_start_matches("sha256:"));
+        let reset = || {
+            let _ = std::fs::remove_dir_all(ws.join(".scarab-build"));
+            let _ = std::fs::remove_file(&result);
+            write_layout(&ws);
+        };
+        let index = |digests: &[&str]| {
+            std::fs::write(oci.join("index.json"), layout_index(digests)).unwrap()
+        };
+        let plants: [(&str, Box<dyn Fn()>); 5] = [
+            (
+                "index.json names another image",
+                Box::new(|| {
+                    std::fs::write(&other_blob, "[]").unwrap();
+                    index(&[other]);
+                }),
+            ),
+            (
+                "the manifest is changed under its name",
+                Box::new(|| {
+                    std::fs::write(
+                        oci.join("blobs/sha256")
+                            .join(LAYOUT_DIGEST.trim_start_matches("sha256:")),
+                        "[]",
+                    )
+                    .unwrap()
+                }),
+            ),
+            (
+                "index.json names two images",
+                Box::new(|| {
+                    std::fs::write(&other_blob, "[]").unwrap();
+                    index(&[LAYOUT_DIGEST, other]);
+                }),
+            ),
+            ("index.json names no image", Box::new(|| index(&[]))),
+            (
+                "index.json is gone",
+                Box::new(|| std::fs::remove_file(oci.join("index.json")).unwrap()),
+            ),
+        ];
+        for (what, plant) in &plants {
+            reset();
+            plant();
+            assert_eq!(run(&[]), (Some(2), false), "{what}");
+            assert!(!result.exists(), "{what}");
+        }
+        // The build Step reported another digest, or none while results are
+        // collected (the harness's results directory exists).
+        for want in [other, ""] {
+            reset();
+            assert_eq!(
+                run(&[("SCARAB_BUILD_DIGEST", want)]),
+                (Some(2), false),
+                "{want:?}"
+            );
+            assert!(!result.exists(), "{want:?}");
+        }
+        // crane reports a digest other than the layout's.
+        reset();
+        assert_eq!(run(&[("CRANE_DIGEST", other)]), (Some(1), true));
+        assert!(!result.exists(), "no push result for a digest that differs");
+        // The image the build Step built pushes.
+        reset();
+        assert_eq!(run(&[]), (Some(0), true));
+        assert!(result.exists());
     }
 
     #[test]

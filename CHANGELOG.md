@@ -20,6 +20,12 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Security
 
+- **The build library's push step pushes only the image the build step built** (git-bug 23a29ab).
+  It receives BuildKit's `containerimage.digest` from the build step's `image` result and refuses
+  (exit 2) a layout whose `index.json` does not name exactly that one manifest, or whose manifest
+  file does not hash to its digest. A process that a Dockerfile `RUN` left behind could rewrite
+  the layout before the push step read it. If crane reports another digest, the step fails and
+  writes no `push` result. When the server collects no step results, only the layout is checked.
 - **The build library refuses a `build_args` name that starts with `BUILDKIT_`** (git-bug 410eed3).
   BuildKit reads those arguments as settings, and `BUILDKIT_SYNTAX` names a frontend image that it
   pulls and runs, so a `build_args` value built from text someone else writes could pick the
