@@ -4,11 +4,12 @@
 // outputs downstream steps read; a second line says why the try exists and
 // when it started. Past four tries the older ones go in an "Earlier tries"
 // menu, whose trigger names the selected try when the selection is in there.
-// A gate's tries are its waits. Page chrome, so it reads the page tokens.
-import { For, Show } from "solid-js";
+// A gate's tries are its waits, and a resolved wait says who resolved it.
+// Page chrome, so it reads the page tokens.
+import { createMemo, For, Show } from "solid-js";
 import { causeText, type FilmstripTry } from "../attempts";
 import { compactDuration, statusGlyph } from "../run-page";
-import { foldTries, pluralNoun, tryDurationMs, tryWords } from "../run-tabs";
+import { foldTries, pluralNoun, tryDurationMs, tryWords, type WaitResolution } from "../run-tabs";
 import { absTime, relTime } from "../fmt";
 import { TryMenu } from "./AttemptsDropdown";
 
@@ -25,46 +26,58 @@ export default function TryTabs(props: {
   /** "Try", or "Wait" for a gate. */
   noun: string;
   now: number;
+  /** How the gate's latest wait was resolved, for a gate. */
+  resolution?: WaitResolution | null;
 }) {
   const fold = () => foldTries(props.tries, props.active);
   const selectedEarlier = () => props.tries.find((t) => t.id === props.active && fold().selectedEarlier);
+  // The tabs are keyed by try id: the poll rebuilds every try object, and a
+  // tab keyed by object would be re-created each second and lose focus.
+  const shownIds = createMemo(() => fold().shown.map((t) => t.id), undefined, {
+    equals: (a, b) => a.length === b.length && a.every((x, i) => x === b[i]),
+  });
+  const byId = (id: string) => props.tries.find((x) => x.id === id);
 
   return (
     <div class="trytabs">
       <div class="trytabs-list" role="tablist" aria-label={`${pluralNoun(props.noun)} of this step`}>
-        <For each={fold().shown}>
-          {(t) => {
-            const on = () => t.id === props.active;
-            const dur = () => tryDurationMs(t, props.now);
-            return (
-              <button
-                type="button"
-                role="tab"
-                class="tt"
-                classList={{ on: on() }}
-                aria-selected={on()}
-                onClick={() => props.onSelect(t.id)}
-              >
-                <span class="tt-l1">
-                  <span class={`tt-g ${tone(t)}`} aria-hidden="true">
-                    {statusGlyph(t.outcome)}
-                  </span>
-                  <span>{tryWords(t.index + 1, t, props.noun)}</span>
-                  <Show when={dur() !== null}>
-                    <span class="tt-dur">{compactDuration(dur()!)}</span>
-                  </Show>
-                  <Show when={t.id === props.ofRecord}>
-                    <span class="tt-rec">of record</span>
-                  </Show>
-                </span>
-                <small title={t.startedAt ? absTime(t.startedAt) : undefined}>
-                  {[causeText(t.cause), t.startedAt ? `started ${relTime(t.startedAt)}` : ""]
-                    .filter(Boolean)
-                    .join(" · ")}
-                </small>
-              </button>
-            );
-          }}
+        <For each={shownIds()}>
+          {(id) => (
+            <Show when={byId(id)}>
+              {(t) => {
+                const on = () => id === props.active;
+                const dur = () => tryDurationMs(t(), props.now);
+                return (
+                  <button
+                    type="button"
+                    role="tab"
+                    class="tt"
+                    classList={{ on: on() }}
+                    aria-selected={on()}
+                    onClick={() => props.onSelect(id)}
+                  >
+                    <span class="tt-l1">
+                      <span class={`tt-g ${tone(t())}`} aria-hidden="true">
+                        {statusGlyph(t().outcome)}
+                      </span>
+                      <span>{tryWords(t().index + 1, t(), props.noun, props.resolution)}</span>
+                      <Show when={dur() !== null}>
+                        <span class="tt-dur">{compactDuration(dur()!)}</span>
+                      </Show>
+                      <Show when={id === props.ofRecord}>
+                        <span class="tt-rec">of record</span>
+                      </Show>
+                    </span>
+                    <small title={t().startedAt ? absTime(t().startedAt!) : undefined}>
+                      {[causeText(t().cause), t().startedAt ? `started ${relTime(t().startedAt!)}` : ""]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </small>
+                  </button>
+                );
+              }}
+            </Show>
+          )}
         </For>
       </div>
       <Show when={fold().earlier.length > 0}>

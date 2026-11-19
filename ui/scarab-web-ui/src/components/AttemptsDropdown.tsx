@@ -53,17 +53,26 @@ export function TryMenu(props: {
 }) {
   const [open, setOpen] = createSignal(false);
   let menu: HTMLDivElement | undefined;
-  const newestFirst = () => [...props.rows].sort((a, b) => b.index - a.index);
+  let trigger: HTMLButtonElement | undefined;
+  // Rows are keyed by try id: the poll rebuilds every try object, and a row
+  // keyed by object would be re-created and lose focus.
+  const newestFirst = () => [...props.rows].sort((a, b) => b.index - a.index).map((t) => t.id);
+  const byId = (id: string) => props.rows.find((t) => t.id === id);
 
+  // Closing from the keyboard or a pick returns focus to the trigger.
+  const close = () => {
+    setOpen(false);
+    trigger?.focus();
+  };
   const pick = (id: string) => {
     props.onSelect(id);
-    setOpen(false);
+    close();
   };
 
   // Escape closes (the backdrop handles an outside click); the arrow keys move
   // between rows.
   onMount(() => {
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && open() && close();
     document.addEventListener("keydown", onKey);
     onCleanup(() => document.removeEventListener("keydown", onKey));
   });
@@ -81,6 +90,7 @@ export function TryMenu(props: {
       <button
         type="button"
         class={props.class}
+        ref={trigger}
         classList={{ open: open(), on: !!props.selected }}
         aria-haspopup="menu"
         aria-expanded={open()}
@@ -105,38 +115,44 @@ export function TryMenu(props: {
         <div class="adrop-backdrop" aria-hidden="true" onClick={() => setOpen(false)} />
         <div class="adrop-menu" role="menu" aria-label={`${pluralNoun(props.noun)} of this step`} ref={menu} onKeyDown={onMenuKey}>
           <For each={newestFirst()}>
-            {(t) => {
-              const isActive = () => t.id === props.active;
-              return (
-                <button
-                  type="button"
-                  role="menuitemradio"
-                  aria-checked={isActive()}
-                  class={`adrop-row ${tone(t)}`}
-                  classList={{ shadow: t.shadowed, sel: isActive() }}
-                  onClick={() => pick(t.id)}
-                >
-                  <span class="adrop-n">
-                    {props.noun} {t.index + 1}
-                  </span>
-                  <span class="adrop-body">
-                    <span class="adrop-out">
-                      {statusGlyph(t.outcome)} {outcomeWords(t)}
-                      <Show when={t.readopted}>
-                        {" "}
-                        <Readopt />
-                      </Show>
-                    </span>
-                    <small>
-                      {[causeText(t.cause), t.startedAt ? relTime(t.startedAt) : ""].filter(Boolean).join(" · ")}
-                    </small>
-                  </span>
-                  <span class="adrop-dur">
-                    {t.startedAt && t.finishedAt ? duration(t.startedAt, t.finishedAt) : ""}
-                  </span>
-                </button>
-              );
-            }}
+            {(id) => (
+              <Show when={byId(id)}>
+                {(t) => {
+                  const isActive = () => id === props.active;
+                  return (
+                    <button
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={isActive()}
+                      class={`adrop-row ${tone(t())}`}
+                      classList={{ shadow: t().shadowed, sel: isActive() }}
+                      onClick={() => pick(id)}
+                    >
+                      <span class="adrop-n">
+                        {props.noun} {t().index + 1}
+                      </span>
+                      <span class="adrop-body">
+                        <span class="adrop-out">
+                          {statusGlyph(t().outcome)} {outcomeWords(t())}
+                          <Show when={t().readopted}>
+                            {" "}
+                            <Readopt />
+                          </Show>
+                        </span>
+                        <small>
+                          {[causeText(t().cause), t().startedAt ? relTime(t().startedAt!) : ""]
+                            .filter(Boolean)
+                            .join(" · ")}
+                        </small>
+                      </span>
+                      <span class="adrop-dur">
+                        {t().startedAt && t().finishedAt ? duration(t().startedAt!, t().finishedAt!) : ""}
+                      </span>
+                    </button>
+                  );
+                }}
+              </Show>
+            )}
           </For>
         </div>
       </Show>

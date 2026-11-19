@@ -357,6 +357,32 @@ test("try tabs: newest first, earlier tries in a menu, and tries nested in the L
   await expect(page.getByRole("button", { name: /^Try 2 of 3/ })).toBeVisible();
 });
 
+// The page polls a live run every 1.2s and its clock ticks every second.
+// Regression: each poll re-created the List rows and the try tabs (focus
+// lost), and closed the Workspace tab's open file.
+test("a live run's polls keep focus, the open file and the step tab", async ({ page }) => {
+  await page.goto(`/acme/scarab/runs/${RETRIES_RUN_ID}?step=1`);
+  const tries = page.getByRole("tablist", { name: "Tries of this step" });
+  const try2 = tries.getByRole("tab", { name: /Try 2 ·/ });
+  await try2.focus();
+  await page.waitForTimeout(2500);
+  await expect(try2).toBeFocused();
+
+  await page.getByRole("button", { name: /^List/ }).click();
+  const row = page.locator(".slist-row", { hasText: "unit" });
+  await row.focus();
+  await page.waitForTimeout(2500);
+  await expect(row).toBeFocused();
+
+  await page.getByRole("button", { name: /^Workspace try 3/ }).click();
+  await expect(page).toHaveURL(/[?&]ptab=workspace(&|$)/);
+  await page.getByRole("button", { name: /summary\.txt/ }).click();
+  await expect(page.locator(".fileview")).toContainText("12 passed, 0 failed");
+  await page.waitForTimeout(2600);
+  await expect(page.locator(".fileview")).toContainText("12 passed, 0 failed");
+  await expect(page).toHaveURL(/[?&]ptab=workspace(&|$)/);
+});
+
 // Regression: when the first read of the events failed, the page applied the
 // URL's selection to a run with no versions and dropped `v` and `try`.
 test("a failed first read of the events keeps the URL's version and try", async ({ page }) => {

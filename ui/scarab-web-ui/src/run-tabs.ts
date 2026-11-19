@@ -199,15 +199,45 @@ export function pluralNoun(noun: string): string {
   return noun === "Wait" ? "Waits" : "Tries";
 }
 
+/** How a gate's wait was resolved, as the server reports it for the gate's
+ * latest wait (`gate_resolution`). */
+export type WaitResolution = {
+  passed: boolean;
+  reason?: string | null;
+  /** Who released or rejected it, when a person or a plugin did. */
+  by?: string | null;
+  /** The wait (attempt id) it resolved. */
+  attempt: string;
+};
+
+/** A resolved wait in words: "approved by a.kim", "rejected by a.kim: not
+ * today", "expired". Null when the resolution names no one and did not expire
+ * (a timer that ran out), so the plain outcome reads instead. */
+export function resolutionWords(r: WaitResolution): string | null {
+  const reason = r.reason?.trim();
+  if (r.passed) return r.by ? `approved by ${r.by}` : null;
+  if (r.by) return `rejected by ${r.by}${reason ? `: ${reason}` : ""}`;
+  if (reason && /expire/i.test(reason)) return "expired";
+  return null;
+}
+
 /** One try in words, numbered from 1: "Try 3 · passed", "Try 2 · failed: step
- * error", "Wait 1 · running". */
-export function tryWords(n: number, t: { outcome: string; failure?: string | null }, noun = "Try"): string {
+ * error", "Wait 1 · running". A gate's wait with a `resolution` for that wait
+ * says how it was resolved: "Wait 1 · approved by a.kim". */
+export function tryWords(
+  n: number,
+  t: { id?: string; outcome: string; failure?: string | null },
+  noun = "Try",
+  resolution?: WaitResolution | null,
+): string {
+  const resolved = resolution && t.id !== undefined && resolution.attempt === t.id ? resolutionWords(resolution) : null;
   const what =
-    t.outcome === "failed"
+    resolved ??
+    (t.outcome === "failed"
       ? `failed: ${failureWords(t.failure)}`
       : t.outcome === "succeeded"
         ? "passed"
-        : statusWord(t.outcome).toLowerCase();
+        : statusWord(t.outcome).toLowerCase());
   return `${noun} ${n} · ${what}`;
 }
 

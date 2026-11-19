@@ -1429,6 +1429,7 @@ export default function RunDetail() {
                       triesOf={triesOfStep}
                       activeTry={stripActiveAttempt()}
                       onSelectTry={selectTry}
+                      resolutionOf={(sid) => stepList().find((x) => x.id === sid)?.gate_resolution ?? null}
                     />
                   }
                 >

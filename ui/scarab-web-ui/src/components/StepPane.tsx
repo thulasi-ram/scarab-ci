@@ -58,6 +58,12 @@ export type PaneTab = "logs" | "results" | "outputs" | "workspace" | "source" | 
 // Cap rendered lines so a giant attempt can't blow up the DOM (windowing v1).
 const MAX_LINES = 1500;
 
+/** A memo that notifies only when its value changes by content, for a fetch
+ * key rebuilt as a new object on every poll. */
+function sameKey<T>(fn: () => T): () => T {
+  return createMemo(fn, undefined, { equals: (a, b) => JSON.stringify(a) === JSON.stringify(b) });
+}
+
 /** A compact display of a result value — scalars inline, structures as JSON. */
 function showValue(v: unknown): string {
   if (typeof v === "string") return v;
@@ -151,24 +157,25 @@ export default function StepPane(props: {
   // A plugin gate opens on its Gate tab; any other step never
   // stays on one.
   const isPluginGate = () => !!props.step?.plugin_gate;
+  // The selected step's id. A memo, so the 1.2s poll (a new `props.step`
+  // object every tick) does not count as a new selection: the effects keyed on
+  // it below keep the open tab, folder and file across polls.
+  const stepId = createMemo(() => props.step?.id ?? null);
   createEffect(
-    on(
-      () => props.step?.id,
-      () => {
-        if (!props.step) return;
-        if (isPluginGate()) setTab("gate");
-        else if (tab() === "gate" || (tab() === "source" && (props.step?.origin ?? []).length === 0)) setTab("logs");
-      },
-    ),
+    on(stepId, () => {
+      if (!props.step) return;
+      if (isPluginGate()) setTab("gate");
+      else if (tab() === "gate" || (tab() === "source" && (props.step?.origin ?? []).length === 0)) setTab("logs");
+    }),
   );
   // Where the step comes from: the chain, its bound inputs, and its render.
   // Read when the Source or Gate tab is open.
   const [origin] = createResource(
-    () => {
+    sameKey(() => {
       const s = props.step;
       const t = tab();
       return s && (t === "source" || t === "gate") ? { run: props.runId, step: s.id, n: s.attempt_list?.length ?? 0 } : null;
-    },
+    }),
     (k) => stepOrigin(k.run, k.step).catch(() => null),
   );
   // A launch refused because a library version is yanked.
@@ -193,7 +200,6 @@ export default function StepPane(props: {
   };
   const sidecars = () => props.step?.services ?? [];
 
-  const stepId = () => props.step?.id ?? null;
   // The attempts this pane's tabs are scoped to. Take-windowed in EVERY view:
   // when the caller hands a `window` (the
   // selected take's attempt-id set), keep only those tries — so a step carried
@@ -317,24 +323,25 @@ export default function StepPane(props: {
     return `from ${noun().toLowerCase()} ${ofRecordIndex() + 1}`;
   };
 
-  // Reset per-step view state when the DAG selection moves.
-  createEffect(() => {
-    void stepId();
-    setWsPath("");
-    setOpenFile(null);
-  });
+  // Reset per-step view state when the selection moves to another step.
+  createEffect(
+    on(stepId, () => {
+      setWsPath("");
+      setOpenFile(null);
+    }),
+  );
 
   // The Logs container follows the selection: a clicked sidecar chip
   // (`focusSidecar` set) opens that sidecar's container in the Logs tab; any
   // other step selection resets to the main container. Tracks stepId so
   // re-selecting a step returns to `step`, and focusSidecar so clicking a chip
   // on the current step re-focuses it.
-  createEffect(() => {
-    void stepId();
-    const f = props.focusSidecar ?? null;
-    setContainer(f);
-    if (f != null) setTab("logs");
-  });
+  createEffect(
+    on([stepId, () => props.focusSidecar ?? null], ([, f]) => {
+      setContainer(f);
+      if (f != null) setTab("logs");
+    }),
+  );
 
   // A brief "changed / loading" pulse whenever the scoped (step, try) or tab
   // moves. The evidence pane no longer repeats the step name or try in a header
@@ -419,13 +426,16 @@ export default function StepPane(props: {
 
   // --- Results / Logs / Workspace: fetches scoped to the SELECTED try
   // (`scoped()`). Outputs read a DIFFERENT (of-record) attempt below. ---
-  const evidenceArg = () => {
+  // Each fetch key below is compared by value, so a poll that hands in a new
+  // `props.step` with the same ids fetches nothing again. The outcome is part
+  // of the key: a try that finishes is read once more.
+  const evidenceArg = sameKey(() => {
     const s = stepId();
     const a = scoped();
     // Not-run in this version → no per-try evidence to fetch (the tabs render a
     // "didn't run" line); skip the request rather than pull a stale attempt.
-    return s && !notRun() ? { run: props.runId, step: s, attempt: a?.id } : null;
-  };
+    return s && !notRun() ? { run: props.runId, step: s, attempt: a?.id, outcome: a?.outcome } : null;
+  });
   const [results] = createResource(evidenceArg, (a) =>
     getStepResults(a.run, a.step, a.attempt).catch(() => []),
   );
@@ -435,21 +445,21 @@ export default function StepPane(props: {
   // pair. Null (no success, or not-run) simply doesn't fetch — the tab shows the
   // of-record empty copy. The interpolation view AND the "built on …" consumed
   // line both read these, so what a downstream step would see is what shows.
-  const outputsArg = () => {
+  const outputsArg = sameKey(() => {
     const s = stepId();
     const rec = ofRecordTry();
     return s && rec ? { run: props.runId, step: s, attempt: rec } : null;
-  };
+  });
   const [outResults] = createResource(outputsArg, (a) =>
     getStepResults(a.run, a.step, a.attempt).catch(() => []),
   );
   const [outConsumed] = createResource(outputsArg, (a) =>
     getConsumed(a.run, a.step, a.attempt).catch(() => null),
   );
-  const wsArg = () => {
+  const wsArg = sameKey(() => {
     const base = evidenceArg();
     return base ? { ...base, path: wsPath() } : null;
-  };
+  });
   // Swallow browse failures into an unavailable listing — an uncaught reject
   // here would re-throw while rendering and tear down the whole pane (tabs and
   // all), stranding the user with no way back to Logs/Results.
@@ -459,10 +469,10 @@ export default function StepPane(props: {
     ),
   );
 
-  const fileArg = () => {
+  const fileArg = sameKey(() => {
     const base = evidenceArg();
     return base && openFile() ? { ...base, path: openFile()! } : null;
-  };
+  });
   const [fileBody] = createResource(fileArg, async (a) => {
     // Like the listing above, never let a failed read re-throw during render —
     // a file the CAS can no longer hand back would otherwise tear down the pane.
@@ -575,6 +585,7 @@ export default function StepPane(props: {
                 onSelect={props.onAttemptSelect}
                 noun={noun()}
                 now={props.now ?? Date.now()}
+                resolution={props.step?.gate_resolution ?? null}
               />
             </Show>
             {props.note}
@@ -838,7 +849,7 @@ export default function StepPane(props: {
                     <Show when={carried()}>
                       {(c) => (
                         <span class="ofrec-here">
-                          of record · from version {c().take}, try {c().try}
+                          of record · from version {c().take}, {noun().toLowerCase()} {c().try}
                         </span>
                       )}
                     </Show>
@@ -849,13 +860,13 @@ export default function StepPane(props: {
                         <button
                           class="ofrec-jump"
                           onClick={() => props.onAttemptSelect(ofRecordTry())}
-                          title="jump the selection to the of-record try"
+                          title={`Select the ${noun().toLowerCase()} of record`}
                         >
-                          of record · try {ofRecordIndex() + 1} →
+                          of record · {noun().toLowerCase()} {ofRecordIndex() + 1} →
                         </button>
                       }
                     >
-                      <span class="ofrec-here">of record · this try</span>
+                      <span class="ofrec-here">of record · this {noun().toLowerCase()}</span>
                     </Show>
                     </Show>
                   </div>

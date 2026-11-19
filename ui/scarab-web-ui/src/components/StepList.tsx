@@ -6,10 +6,17 @@
 // view lists them under its row, newest first, each opening that try. Shared
 // services come first, as rows that open the service. For runs too big to
 // read as a graph. Page chrome, so it reads the page tokens.
-import { createSignal, For, Show } from "solid-js";
+import { createMemo, createSignal, For, Show } from "solid-js";
 import type { DagService, DagStep } from "./Dag";
-import { compactDuration, matrixHeading, segmentByMatrix, statusGlyph, statusWord } from "../run-page";
-import { nestedTries, tryDurationMs, tryWords } from "../run-tabs";
+import {
+  compactDuration,
+  matrixHeading,
+  segmentByMatrix,
+  statusGlyph,
+  statusWord,
+  type MatrixSegment,
+} from "../run-page";
+import { nestedTries, tryDurationMs, tryWords, type WaitResolution } from "../run-tabs";
 import { causeText, type FilmstripTry } from "../attempts";
 
 /** The words for a row: "Passed · 2 tries", "Waiting for a node". */
@@ -37,11 +44,33 @@ export default function StepList(props: {
   activeTry?: string | null;
   /** Open one try of a step. */
   onSelectTry?: (step: string, attempt: string) => void;
+  /** How a gate step's latest wait was resolved. */
+  resolutionOf?: (id: string) => WaitResolution | null;
 }) {
   const [filter, setFilter] = createSignal<"all" | "failed">("all");
   const failedCount = () => props.steps.filter((s) => s.status === "failed").length;
   const shown = () => (filter() === "failed" ? props.steps.filter((s) => s.status === "failed") : props.steps);
-  const segments = () => segmentByMatrix(shown(), (s) => s.id);
+  // Rows are keyed by id, never by object: the page rebuilds every step object
+  // each second (the clock tick), and a row keyed by object would be re-created
+  // and lose focus. A segment that did not change keeps its identity.
+  const stepById = createMemo(() => new Map(props.steps.map((s) => [s.id, s])));
+  let segCache = new Map<string, MatrixSegment<string>>();
+  const segments = createMemo(() => {
+    const next = new Map<string, MatrixSegment<string>>();
+    const out = segmentByMatrix(
+      shown().map((s) => s.id),
+      (id) => id,
+    ).map((seg) => {
+      const key = `${seg.matrix ? matrixHeading(seg.matrix) : ""}\u0000${seg.items.map((i) => i.item).join("\u0001")}`;
+      const kept = segCache.get(key) ?? seg;
+      next.set(key, kept);
+      return kept;
+    });
+    segCache = next;
+    return out;
+  });
+  const serviceNames = () => (props.services ?? []).map((s) => s.name);
+  const serviceStatus = (name: string) => props.services?.find((s) => s.name === name)?.status ?? "";
   const took = (s: DagStep): string =>
     s.status === "running" && s.runningSince
       ? compactDuration(props.now - s.runningSince)
@@ -70,11 +99,11 @@ export default function StepList(props: {
         </button>
         <span class="subtle">in dependency order</span>
       </div>
-      <Show when={filter() === "all" && (props.services?.length ?? 0) > 0}>
+      <Show when={filter() === "all" && serviceNames().length > 0}>
         <div class="slist-grp">Shared services</div>
-        <For each={props.services}>
-          {(sv) => {
-            const id = `service:${sv.name}`;
+        <For each={serviceNames()}>
+          {(name) => {
+            const id = `service:${name}`;
             return (
               <button
                 type="button"
@@ -86,8 +115,8 @@ export default function StepList(props: {
                 <span class="slist-g service" aria-hidden="true">
                   ⬡
                 </span>
-                <span class="slist-name">{sv.name}</span>
-                <span class="slist-words">{sv.status}</span>
+                <span class="slist-name">{name}</span>
+                <span class="slist-words">{serviceStatus(name)}</span>
                 <span class="slist-dur" />
               </button>
             );
@@ -109,45 +138,66 @@ export default function StepList(props: {
             </Show>
             <For each={seg.items}>
               {(it) => (
-                <>
-                  <button
-                    type="button"
-                    class="slist-row"
-                    classList={{ sel: props.selected === it.item.id, cell: !!seg.matrix }}
-                    aria-pressed={props.selected === it.item.id}
-                    onClick={() => props.onSelect(it.item.id)}
-                    title={it.item.id}
-                  >
-                    <span class={`slist-g ${tone(it.item)}`} aria-hidden="true">
-                      {it.item.note?.tone === "warning" ? "◷" : statusGlyph(it.item.status)}
-                    </span>
-                    <span class="slist-name">{it.label}</span>
-                    <span class="slist-words">{rowWords(it.item)}</span>
-                    <span class="slist-dur">{took(it.item)}</span>
-                  </button>
-                  <For each={props.triesOf ? nestedTries(props.triesOf(it.item.id)) : []}>
-                    {(t) => {
-                      const on = () => props.selected === it.item.id && props.activeTry === t.id;
-                      const dur = () => tryDurationMs(t, props.now);
-                      return (
+                <Show when={stepById().get(it.item)}>
+                  {(step) => {
+                    const id = it.item;
+                    const tries = createMemo(() => (props.triesOf ? nestedTries(props.triesOf(id)) : []));
+                    const tryIds = () => tries().map((t) => t.id);
+                    const tryById = (tid: string) => tries().find((t) => t.id === tid);
+                    return (
+                      <>
                         <button
                           type="button"
-                          class="slist-try"
-                          classList={{ sel: on(), cell: !!seg.matrix }}
-                          aria-pressed={on()}
-                          onClick={() => props.onSelectTry?.(it.item.id, t.id)}
+                          class="slist-row"
+                          classList={{ sel: props.selected === id, cell: !!seg.matrix }}
+                          aria-pressed={props.selected === id}
+                          onClick={() => props.onSelect(id)}
+                          title={id}
                         >
-                          <span class={`slist-g ${t.outcome}`} aria-hidden="true">
-                            {statusGlyph(t.outcome)}
+                          <span class={`slist-g ${tone(step())}`} aria-hidden="true">
+                            {step().note?.tone === "warning" ? "◷" : statusGlyph(step().status)}
                           </span>
-                          <span class="slist-try-w">{tryWords(t.index + 1, t, it.item.gate ? "Wait" : "Try")}</span>
-                          <span class="slist-words">{causeText(t.cause)}</span>
-                          <span class="slist-dur">{dur() !== null ? compactDuration(dur()!) : ""}</span>
+                          <span class="slist-name">{it.label}</span>
+                          <span class="slist-words">{rowWords(step())}</span>
+                          <span class="slist-dur">{took(step())}</span>
                         </button>
-                      );
-                    }}
-                  </For>
-                </>
+                        <For each={tryIds()}>
+                          {(tid) => (
+                            <Show when={tryById(tid)}>
+                              {(t) => {
+                                const on = () => props.selected === id && props.activeTry === tid;
+                                const dur = () => tryDurationMs(t(), props.now);
+                                return (
+                                  <button
+                                    type="button"
+                                    class="slist-try"
+                                    classList={{ sel: on(), cell: !!seg.matrix }}
+                                    aria-pressed={on()}
+                                    onClick={() => props.onSelectTry?.(id, tid)}
+                                  >
+                                    <span class={`slist-g ${t().outcome}`} aria-hidden="true">
+                                      {statusGlyph(t().outcome)}
+                                    </span>
+                                    <span class="slist-try-w">
+                                      {tryWords(
+                                        t().index + 1,
+                                        t(),
+                                        step().gate ? "Wait" : "Try",
+                                        props.resolutionOf?.(id) ?? null,
+                                      )}
+                                    </span>
+                                    <span class="slist-words">{causeText(t().cause)}</span>
+                                    <span class="slist-dur">{dur() !== null ? compactDuration(dur()!) : ""}</span>
+                                  </button>
+                                );
+                              }}
+                            </Show>
+                          )}
+                        </For>
+                      </>
+                    );
+                  }}
+                </Show>
               )}
             </For>
           </>

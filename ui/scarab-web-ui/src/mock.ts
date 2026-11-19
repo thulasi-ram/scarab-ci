@@ -2809,6 +2809,11 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   }
   if (/\/steps\/[^/]+\/results$/.test(p)) return json(testResults);
   if (/\/steps\/[^/]+\/consumed$/.test(p)) return json(testConsumed);
+  // The RETRIES run kept its workspace snapshots: one file to open.
+  if (p.startsWith(`/v1/runs/${RETRIES_RUN_ID}/steps/`) && p.endsWith("/workspace/file"))
+    return new Response("12 passed, 0 failed\n", { status: 200, headers: { "content-type": "text/plain" } });
+  if (p.startsWith(`/v1/runs/${RETRIES_RUN_ID}/steps/`) && p.endsWith("/workspace"))
+    return json({ available: true, path: "", entries: [{ name: "summary.txt", kind: "file" }] });
   if (/\/steps\/[^/]+\/workspace$/.test(p))
     return json({ available: false, path: "", entries: [] });
 
