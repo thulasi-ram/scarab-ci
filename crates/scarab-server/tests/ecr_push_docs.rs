@@ -449,10 +449,8 @@ async fn the_page_policy_refuses_a_pipeline_file_step_naming_ecr_push() {
 
 /// The page's two-architecture steps (one build per architecture and the
 /// image index library), added to the page's Pipeline in place of its one
-/// build: a push to main is admitted under the page's Policy, `ecr-push`
-/// reaches each build's push Step and the index Step, and no build Step.
-#[tokio::test]
-async fn the_page_two_architecture_steps_run_with_ecr_push_on_the_index_step() {
+/// build.
+fn two_architecture_pipeline() -> String {
     let found: Vec<String> = blocks("yaml")
         .into_iter()
         .filter(|b| b.contains("lib:thulasi-ram::scarab-ci::image-index"))
@@ -463,7 +461,97 @@ async fn the_page_two_architecture_steps_run_with_ecr_push_on_the_index_step() {
     steps.retain(|s| s["id"].as_str() != Some("image"));
     let more: Vec<serde_yaml::Value> = serde_yaml::from_str(&found[0]).unwrap();
     steps.extend(more);
-    let ci = serde_yaml::to_string(&doc).unwrap();
+    serde_yaml::to_string(&doc).unwrap()
+}
+
+/// git-bug 794b3ac: the page's index step launches on a fork pull request,
+/// whose builds push nothing and publish no `push` result: `images` renders
+/// as empty lines (the library's script then exits 0 for a fork). With both
+/// builds pushed it renders their references, one per line, and the index
+/// step needs the builds' push Steps only.
+#[test]
+fn the_page_index_step_renders_with_and_without_pushed_builds() {
+    let libraries = Libraries {
+        installed: BTreeMap::from([
+            (
+                "thulasi-ram::scarab-ci::build".to_string(),
+                InstalledLibrary {
+                    content: BUILD.into(),
+                    source: BUILD_SOURCE.into(),
+                },
+            ),
+            (
+                "thulasi-ram::scarab-ci::clone".to_string(),
+                InstalledLibrary {
+                    content: CLONE.into(),
+                    source: CLONE_SOURCE.into(),
+                },
+            ),
+            (
+                "thulasi-ram::scarab-ci::image-index".to_string(),
+                InstalledLibrary {
+                    content: INDEX.into(),
+                    source: INDEX_SOURCE.into(),
+                },
+            ),
+        ]),
+        ..Default::default()
+    };
+    let ir = scarab_pipeline::compile_with_libraries(&two_architecture_pipeline(), &libraries)
+        .expect("the page's two-architecture Pipeline compiles");
+    let index = ir
+        .steps
+        .iter()
+        .find(|s| s.id == "app/index")
+        .expect("the index step");
+    let mut needs = index.needs.0.clone();
+    needs.sort();
+    assert_eq!(needs, ["amd64/push", "arm64/push"]);
+    let images = |results: serde_json::Value| -> Result<String, String> {
+        let results: scarab_pipeline::Results = serde_json::from_value(results).unwrap();
+        let event = serde_json::json!({ "sha": SHA });
+        let rendered = scarab_pipeline::render(
+            scarab_pipeline::Templates {
+                image: &index.image,
+                command: &index.command,
+                env: &index.env,
+            },
+            index.scope.as_ref(),
+            &index.matrix_values,
+            scarab_pipeline::Facts::Launch {
+                params: &BTreeMap::new(),
+                declared: &[],
+                results: &results,
+                event: event.as_object().unwrap(),
+            },
+        )?;
+        Ok(rendered
+            .env
+            .into_iter()
+            .find(|(k, _)| k == "SCARAB_INDEX_IMAGES")
+            .expect("SCARAB_INDEX_IMAGES")
+            .1)
+    };
+    let fork = images(serde_json::json!({ "amd64/push": {}, "arm64/push": {} }))
+        .expect("the index step renders when no build pushed");
+    assert!(fork.trim().is_empty(), "{fork:?}");
+    let repo = "444455556666.dkr.ecr.eu-west-1.amazonaws.com/app";
+    let amd64 = format!("sha256:{}", "1".repeat(64));
+    let arm64 = format!("sha256:{}", "2".repeat(64));
+    let pushed = images(serde_json::json!({
+        "amd64/push": { "push": { "ref": format!("{repo}@{amd64}"), "digest": amd64 } },
+        "arm64/push": { "push": { "ref": format!("{repo}@{arm64}"), "digest": arm64 } },
+    }))
+    .expect("the index step renders the pushed references");
+    assert_eq!(pushed, format!("{repo}@{amd64}\n{repo}@{arm64}\n"));
+}
+
+/// The page's two-architecture steps: a push to main is admitted under the
+/// page's Policy, `ecr-push` reaches each build's push Step and the index
+/// Step, and no build Step.
+#[tokio::test]
+async fn the_page_two_architecture_steps_run_with_ecr_push_on_the_index_step() {
+    let ci = two_architecture_pipeline();
 
     let db = InMemoryDb::new();
     let out = trigger(&db, &ci, true, &push_to("refs/heads/main")).await;

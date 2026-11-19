@@ -10,8 +10,13 @@
 #     with:
 #       image: ghcr.io/acme/app:${{ event.sha }}
 #       images: |
-#         ${{ outputs.amd64.push.ref }}
-#         ${{ outputs.arm64.push.ref }}
+#         ${{ has(outputs.amd64.push) ? outputs.amd64.push.ref : '' }}
+#         ${{ has(outputs.arm64.push) ? outputs.arm64.push.ref : '' }}
+#
+# A build library push Step that pushed nothing (a fork pull request, a Run
+# locked out of its Environment's secrets) publishes no `push` result, so
+# `outputs.amd64.push.ref` would not render and the Step would fail at
+# launch. The `has(...)` form renders an empty line instead.
 #
 # Its one Step is `app/index` (named after the invoke); `needs: [app]`
 # reaches it. It runs `crane index append`, which writes the index to the
@@ -31,6 +36,17 @@
 # then copies each image into the index's repository, when it is not
 # already there.
 #
+# The Step reads the manifest and config with grep, and crane reads them
+# with Go's JSON decoder, which decodes a `\u` escape in a key and matches
+# keys without regard to case. So the Step refuses (exit 2) a manifest or
+# config that spells a letter, digit, `.`, `_` or `-` with a `\u` escape or
+# holds one of the two non-ASCII letters Go folds onto ASCII ones (U+017F,
+# U+212A), and it matches `manifests`, `os`, `architecture`, `variant` and
+# `os.version` in any case, refusing a name it finds more than once. These
+# checks are about whoever made the source images, who chose their content
+# anyway; they keep a platform check from reading another field than crane
+# does.
+#
 # Output:
 #   ${{ outputs.app.index }}  {"ref": "<repository>@sha256:…", "digest":
 #                             "sha256:…"}, as crane reported the push.
@@ -38,8 +54,10 @@
 #
 # A fork pull request, or a Run locked out of its Environment's secrets, gets
 # no registry credential, and Scarab tells the Step so with
-# SCARAB_FORK_PR=true: the Step then pushes nothing and exits 0. A missing
-# SCARAB_FORK_PR is treated the same way.
+# SCARAB_FORK_PR=true: the Step then pushes nothing and exits 0, whether
+# `images` names images or is empty (the builds pushed nothing). A missing
+# SCARAB_FORK_PR is treated the same way. Otherwise an empty `images` fails
+# the Step (exit 2).
 #
 # Every input reaches the script through an environment variable, never the
 # command.
@@ -48,7 +66,10 @@
 #   image     the tag to push the index to, e.g. ghcr.io/acme/app:1.2.0; a
 #             reference with a tag and no digest
 #   images    the images to join, one <repository>@sha256:<digest> per line,
-#             each a different platform
+#             each a different platform; or only line breaks (empty
+#             included), which the `has(...)` form renders when no build
+#             pushed, and which only a fork's Step accepts. A mix of
+#             references and empty lines is refused
 #   insecure  reach the registry over plain HTTP, for a registry with no TLS
 #             (default false); for a test or development registry only. crane
 #             then skips TLS verification too, so the Step refuses it (exit 2)
@@ -62,8 +83,8 @@ interface:
       description: the tag to push the index to, with a tag and no digest
     - name: images
       type: string
-      validate: 'value.matches("^([a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*@sha256:[a-f0-9]{64}\n)*[a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*@sha256:[a-f0-9]{64}\n?$")'
-      description: the images to join, one <repository>@sha256:<digest> per line
+      validate: 'value.matches("^\n*$") || value.matches("^([a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*@sha256:[a-f0-9]{64}\n)*[a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*@sha256:[a-f0-9]{64}\n?$")'
+      description: the images to join, one <repository>@sha256:<digest> per line, or only line breaks when no build pushed
     - name: insecure
       type: boolean
       required: false
@@ -137,14 +158,15 @@ steps:
         done <<EOF
         ${SCARAB_INDEX_IMAGES-}
         EOF
-        [ "$count" -gt 0 ] || fail "images names no image"
         # Scarab sets SCARAB_FORK_PR on every launch of this Step; a value
         # other than `false` (none included) is a fork pull request's Run,
-        # or a Run locked out of its Environment's secrets.
+        # or a Run locked out of its Environment's secrets. Its builds
+        # pushed nothing, so `images` is empty, and that is not a failure.
         if [ "${SCARAB_FORK_PR-}" != false ]; then
           echo "scarab: not pushed: this Run is a fork pull request's, or is locked out of its Environment's secrets"
           exit 0
         fi
+        [ "$count" -gt 0 ] || fail "images names no image"
         # crane's --insecure also skips TLS verification, so a registry
         # login would go to whoever answers at the registry's host.
         if [ "$insecure" = true ] && [ -e "${DOCKER_CONFIG-}/config.json" ]; then
@@ -152,14 +174,35 @@ steps:
         fi
         tls=
         [ "$insecure" = false ] || tls=--insecure
-        # Sets v to the string value of key $1 in $2, a JSON document, or to
-        # empty when the key is absent. A key named more than once (a label
-        # named "os", for one) is refused rather than guessed at.
-        field() {
-          v=$(printf '%s\n' "$2" | grep -o "\"$1\" *: *\"[^\"]*\"") || v=
-          case "$v" in
-            *"$nl"*) fail "the config of $src names \"$1\" more than once" ;;
+        # U+017F and U+212A in UTF-8: Go's JSON decoder matches them to
+        # "s" and "k" when it matches a key.
+        longs=$(printf '\305\277')
+        kelvin=$(printf '\342\204\252')
+        # Refuses (exit 2) $2, the JSON text $1 names, when it spells a
+        # letter, digit, ".", "_" or "-" with a \u escape, or holds U+017F
+        # or U+212A: crane decodes either into a key the greps here would
+        # not see.
+        plain() {
+          if printf '%s\n' "$2" |
+            grep -qiE '\\u(00(2[de]|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a])|017f|212a)'; then
+            fail "$1 spells a name with a \\u escape"
+          fi
+          case "$2" in
+            *"$longs"* | *"$kelvin"*) fail "$1 holds a letter that JSON decoders read as s or k" ;;
           esac
+        }
+        # Sets v to the string value of key $1 in $2, a JSON document, or to
+        # empty when the key is absent. The key is matched in any case, as
+        # crane's decoder matches it. A key named more than once (a label
+        # named "os", for one), or written where the value is not on the
+        # same line, is refused rather than guessed at.
+        field() {
+          n=$(printf '%s\n' "$2" | grep -oi "\"$1\"" | grep -c .) || n=0
+          [ "$n" -le 1 ] || fail "the config of $src names \"$1\" more than once"
+          v=
+          [ "$n" -eq 1 ] || return 0
+          v=$(printf '%s\n' "$2" | grep -oi "\"$1\" *: *\"[^\"]*\"") ||
+            fail "the config of $src names \"$1\" in a form this step does not read"
           v=${v%\"}
           v=${v##*\"}
         }
@@ -173,13 +216,15 @@ steps:
             echo "scarab: cannot read the manifest of $src" >&2
             exit 1
           }
-          case "$manifest" in
-            *'"manifests"'*) fail "$src is an index, not one image; name each architecture's image by its own digest" ;;
-          esac
+          plain "the manifest of $src" "$manifest"
+          if printf '%s\n' "$manifest" | grep -qi '"manifests"'; then
+            fail "$src is an index, not one image; name each architecture's image by its own digest"
+          fi
           config=$(crane config "$src" $tls </dev/null) || {
             echo "scarab: cannot read the config of $src" >&2
             exit 1
           }
+          plain "the config of $src" "$config"
           field os "$config"
           os=$v
           field architecture "$config"

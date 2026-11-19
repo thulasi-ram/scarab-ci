@@ -43,7 +43,10 @@ fn libraries() -> Libraries {
 }
 
 /// Two builds, one per architecture, joined by the index library from their
-/// pushed references, and a deploy that reads the index's digest.
+/// pushed references, and a deploy that reads the index's digest. `images`
+/// is written as the library's header writes it: a build that pushed
+/// nothing (a fork pull request) has no `push` result, and renders as an
+/// empty line.
 const TWO_ARCH: &str = r#"
 on: { push: {} }
 steps:
@@ -62,8 +65,8 @@ steps:
     with:
       image: "ghcr.io/acme/app:${{ event.sha }}"
       images: |
-        ${{ outputs.amd64.push.ref }}
-        ${{ outputs.arm64.push.ref }}
+        ${{ has(outputs.amd64.push) ? outputs.amd64.push.ref : '' }}
+        ${{ has(outputs.arm64.push) ? outputs.arm64.push.ref : '' }}
   - id: deploy
     image: busybox
     needs: [app]
@@ -203,6 +206,38 @@ fn the_images_reach_the_step_by_digest_only() {
     }
 }
 
+/// git-bug 794b3ac: on a fork pull request the build library's push Steps
+/// exit 0 without a `push` result. The documented template still renders,
+/// to empty lines, and the Step launches with `SCARAB_INDEX_IMAGES` blank
+/// (its script then exits 0 for a fork and 2 otherwise). A mix of a
+/// reference and an empty line is refused before the Step launches.
+#[test]
+fn the_documented_images_render_blank_when_no_build_pushed() {
+    let ir = compile_with_libraries(TWO_ARCH, &libraries()).unwrap();
+    let index = step(&ir, "app/index");
+    for results in [
+        serde_json::json!({}),
+        serde_json::json!({ "amd64/push": {}, "arm64/push": {} }),
+        serde_json::json!({
+            "amd64/image": { "image": { "containerimage.digest": AMD64 } },
+            "arm64/image": { "image": { "containerimage.digest": ARM64 } },
+        }),
+    ] {
+        let env = launch(index, results.clone()).unwrap_or_else(|e| panic!("{results}: {e}"));
+        let images = env
+            .iter()
+            .find(|(k, _)| k == "SCARAB_INDEX_IMAGES")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_else(|| panic!("no SCARAB_INDEX_IMAGES in {env:?}"));
+        assert!(images.trim().is_empty(), "{results}: {images:?}");
+    }
+    let half = serde_json::json!({
+        "amd64/push": { "push": { "ref": format!("ghcr.io/acme/app@{AMD64}"), "digest": AMD64 } },
+    });
+    let err = launch(index, half).unwrap_err();
+    assert!(err.contains("input `images`"), "{err}");
+}
+
 /// A literal `with:` is checked when the Pipeline compiles: the target needs
 /// a tag and no digest, and each image a digest and no tag.
 #[test]
@@ -218,6 +253,9 @@ fn literal_inputs_are_checked_at_compile() {
     let two = format!("registry.example:5000/app@{AMD64}\\nregistry.example:5000/app@{ARM64}\\n");
     compile("registry.example:5000/app:1.2.0", &two).expect("a tag and two digests compile");
     compile("app:latest", &format!("app@{AMD64}")).expect("one image compiles");
+    // Only line breaks: what a fork's builds render; the Step decides.
+    compile("app:latest", "").expect("an empty images compiles");
+    compile("app:latest", "\\n\\n").expect("empty lines compile");
     for (image, images, input) in [
         ("registry.example/app", two.as_str(), "image"),
         (
@@ -232,7 +270,12 @@ fn literal_inputs_are_checked_at_compile() {
             "registry.example/app:amd64",
             "images",
         ),
-        ("registry.example/app:1", "", "images"),
+        (
+            "registry.example/app:1",
+            &format!("\\nregistry.example/app@{AMD64}") as &str,
+            "images",
+        ),
+        ("registry.example/app:1", " ", "images"),
         (
             "registry.example/app:1",
             "registry.example/app@sha256:abc",

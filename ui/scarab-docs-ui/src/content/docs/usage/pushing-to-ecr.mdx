@@ -317,9 +317,13 @@ reaches it from a plain list:
     with:
       image: "444455556666.dkr.ecr.eu-west-1.amazonaws.com/app:${{ event.sha }}"
       images: |
-        ${{ outputs.amd64.push.ref }}
-        ${{ outputs.arm64.push.ref }}
+        ${{ has(outputs.amd64.push) ? outputs.amd64.push.ref : '' }}
+        ${{ has(outputs.arm64.push) ? outputs.arm64.push.ref : '' }}
 ```
+
+A fork pull request's builds push nothing and have no `push` result, so each line reads
+`outputs.<build>.push` only when it is there. On a fork the lines are empty, and the index step
+pushes nothing and succeeds; anywhere else, empty lines fail the step.
 
 The role in part 1 already reads and writes the `app` repository, which is all the join needs.
 Deploy by `${{ outputs.app.index.digest }}`.
@@ -591,8 +595,6 @@ Scarab has no pull credential of its own for the build step.
 - **Private base images in ECR only.** The build step holds no registry credential. A pull-only
   role and a login init container on the build step's Pod reach private ECR base images
   ([above](#private-base-images-in-ecr)); a private base image elsewhere is not supported yet.
-- **The push step runs as root**, because crane's image has no other user. An org Policy that
-  denies run-as-root refuses every Run that invokes the build library.
 - **The layer cache is S3 only**, reached with the build step's own identity. Give it a role of its
   own on the build step's profile (`build-cache` in part 4), limited to the cache bucket. Never put
   the push role there: a Dockerfile `RUN` can read what the build step holds, so anyone who can

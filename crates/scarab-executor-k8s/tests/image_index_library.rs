@@ -324,6 +324,82 @@ fn the_step_pushes_nothing_for_a_fork() {
     }
 }
 
+/// git-bug 794b3ac: a fork pull request's builds push nothing, so the
+/// documented `has(outputs.<build>.push) ? … : ''` template renders `images`
+/// as empty lines. A fork's Step then pushes nothing and exits 0; a Run that
+/// is not a fork's fails on the same input (exit 2), before crane runs.
+#[test]
+fn a_fork_with_no_images_pushes_nothing_and_a_non_fork_fails() {
+    let h = Harness::new();
+    for images in ["", "\n", "\n\n"] {
+        for fork in ["true", ""] {
+            let (code, calls) = h.run(images, &[("SCARAB_FORK_PR", fork)]);
+            assert_eq!((code, calls.len()), (Some(0), 0), "{images:?} {fork:?}");
+            assert!(h.result().is_none());
+        }
+        let (code, calls) = h.run(images, &[]);
+        assert_eq!((code, calls.len()), (Some(2), 0), "{images:?}");
+        assert!(h.result().is_none());
+    }
+}
+
+// Attack: whoever made a source image writes its manifest or config so that
+// grep and crane's Go JSON decoder read different things: an index whose
+// `manifests` key is spelled with a \u escape or in another case (crane's
+// `index append` would flatten it into the new index), or a config whose
+// real `os` key is escaped, upper-cased or spelled with U+017F beside a
+// decoy `os` label (the platform check would read the label). Safe outcome:
+// exit 2 before `crane index append` runs, and no result.
+#[test]
+fn the_step_refuses_a_manifest_or_config_crane_would_read_differently() {
+    let h = Harness::new();
+    let a = by_digest('a');
+    let arm64 = config(r#""architecture":"arm64","os":"linux""#);
+    h.serve(
+        '1',
+        r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#,
+        &arm64,
+    );
+    h.serve(
+        '2',
+        r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","Manifests":[]}"#,
+        &arm64,
+    );
+    let decoy = |key: &str| {
+        format!(
+            r#"{{"architecture":"arm64","{key}":"windows","rootfs":{{"type":"layers","diff_ids":[]}},"config":{{"Labels":{{"os":"linux"}}}}}}"#
+        )
+    };
+    h.serve('3', image_manifest(), &decoy(r"os"));
+    h.serve('4', image_manifest(), &decoy("OS"));
+    h.serve('5', image_manifest(), &decoy("o\u{17f}"));
+    for c in ['1', '2', '3', '4', '5'] {
+        let (code, calls) = h.run(&format!("{a}\n{}", by_digest(c)), &[]);
+        assert_eq!(code, Some(2), "{c}: {calls:?}");
+        assert!(
+            calls.iter().all(|l| !l.starts_with("index ")),
+            "{c}: {calls:?}"
+        );
+        assert!(h.result().is_none(), "{c}");
+    }
+}
+
+/// What image builders write is not refused: Go's encoder escapes `&`, `<`
+/// and `>` as `&`, `<` and `>` (a `RUN a && b` in the
+/// history), and a label may hold any UTF-8 text.
+#[test]
+fn the_step_joins_images_whose_config_holds_escaped_html_and_utf8() {
+    let h = Harness::new();
+    h.serve(
+        '0',
+        image_manifest(),
+        r#"{"architecture":"arm64","os":"linux","config":{"Labels":{"maintainer":"José <jose@example.com>"}},"history":[{"created_by":"RUN apt-get update && apt-get install -y curl"}],"rootfs":{"type":"layers","diff_ids":[]}}"#,
+    );
+    let (code, calls) = h.run(&format!("{}\n{}", by_digest('a'), by_digest('0')), &[]);
+    assert_eq!(code, Some(0), "{calls:?}");
+    assert!(h.result().is_some());
+}
+
 /// A reference crane reports that is not `<repository>@sha256:<64 hex>`
 /// fails the Step (exit 1) and writes no result.
 #[test]
