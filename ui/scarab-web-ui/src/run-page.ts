@@ -104,6 +104,12 @@ export function stepName(id: string): { base: string; cell: string | null } {
   return m ? { base: m.base, cell: m.values.join(" · ") } : { base: id, cell: null };
 }
 
+/** A step's name on one line: "plan · treebo-production · aws-cluster". */
+export function stepDisplayName(id: string): string {
+  const n = stepName(id);
+  return n.cell ? `${n.base} · ${n.cell}` : n.base;
+}
+
 // ── Status words and glyphs ─────────────────────────────────────────────────
 
 /** One glyph per step or try status, used by the summary, list and header. */

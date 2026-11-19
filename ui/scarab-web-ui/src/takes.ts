@@ -302,17 +302,19 @@ export function attemptPlaces(events: RunEvent[]): Record<string, Record<string,
  * belongs to the version in view, "plan · version 1 · try 2" when it belongs
  * to another one. Falls back to the raw id when the event log does not know
  * the attempt (an old run, or a log still loading). `viewedTake` null = no
- * version context, so the version is always named. */
+ * version context, so the version is always named. `name` replaces the step
+ * id in the label ("plan · treebo-production · aws-cluster · try 2"). */
 export function tryLabel(
   places: Record<string, Record<string, AttemptPlace>>,
   step: string,
   attempt: string,
   viewedTake: number | null,
+  name: string = step,
 ): string {
   const p = places[step]?.[attempt];
-  if (!p) return `${step} · ${attempt}`;
-  if (viewedTake !== null && p.take === viewedTake) return `${step} · try ${p.try}`;
-  return `${step} · version ${p.take} · try ${p.try}`;
+  if (!p) return `${name} · ${attempt}`;
+  if (viewedTake !== null && p.take === viewedTake) return `${name} · try ${p.try}`;
+  return `${name} · version ${p.take} · try ${p.try}`;
 }
 
 /** The of-record attempt of a step that did not run in the version in view

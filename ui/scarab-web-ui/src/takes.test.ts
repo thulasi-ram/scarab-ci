@@ -469,6 +469,11 @@ describe("attemptPlaces + tryLabel", () => {
   it("falls back to the raw id for an attempt the log does not know", () => {
     expect(tryLabel(places, "b", "a9", 2)).toBe("b · a9");
   });
+
+  it("uses the display name in place of the step id when given one", () => {
+    expect(tryLabel(places, "b", "a3", 2, "build · eu")).toBe("build · eu · try 1");
+    expect(tryLabel(places, "b", "a2", 2, "build · eu")).toBe("build · eu · version 1 · try 2");
+  });
 });
 
 // Regression: a step carried forward into a later version showed "nothing of
