@@ -18,6 +18,17 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **A step whose Pod waits for a new node keeps its logs.** While a Pod has no node (a cluster
+  autoscaler such as Karpenter is adding one), Kubernetes answers a log request for it with an
+  empty response instead of an error. The server took that as the step's complete log and never
+  read the step again, so every line the step printed once the node joined was lost, with nothing
+  logged. Since 0.4.1 lets such a Pod wait for a node instead of failing, this hit most steps on
+  autoscaled clusters. The server now waits until the Pod has a node, and a log read that ends
+  with no output is tried again. The server log has an INFO line when a step's output starts
+  arriving and when its log read ends, with the byte count.
+
 ## [0.4.3] - 2026-11-17
 
 ### Enhancement

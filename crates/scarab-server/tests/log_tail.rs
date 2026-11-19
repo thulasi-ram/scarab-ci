@@ -259,3 +259,48 @@ async fn tailer_dedups_per_fence() {
     .expect("tail drained its chunk into the pipeline");
     assert_eq!(exec.calls(), 1);
 }
+
+/// git-bug 1dee2f3: a tail that ends having read nothing is not a complete
+/// log. Kubernetes answers a log request for a Pod with no node yet with an
+/// empty stream; the next `ensure` after the backoff opens the tail again and
+/// the step's later output reaches the pipeline.
+#[tokio::test]
+async fn a_tail_that_read_nothing_is_retried() {
+    // One empty chunk: the pump skips it, so the tail reads 0 bytes.
+    let exec = GatedExec::new(vec![Vec::new()]);
+    let logs = logs();
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    let step = running_step();
+
+    // First tail: the stream ends with no output.
+    tailer.ensure(&step);
+    wait_for(|| exec.calls() == 1).await;
+    exec.open.notify_one();
+    // The first tail has taken its (empty) chunks.
+    wait_for(|| exec.chunks.lock().unwrap().is_empty()).await;
+
+    // The Pod now prints. After the backoff the next ensure re-opens it.
+    *exec.chunks.lock().unwrap() = vec![b"late\n".to_vec()];
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while exec.calls() < 2 {
+            tailer.ensure(&step);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("an empty tail is opened again");
+    exec.open.notify_one();
+
+    let (run, s, a) = stream();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if logs.read_all(&run, &s, &a).await.unwrap_or_default() == b"late\n" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the later output reached the pipeline");
+}
