@@ -8014,7 +8014,11 @@ mod tests {
                     .is_some_and(|ps| ps.iter().any(|p| p["name"] == "ecr-push"))
             })
             .collect();
-        assert_eq!(chart.len(), 1, "one chart-values block holds the ecr-push profile");
+        assert_eq!(
+            chart.len(),
+            1,
+            "one chart-values block holds the ecr-push profile"
+        );
         let placement: PlacementConfig =
             serde_yaml::from_value(chart[0]["scarab"]["placement"].clone())
                 .expect("the page's placement values parse as the server's config");
