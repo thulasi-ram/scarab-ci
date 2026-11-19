@@ -985,6 +985,7 @@ async fn drain(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::{
@@ -1091,5 +1092,133 @@ mod tests {
             ),
             TailErrorClass::Failed
         );
+    }
+
+    /// J-1: a replica that tails a step it did not launch registers every
+    /// value the launching replica registered, the forge token and the OIDC
+    /// token included. The launch runs through the server's decorators over
+    /// a fake unit. The peer's executor answers `log_redactions` with what
+    /// the k8s executor reads back from the Secrets it writes for the
+    /// launched spec: the token of `<pod>-token` and of `<pod>-oidc`
+    /// (scarab-executor-k8s `log_redactions_cover_every_credential_the_launch_mounts`).
+    #[tokio::test]
+    async fn a_peer_registers_every_token_the_launch_registers() {
+        use scarab_engine::{
+            Attempt, AttemptId, AttemptOutcome, Db, DeployContext, Executor, ForgeTokenConfig,
+            RunId, StepId, StepRun, StepSpec, StepStatus, Timestamp,
+        };
+        use scarab_testkit::{
+            FakeExecutor, FakeForge, FakeSecrets, InMemoryDb, InMemoryObjectStore,
+        };
+
+        use crate::logs::LogService;
+
+        let db = Arc::new(InMemoryDb::new());
+        db.set_run_deploy_context(
+            &RunId("r1".into()),
+            &DeployContext {
+                org: "acme".into(),
+                project: "web".into(),
+                environment: "prod".into(),
+                git_ref: "refs/heads/main".into(),
+                locked_out: false,
+            },
+        )
+        .await
+        .unwrap();
+        let log_service = || {
+            Arc::new(LogService::new(
+                Arc::new(InMemoryObjectStore::new()),
+                db.clone() as Arc<dyn Db>,
+            ))
+        };
+        let launching = log_service();
+        let inner = Arc::new(FakeExecutor::new());
+        let issuer =
+            Arc::new(crate::oidc::Rs256Issuer::generate("https://scarab.example").unwrap());
+        let with_secrets = crate::SecretInjectingExecutor::new(
+            inner.clone(),
+            db.clone() as Arc<dyn Db>,
+            Arc::new(FakeSecrets::new()),
+            launching.clone(),
+        )
+        .with_oidc(issuer, "https://scarab.example", "sts.example.com");
+        let exec = crate::forge_token::ForgeCredentialExecutor::new(
+            Arc::new(with_secrets),
+            Arc::new(FakeForge::new().with_minted_tokens()),
+        )
+        .with_logs(launching.clone());
+
+        let step = StepRun {
+            run: RunId("r1".into()),
+            step: StepId("deploy".into()),
+            status: StepStatus::Running,
+            attempts: vec![Attempt {
+                id: AttemptId("a1".into()),
+                started_at: Timestamp(0),
+                failure: None,
+                failure_detail: None,
+                outcome: AttemptOutcome::Running,
+            }],
+            needs: vec![],
+            gate_kind: None,
+        };
+        let spec = StepSpec {
+            image: "busybox".into(),
+            command: vec![],
+            env: vec![],
+            secrets: vec![],
+            run_as_root: false,
+            run_as_user: None,
+            add_capabilities: vec![],
+            privileged: false,
+            timeout_seconds: None,
+            workspace_inputs: vec![],
+            workspace_outputs: vec![],
+            cache: None,
+            forge_token: Some(ForgeTokenConfig {
+                access: scarab_pipeline::ForgeToken::Read,
+                owner: "acme".into(),
+                name: "web".into(),
+                read_only: false,
+                trusted_library: None,
+                credential: None,
+            }),
+            sandbox: None,
+            registry_auth: None,
+            build: None,
+            artifacts: vec![],
+            placement_profiles: vec![],
+            resources: Default::default(),
+            k8s_overlay: None,
+            oidc_token: None,
+            resolved_secrets: Default::default(),
+            services: Vec::new(),
+            uses: Vec::new(),
+            matrix_values: Default::default(),
+            scope: None,
+        };
+        let handle = exec.launch(&step, &spec).await.unwrap();
+        let launched = inner.launched_spec(&handle).unwrap();
+        let forge = launched.forge_token.unwrap().credential.unwrap().token;
+        let oidc = launched.oidc_token.expect("an OIDC token is minted");
+
+        let registered = launching.registered_secrets();
+        assert!(registered.contains(&forge.clone().into_bytes()));
+        assert!(registered.contains(&oidc.clone().into_bytes()));
+
+        inner.set_log_redactions(vec![forge.into_bytes(), oidc.into_bytes()]);
+        let peer = log_service();
+        super::register_unit_secrets(&exec, &peer, &super::TailSource::Step(step))
+            .await
+            .unwrap();
+        let at_peer = peer.registered_secrets();
+        for value in &registered {
+            assert!(
+                at_peer.contains(value),
+                "{} is not registered at the peer",
+                String::from_utf8_lossy(value)
+            );
+        }
     }
 }

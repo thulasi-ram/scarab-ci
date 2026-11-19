@@ -782,6 +782,9 @@ impl Executor for SecretInjectingExecutor {
             .await?;
         let mut base = None;
         if let Some(token) = oidc_token {
+            // Mounted into the step container: a step that prints it shows
+            // `***`. Each launch mints a new one and registers it here.
+            self.logs.register_secret(token.as_bytes());
             base = Some(StepSpec {
                 oidc_token: Some(token),
                 ..spec.clone()

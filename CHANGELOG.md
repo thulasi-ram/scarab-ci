@@ -169,6 +169,11 @@ release.yml uses that version's section as the GitHub Release text. See
   part where that part holds `***`, the replica stores nothing more of that step's log and logs a
   warning, instead of storing the value in clear. See
   [Run logs](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/#how-the-server-stores-a-log).
+- **Forge and identity tokens mounted into a step are redacted from its log.** Only the step's
+  own secrets and its registry credential were redacted. The forge token a step gets with
+  `forge_token:` and the OIDC token Scarab issues to a deploy step were stored as printed. Both
+  are now registered when the step launches, again with the new token on each relaunch, and a
+  replica that did not launch the step reads both back from the step Pod's Secrets.
 
 ### Enhancement
 

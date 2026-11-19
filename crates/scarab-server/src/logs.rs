@@ -107,6 +107,12 @@ impl LogService {
         }
     }
 
+    /// Every value registered so far.
+    #[cfg(test)]
+    pub(crate) fn registered_secrets(&self) -> Vec<Vec<u8>> {
+        self.secrets.lock().unwrap().clone()
+    }
+
     /// Replace every registered secret value in a **text diagnostic** with
     /// `***` — the same scrub [`append`](Self::append) applies to log bytes,
     /// for the strings that never travel as log bytes.

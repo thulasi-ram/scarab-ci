@@ -419,6 +419,49 @@ async fn deploy_run_gets_a_verifiable_token_with_the_run_subject() {
     assert_eq!(claims["iss"], "https://scarab.example");
 }
 
+/// The OIDC token is mounted into the step container: a step that prints it
+/// stores `***`. Each launch registers the token it mints.
+#[tokio::test]
+async fn a_printed_oidc_token_is_stored_redacted() {
+    let db = Arc::new(InMemoryDb::new());
+    seed_deploy(&db, "r1", false).await;
+    let issuer = Arc::new(Rs256Issuer::generate("https://scarab.example").unwrap());
+    let inner = Arc::new(SpecCapturingExec::default());
+    let logs = logs(db.clone());
+    let exec = SecretInjectingExecutor::new(
+        inner.clone(),
+        db.clone() as Arc<dyn Db>,
+        Arc::new(FakeSecrets::new()),
+        logs.clone(),
+    )
+    .with_oidc(issuer, "https://scarab.example", "sts.example.com");
+    exec.launch(&step("r1"), &plain_spec()).await.unwrap();
+    let token = inner
+        .last
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap()
+        .oidc_token
+        .unwrap();
+
+    let (run, step, attempt) = (
+        RunId("r1".into()),
+        StepId("s1".into()),
+        scarab_engine::AttemptId("a1".into()),
+    );
+    logs.append(&run, &step, &attempt, format!("OIDC={token}\n").as_bytes())
+        .await
+        .unwrap();
+    let stored = logs.read_all(&run, &step, &attempt).await.unwrap();
+    let stored = String::from_utf8_lossy(&stored);
+    assert!(
+        !stored.contains(token.as_str()),
+        "stored in clear: {stored}"
+    );
+    assert_eq!(stored, "OIDC=***\n");
+}
+
 #[tokio::test]
 async fn fork_pr_token_subject_is_downgraded_to_env_none() {
     let db = Arc::new(InMemoryDb::new());

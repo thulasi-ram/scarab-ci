@@ -440,8 +440,8 @@ pub struct ForgeCredentialExecutor {
     clock: Arc<dyn scarab_engine::Clock>,
     /// Principals: a recorded approver set compares as ids (ADR-0080 §3).
     identities: Option<Arc<dyn scarab_identity::IdentityStore>>,
-    /// The log pipeline's redactor: a resolved registry credential is
-    /// registered with it before the Step launches.
+    /// The log pipeline's redactor: the forge token and a resolved registry
+    /// credential are registered with it before the Step launches.
     logs: Option<Arc<crate::LogService>>,
 }
 
@@ -460,8 +460,8 @@ impl ForgeCredentialExecutor {
         }
     }
 
-    /// Register each registry credential resolved at launch with `logs`'
-    /// redactor, so a Step that prints it shows `***`.
+    /// Register the forge token and each registry credential resolved at
+    /// launch with `logs`' redactor, so a Step that prints one shows `***`.
     pub fn with_logs(mut self, logs: Arc<crate::LogService>) -> Self {
         self.logs = Some(logs);
         self
@@ -1026,6 +1026,13 @@ impl Executor for ForgeCredentialExecutor {
                 )));
             }
         }
+        // The token is mounted into the step container: a step that prints
+        // it shows `***`. A re-drive mints a new one and registers it here
+        // too. A peer replica reads it back from the unit
+        // (`Executor::log_redactions`).
+        if let (Some(logs), Some(c)) = (&self.logs, &credential) {
+            logs.register_secret(c.token.as_bytes());
+        }
         let mut enriched = spec.clone();
         if let Some(f) = enriched.forge_token.as_mut() {
             f.access = access;
@@ -1266,9 +1273,8 @@ mod tests {
     // the launching replica registered (`step_registry_auth`). For a
     // forge-derived credential the Secret holds the dockerconfigjson the k8s
     // executor builds (`registry_dockerconfig`); for the `REGISTRY_AUTH`
-    // secret it holds that JSON as stored. The forge token mounted for the
-    // Step (`<pod>-token`) is registered by neither: the launch does not
-    // register it, so the peer does not either.
+    // secret it holds that JSON as stored. The forge and OIDC tokens are
+    // checked by `log_tail::tests::a_peer_registers_every_token_the_launch_registers`.
     #[test]
     fn a_peer_registers_every_registry_value_the_launch_registers() {
         use base64::Engine;
