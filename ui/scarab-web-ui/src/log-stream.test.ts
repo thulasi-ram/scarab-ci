@@ -68,10 +68,29 @@ describe("appendLog", () => {
     expect(b.droppedBytes).toBe(7);
   });
 
-  it("never cuts the last line, even when it alone is over the cap", () => {
-    const b = appendLog(emptyLogBuffer(), "a\nbbbbbbbbbb", 4);
-    expect(b.text).toBe("bbbbbbbbbb");
+  it("does not cut the last line while it alone is under twice the cap", () => {
+    const b = appendLog(emptyLogBuffer(), "a\nbbbbbbb", 4);
+    expect(b.text).toBe("bbbbbbb");
     expect(b.droppedBytes).toBe(2);
+  });
+
+  it("cuts the start of a log with no line breaks once it is over twice the cap", () => {
+    const cap = 10;
+    let b = emptyLogBuffer();
+    for (let i = 0; i < 3; i++) b = appendLog(b, "x".repeat(cap), cap);
+    expect(b.bytes).toBeLessThanOrEqual(2 * cap);
+    expect(b.text.length).toBe(b.bytes);
+    expect(b.droppedBytes).toBeGreaterThan(0);
+    expect(b.bytes + b.droppedBytes).toBe(3 * cap);
+    expect(logNotice(b)?.text).toBe("Showing the last 10 B of 30 B.");
+  });
+
+  it("cuts a line with no breaks on a character boundary", () => {
+    // 4-byte characters (two UTF-16 units each) over a cap of 6 bytes.
+    const b = appendLog(emptyLogBuffer(), "🪲".repeat(5), 6);
+    expect(b.text).toBe("🪲");
+    expect(b.bytes).toBe(4);
+    expect(b.droppedBytes).toBe(16);
   });
 });
 
@@ -141,10 +160,16 @@ describe("tailRows", () => {
   });
 });
 
-/** A fake server: each `open` is one stream the test drives by hand. */
-function harness(opts: { outcome: () => string | undefined; tail?: number }) {
+/** A fake server: each `open` is one stream the test drives by hand.
+ * `probe` answers the follower's question about a cursor. */
+function harness(opts: {
+  outcome: () => string | undefined;
+  tail?: number;
+  probe?: (q: LogStreamQuery) => Promise<number | null>;
+}) {
   const opened: { q: LogStreamQuery; h: LogStreamHandlers; closed: boolean }[] = [];
   const pending: { fn: () => void; ms: number; cleared: boolean }[] = [];
+  let clock = 0;
   const timers: Timers = {
     set: (fn, ms) => {
       const t = { fn, ms, cleared: false };
@@ -154,6 +179,7 @@ function harness(opts: { outcome: () => string | undefined; tail?: number }) {
     clear: (t) => {
       (t as { cleared: boolean }).cleared = true;
     },
+    now: () => clock,
   };
   const shown: string[] = [];
   let ends = 0;
@@ -172,18 +198,27 @@ function harness(opts: { outcome: () => string | undefined; tail?: number }) {
     onTruncated: () => {},
     onEnd: () => ends++,
     onReset: () => resets++,
+    probe: opts.probe,
     timers,
     random: () => 0,
   });
-  /** Run the next timer that is due. */
+  /** Run the next timer that is due, moving the clock to it. */
   const tick = () => {
     const t = pending.shift();
     expect(t).toBeDefined();
+    clock += t!.ms;
     if (!t!.cleared) t!.fn();
     return t!.ms;
   };
-  return { f, opened, pending, shown, tick, ends: () => ends, resets: () => resets };
+  /** Move the clock on. */
+  const advance = (ms: number) => {
+    clock += ms;
+  };
+  return { f, opened, pending, shown, tick, advance, ends: () => ends, resets: () => resets };
 }
+
+/** Let a probe's answer arrive. */
+const settle = () => new Promise((r) => setTimeout(r, 0));
 
 describe("followLog", () => {
   it("opens with the tail, and resumes after the last event id", () => {
@@ -216,9 +251,16 @@ describe("followLog", () => {
     expect(h.opened[h.opened.length - 1]!.q).toEqual({ from: "a1:2" });
   });
 
-  it("after 3 reopens in a row fail before opening, drops the cursor and opens fresh with the tail", () => {
+  it("after 3 reopens in a row fail before opening and the server refuses the cursor, opens fresh with the tail", async () => {
     // A cursor the server refuses (400) ends each reopen before it opens.
-    const h = harness({ outcome: () => "running" });
+    const probed: LogStreamQuery[] = [];
+    const h = harness({
+      outcome: () => "running",
+      probe: async (q) => {
+        probed.push(q);
+        return 400;
+      },
+    });
     h.opened[0]!.h.onChunk("x\n", "a1:1");
     const last = () => h.opened[h.opened.length - 1]!;
     const waits: number[] = [];
@@ -226,6 +268,8 @@ describe("followLog", () => {
       last().h.onEnd!();
       waits.push(h.tick());
     }
+    await settle();
+    expect(probed).toEqual([{ from: "a1:1" }]);
     // The backoff goes on from where it was.
     expect(waits).toEqual([1000, 2000, 4000, 8000]);
     expect(h.opened.map((s) => s.q)).toEqual([
@@ -247,6 +291,37 @@ describe("followLog", () => {
     expect(h.tick()).toBe(1000);
     expect(last().q).toEqual({ from: "a1:4" });
     expect(h.resets()).toBe(1);
+  });
+
+  it("keeps the cursor when the server does not answer the probe", async () => {
+    // The server is down: reopens fail, and so does the probe.
+    const h = harness({ outcome: () => "running", probe: async () => null });
+    h.opened[0]!.h.onChunk("x\n", "a1:1");
+    const last = () => h.opened[h.opened.length - 1]!;
+    for (let i = 0; i < 4; i++) {
+      last().h.onEnd!();
+      h.tick();
+    }
+    await settle();
+    expect(h.opened.slice(1).map((s) => s.q)).toEqual(Array(4).fill({ from: "a1:1" }));
+    expect(h.f.lastId()).toBe("a1:1");
+    expect(h.resets()).toBe(0);
+  });
+
+  it("a quiet stream that stays open longer than the wait before it starts the backoff over", () => {
+    const h = harness({ outcome: () => "running" });
+    h.opened[0]!.h.onChunk("x\n", "a1:1");
+    const last = () => h.opened[h.opened.length - 1]!;
+    const waits: number[] = [];
+    // Each reopened stream opens, gets only keepalive comments for 5 s, and
+    // drops.
+    for (let i = 0; i < 6; i++) {
+      last().h.onEnd!();
+      waits.push(h.tick());
+      last().h.onOpen!();
+      h.advance(5000);
+    }
+    expect(waits).toEqual(Array(6).fill(1000));
   });
 
   it("does not reload a quiet step whose opened streams drop with no event", () => {

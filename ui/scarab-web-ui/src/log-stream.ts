@@ -21,11 +21,11 @@ export const CLIENT_CAP_BYTES = 8 * MiB;
 export const BACKOFF_INITIAL_MS = 1000;
 export const BACKOFF_MAX_MS = 30_000;
 
-/** Reopens in a row that fail before the stream opens, before the pane stops
- * resuming and opens the log fresh. A cursor the server refuses (400) fails
- * every reopen that way, and an EventSource reports it only as an error, so it
- * would retry forever. A quiet step's stream opens and gets only keepalive
- * comments, so its drops do not count. */
+/** Reopens in a row that fail before the stream opens, before the pane asks
+ * the server whether it refuses the cursor. A cursor the server refuses (400)
+ * fails every reopen that way, and an EventSource reports it only as an error,
+ * so it would retry forever. A quiet step's stream opens and gets only
+ * keepalive comments, so its drops do not count. */
 export const FAILED_REOPENS_BEFORE_FRESH = 3;
 
 /** The server's `truncated` event: the replay skipped the first `skippedBytes`
@@ -104,9 +104,31 @@ export function truncateLog(buf: LogBuffer, t: LogTruncation): LogBuffer {
   return { ...buf, skippedBytes: t.skippedBytes };
 }
 
+/** The start of `s` that is at least `bytes` UTF-8 bytes long, cut on a
+ * character boundary: its length in UTF-16 code units and in bytes. */
+function headOf(s: string, bytes: number): { units: number; bytes: number } {
+  let i = 0;
+  let n = 0;
+  while (i < s.length && n < bytes) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+      const d = s.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d <= 0xdfff) {
+        n += 4;
+        i++;
+      } else n += 3;
+    } else n += 3;
+    i++;
+  }
+  return { units: i, bytes: n };
+}
+
 /** Append a chunk as it came (a chunk is raw output, so it may end mid-line).
  * Past `cap` bytes, whole lines are dropped from the top until the text fits.
- * The last line is never cut: when it alone is over the cap, it stays. */
+ * The last line is not cut while it is under twice the cap; past that, its
+ * start is dropped down to `cap` bytes, on a character boundary. */
 export function appendLog(buf: LogBuffer, chunk: string, cap = CLIENT_CAP_BYTES): LogBuffer {
   if (chunk.length === 0) return buf;
   let text = buf.text + chunk;
@@ -131,6 +153,13 @@ export function appendLog(buf: LogBuffer, chunk: string, cap = CLIENT_CAP_BYTES)
     newlines -= cutLines;
     droppedBytes += cutBytes;
     droppedLines += cutLines;
+    // A log with no line breaks: what is left is one line. Cut its start.
+    if (bytes > 2 * cap) {
+      const head = headOf(text, bytes - cap);
+      text = text.slice(head.units);
+      bytes -= head.bytes;
+      droppedBytes += head.bytes;
+    }
   }
   return { ...buf, text, bytes, newlines, droppedBytes, droppedLines };
 }
@@ -184,11 +213,14 @@ export function backoffDelay(failures: number, random: () => number = Math.rando
 export type Timers = {
   set: (fn: () => void, ms: number) => unknown;
   clear: (handle: unknown) => void;
+  /** Milliseconds since some fixed point. */
+  now: () => number;
 };
 
 const realTimers: Timers = {
   set: (fn, ms) => setTimeout(fn, ms),
   clear: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+  now: () => Date.now(),
 };
 
 export type LogFollower = {
@@ -205,11 +237,13 @@ export type LogFollower = {
  * The first stream opens with `tail`. When a stream ends while the try still
  * reads as running, it opens again after a backoff (`backoffDelay`), resuming
  * after the last event id so nothing is sent twice; the backoff resets once a
- * reopened stream delivers an event. After `FAILED_REOPENS_BEFORE_FRESH`
- * reopens in a row that end before they open, the cursor is dropped and the next
- * stream opens with `tail` again; `onReset` clears the pane when that stream
- * delivers its first event, so the old text stays up while the server is
- * unreachable. The backoff goes on from where it was. `streamEndStep` decides each end: a try
+ * reopened stream delivers an event, or stayed open longer than the wait
+ * before it. After `FAILED_REOPENS_BEFORE_FRESH` reopens in a row that end
+ * before they open, `probe` asks the server about the cursor. Only when it
+ * answers 400 is the cursor dropped and the next stream opened with `tail`
+ * again; `onReset` clears the pane when that stream delivers its first event.
+ * When the server is unreachable or answers anything else, the cursor is
+ * kept. The backoff goes on from where it was. `streamEndStep` decides each end: a try
  * that finished is done, and one that finished with no output is read once
  * more. `outcome()` is undefined while the log is out of view; the decision
  * then waits for `inView()`, and the pane stops reopening a try it switched
@@ -228,6 +262,10 @@ export function followLog(opts: {
   /** A stream opened fresh with `tail` after resuming failed delivered its
    * first event: clear what the pane holds before it arrives. */
   onReset?: () => void;
+  /** Ask the server about the stream `q` names without reading it: the HTTP
+   * status, or null when the server did not answer. Without it the cursor is
+   * always kept. */
+  probe?: (q: LogStreamQuery) => Promise<number | null>;
   timers?: Timers;
   random?: () => number;
 }): LogFollower {
@@ -243,14 +281,33 @@ export function followLog(opts: {
   let failedReopens = 0;
   // The stream in flight is a fresh open after resuming failed.
   let resetPending = false;
+  // The wait before the stream in flight opened.
+  let lastWait = 0;
 
   const start = (reopen: boolean) => {
     if (stopped) return;
     if (reopen && lastId != null && failedReopens >= FAILED_REOPENS_BEFORE_FRESH) {
-      lastId = null;
+      // Reopens keep failing: a refused cursor (400) or a server that is
+      // down. Ask which before giving up the cursor.
       failedReopens = 0;
-      resetPending = true;
+      const cursor = lastId;
+      const probe = opts.probe ?? (() => Promise.resolve(null));
+      const then = (status: number | null) => {
+        if (stopped) return;
+        if (status === 400 && lastId === cursor) {
+          lastId = null;
+          resetPending = true;
+        }
+        openStream(reopen);
+      };
+      probe({ from: cursor }).then(then, () => then(null));
+      return;
     }
+    openStream(reopen);
+  };
+
+  const openStream = (reopen: boolean) => {
+    if (stopped) return;
     // One stream at a time: `current` tells this stream's events from a
     // closed one's.
     const current = {};
@@ -258,7 +315,9 @@ export function followLog(opts: {
     let close: (() => void) | null = null;
     const mine = () => active === current && !stopped;
     let opened = false;
+    let openedAt = 0;
     const gotOpen = () => {
+      if (!opened) openedAt = timers.now();
       opened = true;
       failedReopens = 0;
     };
@@ -295,6 +354,9 @@ export function followLog(opts: {
       onEnd: () => {
         if (!mine()) return;
         if (reopen && !opened) failedReopens++;
+        // A quiet stream that stayed open longer than the wait before it was
+        // not a failure: the backoff starts over.
+        if (opened && timers.now() - openedAt > lastWait) failures = 0;
         active = null;
         closeStream = null;
         close?.();
@@ -324,10 +386,12 @@ export function followLog(opts: {
     if (step === "reopen") {
       start(true);
     } else if (step === "wait" && timer === null) {
+      const wait = backoffDelay(failures++, opts.random);
       timer = timers.set(() => {
         timer = null;
+        lastWait = wait;
         decide(true);
-      }, backoffDelay(failures++, opts.random));
+      }, wait);
     }
   };
 

@@ -28,6 +28,8 @@ import {
   getConsumed,
   listWorkspace,
   workspaceFileUrl,
+  probeLogStream,
+  stepLogStreamUrl,
   streamStepLogs,
   streamStepSidecarLogs,
   stepLogsRawUrl,
@@ -451,6 +453,7 @@ export default function StepPane(props: {
           c == null
             ? streamStepLogs(props.runId, s, { attempt: attemptId, ...q, ...h })
             : streamStepSidecarLogs(props.runId, s, c, { attempt: attemptId, ...q, ...h }),
+        probe: (q) => probeLogStream(stepLogStreamUrl(props.runId, s, { attempt: attemptId, sidecar: c, ...q })),
         tail: tails.get(key) ?? DEFAULT_TAIL_BYTES,
         // The try's outcome now, only while its log is the one in view: the
         // pane does not reopen a log it switched away from until it is back.

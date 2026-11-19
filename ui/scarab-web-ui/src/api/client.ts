@@ -1494,11 +1494,37 @@ export function streamStepLogs(
   step: string,
   opts: { attempt?: string } & LogStreamQuery & LogStreamHandlers,
 ): () => void {
+  return openLogStream(stepLogStreamUrl(id, step, opts), opts);
+}
+
+/** The URL of a step's log stream; `sidecar` picks a sidecar's log. */
+export function stepLogStreamUrl(
+  id: string,
+  step: string,
+  opts: { attempt?: string; sidecar?: number | null } & LogStreamQuery,
+): string {
   const base = `/v1/runs/${encodeURIComponent(id)}/steps/${encodeURIComponent(step)}/logs`;
   const q = new URLSearchParams();
+  if (opts.sidecar != null) q.set("sidecar", String(opts.sidecar));
   if (opts.attempt) q.set("attempt", opts.attempt);
   const qs = logQuery(q, opts).toString();
-  return openLogStream(qs ? `${base}?${qs}` : base, opts);
+  return qs ? `${base}?${qs}` : base;
+}
+
+/** Ask for a log stream without reading it: the HTTP status once the headers
+ * arrive (the body is not read), or null when the server did not answer. A
+ * log pane uses it to tell a cursor the server refuses (400) from a server
+ * that is down, which an EventSource reports the same way. */
+export async function probeLogStream(url: string): Promise<number | null> {
+  const ctl = new AbortController();
+  try {
+    const resp = await fetch(url, { headers: { accept: "text/event-stream" }, signal: ctl.signal });
+    return resp.status;
+  } catch {
+    return null;
+  } finally {
+    ctl.abort();
+  }
 }
 
 /**
@@ -1515,10 +1541,7 @@ export function streamStepSidecarLogs(
   index: number,
   opts: { attempt?: string } & LogStreamQuery & LogStreamHandlers,
 ): () => void {
-  const base = `/v1/runs/${encodeURIComponent(id)}/steps/${encodeURIComponent(step)}/logs`;
-  const q = new URLSearchParams({ sidecar: String(index) });
-  if (opts.attempt) q.set("attempt", opts.attempt);
-  return openLogStream(`${base}?${logQuery(q, opts).toString()}`, opts);
+  return openLogStream(stepLogStreamUrl(id, step, { ...opts, sidecar: index }), opts);
 }
 
 /** The whole log of one try as a plain-text download
@@ -1554,11 +1577,20 @@ export function streamServiceLogs(
   service: string,
   opts: { take?: number } & LogStreamQuery & LogStreamHandlers,
 ): () => void {
+  return openLogStream(serviceLogStreamUrl(id, service, opts), opts);
+}
+
+/** The URL of a shared service's log stream. */
+export function serviceLogStreamUrl(
+  id: string,
+  service: string,
+  opts: { take?: number } & LogStreamQuery,
+): string {
   const base = `/v1/runs/${encodeURIComponent(id)}/services/${encodeURIComponent(service)}/logs`;
   const q = new URLSearchParams();
   if (opts.take != null) q.set("take", String(opts.take));
   const qs = logQuery(q, opts).toString();
-  return openLogStream(qs ? `${base}?${qs}` : base, opts);
+  return qs ? `${base}?${qs}` : base;
 }
 
 /** Parse the SSE wire body into `data:` payloads (one per event block). */
