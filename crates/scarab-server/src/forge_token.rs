@@ -1260,6 +1260,44 @@ mod tests {
         assert_eq!(inner.launched_services(), vec![handle.0]);
     }
 
+    // J-1: a replica that tails a step it did not launch registers what
+    // `log_redactions` reads back from the Pod's `<pod>-registry` Secret,
+    // run through `registry_secret_values` (log_tail.rs). It must cover what
+    // the launching replica registered (`step_registry_auth`). For a
+    // forge-derived credential the Secret holds the dockerconfigjson the k8s
+    // executor builds (`registry_dockerconfig`); for the `REGISTRY_AUTH`
+    // secret it holds that JSON as stored. The forge token mounted for the
+    // Step (`<pod>-token`) is registered by neither: the launch does not
+    // register it, so the peer does not either.
+    #[test]
+    fn a_peer_registers_every_registry_value_the_launch_registers() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let derived = scarab_engine::RegistryCredential {
+            registry: "ghcr.io".into(),
+            username: "x-access-token".into(),
+            token: "ghs_derivedtoken".into(),
+        };
+        let built = serde_json::json!({ "auths": { "ghcr.io": {
+            "auth": b64.encode("x-access-token:ghs_derivedtoken")
+        } } })
+        .to_string();
+        let stored = serde_json::json!({ "auths": { "registry.corp": {
+            "auth": b64.encode("ci:s3cret"), "identitytoken": "idtok"
+        } } })
+        .to_string();
+        for (launch, unit) in [
+            (registry_secret_values(None, Some(&derived)), built),
+            (registry_secret_values(Some(&stored), None), stored.clone()),
+        ] {
+            let peer = registry_secret_values(Some(&unit), None);
+            assert!(!launch.is_empty());
+            for value in &launch {
+                assert!(peer.contains(value), "{value} not in {peer:?}");
+            }
+        }
+    }
+
     // This decorator must forward `log_redactions`: the trait default answers
     // none, and a replica that did not launch a step would then store the
     // step's secrets in its log in clear.
