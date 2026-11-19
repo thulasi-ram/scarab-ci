@@ -1245,3 +1245,84 @@ async fn a_run_as_root_step_launches_without_a_grant() {
         assert!(launched);
     }
 }
+
+/// A pull request Pipeline into `prod` whose Step carries an allowed
+/// `k8s_overlay`.
+const OVERLAY_PR_YAML: &str = r#"
+on:
+  pull_request: {}
+environment: prod
+steps:
+  - id: build
+    image: busybox
+    command: ["true"]
+    k8s_overlay: { spec: { nodeSelector: { pool: gpu } } }
+"#;
+
+/// A pull request event for `web`, from a fork when `fork`.
+fn pull_request(fork: bool) -> Event {
+    Event::PullRequest {
+        actor: "octocat".into(),
+        actor_id: String::new(),
+        repo: repo(),
+        number: 7,
+        head: "1234567890abcdef1234567890abcdef12345678".into(),
+        title: "add a widget".into(),
+        base: "main".into(),
+        fork,
+    }
+}
+
+// Attack (T2): a fork pull request's author controls the Pipeline, so a
+// grant that permits overlays in `prod` must not extend to it. The
+// lock-out was unit-tested on `admit_k8s_overlay` but never through Run
+// creation, where the call site passes it. Safe outcome: the fork's Run is
+// refused with the lock-out text; the same pull request from the repository
+// itself is created with its overlay.
+#[tokio::test]
+async fn a_fork_pull_requests_k8s_overlay_is_refused_at_run_creation() {
+    let governance = prod_for_everyone();
+    let grant = EnvironmentProjectPrivilegeGrant {
+        permit_k8s_overlay: true,
+        ..privileged_grant()
+    };
+    governance
+        .put_environment_project_privilege_grant(&grant, "amy", 1)
+        .await
+        .unwrap();
+    let forge = FakeForge::new().with_file(".scarab/ci.yaml", OVERLAY_PR_YAML);
+
+    let db = InMemoryDb::new();
+    let outcome = trigger_runs_from_event(
+        &forge,
+        &db,
+        &FakeClock::new(1_000),
+        scarab_server::AdmissionPorts::governance(Some(&governance)),
+        &pull_request(false),
+    )
+    .await
+    .expect("a pull request from the repository is admitted");
+    assert_eq!(outcome.runs.len(), 1, "{outcome:?}");
+    let spec = db
+        .step_spec(&outcome.runs[0], &StepId("build".into()))
+        .await
+        .unwrap()
+        .expect("the step has a spec");
+    assert!(spec.k8s_overlay.is_some(), "the overlay is kept");
+
+    let db = InMemoryDb::new();
+    let err = trigger_runs_from_event(
+        &forge,
+        &db,
+        &FakeClock::new(1_000),
+        scarab_server::AdmissionPorts::governance(Some(&governance)),
+        &pull_request(true),
+    )
+    .await
+    .expect_err("a fork's overlay is refused");
+    assert!(
+        err.to_string()
+            .contains("a fork pull request's Run (or a Run locked out of its Environment) may not use `k8s_overlay`"),
+        "{err}"
+    );
+}

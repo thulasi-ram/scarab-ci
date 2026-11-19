@@ -4,6 +4,8 @@
 //! and forge are the in-memory ones; the one external faked is the forge's
 //! HTTP (`StaticFetcher`: answers from a map and records every URL asked).
 
+mod step_up_harness;
+
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -987,4 +989,69 @@ async fn untrusting_a_source_without_naming_a_grant_leaves_it_no_grant() {
     assert_eq!(st, StatusCode::NO_CONTENT);
     let (_, list) = call(&h.app, "GET", "/v1/orgs/acme/libraries", None).await;
     assert_eq!(list["trusted_sources"], json!([]), "{list}");
+}
+
+// AUD-10: with step-up on, the security log's `op.completed` event for a
+// library install names the grants the install carried to the new version,
+// as the CHANGELOG and the libraries page say.
+#[tokio::test]
+async fn a_stepped_up_install_records_the_grants_it_carried() {
+    use scarab_identity::{Role, Scope};
+    use scarab_policy::library::{trust_key, LibraryVersion, TrustGrant, TrustedSource};
+    let source = format!("github.com/acme/libs//deploy.yaml@{C1}");
+    let store = Arc::new(InMemoryLibraries::new());
+    store
+        .put_version(&LibraryVersion {
+            org: "acme".into(),
+            content_hash: content_hash(V1),
+            content: V1.into(),
+            source: source.clone(),
+            name: DEPLOY.into(),
+            fetched_by: "amy".into(),
+            fetched_at: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .trust_source(&TrustedSource {
+            org: "acme".into(),
+            source: trust_key(&source).into(),
+            grant: TrustGrant::ForgeCredentials,
+            trusted_by: "amy".into(),
+            trusted_at: 1,
+            step_up_ref: Some("su-0".into()),
+        })
+        .await
+        .unwrap();
+    let libs = store.clone();
+    let h = step_up_harness::harness_with(move |st| st.with_libraries(libs));
+    h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
+    let s = h.browser_session(step_up_harness::owner("amy")).await;
+    let mut soft = step_up_harness::passkey();
+    h.enroll(&s, &mut soft, "Laptop").await;
+    h.open_window(&s, &mut soft).await;
+
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/library-installations",
+            Some(json!({
+                "name": DEPLOY,
+                "content_hash": content_hash(V1),
+                "carry_grants": ["forge_credentials"]
+            })),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    let completed = h.events("op.completed").await;
+    let install = completed
+        .iter()
+        .find(|e| e.op.as_deref() == Some("library.install"))
+        .unwrap_or_else(|| panic!("no completed install: {completed:?}"));
+    assert_eq!(
+        install.detail["carried_grants"],
+        json!(["forge_credentials"]),
+        "{install:?}"
+    );
 }
