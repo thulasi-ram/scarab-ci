@@ -133,6 +133,7 @@ image_plugin_argocd:
 # release tag. Its rendered defaults read nothing outside `deploy/helm/`.
 chart:
   - "deploy/helm/**"
+  - "scripts/chart_render_check.sh"
   - "scripts/chart_statefulset_immutable.sh"
   - ".github/workflows/image.yml"
   - ".github/path-filters.yml"
