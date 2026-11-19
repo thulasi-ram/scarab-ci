@@ -750,7 +750,7 @@ fn misspelt_variable() {
     assert_rejected(
         r#"triger.kind == "push""#,
         "`triger`: no variable `triger` at run.create (did you mean `trigger`?); \
-         variables are org, project, trigger, pipeline, steps, gates, principal, principal_id, time",
+         variables are org, project, trigger, pipeline, steps, gates, services, principal, principal_id, time",
     );
 }
 
