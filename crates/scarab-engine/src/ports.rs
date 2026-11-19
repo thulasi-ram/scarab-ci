@@ -992,7 +992,30 @@ pub trait Db: Send + Sync {
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
+    ) -> Result<Vec<LogChunkMeta>, DbError> {
+        self.log_chunks_from(run, step, attempt, 0).await
+    }
+
+    /// The rows of [`Self::log_chunks`] with `seq >= from_seq`, ordered by
+    /// `seq`. A live log poll reads only the rows it has not seen (git-bug
+    /// 209ef14) instead of the whole index every pass.
+    async fn log_chunks_from(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        from_seq: u64,
     ) -> Result<Vec<LogChunkMeta>, DbError>;
+
+    /// The newest row of the stream's index (highest `seq`), or `None` when
+    /// the stream has no chunk. An append computes the next seq and offset
+    /// from it without reading the whole index.
+    async fn last_log_chunk(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<LogChunkMeta>, DbError>;
 
     /// All step projections of a run (with their attempts) — the DAG snapshot
     /// the scheduler folds to decide admission and completion.

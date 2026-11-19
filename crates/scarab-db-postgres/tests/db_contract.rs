@@ -963,3 +963,71 @@ contract_test!(
     projects_with_runs_in_contract,
     projects_with_runs_in_reads_run_history
 );
+
+/// The log-chunk index reads (git-bug 209ef14): `log_chunks_from` returns the
+/// rows from a seq on, in seq order, scoped to one attempt's stream;
+/// `last_log_chunk` returns the newest row, and `None` for an empty stream.
+async fn log_chunk_index_reads_are_bounded_by_seq(db: &dyn Db) {
+    let run = RunId("r1".into());
+    let step = StepId("build".into());
+    let (a1, a2) = (AttemptId("a1".into()), AttemptId("a2".into()));
+    let chunk = |seq: u64| scarab_engine::LogChunkMeta {
+        seq,
+        byte_offset: seq * 10,
+        len: 10,
+        object_key: format!("logs/r1/build/a1/{seq}.gz"),
+    };
+    assert!(db.last_log_chunk(&run, &step, &a1).await.unwrap().is_none());
+    // Out of order, with a replay of seq 1 (idempotent).
+    for seq in [2, 0, 3, 1, 1] {
+        db.append_log_chunk(&run, &step, &a1, &chunk(seq))
+            .await
+            .unwrap();
+    }
+    // Another attempt's rows stay out of a1's reads.
+    db.append_log_chunk(&run, &step, &a2, &chunk(7))
+        .await
+        .unwrap();
+
+    let seqs = |rows: Vec<scarab_engine::LogChunkMeta>| -> Vec<u64> {
+        rows.into_iter().map(|c| c.seq).collect()
+    };
+    assert_eq!(
+        seqs(db.log_chunks(&run, &step, &a1).await.unwrap()),
+        [0, 1, 2, 3]
+    );
+    assert_eq!(
+        seqs(db.log_chunks_from(&run, &step, &a1, 0).await.unwrap()),
+        [0, 1, 2, 3]
+    );
+    assert_eq!(
+        seqs(db.log_chunks_from(&run, &step, &a1, 2).await.unwrap()),
+        [2, 3]
+    );
+    assert!(db
+        .log_chunks_from(&run, &step, &a1, 4)
+        .await
+        .unwrap()
+        .is_empty());
+    // A cursor past the i64 range reads nothing rather than everything.
+    assert!(db
+        .log_chunks_from(&run, &step, &a1, u64::MAX)
+        .await
+        .unwrap()
+        .is_empty());
+    let last = db.last_log_chunk(&run, &step, &a1).await.unwrap().unwrap();
+    assert_eq!(last, chunk(3));
+    assert_eq!(
+        db.last_log_chunk(&run, &step, &a2)
+            .await
+            .unwrap()
+            .unwrap()
+            .seq,
+        7
+    );
+}
+
+contract_test!(
+    log_chunk_index_contract,
+    log_chunk_index_reads_are_bounded_by_seq
+);

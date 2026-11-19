@@ -160,10 +160,12 @@ impl LogService {
         // a value never reaches stored or streamed logs (ADR-0013, 0032).
         let chunk = self.redact(chunk);
 
-        // Next seq / cumulative uncompressed offset from the existing index.
-        let existing = self.db.log_chunks(run, step, attempt).await?;
-        let seq = existing.len() as u64;
-        let byte_offset = existing.iter().map(|c| c.len).sum();
+        // Next seq / cumulative uncompressed offset from the newest index row
+        // (seqs are dense from 0, so it carries the whole stream's length).
+        let (seq, byte_offset) = match self.db.last_log_chunk(run, step, attempt).await? {
+            Some(last) => (last.seq + 1, last.byte_offset + last.len),
+            None => (0, 0),
+        };
 
         let key = object_key(run, step, attempt, seq);
         let compressed = gzip(&chunk).map_err(|e| LogError::Gzip(e.to_string()))?;
@@ -192,7 +194,7 @@ impl LogService {
         step: &StepId,
         attempt: &AttemptId,
     ) -> Result<bool, LogError> {
-        Ok(!self.db.log_chunks(run, step, attempt).await?.is_empty())
+        Ok(self.db.last_log_chunk(run, step, attempt).await?.is_some())
     }
 
     /// A stream's chunk index, in `seq` order (durable, replica-agnostic:
@@ -204,6 +206,21 @@ impl LogService {
         attempt: &AttemptId,
     ) -> Result<Vec<LogChunkMeta>, LogError> {
         Ok(self.db.log_chunks(run, step, attempt).await?)
+    }
+
+    /// The rows of [`Self::chunks`] with `seq >= from_seq`: what a live poll
+    /// has not read yet.
+    pub async fn chunks_from(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        from_seq: u64,
+    ) -> Result<Vec<LogChunkMeta>, LogError> {
+        Ok(self
+            .db
+            .log_chunks_from(run, step, attempt, from_seq)
+            .await?)
     }
 
     /// Fetch and decompress one indexed chunk.

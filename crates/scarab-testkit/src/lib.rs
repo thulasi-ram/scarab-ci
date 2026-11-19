@@ -1905,11 +1905,12 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
-    async fn log_chunks(
+    async fn log_chunks_from(
         &self,
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
+        from_seq: u64,
     ) -> Result<Vec<LogChunkMeta>, DbError> {
         Ok(self
             .state
@@ -1917,8 +1918,29 @@ impl Db for InMemoryDb {
             .unwrap()
             .logs
             .get(&(run.clone(), step.clone(), attempt.clone()))
-            .cloned()
+            .map(|chunks| {
+                chunks
+                    .iter()
+                    .filter(|c| c.seq >= from_seq)
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default())
+    }
+
+    async fn last_log_chunk(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<LogChunkMeta>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .logs
+            .get(&(run.clone(), step.clone(), attempt.clone()))
+            .and_then(|chunks| chunks.last().cloned()))
     }
 
     async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError> {

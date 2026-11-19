@@ -24,7 +24,8 @@
 //! - **Tail.** [`Start::Tail`] skips the earliest whole chunks so at most `tail`
 //!   bytes are replayed, announced by one `truncated` event first.
 //! - **Live.** Polls the durable index every 500 ms (ADR-0051), so any replica
-//!   serves the tail; a keepalive comment when a poll finds nothing; ends one
+//!   serves the tail; a poll reads only the index rows from the last one sent
+//!   on; a keepalive comment when a poll finds nothing; ends one
 //!   poll after the run settles or its row is gone, or after a pinned attempt
 //!   is no longer latest. An attempt that is not running stops being polled
 //!   once it has sent everything and nothing new came for [`SETTLE`] (the read
@@ -395,7 +396,13 @@ impl LogStream {
             return Ok(None);
         }
         if self.index.is_none() {
-            self.index = Some(self.logs.chunks(&self.run, &step, &attempt).await?);
+            // Only the rows not sent yet, plus the one before `from` (a
+            // resumed stream may read it to join a `\r\n`).
+            self.index = Some(
+                self.logs
+                    .chunks_from(&self.run, &step, &attempt, from.saturating_sub(1))
+                    .await?,
+            );
             self.index_reads += 1;
         }
         let index = self.index.as_deref().unwrap_or_default();

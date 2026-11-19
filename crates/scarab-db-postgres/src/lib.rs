@@ -2069,31 +2069,47 @@ impl Db for PostgresDb {
         Ok(())
     }
 
-    async fn log_chunks(
+    async fn log_chunks_from(
         &self,
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
+        from_seq: u64,
     ) -> Result<Vec<LogChunkMeta>, DbError> {
+        // A range scan on the primary key (run_id, step_id, attempt_id, seq).
         let rows = sqlx::query(
             "SELECT seq, byte_offset, len, object_key FROM log_chunks
-             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3 ORDER BY seq",
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3 AND seq >= $4
+             ORDER BY seq",
         )
         .bind(&run.0)
         .bind(&step.0)
         .bind(&attempt.0)
+        .bind(i64::try_from(from_seq).unwrap_or(i64::MAX))
         .fetch_all(self.pool())
         .await
         .map_err(db_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|r| LogChunkMeta {
-                seq: r.get::<i64, _>("seq") as u64,
-                byte_offset: r.get::<i64, _>("byte_offset") as u64,
-                len: r.get::<i64, _>("len") as u64,
-                object_key: r.get::<String, _>("object_key"),
-            })
-            .collect())
+        Ok(rows.iter().map(log_chunk_row).collect())
+    }
+
+    async fn last_log_chunk(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<LogChunkMeta>, DbError> {
+        let row = sqlx::query(
+            "SELECT seq, byte_offset, len, object_key FROM log_chunks
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(row.as_ref().map(log_chunk_row))
     }
 
     async fn record_step_transition(
@@ -5486,5 +5502,15 @@ impl scarab_identity::ApiTokenStore for PostgresDb {
         .await
         .map_err(identity_err)?;
         Ok(())
+    }
+}
+
+/// One `log_chunks` index row (seq, byte_offset, len, object_key).
+fn log_chunk_row(r: &sqlx::postgres::PgRow) -> LogChunkMeta {
+    LogChunkMeta {
+        seq: r.get::<i64, _>("seq") as u64,
+        byte_offset: r.get::<i64, _>("byte_offset") as u64,
+        len: r.get::<i64, _>("len") as u64,
+        object_key: r.get::<String, _>("object_key"),
     }
 }
