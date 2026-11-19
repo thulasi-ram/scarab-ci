@@ -3183,8 +3183,12 @@ async fn get_step_logs_raw(
             "text/plain; charset=utf-8",
         )
         .header(axum::http::header::CONTENT_DISPOSITION, disposition)
+        // The bytes are a step's output: a browser must not sniff them into
+        // HTML or script.
+        .header(axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .body(axum::body::Body::from_stream(body))
-        .map_err(|e| ApiError::BadRequest(e.to_string()))
+        // The headers are built here, not sent: a failure is the server's.
+        .map_err(|e| ApiError::Db(DbError::Other(format!("raw log response: {e}"))))
 }
 
 /// The shared services of a run's **current Take** (ADR-0058), name-ordered —
