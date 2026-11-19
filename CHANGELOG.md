@@ -187,8 +187,9 @@ release.yml uses that version's section as the GitHub Release text. See
   values). A step's output equal to another step's secret, in any org, was stored as `***`, which
   showed which values existed, and made a later re-read of that log differ where nothing had been
   redacted for it. Each value is now kept for the log of the step try (or sidecar) it was mounted
-  into, and dropped when that log is complete. A failure message or infra condition, which the
-  server reads by Pod and not by log, is redacted with the values of every log not complete yet.
+  into, and dropped once that log is complete and the step try has ended. A failure message or
+  infra condition, which the server reads by Pod and not by log, is redacted with the values of
+  every step try that has not ended yet, its own included.
 - **Forge and identity tokens mounted into a step are redacted from its log.** Only the step's
   own secrets and its registry credential were redacted. The forge token a step gets with
   `forge_token:` and the OIDC token Scarab issues to a deploy step were stored as printed. Both

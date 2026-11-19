@@ -1524,6 +1524,79 @@ async fn a_running_unit_that_cannot_be_checked_is_stored_from_now_on_after_a_mar
     assert_eq!(markers(&stored), 0, "not stored again from the first byte");
 }
 
+/// RC-1: once a stream is stored "from now on", a read that breaks is
+/// retried from now on too, after the marker again for the gap. It is never
+/// compared from the source's first byte with the part after the marker:
+/// that differs plainly, and would store the whole log again with this
+/// replica's values, which the first check found incomplete, so the value
+/// behind the stored `***` would be stored in clear.
+#[tokio::test]
+async fn a_broken_read_of_a_stream_stored_from_now_on_resumes_from_now_on() {
+    let captured = Captured::default();
+    let _guard = captured.install();
+
+    let db = Arc::new(InMemoryDb::new());
+    let store = Arc::new(InMemoryObjectStore::new());
+    let (run, s, at) = stream();
+    let launcher = LogService::new(store.clone(), db.clone());
+    launcher.register_secret(&fence(), b"s3cr3t-value");
+    launcher
+        .append(&run, &s, &at, b"token=s3cr3t-value\n")
+        .await
+        .unwrap();
+
+    // The peer's executor reads no value back. Its first read (from the
+    // first byte) stops at the `***`; its read from now on breaks after one
+    // chunk.
+    let logs = Arc::new(LogService::new(store, db));
+    let exec = LiveLog::new(
+        b"token=s3cr3t-value\n",
+        true,
+        vec![
+            Read {
+                chunk: 4,
+                fail_after: None,
+            },
+            Read {
+                chunk: 64,
+                fail_after: Some(1),
+            },
+        ],
+    );
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    let step = running_step();
+    tailer.ensure(&step);
+    wait_stored(&logs, &cat(&[b"token=***\n", FROM_NOW])).await;
+    wait_for(|| exec.opens() >= 2).await;
+    exec.print(b"later\n");
+    wait_stored(&logs, &cat(&[b"token=***\n", FROM_NOW, b"later\n"])).await;
+
+    // The read broke after `later`; the retry reads the stream again.
+    ensure_until(&tailer, &step, || exec.opens() >= 3).await;
+    exec.print(b"more\n");
+    let want = cat(&[b"token=***\n", FROM_NOW, b"later\n", FROM_NOW, b"more\n"]);
+    wait_stored(&logs, &want).await;
+    exec.stop();
+    for _ in 0..3 {
+        tailer.ensure(&step);
+        settle().await;
+    }
+    let stored = logs.read_all(&run, &s, &at).await.unwrap();
+    assert_eq!(stored, want);
+    assert!(!holds(&stored, b"s3cr3t-value"));
+    assert_eq!(markers(&stored), 0, "not stored again from the first byte");
+    // The retry did not compare with the stored part at all: only the first
+    // read found the difference at the `***`.
+    let out = captured.text();
+    assert_eq!(
+        out.matches("storing its output from now on after a marker")
+            .count(),
+        1,
+        "one difference found, by the first read: {out}"
+    );
+}
+
 /// The same for an ended unit (its last read): a marker says the rest was
 /// withheld. Before this, nothing was stored and nothing said so.
 #[tokio::test]
@@ -1951,4 +2024,234 @@ async fn the_driver_reads_the_log_of_a_step_that_ended() {
         }
     }
     assert_eq!(stored, b"short step\n");
+}
+
+/// A driver-level executor whose step prints its secret, ends its log while
+/// the step is still `Running` in the store, and then fails with a cause that
+/// quotes the secret. `log_redactions` reads the value back, as the
+/// Kubernetes executor reads a step Pod's Secrets.
+struct FailsAfterItsLog {
+    ended: std::sync::atomic::AtomicBool,
+    log_opens: AtomicUsize,
+    output: Mutex<Vec<Vec<u8>>>,
+}
+
+const STEP_SECRET: &[u8] = b"s3cr3t-value";
+
+#[async_trait]
+impl Executor for FailsAfterItsLog {
+    async fn results_delivery_failure(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+    async fn gate_refusal(&self, _gate: &StepRun) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+    async fn infra_condition(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
+        Ok(None)
+    }
+    async fn take_forge_credential(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
+        Ok(None)
+    }
+    async fn workspace_provisioning(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
+        Ok(None)
+    }
+    async fn launch(&self, step: &StepRun, _spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+        Ok(ExecHandle(step.step.0.clone()))
+    }
+    async fn poll(&self, _h: &ExecHandle) -> Result<ExecState, ExecError> {
+        Ok(if self.ended.load(Ordering::SeqCst) {
+            ExecState::Failed {
+                exit_code: Some(1),
+                class: scarab_engine::ports::FailureClass::Step,
+                cause: Some("upload refused for token s3cr3t-value".into()),
+            }
+        } else {
+            ExecState::Running
+        })
+    }
+    async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
+        Ok(())
+    }
+    fn unit_handle(&self, _step: &StepRun) -> Option<ExecHandle> {
+        None
+    }
+    async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
+        Ok(true)
+    }
+    async fn log_stream(
+        &self,
+        _step: &StepRun,
+        _from: LogFrom,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        self.log_opens.fetch_add(1, Ordering::SeqCst);
+        let chunks = std::mem::take(&mut *self.output.lock().unwrap());
+        Ok(Some(Box::new(MockChunks(chunks.into()))))
+    }
+    async fn log_redactions(&self, _step: &StepRun) -> Result<LogRedactions, ExecError> {
+        Ok(LogRedactions::Values(vec![STEP_SECRET.to_vec()]))
+    }
+}
+
+/// RC-5 and RC-T2 through `tick_once`. The follow read of an exited
+/// container ends before the scheduler's poll sees the step fail, so the
+/// tail closes the stream while the step is still `Running`. The failure
+/// cause the later poll records is redacted with the step's own values:
+/// they are kept until the driver pass after the step ended. Before this,
+/// closing the tail dropped them, and the cause was stored in clear. That
+/// pass then drops them, so values do not pile up for the life of the
+/// process.
+#[tokio::test]
+async fn a_failure_cause_after_the_tail_closed_is_redacted_and_the_values_then_dropped() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use scarab_engine::{Clock, Db};
+    use scarab_secrets::SecretProvider;
+    use scarab_server::{converged, router, AppState, SecretInjectingExecutor};
+    use scarab_testkit::{FakeClock, FakeSecrets};
+    use tower::ServiceExt;
+
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let app = router(AppState::new(db.clone(), clock.clone(), logs.clone()));
+    let body = serde_json::json!({
+        "pipeline": {
+            "ir_version": 1,
+            "steps": [{ "id": "build", "image": "busybox:latest", "command": ["echo", "hi"] }]
+        }
+    })
+    .to_string();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let run = RunId(v["id"].as_str().unwrap().to_string());
+
+    let inner = Arc::new(FailsAfterItsLog {
+        ended: Default::default(),
+        log_opens: AtomicUsize::new(0),
+        output: Mutex::new(vec![b"token=s3cr3t-value\n".to_vec()]),
+    });
+    let db_dyn: Arc<dyn Db> = db.clone();
+    // The decorator that redacts the failure cause, as `main.rs` wires it.
+    let exec: Arc<dyn Executor> = Arc::new(SecretInjectingExecutor::new(
+        inner.clone(),
+        db_dyn.clone(),
+        Arc::new(FakeSecrets::new()) as Arc<dyn SecretProvider>,
+        logs.clone(),
+    ));
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    let clock_dyn: Arc<dyn Clock> = clock.clone();
+    let supervision = scarab_engine::Supervision::new();
+    let health = scarab_engine::TickHealth::new();
+    macro_rules! tick {
+        () => {
+            converged::tick_once(
+                &db_dyn,
+                &clock_dyn,
+                &exec,
+                None,
+                None,
+                Some(&tailer),
+                None,
+                "log-tail-test",
+                0,
+                3_600_000,
+                None,
+                "http://scarab.test",
+                &supervision,
+                &health,
+            )
+            .await
+            .unwrap()
+        };
+    }
+    let step = StepId("build".into());
+    let first_attempt = || async {
+        db.steps_of_run(&run)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.step == step)
+            .and_then(|s| s.attempts.first().cloned())
+    };
+
+    // Cycles while the step runs: its tail reads the whole log and closes.
+    let mut stored = Vec::new();
+    for _ in 0..30 {
+        tick!();
+        settle().await;
+        if let Some(a) = first_attempt().await {
+            stored = logs.read_all(&run, &step, &a.id).await.unwrap();
+        }
+        if !stored.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(stored, b"token=***\n");
+    // One more cycle with the step still Running and its tail closed.
+    tick!();
+    settle().await;
+    assert_eq!(inner.log_opens.load(Ordering::SeqCst), 1, "the tail closed");
+
+    // The step fails; the next cycle records its cause.
+    inner.ended.store(true, Ordering::SeqCst);
+    let mut attempt = None;
+    for _ in 0..30 {
+        tick!();
+        settle().await;
+        attempt = first_attempt().await.filter(|a| a.failure_detail.is_some());
+        if attempt.is_some() {
+            break;
+        }
+    }
+    let attempt = attempt.expect("the attempt failed with a cause");
+    let detail = attempt.failure_detail.unwrap();
+    assert!(
+        !detail.contains("s3cr3t-value"),
+        "the failure cause was stored with the step's secret: {detail}"
+    );
+    assert!(detail.contains("upload refused for token ***"), "{detail}");
+
+    // RC-T2: the pass after the step ended dropped its values.
+    tick!();
+    settle().await;
+    let fence = LogFence::new(&run, &step, &attempt.id);
+    assert!(
+        !logs.values_loaded(&fence),
+        "the ended step's values are dropped"
+    );
+    assert_eq!(
+        logs.redact_text("token s3cr3t-value"),
+        "token s3cr3t-value",
+        "no stream holds the ended step's value"
+    );
 }

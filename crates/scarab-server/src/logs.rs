@@ -122,8 +122,9 @@ pub struct LogService {
     /// Secret values to scrub from a stream's chunks before they are stored
     /// or streamed (ADR-0013, 0032), per stream: a value redacts only the
     /// stream it was registered for. Registered when secrets are injected
-    /// into a step, and by a log tail from the unit it reads; removed when
-    /// the tail closes the stream ([`forget_secrets`](Self::forget_secrets)).
+    /// into a step, and by a log tail from the unit it reads; removed once
+    /// the tail has closed the stream and the unit has ended
+    /// ([`forget_secrets`](Self::forget_secrets)).
     /// There is no server-wide value: every value Scarab registers belongs
     /// to one launch. A [`StreamRedactor`] holds its stream's entry and reads
     /// it at each push.
@@ -183,8 +184,9 @@ impl LogService {
             .is_some_and(|e| e.loaded.load(Ordering::SeqCst))
     }
 
-    /// Drop `fence`'s values: its log tail has closed the stream. A
-    /// redactor already made for it keeps them.
+    /// Drop `fence`'s values: its log tail has closed the stream and its
+    /// unit has ended, so its failure cause is recorded. A redactor already
+    /// made for it keeps them.
     pub fn forget_secrets(&self, fence: &LogFence) {
         self.secrets.lock().unwrap().remove(&fence.key());
     }
@@ -211,9 +213,10 @@ impl LogService {
     /// this they would be the one uncensored channel out of a step.
     ///
     /// The caller knows the unit's handle, not its stream, so this uses the
-    /// values of every stream registered now: a stream's values live only
-    /// until its tail closes it, so the set is bounded by the units that
-    /// have not ended yet.
+    /// values of every stream registered now. A stream's values live until
+    /// its tail has closed it and the driver pass after the unit ended, so
+    /// the terminal poll of a unit still has them, and the set is bounded by
+    /// the units that have not ended yet.
     ///
     /// Lossy by design on invalid UTF-8: a diagnostic is for reading.
     pub fn redact_text(&self, text: &str) -> String {

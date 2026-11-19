@@ -410,6 +410,13 @@ pub struct LogTailer {
     open: Arc<Mutex<HashMap<Fence, OpenTail>>>,
     /// Fences ensured since the last [`end_pass`](LogTailer::end_pass).
     seen: Mutex<HashSet<Fence>>,
+    /// Closed fences whose secret values are still kept: until the unit has
+    /// ended, its terminal poll redacts the failure cause with them
+    /// ([`LogService::redact_text`]). The first complete
+    /// [`end_pass`](LogTailer::end_pass) that did not ensure a fence drops
+    /// its values; the driver runs that pass after the scheduler tick that
+    /// settled the unit.
+    settling: Arc<Mutex<HashMap<Fence, LogFence>>>,
 }
 
 /// How to reopen a fence that is not drained yet.
@@ -447,6 +454,7 @@ impl LogTailer {
             retry_backoff: RETRY_BACKOFF,
             open: Arc::new(Mutex::new(HashMap::new())),
             seen: Mutex::new(HashSet::new()),
+            settling: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -460,6 +468,9 @@ impl LogTailer {
     /// replica or another, and appends what follows it: output printed after
     /// a live tail failed part way through is stored, and nothing is stored
     /// twice (git-bug de2bd9b; see `drain`).
+    /// A closed fence that was not ensured in this pass drops its secret
+    /// values: its unit has ended, and the scheduler tick before this pass
+    /// redacted the unit's failure cause with them.
     /// `complete` is false when the pass did not ensure every unit (a store
     /// error); such a pass only resets the bookkeeping.
     pub fn end_pass(&self, complete: bool) {
@@ -467,6 +478,13 @@ impl LogTailer {
         if !complete {
             return;
         }
+        self.settling.lock().unwrap().retain(|fence, log_fence| {
+            let running = seen.contains(fence);
+            if !running {
+                self.logs.forget_secrets(log_fence);
+            }
+            running
+        });
         let ended: Vec<(Fence, OpenTail)> = self
             .open
             .lock()
@@ -592,12 +610,16 @@ impl LogTailer {
         source: TailSource,
         final_read: bool,
     ) {
+        // A drained fence is still seen while its unit runs, so `end_pass`
+        // keeps its secret values until the unit has ended.
+        if !final_read {
+            self.seen.lock().unwrap().insert(fence.clone());
+        }
         // Already fully drained — the Pod's log is complete; never re-tail it.
         if self.drained.lock().unwrap().contains(&fence) {
             return;
         }
         if !final_read {
-            self.seen.lock().unwrap().insert(fence.clone());
             self.open
                 .lock()
                 .unwrap()
@@ -649,21 +671,26 @@ impl LogTailer {
         let retry_backoff = self.retry_backoff;
         let open = self.open.clone();
         let log_fence = LogFence::new(&run, &step_id, &attempt);
-        // The fence's log is complete (or given up): never read it again,
-        // and drop its secret values.
+        // The fence's log is complete (or given up): never read it again.
+        // Its secret values stay until the unit has ended (`end_pass`): the
+        // terminal poll that records a failure cause runs after the follow
+        // read of an exited container ends.
         let close = {
             let drained = self.drained.clone();
             let retry_at = retry_at.clone();
             let not_ready = not_ready.clone();
             let open = open.clone();
-            let logs = logs.clone();
+            let settling = self.settling.clone();
             let log_fence = log_fence.clone();
             move |fence: &Fence| {
                 drained.lock().unwrap().insert(fence.clone());
                 retry_at.lock().unwrap().remove(fence);
                 not_ready.lock().unwrap().remove(fence);
                 open.lock().unwrap().remove(fence);
-                logs.forget_secrets(&log_fence);
+                settling
+                    .lock()
+                    .unwrap()
+                    .insert(fence.clone(), log_fence.clone());
             }
         };
         // Retry the fence after the backoff.
