@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1795109250,"nonce":"CIyiAHTss6cN0SmMT4luqhrDhPQ=","message":"Closed 2026-11-19 (triage at origin/main 1ce54713): fixed in 9d7b3623 (PR #180): strategic_merge in scarab-executor-k8s/src/lib.rs ~5708, tolerations union ~5693, tests ~7882/~7911; ADR-0055:92 matches.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1795109250,"nonce":"14QQJmn9wWKIYhgxML0jV8MDd84=","status":2}]}
