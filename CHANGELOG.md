@@ -45,7 +45,6 @@ release.yml uses that version's section as the GitHub Release text. See
 - **A manual Retry is no longer labelled an automatic retry.** The try says who retried it.
 - **A try with no log output shows why it failed.** The Logs tab said "waiting for output…" for
   good, and the failure reason under it never appeared.
-
 - **A step whose Pod waits for a new node keeps its logs.** While a Pod has no node (a cluster
   autoscaler such as Karpenter is adding one), Kubernetes answers a log request for it with an
   empty response instead of an error. The server took that as the step's complete log and never
