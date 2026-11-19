@@ -110,7 +110,11 @@ release.yml uses that version's section as the GitHub Release text. See
   now nothing said so. The fetch answer lists every grant the source holds in `carried_grants`;
   the install must name the same grants in `carry_grants`, or it fails with a 400 that names them.
   The review page shows one box per grant, and **Upgrade** stays off until each is ticked. The
-  step-up summary and the `op.completed` security event name the grants carried. See
+  step-up summary and the `op.completed` security event name the grants carried. The install
+  checks `carry_grants` before it asks for step-up, so a missing or wrong list is a 400 and uses
+  no confirmation, and it compares the grants again inside the install's own transaction, so a
+  grant another admin gives the source in between is refused with a 400 that names the grants
+  (git-bug 9c54b46). See
   [Upgrade](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#upgrade).
 - **The build library's push step pushes only the image the build step built** (git-bug 23a29ab).
   It receives BuildKit's `containerimage.digest` from the build step's `image` result and refuses
@@ -167,13 +171,22 @@ release.yml uses that version's section as the GitHub Release text. See
 - **The Run page loads the last 2 MB of a log** (git-bug 9ac20c0). A notice above a longer log
   says how much shows and where line numbers start ("Showing the last 2.0 MB of 14.3 MB. Line
   numbers start here."). **Load full log** reads up to 8 MB, and for a step **Download** saves the
-  try's whole log; a shared service's pane has Load full log but no Download yet. The pane keeps
+  try's whole log; a shared service's pane has both. The pane keeps
   at most 8 MB, dropping lines from the top; a log with no line breaks is cut to its last 8 MB
   once it passes 16 MB. A dropped connection reconnects after 1 s, 2 s, 4 s and so on up to 30 s
   and continues after the last part received. After three reopens in a row that fail before the
   stream opens, the pane asks the server about its position; only when the server answers 400 does
   it load the end of the log again, as much as it showed. See
   [On the Run page](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/#on-the-run-page).
+- **A shared service's log can be downloaded** (git-bug 5ca1f3c).
+  `GET /v1/runs/{id}/services/{service}/logs/raw?take=<n>` sends the service's whole log in Take
+  `n` (default the current Take) as `text/plain`, named `scarab-<run>-<service>-take<n>.log`, with
+  each character of the run id and service name outside `[A-Za-z0-9_-]` replaced by `_`. The
+  service pane has **Download** in its header and in the notice above a longer log. See
+  [Run logs](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/).
+- **A live log reads only the new part of its chunk index** (git-bug 209ef14). Each poll of a
+  running step's log, every 500 ms, read the step's whole list of stored chunks; it now reads the
+  rows from its position on. Storing a chunk reads only the newest row.
 - **The server warns at startup when `default_resources` sets one axis only** (git-bug 9cfeac4).
   With `cpu_millis` and no `memory_mib`, a step container that sets no memory has no
   `requests.memory` or `limits.memory`; with `memory_mib` and no `cpu_millis`, it has no
@@ -220,6 +233,9 @@ release.yml uses that version's section as the GitHub Release text. See
   attempt and service that stops running before its log was read in full, unless a replica already
   stored it. That first read does not wait out the 3 second backoff, so a viewer whose stream
   ended sees the output on the next load.
+- **Log output printed after a log tail broke part way is stored once** (git-bug de2bd9b). Before,
+  it was lost if the step ended before the tail retried, and a retry while the step ran stored the
+  earlier lines twice.
 - **A step whose Pod is refused at launch fails as a configuration error.** A refusal of the
   step's `k8s_overlay` when the Pod is built (a clash with the placement baseline or a profile, or
   a Run stored before a field left the list) was retried until the Run was dead-lettered. The step
