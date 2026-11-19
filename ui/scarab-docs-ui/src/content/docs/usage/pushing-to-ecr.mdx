@@ -289,14 +289,50 @@ which reaches both steps: the build step's launch fails. The build step runs you
 Each Attempt's Pod logs in again, so a Run started days after the setup gets a password minted for
 it, and a retry gets a new one.
 
+### One image for amd64 and arm64
+
+Build once per architecture, each build pushing its own tag, and join the two with Scarab's image
+index library
+([Joining images into one multi-architecture image](/scarab-ci/usage/pipeline-syntax/#joining-images-into-one-multi-architecture-image)).
+Install it and trust its source with the registry credential, as
+[Libraries](/scarab-ci/usage/libraries/#install-scarabs-image-index-library) describes; the build
+library's trust does not reach it. Its one step holds the registry credential, so `ecr-push`
+reaches it from a plain list:
+
+```yaml
+  - id: amd64
+    invoke: lib:thulasi-ram::scarab-ci::build
+    needs: [checkout]
+    placement_profiles: { image: [amd64-builders, build-cache], push: [ecr-push] }
+    with: { image: "444455556666.dkr.ecr.eu-west-1.amazonaws.com/app:${{ event.sha }}-amd64", push: true }
+  - id: arm64
+    invoke: lib:thulasi-ram::scarab-ci::build
+    needs: [checkout]
+    placement_profiles: { image: [arm64-builders, build-cache], push: [ecr-push] }
+    with: { image: "444455556666.dkr.ecr.eu-west-1.amazonaws.com/app:${{ event.sha }}-arm64", push: true }
+  - id: app
+    invoke: lib:thulasi-ram::scarab-ci::image-index
+    needs: [amd64, arm64]
+    placement_profiles: [ecr-push]
+    with:
+      image: "444455556666.dkr.ecr.eu-west-1.amazonaws.com/app:${{ event.sha }}"
+      images: |
+        ${{ outputs.amd64.push.ref }}
+        ${{ outputs.arm64.push.ref }}
+```
+
+The role in part 1 already reads and writes the `app` repository, which is all the join needs.
+Deploy by `${{ outputs.app.index.digest }}`.
+
 ## What the marker does
 
 Pipeline authors name profiles, so without `registry_auth_only` any step could ask for
 `ecr-push`. With it, Scarab decides at each launch, before it merges the profile:
 
-- **The build library's push step**, in a Run that is not a fork pull request and not locked out
-  of its Environment's secrets, from a library source the org trusted with the registry credential
-  when the Run was created and still trusts: the profile applies.
+- **The build library's push step**, or the image index library's step, in a Run that is not a
+  fork pull request and not locked out of its Environment's secrets, from a library source the
+  org trusted with the registry credential when the Run was created and still trusts: the profile
+  applies.
 - **The same push step otherwise**: the profile is left out, and the server logs that it was. A
   fork pull request's push step pushes nothing and succeeds. Without the trust, crane pushes with
   no login and ECR refuses the push.
@@ -355,18 +391,20 @@ rules:
   - when: >-
       steps.exists(s, 'ecr-push' in s.placement_profiles
       && !s.origin.exists(o, o.kind == 'library' && has(o.source)
-      && o.source.startsWith('github.com/thulasi-ram/scarab-ci//libs/build.yaml@')))
+      && (o.source.startsWith('github.com/thulasi-ram/scarab-ci//libs/build.yaml@')
+      || o.source.startsWith('github.com/thulasi-ram/scarab-ci//libs/image-index.yaml@'))))
     effect: deny
-    message: "Only the build library's steps may name the ecr-push placement profile."
+    message: "Only the build and image index libraries' steps may name the ecr-push placement profile."
 ```
 
 - The first rule refuses a Run that names `ecr-push` unless it is on `refs/heads/main` and not
   from a fork. A Run with no ref (a comment trigger) is refused too. A refused Run is not created
   at all, so keep the push in a Pipeline that triggers only on `main`, as in part 4, and build pull
   requests in another Pipeline.
-- The second rule refuses, when the Run is created, a step the launch would fail anyway: one that
-  names `ecr-push` and does not come from the build library. It matches the library by the source
-  it was installed from, since the name is chosen at install.
+- The second rule refuses, when the Run is created, a step that names `ecr-push` and does not
+  come from the build library or the image index library. It matches each library by the source
+  it was installed from, since the name is chosen at install. Leave out the image index line if
+  you do not install that library.
 - To limit the profile to an Environment instead, use
   `has(pipeline.environment) && pipeline.environment == 'production'` in place of the ref check.
 - The editor starts a new Policy in `audit` mode. Run **Try it on recent decisions** before you

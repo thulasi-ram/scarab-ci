@@ -229,6 +229,29 @@ launch, and again on each retry or rerun, with the same replacement; start a new
 Pipeline is changed. A Pipeline that fails its check creates no Run and posts no commit status
 yet; the error shows in the repository's Runs list in Scarab.
 
+## Install Scarab's image index library
+
+`lib:thulasi-ram::scarab-ci::image-index` joins images built for different architectures into one
+multi-architecture image with `crane index append`
+([Joining images into one multi-architecture image](/scarab-ci/usage/pipeline-syntax/#joining-images-into-one-multi-architecture-image)).
+It is the file `libs/image-index.yaml` in Scarab's repository. Its one step, `index`, pushes the
+index, so it holds the registry credential. It needs no build sandbox.
+
+1. Settings › Libraries › **Install library**, with the file
+   `github.com/thulasi-ram/scarab-ci//libs/image-index.yaml` and a Scarab release tag as the ref.
+2. Keep the default name, `thulasi-ram::scarab-ci::image-index`. Review the file and install it.
+   Confirm with your passkey.
+3. Trust its source with the registry credential
+   ([below](#trusting-a-library-with-the-registry-credential)). Without that the step runs
+   anonymously, and the push fails at a registry that needs a login. To push to the forge's own
+   registry with no `REGISTRY_AUTH` secret, also trust its source with forge credentials. Trust
+   given to the build library's source does not reach this one: each source is trusted on its
+   own.
+4. A placement profile marked `registry_auth_only` (an ECR push role, say) reaches the step from
+   a plain list, `placement_profiles: [<profile>]`, since the library has no other step.
+
+The step runs as uid 1000 and pins the same crane image as the build library, by digest.
+
 ## Trusting a library with forge credentials
 
 A step with `forge_token` receives a forge credential ([Pipeline syntax](/scarab-ci/usage/pipeline-syntax/#forge-credentials-forge_token)).

@@ -2149,6 +2149,191 @@ async fn the_build_library_refuses_a_committed_symlink_context_out_of_the_worksp
     }
 }
 
+/// `libs/image-index.yaml` compiled as Run creation stores it, for one
+/// invoke `image` (so its Step is `image/index`, and the build library's
+/// helpers render it) whose `with:` holds `with`.
+fn image_index_library_ir(with: &str) -> scarab_pipeline::PipelineIr {
+    let ir = scarab_pipeline::compile_with_libraries(
+        &format!(
+            "steps:\n  - id: image\n    invoke: lib:thulasi-ram::scarab-ci::image-index\n    with:\n      {with}"
+        ),
+        &scarab_pipeline::Libraries {
+            installed: std::collections::BTreeMap::from([(
+                "thulasi-ram::scarab-ci::image-index".to_string(),
+                scarab_pipeline::InstalledLibrary {
+                    content: include_str!("../../../libs/image-index.yaml").to_string(),
+                    source: "github.com/thulasi-ram/scarab-ci//libs/image-index.yaml@test".into(),
+                },
+            )]),
+            ..Default::default()
+        },
+    )
+    .expect("the image index library compiles");
+    let step = ir
+        .steps
+        .iter()
+        .find(|s| s.id == "image/index")
+        .expect("the image index Step");
+    assert!(step.registry_auth);
+    assert_eq!(step.sandbox(), None);
+    ir
+}
+
+/// An OCI image layout holding one image of `arch` with one empty layer,
+/// written under `dir`, and its manifest's digest. `label` makes a second
+/// image of the same platform with another digest.
+fn single_arch_layout(dir: &std::path::Path, arch: &str, label: Option<&str>) -> String {
+    let blobs = dir.join("blobs/sha256");
+    std::fs::create_dir_all(&blobs).unwrap();
+    let put = |bytes: &[u8]| {
+        let hex = scarab_storage::sha256_hex(bytes);
+        std::fs::write(blobs.join(&hex), bytes).unwrap();
+        (format!("sha256:{hex}"), bytes.len())
+    };
+    // An empty tar archive: two zero blocks.
+    let (layer, layer_size) = put(&[0u8; 1024]);
+    let labels = label
+        .map(|l| format!(r#","config":{{"Labels":{{"scarab.test":"{l}"}}}}"#))
+        .unwrap_or_default();
+    let config = format!(
+        r#"{{"architecture":"{arch}","os":"linux","rootfs":{{"type":"layers","diff_ids":["{layer}"]}}{labels}}}"#
+    );
+    let (config, config_size) = put(config.as_bytes());
+    let manifest = format!(
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config}","size":{config_size}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{layer}","size":{layer_size}}}]}}"#
+    );
+    let (manifest, manifest_size) = put(manifest.as_bytes());
+    std::fs::write(dir.join("oci-layout"), r#"{"imageLayoutVersion":"1.0.0"}"#).unwrap();
+    std::fs::write(
+        dir.join("index.json"),
+        format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{manifest}","size":{manifest_size}}}]}}"#
+        ),
+    )
+    .unwrap();
+    manifest
+}
+
+/// LIVE `lib:thulasi-ram::scarab-ci::image-index` (git-bug 794b3ac): a setup
+/// Step pushes three single-architecture images (amd64, arm64, and a second
+/// amd64) to the local in-cluster registry from OCI layouts written here,
+/// with no network beyond the cluster. The library's Step, compiled from
+/// `libs/image-index.yaml` and rendered as the scheduler renders it, joins
+/// amd64 and arm64 by digest into `scarab-index:live` with the real crane,
+/// and a verification Step reads the index back and finds both digests and
+/// both platforms. Joining the two amd64 images is refused (exit 2) in the
+/// real image's busybox. Needs SCARAB_TEST_REGISTRY, as the build library's
+/// case does. `#[ignore]`d + SCARAB_TEST_KUBE gated.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn the_image_index_library_joins_two_architectures_in_a_local_registry() {
+    let ns = enter_tier();
+    let registry = tier_var("SCARAB_TEST_REGISTRY");
+    let ws = workspace_fixture();
+    let client = kube_client().await;
+    let exec = K8sExecutor::with_client(ns, client)
+        .with_workspace_cas(ws.cas.clone())
+        .with_workspace_depot(ws.depot.clone())
+        .with_workspace_service(ws.fetch.clone());
+
+    use scarab_storage::Cas as _;
+    let layouts = tempfile::tempdir().expect("layouts dir");
+    let amd64 = single_arch_layout(&layouts.path().join("amd64"), "amd64", None);
+    let arm64 = single_arch_layout(&layouts.path().join("arm64"), "arm64", None);
+    let amd64b = single_arch_layout(&layouts.path().join("amd64b"), "amd64", Some("b"));
+    let root = ws
+        .depot
+        .ingest(layouts.path().to_str().unwrap())
+        .await
+        .expect("ingest layouts")
+        .root
+        .0;
+    let src = format!("{registry}/scarab-index-src");
+    let target = format!("{registry}/scarab-index:live");
+
+    let run_id = unique_run("run-index");
+    let with = |images: &str| {
+        image_index_library_ir(&format!(
+            "image: {target}\n      images: \"{images}\"\n      insecure: \"true\"\n"
+        ))
+    };
+    let ir = with(&format!("{src}@{amd64}\\n{src}@{arm64}\\n"));
+    let index = build_library_spec(&ir, "index", vec![]);
+
+    // The setup and verification Steps run in the same image, as the same
+    // user, as the library's Step, with no registry credential.
+    let plain = |command: String, inputs: Vec<String>| StepSpec {
+        command: vec!["/busybox/sh".into(), "-c".into(), command],
+        env: vec![],
+        workspace_inputs: inputs,
+        registry_auth: None,
+        ..index.clone()
+    };
+    let setup = plain(
+        format!(
+            "set -eu; for a in amd64 arm64 amd64b; do crane push --insecure /workspace/$a {src}:$a; done"
+        ),
+        vec![root],
+    );
+    let h = exec
+        .launch(&build_library_step_run(&run_id, "setup", vec![]), &setup)
+        .await
+        .expect("launch setup");
+    assert_eq!(
+        poll_to_terminal(&exec, &h, 300).await,
+        Some(ExecState::Succeeded),
+        "the three images are pushed"
+    );
+
+    let ih = exec
+        .launch(&build_library_step_run(&run_id, "index", vec![]), &index)
+        .await
+        .expect("launch index");
+    assert_eq!(
+        poll_to_terminal(&exec, &ih, 300).await,
+        Some(ExecState::Succeeded),
+        "the index step joins amd64 and arm64"
+    );
+
+    let verify = plain(
+        format!(
+            "set -eu; m=$(crane manifest --insecure {target}); echo \"$m\"; \
+             echo \"$m\" | grep -q '{amd64}'; echo \"$m\" | grep -q '{arm64}'; \
+             echo \"$m\" | grep -q '\"architecture\":\"arm64\"'; \
+             ! echo \"$m\" | grep -q '{amd64b}'"
+        ),
+        vec![],
+    );
+    let vh = exec
+        .launch(&build_library_step_run(&run_id, "verify", vec![]), &verify)
+        .await
+        .expect("launch verify");
+    assert_eq!(
+        poll_to_terminal(&exec, &vh, 120).await,
+        Some(ExecState::Succeeded),
+        "the registry holds an index of the two images"
+    );
+
+    // Two images of one platform: refused before crane index append runs.
+    let same = build_library_spec(
+        &with(&format!("{src}@{amd64}\\n{src}@{amd64b}")),
+        "index",
+        vec![],
+    );
+    let sh = exec
+        .launch(&build_library_step_run(&run_id, "same", vec![]), &same)
+        .await
+        .expect("launch index of one platform");
+    match poll_to_terminal(&exec, &sh, 300).await {
+        Some(ExecState::Failed { exit_code, .. }) => assert_eq!(exit_code, Some(2)),
+        other => panic!("two amd64 images: expected Failed(2), got {other:?}"),
+    }
+
+    for handle in [&sh, &vh, &ih, &h] {
+        exec.cancel(handle).await.expect("cleanup");
+    }
+}
+
 /// LIVE results egress (ADR-0042/0041): a step writes a named result to
 /// /scarab/results; the trusted sidecar (the real scarab-results-sidecar
 /// image) drains it on step exit and POSTs it — token-authenticated — to the

@@ -39,16 +39,19 @@ const PAGE: &str =
     include_str!("../../../ui/scarab-docs-ui/src/content/docs/usage/pushing-to-ecr.mdx");
 const BUILD: &str = include_str!("../../../libs/build.yaml");
 const CLONE: &str = include_str!("../../../libs/clone.yaml");
+const INDEX: &str = include_str!("../../../libs/image-index.yaml");
 const BUILD_SOURCE: &str =
     "github.com/thulasi-ram/scarab-ci//libs/build.yaml@1111111111111111111111111111111111111111";
 const CLONE_SOURCE: &str =
     "github.com/thulasi-ram/scarab-ci//libs/clone.yaml@1111111111111111111111111111111111111111";
+const INDEX_SOURCE: &str =
+    "github.com/thulasi-ram/scarab-ci//libs/image-index.yaml@1111111111111111111111111111111111111111";
 const SHA: &str = "1234567890abcdef1234567890abcdef12345678";
 
 const BRANCH_RULE: &str =
     "policy `ecr-push`: Only Runs on main, not from a fork, may name the ecr-push placement profile.";
 const LIBRARY_RULE: &str =
-    "policy `ecr-push`: Only the build library's steps may name the ecr-push placement profile.";
+    "policy `ecr-push`: Only the build and image index libraries' steps may name the ecr-push placement profile.";
 
 /// The page's fenced code blocks of `lang`, with the fence's indent removed
 /// from each line (a block inside a list item is indented).
@@ -103,7 +106,8 @@ fn page_policy() -> Policy {
     let policies: Vec<String> = blocks("yaml")
         .into_iter()
         .filter(|b| {
-            serde_yaml::from_str::<serde_yaml::Value>(b).unwrap()["kind"].as_str() == Some("policy")
+            let v = serde_yaml::from_str::<serde_yaml::Value>(b).unwrap();
+            v["kind"].as_str() == Some("policy") && v["name"].as_str() == Some("ecr-push")
         })
         .collect();
     assert_eq!(policies.len(), 1, "{policies:?}");
@@ -126,8 +130,10 @@ fn pipeline_with(on: &str, extra: &str) -> String {
 #[test]
 fn every_yaml_and_json_block_on_the_page_parses() {
     let yaml = yaml_blocks();
-    // The ServiceAccount, the chart values, the Pipeline and the Policy.
-    assert_eq!(yaml.len(), 4, "{yaml:?}");
+    // The ServiceAccount, the chart values, the Pipeline, the image index
+    // steps, the Policy, and for private base images the pull profile's
+    // chart values, its placement map and its Policy.
+    assert_eq!(yaml.len(), 8, "{yaml:?}");
     let json = blocks("json");
     // The push role's policy and its hardened variant.
     assert_eq!(json.len(), 2);
@@ -270,9 +276,10 @@ async fn trust(libs: &InMemoryLibraries, source: &str, grant: TrustGrant) {
     .unwrap();
 }
 
-/// The clone library trusted with forge credentials, and the build library
+/// The clone library trusted with forge credentials, the build library
 /// trusted as the page says: for the build sandbox and with the registry
-/// credential, not with forge credentials.
+/// credential, not with forge credentials; and the image index library
+/// trusted with the registry credential.
 async fn libraries() -> InMemoryLibraries {
     let libs = InMemoryLibraries::new();
     install(&libs, "thulasi-ram::scarab-ci::clone", CLONE, CLONE_SOURCE).await;
@@ -280,6 +287,14 @@ async fn libraries() -> InMemoryLibraries {
     install(&libs, "thulasi-ram::scarab-ci::build", BUILD, BUILD_SOURCE).await;
     trust(&libs, BUILD_SOURCE, TrustGrant::BuildSandbox).await;
     trust(&libs, BUILD_SOURCE, TrustGrant::RegistryCredential).await;
+    install(
+        &libs,
+        "thulasi-ram::scarab-ci::image-index",
+        INDEX,
+        INDEX_SOURCE,
+    )
+    .await;
+    trust(&libs, INDEX_SOURCE, TrustGrant::RegistryCredential).await;
     libs
 }
 
@@ -430,4 +445,51 @@ async fn the_page_policy_refuses_a_pipeline_file_step_naming_ecr_push() {
     let db = InMemoryDb::new();
     let out = trigger(&db, &ci, true, &push_to("refs/heads/main")).await;
     assert_eq!(refused_messages(&out), vec![LIBRARY_RULE.to_string()]);
+}
+
+/// The page's two-architecture steps (one build per architecture and the
+/// image index library), added to the page's Pipeline in place of its one
+/// build: a push to main is admitted under the page's Policy, `ecr-push`
+/// reaches each build's push Step and the index Step, and no build Step.
+#[tokio::test]
+async fn the_page_two_architecture_steps_run_with_ecr_push_on_the_index_step() {
+    let found: Vec<String> = blocks("yaml")
+        .into_iter()
+        .filter(|b| b.contains("lib:thulasi-ram::scarab-ci::image-index"))
+        .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&page_pipeline()).unwrap();
+    let steps = doc["steps"].as_sequence_mut().unwrap();
+    steps.retain(|s| s["id"].as_str() != Some("image"));
+    let more: Vec<serde_yaml::Value> = serde_yaml::from_str(&found[0]).unwrap();
+    steps.extend(more);
+    let ci = serde_yaml::to_string(&doc).unwrap();
+
+    let db = InMemoryDb::new();
+    let out = trigger(&db, &ci, true, &push_to("refs/heads/main")).await;
+    assert!(out.refused.is_empty(), "{:?}", out.refused);
+    assert_eq!(out.runs.len(), 1);
+    let run = &out.runs[0];
+    for id in ["amd64/push", "arm64/push", "app/index"] {
+        assert_eq!(
+            stored_profiles(&db, run, id).await,
+            vec!["ecr-push".to_string()],
+            "{id}"
+        );
+    }
+    for id in ["amd64/image", "arm64/image"] {
+        assert!(
+            !stored_profiles(&db, run, id)
+                .await
+                .contains(&"ecr-push".to_string()),
+            "{id}"
+        );
+    }
+    let index = db
+        .step_spec(run, &StepId("app/index".into()))
+        .await
+        .unwrap()
+        .unwrap();
+    let auth = index.registry_auth.expect("registry_auth");
+    assert_eq!(auth.library, Some(content_hash(INDEX)));
 }
