@@ -834,35 +834,12 @@ impl K8sExecutor {
         pod: &Pod,
         spec: &StepSpec,
     ) -> Result<(), ExecError> {
-        let Some(config_json) = step_registry_dockerconfig(spec) else {
+        let Some(secret) = registry_secret(pod_name, &self.namespace, pod, spec) else {
             return Ok(());
         };
         let client = self.client.clone().ok_or(ExecError::Unavailable)?;
         let secrets: Api<k8s_openapi::api::core::v1::Secret> =
             Api::namespaced(client, &self.namespace);
-        let secret = k8s_openapi::api::core::v1::Secret {
-            metadata: ObjectMeta {
-                name: Some(registry_secret_name(pod_name)),
-                namespace: Some(self.namespace.clone()),
-                owner_references: pod.metadata.uid.clone().map(|uid| {
-                    vec![
-                        k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
-                            api_version: "v1".into(),
-                            kind: "Pod".into(),
-                            name: pod_name.to_string(),
-                            uid,
-                            ..Default::default()
-                        },
-                    ]
-                }),
-                ..Default::default()
-            },
-            string_data: Some(std::collections::BTreeMap::from([(
-                REGISTRY_AUTH_KEY.to_string(),
-                config_json,
-            )])),
-            ..Default::default()
-        };
         match secrets.create(&PostParams::default(), &secret).await {
             Ok(_) => Ok(()),
             Err(kube::Error::Api(ae)) if ae.code == 409 => secrets
@@ -888,35 +865,12 @@ impl K8sExecutor {
         pod: &Pod,
         spec: &StepSpec,
     ) -> Result<(), ExecError> {
-        let Some(token) = &spec.oidc_token else {
+        let Some(secret) = oidc_secret(pod_name, &self.namespace, pod, spec) else {
             return Ok(());
         };
         let client = self.client.clone().ok_or(ExecError::Unavailable)?;
         let secrets: Api<k8s_openapi::api::core::v1::Secret> =
             Api::namespaced(client, &self.namespace);
-        let secret = k8s_openapi::api::core::v1::Secret {
-            metadata: ObjectMeta {
-                name: Some(oidc_secret_name(pod_name)),
-                namespace: Some(self.namespace.clone()),
-                owner_references: pod.metadata.uid.clone().map(|uid| {
-                    vec![
-                        k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
-                            api_version: "v1".into(),
-                            kind: "Pod".into(),
-                            name: pod_name.to_string(),
-                            uid,
-                            ..Default::default()
-                        },
-                    ]
-                }),
-                ..Default::default()
-            },
-            string_data: Some(std::collections::BTreeMap::from([(
-                OIDC_TOKEN_KEY.to_string(),
-                token.clone(),
-            )])),
-            ..Default::default()
-        };
         match secrets.create(&PostParams::default(), &secret).await {
             Ok(_) => Ok(()),
             Err(kube::Error::Api(ae)) if ae.code == 409 => secrets
@@ -3609,24 +3563,24 @@ impl Executor for K8sExecutor {
         })))
     }
 
-    /// The secret values of `step`'s Pod, read back from its `<pod>-secrets`
-    /// Secret (each value) and its `<pod>-registry` Secret (the
-    /// dockerconfigjson), so a control plane that tails the log of a step it
-    /// did not launch redacts them. A Secret that is not there (the step had
+    /// The credential values of `step`'s Pod, read back from the Secrets
+    /// [`log_redaction_sources`] names (the step's own secrets, the registry
+    /// dockerconfigjson, the forge token and the OIDC token), so a control
+    /// plane that tails the log of a step it did not launch redacts what the
+    /// launching one registered. A Secret that is not there (the step had
     /// none, or it was deleted when the attempt settled) adds nothing.
     async fn log_redactions(&self, step: &StepRun) -> Result<Vec<Vec<u8>>, ExecError> {
         let client = self.client.clone().ok_or(ExecError::Unavailable)?;
         let secrets: Api<k8s_openapi::api::core::v1::Secret> =
             Api::namespaced(client, &self.namespace);
-        let pod = pod_name(step);
         let mut out = Vec::new();
-        for name in [step_secrets_secret_name(&pod), registry_secret_name(&pod)] {
+        for (name, key) in log_redaction_sources(&pod_name(step)) {
             let secret = secrets
                 .get_opt(&name)
                 .await
                 .map_err(|e| ExecError::Other(format!("reading secret {name}: {e}")))?;
-            if let Some(data) = secret.and_then(|s| s.data) {
-                out.extend(data.into_values().map(|v| v.0).filter(|v| !v.is_empty()));
+            if let Some(secret) = secret {
+                out.extend(secret_redaction_values(&secret, key));
             }
         }
         Ok(out)
@@ -6754,6 +6708,102 @@ const OIDC_TOKEN_KEY: &str = "token";
 /// The per-Pod Secret carrying the OIDC token.
 fn oidc_secret_name(pod_name: &str) -> String {
     format!("{pod_name}-oidc")
+}
+
+/// The per-Pod Secrets whose values reach the step container and must never
+/// show in its log, each with the one key to read (`None`: every key). The
+/// forge-token Secret's username is not a credential. The workspace token
+/// and the results token are held by the fetcher and the egress sidecar
+/// only, whose output is not tailed.
+fn log_redaction_sources(pod_name: &str) -> [(String, Option<&'static str>); 4] {
+    [
+        (step_secrets_secret_name(pod_name), None),
+        (registry_secret_name(pod_name), None),
+        (forge_token_secret_name(pod_name), Some(FORGE_TOKEN_KEY)),
+        (oidc_secret_name(pod_name), Some(OIDC_TOKEN_KEY)),
+    ]
+}
+
+/// The non-empty values of `secret` under `key` (every key when `None`),
+/// read as the API server returns them (`data`) or as written
+/// (`stringData`).
+fn secret_redaction_values(
+    secret: &k8s_openapi::api::core::v1::Secret,
+    key: Option<&str>,
+) -> Vec<Vec<u8>> {
+    let wanted = |k: &String| key.is_none_or(|key| k == key);
+    let data = secret
+        .data
+        .iter()
+        .flatten()
+        .filter(|(k, _)| wanted(k))
+        .map(|(_, v)| v.0.clone());
+    let string_data = secret
+        .string_data
+        .iter()
+        .flatten()
+        .filter(|(k, _)| wanted(k))
+        .map(|(_, v)| v.clone().into_bytes());
+    data.chain(string_data).filter(|v| !v.is_empty()).collect()
+}
+
+/// The per-Pod Secret carrying a `registry_auth` Step's dockerconfigjson,
+/// or `None` when the launch carries no registry credential.
+fn registry_secret(
+    pod_name: &str,
+    namespace: &str,
+    pod: &Pod,
+    spec: &StepSpec,
+) -> Option<k8s_openapi::api::core::v1::Secret> {
+    let config_json = step_registry_dockerconfig(spec)?;
+    Some(k8s_openapi::api::core::v1::Secret {
+        metadata: pod_owned_meta(registry_secret_name(pod_name), namespace, pod_name, pod),
+        string_data: Some(std::collections::BTreeMap::from([(
+            REGISTRY_AUTH_KEY.to_string(),
+            config_json,
+        )])),
+        ..Default::default()
+    })
+}
+
+/// The per-Pod Secret carrying the per-attempt OIDC token, or `None` when
+/// the launch carries none.
+fn oidc_secret(
+    pod_name: &str,
+    namespace: &str,
+    pod: &Pod,
+    spec: &StepSpec,
+) -> Option<k8s_openapi::api::core::v1::Secret> {
+    let token = spec.oidc_token.as_ref()?;
+    Some(k8s_openapi::api::core::v1::Secret {
+        metadata: pod_owned_meta(oidc_secret_name(pod_name), namespace, pod_name, pod),
+        string_data: Some(std::collections::BTreeMap::from([(
+            OIDC_TOKEN_KEY.to_string(),
+            token.clone(),
+        )])),
+        ..Default::default()
+    })
+}
+
+/// Metadata for a per-Pod object named `name`: owner-referenced to the Pod
+/// (when it has a uid), so it is garbage-collected with it.
+fn pod_owned_meta(name: String, namespace: &str, pod_name: &str, pod: &Pod) -> ObjectMeta {
+    ObjectMeta {
+        name: Some(name),
+        namespace: Some(namespace.to_string()),
+        owner_references: pod.metadata.uid.clone().map(|uid| {
+            vec![
+                k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                    api_version: "v1".into(),
+                    kind: "Pod".into(),
+                    name: pod_name.to_string(),
+                    uid,
+                    ..Default::default()
+                },
+            ]
+        }),
+        ..Default::default()
+    }
 }
 
 /// The security context of a `rootless-buildkit` sandbox: rootless BuildKit
@@ -14747,6 +14797,72 @@ mod tests {
         // No credential on the launch: no Secret.
         spec.forge_token.as_mut().unwrap().credential = None;
         assert!(forge_token_secret("scarab-x", "ns", &Pod::default(), &spec).is_none());
+    }
+
+    /// `log_redactions` reads back every credential the launch mounts into
+    /// the step container, from the Secrets the launch writes, so a replica
+    /// that did not launch the step redacts what the launching one
+    /// registered: the step's secrets, the registry dockerconfigjson, the
+    /// forge token and the OIDC token. Read back as the API server returns
+    /// them (`data`). The forge username is not a credential.
+    #[test]
+    fn log_redactions_cover_every_credential_the_launch_mounts() {
+        use scarab_engine::{ForgeCredential, ForgeTokenConfig, RegistryAuthConfig};
+        let mut spec = busybox();
+        spec.forge_token = Some(ForgeTokenConfig {
+            access: scarab_pipeline::ForgeToken::Read,
+            owner: "acme".into(),
+            name: "web".into(),
+            read_only: false,
+            trusted_library: None,
+            credential: Some(ForgeCredential {
+                username: "x-access-token".into(),
+                token: "ghs_minted".into(),
+                minted: true,
+            }),
+        });
+        spec.secrets = vec!["NPM_TOKEN".into()];
+        spec.resolved_secrets =
+            scarab_engine::ResolvedSecrets(vec![("NPM_TOKEN".into(), "sekret-npm".into())]);
+        let registry = r#"{"auths":{"registry.corp":{"auth":"Y2k6czNjcmV0"}}}"#;
+        spec.registry_auth = Some(RegistryAuthConfig {
+            registry_auth_json: Some(registry.into()),
+            ..Default::default()
+        });
+        spec.oidc_token = Some("eyJ.oidc.sig".into());
+        let pod = Pod::default();
+        let as_returned = |mut secret: k8s_openapi::api::core::v1::Secret| {
+            let mut data = secret.data.take().unwrap_or_default();
+            for (k, v) in secret.string_data.take().into_iter().flatten() {
+                data.insert(k, k8s_openapi::ByteString(v.into_bytes()));
+            }
+            secret.data = Some(data);
+            secret
+        };
+        let written: Vec<_> = [
+            step_secrets_secret("scarab-x", "ns", &pod, &spec),
+            registry_secret("scarab-x", "ns", &pod, &spec),
+            forge_token_secret("scarab-x", "ns", &pod, &spec),
+            oidc_secret("scarab-x", "ns", &pod, &spec),
+        ]
+        .into_iter()
+        .map(|s| as_returned(s.expect("the launch writes this Secret")))
+        .collect();
+        let mut read = Vec::new();
+        for (name, key) in log_redaction_sources("scarab-x") {
+            let secret = written
+                .iter()
+                .find(|s| s.metadata.name.as_deref() == Some(name.as_str()))
+                .unwrap_or_else(|| panic!("no Secret named {name}"));
+            read.extend(secret_redaction_values(secret, key));
+        }
+        for value in ["sekret-npm", registry, "ghs_minted", "eyJ.oidc.sig"] {
+            assert!(
+                read.contains(&value.as_bytes().to_vec()),
+                "{value} is not read back"
+            );
+        }
+        assert!(!read.contains(&b"x-access-token".to_vec()));
     }
 
     /// The Pipeline check refuses a templated value on a `forge_token` Step

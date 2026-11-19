@@ -3622,7 +3622,8 @@ async fn a_needs_step_with_a_uid_pinned_service_can_write_its_workspace() {
 /// launch reads the step's secret values back from the step's own Secrets,
 /// so it redacts them as the launching replica does. A second executor (a
 /// fresh client, nothing in memory from the launch) returns the step's
-/// secret values and the registry dockerconfigjson; a Pod with no secrets
+/// secret values, the registry dockerconfigjson, the forge token and the
+/// OIDC token; a Pod with no secrets
 /// returns none; once the Attempt ends and its Secrets are deleted it
 /// returns none.
 #[tokio::test]
@@ -3650,13 +3651,35 @@ async fn log_redactions_reads_the_values_back_from_another_executor() {
         }),
         ..Default::default()
     });
+    spec.forge_token = Some(scarab_engine::ForgeTokenConfig {
+        access: scarab_pipeline::ForgeToken::Read,
+        owner: "acme".into(),
+        name: "web".into(),
+        read_only: false,
+        trusted_library: None,
+        credential: Some(scarab_engine::ForgeCredential {
+            username: "x-access-token".into(),
+            token: "sekret-forge-redact".into(),
+            minted: false,
+        }),
+    });
+    spec.oidc_token = Some("sekret-oidc-redact".into());
     let h = launcher.launch(&step, &spec).await.expect("launch");
 
     let values = peer.log_redactions(&step).await.expect("log_redactions");
-    assert!(
-        values.iter().any(|v| v == b"sekret-db-redact"),
-        "the step secret: {values:?}"
-    );
+    for value in [
+        &b"sekret-db-redact"[..],
+        b"sekret-forge-redact",
+        b"sekret-oidc-redact",
+    ] {
+        assert!(
+            values.iter().any(|v| v == value),
+            "{}: {values:?}",
+            String::from_utf8_lossy(value)
+        );
+    }
+    // The forge username is not a credential.
+    assert!(values.iter().all(|v| v != b"x-access-token"));
     // The launching replica registers the token and `base64(user:token)`;
     // the server extracts both from the dockerconfigjson returned here.
     use base64::Engine as _;
