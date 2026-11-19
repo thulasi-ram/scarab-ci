@@ -1,17 +1,18 @@
-// The run's step DAG — the differentiating surface, "blueprint
-// spine" treatment. Steps lay out in dependency layers (longest-path from the
-// roots); `needs` in-edges are drawn as measured orthogonal connectors on an SVG
-// under the nodes, and the edge feeding a running step animates a dashed flow.
+// The run's step graph on the always-dark canvas. Steps lay out in dependency
+// layers (longest path from the roots); `needs` edges are drawn as measured
+// orthogonal connectors on an SVG under the nodes, and the edge feeding a
+// running step animates a dashed flow.
 //
-// This is a PURE STATUS MAP (redesign stage 3): one node per step showing its
-// status ring, id, a short meta line, a `×N` badge when the step took more than
-// one try, a gate icon, and a running scanline. The "which try" axis lives
-// elsewhere now — the attempts filmstrip in the evidence-pane header — so the
-// graph answers "what shape, and where does each step stand", not "which try".
-// Clicking a node selects it.
+// One node per step: its status ring, its name, a meta line ("passed on try 3
+// · 2m11s", "waiting for a node · 1m10s"), a gate or deploy icon, and a
+// running scanline. The cells of a matrix sit under one heading naming the
+// step and its keys, and each cell shows only its values. The graph is drawn
+// at 100% and scrolls inside the band; only a graph wider than the band
+// shrinks, to 75% at most. Clicking a node selects it.
 import { createSignal, onMount, onCleanup, createEffect, createMemo, For, Show } from "solid-js";
 import { isGateOpen, type GateStatus } from "../gates";
 import { layoutGroups, type DagCell, type OriginLink } from "../dag-layout";
+import { fitBand, matrixHeading, nodeMeta, segmentByMatrix } from "../run-page";
 import { shortHash } from "../libraries";
 import Icon from "./Icon";
 import Pill from "./Pill";
@@ -22,13 +23,17 @@ export type DagNote = {
   text: string;
   /** The full account for the hover title, when the text shortens it. */
   detail?: string;
+  /** When the condition started (warning tone): the meta says for how long. */
+  since?: number | null;
 };
 
 export type DagStep = {
   id: string;
   status: string;
-  /** Attempt count — >1 means it was retried/restarted (the rerun signal). */
+  /** Tries in the version in view: more than one means it was retried. */
   attempts: number;
+  /** Of those, the ones that failed ("failed 2 of 2 tries"). */
+  failedTries?: number;
   /** Time-travel only: this step was carried forward untouched by the viewed
    * Take (0 attempts in it) — render muted, "not part of this rerun". */
   reused?: boolean;
@@ -84,29 +89,11 @@ type Edge = {
   vertical: boolean;
 };
 
-/** m:ss (or h:mm:ss) elapsed since `since`, ticking off the caller's `now`. */
-function elapsed(since: number, now: number): string {
-  return fmtDur(now - since);
-}
-
-/** A compact duration label (e.g. `4.2s`, `1m12s`, `1h03m`) from a ms delta. */
-function fmtDur(ms: number): string {
-  const s = Math.max(0, ms) / 1000;
-  if (s < 10) return `${s.toFixed(1)}s`;
-  const total = Math.round(s);
-  if (total < 60) return `${total}s`;
-  const mm = Math.floor(total / 60);
-  const ss = total % 60;
-  if (mm < 60) return `${mm}m${String(ss).padStart(2, "0")}s`;
-  const hh = Math.floor(mm / 60);
-  return `${hh}h${String(mm % 60).padStart(2, "0")}m`;
-}
-
-/** Imperative zoom controls the Pipeline band toolbar drives (Proposal B, stage
- * 3). Dag owns the zoom/pan state and hands these out on mount so the toolbar's
- * fit / ＋ / － cluster (page chrome, outside the dark canvas) can call in. */
+/** Zoom controls the Pipeline panel header drives. Dag owns the zoom and scroll
+ * state and hands these out on mount, so the header's fit / ＋ / － buttons
+ * (page chrome, outside the dark canvas) can call in. */
 export type DagControls = {
-  /** Fit the whole graph within the band and re-center (the auto-fit baseline). */
+  /** Back to the fitted view: 100%, or less for a graph wider than the band. */
   fit: () => void;
   zoomIn: () => void;
   zoomOut: () => void;
@@ -125,8 +112,8 @@ export default function Dag(props: {
   /** The sidecar index whose logs are currently active on the SELECTED step —
    * drives the docked chip's selected outline. */
   sidecarFocus?: number | null;
-  /** Handed the zoom controls on mount (fit / zoom in / zoom out) so the band
-   * toolbar can drive them (Proposal B, stage 3). */
+  /** Handed the zoom controls on mount (fit / zoom in / zoom out) so the
+   * panel header can drive them. */
   onControls?: (c: DagControls) => void;
 }) {
   let container: HTMLDivElement | undefined; // the band viewport (overflow clipped)
@@ -136,28 +123,28 @@ export default function Dag(props: {
   // A 1s tick so running nodes' elapsed counters advance in place.
   const [now, setNow] = createSignal(Date.now());
 
-  // ── Fit-to-view zoom + pan (Proposal B, stage 3) ──────────────────────────
-  // The graph content is wrapped in a zoom layer transformed by `scale` +
-  // (`tx`,`ty`). `fit()` scales the whole graph to sit within the band (never
-  // upscaling past 1×) and centers it; the band's rendered height tracks the
-  // fitted content height, capped at a max. Edges are measured in UNSCALED
-  // content coordinates (offsetLeft/offsetTop, which CSS transforms don't
-  // touch), so the zoom transform never breaks where they land.
+  // ── Zoom and scroll ─────────────────────────────────────────────────────
+  // The graph sits in a zoom layer scaled by `scale`, inside a sizer as big as
+  // the scaled graph, inside the band, which scrolls. `fit()` sets the scale
+  // (1, or less for a graph wider than the band, not below 0.75) and the band
+  // height (the graph's, capped at ~60vh). Edges are measured in UNSCALED
+  // graph coordinates (offsetLeft/offsetTop, which transforms don't touch), so
+  // the zoom never moves them off their nodes.
   const [scale, setScale] = createSignal(1);
-  const [tx, setTx] = createSignal(0);
-  const [ty, setTy] = createSignal(0);
-  const [bandH, setBandH] = createSignal(320);
-  const [fitZ, setFitZ] = createSignal(1); // the last fit scale — pan unlocks above it
+  const [bandH, setBandH] = createSignal(240);
+  const [contentW, setContentW] = createSignal(0);
   const [contentH, setContentH] = createSignal(0);
   const [dragging, setDragging] = createSignal(false);
 
-  const PAD = 24; // inset (px) between the graph and the band edges, at scale 1
+  const PAD = 24; // inset (px) between the graph and the band edges
   const MIN_Z = 0.2;
   const MAX_Z = 1.5;
   const clampZ = (z: number) => Math.min(MAX_Z, Math.max(MIN_Z, z));
-  // Band ceiling ~60vh (the DAG never eats more than that); floored so a tiny
-  // graph still gets a usable strip.
+  // Band ceiling ~60vh (the graph never takes more than that); floored so a
+  // tiny viewport still gets a usable strip.
   const maxBandH = () => Math.max(200, Math.round(window.innerHeight * 0.6));
+  const sizeW = () => Math.round(contentW() * scale() + PAD * 2);
+  const sizeH = () => Math.round(contentH() * scale() + PAD * 2);
 
   // Cumulative unscaled offset of `el` up to `ancestor` (the graph). offsetLeft/
   // offsetTop are LAYOUT coordinates — unaffected by the zoom layer's transform —
@@ -241,67 +228,54 @@ export default function Dag(props: {
     setEdges(es);
   }
 
-  // Fit the whole graph within the band: scale so it fits both axes (never past
-  // 1×), center it, and shrink the band to the fitted content height (capped at
-  // the max — no wasted vertical space when the graph is small). Auto-fit runs on
-  // mount, on topology change, and on a width resize.
+  // Back to the fitted view and the top-left corner. Runs on mount, on a
+  // topology change and on a width resize; never on a status poll.
   function fit() {
     if (!container || !graph) return;
-    const bandW = container.clientWidth;
     const cw = graph.offsetWidth;
     const ch = graph.offsetHeight;
+    const bandW = container.clientWidth;
+    setContentW(cw);
     setContentH(ch);
     if (cw <= 0 || ch <= 0 || bandW <= 0) return;
-    const availW = Math.max(1, bandW - PAD * 2);
-    const availH = Math.max(1, maxBandH() - PAD * 2);
-    const z = Math.min(availW / cw, availH / ch, 1);
-    const scaledW = cw * z;
-    const scaledH = ch * z;
-    const h = Math.round(scaledH + PAD * 2);
-    setScale(z);
-    setFitZ(z);
-    setTx((bandW - scaledW) / 2);
-    setTy((h - scaledH) / 2);
-    setBandH(h);
+    const f = fitBand({ bandW, contentW: cw, contentH: ch, maxH: maxBandH(), pad: PAD });
+    setScale(f.scale);
+    setBandH(f.bandH);
+    container.scrollLeft = 0;
+    container.scrollTop = 0;
   }
 
-  // Zoom to `nz`, keeping the focal point (band center by default) fixed, and
-  // grow the band up to the max so there's room to read/pan when zoomed in.
-  function zoomTo(nz: number, fx?: number, fy?: number) {
+  // Zoom to `nz` around the band's centre. The band keeps its height (a jump
+  // on every ＋/－ moved the whole page); the graph scrolls inside it instead.
+  function zoomTo(nz: number) {
     if (!container) return;
     const z0 = scale();
     const z = clampZ(nz);
-    const cx = fx ?? container.clientWidth / 2;
-    const cy = fy ?? bandH() / 2;
-    const contentX = (cx - tx()) / z0;
-    const contentY = (cy - ty()) / z0;
+    const cx = (container.scrollLeft + container.clientWidth / 2 - PAD) / z0;
+    const cy = (container.scrollTop + container.clientHeight / 2 - PAD) / z0;
     setScale(z);
-    setTx(cx - contentX * z);
-    setTy(cy - contentY * z);
-    // NB: manual zoom scales the INNER canvas only — it must NOT resize the band
-    // container. Growing `bandH` here made the whole component jump on every
-    // ＋/－; the band is a fixed viewport (set by `fit()` on topology change),
-    // and zooming past the fit just overflows it (clipped) and unlocks panning.
+    container.scrollLeft = cx * z + PAD - container.clientWidth / 2;
+    container.scrollTop = cy * z + PAD - container.clientHeight / 2;
   }
   const zoomIn = () => zoomTo(scale() * 1.2);
   const zoomOut = () => zoomTo(scale() / 1.2);
 
-  // Drag-to-pan, unlocked only once zoomed in past the fit scale (when the graph
-  // overflows the band). Starting on a node/chip is a select, not a pan.
-  let panStart: { x: number; y: number; tx: number; ty: number } | null = null;
-  const pannable = () => scale() > fitZ() + 0.001;
+  // Drag to pan whenever the graph overflows the band. Starting on a node or
+  // chip is a select, not a pan.
+  let panStart: { x: number; y: number; left: number; top: number } | null = null;
+  const pannable = () => sizeW() > (container?.clientWidth ?? Infinity) + 1 || sizeH() > bandH() + 1;
   const onPointerDown = (e: PointerEvent) => {
-    if (!pannable() || !container) return;
+    if (!pannable() || !container || e.button !== 0) return;
     if ((e.target as HTMLElement).closest("button, [role='button']")) return;
-    panStart = { x: e.clientX, y: e.clientY, tx: tx(), ty: ty() };
+    panStart = { x: e.clientX, y: e.clientY, left: container.scrollLeft, top: container.scrollTop };
     setDragging(true);
     container.setPointerCapture(e.pointerId);
     e.preventDefault();
   };
   const onPointerMove = (e: PointerEvent) => {
-    if (!panStart) return;
-    setTx(panStart.tx + (e.clientX - panStart.x));
-    setTy(panStart.ty + (e.clientY - panStart.y));
+    if (!panStart || !container) return;
+    container.scrollLeft = panStart.left - (e.clientX - panStart.x);
+    container.scrollTop = panStart.top - (e.clientY - panStart.y);
   };
   const onPointerUp = (e: PointerEvent) => {
     if (!panStart) return;
@@ -325,15 +299,16 @@ export default function Dag(props: {
     );
 
   onMount(() => {
-    // Hand the zoom controls up to the band toolbar (Proposal B, stage 3).
+    // Hand the zoom controls up to the panel header.
     props.onControls?.({ fit, zoomIn, zoomOut });
     fitAndMeasure();
-    // Re-fit on a WIDTH resize only — a height change is self-inflicted by fit
-    // (it sets the band height), so guarding on width avoids a feedback loop.
+    // Re-fit on a WIDTH resize only: a height change is fit's own doing (it
+    // sets the band height). A change smaller than a scrollbar is the band's
+    // own vertical scrollbar coming or going, and refitting on it could loop.
     let lastW = container?.clientWidth ?? 0;
     const ro = new ResizeObserver(() => {
       const w = container?.clientWidth ?? 0;
-      if (Math.abs(w - lastW) < 1) return;
+      if (Math.abs(w - lastW) < 24) return;
       lastW = w;
       requestAnimationFrame(fit);
     });
@@ -369,42 +344,40 @@ export default function Dag(props: {
     fitAndMeasure();
   });
 
-  // Re-measure EDGES (only) when a node's box could have changed — topology or
-  // per-step status (a running scanline, a ×N badge, the finished duration each
-  // resize the node). Zoom/pan need no re-measure: edges are stored in unscaled
-  // graph coords, so the transform scales them onto the nodes for free.
+  // Re-measure EDGES (and the graph's size) when a node's box could have
+  // changed: topology or a per-step status. Zoom and scroll need no
+  // re-measure: edges are stored in unscaled graph coords.
   createEffect(() => {
     props.steps
       .map((s) => `${s.id}:${s.status}:${s.attempts}:${s.gate ?? ""}:${s.note?.text ?? ""}`)
       .join(",");
     (props.services ?? []).map((s) => `${s.name}:${s.status}`).join(",");
-    requestAnimationFrame(() => requestAnimationFrame(measure));
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        measure();
+        if (graph) {
+          setContentW(graph.offsetWidth);
+          setContentH(graph.offsetHeight);
+        }
+      }),
+    );
   });
 
-  // A short status meta line under the node id.
-  const meta = (s: DagStep): string => {
-    // A running step whose Pod is held back (no node, an image that will not
-    // pull) is not running yet: say what it waits for instead of a clock.
-    if (s.note?.tone === "warning") return s.note.text;
-    if (s.status === "running") {
-      return s.runningSince ? `running · ${elapsed(s.runningSince, now())}` : "running";
-    }
-    // A gate's verdict / wait, or a concurrency hold, says more than the
-    // status: "waiting on argocd/web (in progress)", "failed: <reason>".
-    if (s.note) return s.note.text;
-    if (isGateOpen(s)) {
-      return s.approvalGate ? "gate · approval" : `gate · ${s.gate}`;
-    }
-    // Finished steps show how long they took (from the event log).
-    if (s.durationMs != null && (s.status === "succeeded" || s.status === "failed")) {
-      const mark = s.status === "succeeded" ? "✓" : "✕";
-      return `${mark} ${fmtDur(s.durationMs)}`;
-    }
-    // Time-travel display statuses: prettify the underscore form.
-    if (s.status === "superseded") return "superseded";
-    if (s.status === "not_run") return "not run";
-    return s.status;
-  };
+  // The meta line under the node's name. Pure, in run-page.ts.
+  const meta = (s: DagStep) =>
+    nodeMeta(
+      {
+        status: s.status,
+        tries: s.attempts,
+        failedTries: s.failedTries,
+        durationMs: s.durationMs,
+        runningSince: s.runningSince,
+        note: s.note,
+        gate: s.gate,
+        approvalGate: s.approvalGate,
+      },
+      now(),
+    );
 
   // A shared-service node's meta line: ports (when the projection carries them)
   // then its lifecycle status — e.g. `port 5432 · ready`, or just `ready`.
@@ -422,24 +395,26 @@ export default function Dag(props: {
 
   // One Step node. A plugin gate is dashed and names its
   // plugin under its id.
-  const StepNode = (p: { s: DagStep }) => {
+  const StepNode = (p: { s: DagStep; label: string }) => {
     const s = p.s;
     const sel = () => props.selected === s.id;
     const plugin = () => s.origin?.find((o) => o.kind === "plugin");
+    const m = () => meta(s);
     return (
       <button
         class={`dnode ${s.status} ${sel() ? "sel" : ""}`}
         classList={{ reused: !!s.reused, plugin: !!plugin(), waiting: !!plugin() && isGateOpen(s) }}
         ref={(el) => nodes.set(s.id, el)}
         onClick={() => props.onSelect(s.id)}
+        aria-pressed={sel()}
       >
         <span class={`dring ${s.status}`}>
           <span class="dring-core" />
         </span>
         <span class="dnode-main" title={s.id}>
-          <span class="dnode-id">{s.id}</span>
-          <span class={`dnode-meta ${s.note ? `gnote ${s.note.tone}` : ""}`} title={s.note?.detail ?? s.note?.text}>
-            {meta(s)}
+          <span class="dnode-id">{p.label}</span>
+          <span class={`dnode-meta ${m().tone ? `gnote ${m().tone}` : ""}`} title={s.note?.detail ?? m().text}>
+            {m().text}
           </span>
           <Show when={plugin()}>
             {(o) => <span class="dnode-origin">plugin:{o().name.split("/")[0]}</span>}
@@ -452,11 +427,6 @@ export default function Dag(props: {
             )}
           </Show>
         </span>
-        <Show when={s.attempts > 1}>
-          <span class="dnode-count" title={`${s.attempts} tries`}>
-            ×{s.attempts}
-          </span>
-        </Show>
         <Show when={s.gate}>
           <Icon icon="timer" size={12} class="dnode-gate" />
         </Show>
@@ -510,16 +480,41 @@ export default function Dag(props: {
 
   // Dependency columns; a library invocation is a box holding its own
   // columns, nested for an inner invocation.
+  // The cells of one matrix in a column sit under one heading naming the step
+  // and its keys; each cell's node shows only its values.
   const Cols = (p: { cols: DagCell<DagStep>[][] }) => (
     <div class="dag-cols">
       <For each={p.cols}>
         {(col) => (
           <div class="dag-col">
-            <For each={col}>
-              {(cell) =>
-                cell.kind === "step" ? (
-                  <StepNode s={cell.step} />
+            <For each={segmentByMatrix(col, (c) => (c.kind === "step" ? c.step.id : null))}>
+              {(seg) =>
+                seg.matrix ? (
+                  <div class="dag-mx">
+                    <div class="dag-mxh" title={matrixHeading(seg.matrix)}>
+                      <b>{seg.matrix.base}</b> · matrix · {seg.matrix.keys.join(" · ")}
+                    </div>
+                    <For each={seg.items}>
+                      {(it) => (it.item.kind === "step" ? <StepNode s={it.item.step} label={it.label} /> : null)}
+                    </For>
+                  </div>
                 ) : (
+                  <For each={seg.items}>{(it) => <Cell cell={it.item} />}</For>
+                )
+              }
+            </For>
+          </div>
+        )}
+      </For>
+    </div>
+  );
+
+  // A step, or a library invocation's box with its own columns.
+  const Cell = (p: { cell: DagCell<DagStep> }) => {
+    const cell = p.cell;
+    return cell.kind === "step" ? (
+      <StepNode s={cell.step} label={cell.step.id} />
+    ) : (
                   <div class="dgroup" title={`${cell.group.key}: ${cell.group.kind === "library" ? "lib:" : ""}${cell.group.name} ${cell.group.content_hash}`}>
                     <div class="dgroup-h">
                       <span class="gi">{cell.group.label}</span>
@@ -534,14 +529,8 @@ export default function Dag(props: {
                     </div>
                     <Cols cols={cell.cols} />
                   </div>
-                )
-              }
-            </For>
-          </div>
-        )}
-      </For>
-    </div>
-  );
+    );
+  };
 
   return (
     <div
@@ -554,13 +543,13 @@ export default function Dag(props: {
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
     >
-      {/* Zoom/pan layer: the whole graph (edges + nodes) is transformed as one,
-          so a fit-to-view scale (or manual zoom + pan) never desyncs the edges
-          from the nodes. Edge coords are measured UNSCALED, so `scale()` here
-          scales them onto the nodes for free. */}
+      {/* The sizer is as big as the scaled graph, so the band scrolls over it.
+          The zoom layer transforms edges and nodes as one, so a zoom never
+          moves an edge off its node. */}
+      <div class="dag-sizer" style={{ width: `${sizeW()}px`, height: `${sizeH()}px` }}>
       <div
         class="dag-zoom"
-        style={{ transform: `translate(${tx()}px, ${ty()}px) scale(${scale()})` }}
+        style={{ transform: `translate(${PAD}px, ${PAD}px) scale(${scale()})` }}
       >
       <svg class="dag-edges" aria-hidden="true">
         <For each={edges()}>
@@ -636,6 +625,7 @@ export default function Dag(props: {
           </div>
         </Show>
         <Cols cols={layers()} />
+      </div>
       </div>
       </div>
     </div>

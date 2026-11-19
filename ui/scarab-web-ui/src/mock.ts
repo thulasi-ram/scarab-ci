@@ -57,6 +57,10 @@ const GATES_RUN_ID = "0190f8a2000071fb8c00d3e9107a1616";
 // The ENVIRONMENT GATE run: a deploy into production with a plain QA gate
 // and the approval gate production added. /acme/scarab/runs/<id>.
 const ENV_GATE_RUN_ID = "0190f8a2000071fb8c00e7a9b0c1d2e3";
+// The MATRIX run: a failed plan over a cluster × phase matrix. Two cells
+// failed (one on both of its tries, after waiting for a node), so the summary
+// line names two root failures. /acme/scarab/runs/<id>.
+const MATRIX_RUN_ID = "0190f8a2000071fb8c00f00d4a7b1c33";
 
 // ── /v1/me ────────────────────────────────────────────────────────────────
 // An Owner of the one implicit org, so the Settings gear renders.
@@ -529,6 +533,159 @@ const richEventsBody = [
   rev(ago(10 * min - 1000), { StepTransitioned: { step: "test", from: "running", to: "succeeded" } }),
   rev(ago(9 * min + 50000), { StepTransitioned: { step: "approve", from: "pending", to: "waiting" } }),
 ].join("");
+
+// ── the MATRIX run (summary line, matrix labels, retries) ───────────────────
+// checkout `git`, then `plan` over cluster × phase. treebo-production ×
+// aws-cluster failed twice (the engine retried it), and its second try waited
+// about a minute for a node first; treebo-production × aws-post-cluster
+// failed once. The other four cells passed and published a plan each.
+const MX_CELLS: [string, string, "ok" | "fail" | "fail2"][] = [
+  ["superhero-tools-common", "aws-cluster", "ok"],
+  ["superhero-tools-common", "aws-post-cluster", "ok"],
+  ["treebo-production", "aws-cluster", "fail2"],
+  ["treebo-production", "aws-post-cluster", "fail"],
+  ["treebo-staging", "aws-cluster", "ok"],
+  ["treebo-staging", "aws-post-cluster", "ok"],
+];
+const mxId = (cluster: string, phase: string) => `plan[cluster=${cluster},phase=${phase}]`;
+const MX_T0 = 12 * min; // the run started 12 minutes ago
+const MX_PLAN_AT = MX_T0 - 61_000; // the plan cells start when git finishes
+const matrixRunStatus: RunStatusDto = {
+  id: MATRIX_RUN_ID,
+  status: "failed",
+  run_number: 33,
+  pipeline: "tofu-plan",
+  trigger_title: "Smoke-run the plan pipelines on the new cluster module",
+  origin_pr_base: "develop",
+  params: {},
+  snapshot_retention: { retention_days: 14, expired: false, pinned: false },
+  steps: [
+    {
+      id: "git",
+      status: "succeeded",
+      attempts: 1,
+      needs: [],
+      attempt_list: [
+        { id: "a1", started_at: ago(MX_T0), finished_at: ago(MX_PLAN_AT), failed: false, outcome: "succeeded" },
+      ],
+    },
+    ...MX_CELLS.map(([cluster, phase, how], i) => {
+      const start = MX_PLAN_AT - 2000;
+      const took = 150_000 + i * 6_000;
+      const attempt_list =
+        how === "ok"
+          ? [{ id: "a1", started_at: ago(start), finished_at: ago(start - took), failed: false, outcome: "succeeded" }]
+          : how === "fail"
+            ? [
+                {
+                  id: "a1",
+                  started_at: ago(start),
+                  finished_at: ago(start - 121_000),
+                  failed: true,
+                  failure: "step",
+                  failure_detail: "tofu plan exited 1: Error acquiring the state lock",
+                  outcome: "failed",
+                },
+              ]
+            : [
+                {
+                  id: "a1",
+                  started_at: ago(start),
+                  finished_at: ago(start - 48_000),
+                  failed: true,
+                  failure: "step",
+                  failure_detail: "tofu init exited 1: registry.terraform.io timed out",
+                  outcome: "failed",
+                },
+                {
+                  id: "a2",
+                  started_at: ago(start - 60_000),
+                  finished_at: ago(start - 60_000 - 126_000),
+                  failed: true,
+                  failure: "step",
+                  failure_detail: "tofu plan exited 1: Error acquiring the state lock",
+                  outcome: "failed",
+                },
+              ];
+      return {
+        id: mxId(cluster, phase),
+        status: how === "ok" ? "succeeded" : "failed",
+        attempts: attempt_list.length,
+        needs: ["git"],
+        attempt_list,
+      };
+    }),
+  ],
+};
+const mxv = sse(MATRIX_RUN_ID);
+const matrixEventsBody = (() => {
+  const out: string[] = [
+    mxv(ago(MX_T0 + 3000), {
+      Raw: {
+        trigger: {
+          event: {
+            kind: "pull_request",
+            actor: "thulasi",
+            branch: "feature/cluster-module",
+            sha: "15f2297b9c0d1e2f3a4b5c6d7e8f9a0b",
+            repo: { owner: "acme", name: "scarab" },
+            pr: 2949,
+          },
+        },
+      },
+    }),
+    mxv(ago(MX_T0), { AttemptStarted: { step: "git", attempt: "a1" } }),
+    mxv(ago(MX_PLAN_AT), { AttemptFinished: { step: "git", attempt: "a1" } }),
+    mxv(ago(MX_PLAN_AT - 500), { StepTransitioned: { step: "git", from: "running", to: "succeeded" } }),
+  ];
+  const timed: [number, string][] = [];
+  for (const s of matrixRunStatus.steps.slice(1)) {
+    for (const a of s.attempt_list ?? []) {
+      timed.push([a.started_at, mxv(a.started_at, { AttemptStarted: { step: s.id, attempt: a.id } })]);
+      if (a.id === "a2") {
+        // The retry waited about a minute for a node before it started.
+        timed.push([
+          a.started_at + 62_000,
+          mxv(a.started_at + 62_000, {
+            StepInfraCondition: {
+              step: s.id,
+              attempt: a.id,
+              reason: "Unschedulable",
+              message: "0/14 nodes are available: 12 node(s) had untolerated taints, 2 node(s) didn't match the node selector",
+              held_ms: 62_000,
+              observations: 4,
+            },
+          }),
+        ]);
+      }
+      const fin = a.finished_at!;
+      timed.push([
+        fin,
+        mxv(fin, { AttemptFinished: { step: s.id, attempt: a.id, ...(a.failed ? { failure: a.failure } : {}) } }),
+      ]);
+    }
+    timed.push([
+      s.attempt_list![s.attempt_list!.length - 1]!.finished_at! + 500,
+      mxv(s.attempt_list![s.attempt_list!.length - 1]!.finished_at! + 500, {
+        StepTransitioned: { step: s.id, from: "running", to: s.status },
+      }),
+    ]);
+  }
+  timed.sort((a, b) => a[0] - b[0]);
+  const end = Math.max(...timed.map(([at]) => at));
+  out.push(...timed.map(([, line]) => line));
+  out.push(mxv(end + 1000, { RunTransitioned: { from: "running", to: "failed" } }));
+  return out.join("");
+})();
+const matrixArtifacts: ArtifactDto[] = MX_CELLS.filter(([, , how]) => how === "ok").map(([cluster, phase], i) => ({
+  name: `plan-${cluster}-${phase}.txt`,
+  step: mxId(cluster, phase),
+  attempt: "a1",
+  of_record: true,
+  succeeded: true,
+  size: 22_000 + i * 13_000,
+  content_type: "text/plain",
+}));
 
 const richArtifacts: ArtifactDto[] = [
   {
@@ -2444,6 +2601,16 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   if (method === "POST" && /^\/v1\/runs\/[^/]+\/gates\/[^/]+\/reject$/.test(p)) {
     return json({ rejected: true }, { status: 202 });
   }
+
+  // the MATRIX run
+  if (p === `/v1/runs/${MATRIX_RUN_ID}`) return json(matrixRunStatus);
+  if (p === `/v1/runs/${MATRIX_RUN_ID}/events`)
+    return new Response(matrixEventsBody, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  if (p === `/v1/runs/${MATRIX_RUN_ID}/artifacts`) return json(matrixArtifacts);
+  if (p === `/v1/runs/${MATRIX_RUN_ID}/services`) return json([]);
 
   // the RICH run (Playwright walkthrough fixture)
   if (p === `/v1/runs/${RICH_RUN_ID}`) return json(richRunStatus);

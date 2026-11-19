@@ -419,11 +419,17 @@ export const rowTime = (takes: Take[], t: Take, startedAt: number | null): numbe
 export const rowActor = (takes: Take[], t: Take): string | null =>
   t.n <= 1 ? null : (takes[t.n - 2]?.closedBy ?? null);
 
-/** The row's second line: on the latest row show what opened it ("you reran b"),
- * then the actor and time — enough provenance without a banner. */
+/** Why a version exists: the trigger for the first ("PR #131", or "original
+ * run" when the caller has no trigger words), "you reran from <step>" for a
+ * later one. */
+export const rowWhy = (takes: Take[], t: Take, trigger?: string | null): string => {
+  const by = openedBy(takes, t);
+  return by ? `you reran from ${by}` : (trigger ?? "original run");
+};
+
+/** The row's second line: who opened the version and when. */
 export const rowSub = (takes: Take[], t: Take, startedAt: number | null): string => {
   const parts: string[] = [];
-  if (t.n === takes.length && t.n > 1) parts.push(rowLabel(takes, t));
   const who = rowActor(takes, t);
   if (who) parts.push(`by ${who}`);
   const at = rowTime(takes, t, startedAt);
@@ -475,6 +481,7 @@ export function versionRows(
   latestStatuses: string[],
   selectedN: number | null,
   startedAt: number | null,
+  trigger?: string | null,
 ): VersionRow[] {
   const latest = takes.length;
   const selN = selectedN ?? latest;
@@ -486,6 +493,7 @@ export function versionRows(
     return {
       n: t.n,
       label: isLatest ? "latest" : rowLabel(takes, t),
+      why: rowWhy(takes, t, trigger),
       sub: rowSub(takes, t, startedAt),
       summary: tally(statuses),
       isLatest,

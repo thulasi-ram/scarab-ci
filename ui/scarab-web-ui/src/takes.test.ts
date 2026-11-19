@@ -406,10 +406,12 @@ describe("versionRows", () => {
     expect(rows[1].summary).toMatchObject({ succeeded: 2, running: 1 });
   });
 
-  it("the latest row's sub names what opened it and who pressed it", () => {
-    const rows = versionRows(events, takes, liveStatuses, null, 1000);
-    expect(rows[1].sub).toContain("you reran b");
+  it("each row says why the version exists, and who opened it", () => {
+    const rows = versionRows(events, takes, liveStatuses, null, 1000, "PR #12");
+    expect(rows[0].why).toBe("PR #12");
+    expect(rows[1].why).toBe("you reran from b");
     expect(rows[1].sub).toContain("by a.kim");
+    expect(versionRows(events, takes, liveStatuses, null, 1000)[0].why).toBe("original run");
   });
 
   it("selection: null selects the latest; a take number selects that row", () => {

@@ -1,9 +1,8 @@
-// Copy and predicates for the **cold tier's** Workspace-Snapshot retention
-// (ADR-0061 s5): the retention window a run's snapshots live under, the manual
-// pin that holds it open, and — the part that matters most — what the rerun
-// button is allowed to claim.
+// Copy and predicates for the **cold tier's** Workspace-Snapshot retention:
+// the retention window a run's snapshots live under, the manual pin that holds
+// it open, and what the rerun button is allowed to claim.
 //
-// ADR-0061 gives Workspace Snapshots two tiers with two policies. The workspace
+// Workspace Snapshots have two tiers with two policies. The workspace
 // service (warm) is bounded by SPACE and evicts least-recently-used; it carries
 // no promise, because a miss there is slower and never wrong. Object storage
 // (cold) is bounded by TIME under a retention window, and *that* is the
@@ -11,8 +10,8 @@
 // pin copy says so explicitly rather than letting a reader assume a pin also
 // pins a cache.
 //
-// ADR-0027's rule governs the rerun affordance: **smart never means
-// mysterious.** A rerun whose inputs expired is a bigger action than the button
+// The rerun button follows one rule: a smart rerun is never a mysterious one.
+// A rerun whose inputs expired is a bigger action than the button
 // implies — it walks upstream to regenerate them, in the limit back to `clone` —
 // so the label has to change *before* the click, not explain itself afterwards.
 //
@@ -66,11 +65,10 @@ export function isWidened(plan: RerunPlan | null | undefined): boolean {
   return !!plan && plan.widened.length > 0;
 }
 
-/** The rerun button's LABEL. The whole point of ADR-0061 s5's UI half: a widened
- * rerun must say which it is before it is confirmed, naming where it restarts
- * from — not "Rerun pipeline from this step", which would be false. */
+/** The rerun button's LABEL. A widened rerun must say which it is before it is
+ * confirmed, naming where it restarts from: "Rerun from here" would be false. */
 export function rerunLabel(plan: RerunPlan | null | undefined): string {
-  if (!isWidened(plan)) return "Rerun pipeline from this step";
+  if (!isWidened(plan)) return "Rerun from here";
   const from = nameList(plan!.starts_from);
   return `Inputs expired — this re-runs from ${from}`;
 }
@@ -123,9 +121,9 @@ export function retentionNote(r: RetentionInfo, terminal: boolean): string {
   return `Workspace snapshots kept for ${d} days after this run finished.`;
 }
 
-/** The pin toggle's label. */
+/** The pin toggle's label (an item in the run header's ⋯ menu). */
 export function pinLabel(r: RetentionInfo): string {
-  return r.pinned ? "Unpin snapshots" : "Keep snapshots";
+  return r.pinned ? "Stop keeping workspace snapshots" : "Keep workspace snapshots";
 }
 
 /** The pin toggle's title — and the one place the two-tier honesty lives. A pin

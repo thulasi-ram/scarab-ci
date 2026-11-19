@@ -865,28 +865,21 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
    plain ghost action — the visual change and the label change land together.
    `--warn` is the theme's cautionary ink (never a fill), which is exactly the
    register here: this is not an error, it is a bigger job than you asked for. */
-.run-toolbar .btn.widened {
+.sp-actions .btn.widened {
   border-color: var(--border-warn);
   color: var(--warn);
 }
-/* A pinned run is holding storage on purpose: mark the toggle as engaged. */
-.run-toolbar .btn.pinned {
-  border-color: color-mix(in srgb, var(--emerald) 45%, transparent);
-  color: var(--emerald);
-}
-/* The two notes under the toolbar. Right-aligned to sit under the actions they
-   explain, and always visible — a scope change discovered on hover is still a
-   surprise. */
+/* The widened-rerun note sits under the step header, and the retention note
+   in the notice slot. Always visible: a scope change discovered on hover is
+   still a surprise. */
 .rd-widened,
 .rd-retention {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
   gap: 6px;
-  margin: -14px 0 16px;
-  text-align: right;
+  margin: 0;
 }
-.rd-widened { color: var(--warn); }
+.rd-widened { color: var(--warn); padding: 6px 14px; border-bottom: 1px solid var(--border-soft); }
 
 /* The rerun/retry CONFIRM popover (git-bug 4afaa3e): portalled + fixed, the
    SearchSelect machinery, sized for a sentence or a grouped step list. */
@@ -2410,7 +2403,9 @@ h1, .crumb-head, .run-title {
   grid-template-columns: auto 1fr auto;
   align-items: center;
   gap: 10px;
-  width: 190px;
+  /* Wide enough for a matrix cell's values ("treebo-production ·
+     aws-post-cluster") on one line. */
+  width: 320px;
   padding: 10px 12px;
   border: 1px solid var(--terminal-line);
   border-radius: 3px;
@@ -2428,25 +2423,17 @@ h1, .crumb-head, .run-title {
 .dnode.reused { opacity: 0.5; filter: saturate(0.55); }
 
 .dnode-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
-/* Contain long step ids (matrix names like `test[features=default,toolchain=
- * stable]`) INSIDE the fixed-width node: re-enable wrapping (the node inherits
- * `white-space: nowrap`) and break the unbreakable token so it never overflows.
- * The full id is on the node's `title` for hover. */
+/* One line: a name that does not fit ends in an ellipsis, and the full id is
+ * on the node's `title`. */
 .dnode-id {
   font: var(--t-mono);
   color: var(--terminal-ink);
   min-width: 0;
-  white-space: normal;
-  overflow-wrap: anywhere;
-  word-break: break-word;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .dnode-meta { font: var(--t-mono); color: var(--muted-sage); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-/* `×N` tries badge — tabular mono, sits where the old retry pill did. */
-.dnode-count {
-  font: var(--t-mono); font-variant-numeric: tabular-nums;
-  color: var(--copper); border: 1px solid var(--border-copper);
-  border-radius: 3px; padding: 1px 6px;
-}
 .dnode-gate { color: var(--warn); }
 .dnode-prog {
   position: absolute; left: 10px; right: 10px; bottom: 4px; height: 2px; border-radius: 2px;
@@ -2519,7 +2506,7 @@ h1, .crumb-head, .run-title {
    from a step's rounded-rect, so it never reads as a `needs`-able step. The node
    border + database glyph carry the "shared service" identity; the ring carries
    lifecycle (below). */
-.dnode.service { border-radius: 999px; border-color: var(--border-copper); }
+.dnode.service { width: auto; min-width: 190px; border-radius: 999px; border-color: var(--border-copper); }
 .dnode.service:hover { border-color: var(--copper); }
 .dnode.service.sel { border-color: var(--copper); box-shadow: inset 0 0 0 1px var(--copper); }
 .dnode-svc-ico { color: var(--copper); }
@@ -2847,9 +2834,8 @@ h1, .crumb-head, .run-title {
 }
 .pipeline-panel > .panel-h .grow1 { flex: 1; }
 
-/* Band toolbar (Proposal B): the version dropdown + a "Pipeline · N steps"
-   label on the left, zoom controls pushed right. `overflow: visible` + a
-   stacking context so the version popover escapes the panel. */
+/* Pipeline panel header: the Graph | List switch and a hint on the left, zoom
+   controls pushed right. */
 .pipeline-toolbar {
   position: relative; z-index: 6; overflow: visible;
   gap: 10px;
@@ -2875,24 +2861,21 @@ h1, .crumb-head, .run-title {
 }
 .dag-zoomctl button:hover { color: var(--soft-white); border-color: var(--emerald); }
 
-/* Blueprint band (Proposal B): the DAG canvas as a full-width band across the
-   top of the component — always the dark terminal surface, like today. Stage 1
-   gives it a fixed height + scroll; stage 3 makes it dynamic-height with a
-   fit-to-view zoom. The band spans the component edge-to-edge (no radius — the
-   panel's own rounding + overflow clip the corners). */
+/* The graph band: the dark canvas across the panel, edge to edge (the panel's
+   rounding and overflow clip the corners). */
 .dag-band { display: flex; flex-direction: column; }
-/* The band viewport: full-width, its HEIGHT driven by the fit (an inline style
-   from Dag — dynamic, capped at ~60vh), overflow CLIPPED. The fit-to-view zoom
-   scales the whole graph to sit inside, so there is no scrolling; drag-to-pan
-   takes over once zoomed in past fit. Always the dark terminal surface. */
+/* The band viewport: full-width, its height set by the fit (the graph's,
+   capped at ~60vh). The graph is drawn at 100% and scrolls inside the band;
+   drag-to-pan works whenever it overflows. Always the dark terminal surface. */
 .pipeline-panel .dag-band .dag {
-  position: relative; overflow: hidden; padding: 0;
+  position: relative; overflow: auto; padding: 0;
   border-radius: 0; background: var(--terminal);
 }
+/* As big as the scaled graph, so the band's scrollbars cover all of it. */
+.dag-sizer { position: relative; }
 .pipeline-panel .dag-band .dag.pannable { cursor: grab; }
 .pipeline-panel .dag-band .dag.dragging { cursor: grabbing; }
-/* Zoom/pan layer: sized to the graph, transformed from its top-left corner so
-   fit's translate + scale center it in the band. */
+/* Zoom layer: sized to the graph, transformed from its top-left corner. */
 .dag-zoom {
   position: absolute; top: 0; left: 0; width: max-content;
   transform-origin: 0 0; will-change: transform;
@@ -2926,44 +2909,35 @@ h1, .crumb-head, .run-title {
 .svc-logs { margin: 4px 0 2px; max-height: 180px; overflow: auto; border-radius: var(--radius-sm); }
 .sdot.starting { background: var(--muted-sage); }
 .sdot.torn-down { background: color-mix(in srgb, var(--muted-sage) 55%, transparent); }
-/* Evidence pinned below the band (Proposal B): full-width, always visible. No
-   card of its own — a page-token surface separated from the dark band by a
-   hairline. The selected tab fills a comfortable height and scrolls in place so
-   logs are readable without stretching the page unboundedly. */
-.evidence-pinned {
-  display: flex; flex-direction: column; min-height: 0;
-  border-top: 1px solid var(--border);
-}
-.evidence-pinned > .steppane {
-  display: flex; flex-direction: column; min-height: 0;
-  border: none; background: transparent; overflow: visible; margin: 0;
-}
-.pipeline-panel .steppane .tabpane {
+/* The step pane, below the Pipeline panel: its own card. The selected tab
+   fills a comfortable height and scrolls in place, so logs are readable
+   without stretching the page. */
+.rd-evidence > .steppane { display: flex; flex-direction: column; min-height: 0; overflow: visible; }
+.rd-evidence .steppane .tabpane {
   min-height: 300px; max-height: 52vh; overflow: auto;
 }
 
-/* Read-only (an older version): no edge, no shadow — a faint wash + gently
-   desaturated body. The `.readonly-banner` under the toolbar names the state. */
+/* Read-only (an older version): a faint wash and a gently desaturated body.
+   The read-only banner in the notice slot names the state. */
 .pipeline-panel.readonly { background: color-mix(in srgb, var(--emerald) 4%, transparent); }
 .pipeline-panel.readonly .dag-band,
-.pipeline-panel.readonly .evidence-pinned { filter: saturate(0.72); opacity: 0.9; }
+.pipeline-panel.readonly .slist,
+.rd-evidence.readonly { filter: saturate(0.72); opacity: 0.9; }
 
-/* Read-only banner (redesign stage 2): a full-width strip under the panel header
-   while time-travelling — copper-washed so it reads as a caution, not chrome. */
+/* Read-only banner: a caution strip in the notice slot while an older version
+   is in view. */
 .readonly-banner {
   display: flex; align-items: center; gap: 8px;
-  padding: 8px 14px; border-bottom: 1px solid var(--border);
+  padding: 8px 14px; border: 1px solid var(--border-warn); border-radius: var(--radius);
   background: color-mix(in srgb, var(--warn) 12%, var(--emerald-surface));
-  font: var(--t-mono); color: var(--sage);
+  font: var(--t-body); color: var(--sage);
 }
 .readonly-banner .rb-eye { font: var(--t-body); line-height: 1; }
 .readonly-banner b { color: var(--soft-white); font: var(--t-label); }
 .readonly-banner .rb-hint { color: var(--muted-sage); }
 
-/* ── Version dropdown (Proposal B) — the run-history control, folded from the
-   former persistent left rail into a compact dropdown in the band toolbar
-   (◈ latest ▾). PAGE chrome (not the dark DAG canvas), so it reads the
-   page/theme tokens; the tokens re-point per theme, covering light + dark. ──── */
+/* ── Version dropdown: the version selector's menu in the run header's
+   provenance line. Page chrome, so it reads the page tokens. ──── */
 .vdrop { position: relative; display: inline-flex; flex: none; }
 .vdrop-btn {
   display: inline-flex; align-items: center; gap: 6px; max-width: 240px;
@@ -3090,12 +3064,7 @@ h1, .crumb-head, .run-title {
 @media (prefers-reduced-motion: reduce) {
   .pane-load.on svg { animation: none; }
 }
-/* Permanent coordinate stamp (redesign stage 4): the pane's "you are here" —
-   step · [attempts] · version — so the evidence below never floats context-free.
-   PAGE/theme chrome (not the dark DAG canvas), so it reads the page tokens. The
-   middle segment is the attempts dropdown (below); it — and its separator dot —
-   drop out when nothing ran here, leaving `step · version`. `align-items:center`
-   so the inline dropdown pill sits level with the text segments. */
+/* The service pane's name line. Page chrome, so it reads the page tokens. */
 .steppane .coord-stamp {
   display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
   padding: 8px 12px 6px; color: var(--muted-sage);
@@ -3254,6 +3223,203 @@ h1, .crumb-head, .run-title {
 /* Fan-in collision warning (2e1a458): louder than info's copper-on-border-copper,
    quieter than err — copper on both, like a gate, but with the △ glyph. */
 .tl-glyph.warning { border-color: var(--warn); color: var(--warn); }
+
+
+/* ════════════════════════════════════════════════════════════════════════
+   Run page: header, notice slot, summary line, Graph | List, step header
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* Run header: breadcrumb with `#N` and the title, status, actions. */
+.rh { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+.rh-row { display: flex; align-items: center; gap: 12px; min-width: 0; flex-wrap: wrap; }
+.rh-row .grow1 { flex: 1; }
+.rh-crumbs { min-width: 0; flex: 0 1 auto; max-width: 100%; }
+.rh-num { flex: none; color: var(--display-ink); }
+.rh-title { color: var(--display-ink); }
+.rh-actions { display: inline-flex; align-items: center; gap: 8px; flex: none; margin-left: auto; }
+.rh-actions .btn-sm { display: inline-flex; align-items: center; gap: 6px; }
+/* Provenance: one wrapping line of facts, ending in the version selector. */
+.rh-prov { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 16px; color: var(--sage); }
+.rh-prov .pfact { color: var(--sage); }
+.rh-prov .pfact a { color: var(--emerald); text-decoration: none; }
+.rh-prov .pfact a:hover { text-decoration: underline; }
+.rh-prov .pfact a.plain { color: inherit; pointer-events: none; }
+.rh-prov .pfact a.sha { color: var(--copper); margin-left: 4px; }
+.rh-prov .pfact .subtle { color: var(--muted-sage); }
+
+/* The ⋯ menu. */
+.rmenu { position: relative; display: inline-flex; }
+.rmenu-btn { min-width: 32px; justify-content: center; }
+.rmenu-pop {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 31;
+  width: 320px; max-width: 90vw; padding: 4px;
+  display: flex; flex-direction: column; gap: 2px;
+  background: var(--emerald-elevated); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
+}
+.rmenu-item {
+  display: flex; flex-direction: column; gap: 2px; width: 100%; text-align: left;
+  background: transparent; border: 1px solid transparent; border-radius: var(--radius-sm);
+  padding: 7px 10px; cursor: pointer; color: var(--soft-white);
+}
+.rmenu-item:hover, .rmenu-item:focus-visible { background: color-mix(in srgb, var(--emerald) 10%, transparent); }
+.rmenu-item:disabled { opacity: 0.5; cursor: default; }
+.rmenu-lbl { font: var(--t-label); }
+.rmenu-item small { color: var(--muted-sage); overflow-wrap: anywhere; }
+
+/* The version and try selectors: "Version 2 of 3 · latest ▾", "Try 2 of 3 ▾".
+   Plain text, dashed, when there is only one. */
+.vpick, .trypick {
+  display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  font: var(--t-body); color: var(--soft-white);
+  background: var(--emerald-surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 3px 9px; cursor: pointer;
+  transition: border-color 0.12s var(--ease-out), background 0.12s var(--ease-out);
+}
+.vpick .k, .trypick .k { color: var(--muted-sage); }
+.vpick:hover, .trypick:hover, .vpick.open, .trypick.open { border-color: var(--emerald); }
+.vpick.static, .trypick.static { border-style: dashed; color: var(--sage); cursor: default; }
+.vpick.traveling { color: var(--warn); border-color: var(--border-warn); }
+.vdrop-why { font: var(--t-body); color: var(--soft-white); }
+
+/* Try menu rows: number, outcome and cause, duration. */
+.adrop-row { display: grid; grid-template-columns: 56px minmax(0, 1fr) auto; align-items: start; gap: 8px; }
+.adrop-menu { min-width: 340px; }
+.adrop-n { font: var(--t-label); color: var(--soft-white); }
+.adrop-body { display: flex; flex-direction: column; min-width: 0; }
+.adrop-out { font: var(--t-body); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.adrop-body small { color: var(--muted-sage); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.adrop-dur { font: var(--t-mono); color: var(--muted-sage); }
+
+/* Notice slot: each notice a full-width strip, in priority order. */
+.rd-notice { margin-bottom: 12px; }
+.rd-retention.rd-notice { color: var(--muted-sage); }
+
+/* Summary line: where the run failed, or what runs and waits. */
+.rd-summary {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px;
+  margin: 0 0 12px; min-height: 20px; color: var(--sage);
+}
+.rd-summary .linklike { font: var(--t-mono); overflow-wrap: anywhere; text-align: left; }
+.rd-sum-roots { min-width: 0; }
+.rd-sum-part { font: var(--t-label); white-space: nowrap; }
+.rd-sum-part.failed { color: var(--danger); }
+.rd-sum-part.running { color: var(--running-ink); }
+.rd-sum-part.warning { color: var(--warn); }
+.rd-sum-part.passed { color: var(--ok-ink); }
+.rd-sum-part.subtle { font: var(--t-body); color: var(--muted-sage); }
+
+/* Graph | List switch in the Pipeline panel header. */
+.pv-switch { display: inline-flex; gap: 2px; align-self: stretch; margin: -10px 0; }
+.pv-tab {
+  display: inline-flex; align-items: center; gap: 6px;
+  font: var(--t-label); color: var(--muted-sage);
+  background: none; border: 0; border-bottom: 2px solid transparent;
+  padding: 10px 10px 8px; cursor: pointer;
+}
+.pv-tab:hover { color: var(--sage); }
+.pv-tab[aria-pressed="true"] { color: var(--soft-white); border-bottom-color: var(--emerald); }
+.pv-count {
+  font: var(--t-mono); color: var(--muted-sage);
+  background: var(--emerald-surface); border: 1px solid var(--border); border-radius: 20px; padding: 0 6px;
+}
+
+/* A matrix in the graph: its cells under one heading naming the step and its
+   keys. Canvas tokens only. */
+.dag-mx { display: flex; flex-direction: column; gap: 18px; }
+.dag-mxh {
+  font: var(--t-mono); color: var(--terminal-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 320px;
+  margin-bottom: -10px;
+}
+.dag-mxh b { font: inherit; color: var(--terminal-ink); }
+
+/* List view. */
+.slist { padding-bottom: 8px; }
+.slist-filter {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  padding: 10px 12px; border-bottom: 1px solid var(--border-soft);
+}
+.slist .chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  font: var(--t-label); color: var(--sage);
+  background: var(--emerald-surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 2px 10px; cursor: pointer;
+}
+.slist .chip[aria-pressed="true"] {
+  color: var(--emerald); border-color: var(--emerald);
+  background: color-mix(in srgb, var(--emerald) 10%, transparent);
+}
+.slist-filter .subtle { color: var(--muted-sage); }
+.slist-grp { font: var(--t-label); color: var(--sage); padding: 10px 14px 4px; }
+.slist-grp .mono { color: var(--muted-sage); margin-left: 6px; }
+.slist-row {
+  display: grid; grid-template-columns: 16px minmax(0, 1fr) minmax(0, 220px) 72px;
+  align-items: center; gap: 10px; width: 100%; text-align: left;
+  padding: 6px 14px; background: none; border: 0; border-left: 2px solid transparent;
+  cursor: pointer; color: var(--soft-white);
+}
+.slist-row.cell { padding-left: 24px; }
+.slist-row:hover { background: color-mix(in srgb, var(--emerald) 8%, transparent); }
+.slist-row.sel {
+  background: color-mix(in srgb, var(--emerald) 10%, transparent);
+  border-left-color: var(--emerald);
+}
+.slist-g { font: var(--t-mono); color: var(--muted-sage); }
+.slist-g.succeeded { color: var(--ok-ink); }
+.slist-g.failed { color: var(--danger); }
+.slist-g.running { color: var(--running-ink); }
+.slist-g.warning, .slist-g.service { color: var(--warn); }
+.slist-name { font: var(--t-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.slist-words { color: var(--sage); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.slist-dur { font: var(--t-mono); color: var(--muted-sage); text-align: right; }
+.slist-empty { padding: 10px 14px; }
+
+/* Step header: name, try, status, files, actions. */
+.sp-head {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px;
+  padding: 10px 14px; border-bottom: 1px solid var(--border);
+}
+.sp-head .grow1 { flex: 1; }
+.sp-name { font: var(--t-label); color: var(--display-ink); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sp-cell { font: var(--t-mono); color: var(--sage); }
+.sp-status { font: var(--t-label); white-space: nowrap; color: var(--muted-sage); }
+.sp-status.passed { color: var(--ok-ink); }
+.sp-status.failed { color: var(--danger); }
+.sp-status.running { color: var(--running-ink); }
+.sp-status.warning { color: var(--warn); }
+.sp-files { color: var(--muted-sage); }
+.sp-actions { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.sp-actions .btn-sm { display: inline-flex; align-items: center; gap: 6px; }
+
+/* The box above the content tabs: why the try failed, what holds it back. */
+.sp-box {
+  display: grid; gap: 3px; margin: 12px 14px 0; padding: 9px 12px;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--pine-deep); overflow-wrap: anywhere;
+}
+.sp-box-h { font: var(--t-label); color: var(--soft-white); }
+.sp-box-d { color: var(--sage); }
+.sp-box.failed { border-color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, var(--emerald-surface)); }
+.sp-box.failed .sp-box-h { color: var(--danger); }
+.sp-box.warning { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, var(--emerald-surface)); }
+.sp-box.warning .sp-box-h { color: var(--warn); }
+.steppane .pane-tabbar { margin-top: 10px; }
+.steppane .pane-tabbar .tabs { min-width: 0; }
+/* A content tab's scope: "try 2", "from try 3", "none". */
+.inspector .tab .tscope { font: var(--t-mono); color: var(--muted-sage); }
+
+/* Artifacts as their own panel below the step pane. */
+.artifacts-panel .artifacts-foot { border-top: none; }
+.artifacts-panel .filerow { flex-wrap: wrap; }
+.artifacts-panel .filerow .fname { min-width: 0; overflow-wrap: anywhere; }
+
+@media (max-width: 640px) {
+  .rh-actions { margin-left: 0; }
+  .slist-row { grid-template-columns: 16px minmax(0, 1fr) 64px; }
+  .slist-words { display: none; }
+  .adrop-menu { min-width: 0; }
+}
 
 /* --- Sign-in screen -------------------------------------------
    Replaces the whole shell when there is no session, so it centres in the
@@ -3729,15 +3895,7 @@ h1, .crumb-head, .run-title {
 }
 .dnode-origin::before { content: "⧉ "; opacity: .8; }
 
-/* --- step pane: origin strip + origin tab --- */
-.origin-strip {
-  display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 6px 18px 8px;
-  font: var(--t-mono); color: var(--muted-sage); border-bottom: 1px solid var(--border-soft);
-}
-.origin-strip .k { font: var(--t-label); margin-right: 4px; }
-.origin-strip .lnk { color: var(--soft-white); }
-.origin-strip .h { color: var(--copper); }
-.origin-strip .sep { opacity: .5; }
+/* --- step pane: Source tab --- */
 .chain { list-style: none; margin: 0; padding: 0; display: grid; gap: 0; }
 .chain li { display: grid; grid-template-columns: 22px 1fr; gap: 8px; position: relative; padding-bottom: 14px; }
 .chain li::before { content: ""; position: absolute; left: 10px; top: 20px; bottom: 0; border-left: 1px dotted var(--border); }
@@ -3860,7 +4018,6 @@ code.c { font: var(--t-mono); color: var(--copper); }
 .lib-toast .btn { margin-left: auto; flex: none; }
 .rd-yank { position: static; max-width: none; width: auto; display: flex; align-items: center; gap: 8px; margin: 10px 0; box-shadow: none; }
 .rd-yank .btn { margin-left: auto; flex: none; }
-.origin-strip .lnk.y { color: var(--danger); }
 .lib-table td.lib-src { font: var(--t-mono); }
 .lib-table td { font: var(--t-body); }
 

@@ -48,20 +48,19 @@ describe("nameList", () => {
 
 describe("rerunLabel", () => {
   it("is the plain label when nothing widened", () => {
-    expect(rerunLabel(plan())).toBe("Rerun pipeline from this step");
+    expect(rerunLabel(plan())).toBe("Rerun from here");
   });
 
   it("is the plain label while the preview has not loaded", () => {
     // A null plan must never render as "inputs expired" — an unknown answer is
     // not a scary answer.
-    expect(rerunLabel(null)).toBe("Rerun pipeline from this step");
-    expect(rerunLabel(undefined)).toBe("Rerun pipeline from this step");
+    expect(rerunLabel(null)).toBe("Rerun from here");
+    expect(rerunLabel(undefined)).toBe("Rerun from here");
   });
 
   it("says which it is, and names where it restarts from", () => {
-    // ADR-0061 s5's literal requirement, and ADR-0027's "smart never means
-    // mysterious": the button may not claim to rerun one step when it will
-    // re-run the pipeline from clone.
+    // A smart rerun is never a mysterious one: the button may not claim to
+    // rerun one step when it will re-run the pipeline from clone.
     expect(rerunLabel(widenedPlan)).toBe("Inputs expired — this re-runs from clone");
   });
 
@@ -121,8 +120,8 @@ describe("retentionNote", () => {
   });
 
   it("does not promise an expiry for a run that has not finished", () => {
-    // ADR-0050: a non-terminal run — including one suspended on a gate for
-    // weeks — is never GC-eligible regardless of age.
+    // A non-terminal run, including one suspended on a gate for weeks, is
+    // never collected, whatever its age.
     expect(retentionNote(retention({ expires_at: null }), false)).toBe(
       "Workspace snapshots are kept while this run is unfinished; the 14-day window starts when it finishes.",
     );
@@ -146,8 +145,8 @@ describe("retentionNote", () => {
 
 describe("pin affordance", () => {
   it("toggles its label with the state", () => {
-    expect(pinLabel(retention())).toBe("Keep snapshots");
-    expect(pinLabel(retention({ pinned: true }))).toBe("Unpin snapshots");
+    expect(pinLabel(retention())).toBe("Keep workspace snapshots");
+    expect(pinLabel(retention({ pinned: true }))).toBe("Stop keeping workspace snapshots");
   });
 
   it("is honest that a pin cannot pin the warm cache", () => {
