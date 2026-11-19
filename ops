@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1787758420,"nonce":"g+EdTbad3Mfbn3scAf2/mWf53T8=","added":["parked"],"removed":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1795108719,"nonce":"R80aRua9UDmIUR9mkHe3+fORZqA=","title":"PARKED: benchmark Depot feed under concurrent fan-out before choosing a per-node cache or Dragonfly","was":"Decided 2026-08-03 (grill; ADR-0066) as the single gate on three deferred candidates."}]}
