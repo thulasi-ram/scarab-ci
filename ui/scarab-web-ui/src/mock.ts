@@ -944,6 +944,30 @@ function bigLog(): string[] {
   return out;
 }
 
+/** The rich run's shared `postgres` service logged about 3 MB: the service
+ * pane shows its last 2 MB and offers Load full log. */
+let bigServiceLogChunks: string[] | null = null;
+/** The large service log's chunks, built on first use: the start-up lines,
+ * 30,000 statement lines, 500 to a chunk, then the ready lines again. */
+function bigServiceLog(): string[] {
+  if (bigServiceLogChunks) return bigServiceLogChunks;
+  const out: string[] = [serviceLogLines.join("\n") + "\n"];
+  const total = 30_000;
+  let chunk = "";
+  for (let i = 0; i < total; i++) {
+    chunk +=
+      `LOG:  duration: ${(i % 97) + 0.125} ms  statement: ` +
+      `SELECT id, status FROM integration_runs WHERE shard = ${i % 64}\n`;
+    if ((i + 1) % 500 === 0) {
+      out.push(chunk);
+      chunk = "";
+    }
+  }
+  out.push(chunk + "LOG:  checkpoint complete: wrote 412 buffers\n");
+  bigServiceLogChunks = out;
+  return out;
+}
+
 /** The stored chunks of the log a step or service stream reads, or null when
  * it has none (a Pod that never started printed nothing). */
 function mockLogChunks(url: string): string[] | null {
@@ -960,7 +984,11 @@ function mockLogChunks(url: string): string[] | null {
     if (step[1] === MATRIX_RUN_ID && decodeURIComponent(step[2]!) === BIG_LOG_STEP) return bigLog();
     return [testLogLines.join("\n") + "\n"];
   }
-  if (/^\/v1\/runs\/[^/]+\/services\/[^/]+\/logs$/.test(path)) return [serviceLogLines.join("\n") + "\n"];
+  const service = path.match(/^\/v1\/runs\/([^/]+)\/services\/([^/]+)\/logs$/);
+  if (service) {
+    if (service[1] === RICH_RUN_ID && decodeURIComponent(service[2]!) === "postgres") return bigServiceLog();
+    return [serviceLogLines.join("\n") + "\n"];
+  }
   return null;
 }
 

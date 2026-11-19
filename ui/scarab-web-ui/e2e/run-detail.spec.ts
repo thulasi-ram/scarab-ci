@@ -286,6 +286,23 @@ test("a large log shows its last 2 MB, Load full log reads it all, Download name
   await expect(last.locator(".lgln")).toHaveText("130004");
 });
 
+// The rich run's shared postgres service logged about 3 MB (30,005 lines).
+// Its pane shows the last 2 MB and can read the whole log.
+test("a large service log offers Load full log", async ({ page }) => {
+  await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}`);
+  await page.getByRole("button", { name: /postgres/ }).click();
+  const pane = page.locator(".servicepane");
+  const notice = pane.getByRole("status").filter({ hasText: "Showing the last" });
+  await expect(notice).toHaveText(/Showing the last [\d.]+ MB of 2\.\d MB\./);
+  const last = pane.locator(".lgrow", { hasText: "checkpoint complete" });
+  await expect(last).toBeVisible();
+  await expect(last.locator(".lgln")).not.toHaveText("30005");
+
+  await notice.getByRole("button", { name: "Load full log" }).click();
+  await expect(notice).toHaveCount(0);
+  await expect(last.locator(".lgln")).toHaveText("30005");
+});
+
 test("the run header's ⋯ menu copies the run ID and keeps snapshots", async ({ page, context }) => {
   await context.grantPermissions(["clipboard-read", "clipboard-write"]);
   await page.goto(`/acme/scarab/runs/${MATRIX_RUN_ID}`);
