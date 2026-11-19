@@ -290,6 +290,7 @@ pub(crate) fn governed_routes() -> Routes {
         .get("/v1/runs/{id}/artifacts", list_artifacts)
         .get("/v1/runs/{id}/artifacts/{*name}", download_artifact)
         .get("/v1/runs/{id}/steps/{step}/logs", get_step_logs)
+        .get("/v1/runs/{id}/steps/{step}/logs/raw", get_step_logs_raw)
         .get("/v1/runs/{id}/services", get_services)
         .get("/v1/runs/{id}/services/{service}/logs", get_service_logs)
         .get_governed(

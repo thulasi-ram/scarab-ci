@@ -7830,7 +7830,7 @@
         "tags": [
           "Runs"
         ],
-        "summary": "Server-Sent-Events of step **log bodies** (ADR-0013): replays every\ncommitted chunk (decompressed from the object store, indexed by Postgres\noffsets), then — while the run is still going — live-tails new chunks via the\nlog pipeline's broadcast. A terminal run yields the full log and closes.",
+        "summary": "Server-Sent-Events of step **log bodies** (ADR-0013): replays every\ncommitted chunk of every step and attempt (decompressed from the object\nstore, indexed by Postgres offsets) in batches of up to 256 KiB, then — while\nthe run is still going — polls the durable index for new chunks. A terminal\nrun yields the full log and closes. Events carry ids like the per-step\nroute, but this route takes no cursor and no tail.",
         "operationId": "get_logs",
         "parameters": [
           {
@@ -7988,11 +7988,34 @@
               "type": "integer",
               "format": "int64"
             }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "resume after this cursor (an event id); default = the Last-Event-ID header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "tail",
+            "in": "query",
+            "description": "without a cursor, replay at most this many bytes from the end, in whole chunks (clamped to 1..67108864)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
           }
         ],
         "responses": {
           "200": {
             "description": "SSE stream of this service's log output"
+          },
+          "400": {
+            "description": "malformed cursor, or a cursor for another Take"
           },
           "404": {
             "description": "no such run or service"
@@ -8267,7 +8290,7 @@
         "tags": [
           "Runs"
         ],
-        "summary": "SSE of ONE step's log bodies (ADR-0013), the source for the run detail's\nper-step fold. Same machinery as the run-wide `/logs`, scoped to the step —\nand, with `?attempt=`, to a single attempt so a rerun's earlier (failed)\noutput can be read in isolation. Replays committed chunks then live-tails\nonly when the run is still going AND the latest attempt is in scope\n(historical attempts are immutable). Read at the run's tenant.",
+        "summary": "SSE of ONE step's log bodies (ADR-0013), the source for the run detail's\nper-step fold. Same machinery as the run-wide `/logs`, scoped to the step —\nand, with `?attempt=`, to a single attempt so a rerun's earlier (failed)\noutput can be read in isolation. Replays committed chunks in batches of up\nto 256 KiB, each `data` event with `id: <attempt_id>:<next_seq>`; resumes\nfrom `?from=` or `Last-Event-ID`; `?tail=` cuts the replay to the last bytes\nafter an `event: truncated` (`{\"skipped_bytes\",\"total_bytes\"}`). Live-tails\nonly when the run is still going AND the latest attempt is in scope\n(historical attempts are immutable). Read at the run's tenant.",
         "operationId": "get_step_logs",
         "parameters": [
           {
@@ -8306,14 +8329,107 @@
               "type": "integer",
               "minimum": 0
             }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "resume after this cursor (`<attempt_id>:<next_seq>`, an event id); default = the Last-Event-ID header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "tail",
+            "in": "query",
+            "description": "without a cursor, replay at most this many bytes from the end, in whole chunks (clamped to 1..67108864)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
           }
         ],
         "responses": {
           "200": {
             "description": "SSE stream of this step's log output"
           },
+          "400": {
+            "description": "malformed cursor, or a cursor naming an attempt outside the selection"
+          },
           "404": {
             "description": "no such run or step"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/runs/{id}/steps/{step}/logs/raw": {
+      "get": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "One try's whole log as a plain-text download, streamed chunk by chunk from\nthe object store (no tail, no cut). `?sidecar=` reads that sidecar's log for\nthe same try. Same authz as the SSE route. Read at the run's tenant.",
+        "operationId": "get_step_logs_raw",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "step",
+            "in": "path",
+            "description": "step id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attempt",
+            "in": "query",
+            "description": "the attempt id (required)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sidecar",
+            "in": "query",
+            "description": "a sidecar service by its index in the step's services (default = the step's main container)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the try's log as text/plain, sent as an attachment",
+            "content": {
+              "text/plain": {}
+            }
+          },
+          "400": {
+            "description": "no attempt given"
+          },
+          "404": {
+            "description": "no such run, step or attempt"
           }
         },
         "security": [

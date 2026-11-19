@@ -185,41 +185,35 @@ impl LogService {
         Ok(meta)
     }
 
-    /// Read a stream's chunks from `from_seq` onward (durable index + store) —
-    /// the replica-agnostic live-tail path (ADR-0051): ANY replica serves new
-    /// chunks by re-reading the index the tailing replica writes. Returns the
-    /// concatenated bodies and the next `from_seq`.
-    pub async fn read_from(
+    /// A stream's chunk index, in `seq` order (durable, replica-agnostic:
+    /// ADR-0051). Metadata only; the bodies stay in the object store.
+    pub async fn chunks(
         &self,
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
-        from_seq: u64,
-    ) -> Result<(Vec<u8>, u64), LogError> {
-        let chunks = self.db.log_chunks(run, step, attempt).await?;
-        let mut out = Vec::new();
-        let mut next = from_seq;
-        for c in chunks.into_iter().filter(|c| c.seq >= from_seq) {
-            let blob = self.store.get(&c.object_key).await?;
-            out.extend(gunzip(&blob).map_err(|e| LogError::Gzip(e.to_string()))?);
-            next = c.seq + 1;
-        }
-        Ok((out, next))
+    ) -> Result<Vec<LogChunkMeta>, LogError> {
+        Ok(self.db.log_chunks(run, step, attempt).await?)
     }
 
-    /// Replay a stream's full log by reading every indexed chunk from the object
-    /// store and decompressing in order (the post-completion path).
+    /// Fetch and decompress one indexed chunk.
+    pub async fn read_chunk(&self, meta: &LogChunkMeta) -> Result<Vec<u8>, LogError> {
+        let blob = self.store.get(&meta.object_key).await?;
+        gunzip(&blob).map_err(|e| LogError::Gzip(e.to_string()))
+    }
+
+    /// A stream's whole log in one buffer. For tests and small reads; the
+    /// HTTP routes stream chunk by chunk ([`chunks`](Self::chunks) +
+    /// [`read_chunk`](Self::read_chunk)).
     pub async fn read_all(
         &self,
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
     ) -> Result<Vec<u8>, LogError> {
-        let chunks = self.db.log_chunks(run, step, attempt).await?;
         let mut out = Vec::new();
-        for c in chunks {
-            let blob = self.store.get(&c.object_key).await?;
-            out.extend(gunzip(&blob).map_err(|e| LogError::Gzip(e.to_string()))?);
+        for c in self.chunks(run, step, attempt).await? {
+            out.extend(self.read_chunk(&c).await?);
         }
         Ok(out)
     }

@@ -93,6 +93,7 @@ pub mod forge_token;
 pub mod infra_observer;
 pub mod libraries;
 pub mod library_fetch;
+pub mod log_stream;
 pub mod log_tail;
 pub mod logs;
 pub mod metrics;
@@ -2912,9 +2913,11 @@ async fn get_events(
 }
 
 /// Server-Sent-Events of step **log bodies** (ADR-0013): replays every
-/// committed chunk (decompressed from the object store, indexed by Postgres
-/// offsets), then — while the run is still going — live-tails new chunks via the
-/// log pipeline's broadcast. A terminal run yields the full log and closes.
+/// committed chunk of every step and attempt (decompressed from the object
+/// store, indexed by Postgres offsets) in batches of up to 256 KiB, then — while
+/// the run is still going — polls the durable index for new chunks. A terminal
+/// run yields the full log and closes. Events carry ids like the per-step
+/// route, but this route takes no cursor and no tail.
 #[utoipa::path(
     get,
     path = "/v1/runs/{id}/logs",
@@ -2930,88 +2933,16 @@ async fn get_logs(
     let scope = run_scope(&st, &run).await;
     authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
     let status = st.db.run_status(&run).await?.ok_or(ApiError::NotFound)?;
-    let steps = st.db.steps_of_run(&run).await?;
-
-    // Replay everything committed so far, remembering how far each stream was
-    // consumed (the live tail resumes from these seqs — never duplicating).
-    let mut replay: Vec<Result<Event, Infallible>> = Vec::new();
-    let mut seen: std::collections::HashMap<(String, String), u64> =
-        std::collections::HashMap::new();
-    for s in &steps {
-        for a in &s.attempts {
-            // `Ok` with no chunks is the truthful empty pane; `Err` means the
-            // index promised bytes the store could not produce (or the index
-            // itself failed) — surface it, never a plausible blank (ADR-0063
-            // part 5).
-            let (body, next) = st.logs.read_from(&run, &s.step, &a.id, 0).await?;
-            if !body.is_empty() {
-                replay.push(Ok(Event::default().data(String::from_utf8_lossy(&body))));
-            }
-            seen.insert((s.step.0.clone(), a.id.0.clone()), next);
-        }
-    }
-
-    let replay_stream = stream::iter(replay);
-    if status.is_terminal() {
-        // Nothing more will be written: replay and close.
-        Ok(Sse::new(replay_stream.boxed()))
-    } else {
-        // Live tail (ADR-0051): poll the DURABLE index for new chunks, so ANY
-        // replica serves live logs regardless of which replica tails the Pod.
-        // (The in-process broadcast is only a same-replica fast-path, not the
-        // source of truth — this path never depends on it.) The stream ends
-        // one poll after the run settles.
-        let live = futures::stream::unfold(
-            (st.clone(), run.clone(), seen, false),
-            |(st, run, mut seen, done)| async move {
-                if done {
-                    return None;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                let terminal = matches!(
-                    st.db.run_status(&run).await,
-                    Ok(Some(s)) if s.is_terminal()
-                );
-                let steps = st.db.steps_of_run(&run).await.unwrap_or_default();
-                let mut body = Vec::new();
-                let mut failed: Option<crate::logs::LogError> = None;
-                'read: for s in &steps {
-                    for a in &s.attempts {
-                        let key = (s.step.0.clone(), a.id.0.clone());
-                        let from = seen.get(&key).copied().unwrap_or(0);
-                        match st.logs.read_from(&run, &s.step, &a.id, from).await {
-                            Ok((bytes, next)) => {
-                                if !bytes.is_empty() {
-                                    body.extend(bytes);
-                                }
-                                seen.insert(key, next);
-                            }
-                            Err(e) => {
-                                failed = Some(e);
-                                break 'read;
-                            }
-                        }
-                    }
-                }
-                // Chunks the index promised could not be read: tell the reader
-                // and end the stream instead of tailing a plausible blank
-                // (ADR-0063 part 5).
-                if let Some(e) = failed {
-                    let event = Event::default()
-                        .event("error")
-                        .data(format!("log storage read failed: {e}"));
-                    return Some((Ok(event), (st, run, seen, true)));
-                }
-                let event = if body.is_empty() {
-                    Event::default().comment("keepalive")
-                } else {
-                    Event::default().data(String::from_utf8_lossy(&body))
-                };
-                Some((Ok(event), (st, run, seen, terminal)))
-            },
-        );
-        Ok(Sse::new(replay_stream.chain(live).boxed()))
-    }
+    // Attempt ids repeat across steps ("a1"), so a run-wide cursor would be
+    // ambiguous: this route sends ids but always replays from the start.
+    crate::log_stream::sse(
+        &st,
+        run,
+        crate::log_stream::Scope::Run,
+        crate::log_stream::Start::Full,
+        !status.is_terminal(),
+    )
+    .await
 }
 
 /// The `?attempt=` scope for a per-step log stream. Absent = the whole step
@@ -3026,12 +2957,23 @@ struct StepLogsQuery {
     /// `attempt` (a sidecar shares the step's attempts). Absent = the step's log.
     #[serde(default)]
     sidecar: Option<usize>,
+    /// Resume after this cursor (`<attempt_id>:<next_seq>`, an event's `id`).
+    /// Absent = the `Last-Event-ID` header, else no cursor.
+    #[serde(default)]
+    from: Option<String>,
+    /// Without a cursor, replay at most this many bytes from the end (whole
+    /// chunks; clamped to 1 B..64 MiB). Absent = everything.
+    #[serde(default)]
+    tail: Option<u64>,
 }
 
 /// SSE of ONE step's log bodies (ADR-0013), the source for the run detail's
 /// per-step fold. Same machinery as the run-wide `/logs`, scoped to the step —
 /// and, with `?attempt=`, to a single attempt so a rerun's earlier (failed)
-/// output can be read in isolation. Replays committed chunks then live-tails
+/// output can be read in isolation. Replays committed chunks in batches of up
+/// to 256 KiB, each `data` event with `id: <attempt_id>:<next_seq>`; resumes
+/// from `?from=` or `Last-Event-ID`; `?tail=` cuts the replay to the last bytes
+/// after an `event: truncated` (`{"skipped_bytes","total_bytes"}`). Live-tails
 /// only when the run is still going AND the latest attempt is in scope
 /// (historical attempts are immutable). Read at the run's tenant.
 #[utoipa::path(
@@ -3041,9 +2983,15 @@ struct StepLogsQuery {
         ("id" = String, Path, description = "run id"),
         ("step" = String, Path, description = "step id"),
         ("attempt" = Option<String>, Query, description = "restrict to one attempt id (default = all)"),
-        ("sidecar" = Option<usize>, Query, description = "restrict to a sidecar service by its index in the step's services (default = the step's main container)")
+        ("sidecar" = Option<usize>, Query, description = "restrict to a sidecar service by its index in the step's services (default = the step's main container)"),
+        ("from" = Option<String>, Query, description = "resume after this cursor (`<attempt_id>:<next_seq>`, an event id); default = the Last-Event-ID header"),
+        ("tail" = Option<u64>, Query, description = "without a cursor, replay at most this many bytes from the end, in whole chunks (clamped to 1..67108864)")
     ),
-    responses((status = 200, description = "SSE stream of this step's log output"), (status = 404, description = "no such run or step"))
+    responses(
+        (status = 200, description = "SSE stream of this step's log output"),
+        (status = 400, description = "malformed cursor, or a cursor naming an attempt outside the selection"),
+        (status = 404, description = "no such run or step")
+    )
 )]
 async fn get_step_logs(
     State(st): State<AppState>,
@@ -3063,104 +3011,157 @@ async fn get_step_logs(
         .into_iter()
         .find(|s| s.step == step)
         .ok_or(ApiError::NotFound)?;
+    let cursor = crate::log_stream::cursor_from(q.from.as_deref(), &headers)?;
 
-    // The attempts to stream, in order: one requested, else all this step ran.
-    let selected: Vec<scarab_engine::AttemptId> = match &q.attempt {
+    let pinned = match &q.attempt {
         Some(a) => {
             let aid = scarab_engine::AttemptId(a.clone());
             if !sr.attempts.iter().any(|x| x.id == aid) {
                 return Err(ApiError::NotFound);
             }
-            vec![aid]
+            Some(aid)
         }
-        None => sr.attempts.iter().map(|a| a.id.clone()).collect(),
+        None => None,
     };
 
     // Sidecar logs (ADR-0058) are stored under a synthetic step id
     // (`{step}::service-{i}`) but keyed on the step's REAL attempt ids (a sidecar
-    // shares the step's Pod + Attempt), so the attempt resolution above is
-    // unchanged — only the read key swaps to the sidecar's synthetic stream.
+    // shares the step's Pod + Attempt), so only the read key changes.
     let read_step = match q.sidecar {
         Some(i) => crate::logs::sidecar_stream_key(&step, i),
         None => step.clone(),
     };
 
-    // Replay each selected attempt in order, remembering how far it was read.
-    let mut replay: Vec<Result<Event, Infallible>> = Vec::new();
-    let mut seen: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    for aid in &selected {
-        // As on the run-wide route: no chunks is a truthful empty pane, a
-        // failed read of promised chunks is an error the reader must see.
-        let (body, next) = st.logs.read_from(&run, &read_step, aid, 0).await?;
-        if !body.is_empty() {
-            replay.push(Ok(Event::default().data(String::from_utf8_lossy(&body))));
-        }
-        seen.insert(aid.0.clone(), next);
-    }
-    let replay_stream = stream::iter(replay);
-
     // Live-tail only if the run is going AND the latest attempt is in scope.
-    let latest_in_scope = sr
-        .attempts
-        .last()
-        .map(|a| a.id.clone())
-        .filter(|latest| selected.iter().any(|s| s == latest))
-        .is_some();
-    if status.is_terminal() || !latest_in_scope {
-        return Ok(Sse::new(replay_stream.boxed()));
-    }
-    let live = futures::stream::unfold(
-        (
-            st.clone(),
-            run.clone(),
-            read_step.clone(),
-            selected,
-            seen,
-            false,
-        ),
-        |(st, run, step, attempts, mut seen, done)| async move {
-            if done {
-                return None;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let terminal = matches!(
-                st.db.run_status(&run).await,
-                Ok(Some(s)) if s.is_terminal()
-            );
-            let mut body = Vec::new();
-            let mut failed: Option<crate::logs::LogError> = None;
-            for aid in &attempts {
-                let from = seen.get(&aid.0).copied().unwrap_or(0);
-                match st.logs.read_from(&run, &step, aid, from).await {
-                    Ok((bytes, next)) => {
-                        if !bytes.is_empty() {
-                            body.extend(bytes);
-                        }
-                        seen.insert(aid.0.clone(), next);
-                    }
-                    Err(e) => {
-                        failed = Some(e);
-                        break;
-                    }
-                }
-            }
-            // Promised chunks that would not read: error out and end the
-            // stream rather than tailing a blank (ADR-0063 part 5).
-            if let Some(e) = failed {
-                let event = Event::default()
-                    .event("error")
-                    .data(format!("log storage read failed: {e}"));
-                return Some((Ok(event), (st, run, step, attempts, seen, true)));
-            }
-            let event = if body.is_empty() {
-                Event::default().comment("keepalive")
-            } else {
-                Event::default().data(String::from_utf8_lossy(&body))
-            };
-            Some((Ok(event), (st, run, step, attempts, seen, terminal)))
+    let latest_in_scope = match (&pinned, sr.attempts.last()) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(p), Some(latest)) => &latest.id == p,
+    };
+    crate::log_stream::sse(
+        &st,
+        run,
+        crate::log_stream::Scope::Step {
+            step,
+            read_step,
+            pinned,
         },
+        crate::log_stream::start_of(cursor, q.tail),
+        !status.is_terminal() && latest_in_scope,
+    )
+    .await
+}
+
+/// The selector for a raw log download: the attempt is required.
+#[derive(Debug, Deserialize)]
+struct RawLogsQuery {
+    attempt: String,
+    #[serde(default)]
+    sidecar: Option<usize>,
+}
+
+/// The download filename for one try's raw log: ASCII from the run id and the
+/// try number only (a step id is user-authored text).
+fn raw_log_filename(run: &RunId, try_no: usize, sidecar: Option<usize>) -> String {
+    let safe: String = run
+        .0
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    match sidecar {
+        Some(i) => format!("scarab-{safe}-try{try_no}-sidecar{i}.log"),
+        None => format!("scarab-{safe}-try{try_no}.log"),
+    }
+}
+
+/// One try's whole log as a plain-text download, streamed chunk by chunk from
+/// the object store (no tail, no cut). `?sidecar=` reads that sidecar's log for
+/// the same try. Same authz as the SSE route. Read at the run's tenant.
+#[utoipa::path(
+    get,
+    path = "/v1/runs/{id}/steps/{step}/logs/raw",
+    params(
+        ("id" = String, Path, description = "run id"),
+        ("step" = String, Path, description = "step id"),
+        ("attempt" = String, Query, description = "the attempt id (required)"),
+        ("sidecar" = Option<usize>, Query, description = "a sidecar service by its index in the step's services (default = the step's main container)")
+    ),
+    responses(
+        (status = 200, description = "the try's log as text/plain, sent as an attachment", content_type = "text/plain"),
+        (status = 400, description = "no attempt given"),
+        (status = 404, description = "no such run, step or attempt")
+    )
+)]
+async fn get_step_logs_raw(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((id, step)): Path<(String, String)>,
+    Query(q): Query<RawLogsQuery>,
+) -> Result<Response, ApiError> {
+    let run = RunId(id);
+    let step = StepId(step);
+    let scope = run_scope(&st, &run).await;
+    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
+    st.db.run_status(&run).await?.ok_or(ApiError::NotFound)?;
+    let sr = st
+        .db
+        .steps_of_run(&run)
+        .await?
+        .into_iter()
+        .find(|s| s.step == step)
+        .ok_or(ApiError::NotFound)?;
+    let attempt = scarab_engine::AttemptId(q.attempt);
+    let try_no = sr
+        .attempts
+        .iter()
+        .position(|a| a.id == attempt)
+        .ok_or(ApiError::NotFound)?
+        + 1;
+    let read_step = match q.sidecar {
+        Some(i) => crate::logs::sidecar_stream_key(&step, i),
+        None => step.clone(),
+    };
+    let mut index = st
+        .logs
+        .chunks(&run, &read_step, &attempt)
+        .await?
+        .into_iter();
+    // The first chunk is read before the response starts, so a missing body
+    // is a 500 rather than a short download; a later one aborts the body.
+    let first = match index.next() {
+        Some(c) => Some(st.logs.read_chunk(&c).await?),
+        None => None,
+    };
+    let logs = st.logs.clone();
+    let rest = stream::unfold((logs, index), |(logs, mut index)| async move {
+        let c = index.next()?;
+        let item = logs
+            .read_chunk(&c)
+            .await
+            .map(Bytes::from)
+            .map_err(|e| std::io::Error::other(e.to_string()));
+        Some((item, (logs, index)))
+    });
+    let body = stream::iter(first.map(|b| Ok::<_, std::io::Error>(Bytes::from(b)))).chain(rest);
+    let disposition = format!(
+        "attachment; filename=\"{}\"",
+        raw_log_filename(&run, try_no, q.sidecar)
     );
-    Ok(Sse::new(replay_stream.chain(live).boxed()))
+    Response::builder()
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )
+        .header(axum::http::header::CONTENT_DISPOSITION, disposition)
+        .body(axum::body::Body::from_stream(body))
+        .map_err(|e| ApiError::BadRequest(e.to_string()))
 }
 
 /// The shared services of a run's **current Take** (ADR-0058), name-ordered —
@@ -3203,6 +3204,13 @@ async fn get_services(
 struct ServiceLogsQuery {
     #[serde(default)]
     take: Option<i64>,
+    /// Resume after this cursor (`t<take>:<next_seq>`, an event's `id`).
+    /// Absent = the `Last-Event-ID` header, else no cursor.
+    #[serde(default)]
+    from: Option<String>,
+    /// Without a cursor, replay at most this many bytes from the end.
+    #[serde(default)]
+    tail: Option<u64>,
 }
 
 /// SSE of ONE shared service's log output (ADR-0058 evidence), the source for the
@@ -3216,9 +3224,15 @@ struct ServiceLogsQuery {
     params(
         ("id" = String, Path, description = "run id"),
         ("service" = String, Path, description = "declared service name"),
-        ("take" = Option<i64>, Query, description = "restrict to one Take generation (default = current)")
+        ("take" = Option<i64>, Query, description = "restrict to one Take generation (default = current)"),
+        ("from" = Option<String>, Query, description = "resume after this cursor (an event id); default = the Last-Event-ID header"),
+        ("tail" = Option<u64>, Query, description = "without a cursor, replay at most this many bytes from the end, in whole chunks (clamped to 1..67108864)")
     ),
-    responses((status = 200, description = "SSE stream of this service's log output"), (status = 404, description = "no such run or service"))
+    responses(
+        (status = 200, description = "SSE stream of this service's log output"),
+        (status = 400, description = "malformed cursor, or a cursor for another Take"),
+        (status = 404, description = "no such run or service")
+    )
 )]
 async fn get_service_logs(
     State(st): State<AppState>,
@@ -3246,60 +3260,15 @@ async fn get_service_logs(
         return Err(ApiError::NotFound);
     }
     let (step, attempt) = crate::logs::service_stream_key(&service, take);
-
-    // Replay committed chunks, remembering how far the stream was consumed.
-    let mut replay: Vec<Result<Event, Infallible>> = Vec::new();
-    // No chunks is a truthful empty pane; a failed read of promised chunks
-    // is an error the reader must see (ADR-0063 part 5).
-    let (body, next) = st.logs.read_from(&run, &step, &attempt, 0).await?;
-    if !body.is_empty() {
-        replay.push(Ok(Event::default().data(String::from_utf8_lossy(&body))));
-    }
-    let replay_stream = stream::iter(replay);
-    if status.is_terminal() {
-        // Nothing more will be written: replay and close.
-        return Ok(Sse::new(replay_stream.boxed()));
-    }
-    // Live tail: poll the durable index for new chunks (ADR-0051), replica-
-    // agnostic like the step-log tail; the stream ends one poll after settle. The
-    // next seq to read rides in the fold state (like the step-log tail's `seen`).
-    let live = futures::stream::unfold(
-        (st.clone(), run.clone(), step, attempt, next, false),
-        |(st, run, step, attempt, mut next, done)| async move {
-            if done {
-                return None;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let terminal = matches!(
-                st.db.run_status(&run).await,
-                Ok(Some(s)) if s.is_terminal()
-            );
-            let mut body = Vec::new();
-            match st.logs.read_from(&run, &step, &attempt, next).await {
-                Ok((bytes, n)) => {
-                    if !bytes.is_empty() {
-                        body.extend(bytes);
-                    }
-                    next = n;
-                }
-                // Promised chunks that would not read: error out and end the
-                // stream rather than tailing a blank (ADR-0063 part 5).
-                Err(e) => {
-                    let event = Event::default()
-                        .event("error")
-                        .data(format!("log storage read failed: {e}"));
-                    return Some((Ok(event), (st, run, step, attempt, next, true)));
-                }
-            }
-            let event = if body.is_empty() {
-                Event::default().comment("keepalive")
-            } else {
-                Event::default().data(String::from_utf8_lossy(&body))
-            };
-            Some((Ok(event), (st, run, step, attempt, next, terminal)))
-        },
-    );
-    Ok(Sse::new(replay_stream.chain(live).boxed()))
+    let cursor = crate::log_stream::cursor_from(q.from.as_deref(), &headers)?;
+    crate::log_stream::sse(
+        &st,
+        run,
+        crate::log_stream::Scope::Fixed { step, attempt },
+        crate::log_stream::start_of(cursor, q.tail),
+        !status.is_terminal(),
+    )
+    .await
 }
 
 /// Map a rerun/retry outcome to the API's error space (the success half rides
@@ -14878,6 +14847,7 @@ impl utoipa::Modify for StepUpResponses {
         get_events,
         get_logs,
         get_step_logs,
+        get_step_logs_raw,
         get_services,
         get_service_logs,
         attach_step,

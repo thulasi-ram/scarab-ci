@@ -2217,9 +2217,11 @@ export interface paths {
         };
         /**
          * Server-Sent-Events of step **log bodies** (ADR-0013): replays every
-         *     committed chunk (decompressed from the object store, indexed by Postgres
-         *     offsets), then — while the run is still going — live-tails new chunks via the
-         *     log pipeline's broadcast. A terminal run yields the full log and closes.
+         *     committed chunk of every step and attempt (decompressed from the object
+         *     store, indexed by Postgres offsets) in batches of up to 256 KiB, then — while
+         *     the run is still going — polls the durable index for new chunks. A terminal
+         *     run yields the full log and closes. Events carry ids like the per-step
+         *     route, but this route takes no cursor and no tail.
          */
         get: operations["get_logs"];
         put?: never;
@@ -2402,11 +2404,35 @@ export interface paths {
          * SSE of ONE step's log bodies (ADR-0013), the source for the run detail's
          *     per-step fold. Same machinery as the run-wide `/logs`, scoped to the step —
          *     and, with `?attempt=`, to a single attempt so a rerun's earlier (failed)
-         *     output can be read in isolation. Replays committed chunks then live-tails
+         *     output can be read in isolation. Replays committed chunks in batches of up
+         *     to 256 KiB, each `data` event with `id: <attempt_id>:<next_seq>`; resumes
+         *     from `?from=` or `Last-Event-ID`; `?tail=` cuts the replay to the last bytes
+         *     after an `event: truncated` (`{"skipped_bytes","total_bytes"}`). Live-tails
          *     only when the run is still going AND the latest attempt is in scope
          *     (historical attempts are immutable). Read at the run's tenant.
          */
         get: operations["get_step_logs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/runs/{id}/steps/{step}/logs/raw": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One try's whole log as a plain-text download, streamed chunk by chunk from
+         *     the object store (no tail, no cut). `?sidecar=` reads that sidecar's log for
+         *     the same try. Same authz as the SSE route. Read at the run's tenant.
+         */
+        get: operations["get_step_logs_raw"];
         put?: never;
         post?: never;
         delete?: never;
@@ -12186,6 +12212,10 @@ export interface operations {
             query?: {
                 /** @description restrict to one Take generation (default = current) */
                 take?: number;
+                /** @description resume after this cursor (an event id); default = the Last-Event-ID header */
+                from?: string;
+                /** @description without a cursor, replay at most this many bytes from the end, in whole chunks (clamped to 1..67108864) */
+                tail?: number;
             };
             header?: never;
             path: {
@@ -12200,6 +12230,13 @@ export interface operations {
         responses: {
             /** @description SSE stream of this service's log output */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description malformed cursor, or a cursor for another Take */
+            400: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -12404,6 +12441,10 @@ export interface operations {
                 attempt?: string;
                 /** @description restrict to a sidecar service by its index in the step's services (default = the step's main container) */
                 sidecar?: number;
+                /** @description resume after this cursor (`<attempt_id>:<next_seq>`, an event id); default = the Last-Event-ID header */
+                from?: string;
+                /** @description without a cursor, replay at most this many bytes from the end, in whole chunks (clamped to 1..67108864) */
+                tail?: number;
             };
             header?: never;
             path: {
@@ -12423,7 +12464,58 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description malformed cursor, or a cursor naming an attempt outside the selection */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description no such run or step */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_step_logs_raw: {
+        parameters: {
+            query: {
+                /** @description the attempt id (required) */
+                attempt: string;
+                /** @description a sidecar service by its index in the step's services (default = the step's main container) */
+                sidecar?: number;
+            };
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+                /** @description step id */
+                step: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description the try's log as text/plain, sent as an attachment */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": unknown;
+                };
+            };
+            /** @description no attempt given */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such run, step or attempt */
             404: {
                 headers: {
                     [name: string]: unknown;

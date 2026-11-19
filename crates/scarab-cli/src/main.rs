@@ -13,6 +13,7 @@
 //! one-time browser link its human confirms the operation at.
 
 mod security;
+mod sse;
 mod validate;
 
 use clap::{Args, Parser, Subcommand};
@@ -229,7 +230,8 @@ fn lint(args: &FileArgs) -> i32 {
 }
 
 /// `scarab logs <run>`: replay + live-tail the run's logs (the same SSE the
-/// UI streams), printing data lines until the server closes the stream.
+/// UI streams), printing each event's payload as it arrives until the server
+/// closes the stream. An `error` event goes to stderr and exits 1.
 async fn logs(args: LogsArgs) -> i32 {
     let base = args.server.trim_end_matches('/');
     let url = format!("{base}/v1/runs/{}/logs", args.run);
@@ -248,18 +250,25 @@ async fn logs(args: LogsArgs) -> i32 {
         return 1;
     }
     let mut resp = resp;
-    let mut buf: Vec<u8> = Vec::new();
+    let mut parser = sse::SseParser::default();
     loop {
         match resp.chunk().await {
             Ok(Some(chunk)) => {
-                buf.extend_from_slice(&chunk);
-                // SSE frames are newline-delimited; print each complete
-                // `data:` line as it arrives (live tail).
-                while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
-                    let line: Vec<u8> = buf.drain(..=pos).collect();
-                    let line = String::from_utf8_lossy(&line);
-                    if let Some(data) = line.strip_prefix("data:") {
-                        println!("{}", data.trim_start().trim_end_matches('\n'));
+                for ev in parser.feed(&chunk) {
+                    match ev.event.as_deref() {
+                        // A log read failed on the server: the stream ends here.
+                        Some("error") => {
+                            eprintln!("error: {}", ev.data);
+                            return 1;
+                        }
+                        // Each payload is a run of log bytes; print it as is.
+                        None | Some("message") => {
+                            use std::io::Write;
+                            let mut out = std::io::stdout().lock();
+                            let _ = out.write_all(ev.data.as_bytes());
+                            let _ = out.flush();
+                        }
+                        Some(_) => {}
                     }
                 }
             }
