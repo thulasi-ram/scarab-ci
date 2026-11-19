@@ -97,6 +97,30 @@ fn step(run: &str) -> StepRun {
         gate_kind: None,
     }
 }
+/// [`step`] with its first attempt `a1`: the log stream a launch registers
+/// the values it mounts for.
+fn step_in_attempt(run: &str) -> StepRun {
+    StepRun {
+        attempts: vec![scarab_engine::Attempt {
+            id: scarab_engine::AttemptId("a1".into()),
+            started_at: scarab_engine::Timestamp(0),
+            failure: None,
+            failure_detail: None,
+            outcome: scarab_engine::AttemptOutcome::Running,
+        }],
+        ..step(run)
+    }
+}
+
+/// Some open log stream, so a diagnostic is redacted with its values.
+fn any_fence() -> scarab_server::LogFence {
+    scarab_server::LogFence::new(
+        &RunId("r1".into()),
+        &StepId("s1".into()),
+        &scarab_engine::AttemptId("a1".into()),
+    )
+}
+
 fn spec_with_secret() -> StepSpec {
     StepSpec {
         image: "busybox".into(),
@@ -435,7 +459,9 @@ async fn a_printed_oidc_token_is_stored_redacted() {
         logs.clone(),
     )
     .with_oidc(issuer, "https://scarab.example", "sts.example.com");
-    exec.launch(&step("r1"), &plain_spec()).await.unwrap();
+    exec.launch(&step_in_attempt("r1"), &plain_spec())
+        .await
+        .unwrap();
     let token = inner
         .last
         .lock()
@@ -618,7 +644,7 @@ impl Executor for ConditionExec {
 async fn the_decorator_forwards_and_scrubs_the_infra_condition() {
     let db = Arc::new(InMemoryDb::new());
     let logs = logs(db.clone());
-    logs.register_secret(b"sup3r-s3cret");
+    logs.register_secret(&any_fence(), b"sup3r-s3cret");
     let exec = SecretInjectingExecutor::new(
         Arc::new(ConditionExec),
         db.clone() as Arc<dyn Db>,
@@ -646,7 +672,7 @@ async fn the_decorator_forwards_and_scrubs_the_infra_condition() {
 async fn the_decorator_scrubs_the_failure_cause() {
     let db = Arc::new(InMemoryDb::new());
     let logs = logs(db.clone());
-    logs.register_secret(b"sup3r-s3cret");
+    logs.register_secret(&any_fence(), b"sup3r-s3cret");
     let exec = SecretInjectingExecutor::new(
         Arc::new(ConditionExec),
         db.clone() as Arc<dyn Db>,

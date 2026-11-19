@@ -39,7 +39,9 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{Api, AttachParams, DeleteParams, LogParams, Patch, PatchParams, PostParams};
 use std::sync::Arc;
 
-use scarab_engine::ports::{ExecHandle, ExecState, FailureClass, LogChunks};
+use scarab_engine::ports::{
+    ExecHandle, ExecState, FailureClass, LogChunks, LogFrom, LogRedactions,
+};
 use scarab_engine::{ExecError, Executor, InfraCondition, RunId, StepRun, StepSpec};
 use scarab_storage::Cas;
 
@@ -3545,15 +3547,15 @@ impl Executor for K8sExecutor {
     /// in. The control plane drains the returned [`LogChunks`] into the log
     /// pipeline. Best-effort: if the Pod's log is not yet available (still Pending,
     /// container not started) this errors and the caller retries on a later tick.
-    async fn log_stream(&self, step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+    async fn log_stream(
+        &self,
+        step: &StepRun,
+        from: LogFrom,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         let name = pod_name(step);
         self.require_node(&name, STEP_CONTAINER).await?;
         let pods = self.stream_pods()?;
-        let params = LogParams {
-            follow: true,
-            container: Some(STEP_CONTAINER.to_string()),
-            ..LogParams::default()
-        };
+        let params = follow_params(STEP_CONTAINER, from);
         let reader = pods
             .log_stream(&name, &params)
             .await
@@ -3567,23 +3569,40 @@ impl Executor for K8sExecutor {
     /// [`log_redaction_sources`] names (the step's own secrets, the registry
     /// dockerconfigjson, the forge token and the OIDC token), so a control
     /// plane that tails the log of a step it did not launch redacts what the
-    /// launching one registered. A Secret that is not there (the step had
-    /// none, or it was deleted when the attempt settled) adds nothing.
-    async fn log_redactions(&self, step: &StepRun) -> Result<Vec<Vec<u8>>, ExecError> {
+    /// launching one registered.
+    ///
+    /// Only the Secrets the Pod references are read. One it references that
+    /// does not exist (deleted when the attempt settled, or not written yet:
+    /// the launch writes them after the Pod) is [`LogRedactions::Gone`], never
+    /// "no values". A Pod that is not there, or any read that fails, is an
+    /// error.
+    async fn log_redactions(&self, step: &StepRun) -> Result<LogRedactions, ExecError> {
+        let name = pod_name(step);
+        let pod = self
+            .pods()?
+            .get_opt(&name)
+            .await
+            .map_err(|e| ExecError::Other(format!("reading pod {name}: {e}")))?
+            .ok_or_else(|| ExecError::Other(format!("pods \"{name}\" not found: NotFound")))?;
+        let referenced = pod_secret_names(&pod);
         let client = self.client.clone().ok_or(ExecError::Unavailable)?;
         let secrets: Api<k8s_openapi::api::core::v1::Secret> =
             Api::namespaced(client, &self.namespace);
         let mut out = Vec::new();
-        for (name, key) in log_redaction_sources(&pod_name(step)) {
+        for (secret_name, key) in log_redaction_sources(&name) {
+            if !referenced.contains(&secret_name) {
+                continue;
+            }
             let secret = secrets
-                .get_opt(&name)
+                .get_opt(&secret_name)
                 .await
-                .map_err(|e| ExecError::Other(format!("reading secret {name}: {e}")))?;
-            if let Some(secret) = secret {
-                out.extend(secret_redaction_values(&secret, key));
+                .map_err(|e| ExecError::Other(format!("reading secret {secret_name}: {e}")))?;
+            match secret {
+                Some(secret) => out.extend(secret_redaction_values(&secret, key)),
+                None => return Ok(LogRedactions::Gone),
             }
         }
-        Ok(out)
+        Ok(LogRedactions::Values(out))
     }
 
     /// Open a live tail of ONE of the step Pod's sidecar containers (ADR-0058
@@ -3596,15 +3615,12 @@ impl Executor for K8sExecutor {
         &self,
         step: &StepRun,
         container: &str,
+        from: LogFrom,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         let name = pod_name(step);
         self.require_node(&name, container).await?;
         let pods = self.stream_pods()?;
-        let params = LogParams {
-            follow: true,
-            container: Some(container.to_string()),
-            ..LogParams::default()
-        };
+        let params = follow_params(container, from);
         let reader = pods
             .log_stream(&name, &params)
             .await
@@ -3719,14 +3735,11 @@ impl Executor for K8sExecutor {
     async fn service_log_stream(
         &self,
         handle: &ExecHandle,
+        from: LogFrom,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         self.require_node(&handle.0, SERVICE_POD_CONTAINER).await?;
         let pods = self.stream_pods()?;
-        let params = LogParams {
-            follow: true,
-            container: Some(SERVICE_POD_CONTAINER.to_string()),
-            ..LogParams::default()
-        };
+        let params = follow_params(SERVICE_POD_CONTAINER, from);
         let reader = pods
             .log_stream(&handle.0, &params)
             .await
@@ -6722,6 +6735,65 @@ fn log_redaction_sources(pod_name: &str) -> [(String, Option<&'static str>); 4] 
         (forge_token_secret_name(pod_name), Some(FORGE_TOKEN_KEY)),
         (oidc_secret_name(pod_name), Some(OIDC_TOKEN_KEY)),
     ]
+}
+
+/// The names of every Secret `pod` references: Secret and projected
+/// volumes, `secretKeyRef` and `envFrom` of every container and init
+/// container, and image pull Secrets.
+fn pod_secret_names(pod: &Pod) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    let Some(spec) = &pod.spec else {
+        return names;
+    };
+    for volume in spec.volumes.iter().flatten() {
+        if let Some(name) = volume.secret.as_ref().and_then(|s| s.secret_name.clone()) {
+            names.insert(name);
+        }
+        let projected = volume.projected.as_ref().and_then(|p| p.sources.as_ref());
+        for source in projected.into_iter().flatten() {
+            if let Some(secret) = &source.secret {
+                names.insert(secret.name.clone());
+            }
+        }
+    }
+    let containers = spec
+        .containers
+        .iter()
+        .chain(spec.init_containers.iter().flatten());
+    for container in containers {
+        for env in container.env.iter().flatten() {
+            let from = env
+                .value_from
+                .as_ref()
+                .and_then(|v| v.secret_key_ref.as_ref());
+            if let Some(selector) = from {
+                names.insert(selector.name.clone());
+            }
+        }
+        for env_from in container.env_from.iter().flatten() {
+            if let Some(secret) = &env_from.secret_ref {
+                names.insert(secret.name.clone());
+            }
+        }
+    }
+    for pull in spec.image_pull_secrets.iter().flatten() {
+        names.insert(pull.name.clone());
+    }
+    names
+}
+
+/// The parameters of a followed read of `container`'s log. [`LogFrom::Now`]
+/// asks for no earlier line (`tailLines: 0`).
+fn follow_params(container: &str, from: LogFrom) -> LogParams {
+    LogParams {
+        follow: true,
+        container: Some(container.to_string()),
+        tail_lines: match from {
+            LogFrom::Start => None,
+            LogFrom::Now => Some(0),
+        },
+        ..LogParams::default()
+    }
 }
 
 /// The non-empty values of `secret` under `key` (every key when `None`),
@@ -14863,6 +14935,56 @@ mod tests {
             );
         }
         assert!(!read.contains(&b"x-access-token".to_vec()));
+
+        // `log_redactions` reads only the Secrets the Pod references: the
+        // Pod this launch builds references all four.
+        let built = build_pod(
+            "scarab-x",
+            "ns",
+            &step_with_attempt("run-1", "deploy", "a1"),
+            &spec,
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            false,
+            None,
+        );
+        let referenced = pod_secret_names(&built);
+        for (name, _) in log_redaction_sources("scarab-x") {
+            assert!(
+                referenced.contains(&name),
+                "the Pod does not reference {name}: {referenced:?}"
+            );
+        }
+        // A Pod with no credential references none of them.
+        let plain = build_pod(
+            "scarab-x",
+            "ns",
+            &step_with_attempt("run-1", "build", "a1"),
+            &busybox(),
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            false,
+            None,
+        );
+        let referenced = pod_secret_names(&plain);
+        for (name, _) in log_redaction_sources("scarab-x") {
+            assert!(!referenced.contains(&name), "{name}: {referenced:?}");
+        }
+    }
+
+    /// A read from now asks the API for no earlier line; a read from the
+    /// start asks for all of them.
+    #[test]
+    fn a_read_from_now_asks_for_no_earlier_line() {
+        let now = follow_params("step", LogFrom::Now);
+        assert_eq!(now.tail_lines, Some(0));
+        assert!(now.follow);
+        assert_eq!(now.container.as_deref(), Some("step"));
+        let start = follow_params("service-0", LogFrom::Start);
+        assert_eq!(start.tail_lines, None);
+        assert_eq!(start.since_time, None);
+        assert_eq!(start.since_seconds, None);
+        assert_eq!(start.container.as_deref(), Some("service-0"));
     }
 
     /// The Pipeline check refuses a templated value on a `forge_token` Step

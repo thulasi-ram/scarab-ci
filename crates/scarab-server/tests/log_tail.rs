@@ -8,12 +8,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use scarab_engine::ports::{ExecHandle, ExecState, Executor, LogChunks};
+use scarab_engine::ports::{ExecHandle, ExecState, Executor, LogChunks, LogFrom, LogRedactions};
 use scarab_engine::{
     Attempt, AttemptId, AttemptOutcome, ExecError, RunId, StepId, StepRun, StepSpec, StepStatus,
     Timestamp,
 };
-use scarab_server::{pump_log_stream, LogService, LogTailer};
+use scarab_server::{pump_log_stream, LogFence, LogService, LogTailer};
 use scarab_testkit::{InMemoryDb, InMemoryObjectStore};
 
 fn logs() -> Arc<LogService> {
@@ -29,6 +29,12 @@ fn stream() -> (RunId, StepId, AttemptId) {
         StepId("build".into()),
         AttemptId("a1".into()),
     )
+}
+
+/// The fence of [`stream`]: the stream whose values redact it.
+fn fence() -> LogFence {
+    let (run, step, attempt) = stream();
+    LogFence::new(&run, &step, &attempt)
 }
 
 /// A mock log source: hands out queued chunks, then end-of-stream.
@@ -68,7 +74,7 @@ async fn pump_drains_all_chunks_in_order() {
 async fn pump_redacts_registered_secrets() {
     let logs = logs();
     let (run, step, attempt) = stream();
-    logs.register_secret(b"s3cr3t");
+    logs.register_secret(&fence(), b"s3cr3t");
 
     let source = Box::new(MockChunks(VecDeque::from(vec![
         b"token=s3cr3t done\n".to_vec()
@@ -201,7 +207,11 @@ impl Executor for GatedExec {
     }
     // ADR-0064 s2: required (never defaulted) so the compiler makes every impl —
     // wrappers included — decide; this stub snapshots nothing, so no stamp.
-    async fn log_stream(&self, _step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+    async fn log_stream(
+        &self,
+        _step: &StepRun,
+        _from: LogFrom,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         // Count the open *before* parking, so the fence is provably held while a
         // concurrent `ensure` runs.
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -371,7 +381,11 @@ impl Executor for ScriptedExec {
     async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
         Ok(true)
     }
-    async fn log_stream(&self, _step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+    async fn log_stream(
+        &self,
+        _step: &StepRun,
+        _from: LogFrom,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         match self.script.lock().unwrap().pop_front() {
             Some(Ok(chunks)) => Ok(Some(Box::new(MockChunks(chunks.into())))),
@@ -658,7 +672,11 @@ impl Executor for ContainerLog {
     async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
         Ok(true)
     }
-    async fn log_stream(&self, _step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+    async fn log_stream(
+        &self,
+        _step: &StepRun,
+        _from: LogFrom,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         self.opens.fetch_add(1, Ordering::SeqCst);
         let read = self.reads.lock().unwrap().pop_front().unwrap_or(Read {
             chunk: 4,
@@ -813,7 +831,7 @@ async fn redaction_in_the_stored_part_does_not_move_the_resume_point() {
         ],
     );
     let logs = logs();
-    logs.register_secret(b"s3cr3t-value");
+    logs.register_secret(&fence(), b"s3cr3t-value");
     let tailer =
         LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_secs(3600));
 
@@ -888,7 +906,7 @@ struct LiveLog {
     running: Arc<std::sync::atomic::AtomicBool>,
     reads: Mutex<VecDeque<Read>>,
     opens: AtomicUsize,
-    redactions: Mutex<Result<Vec<Vec<u8>>, String>>,
+    redactions: Mutex<Result<LogRedactions, String>>,
 }
 
 impl LiveLog {
@@ -898,7 +916,7 @@ impl LiveLog {
             running: Arc::new(std::sync::atomic::AtomicBool::new(running)),
             reads: Mutex::new(reads.into()),
             opens: AtomicUsize::new(0),
-            redactions: Mutex::new(Ok(Vec::new())),
+            redactions: Mutex::new(Ok(LogRedactions::Values(Vec::new()))),
         })
     }
     fn opens(&self) -> usize {
@@ -913,8 +931,17 @@ impl LiveLog {
     fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
     }
-    fn open(&self) -> Box<dyn LogChunks> {
+    /// What `log_redactions` answers from now on.
+    fn answer(&self, answer: Result<LogRedactions, &str>) {
+        *self.redactions.lock().unwrap() = answer.map_err(str::to_string);
+    }
+    fn open(&self, from: LogFrom) -> Box<dyn LogChunks> {
         self.opens.fetch_add(1, Ordering::SeqCst);
+        // A read from now on starts after what is printed already.
+        let pos = match from {
+            LogFrom::Start => 0,
+            LogFrom::Now => self.log.lock().unwrap().len(),
+        };
         let read = self.reads.lock().unwrap().pop_front().unwrap_or(Read {
             chunk: 4,
             fail_after: None,
@@ -922,7 +949,7 @@ impl LiveLog {
         Box::new(FollowChunks {
             log: self.log.clone(),
             running: self.running.clone(),
-            pos: 0,
+            pos,
             read,
             served: 0,
         })
@@ -1008,17 +1035,22 @@ impl Executor for LiveLog {
     async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
         Ok(true)
     }
-    async fn log_stream(&self, _step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        Ok(Some(self.open()))
+    async fn log_stream(
+        &self,
+        _step: &StepRun,
+        from: LogFrom,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        Ok(Some(self.open(from)))
     }
     async fn sidecar_log_stream(
         &self,
         _step: &StepRun,
         _container: &str,
+        from: LogFrom,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        Ok(Some(self.open()))
+        Ok(Some(self.open(from)))
     }
-    async fn log_redactions(&self, _step: &StepRun) -> Result<Vec<Vec<u8>>, ExecError> {
+    async fn log_redactions(&self, _step: &StepRun) -> Result<LogRedactions, ExecError> {
         self.redactions
             .lock()
             .unwrap()
@@ -1247,7 +1279,7 @@ async fn a_retry_after_a_fallback_appends_only_new_output() {
 async fn pump_redacts_a_secret_split_across_chunks() {
     let logs = logs();
     let (run, step, attempt) = stream();
-    logs.register_secret(b"token-value");
+    logs.register_secret(&fence(), b"token-value");
     let source = Box::new(MockChunks(VecDeque::from(vec![
         b"tok".to_vec(),
         b"en-value\n".to_vec(),
@@ -1275,7 +1307,7 @@ async fn a_secret_across_the_resume_point_is_redacted() {
         }],
     );
     let logs = logs();
-    logs.register_secret(b"token-value");
+    logs.register_secret(&fence(), b"token-value");
     let tailer =
         LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
     let step = running_step();
@@ -1309,7 +1341,7 @@ async fn chunks_stored_before_the_upgrade_resume_with_no_fragment_of_a_secret() 
     let secret = b"0123456789abcdefghijklmnopqrstuvwxyzABCD";
     assert_eq!(secret.len(), 40);
     let logs = logs();
-    logs.register_secret(secret);
+    logs.register_secret(&fence(), secret);
     let (run, s, at) = stream();
     // Written as an older server stored it: the redacted line only.
     logs.append(&run, &s, &at, b"key=***\n").await.unwrap();
@@ -1402,7 +1434,7 @@ async fn a_replica_that_did_not_launch_the_step_redacts_its_secrets() {
     let (run, s, at) = stream();
     // The replica that launched the step stored the first line.
     let launcher = LogService::new(store.clone(), db.clone());
-    launcher.register_secret(b"s3cr3t-value");
+    launcher.register_secret(&fence(), b"s3cr3t-value");
     launcher
         .append(&run, &s, &at, b"token=s3cr3t-value\n")
         .await
@@ -1411,7 +1443,7 @@ async fn a_replica_that_did_not_launch_the_step_redacts_its_secrets() {
     // Another replica takes the tail over.
     let logs = Arc::new(LogService::new(store, db));
     let exec = LiveLog::new(b"token=s3cr3t-value\nagain s3cr3t-value\n", false, vec![]);
-    *exec.redactions.lock().unwrap() = Ok(vec![b"s3cr3t-value".to_vec()]);
+    exec.answer(Ok(LogRedactions::Values(vec![b"s3cr3t-value".to_vec()])));
     let tailer =
         LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
     tailer.ensure(&running_step());
@@ -1428,8 +1460,7 @@ async fn a_replica_that_did_not_launch_the_step_redacts_its_secrets() {
 #[tokio::test]
 async fn a_tail_that_cannot_read_the_secret_values_reads_nothing() {
     let exec = LiveLog::new(b"token=s3cr3t-value\n", false, vec![]);
-    *exec.redactions.lock().unwrap() =
-        Err("secrets \"scarab-build-a1-secrets\" is forbidden".into());
+    exec.answer(Err("secrets \"scarab-build-a1-secrets\" is forbidden"));
     let logs = logs();
     let tailer =
         LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
@@ -1442,33 +1473,285 @@ async fn a_tail_that_cannot_read_the_secret_values_reads_nothing() {
     assert!(logs.read_all(&run, &s, &at).await.unwrap().is_empty());
 }
 
-/// A replica that lacks a secret value the stored part redacted (its Secret
-/// is gone: the attempt settled before this read) sees its source differ
-/// where the stored part holds `***`. It stores nothing more, no marker, and
-/// closes the fence: storing the log again would store the value in clear.
+/// The markers a tail stores in place of output it cannot check; the texts
+/// the run-logs docs page quotes.
+const FROM_NOW: &[u8] =
+    b"\nscarab: earlier output could not be checked; showing output from now on\n";
+const WITHHELD: &[u8] = b"\nscarab: the rest of this log was withheld: it could not be checked against the part already stored\n";
+const VALUES_UNREAD: &[u8] =
+    b"\nscarab: the rest of this log was not stored: its secret values could not be read\n";
+
+fn holds(log: &[u8], value: &[u8]) -> bool {
+    log.windows(value.len()).any(|w| w == value)
+}
+
+/// R3-2: a running unit whose log differs from the stored part where that
+/// part holds a `***` (the replica that stored it held a value this one does
+/// not) is not stored again from its first byte, which would store the value
+/// in clear, and its tail is not closed with no word: a marker, then its
+/// output from now on. Before this, the fence was closed and `later` was
+/// never stored.
 #[tokio::test]
-async fn a_replica_without_the_secret_values_does_not_store_the_log_again() {
+async fn a_running_unit_that_cannot_be_checked_is_stored_from_now_on_after_a_marker() {
     let db = Arc::new(InMemoryDb::new());
     let store = Arc::new(InMemoryObjectStore::new());
     let (run, s, at) = stream();
     let launcher = LogService::new(store.clone(), db.clone());
-    launcher.register_secret(b"s3cr3t-value");
+    launcher.register_secret(&fence(), b"s3cr3t-value");
+    launcher
+        .append(&run, &s, &at, b"token=s3cr3t-value\n")
+        .await
+        .unwrap();
+
+    // The peer's executor reads no value back (the unit's value changed).
+    let logs = Arc::new(LogService::new(store, db));
+    let exec = LiveLog::new(b"token=s3cr3t-value\n", true, vec![]);
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    tailer.ensure(&running_step());
+    wait_stored(&logs, &cat(&[b"token=***\n", FROM_NOW])).await;
+
+    exec.print(b"later\n");
+    wait_stored(&logs, &cat(&[b"token=***\n", FROM_NOW, b"later\n"])).await;
+    exec.stop();
+    for _ in 0..3 {
+        tailer.ensure(&running_step());
+        settle().await;
+    }
+    let stored = logs.read_all(&run, &s, &at).await.unwrap();
+    assert_eq!(stored, cat(&[b"token=***\n", FROM_NOW, b"later\n"]));
+    assert!(!holds(&stored, b"s3cr3t-value"));
+    assert_eq!(markers(&stored), 0, "not stored again from the first byte");
+}
+
+/// The same for an ended unit (its last read): a marker says the rest was
+/// withheld. Before this, nothing was stored and nothing said so.
+#[tokio::test]
+async fn an_ended_unit_that_cannot_be_checked_gets_a_marker() {
+    let db = Arc::new(InMemoryDb::new());
+    let store = Arc::new(InMemoryObjectStore::new());
+    let (run, s, at) = stream();
+    let launcher = LogService::new(store.clone(), db.clone());
+    launcher.register_secret(&fence(), b"s3cr3t-value");
     launcher
         .append(&run, &s, &at, b"token=s3cr3t-value\n")
         .await
         .unwrap();
 
     let logs = Arc::new(LogService::new(store, db));
-    let exec = LiveLog::new(b"token=s3cr3t-value\nmore\n", false, vec![]);
+    // The live read breaks before its first chunk.
+    let exec = LiveLog::new(
+        b"token=s3cr3t-value\nmore\n",
+        false,
+        vec![Read {
+            chunk: 4,
+            fail_after: Some(0),
+        }],
+    );
     let tailer =
         LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    for _ in 0..5 {
-        tailer.ensure(&running_step());
+    tailer.ensure(&running_step());
+    settle().await;
+    tailer.end_pass(true);
+    // The step is no longer ensured: the read of the ended unit.
+    tailer.end_pass(true);
+    wait_stored(&logs, &cat(&[b"token=***\n", WITHHELD])).await;
+    for _ in 0..3 {
+        tailer.end_pass(true);
         settle().await;
     }
-    assert_eq!(exec.opens(), 1, "the fence is closed after one read");
     let stored = logs.read_all(&run, &s, &at).await.unwrap();
-    assert_eq!(stored, b"token=***\n");
+    assert_eq!(stored, cat(&[b"token=***\n", WITHHELD]));
+}
+
+/// The tail lease of `stream()`.
+const TAIL_RESOURCE: &str = "tail:r:build:a1";
+
+/// R3-1 / RT-R3-1: a replica that a dead replica's lease kept from the
+/// step, and that never read the step's values (the Secrets were deleted
+/// when the attempt settled), reads the ended step once the lease expires.
+/// It stores a marker in place of the output, never the output. Before
+/// this, it read no values ("none"), matched the stored part and appended
+/// `TOKEN=s3cr3t-value` in clear.
+#[tokio::test]
+async fn a_peer_that_never_read_the_values_stores_a_marker_not_the_output() {
+    use scarab_engine::Db as _;
+    let db = Arc::new(InMemoryDb::new());
+    let store = Arc::new(InMemoryObjectStore::new());
+    let (run, s, at) = stream();
+    // The replica that launched the step stored a line, then died holding
+    // the tail lease.
+    let launcher = LogService::new(store.clone(), db.clone());
+    launcher.append(&run, &s, &at, b"line one\n").await.unwrap();
+    db.lease(TAIL_RESOURCE, "dead", 45_000).await.unwrap();
+
+    let logs = Arc::new(LogService::new(store, db.clone()));
+    let exec = LiveLog::new(b"line one\n", true, vec![]);
+    exec.answer(Ok(LogRedactions::Gone));
+    let tailer = LogTailer::new(exec.clone(), logs.clone())
+        .with_retry_backoff(Duration::from_millis(10))
+        .with_lease(db.clone(), "b");
+    for _ in 0..3 {
+        tailer.ensure(&running_step());
+        settle().await;
+        tailer.end_pass(true);
+    }
+    assert_eq!(exec.opens(), 0, "nothing is read without the values");
+
+    // The step prints its secret and ends; the dead replica's lease expires.
+    exec.print(b"TOKEN=s3cr3t-value\n");
+    exec.stop();
+    db.release_lease(TAIL_RESOURCE, "dead").await.unwrap();
+    let want = cat(&[b"line one\n", VALUES_UNREAD]);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while logs.read_all(&run, &s, &at).await.unwrap() != want {
+            tailer.end_pass(true);
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    })
+    .await
+    .expect("the marker is stored");
+    for _ in 0..3 {
+        tailer.end_pass(true);
+        settle().await;
+    }
+    let stored = logs.read_all(&run, &s, &at).await.unwrap();
+    assert_eq!(stored, want);
+    assert!(!holds(&stored, b"s3cr3t-value"));
+}
+
+/// R3-1: the values load before the lease claim. A replica the lease turns
+/// away while the step runs still reads them, so after the attempt settles
+/// (its Secrets deleted) and the lease expires, it redacts the step's last
+/// output. Before this, it read them only after winning the lease, when
+/// they were gone, and stored `TOKEN=s3cr3t-value` in clear.
+#[tokio::test]
+async fn a_peer_turned_away_by_the_lease_reads_the_values_while_the_step_runs() {
+    use scarab_engine::Db as _;
+    let db = Arc::new(InMemoryDb::new());
+    let store = Arc::new(InMemoryObjectStore::new());
+    let (run, s, at) = stream();
+    let launcher = LogService::new(store.clone(), db.clone());
+    launcher.append(&run, &s, &at, b"line one\n").await.unwrap();
+    db.lease(TAIL_RESOURCE, "dead", 45_000).await.unwrap();
+
+    let logs = Arc::new(LogService::new(store, db.clone()));
+    let exec = LiveLog::new(b"line one\n", true, vec![]);
+    exec.answer(Ok(LogRedactions::Values(vec![b"s3cr3t-value".to_vec()])));
+    let tailer = LogTailer::new(exec.clone(), logs.clone())
+        .with_retry_backoff(Duration::from_millis(10))
+        .with_lease(db.clone(), "b");
+    for _ in 0..3 {
+        tailer.ensure(&running_step());
+        settle().await;
+        tailer.end_pass(true);
+    }
+    assert_eq!(exec.opens(), 0, "the lease keeps it from the log");
+
+    // Settled: the Secrets are deleted.
+    exec.answer(Ok(LogRedactions::Gone));
+    exec.print(b"TOKEN=s3cr3t-value\n");
+    exec.stop();
+    db.release_lease(TAIL_RESOURCE, "dead").await.unwrap();
+    let want = b"line one\nTOKEN=***\n".to_vec();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while logs.read_all(&run, &s, &at).await.unwrap() != want {
+            tailer.end_pass(true);
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    })
+    .await
+    .expect("the end of the log is stored, redacted");
+}
+
+/// An error reading the values is never "no values" (RT-R3 mutation 3, on
+/// the server's side): an ended unit whose values cannot be read gets a
+/// marker after its last try, not its output.
+#[tokio::test]
+async fn an_ended_unit_whose_values_cannot_be_read_gets_a_marker_not_its_output() {
+    let exec = LiveLog::new(b"TOKEN=s3cr3t-value\n", false, vec![]);
+    exec.answer(Err("secrets \"scarab-build-a1-secrets\" is forbidden"));
+    let logs = logs();
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    tailer.ensure(&running_step());
+    settle().await;
+    tailer.end_pass(true);
+    let (run, s, at) = stream();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while logs.read_all(&run, &s, &at).await.unwrap() != VALUES_UNREAD {
+            tailer.end_pass(true);
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    })
+    .await
+    .expect("the marker is stored");
+    for _ in 0..3 {
+        tailer.end_pass(true);
+        settle().await;
+    }
+    assert_eq!(logs.read_all(&run, &s, &at).await.unwrap(), VALUES_UNREAD);
+}
+
+/// RT-R3 mutation 1: a sidecar is in the step's Pod; its tail reads the
+/// step's values like the step's tail, and redacts them.
+#[tokio::test]
+async fn a_sidecar_tail_redacts_the_step_values() {
+    let exec = LiveLog::new(b"pw=s3cr3t-value\n", false, vec![]);
+    exec.answer(Ok(LogRedactions::Values(vec![b"s3cr3t-value".to_vec()])));
+    let logs = logs();
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    let step = running_step();
+    let sidecar = scarab_server::logs::sidecar_stream_key(&step.step, 0);
+    tailer.ensure_sidecar(&step, 0);
+    wait_stored_in(&logs, &sidecar, b"pw=***\n").await;
+}
+
+/// RT-R3-2 / RT-R3-5: values are kept per stream. Another Run's secret
+/// (`postgres`) is not redacted from this step's log, so a peer that reads
+/// only this step's values verifies the stored part and stores what
+/// follows, with no marker. Before this, the server stored `starting ***`
+/// and a peer's re-read closed the tail.
+#[tokio::test]
+async fn another_streams_value_neither_redacts_this_log_nor_trips_the_guard() {
+    let db = Arc::new(InMemoryDb::new());
+    let store = Arc::new(InMemoryObjectStore::new());
+    let (run, s, at) = stream();
+    let first = Arc::new(LogService::new(store.clone(), db.clone()));
+    first.register_secret(
+        &LogFence::new(
+            &RunId("other".into()),
+            &StepId("migrate".into()),
+            &AttemptId("a1".into()),
+        ),
+        b"postgres",
+    );
+    let exec = LiveLog::new(
+        b"starting postgres\n",
+        true,
+        vec![Read {
+            chunk: 18,
+            fail_after: Some(1),
+        }],
+    );
+    let tailer =
+        LogTailer::new(exec.clone(), first.clone()).with_retry_backoff(Duration::from_secs(3600));
+    tailer.ensure(&running_step());
+    wait_stored(&first, b"starting postgres\n").await;
+    settle().await;
+
+    // A peer takes the tail over.
+    let peer = Arc::new(LogService::new(store, db));
+    exec.print(b"ready\n");
+    let tailer =
+        LogTailer::new(exec.clone(), peer.clone()).with_retry_backoff(Duration::from_millis(10));
+    tailer.ensure(&running_step());
+    wait_stored(&peer, b"starting postgres\nready\n").await;
+    exec.stop();
+    settle().await;
+    let stored = peer.read_all(&run, &s, &at).await.unwrap();
+    assert_eq!(stored, b"starting postgres\nready\n");
 }
 
 // --- Through the converged driver ---------------------------------------------
@@ -1539,7 +1822,11 @@ impl Executor for DrivenExec {
     async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
         Ok(true)
     }
-    async fn log_stream(&self, _step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+    async fn log_stream(
+        &self,
+        _step: &StepRun,
+        _from: LogFrom,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         self.log_opens.fetch_add(1, Ordering::SeqCst);
         if !self.ended() {
             return Err(ExecError::Other(INITIALIZING.into()));

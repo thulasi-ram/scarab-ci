@@ -45,9 +45,16 @@ async fn fork_pr_is_locked_out_of_secrets_and_gets_env_none() {
     assert!(policy.secrets_locked_out);
     assert_eq!(policy.oidc_env, "none");
 
-    let env = resolve_step_secrets(&secrets, &logs, &scope(), &keys, policy.secrets_locked_out)
-        .await
-        .unwrap();
+    let env = resolve_step_secrets(
+        &secrets,
+        &logs,
+        None,
+        &scope(),
+        &keys,
+        policy.secrets_locked_out,
+    )
+    .await
+    .unwrap();
     assert!(env.is_empty(), "a fork PR must read no secrets");
 
     let subject = Claims::run_subject("acme", "app", &policy.oidc_env, "refs/pull/1/head");
@@ -60,8 +67,15 @@ async fn fork_pr_is_locked_out_of_secrets_and_gets_env_none() {
     let trusted = fork_policy(&pr(false), "prod");
     assert!(!trusted.secrets_locked_out);
     assert_eq!(trusted.oidc_env, "prod");
-    let env = resolve_step_secrets(&secrets, &logs, &scope(), &keys, trusted.secrets_locked_out)
-        .await
-        .unwrap();
+    let env = resolve_step_secrets(
+        &secrets,
+        &logs,
+        None,
+        &scope(),
+        &keys,
+        trusted.secrets_locked_out,
+    )
+    .await
+    .unwrap();
     assert_eq!(env, vec![("TOKEN".to_string(), b"top-secret".to_vec())]);
 }

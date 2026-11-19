@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use flate2::read::GzDecoder;
@@ -37,6 +38,46 @@ type StreamKey = (String, String, String);
 
 fn stream_key(run: &RunId, step: &StepId, attempt: &AttemptId) -> StreamKey {
     (run.0.clone(), step.0.clone(), attempt.0.clone())
+}
+
+/// One log stream, as the secret values that redact it are kept: a single
+/// attempt of a step, or a sidecar or shared-service stream
+/// ([`sidecar_stream_key`], [`service_stream_key`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogFence {
+    pub run: RunId,
+    pub step: StepId,
+    pub attempt: AttemptId,
+}
+
+impl LogFence {
+    pub fn new(run: &RunId, step: &StepId, attempt: &AttemptId) -> Self {
+        Self {
+            run: run.clone(),
+            step: step.clone(),
+            attempt: attempt.clone(),
+        }
+    }
+
+    /// The fence of `step`'s current attempt; `None` before it has one.
+    pub fn of_step(step: &scarab_engine::StepRun) -> Option<Self> {
+        step.current_attempt()
+            .map(|a| Self::new(&step.run, &step.step, &a.id))
+    }
+
+    fn key(&self) -> StreamKey {
+        stream_key(&self.run, &self.step, &self.attempt)
+    }
+}
+
+/// The secret values of one log stream.
+#[derive(Default)]
+struct FenceValues {
+    values: Mutex<Vec<Vec<u8>>>,
+    /// Every value the stream's unit holds is registered: read back from the
+    /// unit (`Executor::log_redactions`), or registered by the launch on this
+    /// process.
+    loaded: AtomicBool,
 }
 
 fn object_key(run: &RunId, step: &StepId, attempt: &AttemptId, seq: u64) -> String {
@@ -78,11 +119,15 @@ pub struct LogService {
     db: Arc<dyn Db>,
     /// Live broadcast channels, one per in-flight stream.
     live: Mutex<HashMap<StreamKey, broadcast::Sender<Vec<u8>>>>,
-    /// Secret values to scrub from every chunk before it is stored or streamed
-    /// (ADR-0013, 0032). Registered when secrets are injected into a step,
-    /// and by a log tail from the unit it reads. Shared with every
-    /// [`StreamRedactor`], which reads it at each push.
-    secrets: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// Secret values to scrub from a stream's chunks before they are stored
+    /// or streamed (ADR-0013, 0032), per stream: a value redacts only the
+    /// stream it was registered for. Registered when secrets are injected
+    /// into a step, and by a log tail from the unit it reads; removed when
+    /// the tail closes the stream ([`forget_secrets`](Self::forget_secrets)).
+    /// There is no server-wide value: every value Scarab registers belongs
+    /// to one launch. A [`StreamRedactor`] holds its stream's entry and reads
+    /// it at each push.
+    secrets: Mutex<HashMap<StreamKey, Arc<FenceValues>>>,
 }
 
 impl LogService {
@@ -91,26 +136,68 @@ impl LogService {
             store,
             db,
             live: Mutex::new(HashMap::new()),
-            secrets: Arc::new(Mutex::new(Vec::new())),
+            secrets: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Register a secret value so it is redacted from all subsequent log chunks.
-    /// Empty values are ignored. Idempotent.
-    pub fn register_secret(&self, value: &[u8]) {
+    /// The values entry of `fence`, created when missing.
+    fn fence_values(&self, fence: &LogFence) -> Arc<FenceValues> {
+        self.secrets
+            .lock()
+            .unwrap()
+            .entry(fence.key())
+            .or_default()
+            .clone()
+    }
+
+    /// Register a secret value of `fence`'s unit so it is redacted from the
+    /// stream's later chunks, and from no other stream. Empty values are
+    /// ignored. Idempotent.
+    pub fn register_secret(&self, fence: &LogFence, value: &[u8]) {
         if value.is_empty() {
             return;
         }
-        let mut secrets = self.secrets.lock().unwrap();
-        if !secrets.iter().any(|v| v == value) {
-            secrets.push(value.to_vec());
+        let entry = self.fence_values(fence);
+        let mut values = entry.values.lock().unwrap();
+        if !values.iter().any(|v| v == value) {
+            values.push(value.to_vec());
         }
     }
 
-    /// Every value registered so far.
+    /// Every value of `fence`'s unit is registered now (see
+    /// [`values_loaded`](Self::values_loaded)).
+    pub fn mark_values_loaded(&self, fence: &LogFence) {
+        self.fence_values(fence)
+            .loaded
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// Whether every value of `fence`'s unit is registered: read back from
+    /// the unit, or registered by its launch on this process. A log tail
+    /// stores nothing from a stream whose values are not loaded.
+    pub fn values_loaded(&self, fence: &LogFence) -> bool {
+        self.secrets
+            .lock()
+            .unwrap()
+            .get(&fence.key())
+            .is_some_and(|e| e.loaded.load(Ordering::SeqCst))
+    }
+
+    /// Drop `fence`'s values: its log tail has closed the stream. A
+    /// redactor already made for it keeps them.
+    pub fn forget_secrets(&self, fence: &LogFence) {
+        self.secrets.lock().unwrap().remove(&fence.key());
+    }
+
+    /// Every value registered for `fence`.
     #[cfg(test)]
-    pub(crate) fn registered_secrets(&self) -> Vec<Vec<u8>> {
-        self.secrets.lock().unwrap().clone()
+    pub(crate) fn registered_secrets(&self, fence: &LogFence) -> Vec<Vec<u8>> {
+        self.secrets
+            .lock()
+            .unwrap()
+            .get(&fence.key())
+            .map(|e| e.values.lock().unwrap().clone())
+            .unwrap_or_default()
     }
 
     /// Replace every registered secret value in a **text diagnostic** with
@@ -123,25 +210,47 @@ impl LogService {
     /// the API, neither of which passes through the log pipeline — so without
     /// this they would be the one uncensored channel out of a step.
     ///
+    /// The caller knows the unit's handle, not its stream, so this uses the
+    /// values of every stream registered now: a stream's values live only
+    /// until its tail closes it, so the set is bounded by the units that
+    /// have not ended yet.
+    ///
     /// Lossy by design on invalid UTF-8: a diagnostic is for reading.
     pub fn redact_text(&self, text: &str) -> String {
-        String::from_utf8_lossy(&self.redact(text.as_bytes())).into_owned()
+        let entries: Vec<Arc<FenceValues>> =
+            self.secrets.lock().unwrap().values().cloned().collect();
+        let mut values: Vec<Vec<u8>> = Vec::new();
+        for entry in entries {
+            for v in entry.values.lock().unwrap().iter() {
+                if !values.contains(v) {
+                    values.push(v.clone());
+                }
+            }
+        }
+        let all = FenceValues {
+            values: Mutex::new(values),
+            loaded: AtomicBool::new(true),
+        };
+        let out = redact_with(Arc::new(all), text.as_bytes());
+        String::from_utf8_lossy(&out).into_owned()
     }
 
-    /// Replace every registered secret value in `data` with `***`: one
-    /// [`StreamRedactor`] given all of `data` at once.
-    fn redact(&self, data: &[u8]) -> Vec<u8> {
-        let mut redactor = self.redactor();
-        let mut out = redactor.push(data);
-        out.extend(redactor.finish());
-        out
-    }
-
-    /// A redactor for one read of a log source, which can split a secret
-    /// value across two chunks. See [`StreamRedactor`].
-    pub fn redactor(&self) -> StreamRedactor {
+    /// A redactor for one read of `fence`'s log source, which can split a
+    /// secret value across two chunks. It redacts the values registered for
+    /// `fence` only. See [`StreamRedactor`].
+    pub fn redactor(&self, fence: &LogFence) -> StreamRedactor {
+        // A stream with no entry gets an empty one that is not kept: a
+        // value registered later goes to the kept entry, which this
+        // redactor does not see. A tail registers before it reads.
+        let values = self
+            .secrets
+            .lock()
+            .unwrap()
+            .get(&fence.key())
+            .cloned()
+            .unwrap_or_default();
         StreamRedactor {
-            secrets: self.secrets.clone(),
+            secrets: values,
             held: Vec::new(),
         }
     }
@@ -174,7 +283,10 @@ impl LogService {
     ) -> Result<LogChunkMeta, LogError> {
         // Scrub secrets before the bytes touch the store OR the live stream, so
         // a value never reaches stored or streamed logs (ADR-0013, 0032).
-        let chunk = self.redact(chunk);
+        let mut redactor = self.redactor(&LogFence::new(run, step, attempt));
+        let mut redacted = redactor.push(chunk);
+        redacted.extend(redactor.finish());
+        let chunk = redacted;
         self.append_redacted(run, step, attempt, &chunk).await
     }
 
@@ -306,7 +418,7 @@ const REDACTED: &[u8] = b"***";
 /// source only. A read that fails drops the redactor and its held bytes:
 /// they may be the start of a secret, and the next read sees them again.
 pub struct StreamRedactor {
-    secrets: Arc<Mutex<Vec<Vec<u8>>>>,
+    secrets: Arc<FenceValues>,
     held: Vec<u8>,
 }
 
@@ -315,9 +427,10 @@ impl StreamRedactor {
     pub fn push(&mut self, src: &[u8]) -> Vec<u8> {
         let mut buf = std::mem::take(&mut self.held);
         buf.extend_from_slice(src);
-        let secrets = self.secrets.lock().unwrap();
-        let (out, held_from) = redact_scan(&buf, &secrets, false);
-        drop(secrets);
+        // A snapshot of the stream's values, so the scan does not hold the
+        // lock a launch registering a value waits on.
+        let values = self.secrets.values.lock().unwrap().clone();
+        let (out, held_from) = redact_scan(&buf, &values, false);
         buf.drain(..held_from);
         self.held = buf;
         out
@@ -325,9 +438,21 @@ impl StreamRedactor {
 
     /// The source ended cleanly: redact and emit the held bytes.
     pub fn finish(self) -> Vec<u8> {
-        let secrets = self.secrets.lock().unwrap();
-        redact_scan(&self.held, &secrets, true).0
+        let values = self.secrets.values.lock().unwrap().clone();
+        redact_scan(&self.held, &values, true).0
     }
+}
+
+/// Redact all of `data` with `values`: one [`StreamRedactor`] given all of
+/// it at once.
+fn redact_with(values: Arc<FenceValues>, data: &[u8]) -> Vec<u8> {
+    let mut redactor = StreamRedactor {
+        secrets: values,
+        held: Vec::new(),
+    };
+    let mut out = redactor.push(data);
+    out.extend(redactor.finish());
+    out
 }
 
 /// One left-to-right pass of [`StreamRedactor`] over `buf`. Returns the
@@ -335,6 +460,7 @@ impl StreamRedactor {
 /// nothing is held; always that when `at_end`).
 fn redact_scan(buf: &[u8], values: &[Vec<u8>], at_end: bool) -> (Vec<u8>, usize) {
     let mut out = Vec::with_capacity(buf.len());
+    let longest = values.iter().map(Vec::len).max().unwrap_or(0);
     let mut i = 0;
     while i < buf.len() {
         let rest = &buf[i..];
@@ -342,6 +468,7 @@ fn redact_scan(buf: &[u8], values: &[Vec<u8>], at_end: bool) -> (Vec<u8>, usize)
         // not been read yet: hold it, even when a shorter value matches here,
         // so the longest match wins as it would on the whole stream.
         if !at_end
+            && rest.len() < longest
             && values
                 .iter()
                 .any(|v| v.len() > rest.len() && v.starts_with(rest))
@@ -369,15 +496,91 @@ fn redact_scan(buf: &[u8], values: &[Vec<u8>], at_end: bool) -> (Vec<u8>, usize)
 
 #[cfg(test)]
 mod tests {
-    use super::{sidecar_stream_key, StreamRedactor};
-    use scarab_engine::StepId;
+    use super::{sidecar_stream_key, FenceValues, LogFence, LogService, StreamRedactor};
+    use scarab_engine::{AttemptId, Db, RunId, StepId};
+    use scarab_testkit::{InMemoryDb, InMemoryObjectStore};
     use std::sync::{Arc, Mutex};
 
     fn redactor(values: &[&[u8]]) -> StreamRedactor {
         StreamRedactor {
-            secrets: Arc::new(Mutex::new(values.iter().map(|v| v.to_vec()).collect())),
+            secrets: Arc::new(FenceValues {
+                values: Mutex::new(values.iter().map(|v| v.to_vec()).collect()),
+                ..Default::default()
+            }),
             held: Vec::new(),
         }
+    }
+
+    fn service() -> LogService {
+        LogService::new(
+            Arc::new(InMemoryObjectStore::new()),
+            Arc::new(InMemoryDb::new()) as Arc<dyn Db>,
+        )
+    }
+
+    fn fence(run: &str, attempt: &str) -> LogFence {
+        LogFence::new(
+            &RunId(run.into()),
+            &StepId("build".into()),
+            &AttemptId(attempt.into()),
+        )
+    }
+
+    /// RT-R3-2 / R3-3: values are kept per stream. Registering the tokens of
+    /// many other launches does not grow the set a stream's redactor scans
+    /// (the cost per byte), and drops when each of them closes.
+    #[test]
+    fn values_of_other_streams_do_not_reach_a_stream() {
+        let logs = service();
+        let mine = fence("r1", "a1");
+        logs.register_secret(&mine, b"my-token");
+        for i in 0..1000 {
+            let other = fence(&format!("other-{i}"), "a1");
+            logs.register_secret(&other, format!("token-{i}").as_bytes());
+        }
+        assert_eq!(logs.registered_secrets(&mine), vec![b"my-token".to_vec()]);
+        let r = logs.redactor(&mine);
+        assert_eq!(r.secrets.values.lock().unwrap().len(), 1);
+
+        // Another stream's value is not redacted here.
+        let mut r = logs.redactor(&mine);
+        let mut out = r.push(b"token-7 my-token\n");
+        out.extend(r.finish());
+        assert_eq!(out, b"token-7 ***\n".to_vec());
+
+        // A closed stream's values are gone.
+        for i in 0..1000 {
+            logs.forget_secrets(&fence(&format!("other-{i}"), "a1"));
+        }
+        assert_eq!(logs.secrets.lock().unwrap().len(), 1);
+        logs.forget_secrets(&mine);
+        assert!(logs.registered_secrets(&mine).is_empty());
+        assert!(!logs.values_loaded(&mine));
+    }
+
+    /// A stream's values are loaded only once marked, and the mark is per
+    /// stream.
+    #[test]
+    fn values_loaded_is_per_stream() {
+        let logs = service();
+        let a = fence("r1", "a1");
+        let b = fence("r1", "a2");
+        logs.register_secret(&a, b"x");
+        assert!(!logs.values_loaded(&a));
+        logs.mark_values_loaded(&a);
+        assert!(logs.values_loaded(&a));
+        assert!(!logs.values_loaded(&b));
+    }
+
+    /// A diagnostic is redacted with the values of every open stream.
+    #[test]
+    fn redact_text_uses_every_open_stream() {
+        let logs = service();
+        logs.register_secret(&fence("r1", "a1"), b"one-secret");
+        logs.register_secret(&fence("r2", "a1"), b"two-secret");
+        assert_eq!(logs.redact_text("a one-secret b two-secret"), "a *** b ***");
+        logs.forget_secrets(&fence("r1", "a1"));
+        assert_eq!(logs.redact_text("one-secret"), "one-secret");
     }
 
     /// Feed `chunks` through one redactor and return everything it emitted.

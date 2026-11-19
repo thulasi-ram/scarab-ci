@@ -132,7 +132,7 @@ pub mod workspaced;
 
 pub use infra_observer::{live_fences, InfraObserver};
 pub use log_tail::{pump_log_stream, LogTailer};
-pub use logs::LogService;
+pub use logs::{LogFence, LogService};
 pub use secret_executor::SecretInjectingExecutor;
 
 /// The cold-tier Workspace-Snapshot retention default, in days — mirrors
@@ -14390,12 +14390,14 @@ pub async fn connection_credential(
 
 /// Resolve a step's scoped secrets and prepare them for injection (ADR-0014,
 /// 0013): fetch each `key` at `scope` from `provider`, **register its value with
-/// the log redactor** so it can never appear in stored or streamed logs, and
-/// return the values as `(key, value)` pairs, the value bytes as stored. The
-/// executor writes each one as a file under `/scarab/secrets/`.
+/// the log redactor** for the step's log stream `fence` so it can never appear
+/// in its stored or streamed log, and return the values as `(key, value)`
+/// pairs, the value bytes as stored. The executor writes each one as a file
+/// under `/scarab/secrets/`.
 pub async fn resolve_step_secrets(
     provider: &dyn scarab_secrets::SecretProvider,
     logs: &LogService,
+    fence: Option<&LogFence>,
     scope: &scarab_secrets::SecretScope,
     keys: &[String],
     locked_out: bool,
@@ -14410,7 +14412,9 @@ pub async fn resolve_step_secrets(
         // `resolve` (not `get`) so an env-scoped run inherits repo/org secrets
         // (ADR-0037); the exact scope is tried first, so exact hits are unchanged.
         let secret = provider.resolve(scope, key).await?;
-        logs.register_secret(&secret.value);
+        if let Some(fence) = fence {
+            logs.register_secret(fence, &secret.value);
+        }
         env.push((key.clone(), secret.value));
     }
     Ok(env)

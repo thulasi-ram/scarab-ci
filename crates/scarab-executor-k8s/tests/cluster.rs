@@ -26,7 +26,7 @@
 //! code recorded, and a second `launch` of the same fence re-attaches to the
 //! existing Pod rather than creating a new one.
 
-use scarab_engine::ports::{ExecHandle, ExecState, FailureClass};
+use scarab_engine::ports::{ExecHandle, ExecState, FailureClass, LogFrom, LogRedactions};
 use scarab_engine::{
     Attempt, AttemptId, AttemptOutcome, Executor, RunId, StepId, StepRun, StepSpec, StepStatus,
     Timestamp,
@@ -657,7 +657,7 @@ async fn log_stream_tails_pod_stdout() {
     // open while the container is still starting (Pending → no log yet).
     let mut logs = Vec::new();
     for _ in 0..60 {
-        if let Ok(Some(chunks)) = exec.log_stream(&step).await {
+        if let Ok(Some(chunks)) = exec.log_stream(&step, LogFrom::Start).await {
             logs = drain_to_end(chunks).await;
             if !logs.is_empty() {
                 break;
@@ -3625,7 +3625,7 @@ async fn a_needs_step_with_a_uid_pinned_service_can_write_its_workspace() {
 /// secret values, the registry dockerconfigjson, the forge token and the
 /// OIDC token; a Pod with no secrets
 /// returns none; once the Attempt ends and its Secrets are deleted it
-/// returns none.
+/// answers `Gone`, never "none".
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn log_redactions_reads_the_values_back_from_another_executor() {
@@ -3666,7 +3666,10 @@ async fn log_redactions_reads_the_values_back_from_another_executor() {
     spec.oidc_token = Some("sekret-oidc-redact".into());
     let h = launcher.launch(&step, &spec).await.expect("launch");
 
-    let values = peer.log_redactions(&step).await.expect("log_redactions");
+    let values = match peer.log_redactions(&step).await.expect("log_redactions") {
+        LogRedactions::Values(values) => values,
+        LogRedactions::Gone => panic!("the Secrets exist"),
+    };
     for value in [
         &b"sekret-db-redact"[..],
         b"sekret-forge-redact",
@@ -3697,23 +3700,21 @@ async fn log_redactions_reads_the_values_back_from_another_executor() {
             .collect::<Vec<_>>()
     );
 
-    // The Attempt ends: its Secrets are deleted, and nothing is read back.
+    // The Attempt ends: its Secrets are deleted. The Pod still references
+    // them, so the answer is `Gone`, not "no values".
     launcher
         .take_forge_credential(&h)
         .await
         .expect("attempt-end hook");
     let mut after = peer.log_redactions(&step).await.expect("log_redactions");
     for _ in 0..10 {
-        if after.iter().all(|v| v != b"sekret-db-redact") {
+        if after == LogRedactions::Gone {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         after = peer.log_redactions(&step).await.expect("log_redactions");
     }
-    assert!(
-        after.iter().all(|v| v != b"sekret-db-redact"),
-        "the step secret is gone: {after:?}"
-    );
+    assert_eq!(after, LogRedactions::Gone);
     launcher.cancel(&h).await.expect("cleanup");
 
     // A Pod with no secrets: none.
@@ -3724,7 +3725,7 @@ async fn log_redactions_reads_the_values_back_from_another_executor() {
         .expect("launch");
     assert_eq!(
         peer.log_redactions(&plain).await.expect("log_redactions"),
-        Vec::<Vec<u8>>::new()
+        LogRedactions::Values(Vec::new())
     );
     launcher.cancel(&hp).await.expect("cleanup");
 }

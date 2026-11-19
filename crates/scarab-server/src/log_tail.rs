@@ -17,9 +17,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use scarab_engine::{AttemptId, Executor, LogChunkMeta, LogChunks, RunId, StepId, StepRun};
+use scarab_engine::{
+    AttemptId, Executor, LogChunkMeta, LogChunks, LogFrom, LogRedactions, RunId, StepId, StepRun,
+};
 
-use crate::logs::{LogError, LogService};
+use crate::logs::{LogError, LogFence, LogService};
 
 /// Cool-down before re-tailing a fence whose last attempt errored. Without it, a
 /// step whose Pod never produces a log (e.g. stuck in `CreateContainerConfigError`
@@ -66,6 +68,27 @@ pub enum LogTailError {
 pub const LOG_SOURCE_RESTARTED: &[u8] =
     b"\nscarab: the log source restarted; earlier lines may repeat\n";
 
+/// The chunk stored when a running unit's log differs from the part already
+/// stored where that part holds a `***`, so this server cannot check it
+/// without storing a secret in clear: what follows is the unit's output from
+/// the time of the marker on; what it printed between the part stored and the
+/// marker is not stored. A chunk of its own, found like
+/// [`LOG_SOURCE_RESTARTED`]: every later read of the stream reads from now on
+/// too, and stores this marker again before output that follows a gap.
+pub const LOG_FROM_NOW: &[u8] =
+    b"\nscarab: earlier output could not be checked; showing output from now on\n";
+
+/// The chunk stored, instead of the rest of the log, when an ended unit's log
+/// differs from the part already stored where that part holds a `***`.
+pub const LOG_WITHHELD: &[u8] = b"\nscarab: the rest of this log was withheld: it could not be \
+      checked against the part already stored\n";
+
+/// The chunk stored, instead of the rest of the log, when this server never
+/// read the secret values of an ended unit (its Secrets are deleted, or
+/// cannot be read): storing the output would store them in clear.
+pub const LOG_VALUES_UNREAD: &[u8] =
+    b"\nscarab: the rest of this log was not stored: its secret values could not be read\n";
+
 /// Drain one log source into the pipeline: read chunks until end-of-stream
 /// and append them to [`LogService`] under the `{run, step, attempt}` fence,
 /// redacted as one stream ([`LogService::redactor`]), so a secret split
@@ -83,7 +106,7 @@ pub async fn pump_log_stream(
     step: &StepId,
     attempt: &AttemptId,
 ) -> Result<u64, LogTailError> {
-    match pump(chunks, logs, run, step, attempt, Vec::new()).await? {
+    match pump(chunks, logs, run, step, attempt, Vec::new(), None).await? {
         PumpEnd::Done(p) => Ok(p.appended),
         // An empty stored part has nothing to differ from.
         PumpEnd::Mismatch { .. } | PumpEnd::Unverifiable { .. } => Ok(0),
@@ -114,27 +137,49 @@ enum PumpEnd {
 }
 
 /// The **current part** of a stream: every chunk after the newest
-/// [`LOG_SOURCE_RESTARTED`] chunk, or the whole stream when there is none.
-/// The index rows are read whole; a chunk body is read only when its length
-/// is the marker's, newest first. A step that prints the marker text itself
-/// can only make the next read store its log again after a marker; it cannot
-/// make a read skip output.
+/// [`LOG_SOURCE_RESTARTED`] or [`LOG_FROM_NOW`] chunk, or the whole stream
+/// when there is none.
+struct Part {
+    chunks: Vec<LogChunkMeta>,
+    /// The newest marker is [`LOG_FROM_NOW`]: the part does not begin at the
+    /// source's first byte, so a read cannot compare with it and reads from
+    /// now on.
+    from_now: bool,
+}
+
+/// Find the [`Part`] of a stream. The index rows are read whole; a chunk
+/// body is read only when its length is a marker's, newest first. A step
+/// that prints [`LOG_SOURCE_RESTARTED`] itself can only make the next read
+/// store its log again after a marker; one that prints [`LOG_FROM_NOW`] can
+/// only make later reads read from now on, after that text.
 async fn current_part(
     logs: &LogService,
     run: &RunId,
     step: &StepId,
     attempt: &AttemptId,
-) -> Result<Vec<LogChunkMeta>, LogError> {
+) -> Result<Part, LogError> {
     let mut chunks = logs.chunks(run, step, attempt).await?;
     for i in (0..chunks.len()).rev() {
         let c = &chunks[i];
-        if c.len == LOG_SOURCE_RESTARTED.len() as u64
-            && logs.read_chunk(c).await? == LOG_SOURCE_RESTARTED
-        {
-            return Ok(chunks.split_off(i + 1));
+        let marker = [LOG_SOURCE_RESTARTED, LOG_FROM_NOW]
+            .into_iter()
+            .filter(|m| c.len == m.len() as u64)
+            .collect::<Vec<_>>();
+        if marker.is_empty() {
+            continue;
+        }
+        let body = logs.read_chunk(c).await?;
+        if let Some(m) = marker.into_iter().find(|m| body == *m) {
+            return Ok(Part {
+                chunks: chunks.split_off(i + 1),
+                from_now: m == LOG_FROM_NOW,
+            });
         }
     }
-    Ok(chunks)
+    Ok(Part {
+        chunks,
+        from_now: false,
+    })
 }
 
 /// Compares a read's redacted output with the stored part, one stored chunk
@@ -246,7 +291,8 @@ impl Verify {
 /// with it and dropped; once it has, the rest is appended. A difference ends
 /// the read with nothing appended. On a clean end the redactor's held bytes
 /// are emitted like any output; on an error they are dropped (they may be the
-/// start of a secret, and the next read sees them again).
+/// start of a secret, and the next read sees them again). `lead` is appended
+/// before the first bytes the read appends, if any.
 ///
 /// Memory: one source chunk, one stored chunk body, the redactor's held bytes
 /// and the stored part's index rows.
@@ -257,8 +303,9 @@ async fn pump(
     step: &StepId,
     attempt: &AttemptId,
     part: Vec<LogChunkMeta>,
+    mut lead: Option<&'static [u8]>,
 ) -> Result<PumpEnd, LogTailError> {
-    let mut redactor = Some(logs.redactor());
+    let mut redactor = Some(logs.redactor(&LogFence::new(run, step, attempt)));
     let mut verify = (!part.is_empty()).then(|| Verify::new(part));
     let mut read = 0u64;
     let mut appended = 0u64;
@@ -293,6 +340,9 @@ async fn pump(
         if !new.is_empty() {
             if appended == 0 {
                 tracing::info!(run = %run.0, step = %step.0, attempt = %attempt.0, "log tail: receiving output");
+            }
+            if let Some(marker) = lead.take() {
+                logs.append_redacted(run, step, attempt, marker).await?;
             }
             logs.append_redacted(run, step, attempt, new).await?;
             appended += new.len() as u64;
@@ -593,69 +643,96 @@ impl LogTailer {
         let executor = self.executor.clone();
         let logs = self.logs.clone();
         let active = self.active.clone();
-        let drained = self.drained.clone();
         let retry_at = self.retry_at.clone();
         let not_ready = self.not_ready.clone();
         let lease = self.lease.clone();
         let retry_backoff = self.retry_backoff;
         let open = self.open.clone();
-        // The fence's log is complete (or given up): never read it again.
+        let log_fence = LogFence::new(&run, &step_id, &attempt);
+        // The fence's log is complete (or given up): never read it again,
+        // and drop its secret values.
         let close = {
-            let drained = drained.clone();
+            let drained = self.drained.clone();
             let retry_at = retry_at.clone();
             let not_ready = not_ready.clone();
             let open = open.clone();
+            let logs = logs.clone();
+            let log_fence = log_fence.clone();
             move |fence: &Fence| {
                 drained.lock().unwrap().insert(fence.clone());
                 retry_at.lock().unwrap().remove(fence);
                 not_ready.lock().unwrap().remove(fence);
                 open.lock().unwrap().remove(fence);
+                logs.forget_secrets(&log_fence);
+            }
+        };
+        // Retry the fence after the backoff.
+        let back_off = {
+            let retry_at = retry_at.clone();
+            move |fence: &Fence| {
+                retry_at
+                    .lock()
+                    .unwrap()
+                    .insert(fence.clone(), Instant::now() + retry_backoff);
             }
         };
 
         tokio::spawn(async move {
-            // Claim-to-tail (ADR-0051): only the lease holder tails this
-            // fence; everyone else backs off and re-checks next tick — when
-            // the holder's lease expires (crash), a peer takes over here.
-            let mut renewer: Option<tokio::task::JoinHandle<()>> = None;
-            if let Some((db, owner)) = &lease {
-                match db.lease(&resource, owner, TAIL_LEASE_TTL_MS).await {
-                    Ok(l) if &l.owner == owner => {
-                        // Ours: renew in the background while the drain runs.
-                        let db = db.clone();
-                        let owner = owner.clone();
-                        renewer = Some(tokio::spawn(async move {
-                            loop {
-                                tokio::time::sleep(std::time::Duration::from_millis(
-                                    (TAIL_LEASE_TTL_MS / 3) as u64,
-                                ))
-                                .await;
-                                if db
-                                    .lease(&resource, &owner, TAIL_LEASE_TTL_MS)
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                        }));
+            // The unit's secret values load first: before any read, and
+            // before the lease claim, so a replica that a peer's lease turns
+            // away holds them when it reads the unit after its Secrets are
+            // deleted. Once loaded they are not read again.
+            let values = if logs.values_loaded(&log_fence) {
+                Values::Loaded
+            } else {
+                load_unit_values(&*executor, &logs, &source, &log_fence).await
+            };
+            if !final_read {
+                match values {
+                    Values::Loaded => {}
+                    // Not written yet (the launch writes them just after the
+                    // Pod), or deleted (the attempt settled; the read of the
+                    // ended unit follows). Tried again on the next tick,
+                    // without the backoff, so a short step's values are read
+                    // while they exist.
+                    Values::Gone => {
+                        tracing::debug!(run = %run.0, step = %step_id.0, "log tail: the unit's secret values are not there; retrying");
+                        active.lock().unwrap().remove(&fence);
+                        return;
                     }
-                    _ => {
-                        // Another replica tails it (or the store hiccuped):
-                        // back off, retry the claim next backoff window.
-                        retry_at
-                            .lock()
-                            .unwrap()
-                            .insert(fence.clone(), Instant::now() + retry_backoff);
+                    Values::Failed(e) => {
+                        report_live_error(&not_ready, &fence, &run, &step_id, &e);
+                        back_off(&fence);
                         active.lock().unwrap().remove(&fence);
                         return;
                     }
                 }
             }
+            // Claim-to-tail (ADR-0051): only the lease holder tails this
+            // fence; everyone else backs off and re-checks next tick — when
+            // the holder's lease expires (crash), a peer takes over here.
+            let Ok(renewer) = claim_lease(lease.as_ref(), &resource).await else {
+                back_off(&fence);
+                active.lock().unwrap().remove(&fence);
+                return;
+            };
             if final_read {
                 // The unit has ended: one read of what it printed after the
                 // part already stored, if any.
-                let result = drain(&*executor, &logs, &source, &run, &step_id, &attempt).await;
+                let loaded = matches!(values, Values::Loaded);
+                let result = match values {
+                    Values::Loaded => {
+                        drain(&*executor, &logs, &source, &run, &step_id, &attempt, true).await
+                    }
+                    // The Secrets were deleted before this server read them:
+                    // a marker in place of the output.
+                    Values::Gone => {
+                        withhold_unread(&*executor, &logs, &source, &run, &step_id, &attempt)
+                            .await
+                            .map(|_| None)
+                    }
+                    Values::Failed(e) => Err(e),
+                };
                 if let Some(r) = renewer {
                     r.abort();
                 }
@@ -680,13 +757,21 @@ impl LogTailer {
                         };
                         if tries < FINAL_READ_TRIES {
                             tracing::debug!(run = %run.0, step = %step_id.0, error = %msg, "log tail: reading an ended unit failed; retrying");
-                            retry_at
-                                .lock()
-                                .unwrap()
-                                .insert(fence.clone(), Instant::now() + retry_backoff);
+                            back_off(&fence);
                         } else {
                             if never_ran_or_gone(&msg) {
                                 tracing::debug!(run = %run.0, step = %step_id.0, error = %msg, "log tail: an ended unit has no log to read");
+                            } else if !loaded {
+                                // The secret values could not be read: a
+                                // marker in place of the output, never the
+                                // output.
+                                if let Err(e) = withhold_unread(
+                                    &*executor, &logs, &source, &run, &step_id, &attempt,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(run = %run.0, step = %step_id.0, attempt = %attempt.0, error = %msg, marker_error = %e, "log tail: could not read the secret values of an ended unit; its output is not stored");
+                                }
                             } else {
                                 tracing::warn!(run = %run.0, step = %step_id.0, attempt = %attempt.0, error = %msg, "log tail: could not read the log of an ended unit; its output is not stored");
                             }
@@ -697,7 +782,7 @@ impl LogTailer {
                 active.lock().unwrap().remove(&fence);
                 return;
             }
-            let result = drain(&*executor, &logs, &source, &run, &step_id, &attempt).await;
+            let result = drain(&*executor, &logs, &source, &run, &step_id, &attempt, false).await;
             if let Some(r) = renewer {
                 r.abort();
             }
@@ -716,10 +801,7 @@ impl LogTailer {
                 // closed because the container ended.
                 Ok(Some(Pumped { read: 0, .. })) => {
                     tracing::debug!(run = %run.0, step = %step_id.0, "log tail: the stream ended with no output; retrying");
-                    retry_at
-                        .lock()
-                        .unwrap()
-                        .insert(fence.clone(), Instant::now() + retry_backoff);
+                    back_off(&fence);
                 }
                 // Stream closed cleanly after output, or the executor has no
                 // log source: we have the step's complete log. Mark the fence
@@ -730,69 +812,109 @@ impl LogTailer {
                     }
                     close(&fence);
                 }
-                // Best-effort: a lost tail never fails the run (ADR-0013). The
-                // common benign case is a step Pod that hasn't started its
-                // container yet (Pending / PodInitializing / ContainerCreating) —
-                // an expected pre-start state, not a failure. On a cold image
-                // pull that can last minutes, so log it at debug and back off
-                // quietly; only WARN on a genuine tail error, or on a pre-start
-                // state that has outlasted NOT_READY_GRACE (a tail that never
-                // starts must still be visible). Either way, back off before
-                // retrying so we don't hammer the API each tick. What the
-                // tail appended before it failed is stored; the retry
-                // compares with it and appends what follows (git-bug
+                // Best-effort: a lost tail never fails the run (ADR-0013).
+                // What the tail appended before it failed is stored; the
+                // retry compares with it and appends what follows (git-bug
                 // de2bd9b).
                 Err(e) => {
-                    let msg = e.to_string();
-                    let now = Instant::now();
-                    let (class, stuck_for) = {
-                        let mut nr = not_ready.lock().unwrap();
-                        if is_pod_not_ready(&msg) {
-                            let entry = nr.entry(fence.clone()).or_insert(NotReady {
-                                since: now,
-                                last_warn: None,
-                            });
-                            let stuck_for = now.duration_since(entry.since);
-                            let class = classify_tail_error(
-                                &msg,
-                                stuck_for,
-                                entry.last_warn.map(|w| now.duration_since(w)),
-                            );
-                            if class == TailErrorClass::StuckNotReady {
-                                entry.last_warn = Some(now);
-                            }
-                            (class, stuck_for)
-                        } else {
-                            // A different (real) failure supersedes any pre-start
-                            // streak — start clean if it goes back to waiting.
-                            nr.remove(&fence);
-                            (TailErrorClass::Failed, Duration::ZERO)
-                        }
-                    };
-                    match class {
-                        TailErrorClass::Quiet => {
-                            tracing::debug!(run = %run.0, step = %step_id.0, error = %msg, "log tail: step Pod not ready yet, backing off");
-                        }
-                        TailErrorClass::StuckNotReady => {
-                            tracing::warn!(
-                                run = %run.0, step = %step_id.0,
-                                not_ready_for_s = stuck_for.as_secs(), error = %msg,
-                                "log tail: step Pod still has not started its container — \
-                                 no logs will appear; check its init containers / image pull"
-                            );
-                        }
-                        TailErrorClass::Failed => {
-                            tracing::warn!(run = %run.0, step = %step_id.0, error = %msg, "log tail ended with error");
-                        }
-                    }
-                    retry_at
-                        .lock()
-                        .unwrap()
-                        .insert(fence.clone(), Instant::now() + retry_backoff);
+                    report_live_error(&not_ready, &fence, &run, &step_id, &e);
+                    back_off(&fence);
                 }
             }
             active.lock().unwrap().remove(&fence);
         });
+    }
+}
+
+/// Claim the fence's tail lease (ADR-0051) and renew it in the background
+/// while the read runs. `Ok(None)`: single-replica mode, no lease. `Err`:
+/// another replica holds it (or the store hiccuped).
+async fn claim_lease(
+    lease: Option<&(Arc<dyn scarab_engine::Db>, String)>,
+    resource: &str,
+) -> Result<Option<tokio::task::JoinHandle<()>>, ()> {
+    let Some((db, owner)) = lease else {
+        return Ok(None);
+    };
+    match db.lease(resource, owner, TAIL_LEASE_TTL_MS).await {
+        Ok(l) if &l.owner == owner => {
+            let db = db.clone();
+            let owner = owner.clone();
+            let resource = resource.to_string();
+            Ok(Some(tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        (TAIL_LEASE_TTL_MS / 3) as u64,
+                    ))
+                    .await;
+                    if db
+                        .lease(&resource, &owner, TAIL_LEASE_TTL_MS)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })))
+        }
+        _ => Err(()),
+    }
+}
+
+/// Report a failed read of a running unit. The common benign case is a step
+/// Pod that hasn't started its container yet (Pending / PodInitializing /
+/// ContainerCreating) — an expected pre-start state, not a failure. On a cold
+/// image pull that can last minutes, so it is logged at debug; only a genuine
+/// tail error, or a pre-start state that has outlasted [`NOT_READY_GRACE`],
+/// is a WARN (a tail that never starts must still be visible).
+fn report_live_error(
+    not_ready: &Mutex<HashMap<Fence, NotReady>>,
+    fence: &Fence,
+    run: &RunId,
+    step_id: &StepId,
+    e: &LogTailError,
+) {
+    let msg = e.to_string();
+    let now = Instant::now();
+    let (class, stuck_for) = {
+        let mut nr = not_ready.lock().unwrap();
+        if is_pod_not_ready(&msg) {
+            let entry = nr.entry(fence.clone()).or_insert(NotReady {
+                since: now,
+                last_warn: None,
+            });
+            let stuck_for = now.duration_since(entry.since);
+            let class = classify_tail_error(
+                &msg,
+                stuck_for,
+                entry.last_warn.map(|w| now.duration_since(w)),
+            );
+            if class == TailErrorClass::StuckNotReady {
+                entry.last_warn = Some(now);
+            }
+            (class, stuck_for)
+        } else {
+            // A different (real) failure supersedes any pre-start
+            // streak — start clean if it goes back to waiting.
+            nr.remove(fence);
+            (TailErrorClass::Failed, Duration::ZERO)
+        }
+    };
+    match class {
+        TailErrorClass::Quiet => {
+            tracing::debug!(run = %run.0, step = %step_id.0, error = %msg, "log tail: step Pod not ready yet, backing off");
+        }
+        TailErrorClass::StuckNotReady => {
+            tracing::warn!(
+                run = %run.0, step = %step_id.0,
+                not_ready_for_s = stuck_for.as_secs(), error = %msg,
+                "log tail: step Pod still has not started its container — \
+                 no logs will appear; check its init containers / image pull"
+            );
+        }
+        TailErrorClass::Failed => {
+            tracing::warn!(run = %run.0, step = %step_id.0, error = %msg, "log tail ended with error");
+        }
     }
 }
 
@@ -873,50 +995,100 @@ enum TailSource {
     },
 }
 
-/// Open the executor's log source for `source`. `Ok(None)`: the backend has
-/// no log source (e.g. the local/dev executor).
+/// Open the executor's log source for `source`, from `from`. `Ok(None)`: the
+/// backend has no log source (e.g. the local/dev executor).
 async fn open_source(
     executor: &dyn Executor,
     source: &TailSource,
+    from: LogFrom,
 ) -> Result<Option<Box<dyn LogChunks>>, LogTailError> {
     Ok(match source {
-        TailSource::Step(step_run) => executor.log_stream(step_run).await?,
-        TailSource::Service(handle) => executor.service_log_stream(handle).await?,
+        TailSource::Step(step_run) => executor.log_stream(step_run, from).await?,
+        TailSource::Service(handle) => executor.service_log_stream(handle, from).await?,
         TailSource::Sidecar { step, index } => {
             // The co-located `service-{index}` container in the step's own Pod.
             let container = format!("service-{index}");
-            executor.sidecar_log_stream(step, &container).await?
+            executor.sidecar_log_stream(step, &container, from).await?
         }
     })
 }
 
-/// Register with `logs` the secret values of the unit a tail reads
-/// ([`Executor::log_redactions`]), so a replica that did not launch the unit
-/// (a lease takeover, a server roll while it runs) redacts its log like the
-/// one that did. A registry dockerconfigjson also registers each credential
-/// in it, as the launch does.
-async fn register_unit_secrets(
+/// Whether a fence's secret values are loaded ([`load_unit_values`]).
+enum Values {
+    Loaded,
+    /// The unit references a Secret that is not there.
+    Gone,
+    /// They could not be read.
+    Failed(LogTailError),
+}
+
+/// Register with `logs`, for `fence` only, the secret values of the unit a
+/// tail reads ([`Executor::log_redactions`]), so a replica that did not
+/// launch the unit (a lease takeover, a server roll while it runs) redacts
+/// its log like the one that did, and mark them loaded. A registry
+/// dockerconfigjson also registers each credential in it, as the launch
+/// does. A sidecar is in the step's Pod and gets the step's values.
+async fn load_unit_values(
     executor: &dyn Executor,
     logs: &LogService,
     source: &TailSource,
-) -> Result<(), LogTailError> {
+    fence: &LogFence,
+) -> Values {
     let step = match source {
         TailSource::Step(step) | TailSource::Sidecar { step, .. } => step,
-        TailSource::Service(_) => return Ok(()),
-    };
-    for value in executor.log_redactions(step).await? {
-        logs.register_secret(&value);
-        if let Ok(text) = std::str::from_utf8(&value) {
-            for v in crate::forge_token::registry_secret_values(Some(text), None) {
-                logs.register_secret(v.as_bytes());
-            }
+        // A shared service is launched with literal `env` only: it has no
+        // Secret to read back. If services get `secrets:`, read them here.
+        TailSource::Service(_) => {
+            logs.mark_values_loaded(fence);
+            return Values::Loaded;
         }
+    };
+    match executor.log_redactions(step).await {
+        Ok(LogRedactions::Values(values)) => {
+            for value in values {
+                logs.register_secret(fence, &value);
+                if let Ok(text) = std::str::from_utf8(&value) {
+                    for v in crate::forge_token::registry_secret_values(Some(text), None) {
+                        logs.register_secret(fence, v.as_bytes());
+                    }
+                }
+            }
+            logs.mark_values_loaded(fence);
+            Values::Loaded
+        }
+        Ok(LogRedactions::Gone) => Values::Gone,
+        Err(e) => Values::Failed(e.into()),
     }
-    Ok(())
+}
+
+/// Store [`LOG_VALUES_UNREAD`] in place of the rest of an ended unit's log,
+/// whose secret values this server never read. Only when its log source
+/// opens: a unit that never ran, or is gone, has nothing to withhold.
+/// Nothing is read from the source. Returns whether the marker was stored.
+async fn withhold_unread(
+    executor: &dyn Executor,
+    logs: &LogService,
+    source: &TailSource,
+    run: &RunId,
+    step: &StepId,
+    attempt: &AttemptId,
+) -> Result<bool, LogTailError> {
+    if open_source(executor, source, LogFrom::Now).await?.is_none() {
+        return Ok(false);
+    }
+    tracing::warn!(
+        run = %run.0, step = %step.0, attempt = %attempt.0,
+        "log tail: this server could not read the secret values of an ended unit; \
+         the rest of its log is not stored"
+    );
+    logs.append_redacted(run, step, attempt, LOG_VALUES_UNREAD)
+        .await?;
+    Ok(true)
 }
 
 /// Read the log of the unit `source` into the pipeline, after the part
-/// already stored (git-bug de2bd9b).
+/// already stored (git-bug de2bd9b). The caller has loaded the unit's secret
+/// values ([`load_unit_values`]).
 ///
 /// The Kubernetes log API takes no byte offset, so a read starts at the
 /// container log's first byte. The read is redacted from that byte and
@@ -928,14 +1100,14 @@ async fn register_unit_secrets(
 /// read compares with the part after it, so a source is never stored twice
 /// and a failing tail does not grow the log on every retry.
 ///
-/// A difference where the stored part holds a `***` means this replica lacks
-/// a secret value that the one which stored it held (the unit's Secret is
-/// gone: an ended unit read after its attempt settled). Nothing is appended
-/// and the fence is closed: storing the log again would store that value in
-/// clear.
-///
-/// The unit's secret values are registered first ([`register_unit_secrets`]);
-/// failing that fails the read, before anything is read.
+/// A difference where the stored part holds a `***` cannot be checked
+/// without storing a value in clear (the replica that stored the part held
+/// a value this one does not, or the step printed `***` itself). The log is
+/// never stored again from its first byte then. A running unit (`final_read`
+/// false) gets a [`LOG_FROM_NOW`] chunk and its output from now on; an ended
+/// one gets a [`LOG_WITHHELD`] chunk in place of the rest. Once the newest
+/// marker is [`LOG_FROM_NOW`], every read reads from now on, and stores the
+/// marker again before output that follows a gap.
 async fn drain(
     executor: &dyn Executor,
     logs: &LogService,
@@ -943,24 +1115,53 @@ async fn drain(
     run: &RunId,
     step: &StepId,
     attempt: &AttemptId,
+    final_read: bool,
 ) -> Result<Option<Pumped>, LogTailError> {
-    register_unit_secrets(executor, logs, source).await?;
-    let Some(chunks) = open_source(executor, source).await? else {
+    let part = current_part(logs, run, step, attempt).await?;
+    if part.from_now {
+        let Some(chunks) = open_source(executor, source, LogFrom::Now).await? else {
+            return Ok(None);
+        };
+        // Output stored after the marker means an earlier read from now on
+        // ended: what was printed since is not stored, so mark the gap.
+        let lead = (!part.chunks.is_empty()).then_some(LOG_FROM_NOW);
+        return match pump(chunks, logs, run, step, attempt, Vec::new(), lead).await? {
+            PumpEnd::Done(pumped) => Ok(Some(pumped)),
+            // An empty stored part has nothing to differ from.
+            PumpEnd::Mismatch { .. } | PumpEnd::Unverifiable { .. } => Ok(None),
+        };
+    }
+    let Some(chunks) = open_source(executor, source, LogFrom::Start).await? else {
         return Ok(None);
     };
-    let part = current_part(logs, run, step, attempt).await?;
-    let stored: u64 = part.iter().map(|c| c.len).sum();
-    match pump(chunks, logs, run, step, attempt, part).await? {
+    let stored: u64 = part.chunks.iter().map(|c| c.len).sum();
+    match pump(chunks, logs, run, step, attempt, part.chunks, None).await? {
         PumpEnd::Done(pumped) => Ok(Some(pumped)),
+        PumpEnd::Unverifiable { at } if final_read => {
+            tracing::warn!(
+                run = %run.0, step = %step.0, attempt = %attempt.0, at, stored,
+                "log tail: the log of an ended unit differs from the part already stored \
+                 where that part holds a redacted value; the rest of it is withheld"
+            );
+            logs.append_redacted(run, step, attempt, LOG_WITHHELD)
+                .await?;
+            Ok(None)
+        }
         PumpEnd::Unverifiable { at } => {
             tracing::warn!(
                 run = %run.0, step = %step.0, attempt = %attempt.0, at, stored,
                 "log tail: the log differs from the part already stored where that part \
-                 holds a redacted value, and this server does not hold the value; \
-                 later output of this log is not stored"
+                 holds a redacted value; storing its output from now on after a marker"
             );
-            // As for a backend with no log source: the fence is closed.
-            Ok(None)
+            logs.append_redacted(run, step, attempt, LOG_FROM_NOW)
+                .await?;
+            let Some(chunks) = open_source(executor, source, LogFrom::Now).await? else {
+                return Ok(None);
+            };
+            match pump(chunks, logs, run, step, attempt, Vec::new(), None).await? {
+                PumpEnd::Done(pumped) => Ok(Some(pumped)),
+                PumpEnd::Mismatch { .. } | PumpEnd::Unverifiable { .. } => Ok(None),
+            }
         }
         PumpEnd::Mismatch { at } => {
             tracing::warn!(
@@ -971,10 +1172,10 @@ async fn drain(
             );
             logs.append_redacted(run, step, attempt, LOG_SOURCE_RESTARTED)
                 .await?;
-            let Some(chunks) = open_source(executor, source).await? else {
+            let Some(chunks) = open_source(executor, source, LogFrom::Start).await? else {
                 return Ok(None);
             };
-            match pump(chunks, logs, run, step, attempt, Vec::new()).await? {
+            match pump(chunks, logs, run, step, attempt, Vec::new(), None).await? {
                 PumpEnd::Done(pumped) => Ok(Some(pumped)),
                 // An empty stored part has nothing to differ from.
                 PumpEnd::Mismatch { .. } | PumpEnd::Unverifiable { .. } => Ok(None),
@@ -1094,6 +1295,53 @@ mod tests {
         );
     }
 
+    /// RT-R3 mutation 2: a `***` of the stored part covers a difference at
+    /// any of its three bytes, not only at its first. A difference near no
+    /// `***` is a plain one.
+    #[tokio::test]
+    async fn a_difference_inside_a_stored_redaction_is_found_at_each_star() {
+        use scarab_engine::{AttemptId, Db, RunId, StepId};
+        use scarab_testkit::{InMemoryDb, InMemoryObjectStore};
+
+        use super::{Check, Verify};
+        use crate::logs::LogService;
+
+        let logs = LogService::new(
+            Arc::new(InMemoryObjectStore::new()),
+            Arc::new(InMemoryDb::new()) as Arc<dyn Db>,
+        );
+        let run = RunId("r".into());
+        let attempt = AttemptId("a1".into());
+        let starred = StepId("starred".into());
+        logs.append_redacted(&run, &starred, &attempt, b"a ***\n")
+            .await
+            .unwrap();
+        let part = logs.chunks(&run, &starred, &attempt).await.unwrap();
+        for (source, want_at) in [(&b"a Q\n"[..], 2), (b"a *Q\n", 3), (b"a **Q\n", 4)] {
+            let mut v = Verify::new(part.clone());
+            match v.check(&logs, source).await.unwrap() {
+                Check::Differs { at, in_redaction } => {
+                    assert_eq!(at, want_at, "{}", String::from_utf8_lossy(source));
+                    assert!(in_redaction, "{}", String::from_utf8_lossy(source));
+                }
+                _ => panic!("{} differs", String::from_utf8_lossy(source)),
+            }
+        }
+
+        let plain = StepId("plain".into());
+        logs.append_redacted(&run, &plain, &attempt, b"ab c***\n")
+            .await
+            .unwrap();
+        let part = logs.chunks(&run, &plain, &attempt).await.unwrap();
+        match Verify::new(part).check(&logs, b"ab X").await.unwrap() {
+            Check::Differs { at, in_redaction } => {
+                assert_eq!(at, 3);
+                assert!(!in_redaction);
+            }
+            _ => panic!("differs"),
+        }
+    }
+
     /// J-1: a replica that tails a step it did not launch registers every
     /// value the launching replica registered, the forge token and the OIDC
     /// token included. The launch runs through the server's decorators over
@@ -1203,16 +1451,22 @@ mod tests {
         let forge = launched.forge_token.unwrap().credential.unwrap().token;
         let oidc = launched.oidc_token.expect("an OIDC token is minted");
 
-        let registered = launching.registered_secrets();
+        let fence = crate::logs::LogFence::of_step(&step).unwrap();
+        let registered = launching.registered_secrets(&fence);
+        assert!(
+            launching.values_loaded(&fence),
+            "a launch on this process loads the values"
+        );
         assert!(registered.contains(&forge.clone().into_bytes()));
         assert!(registered.contains(&oidc.clone().into_bytes()));
 
         inner.set_log_redactions(vec![forge.into_bytes(), oidc.into_bytes()]);
         let peer = log_service();
-        super::register_unit_secrets(&exec, &peer, &super::TailSource::Step(step))
-            .await
-            .unwrap();
-        let at_peer = peer.registered_secrets();
+        assert!(matches!(
+            super::load_unit_values(&exec, &peer, &super::TailSource::Step(step), &fence).await,
+            super::Values::Loaded
+        ));
+        let at_peer = peer.registered_secrets(&fence);
         for value in &registered {
             assert!(
                 at_peer.contains(value),

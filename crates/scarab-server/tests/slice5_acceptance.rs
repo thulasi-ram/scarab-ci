@@ -57,9 +57,16 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
     let db: Arc<dyn Db> = pg.clone();
     let logs = LogService::new(Arc::new(InMemoryObjectStore::new()), db);
 
+    let (run, step, attempt) = (
+        RunId("run-1".into()),
+        StepId("deploy".into()),
+        scarab_engine::AttemptId("a1".into()),
+    );
+    let fence = scarab_server::LogFence::new(&run, &step, &attempt);
     let env = resolve_step_secrets(
         &secrets,
         &logs,
+        Some(&fence),
         &scope(),
         &["DEPLOY_TOKEN".to_string()],
         false,
@@ -69,12 +76,6 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
     assert_eq!(
         env,
         vec![("DEPLOY_TOKEN".to_string(), b"prod-token-xyz".to_vec())]
-    );
-
-    let (run, step, attempt) = (
-        RunId("run-1".into()),
-        StepId("deploy".into()),
-        scarab_engine::AttemptId("a1".into()),
     );
     logs.append(
         &run,

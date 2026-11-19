@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use scarab_engine::{AttemptId, RunId, StepId};
 use scarab_secrets::SecretScope;
-use scarab_server::{resolve_step_secrets, LogService};
+use scarab_server::{resolve_step_secrets, LogFence, LogService};
 use scarab_testkit::{FakeSecrets, InMemoryDb, InMemoryObjectStore};
 
 fn scope() -> SecretScope {
@@ -24,16 +24,23 @@ async fn injected_secret_is_redacted_from_stored_and_streamed_logs() {
 
     // Resolve the step's secret: it comes back as env AND is registered with the
     // redactor.
-    let env = resolve_step_secrets(&secrets, &logs, &scope(), &["TOKEN".to_string()], false)
-        .await
-        .unwrap();
-    assert_eq!(env, vec![("TOKEN".to_string(), b"sup3r-s3cret".to_vec())]);
-
     let (run, step, attempt) = (
         RunId("run-1".into()),
         StepId("build".into()),
         AttemptId("a1".into()),
     );
+    let fence = LogFence::new(&run, &step, &attempt);
+    let env = resolve_step_secrets(
+        &secrets,
+        &logs,
+        Some(&fence),
+        &scope(),
+        &["TOKEN".to_string()],
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(env, vec![("TOKEN".to_string(), b"sup3r-s3cret".to_vec())]);
 
     // Subscribe to the live stream before the step "logs" the secret.
     let mut live = logs.subscribe(&run, &step, &attempt);
@@ -82,7 +89,14 @@ async fn a_backend_diagnostic_is_redacted_like_a_log_chunk() {
         Arc::new(InMemoryObjectStore::new()),
         Arc::new(InMemoryDb::new()),
     );
-    logs.register_secret(b"sup3r-s3cret");
+    logs.register_secret(
+        &LogFence::new(
+            &RunId("run-1".into()),
+            &StepId("build".into()),
+            &AttemptId("a1".into()),
+        ),
+        b"sup3r-s3cret",
+    );
 
     // The shape a registry rejection actually takes: the credential is inside
     // the message the kubelet reports.

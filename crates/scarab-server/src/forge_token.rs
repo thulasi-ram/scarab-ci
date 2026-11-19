@@ -810,9 +810,9 @@ impl ForgeCredentialExecutor {
         let (json, derived) = self
             .resolve_registry_auth(&config.owner, &config.name, forge_derived)
             .await;
-        if let Some(logs) = &self.logs {
+        if let (Some(logs), Some(fence)) = (&self.logs, crate::LogFence::of_step(step)) {
             for value in registry_secret_values(json.as_deref(), derived.as_ref()) {
-                logs.register_secret(value.as_bytes());
+                logs.register_secret(&fence, value.as_bytes());
             }
         }
         out.registry_auth_json = json;
@@ -901,6 +901,15 @@ impl Executor for ForgeCredentialExecutor {
     }
 
     async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+        // Every value this launch mounts is registered for the step's log
+        // stream by the time the wrapped launch returns: the forge token and
+        // registry values here, the OIDC token and secrets in the wrapped
+        // `SecretInjectingExecutor`. A launch that succeeded marks them
+        // loaded, so this process's tail of the stream does not wait for the
+        // unit's Secrets, which are deleted when the attempt settles. A
+        // failed launch drops them: its tail reads them back from the unit.
+        let fence = crate::LogFence::of_step(step);
+        let result: Result<ExecHandle, ExecError> = async {
         // Only a forge-token, sandboxed or `registry_auth` Step asks for a
         // credential or a trust here; the yank check for every other Step is
         // SecretInjecting's.
@@ -1030,8 +1039,8 @@ impl Executor for ForgeCredentialExecutor {
         // it shows `***`. A re-drive mints a new one and registers it here
         // too. A peer replica reads it back from the unit
         // (`Executor::log_redactions`).
-        if let (Some(logs), Some(c)) = (&self.logs, &credential) {
-            logs.register_secret(c.token.as_bytes());
+        if let (Some(logs), Some(c), Some(fence)) = (&self.logs, &credential, &fence) {
+            logs.register_secret(fence, c.token.as_bytes());
         }
         let mut enriched = spec.clone();
         if let Some(f) = enriched.forge_token.as_mut() {
@@ -1072,6 +1081,15 @@ impl Executor for ForgeCredentialExecutor {
             }
         }
         launched
+        }
+        .await;
+        if let (Some(logs), Some(fence)) = (&self.logs, &fence) {
+            match &result {
+                Ok(_) => logs.mark_values_loaded(fence),
+                Err(_) => logs.forget_secrets(fence),
+            }
+        }
+        result
     }
 
     async fn poll(&self, handle: &ExecHandle) -> Result<ExecState, ExecError> {
@@ -1151,11 +1169,18 @@ impl Executor for ForgeCredentialExecutor {
         self.inner.cache_saves(handle).await
     }
 
-    async fn log_stream(&self, step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        self.inner.log_stream(step).await
+    async fn log_stream(
+        &self,
+        step: &StepRun,
+        from: scarab_engine::LogFrom,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        self.inner.log_stream(step, from).await
     }
 
-    async fn log_redactions(&self, step: &StepRun) -> Result<Vec<Vec<u8>>, ExecError> {
+    async fn log_redactions(
+        &self,
+        step: &StepRun,
+    ) -> Result<scarab_engine::LogRedactions, ExecError> {
         // Forward: the trait default answers none, which would make every
         // replica that did not launch a step store its secrets in clear.
         self.inner.log_redactions(step).await
@@ -1165,8 +1190,9 @@ impl Executor for ForgeCredentialExecutor {
         &self,
         step: &StepRun,
         container: &str,
+        from: scarab_engine::LogFrom,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        self.inner.sidecar_log_stream(step, container).await
+        self.inner.sidecar_log_stream(step, container, from).await
     }
 
     // ADR-0058 shared-service methods forward to the wrapped executor. Without
@@ -1194,8 +1220,9 @@ impl Executor for ForgeCredentialExecutor {
     async fn service_log_stream(
         &self,
         handle: &ExecHandle,
+        from: scarab_engine::LogFrom,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        self.inner.service_log_stream(handle).await
+        self.inner.service_log_stream(handle, from).await
     }
 }
 
@@ -1324,7 +1351,15 @@ mod tests {
 
         assert_eq!(
             decorator.log_redactions(&step).await.unwrap(),
-            vec![b"s3cr3t".to_vec()]
+            scarab_engine::LogRedactions::Values(vec![b"s3cr3t".to_vec()])
         );
+        // `Gone` and an error pass through as they are, never as "none".
+        inner.set_log_redactions_answer(Ok(scarab_engine::LogRedactions::Gone));
+        assert_eq!(
+            decorator.log_redactions(&step).await.unwrap(),
+            scarab_engine::LogRedactions::Gone
+        );
+        inner.set_log_redactions_answer(Err("forbidden".into()));
+        assert!(decorator.log_redactions(&step).await.is_err());
     }
 }
