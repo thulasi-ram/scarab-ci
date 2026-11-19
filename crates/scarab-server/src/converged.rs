@@ -121,14 +121,20 @@ async fn tick_cycle(
     // re-ensuring every tick just no-ops for streams already in flight.
     if let Some(tailer) = tailer {
         driver.enter("log tails");
-        if let Err(e) = ensure_log_tails(db, tailer).await {
+        let steps = ensure_log_tails(db, tailer).await;
+        if let Err(e) = &steps {
             tracing::warn!(error = %e, "ensuring log tails failed");
         }
         // Shared-service log tails (ADR-0058 evidence): same best-effort channel,
         // keyed on the service instance instead of a step fence.
-        if let Err(e) = ensure_service_tails(db, tailer).await {
+        let services = ensure_service_tails(db, tailer).await;
+        if let Err(e) = &services {
             tracing::warn!(error = %e, "ensuring service log tails failed");
         }
+        // Read once more each tail whose unit ended since the last pass, so a
+        // short step that finished during a retry backoff keeps its output
+        // (git-bug 1dee2f3).
+        tailer.end_pass(steps.is_ok() && services.is_ok());
     }
     // Infra observation (ADR-0068): narrate why an in-flight step has no logs
     // yet. Runs on its own 30s cadence inside the observer, so calling it every

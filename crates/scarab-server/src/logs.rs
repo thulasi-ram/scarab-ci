@@ -185,6 +185,16 @@ impl LogService {
         Ok(meta)
     }
 
+    /// Whether any chunk of the stream is stored, by any replica.
+    pub async fn has_output(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<bool, LogError> {
+        Ok(!self.db.log_chunks(run, step, attempt).await?.is_empty())
+    }
+
     /// A stream's chunk index, in `seq` order (durable, replica-agnostic:
     /// ADR-0051). Metadata only; the bodies stay in the object store.
     pub async fn chunks(

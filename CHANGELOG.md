@@ -28,6 +28,11 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Bug Fixes
 
+- **A short step keeps its logs.** The log tail read a step only while it was running, and waited
+  3 seconds after a read that found the Pod not ready. A step that started and finished inside that
+  wait had no logs stored. The server now reads the log of each step, retried attempt and service
+  that stops running before its log was read in full, unless a replica already stored it
+  (git-bug 1dee2f3).
 - **The Run page's Activity tab words every step status change.** A change with no try read
   `running → ready`; it now reads "queued", "waiting to retry", "reset to run again", "needed
   again", "skipped because build failed", "skipped by its when: condition" or "passed without a

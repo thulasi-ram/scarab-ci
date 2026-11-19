@@ -304,3 +304,222 @@ async fn a_tail_that_read_nothing_is_retried() {
     .await
     .expect("the later output reached the pipeline");
 }
+
+// --- Ended units (git-bug 1dee2f3) ------------------------------------------
+
+/// A fake executor whose `log_stream` answers each open from a script: an
+/// error, or a stream of chunks. Once the script is spent it answers an empty
+/// stream. Counts opens.
+struct ScriptedExec {
+    calls: AtomicUsize,
+    script: Mutex<VecDeque<Result<Vec<Vec<u8>>, String>>>,
+}
+
+impl ScriptedExec {
+    fn new(script: Vec<Result<Vec<Vec<u8>>, String>>) -> Arc<Self> {
+        Arc::new(Self {
+            calls: AtomicUsize::new(0),
+            script: Mutex::new(script.into()),
+        })
+    }
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Executor for ScriptedExec {
+    async fn results_delivery_failure(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+    async fn gate_refusal(&self, _gate: &StepRun) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+    async fn infra_condition(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
+        Ok(None)
+    }
+    async fn take_forge_credential(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
+        Ok(None)
+    }
+    async fn workspace_provisioning(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
+        Ok(None)
+    }
+    async fn launch(&self, step: &StepRun, _spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+        Ok(ExecHandle(step.step.0.clone()))
+    }
+    async fn poll(&self, _h: &ExecHandle) -> Result<ExecState, ExecError> {
+        Ok(ExecState::Running)
+    }
+    async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
+        Ok(())
+    }
+    fn unit_handle(&self, _step: &StepRun) -> Option<ExecHandle> {
+        None
+    }
+    async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
+        Ok(true)
+    }
+    async fn log_stream(&self, _step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match self.script.lock().unwrap().pop_front() {
+            Some(Ok(chunks)) => Ok(Some(Box::new(MockChunks(chunks.into())))),
+            Some(Err(e)) => Err(ExecError::Other(e)),
+            None => Ok(Some(Box::new(MockChunks(VecDeque::new())))),
+        }
+    }
+}
+
+const INITIALIZING: &str =
+    "container \"step\" in pod \"scarab-build-a1\" is waiting to start: PodInitializing";
+
+/// Wait long enough for spawned tails and a 10 ms backoff to play out.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(60)).await;
+}
+
+/// git-bug 1dee2f3: a short step whose first tail found its Pod not ready,
+/// and which ran and finished inside the retry backoff, is never `Running`
+/// again on a later tick. The pass that no longer ensures it reads its log
+/// once more, so its output is stored.
+#[tokio::test]
+async fn a_step_that_ended_during_the_backoff_is_read_once_more() {
+    let exec = ScriptedExec::new(vec![
+        Err(INITIALIZING.into()),
+        Ok(vec![b"short step\n".to_vec()]),
+    ]);
+    let logs = logs();
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+
+    // The pass that sees the step Running: its tail finds the Pod not ready.
+    tailer.ensure(&running_step());
+    tailer.end_pass(true);
+    wait_for(|| exec.calls() == 1).await;
+    settle().await;
+
+    // The step has ended: the next pass ensures nothing.
+    tailer.end_pass(true);
+    let (run, s, a) = stream();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while logs.read_all(&run, &s, &a).await.unwrap_or_default() != b"short step\n" {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the ended step's output reached the pipeline");
+
+    // The fence is closed: later passes do not read it again.
+    for _ in 0..3 {
+        tailer.end_pass(true);
+        settle().await;
+    }
+    assert_eq!(exec.calls(), 2);
+    assert_eq!(logs.read_all(&run, &s, &a).await.unwrap(), b"short step\n");
+}
+
+/// A step that prints nothing is re-read only while it is `Running`; once it
+/// ends, one more read closes the fence and nothing reopens it.
+#[tokio::test]
+async fn a_silent_step_stops_being_read_once_it_ends() {
+    let exec = ScriptedExec::new(vec![]);
+    let logs = logs();
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+
+    tailer.ensure(&running_step());
+    tailer.end_pass(true);
+    wait_for(|| exec.calls() == 1).await;
+    settle().await;
+
+    // Ended: one more read, then nothing.
+    tailer.end_pass(true);
+    wait_for(|| exec.calls() == 2).await;
+    for _ in 0..5 {
+        tailer.end_pass(true);
+        settle().await;
+    }
+    assert_eq!(exec.calls(), 2, "a closed fence is never read again");
+}
+
+/// A replica that stored the fence's output first (it held the tail lease)
+/// is not repeated: the read of the ended step finds stored output and adds
+/// nothing.
+#[tokio::test]
+async fn an_ended_step_with_stored_output_is_not_read_again() {
+    let exec = ScriptedExec::new(vec![Err(INITIALIZING.into()), Ok(vec![b"once\n".to_vec()])]);
+    let logs = logs();
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+
+    tailer.ensure(&running_step());
+    tailer.end_pass(true);
+    wait_for(|| exec.calls() == 1).await;
+    settle().await;
+
+    // A peer replica tailed the step and stored its output.
+    let (run, s, a) = stream();
+    logs.append(&run, &s, &a, b"once\n").await.unwrap();
+
+    tailer.end_pass(true);
+    settle().await;
+    assert_eq!(exec.calls(), 1, "stored output is not read again");
+    assert_eq!(logs.read_all(&run, &s, &a).await.unwrap(), b"once\n");
+}
+
+/// The read of an ended unit is bounded: a Pod that is gone fails every read,
+/// and the fence is given up after a few tries.
+#[tokio::test]
+async fn reading_an_ended_step_gives_up_after_a_few_tries() {
+    let gone =
+        || Err::<Vec<Vec<u8>>, _>("pods \"scarab-build-a1\" not found: NotFound".to_string());
+    let exec = ScriptedExec::new((0..10).map(|_| gone()).collect());
+    let logs = logs();
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+
+    tailer.ensure(&running_step());
+    tailer.end_pass(true);
+    wait_for(|| exec.calls() == 1).await;
+    settle().await;
+
+    for _ in 0..10 {
+        tailer.end_pass(true);
+        settle().await;
+    }
+    assert_eq!(
+        exec.calls(),
+        4,
+        "one live tail, then three reads of the ended step"
+    );
+}
+
+/// A pass that did not ensure every unit (a store error) does not treat the
+/// units it missed as ended.
+#[tokio::test]
+async fn an_incomplete_pass_reads_nothing() {
+    let exec = ScriptedExec::new(vec![Err(INITIALIZING.into())]);
+    let logs = logs();
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+
+    tailer.ensure(&running_step());
+    tailer.end_pass(true);
+    wait_for(|| exec.calls() == 1).await;
+    settle().await;
+
+    tailer.end_pass(false);
+    settle().await;
+    assert_eq!(exec.calls(), 1);
+}

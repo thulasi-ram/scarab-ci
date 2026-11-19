@@ -42,6 +42,11 @@ const NOT_READY_GRACE: Duration = Duration::from_secs(180);
 /// a line every [`RETRY_BACKOFF`].
 const STUCK_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Reads of an ended fence before its log is given up (git-bug 1dee2f3). A
+/// failed read is retried after the backoff; most failures here mean the
+/// container never ran or its Pod is gone, so a few tries are enough.
+const FINAL_READ_TRIES: u32 = 3;
+
 /// Errors from draining a log tail. Both arms are best-effort at the call site —
 /// the tail is logged and dropped, never failing the run (ADR-0013).
 #[derive(Debug, thiserror::Error)]
@@ -126,6 +131,24 @@ pub struct LogTailer {
     /// Wait before re-tailing a fence whose last tail errored or read
     /// nothing ([`RETRY_BACKOFF`] unless a test shortens it).
     retry_backoff: Duration,
+    /// Fences tailed at least once and not drained yet, with what reopens
+    /// them. When the driver stops ensuring one (its step left `Running`),
+    /// [`end_pass`](LogTailer::end_pass) reads it once more (git-bug 1dee2f3).
+    open: Arc<Mutex<HashMap<Fence, OpenTail>>>,
+    /// Fences ensured since the last [`end_pass`](LogTailer::end_pass).
+    seen: Mutex<HashSet<Fence>>,
+}
+
+/// How to reopen a fence that is not drained yet.
+#[derive(Clone)]
+struct OpenTail {
+    resource: String,
+    run: RunId,
+    step: StepId,
+    attempt: AttemptId,
+    source: TailSource,
+    /// Failed reads since the fence's unit ended.
+    final_tries: u32,
 }
 
 /// Per-fence bookkeeping for a tail parked in a benign pre-start state: when the
@@ -147,6 +170,42 @@ impl LogTailer {
             retry_at: Arc::new(Mutex::new(HashMap::new())),
             not_ready: Arc::new(Mutex::new(HashMap::new())),
             retry_backoff: RETRY_BACKOFF,
+            open: Arc::new(Mutex::new(HashMap::new())),
+            seen: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// End one driver pass of `ensure*` calls. A fence that is still open but
+    /// was not ensured in this pass belongs to a unit that ended (a step that
+    /// left `Running`, a retried attempt, a stopped service): its log is read
+    /// once more, so a step that ran and finished inside a retry backoff
+    /// keeps its output (git-bug 1dee2f3). The read is skipped when any
+    /// replica already stored output for the fence, so nothing is appended
+    /// twice. `complete` is false when the pass did not ensure every unit (a
+    /// store error); such a pass only resets the bookkeeping.
+    pub fn end_pass(&self, complete: bool) {
+        let seen = std::mem::take(&mut *self.seen.lock().unwrap());
+        if !complete {
+            return;
+        }
+        let ended: Vec<(Fence, OpenTail)> = self
+            .open
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(fence, _)| !seen.contains(*fence))
+            .map(|(fence, tail)| (fence.clone(), tail.clone()))
+            .collect();
+        for (fence, tail) in ended {
+            self.spawn_tail(
+                fence,
+                tail.resource,
+                tail.run,
+                tail.step,
+                tail.attempt,
+                tail.source,
+                true,
+            );
         }
     }
 
@@ -180,6 +239,7 @@ impl LogTailer {
             step.step.clone(),
             attempt,
             TailSource::Step(step.clone()),
+            false,
         );
     }
 
@@ -199,6 +259,7 @@ impl LogTailer {
             step,
             attempt,
             TailSource::Service(scarab_engine::ports::ExecHandle(handle.to_string())),
+            false,
         );
     }
 
@@ -231,6 +292,7 @@ impl LogTailer {
                 step: step.clone(),
                 index,
             },
+            false,
         );
     }
 
@@ -238,7 +300,9 @@ impl LogTailer {
     /// and [`ensure_service`](Self::ensure_service): dedup by fence, claim the
     /// per-fence tail lease (ADR-0051), drain the `source` into the pipeline under
     /// `{run, step, attempt}`, then release the fence. `source` selects the
-    /// executor log endpoint (step Pod vs. service Pod).
+    /// executor log endpoint (step Pod vs. service Pod). `final_read` is the
+    /// read of a fence whose unit has ended (see [`end_pass`](Self::end_pass)).
+    #[allow(clippy::too_many_arguments)]
     fn spawn_tail(
         &self,
         fence: Fence,
@@ -247,10 +311,26 @@ impl LogTailer {
         step_id: StepId,
         attempt: AttemptId,
         source: TailSource,
+        final_read: bool,
     ) {
         // Already fully drained — the Pod's log is complete; never re-tail it.
         if self.drained.lock().unwrap().contains(&fence) {
             return;
+        }
+        if !final_read {
+            self.seen.lock().unwrap().insert(fence.clone());
+            self.open
+                .lock()
+                .unwrap()
+                .entry(fence.clone())
+                .or_insert_with(|| OpenTail {
+                    resource: resource.clone(),
+                    run: run.clone(),
+                    step: step_id.clone(),
+                    attempt: attempt.clone(),
+                    source: source.clone(),
+                    final_tries: 0,
+                });
         }
         // Backing off after a recent error — don't hammer a Pod with no log yet.
         if let Some(at) = self.retry_at.lock().unwrap().get(&fence) {
@@ -271,6 +351,20 @@ impl LogTailer {
         let not_ready = self.not_ready.clone();
         let lease = self.lease.clone();
         let retry_backoff = self.retry_backoff;
+        let open = self.open.clone();
+        // The fence's log is complete (or given up): never read it again.
+        let close = {
+            let drained = drained.clone();
+            let retry_at = retry_at.clone();
+            let not_ready = not_ready.clone();
+            let open = open.clone();
+            move |fence: &Fence| {
+                drained.lock().unwrap().insert(fence.clone());
+                retry_at.lock().unwrap().remove(fence);
+                not_ready.lock().unwrap().remove(fence);
+                open.lock().unwrap().remove(fence);
+            }
+        };
 
         tokio::spawn(async move {
             // Claim-to-tail (ADR-0051): only the lease holder tails this
@@ -311,6 +405,55 @@ impl LogTailer {
                     }
                 }
             }
+            if final_read {
+                // The unit has ended: one plain read of what it printed, unless
+                // a replica already stored output (no second copy).
+                let result = match logs.has_output(&run, &step_id, &attempt).await {
+                    Ok(true) => Ok(None),
+                    Ok(false) => drain(&*executor, &logs, &source, &run, &step_id, &attempt).await,
+                    Err(e) => Err(e.into()),
+                };
+                if let Some(r) = renewer {
+                    r.abort();
+                }
+                match result {
+                    Ok(bytes) => {
+                        if let Some(bytes) = bytes.filter(|b| *b > 0) {
+                            tracing::info!(run = %run.0, step = %step_id.0, attempt = %attempt.0, bytes, "log tail: read the log of an ended unit");
+                        }
+                        close(&fence);
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let tries = {
+                            let mut open = open.lock().unwrap();
+                            match open.get_mut(&fence) {
+                                Some(t) => {
+                                    t.final_tries += 1;
+                                    t.final_tries
+                                }
+                                None => FINAL_READ_TRIES,
+                            }
+                        };
+                        if tries < FINAL_READ_TRIES {
+                            tracing::debug!(run = %run.0, step = %step_id.0, error = %msg, "log tail: reading an ended unit failed; retrying");
+                            retry_at
+                                .lock()
+                                .unwrap()
+                                .insert(fence.clone(), Instant::now() + retry_backoff);
+                        } else {
+                            if never_ran_or_gone(&msg) {
+                                tracing::debug!(run = %run.0, step = %step_id.0, error = %msg, "log tail: an ended unit has no log to read");
+                            } else {
+                                tracing::warn!(run = %run.0, step = %step_id.0, attempt = %attempt.0, error = %msg, "log tail: could not read the log of an ended unit; its output is not stored");
+                            }
+                            close(&fence);
+                        }
+                    }
+                }
+                active.lock().unwrap().remove(&fence);
+                return;
+            }
             let result = drain(&*executor, &logs, &source, &run, &step_id, &attempt).await;
             if let Some(r) = renewer {
                 r.abort();
@@ -322,8 +465,10 @@ impl LogTailer {
                 // autoscaler to add a node) with an empty stream, not an
                 // error, so marking it drained lost every line the step
                 // printed later. Retry after the backoff, like a Pod that is
-                // not ready. A step that prints nothing is re-read every few
-                // seconds while it runs, which costs one empty request each.
+                // not ready. A follow read of a running container stays open,
+                // so a silent step costs one empty read per backoff only
+                // between its exit and leaving `Running`; then `end_pass`
+                // reads it once more and closes the fence.
                 Ok(Some(0)) => {
                     tracing::debug!(run = %run.0, step = %step_id.0, "log tail: the stream ended with no output; retrying");
                     retry_at
@@ -338,9 +483,7 @@ impl LogTailer {
                     if let Some(bytes) = bytes {
                         tracing::info!(run = %run.0, step = %step_id.0, attempt = %attempt.0, bytes, "log tail: ended");
                     }
-                    drained.lock().unwrap().insert(fence.clone());
-                    retry_at.lock().unwrap().remove(&fence);
-                    not_ready.lock().unwrap().remove(&fence);
+                    close(&fence);
                 }
                 // Best-effort: a lost tail never fails the run (ADR-0013). The
                 // common benign case is a step Pod that hasn't started its
@@ -459,9 +602,16 @@ fn is_pod_not_ready(err: &str) -> bool {
     NOT_READY.iter().any(|m| err.contains(m))
 }
 
+/// A read of an ended unit failed in a way that means there was nothing to
+/// read: its container never started, or its Pod is gone (deleted on cancel).
+fn never_ran_or_gone(err: &str) -> bool {
+    is_pod_not_ready(err) || err.contains("is waiting to start") || err.contains("NotFound")
+}
+
 /// The unit whose live log tail is being drained — a step Pod or a shared-service
 /// Pod (ADR-0058). Selects which executor log endpoint the drain opens; both pump
 /// into the same pipeline under the fence's `{run, step, attempt}` stream key.
+#[derive(Clone)]
 enum TailSource {
     Step(StepRun),
     Service(scarab_engine::ports::ExecHandle),
