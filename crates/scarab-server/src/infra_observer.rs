@@ -20,7 +20,10 @@
 //! ([`POLL_INTERVAL_MS`]); appending is expensive and rare. An event is written
 //! only when the condition **changes** — once at onset, once when it clears or
 //! the attempt ends — so a Pod wedged for the full step timeout costs two rows
-//! rather than one per poll.
+//! rather than one per poll. An episode is keyed by the condition's reason and
+//! the words of its message: when only the numbers change (the scheduler's node
+//! counts move as an autoscaler adds nodes) the latest message is kept and
+//! written on the close row, not opened as a new episode.
 //!
 //! That is not tidiness, it is a load-bearing constraint. The run's event log is
 //! walked in full on the scheduler's hot path — `settle_failed_attempt` scans
@@ -55,6 +58,8 @@ fn fence_of(run: &RunId, step: &StepId, attempt: &AttemptId) -> Fence {
 /// An infra condition currently held by a fence, and what we have seen of it.
 #[derive(Debug, Clone)]
 struct Held {
+    /// The condition's reason as first seen, with the latest message seen
+    /// in this episode (written on the close row).
     condition: InfraCondition,
     /// When this condition was first observed — the base for `held_ms`.
     since: Timestamp,
@@ -174,13 +179,16 @@ impl InfraObserver {
             }
 
             (Some(held), Some(condition)) => {
-                if same_condition(&held.condition, &condition) {
-                    // Unchanged: count it and stay silent. This is the branch
-                    // that keeps a forty-minute wedge to two rows.
+                if same_episode(&held.condition, &condition) {
+                    // Same episode: count it and stay silent, keeping the latest
+                    // message for the close row. This is the branch that keeps
+                    // a forty-minute wedge to two rows, even when the node
+                    // counts in the message change on every poll.
                     let mut map = self.held.lock().unwrap();
                     if let Some(entry) = map.get_mut(&fence) {
                         entry.observations = entry.observations.saturating_add(1);
                         entry.last_poll = now;
+                        entry.condition.message = condition.message;
                     }
                 } else {
                     // Changed: close the old episode before opening the new one,
@@ -301,15 +309,40 @@ impl InfraObserver {
     }
 }
 
-/// Two observations describe the same episode when the backend's machine token
-/// AND its message agree.
+/// Two observations of one attempt belong to the same episode when the
+/// backend's machine token (the reason) agrees and their messages agree once
+/// the numbers are taken out.
 ///
-/// Keying on the reason alone would collapse a message that changed under a
-/// stable reason — `FailedScheduling` first reporting insufficient CPU and later
-/// a taint is a genuinely different problem wearing the same label, and it is
-/// exactly the transition an operator is trying to see.
-fn same_condition(a: &InfraCondition, b: &InfraCondition) -> bool {
-    a.reason == b.reason && a.message == b.message
+/// The numbers are not part of the key: the scheduler rewrites its node counts
+/// as nodes come and go (`0/12 nodes are available` → `0/14 …`), and keying on
+/// the raw text closed and reopened one `Unschedulable` wait every poll. The
+/// words are: `FailedScheduling` first reporting insufficient CPU and later a
+/// taint is a different problem under the same label, and it is the transition
+/// an operator wants to see. The latest message reaches the log on the close row.
+fn same_episode(a: &InfraCondition, b: &InfraCondition) -> bool {
+    a.reason == b.reason
+        && message_shape(a.message.as_deref()) == message_shape(b.message.as_deref())
+}
+
+/// A message with every run of digits replaced by `#`, so counts that move
+/// compare equal and anything else does not.
+fn message_shape(message: Option<&str>) -> Option<String> {
+    message.map(|m| {
+        let mut out = String::with_capacity(m.len());
+        let mut in_digits = false;
+        for ch in m.chars() {
+            if ch.is_ascii_digit() {
+                if !in_digits {
+                    out.push('#');
+                }
+                in_digits = true;
+            } else {
+                out.push(ch);
+                in_digits = false;
+            }
+        }
+        out
+    })
 }
 
 /// Errors from observing. Best-effort at the call site — logged and dropped,
