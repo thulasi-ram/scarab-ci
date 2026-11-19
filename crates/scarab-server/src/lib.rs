@@ -2810,7 +2810,10 @@ async fn get_run(
     // 0058) from the stored spec, so the FE can render sidecar nodes and `uses`
     // edges and address per-sidecar logs by index. A step with no stored spec
     // (e.g. a gate) carries empty vecs.
-    let mut gate_views = run_gate_view::step_gate_views(&st, &run, &steps).await?;
+    // The run's journal, read once: the gate view and each attempt's end time
+    // both come from it.
+    let events = st.db.events(&run).await?;
+    let mut gate_views = run_gate_view::step_gate_views(&st, &steps, &events).await;
     let run_origin::StepViews {
         views: mut origin_views,
         yanked: yanked_libraries,
@@ -2818,7 +2821,7 @@ async fn get_run(
     } = run_origin::step_views(&st, &run, &steps).await?;
     let deploy_steps = st.db.deploy_steps_of_run(&run).await?;
     let environment = run_origin::run_environment(&st, &run, environment).await?;
-    let attempt_ends = AttemptEnds::from_events(&st.db.events(&run).await?);
+    let attempt_ends = AttemptEnds::from_events(&events);
     let mut step_dtos = Vec::with_capacity(steps.len());
     for s in steps {
         let view = gate_views.remove(&s.step.0).unwrap_or_default();
