@@ -5334,7 +5334,7 @@
           "Policies"
         ],
         "summary": "Evaluate Policies without enforcing or recording (ADR-0075 §9)",
-        "description": "Policies: `policy` (a draft, compiled at the org level; a 400 when it\ndoes not compile), `policy_id` (a stored Policy of this org), or neither\n(the org's and the input's Project's effective Policies, as the\ncheckpoint consults them). Input: `input` (at `checkpoint`, by default\nthe Policy's, else `run.create`), `decision_id` (its recorded input,\ncheckpoint and schema version), or `pipeline` (a `run.create` input,\ncompiled here with `libs`; no forge read). A Policy at another checkpoint\nthan the input is a 400. A supplied or recorded input with a string or a\nlist over its cap is a 400. The built-in Environment rules a recorded\n`step.admit` or `gate.resolve` decision holds are not evaluated again.\nA Pipeline whose Run is over an input cap is answered as admission\ndecides it: each matched Policy is an error, which denies when the Policy\nis enforced.\n\nPermissions: Read on the input's Project for its effective Policies\n(neither `policy` nor `policy_id`, which is what `scarab validate\n--server` sends) or its own typed setting by id; Read on the org for an\norg Policy by id; Administer on the org for a draft `policy`, as saving it\nwould need. Org Read covers every Project.",
+        "description": "Policies: `policy` (a draft, compiled at the org level; a 400 when it\ndoes not compile), `policy_id` (a stored Policy of this org), or neither\n(the org's and the input's Project's effective Policies, as the\ncheckpoint consults them). Input: `input` (at `checkpoint`, by default\nthe Policy's, else `run.create`), `decision_id` (its recorded input,\ncheckpoint and schema version), or `pipeline` (a `run.create` input,\ncompiled here with `libs`; no forge read). A Policy at another checkpoint\nthan the input is a 400. A supplied or recorded input with a string or a\nlist over its cap is a 400. The built-in Environment rules a recorded\n`step.admit` or `gate.resolve` decision holds are not evaluated again.\nA Pipeline whose Run is over an input cap is answered as admission\ndecides it: each matched Policy is an error, which denies when the Policy\nis enforced. A Pipeline that Run creation would refuse for a library or\ncredential reason (a yanked version, a forge credential, the build\nsandbox) is a deny with that reason, from the check Run creation runs;\nthe answer names the reason in `refusal`, and `pipeline` says what was\ncompiled.\n\nPermissions: Read on the input's Project for its effective Policies\n(neither `policy` nor `policy_id`, which is what `scarab validate\n--server` sends) or its own typed setting by id; Read on the org for an\norg Policy by id; Administer on the org for a draft `policy`, as saving it\nwould need. Org Read covers every Project.",
         "operationId": "policy_test",
         "parameters": [
           {
@@ -13641,6 +13641,34 @@
           }
         }
       },
+      "PolicyTestCompiledDto": {
+        "type": "object",
+        "description": "The Pipeline the policy test compiled, as the Run would store it.",
+        "required": [
+          "steps",
+          "ir_version",
+          "libraries"
+        ],
+        "properties": {
+          "ir_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "libraries": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Each installed library the Run's Steps come from, by the name `lib:`\ninvokes it by, transitively."
+          },
+          "steps": {
+            "type": "integer",
+            "description": "The Run's Steps: every `file:` and `lib:` library inlined, and the\ngate the Environment would add.",
+            "minimum": 0
+          }
+        }
+      },
       "PolicyTestPipeline": {
         "type": "object",
         "description": "The Pipeline form of the policy test: what `scarab validate --server`\nsends.",
@@ -13746,12 +13774,30 @@
             "type": "object",
             "description": "The PolicyDecision, as admission would record it (see\n[`PolicyDecisionRecordDto::decision`]). A draft Policy has\n`policy_id` \"\" and `version` 0."
           },
+          "pipeline": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PolicyTestCompiledDto",
+                "description": "For a `pipeline`: what the server compiled. Absent for the other\ninput forms."
+              }
+            ]
+          },
           "policies": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/PolicyReadsDto"
             },
             "description": "Per evaluated Policy, what each rule reads."
+          },
+          "refusal": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For a `pipeline`: why Run creation would refuse the Run before it\nconsults Policies (a yanked library version, a forge credential, the\nbuild sandbox). The decision is then a deny whose first message is\nthis; its results are still each Policy's. Absent when there is none."
           }
         }
       },

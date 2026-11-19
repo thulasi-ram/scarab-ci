@@ -5997,30 +5997,19 @@ async fn admit_unrecorded(
     };
     let ir = &ir;
 
-    // ADR-0076 §6: a yanked library version is a PolicyInvariant, checked
-    // before (and whether or not) any Policy is consulted.
-    if let Some(libraries) = ports.libraries {
-        let items: Vec<(String, &[scarab_pipeline::OriginEntry])> = ir
-            .steps
-            .iter()
-            .map(|s| (format!("`{}`", s.id), s.origin.as_slice()))
-            .collect();
-        let messages = libraries::yank_refusals_for(libraries, &repo.owner, &items)
-            .await
-            .map_err(|e| TriggerError::Db(DbError::Other(format!("library store: {e}"))))?;
-        if !messages.is_empty() {
-            return Ok(Admission::Refused(AdmissionRefusal::LibraryYanked {
-                messages,
-            }));
-        }
-    }
-
+    // The library and credential PolicyInvariants, before any Policy is
+    // consulted; the policy test runs the same ones.
+    let LibraryAdmission {
+        clone_url,
+        tokens,
+        sandbox,
+        registry,
+    } = match library_admission(Some(forge), ports, event, repo, ir, &gov).await? {
+        Ok(admitted) => admitted,
+        Err(refusal) => return Ok(Admission::Refused(refusal)),
+    };
     // ADR-0076 §9: the `event` values the Pipeline's templates read, checked
-    // and fixed now, and which Steps may receive a forge credential. Both are
-    // fixed checks, decided before any Policy is consulted.
-    let clone_url = forge_token::repo_clone_url(event, ports.connections)
-        .await
-        .map_err(|e| TriggerError::Db(DbError::Other(e)))?;
+    // and fixed now, before any Policy is consulted.
     let facts = match forge_token::event_facts(event, clone_url.as_deref(), ir) {
         Ok(facts) => facts,
         Err(messages) => {
@@ -6029,45 +6018,6 @@ async fn admit_unrecorded(
             }))
         }
     };
-    let write = match gov.protection() {
-        Some(p) => forge_token::WriteGovernance {
-            restricts_refs: !p.unrestricted_refs(),
-        },
-        None => forge_token::WriteGovernance::default(),
-    };
-    let tokens = forge_token::forge_token_refusals(
-        forge,
-        ports.libraries,
-        &repo.owner,
-        repo,
-        clone_url.as_deref(),
-        ir,
-        event.is_fork_pr() || gov.locked_out(),
-        write,
-    )
-    .await
-    .map_err(|e| TriggerError::Db(DbError::Other(e)))?;
-    if !tokens.refusals.is_empty() {
-        return Ok(Admission::Refused(AdmissionRefusal::ForgeToken {
-            messages: tokens.refusals,
-        }));
-    }
-    // ADR-0018 (amendment of 2026-11-12): a sandboxed Step's library must be
-    // trusted for the sandbox, a `registry_auth` Step gets a registry
-    // credential only from a library trusted with it, and the forge-derived
-    // one only from a library trusted with forge credentials too. Fixed
-    // checks, before any Policy is consulted.
-    let sandbox = forge_token::sandbox_refusals(ports.libraries, &repo.owner, ir)
-        .await
-        .map_err(|e| TriggerError::Db(DbError::Other(e)))?;
-    if !sandbox.refusals.is_empty() {
-        return Ok(Admission::Refused(AdmissionRefusal::Sandbox {
-            messages: sandbox.refusals,
-        }));
-    }
-    let registry = forge_token::registry_libraries(ports.libraries, &repo.owner, ir)
-        .await
-        .map_err(|e| TriggerError::Db(DbError::Other(e)))?;
 
     let now = clock.now().await;
     let run = run_id_for(event, path);
@@ -6129,6 +6079,91 @@ async fn admit_unrecorded(
     )
     .await?;
     Ok(Admission::Created(run))
+}
+
+/// What the library and credential PolicyInvariants decided for a Run
+/// ([`library_admission`]).
+struct LibraryAdmission {
+    /// The repository's clone URL ([`forge_token::repo_clone_url`]).
+    clone_url: Option<String>,
+    tokens: forge_token::ForgeTokenAdmission,
+    sandbox: forge_token::SandboxAdmission,
+    registry: forge_token::RegistryAdmission,
+}
+
+/// The fixed checks Run creation makes on a Run's Steps before any Policy
+/// is consulted, in this order: a yanked library version (ADR-0076 §6),
+/// which Steps may receive a forge credential (ADR-0076 §9), which may run
+/// in the sandbox, and which may receive a registry credential (ADR-0018,
+/// amendment of 2026-11-12). Run creation and the policy test (`scarab
+/// validate --server`) both call it, so the test refuses what Run creation
+/// refuses. `forge` `None` is a forge that cannot say whether it mints
+/// tokens, which only refuses more. A store failure is an `Err`.
+async fn library_admission(
+    forge: Option<&dyn scarab_forge::ForgePort>,
+    ports: AdmissionPorts<'_>,
+    event: &scarab_forge::Event,
+    repo: &scarab_forge::RepoRef,
+    ir: &scarab_pipeline::PipelineIr,
+    gov: &RunGovernance,
+) -> Result<Result<LibraryAdmission, AdmissionRefusal>, TriggerError> {
+    let store = |e: String| TriggerError::Db(DbError::Other(e));
+    if let Some(libraries) = ports.libraries {
+        let items: Vec<(String, &[scarab_pipeline::OriginEntry])> = ir
+            .steps
+            .iter()
+            .map(|s| (format!("`{}`", s.id), s.origin.as_slice()))
+            .collect();
+        let messages = libraries::yank_refusals_for(libraries, &repo.owner, &items)
+            .await
+            .map_err(|e| store(format!("library store: {e}")))?;
+        if !messages.is_empty() {
+            return Ok(Err(AdmissionRefusal::LibraryYanked { messages }));
+        }
+    }
+    let clone_url = forge_token::repo_clone_url(event, ports.connections)
+        .await
+        .map_err(store)?;
+    let write = match gov.protection() {
+        Some(p) => forge_token::WriteGovernance {
+            restricts_refs: !p.unrestricted_refs(),
+        },
+        None => forge_token::WriteGovernance::default(),
+    };
+    let tokens = forge_token::forge_token_refusals(
+        forge,
+        ports.libraries,
+        &repo.owner,
+        repo,
+        clone_url.as_deref(),
+        ir,
+        event.is_fork_pr() || gov.locked_out(),
+        write,
+    )
+    .await
+    .map_err(store)?;
+    if !tokens.refusals.is_empty() {
+        return Ok(Err(AdmissionRefusal::ForgeToken {
+            messages: tokens.refusals,
+        }));
+    }
+    let sandbox = forge_token::sandbox_refusals(ports.libraries, &repo.owner, ir)
+        .await
+        .map_err(store)?;
+    if !sandbox.refusals.is_empty() {
+        return Ok(Err(AdmissionRefusal::Sandbox {
+            messages: sandbox.refusals,
+        }));
+    }
+    let registry = forge_token::registry_libraries(ports.libraries, &repo.owner, ir)
+        .await
+        .map_err(store)?;
+    Ok(Ok(LibraryAdmission {
+        clone_url,
+        tokens,
+        sandbox,
+        registry,
+    }))
 }
 
 /// `ir` as an Environment-governed Run stores it (ADR-0078 §1-3), decided by
@@ -15025,6 +15060,7 @@ impl utoipa::Modify for StepUpResponses {
         policies::PolicyTestTrigger,
         policies::PolicyTestResponse,
         policies::PolicyReadsDto,
+        policies::PolicyTestCompiledDto,
         policies::RuleReadsDto,
         policies::PolicyCheckRequest,
         policies::PolicyCheckResponse,

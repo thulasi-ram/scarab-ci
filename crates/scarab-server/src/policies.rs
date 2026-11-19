@@ -372,6 +372,28 @@ pub struct PolicyTestResponse {
     pub decision: PolicyDecision,
     /// Per evaluated Policy, what each rule reads.
     pub policies: Vec<PolicyReadsDto>,
+    /// For a `pipeline`: what the server compiled. Absent for the other
+    /// input forms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<PolicyTestCompiledDto>,
+    /// For a `pipeline`: why Run creation would refuse the Run before it
+    /// consults Policies (a yanked library version, a forge credential, the
+    /// build sandbox). The decision is then a deny whose first message is
+    /// this; its results are still each Policy's. Absent when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+}
+
+/// The Pipeline the policy test compiled, as the Run would store it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PolicyTestCompiledDto {
+    /// The Run's Steps: every `file:` and `lib:` library inlined, and the
+    /// gate the Environment would add.
+    pub steps: usize,
+    pub ir_version: u32,
+    /// Each installed library the Run's Steps come from, by the name `lib:`
+    /// invokes it by, transitively.
+    pub libraries: Vec<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1351,20 +1373,26 @@ fn test_event(
 }
 
 /// The Pipeline form's input (an `Err` when it could not be built), what
-/// `match` sees, and the Pipeline's plugin gates.
-type PipelineInput = (
-    Result<Value, String>,
-    MatchContext,
-    Vec<run_create::PluginGate>,
-);
+/// `match` sees, the Pipeline's plugin gates, what was compiled, and the
+/// refusal Run creation makes before it consults Policies, if any.
+struct PipelineInput {
+    input: Result<Value, String>,
+    ctx: MatchContext,
+    plugin_gates: Vec<run_create::PluginGate>,
+    compiled: PolicyTestCompiledDto,
+    refusal: Option<String>,
+}
 
 /// The input of the Pipeline form: compiled here from the sent sources,
 /// then built through the code admission runs (`admission_before_policies`,
 /// `run_create_facts`, `run_create_input`), so the input evaluated is the
-/// one admission would record for the same event. A refusal admission makes
-/// before consulting Policies is a 400. An input that cannot be built (a
-/// Run over a list or string cap) is an `Err` evaluated as admission
-/// evaluates it, with the Pipeline's plugin gates.
+/// one admission would record for the same event. An Environment refusal
+/// admission makes before consulting Policies is a 400. A library or
+/// credential refusal (a yanked version, a forge credential, the build
+/// sandbox) comes from the same check Run creation runs
+/// (`library_admission`) and is returned to be answered as a deny. An input
+/// that cannot be built (a Run over a list or string cap) is an `Err`
+/// evaluated as admission evaluates it, with the Pipeline's plugin gates.
 async fn pipeline_input(
     st: &AppState,
     org: &str,
@@ -1416,6 +1444,35 @@ async fn pipeline_input(
     let (ir, _) = crate::environment_approval_ir(&ir, &gov, &[]).map_err(|(refusal, _)| {
         refused(crate::admission_refusal_message(&refusal, org, &repo.name))
     })?;
+    // The library and credential refusals, as Run creation decides them.
+    let refusal = match crate::library_admission(
+        st.forge.as_deref(),
+        st.admission_ports(),
+        &event,
+        &repo,
+        &ir,
+        &gov,
+    )
+    .await
+    {
+        Ok(Ok(_)) => None,
+        Ok(Err(refusal)) => Some(crate::admission_refusal_message(&refusal, org, &repo.name)),
+        Err(crate::TriggerError::Db(e)) => return Err(ApiError::Db(e)),
+        Err(e) => return Err(ApiError::Db(DbError::Other(e.to_string()))),
+    };
+    let compiled = PolicyTestCompiledDto {
+        steps: ir.steps.len(),
+        ir_version: ir.ir_version,
+        libraries: ir
+            .steps
+            .iter()
+            .flat_map(|s| &s.origin)
+            .filter(|o| o.kind == scarab_pipeline::OriginKind::Library)
+            .map(|o| o.name.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+    };
 
     let path = p.path.unwrap_or_else(|| ".scarab/ci.yaml".to_string());
     let now = st.clock.now().await.0;
@@ -1431,7 +1488,13 @@ async fn pipeline_input(
         Ok(facts) => blocking(move || crate::run_create_input(&ir, facts)).await?,
         Err(e) => Err(e),
     };
-    Ok((input, ctx, plugin_gates))
+    Ok(PipelineInput {
+        input,
+        ctx,
+        plugin_gates,
+        compiled,
+        refusal,
+    })
 }
 
 /// A supplied or recorded input with a string or a list over its cap is a
@@ -1526,7 +1589,11 @@ fn reads_of(policies: &[StoredPolicy]) -> Vec<PolicyReadsDto> {
 /// `step.admit` or `gate.resolve` decision holds are not evaluated again.
 /// A Pipeline whose Run is over an input cap is answered as admission
 /// decides it: each matched Policy is an error, which denies when the Policy
-/// is enforced.
+/// is enforced. A Pipeline that Run creation would refuse for a library or
+/// credential reason (a yanked version, a forge credential, the build
+/// sandbox) is a deny with that reason, from the check Run creation runs;
+/// the answer names the reason in `refusal`, and `pipeline` says what was
+/// compiled.
 ///
 /// Permissions: Read on the input's Project for its effective Policies
 /// (neither `policy` nor `policy_id`, which is what `scarab validate
@@ -1617,6 +1684,9 @@ pub(crate) async fn policy_test(
         .and_then(Option::as_ref)
         .map(|p| p.body.checkpoint));
 
+    // For a Pipeline: what was compiled, and the refusal Run creation would
+    // make before its Policies.
+    let mut compiled = None;
     // The input (an `Err` when a Pipeline's could not be built), its
     // checkpoint and schema version, what `match` sees, and the Pipeline's
     // plugin gates.
@@ -1678,14 +1748,14 @@ pub(crate) async fn policy_test(
             ));
         }
         project_allowed(pipeline.project.clone()).await?;
-        let (input, ctx, gates) =
-            pipeline_input(&st, &org, caller.principal.handle(), pipeline).await?;
+        let p = pipeline_input(&st, &org, caller.principal.handle(), pipeline).await?;
+        compiled = Some((p.compiled, p.refusal));
         (
-            input,
+            p.input,
             Checkpoint::RunCreate,
             run_create::SCHEMA_VERSION,
-            ctx,
-            Some(gates),
+            p.ctx,
+            Some(p.plugin_gates),
         )
     };
     if let Some(at) = policy_checkpoint.filter(|c| *c != checkpoint) {
@@ -1733,10 +1803,24 @@ pub(crate) async fn policy_test(
         )
     })
     .await?;
+    let mut decision = decision;
     let reads = blocking(move || reads_of(&reads_input)).await?;
+    let (pipeline, refusal) = match compiled {
+        Some((compiled, refusal)) => (Some(compiled), refusal),
+        None => (None, None),
+    };
+    // Run creation refuses before it consults Policies: a deny, whatever
+    // the Policies answer.
+    if let Some(why) = &refusal {
+        let mut messages = vec![why.clone()];
+        messages.extend(decision.messages().iter().cloned());
+        decision.outcome = scarab_policy::evaluate::DecisionOutcome::Deny { messages };
+    }
     Ok(Json(PolicyTestResponse {
         decision,
         policies: reads,
+        pipeline,
+        refusal,
     }))
 }
 

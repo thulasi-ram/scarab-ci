@@ -1484,7 +1484,11 @@ export interface paths {
          *     `step.admit` or `gate.resolve` decision holds are not evaluated again.
          *     A Pipeline whose Run is over an input cap is answered as admission
          *     decides it: each matched Policy is an error, which denies when the Policy
-         *     is enforced.
+         *     is enforced. A Pipeline that Run creation would refuse for a library or
+         *     credential reason (a yanked version, a forge credential, the build
+         *     sandbox) is a deny with that reason, from the check Run creation runs;
+         *     the answer names the reason in `refusal`, and `pipeline` says what was
+         *     compiled.
          *
          *     Permissions: Read on the input's Project for its effective Policies
          *     (neither `policy` nor `policy_id`, which is what `scarab validate
@@ -4955,6 +4959,21 @@ export interface components {
              */
             skipped: number;
         };
+        /** @description The Pipeline the policy test compiled, as the Run would store it. */
+        PolicyTestCompiledDto: {
+            /** Format: int32 */
+            ir_version: number;
+            /**
+             * @description Each installed library the Run's Steps come from, by the name `lib:`
+             *     invokes it by, transitively.
+             */
+            libraries: string[];
+            /**
+             * @description The Run's Steps: every `file:` and `lib:` library inlined, and the
+             *     gate the Environment would add.
+             */
+            steps: number;
+        };
         /**
          * @description The Pipeline form of the policy test: what `scarab validate --server`
          *     sends.
@@ -5013,8 +5032,16 @@ export interface components {
              *     `policy_id` "" and `version` 0.
              */
             decision: Record<string, never>;
+            pipeline?: null | components["schemas"]["PolicyTestCompiledDto"];
             /** @description Per evaluated Policy, what each rule reads. */
             policies: components["schemas"]["PolicyReadsDto"][];
+            /**
+             * @description For a `pipeline`: why Run creation would refuse the Run before it
+             *     consults Policies (a yanked library version, a forge credential, the
+             *     build sandbox). The decision is then a deny whose first message is
+             *     this; its results are still each Policy's. Absent when there is none.
+             */
+            refusal?: string | null;
         };
         PolicyTestTrigger: {
             /**

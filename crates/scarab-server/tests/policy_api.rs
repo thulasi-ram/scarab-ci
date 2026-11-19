@@ -857,3 +857,119 @@ async fn decision_logs_page_the_org_and_list_a_runs_own() {
         .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+/// A library whose Step runs its own command in the build sandbox.
+const SANDBOXED_LIB: &str = r#"kind: library
+steps:
+  - id: run
+    image: "moby/buildkit:rootless@sha256:5987568f92dafbfb679879de59c1cd8d26597f5f6635c314e166164e2615870c"
+    command: [/bin/sh, -c, id]
+    security: { sandbox: rootless-buildkit }
+"#;
+
+const SANDBOXED_SOURCE: &str =
+    "github.com/evil/libs//build.yaml@2222222222222222222222222222222222222222";
+
+const SANDBOXED_CI: &str = "on: { push: {} }\nsteps:\n  - id: b\n    invoke: lib:evil/build\n";
+
+// git-bug 1aa19e6: the policy test answered `allow` for a Run that Run
+// creation refuses because the org does not trust the library's source for
+// the build sandbox. It now runs Run creation's own check and answers a deny
+// with the same reason, and says what it compiled.
+#[tokio::test]
+async fn policy_test_denies_a_run_that_run_creation_refuses_for_the_sandbox() {
+    use scarab_policy::library::{
+        content_hash, trust_key, LibraryStore, LibraryVersion, NewInstallation, Replaces,
+        TrustGrant, TrustedSource,
+    };
+    let libs = Arc::new(scarab_testkit::InMemoryLibraries::new());
+    libs.put_version(&LibraryVersion {
+        org: "acme".into(),
+        content_hash: content_hash(SANDBOXED_LIB),
+        content: SANDBOXED_LIB.into(),
+        source: SANDBOXED_SOURCE.into(),
+        name: "evil/build".into(),
+        fetched_by: "amy".into(),
+        fetched_at: 1,
+    })
+    .await
+    .unwrap();
+    libs.install(
+        &NewInstallation {
+            org: "acme".into(),
+            name: "evil/build".into(),
+            content_hash: content_hash(SANDBOXED_LIB),
+            installed_by: "amy".into(),
+            installed_at: 1,
+            step_up_ref: None,
+        },
+        &Replaces::Nothing,
+    )
+    .await
+    .unwrap();
+    let policies = Arc::new(InMemoryPolicies::new());
+    let (p, l) = (policies.clone(), libs.clone());
+    let h = harness_with(move |st| st.with_policies(p).with_libraries(l));
+    let (s, _) = admin(&h).await;
+
+    // Run creation refuses the Run.
+    let forge = FakeForge::new()
+        .with_file(".scarab/ci.yaml", SANDBOXED_CI)
+        .with_commit("refs/heads/main", SHA);
+    let outcome = trigger_runs_from_event(
+        &forge,
+        h.db.as_ref(),
+        &FakeClock::new(1_000),
+        AdmissionPorts::default().with_libraries(libs.as_ref()),
+        &push(),
+    )
+    .await
+    .unwrap();
+    assert!(outcome.runs.is_empty(), "{:?}", outcome.runs);
+    let reason = outcome.refused[0].reason.clone();
+    assert!(
+        reason.contains("does not trust for the build sandbox"),
+        "{reason}"
+    );
+
+    // The policy test answers a deny with the same reason.
+    let form = json!({
+        "pipeline": {
+            "yaml": SANDBOXED_CI,
+            "path": ".scarab/ci.yaml",
+            "project": "web",
+            "trigger": { "kind": "push", "ref": "refs/heads/main", "sha": SHA }
+        }
+    });
+    let (st, b) = h
+        .cookie("POST", "/v1/orgs/acme/policy-test", Some(form.clone()), &s)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["refusal"], json!(reason), "{b}");
+    assert_eq!(b["decision"]["outcome"]["kind"], "deny", "{b}");
+    assert_eq!(
+        b["decision"]["outcome"]["messages"][0],
+        json!(reason),
+        "{b}"
+    );
+    assert_eq!(b["pipeline"]["steps"], 1, "{b}");
+    assert_eq!(b["pipeline"]["libraries"], json!(["evil/build"]), "{b}");
+
+    // Trusted for the sandbox, both admit it.
+    libs.trust_source(&TrustedSource {
+        org: "acme".into(),
+        source: trust_key(SANDBOXED_SOURCE).into(),
+        grant: TrustGrant::BuildSandbox,
+        trusted_by: "amy".into(),
+        trusted_at: 2,
+        step_up_ref: Some("su-1".into()),
+    })
+    .await
+    .unwrap();
+    let (st, b) = h
+        .cookie("POST", "/v1/orgs/acme/policy-test", Some(form), &s)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["decision"]["outcome"]["kind"], "allow", "{b}");
+    assert!(b.get("refusal").is_none(), "{b}");
+}

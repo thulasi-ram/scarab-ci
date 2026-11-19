@@ -47,6 +47,10 @@ steps:
   - id: helm
     image: alpine/helm@sha256:aaaa
     command: [helm, upgrade, "${{ inputs.release }}"]
+  - id: verify
+    image: alpine/helm@sha256:aaaa
+    needs: [helm]
+    command: [helm, status, "${{ inputs.release }}"]
 "#;
 
 async fn serve() -> String {
@@ -145,7 +149,15 @@ async fn offline_reports_a_lib_target_as_unresolved_and_checks_the_rest() {
     let out = output(scarab(&dir, &["validate", ".scarab/ci.yaml"])).await;
     let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
     assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
-    assert!(stdout.contains("unresolved: `lib:acme/deploy`"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "unresolved: `lib:acme/deploy` is installed on the server, not on disk; its Steps \
+             were not checked (use --server to check them)"
+        ),
+        "{stdout}"
+    );
+    // The library is one stand-in Step offline.
+    assert!(stdout.contains("ok: 2 step(s)"), "{stdout}");
 
     // The rest is still checked.
     let out = output(scarab(&dir, &["validate", ".scarab/broken.yaml"])).await;
@@ -175,6 +187,15 @@ async fn with_a_server_the_installed_library_is_compiled_there() {
     let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
     assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
     assert!(stdout.contains("outcome: allow"), "{stdout}");
+    // git-bug 1aa19e6: the server checked the library, so the output says
+    // so, and counts the Run's Steps as the server compiled them (the
+    // library's two, and `notify`), not the offline stand-in.
+    assert!(!stdout.contains("not checked"), "{stdout}");
+    assert!(stdout.contains("ok: 3 step(s), ir v"), "{stdout}");
+    assert!(
+        stdout.contains("compiled by the server with `lib:acme/deploy` as installed in org `acme`"),
+        "{stdout}"
+    );
 
     // In an org that has not installed it, the server says so.
     let out = output(scarab(&dir, &args("globex"))).await;

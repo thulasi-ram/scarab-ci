@@ -142,11 +142,12 @@ pub struct ForgeTokenAdmission {
 /// Decide each `forge_token` Step of `ir` (see the module docs). `fork` is
 /// a fork pull request, or a Run locked out of its Environment's secrets:
 /// its Steps get `read`. `clone_url` is the repository's
-/// ([`repo_clone_url`]): a token is never sent over plain HTTP. A store
-/// failure is an `Err`: no Run.
+/// ([`repo_clone_url`]): a token is never sent over plain HTTP. `forge`
+/// `None` cannot say whether it mints tokens. A store failure is an `Err`:
+/// no Run.
 #[allow(clippy::too_many_arguments)]
 pub async fn forge_token_refusals(
-    forge: &dyn ForgePort,
+    forge: Option<&dyn ForgePort>,
     libraries: Option<&dyn LibraryStore>,
     org: &str,
     repo: &RepoRef,
@@ -177,7 +178,10 @@ pub async fn forge_token_refusals(
     }
     // A forge that cannot say is treated as handing out a long-lived token:
     // that only ever refuses more.
-    let mints = forge.mints_repo_tokens(repo).await.unwrap_or(false);
+    let mints = match forge {
+        Some(f) => f.mints_repo_tokens(repo).await.unwrap_or(false),
+        None => false,
+    };
     let trusted_sources = match libraries {
         Some(l) => trusted_sources(l, org, TrustGrant::ForgeCredentials).await?,
         None => BTreeSet::new(),

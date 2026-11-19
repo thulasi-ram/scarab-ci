@@ -4,13 +4,17 @@
 //! runs, after reading every `file:` library it invokes (transitively) from
 //! the repository on disk, so a Pipeline with `invoke:` compiles without a
 //! server. A `lib:` library is installed on the server: offline it is
-//! reported as unresolved and the rest is checked.
+//! reported as unresolved and the rest is checked. With `--server`, the
+//! server compiles it against `--org`'s installed libraries, and the step
+//! count printed is the server's.
 //!
 //! With `--server`, it also asks the server's policy test API
 //! (`POST /v1/orgs/{org}/policy-test`, ADR-0075 §2 and §9) what the
 //! `run.create` Policies would decide for a Run of this Pipeline in
 //! `--project`, for the given trigger (by default a push to the current
-//! branch). Nothing is enforced or recorded. A rule that reads the trigger,
+//! branch). Nothing is enforced or recorded. A Run that Run creation would
+//! refuse before its Policies (a yanked library version, a forge credential,
+//! the build sandbox) is a deny with that reason. A rule that reads the trigger,
 //! the Principal or the time is labelled with the trigger it was decided
 //! for.
 //!
@@ -172,22 +176,16 @@ pub fn read_sources(file: &str) -> Result<Sources, i32> {
 /// checked; with `--server`, the server compiles it against the org's
 /// installed libraries.
 pub fn compile(sources: &Sources) -> Result<scarab_pipeline::PipelineIr, ()> {
-    let all =
-        std::iter::once(sources.yaml.as_str()).chain(sources.libs.values().map(String::as_str));
-    let installed = scarab_pipeline::unresolved_library_stubs(all, &BTreeMap::new());
-    for name in installed.keys() {
-        println!(
-            "unresolved: `lib:{name}` is installed on the server, not on disk; its Steps were              not checked (use --server to check them)"
-        );
-    }
-    let all =
-        std::iter::once(sources.yaml.as_str()).chain(sources.libs.values().map(String::as_str));
-    let plugin_gates = scarab_pipeline::unresolved_plugin_gate_stubs(all);
-    for name in plugin_gates.keys() {
-        println!(
-            "unresolved: `plugin:{name}` is a gate of a plugin installed on the server; its \
-             inputs and output types were not checked (use --server to check them)"
-        );
+    compile_reporting(sources, true)
+}
+
+/// [`compile`], printing the unresolved `lib:` and `plugin:` targets only
+/// when `offline`: with `--server`, the server compiles them and the output
+/// says what it found ([`print_compiled`]).
+fn compile_reporting(sources: &Sources, offline: bool) -> Result<scarab_pipeline::PipelineIr, ()> {
+    let (installed, plugin_gates) = stubs(sources);
+    if offline {
+        print_unresolved(&installed, &plugin_gates);
     }
     let libraries = scarab_pipeline::Libraries {
         files: sources.libs.clone(),
@@ -206,6 +204,73 @@ pub fn compile(sources: &Sources) -> Result<scarab_pipeline::PipelineIr, ()> {
             eprintln!("error: {e}");
             Err(())
         }
+    }
+}
+
+/// The stand-ins for the `lib:` targets and `plugin:` gates the sources
+/// name, which only the server can resolve.
+fn stubs(
+    sources: &Sources,
+) -> (
+    BTreeMap<String, scarab_pipeline::InstalledLibrary>,
+    BTreeMap<String, scarab_pipeline::PluginGateDef>,
+) {
+    let all =
+        || std::iter::once(sources.yaml.as_str()).chain(sources.libs.values().map(String::as_str));
+    (
+        scarab_pipeline::unresolved_library_stubs(all(), &BTreeMap::new()),
+        scarab_pipeline::unresolved_plugin_gate_stubs(all()),
+    )
+}
+
+/// Say which `lib:` targets and `plugin:` gates an offline check stood in
+/// for.
+fn print_unresolved<L, G>(libraries: &BTreeMap<String, L>, plugin_gates: &BTreeMap<String, G>) {
+    for name in libraries.keys() {
+        println!(
+            "unresolved: `lib:{name}` is installed on the server, not on disk; its Steps were \
+             not checked (use --server to check them)"
+        );
+    }
+    for name in plugin_gates.keys() {
+        println!(
+            "unresolved: `plugin:{name}` is a gate of a plugin installed on the server; its \
+             inputs and output types were not checked (use --server to check them)"
+        );
+    }
+}
+
+/// With `--server`: the step count of the Run the server compiled, with
+/// every `lib:` target resolved against `org`'s installed libraries. A
+/// server that does not say what it compiled gets the offline answer.
+fn print_compiled(answer: &Value, ir: &scarab_pipeline::PipelineIr, sources: &Sources, org: &str) {
+    let s = crate::security::sanitize;
+    let compiled = &answer["pipeline"];
+    let Some(steps) = compiled["steps"].as_u64() else {
+        let (installed, plugin_gates) = stubs(sources);
+        print_unresolved(&installed, &plugin_gates);
+        println!("ok: {} step(s), ir v{}", ir.steps.len(), ir.ir_version);
+        return;
+    };
+    let version = compiled["ir_version"]
+        .as_u64()
+        .unwrap_or(u64::from(ir.ir_version));
+    let libraries: Vec<String> = compiled["libraries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|l| format!("`lib:{}`", s(l)))
+        .collect();
+    if libraries.is_empty() {
+        println!("ok: {steps} step(s), ir v{version}, compiled by the server");
+    } else {
+        println!(
+            "ok: {steps} step(s), ir v{version}, compiled by the server with {} as installed \
+             in org `{}`",
+            libraries.join(", "),
+            s(org)
+        );
     }
 }
 
@@ -263,13 +328,12 @@ pub async fn run(args: ValidateArgs) -> i32 {
         Ok(s) => s,
         Err(code) => return code,
     };
-    let ir = match compile(&sources) {
+    // Compiled here too, so a file that does not compile fails before the
+    // request; the server compiles the `lib:` targets this cannot see.
+    let ir = match compile_reporting(&sources, false) {
         Ok(ir) => ir,
         Err(()) => return 2,
     };
-    println!("ok: {} step(s), ir v{}", ir.steps.len(), ir.ir_version);
-    print_approval_gates(&ir);
-    print_warnings(&ir);
 
     let dir = file_dir(&args.file);
     if args.pr.is_some() && args.event != "pull_request" {
@@ -344,6 +408,9 @@ pub async fn run(args: ValidateArgs) -> i32 {
         Ok(v) => v,
         Err(code) => return code,
     };
+    print_compiled(&answer, &ir, &sources, &org);
+    print_approval_gates(&ir);
+    print_warnings(&ir);
     print_answer(&answer, &args.event, &git_ref)
 }
 

@@ -59,6 +59,16 @@ release.yml uses that version's section as the GitHub Release text. See
 - **Plugin probe Pods have cpu and memory requests and a memory limit.** A namespace that
   requires resources refused the probe Pods, so the plugin namespace check failed. They now
   carry the same resources as a Plugin Pod's self-check.
+- **`scarab validate --server` reports what the server checked** (git-bug 1aa19e6). It printed
+  "`lib:` ... its Steps were not checked (use --server to check them)" although the server had
+  compiled those libraries, and counted the Run's Steps from the offline check, where each
+  library is one Step. With `--server` it now prints the Run's step count as the server compiled
+  it and the installed libraries it resolved. The policy test API returns these as `pipeline`.
+- **The policy test refuses what Run creation refuses for a library or a credential**
+  (git-bug 1aa19e6). A Run of a Pipeline whose library Step asks for the build sandbox, a forge
+  token or a yanked version, without the trust Run creation requires, got `outcome: allow` from
+  `scarab validate --server` and was refused when created. The policy test now runs the same check
+  as Run creation and answers a deny with Run creation's reason, also returned as `refusal`.
 
 ## [0.4.4] - 2026-11-19
 
