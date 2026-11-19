@@ -7,6 +7,7 @@ import {
   eventCategory,
   EVENT_GLYPH,
   activeInfraConditions,
+  heldBeforeStart,
   infraReasonText,
 } from "./events";
 import {
@@ -313,7 +314,7 @@ describe("activeInfraConditions", () => {
   it("an onset with no close is active on the step's current attempt", () => {
     const evs = [started(1, "build", "a1"), infraCondition(2, "build", "a1", "Unschedulable")];
     expect(activeInfraConditions(evs)).toEqual({
-      build: { attempt: "a1", reason: "Unschedulable" },
+      build: { attempt: "a1", reason: "Unschedulable", since: 2 },
     });
   });
 
@@ -397,5 +398,36 @@ describe("infraReasonText", () => {
 
   it("splits an unknown token into words rather than hiding it", () => {
     expect(infraReasonText("SomeNewReason")).toBe("some new reason");
+  });
+});
+
+// The failure box says how long a try waited for a node before it started:
+// the closed episodes of that one attempt, never another attempt's.
+describe("heldBeforeStart", () => {
+  it("sums the closed node waits of one attempt", () => {
+    const evs = [
+      started(1, "plan", "a1"),
+      infraCondition(2, "plan", "a1", "Unschedulable"),
+      infraCondition(40_000, "plan", "a1", "Unschedulable", 38_000),
+      infraCondition(41_000, "plan", "a1", "NotScheduled", 20_000),
+    ];
+    expect(heldBeforeStart(evs, "plan", "a1")).toBe(58_000);
+  });
+
+  it("ignores other attempts, other steps, open onsets and other reasons", () => {
+    const evs = [
+      infraCondition(2, "plan", "a2", "Unschedulable", 9_000),
+      infraCondition(3, "apply", "a1", "Unschedulable", 9_000),
+      infraCondition(4, "plan", "a1", "Unschedulable"),
+      infraCondition(5, "plan", "a1", "ImagePullBackOff", 9_000),
+    ];
+    expect(heldBeforeStart(evs, "plan", "a1")).toBeNull();
+  });
+});
+
+describe("activeInfraConditions since", () => {
+  it("is the onset's time, so the graph can say how long the step has waited", () => {
+    const evs = [started(1, "plan", "a1"), infraCondition(5_000, "plan", "a1", "Unschedulable")];
+    expect(activeInfraConditions(evs).plan?.since).toBe(5_000);
   });
 });

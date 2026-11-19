@@ -19,6 +19,10 @@ export type AttemptLike = {
    * This field existed on the API for months and no view read it, which is why
    * a dead-lettered step showed "no output for this try" and nothing else. */
   failure_detail?: string | null;
+  /** When the attempt started and ended (unix-ms); `finished_at` is null
+   * while it runs. */
+  started_at?: number | null;
+  finished_at?: number | null;
 };
 
 /** The attempts a step pane's tabs are scoped to. Take-windowed in EVERY view:
@@ -83,6 +87,9 @@ export type FilmstripTry = {
   shadowed: boolean;
   /** Re-adopted after a control-plane restart (visibility marker, not a re-run). */
   readopted: boolean;
+  /** When the try started and ended (unix-ms), when the API gave them. */
+  startedAt?: number | null;
+  finishedAt?: number | null;
 };
 
 /** A step's tries as the attempts dropdown renders them, scoped to a Take's
@@ -110,6 +117,8 @@ export function stripTries(
     superseded: c.superseded.has(a.id),
     shadowed: c.shadowed.has(a.id),
     readopted: c.readopted.has(a.id),
+    startedAt: a.started_at ?? null,
+    finishedAt: a.finished_at ?? null,
   }));
 }
 

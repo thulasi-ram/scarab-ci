@@ -224,7 +224,13 @@ export const EVENT_GLYPH: Record<EventCat, string> = {
 
 /** A condition still holding a step's attempt back: the onset was logged and
  * no closing event (the one carrying `held_ms`) has followed yet. */
-export type ActiveInfraCondition = { attempt: string; reason: string; message?: string };
+export type ActiveInfraCondition = {
+  attempt: string;
+  reason: string;
+  message?: string;
+  /** When the condition started (the onset event's time). */
+  since: number;
+};
 
 /** The infra condition holding each step's CURRENT attempt back right now, by
  * step id. A step whose latest attempt has no open condition is absent.
@@ -262,6 +268,7 @@ export function activeInfraConditions(events: RunEvent[]): Record<string, Active
             attempt,
             reason: String(v.reason ?? ""),
             ...(v.message ? { message: String(v.message) } : {}),
+            since: e.at,
           };
         }
         break;
@@ -269,6 +276,25 @@ export function activeInfraConditions(events: RunEvent[]): Record<string, Active
     }
   }
   return open;
+}
+
+/** Reasons that mean the scheduler could not place the Pod on a node. */
+const NODE_WAIT_REASONS = new Set(["Unschedulable", "NotScheduled", "SchedulingGated"]);
+
+/** How long the scheduler could not place one attempt's Pod, in ms: the sum of
+ * its closed "waiting for a node" conditions. Null when there were none. An
+ * open condition is not counted; the caller shows it as active instead. */
+export function heldBeforeStart(events: RunEvent[], step: string, attempt: string): number | null {
+  let total = 0;
+  for (const e of events) {
+    const k = e.kind;
+    if (typeof k === "string") continue;
+    const v = k.StepInfraCondition;
+    if (!v || v.step !== step || String(v.attempt ?? "") !== attempt) continue;
+    if (typeof v.held_ms !== "number" || !NODE_WAIT_REASONS.has(String(v.reason ?? ""))) continue;
+    total += v.held_ms;
+  }
+  return total > 0 ? total : null;
 }
 
 /** An infra condition's reason token in plain words, for the graph node:
