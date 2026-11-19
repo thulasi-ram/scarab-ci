@@ -187,7 +187,8 @@ export function logNotice(buf: LogBuffer): { text: string; loadFull: boolean } |
 export function tailRows(buf: LogBuffer, max: number): { n: number; line: string }[] {
   const text = buf.text;
   let start = 0;
-  let pos = text.length;
+  // A final newline ends the last line; it does not start a row of its own.
+  let pos = text.endsWith("\n") ? text.length - 1 : text.length;
   for (let seen = 0; ; ) {
     const p = pos > 0 ? text.lastIndexOf("\n", pos - 1) : -1;
     if (p < 0) break;
