@@ -21,6 +21,11 @@ export const CLIENT_CAP_BYTES = 8 * MiB;
 export const BACKOFF_INITIAL_MS = 1000;
 export const BACKOFF_MAX_MS = 30_000;
 
+/** Reopens in a row that deliver no event before the pane stops resuming and
+ * opens the log fresh. An EventSource cannot tell a cursor the server refused
+ * (400) from a dropped connection, so a refused cursor would retry forever. */
+export const EMPTY_REOPENS_BEFORE_FRESH = 3;
+
 /** The server's `truncated` event: the replay skipped the first `skippedBytes`
  * of a log that was `totalBytes` long when the stream opened. */
 export type LogTruncation = { skippedBytes: number; totalBytes: number };
@@ -127,15 +132,20 @@ export function appendLog(buf: LogBuffer, chunk: string, cap = CLIENT_CAP_BYTES)
 }
 
 /** The notice above a log when part of it is not shown, or null. `loadFull`:
- * the whole log fits under `FULL_LOG_BYTES`, so the pane can ask for all of it. */
+ * the whole log fits under `FULL_LOG_BYTES`, so the pane can ask for all of it.
+ *
+ * Line numbers count from the first line the pane received. After the
+ * server's cutoff that is not line 1 of the log, so the notice says where the
+ * numbers start. Lines the pane dropped itself keep their numbers. */
 export function logNotice(buf: LogBuffer): { text: string; loadFull: boolean } | null {
   const hidden = buf.skippedBytes + buf.droppedBytes;
   if (hidden === 0) return null;
   const total = hidden + buf.bytes;
-  return {
-    text: `Showing the last ${formatSize(buf.bytes)} of ${formatSize(total)}.`,
-    loadFull: total <= FULL_LOG_BYTES,
-  };
+  let text = `Showing the last ${formatSize(buf.bytes)} of ${formatSize(total)}.`;
+  if (buf.skippedBytes > 0) {
+    text += buf.droppedLines > 0 ? " Line numbers start at the first line loaded." : " Line numbers start here.";
+  }
+  return { text, loadFull: total <= FULL_LOG_BYTES };
 }
 
 /** The last `max` lines of the buffer, numbered from the log's first line the
@@ -191,7 +201,11 @@ export type LogFollower = {
  * The first stream opens with `tail`. When a stream ends while the try still
  * reads as running, it opens again after a backoff (`backoffDelay`), resuming
  * after the last event id so nothing is sent twice; the backoff resets once a
- * reopened stream delivers an event. `streamEndStep` decides each end: a try
+ * reopened stream delivers an event. After `EMPTY_REOPENS_BEFORE_FRESH`
+ * reopens in a row that deliver no event, the cursor is dropped and the next
+ * stream opens with `tail` again; `onReset` clears the pane when that stream
+ * delivers its first event, so the old text stays up while the server is
+ * unreachable. The backoff goes on from where it was. `streamEndStep` decides each end: a try
  * that finished is done, and one that finished with no output is read once
  * more. `outcome()` is undefined while the log is out of view; the decision
  * then waits for `inView()`, and the pane stops reopening a try it switched
@@ -207,6 +221,9 @@ export function followLog(opts: {
   onEnd: () => void;
   /** A stream opened again. */
   onReopen?: () => void;
+  /** A stream opened fresh with `tail` after resuming failed delivered its
+   * first event: clear what the pane holds before it arrives. */
+  onReset?: () => void;
   timers?: Timers;
   random?: () => number;
 }): LogFollower {
@@ -218,32 +235,55 @@ export function followLog(opts: {
   let lastId: string | null = null;
   let hadOutput = false;
   let failures = 0;
+  // Reopens in a row that ended with no event.
+  let emptyReopens = 0;
+  // The stream in flight is a fresh open after resuming failed.
+  let resetPending = false;
 
   const start = (reopen: boolean) => {
     if (stopped) return;
+    if (reopen && lastId != null && emptyReopens >= EMPTY_REOPENS_BEFORE_FRESH) {
+      lastId = null;
+      emptyReopens = 0;
+      resetPending = true;
+    }
     // One stream at a time: `current` tells this stream's events from a
     // closed one's.
     const current = {};
     let active: object | null = current;
     let close: (() => void) | null = null;
     const mine = () => active === current && !stopped;
+    let delivered = false;
+    // Any event of this stream: the backoff and the empty-reopen count start
+    // over, and a fresh open after resuming failed clears the pane first.
+    const gotEvent = () => {
+      failures = 0;
+      emptyReopens = 0;
+      delivered = true;
+      if (resetPending) {
+        resetPending = false;
+        hadOutput = false;
+        opts.onReset?.();
+      }
+    };
     const q: LogStreamQuery = lastId != null ? { from: lastId } : { tail: opts.tail };
     if (reopen) opts.onReopen?.();
     close = opts.open(q, {
       onChunk: (text, id) => {
         if (!mine()) return;
-        failures = 0;
+        gotEvent();
         if (id) lastId = id;
         if (text.length > 0) hadOutput = true;
         opts.onChunk(text);
       },
       onTruncated: (t) => {
         if (!mine()) return;
-        failures = 0;
+        gotEvent();
         opts.onTruncated(t);
       },
       onEnd: () => {
         if (!mine()) return;
+        if (reopen && !delivered) emptyReopens++;
         active = null;
         closeStream = null;
         close?.();

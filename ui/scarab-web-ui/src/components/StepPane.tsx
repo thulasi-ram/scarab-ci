@@ -464,6 +464,7 @@ export default function StepPane(props: {
         onTruncated: (t) => updateBuffer(key, (b) => truncateLog(b, t)),
         onEnd: () => setEndedKey(key, true),
         onReopen: () => setEndedKey(key, false),
+        onReset: () => updateBuffer(key, () => emptyLogBuffer()),
       }),
     );
   });
@@ -487,7 +488,8 @@ export default function StepPane(props: {
     const b = logBuffer();
     return b ? tailRows(b, MAX_LINES).map((r) => ({ ...r, lvl: levelOf(r.line) })) : [];
   };
-  // "Showing the last 2.0 MB of 14.3 MB." when part of the log is not shown.
+  // "Showing the last 2.0 MB of 14.3 MB. Line numbers start here." when part
+  // of the log is not shown.
   const notice = () => {
     const b = logBuffer();
     return b ? logNotice(b) : null;

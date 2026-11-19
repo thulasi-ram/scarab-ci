@@ -80,19 +80,34 @@ describe("logNotice", () => {
     expect(logNotice(appendLog(emptyLogBuffer(), "line\n"))).toBeNull();
   });
 
-  it("names what shows and the whole size when the server sent only the end", () => {
+  it("names what shows, the whole size, and where line numbers start when the server sent only the end", () => {
     let b = truncateLog(emptyLogBuffer(), { skippedBytes: 12.3 * MiB, totalBytes: 14.3 * MiB });
     b = appendLog(b, "x".repeat(2 * MiB - 1) + "\n");
-    expect(logNotice(b)).toEqual({ text: "Showing the last 2.0 MB of 14.3 MB.", loadFull: false });
+    expect(logNotice(b)).toEqual({
+      text: "Showing the last 2.0 MB of 14.3 MB. Line numbers start here.",
+      loadFull: false,
+    });
+    // Line numbers stay relative: the first line shown is 1.
+    expect(tailRows(b, 1)[0]!.n).toBe(1);
+  });
+
+  it("says line numbers start at the first line loaded once the pane dropped some of it too", () => {
+    let b = truncateLog(emptyLogBuffer(), { skippedBytes: 100, totalBytes: 110 });
+    b = appendLog(b, "aaaa\nbbbb\n", 6);
+    expect(logNotice(b)?.text).toBe("Showing the last 5 B of 110 B. Line numbers start at the first line loaded.");
+    expect(tailRows(b, 5)).toEqual([{ n: 2, line: "bbbb" }]);
   });
 
   it("offers Load full log when the whole log fits in 8 MB", () => {
     let b = truncateLog(emptyLogBuffer(), { skippedBytes: 3 * MiB, totalBytes: 5 * MiB });
     b = appendLog(b, "x".repeat(2 * MiB - 1) + "\n");
-    expect(logNotice(b)).toEqual({ text: "Showing the last 2.0 MB of 5.0 MB.", loadFull: true });
+    expect(logNotice(b)).toEqual({
+      text: "Showing the last 2.0 MB of 5.0 MB. Line numbers start here.",
+      loadFull: true,
+    });
   });
 
-  it("counts lines the pane dropped", () => {
+  it("counts lines the pane dropped, whose numbers stay put", () => {
     const b = appendLog(appendLog(emptyLogBuffer(), "a".repeat(1023) + "\n", 2048), "b".repeat(1500) + "\n", 2048);
     expect(logNotice(b)?.text).toBe("Showing the last 1.5 KB of 2.5 KB.");
   });
@@ -142,6 +157,7 @@ function harness(opts: { outcome: () => string | undefined; tail?: number }) {
   };
   const shown: string[] = [];
   let ends = 0;
+  let resets = 0;
   const f = followLog({
     open: (q, h) => {
       const s = { q, h, closed: false };
@@ -155,6 +171,7 @@ function harness(opts: { outcome: () => string | undefined; tail?: number }) {
     onChunk: (t) => shown.push(t),
     onTruncated: () => {},
     onEnd: () => ends++,
+    onReset: () => resets++,
     timers,
     random: () => 0,
   });
@@ -165,7 +182,7 @@ function harness(opts: { outcome: () => string | undefined; tail?: number }) {
     if (!t!.cleared) t!.fn();
     return t!.ms;
   };
-  return { f, opened, pending, shown, tick, ends: () => ends };
+  return { f, opened, pending, shown, tick, ends: () => ends, resets: () => resets };
 }
 
 describe("followLog", () => {
@@ -197,6 +214,39 @@ describe("followLog", () => {
     s.h.onEnd!();
     expect(h.tick()).toBe(1000);
     expect(h.opened[h.opened.length - 1]!.q).toEqual({ from: "a1:2" });
+  });
+
+  it("after 3 reopens in a row deliver no event, drops the cursor and opens fresh with the tail", () => {
+    // A cursor the server refuses (400) ends each reopen with no event.
+    const h = harness({ outcome: () => "running" });
+    h.opened[0]!.h.onChunk("x\n", "a1:1");
+    const last = () => h.opened[h.opened.length - 1]!;
+    const waits: number[] = [];
+    for (let i = 0; i < 4; i++) {
+      last().h.onEnd!();
+      waits.push(h.tick());
+    }
+    // The backoff goes on from where it was.
+    expect(waits).toEqual([1000, 2000, 4000, 8000]);
+    expect(h.opened.map((s) => s.q)).toEqual([
+      { tail: 2 * MiB },
+      { from: "a1:1" },
+      { from: "a1:1" },
+      { from: "a1:1" },
+      { tail: 2 * MiB },
+    ]);
+    expect(h.f.lastId()).toBeNull();
+    // The old text stays until the fresh stream delivers; then the pane clears
+    // once, before that first event.
+    expect(h.resets()).toBe(0);
+    last().h.onTruncated!({ skippedBytes: 10, totalBytes: 20 });
+    last().h.onChunk("y\n", "a1:4");
+    expect(h.resets()).toBe(1);
+    // Resuming works again, with the backoff reset.
+    last().h.onEnd!();
+    expect(h.tick()).toBe(1000);
+    expect(last().q).toEqual({ from: "a1:4" });
+    expect(h.resets()).toBe(1);
   });
 
   it("stops when the try has ended", () => {
