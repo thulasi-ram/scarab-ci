@@ -1,4 +1,4 @@
-// Gate predicates (ADR-0008), shared so the DAG's label and the approve action
+// Gate predicates, shared so the DAG's label and the approve action
 // can never disagree about what "this gate is waiting" means.
 //
 // A gate launches no Pod. It holds its step status until something releases it,
@@ -36,7 +36,7 @@ export function isGateOpen(s: GateLike): boolean {
 
 /** Is this gate one a human can approve? Only `manual` gates are: a `timer`
  * gate releases itself and an `external` one is released by a signed token
- * (ADR-0034), so offering an Approve button for either would always 40x. */
+ * so offering an Approve button for either would always 40x. */
 export function isApprovable(s: GateLike): boolean {
   return isGateOpen(s) && s.gate === "manual";
 }
@@ -61,7 +61,7 @@ export function approvableGates<T extends GateLike>(steps: readonly T[]): T[] {
   return steps.filter(isApprovable);
 }
 
-// --- Verdicts (ADR-0070 §9) -------------------------------------------------
+// --- Verdicts ---------------------------------------------------------------
 // The server says, per step, how a gate's latest wait resolved
 // (`gate_resolution`, the journal's GateResolved). This turns it into the one
 // line the DAG node and the step pane both show.
@@ -285,7 +285,7 @@ export function approvalNote(res: GateApprovalLike, time: (ms: number) => string
 }
 
 // --- The dashboard's action inbox (git-bug c489346) --------------------------
-// A waiting gate holds only its dependents (ADR-0070 §9): a Run whose gate is
+// A waiting gate holds only its dependents: a Run whose gate is
 // reached while an independent sibling still runs stays `running`. So "this
 // run waits on a gate" is the server's `waiting_gates` (gate steps Pending,
 // reached, with an open Attempt), never `status === "suspended"`.

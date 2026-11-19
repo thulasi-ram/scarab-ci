@@ -1,4 +1,4 @@
-// Issued API tokens, as the UI has to reason about them (ADR-0049). Pure — no
+// Issued API tokens, as the UI has to reason about them. Pure — no
 // DOM, no fetch — so the parts that are easy to get subtly wrong (which state a
 // record is in, what its role actually promises, whether a lifetime is
 // mintable) are testable without rendering anything.

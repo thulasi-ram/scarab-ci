@@ -35,9 +35,24 @@ scarab:
   role: converged
   # k8s (production, one Pod per step) | local (host processes — dev only).
   executor: k8s
-  # Namespace the executor launches step Pods into. Empty => the release
-  # namespace (.Release.Namespace); the RBAC below is granted there.
+  # Namespace the executor launches step Pods into; the executor's RBAC
+  # (templates/rbac.yaml) is granted there. Empty => `<release namespace>-steps`
+  # with the k8s executor, so pipeline code does not run beside the server's
+  # Secret and ServiceAccount; the release namespace instead when
+  # `rbac.create` or `createNamespace` is false, or the executor is local.
+  # Set it to the release namespace to keep step Pods there, as the chart did
+  # before. A namespace you name here is yours to create, before the install:
+  # the chart renders a Role into it.
   namespace: ""
+  # Render `<release namespace>-steps` when `namespace` is empty. Creating a
+  # Namespace needs cluster-wide rights; set false when the installer has only
+  # rights in the release namespace, and step Pods run there. To create
+  # `<release namespace>-steps` yourself (a LimitRange or ResourceQuota for
+  # step Pods, labels your cluster requires), set `namespace` to its name. The
+  # Namespace is kept on `helm uninstall` (helm.sh/resource-policy: keep), with
+  # any step Pods still in it. No Pod Security label: a `rootless-buildkit`
+  # step needs an Unconfined seccomp profile, which `baseline` refuses.
+  createNamespace: true
   # Address scarab-server binds inside the container.
   addr: "0.0.0.0:8080"
   # Extra plain (non-secret) env vars, e.g. RUST_LOG.
@@ -142,9 +157,9 @@ scarab:
   # `nodeSelector` and `workspace.tolerations` / `workspace.nodeSelector`.
   #
   # Rendered verbatim into a mounted ConfigMap, so these keys are the SERVER's
-  # schema (snake_case). Only `baseline`, `default_resources` and `profiles` are
-  # accepted; any other top-level key fails the render (the server itself would
-  # silently ignore it, leaving every step Pod Pending).
+  # schema (snake_case). Only `baseline`, `default_resources`, `profiles` and
+  # `author_overlay` are accepted; any other top-level key fails the render (the
+  # server itself would silently ignore it, leaving every step Pod Pending).
   #
   # `baseline` and each profile's `k8s` are POD fragments, strategic-merged onto
   # the whole Pod — so pod-spec fields go under `spec:`. A profile's
@@ -178,6 +193,20 @@ scarab:
   # Mark every profile that grants push access (a ServiceAccount with a push
   # role, an init container that logs in) `registry_auth_only: true`. Authors
   # name profiles, so the marker is what keeps it off steps that run their code.
+  #
+  # `author_overlay` lists the label, annotation and toleration keys a step's
+  # own `k8s_overlay` may set (where an Environment permits overlays). Each
+  # entry is an exact key, `prefix/*` (every key under that prefix) or `*`
+  # (every key without a prefix). Unset, no key is listed: an overlay that sets
+  # a label, an annotation or a toleration is refused. Keys under
+  # `scarab.io/`, `scarab.dev/`, `app.kubernetes.io/`, the AppArmor and seccomp
+  # annotations, `node-role.kubernetes.io/` taints and a toleration without a
+  # key stay refused even when listed.
+  #
+  #   author_overlay:
+  #     label_keys: [team, cost-center]
+  #     annotation_keys: ["karpenter.sh/do-not-disrupt"]
+  #     toleration_keys: [nvidia.com/gpu]
   placement: {}
 
   # Object store (logs, artifacts, the workspace CAS cold tier). EFFECTIVELY
@@ -636,7 +665,10 @@ plugins:
   # verdict is only as good as the image printing it.
   probeImage: ""
 
-# RBAC the k8s executor needs to run one Pod per step in scarab.namespace.
+# RBAC the k8s executor needs to run one Pod per step in scarab.namespace
+# (`<release namespace>-steps` by default). With `create: false`, you grant
+# the server's ServiceAccount those rights yourself, and an empty
+# scarab.namespace means the release namespace.
 # NOTE: the workspace StatefulSet gets its own ServiceAccount with NO
 # RoleBinding — see templates/serviceaccount-workspace.yaml for why that is
 # deliberate rather than an omission.

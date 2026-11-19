@@ -992,7 +992,30 @@ pub trait Db: Send + Sync {
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
+    ) -> Result<Vec<LogChunkMeta>, DbError> {
+        self.log_chunks_from(run, step, attempt, 0).await
+    }
+
+    /// The rows of [`Self::log_chunks`] with `seq >= from_seq`, ordered by
+    /// `seq`. A live log poll reads only the rows it has not seen (git-bug
+    /// 209ef14) instead of the whole index every pass.
+    async fn log_chunks_from(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        from_seq: u64,
     ) -> Result<Vec<LogChunkMeta>, DbError>;
+
+    /// The newest row of the stream's index (highest `seq`), or `None` when
+    /// the stream has no chunk. An append computes the next seq and offset
+    /// from it without reading the whole index.
+    async fn last_log_chunk(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<LogChunkMeta>, DbError>;
 
     /// All step projections of a run (with their attempts) — the DAG snapshot
     /// the scheduler folds to decide admission and completion.
@@ -1447,6 +1470,29 @@ pub trait LogChunks: Send {
     async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ExecError>;
 }
 
+/// Where a log read starts: [`Executor::log_stream`] and its sidecar and
+/// service forms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFrom {
+    /// The container log's first byte.
+    Start,
+    /// Output printed after the read opens; nothing printed before it.
+    Now,
+}
+
+/// The secret values a unit was launched with, as
+/// [`Executor::log_redactions`] reads them back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogRedactions {
+    /// Every value the unit holds. Empty: the unit references no credential
+    /// Secret.
+    Values(Vec<Vec<u8>>),
+    /// The unit references a credential Secret that does not exist: it was
+    /// deleted when the attempt settled, or the launch has not written it
+    /// yet. Its values cannot be read.
+    Gone,
+}
+
 /// The only source of "now" in the domain. Behind this port a real clock uses
 /// the wall clock; the fake clock advances virtual time manually (DST).
 #[async_trait]
@@ -1692,8 +1738,35 @@ pub trait Executor: Send + Sync {
     /// does not tail). Takes the fenced [`StepRun`] rather than an [`ExecHandle`]
     /// because the source is derived from the fence — the same derivation `launch`
     /// uses — so the caller needs no handle bookkeeping to start a tail.
-    async fn log_stream(&self, _step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+    ///
+    /// `from` says where the read starts: [`LogFrom::Now`] skips what the
+    /// unit printed before the read opened.
+    async fn log_stream(
+        &self,
+        _step: &StepRun,
+        _from: LogFrom,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         Ok(None)
+    }
+
+    /// The secret values `step`'s fenced unit was launched with, read back
+    /// from the unit, so that whichever control plane tails its log
+    /// ([`log_stream`](Self::log_stream), [`sidecar_log_stream`](Self::sidecar_log_stream))
+    /// can redact them: the log redactor is process memory, filled at launch,
+    /// and a replica that did not launch the unit (a tail-lease takeover, a
+    /// server roll while it runs) would otherwise store them in clear.
+    ///
+    /// Each value is returned as the unit holds it: the step's own secret
+    /// values, and the registry dockerconfigjson whole (the caller extracts
+    /// the credentials in it). [`LogRedactions::Values`] with no values when
+    /// the unit references no credential Secret; [`LogRedactions::Gone`]
+    /// when it references one that does not exist (deleted when the attempt
+    /// settled, or not written yet). An `Err` (the unit or a Secret could
+    /// not be read) is never "none": the tail reads nothing until the values
+    /// load. The default answers no values: a backend without a log source,
+    /// or whose log tail runs only where the unit was launched.
+    async fn log_redactions(&self, _step: &StepRun) -> Result<LogRedactions, ExecError> {
+        Ok(LogRedactions::Values(Vec::new()))
     }
 
     /// Open a best-effort **live tail** of one of `step`'s co-located sidecar
@@ -1707,6 +1780,7 @@ pub trait Executor: Send + Sync {
         &self,
         _step: &StepRun,
         _container: &str,
+        _from: LogFrom,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         Ok(None)
     }
@@ -1755,6 +1829,7 @@ pub trait Executor: Send + Sync {
     async fn service_log_stream(
         &self,
         _handle: &ExecHandle,
+        _from: LogFrom,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         Ok(None)
     }

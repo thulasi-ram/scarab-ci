@@ -517,10 +517,10 @@ const richEventsBody = [
   // ── version 1 (original run) ──
   rev(ago(25 * min), { AttemptStarted: { step: "clone", attempt: "a1" } }),
   rev(ago(24 * min + 45000), { AttemptFinished: { step: "clone", attempt: "a1" } }),
-  rev(ago(24 * min + 44000), { StepTransitioned: { step: "clone", from: "running", to: "succeeded" } }),
+  rev(ago(24 * min + 44000), { StepTransitioned: { step: "clone", from: "Running", to: "Succeeded" } }),
   rev(ago(24 * min + 30000), { AttemptStarted: { step: "build", attempt: "a1" } }),
   rev(ago(23 * min + 20000), { AttemptFinished: { step: "build", attempt: "a1" } }),
-  rev(ago(23 * min + 19000), { StepTransitioned: { step: "build", from: "running", to: "succeeded" } }),
+  rev(ago(23 * min + 19000), { StepTransitioned: { step: "build", from: "Running", to: "Succeeded" } }),
   rev(ago(23 * min + 15000), { AttemptStarted: { step: "test", attempt: "a1" } }),
   // ── the boundary: a human reran build; test (in flight) + approve cascade ──
   rev(ago(15 * min), {
@@ -529,15 +529,18 @@ const richEventsBody = [
   // ── version 2 (latest) ──
   rev(ago(14 * min + 55000), { AttemptStarted: { step: "build", attempt: "a2" } }),
   rev(ago(13 * min + 50000), { AttemptFinished: { step: "build", attempt: "a2", failure: "step" } }),
-  rev(ago(13 * min + 49000), { StepTransitioned: { step: "build", from: "running", to: "failed" } }),
+  rev(ago(13 * min + 49000), { StepTransitioned: { step: "build", from: "Running", to: "Ready" } }),
   rev(ago(13 * min + 40000), { AttemptStarted: { step: "build", attempt: "a3" } }),
   rev(ago(12 * min + 30000), { AttemptFinished: { step: "build", attempt: "a3" } }),
-  rev(ago(12 * min + 29000), { StepTransitioned: { step: "build", from: "running", to: "succeeded" } }),
+  rev(ago(12 * min + 29000), { StepTransitioned: { step: "build", from: "Running", to: "Succeeded" } }),
   rev(ago(12 * min + 25000), { AttemptStarted: { step: "test", attempt: "a2" } }),
   rev(ago(10 * min), { AttemptFinished: { step: "test", attempt: "a2" } }),
-  rev(ago(10 * min - 1000), { StepTransitioned: { step: "test", from: "running", to: "succeeded" } }),
-  rev(ago(9 * min + 50000), { StepTransitioned: { step: "approve", from: "pending", to: "waiting" } }),
+  rev(ago(10 * min - 1000), { StepTransitioned: { step: "test", from: "Running", to: "Succeeded" } }),
 ].join("");
+
+// A status as the server's events carry it: the engine's names, `Succeeded`
+// for the DTOs' `succeeded`.
+const wireStatus = (s: string): string => s.replace(/(^|_)([a-z])/g, (_m, _u, c: string) => c.toUpperCase());
 
 // ── the MATRIX run (summary line, matrix labels, retries) ───────────────────
 // checkout `git`, then `plan` over cluster × phase. treebo-production ×
@@ -641,7 +644,7 @@ const matrixEventsBody = (() => {
     }),
     mxv(ago(MX_T0), { AttemptStarted: { step: "git", attempt: "a1" } }),
     mxv(ago(MX_PLAN_AT), { AttemptFinished: { step: "git", attempt: "a1" } }),
-    mxv(ago(MX_PLAN_AT - 500), { StepTransitioned: { step: "git", from: "running", to: "succeeded" } }),
+    mxv(ago(MX_PLAN_AT - 500), { StepTransitioned: { step: "git", from: "Running", to: "Succeeded" } }),
   ];
   const timed: [number, string][] = [];
   for (const s of matrixRunStatus.steps.slice(1)) {
@@ -672,14 +675,14 @@ const matrixEventsBody = (() => {
     timed.push([
       s.attempt_list![s.attempt_list!.length - 1]!.finished_at! + 500,
       mxv(s.attempt_list![s.attempt_list!.length - 1]!.finished_at! + 500, {
-        StepTransitioned: { step: s.id, from: "running", to: s.status },
+        StepTransitioned: { step: s.id, from: "Running", to: wireStatus(s.status) },
       }),
     ]);
   }
   timed.sort((a, b) => a[0] - b[0]);
   const end = Math.max(...timed.map(([at]) => at));
   out.push(...timed.map(([, line]) => line));
-  out.push(mxv(end + 1000, { RunTransitioned: { from: "running", to: "failed" } }));
+  out.push(mxv(end + 1000, { RunTransitioned: { from: "Running", to: "Failed" } }));
   return out.join("");
 })();
 const matrixArtifacts: ArtifactDto[] = MX_CELLS.filter(([, , how]) => how === "ok").map(([cluster, phase], i) => ({
@@ -795,7 +798,7 @@ const retriesEventsBody = (() => {
         },
       },
     ],
-    [ms(20, 2), { RunTransitioned: { from: "pending", to: "running" } }],
+    [ms(20, 2), { RunTransitioned: { from: "Pending", to: "Running" } }],
     // a.kim retried `unit` after its second try timed out.
     [ms(13), { StepRetryRequested: { target: "unit", invalidated: [], by: "a.kim" } }],
   ];
@@ -828,7 +831,7 @@ const retriesEventsBody = (() => {
     if (last.end !== null)
       timed.push([
         last.end - 500,
-        { StepTransitioned: { step, from: "running", to: last.failure ? "failed" : "succeeded" } },
+        { StepTransitioned: { step, from: "Running", to: last.failure ? "Failed" : "Succeeded" } },
       ]);
   }
   // Oldest first: a larger "before now" is earlier.
@@ -900,6 +903,123 @@ const testLogLines = [
   "test store::cas::dedups_identical_blobs ... ok",
   "test log::pipeline::appends_are_ordered_per_fence ... ok",
 ];
+
+// ── log streams ─────────────────────────────────────────────────────────────
+// The mock serves a log as the server does: stored chunks of raw output, each
+// `data` event carrying an id `<attempt>:<next chunk>` to resume after, the
+// last `?tail=` bytes with a `truncated` event first, and the whole log at
+// `…/logs/raw` (a step try's or a shared service's).
+
+/** The matrix cell whose `tofu plan` printed a large log (about 5 MB): the
+ * pane shows its last 2 MB and offers Load full log and Download. */
+const BIG_LOG_STEP = mxId("treebo-staging", "aws-cluster");
+let bigLogChunks: string[] | null = null;
+/** The large log's chunks, built on first use: 13,000 planned resources,
+ * 200 to a chunk. */
+function bigLog(): string[] {
+  if (bigLogChunks) return bigLogChunks;
+  const header = "$ tofu plan -input=false -out=plan.tfplan\nOpenTofu will perform the following actions:\n\n";
+  const out: string[] = [];
+  const total = 13_000;
+  let chunk = header;
+  for (let i = 0; i < total; i++) {
+    const az = ["a", "b", "c"][i % 3];
+    chunk +=
+      `  # module.cluster.aws_security_group_rule.node_ingress[${i}] will be created\n` +
+      `  + resource "aws_security_group_rule" "node_ingress" {\n` +
+      `      + cidr_blocks              = ["10.${(i >> 8) & 255}.${i & 255}.0/24"]\n` +
+      `      + from_port                = ${30000 + (i % 2768)}\n` +
+      `      + id                       = (known after apply)\n` +
+      `      + protocol                 = "tcp"\n` +
+      `      + security_group_id        = "sg-0${(i * 2654435761 >>> 0).toString(16).padStart(8, "0")}"\n` +
+      `      + description              = "node port ${i} (eu-west-1${az})"\n` +
+      `    }\n\n`;
+    if ((i + 1) % 200 === 0) {
+      out.push(chunk);
+      chunk = "";
+    }
+  }
+  out.push(chunk + `Plan: ${total} to add, 0 to change, 0 to destroy.\n`);
+  bigLogChunks = out;
+  return out;
+}
+
+/** The rich run's shared `postgres` service logged about 3 MB: the service
+ * pane shows its last 2 MB and offers Load full log and Download. */
+let bigServiceLogChunks: string[] | null = null;
+/** The large service log's chunks, built on first use: the start-up lines,
+ * 30,000 statement lines, 500 to a chunk, then the ready lines again. */
+function bigServiceLog(): string[] {
+  if (bigServiceLogChunks) return bigServiceLogChunks;
+  const out: string[] = [serviceLogLines.join("\n") + "\n"];
+  const total = 30_000;
+  let chunk = "";
+  for (let i = 0; i < total; i++) {
+    chunk +=
+      `LOG:  duration: ${(i % 97) + 0.125} ms  statement: ` +
+      `SELECT id, status FROM integration_runs WHERE shard = ${i % 64}\n`;
+    if ((i + 1) % 500 === 0) {
+      out.push(chunk);
+      chunk = "";
+    }
+  }
+  out.push(chunk + "LOG:  checkpoint complete: wrote 412 buffers\n");
+  bigServiceLogChunks = out;
+  return out;
+}
+
+/** The stored chunks of the log a step or service stream reads, or null when
+ * it has none (a Pod that never started printed nothing). */
+function mockLogChunks(url: string): string[] | null {
+  let u: URL;
+  try {
+    u = new URL(url, window.location.origin);
+  } catch {
+    return null;
+  }
+  const path = u.pathname.replace(/\/raw$/, "");
+  const step = path.match(/^\/v1\/runs\/([^/]+)\/steps\/([^/]+)\/logs$/);
+  if (step) {
+    if (unscheduledTry(url)) return null;
+    if (step[1] === MATRIX_RUN_ID && decodeURIComponent(step[2]!) === BIG_LOG_STEP) return bigLog();
+    return [testLogLines.join("\n") + "\n"];
+  }
+  const service = path.match(/^\/v1\/runs\/([^/]+)\/services\/([^/]+)\/logs$/);
+  if (service) {
+    if (service[1] === RICH_RUN_ID && decodeURIComponent(service[2]!) === "postgres") return bigServiceLog();
+    return [serviceLogLines.join("\n") + "\n"];
+  }
+  return null;
+}
+
+/** The events a log stream sends for `url`: where `?from=` or `?tail=` says
+ * to start, a `truncated` event when the tail skipped chunks, then one `data`
+ * event per chunk. */
+function mockLogEvents(url: string): { type: string; data: string; id?: string }[] {
+  const chunks = mockLogChunks(url);
+  if (!chunks) return [];
+  const u = new URL(url, window.location.origin);
+  const attempt = u.searchParams.get("attempt") ?? "a1";
+  const from = u.searchParams.get("from");
+  const tail = u.searchParams.get("tail");
+  const out: { type: string; data: string; id?: string }[] = [];
+  let start = 0;
+  if (from) {
+    start = Number(from.split(":")[1] ?? 0) || 0;
+  } else if (tail) {
+    const sizes = chunks.map((c) => new TextEncoder().encode(c).length);
+    const total = sizes.reduce((a, b) => a + b, 0);
+    let rest = total;
+    while (start < chunks.length - 1 && rest > Number(tail)) rest -= sizes[start++]!;
+    if (start > 0) {
+      out.push({ type: "truncated", data: JSON.stringify({ skipped_bytes: total - rest, total_bytes: total }) });
+    }
+  }
+  for (let i = start; i < chunks.length; i++) {
+    out.push({ type: "message", data: chunks[i]!, id: `${attempt}:${i + 1}` });
+  }
+  return out;
+}
 
 // ── environments / secrets ───────────────────────────────────────────────────
 // A repository's Environments are org Environments: see `orgEnvironments`,
@@ -993,7 +1113,7 @@ const gatesEventsBody = [
   ...["bump", "bump-canary", "bump-eu"].flatMap((s) => [
     gev(ago(5 * min), { AttemptStarted: { step: s, attempt: "a1" } }),
     gev(ago(4 * min + 10000), { AttemptFinished: { step: s, attempt: "a1" } }),
-    gev(ago(4 * min + 9000), { StepTransitioned: { step: s, from: "running", to: "succeeded" } }),
+    gev(ago(4 * min + 9000), { StepTransitioned: { step: s, from: "Running", to: "Succeeded" } }),
   ]),
   ...["live", "live-canary", "live-eu"].map((s) =>
     gev(ago(4 * min), { AttemptStarted: { step: s, attempt: "a1" } }),
@@ -1086,7 +1206,7 @@ const envGateEventsBody = [
   }),
   egv(ago(5 * min), { AttemptStarted: { step: "build", attempt: "a1" } }),
   egv(ago(3 * min + 10000), { AttemptFinished: { step: "build", attempt: "a1" } }),
-  egv(ago(3 * min + 9000), { StepTransitioned: { step: "build", from: "running", to: "succeeded" } }),
+  egv(ago(3 * min + 9000), { StepTransitioned: { step: "build", from: "Running", to: "Succeeded" } }),
   ...["qa", "environment-approval"].map((g) =>
     egv(ago(3 * min), { AttemptStarted: { step: g, attempt: "a1" } }),
   ),
@@ -2163,6 +2283,17 @@ function json(body: unknown, init?: ResponseInit) {
 function route(pathname: string, search: string, method: string, body = ""): Response | null {
   const p = pathname;
   if (p === "/v1/me") return json(me);
+  // A try's or a shared service's whole log as a file.
+  if (/^\/v1\/runs\/[^/]+\/(steps|services)\/[^/]+\/logs\/raw$/.test(p)) {
+    const chunks = mockLogChunks(p + search);
+    return new Response((chunks ?? []).join(""), {
+      status: 200,
+      headers: {
+        "content-type": "text/plain; charset=utf-8",
+        "content-disposition": 'attachment; filename="log.txt"',
+      },
+    });
+  }
   if (p === "/v1/about") {
     return json({
       version: "0.3.2",
@@ -2923,7 +3054,8 @@ export function installMock() {
     });
   }) as typeof window.fetch;
 
-  // EventSource — step/service log streams. Replays fixture lines then idles.
+  // EventSource — step/service log streams. Replays the fixture's chunks
+  // (`mockLogEvents`) then idles.
   const RealES = window.EventSource;
   class MockES extends EventTarget {
     static readonly CONNECTING = 0;
@@ -2937,26 +3069,16 @@ export function installMock() {
     constructor(url: string | URL) {
       super();
       this.url = url.toString();
-      const path = (() => {
-        try {
-          return new URL(this.url, window.location.origin).pathname;
-        } catch {
-          return this.url;
-        }
-      })();
-      const replay =
-        unscheduledTry(this.url)
-          ? null
-          : /\/steps\/[^/]+\/logs$/.test(path)
-          ? testLogLines
-          : /\/services\/[^/]+\/logs$/.test(path)
-            ? serviceLogLines
-            : null;
-      if (replay) {
+      const events = mockLogEvents(this.url);
+      queueMicrotask(() => {
+        if (this.readyState !== 2) this.onopen?.(new Event("open"));
+      });
+      if (events.length > 0) {
         queueMicrotask(() => {
-          for (const line of replay) {
-            const e = new MessageEvent("message", { data: line });
-            this.onmessage?.(e);
+          for (const ev of events) {
+            if (this.readyState === 2) return;
+            const e = new MessageEvent(ev.type, { data: ev.data, lastEventId: ev.id ?? "" });
+            if (ev.type === "message") this.onmessage?.(e);
             this.dispatchEvent(e);
           }
           // leave open (running step keeps tailing) — no onerror.

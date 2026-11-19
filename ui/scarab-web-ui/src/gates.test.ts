@@ -57,7 +57,7 @@ describe("isGateOpen", () => {
 
 describe("isApprovable", () => {
   it("covers manual gates only", () => {
-    // timer releases itself; external needs a signed token (ADR-0034). Offering
+    // timer releases itself; external needs a signed token. Offering
     // Approve on either would always fail.
     expect(isApprovable(gate("g", "pending", "manual"))).toBe(true);
     expect(isApprovable(gate("g", "pending", "timer"))).toBe(false);

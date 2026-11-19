@@ -1,4 +1,4 @@
-// Where a Run's Steps come from, and a plugin gate's wait (ADR-0076), as the
+// Where a Run's Steps come from, and a plugin gate's wait, as the
 // Run page words them. Pure: the page and its tests agree.
 import { idSegments, type OriginLink } from "./dag-layout";
 import { shortHash } from "./libraries";
@@ -118,5 +118,5 @@ export function yankNote(
   return parts.join(" ");
 }
 
-/** Is an attempt's failure a yank refusal (ADR-0076 §6)? */
+/** Is an attempt's failure a yank refusal? */
 export const isYankRefusal = (detail: string | null | undefined) => /yanked/i.test(detail ?? "");

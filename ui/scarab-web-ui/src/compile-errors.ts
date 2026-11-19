@@ -1,5 +1,5 @@
-// Compile errors as the Run pipeline page and the Runs list show them
-// (ADR-0076): one "what" line, one "fix" line, and a collapsed "Why". The
+// Compile errors as the Run pipeline page and the Runs list show them:
+// one "what" line, one "fix" line, and a collapsed "Why". The
 // server reads each error's fields back from the compiler's text
 // (`CompileErrorDto`); these helpers only word them. Pure, so the page and
 // its tests agree.

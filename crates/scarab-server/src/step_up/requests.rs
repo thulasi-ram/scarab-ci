@@ -657,7 +657,7 @@ fn confirmable(r: &StepUpConfirmationRequest, now: i64) -> Result<(), ApiError> 
     get,
     path = "/v1/step-up/requests/{id}",
     params(("id" = String, Path, description = "request id (from `confirmation_url`)")),
-    summary = "A step-up confirmation request (ADR-0073 §6)",
+    summary = "A step-up confirmation request",
     responses(
         (status = 200, body = StepUpRequestDto),
         (status = 401, description = "not signed in"),
@@ -707,7 +707,7 @@ pub(crate) async fn get_request(
     post,
     path = "/v1/step-up/requests/{id}/options",
     params(("id" = String, Path, description = "request id")),
-    summary = "Begin confirming a step-up confirmation request (ADR-0073 §6)",
+    summary = "Begin confirming a step-up confirmation request",
     responses(
         (status = 200, body = WebauthnChallengeDto, description = "PublicKeyCredentialRequestOptionsJSON under `public_key`"),
         (status = 400, description = "`no_passkey`: enroll one first"),
@@ -767,7 +767,7 @@ pub(crate) async fn request_options(
     path = "/v1/step-up/requests/{id}/confirm",
     params(("id" = String, Path, description = "request id")),
     request_body = StepUpConfirmRequest,
-    summary = "Confirm a step-up confirmation request: it runs once (ADR-0073 §6)",
+    summary = "Confirm a step-up confirmation request: it runs once",
     responses(
         (status = 200, body = StepUpRequestResultDto, description = "it ran; `state` says whether the operation succeeded"),
         (status = 400, description = "challenge unknown/used/expired/for another request, or the assertion failed verification (`code` names the check)"),

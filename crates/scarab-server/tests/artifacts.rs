@@ -603,6 +603,7 @@ async fn published_artifacts_are_durably_indexed_in_postgres() {
         env: vec![],
         secrets: vec![],
         run_as_root: false,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: None,

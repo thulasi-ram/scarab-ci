@@ -143,6 +143,23 @@ describe("replayTake", () => {
     expect(view.status["a"]).toBe("succeeded");
   });
 
+  // Regression: the server sends the engine's status names ("Succeeded"); a
+  // re-armed gate that had passed with no try in the window read as not_run.
+  it("reads statuses in the server's casing", () => {
+    const evs = [
+      started(1000, "a", "a1"),
+      finished(2000, "a", "a1", "step"),
+      transitioned(2100, "a", "Running", "Failed"),
+      transitioned(2200, "g", "Pending", "Succeeded"),
+      transitioned(2300, "s", "Pending", "Skipped"),
+      rerun(3000, "a", ["g", "s"], "a.kim"),
+      started(4000, "a", "a2"),
+    ];
+    const ts = deriveTakes(evs);
+    const view = replayTake(evs, ts, ts[0]);
+    expect(view.status).toEqual({ a: "failed", g: "succeeded", s: "not_run" });
+  });
+
   it("closed take: an in-flight step NOT re-armed genuinely straddles — stays running", () => {
     const evs = [
       started(1000, "a", "a1"), // never finishes, not re-armed

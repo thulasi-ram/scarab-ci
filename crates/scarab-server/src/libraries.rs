@@ -104,9 +104,8 @@ pub struct LibraryInstallationDto {
 pub struct OrgLibrariesDto {
     pub installations: Vec<LibraryInstallationDto>,
     pub yanks: Vec<LibraryYankDto>,
-    /// The library sources this org trusts, one entry per source and grant
-    /// (ADR-0076 §9, ADR-0018 amendment of 2026-11-12). No library is
-    /// trusted without one.
+    /// The library sources this org trusts, one entry per source and grant.
+    /// No library is trusted without one.
     pub trusted_sources: Vec<TrustedSourceDto>,
 }
 
@@ -147,9 +146,9 @@ impl From<TrustGrant> for TrustGrantDto {
     }
 }
 
-/// A library source the org trusts with one grant (ADR-0076 §9, ADR-0018
-/// amendment of 2026-11-12). Trust holds across upgrades from the same
-/// source.
+/// A library source the org trusts with one grant. Trust holds across upgrades from the same
+/// source; an install that would carry a grant to a new version names it in
+/// `carry_grants`.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TrustedSourceDto {
     /// `<host>/<owner>/<repo>//<path>`, without a commit.
@@ -269,6 +268,12 @@ pub struct FetchedLibraryDto {
     /// The change from `current`, one line per entry, each starting with
     /// `+`, `-` or a space. Empty when nothing is installed.
     pub diff: String,
+    /// The grants (`forge_credentials`, `registry_credential`,
+    /// `build_sandbox`) the org trusts this version's source with. Trust is
+    /// kept per source, not per commit, so installing this version gives it
+    /// these grants: the install must name them, exactly, in
+    /// `carry_grants`. Empty when the source holds none.
+    pub carried_grants: Vec<TrustGrantDto>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -281,6 +286,13 @@ pub struct InstallLibraryRequest {
     /// The hash installed now (an upgrade), or omitted for a first install.
     #[serde(default)]
     pub replaces: Option<String>,
+    /// The grants the version's source holds, which the version
+    /// gets once installed: exactly the fetch's `carried_grants`, in any
+    /// order. Required when the source holds any; a list that differs from
+    /// what the source holds now is refused with the grants named. Empty or
+    /// omitted when the source holds none.
+    #[serde(default)]
+    pub carry_grants: Vec<TrustGrantDto>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -313,6 +325,7 @@ pub(crate) fn store_api_error(e: LibraryStoreError) -> ApiError {
                 .into(),
         ),
         LibraryStoreError::Invalid(m) => ApiError::BadRequest(m),
+        e @ LibraryStoreError::CarriedGrants(_) => ApiError::BadRequest(e.to_string()),
         LibraryStoreError::Store(m) => ApiError::Db(DbError::Other(m)),
     }
 }
@@ -775,7 +788,7 @@ async fn check_compiles(
     get,
     path = "/v1/orgs/{org}/libraries",
     params(("org" = String, Path, description = "org")),
-    summary = "An org's installed libraries (ADR-0076 §4)",
+    summary = "An org's installed libraries",
     responses(
         (status = 200, body = OrgLibrariesDto),
         (status = 403, description = "no read access to the org"),
@@ -818,7 +831,7 @@ pub(crate) async fn list_libraries(
         ("org" = String, Path, description = "org"),
         ("id" = String, Path, description = "installation id")
     ),
-    summary = "One installed library, by id (ADR-0076 §4)",
+    summary = "One installed library, by id",
     responses(
         (status = 200, body = LibraryInstallationDto),
         (status = 403, description = "no read access to the org"),
@@ -848,6 +861,72 @@ fn trusted_dto(t: &TrustedSource) -> TrustedSourceDto {
         trusted_by: t.trusted_by.clone(),
         trusted_at: t.trusted_at,
     }
+}
+
+/// The grants `org` trusts `source`'s trust key with: what a version from
+/// `source` receives once installed. Trust is kept per source, not per
+/// commit, so an upgrade carries these to code nobody trusted by name; the
+/// install names them in `carry_grants` to confirm it (8c62098).
+async fn carried_grants(
+    store: &dyn LibraryStore,
+    org: &str,
+    source: &str,
+) -> Result<BTreeSet<TrustGrant>, ApiError> {
+    let key = scarab_policy::library::trust_key(source);
+    Ok(store
+        .trusted_sources(org)
+        .await
+        .map_err(store_api_error)?
+        .into_iter()
+        .filter(|t| t.source == key)
+        .map(|t| t.grant)
+        .collect())
+}
+
+fn grant_names(grants: &BTreeSet<TrustGrant>) -> String {
+    grants
+        .iter()
+        .map(|g| g.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Why `acked` (an install's `carry_grants`) is not `carried`, the grants
+/// `source` holds; `None` when they are the same set.
+fn carry_refusal(
+    source: &str,
+    carried: &BTreeSet<TrustGrant>,
+    acked: &BTreeSet<TrustGrant>,
+) -> Option<String> {
+    if carried == acked {
+        return None;
+    }
+    let key = scarab_policy::library::trust_key(source);
+    let json_list = carried
+        .iter()
+        .map(|g| format!("\"{}\"", g.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(if carried.is_empty() {
+        format!(
+            "`carry_grants` names {}, but the org trusts `{key}` with no grant; \
+             leave `carry_grants` out",
+            grant_names(acked)
+        )
+    } else if acked.is_empty() {
+        format!(
+            "the org trusts `{key}` with {}; trust is kept per source, so this version gets \
+             them too. Confirm it with `\"carry_grants\": [{json_list}]`",
+            grant_names(carried)
+        )
+    } else {
+        format!(
+            "`carry_grants` names {}, but the org trusts `{key}` with {}; fetch again to see \
+             what it holds now and send `\"carry_grants\": [{json_list}]`",
+            grant_names(acked),
+            grant_names(carried)
+        )
+    })
 }
 
 /// `source` in its trust form ([`trust_key`](scarab_policy::library::trust_key)),
@@ -987,7 +1066,7 @@ pub const MAX_NEVER_INSTALLED_VERSIONS: usize = 50;
     path = "/v1/orgs/{org}/libraries/fetch",
     params(("org" = String, Path, description = "org")),
     request_body = FetchLibraryRequest,
-    summary = "Fetch a library version to review before installing (ADR-0076 §4)",
+    summary = "Fetch a library version to review before installing",
     responses(
         (status = 200, body = FetchedLibraryDto),
         (status = 400, description = "a bad source or name, a fetch that failed, or a file that does not compile as a closed library"),
@@ -1072,6 +1151,7 @@ pub(crate) async fn fetch_library(
         }
         None => String::new(),
     };
+    let carried = carried_grants(store, &org, &stored.source).await?;
     Ok(Json(FetchedLibraryDto {
         name,
         content_hash: stored.content_hash,
@@ -1082,21 +1162,26 @@ pub(crate) async fn fetch_library(
             source: c.source,
         }),
         diff,
+        carried_grants: carried.into_iter().map(Into::into).collect(),
     }))
 }
 
 /// Install or upgrade `lib:<name>` to a fetched version. Needs a step-up:
 /// installing and upgrading loosen (ADR-0076 §4). `replaces` must be the
-/// hash installed now, or omitted when nothing is. Administer on the org.
+/// hash installed now, or omitted when nothing is. When the org trusts the
+/// version's source with any grant, `carry_grants` must name exactly
+/// those grants: trust is kept per source, so the new version gets them, and
+/// the admin says so. The `op.completed` event names the grants carried.
+/// Administer on the org.
 #[utoipa::path(
     post,
     path = "/v1/orgs/{org}/library-installations",
     params(("org" = String, Path, description = "org")),
     request_body = InstallLibraryRequest,
-    summary = "Install or upgrade a library (ADR-0076 §4)",
+    summary = "Install or upgrade a library",
     responses(
         (status = 200, body = LibraryInstallationDto),
-        (status = 400, description = "a bad name or hash, a version not fetched into this org, or one that no longer compiles here"),
+        (status = 400, description = "a bad name or hash, a version not fetched into this org, one that no longer compiles here, or `carry_grants` that are not the grants the source holds"),
         (status = 403, description = "not an org admin, or no step-up"),
         (status = 404, description = "libraries not configured"),
         (status = 409, description = "`replaces` is not what is installed now")
@@ -1104,7 +1189,7 @@ pub(crate) async fn fetch_library(
 )]
 pub(crate) async fn install_library(
     State(st): State<AppState>,
-    guard: Option<Extension<GuardCtx>>,
+    Extension(guard): Extension<GuardCtx>,
     headers: HeaderMap,
     Path(org): Path<String>,
     Json(body): Json<InstallLibraryRequest>,
@@ -1115,7 +1200,6 @@ pub(crate) async fn install_library(
     check_name(&name)?;
     check_hash(&body.content_hash)?;
     let store = store(&st)?;
-    super::note_org(&st, &org).await?;
     let version = store
         .version(&org, &body.content_hash)
         .await
@@ -1126,25 +1210,60 @@ pub(crate) async fn install_library(
     // Checked again: the org's other libraries may have changed since the
     // fetch, and a version fetched under another name is installed here.
     check_compiles(store, &org, &name, &version.content).await?;
+    // Checked before the step-up, so a request that names the wrong grants
+    // is refused without asking for a confirmation (git-bug 9c54b46). The
+    // store checks again in the install's own transaction.
+    let carried = carried_grants(store, &org, &version.source).await?;
+    let acked: BTreeSet<TrustGrant> = body.carry_grants.iter().map(|&g| g.into()).collect();
+    if let Some(why) = carry_refusal(&version.source, &carried, &acked) {
+        return Err(ApiError::BadRequest(why));
+    }
+    // Installing and upgrading always loosen: a step-up, once the request
+    // is known to be one that can run.
+    guard.require(&st, Vec::new()).await?;
+    super::note_org(&st, &org).await?;
     let replaces = match body.replaces {
         Some(h) => Replaces::Version(h),
         None => Replaces::Nothing,
     };
     let now = st.clock.now().await.0;
     let installed = store
-        .install(
+        .install_carrying(
             &NewInstallation {
                 org: org.clone(),
                 name,
                 content_hash: version.content_hash,
                 installed_by: by,
                 installed_at: now,
-                step_up_ref: guard.and_then(|Extension(g)| g.confirmation_id()),
+                step_up_ref: guard.confirmation_id(),
             },
             &replaces,
+            &acked,
         )
         .await
-        .map_err(store_api_error)?;
+        .map_err(|e| match e {
+            // A trust grant made or removed since the check above.
+            LibraryStoreError::CarriedGrants(held) => {
+                match carry_refusal(&version.source, &held, &acked) {
+                    Some(why) => ApiError::BadRequest(why),
+                    None => store_api_error(LibraryStoreError::CarriedGrants(held)),
+                }
+            }
+            e => store_api_error(e),
+        })?;
+    // The install committed with exactly the acknowledged grants.
+    let carried = acked;
+    let carried_names: Vec<&str> = carried.iter().map(|g| g.as_str()).collect();
+    guard.note_completed("carried_grants", serde_json::json!(carried_names));
+    if !carried.is_empty() {
+        tracing::warn!(
+            org = %org,
+            library = %installed.name,
+            source = %version.source,
+            grants = %carried_names.join(","),
+            "library version installed with the grants its source holds"
+        );
+    }
     let yanks = store.yanks(&org).await.map_err(store_api_error)?;
     Ok(Json(
         crate::people::shown(
@@ -1165,7 +1284,7 @@ pub(crate) async fn install_library(
         ("org" = String, Path, description = "org"),
         ("id" = String, Path, description = "installation id")
     ),
-    summary = "Remove an installed library (ADR-0076 §4)",
+    summary = "Remove an installed library",
     responses(
         (status = 204, description = "removed"),
         (status = 403, description = "not an org admin"),
@@ -1196,7 +1315,7 @@ pub(crate) async fn remove_library(
     path = "/v1/orgs/{org}/library-yanks",
     params(("org" = String, Path, description = "org")),
     request_body = YankLibraryRequest,
-    summary = "Yank a library version (ADR-0076 §6)",
+    summary = "Yank a library version",
     responses(
         (status = 200, body = LibraryYankDto),
         (status = 400, description = "a bad hash, an empty or long reason, or a version this org never fetched"),
@@ -1333,7 +1452,7 @@ pub(crate) async fn yank_impact(
         ("org" = String, Path, description = "org"),
         ("hash" = String, Path, description = "content hash")
     ),
-    summary = "The Runs in progress that use a library version (ADR-0076 §6)",
+    summary = "The Runs in progress that use a library version",
     responses(
         (status = 200, body = YankImpactDto),
         (status = 400, description = "not a content hash"),
@@ -1359,7 +1478,7 @@ pub(crate) async fn get_yank_impact(
         ("org" = String, Path, description = "org"),
         ("hash" = String, Path, description = "content hash")
     ),
-    summary = "Lift a library yank (ADR-0076 §6)",
+    summary = "Lift a library yank",
     responses(
         (status = 200, body = LibraryYankDto),
         (status = 403, description = "not an org admin, or no step-up"),

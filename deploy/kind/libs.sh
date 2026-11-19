@@ -128,7 +128,7 @@ fi
 # is there), and trust its source with GRANT (forge_credentials or
 # build_sandbox).
 install_lib() {
-  local file="$1" grant="$2" name source fetched hash current replaces
+  local file="$1" grant="$2" name source fetched hash current replaces carry
   name="thulasi-ram::scarab-ci::$file"
   source="$host/$org/$libs_repo//$file.yaml@$commit"
   echo "==> installing lib:$name into $org from $source"
@@ -145,8 +145,11 @@ install_lib() {
   if [ "$current" != "$hash" ]; then
     replaces=null
     [ -z "$current" ] || replaces="\"$current\""
+    # Trust is kept per source, so the new commit gets the grants the source
+    # holds; the install names them to confirm that.
+    carry="$(echo "$fetched" | json '",".join("\"%s\"" % g for g in d.get("carried_grants") or [])')"
     call POST "/v1/orgs/$org/library-installations" \
-      "{\"name\":\"$name\",\"content_hash\":\"$hash\",\"replaces\":$replaces}" >/dev/null
+      "{\"name\":\"$name\",\"content_hash\":\"$hash\",\"replaces\":$replaces,\"carry_grants\":[$carry]}" >/dev/null
     echo "    installed ${hash:0:12}"
   else
     echo "    ${hash:0:12} is installed already"

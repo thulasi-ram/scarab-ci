@@ -318,10 +318,10 @@ const policyRunEvents = [
   }),
   sse(ago(39 * min), { AttemptStarted: { step: "build", attempt: "a1" } }),
   sse(ago(36 * min), { AttemptFinished: { step: "build", attempt: "a1" } }),
-  sse(ago(36 * min), { StepTransitioned: { step: "build", from: "running", to: "succeeded" } }),
+  sse(ago(36 * min), { StepTransitioned: { step: "build", from: "Running", to: "Succeeded" } }),
   sse(ago(35 * min), { AttemptStarted: { step: "deploy", attempt: "a1" } }),
   sse(ago(35 * min), { AttemptFinished: { step: "deploy", attempt: "a1", failure: "step" } }),
-  sse(ago(35 * min), { StepTransitioned: { step: "deploy", from: "running", to: "failed" } }),
+  sse(ago(35 * min), { StepTransitioned: { step: "deploy", from: "Running", to: "Failed" } }),
 ].join("");
 
 // ── The mock checker ─────────────────────────────────────────────────────────

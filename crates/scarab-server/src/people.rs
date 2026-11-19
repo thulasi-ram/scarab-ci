@@ -15,7 +15,7 @@ use scarab_identity::{IdentityStore, PrincipalRecord};
 use serde::Serialize;
 use utoipa::ToSchema;
 
-/// A person as an API response names them (ADR-0080 §5).
+/// A person as an API response names them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct PersonDto {
     /// The Principal's id: what a URL carries. For a reference that names

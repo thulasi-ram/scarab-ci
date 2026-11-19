@@ -125,7 +125,7 @@ pub struct PipelineIr {
     /// Distinct from the per-step workspace `inputs:`/`outputs:` (ADR-0007, 0035).
     #[serde(default, skip_serializing_if = "Interface::is_empty")]
     pub interface: Interface,
-    /// Opt-in run budget in seconds (ADR-0047): the run fails once its
+    /// Opt-in run budget in seconds: the run fails once its
     /// **active** time (gate-suspended time excluded) exceeds this. No default
     /// — a run suspended for weeks on a gate is the core feature, not a hang; forward
     /// progress rests on step timeouts and gate expiry.
@@ -863,7 +863,7 @@ pub struct StepSpec {
     pub security: Option<StepSecurity>,
     #[serde(default)]
     pub needs: Needs,
-    /// Explicit input workspaces (ADR-0007): the subset of `needs` whose output
+    /// Explicit input workspaces: the subset of `needs` whose output
     /// workspace this step consumes. Absent = implicit-by-default (inherit every
     /// need's workspace). Naming a subset restricts what flows in *and* sharpens
     /// restart invalidation — the step's skip-if-unchanged signature is computed
@@ -871,7 +871,7 @@ pub struct StepSpec {
     /// not force it to re-run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs: Option<Vec<String>>,
-    /// Explicit output workspace paths (ADR-0007): the workspace-relative paths
+    /// Explicit output workspace paths: the workspace-relative paths
     /// this step publishes downstream. Absent = the whole workspace (the implicit
     /// default). Naming a subset restricts what flows and gives a precise output
     /// hash. Enforced by the post-step CAS snapshot on the live-workspace path
@@ -939,7 +939,7 @@ pub struct StepSpec {
     /// steps authored without a matrix). Consumed later by CEL interpolation.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub matrix_values: BTreeMap<String, String>,
-    /// Sidecar services (ADR-0058): throwaway backing containers co-located in
+    /// Sidecar services: throwaway backing containers co-located in
     /// this Step's Pod, reachable at `localhost:<port>`. Each is a
     /// [`ServiceSpec`]; none is a `needs`-able DAG node. A matrixed Step's
     /// sidecars multiply per instance (each instance's Pod gets its own).
@@ -1290,6 +1290,13 @@ pub struct StepSecurity {
     /// not escape it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub run_as_root: bool,
+    /// Run as this uid, for an image whose default user is root but whose
+    /// program runs as any user. A non-zero uid is not a grant: the
+    /// container still runs as non-root. `0` asks for root and is the same
+    /// request as [`run_as_root`](Self::run_as_root) (see
+    /// [`runs_as_root`](Self::runs_as_root)); the two cannot both be set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_as_user: Option<u32>,
     /// Linux capabilities to add (e.g. `NET_ADMIN`). Governed: each must be
     /// whitelisted for the image digest by the Environment admin.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1302,16 +1309,32 @@ pub struct StepSecurity {
     /// Only a Step from an installed library may ask for one, and Run
     /// creation admits it only when the org trusts that library's source
     /// for the sandbox. It cannot be combined with `run_as_root`,
-    /// `add_capabilities` or `privileged`. Not an ADR-0039 grant:
+    /// `run_as_user`, `add_capabilities` or `privileged`. Not an ADR-0039 grant:
     /// [`is_baseline`](Self::is_baseline) does not count it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<Sandbox>,
 }
 
 impl StepSecurity {
-    /// Does this request any escalation at all?
+    /// Does this request any escalation at all? A non-zero
+    /// [`run_as_user`](Self::run_as_user) is not one.
     pub fn is_baseline(&self) -> bool {
-        !self.run_as_root && !self.privileged && self.add_capabilities.is_empty()
+        !self.runs_as_root() && !self.privileged && self.add_capabilities.is_empty()
+    }
+
+    /// Whether the Step asks to run as uid 0, by `run_as_root: true` or by
+    /// `run_as_user: 0`. Both are the one `run-as-root` request: admission,
+    /// Policies and the executor read this, never the two fields.
+    pub fn runs_as_root(&self) -> bool {
+        self.run_as_root || self.run_as_user == Some(0)
+    }
+
+    /// The non-zero uid the Step names, which the executor sets as the
+    /// container's `runAsUser`. `None` for `run_as_user: 0`, which is
+    /// [`runs_as_root`](Self::runs_as_root) and reaches the executor only as
+    /// an admitted `run-as-root` grant.
+    pub fn non_root_uid(&self) -> Option<u32> {
+        self.run_as_user.filter(|&uid| uid != 0)
     }
 }
 
@@ -1390,6 +1413,28 @@ pub struct ServiceSpec {
     /// restricted non-root baseline. Deliberately *not* the default path.
     #[serde(default, skip_serializing_if = "is_false")]
     pub run_as_root: bool,
+}
+
+impl ServiceSpec {
+    /// Whether the service runs as uid 0, by `run_as_root: true` or by
+    /// `run_as_user: 0`: one self-service request, which the executor applies
+    /// without `runAsNonRoot` (as [`StepSecurity::runs_as_root`] for a Step).
+    pub fn runs_as_root(&self) -> bool {
+        self.run_as_root || self.run_as_user == Some(0)
+    }
+}
+
+/// A service's `run_as_root: true` beside a non-zero `run_as_user`: a
+/// diagnostic, as for a Step's `security` block. `run_as_user: 0` is the
+/// `run_as_root` request, so `run_as_root: true` with `run_as_user: 0` agree
+/// and compile, as the pair did before this check.
+fn validate_service_uid(svc: &ServiceSpec, what: &str, diagnostics: &mut Vec<String>) {
+    if svc.run_as_root && svc.run_as_user.is_some_and(|uid| uid != 0) {
+        diagnostics.push(format!(
+            "{what}: a service's non-zero `run_as_user` contradicts its `run_as_root: true` \
+             (`run_as_user: 0` is the same request as `run_as_root: true`)"
+        ));
+    }
 }
 
 /// A sidecar service's readiness probe (ADR-0058), authored as a one-key map:
@@ -5916,6 +5961,18 @@ fn validate_with(
                 step.id
             ));
         }
+        // `run_as_user: 0` is the `run_as_root` request: `run_as_root: true`
+        // beside `run_as_user: 0` agree; beside another uid they contradict.
+        if let Some(sec) = &step.security {
+            if sec.run_as_root && sec.run_as_user.is_some_and(|uid| uid != 0) {
+                diagnostics.push(format!(
+                    "step `{}`: a non-zero `security.run_as_user` contradicts \
+                     `security.run_as_root: true` (`run_as_user: 0` is the same request \
+                     as `run_as_root: true`)",
+                    step.id
+                ));
+            }
+        }
         // The sandbox and the registry credential (ADR-0018, amendment of
         // 2026-11-12) are for a Step that runs an image: a gate runs
         // nothing.
@@ -5930,10 +5987,10 @@ fn validate_with(
             // The sandbox is a fixed Pod shape; an ADR-0039 grant would change
             // it.
             if let Some(sec) = &step.security {
-                if !sec.is_baseline() {
+                if !sec.is_baseline() || sec.run_as_user.is_some() {
                     diagnostics.push(format!(
                         "step `{}`: `security.sandbox: {}` cannot be combined with \
-                         `run_as_root`, `add_capabilities` or `privileged`",
+                         `run_as_root`, `run_as_user`, `add_capabilities` or `privileged`",
                         step.id,
                         sandbox.as_str()
                     ));
@@ -5965,6 +6022,16 @@ fn validate_with(
             diagnostics.push(format!(
                 "step `{}`: `registry_auth` is only valid on a step that runs an image (not a \
                  gate)",
+                step.id
+            ));
+        }
+        // A sidecar service (`service-N`) runs in the Step's Pod, under the
+        // ServiceAccount a `registry_auth_only` placement profile gives that
+        // Pod: it would get the cloud role unless the profile's IRSA skip
+        // list named it.
+        if step.registry_auth && !step.services.is_empty() {
+            diagnostics.push(format!(
+                "step `{}`: a step with `registry_auth` must not set `services:`",
                 step.id
             ));
         }
@@ -6091,6 +6158,7 @@ fn validate_with(
             // A sidecar's `ready:` probe is validated by the shared helper (the
             // same rules a shared service's probe obeys).
             validate_ready_probe(&svc.ready, &format!("step `{}`", step.id), &mut diagnostics);
+            validate_service_uid(svc, &format!("step `{}`", step.id), &mut diagnostics);
             // No probe + no port = nothing to gate on; still valid (the main
             // container simply starts immediately alongside the sidecar).
         }
@@ -6166,7 +6234,11 @@ fn validate_with(
                     ));
                 }
                 // A gate launches no Pod, so a privilege request is meaningless.
-                if step.security.as_ref().is_some_and(|s| !s.is_baseline()) {
+                if step
+                    .security
+                    .as_ref()
+                    .is_some_and(|s| !s.is_baseline() || s.run_as_user.is_some())
+                {
                     diagnostics.push(format!(
                         "step `{}`: a gate step launches nothing — it must not set `security`",
                         step.id
@@ -6496,6 +6568,11 @@ fn validate_with(
                 svc.name
             ));
         }
+        validate_service_uid(
+            &svc.spec,
+            &format!("service `{}`", svc.name),
+            &mut diagnostics,
+        );
         validate_ready_probe(
             &svc.spec.ready,
             &format!("service `{}`", svc.name),
@@ -7057,6 +7134,55 @@ mod tests {
         assert!(ir2.steps[0].security.is_none());
         let json = serde_json::to_string(&ir2).unwrap();
         assert!(!json.contains("security"));
+    }
+
+    /// git-bug 1a20384: `security.run_as_user` parses and round-trips. A
+    /// non-zero uid is no grant; `0` is the `run-as-root` request.
+    #[test]
+    fn step_run_as_user_parses_and_zero_is_the_run_as_root_request() {
+        let ir = compile("steps: [{ id: a, image: busybox, security: { run_as_user: 1000 } }]");
+        let sec = ir.steps[0].security.as_ref().unwrap();
+        assert_eq!(sec.run_as_user, Some(1000));
+        assert!(!sec.run_as_root && !sec.runs_as_root());
+        assert!(sec.is_baseline(), "a non-zero uid is not a grant");
+        let json = serde_json::to_string(&ir).unwrap();
+        assert!(json.contains("\"run_as_user\":1000"), "{json}");
+        let back: PipelineIr = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.steps[0].security, ir.steps[0].security);
+
+        let ir = compile("steps: [{ id: a, image: busybox, security: { run_as_user: 0 } }]");
+        let sec = ir.steps[0].security.as_ref().unwrap();
+        assert!(sec.runs_as_root(), "uid 0 is root");
+        assert!(!sec.is_baseline(), "uid 0 asks for the run-as-root grant");
+
+        let err = parse_error("steps: [{ id: a, image: x, security: { run_as_user: -1 } }]");
+        assert!(!err.is_empty());
+    }
+
+    /// git-bug 1a20384: a non-zero `run_as_user` beside `run_as_root: true`
+    /// contradicts it and does not compile; `run_as_user: 0` beside it is the
+    /// same request and compiles as root. A uid on a gate does not compile.
+    #[test]
+    fn run_as_user_cannot_contradict_run_as_root_or_be_set_on_a_gate() {
+        let ir = compile(
+            "steps: [{ id: a, image: x, security: { run_as_root: true, run_as_user: 0 } }]",
+        );
+        let sec = ir.steps[0].security.as_ref().unwrap();
+        assert!(sec.runs_as_root(), "the agreeing pair is root");
+        assert_eq!(sec.non_root_uid(), None);
+        let errs = errors(
+            "steps: [{ id: a, image: x, security: { run_as_root: true, run_as_user: 1000 } }]",
+        );
+        assert!(
+            errs.iter().any(|e| e.starts_with("step `a`: ")
+                && e.contains("contradicts `security.run_as_root: true`")),
+            "{errs:?}"
+        );
+        let errs = errors("steps: [{ id: g, gate: manual, security: { run_as_user: 1000 } }]");
+        assert!(
+            errs.iter().any(|e| e.contains("must not set `security`")),
+            "{errs:?}"
+        );
     }
 
     #[test]
@@ -10244,6 +10370,7 @@ mod tests {
             "{ sandbox: rootless-buildkit, run_as_root: true }",
             "{ sandbox: rootless-buildkit, privileged: true }",
             "{ sandbox: rootless-buildkit, add_capabilities: [NET_ADMIN] }",
+            "{ sandbox: rootless-buildkit, run_as_user: 1000 }",
         ] {
             let lib = SANDBOXED_LIB.replace("{ sandbox: rootless-buildkit }", security);
             let libs = Libraries {
@@ -10335,7 +10462,7 @@ mod tests {
     /// `libs/build.yaml` installs and compiles to two Steps: `image/image`
     /// builds in the sandbox and holds no registry credential, and
     /// `image/push` needs it, holds the credential, has no sandbox and runs
-    /// as root (crane's image has no other user). Both take every input
+    /// as uid 1000, not root. Both take every input
     /// through env; the invoke exposes both results; a list of placement
     /// profiles reaches both Steps and a map routes each list to its Step.
     #[test]
@@ -10383,7 +10510,12 @@ mod tests {
         assert!(!build.registry_auth, "the build Step holds no credential");
         assert!(push.registry_auth);
         assert_eq!(push.sandbox(), None);
-        assert!(push.security.as_ref().is_some_and(|s| s.run_as_root));
+        // git-bug 1a20384: the push Step runs as uid 1000, not as root, so it
+        // asks for no `run-as-root` grant an org Policy might deny.
+        let push_sec = push.security.as_ref().expect("the push Step names its uid");
+        assert_eq!(push_sec.run_as_user, Some(1000));
+        assert!(!push_sec.run_as_root && !push_sec.runs_as_root());
+        assert!(push_sec.is_baseline());
         assert_eq!(push.needs.0, vec!["image/image".to_string()]);
         assert_eq!(build.needs.0, vec!["src".to_string()]);
         for s in [&build, &push] {
@@ -10797,6 +10929,140 @@ mod tests {
             let ok = compile_with_libraries(&yaml, &with_build_library());
             assert!(ok.is_ok(), "{path:?}: {ok:?}");
         }
+    }
+
+    // Attack: `build_args` built from free text (a prior step's result holding a commit message, say) carries a line `BUILDKIT_SYNTAX=<image>`, in any case, so BuildKit pulls and runs a frontend image the text chose. Safe outcome: the input's `validate:` refuses it, as a literal when the Pipeline compiles and as a template when the build Step launches; plain arguments still render.
+    #[test]
+    fn the_build_library_refuses_buildkit_build_args() {
+        for args in [
+            "BUILDKIT_SYNTAX=docker.io/evil/frontend:1",
+            "A=1\\nbuildkit_syntax=docker.io/evil/frontend:1\\n",
+        ] {
+            let errs = library_errors(
+                &format!(
+                    "steps:\n  - id: image\n    invoke: lib:thulasi-ram::scarab-ci::build\n    \
+                     with: {{ image: registry.example/app:1, build_args: \"{args}\" }}\n"
+                ),
+                &with_build_library(),
+            );
+            assert!(
+                errs.iter().any(|e| e.contains("build_args")),
+                "{args:?}: {errs:?}"
+            );
+        }
+        let ir = compile_with_libraries(
+            r#"
+            on: { push: {} }
+            steps:
+              - { id: meta, image: busybox, command: [echo] }
+              - id: image
+                invoke: lib:thulasi-ram::scarab-ci::build
+                needs: [meta]
+                with:
+                  image: registry.example/app:1
+                  build_args: "${{ outputs.meta.args }}"
+            "#,
+            &with_build_library(),
+        )
+        .unwrap();
+        let step = ir.steps.iter().find(|s| s.id == "image/image").unwrap();
+        let launch = |args: &str| {
+            let results = Results::from([(
+                "meta".to_string(),
+                BTreeMap::from([("args".to_string(), json!(args))]),
+            )]);
+            render(
+                Templates {
+                    image: &step.image,
+                    command: &step.command,
+                    env: &step.env,
+                },
+                step.scope.as_ref(),
+                &step.matrix_values,
+                Facts::Launch {
+                    params: &BTreeMap::new(),
+                    declared: &[],
+                    results: &results,
+                    event: &serde_json::Map::new(),
+                },
+            )
+            .map(|r| r.env.into_iter().collect::<BTreeMap<_, _>>())
+        };
+        for args in [
+            "BUILDKIT_SYNTAX=docker.io/evil/frontend:1",
+            "fix: typo\nBUILDKIT_SYNTAX=docker.io/evil/frontend:1",
+            "NOTES=fix typo\nBuildKit_Syntax=docker.io/evil/frontend:1\n",
+            "NOTES=fix typo\nBUILDKIT_SANDBOX_HOSTNAME=x",
+        ] {
+            assert!(launch(args).is_err(), "{args:?} rendered");
+        }
+        let env = launch("NOTES=fix typo\nMY_BUILDKIT_SYNTAX=1\n").unwrap();
+        assert_eq!(
+            env["SCARAB_BUILD_ARGS"],
+            "NOTES=fix typo\nMY_BUILDKIT_SYNTAX=1\n"
+        );
+    }
+
+    /// The push Step receives the digest BuildKit reported for the image the
+    /// build Step built (`containerimage.digest` in its `image` result) as
+    /// `SCARAB_BUILD_DIGEST`, and an empty value when the build Step
+    /// published no such result, so that the Step's script, not the
+    /// template, decides what a missing digest means.
+    #[test]
+    fn the_push_step_receives_the_digest_the_build_step_reported() {
+        let ir = compile_with_libraries(
+            "steps:\n  - id: image\n    invoke: lib:thulasi-ram::scarab-ci::build\n    \
+             with: { image: registry.example/app:1, push: \"true\" }\n",
+            &with_build_library(),
+        )
+        .unwrap();
+        let push = ir.steps.iter().find(|s| s.id == "image/push").unwrap();
+        assert_eq!(push.needs.0, vec!["image/image".to_string()]);
+        let launch = |results: &Results| {
+            render(
+                Templates {
+                    image: &push.image,
+                    command: &push.command,
+                    env: &push.env,
+                },
+                push.scope.as_ref(),
+                &push.matrix_values,
+                Facts::Launch {
+                    params: &BTreeMap::new(),
+                    declared: &[],
+                    results,
+                    event: &serde_json::Map::new(),
+                },
+            )
+            .unwrap()
+            .env
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()["SCARAB_BUILD_DIGEST"]
+                .clone()
+        };
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let built = |image: serde_json::Value| {
+            Results::from([(
+                "image/image".to_string(),
+                BTreeMap::from([("image".to_string(), image)]),
+            )])
+        };
+        assert_eq!(
+            launch(&built(json!({
+                "containerimage.digest": digest,
+                "containerimage.descriptor": { "digest": digest, "size": 2 },
+            }))),
+            digest
+        );
+        assert_eq!(launch(&built(json!({ "image.name": "x" }))), "");
+        assert_eq!(launch(&Results::new()), "");
+        assert_eq!(
+            launch(&Results::from([(
+                "image/image".to_string(),
+                BTreeMap::new()
+            )])),
+            ""
+        );
     }
 
     // Attack: a branch name (git allows `,` and `=`) templated into the build library's `image` and `cache_name` adds buildctl output options to the build Step, or crane arguments to the push Step, when it launches. Safe outcome: the rendered value fails the input's `validate:` rule and the launch of either Step is refused; a plain branch renders.
@@ -11694,6 +11960,67 @@ steps:
             ),
             other => panic!("expected validation error, got {other:?}"),
         }
+    }
+
+    /// git-bug d2a8efc: a sidecar service in a `registry_auth` Step's Pod
+    /// would run under the ServiceAccount a `registry_auth_only` profile
+    /// gives that Pod, so the two do not compile together.
+    #[test]
+    fn a_registry_auth_step_with_sidecar_services_does_not_compile() {
+        let errs = errors(
+            "steps: [{ id: push, image: x, command: [y], registry_auth: true, services: [{ image: postgres:16 }] }]",
+        );
+        assert!(
+            errs.iter().any(|e| e.starts_with("step `push`: ")
+                && e.contains("`registry_auth` must not set `services:`")),
+            "{errs:?}"
+        );
+        // Without `registry_auth` the same services compile.
+        compile(
+            "steps: [{ id: push, image: x, command: [y], services: [{ image: postgres:16 }] }]",
+        );
+    }
+
+    /// git-bug 1a20384: a service's `run_as_user: 0` is its `run_as_root`
+    /// request. `run_as_root: true` beside `run_as_user: 0` agree and compile
+    /// as root, as they did before (a sidecar or a shared service); beside a
+    /// non-zero uid they contradict and do not compile.
+    #[test]
+    fn a_service_uid_follows_the_run_as_root_rule() {
+        let ir = compile(
+            "steps: [{ id: t, image: x, services: [{ image: postgres:16, run_as_user: 0 }] }]",
+        );
+        assert!(ir.steps[0].services[0].runs_as_root());
+        let ir = compile(
+            "steps: [{ id: t, image: x, services: [{ image: postgres:16, run_as_user: 999 }] }]",
+        );
+        assert!(!ir.steps[0].services[0].runs_as_root());
+        // The agreeing pair compiles and runs as root.
+        let ir = compile(
+            "steps: [{ id: t, image: x, services: [{ image: postgres:16, run_as_root: true, run_as_user: 0 }] }]",
+        );
+        assert!(ir.steps[0].services[0].runs_as_root());
+        let ir = compile(
+            "services: [{ name: db, image: postgres:16, run_as_root: true, run_as_user: 0 }]\nsteps: [{ id: t, image: x, uses: [db] }]",
+        );
+        assert!(ir.services[0].spec.runs_as_root());
+        // The contradicting pair is a diagnostic.
+        let errs = errors(
+            "steps: [{ id: t, image: x, services: [{ image: postgres:16, run_as_root: true, run_as_user: 999 }] }]",
+        );
+        assert!(
+            errs.iter().any(|e| e.starts_with("step `t`: ")
+                && e.contains("contradicts its `run_as_root: true`")),
+            "{errs:?}"
+        );
+        let errs = errors(
+            "services: [{ name: db, image: postgres:16, run_as_root: true, run_as_user: 999 }]\nsteps: [{ id: t, image: x, uses: [db] }]",
+        );
+        assert!(
+            errs.iter().any(|e| e.starts_with("service `db`: ")
+                && e.contains("contradicts its `run_as_root: true`")),
+            "{errs:?}"
+        );
     }
 
     #[test]

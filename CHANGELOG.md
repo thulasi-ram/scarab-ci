@@ -18,6 +18,333 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **Step Pods run in a namespace of their own by default.** With the k8s executor, `rbac.create`
+  and `scarab.createNamespace` on (the defaults), an empty `scarab.namespace` now means
+  `<release namespace>-steps`, which the chart creates, instead of the release namespace, so
+  pipeline code no longer runs beside the server's Secret and ServiceAccount. The executor's Role
+  and RoleBinding move with it. Step Pods running during the upgrade stay in the release
+  namespace, and the new server does not see or delete them: it marks a step that was still
+  running lost, and the step's retry policy decides whether it runs again. Let running Runs finish
+  before you upgrade, or set `scarab.namespace` to the release namespace to keep step Pods where
+  they are. Creating a Namespace needs cluster-wide rights: an installer with rights only in the
+  release namespace sets `scarab.createNamespace: false` (step Pods then run in the release
+  namespace) or names an existing namespace in `scarab.namespace`. With `rbac.create: false` an
+  empty `scarab.namespace` still means the release namespace, where your own RoleBinding is.
+  Recreate in the new namespace what you set up for step Pods (a LimitRange, `imagePullSecrets`,
+  the ServiceAccounts placement profiles name). Installs that set `scarab.namespace` already see
+  no change. See
+  [Where step Pods run](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#where-step-pods-run).
+- **A step's `k8s_overlay` may set only an allowed list of Pod fields, and its labels,
+  annotations and tolerations only with keys the operator lists** (git-bug 24a3126, 743545c,
+  5b6b5cf). The Security entry below says why. An overlay that worked before is refused when it:
+  - sets any label, annotation or toleration whose key the operator has not listed. Nothing is
+    listed by default, so this covers team or cost labels, `karpenter.sh/do-not-disrupt`,
+    `cluster-autoscaler.kubernetes.io/safe-to-evict`, Prometheus or Datadog scrape annotations,
+    and tolerations of a GPU or spot pool taint. To allow a key, list it in the placement config
+    (the chart value `scarab.placement.author_overlay`), for example
+    `author_overlay: { label_keys: [team], annotation_keys: ["karpenter.sh/do-not-disrupt"], toleration_keys: [nvidia.com/gpu] }`.
+    Each entry is an exact key, `prefix/*` (a prefix with no `/` of its own), or `*` for every
+    key with no prefix. Keys under
+    `scarab.io/`, `scarab.dev/` and `app.kubernetes.io/`, the AppArmor and seccomp annotations,
+    `node-role.kubernetes.io/` taints and a toleration with an empty or missing key stay refused
+    even when listed;
+  - sets `spec.affinity` other than `nodeAffinity` (Pod affinity and anti-affinity), or any field
+    outside the list, such as `priorityClassName`, `schedulerName`, `serviceAccountName`, a host
+    field or a Secret reference;
+  - declares a volume with a name the Pod already has, or lists one twice;
+  - changes or removes what the placement baseline or a profile set, such as a baseline
+    toleration or a profile's variable.
+
+  Move such a setting into a placement profile (under the profile's `k8s`), where these limits do
+  not apply, and name the profile in the step's `placement_profiles`. A misspelled key inside
+  `author_overlay` stops the server at boot, and a malformed entry fails validation. See
+  [Placement & resources](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#placement--resources).
+- **An API script that installs or upgrades a library whose source holds a trust grant must
+  send `carry_grants`** (git-bug 8c62098). Copy the list from the `carried_grants` field of the
+  `POST /v1/orgs/{org}/libraries/fetch` answer into the `POST /v1/orgs/{org}/library-installations`
+  body. It names every grant the source holds: forge credentials, the registry credential and the
+  build sandbox. Without it the install fails with a 400 that names the grants. A source with no
+  grant needs nothing. See
+  [Upgrade](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#upgrade).
+- **A step with `registry_auth: true` may not set `services:`** (git-bug d2a8efc). Such a Pipeline
+  no longer compiles. The Security entry below says why. The build library's push step sets no
+  services, so it is unaffected.
+- **A service with `run_as_root: true` beside a non-zero `run_as_user` no longer compiles**
+  (git-bug 1a20384). The two fields contradict each other. `run_as_root: true` beside
+  `run_as_user: 0` is the same request and compiles, and runs as root. A step's `security` block
+  follows the same rule. See
+  [Steps: the step shape](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#steps-the-step-shape).
+- **Install the build library again from the release commit, and change the ECR login init
+  container** (git-bug 1a20384, 23a29ab, 410eed3). The build library's fixes below reach an org
+  only through a new install. Its push step now runs as uid 1000. The ECR guide's `ecr-login` init container runs as uid 1000 too, with `HOME=/tmp`, so the
+  push step can read the `0600` login file it writes: an operator who set up that profile from the
+  guide changes its `securityContext` and env to match. See
+  [The placement profile](https://thulasi-ram.github.io/scarab-ci/usage/pushing-to-ecr/#2-the-placement-profile).
+- **A `run.create` Policy counts and sees services** (git-bug 328010f). While an enforced
+  `run.create` Policy applies, Run creation refuses a Run with more than 8 sidecar services on one
+  step, more than 32 shared services, or more than 4 grants on one service. A sidecar that runs as
+  root (`run_as_root: true` or `run_as_user: 0`) now puts `run-as-root` in its step's `grants`, so
+  a Policy that denies root now refuses Runs it passed before. To keep such a Run, allow the
+  service in the Policy by reading the step's `services`, or run the service as a non-root uid. The
+  Security entry below says why. See
+  [Policies: rules over services](https://thulasi-ram.github.io/scarab-ci/usage/policies/#rules-over-services).
+
+### Security
+
+- **A step's `k8s_overlay` may set only an allowed list of Pod fields** (git-bug 24a3126, 743545c,
+  5b6b5cf). An Environment that permits raw overlays let a pipeline author set any Pod field: mount
+  the server's Secret or another Run's per-Pod Secret by its name, run as the server's
+  ServiceAccount, use the host's network, PID namespace or filesystem, run privileged, or point
+  the sidecars at another address with `hostAliases` or `dnsConfig`. The overlay may now set
+  `nodeSelector`, `affinity.nodeAffinity` and `topologySpreadConstraints`, emptyDir volumes with
+  new names, and the step container's `resources`, literal `env` and mounts of those volumes.
+  Labels, annotations and tolerations are allowed only for keys the operator lists: a label can
+  put the Pod in a NetworkPolicy's or a Service's selector, an annotation can ask an admission
+  webhook for an IAM role or a Vault or mesh sidecar, and a toleration lets the Pod onto a node
+  pool kept for something else. Pod anti-affinity is refused because a required one keeps other
+  Pods off the step Pod's nodes. A volume the overlay re-declared by name merged into the
+  operator's volume of that name, so the step container could mount it; that is refused now. The
+  overlay may add to the Pod but not change what the placement baseline or a profile set. Run
+  creation, `scarab validate --server` and the policy test refuse with the field's path, and the
+  executor checks again before it creates the Pod. Breaking changes above says what to do. See
+  [Placement & resources](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#placement--resources).
+- **The workspace drain checks its fence against the Pod's name** (git-bug 13f0c09). The drain read
+  the `{run, step, attempt}` fence from the step container's env, which the Pod spec sets. It now
+  refuses a fence whose step Pod name is not the Pod's own name.
+- **Installing or upgrading a library names the grants its source's trust gives the new
+  commit** (git-bug 8c62098). Trust stays keyed by source, so a new commit from a source trusted
+  with forge credentials, the registry credential or the build sandbox gets them too, and until
+  now nothing said so. The fetch answer lists every grant the source holds in `carried_grants`;
+  the install must name the same grants in `carry_grants`, or it fails with a 400 that names them.
+  The review page shows one box per grant, and **Upgrade** stays off until each is ticked. The
+  step-up summary and the `op.completed` security event name the grants carried. The install
+  checks `carry_grants` before it asks for step-up, so a missing or wrong list is a 400 and uses
+  no confirmation, and it compares the grants again inside the install's own transaction, so a
+  grant another admin gives the source in between is refused with a 400 that names the grants
+  (git-bug 9c54b46). See
+  [Upgrade](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#upgrade).
+- **The build library's push step pushes only the image the build step built** (git-bug 23a29ab).
+  It receives BuildKit's `containerimage.digest` from the build step's `image` result and refuses
+  (exit 2) a layout whose `index.json` does not name exactly that one manifest, or whose manifest
+  file does not hash to its digest: a stale, half-written or swapped layout. It also refuses an
+  `index.json` that holds a backslash, a byte that is not printable ASCII, or the word `digest` in
+  any case other than once, since crane's JSON decoder reads keys in any case and decodes escapes.
+  crane then pushes from an `index.json` the step writes, naming only the checked manifest. If
+  crane reports another digest, the step fails and writes no `push` result. The check does not
+  cover a build that rewrites its own `image` result as well as the layout. When the server
+  collects no step results, the step checks only the layout, pushes, and logs a line starting
+  `scarab: warning:`. See
+  [Building an image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#building-an-image).
+- **The build library refuses a `build_args` name that starts with `BUILDKIT_`** (git-bug 410eed3).
+  BuildKit reads those arguments as settings, and `BUILDKIT_SYNTAX` names a frontend image that it
+  pulls and runs, so a `build_args` value built from text someone else writes could pick the
+  image. The input's `validate:` rule and the build step's script both refuse such a name in any
+  case, and the script also refuses a control character in a value. The docs now say not to build
+  `build_args` from free text.
+- **A step with `registry_auth: true` may not set `services:`** (git-bug d2a8efc). A sidecar
+  service runs in the step's Pod, under the ServiceAccount a `registry_auth_only` placement profile
+  gives that Pod, and the IRSA skip list in the ECR guide does not name `service-N` containers.
+- **The build library's push step no longer runs as root** (git-bug 1a20384). It sets
+  `security: { run_as_user: 1000 }` in place of `run_as_root: true`, so its Policy input no longer
+  lists the `run-as-root` grant and an org Policy that denies root no longer refuses every build.
+- **A `run.create` Policy sees services** (git-bug 328010f). The Policy input listed no service,
+  so a Policy that denies root saw a step's `run_as_root` but not a service's, and a Run with a
+  root service passed it. Each step now lists its sidecar services under `services`, and the Run's
+  shared services are in a top-level `services`, each with `image`, `digest`, `run_as_root`,
+  `run_as_user` and `grants`. `run_as_root` is true for `run_as_root: true` and for
+  `run_as_user: 0`. A root sidecar also puts `run-as-root` in its step's `grants`, so a Policy
+  written against step grants now refuses it; a root shared service belongs to no step, and a rule
+  reads the top-level `services` to see it. Decisions recorded before have neither field.
+  Breaking changes above gives the limits on services and what an existing Policy now refuses. See
+  [Policies: rules over services](https://thulasi-ram.github.io/scarab-ci/usage/policies/#rules-over-services).
+- **A server replica that reads a step's log redacts that step's secrets, even when another
+  replica launched the step.** The values to redact were held only in the memory of the replica
+  that launched the step. When another replica took over the log tail, as on any server roll while
+  a step ran, it stored the step's output as printed, secrets included. A replica now reads the
+  step's secret values, its registry credential, its forge token and its OIDC token from the step
+  Pod's Secrets before it claims the log tail and before it reads any of the log, and keeps them
+  until the log is complete. A read that fails is never taken as "no secrets": while the step runs,
+  the replica reads no log and tries again later. When the step has ended and the values were
+  never read (its Secrets are deleted when its try ends, or the read keeps failing), the replica
+  stores this line in place of the rest of the log, and logs a warning:
+  `scarab: the rest of this log was not stored: its secret values could not be read`. Before, a
+  replica that a dead replica's tail lease kept away until the step ended read no values and
+  stored the end of the log as printed. When a re-read differs from the stored part where that
+  part holds `***`, the replica no longer stops storing the log with no line saying so: for a
+  running step it stores
+  `scarab: earlier output could not be checked; showing output from now on` and then the output
+  printed from then on (what was printed in between is not stored), and for a step that has
+  ended it stores
+  `scarab: the rest of this log was withheld: it could not be checked against the part already stored`.
+  See
+  [Run logs](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/#how-the-server-stores-a-log).
+- **A step's secret values redact only that step's log.** The values were one list per server,
+  for every step of every Run, kept for the life of the process. Every log byte was checked
+  against the whole list, under one lock, so with a forge token or an OIDC token added at each
+  launch, storing logs slowed down the longer the server ran (about 3 s per MiB of log at 1,000
+  values). A step's output equal to another step's secret, in any org, was stored as `***`, which
+  showed which values existed, and made a later re-read of that log differ where nothing had been
+  redacted for it. Each value is now kept for the log of the step try (or sidecar) it was mounted
+  into, and dropped once that log is complete and the step try has ended. A failure message or
+  infra condition, which the server reads by Pod and not by log, is redacted with the values of
+  every step try that has not ended yet, its own included.
+- **Forge and identity tokens mounted into a step are redacted from its log.** Only the step's
+  own secrets and its registry credential were redacted. The forge token a step gets with
+  `forge_token:` and the OIDC token Scarab issues to a deploy step were stored as printed. Both
+  are now registered for the step's log when the step launches, again with the new token on each
+  relaunch, and a replica that did not launch the step reads both back from the step Pod's
+  Secrets.
+
+### Enhancement
+
+- **Step logs stream in parts and can resume** (git-bug 9ac20c0). The server read a try's whole
+  log into memory and sent it as one event. It now reads the log chunk by chunk and sends events of
+  about 256 KiB (at most 256 KiB plus two stored chunks), each with an id
+  (`<attempt_id>:<next_seq>`). `?from=<id>` or the `Last-Event-ID` header continues after that
+  event. An id the server cannot read, or one that names a try outside the stream, is a 400; an
+  id with a position past the end of a try's log is not refused, and the stream sends nothing for
+  that try until its log passes that position. `?tail=<bytes>` (at most 64 MiB) sends only the end
+  of the log, from a chunk boundary, after an `event: truncated` that gives the skipped and total
+  bytes. A character a stored chunk cuts in two is sent whole; on a running try the server waits
+  at most two polls for the rest, then sends U+FFFD, and on an ended try it sends U+FFFD at once.
+  A stream ends one poll after the Run finishes, or when the Run no longer exists.
+  `GET /v1/runs/{id}/steps/{step}/logs/raw?attempt=<id>` downloads one try's whole log as plain
+  text, with `X-Content-Type-Options: nosniff`. See
+  [Run logs](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/).
+- **The Run page loads the last 2 MB of a log** (git-bug 9ac20c0). A notice above a longer log
+  says how much shows and where line numbers start ("Showing the last 2.0 MB of 14.3 MB. Line
+  numbers start here."). **Load full log** reads up to 8 MB, and for a step **Download** saves the
+  try's whole log; a shared service's pane has both. The pane keeps
+  at most 8 MB, dropping lines from the top; a log with no line breaks is cut to its last 8 MB
+  once it passes 16 MB. A dropped connection reconnects after 1 s, 2 s, 4 s and so on up to 30 s
+  and continues after the last part received. After three reopens in a row that fail before the
+  stream opens, the pane asks the server about its position; only when the server answers 400 does
+  it load the end of the log again, as much as it showed. See
+  [On the Run page](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/#on-the-run-page).
+- **A shared service's log can be downloaded** (git-bug 5ca1f3c).
+  `GET /v1/runs/{id}/services/{service}/logs/raw?take=<n>` sends the service's whole log in Take
+  `n` (default the current Take) as `text/plain`, named `scarab-<run>-<service>-take<n>.log`, with
+  each character of the run id and service name outside `[A-Za-z0-9_-]` replaced by `_`. The
+  service pane has **Download** in its header and in the notice above a longer log. See
+  [Run logs](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/).
+- **A live log reads only the new part of its chunk index** (git-bug 209ef14). Each poll of a
+  running step's log, every 500 ms, read the step's whole list of stored chunks; it now reads the
+  rows from its position on. Storing a chunk reads only the newest row.
+- **The server warns at startup when `default_resources` sets one axis only** (git-bug 9cfeac4).
+  With `cpu_millis` and no `memory_mib`, a step container that sets no memory has no
+  `requests.memory` or `limits.memory`; with `memory_mib` and no `cpu_millis`, it has no
+  `requests.cpu`. The warning names the missing field and says that a cluster that requires
+  resource limits (a Kyverno require-resource-limits policy, for example) will refuse those step
+  Pods. See
+  [Placement & resources](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#placement--resources).
+- **A library joins per-architecture images into one multi-architecture image** (git-bug
+  794b3ac). `lib:thulasi-ram::scarab-ci::image-index`, the file `libs/image-index.yaml`, runs
+  `crane index append` over images named by digest (one `<repository>@sha256:<digest>` per line)
+  and pushes the index under a tag. Write each line as
+  `${{ has(outputs.amd64.push) ? outputs.amd64.push.ref : '' }}`: on a fork pull request the
+  builds push nothing, the lines are empty, and the index step pushes nothing and exits 0; anywhere
+  else an empty `images` fails the step. It refuses an image named by tag, an image that is itself
+  an index, two images of one platform, and a manifest or config that hides a key from its checks
+  with a `\u` escape or a second spelling in other case. It reports the index's digest as
+  `outputs.<id>.index.digest`. Its one step holds the registry credential, so an org admin
+  installs it and trusts its source with the registry credential. See
+  [Joining images into one multi-architecture image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#joining-images-into-one-multi-architecture-image).
+- **A step can name the uid it runs as** (git-bug 1a20384). `security: { run_as_user: <uid> }`
+  sets the step container's `runAsUser`, for an image whose `USER` is root or a name. A non-zero
+  uid is self-service and still runs with `runAsNonRoot`. `run_as_user: 0` is the same request as
+  `run_as_root: true`: it needs the same grant, and Policies see it as `run-as-root` in the step's
+  `grants`. `run_as_root: true` beside `run_as_user: 0` compiles; beside a non-zero uid it does
+  not. `run_as_user` cannot be combined with `sandbox`. The `run.create` Policy input has a new
+  `step.run_as_user` field. A service's `run_as_user: 0` is likewise its `run_as_root` request: it
+  ran under `runAsNonRoot` and the kubelet refused it. Running a service as root stays
+  self-service; the Security entry on services in the Policy input says what a Policy sees. See
+  [Steps: the step shape](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#steps-the-step-shape).
+
+### Bug Fixes
+
+- **`scarab logs` no longer adds a line break between stored chunks** (git-bug 9ac20c0). It
+  printed each `data:` line with a newline after it, so a line split across two stored chunks came
+  out as two lines. It now joins an event's lines as Server-Sent Events defines and prints the
+  text with nothing added. When the reader of its output goes away (`scarab logs <run> | head`),
+  it stops and exits 0; it used to keep its connection open until the Run ended.
+- **A `\r\n` in a step's output shows as one line break**, on the Run page and in `scarab logs`.
+  It showed as two, with a blank line between. A lone `\r` still shows as a line break. The raw
+  download keeps the bytes the step wrote.
+- **A short step keeps its logs** (git-bug 1dee2f3). The log tail read a step only while it was
+  running, and waited 3 seconds after a read that found the Pod not ready. A step that started and
+  finished inside that wait had no logs stored. The server now reads the log of each step, retried
+  attempt and service that stops running before its log was read in full, and stores what follows
+  the part already stored, as the next entry describes. That first read does not wait out the 3
+  second backoff, so a viewer whose stream ended sees the output on the next load.
+- **Log output printed after a log tail broke part way is stored** (git-bug de2bd9b). Before, it
+  was lost if the step ended before the tail retried, and a retry while the step ran stored the
+  earlier lines twice. On a retry, and on the read after a step stops, the server now reads the
+  container's log from the start, redacts it as one stream, and compares it with the part already
+  stored. When the log begins with exactly that part, the server stores only what follows it.
+  When it does not (the kubelet rotated the log file, the container restarted, or the step's
+  secret values changed), the server
+  stores the line `scarab: the log source restarted; earlier lines may repeat` and then the whole
+  log it read, so no output is dropped and earlier lines may show twice. A secret value split
+  between two reads of the log, or between two chunks of one read, is redacted; each chunk used to
+  be redacted on its own. Each retry reads the stored part back from object storage to compare it.
+  Output the kubelet rotated away before the server read it is gone: the marker line says the
+  source restarted, and does not recover those lines. Two replicas that tail one step at the same
+  time can still store one replica's chunk under the other's index entry. See
+  [Run logs](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/#how-the-server-stores-a-log).
+- **A step whose Pod is refused at launch fails as a configuration error.** A refusal of the
+  step's `k8s_overlay` when the Pod is built (a clash with the placement baseline or a profile, or
+  a Run stored before a field left the list) was retried until the Run was dead-lettered. The step
+  now fails with the reason.
+- **A step whose `k8s_overlay` makes a Pod Kubernetes refuses fails as a configuration error.**
+  An overlay that keeps to the allowed fields can still be invalid to Kubernetes: a
+  `nodeSelector` value that is not a label value, a memory request above the limit, a volume name
+  in capitals. The launch error was retried for 5 minutes and then the Run was dead-lettered. When
+  Kubernetes refuses the Pod as invalid (400 or 422), Scarab now creates the Pod without the
+  overlay as a dry run; if that passes, the step fails with Kubernetes' message. If it fails too,
+  the operator's baseline or a profile is at fault and the launch error stays. A quota or
+  permission refusal (403) stays a launch error. See
+  [Placement & resources](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#placement--resources).
+- **Run creation refuses a placement profile the operator's config does not allow.**
+  With the k8s executor, a step that names a profile the registry does not hold, or a
+  `registry_auth_only` profile without `registry_auth`, was created and then failed at every
+  launch until the Run was dead-lettered. Run creation now refuses it, naming the step and the
+  profile, and for an unknown name the profiles the registry holds. `scarab validate --server` and
+  the policy test report the same refusal. A `registry_auth_only` profile on a step without
+  `registry_auth` that still reaches launch fails the step as a configuration error. A profile
+  removed after the Run was created stays a launch error, which a retry covers during a server
+  roll. See
+  [Placement & resources](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#placement--resources).
+- **The Run page's Activity tab words every step status change** (git-bug d390aa3). A change with
+  no try read `running → ready`; it now reads "queued", "waiting to retry", "reset to run again",
+  "needed again", "skipped because build failed", "skipped by its when: condition" or "passed
+  without a try: inputs unchanged".
+- **The Run page reads the status names the server's events carry** (git-bug d390aa3). The server
+  sends `Running`, `Succeeded`; the page matched only lowercase names. Activity rows for a status
+  change all had the plain info mark, a finished try and its step's move to passed or failed took
+  two rows, and an earlier version could show a re-armed step that had passed or failed as not
+  run.
+- **Plugin probe Pods have cpu and memory requests and a memory limit** (git-bug dac7953). A
+  namespace that requires resources refused the probe Pods, so the plugin namespace check failed.
+  They now carry the same resources as a Plugin Pod's self-check.
+- **`scarab validate --server` reports what the server checked** (git-bug 1aa19e6). It printed
+  "`lib:` ... its Steps were not checked (use --server to check them)" although the server had
+  compiled those libraries, and counted the Run's Steps from the offline check, where each
+  library is one Step. With `--server` it now prints the Run's step count as the server compiled
+  it and the installed libraries it resolved. The policy test API returns these as `pipeline`. The
+  approval gates and warnings from the local check now print before the request, so they show
+  when the server cannot be reached or refuses the token.
+- **The policy test refuses what Run creation refuses** (git-bug 1aa19e6). A Run of a Pipeline
+  whose library Step asks for the build sandbox, a forge token or a yanked version without the
+  trust Run creation requires, or whose Step's `k8s_overlay` or privilege request Run creation
+  refuses, got `outcome: allow` from `scarab validate --server` and was refused when created. The
+  policy test now runs the same checks as Run creation and answers a deny with Run creation's
+  reason, also returned as `refusal`. A server with no forge configured leaves the forge token
+  check out of the answer and logs that it did. For a manual, api or cron trigger the policy test
+  renders a step's image with the Pipeline's input defaults, as Run creation does, so an image
+  such as `reg/x@${{ inputs.digest }}` is checked against a privilege grant by its digest.
+
 ## [0.4.4] - 2026-11-19
 
 ### Enhancement

@@ -5,8 +5,10 @@
   control-plane restart (get/list). The step Pod sweep (git-bug 986542a) lists
   the Pods, Services and NetworkPolicies labelled managed-by=scarab and deletes
   those of Runs that finished more than SCARAB_RETENTION_STEP_POD_MINUTES ago
-  (list/delete). Scope the Role to the namespace step Pods land in — the
-  release namespace by default.
+  (list/delete). Scope the Role to the namespace step Pods land in —
+  `<release namespace>-steps` by default (namespace-steps.yaml). The server
+  needs nothing here in its own namespace: it reaches the Data Depot and its
+  own results API through Services, not the Kubernetes API.
 */ -}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

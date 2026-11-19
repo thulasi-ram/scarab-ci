@@ -26,7 +26,7 @@
 //! code recorded, and a second `launch` of the same fence re-attaches to the
 //! existing Pod rather than creating a new one.
 
-use scarab_engine::ports::{ExecHandle, ExecState, FailureClass};
+use scarab_engine::ports::{ExecHandle, ExecState, FailureClass, LogFrom, LogRedactions};
 use scarab_engine::{
     Attempt, AttemptId, AttemptOutcome, Executor, RunId, StepId, StepRun, StepSpec, StepStatus,
     Timestamp,
@@ -462,6 +462,7 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
         // busybox runs as root; without the self-service grant the hardened
         // ADR-0039 baseline rejects the container (CreateContainerConfigError).
         run_as_root: true,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: None,
@@ -534,6 +535,7 @@ async fn sleeping_step_is_killed_at_its_deadline() {
         // baseline rejects the container (CreateContainerConfigError) and the
         // step never starts — this test needs the sleep to actually run.
         run_as_root: true,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(5),
@@ -626,6 +628,7 @@ async fn log_stream_tails_pod_stdout() {
         secrets: vec![],
         // busybox runs as root; the hardened baseline would reject it.
         run_as_root: true,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: None,
@@ -654,7 +657,7 @@ async fn log_stream_tails_pod_stdout() {
     // open while the container is still starting (Pending → no log yet).
     let mut logs = Vec::new();
     for _ in 0..60 {
-        if let Ok(Some(chunks)) = exec.log_stream(&step).await {
+        if let Ok(Some(chunks)) = exec.log_stream(&step, LogFrom::Start).await {
             logs = drain_to_end(chunks).await;
             if !logs.is_empty() {
                 break;
@@ -715,6 +718,7 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
         env: vec![],
         secrets: vec![],
         run_as_root: true, // busybox runs as root; fsGroup covers the emptyDir
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(120),
@@ -931,6 +935,7 @@ async fn a_green_attempt_is_backed_by_a_durable_snapshot_at_the_instant_it_goes_
         env: vec![],
         secrets: vec![],
         run_as_root: true,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(120),
@@ -1113,6 +1118,7 @@ async fn a_missing_input_snapshot_fails_the_attempt_instead_of_hanging() {
         env: vec![],
         secrets: vec![],
         run_as_root: true,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(120),
@@ -1205,6 +1211,7 @@ async fn a_step_with_inputs_is_refused_when_no_workspace_service_is_configured()
         env: vec![],
         secrets: vec![],
         run_as_root: true,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(60),
@@ -1317,6 +1324,7 @@ async fn declared_outputs_publish_only_those_paths_through_the_cas() {
         env: vec![],
         secrets: vec![],
         run_as_root: true,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(120),
@@ -1467,6 +1475,7 @@ async fn clone_step_produces_a_source_workspace() {
         env: clone_env(sha.as_str(), "1"),
         secrets: vec![],
         run_as_root: false, // scarab-clone is non-root by construction
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(300),
@@ -1560,6 +1569,7 @@ async fn clone_step_produces_a_source_workspace() {
         env: vec![],
         secrets: vec![],
         run_as_root: false,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(300),
@@ -1636,6 +1646,7 @@ async fn clone_depth_full_exposes_history() {
         env: clone_env(sha.as_str(), "full"),
         secrets: vec![],
         run_as_root: false,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(300),
@@ -1693,6 +1704,7 @@ async fn clone_depth_full_exposes_history() {
         env: vec![],
         secrets: vec![],
         run_as_root: false,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(300),
@@ -1768,6 +1780,7 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
         env: clone_env("0000000000000000000000000000000000000001", "1"),
         secrets: vec![],
         run_as_root: false,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(300),
@@ -1812,59 +1825,13 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
     exec.cancel(&h).await.expect("cleanup");
 }
 
-/// LIVE `lib:thulasi-ram::scarab-ci::build` (ADR-0018, amendment of 2026-11-12): the
-/// library's two Steps, compiled from `libs/build.yaml` and rendered as the
-/// scheduler renders them. The build Step runs in the `rootless-buildkit`
-/// sandbox with no registry credential and writes a trivial image, built
-/// from a CAS-materialized workspace, as an OCI layout into its workspace;
-/// the push Step reads that workspace and pushes the layout with crane to a
-/// local in-cluster registry; a verification step then reads the
-/// registry's tag list. Needs a registry Service in the cluster (SCARAB_TEST_REGISTRY, e.g.
-/// `registry.default.svc.cluster.local:5000`, plain HTTP, hence the
-/// library's `insecure_push` input). `#[ignore]`d + SCARAB_TEST_KUBE gated.
-#[tokio::test]
-#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
-async fn the_build_library_builds_and_pushes_to_a_local_registry() {
-    let ns = enter_tier();
-    let registry = tier_var("SCARAB_TEST_REGISTRY");
-    // The build step inherits its context as a workspace input, so the fetcher
-    // provisions it (ADR-0061 s3-feed).
-    let ws = workspace_fixture();
-    let run_id = unique_run("run-build");
-
-    let client = kube_client().await;
-    let exec = K8sExecutor::with_client(ns, client)
-        .with_workspace_cas(ws.cas.clone())
-        .with_workspace_depot(ws.depot.clone())
-        .with_workspace_service(ws.fetch.clone());
-
-    // The build context: a trivial Dockerfile, ingested as the upstream
-    // (checkout) workspace — through the SERVICE, so the fetcher can read it
-    // back. Through the DEPOT CLIENT, not the tiered handle: `TieredCas::ingest`
-    // refuses by design (ADR-0064 — drains write warm, then flush), and warm is
-    // all a fetcher's read needs.
-    use scarab_storage::Cas as _;
-    let ctx = tempfile::tempdir().expect("context dir");
-    std::fs::write(
-        ctx.path().join("Dockerfile"),
-        "FROM busybox\nRUN echo scarab-built > /built.txt\n",
-    )
-    .unwrap();
-    let root = ws
-        .depot
-        .ingest(ctx.path().to_str().unwrap())
-        .await
-        .expect("ingest context")
-        .root
-        .0;
-
-    let image = format!("{registry}/scarab-test:live");
-    // The library's Steps as Run creation stores them, rendered as the
-    // scheduler renders them at launch.
+/// `libs/build.yaml` compiled as Run creation stores it, for one invoke
+/// `image` whose `with:` holds `with` (YAML lines, each after the first
+/// indented six spaces).
+fn build_library_ir(with: &str) -> scarab_pipeline::PipelineIr {
     let ir = scarab_pipeline::compile_with_libraries(
         &format!(
-            "steps:\n  - id: image\n    invoke: lib:thulasi-ram::scarab-ci::build\n    with:\n      \
-             image: {image}\n      push: \"true\"\n      insecure_push: \"true\"\n"
+            "steps:\n  - id: image\n    invoke: lib:thulasi-ram::scarab-ci::build\n    with:\n      {with}"
         ),
         &scarab_pipeline::Libraries {
             installed: std::collections::BTreeMap::from([(
@@ -1891,8 +1858,13 @@ async fn the_build_library_builds_and_pushes_to_a_local_registry() {
     );
     assert!(lib_step("push").registry_auth);
     assert_eq!(lib_step("push").sandbox(), None);
-    let step_run = |id: &str, needs: Vec<StepId>| StepRun {
-        run: RunId(run_id.clone()),
+    ir
+}
+
+/// The running fence of the build library's Step `image/<id>` in `run`.
+fn build_library_step_run(run: &str, id: &str, needs: Vec<StepId>) -> StepRun {
+    StepRun {
+        run: RunId(run.to_string()),
         step: StepId(format!("image/{id}")),
         status: StepStatus::Running,
         attempts: vec![Attempt {
@@ -1904,71 +1876,175 @@ async fn the_build_library_builds_and_pushes_to_a_local_registry() {
         }],
         needs,
         gate_kind: None,
-    };
-    let spec = |id: &str, inputs: Vec<String>| {
-        let s = lib_step(id);
-        let rendered = scarab_pipeline::render(
-            scarab_pipeline::Templates {
-                image: &s.image,
-                command: &s.command,
-                env: &s.env,
-            },
-            s.scope.as_ref(),
-            &s.matrix_values,
-            scarab_pipeline::Facts::Launch {
-                params: &Default::default(),
-                declared: &[],
-                results: &Default::default(),
-                event: &Default::default(),
-            },
-        )
-        .expect("the build library's Step renders");
-        // What the server's launch decorator adds for a sandboxed or
-        // registry_auth Step: this is not a fork pull request's build, so
-        // it is pushed.
-        let mut env = rendered.env;
-        env.push((
-            scarab_pipeline::FORK_PR_ENV.to_string(),
-            "false".to_string(),
-        ));
-        StepSpec {
-            image: rendered.image,
-            command: rendered.command,
-            env,
-            secrets: vec![],
-            run_as_root: s.security.as_ref().is_some_and(|sec| sec.run_as_root),
-            add_capabilities: vec![],
-            privileged: false,
-            timeout_seconds: Some(600),
-            workspace_inputs: inputs,
-            workspace_outputs: vec![],
-            cache: None,
-            forge_token: None,
-            sandbox: s.sandbox().map(|sandbox| scarab_engine::SandboxConfig {
-                sandbox,
-                org: "acme".into(),
-                library: "ab".repeat(32),
-            }),
-            // The local test registry takes pushes with no credential:
-            // nothing resolves, so nothing is mounted.
-            registry_auth: s.registry_auth.then(|| scarab_engine::RegistryAuthConfig {
-                owner: "acme".into(),
-                name: "app".into(),
-                ..Default::default()
-            }),
-            build: None,
-            artifacts: vec![],
-            placement_profiles: vec![],
-            resources: Default::default(),
-            k8s_overlay: None,
-            oidc_token: None,
-            resolved_secrets: Default::default(),
-            services: Vec::new(),
-            uses: Vec::new(),
-            matrix_values: Default::default(),
-            scope: None,
-        }
-    };
+    }
+}
+
+/// The build library's Step `image/<id>` from `ir`, rendered as the
+/// scheduler renders it at launch (no results of its needs), with the
+/// workspace `inputs`.
+fn build_library_spec(ir: &scarab_pipeline::PipelineIr, id: &str, inputs: Vec<String>) -> StepSpec {
+    build_library_spec_with(ir, id, inputs, &Default::default())
+}
+
+/// [`build_library_spec`], rendered with `results` as its needs' results.
+fn build_library_spec_with(
+    ir: &scarab_pipeline::PipelineIr,
+    id: &str,
+    inputs: Vec<String>,
+    results: &scarab_pipeline::Results,
+) -> StepSpec {
+    let s = ir
+        .steps
+        .iter()
+        .find(|s| s.id == format!("image/{id}"))
+        .expect("the build library's Step");
+    let rendered = scarab_pipeline::render(
+        scarab_pipeline::Templates {
+            image: &s.image,
+            command: &s.command,
+            env: &s.env,
+        },
+        s.scope.as_ref(),
+        &s.matrix_values,
+        scarab_pipeline::Facts::Launch {
+            params: &Default::default(),
+            declared: &[],
+            results,
+            event: &Default::default(),
+        },
+    )
+    .expect("the build library's Step renders");
+    // What the server's launch decorator adds for a sandboxed or
+    // registry_auth Step: this is not a fork pull request's build, so
+    // it is pushed.
+    let mut env = rendered.env;
+    env.push((
+        scarab_pipeline::FORK_PR_ENV.to_string(),
+        "false".to_string(),
+    ));
+    StepSpec {
+        image: rendered.image,
+        command: rendered.command,
+        env,
+        secrets: vec![],
+        // As Run creation admits it: `run_as_user: 0` is root, a non-zero
+        // uid rides as itself (git-bug 1a20384).
+        run_as_root: s.security.as_ref().is_some_and(|sec| sec.runs_as_root()),
+        run_as_user: s.security.as_ref().and_then(|sec| sec.non_root_uid()),
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: Some(600),
+        workspace_inputs: inputs,
+        workspace_outputs: vec![],
+        cache: None,
+        forge_token: None,
+        sandbox: s.sandbox().map(|sandbox| scarab_engine::SandboxConfig {
+            sandbox,
+            org: "acme".into(),
+            library: "ab".repeat(32),
+        }),
+        // The local test registry takes pushes with no credential:
+        // nothing resolves, so nothing is mounted.
+        registry_auth: s.registry_auth.then(|| scarab_engine::RegistryAuthConfig {
+            owner: "acme".into(),
+            name: "app".into(),
+            ..Default::default()
+        }),
+        build: None,
+        artifacts: vec![],
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
+        resolved_secrets: Default::default(),
+        services: Vec::new(),
+        uses: Vec::new(),
+        matrix_values: Default::default(),
+        scope: None,
+    }
+}
+
+/// LIVE `lib:thulasi-ram::scarab-ci::build` (ADR-0018, amendment of 2026-11-12): the
+/// library's two Steps, compiled from `libs/build.yaml` and rendered as the
+/// scheduler renders them. The build Step runs in the `rootless-buildkit`
+/// sandbox with no registry credential and writes a trivial image, built
+/// from a CAS-materialized workspace, as an OCI layout into its workspace;
+/// the push Step reads that workspace and pushes the layout with crane to a
+/// local in-cluster registry; a verification step then reads the
+/// registry's tag list. Results are collected (the real results sidecar,
+/// posting to a stub listener on the host), so the build Step's `image`
+/// result is BuildKit's own metadata file, and the push Step is rendered
+/// with it: its digest check meets a real BuildKit layout and a real
+/// `containerimage.digest` (git-bug 23a29ab). The same push rendered with
+/// another digest is refused (exit 2). Needs a registry Service in the cluster (SCARAB_TEST_REGISTRY, e.g.
+/// `registry.default.svc.cluster.local:5000`, plain HTTP, hence the
+/// library's `insecure_push` input), SCARAB_TEST_SIDECAR_IMAGE and
+/// SCARAB_TEST_HOST_IP. `#[ignore]`d + SCARAB_TEST_KUBE gated.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn the_build_library_builds_and_pushes_to_a_local_registry() {
+    let ns = enter_tier();
+    let registry = tier_var("SCARAB_TEST_REGISTRY");
+    let sidecar_image = tier_var("SCARAB_TEST_SIDECAR_IMAGE");
+    let host_ip = tier_var("SCARAB_TEST_HOST_IP");
+    // The build step inherits its context as a workspace input, so the fetcher
+    // provisions it (ADR-0061 s3-feed).
+    let ws = workspace_fixture();
+    let run_id = unique_run("run-build");
+
+    // A stub results API: records the body of every POST the results
+    // sidecars make, whatever the path.
+    let received: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+    let rec = received.clone();
+    let app =
+        axum::Router::new().fallback(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let rec = rec.clone();
+            async move {
+                rec.lock().await.push(body);
+                axum::http::StatusCode::ACCEPTED
+            }
+        });
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let client = kube_client().await;
+    let exec = K8sExecutor::with_client(ns, client)
+        .with_workspace_cas(ws.cas.clone())
+        .with_workspace_depot(ws.depot.clone())
+        .with_workspace_service(ws.fetch.clone())
+        .with_results_egress(scarab_executor_k8s::ResultsEgress {
+            base_url: format!("http://{host_ip}:{port}"),
+            token_secret: b"live-build-results-secret".to_vec(),
+            sidecar_image,
+        });
+
+    // The build context: a trivial Dockerfile, ingested as the upstream
+    // (checkout) workspace — through the SERVICE, so the fetcher can read it
+    // back. Through the DEPOT CLIENT, not the tiered handle: `TieredCas::ingest`
+    // refuses by design (ADR-0064 — drains write warm, then flush), and warm is
+    // all a fetcher's read needs.
+    use scarab_storage::Cas as _;
+    let ctx = tempfile::tempdir().expect("context dir");
+    std::fs::write(
+        ctx.path().join("Dockerfile"),
+        "FROM busybox\nRUN echo scarab-built > /built.txt\n",
+    )
+    .unwrap();
+    let root = ws
+        .depot
+        .ingest(ctx.path().to_str().unwrap())
+        .await
+        .expect("ingest context")
+        .root
+        .0;
+
+    let image = format!("{registry}/scarab-test:live");
+    let ir = build_library_ir(&format!(
+        "image: {image}\n      push: \"true\"\n      insecure_push: \"true\"\n"
+    ));
+    let step_run = |id: &str, needs: Vec<StepId>| build_library_step_run(&run_id, id, needs);
+    let spec = |id: &str, inputs: Vec<String>| build_library_spec(&ir, id, inputs);
 
     let build = step_run("image", vec![StepId("checkout".into())]);
     let h = exec
@@ -1983,14 +2059,80 @@ async fn the_build_library_builds_and_pushes_to_a_local_registry() {
         .await
         .expect("output")
         .expect("the build Step published its workspace");
+    // The build Step's `image` result: what buildctl wrote with
+    // --metadata-file.
+    let mut metadata = None;
+    for _ in 0..60 {
+        metadata = received
+            .lock()
+            .await
+            .iter()
+            .find_map(|body| body.get("image").cloned());
+        if metadata.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let metadata = metadata.expect("the build Step published its image result");
+    let digest = metadata["containerimage.digest"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no containerimage.digest in {metadata}"))
+        .to_string();
+    assert!(digest.starts_with("sha256:"), "{digest}");
+    let reported = |image: serde_json::Value| -> scarab_pipeline::Results {
+        std::collections::BTreeMap::from([(
+            "image/image".to_string(),
+            std::collections::BTreeMap::from([("image".to_string(), image)]),
+        )])
+    };
+    let push_spec = |image: serde_json::Value| {
+        let spec = build_library_spec_with(&ir, "push", vec![built.clone()], &reported(image));
+        assert!(
+            spec.env.iter().any(|(k, _)| k == "SCARAB_BUILD_DIGEST"),
+            "{:?}",
+            spec.env
+        );
+        spec
+    };
+    let real = push_spec(metadata.clone());
+    assert!(
+        real.env
+            .iter()
+            .any(|(k, v)| k == "SCARAB_BUILD_DIGEST" && *v == digest),
+        "{:?}",
+        real.env
+    );
 
     let push = step_run("push", vec![StepId("image/image".into())]);
-    let ph = exec
-        .launch(&push, &spec("push", vec![built]))
-        .await
-        .expect("launch push");
+    let ph = exec.launch(&push, &real).await.expect("launch push");
     let terminal = poll_to_terminal(&exec, &ph, 300).await;
-    assert_eq!(terminal, Some(ExecState::Succeeded), "push step succeeds");
+    assert_eq!(
+        terminal,
+        Some(ExecState::Succeeded),
+        "push step succeeds: BuildKit's layout holds the digest BuildKit reported"
+    );
+
+    // The same layout, with the build Step said to have built another
+    // image: refused before crane runs.
+    let mut other = metadata.clone();
+    other["containerimage.digest"] =
+        serde_json::Value::String(format!("sha256:{}", "0".repeat(64)));
+    let wrong = StepRun {
+        run: RunId(unique_run("run-build-wrong")),
+        ..push.clone()
+    };
+    let wh = exec
+        .launch(&wrong, &push_spec(other))
+        .await
+        .expect("launch push with another digest");
+    match poll_to_terminal(&exec, &wh, 300).await {
+        Some(ExecState::Failed { exit_code, .. }) => assert_eq!(
+            exit_code,
+            Some(2),
+            "a digest other than the layout's is refused (exit 2)"
+        ),
+        other => panic!("push with another digest: expected Failed(2), got {other:?}"),
+    }
 
     // The push is observable: a verification step reads the registry's tag
     // list from inside the cluster.
@@ -2022,6 +2164,7 @@ async fn the_build_library_builds_and_pushes_to_a_local_registry() {
         secrets: vec![],
         // busybox runs as root; the hardened baseline would reject it.
         run_as_root: true,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(120),
@@ -2055,8 +2198,248 @@ async fn the_build_library_builds_and_pushes_to_a_local_registry() {
     );
 
     exec.cancel(&vh).await.expect("cleanup verify");
+    exec.cancel(&wh)
+        .await
+        .expect("cleanup push with another digest");
     exec.cancel(&ph).await.expect("cleanup push");
     exec.cancel(&h).await.expect("cleanup build");
+}
+
+// Attack: a commit holds a symlink (`escape -> /etc`, or relative, `up -> ../../etc`) and the Pipeline names it as the build context, so BuildKit would send files from outside the workspace (the build Pod's own filesystem, a credential mount) as the context. The unit tests run the guard with the host's `/bin/sh` and `realpath`; this runs it in the build image itself (busybox in moby/buildkit:rootless). Safe outcome: the build Step exits 2 before buildctl runs.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn the_build_library_refuses_a_committed_symlink_context_out_of_the_workspace() {
+    let ns = enter_tier();
+    let ws = workspace_fixture();
+    let client = kube_client().await;
+    let exec = K8sExecutor::with_client(ns, client)
+        .with_workspace_cas(ws.cas.clone())
+        .with_workspace_depot(ws.depot.clone())
+        .with_workspace_service(ws.fetch.clone());
+
+    // The checkout: a Dockerfile, and symlinks that leave the workspace,
+    // recorded as symlinks and recreated as symlinks in the build Pod.
+    use scarab_storage::Cas as _;
+    let ctx = tempfile::tempdir().expect("context dir");
+    std::fs::write(ctx.path().join("Dockerfile"), "FROM busybox\n").unwrap();
+    std::os::unix::fs::symlink("/etc", ctx.path().join("escape")).unwrap();
+    std::os::unix::fs::symlink("../../etc", ctx.path().join("up")).unwrap();
+    let root = ws
+        .depot
+        .ingest(ctx.path().to_str().unwrap())
+        .await
+        .expect("ingest context")
+        .root
+        .0;
+
+    for context in ["escape", "up"] {
+        let run_id = unique_run("run-build-guard");
+        let ir = build_library_ir(&format!(
+            "image: registry.example/scarab-test:guard\n      context: {context}\n"
+        ));
+        let build = build_library_step_run(&run_id, "image", vec![StepId("checkout".into())]);
+        let h = exec
+            .launch(
+                &build,
+                &build_library_spec(&ir, "image", vec![root.clone()]),
+            )
+            .await
+            .expect("launch build");
+        match poll_to_terminal(&exec, &h, 300).await {
+            Some(ExecState::Failed { exit_code, .. }) => assert_eq!(
+                exit_code,
+                Some(2),
+                "context {context}: the guard refuses it (exit 2) before buildctl runs"
+            ),
+            other => panic!("context {context}: expected Failed(2), got {other:?}"),
+        }
+        exec.cancel(&h).await.expect("cleanup build");
+    }
+}
+
+/// `libs/image-index.yaml` compiled as Run creation stores it, for one
+/// invoke `image` (so its Step is `image/index`, and the build library's
+/// helpers render it) whose `with:` holds `with`.
+fn image_index_library_ir(with: &str) -> scarab_pipeline::PipelineIr {
+    let ir = scarab_pipeline::compile_with_libraries(
+        &format!(
+            "steps:\n  - id: image\n    invoke: lib:thulasi-ram::scarab-ci::image-index\n    with:\n      {with}"
+        ),
+        &scarab_pipeline::Libraries {
+            installed: std::collections::BTreeMap::from([(
+                "thulasi-ram::scarab-ci::image-index".to_string(),
+                scarab_pipeline::InstalledLibrary {
+                    content: include_str!("../../../libs/image-index.yaml").to_string(),
+                    source: "github.com/thulasi-ram/scarab-ci//libs/image-index.yaml@test".into(),
+                },
+            )]),
+            ..Default::default()
+        },
+    )
+    .expect("the image index library compiles");
+    let step = ir
+        .steps
+        .iter()
+        .find(|s| s.id == "image/index")
+        .expect("the image index Step");
+    assert!(step.registry_auth);
+    assert_eq!(step.sandbox(), None);
+    ir
+}
+
+/// An OCI image layout holding one image of `arch` with one empty layer,
+/// written under `dir`, and its manifest's digest. `label` makes a second
+/// image of the same platform with another digest.
+fn single_arch_layout(dir: &std::path::Path, arch: &str, label: Option<&str>) -> String {
+    let blobs = dir.join("blobs/sha256");
+    std::fs::create_dir_all(&blobs).unwrap();
+    let put = |bytes: &[u8]| {
+        let hex = scarab_storage::sha256_hex(bytes);
+        std::fs::write(blobs.join(&hex), bytes).unwrap();
+        (format!("sha256:{hex}"), bytes.len())
+    };
+    // An empty tar archive: two zero blocks.
+    let (layer, layer_size) = put(&[0u8; 1024]);
+    let labels = label
+        .map(|l| format!(r#","config":{{"Labels":{{"scarab.test":"{l}"}}}}"#))
+        .unwrap_or_default();
+    let config = format!(
+        r#"{{"architecture":"{arch}","os":"linux","rootfs":{{"type":"layers","diff_ids":["{layer}"]}}{labels}}}"#
+    );
+    let (config, config_size) = put(config.as_bytes());
+    let manifest = format!(
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config}","size":{config_size}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{layer}","size":{layer_size}}}]}}"#
+    );
+    let (manifest, manifest_size) = put(manifest.as_bytes());
+    std::fs::write(dir.join("oci-layout"), r#"{"imageLayoutVersion":"1.0.0"}"#).unwrap();
+    std::fs::write(
+        dir.join("index.json"),
+        format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{manifest}","size":{manifest_size}}}]}}"#
+        ),
+    )
+    .unwrap();
+    manifest
+}
+
+/// LIVE `lib:thulasi-ram::scarab-ci::image-index` (git-bug 794b3ac): a setup
+/// Step pushes three single-architecture images (amd64, arm64, and a second
+/// amd64) to the local in-cluster registry from OCI layouts written here,
+/// with no network beyond the cluster. The library's Step, compiled from
+/// `libs/image-index.yaml` and rendered as the scheduler renders it, joins
+/// amd64 and arm64 by digest into `scarab-index:live` with the real crane,
+/// and a verification Step reads the index back and finds both digests and
+/// both platforms. Joining the two amd64 images is refused (exit 2) in the
+/// real image's busybox. Needs SCARAB_TEST_REGISTRY, as the build library's
+/// case does. `#[ignore]`d + SCARAB_TEST_KUBE gated.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn the_image_index_library_joins_two_architectures_in_a_local_registry() {
+    let ns = enter_tier();
+    let registry = tier_var("SCARAB_TEST_REGISTRY");
+    let ws = workspace_fixture();
+    let client = kube_client().await;
+    let exec = K8sExecutor::with_client(ns, client)
+        .with_workspace_cas(ws.cas.clone())
+        .with_workspace_depot(ws.depot.clone())
+        .with_workspace_service(ws.fetch.clone());
+
+    use scarab_storage::Cas as _;
+    let layouts = tempfile::tempdir().expect("layouts dir");
+    let amd64 = single_arch_layout(&layouts.path().join("amd64"), "amd64", None);
+    let arm64 = single_arch_layout(&layouts.path().join("arm64"), "arm64", None);
+    let amd64b = single_arch_layout(&layouts.path().join("amd64b"), "amd64", Some("b"));
+    let root = ws
+        .depot
+        .ingest(layouts.path().to_str().unwrap())
+        .await
+        .expect("ingest layouts")
+        .root
+        .0;
+    let src = format!("{registry}/scarab-index-src");
+    let target = format!("{registry}/scarab-index:live");
+
+    let run_id = unique_run("run-index");
+    let with = |images: &str| {
+        image_index_library_ir(&format!(
+            "image: {target}\n      images: \"{images}\"\n      insecure: \"true\"\n"
+        ))
+    };
+    let ir = with(&format!("{src}@{amd64}\\n{src}@{arm64}\\n"));
+    let index = build_library_spec(&ir, "index", vec![]);
+
+    // The setup and verification Steps run in the same image, as the same
+    // user, as the library's Step, with no registry credential.
+    let plain = |command: String, inputs: Vec<String>| StepSpec {
+        command: vec!["/busybox/sh".into(), "-c".into(), command],
+        env: vec![],
+        workspace_inputs: inputs,
+        registry_auth: None,
+        ..index.clone()
+    };
+    let setup = plain(
+        format!(
+            "set -eu; for a in amd64 arm64 amd64b; do crane push --insecure /workspace/$a {src}:$a; done"
+        ),
+        vec![root],
+    );
+    let h = exec
+        .launch(&build_library_step_run(&run_id, "setup", vec![]), &setup)
+        .await
+        .expect("launch setup");
+    assert_eq!(
+        poll_to_terminal(&exec, &h, 300).await,
+        Some(ExecState::Succeeded),
+        "the three images are pushed"
+    );
+
+    let ih = exec
+        .launch(&build_library_step_run(&run_id, "index", vec![]), &index)
+        .await
+        .expect("launch index");
+    assert_eq!(
+        poll_to_terminal(&exec, &ih, 300).await,
+        Some(ExecState::Succeeded),
+        "the index step joins amd64 and arm64"
+    );
+
+    let verify = plain(
+        format!(
+            "set -eu; m=$(crane manifest --insecure {target}); echo \"$m\"; \
+             echo \"$m\" | grep -q '{amd64}'; echo \"$m\" | grep -q '{arm64}'; \
+             echo \"$m\" | grep -q '\"architecture\":\"arm64\"'; \
+             ! echo \"$m\" | grep -q '{amd64b}'"
+        ),
+        vec![],
+    );
+    let vh = exec
+        .launch(&build_library_step_run(&run_id, "verify", vec![]), &verify)
+        .await
+        .expect("launch verify");
+    assert_eq!(
+        poll_to_terminal(&exec, &vh, 120).await,
+        Some(ExecState::Succeeded),
+        "the registry holds an index of the two images"
+    );
+
+    // Two images of one platform: refused before crane index append runs.
+    let same = build_library_spec(
+        &with(&format!("{src}@{amd64}\\n{src}@{amd64b}")),
+        "index",
+        vec![],
+    );
+    let sh = exec
+        .launch(&build_library_step_run(&run_id, "same", vec![]), &same)
+        .await
+        .expect("launch index of one platform");
+    match poll_to_terminal(&exec, &sh, 300).await {
+        Some(ExecState::Failed { exit_code, .. }) => assert_eq!(exit_code, Some(2)),
+        other => panic!("two amd64 images: expected Failed(2), got {other:?}"),
+    }
+
+    for handle in [&sh, &vh, &ih, &h] {
+        exec.cancel(handle).await.expect("cleanup");
+    }
 }
 
 /// LIVE results egress (ADR-0042/0041): a step writes a named result to
@@ -2136,6 +2519,7 @@ async fn results_sidecar_captures_a_named_result_end_to_end() {
         env: vec![],
         secrets: vec![],
         run_as_root: true, // busybox
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(120),
@@ -2325,6 +2709,7 @@ async fn cancel_tears_down_a_running_pod() {
         env: vec![],
         secrets: vec![],
         run_as_root: true, // busybox
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(600),
@@ -2426,6 +2811,7 @@ async fn artifacts_are_harvested_post_step() {
         env: vec![],
         secrets: vec![],
         run_as_root: true, // busybox
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(120),
@@ -2513,6 +2899,7 @@ async fn artifacts_are_harvested_from_a_failed_step() {
         env: vec![],
         secrets: vec![],
         run_as_root: true, // busybox
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(120),
@@ -2583,6 +2970,7 @@ fn busybox_spec(cmd: &str, run_as_root: bool) -> StepSpec {
         env: vec![],
         secrets: vec![],
         run_as_root,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(600),
@@ -2930,6 +3318,7 @@ async fn fanin_collision_summary_survives_the_termination_log_as_uid_65532() {
         env: vec![],
         secrets: vec![],
         run_as_root: true, // busybox runs as root; fsGroup covers the emptyDir
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(120),
@@ -3227,4 +3616,156 @@ async fn a_needs_step_with_a_uid_pinned_service_can_write_its_workspace() {
     for h in [ha, hb] {
         exec.cancel(&h).await.expect("cleanup");
     }
+}
+
+/// LIVE (J-1, round 2 judge S7): a control plane that tails a step it did not
+/// launch reads the step's secret values back from the step's own Secrets,
+/// so it redacts them as the launching replica does. A second executor (a
+/// fresh client, nothing in memory from the launch) returns the step's
+/// secret values, the registry dockerconfigjson, the forge token and the
+/// OIDC token; a Pod with no secrets
+/// returns none; once the Attempt ends and its Secrets are deleted it
+/// answers `Gone`, never "none".
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn log_redactions_reads_the_values_back_from_another_executor() {
+    let ns = enter_tier();
+
+    let launcher = K8sExecutor::with_client(ns.clone(), kube_client().await);
+    let peer = K8sExecutor::with_client(ns, kube_client().await);
+
+    let step = step_run_of(&unique_run("run-redact"), "redact");
+    let mut spec = busybox_spec("sleep 30", true);
+    spec.secrets = vec!["DB_PASSWORD".into()];
+    spec.resolved_secrets =
+        scarab_engine::ResolvedSecrets(vec![("DB_PASSWORD".into(), "sekret-db-redact".into())]);
+    spec.registry_auth = Some(scarab_engine::RegistryAuthConfig {
+        owner: "acme".into(),
+        name: "web".into(),
+        library: Some("ab".repeat(32)),
+        credential_eligible: true,
+        derived_auth: Some(scarab_engine::RegistryCredential {
+            registry: "ghcr.io".into(),
+            username: "x-access-token".into(),
+            token: "sekret-registry-token".into(),
+        }),
+        ..Default::default()
+    });
+    spec.forge_token = Some(scarab_engine::ForgeTokenConfig {
+        access: scarab_pipeline::ForgeToken::Read,
+        owner: "acme".into(),
+        name: "web".into(),
+        read_only: false,
+        trusted_library: None,
+        credential: Some(scarab_engine::ForgeCredential {
+            username: "x-access-token".into(),
+            token: "sekret-forge-redact".into(),
+            minted: false,
+        }),
+    });
+    spec.oidc_token = Some("sekret-oidc-redact".into());
+    let h = launcher.launch(&step, &spec).await.expect("launch");
+
+    let values = match peer.log_redactions(&step).await.expect("log_redactions") {
+        LogRedactions::Values(values) => values,
+        LogRedactions::Gone => panic!("the Secrets exist"),
+    };
+    for value in [
+        &b"sekret-db-redact"[..],
+        b"sekret-forge-redact",
+        b"sekret-oidc-redact",
+    ] {
+        assert!(
+            values.iter().any(|v| v == value),
+            "{}: {values:?}",
+            String::from_utf8_lossy(value)
+        );
+    }
+    // The forge username is not a credential.
+    assert!(values.iter().all(|v| v != b"x-access-token"));
+    // The launching replica registers the token and `base64(user:token)`;
+    // the server extracts both from the dockerconfigjson returned here.
+    use base64::Engine as _;
+    let auth =
+        base64::engine::general_purpose::STANDARD.encode("x-access-token:sekret-registry-token");
+    assert!(
+        values.iter().any(|v| {
+            serde_json::from_slice::<serde_json::Value>(v)
+                .is_ok_and(|j| j["auths"]["ghcr.io"]["auth"] == auth.as_str())
+        }),
+        "the registry dockerconfigjson: {:?}",
+        values
+            .iter()
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .collect::<Vec<_>>()
+    );
+
+    // The Attempt ends: its Secrets are deleted. The Pod still references
+    // them, so the answer is `Gone`, not "no values".
+    launcher
+        .take_forge_credential(&h)
+        .await
+        .expect("attempt-end hook");
+    let mut after = peer.log_redactions(&step).await.expect("log_redactions");
+    for _ in 0..10 {
+        if after == LogRedactions::Gone {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        after = peer.log_redactions(&step).await.expect("log_redactions");
+    }
+    assert_eq!(after, LogRedactions::Gone);
+    launcher.cancel(&h).await.expect("cleanup");
+
+    // A Pod with no secrets: none.
+    let plain = step_run_of(&unique_run("run-redact-none"), "plain");
+    let hp = launcher
+        .launch(&plain, &busybox_spec("true", true))
+        .await
+        .expect("launch");
+    assert_eq!(
+        peer.log_redactions(&plain).await.expect("log_redactions"),
+        LogRedactions::Values(Vec::new())
+    );
+    launcher.cancel(&hp).await.expect("cleanup");
+}
+
+/// LIVE (RT-R2-1): an overlay that keeps to the author's fields and makes a
+/// Pod the API server refuses (a node selector value that is not a label
+/// value) fails the step with the API's reason (`Refused`, which the
+/// scheduler records as the step's `Config` failure), not a launch error
+/// the scheduler retries until the Run dead-letters. No Pod is left behind:
+/// the dry run that put the fault on the overlay stores nothing.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn an_overlay_kubernetes_refuses_fails_the_step() {
+    let ns = enter_tier();
+
+    let client = kube_client().await;
+    let exec = K8sExecutor::with_client(ns.clone(), client.clone());
+    use kube::api::Api;
+    let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client, &ns);
+
+    let step = step_run_of(&unique_run("run-badoverlay"), "badoverlay");
+    let mut spec = busybox_spec("true", true);
+    spec.k8s_overlay = Some(serde_json::json!({
+        "spec": { "nodeSelector": { "pool": "not a label value!" } }
+    }));
+    let err = exec
+        .launch(&step, &spec)
+        .await
+        .expect_err("the API server refuses the Pod");
+    match &err {
+        scarab_engine::ExecError::Refused(m) => {
+            assert!(
+                m.contains("k8s_overlay") && m.contains("nodeSelector"),
+                "{m}"
+            )
+        }
+        other => panic!("expected Refused, got {other:?}"),
+    }
+    assert!(
+        pods.get_opt(&pod_name(&step)).await.expect("get").is_none(),
+        "no Pod was created"
+    );
 }

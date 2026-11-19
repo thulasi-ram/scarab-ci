@@ -190,3 +190,111 @@ steps:
     assert_eq!(by_id("own")["image"], "app@sha256:run");
     assert_eq!(by_id("own")["digest"], "sha256:run");
 }
+
+/// git-bug 1a20384: `run_as_user: 0` is the `run-as-root` request, so a
+/// Policy that denies root refuses it as it refuses `run_as_root: true`; a
+/// non-zero uid is no grant, and `run_as_user` carries the uid either way.
+#[test]
+fn run_as_user_zero_is_the_run_as_root_grant() {
+    let ir = scarab_pipeline::compile_yaml(
+        r#"
+steps:
+  - { id: root, image: busybox, security: { run_as_root: true } }
+  - { id: zero, image: busybox, security: { run_as_user: 0 } }
+  - { id: user, image: busybox, security: { run_as_user: 1000 } }
+  - { id: plain, image: busybox }
+"#,
+    )
+    .unwrap();
+    let input = serde_json::to_value(input_from_pipeline(&ir, facts()).unwrap()).unwrap();
+    let step = |i: usize| &input["steps"][i];
+    assert_eq!(step(0)["grants"], serde_json::json!(["run-as-root"]));
+    assert_eq!(step(0)["run_as_user"], serde_json::Value::Null);
+    assert_eq!(step(1)["grants"], serde_json::json!(["run-as-root"]));
+    assert_eq!(step(1)["run_as_user"], 0);
+    assert_eq!(step(2)["grants"], serde_json::json!([]));
+    assert_eq!(step(2)["run_as_user"], 1000);
+    assert_eq!(step(3)["run_as_user"], serde_json::Value::Null);
+}
+
+/// git-bug 328010f: a Policy sees each service. A sidecar lists under its
+/// Step's `services` and a shared service under the Run's `services`, with
+/// `run_as_root` true for `run_as_root: true` and for `run_as_user: 0`. A
+/// root sidecar also puts `run-as-root` in its Step's `grants`, so a rule
+/// over Step grants covers it; a non-zero uid is no grant.
+#[test]
+fn services_are_listed_and_run_as_user_zero_is_root() {
+    let ir = scarab_pipeline::compile_yaml(
+        r#"
+services:
+  - { name: db, image: "postgres:16@sha256:db", run_as_user: 0 }
+  - { name: cache, image: redis:7, run_as_user: 999 }
+steps:
+  - id: t
+    image: busybox
+    uses: [db, cache]
+    services:
+      - { image: "postgres:16", run_as_user: 999 }
+      - { image: minio, run_as_user: 0 }
+      - { image: mongo, run_as_root: true }
+  - id: plain
+    image: busybox
+    services: [{ image: "redis:7@sha256:r", run_as_user: 1000 }]
+  - { id: none, image: busybox }
+"#,
+    )
+    .unwrap();
+    let input = serde_json::to_value(input_from_pipeline(&ir, facts()).unwrap()).unwrap();
+
+    assert_eq!(
+        input["services"],
+        serde_json::json!([
+            { "name": "db", "image": "postgres:16@sha256:db", "digest": "sha256:db",
+              "grants": ["run-as-root"], "run_as_root": true, "run_as_user": 0 },
+            { "name": "cache", "image": "redis:7", "digest": null,
+              "grants": [], "run_as_root": false, "run_as_user": 999 },
+        ])
+    );
+    let step = |i: usize| &input["steps"][i];
+    assert_eq!(
+        step(0)["services"],
+        serde_json::json!([
+            { "index": 0, "image": "postgres:16", "digest": null,
+              "grants": [], "run_as_root": false, "run_as_user": 999 },
+            { "index": 1, "image": "minio", "digest": null,
+              "grants": ["run-as-root"], "run_as_root": true, "run_as_user": 0 },
+            { "index": 2, "image": "mongo", "digest": null,
+              "grants": ["run-as-root"], "run_as_root": true, "run_as_user": null },
+        ])
+    );
+    assert_eq!(
+        step(0)["grants"],
+        serde_json::json!(["run-as-root"]),
+        "a root sidecar is a root container in the Step's Pod"
+    );
+    assert_eq!(step(1)["services"][0]["digest"], "sha256:r");
+    assert_eq!(step(1)["services"][0]["run_as_root"], false);
+    assert_eq!(step(1)["grants"], serde_json::json!([]));
+    assert_eq!(step(2)["services"], serde_json::json!([]));
+}
+
+/// A Step whose own `security` and a sidecar both ask for root lists
+/// `run-as-root` once.
+#[test]
+fn a_root_step_with_a_root_sidecar_lists_run_as_root_once() {
+    let ir = scarab_pipeline::compile_yaml(
+        r#"
+steps:
+  - id: t
+    image: busybox
+    security: { run_as_root: true }
+    services: [{ image: minio, run_as_root: true }]
+"#,
+    )
+    .unwrap();
+    let input = serde_json::to_value(input_from_pipeline(&ir, facts()).unwrap()).unwrap();
+    assert_eq!(
+        input["steps"][0]["grants"],
+        serde_json::json!(["run-as-root"])
+    );
+}

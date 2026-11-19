@@ -1,0 +1,24 @@
+{{- if include "scarab.createExecNamespace" . -}}
+{{- /*
+  The namespace step Pods run in, `<release namespace>-steps`, rendered only
+  when the chart chose the name: scarab.namespace is empty, the executor is
+  k8s, and rbac.create and scarab.createNamespace are true
+  (scarab.createExecNamespace in _helpers.tpl). Step Pods run
+  pipeline code; here they do not share a namespace with the server's Secret,
+  ServiceAccount or the Data Depot. The executor's Role and RoleBinding
+  (rbac.yaml) are rendered into it; Helm creates a Namespace before the
+  objects in it.
+
+  `helm.sh/resource-policy: keep`: `helm uninstall` leaves the namespace and
+  any step Pods still in it, as for the plugin namespace. A reinstall under
+  the same release name and namespace adopts it again.
+*/ -}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "scarab.execNamespace" . }}
+  labels:
+    {{- include "scarab.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+{{- end }}

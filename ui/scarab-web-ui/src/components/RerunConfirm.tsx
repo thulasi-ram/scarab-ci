@@ -1,6 +1,6 @@
 // The rerun/retry CONFIRM popover (git-bug 4afaa3e): the first click opens
 // this; the POST fires only from its confirm button, so the whole cascade is
-// named BEFORE anything re-arms (ADR-0027 — smart never means mysterious).
+// named BEFORE anything re-arms (smart never means mysterious).
 //
 // Portalled to <body> with fixed positioning, the same machinery as
 // SearchSelect/VersionDropdown (amendment F5: never clipped by an ancestor's

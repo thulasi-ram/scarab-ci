@@ -97,6 +97,30 @@ fn step(run: &str) -> StepRun {
         gate_kind: None,
     }
 }
+/// [`step`] with its first attempt `a1`: the log stream a launch registers
+/// the values it mounts for.
+fn step_in_attempt(run: &str) -> StepRun {
+    StepRun {
+        attempts: vec![scarab_engine::Attempt {
+            id: scarab_engine::AttemptId("a1".into()),
+            started_at: scarab_engine::Timestamp(0),
+            failure: None,
+            failure_detail: None,
+            outcome: scarab_engine::AttemptOutcome::Running,
+        }],
+        ..step(run)
+    }
+}
+
+/// Some open log stream, so a diagnostic is redacted with its values.
+fn any_fence() -> scarab_server::LogFence {
+    scarab_server::LogFence::new(
+        &RunId("r1".into()),
+        &StepId("s1".into()),
+        &scarab_engine::AttemptId("a1".into()),
+    )
+}
+
 fn spec_with_secret() -> StepSpec {
     StepSpec {
         image: "busybox".into(),
@@ -104,6 +128,7 @@ fn spec_with_secret() -> StepSpec {
         env: vec![("PLAIN".into(), "1".into())],
         secrets: vec!["TOKEN".into()],
         run_as_root: false,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: None,
@@ -346,6 +371,7 @@ fn plain_spec() -> StepSpec {
         env: vec![],
         secrets: vec![],
         run_as_root: false,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: None,
@@ -415,6 +441,51 @@ async fn deploy_run_gets_a_verifiable_token_with_the_run_subject() {
     );
     assert_eq!(claims["run_id"], "r1");
     assert_eq!(claims["iss"], "https://scarab.example");
+}
+
+/// The OIDC token is mounted into the step container: a step that prints it
+/// stores `***`. Each launch registers the token it mints.
+#[tokio::test]
+async fn a_printed_oidc_token_is_stored_redacted() {
+    let db = Arc::new(InMemoryDb::new());
+    seed_deploy(&db, "r1", false).await;
+    let issuer = Arc::new(Rs256Issuer::generate("https://scarab.example").unwrap());
+    let inner = Arc::new(SpecCapturingExec::default());
+    let logs = logs(db.clone());
+    let exec = SecretInjectingExecutor::new(
+        inner.clone(),
+        db.clone() as Arc<dyn Db>,
+        Arc::new(FakeSecrets::new()),
+        logs.clone(),
+    )
+    .with_oidc(issuer, "https://scarab.example", "sts.example.com");
+    exec.launch(&step_in_attempt("r1"), &plain_spec())
+        .await
+        .unwrap();
+    let token = inner
+        .last
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap()
+        .oidc_token
+        .unwrap();
+
+    let (run, step, attempt) = (
+        RunId("r1".into()),
+        StepId("s1".into()),
+        scarab_engine::AttemptId("a1".into()),
+    );
+    logs.append(&run, &step, &attempt, format!("OIDC={token}\n").as_bytes())
+        .await
+        .unwrap();
+    let stored = logs.read_all(&run, &step, &attempt).await.unwrap();
+    let stored = String::from_utf8_lossy(&stored);
+    assert!(
+        !stored.contains(token.as_str()),
+        "stored in clear: {stored}"
+    );
+    assert_eq!(stored, "OIDC=***\n");
 }
 
 #[tokio::test]
@@ -573,7 +644,7 @@ impl Executor for ConditionExec {
 async fn the_decorator_forwards_and_scrubs_the_infra_condition() {
     let db = Arc::new(InMemoryDb::new());
     let logs = logs(db.clone());
-    logs.register_secret(b"sup3r-s3cret");
+    logs.register_secret(&any_fence(), b"sup3r-s3cret");
     let exec = SecretInjectingExecutor::new(
         Arc::new(ConditionExec),
         db.clone() as Arc<dyn Db>,
@@ -601,7 +672,7 @@ async fn the_decorator_forwards_and_scrubs_the_infra_condition() {
 async fn the_decorator_scrubs_the_failure_cause() {
     let db = Arc::new(InMemoryDb::new());
     let logs = logs(db.clone());
-    logs.register_secret(b"sup3r-s3cret");
+    logs.register_secret(&any_fence(), b"sup3r-s3cret");
     let exec = SecretInjectingExecutor::new(
         Arc::new(ConditionExec),
         db.clone() as Arc<dyn Db>,

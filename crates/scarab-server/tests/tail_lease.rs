@@ -100,7 +100,11 @@ impl Executor for TwoChunkExec {
     }
     // ADR-0064 s2: required (never defaulted) so the compiler makes every impl —
     // wrappers included — decide; this stub snapshots nothing, so no stamp.
-    async fn log_stream(&self, _s: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+    async fn log_stream(
+        &self,
+        _s: &StepRun,
+        _from: scarab_engine::LogFrom,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         self.opened.fetch_add(1, Ordering::SeqCst);
         Ok(Some(Box::new(TwoChunks {
             left: Mutex::new(vec![b"line-2\n".to_vec(), b"line-1\n".to_vec()]),

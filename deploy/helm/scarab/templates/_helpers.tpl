@@ -129,9 +129,32 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 {{- end -}}
 
-{{/* Namespace the executor launches step Pods into (defaults to release ns). */}}
+{{/* Whether the chart names and renders the step namespace
+     `<release namespace>-steps`: scarab.namespace is empty, the executor is
+     k8s, the chart renders the executor's Role (rbac.create) and may create a
+     Namespace (scarab.createNamespace). Otherwise the default is the release
+     namespace: with rbac.create false the operator's own RoleBinding is there,
+     and with createNamespace false a namespace-only installer keeps working. */}}
+{{- define "scarab.createExecNamespace" -}}
+{{- if and (not .Values.scarab.namespace) (eq .Values.scarab.executor "k8s") .Values.rbac.create .Values.scarab.createNamespace -}}true{{- end -}}
+{{- end -}}
+
+{{/* Namespace the executor launches step Pods into: scarab.namespace, else
+     `<release namespace>-steps` when the chart creates it (above), else the
+     release namespace. A derived name longer than a namespace may be fails the
+     render rather than being cut back to the release namespace. */}}
 {{- define "scarab.execNamespace" -}}
-{{- default .Release.Namespace .Values.scarab.namespace -}}
+{{- if .Values.scarab.namespace -}}
+{{- .Values.scarab.namespace -}}
+{{- else if include "scarab.createExecNamespace" . -}}
+{{- $ns := printf "%s-steps" .Release.Namespace -}}
+{{- if gt (len $ns) 63 -}}
+{{- fail (printf "scarab: the step namespace `%s` is longer than 63 characters; set scarab.namespace." $ns) -}}
+{{- end -}}
+{{- $ns -}}
+{{- else -}}
+{{- .Release.Namespace -}}
+{{- end -}}
 {{- end -}}
 
 {{/* plugins.namespace must be a namespace of its own (ADR-0072 §9). The

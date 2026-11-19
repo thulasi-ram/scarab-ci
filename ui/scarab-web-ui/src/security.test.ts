@@ -1,4 +1,4 @@
-// Security shaping (ADR-0073): the app banner, the posture line, event rows,
+// Security shaping: the app banner, the posture line, event rows,
 // passkey badges, and the confirm page's words for each outcome.
 import { describe, expect, it } from "vitest";
 import {

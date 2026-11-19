@@ -1,7 +1,8 @@
 # scarab Helm chart
 
 Deploys **scarab-server** (one binary, selectable roles) onto Kubernetes,
-with the RBAC it needs to launch one Pod per step in its namespace.
+with the RBAC it needs to launch one Pod per step in the step namespace
+(`<release namespace>-steps` by default).
 
 ## Prerequisites
 
@@ -240,6 +241,47 @@ its repo bindings.
 the running server can store it). `SCARAB_GITHUB_APP_PEM[_FILE]` above is the same
 mechanism, applied kind-wide to GitHub App-mode connections.
 
+## Where step Pods run (`scarab.namespace`)
+
+Step Pods run pipeline code, so by default they run in a namespace of their
+own, `<release namespace>-steps`, not beside the server's Secret, its
+ServiceAccount and the Data Depot. The chart renders that namespace and a Role
+in it for the server's ServiceAccount: step Pods and their logs, exec and
+events, the Secrets the server creates for each Pod, and the Services and
+NetworkPolicies of shared services. Step Pods reach the Data Depot and the
+server's results API through Services by their full DNS names, so the server
+needs no Kubernetes API rights in its own namespace for them.
+
+| Values | Step Pods run in |
+|--------|------------------|
+| `scarab.namespace` empty (default) | `<release namespace>-steps`, which the chart creates |
+| `scarab.namespace` empty, `scarab.createNamespace: false` | the release namespace, beside the server |
+| `scarab.namespace` empty, `rbac.create: false` | the release namespace, where you grant the server's ServiceAccount its rights |
+| `scarab.namespace` empty, `scarab.executor: local` | no step Pods; the chart renders no Namespace |
+| `scarab.namespace: <name>` | `<name>`, which you create before the install; the chart renders the Role into it |
+| `scarab.namespace: <release namespace>` | the release namespace, beside the server (the behaviour up to 0.4.4) |
+
+Creating a Namespace needs cluster-wide rights. An installer with rights only in
+the release namespace sets `scarab.createNamespace: false`, or names a namespace
+that already exists in `scarab.namespace`. To keep step Pods apart and create
+the namespace yourself, set `scarab.namespace: <release namespace>-steps` and
+create it before the install. With `rbac.create: false` the chart renders no
+Role, so the default is the release namespace, where your own RoleBinding is;
+name another namespace only if you grant the server's ServiceAccount the
+executor's rights there (`templates/rbac.yaml` lists them). A release namespace
+longer than 57 characters makes `<release namespace>-steps` too long: the
+render fails and asks for `scarab.namespace`.
+
+What you set up for step Pods belongs in the step namespace: a LimitRange or
+ResourceQuota, `imagePullSecrets` on its `default` ServiceAccount, and every
+ServiceAccount a placement profile names (an IRSA role's, for example).
+
+The chart renders no Pod Security label on the namespace: a `rootless-buildkit`
+step needs an Unconfined seccomp profile, which the `baseline` level refuses.
+`helm uninstall` leaves the namespace and any step Pods in it
+(`helm.sh/resource-policy: keep`); a reinstall under the same release name and
+namespace adopts it again.
+
 ## Step Pod placement (`scarab.placement`, ADR-0055)
 
 Step Pods are created by the server at run time, so the chart's `tolerations` /
@@ -287,11 +329,35 @@ full rules.
 
 The block is rendered verbatim into a mounted ConfigMap and
 `SCARAB_PLACEMENT_CONFIG_FILE` points at it, so the keys are the **server's**
-schema (`baseline`, `default_resources`, `profiles`). The server silently accepts
+schema (`baseline`, `default_resources`, `profiles`, `author_overlay`). The server silently accepts
 two mistakes: an unknown top-level key, and a fragment key other than
 `metadata`/`spec` (dropped when the merged Pod is decoded). Either one leaves
 every step Pod `Pending` with no error. The chart **fails the render** on both
 instead. A change rolls the server (it is read once at boot).
+
+### Keys a step's own overlay may set (`author_overlay`)
+
+Where an Environment permits it, a step can carry its own `k8s_overlay`. Labels,
+annotations and tolerations in it are refused unless their key is listed here:
+
+```yaml
+scarab:
+  placement:
+    author_overlay:
+      label_keys: [team, cost-center]
+      annotation_keys: ["karpenter.sh/do-not-disrupt", "prometheus.io/*"]
+      toleration_keys: [nvidia.com/gpu]
+```
+
+Each entry is an exact key, `prefix/*` (every key under that prefix) or `*`
+(every key without a prefix). Nothing is listed by default. Keys under
+`scarab.io/`, `scarab.dev/`, `app.kubernetes.io/` and `node-role.kubernetes.io/`,
+the AppArmor and seccomp annotations, and a toleration with an empty or missing
+key stay refused even when listed. A misspelled key inside `author_overlay`
+stops the server at boot; a malformed entry fails validation. A label a
+NetworkPolicy or Service selects on, or an annotation an admission webhook acts
+on (an IAM role, a mesh or Vault injector), is safer in a placement profile,
+which the operator writes.
 
 ## The workspace service (`workspace`, ADR-0061)
 
@@ -376,6 +442,38 @@ the old count until the release is upgraded.
 The StatefulSet's `serviceName` is unchanged, so upgrading needs no migration.
 
 > **Unverified in this chart version:** per-availability-zone placement.
+
+### Upgrading from 0.4.4 or earlier: step Pods move
+
+Up to 0.4.4 an empty `scarab.namespace` meant the release namespace. Now, with
+the k8s executor, `rbac.create: true` and `scarab.createNamespace: true` (the
+defaults), it means `<release namespace>-steps`. If your values leave it empty,
+the upgrade:
+
+- creates the Namespace `<release namespace>-steps` and moves the executor's
+  Role and RoleBinding there, so the server has no rights left over step Pods
+  in the release namespace;
+- leaves step Pods that are running in the release namespace where they are.
+  The new server looks for a step's Pod only in the new namespace: for a step
+  still running it finds none and marks the Attempt lost, and the step's retry
+  policy decides whether a new Attempt runs, in the new namespace. It does not
+  delete the old Pods.
+
+Let running Runs finish before the upgrade
+(`kubectl -n <release namespace> get pods -l scarab.io/run` lists none), or set
+`scarab.namespace` to the release namespace to keep step Pods where they are.
+Delete leftover Pods once they end
+(`kubectl -n <release namespace> delete pods -l scarab.io/run`). Before the
+upgrade, recreate in the new namespace what you set up for step Pods
+([Where step Pods run](#where-step-pods-run-scarabnamespace)).
+
+Creating a Namespace needs cluster-wide rights. If the account that runs
+`helm upgrade` has rights only in the release namespace, the upgrade fails;
+set `scarab.createNamespace: false` (step Pods stay in the release namespace),
+or name a namespace that already exists in `scarab.namespace`.
+
+Installs that already set `scarab.namespace`, set `rbac.create: false`, or run
+the local executor see no change.
 
 ### Upgrading to 0.3.1
 
@@ -477,7 +575,8 @@ DNS, which must be the usual `kube-system` Pods labelled `k8s-app=kube-dns`.
 | `strategy` | `type: Recreate` | server Deployment update strategy: old server Pods stop before new ones start, so two versions never run Steps side by side. Switch to `RollingUpdate` only where a release's notes say mixed versions are safe |
 | `scarab.role` | `converged` | `api` / `scheduler` / `executor` / `webhook` / `converged` |
 | `scarab.executor` | `k8s` | `k8s` (prod) or `local` (dev only) |
-| `scarab.namespace` | release ns | namespace step Pods launch into (RBAC granted there) |
+| `scarab.namespace` | `<release ns>-steps` | namespace step Pods launch into (RBAC granted there); see [Where step Pods run](#where-step-pods-run-scarabnamespace) |
+| `scarab.createNamespace` | `true` | render `<release ns>-steps` when `scarab.namespace` is empty; `false` runs step Pods in the release namespace |
 | `scarab.s3.*` | — | object store; set `bucket` to enable S3/MinIO |
 | `scarab.oauth.*` | — | OAuth/OIDC login: `clientId`, `authorizeUrl`, `tokenUrl`, `userinfoUrl`, `scopes`, `owners`, `issuer` (above) |
 | `scarab.devInsecure` | `false` | ⚠ dev/eval only — no auth; mutually exclusive with `scarab.oauth` |
@@ -486,6 +585,7 @@ DNS, which must be the usual `kube-system` Pods labelled `k8s-app=kube-dns`.
 | `secrets.githubAppPemSecret.name` / `.key` | — / `github-app.pem` | mount the App PEM from your own Secret (above) |
 | `scarab.connections` | `[]` | declarative, config-owned forge connections (above) |
 | `scarab.placement` | `{}` | step Pod baseline + PlacementProfiles (above); required on an all-tainted cluster |
+| `scarab.placement.author_overlay` | nothing listed | label, annotation and toleration keys a step's own `k8s_overlay` may set (above) |
 | `workspace.enabled` | `true` | the ADR-0061 workspace service; renders only when a workspace token secret exists (above) |
 | `workspace.dataDir` | `/var/lib/scarab/cas` | where the warm tier's PVC is mounted (`SCARAB_WORKSPACE_DATA_DIR`) |
 | `workspace.persistence.size` / `.storageClass` | `20Gi` / cluster default | the warm tier's volume — bounded by SPACE via the LRU sweep (git-bug cba7165); prefer local disk (above) |

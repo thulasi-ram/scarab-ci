@@ -386,7 +386,10 @@ fn short_hash(h: &str) -> String {
 
 /// `library.install`: the library by its Pipeline name and the org,
 /// `lib:acme::scarab-libs::deploy-helm in acme`, and the version change first
-/// (`version = 5d1e0c7a9b3f → 0c4e7b2a91f5`), then the full hashes.
+/// (`version = 5d1e0c7a9b3f → 0c4e7b2a91f5`), then the grants the new version
+/// gets from its source's trust when `carry_grants` names any
+/// (`grants carried to this version = forge_credentials`), then
+/// the full hashes.
 pub fn describe_library_install(op: &Op, input: &OpInput) -> OpSummary {
     let generic = describe_generic(op, input);
     let (Some(org), Some(name)) = (input.param("org"), input.body_str("/name")) else {
@@ -398,6 +401,22 @@ pub fn describe_library_install(op: &Op, input: &OpInput) -> OpSummary {
         None => format!("version = {} (nothing installed before)", short_hash(&new)),
     };
     let mut changes = vec![escape_invisible(&version)];
+    if let Some(Value::Array(grants)) = input.body.pointer("/carry_grants") {
+        if !grants.is_empty() {
+            let names: Vec<String> = grants
+                .iter()
+                .map(|g| {
+                    g.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| g.to_string())
+                })
+                .collect();
+            changes.push(escape_invisible(&format!(
+                "grants carried to this version = {}",
+                names.join(", ")
+            )));
+        }
+    }
     changes.extend(generic.changes);
     OpSummary {
         operation: generic.operation,
@@ -1539,7 +1558,13 @@ pub static LIBRARY_FETCH: Op = op(
 pub static LIBRARY_INSTALL: Op = op(
     "library.install",
     "Install or upgrade a library",
-    Class::CrownJewel(W),
+    // Every install asks; conditional only so the handler asks after it has
+    // checked the request (git-bug 9c54b46: a wrong `carry_grants` is a 400
+    // that costs no confirmation).
+    Class::Conditional {
+        mode: W,
+        rule: "always, once the request is checked",
+    },
     "ADR-0076 §4: installing and upgrading loosen",
     ADMIN,
     OrgOf::Path("org"),
@@ -1682,6 +1707,26 @@ mod tests {
             s.changes.contains(&format!("content_hash = {new}")),
             "{:?}",
             s.changes
+        );
+
+        assert!(
+            !s.changes.iter().any(|c| c.starts_with("grants carried")),
+            "{:?}",
+            s.changes
+        );
+
+        // An upgrade that carries a grant to the new version
+        // says so right after the version change.
+        i.body = json!({
+            "name": name,
+            "content_hash": new,
+            "replaces": old,
+            "carry_grants": ["build_sandbox", "forge_credentials", "registry_credential"]
+        });
+        let s = LIBRARY_INSTALL.summary(&i);
+        assert_eq!(
+            s.changes[1],
+            "grants carried to this version = build_sandbox, forge_credentials, registry_credential"
         );
 
         i.body = json!({ "name": name, "content_hash": new });

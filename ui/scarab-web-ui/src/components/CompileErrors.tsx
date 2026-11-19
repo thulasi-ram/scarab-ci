@@ -1,4 +1,4 @@
-// A Pipeline that does not compile, as rows of a check list (ADR-0076): the
+// A Pipeline that does not compile, as rows of a check list: the
 // checks it still passed, dimmed, then one row per error with a "what" line,
 // a "fix" line, and a collapsed "Why" holding the explanation, a suggested
 // change and the server's own message.

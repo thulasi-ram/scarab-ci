@@ -22,11 +22,13 @@ export default function RunActivity(props: {
   active: Record<string, { attempt: string; since: number }>;
   /** The trigger event in words. */
   trigger: string | null;
+  /** Each step's needs, to say which need a skipped step was skipped for. */
+  needs: Record<string, string[]>;
 }) {
   const [filter, setFilter] = createSignal<ActivityFilter>("steps");
   const view = () => activityView(props.events, props.active, filter());
   const note = () => activityHiddenNote(view().hiddenCleared, props.later);
-  const words = createMemo(() => activityWords(props.events));
+  const words = createMemo(() => activityWords(props.events, props.needs));
 
   const Chip = (p: { f: ActivityFilter; label: string }) => (
     <button type="button" class="chip" aria-pressed={filter() === p.f} onClick={() => setFilter(p.f)}>

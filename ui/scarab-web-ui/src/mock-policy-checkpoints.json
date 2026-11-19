@@ -286,6 +286,22 @@
        }
       },
       {
+       "doc": "The Run's shared services. Absent from inputs recorded before it existed, so a rule reads it as `services != null && services.exists(v, v.run_as_root)`.",
+       "max_len": 1024,
+       "name": "services",
+       "optional": true,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 32,
+         "elem": {
+          "kind": "struct",
+          "of": "SharedService"
+         }
+        }
+       }
+      },
+      {
        "doc": "The human or token creating the Run; absent for a webhook.",
        "max_len": 1024,
        "name": "principal",
@@ -305,6 +321,136 @@
       }
      ],
      "name": "RunCreateInput"
+    },
+    "SharedService": {
+     "fields": [
+      {
+       "doc": "The name Steps give in `uses:`.",
+       "max_len": 1024,
+       "name": "name",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "image",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "The digest the image is pinned to (after `@`), if any.",
+       "max_len": 1024,
+       "name": "digest",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "`run-as-root` when the service runs as uid 0, the same name a Step's `grants` uses.",
+       "max_len": 1024,
+       "name": "grants",
+       "optional": false,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 4,
+         "elem": {
+          "kind": "string"
+         }
+        }
+       }
+      },
+      {
+       "doc": "The service runs as uid 0: it sets `run_as_root: true` or `run_as_user: 0`.",
+       "max_len": 1024,
+       "name": "run_as_root",
+       "optional": false,
+       "ty": {
+        "kind": "bool"
+       }
+      },
+      {
+       "doc": "The uid the service names (`run_as_user`). Absent when it names none.",
+       "max_len": 1024,
+       "name": "run_as_user",
+       "optional": true,
+       "ty": {
+        "kind": "uint"
+       }
+      }
+     ],
+     "name": "SharedService"
+    },
+    "SidecarService": {
+     "fields": [
+      {
+       "doc": "Its position in the Step's `services` list, from 0.",
+       "max_len": 1024,
+       "name": "index",
+       "optional": false,
+       "ty": {
+        "kind": "uint"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "image",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "The digest the image is pinned to (after `@`), if any.",
+       "max_len": 1024,
+       "name": "digest",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "`run-as-root` when the service runs as uid 0, the same name a Step's `grants` uses.",
+       "max_len": 1024,
+       "name": "grants",
+       "optional": false,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 4,
+         "elem": {
+          "kind": "string"
+         }
+        }
+       }
+      },
+      {
+       "doc": "The service runs as uid 0: it sets `run_as_root: true` or `run_as_user: 0`.",
+       "max_len": 1024,
+       "name": "run_as_root",
+       "optional": false,
+       "ty": {
+        "kind": "bool"
+       }
+      },
+      {
+       "doc": "The uid the service names (`run_as_user`). Absent when it names none.",
+       "max_len": 1024,
+       "name": "run_as_user",
+       "optional": true,
+       "ty": {
+        "kind": "uint"
+       }
+      }
+     ],
+     "name": "SidecarService"
     },
     "Step": {
      "fields": [
@@ -336,7 +482,7 @@
        }
       },
       {
-       "doc": "",
+       "doc": "What the Step's Pod asks for above the baseline: `run-as-root` when the Step or one of its sidecar `services` runs as uid 0, `privileged`, and `add-capabilities:<CAP>` for each capability.",
        "max_len": 1024,
        "name": "grants",
        "optional": false,
@@ -442,7 +588,32 @@
        }
       },
       {
-       "doc": "The Step uses the Environment's authority (ADR-0075 \u00a75).",
+       "doc": "The uid the Step asks to run as (`security.run_as_user`). Absent when it names none, and from inputs recorded before it existed. `0` is also in `grants` as `run-as-root`, as `run_as_root: true` is.",
+       "max_len": 1024,
+       "name": "run_as_user",
+       "optional": true,
+       "ty": {
+        "kind": "uint"
+       }
+      },
+      {
+       "doc": "The Step's sidecar services. Absent from inputs recorded before it existed, so a rule reads it as `has(step.services) && step.services.exists(v, v.run_as_root)`.",
+       "max_len": 1024,
+       "name": "services",
+       "optional": true,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 8,
+         "elem": {
+          "kind": "struct",
+          "of": "SidecarService"
+         }
+        }
+       }
+      },
+      {
+       "doc": "The Step uses the Environment's authority: it declares secrets, requests a governed grant or a raw overlay, is a deploy Step, or asks for `forge_token: write`.",
        "max_len": 1024,
        "name": "uses_environment_authority",
        "optional": false,
@@ -534,7 +705,7 @@
        }
       },
       {
-       "doc": "The Principal linked to `actor` (ADR-0069), when there is one.",
+       "doc": "The handle of the Principal whose linked forge identity is `actor`, when there is one.",
        "max_len": 1024,
        "name": "principal",
        "optional": true,
@@ -648,6 +819,22 @@
        "elem": {
         "kind": "struct",
         "of": "Gate"
+       }
+      }
+     }
+    },
+    {
+     "doc": "The Run's shared services. Absent from inputs recorded before it existed, so a rule reads it as `services != null && services.exists(v, v.run_as_root)`.",
+     "max_len": 1024,
+     "name": "services",
+     "optional": true,
+     "ty": {
+      "kind": "list",
+      "of": {
+       "cap": 32,
+       "elem": {
+        "kind": "struct",
+        "of": "SharedService"
        }
       }
      }
@@ -837,7 +1024,7 @@
        }
       },
       {
-       "doc": "The Step uses the Environment's authority (ADR-0075 \u00a75).",
+       "doc": "The Step uses the Environment's authority: it declares secrets, requests a governed grant or a raw overlay, is a deploy Step, or asks for `forge_token: write`.",
        "max_len": 1024,
        "name": "uses_environment_authority",
        "optional": false,
@@ -1406,7 +1593,7 @@
        }
       },
       {
-       "doc": "The gate is an Environment approval gate (ADR-0078 \u00a71).",
+       "doc": "The gate is an Environment approval gate: a Step after it uses the Environment's authority, so releasing it needs the Environment's approvers.",
        "max_len": 1024,
        "name": "environment_approval_gate",
        "optional": false,

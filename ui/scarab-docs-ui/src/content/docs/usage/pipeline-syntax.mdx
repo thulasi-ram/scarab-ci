@@ -333,8 +333,29 @@ Without `run_as_root`, a step runs with `runAsNonRoot` and no user id of its own
 `USER` must be a non-zero number (`USER 65532`). The kubelet cannot check that a user name is not
 root, so an image whose `USER` is a name, such as `curlimages/curl`, fails to start with
 `CreateContainerConfigError`. The step fails as a configuration error whose message says to use a
-numeric user. Scarab does not override the image's user: rebuild the image with a numeric `USER`,
-use an image that has one, or ask for `run_as_root`.
+numeric user. Scarab does not override the image's user unless the step names one: rebuild the
+image with a numeric `USER`, use an image that has one, set `run_as_user`, or ask for
+`run_as_root`.
+
+`run_as_user` runs the step as that uid, for an image whose `USER` is root or a name but whose
+program runs as any user. A non-zero uid is self-service and is not a grant: the step still runs
+with `runAsNonRoot`, and it reads and writes `/workspace` through the workspace group, as every
+step does.
+
+```yaml
+- id: push
+  image: gcr.io/go-containerregistry/crane:debug@sha256:…   # its USER is root
+  security:
+    run_as_user: 1000
+```
+
+`run_as_user: 0` is root: it is the same request as `run_as_root: true`, and a Policy sees it in
+the step's `grants` as `run-as-root`. `run_as_root: true` beside `run_as_user: 0` is the same
+request and compiles; `run_as_root: true` beside a non-zero `run_as_user` contradicts itself and
+does not compile. The same rule holds for a service's `run_as_user` and `run_as_root`, and a
+Policy sees a root service too (see
+[Policies: rules over services](/scarab-ci/usage/policies/#rules-over-services)). A uid is
+not allowed beside `sandbox`, which sets the uid itself.
 
 Some steps are **kinds** with no image that the engine runs on your behalf (you set no `image`/`command`):
 
@@ -424,12 +445,18 @@ Its inputs:
 | `context` | `.` | The build context, relative to the workspace. No absolute path, no `..`, no `,`. |
 | `dockerfile` | `Dockerfile` | The Dockerfile, relative to the context, with the same rules. |
 | `push` | `false` | Push the image after building it. |
-| `build_args` | empty | Build arguments, one `KEY=VALUE` per line. No `,` in a value. |
+| `build_args` | empty | Build arguments, one `KEY=VALUE` per line. No `,` in a value, and no name that starts with `BUILDKIT_`. |
 | `cache` | `none` | Where BuildKit imports and exports its layer cache: `none` or `s3`. |
 | `cache_bucket` | empty | For `cache: s3`, the bucket. |
 | `cache_region` | empty | For `cache: s3`, the bucket's region. |
 | `cache_name` | empty | For `cache: s3`, the cache's name in the bucket; BuildKit's default when empty. |
 | `insecure_push` | `false` | Push over plain HTTP. For a test or development registry with no TLS only. crane then also skips TLS verification, so the push Step refuses it (exit 2) when it holds a registry login. |
+
+`build_args` refuses a name that starts with `BUILDKIT_`, in any case: BuildKit reads those
+arguments as settings, and `BUILDKIT_SYNTAX` names a frontend image that BuildKit pulls and runs.
+Don't build `build_args` from text that someone else writes, such as a step result that holds a
+commit message or a pull request title. Each line of that text becomes a build argument, which
+your Dockerfile can read and which BuildKit may act on.
 
 Its outputs:
 
@@ -439,10 +466,18 @@ Its outputs:
   there is no such result, and a step that reads it fails before it launches, so read it only
   where the image is pushed.
 - `outputs.image.image` is what BuildKit wrote with `--metadata-file`: a JSON object whose
-  `containerimage.digest` is the digest of the image it built. crane pushes the layout's manifest
-  unchanged, so this is also the digest in the registry, unless the Dockerfile changed the layout
-  after BuildKit wrote it (a `RUN` shares the build step's Pod). In `env:` it becomes that
-  object's compact JSON text.
+  `containerimage.digest` is the digest of the image it built. Before it pushes, the push step
+  checks that the layout's `index.json` names one manifest, that the manifest's file hashes to
+  that digest, and that the digest is the build step's `containerimage.digest`. It refuses
+  (exit 2) a layout that fails any of these: a stale, half-written or swapped layout. It also
+  refuses an `index.json` that holds a backslash, a byte that is not printable ASCII, or the word
+  `digest` (in any case) other than once, since crane's JSON decoder would read it differently.
+  crane then pushes from an `index.json` the step writes, naming only the checked manifest. The
+  step fails if crane reports another digest, so this digest and `outputs.image.push.digest` are
+  the same. The check does not cover a build that rewrites its own `image` result as well as the
+  layout. When the server collects no step results, there is no `image` result to compare: the
+  push step checks only the layout, pushes, and logs a line starting `scarab: warning:`. In
+  `env:` this output becomes that object's compact JSON text.
 
 - **The registry credential.** Only the push step asks for `registry_auth: true`. It receives a
   credential only when the org trusts the library's source with the registry credential
@@ -456,7 +491,9 @@ Its outputs:
   with forge credentials. With neither, the build still runs and pulls public base images, and
   the push fails at the registry. The build step never receives a credential: BuildKit runs
   without its process sandbox, so a `RUN` in your Dockerfile could read anything the build step
-  holds. For the same reason the build step cannot pull private base images.
+  holds. For the same reason Scarab gives the build step no login to pull private base images;
+  for ECR, a placement profile can
+  ([Private base images in ECR](/scarab-ci/usage/pushing-to-ecr/#private-base-images-in-ecr)).
 - **No registry cache.** The library offers no `cache: registry`: writing a cache to a registry
   needs the push credential in the build step. The S3 cache is reached with the build Pod's own
   identity, such as a ServiceAccount a placement profile sets; Scarab passes no credential.
@@ -511,16 +548,109 @@ Its outputs:
     with: { image: "ghcr.io/acme/app:${{ event.sha }}-arm64", push: true }
   ```
 
-  Joining the tags into one multi-architecture image (`crane index append`,
-  `docker buildx imagetools create`) pushes to the registry, so that step needs the registry
-  credential too, which only a step from a trusted library receives. Scarab has no library for
-  it yet; until it does, the join step comes from a library of your own whose source the org
-  trusts with the registry credential. A list of profiles still reaches both steps, which a
-  per-architecture build needs; keep the push profile in the map's `push` entry.
+  To join them into one multi-architecture image, add Scarab's image index library
+  ([below](#joining-images-into-one-multi-architecture-image)). A list of profiles still
+  reaches both steps, which a per-architecture build needs; keep the push profile in the map's
+  `push` entry.
 
 The `build` step kind is gone. A `build:` step fails the pipeline check with one error that holds
 its replacement, an `invoke: lib:thulasi-ram::scarab-ci::build` step written from the old step's fields. The local executor refuses the build library's build step; it
 needs the Kubernetes executor.
+
+### Joining images into one multi-architecture image
+
+Scarab's image index library, `lib:thulasi-ram::scarab-ci::image-index`, joins images built for
+different architectures into one image index and pushes it under one tag. A client that pulls the
+tag gets the image for its own platform. An org admin installs it and trusts its source with the
+registry credential; no org has it until then
+([Install Scarab's image index library](/scarab-ci/usage/libraries/#install-scarabs-image-index-library)).
+
+This Pipeline builds the image on amd64 and arm64 nodes, joins the two, and deploys the index by
+digest:
+
+```yaml
+on:
+  push:
+    when: "event.branch == 'main'"
+steps:
+  - id: checkout
+    invoke: lib:thulasi-ram::scarab-ci::clone
+
+  - id: amd64
+    invoke: lib:thulasi-ram::scarab-ci::build
+    needs: [checkout]
+    placement_profiles: [amd64]
+    with: { image: "ghcr.io/acme/app:${{ event.sha }}-amd64", push: true }
+
+  - id: arm64
+    invoke: lib:thulasi-ram::scarab-ci::build
+    needs: [checkout]
+    placement_profiles: [arm64]
+    with: { image: "ghcr.io/acme/app:${{ event.sha }}-arm64", push: true }
+
+  - id: app
+    invoke: lib:thulasi-ram::scarab-ci::image-index
+    needs: [amd64, arm64]
+    with:
+      image: "ghcr.io/acme/app:${{ event.sha }}"
+      images: |
+        ${{ has(outputs.amd64.push) ? outputs.amd64.push.ref : '' }}
+        ${{ has(outputs.arm64.push) ? outputs.arm64.push.ref : '' }}
+
+  - id: deploy
+    image: alpine:3.20
+    needs: [app]
+    env: [[DIGEST, "${{ outputs.app.index.digest }}"]]
+    command: [sh, -c, 'echo "deploy ghcr.io/acme/app@$DIGEST"']
+```
+
+The library has one step, `app/index`, and `needs: [app]` reaches it. `needs: [amd64, arm64]`
+reaches each build's push step, whose `push` result holds the pushed `<repository>@sha256:…`.
+The step runs `crane index append` with the
+[crane](https://github.com/google/go-containerregistry/tree/main/cmd/crane) image the build
+library pins. It holds the registry credential, runs as uid 1000, runs no code from your
+repository, and reads nothing from the workspace.
+
+Its inputs:
+
+| Input | Default | What it is |
+|---|---|---|
+| `image` | (required) | The tag to push the index to, such as `ghcr.io/acme/app:1.2.0`. It must name a tag, and no digest. |
+| `images` | (required) | The images to join, one `<repository>@sha256:<digest>` per line. Each image is named by digest, never by tag: a tag can be moved, so a retry could join other images. |
+| `insecure` | `false` | Reach the registry over plain HTTP. For a test or development registry with no TLS only. crane then also skips TLS verification, so the step refuses it (exit 2) when it holds a registry login. |
+
+Before it pushes, the step reads each image's manifest and config from the registry, by digest,
+and refuses (exit 2):
+
+- an image that is itself an index (a multi-architecture image, or one with attestations): name
+  each architecture's image by its own digest;
+- an image whose config names no `os` or `architecture`, or names one of them twice (a label
+  called `os`, for example);
+- two images of the same platform: `os/architecture`, then the `variant` (`arm64/v8`, `arm/v7`)
+  and the `os.version` a Windows image names. An index holds one image per platform;
+- a manifest or config that writes a letter, digit, `.`, `_` or `-` with a `\u` escape, or names
+  `manifests`, `os`, `architecture`, `variant` or `os.version` more than once in any case (`os`
+  and `OS`). crane's JSON decoder reads both forms, so the step would otherwise check another
+  field than the one crane reads.
+
+The images may live in other repositories, or other registries, than the index. crane copies
+each image into the index's repository when it is not already there, so the step's credential
+must be able to read each image and push to the index's repository.
+
+Its output: `outputs.app.index` is `{"ref": "<repository>@sha256:…", "digest": "sha256:…"}`,
+as crane reported the push. Deploy by this digest.
+
+A fork pull request, or a Run locked out of its Environment's secrets, pushes nothing: the build
+library's push step writes no `push` result. Each `images` line reads `outputs.<build>.push` only
+when it is there, so on a fork the lines are empty, and the index step pushes nothing and exits 0.
+Anywhere else an empty `images` fails the step, and so does a mix of references and empty lines.
+A line written as `${{ outputs.amd64.push.ref }}` does not render when the build pushed nothing,
+and the index step fails before it launches. The steps that read `outputs.app.index` need
+`when: "event.kind == 'push'"`, or another condition that keeps them off a fork's Run.
+
+The step asks for `registry_auth: true` and is the library's only step, so a profile marked
+`registry_auth_only` (an ECR push role, say) can be named in a plain list:
+`placement_profiles: [ecr-push]`.
 
 ### Forge credentials: `forge_token`
 
@@ -1078,24 +1208,93 @@ with `resources`:
   resources: { cpu_millis: 8000, memory_mib: 16384 }
 ```
 
+With the k8s executor, Scarab checks each name against the operator's profile registry when the
+Run is created. A name the registry does not hold refuses the Run, and the error names the step,
+the profile and the profiles the registry holds. `scarab validate --server` and the policy test
+report the same refusal. If the operator removes a profile after a Run was created, that Run's
+step fails to launch and is retried as a launch error.
+
 For a rare dynamic per-job Kubernetes need there is a governed `k8s_overlay` escape hatch: a raw
 pod-spec fragment merged last onto the Pod. Writing one grants nothing by itself: it is admitted only
 if the run's target environment permits raw overlays; otherwise the run is rejected (fail-closed). Prefer a named
-profile for anything static. Even where raw overlays are permitted, an overlay cannot set or delete the Pod's
-`metadata.name`, `generateName`, `namespace`, `ownerReferences` or `finalizers`, or labels and annotations
-under `app.kubernetes.io/`, `scarab.io/` or `scarab.dev/`: Scarab uses them to find, route to and clean up the Pod.
-Apart from Scarab's own containers, volumes, mounts and env (below), the rest of the Pod spec is not checked. An overlay can ask for privileged containers, host mounts, the
-host network, or a ServiceAccount token. Step Pods run in Scarab's own namespace by default, so that can
-be Scarab's ServiceAccount. Permit raw overlays only on an Environment whose pipeline authors you trust
-with that.
+profile for anything static.
 
 ```yaml
 - id: heavy
   image: builder
   k8s_overlay:
     spec:
-      schedulerName: my-scheduler
+      nodeSelector:
+        gpu: a100
 ```
+
+Whoever edits the Pipeline file writes the overlay, so even where raw overlays are permitted it may
+set only these fields. Scarab refuses any other field when the Run is created, and the error names
+its path. `scarab validate --server` and the policy test report the same refusals. The executor
+checks the same list again before it creates the Pod; an overlay refused there (after the
+operator changed the lists, for example) fails the step as a configuration error with the reason.
+
+An overlay that keeps to these fields can still make a Pod Kubernetes refuses, such as a
+`nodeSelector` value that is not a valid label value, or a memory request above the limit. When
+Kubernetes refuses the Pod as invalid, Scarab asks it whether the same Pod without the overlay is
+valid (a dry run, which creates nothing). If it is, the step fails as a configuration error with
+Kubernetes' message. If the Pod is invalid without the overlay too, the operator's baseline or a
+profile is at fault, and the launch is retried as a launch error. A refusal for quota or
+permissions is always a launch error.
+
+| Field | Why it is allowed |
+|-------|-------------------|
+| `metadata.labels` | Only keys the operator lists in the placement config's `author_overlay.label_keys`. |
+| `metadata.annotations` | Only keys the operator lists in `author_overlay.annotation_keys`. |
+| `spec.nodeSelector` | Picks nodes by label. It can only narrow where the Pod runs. |
+| `spec.affinity.nodeAffinity` | Picks nodes for placement. Pod affinity and anti-affinity are refused: a required anti-affinity keeps other Pods off the nodes the step Pod runs on. |
+| `spec.tolerations` | Lets the Pod onto a tainted node pool, for taint keys the operator lists in `author_overlay.toleration_keys`. |
+| `spec.topologySpreadConstraints` | Spreads step Pods over zones or nodes. |
+| `spec.volumes[]` with `name` and `emptyDir` only | Scratch space that starts empty and holds no credential. The name must be new to the Pod and appear once in the overlay. |
+| `spec.containers[]` entry `step`: `resources.requests`, `resources.limits` | CPU, memory or an extended resource such as a GPU. |
+| `spec.containers[]` entry `step`: `env[]` with `name` and `value` | A literal value. `valueFrom` and `envFrom` can read a Secret. |
+| `spec.containers[]` entry `step`: `volumeMounts[]` with `name`, `mountPath`, `readOnly` | Mounts an emptyDir volume the same overlay adds. |
+
+Labels, annotations and tolerations are refused unless the operator lists their key. A label can
+make the Pod match a NetworkPolicy or a Service, and an annotation can ask an admission webhook
+for an IAM role, a Vault or mesh sidecar, or a network attachment, so the operator chooses which
+keys authors may set. Nothing is listed by default. The operator lists keys in the server's
+placement config (the chart value `scarab.placement.author_overlay`):
+
+```yaml
+author_overlay:
+  label_keys: [team, cost-center]
+  annotation_keys: ["karpenter.sh/do-not-disrupt", "prometheus.io/*"]
+  toleration_keys: [nvidia.com/gpu]
+```
+
+Each entry is an exact key, `prefix/*` for every key under that prefix, or `*` for every key with
+no prefix. An exact key matches only itself: `team` does not cover `team-admin`. A prefix holds no
+`/` of its own (`example.com/*`, not `example.com/x/*`), since a key has one `/` at most; the
+server refuses such an entry when it loads the config. Some keys stay refused even when listed: labels and annotations under `scarab.io/`,
+`scarab.dev/` and `app.kubernetes.io/`, the AppArmor and seccomp annotations, and tolerations of a
+`node-role.kubernetes.io/` taint or with an empty or missing `key`, which would let the Pod onto
+the control-plane nodes.
+
+Everything else is refused. That includes any Secret reference (a `secret` or `projected` volume,
+`secretKeyRef`, `envFrom`, `imagePullSecrets`), `serviceAccountName`, `serviceAccount` and
+`automountServiceAccountToken`, `hostNetwork`, `hostPID`, `hostIPC`, `hostPath` volumes,
+`hostAliases` and `dnsConfig`, `nodeName`, `priorityClassName` (a high class preempts other
+workloads), `schedulerName` (a custom scheduler can ignore the operator's taints and affinity), any
+`securityContext`, the step container's `image` and `command`, and containers of its own
+(`initContainers`, `ephemeralContainers`, or a `containers` entry other than `step`).
+
+The overlay may add to the Pod, but it may not change or remove anything Scarab, the placement
+baseline or a placement profile put there. It can add a toleration or a `nodeSelector` key; it
+cannot remove the baseline's toleration, change a profile's `HTTP_PROXY`, override the baseline's
+`nodeSelector` value, add a second node affinity term, or declare a volume with a name the Pod
+already has. Set the step container's CPU and memory with
+`resources:`; when that or the operator's default already set `requests.cpu`, the overlay cannot
+change it.
+
+To use a field the list does not allow, ask the operator to put it in a placement profile and name
+that profile in `placement_profiles`. The baseline and profiles are written by the operator and are
+not limited by this list.
 
 The operator's baseline, each named profile in the order you list them, and then the
 `k8s_overlay` are merged onto the Pod one after another, with a Kubernetes strategic merge:
@@ -1111,10 +1310,10 @@ The operator's baseline, each named profile in the order you list them, and then
   profile cannot drop the baseline's tolerations.
 - Every other list replaces, as in Kubernetes. Node affinity terms are one of them.
 
-So an overlay can change one field of the step container and keep the rest:
+So a profile can change one field of the step container and keep the rest:
 
 ```yaml
-k8s_overlay:
+k8s:
   spec:
     containers:
       - name: step
@@ -1126,8 +1325,8 @@ The step container is the only container Scarab adds that a profile or overlay m
 results sidecar (`scarab-results-egress`), the workspace containers (`scarab-workspace-init`,
 `scarab-workspace-egress`) and service sidecars (`service-0`, `service-1`, ...) carry Scarab's own
 wiring. If the baseline, a profile or an overlay names or removes one, Scarab does not create
-the Pod, and the launch error names the container and the layer. A container with a new name,
-such as an extra init container, is allowed.
+the Pod, and the launch error names the container and the layer. In the baseline or a profile, a
+container with a new name, such as an extra init container, is allowed.
 
 Scarab's volumes, mounts and env are guarded the same way. A layer may not:
 
@@ -1153,9 +1352,10 @@ only to a step with `registry_auth` that the launch found eligible for a registr
 step from a library your org trusts with the registry credential, in a Run that is not a fork pull
 request or locked out of its Environment's secrets. It applies whether or not a credential
 resolves, so a profile that logs in itself works with no `REGISTRY_AUTH` secret
-([Pushing images to Amazon ECR](/scarab-ci/usage/pushing-to-ecr/)). Named on any other step it
-fails that step's launch; on a `registry_auth` step the launch did not find eligible it is left
-out. A marked profile cannot be the
+([Pushing images to Amazon ECR](/scarab-ci/usage/pushing-to-ecr/)). Named on a step without
+`registry_auth`, it refuses the Run when it is created (with the k8s executor), and the step fails
+as a configuration error if such a Run reaches launch; on a `registry_auth` step the launch did
+not find eligible it is left out. A marked profile cannot be the
 `default` ([Building an image](#building-an-image) shows the map form that routes one to the push
 step).
 

@@ -78,7 +78,7 @@ impl From<&Passkey> for PasskeyDto {
 /// `GET /v1/me/security`.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeSecurityResponse {
-    /// The caller's Principal id (ADR-0080).
+    /// The caller's Principal id.
     pub subject: String,
     /// The caller's handle: what to sign in as.
     pub handle: String,
@@ -260,7 +260,7 @@ pub(crate) async fn consume(
 #[utoipa::path(
     get,
     path = "/v1/me/security",
-    summary = "My passkeys and step-up state (ADR-0073)",
+    summary = "My passkeys and step-up state",
     responses((status = 200, body = MeSecurityResponse), (status = 401, description = "not signed in"))
 )]
 pub(crate) async fn me_security(
@@ -337,7 +337,7 @@ pub(crate) async fn me_security(
     post,
     path = "/v1/me/passkeys/registration/options",
     request_body = PasskeyRegistrationOptionsRequest,
-    summary = "Begin enrolling a passkey (ADR-0073 §2)",
+    summary = "Begin enrolling a passkey",
     responses(
         (status = 200, body = WebauthnChallengeDto, description = "PublicKeyCredentialCreationOptionsJSON under `public_key`"),
         (status = 403, description = "`fresh_login_required` (a first passkey needs a browser login from the last 5 minutes), `step_up_required` (a later passkey is always-ask), or not a browser session"),
@@ -456,7 +456,7 @@ pub(crate) async fn passkey_registration_options(
     post,
     path = "/v1/me/passkeys/registration",
     request_body = PasskeyRegistrationRequest,
-    summary = "Finish enrolling a passkey (ADR-0073 §2)",
+    summary = "Finish enrolling a passkey",
     responses(
         (status = 201, body = PasskeyDto),
         (status = 400, description = "challenge unknown/used/expired, or the credential failed verification (`code` names the check)"),
@@ -556,7 +556,7 @@ pub(crate) async fn passkey_registration(
     delete,
     path = "/v1/me/passkeys/{id}",
     params(("id" = String, Path, description = "passkey id")),
-    summary = "Remove a passkey (ADR-0073 §2; always-ask step-up)",
+    summary = "Remove a passkey (always-ask step-up)",
     responses(
         (status = 204, description = "removed"),
         (status = 403, description = "`step_up_required` (mode `action`)"),
@@ -629,7 +629,7 @@ pub(crate) async fn remove_passkey(
 #[utoipa::path(
     post,
     path = "/v1/me/step-up/options",
-    summary = "Begin a step-up: a challenge that opens a 5-minute window (ADR-0073 §4)",
+    summary = "Begin a step-up: a challenge that opens a 5-minute window",
     responses(
         (status = 200, body = WebauthnChallengeDto, description = "PublicKeyCredentialRequestOptionsJSON under `public_key`"),
         (status = 400, description = "`no_passkey`: enroll one first"),
@@ -677,7 +677,7 @@ pub(crate) async fn step_up_options(
     post,
     path = "/v1/me/step-up",
     request_body = StepUpConfirmRequest,
-    summary = "Confirm a step-up with a passkey (ADR-0073 §4)",
+    summary = "Confirm a step-up with a passkey",
     responses(
         (status = 200, body = StepUpConfirmResponse),
         (status = 400, description = "challenge unknown/used/expired/another session's, unknown credential, or the assertion failed verification (`code` names the check)"),

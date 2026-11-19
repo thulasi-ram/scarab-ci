@@ -90,7 +90,7 @@ pub struct PolicyDto {
     /// 1 on create; each save, the delete included, adds one. A PUT or
     /// DELETE names it as `expected_version`.
     pub version: u64,
-    /// The authored Policy (ADR-0075 §4): `name`, `checkpoint`, `match`,
+    /// The authored Policy: `name`, `checkpoint`, `match`,
     /// `mode`, and `rules` or `setting`.
     #[schema(value_type = Object)]
     pub policy: Policy,
@@ -124,7 +124,7 @@ impl From<StoredPolicy> for PolicyDto {
     }
 }
 
-/// One saved version of a Policy (ADR-0075 §11).
+/// One saved version of a Policy.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PolicyVersionDto {
     pub version: u64,
@@ -160,8 +160,8 @@ impl From<PolicyVersion> for PolicyVersionDto {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreatePolicyRequest {
-    /// The authored Policy (ADR-0075 §4). At the Project level it must be a
-    /// typed `setting` (§7).
+    /// The authored Policy. At the Project level it must be a
+    /// typed `setting`.
     #[schema(value_type = Object)]
     pub policy: Value,
     /// Why, recorded on the PolicyVersion. At most 2,000 bytes.
@@ -192,7 +192,7 @@ pub struct DeletePolicyQuery {
     pub reason: Option<String>,
 }
 
-/// A recorded PolicyDecision (ADR-0075 §9).
+/// A recorded PolicyDecision.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PolicyDecisionRecordDto {
     pub id: String,
@@ -350,7 +350,7 @@ pub struct PolicyTestTrigger {
     #[serde(default)]
     pub actor: Option<String>,
     /// The forge's immutable id of that account (a webhook's `sender.id`),
-    /// which admission resolves to the linked Principal (ADR-0069); webhook
+    /// which admission resolves to the linked Principal; webhook
     /// kinds only. Default none: the Run has no `principal`.
     #[serde(default)]
     pub actor_id: Option<String>,
@@ -372,6 +372,28 @@ pub struct PolicyTestResponse {
     pub decision: PolicyDecision,
     /// Per evaluated Policy, what each rule reads.
     pub policies: Vec<PolicyReadsDto>,
+    /// For a `pipeline`: what the server compiled. Absent for the other
+    /// input forms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<PolicyTestCompiledDto>,
+    /// For a `pipeline`: why Run creation would refuse the Run before it
+    /// consults Policies (a yanked library version, a forge credential, the
+    /// build sandbox). The decision is then a deny whose first message is
+    /// this; its results are still each Policy's. Absent when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+}
+
+/// The Pipeline the policy test compiled, as the Run would store it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PolicyTestCompiledDto {
+    /// The Run's Steps: every `file:` and `lib:` library inlined, and the
+    /// gate the Environment would add.
+    pub steps: usize,
+    pub ir_version: u32,
+    /// Each installed library the Run's Steps come from, by the name `lib:`
+    /// invokes it by, transitively.
+    pub libraries: Vec<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -743,7 +765,7 @@ async fn delete_at(
     get,
     path = "/v1/orgs/{org}/policies",
     params(("org" = String, Path, description = "org")),
-    summary = "List the org's Policies (ADR-0075 §7)",
+    summary = "List the org's Policies",
     responses(
         (status = 200, body = [PolicyDto]),
         (status = 403, description = "no Read on the org"),
@@ -765,7 +787,7 @@ pub(crate) async fn list_org_policies(
     path = "/v1/orgs/{org}/policies",
     params(("org" = String, Path, description = "org")),
     request_body = CreatePolicyRequest,
-    summary = "Add an org Policy (ADR-0075 §4, §10)",
+    summary = "Add an org Policy",
     responses(
         (status = 201, body = PolicyDto),
         (status = 400, description = "not a Policy, or it does not compile (its checkpoint is not yet consulted, a CEL error, an effect the checkpoint does not allow), or `reason` is over 2,000 bytes"),
@@ -791,7 +813,7 @@ pub(crate) async fn create_org_policy(
         ("org" = String, Path, description = "org"),
         ("id" = String, Path, description = "policy id")
     ),
-    summary = "Read an org Policy (ADR-0075 §11)",
+    summary = "Read an org Policy",
     responses(
         (status = 200, body = PolicyDto),
         (status = 403, description = "no Read on the org"),
@@ -817,7 +839,7 @@ pub(crate) async fn get_org_policy(
         ("id" = String, Path, description = "policy id")
     ),
     request_body = UpdatePolicyRequest,
-    summary = "Replace an org Policy (ADR-0075 §10, §11)",
+    summary = "Replace an org Policy",
     responses(
         (status = 200, body = PolicyDto),
         (status = 400, description = "not a Policy, or it does not compile, or `reason` is over 2,000 bytes"),
@@ -846,7 +868,7 @@ pub(crate) async fn update_org_policy(
         ("id" = String, Path, description = "policy id"),
         DeletePolicyQuery
     ),
-    summary = "Delete an org Policy (ADR-0075 §10)",
+    summary = "Delete an org Policy",
     responses(
         (status = 200, body = PolicyDto),
         (status = 400, description = "`reason` is over 2,000 bytes"),
@@ -873,7 +895,7 @@ pub(crate) async fn delete_org_policy(
         ("org" = String, Path, description = "org"),
         ("id" = String, Path, description = "policy id")
     ),
-    summary = "An org Policy's version history (ADR-0075 §11)",
+    summary = "An org Policy's version history",
     responses(
         (status = 200, body = [PolicyVersionDto]),
         (status = 403, description = "no Read on the org"),
@@ -900,7 +922,7 @@ pub(crate) async fn list_org_policy_versions(
         ("org" = String, Path, description = "org"),
         ("project" = String, Path, description = "project")
     ),
-    summary = "List a Project's typed settings (ADR-0075 §7)",
+    summary = "List a Project's typed settings",
     responses(
         (status = 200, body = [PolicyDto]),
         (status = 403, description = "no Read on the Project"),
@@ -925,10 +947,10 @@ pub(crate) async fn list_project_policies(
         ("project" = String, Path, description = "project")
     ),
     request_body = CreatePolicyRequest,
-    summary = "Add a Project typed setting (ADR-0075 §7, §10)",
+    summary = "Add a Project typed setting",
     responses(
         (status = 201, body = PolicyDto),
-        (status = 400, description = "not a typed setting (ADR-0075 §7), or it does not compile, or `reason` is over 2,000 bytes"),
+        (status = 400, description = "not a typed setting, or it does not compile, or `reason` is over 2,000 bytes"),
         (status = 403, description = "not a Project admin"),
         (status = 404, description = "policies not configured"),
         (status = 409, description = "a live Policy here has that name, or the scope holds its 256 Policies")
@@ -952,7 +974,7 @@ pub(crate) async fn create_project_policy(
         ("project" = String, Path, description = "project"),
         ("id" = String, Path, description = "policy id")
     ),
-    summary = "Read a Project typed setting (ADR-0075 §11)",
+    summary = "Read a Project typed setting",
     responses(
         (status = 200, body = PolicyDto),
         (status = 403, description = "no Read on the Project"),
@@ -977,10 +999,10 @@ pub(crate) async fn get_project_policy(
         ("id" = String, Path, description = "policy id")
     ),
     request_body = UpdatePolicyRequest,
-    summary = "Replace a Project typed setting (ADR-0075 §10, §11)",
+    summary = "Replace a Project typed setting",
     responses(
         (status = 200, body = PolicyDto),
-        (status = 400, description = "not a typed setting (ADR-0075 §7), or it does not compile, or `reason` is over 2,000 bytes"),
+        (status = 400, description = "not a typed setting, or it does not compile, or `reason` is over 2,000 bytes"),
         (status = 403, description = "not a Project admin"),
         (status = 404, description = "no such live Policy in this Project, or not configured"),
         (status = 409, description = "`expected_version` is not the stored version, or the name is taken")
@@ -1014,7 +1036,7 @@ pub(crate) async fn update_project_policy(
         ("id" = String, Path, description = "policy id"),
         DeletePolicyQuery
     ),
-    summary = "Delete a Project typed setting (ADR-0075 §10)",
+    summary = "Delete a Project typed setting",
     responses(
         (status = 200, body = PolicyDto),
         (status = 400, description = "`reason` is over 2,000 bytes"),
@@ -1042,7 +1064,7 @@ pub(crate) async fn delete_project_policy(
         ("project" = String, Path, description = "project"),
         ("id" = String, Path, description = "policy id")
     ),
-    summary = "A Project typed setting's version history (ADR-0075 §11)",
+    summary = "A Project typed setting's version history",
     responses(
         (status = 200, body = [PolicyVersionDto]),
         (status = 403, description = "no Read on the Project"),
@@ -1082,7 +1104,7 @@ fn parse_cursor(s: &str) -> Result<DecisionCursor, ApiError> {
     get,
     path = "/v1/orgs/{org}/policy-decisions",
     params(("org" = String, Path, description = "org"), PolicyDecisionsQuery),
-    summary = "The org's PolicyDecision log (ADR-0075 §9)",
+    summary = "The org's PolicyDecision log",
     responses(
         (status = 200, body = PolicyDecisionPageDto),
         (status = 400, description = "`before` is not a cursor, or `checkpoint` is not a checkpoint"),
@@ -1127,7 +1149,7 @@ pub(crate) async fn list_org_policy_decisions(
     get,
     path = "/v1/runs/{id}/policy-decisions",
     params(("id" = String, Path, description = "run id")),
-    summary = "A Run's PolicyDecisions (ADR-0075 §9)",
+    summary = "A Run's PolicyDecisions",
     responses(
         (status = 200, body = [PolicyDecisionRecordDto]),
         (status = 403, description = "no Read on the Run's Project"),
@@ -1213,6 +1235,39 @@ fn checkpoint_named(name: &str) -> Result<Checkpoint, ApiError> {
 }
 
 /// The forge event admission would see for the Pipeline form's trigger.
+/// The launch parameters Run creation would render a test Run's images
+/// with: none for a webhook Run (Run creation passes none), the declared
+/// inputs' defaults for a manual, api or cron Run (a dispatch or a schedule
+/// resolves them; the policy test supplies no values). An input with no
+/// default is left out, so an image that needs it renders as Run creation
+/// would render it with no value.
+fn test_params(
+    event: &scarab_forge::Event,
+    ir: &scarab_pipeline::PipelineIr,
+) -> BTreeMap<String, Value> {
+    use scarab_forge::Event;
+    if !matches!(
+        event,
+        Event::Manual { .. } | Event::Api { .. } | Event::Cron { .. }
+    ) {
+        return BTreeMap::new();
+    }
+    ir.interface
+        .inputs
+        .iter()
+        .filter_map(|input| {
+            let one = scarab_pipeline::Interface {
+                inputs: vec![input.clone()],
+                ..Default::default()
+            };
+            scarab_pipeline::params::resolve_params(&one, &BTreeMap::new())
+                .ok()
+                .and_then(|mut resolved| resolved.remove(&input.name))
+                .map(|v| (input.name.clone(), v))
+        })
+        .collect()
+}
+
 fn test_event(
     t: PolicyTestTrigger,
     repo: scarab_forge::RepoRef,
@@ -1351,20 +1406,28 @@ fn test_event(
 }
 
 /// The Pipeline form's input (an `Err` when it could not be built), what
-/// `match` sees, and the Pipeline's plugin gates.
-type PipelineInput = (
-    Result<Value, String>,
-    MatchContext,
-    Vec<run_create::PluginGate>,
-);
+/// `match` sees, the Pipeline's plugin gates, what was compiled, and the
+/// refusal Run creation makes before it consults Policies, if any.
+struct PipelineInput {
+    input: Result<Value, String>,
+    ctx: MatchContext,
+    plugin_gates: Vec<run_create::PluginGate>,
+    compiled: PolicyTestCompiledDto,
+    refusal: Option<String>,
+}
 
 /// The input of the Pipeline form: compiled here from the sent sources,
 /// then built through the code admission runs (`admission_before_policies`,
 /// `run_create_facts`, `run_create_input`), so the input evaluated is the
-/// one admission would record for the same event. A refusal admission makes
-/// before consulting Policies is a 400. An input that cannot be built (a
-/// Run over a list or string cap) is an `Err` evaluated as admission
-/// evaluates it, with the Pipeline's plugin gates.
+/// one admission would record for the same event. An Environment refusal
+/// admission makes before consulting Policies is a 400. A library or
+/// credential refusal (a yanked version, a forge credential, the build
+/// sandbox) comes from the same check Run creation runs
+/// (`library_admission`), and so does a Step's privilege request or
+/// `k8s_overlay` refusal (`step_privilege_refusals`); each is returned to be
+/// answered as a deny. An input
+/// that cannot be built (a Run over a list or string cap) is an `Err`
+/// evaluated as admission evaluates it, with the Pipeline's plugin gates.
 async fn pipeline_input(
     st: &AppState,
     org: &str,
@@ -1416,6 +1479,68 @@ async fn pipeline_input(
     let (ir, _) = crate::environment_approval_ir(&ir, &gov, &[]).map_err(|(refusal, _)| {
         refused(crate::admission_refusal_message(&refusal, org, &repo.name))
     })?;
+    // The library and credential refusals, as Run creation decides them.
+    let refusal = match crate::library_admission(
+        st.forge.as_deref(),
+        st.admission_ports(),
+        &event,
+        &repo,
+        &ir,
+        &gov,
+    )
+    .await
+    {
+        Ok(Ok(_)) => None,
+        // With no forge port this server cannot ask whether the forge mints
+        // tokens, and Run creation always has one: a forge credential is not
+        // checked here rather than refused for a reason Run creation would
+        // not give (AUD-11).
+        Ok(Err(crate::AdmissionRefusal::ForgeToken { messages })) if st.forge.is_none() => {
+            tracing::info!(
+                org,
+                project = %repo.name,
+                ?messages,
+                "policy test: forge credentials not checked, this server has no forge"
+            );
+            None
+        }
+        Ok(Err(refusal)) => Some(crate::admission_refusal_message(&refusal, org, &repo.name)),
+        Err(crate::TriggerError::Db(e)) => return Err(ApiError::Db(e)),
+        Err(e) => return Err(ApiError::Db(DbError::Other(e.to_string()))),
+    };
+    // Then each Step's privilege request, `k8s_overlay` and placement
+    // profiles, through the function Run creation admits them with: a Run
+    // it would fail for any of them is a deny here too. Images render
+    // against the event values and the launch parameters as Run creation
+    // renders them: a webhook Run has none; a manual, api or cron Run has
+    // its inputs' defaults, the policy test supplying no values of its own
+    // (RT-R2-5).
+    let refusal = refusal.or_else(|| {
+        let facts = crate::forge_token::event_facts(&event, None, &ir).unwrap_or_default();
+        let params = test_params(&event, &ir);
+        let refused = crate::step_privilege_refusals(
+            &ir,
+            &gov,
+            &params,
+            &facts,
+            &st.author_overlay,
+            st.placement.as_deref(),
+        );
+        (!refused.is_empty()).then(|| refused.join("; "))
+    });
+    let compiled = PolicyTestCompiledDto {
+        steps: ir.steps.len(),
+        ir_version: ir.ir_version,
+        libraries: ir
+            .steps
+            .iter()
+            .flat_map(|s| &s.origin)
+            .filter(|o| o.kind == scarab_pipeline::OriginKind::Library)
+            .map(|o| o.name.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+    };
 
     let path = p.path.unwrap_or_else(|| ".scarab/ci.yaml".to_string());
     let now = st.clock.now().await.0;
@@ -1431,7 +1556,13 @@ async fn pipeline_input(
         Ok(facts) => blocking(move || crate::run_create_input(&ir, facts)).await?,
         Err(e) => Err(e),
     };
-    Ok((input, ctx, plugin_gates))
+    Ok(PipelineInput {
+        input,
+        ctx,
+        plugin_gates,
+        compiled,
+        refusal,
+    })
 }
 
 /// A supplied or recorded input with a string or a list over its cap is a
@@ -1526,7 +1657,11 @@ fn reads_of(policies: &[StoredPolicy]) -> Vec<PolicyReadsDto> {
 /// `step.admit` or `gate.resolve` decision holds are not evaluated again.
 /// A Pipeline whose Run is over an input cap is answered as admission
 /// decides it: each matched Policy is an error, which denies when the Policy
-/// is enforced.
+/// is enforced. A Pipeline that Run creation would refuse for a library or
+/// credential reason (a yanked version, a forge credential, the build
+/// sandbox) is a deny with that reason, from the check Run creation runs;
+/// the answer names the reason in `refusal`, and `pipeline` says what was
+/// compiled.
 ///
 /// Permissions: Read on the input's Project for its effective Policies
 /// (neither `policy` nor `policy_id`, which is what `scarab validate
@@ -1538,7 +1673,7 @@ fn reads_of(policies: &[StoredPolicy]) -> Vec<PolicyReadsDto> {
     path = "/v1/orgs/{org}/policy-test",
     params(("org" = String, Path, description = "org")),
     request_body = PolicyTestRequest,
-    summary = "Evaluate Policies without enforcing or recording (ADR-0075 §9)",
+    summary = "Evaluate Policies without enforcing or recording",
     responses(
         (status = 200, body = PolicyTestResponse),
         (status = 400, description = "not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, a Policy at another checkpoint than the input, an input that cannot be matched, or a supplied input with a string or a list over its cap"),
@@ -1617,6 +1752,9 @@ pub(crate) async fn policy_test(
         .and_then(Option::as_ref)
         .map(|p| p.body.checkpoint));
 
+    // For a Pipeline: what was compiled, and the refusal Run creation would
+    // make before its Policies.
+    let mut compiled = None;
     // The input (an `Err` when a Pipeline's could not be built), its
     // checkpoint and schema version, what `match` sees, and the Pipeline's
     // plugin gates.
@@ -1678,14 +1816,14 @@ pub(crate) async fn policy_test(
             ));
         }
         project_allowed(pipeline.project.clone()).await?;
-        let (input, ctx, gates) =
-            pipeline_input(&st, &org, caller.principal.handle(), pipeline).await?;
+        let p = pipeline_input(&st, &org, caller.principal.handle(), pipeline).await?;
+        compiled = Some((p.compiled, p.refusal));
         (
-            input,
+            p.input,
             Checkpoint::RunCreate,
             run_create::SCHEMA_VERSION,
-            ctx,
-            Some(gates),
+            p.ctx,
+            Some(p.plugin_gates),
         )
     };
     if let Some(at) = policy_checkpoint.filter(|c| *c != checkpoint) {
@@ -1733,10 +1871,24 @@ pub(crate) async fn policy_test(
         )
     })
     .await?;
+    let mut decision = decision;
     let reads = blocking(move || reads_of(&reads_input)).await?;
+    let (pipeline, refusal) = match compiled {
+        Some((compiled, refusal)) => (Some(compiled), refusal),
+        None => (None, None),
+    };
+    // Run creation refuses before it consults Policies: a deny, whatever
+    // the Policies answer.
+    if let Some(why) = &refusal {
+        let mut messages = vec![why.clone()];
+        messages.extend(decision.messages().iter().cloned());
+        decision.outcome = scarab_policy::evaluate::DecisionOutcome::Deny { messages };
+    }
     Ok(Json(PolicyTestResponse {
         decision,
         policies: reads,
+        pipeline,
+        refusal,
     }))
 }
 
@@ -1751,7 +1903,7 @@ pub(crate) async fn policy_test(
     get,
     path = "/v1/orgs/{org}/policy-decisions/counts",
     params(("org" = String, Path, description = "org"), PolicyDecisionCountsQuery),
-    summary = "Each Policy's decision counts since a time (ADR-0075 §9)",
+    summary = "Each Policy's decision counts since a time",
     responses(
         (status = 200, body = PolicyDecisionCountsDto),
         (status = 403, description = "no Read on the org"),
@@ -1872,7 +2024,7 @@ fn rule_reads(index: usize, r: &RuleIr) -> RuleReadsDto {
     path = "/v1/orgs/{org}/policies/check",
     params(("org" = String, Path, description = "org")),
     request_body = PolicyCheckRequest,
-    summary = "Check a draft org Policy without saving it (ADR-0075 §6)",
+    summary = "Check a draft org Policy without saving it",
     responses(
         (status = 200, body = PolicyCheckResponse),
         (status = 400, description = "not exactly one of `policy` and `yaml`, or `yaml` over 64 KiB"),
@@ -1978,7 +2130,7 @@ pub struct PolicyCheckpointDto {
 #[utoipa::path(
     get,
     path = "/v1/policy-checkpoints",
-    summary = "Each PolicyCheckpoint's input schema (ADR-0075 §2)",
+    summary = "Each PolicyCheckpoint's input schema",
     responses(
         (status = 200, body = [PolicyCheckpointDto]),
         (status = 401, description = "not signed in")
@@ -2171,7 +2323,7 @@ fn replay(
     path = "/v1/orgs/{org}/policy-test/replay",
     params(("org" = String, Path, description = "org")),
     request_body = PolicyReplayRequest,
-    summary = "Replay a draft Policy over recorded decisions (ADR-0075 §9)",
+    summary = "Replay a draft Policy over recorded decisions",
     responses(
         (status = 200, body = PolicyReplayResponse),
         (status = 400, description = "the draft does not compile"),

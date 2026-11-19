@@ -29,9 +29,17 @@
 #                registry credential when the org trusts this source with
 #                forge credentials) at /scarab/registry/config.json and points
 #                DOCKER_CONFIG at it, when the org trusts this source with the
-#                registry credential. It runs no code from the repository, and
-#                it removes the layout from its own workspace, so a Step that
-#                needs only the invoke does not receive it. A Step that reads
+#                registry credential. It runs no code from the repository. It
+#                pushes the layout only when its manifest has the digest
+#                BuildKit reported to the build Step (passed through the build
+#                Step's `image` result), and it removes the layout from its
+#                own workspace, so a Step that
+#                needs only the invoke does not receive it. This check finds
+#                a stale, half-written or swapped layout. It does not find a
+#                build that rewrites its own result too: a process a
+#                Dockerfile RUN left behind can reach
+#                /scarab/results/image.json as it reaches the layout, and the
+#                Dockerfile's author chooses the image's content anyway. A Step that reads
 #                `outputs.image.image` needs the build Step too and receives
 #                the layout through the build Step's workspace: read
 #                `outputs.image.push.digest` instead, or limit what it
@@ -44,10 +52,12 @@
 #                               by this digest.
 #   ${{ outputs.image.image }}  what buildctl wrote with `--metadata-file`; its
 #                               `containerimage.digest` is the digest of the
-#                               image built. crane pushes the layout's manifest
-#                               unchanged, so it is also the pushed digest
-#                               unless the Dockerfile changed the layout after
-#                               BuildKit wrote it (a RUN shares the build Pod).
+#                               image built. When Scarab collects results, the
+#                               push Step pushes only a layout whose manifest
+#                               has that digest, and fails (exit 2) on any
+#                               other, so the two digests match. When it does
+#                               not, the push Step pushes without the check
+#                               and logs a line starting `scarab: warning:`.
 #
 # A fork pull request, or a Run locked out of its Environment's secrets, gets
 # no registry credential, and Scarab tells both Steps so with
@@ -91,7 +101,11 @@
 #               false); for a test or development registry only. crane
 #               then skips TLS verification too, so the push Step refuses
 #               it (exit 2) when it holds a registry login
-#   build_args  one KEY=VALUE per line, each passed as a build argument
+#   build_args  one KEY=VALUE per line, each passed as a build argument. A
+#               name starting BUILDKIT_ (in any case) is refused: BuildKit
+#               reads those as settings, and BUILDKIT_SYNTAX names a frontend
+#               image it pulls and runs. Do not build this input from text
+#               someone else writes (a commit message, a pull request title)
 #   cache       the layer cache: none or s3 (default none)
 #   cache_bucket, cache_region, cache_name
 #               for cache: s3, where the cache is kept
@@ -128,8 +142,8 @@ interface:
       type: string
       required: false
       default: ""
-      validate: 'value == "" || value.matches("^([A-Za-z_][A-Za-z0-9_]*=[^,[:cntrl:]]*\n)*[A-Za-z_][A-Za-z0-9_]*=[^,[:cntrl:]]*\n?$")'
-      description: build arguments, one KEY=VALUE per line, with no "," in a value
+      validate: 'value == "" || (value.matches("^([A-Za-z_][A-Za-z0-9_]*=[^,[:cntrl:]]*\n)*[A-Za-z_][A-Za-z0-9_]*=[^,[:cntrl:]]*\n?$") && !value.matches("(?i)(^|\n)buildkit_"))'
+      description: build arguments, one KEY=VALUE per line, with no "," in a value and no name starting BUILDKIT_
     - name: cache
       type: choice
       options: [none, s3]
@@ -176,6 +190,8 @@ steps:
       - -c
       - |
         set -eu
+        # Bracket ranges in `case` follow the locale; C keeps [a-z] to a-z.
+        export LC_ALL=C
         root=/workspace
         fail() { echo "scarab: build refused: $*" >&2; exit 2; }
         nl='
@@ -241,9 +257,13 @@ steps:
           [ "$key" != "$line" ] || fail "build arg $line is not KEY=VALUE"
           case "$key" in
             "" | [0-9]* | *[!A-Za-z0-9_]*) fail "build arg name $key is not a name" ;;
+            # BuildKit reads BUILDKIT_* build args as settings; BUILDKIT_SYNTAX
+            # names a frontend image that it pulls and runs.
+            [Bb][Uu][Ii][Ll][Dd][Kk][Ii][Tt]_*) fail "build arg $key is refused: BuildKit reads BUILDKIT_* arguments as settings" ;;
           esac
           case "$line" in
             *,*) fail "build arg $key holds a ','" ;;
+            *[[:cntrl:]]*) fail "build arg $key holds a control character" ;;
           esac
           set -- "$@" --opt "build-arg:$line"
         done <<EOF
@@ -286,18 +306,25 @@ steps:
     image: gcr.io/go-containerregistry/crane:debug@sha256:e78770b31258a3846f878036d9c1f63fbe4c871f9f56990bf77fd95c013e3c1b
     needs: [image]
     registry_auth: true
-    # The image runs as uid 0 and has no non-root user; the Step runs no
-    # repository code, and the baseline's dropped capabilities still apply.
-    security: { run_as_root: true }
+    # The image's default user is root. crane and busybox need no user of
+    # their own, so the Step runs as uid 1000, the build Step's uid. It
+    # reads and cleans the workspace through the workspace group, as every
+    # Step does, and reads the registry login Scarab mounts.
+    security: { run_as_user: 1000 }
     env:
       - [SCARAB_BUILD_IMAGE, "${{ inputs.image }}"]
       - [SCARAB_BUILD_PUSH, "${{ inputs.push }}"]
       - [SCARAB_BUILD_INSECURE_PUSH, "${{ inputs.insecure_push }}"]
+      # The digest BuildKit reported for the image it built (the build Step's
+      # `image` result), or empty when the build Step published no result.
+      - [SCARAB_BUILD_DIGEST, "${{ has(outputs.image) && has(outputs.image.image) && 'containerimage.digest' in outputs.image.image ? outputs.image.image['containerimage.digest'] : '' }}"]
     command:
       - /busybox/sh
       - -c
       - |
         set -eu
+        # Bracket ranges in `case` follow the locale; C keeps [a-z] to a-z.
+        export LC_ALL=C
         root=/workspace
         fail() { echo "scarab: push refused: $*" >&2; exit 2; }
         nl='
@@ -368,6 +395,61 @@ steps:
         odd=$(find "$layout" ! -type f ! -type d | head -n 1)
         [ -z "$odd" ] ||
           fail "the image layout holds $odd, which is not a regular file or a directory"
+        # The layout must hold the image the build Step built, not a stale,
+        # half-written or swapped one. Its index.json must name one
+        # manifest, that manifest's file must hash to its name, and, when
+        # Scarab collects results (/scarab/results exists), its digest must
+        # be the one BuildKit reported (the build Step's `image` result).
+        # This does not cover a build that rewrites that result too: a
+        # process a Dockerfile RUN left behind can reach the result file as
+        # it reaches the layout.
+        #
+        # grep reads index.json here; crane would read it with Go's JSON
+        # decoder, which matches keys in any case and decodes \u escapes.
+        # So index.json is refused when it holds a backslash, a byte that is
+        # not printable ASCII or a line break, or the word "digest", in any
+        # case, other than once. crane then reads an index.json written
+        # below, not this one.
+        index=$layout/index.json
+        [ -f "$index" ] || fail "the image layout has no index.json"
+        n=$(LC_ALL=C tr -d '\11\12\15\40-\176' < "$index" | wc -c) ||
+          fail "cannot read the image layout's index.json"
+        [ $((n)) -eq 0 ] ||
+          fail "the image layout's index.json holds a byte that is not printable ASCII"
+        if grep -q '\\' "$index"; then
+          fail "the image layout's index.json holds a backslash"
+        fi
+        n=$(LC_ALL=C tr 'A-Z' 'a-z' < "$index" | grep -o digest | grep -c .) || n=0
+        [ "$n" -eq 1 ] ||
+          fail "the image layout's index.json does not name exactly one image"
+        found=$(grep -o '"digest" *: *"sha256:[0-9a-f]\{64\}"' "$index") || found=
+        case "$found" in
+          "" | *"$nl"*) fail "the image layout's index.json does not name exactly one image" ;;
+        esac
+        built=${found##*\"sha256:}
+        built=sha256:${built%\"}
+        blob=$layout/blobs/sha256/${built#sha256:}
+        [ -f "$blob" ] || fail "the image layout has no manifest $built"
+        sum=$(sha256sum < "$blob") || fail "cannot hash the manifest $built"
+        [ "sha256:${sum%% *}" = "$built" ] ||
+          fail "the manifest in the image layout does not hash to its digest $built"
+        want=${SCARAB_BUILD_DIGEST-}
+        if [ -n "$want" ]; then
+          [ "$want" = "$built" ] ||
+            fail "the image layout holds $built, but the build step built $want"
+        elif [ -d /scarab/results ]; then
+          fail "the build step reported no image digest (its image result has no containerimage.digest)"
+        else
+          echo "scarab: warning: results are not collected, so the layout is not checked against the build step's digest" >&2
+        fi
+        # crane pushes the manifest index.json names. It reads an index.json
+        # written here, naming only the manifest checked above, by its digest
+        # and size; BuildKit's oci exporter writes OCI media types. The
+        # config and layers are the ones that manifest names, by digest.
+        size=$(wc -c < "$blob") || fail "cannot read the manifest $built"
+        { printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","size":%d}]}\n' "$built" "$((size))" > "$index.scarab" &&
+          mv -f "$index.scarab" "$index"; } ||
+          fail "cannot write the image layout's index.json"
         # crane's --insecure also skips TLS verification, so a registry
         # login (the credential mount, or a profile's /ecr-login) would go
         # to whoever answers at the image's host.
@@ -391,6 +473,10 @@ steps:
           *[!0-9a-f]*) echo "scarab: crane reported $ref" >&2; exit 1 ;;
         esac
         [ "${#hex}" -eq 64 ] || { echo "scarab: crane reported $ref" >&2; exit 1; }
+        if [ "$digest" != "$built" ]; then
+          echo "scarab: crane pushed $ref, but the image layout holds $built" >&2
+          exit 1
+        fi
         echo "scarab: pushed $ref"
         # The pushed reference is the Step's `push` result when Scarab
         # collects results (/scarab/results exists).

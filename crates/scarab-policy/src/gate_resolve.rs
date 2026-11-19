@@ -30,7 +30,9 @@ policy_struct! {
         pub id: String,
         pub kind: GateKind,
         pub origin: Capped<Origin, MAX_ORIGIN>,
-        /// The gate is an Environment approval gate (ADR-0078 §1).
+        /// The gate is an Environment approval gate: a Step after it uses
+        /// the Environment's authority, so releasing it needs the
+        /// Environment's approvers.
         pub environment_approval_gate: bool,
         /// The ids of the Steps that need it, directly.
         pub dependents: Capped<String, MAX_STEPS>,
@@ -41,8 +43,8 @@ policy_struct! {
     pub struct Actor {
         /// The acting Principal's handle (`github:alice`).
         pub principal: String,
-        /// The acting Principal's id (ADR-0080). Absent from inputs recorded
-        /// before it existed.
+        /// The acting Principal's id. Absent from inputs recorded before it
+        /// existed.
         pub principal_id: Option<String>,
     }
 }
@@ -68,8 +70,8 @@ policy_struct! {
         /// The handles of the Principals who have approved in the gate's
         /// current wait, this approval included.
         pub approvals: Capped<String, MAX_APPROVALS>,
-        /// Their ids, in the same order (ADR-0080). Absent from inputs
-        /// recorded before it existed.
+        /// Their ids, in the same order. Absent from inputs recorded before
+        /// it existed.
         pub approval_ids: Option<Capped<String, MAX_APPROVALS>>,
         pub run: GateRun,
         pub time: Timestamp,

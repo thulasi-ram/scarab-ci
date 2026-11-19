@@ -36,7 +36,7 @@ use scarab_engine::ports::{ExecHandle, ExecState, Executor, LogChunks};
 use scarab_engine::{Db, ExecError, StepRun, StepSpec};
 use scarab_secrets::{SecretProvider, SecretScope};
 
-use crate::{resolve_step_secrets, LogService};
+use crate::{resolve_step_secrets, LogFence, LogService};
 
 /// Wraps an [`Executor`], resolving a step's declared secrets at launch
 /// time — and, when the OIDC issuer is configured, minting the
@@ -780,8 +780,16 @@ impl Executor for SecretInjectingExecutor {
         let oidc_token = self
             .mint_oidc_token(step, ctx.as_ref(), admission, now_ms)
             .await?;
+        // The step's log stream: the values this launch mounts redact it,
+        // and no other stream.
+        let fence = LogFence::of_step(step);
         let mut base = None;
         if let Some(token) = oidc_token {
+            // Mounted into the step container: a step that prints it shows
+            // `***`. Each launch mints a new one and registers it here.
+            if let Some(fence) = &fence {
+                self.logs.register_secret(fence, token.as_bytes());
+            }
             base = Some(StepSpec {
                 oidc_token: Some(token),
                 ..spec.clone()
@@ -826,6 +834,7 @@ impl Executor for SecretInjectingExecutor {
         let resolved = resolve_step_secrets(
             self.secrets.as_ref(),
             &self.logs,
+            fence.as_ref(),
             &scope,
             &keys,
             ctx.locked_out,
@@ -989,19 +998,33 @@ impl Executor for SecretInjectingExecutor {
         self.inner.cache_saves(handle).await
     }
 
-    async fn log_stream(&self, step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+    async fn log_stream(
+        &self,
+        step: &StepRun,
+        from: scarab_engine::LogFrom,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         // Forward the log tail unchanged (ADR-0013); redaction happens downstream
         // in the pipeline, not here.
-        self.inner.log_stream(step).await
+        self.inner.log_stream(step, from).await
+    }
+
+    async fn log_redactions(
+        &self,
+        step: &StepRun,
+    ) -> Result<scarab_engine::LogRedactions, ExecError> {
+        // Forward: the trait default answers none, which would make every
+        // replica that did not launch a step store its secrets in clear.
+        self.inner.log_redactions(step).await
     }
 
     async fn sidecar_log_stream(
         &self,
         step: &StepRun,
         container: &str,
+        from: scarab_engine::LogFrom,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         // Same forward-unchanged treatment as `log_stream` (ADR-0058 sidecar tail).
-        self.inner.sidecar_log_stream(step, container).await
+        self.inner.sidecar_log_stream(step, container, from).await
     }
 
     // ADR-0058 shared-service methods forward to the wrapped executor. Without
@@ -1030,7 +1053,8 @@ impl Executor for SecretInjectingExecutor {
     async fn service_log_stream(
         &self,
         handle: &ExecHandle,
+        from: scarab_engine::LogFrom,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        self.inner.service_log_stream(handle).await
+        self.inner.service_log_stream(handle, from).await
     }
 }

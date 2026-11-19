@@ -189,6 +189,7 @@ fn spec() -> StepSpec {
             ("ARGOCD_AUTH_TOKEN".into(), "sekret-argo-token".into()),
         ]),
         run_as_root: false,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: None,

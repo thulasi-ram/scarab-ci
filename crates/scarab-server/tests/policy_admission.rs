@@ -458,6 +458,67 @@ async fn a_run_over_an_input_cap_is_refused_only_when_a_policy_applies() {
     assert_eq!(log[0].decision.input, Value::Null);
 }
 
+/// git-bug 328010f: a `run.create` Policy sees services. One denying root
+/// services refuses a Run with a root sidecar (`run_as_user: 0`) or a root
+/// shared service (`run_as_root: true`), and admits one whose services run
+/// as a non-zero uid. A rule over Step `grants` alone also refuses the root
+/// sidecar, a root container in the Step's Pod.
+#[tokio::test]
+async fn a_policy_denying_root_services_refuses_root_sidecar_and_shared_services() {
+    const MESSAGE: &str = "Services may not run as root.";
+    let no_root_services = json!({
+        "name": "no-root-services",
+        "checkpoint": "run.create",
+        "rules": [{
+            "when": "(services != null && services.exists(v, v.run_as_root)) || steps.exists(s, has(s.services) && s.services.exists(v, v.run_as_root))",
+            "effect": "deny",
+            "message": MESSAGE
+        }]
+    });
+    let no_root_grant = json!({
+        "name": "no-root",
+        "checkpoint": "run.create",
+        "rules": [{
+            "when": "steps.exists(s, 'run-as-root' in s.grants)",
+            "effect": "deny",
+            "message": MESSAGE
+        }]
+    });
+    let root_sidecar = "on: { push: {} }\nsteps:\n  - id: t\n    image: busybox\n    \
+                        services: [{ image: minio, run_as_user: 0 }]\n";
+    let root_shared = "on: { push: {} }\nservices:\n  - { name: db, image: postgres, \
+                       run_as_root: true }\nsteps:\n  - { id: t, image: busybox, uses: [db] }\n";
+    let non_root = "on: { push: {} }\nservices:\n  - { name: db, image: postgres, \
+                    run_as_user: 999 }\nsteps:\n  - id: t\n    image: busybox\n    \
+                    uses: [db]\n    services: [{ image: minio, run_as_user: 1000 }]\n";
+
+    for (policy, ci, refused) in [
+        (&no_root_services, root_sidecar, true),
+        (&no_root_services, root_shared, true),
+        (&no_root_services, non_root, false),
+        (&no_root_grant, root_sidecar, true),
+        (&no_root_grant, non_root, false),
+    ] {
+        let db = InMemoryDb::new();
+        let policies = InMemoryPolicies::new();
+        add(&policies, "pol-1", org(), policy.clone()).await;
+        let outcome = push_with(&db, &policies, &forge_with(ci)).await.unwrap();
+        if refused {
+            assert!(outcome.runs.is_empty(), "{ci}");
+            assert_eq!(
+                outcome.refused[0].messages,
+                [format!(
+                    "policy `{}`: {MESSAGE}",
+                    policy["name"].as_str().unwrap()
+                )],
+                "{ci}"
+            );
+        } else {
+            assert_eq!(outcome.runs.len(), 1, "{ci}: {:?}", outcome.refused);
+        }
+    }
+}
+
 /// A PolicyStore that cannot be read refuses every Run: fail closed.
 struct FailingPolicies;
 

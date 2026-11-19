@@ -14,7 +14,8 @@ use scarab_forge::{ForgeKind, RepoRef};
 use scarab_pipeline::ForgeToken;
 use scarab_policy::library::{content_hash, LibraryStore, LibraryVersion, TrustedSource};
 use scarab_server::forge_token::{clone_url, ForgeCredentialExecutor};
-use scarab_testkit::{FakeExecutor, FakeForge, InMemoryDb, InMemoryLibraries};
+use scarab_server::LogService;
+use scarab_testkit::{FakeExecutor, FakeForge, InMemoryDb, InMemoryLibraries, InMemoryObjectStore};
 
 fn step_run(id: &str) -> StepRun {
     StepRun {
@@ -40,6 +41,7 @@ fn token_spec(access: ForgeToken) -> StepSpec {
         env: vec![],
         secrets: vec![],
         run_as_root: false,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: None,
@@ -115,6 +117,49 @@ async fn each_launch_mints_a_credential_that_is_never_stored() {
         .unwrap();
     assert_ne!(first.token, second.token);
     assert_eq!(forge.credential_calls(), 2);
+}
+
+/// The forge token is mounted into the step container: a step that prints
+/// it stores `***`. A re-drive mints a new token, which is redacted too.
+#[tokio::test]
+async fn a_printed_forge_token_is_stored_redacted() {
+    let db: Arc<dyn Db> = Arc::new(InMemoryDb::new());
+    let logs = Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), db));
+    let inner = Arc::new(FakeExecutor::new());
+    let forge = Arc::new(FakeForge::new().with_minted_tokens());
+    let exec = ForgeCredentialExecutor::new(inner.clone(), forge).with_logs(logs.clone());
+    let spec = token_spec(ForgeToken::Read);
+    let (run, step, attempt) = (
+        RunId("r1".into()),
+        StepId("checkout/git".into()),
+        AttemptId("a1".into()),
+    );
+    let mut tokens = Vec::new();
+    for _ in 0..2 {
+        let handle = exec.launch(&step_run("checkout/git"), &spec).await.unwrap();
+        let token = inner
+            .launched_spec(&handle)
+            .unwrap()
+            .forge_token
+            .unwrap()
+            .credential
+            .unwrap()
+            .token;
+        logs.append(&run, &step, &attempt, format!("token={token}\n").as_bytes())
+            .await
+            .unwrap();
+        tokens.push(token);
+    }
+    assert_ne!(tokens[0], tokens[1]);
+    let stored = logs.read_all(&run, &step, &attempt).await.unwrap();
+    let stored = String::from_utf8_lossy(&stored);
+    for token in &tokens {
+        assert!(
+            !stored.contains(token.as_str()),
+            "stored in clear: {stored}"
+        );
+    }
+    assert_eq!(stored, "token=***\ntoken=***\n");
 }
 
 #[tokio::test]

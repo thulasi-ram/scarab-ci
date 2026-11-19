@@ -5,7 +5,7 @@
        Pods get their tolerations — without it they sit Pending forever.
 
        Rendered verbatim from `scarab.placement`, so the keys are the SERVER's
-       schema (`baseline`, `default_resources`, `profiles`) — what you write here
+       schema (`baseline`, `default_resources`, `profiles`, `author_overlay`) — what you write here
        is exactly what the server parses.
 
        Two mistakes are silent server-side, so the chart refuses them here:
@@ -19,7 +19,7 @@
           `baseline: {spec: {tolerations: …}}`.
 
        Either way every step Pod stays Pending with no error anywhere. */ -}}
-{{- $known := list "baseline" "default_resources" "profiles" -}}
+{{- $known := list "baseline" "default_resources" "profiles" "author_overlay" -}}
 {{- range $key, $_ := .Values.scarab.placement }}
 {{- if not (has $key $known) }}
 {{- fail (printf "scarab.placement: unknown key %q — the server schema is %s (snake_case). Pod fields go in `baseline: {spec: {...}}` or a profile's `k8s: {spec: {...}}`." $key (join ", " $known)) }}

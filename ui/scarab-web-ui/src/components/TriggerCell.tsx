@@ -1,4 +1,4 @@
-// The single shared **Trigger cell** (ADR-0057): the trigger kind as a compact
+// The single shared **Trigger cell**: the trigger kind as a compact
 // chip, then the run **Headline** (`trigger_title` — a push's commit subject, a
 // PR title, a dispatch reason) beside it on one line, truncated with a full-text
 // tooltip. The A·2 primary line, reused by BOTH the runs list (RepoView) and the

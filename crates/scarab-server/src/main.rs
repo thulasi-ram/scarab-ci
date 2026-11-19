@@ -687,6 +687,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     placement
         .validate()
         .map_err(|e| format!("invalid placement config: {e}"))?;
+    for warning in placement.warnings() {
+        tracing::warn!("{warning}");
+    }
 
     // Declarative connections (ADR-0060 part D): the `connections:` block is
     // ALREADY parsed, validated and credential-resolved by the config gate — so
@@ -1019,7 +1022,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The same credential-override table the forge router resolves through
         // (ADR-0060 part D), so the Settings health readout reports a
         // config-supplied credential as present rather than MISSING.
-        .with_credential_overrides(credential_overrides.clone());
+        .with_credential_overrides(credential_overrides.clone())
+        // The keys a step author's `k8s_overlay` may set: Run admission
+        // checks an overlay against the same lists the k8s executor applies.
+        .with_author_overlay(placement.author_overlay.clone());
+    // The profile registry the k8s executor resolves `placement_profiles`
+    // against: Run admission refuses a name it does not hold. Another
+    // executor applies no placement, so nothing is checked.
+    if matches!(config.executor, ExecutorKind::K8s) {
+        state = state.with_placement(placement.clone());
+    }
     // Anonymous library fetches from public forges (ADR-0076 §4). A client
     // that cannot be built leaves only installs through a connection.
     match scarab_server::library_fetch::HttpsFetcher::new() {

@@ -2722,6 +2722,7 @@ dependencies = [
  "axum",
  "clap",
  "reqwest",
+ "scarab-engine",
  "scarab-forge",
  "scarab-identity",
  "scarab-pipeline",

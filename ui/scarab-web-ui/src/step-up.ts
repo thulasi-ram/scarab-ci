@@ -1,4 +1,4 @@
-// Step-up confirmation in the UI (ADR-0073): reading the server's refusal,
+// Step-up confirmation in the UI: reading the server's refusal,
 // and retrying the refused request once the human has confirmed.
 //
 // A crown-jewel operation (writing a secret, changing a role, minting a token…)

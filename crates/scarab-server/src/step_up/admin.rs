@@ -47,7 +47,7 @@ pub const BREAK_GLASS_CALLER: &str = "operator:break-glass";
 pub struct PasskeyResetDto {
     /// The id of the Principal whose passkeys were reset.
     pub subject: String,
-    /// Its handle (ADR-0080).
+    /// Its handle.
     pub handle: String,
     /// How many passkeys were removed.
     pub removed: u64,
@@ -64,7 +64,7 @@ pub struct PasskeyResetDto {
         ("org" = String, Path, description = "org"),
         ("id" = String, Path, description = "the member's Principal id (a handle is accepted too)")
     ),
-    summary = "Reset a member's passkeys (ADR-0073 §10; Owner, always-ask step-up)",
+    summary = "Reset a member's passkeys (Owner, always-ask step-up)",
     responses(
         (status = 200, body = PasskeyResetDto),
         (status = 403, description = "`step_up_required` (mode `action`); not an Owner of the Org; or the member also belongs to an Org you do not own (not named)"),

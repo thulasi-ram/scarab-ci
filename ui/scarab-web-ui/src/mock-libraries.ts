@@ -9,6 +9,9 @@
 // captured:
 //
 //   /orgs/acme/settings/libraries?libs=empty     the empty state
+//   /orgs/acme/settings/libraries/review?source=…&grants=carry
+//                                                an upgrade whose source holds
+//                                                grants to confirm
 //   /acme/edge-gateway/runs/<PLUGIN>?gate=pass | exp | kill
 //   /acme/orders-api/run                         the compile errors (pick release)
 //   /acme/orders-api?status=refused              refused rows
@@ -209,14 +212,20 @@ function lineDiff(a: string, b: string): string {
   return out.join("\n") + "\n";
 }
 
-const fetchedUpgrade: S["FetchedLibraryDto"] = {
+/** The grants the fetched upgrade gets from its source's trust: all three
+ *  with `?grants=carry`, none otherwise. */
+const carriedGrants = (): S["TrustGrantDto"][] =>
+  page().get("grants") === "carry" ? ["build_sandbox", "forge_credentials", "registry_credential"] : [];
+
+const fetchedUpgrade = (): S["FetchedLibraryDto"] => ({
   name: "acme::scarab-libs::deploy-helm",
   content_hash: HELM_NEW,
   source: HELM_NEW_SRC,
   content: NEW,
   current: { content_hash: HELM, source: HELM_SRC },
   diff: lineDiff(OLD, NEW),
-};
+  carried_grants: carriedGrants(),
+});
 
 // ── Runs ──────────────────────────────────────────────────────────────────
 const lib = (name: string, hash: string, source: string, yanked = false): S["OriginLinkDto"] => ({ kind: "library", name, content_hash: hash, source, yanked });
@@ -436,10 +445,19 @@ export function libraryRoute(
     const found = orgLibraries().installations.find((l) => l.id === id);
     return found ? json(found) : new Response("not found", { status: 404 });
   }
-  if (/^\/v1\/orgs\/[^/]+\/libraries\/fetch$/.test(p)) return json(fetchedUpgrade);
+  if (/^\/v1\/orgs\/[^/]+\/libraries\/fetch$/.test(p)) return json(fetchedUpgrade());
   if (/^\/v1\/orgs\/[^/]+\/library-installations$/.test(p) && method === "POST") {
     // Install echoes the reviewed version as installed now. Nothing is kept.
-    const req = JSON.parse(body || "{}") as { name?: string; content_hash?: string };
+    const req = JSON.parse(body || "{}") as { name?: string; content_hash?: string; carry_grants?: string[] };
+    // As the server: the install names exactly the carried grants.
+    const carried = carriedGrants();
+    const acked = [...new Set(req.carry_grants ?? [])].sort();
+    if (acked.join(",") !== carried.join(",")) {
+      return new Response(
+        `the org trusts github.com/acme/scarab-libs//deploy-helm.yaml with ${carried.join(", ") || "no grant"}; name exactly those in carry_grants`,
+        { status: 400 },
+      );
+    }
     const name = req.name ?? "acme::scarab-libs::deploy-helm";
     const was = fullLibraries.installations.find((l) => l.name === name);
     return json(

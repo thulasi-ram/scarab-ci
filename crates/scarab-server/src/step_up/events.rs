@@ -291,7 +291,7 @@ async fn page(
         ("before" = Option<i64>, Query, description = "only events with seq below this (paging; not with cursor)"),
         ("limit" = Option<u32>, Query, description = "page size (default 50, max 200)")
     ),
-    summary = "An Org's security event log (ADR-0073 §7)",
+    summary = "An Org's security event log",
     responses(
         (status = 200, body = SecurityEventsResponse),
         (status = 400, description = "a cursor this server did not issue, or both cursor and before"),
@@ -375,7 +375,7 @@ fn redact_orgless_confirmation(e: &mut SecurityEventDto) {
         ("before" = Option<i64>, Query, description = "only events with seq below this (paging; not with cursor)"),
         ("limit" = Option<u32>, Query, description = "page size (default 50, max 200)")
     ),
-    summary = "My security events (ADR-0073 §7)",
+    summary = "My security events",
     responses(
         (status = 200, body = SecurityEventsResponse),
         (status = 400, description = "a cursor this server did not issue, or both cursor and before"),
@@ -418,7 +418,7 @@ pub(crate) async fn my_security_events(
         ("before" = Option<i64>, Query, description = "only events with seq below this (paging; not with cursor)"),
         ("limit" = Option<u32>, Query, description = "page size (default 50, max 200)")
     ),
-    summary = "The install-wide security event log (ADR-0073 §7)",
+    summary = "The install-wide security event log",
     responses(
         (status = 200, body = SecurityEventsResponse),
         (status = 400, description = "a cursor this server did not issue, or both cursor and before"),
@@ -481,7 +481,7 @@ async fn org_admins(
     get,
     path = "/v1/orgs/{org}/security/summary",
     params(("org" = String, Path, description = "org")),
-    summary = "An Org's step-up posture: admins without a passkey, recent refusals (ADR-0073 §8)",
+    summary = "An Org's step-up posture: admins without a passkey, recent refusals",
     responses(
         (status = 200, body = OrgSecuritySummary),
         (status = 401, description = "not signed in"),

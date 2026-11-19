@@ -437,6 +437,9 @@ jobs:
       - name: StatefulSet upgrades apply in place
         run: scripts/chart_statefulset_immutable.sh "$CHART_DIR"
 
+      - name: Rendered values
+        run: scripts/chart_render_check.sh "$CHART_DIR"
+
       - name: Package + push to ghcr
         if: startsWith(github.ref, 'refs/tags/v')
         env:

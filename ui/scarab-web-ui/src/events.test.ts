@@ -5,6 +5,7 @@ import {
   describeEvent,
   eventParts,
   eventCategory,
+  eventStatus,
   EVENT_GLYPH,
   activeInfraConditions,
   heldBeforeStart,
@@ -34,6 +35,28 @@ describe("eventCategory", () => {
     expect(eventCategory(transitioned(1, "b", "pending", "ready"))).toBe("info");
     expect(eventCategory(ev(1, { RunTransitioned: { from: "running", to: "succeeded" } }))).toBe(
       "ok",
+    );
+  });
+
+  // Regression: the server sends the engine's status names; every transition
+  // fell through to info.
+  it("transitions in the server's casing categorise the same way", () => {
+    expect(eventCategory(transitioned(1, "b", "Running", "Succeeded"))).toBe("ok");
+    expect(eventCategory(transitioned(1, "b", "Running", "Failed"))).toBe("err");
+    expect(eventCategory(transitioned(1, "b", "Pending", "Cancelled"))).toBe("err");
+    expect(eventCategory(transitioned(1, "b", "Ready", "Running"))).toBe("run");
+    expect(eventCategory(transitioned(1, "b", "Running", "Ready"))).toBe("info");
+    expect(eventCategory(ev(1, { RunTransitioned: { from: "Running", to: "Succeeded" } }))).toBe("ok");
+    expect(eventCategory(ev(1, { RunTransitioned: { from: "Running", to: "Failed" } }))).toBe("err");
+  });
+
+  it("eventStatus maps the engine's names to the UI's and leaves the UI's alone", () => {
+    expect(eventStatus("Running")).toBe("running");
+    expect(eventStatus("DeadLettered")).toBe("dead_lettered");
+    expect(eventStatus("dead_lettered")).toBe("dead_lettered");
+    expect(eventStatus(undefined)).toBe("");
+    expect(describeEvent(ev(1, { RunTransitioned: { from: "Running", to: "DeadLettered" } }))).toBe(
+      "Run running → dead_lettered",
     );
   });
 

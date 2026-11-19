@@ -4,7 +4,7 @@
 //
 // Everything here is a pure function over the plan (no DOM), per the no-DOM
 // vitest tier. Design rules baked in:
-// - ADR-0027: smart never means mysterious — the common case is ONE sentence,
+// - Smart never means mysterious — the common case is ONE sentence,
 //   the long/widened case an explicit grouped list.
 // - Amendment F4: a gate member "pauses for approval" — the copy never claims
 //   a gate will run.
@@ -22,7 +22,7 @@ import {
 } from "./snapshot-retention";
 
 /** Which button opened the popover. Retry stays in the current version
- * (ADR-0056: another attempt, no fork); rerun forks a new one. */
+ * (another attempt, no fork); rerun forks a new one. */
 export type ConfirmKind = "rerun" | "retry";
 
 /** The plan's step list, tolerant of a fixture/mock that predates `steps[]`. */
@@ -151,7 +151,7 @@ export function confirmLabel(plan: RerunPlan | null | undefined, kind: ConfirmKi
 }
 
 /** The footnote: maximal-scope honesty (skip-if-unchanged may skip), plus the
- * version framing (rerun forks, retry does not — ADR-0056). */
+ * version framing (rerun forks, retry does not). */
 export function confirmFootnote(plan: RerunPlan, kind: ConfirmKind): string {
   const n = plan.invalidated.length;
   const where = kind === "retry" ? "in this version" : "in a new version";

@@ -284,6 +284,7 @@ async fn an_installed_library_runs_and_a_yank_refuses_its_rerun() {
                     "name": "thulasi-ram/notify",
                     "content_hash": hash,
                     "replaces": current,
+                    "carry_grants": fetched["carried_grants"],
                 }))
                 .send()
                 .await

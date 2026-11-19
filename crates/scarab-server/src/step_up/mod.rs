@@ -683,7 +683,7 @@ pub struct WebauthnChallengeDto {
     pub expires_at: i64,
 }
 
-/// The body of a `403 step_up_required` (ADR-0073 §5).
+/// The body of a `403 step_up_required`.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct StepUpRefusal {
     /// Always `step_up_required`.
@@ -708,7 +708,7 @@ pub struct StepUpRefusal {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fresh_login_until: Option<i64>,
     /// An API token or Bearer-session caller: the one-time link its human
-    /// confirms this exact operation at (ADR-0073 §6).
+    /// confirms this exact operation at.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confirmation_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -164,7 +164,7 @@ pub struct RunEnvironmentDto {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct OriginLinkDto {
     /// `file`, `library`, `plugin`, or `environment` for the gate an
-    /// Environment added to the Run (ADR-0078 §2).
+    /// Environment added to the Run.
     pub kind: String,
     /// A repo-relative path (`file`), the library name (`library`) or the
     /// plugin installation and gate (`plugin`).
@@ -505,7 +505,7 @@ fn bound_inputs(scope: Option<&serde_json::Value>) -> Vec<BoundInputDto> {
         ("id" = String, Path, description = "run id"),
         ("step" = String, Path, description = "step id")
     ),
-    summary = "Where a Step comes from (ADR-0076)",
+    summary = "Where a Step comes from",
     responses(
         (status = 200, body = StepOriginDto),
         (status = 404, description = "no such run or step")

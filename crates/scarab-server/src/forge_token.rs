@@ -142,11 +142,12 @@ pub struct ForgeTokenAdmission {
 /// Decide each `forge_token` Step of `ir` (see the module docs). `fork` is
 /// a fork pull request, or a Run locked out of its Environment's secrets:
 /// its Steps get `read`. `clone_url` is the repository's
-/// ([`repo_clone_url`]): a token is never sent over plain HTTP. A store
-/// failure is an `Err`: no Run.
+/// ([`repo_clone_url`]): a token is never sent over plain HTTP. `forge`
+/// `None` cannot say whether it mints tokens. A store failure is an `Err`:
+/// no Run.
 #[allow(clippy::too_many_arguments)]
 pub async fn forge_token_refusals(
-    forge: &dyn ForgePort,
+    forge: Option<&dyn ForgePort>,
     libraries: Option<&dyn LibraryStore>,
     org: &str,
     repo: &RepoRef,
@@ -177,7 +178,10 @@ pub async fn forge_token_refusals(
     }
     // A forge that cannot say is treated as handing out a long-lived token:
     // that only ever refuses more.
-    let mints = forge.mints_repo_tokens(repo).await.unwrap_or(false);
+    let mints = match forge {
+        Some(f) => f.mints_repo_tokens(repo).await.unwrap_or(false),
+        None => false,
+    };
     let trusted_sources = match libraries {
         Some(l) => trusted_sources(l, org, TrustGrant::ForgeCredentials).await?,
         None => BTreeSet::new(),
@@ -436,8 +440,8 @@ pub struct ForgeCredentialExecutor {
     clock: Arc<dyn scarab_engine::Clock>,
     /// Principals: a recorded approver set compares as ids (ADR-0080 §3).
     identities: Option<Arc<dyn scarab_identity::IdentityStore>>,
-    /// The log pipeline's redactor: a resolved registry credential is
-    /// registered with it before the Step launches.
+    /// The log pipeline's redactor: the forge token and a resolved registry
+    /// credential are registered with it before the Step launches.
     logs: Option<Arc<crate::LogService>>,
 }
 
@@ -456,8 +460,8 @@ impl ForgeCredentialExecutor {
         }
     }
 
-    /// Register each registry credential resolved at launch with `logs`'
-    /// redactor, so a Step that prints it shows `***`.
+    /// Register the forge token and each registry credential resolved at
+    /// launch with `logs`' redactor, so a Step that prints one shows `***`.
     pub fn with_logs(mut self, logs: Arc<crate::LogService>) -> Self {
         self.logs = Some(logs);
         self
@@ -806,9 +810,9 @@ impl ForgeCredentialExecutor {
         let (json, derived) = self
             .resolve_registry_auth(&config.owner, &config.name, forge_derived)
             .await;
-        if let Some(logs) = &self.logs {
+        if let (Some(logs), Some(fence)) = (&self.logs, crate::LogFence::of_step(step)) {
             for value in registry_secret_values(json.as_deref(), derived.as_ref()) {
-                logs.register_secret(value.as_bytes());
+                logs.register_secret(&fence, value.as_bytes());
             }
         }
         out.registry_auth_json = json;
@@ -821,7 +825,7 @@ impl ForgeCredentialExecutor {
 /// dockerconfigjson itself, each `auth`, `password`, `identitytoken` and
 /// `registrytoken` in it, and the password half of each decoded `auth`; or
 /// the forge-derived token and the `auth` Scarab builds from it.
-fn registry_secret_values(
+pub(crate) fn registry_secret_values(
     json: Option<&str>,
     derived: Option<&scarab_engine::RegistryCredential>,
 ) -> Vec<String> {
@@ -897,6 +901,15 @@ impl Executor for ForgeCredentialExecutor {
     }
 
     async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+        // Every value this launch mounts is registered for the step's log
+        // stream by the time the wrapped launch returns: the forge token and
+        // registry values here, the OIDC token and secrets in the wrapped
+        // `SecretInjectingExecutor`. A launch that succeeded marks them
+        // loaded, so this process's tail of the stream does not wait for the
+        // unit's Secrets, which are deleted when the attempt settles. A
+        // failed launch drops them: its tail reads them back from the unit.
+        let fence = crate::LogFence::of_step(step);
+        let result: Result<ExecHandle, ExecError> = async {
         // Only a forge-token, sandboxed or `registry_auth` Step asks for a
         // credential or a trust here; the yank check for every other Step is
         // SecretInjecting's.
@@ -1022,6 +1035,13 @@ impl Executor for ForgeCredentialExecutor {
                 )));
             }
         }
+        // The token is mounted into the step container: a step that prints
+        // it shows `***`. A re-drive mints a new one and registers it here
+        // too. A peer replica reads it back from the unit
+        // (`Executor::log_redactions`).
+        if let (Some(logs), Some(c), Some(fence)) = (&self.logs, &credential, &fence) {
+            logs.register_secret(fence, c.token.as_bytes());
+        }
         let mut enriched = spec.clone();
         if let Some(f) = enriched.forge_token.as_mut() {
             f.access = access;
@@ -1061,6 +1081,15 @@ impl Executor for ForgeCredentialExecutor {
             }
         }
         launched
+        }
+        .await;
+        if let (Some(logs), Some(fence)) = (&self.logs, &fence) {
+            match &result {
+                Ok(_) => logs.mark_values_loaded(fence),
+                Err(_) => logs.forget_secrets(fence),
+            }
+        }
+        result
     }
 
     async fn poll(&self, handle: &ExecHandle) -> Result<ExecState, ExecError> {
@@ -1140,16 +1169,30 @@ impl Executor for ForgeCredentialExecutor {
         self.inner.cache_saves(handle).await
     }
 
-    async fn log_stream(&self, step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        self.inner.log_stream(step).await
+    async fn log_stream(
+        &self,
+        step: &StepRun,
+        from: scarab_engine::LogFrom,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        self.inner.log_stream(step, from).await
+    }
+
+    async fn log_redactions(
+        &self,
+        step: &StepRun,
+    ) -> Result<scarab_engine::LogRedactions, ExecError> {
+        // Forward: the trait default answers none, which would make every
+        // replica that did not launch a step store its secrets in clear.
+        self.inner.log_redactions(step).await
     }
 
     async fn sidecar_log_stream(
         &self,
         step: &StepRun,
         container: &str,
+        from: scarab_engine::LogFrom,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        self.inner.sidecar_log_stream(step, container).await
+        self.inner.sidecar_log_stream(step, container, from).await
     }
 
     // ADR-0058 shared-service methods forward to the wrapped executor. Without
@@ -1177,8 +1220,9 @@ impl Executor for ForgeCredentialExecutor {
     async fn service_log_stream(
         &self,
         handle: &ExecHandle,
+        from: scarab_engine::LogFrom,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        self.inner.service_log_stream(handle).await
+        self.inner.service_log_stream(handle, from).await
     }
 }
 
@@ -1248,5 +1292,74 @@ mod tests {
             .expect("launch_service must forward to inner, not hit the reject default");
 
         assert_eq!(inner.launched_services(), vec![handle.0]);
+    }
+
+    // J-1: a replica that tails a step it did not launch registers what
+    // `log_redactions` reads back from the Pod's `<pod>-registry` Secret,
+    // run through `registry_secret_values` (log_tail.rs). It must cover what
+    // the launching replica registered (`step_registry_auth`). For a
+    // forge-derived credential the Secret holds the dockerconfigjson the k8s
+    // executor builds (`registry_dockerconfig`); for the `REGISTRY_AUTH`
+    // secret it holds that JSON as stored. The forge and OIDC tokens are
+    // checked by `log_tail::tests::a_peer_registers_every_token_the_launch_registers`.
+    #[test]
+    fn a_peer_registers_every_registry_value_the_launch_registers() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let derived = scarab_engine::RegistryCredential {
+            registry: "ghcr.io".into(),
+            username: "x-access-token".into(),
+            token: "ghs_derivedtoken".into(),
+        };
+        let built = serde_json::json!({ "auths": { "ghcr.io": {
+            "auth": b64.encode("x-access-token:ghs_derivedtoken")
+        } } })
+        .to_string();
+        let stored = serde_json::json!({ "auths": { "registry.corp": {
+            "auth": b64.encode("ci:s3cret"), "identitytoken": "idtok"
+        } } })
+        .to_string();
+        for (launch, unit) in [
+            (registry_secret_values(None, Some(&derived)), built),
+            (registry_secret_values(Some(&stored), None), stored.clone()),
+        ] {
+            let peer = registry_secret_values(Some(&unit), None);
+            assert!(!launch.is_empty());
+            for value in &launch {
+                assert!(peer.contains(value), "{value} not in {peer:?}");
+            }
+        }
+    }
+
+    // This decorator must forward `log_redactions`: the trait default answers
+    // none, and a replica that did not launch a step would then store the
+    // step's secrets in its log in clear.
+    #[tokio::test]
+    async fn forwards_log_redactions_to_inner() {
+        let inner = Arc::new(FakeExecutor::new());
+        let forge: Arc<dyn ForgePort> = Arc::new(FakeForge::new());
+        let decorator = ForgeCredentialExecutor::new(inner.clone(), forge);
+        let step = scarab_engine::StepRun {
+            run: RunId("run-1".into()),
+            step: scarab_engine::StepId("build".into()),
+            status: scarab_engine::StepStatus::Running,
+            attempts: vec![],
+            needs: vec![],
+            gate_kind: None,
+        };
+        inner.set_log_redactions(vec![b"s3cr3t".to_vec()]);
+
+        assert_eq!(
+            decorator.log_redactions(&step).await.unwrap(),
+            scarab_engine::LogRedactions::Values(vec![b"s3cr3t".to_vec()])
+        );
+        // `Gone` and an error pass through as they are, never as "none".
+        inner.set_log_redactions_answer(Ok(scarab_engine::LogRedactions::Gone));
+        assert_eq!(
+            decorator.log_redactions(&step).await.unwrap(),
+            scarab_engine::LogRedactions::Gone
+        );
+        inner.set_log_redactions_answer(Err("forbidden".into()));
+        assert!(decorator.log_redactions(&step).await.is_err());
     }
 }

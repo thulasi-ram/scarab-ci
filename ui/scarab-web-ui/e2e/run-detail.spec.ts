@@ -72,10 +72,11 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   // ── (c) the Activity tab is newest-first ─────────────────────────────────
   await page.getByRole("tab", { name: /^Activity/ }).click();
   await expect(page).toHaveURL(/[?&]tab=activity(&|$)/);
-  // The newest event (approve's pending → waiting gate transition) renders
-  // ABOVE the older try events; both strings exist only in the rail.
+  // The newest step event (test's pass on its one try of this version, merged
+  // with its move to passed) renders ABOVE the older try events; both strings
+  // exist only in the rail.
   const bodyText = await page.locator("body").innerText();
-  const newestIdx = bodyText.indexOf("pending → waiting");
+  const newestIdx = bodyText.search(/passed in \S+ on try 1/);
   const olderIdx = bodyText.indexOf("try 1 started");
   expect(newestIdx).toBeGreaterThan(-1);
   expect(olderIdx).toBeGreaterThan(-1);
@@ -254,6 +255,61 @@ test("a failed matrix run names where it failed and opens on the first failure",
   await expect(page.locator(".slist-row")).toHaveCount(2);
   await page.locator(".slist-row", { hasText: "treebo-production · aws-cluster" }).click();
   await expect(page.locator(".sp-name")).toHaveText("plan · treebo-production · aws-cluster");
+});
+
+// The MATRIX run's treebo-staging × aws-cluster cell printed a large plan
+// (5.5 MB, 130,004 lines). The pane asks for the last 2 MB and says so.
+test("a large log shows its last 2 MB, Load full log reads it all, Download names the try", async ({ page }) => {
+  await page.goto(`/acme/scarab/runs/${MATRIX_RUN_ID}?step=5`);
+  await expect(page.locator(".sp-name")).toHaveText("plan · treebo-staging · aws-cluster");
+
+  const notice = page.getByRole("status").filter({ hasText: "Showing the last" });
+  await expect(notice).toHaveText(/Showing the last 2\.0 MB of 5\.5 MB\./);
+  const download = notice.getByRole("link", { name: "Download" });
+  await expect(download).toHaveAttribute("href", /\/steps\/[^/]+\/logs\/raw\?attempt=a1$/);
+  // The log tools offer the download for every try, cut or not.
+  await expect(page.locator(".steplogs-tools").getByRole("link", { name: "Download" })).toBeVisible();
+  // The file is the whole log.
+  const href = await download.getAttribute("href");
+  const raw = await page.evaluate(async (u) => (await fetch(u!)).text(), href);
+  expect(raw.startsWith("$ tofu plan")).toBe(true);
+  expect(raw.endsWith("Plan: 13000 to add, 0 to change, 0 to destroy.\n")).toBe(true);
+
+  // The plan's last line, numbered from the first line the pane received.
+  const last = page.locator(".lgrow", { hasText: "Plan: 13000 to add" });
+  await expect(last).toBeVisible();
+  await expect(last.locator(".lgln")).not.toHaveText("130004");
+
+  // The whole log fits in 8 MB, so the pane can read all of it.
+  await notice.getByRole("button", { name: "Load full log" }).click();
+  await expect(notice).toHaveCount(0);
+  await expect(last.locator(".lgln")).toHaveText("130004");
+});
+
+// The rich run's shared postgres service logged about 3 MB (30,005 lines).
+// Its pane shows the last 2 MB, can read the whole log, and downloads it.
+test("a large service log offers Load full log and Download", async ({ page }) => {
+  await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}`);
+  await page.getByRole("button", { name: /postgres/ }).click();
+  const pane = page.locator(".servicepane");
+  const notice = pane.getByRole("status").filter({ hasText: "Showing the last" });
+  await expect(notice).toHaveText(/Showing the last [\d.]+ MB of 2\.\d MB\./);
+  const download = notice.getByRole("link", { name: "Download" });
+  await expect(download).toHaveAttribute("href", /\/services\/postgres\/logs\/raw$/);
+  // The readout offers the download whether the log is cut or not.
+  await expect(pane.locator(".svc-readout").getByRole("link", { name: "Download" })).toBeVisible();
+  // The file is the whole log.
+  const href = await download.getAttribute("href");
+  const raw = await page.evaluate(async (u) => (await fetch(u!)).text(), href);
+  expect(raw.startsWith("PostgreSQL init process complete")).toBe(true);
+  expect(raw.endsWith("LOG:  checkpoint complete: wrote 412 buffers\n")).toBe(true);
+  const last = pane.locator(".lgrow", { hasText: "checkpoint complete" });
+  await expect(last).toBeVisible();
+  await expect(last.locator(".lgln")).not.toHaveText("30005");
+
+  await notice.getByRole("button", { name: "Load full log" }).click();
+  await expect(notice).toHaveCount(0);
+  await expect(last.locator(".lgln")).toHaveText("30005");
 });
 
 test("the run header's ⋯ menu copies the run ID and keeps snapshots", async ({ page, context }) => {

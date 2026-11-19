@@ -37,6 +37,29 @@ steps:
   - { id: notify, image: busybox, needs: [nowhere] }
 "#;
 
+/// A Step whose command reads a file-only secret as a variable: the local
+/// compile warns.
+const SECRET_YAML: &str = r#"
+on:
+  push: {}
+steps:
+  - id: deploy
+    image: busybox
+    secrets: [TOKEN]
+    command: [sh, -c, 'curl -H "$TOKEN" https://example.com']
+"#;
+
+/// A Step with a `k8s_overlay`, which Run creation refuses for a Run that
+/// targets no Environment permitting overlays.
+const OVERLAY_YAML: &str = r#"
+on:
+  push: {}
+steps:
+  - id: build
+    image: busybox
+    k8s_overlay: { spec: { hostNetwork: true } }
+"#;
+
 const DEPLOY: &str = r#"
 kind: library
 interface:
@@ -47,6 +70,10 @@ steps:
   - id: helm
     image: alpine/helm@sha256:aaaa
     command: [helm, upgrade, "${{ inputs.release }}"]
+  - id: verify
+    image: alpine/helm@sha256:aaaa
+    needs: [helm]
+    command: [helm, status, "${{ inputs.release }}"]
 "#;
 
 async fn serve() -> String {
@@ -104,6 +131,8 @@ fn repo() -> PathBuf {
     std::fs::create_dir_all(dir.join(".scarab")).unwrap();
     std::fs::write(dir.join(".scarab/ci.yaml"), CI_YAML).unwrap();
     std::fs::write(dir.join(".scarab/broken.yaml"), BROKEN_YAML).unwrap();
+    std::fs::write(dir.join(".scarab/secret.yaml"), SECRET_YAML).unwrap();
+    std::fs::write(dir.join(".scarab/overlay.yaml"), OVERLAY_YAML).unwrap();
     for args in [
         &["init", "-q"][..],
         &["symbolic-ref", "HEAD", "refs/heads/main"],
@@ -145,7 +174,15 @@ async fn offline_reports_a_lib_target_as_unresolved_and_checks_the_rest() {
     let out = output(scarab(&dir, &["validate", ".scarab/ci.yaml"])).await;
     let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
     assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
-    assert!(stdout.contains("unresolved: `lib:acme/deploy`"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "unresolved: `lib:acme/deploy` is installed on the server, not on disk; its Steps \
+             were not checked (use --server to check them)"
+        ),
+        "{stdout}"
+    );
+    // The library is one stand-in Step offline.
+    assert!(stdout.contains("ok: 2 step(s)"), "{stdout}");
 
     // The rest is still checked.
     let out = output(scarab(&dir, &["validate", ".scarab/broken.yaml"])).await;
@@ -175,6 +212,15 @@ async fn with_a_server_the_installed_library_is_compiled_there() {
     let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
     assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
     assert!(stdout.contains("outcome: allow"), "{stdout}");
+    // git-bug 1aa19e6: the server checked the library, so the output says
+    // so, and counts the Run's Steps as the server compiled them (the
+    // library's two, and `notify`), not the offline stand-in.
+    assert!(!stdout.contains("not checked"), "{stdout}");
+    assert!(stdout.contains("ok: 3 step(s), ir v"), "{stdout}");
+    assert!(
+        stdout.contains("compiled by the server with `lib:acme/deploy` as installed in org `acme`"),
+        "{stdout}"
+    );
 
     // In an org that has not installed it, the server says so.
     let out = output(scarab(&dir, &args("globex"))).await;
@@ -182,6 +228,67 @@ async fn with_a_server_the_installed_library_is_compiled_there() {
     assert_ne!(out.status.code(), Some(0), "{stdout}{stderr}");
     assert!(
         format!("{stdout}{stderr}").contains("`lib:acme/deploy` is not installed in this org"),
+        "{stdout}{stderr}"
+    );
+}
+
+// git-bug C5: Run creation refuses a Step's `k8s_overlay` (here: no
+// Environment permits one) after its Policies are consulted; `validate
+// --server` answered allow for it. It now answers deny with the reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_a_server_a_refused_k8s_overlay_is_a_deny() {
+    let base = serve().await;
+    let dir = repo();
+    let out = output(scarab(
+        &dir,
+        &[
+            "validate",
+            ".scarab/overlay.yaml",
+            "--server",
+            &base,
+            "--org",
+            "acme",
+            "--project",
+            "web",
+        ],
+    ))
+    .await;
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(1), "{stdout}{stderr}");
+    assert!(stdout.contains("outcome: deny"), "{stdout}");
+    assert!(
+        stdout.contains("step `build`") && stdout.contains("k8s_overlay"),
+        "{stdout}"
+    );
+}
+
+// git-bug C6: the gates and warnings come from the local compile; a server
+// that cannot be reached still leaves the author with them.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_an_unreachable_server_the_local_warnings_still_print() {
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    let dir = repo();
+    let out = output(scarab(
+        &dir,
+        &[
+            "validate",
+            ".scarab/secret.yaml",
+            "--server",
+            &closed,
+            "--org",
+            "acme",
+            "--project",
+            "web",
+        ],
+    ))
+    .await;
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert_ne!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("warning: step `deploy`") && stdout.contains("`$TOKEN`"),
         "{stdout}{stderr}"
     );
 }

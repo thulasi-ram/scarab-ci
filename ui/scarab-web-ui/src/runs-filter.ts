@@ -1,4 +1,4 @@
-// The Runs tab's server-side filters (ADR-0074 §2): Environment, and the
+// The Runs tab's server-side filters: Environment, and the
 // deploy marker (a pipeline or Step marked `deploy: true`). Both run on the
 // server, so the rows on screen are already filtered — the Environment
 // picker's options can't come from them alone, or picking one Environment
@@ -37,7 +37,7 @@ export function runListFilter(
 }
 
 /** A row of the Runs list: a Run, or a trigger that was refused before it
- *  became one (ADR-0076). */
+ *  became one. */
 export type RunListRow<R, F> = { kind: "run"; run: R; at: number } | { kind: "refused"; refused: F; at: number };
 
 /** The bare pipeline name of a refused Run's file (`.scarab/ci.yaml` → `ci`),

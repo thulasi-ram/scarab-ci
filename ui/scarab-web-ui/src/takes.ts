@@ -8,6 +8,7 @@
 // that Rerun re-armed its step (it was cut short), else as `running`.
 import type { RunEvent, Artifact } from "./api/client";
 import type { OutcomeCounts, VersionRow } from "./components/VersionDropdown";
+import { eventStatus } from "./events";
 import { relTime } from "./fmt";
 
 /** The tag + payload of a structured event, or null for unit variants. */
@@ -103,7 +104,7 @@ export function replayTake(events: RunEvent[], takes: Take[], take: Take): TakeV
     const inWindow = i >= startIdx;
     switch (k.tag) {
       case "StepTransitioned":
-        if (step) status[step] = String(k.v.to ?? "");
+        if (step) status[step] = eventStatus(k.v.to);
         break;
       case "AttemptStarted":
         if (step) {

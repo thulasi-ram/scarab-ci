@@ -11,8 +11,13 @@
 //! The insert names the id index as its conflict target, so an id that is
 //! already taken inserts nothing and the insert runs again with a new one;
 //! another installation under the same name is still a unique violation.
+//!
+//! An install that carries its source's trust grants reads them in its own
+//! transaction under an advisory lock on (org, source) that every trust and
+//! untrust of the source takes too, so a grant made while it runs is either
+//! seen by it or made after it commits (git-bug 9c54b46).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 use sqlx::postgres::PgRow;
@@ -20,7 +25,7 @@ use sqlx::Row;
 
 use scarab_pipeline::InstalledLibrary;
 use scarab_policy::library::{
-    LibraryInstallation, LibraryStore, LibraryStoreError, LibraryVersion, LibraryYank,
+    trust_key, LibraryInstallation, LibraryStore, LibraryStoreError, LibraryVersion, LibraryYank,
     NewInstallation, Replaces, TrustGrant, TrustedSource,
 };
 
@@ -134,107 +139,16 @@ impl LibraryStore for PostgresDb {
         new: &NewInstallation,
         replaces: &Replaces,
     ) -> Result<LibraryInstallation, LibraryStoreError> {
-        let mut tx = self.pool().begin().await.map_err(store_err)?;
-        let known: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM library_versions WHERE org = $1 AND content_hash = $2)",
-        )
-        .bind(&new.org)
-        .bind(&new.content_hash)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(store_err)?;
-        if !known {
-            return Err(LibraryStoreError::UnknownVersion(new.content_hash.clone()));
-        }
-        // The write itself checks `replaces`, so two admins racing cannot
-        // both pass a read and then overwrite each other: a first install
-        // only inserts (a row another install committed is a unique
-        // violation), and an upgrade only updates the row that still holds
-        // the version it names.
-        let map_write = |e: sqlx::Error| match sqlstate(&e).as_deref() {
-            Some(UNIQUE_VIOLATION) => LibraryStoreError::Conflict,
-            Some(FOREIGN_KEY_VIOLATION) => {
-                LibraryStoreError::UnknownVersion(new.content_hash.clone())
-            }
-            _ => store_err(e),
-        };
-        let written = match replaces {
-            Replaces::Nothing => {
-                // 40 random bits collide about never; when they do, the
-                // default mints another on the next try.
-                let mut written = 0;
-                for _ in 0..3 {
-                    written = sqlx::query(
-                        "INSERT INTO library_installations \
-                         (org, name, content_hash, installed_by, installed_at, step_up_ref) \
-                         VALUES ($1, $2, $3, $4, $5, $6) \
-                         ON CONFLICT (id) DO NOTHING",
-                    )
-                    .bind(&new.org)
-                    .bind(&new.name)
-                    .bind(&new.content_hash)
-                    .bind(&new.installed_by)
-                    .bind(new.installed_at)
-                    .bind(&new.step_up_ref)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(map_write)?
-                    .rows_affected();
-                    if written == 1 {
-                        break;
-                    }
-                }
-                if written == 0 {
-                    return Err(LibraryStoreError::Store(
-                        "no free installation id after 3 tries".into(),
-                    ));
-                }
-                written
-            }
-            Replaces::Version(h) => sqlx::query(
-                "UPDATE library_installations SET \
-                   content_hash = $3, installed_by = $4, installed_at = $5, step_up_ref = $6 \
-                 WHERE org = $1 AND name = $2 AND content_hash = $7",
-            )
-            .bind(&new.org)
-            .bind(&new.name)
-            .bind(&new.content_hash)
-            .bind(&new.installed_by)
-            .bind(new.installed_at)
-            .bind(&new.step_up_ref)
-            .bind(h)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_write)?
-            .rows_affected(),
-        };
-        if written == 0 {
-            return Err(LibraryStoreError::Conflict);
-        }
-        sqlx::query(
-            "UPDATE library_versions SET installed_once = true \
-             WHERE org = $1 AND content_hash = $2 AND NOT installed_once",
-        )
-        .bind(&new.org)
-        .bind(&new.content_hash)
-        .execute(&mut *tx)
-        .await
-        .map_err(store_err)?;
-        let row = sqlx::query(&format!(
-            "{INSTALLATION_SELECT} WHERE i.org = $1 AND i.name = $2"
-        ))
-        .bind(&new.org)
-        .bind(&new.name)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(store_err)?;
-        tx.commit()
-            .await
-            .map_err(|e| match sqlstate(&e).as_deref() {
-                Some(UNIQUE_VIOLATION) => LibraryStoreError::Conflict,
-                _ => store_err(e),
-            })?;
-        Ok(installation_from_row(&row))
+        self.install_tx(new, replaces, None).await
+    }
+
+    async fn install_carrying(
+        &self,
+        new: &NewInstallation,
+        replaces: &Replaces,
+        carry_grants: &BTreeSet<TrustGrant>,
+    ) -> Result<LibraryInstallation, LibraryStoreError> {
+        self.install_tx(new, replaces, Some(carry_grants)).await
     }
 
     async fn installation(
@@ -459,30 +373,14 @@ impl LibraryStore for PostgresDb {
     }
 
     async fn trusted_sources(&self, org: &str) -> Result<Vec<TrustedSource>, LibraryStoreError> {
-        // Trust with forge credentials is a row of `library_trusted_sources`;
-        // every other grant is a row of `library_source_grants` (migration
-        // 0095).
-        let rows = sqlx::query(
-            // Postgres refuses an expression (COLLATE) in a UNION's own
-            // ORDER BY, so the union is ordered from outside.
-            "SELECT * FROM ( \
-                SELECT org, source, 'forge_credentials' AS trust_grant, trusted_by, trusted_at, \
-                       step_up_ref \
-                FROM library_trusted_sources WHERE org = $1 \
-                UNION ALL \
-                SELECT org, source, trust_grant, trusted_by, trusted_at, step_up_ref \
-                FROM library_source_grants WHERE org = $1 \
-             ) t \
-             ORDER BY source COLLATE \"C\", trust_grant COLLATE \"C\"",
-        )
-        .bind(org)
-        .fetch_all(self.pool())
-        .await
-        .map_err(store_err)?;
-        rows.iter().map(trusted_from_row).collect()
+        trusted_rows(self.pool(), org, None).await
     }
 
     async fn trust_source(&self, t: &TrustedSource) -> Result<TrustedSource, LibraryStoreError> {
+        // Under the source's trust lock: an install carrying its grants
+        // reads them and installs in one transaction (git-bug 9c54b46).
+        let mut tx = self.pool().begin().await.map_err(store_err)?;
+        lock_trust(&mut tx, &t.org, &t.source).await?;
         let row = match t.grant {
             TrustGrant::ForgeCredentials => {
                 sqlx::query(
@@ -495,7 +393,7 @@ impl LibraryStore for PostgresDb {
                 .bind(&t.trusted_by)
                 .bind(t.trusted_at)
                 .bind(&t.step_up_ref)
-                .execute(self.pool())
+                .execute(&mut *tx)
                 .await
                 .map_err(store_err)?;
                 sqlx::query(
@@ -505,7 +403,7 @@ impl LibraryStore for PostgresDb {
                 )
                 .bind(&t.org)
                 .bind(&t.source)
-                .fetch_one(self.pool())
+                .fetch_one(&mut *tx)
                 .await
                 .map_err(store_err)?
             }
@@ -522,7 +420,7 @@ impl LibraryStore for PostgresDb {
                 .bind(&t.trusted_by)
                 .bind(t.trusted_at)
                 .bind(&t.step_up_ref)
-                .execute(self.pool())
+                .execute(&mut *tx)
                 .await
                 .map_err(store_err)?;
                 sqlx::query(
@@ -533,11 +431,12 @@ impl LibraryStore for PostgresDb {
                 .bind(&t.org)
                 .bind(&t.source)
                 .bind(grant.as_str())
-                .fetch_one(self.pool())
+                .fetch_one(&mut *tx)
                 .await
                 .map_err(store_err)?
             }
         };
+        tx.commit().await.map_err(store_err)?;
         trusted_from_row(&row)
     }
 
@@ -547,6 +446,8 @@ impl LibraryStore for PostgresDb {
         source: &str,
         grant: TrustGrant,
     ) -> Result<Option<TrustedSource>, LibraryStoreError> {
+        let mut tx = self.pool().begin().await.map_err(store_err)?;
+        lock_trust(&mut tx, org, source).await?;
         let row = match grant {
             TrustGrant::ForgeCredentials => sqlx::query(
                 "DELETE FROM library_trusted_sources WHERE org = $1 AND source = $2 \
@@ -564,10 +465,190 @@ impl LibraryStore for PostgresDb {
             .bind(source)
             .bind(grant.as_str()),
         }
-        .fetch_optional(self.pool())
+        .fetch_optional(&mut *tx)
         .await
         .map_err(store_err)?;
+        tx.commit().await.map_err(store_err)?;
         row.as_ref().map(trusted_from_row).transpose()
+    }
+}
+
+/// Holds the transaction's lock on `org`'s trust in `source` (its trust
+/// key) until it ends: an install carrying the source's grants and a trust
+/// or untrust of it take turns. An advisory lock, because a new grant is a
+/// new row that no row lock covers.
+async fn lock_trust(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    org: &str,
+    source: &str,
+) -> Result<(), LibraryStoreError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("scarab library trust\n{org}\n{source}"))
+        .execute(&mut **tx)
+        .await
+        .map_err(store_err)?;
+    Ok(())
+}
+
+/// The sources `org` trusts, each grant a row, by source then grant; with
+/// `source`, only that source's.
+async fn trusted_rows<'e, E>(
+    exec: E,
+    org: &str,
+    source: Option<&str>,
+) -> Result<Vec<TrustedSource>, LibraryStoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    // Trust with forge credentials is a row of `library_trusted_sources`;
+    // every other grant is a row of `library_source_grants` (migration
+    // 0095).
+    let rows = sqlx::query(
+        // Postgres refuses an expression (COLLATE) in a UNION's own
+        // ORDER BY, so the union is ordered from outside.
+        "SELECT * FROM ( \
+            SELECT org, source, 'forge_credentials' AS trust_grant, trusted_by, trusted_at, \
+                   step_up_ref \
+            FROM library_trusted_sources WHERE org = $1 \
+            UNION ALL \
+            SELECT org, source, trust_grant, trusted_by, trusted_at, step_up_ref \
+            FROM library_source_grants WHERE org = $1 \
+         ) t \
+         WHERE $2::text IS NULL OR source = $2 \
+         ORDER BY source COLLATE \"C\", trust_grant COLLATE \"C\"",
+    )
+    .bind(org)
+    .bind(source)
+    .fetch_all(exec)
+    .await
+    .map_err(store_err)?;
+    rows.iter().map(trusted_from_row).collect()
+}
+
+impl PostgresDb {
+    /// [`LibraryStore::install`], and with `carry`
+    /// [`LibraryStore::install_carrying`]: the source's grants are read in
+    /// this transaction under [`lock_trust`], which a trust or untrust of
+    /// the source takes too.
+    async fn install_tx(
+        &self,
+        new: &NewInstallation,
+        replaces: &Replaces,
+        carry: Option<&BTreeSet<TrustGrant>>,
+    ) -> Result<LibraryInstallation, LibraryStoreError> {
+        let mut tx = self.pool().begin().await.map_err(store_err)?;
+        let source: Option<String> = sqlx::query_scalar(
+            "SELECT source FROM library_versions WHERE org = $1 AND content_hash = $2",
+        )
+        .bind(&new.org)
+        .bind(&new.content_hash)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(store_err)?;
+        let Some(source) = source else {
+            return Err(LibraryStoreError::UnknownVersion(new.content_hash.clone()));
+        };
+        if let Some(carry) = carry {
+            let key = trust_key(&source);
+            lock_trust(&mut tx, &new.org, key).await?;
+            let held: BTreeSet<TrustGrant> = trusted_rows(&mut *tx, &new.org, Some(key))
+                .await?
+                .into_iter()
+                .map(|t| t.grant)
+                .collect();
+            if &held != carry {
+                return Err(LibraryStoreError::CarriedGrants(held));
+            }
+        }
+        // The write itself checks `replaces`, so two admins racing cannot
+        // both pass a read and then overwrite each other: a first install
+        // only inserts (a row another install committed is a unique
+        // violation), and an upgrade only updates the row that still holds
+        // the version it names.
+        let map_write = |e: sqlx::Error| match sqlstate(&e).as_deref() {
+            Some(UNIQUE_VIOLATION) => LibraryStoreError::Conflict,
+            Some(FOREIGN_KEY_VIOLATION) => {
+                LibraryStoreError::UnknownVersion(new.content_hash.clone())
+            }
+            _ => store_err(e),
+        };
+        let written = match replaces {
+            Replaces::Nothing => {
+                // 40 random bits collide about never; when they do, the
+                // default mints another on the next try.
+                let mut written = 0;
+                for _ in 0..3 {
+                    written = sqlx::query(
+                        "INSERT INTO library_installations \
+                         (org, name, content_hash, installed_by, installed_at, step_up_ref) \
+                         VALUES ($1, $2, $3, $4, $5, $6) \
+                         ON CONFLICT (id) DO NOTHING",
+                    )
+                    .bind(&new.org)
+                    .bind(&new.name)
+                    .bind(&new.content_hash)
+                    .bind(&new.installed_by)
+                    .bind(new.installed_at)
+                    .bind(&new.step_up_ref)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(map_write)?
+                    .rows_affected();
+                    if written == 1 {
+                        break;
+                    }
+                }
+                if written == 0 {
+                    return Err(LibraryStoreError::Store(
+                        "no free installation id after 3 tries".into(),
+                    ));
+                }
+                written
+            }
+            Replaces::Version(h) => sqlx::query(
+                "UPDATE library_installations SET \
+                   content_hash = $3, installed_by = $4, installed_at = $5, step_up_ref = $6 \
+                 WHERE org = $1 AND name = $2 AND content_hash = $7",
+            )
+            .bind(&new.org)
+            .bind(&new.name)
+            .bind(&new.content_hash)
+            .bind(&new.installed_by)
+            .bind(new.installed_at)
+            .bind(&new.step_up_ref)
+            .bind(h)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_write)?
+            .rows_affected(),
+        };
+        if written == 0 {
+            return Err(LibraryStoreError::Conflict);
+        }
+        sqlx::query(
+            "UPDATE library_versions SET installed_once = true \
+             WHERE org = $1 AND content_hash = $2 AND NOT installed_once",
+        )
+        .bind(&new.org)
+        .bind(&new.content_hash)
+        .execute(&mut *tx)
+        .await
+        .map_err(store_err)?;
+        let row = sqlx::query(&format!(
+            "{INSTALLATION_SELECT} WHERE i.org = $1 AND i.name = $2"
+        ))
+        .bind(&new.org)
+        .bind(&new.name)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(store_err)?;
+        tx.commit()
+            .await
+            .map_err(|e| match sqlstate(&e).as_deref() {
+                Some(UNIQUE_VIOLATION) => LibraryStoreError::Conflict,
+                _ => store_err(e),
+            })?;
+        Ok(installation_from_row(&row))
     }
 }
 

@@ -41,6 +41,14 @@ pub const MAX_GRANTS: usize = 16;
 pub const MAX_SECRETS: usize = 32;
 /// The most placement profiles one Step may name.
 pub const MAX_PLACEMENT_PROFILES: usize = 8;
+/// The most sidecar services one Step may have. A rule over every Step's
+/// sidecars, `steps.exists(s, has(s.services) && s.services.exists(v,
+/// 'run-as-root' in v.grants))`, costs about 512 × 80 under these caps.
+pub const MAX_SIDECAR_SERVICES: usize = 8;
+/// The most shared services a Run may have.
+pub const MAX_SHARED_SERVICES: usize = 32;
+/// The most grants one service may request: today only `run-as-root`.
+pub const MAX_SERVICE_GRANTS: usize = 4;
 
 policy_enum! {
     /// What started the Run (`scarab_forge::TriggerKind`).
@@ -107,11 +115,11 @@ policy_struct! {
         pub fork: bool,
         /// The forge account that caused the event.
         pub actor: Option<String>,
-        /// The handle of the Principal linked to `actor` (ADR-0069), when
-        /// there is one.
+        /// The handle of the Principal whose linked forge identity is
+        /// `actor`, when there is one.
         pub principal: Option<String>,
-        /// That Principal's id (ADR-0080). Absent from inputs recorded before
-        /// it existed.
+        /// That Principal's id. Absent from inputs recorded before it
+        /// existed.
         pub principal_id: Option<String>,
         /// The reason given for a manual or API dispatch.
         pub reason: Option<FreeText>,
@@ -146,11 +154,56 @@ policy_struct! {
 }
 
 policy_struct! {
+    /// A sidecar service of a Step (the Step's `services:`): a container
+    /// in the Step's Pod.
+    pub struct SidecarService {
+        /// Its position in the Step's `services` list, from 0.
+        pub index: u64,
+        pub image: String,
+        /// The digest the image is pinned to (after `@`), if any.
+        pub digest: Option<String>,
+        /// `run-as-root` when the service runs as uid 0, the same name a
+        /// Step's `grants` uses.
+        pub grants: Capped<String, MAX_SERVICE_GRANTS>,
+        /// The service runs as uid 0: it sets `run_as_root: true` or
+        /// `run_as_user: 0`.
+        pub run_as_root: bool,
+        /// The uid the service names (`run_as_user`). Absent when it names
+        /// none.
+        pub run_as_user: Option<u64>,
+    }
+}
+
+policy_struct! {
+    /// A shared service of the Run (the Pipeline's `services:`): a Pod of
+    /// its own that Steps reach with `uses:`.
+    pub struct SharedService {
+        /// The name Steps give in `uses:`.
+        pub name: String,
+        pub image: String,
+        /// The digest the image is pinned to (after `@`), if any.
+        pub digest: Option<String>,
+        /// `run-as-root` when the service runs as uid 0, the same name a
+        /// Step's `grants` uses.
+        pub grants: Capped<String, MAX_SERVICE_GRANTS>,
+        /// The service runs as uid 0: it sets `run_as_root: true` or
+        /// `run_as_user: 0`.
+        pub run_as_root: bool,
+        /// The uid the service names (`run_as_user`). Absent when it names
+        /// none.
+        pub run_as_user: Option<u64>,
+    }
+}
+
+policy_struct! {
     /// A Step's static `step.admit` input, with what `run.create` adds.
     pub struct Step {
         pub id: String,
         pub image: String,
         pub digest: Option<String>,
+        /// What the Step's Pod asks for above the baseline: `run-as-root`
+        /// when the Step or one of its sidecar `services` runs as uid 0,
+        /// `privileged`, and `add-capabilities:<CAP>` for each capability.
         pub grants: Capped<String, MAX_GRANTS>,
         pub k8s_overlay: bool,
         pub secrets: Capped<String, MAX_SECRETS>,
@@ -171,7 +224,18 @@ policy_struct! {
         /// existed, so a rule reads it as
         /// `has(step.registry_auth) && step.registry_auth`.
         pub registry_auth: Option<bool>,
-        /// The Step uses the Environment's authority (ADR-0075 §5).
+        /// The uid the Step asks to run as (`security.run_as_user`). Absent
+        /// when it names none, and from inputs recorded before it existed.
+        /// `0` is also in `grants` as `run-as-root`, as `run_as_root: true`
+        /// is.
+        pub run_as_user: Option<u64>,
+        /// The Step's sidecar services. Absent from inputs recorded before
+        /// it existed, so a rule reads it as
+        /// `has(step.services) && step.services.exists(v, v.run_as_root)`.
+        pub services: Option<Capped<SidecarService, MAX_SIDECAR_SERVICES>>,
+        /// The Step uses the Environment's authority: it declares secrets,
+        /// requests a governed grant or a raw overlay, is a deploy Step, or
+        /// asks for `forge_token: write`.
         pub uses_environment_authority: bool,
         /// Empty for a Step written in the Pipeline file itself.
         pub origin: Capped<Origin, MAX_ORIGIN>,
@@ -198,10 +262,14 @@ policy_struct! {
         pub pipeline: Pipeline,
         pub steps: Capped<Step, MAX_STEPS>,
         pub gates: Capped<Gate, MAX_GATES>,
+        /// The Run's shared services. Absent from inputs recorded before it
+        /// existed, so a rule reads it as
+        /// `services != null && services.exists(v, v.run_as_root)`.
+        pub services: Option<Capped<SharedService, MAX_SHARED_SERVICES>>,
         /// The handle of the human or token creating the Run; absent for a
         /// webhook.
         pub principal: Option<String>,
-        /// Its id (ADR-0080). Absent from inputs recorded before it existed.
+        /// Its id. Absent from inputs recorded before it existed.
         pub principal_id: Option<String>,
         pub time: Timestamp,
     }
@@ -494,10 +562,15 @@ pub fn input_from_pipeline(
             }
         }
         let mut grants = Vec::new();
+        // `run_as_user: 0` is the same request as `run_as_root: true`. A
+        // sidecar service running as root puts a root container in the
+        // Step's Pod, so a rule over `grants` sees it too.
+        if s.security.as_ref().is_some_and(|x| x.runs_as_root())
+            || s.services.iter().any(|v| v.runs_as_root())
+        {
+            grants.push("run-as-root".to_string());
+        }
         if let Some(sec) = &s.security {
-            if sec.run_as_root {
-                grants.push("run-as-root".to_string());
-            }
             if sec.privileged {
                 grants.push("privileged".to_string());
             }
@@ -518,10 +591,23 @@ pub fn input_from_pipeline(
             &facts.params,
             &facts.event,
         );
-        let digest = (!image.contains("${{"))
-            .then(|| image.rsplit_once('@').map(|(_, d)| d.to_string()))
-            .flatten()
-            .filter(|d| !d.is_empty());
+        let digest = image_digest(&image);
+        let sidecars = s
+            .services
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let svc = || format!("sidecar service {i} of Step `{}`", s.id);
+                Ok(SidecarService {
+                    index: i as u64,
+                    image: v.image.clone(),
+                    digest: image_digest(&v.image),
+                    grants: service_grants(v, &svc)?,
+                    run_as_root: v.runs_as_root(),
+                    run_as_user: v.run_as_user.map(u64::from),
+                })
+            })
+            .collect::<Result<Vec<_>, CapExceeded>>()?;
         steps.push(Step {
             id: s.id.clone(),
             image,
@@ -559,11 +645,32 @@ pub fn input_from_pipeline(
             }),
             sandbox: s.sandbox().map(|x| x.as_str().to_string()),
             registry_auth: Some(s.registry_auth),
+            run_as_user: s
+                .security
+                .as_ref()
+                .and_then(|x| x.run_as_user)
+                .map(u64::from),
+            services: Some(capped(sidecars, &what, "sidecar services")?),
             uses_environment_authority: uses_environment_authority(ir, s),
             origin: origin_of(&s.origin, &what)?,
             upstream_gates: capped(upstream_gates, &what, "gates upstream of it")?,
         });
     }
+    let shared = ir
+        .services
+        .iter()
+        .map(|v| {
+            let svc = || format!("shared service `{}`", v.name);
+            Ok(SharedService {
+                name: v.name.clone(),
+                image: v.spec.image.clone(),
+                digest: image_digest(&v.spec.image),
+                grants: service_grants(&v.spec, &svc)?,
+                run_as_root: v.spec.runs_as_root(),
+                run_as_user: v.spec.run_as_user.map(u64::from),
+            })
+        })
+        .collect::<Result<Vec<_>, CapExceeded>>()?;
     Ok(RunCreateInput {
         org: Org { name: facts.org },
         project: Project {
@@ -577,10 +684,36 @@ pub fn input_from_pipeline(
         },
         steps: capped(steps, &run, "Steps")?,
         gates: capped(gates, &run, "gates")?,
+        services: Some(capped(shared, &run, "shared services")?),
         principal: facts.principal,
         principal_id: facts.principal_id,
         time: facts.time,
     })
+}
+
+/// The digest `image` is pinned to (the part after `@`); none while it holds
+/// a `${{` not known yet, which pins nothing.
+fn image_digest(image: &str) -> Option<String> {
+    (!image.contains("${{"))
+        .then(|| image.rsplit_once('@').map(|(_, d)| d.to_string()))
+        .flatten()
+        .filter(|d| !d.is_empty())
+}
+
+/// A service's grants: `run-as-root` when it runs as uid 0 (`run_as_root:
+/// true` or `run_as_user: 0`, [`ServiceSpec::runs_as_root`]).
+///
+/// [`ServiceSpec::runs_as_root`]: scarab_pipeline::ServiceSpec::runs_as_root
+fn service_grants(
+    svc: &scarab_pipeline::ServiceSpec,
+    owner: &dyn Fn() -> String,
+) -> Result<Capped<String, MAX_SERVICE_GRANTS>, CapExceeded> {
+    let grants = if svc.runs_as_root() {
+        vec!["run-as-root".to_string()]
+    } else {
+        Vec::new()
+    };
+    capped(grants, owner, "grants")
 }
 
 /// The `run.create` input of `ir` as a PolicyDecision records it: built by

@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
+  carriedGrantBox,
+  carryGrants,
   declaredInputs,
   diffLines,
   diffSides,
@@ -133,5 +135,25 @@ describe("review checks", () => {
     expect(reviewHref("acme", { source: "s@c", name: "acme::x", ref: "", connection: undefined })).toBe(
       "/orgs/acme/settings/libraries/review?source=s%40c&name=acme%3A%3Ax",
     );
+  });
+});
+
+describe("grants an install carries", () => {
+  it("needs every carried grant ticked before it sends them", () => {
+    const carried = ["forge_credentials", "registry_credential"] as const;
+    expect(carryGrants(carried, new Set())).toBeNull();
+    expect(carryGrants(carried, new Set(["registry_credential"]))).toBeNull();
+    expect(carryGrants(carried, new Set(["registry_credential", "forge_credentials"]))).toEqual([
+      "forge_credentials",
+      "registry_credential",
+    ]);
+  });
+  it("sends an empty list when the source holds no grant", () => {
+    expect(carryGrants([], new Set())).toEqual([]);
+  });
+  it("names what each grant lets a Step do", () => {
+    expect(carriedGrantBox("forge_credentials").label).toMatch(/forge credentials/);
+    expect(carriedGrantBox("registry_credential").help).toMatch(/registry_auth/);
+    expect(carriedGrantBox("build_sandbox").label).toMatch(/build sandbox/);
   });
 });

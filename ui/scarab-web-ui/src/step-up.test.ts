@@ -1,4 +1,4 @@
-// Step-up in the UI (ADR-0073): reading the 403, and the confirm-and-retry
+// Step-up in the UI: reading the 403, and the confirm-and-retry
 // loop every crown-jewel call in the app goes through. The ceremony (dialog +
 // passkey) is the one true external here and is a plain function; the
 // responses are real `Response`s.

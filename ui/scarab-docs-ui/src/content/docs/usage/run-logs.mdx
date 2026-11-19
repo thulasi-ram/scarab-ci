@@ -1,0 +1,131 @@
+---
+title: Run logs
+description: Read a step's log on the Run page, with scarab logs, or through the API. The Run page loads the last 2 MB of a try's log, and Download saves all of it.
+---
+
+Scarab stores each step's output in chunks while the step runs. You can read it on the Run page,
+with `scarab logs`, or through the API.
+
+## On the Run page
+
+Open a Run and pick a step. The Logs tab shows the try in view and follows it while it runs.
+
+- The pane loads the last 2 MB of the try's log. When the log is longer, a notice above it says
+  how much shows, for example "Showing the last 2.0 MB of 14.3 MB. Line numbers start here." Line
+  numbers count from the first line loaded, not from the start of the log.
+- **Load full log** reads the log again, up to 8 MB. It shows only when the whole log is 8 MB or
+  less.
+- **Download** saves the whole log of the try as a text file, with the bytes the step wrote. It is
+  in the log toolbar for every try.
+- The pane keeps at most 8 MB. Past that, it drops lines from the top as new output arrives. The
+  notice counts those too, and the lines that stay keep their numbers. A log with no line breaks
+  has no line to drop: once its last line is over 16 MB, the pane cuts its start down to 8 MB, at a
+  character boundary.
+- If the connection drops while the try runs, the pane connects again after 1 s, then 2 s, 4 s and
+  so on up to 30 s, and continues after the last part it received. A connection that stayed open
+  longer than the last wait starts the waits over at 1 s. After three reopens in a row that fail
+  before the stream opens, the pane asks the server about its position. Only when the server
+  answers 400 does it clear the pane and load the end of the log again, as much as it showed
+  (2 MB, or 8 MB after Load full log). While the server cannot be reached, it keeps its position
+  and keeps trying.
+
+A shared service's pane works the same way. Its **Download** is in the pane's header and in the
+notice above a longer log, and saves the whole log of the service in the Take in view.
+
+A `\r\n` line end shows as one line break. A lone `\r`, which a progress bar writes to redraw its
+line, also shows as a line break, so each redraw is a line of its own. Download keeps both as the
+step wrote them.
+
+## With `scarab logs`
+
+```sh
+scarab logs <run-id>
+```
+
+This prints the log of every try of every step of the Run, in step order, and follows the Run until
+it finishes. It prints the whole log, with no 2 MB cut. It exits 1 when a stored part of the log
+cannot be read. When the reader of its output goes away, as with `scarab logs <run-id> | head`, it
+stops and exits 0. It reads `SCARAB_SERVER` and `SCARAB_TOKEN` (see [API tokens](/scarab-ci/usage/api-tokens/)).
+
+## Through the API
+
+| Call | What it returns |
+|------|-----------------|
+| `GET /v1/runs/{id}/steps/{step}/logs` | one step's log as Server-Sent Events. `?attempt=` picks one try, `?tail=<bytes>` asks for the last bytes only (at most 64 MiB), `?from=<event id>` resumes |
+| `GET /v1/runs/{id}/steps/{step}/logs/raw?attempt=<id>` | one try's whole log as `text/plain`, sent as an attachment. `?sidecar=<index>` reads a sidecar's log for the same try. `attempt` is required |
+| `GET /v1/runs/{id}/services/{service}/logs` | one shared service's log, with the same `?tail=` and `?from=` |
+| `GET /v1/runs/{id}/services/{service}/logs/raw?take=<n>` | one shared service's whole log in Take `n` as `text/plain`, sent as an attachment named `scarab-<run>-<service>-take<n>.log` (a character outside `A-Z`, `a-z`, `0-9`, `_` and `-` becomes `_`). Without `?take=`, the current Take |
+| `GET /v1/runs/{id}/logs` | every step's log, as `scarab logs` reads it. Event ids, no `?tail=` |
+
+Each `data` event carries about 256 KiB of one try's log (at most 256 KiB plus two stored chunks)
+and has an id `<attempt_id>:<next_seq>`, the position after it. Send it back as `?from=` or in the
+`Last-Event-ID` header to continue after that event. The server answers 400 to an id it cannot
+read and to one that names a try outside the log you asked for. An id with a position past the
+end of a try's log is not refused: the stream sends nothing for that try until the log passes that
+position.
+
+A UTF-8 character that a stored chunk cuts in two is sent whole when the next chunk arrives. On a
+running try the server waits at most two polls for it, then sends the cut bytes as U+FFFD; on a
+try that has ended it sends U+FFFD at once.
+
+The stream ends one poll after the Run finishes, or when the Run no longer exists. A try that has ended and sent its whole log, with no new part for 30 s, is no longer
+read on each poll.
+
+With `?tail=`, when the log is longer than the tail, the stream starts at a chunk boundary and
+first sends `event: truncated` with `{"skipped_bytes":N,"total_bytes":M}`. `event: error` means a
+stored part of the log could not be read, and the stream ends after it.
+
+The stream sends each `\r\n` as `\n`. The raw download returns the stored bytes unchanged.
+
+## How the server stores a log
+
+A server replica reads each step's container log while the step runs and stores it in chunks.
+Before it stores anything, it replaces each of the step's secret values, its registry credential,
+its forge token and its OIDC token with `***`. It redacts the log as one stream, so a value split
+between two chunks of output is still replaced. A step's values redact only that step's log (and
+its sidecars' logs), never another step's.
+
+A replica that did not launch the step (after a server roll, for example) reads the step's
+secret values from the step Pod's Secrets before it reads any of the log. When it cannot read
+them while the step runs, it reads no log and tries again later. When the step has ended and the
+replica never read them (the Secrets are deleted when the step's try ends), it stores this line in
+place of the rest of the log, never the output itself:
+
+```text
+scarab: the rest of this log was not stored: its secret values could not be read
+```
+
+When a read breaks part way, or the step stops before its log was read in full, the server reads
+the container's log again from the start and compares it with the part already stored:
+
+- When the log begins with exactly the stored part, the server stores only what follows it.
+- When it does not, because the kubelet rotated the log file, the container restarted, or the
+  step's secret values changed, the server stores this line and then the whole log it read:
+
+  ```text
+  scarab: the log source restarted; earlier lines may repeat
+  ```
+
+  No output is dropped, and lines stored before the marker may show again after it.
+
+The log can also differ from the stored part where the stored part holds `***`: the replica that
+stored it held a value this one does not (the step was relaunched with a new token), or the step
+printed `***` itself. Storing the log again from the start could store a value in clear, so the
+replica does not. For a step that is still running it stores this line, then the output the step
+prints from then on; what the step printed between the stored part and the line is not stored:
+
+```text
+scarab: earlier output could not be checked; showing output from now on
+```
+
+For a step that has ended it stores this line in place of the rest of the log:
+
+```text
+scarab: the rest of this log was withheld: it could not be checked against the part already stored
+```
+
+Each of these lines comes with a warning in the server log.
+
+Output the kubelet rotated away before the server read it is gone; the marker line does not
+recover it. Each of these reads also reads the stored part back from object storage to compare
+it, so a retry on a long log costs one read per stored chunk.
