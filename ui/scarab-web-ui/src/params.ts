@@ -1,4 +1,4 @@
-// Pure launch-parameter helpers (ADR-0043 §2, §6). No I/O, no framework — just
+// Pure launch-parameter helpers. No I/O, no framework — just
 // the form model, static client validation, request mapping, server-error
 // mapping, and re-run reconciliation. Kept pure so it reads as obviously
 // correct (there is no JS test runner; correctness is carried by inspection +
@@ -27,7 +27,7 @@ export type ParamSpec = {
 export type FieldValue = string | boolean;
 
 /** The initial value for one field: an optional param pre-fills its `default`
- * (ADR-0043 — optional ⇒ default is mandatory); a required param starts empty. */
+ * (an optional param must have a default); a required param starts empty. */
 export function paramInitialValue(spec: ParamSpec): FieldValue {
   if (spec.type === "boolean") {
     return spec.required ? false : Boolean(spec.default);
@@ -44,7 +44,7 @@ export function initialValues(specs: ParamSpec[]): Record<string, FieldValue> {
 }
 
 /** Static validation for one field — mirrors ONLY `required` / `type` /
- * `options` (ADR-0043 §6). Returns an error string, or null if statically OK.
+ * `options`. Returns an error string, or null if statically OK.
  * Never evaluates `validate:` (server-only). */
 export function validateField(spec: ParamSpec, value: FieldValue): string | null {
   if (spec.type === "boolean") return null; // a checkbox always has a value
@@ -74,7 +74,7 @@ export function validateForm(
   return errors;
 }
 
-/** Map the validated form to a dispatch `params` body (ADR-0043 §4): send
+/** Map the validated form to a dispatch `params` body: send
  * `number`/`boolean` as their JSON-typed values and `string`/`choice` as
  * strings. An empty non-boolean field is omitted so the server applies the
  * declared default (a required-empty field is blocked by validation first). */
@@ -120,7 +120,7 @@ export function mapServerError(
 }
 
 /** Reconcile a prior run's frozen params against the CURRENT interface for a
- * re-run (ADR-0043 §6): pre-fill values that still exist, drop prior params the
+ * re-run: pre-fill values that still exist, drop prior params the
  * interface no longer declares (reported so the UI can note them). Type/validity
  * drift on a surviving param surfaces afterwards via `validateForm`. */
 export function reconcilePrefill(

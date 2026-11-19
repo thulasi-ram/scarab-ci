@@ -1,4 +1,4 @@
-// Identity links, as the UI has to reason about them (ADR-0069). Pure — no
+// Identity links, as the UI has to reason about them. Pure — no
 // DOM, no fetch — so the decisions that are easy to get subtly wrong are
 // testable without rendering: which sign-in buttons to offer, which accounts
 // can still be linked, whether unlinking is allowed, what a link callback's
@@ -32,12 +32,12 @@ export type LoginChoice = { href: string; label: string; primary: boolean };
 /**
  * The sign-in buttons. One provider (or none known — the providers list is
  * best-effort) keeps the single provider-agnostic "Sign in" the page always
- * had: ADR-0049 never tells the browser who is at the other end. Several get a
+ * had: the login never tells the browser who is at the other end. Several get a
  * button each, the default one first and primary — the one an unnamed login
  * would have used anyway.
  */
 export function loginChoices(providers: ProviderLike[], next?: string): LoginChoice[] {
-  // Where to land after the callback (ADR-0073): a deep link — a step-up
+  // Where to land after the callback: a deep link — a step-up
   // confirmation link above all — must survive the sign-in it triggered.
   // Only a relative path the server would accept; `/` is the default anyway.
   const land = next && next !== "/" && safeNext(next) ? `next=${encodeURIComponent(next)}` : "";

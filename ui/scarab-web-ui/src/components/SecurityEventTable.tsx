@@ -1,4 +1,4 @@
-// A table of security events (ADR-0073 §7) — the OrgSecurityEventLog on
+// A table of security events — the OrgSecurityEventLog on
 // Settings → Security and your own events on Account → Security. Rows are
 // shaped by `eventRow` (security.ts); this only lays them out.
 import { For, Show } from "solid-js";

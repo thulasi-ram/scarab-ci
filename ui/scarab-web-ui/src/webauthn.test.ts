@@ -1,4 +1,4 @@
-// The WebAuthn JSON ↔ bytes seam (ADR-0073). The manual fallbacks are what a
+// The WebAuthn JSON ↔ bytes seam. The manual fallbacks are what a
 // browser without the L3 JSON helpers (Safari < 18, Firefox < 119) runs, and
 // a byte off here is a passkey the server refuses with "challenge mismatch" —
 // so they are checked against fixed vectors, not only against themselves.

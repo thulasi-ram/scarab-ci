@@ -451,7 +451,7 @@
        }
       },
       {
-       "doc": "The Step uses the Environment's authority (ADR-0075 \u00a75).",
+       "doc": "The Step uses the Environment's authority: it declares secrets, requests a governed grant or a raw overlay, is a deploy Step, or asks for `forge_token: write`.",
        "max_len": 1024,
        "name": "uses_environment_authority",
        "optional": false,
@@ -543,7 +543,7 @@
        }
       },
       {
-       "doc": "The Principal linked to `actor` (ADR-0069), when there is one.",
+       "doc": "The handle of the Principal whose linked forge identity is `actor`, when there is one.",
        "max_len": 1024,
        "name": "principal",
        "optional": true,
@@ -846,7 +846,7 @@
        }
       },
       {
-       "doc": "The Step uses the Environment's authority (ADR-0075 \u00a75).",
+       "doc": "The Step uses the Environment's authority: it declares secrets, requests a governed grant or a raw overlay, is a deploy Step, or asks for `forge_token: write`.",
        "max_len": 1024,
        "name": "uses_environment_authority",
        "optional": false,
@@ -1415,7 +1415,7 @@
        }
       },
       {
-       "doc": "The gate is an Environment approval gate (ADR-0078 \u00a71).",
+       "doc": "The gate is an Environment approval gate: a Step after it uses the Environment's authority, so releasing it needs the Environment's approvers.",
        "max_len": 1024,
        "name": "environment_approval_gate",
        "optional": false,

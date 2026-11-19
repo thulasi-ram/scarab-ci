@@ -1,4 +1,4 @@
-// WebAuthn in the browser (ADR-0073): the JSON ↔ ArrayBuffer seam between what
+// WebAuthn in the browser: the JSON ↔ ArrayBuffer seam between what
 // the server sends (`PublicKeyCredential*OptionsJSON`, every byte string as
 // base64url) and what `navigator.credentials.*` takes and returns (raw
 // ArrayBuffers), and back again (`RegistrationResponseJSON` /

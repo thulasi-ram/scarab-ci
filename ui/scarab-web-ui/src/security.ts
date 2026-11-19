@@ -1,4 +1,4 @@
-// Security pages, as the UI has to reason about them (ADR-0073). Pure — no
+// Security pages, as the UI has to reason about them. Pure — no
 // DOM, no fetch — so the shaping the Account → Security panel, Settings →
 // Security, the confirm page and the app banner share is testable without
 // rendering anything.

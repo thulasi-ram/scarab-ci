@@ -195,12 +195,6 @@ export function typeLabel(t: SchemaType): string {
   }
 }
 
-/** A field's documentation, as the editor shows it: decision record
- *  references are left out. */
-export function cleanDoc(doc: string): string {
-  return doc.replace(/\s*\(ADR-\d{4}[^)]*\)/g, "").trim();
-}
-
 const MACROS = ["exists", "all", "exists_one"];
 const STRING_FUNCTIONS = ["startsWith", "endsWith", "contains", "matches"];
 
@@ -288,7 +282,7 @@ export function completionsAt(
       optional: false,
     }));
     for (const v of schema.variables) {
-      vars.push({ label: v.name, detail: typeLabel(v.ty), doc: cleanDoc(v.doc), optional: v.optional });
+      vars.push({ label: v.name, detail: typeLabel(v.ty), doc: v.doc, optional: v.optional });
     }
     return keep(vars);
   }
@@ -300,7 +294,7 @@ export function completionsAt(
       (schema.structs[t.of]?.fields ?? []).map((f) => ({
         label: f.name,
         detail: typeLabel(f.ty),
-        doc: cleanDoc(f.doc),
+        doc: f.doc,
         optional: f.optional,
       })),
     );

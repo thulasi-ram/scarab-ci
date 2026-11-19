@@ -107,11 +107,11 @@ policy_struct! {
         pub fork: bool,
         /// The forge account that caused the event.
         pub actor: Option<String>,
-        /// The handle of the Principal linked to `actor` (ADR-0069), when
-        /// there is one.
+        /// The handle of the Principal whose linked forge identity is
+        /// `actor`, when there is one.
         pub principal: Option<String>,
-        /// That Principal's id (ADR-0080). Absent from inputs recorded before
-        /// it existed.
+        /// That Principal's id. Absent from inputs recorded before it
+        /// existed.
         pub principal_id: Option<String>,
         /// The reason given for a manual or API dispatch.
         pub reason: Option<FreeText>,
@@ -176,7 +176,9 @@ policy_struct! {
         /// `0` is also in `grants` as `run-as-root`, as `run_as_root: true`
         /// is.
         pub run_as_user: Option<u64>,
-        /// The Step uses the Environment's authority (ADR-0075 §5).
+        /// The Step uses the Environment's authority: it declares secrets,
+        /// requests a governed grant or a raw overlay, is a deploy Step, or
+        /// asks for `forge_token: write`.
         pub uses_environment_authority: bool,
         /// Empty for a Step written in the Pipeline file itself.
         pub origin: Capped<Origin, MAX_ORIGIN>,
@@ -206,7 +208,7 @@ policy_struct! {
         /// The handle of the human or token creating the Run; absent for a
         /// webhook.
         pub principal: Option<String>,
-        /// Its id (ADR-0080). Absent from inputs recorded before it existed.
+        /// Its id. Absent from inputs recorded before it existed.
         pub principal_id: Option<String>,
         pub time: Timestamp,
     }

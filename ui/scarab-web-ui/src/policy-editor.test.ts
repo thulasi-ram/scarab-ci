@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   applyCompletion,
-  cleanDoc,
   completionsAt,
   diagnosticText,
   fieldError,
@@ -132,12 +131,6 @@ describe("completionsAt", () => {
 
   it("replaces the partial name when one is picked", () => {
     expect(applyCompletion("trigger.re && x", 8, 10, "ref")).toEqual(["trigger.ref && x", 11]);
-  });
-
-  it("leaves decision record references out of a field's doc", () => {
-    expect(cleanDoc("The Principal linked to `actor` (ADR-0069), when there is one.")).toBe(
-      "The Principal linked to `actor`, when there is one.",
-    );
   });
 });
 

@@ -1,4 +1,4 @@
-// The sign-in screen (ADR-0049).
+// The sign-in screen.
 //
 // Rendered by Layout in place of the entire app shell whenever there is no
 // session, so it covers every route without touching the router: an expired
@@ -10,9 +10,9 @@
 // would try to match it against the SPA's routes and render nothing.
 //
 // With ONE provider the wording stays provider-agnostic: the provider is
-// whatever the operator configured (GitHub, Forgejo, Dex, Keycloak — ADR-0049
-// keeps identity forge-agnostic), so the button says where you are going, not
-// who is at the other end. With SEVERAL (ADR-0069) the person has to choose,
+// whatever the operator configured (GitHub, Forgejo, Dex, Keycloak — identity
+// is forge-agnostic), so the button says where you are going, not
+// who is at the other end. With SEVERAL the person has to choose,
 // so each gets a button naming it — the default one first.
 import { For, createResource } from "solid-js";
 import markInk from "./assets/brand/scarab.svg";

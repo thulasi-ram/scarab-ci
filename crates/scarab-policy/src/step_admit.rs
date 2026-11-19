@@ -39,7 +39,9 @@ policy_struct! {
         /// existed, so a rule reads it as
         /// `has(step.registry_auth) && step.registry_auth`.
         pub registry_auth: Option<bool>,
-        /// The Step uses the Environment's authority (ADR-0075 §5).
+        /// The Step uses the Environment's authority: it declares secrets,
+        /// requests a governed grant or a raw overlay, is a deploy Step, or
+        /// asks for `forge_token: write`.
         pub uses_environment_authority: bool,
         pub origin: Capped<Origin, MAX_ORIGIN>,
     }
@@ -74,8 +76,8 @@ policy_struct! {
         /// The handles of the approver set the gate's approvals met, when
         /// recorded.
         pub approvers: Capped<String, MAX_APPROVERS>,
-        /// Their Principal ids, in the same order (ADR-0080). Absent from
-        /// inputs recorded before it existed.
+        /// Their Principal ids, in the same order. Absent from inputs
+        /// recorded before it existed.
         pub approver_ids: Option<Capped<String, MAX_APPROVERS>>,
         pub required: Option<u64>,
     }

@@ -1,4 +1,4 @@
-// The run's identity handle (ADR-0057 amendment). Shows the per-repo **run
+// The run's identity handle. Shows the per-repo **run
 // number** `#N` — the human handle — and, when absent (untenanted inline runs /
 // pre-allocation runs), degrades to the short internal id. Click copies the
 // handle. Shared by the runs-list gutter and the run-detail bar so the two can

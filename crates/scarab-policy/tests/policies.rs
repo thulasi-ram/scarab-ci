@@ -802,3 +802,36 @@ fn oversized_and_overnested_rules() {
     let deep = format!("pipeline{} == \"x\"", ".name".repeat(70));
     assert_rejected(&deep, "nested more than 64 deep");
 }
+
+/// git-bug 57c00ff: a field's doc comment is what the policy editor shows
+/// beside the field (`GET /v1/policy-checkpoints`), and the UI cites no
+/// decision record, so no checkpoint schema's doc names one.
+#[test]
+fn checkpoint_schema_docs_cite_no_decision_record() {
+    for c in Checkpoint::ALL.into_iter().filter(|c| c.is_consulted()) {
+        let version = scarab_policy::ir::schema_version(c).expect("consulted");
+        let schema = scarab_policy::ir::schema_for(c, version).expect("its schema");
+        let json = serde_json::to_value(&schema).expect("serialises");
+        let mut docs = Vec::new();
+        collect_docs(&json, &mut docs);
+        assert!(!docs.is_empty(), "{}: no field docs read", c.as_str());
+        for doc in docs {
+            assert!(!doc.contains("ADR-"), "{}: {doc}", c.as_str());
+        }
+    }
+}
+
+fn collect_docs(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::Object(m) => {
+            for (k, x) in m {
+                match (k.as_str(), x) {
+                    ("doc", serde_json::Value::String(s)) => out.push(s.clone()),
+                    _ => collect_docs(x, out),
+                }
+            }
+        }
+        serde_json::Value::Array(xs) => xs.iter().for_each(|x| collect_docs(x, out)),
+        _ => {}
+    }
+}

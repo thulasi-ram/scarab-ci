@@ -38,7 +38,7 @@ describe("loginChoices", () => {
     ]);
   });
 
-  it("carries the page that needed the sign-in back as `next` (ADR-0073)", () => {
+  it("carries the page that needed the sign-in back as `next`", () => {
     // A step-up confirmation link opened signed-out must land on itself after
     // the login, not on the dashboard with the link lost.
     expect(loginChoices([github], "/security/confirm/abc")[0]!.href).toBe(
