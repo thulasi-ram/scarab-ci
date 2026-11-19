@@ -1415,6 +1415,26 @@ pub struct ServiceSpec {
     pub run_as_root: bool,
 }
 
+impl ServiceSpec {
+    /// Whether the service runs as uid 0, by `run_as_root: true` or by
+    /// `run_as_user: 0`: one self-service request, which the executor applies
+    /// without `runAsNonRoot` (as [`StepSecurity::runs_as_root`] for a Step).
+    pub fn runs_as_root(&self) -> bool {
+        self.run_as_root || self.run_as_user == Some(0)
+    }
+}
+
+/// Both of a service's uid fields set: a diagnostic, as for a Step's
+/// `security` block (`run_as_user: 0` is the `run_as_root` request).
+fn validate_service_uid(svc: &ServiceSpec, what: &str, diagnostics: &mut Vec<String>) {
+    if svc.run_as_root && svc.run_as_user.is_some() {
+        diagnostics.push(format!(
+            "{what}: a service's `run_as_user` cannot be combined with its `run_as_root` \
+             (`run_as_user: 0` is the same request)"
+        ));
+    }
+}
+
 /// A sidecar service's readiness probe (ADR-0058), authored as a one-key map:
 /// `tcp` is the default form (`ready: { tcp: 5432 }`); `exec`
 /// (`ready: { exec: [pg_isready] }`) and `http` (`ready: { http: { port, path } }`)
@@ -6135,6 +6155,7 @@ fn validate_with(
             // A sidecar's `ready:` probe is validated by the shared helper (the
             // same rules a shared service's probe obeys).
             validate_ready_probe(&svc.ready, &format!("step `{}`", step.id), &mut diagnostics);
+            validate_service_uid(svc, &format!("step `{}`", step.id), &mut diagnostics);
             // No probe + no port = nothing to gate on; still valid (the main
             // container simply starts immediately alongside the sidecar).
         }
@@ -6544,6 +6565,11 @@ fn validate_with(
                 svc.name
             ));
         }
+        validate_service_uid(
+            &svc.spec,
+            &format!("service `{}`", svc.name),
+            &mut diagnostics,
+        );
         validate_ready_probe(
             &svc.spec.ready,
             &format!("service `{}`", svc.name),
@@ -11946,6 +11972,39 @@ steps:
         compile(
             "steps: [{ id: push, image: x, command: [y], services: [{ image: postgres:16 }] }]",
         );
+    }
+
+    /// git-bug 1a20384: a service's `run_as_user: 0` is its `run_as_root`
+    /// request; naming both does not compile, for a sidecar or a shared
+    /// service.
+    #[test]
+    fn a_service_uid_follows_the_run_as_root_rule() {
+        let ir = compile(
+            "steps: [{ id: t, image: x, services: [{ image: postgres:16, run_as_user: 0 }] }]",
+        );
+        assert!(ir.steps[0].services[0].runs_as_root());
+        let ir = compile(
+            "steps: [{ id: t, image: x, services: [{ image: postgres:16, run_as_user: 999 }] }]",
+        );
+        assert!(!ir.steps[0].services[0].runs_as_root());
+        for uid in [0, 999] {
+            let errs = errors(&format!(
+                "steps: [{{ id: t, image: x, services: [{{ image: postgres:16, run_as_root: true, run_as_user: {uid} }}] }}]"
+            ));
+            assert!(
+                errs.iter().any(|e| e.starts_with("step `t`: ")
+                    && e.contains("`run_as_user` cannot be combined with its `run_as_root`")),
+                "{uid}: {errs:?}"
+            );
+            let errs = errors(&format!(
+                "services: [{{ name: db, image: postgres:16, run_as_root: true, run_as_user: {uid} }}]\nsteps: [{{ id: t, image: x, uses: [db] }}]"
+            ));
+            assert!(
+                errs.iter().any(|e| e.starts_with("service `db`: ")
+                    && e.contains("`run_as_user` cannot be combined with its `run_as_root`")),
+                "{uid}: {errs:?}"
+            );
+        }
     }
 
     #[test]

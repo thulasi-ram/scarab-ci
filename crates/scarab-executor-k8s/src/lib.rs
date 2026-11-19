@@ -6138,7 +6138,7 @@ fn service_sidecar(index: usize, svc: &scarab_pipeline::ServiceSpec) -> Containe
         // (fenced by inheritance, ADR-0058), dying with the Pod on every Attempt.
         restart_policy: Some("Always".to_string()),
         startup_probe: service_startup_probe(svc),
-        security_context: Some(service_security_context(svc.run_as_user, svc.run_as_root)),
+        security_context: Some(service_security_context(svc)),
         ..Default::default()
     }
 }
@@ -6195,7 +6195,12 @@ fn service_startup_probe(svc: &scarab_pipeline::ServiceSpec) -> Option<Probe> {
 /// out (root inside the caps-dropped, unprivileged, seccomp-confined sandbox does
 /// not escape it); governed `add-capabilities`/`privileged`, which are keyed on
 /// the *service* image digest, are not applied here (fail-closed — a later slice).
-fn service_security_context(run_as_user: Option<u32>, run_as_root: bool) -> SecurityContext {
+///
+/// `run_as_user: 0` is the same root request as `run_as_root`
+/// ([`ServiceSpec::runs_as_root`](scarab_pipeline::ServiceSpec::runs_as_root)),
+/// so a uid 0 never reaches the kubelet under `runAsNonRoot`.
+fn service_security_context(svc: &scarab_pipeline::ServiceSpec) -> SecurityContext {
+    let (run_as_user, run_as_root) = (svc.run_as_user, svc.runs_as_root());
     SecurityContext {
         run_as_non_root: Some(!run_as_root),
         // Root escape hatch pins uid 0; otherwise pin the author-supplied non-root
@@ -6234,7 +6239,7 @@ fn service_security_context(run_as_user: Option<u32>, run_as_root: bool) -> Secu
 /// contract (`WORKSPACE_GID`) and a sidecar mounts no volumes of its own
 /// (git-bug 908f534).
 fn service_pinned_gid(svc: &scarab_pipeline::ServiceSpec) -> Option<i64> {
-    (!svc.run_as_root)
+    (!svc.runs_as_root())
         .then_some(svc.run_as_user)
         .flatten()
         .map(|u| u as i64)
@@ -6338,7 +6343,7 @@ pub fn build_service_pod(
                 .collect()
         }),
         readiness_probe: service_startup_probe(svc),
-        security_context: Some(service_security_context(svc.run_as_user, svc.run_as_root)),
+        security_context: Some(service_security_context(svc)),
         ..Default::default()
     };
     let mut pod = Pod {
@@ -7979,7 +7984,7 @@ mod tests {
     #[test]
     fn k8s_overlay_applies_after_the_operator_layers() {
         let mut spec = busybox();
-        spec.k8s_overlay = Some(serde_json::json!({"spec":{"schedulerName":"mine"}}));
+        spec.k8s_overlay = Some(serde_json::json!({"spec":{"nodeSelector":{"gpu":"a100"}}}));
         let placement = PlacementConfig {
             baseline: Some(serde_json::json!({"spec":{"nodeSelector":{"pool":"ci"}}})),
             ..Default::default()
@@ -7988,8 +7993,9 @@ mod tests {
             .unwrap()
             .spec
             .unwrap();
-        assert_eq!(ps.scheduler_name.as_deref(), Some("mine"));
-        assert_eq!(ps.node_selector.unwrap()["pool"], "ci");
+        let selector = ps.node_selector.unwrap();
+        assert_eq!(selector["pool"], "ci");
+        assert_eq!(selector["gpu"], "a100");
     }
 
     // Attack (git-bug 5b6b5cf): the step's overlay rewrites what the
@@ -7997,13 +8003,13 @@ mod tests {
     #[test]
     fn k8s_overlay_may_not_override_the_baseline() {
         let mut spec = busybox();
-        spec.k8s_overlay = Some(serde_json::json!({"spec":{"schedulerName":"mine"}}));
+        spec.k8s_overlay = Some(serde_json::json!({"spec":{"nodeSelector":{"pool":"mine"}}}));
         let placement = PlacementConfig {
-            baseline: Some(serde_json::json!({"spec":{"schedulerName":"default-sched"}})),
+            baseline: Some(serde_json::json!({"spec":{"nodeSelector":{"pool":"ci"}}})),
             ..Default::default()
         };
         let err = apply_placement(pod_for(&spec), "s", &spec, &placement).unwrap_err();
-        assert!(err.contains("`spec.schedulerName`"), "got: {err}");
+        assert!(err.contains("`spec.nodeSelector.pool`"), "got: {err}");
         assert!(err.contains("k8s_overlay"), "got: {err}");
     }
 
@@ -8557,6 +8563,14 @@ mod tests {
                 "`spec.nodeName`",
             ),
             (
+                serde_json::json!({"spec":{"priorityClassName":"system-cluster-critical"}}),
+                "`spec.priorityClassName`",
+            ),
+            (
+                serde_json::json!({"spec":{"schedulerName":"mine"}}),
+                "`spec.schedulerName`",
+            ),
+            (
                 serde_json::json!({"spec":{"securityContext":{"runAsUser":0}}}),
                 "`spec.securityContext`",
             ),
@@ -8637,8 +8651,6 @@ mod tests {
                         {"key":"zone","operator":"In","values":["a"]}]}}]}},
                 "topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"zone",
                     "whenUnsatisfiable":"ScheduleAnyway"}],
-                "priorityClassName":"ci-low",
-                "schedulerName":"mine",
                 "volumes":[{"name":"scratch","emptyDir":{"sizeLimit":"1Gi"}}],
                 "containers":[{"name":"step",
                     "resources":{"limits":{"nvidia.com/gpu":"1"}},
@@ -8658,8 +8670,6 @@ mod tests {
         );
         let ps = pod.spec.unwrap();
         assert_eq!(ps.node_selector.as_ref().unwrap()["pool"], "gpu");
-        assert_eq!(ps.priority_class_name.as_deref(), Some("ci-low"));
-        assert_eq!(ps.scheduler_name.as_deref(), Some("mine"));
         assert!(ps.affinity.is_some());
         assert_eq!(ps.topology_spread_constraints.as_ref().unwrap().len(), 1);
         assert!(ps
@@ -9087,6 +9097,47 @@ mod tests {
         assert_eq!(sc.run_as_non_root, Some(false));
         assert_eq!(sc.run_as_user, Some(0));
         assert!(ps.security_context.is_none(), "root needs no fsGroup");
+    }
+
+    /// git-bug 1a20384: a service's `run_as_user: 0` is its root request, for
+    /// a shared service Pod and for a sidecar: no `runAsNonRoot`, uid 0, and
+    /// no gid 0 pinned, so it never reaches the kubelet as a non-root uid 0.
+    #[test]
+    fn a_service_run_as_user_zero_runs_as_root_not_under_run_as_non_root() {
+        use scarab_pipeline::ServiceSpec;
+        let zero = ServiceSpec {
+            image: "legacy:1".into(),
+            ports: vec![5432],
+            run_as_user: Some(0),
+            ..Default::default()
+        };
+        let pod = build_service_pod("run-1", "db", 1, "ns", &zero);
+        let ps = pod.spec.unwrap();
+        let sc = ps.containers[0].security_context.as_ref().unwrap();
+        assert_eq!(sc.run_as_non_root, Some(false));
+        assert_eq!(sc.run_as_user, Some(0));
+        assert_eq!(sc.run_as_group, None);
+        assert!(ps.security_context.is_none(), "root needs no fsGroup");
+
+        let mut spec = busybox();
+        spec.services = vec![zero];
+        let ps = pod_for(&spec).spec.unwrap();
+        let sidecar = ps
+            .init_containers
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|c| c.name.starts_with(SERVICE_CONTAINER_PREFIX))
+            .unwrap();
+        let sc = sidecar.security_context.as_ref().unwrap();
+        assert_eq!(sc.run_as_non_root, Some(false));
+        assert_eq!(sc.run_as_user, Some(0));
+        let groups = ps
+            .security_context
+            .as_ref()
+            .and_then(|p| p.supplemental_groups.clone())
+            .unwrap_or_default();
+        assert!(!groups.contains(&0), "{groups:?}");
     }
 
     // ADR-0058 (shared service): the standalone service Pod runs the service

@@ -44,10 +44,11 @@ release.yml uses that version's section as the GitHub Release text. See
   the server's Secret or another Run's per-Pod Secret by its name, run as the server's
   ServiceAccount, use the host's network, PID namespace or filesystem, run privileged, or point
   the sidecars at another address with `hostAliases` or `dnsConfig`. The overlay may now set the
-  placement fields (`nodeSelector`, `affinity`, `tolerations`, `topologySpreadConstraints`,
-  `priorityClassName`, `schedulerName`), labels and annotations outside the reserved keys, emptyDir
-  volumes, and the step container's `resources`, literal `env` and mounts of those volumes. Any
-  other field is refused when the Run is created, with its path in the error, and again before the
+  placement fields `nodeSelector`, `affinity`, `tolerations` and `topologySpreadConstraints`,
+  labels and annotations outside the reserved keys, emptyDir volumes, and the step container's
+  `resources`, literal `env` and mounts of those volumes. `priorityClassName` and `schedulerName`
+  are refused too: a high priority class preempts other workloads, and a custom scheduler can
+  ignore the operator's taints and affinity. Any other field is refused when the Run is created, with its path in the error, and again before the
   Pod is created. The overlay also may no longer change or remove what the placement baseline or a
   placement profile set, such as a baseline toleration or a profile's variable. **This can refuse
   an overlay that worked before.** Move such a setting into a placement profile in the operator's
@@ -124,7 +125,8 @@ release.yml uses that version's section as the GitHub Release text. See
   uid is self-service and still runs with `runAsNonRoot`. `run_as_user: 0` is the same request as
   `run_as_root: true`: it needs the same grant, and Policies see it as `run-as-root` in the step's
   `grants`. A step cannot set both, and `run_as_user` cannot be combined with `sandbox`. The
-  `run.create` Policy input has a new `step.run_as_user` field.
+  `run.create` Policy input has a new `step.run_as_user` field. A service's `run_as_user: 0` is
+  likewise its `run_as_root` request: it ran under `runAsNonRoot` and the kubelet refused it.
 
 ### Bug Fixes
 
