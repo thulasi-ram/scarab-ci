@@ -7,7 +7,7 @@ use scarab_policy::ir::{compile, Level, PolicyIr};
 use scarab_policy::policy::{Checkpoint, Policy};
 use scarab_policy::run_create::{
     schema, ForgeToken, Gate, GateKind, Org, Origin, OriginKind, Pipeline, Project, RunCreateInput,
-    Step, Trigger, TriggerKind, UpstreamGate,
+    SharedService, SidecarService, Step, Trigger, TriggerKind, UpstreamGate,
 };
 use scarab_policy::schema::{Capped, Schema, Timestamp, Type};
 
@@ -60,6 +60,7 @@ fn step(id: &str) -> Step {
         sandbox: None,
         registry_auth: None,
         run_as_user: None,
+        services: None,
         uses_environment_authority: false,
         origin: cap(vec![]),
         upstream_gates: cap(vec![]),
@@ -112,6 +113,7 @@ fn base() -> RunCreateInput {
             origin: cap(vec![]),
             dependents: strings(&["deploy/helm"]),
         }]),
+        services: None,
         principal: None,
         principal_id: None,
         time: at("2026-11-02T10:00:00Z"),
@@ -544,6 +546,86 @@ fn rule_message_is_static() {
             message: "Runs from forks are not allowed here.".to_string()
         }
     );
+}
+
+/// git-bug 328010f: the documented rule denying root services.
+const NO_ROOT_SERVICES: &str = r#"(services != null && services.exists(v, v.run_as_root))
+    || steps.exists(s, has(s.services) && s.services.exists(v, v.run_as_root))"#;
+
+fn sidecar(run_as_root: bool, run_as_user: Option<u64>) -> SidecarService {
+    SidecarService {
+        index: 0,
+        image: "postgres:16".to_string(),
+        digest: None,
+        grants: strings(if run_as_root { &["run-as-root"] } else { &[] }),
+        run_as_root,
+        run_as_user,
+    }
+}
+
+fn shared(run_as_root: bool, run_as_user: Option<u64>) -> SharedService {
+    SharedService {
+        name: "db".to_string(),
+        image: "postgres:16".to_string(),
+        digest: None,
+        grants: strings(if run_as_root { &["run-as-root"] } else { &[] }),
+        run_as_root,
+        run_as_user,
+    }
+}
+
+/// A Policy denying root services checks within the cost bound with no
+/// warning, and denies a root sidecar or a root shared service, not a
+/// non-root one.
+#[test]
+fn root_services_are_denied() {
+    let s = schema();
+    let checked = check(&s, NO_ROOT_SERVICES, &Type::Bool).expect("checks");
+    assert!(checked.cost <= MAX_COST, "{}", checked.cost);
+
+    let with_sidecar = |v: SidecarService| {
+        with_steps(vec![Step {
+            services: Some(cap(vec![v])),
+            ..step("test")
+        }])
+    };
+    let with_shared = |v: SharedService| RunCreateInput {
+        services: Some(cap(vec![v])),
+        ..base()
+    };
+    assert!(applies(&s, NO_ROOT_SERVICES, &with_sidecar(sidecar(true, Some(0)))));
+    assert!(applies(&s, NO_ROOT_SERVICES, &with_shared(shared(true, None))));
+    assert!(!applies(&s, NO_ROOT_SERVICES, &with_sidecar(sidecar(false, Some(999)))));
+    assert!(!applies(&s, NO_ROOT_SERVICES, &with_shared(shared(false, Some(999)))));
+    assert!(!applies(&s, NO_ROOT_SERVICES, &base()));
+}
+
+/// An input recorded before services were part of it has no `services` key
+/// on the Run or on any Step. It still binds to the schema, and the guarded
+/// rule passes rather than failing.
+#[test]
+fn an_input_recorded_before_services_still_evaluates() {
+    let s = schema();
+    let rule = compile_rule(&s, NO_ROOT_SERVICES, "denied").expect("checks");
+    let mut old = serde_json::to_value(base()).unwrap();
+    old.as_object_mut().unwrap().remove("services");
+    for step in old["steps"].as_array_mut().unwrap() {
+        step.as_object_mut().unwrap().remove("services");
+    }
+    assert!(old.get("services").is_none());
+    let ctx = MatchContext {
+        project: "payments-api".to_string(),
+        environment: Some("production".to_string()),
+        trigger_kind: TriggerKind::Push,
+    };
+    let d = evaluate(
+        Checkpoint::RunCreate,
+        scarab_policy::run_create::SCHEMA_VERSION,
+        &old,
+        &ctx,
+        std::slice::from_ref(&rule.ir),
+    );
+    assert_eq!(d.results[0].outcome, PolicyOutcome::Passed, "{d:?}");
 }
 
 // ---------------------------------------------------------------------------

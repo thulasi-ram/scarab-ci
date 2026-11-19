@@ -352,7 +352,9 @@ step does.
 `run_as_user: 0` is root: it is the same request as `run_as_root: true`, and a Policy sees it in
 the step's `grants` as `run-as-root`. `run_as_root: true` beside `run_as_user: 0` is the same
 request and compiles; `run_as_root: true` beside a non-zero `run_as_user` contradicts itself and
-does not compile. The same rule holds for a service's `run_as_user` and `run_as_root`. A uid is
+does not compile. The same rule holds for a service's `run_as_user` and `run_as_root`, and a
+Policy sees a root service too (see
+[Policies: rules over services](/scarab-ci/usage/policies/#rules-over-services)). A uid is
 not allowed beside `sandbox`, which sets the uid itself.
 
 Some steps are **kinds** with no image that the engine runs on your behalf (you set no `image`/`command`):

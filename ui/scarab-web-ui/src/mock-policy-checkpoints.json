@@ -286,6 +286,22 @@
        }
       },
       {
+       "doc": "The Run's shared services. Absent from inputs recorded before it existed, so a rule reads it as `services != null && services.exists(v, v.run_as_root)`.",
+       "max_len": 1024,
+       "name": "services",
+       "optional": true,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 32,
+         "elem": {
+          "kind": "struct",
+          "of": "SharedService"
+         }
+        }
+       }
+      },
+      {
        "doc": "The human or token creating the Run; absent for a webhook.",
        "max_len": 1024,
        "name": "principal",
@@ -305,6 +321,136 @@
       }
      ],
      "name": "RunCreateInput"
+    },
+    "SharedService": {
+     "fields": [
+      {
+       "doc": "The name Steps give in `uses:`.",
+       "max_len": 1024,
+       "name": "name",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "image",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "The digest the image is pinned to (after `@`), if any.",
+       "max_len": 1024,
+       "name": "digest",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "`run-as-root` when the service runs as uid 0, the same name a Step's `grants` uses.",
+       "max_len": 1024,
+       "name": "grants",
+       "optional": false,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 4,
+         "elem": {
+          "kind": "string"
+         }
+        }
+       }
+      },
+      {
+       "doc": "The service runs as uid 0: it sets `run_as_root: true` or `run_as_user: 0`.",
+       "max_len": 1024,
+       "name": "run_as_root",
+       "optional": false,
+       "ty": {
+        "kind": "bool"
+       }
+      },
+      {
+       "doc": "The uid the service names (`run_as_user`). Absent when it names none.",
+       "max_len": 1024,
+       "name": "run_as_user",
+       "optional": true,
+       "ty": {
+        "kind": "uint"
+       }
+      }
+     ],
+     "name": "SharedService"
+    },
+    "SidecarService": {
+     "fields": [
+      {
+       "doc": "Its position in the Step's `services` list, from 0.",
+       "max_len": 1024,
+       "name": "index",
+       "optional": false,
+       "ty": {
+        "kind": "uint"
+       }
+      },
+      {
+       "doc": "",
+       "max_len": 1024,
+       "name": "image",
+       "optional": false,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "The digest the image is pinned to (after `@`), if any.",
+       "max_len": 1024,
+       "name": "digest",
+       "optional": true,
+       "ty": {
+        "kind": "string"
+       }
+      },
+      {
+       "doc": "`run-as-root` when the service runs as uid 0, the same name a Step's `grants` uses.",
+       "max_len": 1024,
+       "name": "grants",
+       "optional": false,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 4,
+         "elem": {
+          "kind": "string"
+         }
+        }
+       }
+      },
+      {
+       "doc": "The service runs as uid 0: it sets `run_as_root: true` or `run_as_user: 0`.",
+       "max_len": 1024,
+       "name": "run_as_root",
+       "optional": false,
+       "ty": {
+        "kind": "bool"
+       }
+      },
+      {
+       "doc": "The uid the service names (`run_as_user`). Absent when it names none.",
+       "max_len": 1024,
+       "name": "run_as_user",
+       "optional": true,
+       "ty": {
+        "kind": "uint"
+       }
+      }
+     ],
+     "name": "SidecarService"
     },
     "Step": {
      "fields": [
@@ -336,7 +482,7 @@
        }
       },
       {
-       "doc": "",
+       "doc": "What the Step's Pod asks for above the baseline: `run-as-root` when the Step or one of its sidecar `services` runs as uid 0, `privileged`, and `add-capabilities:<CAP>` for each capability.",
        "max_len": 1024,
        "name": "grants",
        "optional": false,
@@ -448,6 +594,22 @@
        "optional": true,
        "ty": {
         "kind": "uint"
+       }
+      },
+      {
+       "doc": "The Step's sidecar services. Absent from inputs recorded before it existed, so a rule reads it as `has(step.services) && step.services.exists(v, v.run_as_root)`.",
+       "max_len": 1024,
+       "name": "services",
+       "optional": true,
+       "ty": {
+        "kind": "list",
+        "of": {
+         "cap": 8,
+         "elem": {
+          "kind": "struct",
+          "of": "SidecarService"
+         }
+        }
        }
       },
       {
@@ -657,6 +819,22 @@
        "elem": {
         "kind": "struct",
         "of": "Gate"
+       }
+      }
+     }
+    },
+    {
+     "doc": "The Run's shared services. Absent from inputs recorded before it existed, so a rule reads it as `services != null && services.exists(v, v.run_as_root)`.",
+     "max_len": 1024,
+     "name": "services",
+     "optional": true,
+     "ty": {
+      "kind": "list",
+      "of": {
+       "cap": 32,
+       "elem": {
+        "kind": "struct",
+        "of": "SharedService"
        }
       }
      }

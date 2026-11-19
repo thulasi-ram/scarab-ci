@@ -136,6 +136,17 @@ release.yml uses that version's section as the GitHub Release text. See
 - **The build library's push step no longer runs as root** (git-bug 1a20384). It sets
   `security: { run_as_user: 1000 }` in place of `run_as_root: true`, so its Policy input no longer
   lists the `run-as-root` grant and an org Policy that denies root no longer refuses every build.
+- **A `run.create` Policy sees services** (git-bug 328010f). The Policy input listed no service,
+  so a Policy that denies root saw a step's `run_as_root` but not a service's, and a Run with a
+  root service passed it. Each step now lists its sidecar services under `services`, and the Run's
+  shared services are in a top-level `services`, each with `image`, `digest`, `run_as_root`,
+  `run_as_user` and `grants`. `run_as_root` is true for `run_as_root: true` and for
+  `run_as_user: 0`. A root sidecar also puts `run-as-root` in its step's `grants`, so a Policy
+  written against step grants now refuses it; a root shared service belongs to no step, and a rule
+  reads the top-level `services` to see it. Decisions recorded before have neither field. A step
+  may have at most 8 sidecar services and a Run at most 32 shared services while a `run.create`
+  Policy applies. See
+  [Policies: rules over services](https://thulasi-ram.github.io/scarab-ci/usage/policies/#rules-over-services).
 
 ### Enhancement
 
@@ -190,7 +201,7 @@ release.yml uses that version's section as the GitHub Release text. See
   not. `run_as_user` cannot be combined with `sandbox`. The `run.create` Policy input has a new
   `step.run_as_user` field. A service's `run_as_user: 0` is likewise its `run_as_root` request: it
   ran under `runAsNonRoot` and the kubelet refused it. Running a service as root stays
-  self-service, and the Policy input does not list it. See
+  self-service; the Security entry on services in the Policy input says what a Policy sees. See
   [Steps: the step shape](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#steps-the-step-shape).
 
 ### Bug Fixes
