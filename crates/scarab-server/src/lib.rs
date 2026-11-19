@@ -15217,7 +15217,7 @@ mod grant_admission_tests {
 
     #[test]
     fn k8s_overlay_admitted_when_environment_permits() {
-        let overlay = serde_json::json!({"spec": {"schedulerName": "x"}});
+        let overlay = serde_json::json!({"spec": {"nodeSelector": {"pool": "ci"}}});
         let g = Some(grant(vec![], true));
         assert_eq!(
             admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false).unwrap(),

@@ -1205,7 +1205,8 @@ profile for anything static.
   image: builder
   k8s_overlay:
     spec:
-      schedulerName: my-scheduler
+      nodeSelector:
+        gpu: a100
 ```
 
 Whoever edits the Pipeline file writes the overlay, so even where raw overlays are permitted it may
@@ -1220,8 +1221,6 @@ its path. The executor checks the same list again before it creates the Pod.
 | `spec.affinity` | Picks nodes and neighbouring Pods for placement. |
 | `spec.tolerations` | Lets the Pod onto a tainted node pool. A toleration without a `key`, or of a `node-role.kubernetes.io/` taint, is refused: it would let the Pod onto the control-plane nodes. |
 | `spec.topologySpreadConstraints` | Spreads step Pods over zones or nodes. |
-| `spec.priorityClassName` | Picks one of the PriorityClasses the cluster's operator created. |
-| `spec.schedulerName` | Picks a scheduler the cluster runs. |
 | `spec.volumes[]` with `name` and `emptyDir` only | Scratch space that starts empty and holds no credential. |
 | `spec.containers[]` entry `step`: `resources.requests`, `resources.limits` | CPU, memory or an extended resource such as a GPU. |
 | `spec.containers[]` entry `step`: `env[]` with `name` and `value` | A literal value. `valueFrom` and `envFrom` can read a Secret. |
@@ -1230,14 +1229,15 @@ its path. The executor checks the same list again before it creates the Pod.
 Everything else is refused. That includes any Secret reference (a `secret` or `projected` volume,
 `secretKeyRef`, `envFrom`, `imagePullSecrets`), `serviceAccountName`, `serviceAccount` and
 `automountServiceAccountToken`, `hostNetwork`, `hostPID`, `hostIPC`, `hostPath` volumes,
-`hostAliases` and `dnsConfig`, `nodeName`, any `securityContext`, the step container's `image` and
-`command`, and containers of its own (`initContainers`, `ephemeralContainers`, or a `containers`
-entry other than `step`).
+`hostAliases` and `dnsConfig`, `nodeName`, `priorityClassName` (a high class preempts other
+workloads), `schedulerName` (a custom scheduler can ignore the operator's taints and affinity), any
+`securityContext`, the step container's `image` and `command`, and containers of its own
+(`initContainers`, `ephemeralContainers`, or a `containers` entry other than `step`).
 
 The overlay may add to the Pod, but it may not change or remove anything Scarab, the placement
 baseline or a placement profile put there. It can add a toleration or a `nodeSelector` key; it
 cannot remove the baseline's toleration, change a profile's `HTTP_PROXY`, override the baseline's
-`schedulerName`, or add a second node affinity term. Set the step container's CPU and memory with
+`nodeSelector` value, or add a second node affinity term. Set the step container's CPU and memory with
 `resources:`; when that or the operator's default already set `requests.cpu`, the overlay cannot
 change it.
 

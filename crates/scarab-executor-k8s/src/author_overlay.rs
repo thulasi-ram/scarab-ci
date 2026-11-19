@@ -52,14 +52,6 @@ pub const AUTHOR_OVERLAY_FIELDS: &[(&str, &str)] = &[
         "spec.topologySpreadConstraints",
         "spreads step Pods over zones or nodes",
     ),
-    (
-        "spec.priorityClassName",
-        "picks one of the PriorityClasses the cluster's operator created",
-    ),
-    (
-        "spec.schedulerName",
-        "picks a scheduler the cluster runs; it decides placement only",
-    ),
     ("spec.volumes[].name", "names a volume the overlay adds"),
     (
         "spec.volumes[].emptyDir",
@@ -115,6 +107,11 @@ const RESERVED_ANNOTATION_PREFIXES: [&str; 3] = [
     "seccomp.security.alpha.kubernetes.io/",
     "container.seccomp.security.alpha.kubernetes.io/",
 ];
+
+// Not listed, though they look like placement: `priorityClassName` (a high
+// class preempts other workloads on a shared cluster) and `schedulerName` (a
+// custom scheduler can bind the Pod ignoring the operator's taints and
+// affinity). An operator sets them in a placement profile.
 
 /// Taint key prefixes an author's overlay may not tolerate: the control-plane
 /// nodes' taints.
