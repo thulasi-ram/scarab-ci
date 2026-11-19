@@ -149,8 +149,8 @@ impl From<TrustGrant> for TrustGrantDto {
 
 /// A library source the org trusts with one grant (ADR-0076 §9, ADR-0018
 /// amendment of 2026-11-12). Trust holds across upgrades from the same
-/// source; an install that would carry a credential grant to a new version
-/// names it in `carry_grants`.
+/// source; an install that would carry a grant to a new version names it in
+/// `carry_grants`.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TrustedSourceDto {
     /// `<host>/<owner>/<repo>//<path>`, without a commit.
@@ -270,11 +270,11 @@ pub struct FetchedLibraryDto {
     /// The change from `current`, one line per entry, each starting with
     /// `+`, `-` or a space. Empty when nothing is installed.
     pub diff: String,
-    /// The credential grants (`forge_credentials`, `registry_credential`)
-    /// the org trusts this version's source with. Trust is kept per source,
-    /// not per commit, so installing this version gives it these grants:
-    /// the install must name them, exactly, in `carry_grants`. Empty when
-    /// the source holds none.
+    /// The grants (`forge_credentials`, `registry_credential`,
+    /// `build_sandbox`) the org trusts this version's source with. Trust is
+    /// kept per source, not per commit, so installing this version gives it
+    /// these grants: the install must name them, exactly, in
+    /// `carry_grants`. Empty when the source holds none.
     pub carried_grants: Vec<TrustGrantDto>,
 }
 
@@ -288,7 +288,7 @@ pub struct InstallLibraryRequest {
     /// The hash installed now (an upgrade), or omitted for a first install.
     #[serde(default)]
     pub replaces: Option<String>,
-    /// The credential grants the version's source holds, which the version
+    /// The grants the version's source holds, which the version
     /// gets once installed: exactly the fetch's `carried_grants`, in any
     /// order. Required when the source holds any; a list that differs from
     /// what the source holds now is refused with the grants named. Empty or
@@ -864,18 +864,10 @@ fn trusted_dto(t: &TrustedSource) -> TrustedSourceDto {
     }
 }
 
-/// Whether `grant` hands a Step a credential. The build sandbox does not.
-fn is_credential_grant(grant: TrustGrant) -> bool {
-    matches!(
-        grant,
-        TrustGrant::ForgeCredentials | TrustGrant::RegistryCredential
-    )
-}
-
-/// The credential grants `org` trusts `source`'s trust key with: what a
-/// version from `source` receives once installed. Trust is kept per source,
-/// not per commit, so an upgrade carries these to code nobody trusted by
-/// name; the install names them in `carry_grants` to confirm it (8c62098).
+/// The grants `org` trusts `source`'s trust key with: what a version from
+/// `source` receives once installed. Trust is kept per source, not per
+/// commit, so an upgrade carries these to code nobody trusted by name; the
+/// install names them in `carry_grants` to confirm it (8c62098).
 async fn carried_grants(
     store: &dyn LibraryStore,
     org: &str,
@@ -887,7 +879,7 @@ async fn carried_grants(
         .await
         .map_err(store_api_error)?
         .into_iter()
-        .filter(|t| t.source == key && is_credential_grant(t.grant))
+        .filter(|t| t.source == key)
         .map(|t| t.grant)
         .collect())
 }
@@ -900,8 +892,8 @@ fn grant_names(grants: &BTreeSet<TrustGrant>) -> String {
         .join(", ")
 }
 
-/// Why `acked` (an install's `carry_grants`) is not `carried`, the
-/// credential grants `source` holds; `None` when they are the same set.
+/// Why `acked` (an install's `carry_grants`) is not `carried`, the grants
+/// `source` holds; `None` when they are the same set.
 fn carry_refusal(
     source: &str,
     carried: &BTreeSet<TrustGrant>,
@@ -918,7 +910,7 @@ fn carry_refusal(
         .join(", ");
     Some(if carried.is_empty() {
         format!(
-            "`carry_grants` names {}, but the org trusts `{key}` with no credential; \
+            "`carry_grants` names {}, but the org trusts `{key}` with no grant; \
              leave `carry_grants` out",
             grant_names(acked)
         )
@@ -1178,7 +1170,7 @@ pub(crate) async fn fetch_library(
 /// Install or upgrade `lib:<name>` to a fetched version. Needs a step-up:
 /// installing and upgrading loosen (ADR-0076 §4). `replaces` must be the
 /// hash installed now, or omitted when nothing is. When the org trusts the
-/// version's source with a credential, `carry_grants` must name exactly
+/// version's source with any grant, `carry_grants` must name exactly
 /// those grants: trust is kept per source, so the new version gets them, and
 /// the admin says so. The `op.completed` event names the grants carried.
 /// Administer on the org.
@@ -1190,7 +1182,7 @@ pub(crate) async fn fetch_library(
     summary = "Install or upgrade a library (ADR-0076 §4)",
     responses(
         (status = 200, body = LibraryInstallationDto),
-        (status = 400, description = "a bad name or hash, a version not fetched into this org, one that no longer compiles here, or `carry_grants` that are not the credential grants the source holds"),
+        (status = 400, description = "a bad name or hash, a version not fetched into this org, one that no longer compiles here, or `carry_grants` that are not the grants the source holds"),
         (status = 403, description = "not an org admin, or no step-up"),
         (status = 404, description = "libraries not configured"),
         (status = 409, description = "`replaces` is not what is installed now")
@@ -1254,7 +1246,7 @@ pub(crate) async fn install_library(
             library = %installed.name,
             source = %version.source,
             grants = %carried_names.join(","),
-            "library version installed with the credential grants its source holds"
+            "library version installed with the grants its source holds"
         );
     }
     let yanks = store.yanks(&org).await.map_err(store_api_error)?;

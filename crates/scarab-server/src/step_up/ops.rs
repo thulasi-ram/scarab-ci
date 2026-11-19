@@ -386,9 +386,9 @@ fn short_hash(h: &str) -> String {
 
 /// `library.install`: the library by its Pipeline name and the org,
 /// `lib:acme::scarab-libs::deploy-helm in acme`, and the version change first
-/// (`version = 5d1e0c7a9b3f → 0c4e7b2a91f5`), then the credential grants the
-/// new version gets from its source's trust when `carry_grants` names any
-/// (`credential grants carried to this version = forge_credentials`), then
+/// (`version = 5d1e0c7a9b3f → 0c4e7b2a91f5`), then the grants the new version
+/// gets from its source's trust when `carry_grants` names any
+/// (`grants carried to this version = forge_credentials`), then
 /// the full hashes.
 pub fn describe_library_install(op: &Op, input: &OpInput) -> OpSummary {
     let generic = describe_generic(op, input);
@@ -412,7 +412,7 @@ pub fn describe_library_install(op: &Op, input: &OpInput) -> OpSummary {
                 })
                 .collect();
             changes.push(escape_invisible(&format!(
-                "credential grants carried to this version = {}",
+                "grants carried to this version = {}",
                 names.join(", ")
             )));
         }
@@ -1704,23 +1704,23 @@ mod tests {
         );
 
         assert!(
-            !s.changes.iter().any(|c| c.starts_with("credential grants")),
+            !s.changes.iter().any(|c| c.starts_with("grants carried")),
             "{:?}",
             s.changes
         );
 
-        // An upgrade that carries a credential grant to the new version
+        // An upgrade that carries a grant to the new version
         // says so right after the version change.
         i.body = json!({
             "name": name,
             "content_hash": new,
             "replaces": old,
-            "carry_grants": ["forge_credentials", "registry_credential"]
+            "carry_grants": ["build_sandbox", "forge_credentials", "registry_credential"]
         });
         let s = LIBRARY_INSTALL.summary(&i);
         assert_eq!(
             s.changes[1],
-            "credential grants carried to this version = forge_credentials, registry_credential"
+            "grants carried to this version = build_sandbox, forge_credentials, registry_credential"
         );
 
         i.body = json!({ "name": name, "content_hash": new });

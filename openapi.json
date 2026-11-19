@@ -3121,7 +3121,7 @@
             }
           },
           "400": {
-            "description": "a bad name or hash, a version not fetched into this org, one that no longer compiles here, or `carry_grants` that are not the credential grants the source holds"
+            "description": "a bad name or hash, a version not fetched into this org, one that no longer compiles here, or `carry_grants` that are not the grants the source holds"
           },
           "403": {
             "description": "not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
@@ -11113,7 +11113,7 @@
             "items": {
               "$ref": "#/components/schemas/TrustGrantDto"
             },
-            "description": "The credential grants (`forge_credentials`, `registry_credential`)\nthe org trusts this version's source with. Trust is kept per source,\nnot per commit, so installing this version gives it these grants:\nthe install must name them, exactly, in `carry_grants`. Empty when\nthe source holds none."
+            "description": "The grants (`forge_credentials`, `registry_credential`,\n`build_sandbox`) the org trusts this version's source with. Trust is\nkept per source, not per commit, so installing this version gives it\nthese grants: the install must name them, exactly, in\n`carry_grants`. Empty when the source holds none."
           },
           "content": {
             "type": "string"
@@ -11530,7 +11530,7 @@
             "items": {
               "$ref": "#/components/schemas/TrustGrantDto"
             },
-            "description": "The credential grants the version's source holds, which the version\ngets once installed: exactly the fetch's `carried_grants`, in any\norder. Required when the source holds any; a list that differs from\nwhat the source holds now is refused with the grants named. Empty or\nomitted when the source holds none."
+            "description": "The grants the version's source holds, which the version\ngets once installed: exactly the fetch's `carried_grants`, in any\norder. Required when the source holds any; a list that differs from\nwhat the source holds now is refused with the grants named. Empty or\nomitted when the source holds none."
           },
           "content_hash": {
             "type": "string",
@@ -15927,7 +15927,7 @@
       },
       "TrustedSourceDto": {
         "type": "object",
-        "description": "A library source the org trusts with one grant (ADR-0076 §9, ADR-0018\namendment of 2026-11-12). Trust holds across upgrades from the same\nsource; an install that would carry a credential grant to a new version\nnames it in `carry_grants`.",
+        "description": "A library source the org trusts with one grant (ADR-0076 §9, ADR-0018\namendment of 2026-11-12). Trust holds across upgrades from the same\nsource; an install that would carry a grant to a new version names it in\n`carry_grants`.",
         "required": [
           "source",
           "grant",

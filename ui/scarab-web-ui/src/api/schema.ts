@@ -3727,11 +3727,11 @@ export interface components {
         };
         FetchedLibraryDto: {
             /**
-             * @description The credential grants (`forge_credentials`, `registry_credential`)
-             *     the org trusts this version's source with. Trust is kept per source,
-             *     not per commit, so installing this version gives it these grants:
-             *     the install must name them, exactly, in `carry_grants`. Empty when
-             *     the source holds none.
+             * @description The grants (`forge_credentials`, `registry_credential`,
+             *     `build_sandbox`) the org trusts this version's source with. Trust is
+             *     kept per source, not per commit, so installing this version gives it
+             *     these grants: the install must name them, exactly, in
+             *     `carry_grants`. Empty when the source holds none.
              */
             carried_grants: components["schemas"]["TrustGrantDto"][];
             content: string;
@@ -3929,7 +3929,7 @@ export interface components {
         };
         InstallLibraryRequest: {
             /**
-             * @description The credential grants the version's source holds, which the version
+             * @description The grants the version's source holds, which the version
              *     gets once installed: exactly the fetch's `carried_grants`, in any
              *     order. Required when the source holds any; a list that differs from
              *     what the source holds now is refused with the grants named. Empty or
@@ -6217,8 +6217,8 @@ export interface components {
         /**
          * @description A library source the org trusts with one grant (ADR-0076 §9, ADR-0018
          *     amendment of 2026-11-12). Trust holds across upgrades from the same
-         *     source; an install that would carry a credential grant to a new version
-         *     names it in `carry_grants`.
+         *     source; an install that would carry a grant to a new version names it in
+         *     `carry_grants`.
          */
         TrustedSourceDto: {
             /** @description What the trust grants. */
@@ -8895,7 +8895,7 @@ export interface operations {
                     "application/json": components["schemas"]["LibraryInstallationDto"];
                 };
             };
-            /** @description a bad name or hash, a version not fetched into this org, one that no longer compiles here, or `carry_grants` that are not the credential grants the source holds */
+            /** @description a bad name or hash, a version not fetched into this org, one that no longer compiles here, or `carry_grants` that are not the grants the source holds */
             400: {
                 headers: {
                     [name: string]: unknown;
