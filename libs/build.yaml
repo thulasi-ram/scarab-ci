@@ -34,7 +34,12 @@
 #                BuildKit reported to the build Step (passed through the build
 #                Step's `image` result), and it removes the layout from its
 #                own workspace, so a Step that
-#                needs only the invoke does not receive it. A Step that reads
+#                needs only the invoke does not receive it. This check finds
+#                a stale, half-written or swapped layout. It does not find a
+#                build that rewrites its own result too: a process a
+#                Dockerfile RUN left behind can reach
+#                /scarab/results/image.json as it reaches the layout, and the
+#                Dockerfile's author chooses the image's content anyway. A Step that reads
 #                `outputs.image.image` needs the build Step too and receives
 #                the layout through the build Step's workspace: read
 #                `outputs.image.push.digest` instead, or limit what it
@@ -50,7 +55,9 @@
 #                               image built. When Scarab collects results, the
 #                               push Step pushes only a layout whose manifest
 #                               has that digest, and fails (exit 2) on any
-#                               other, so the two digests match.
+#                               other, so the two digests match. When it does
+#                               not, the push Step pushes without the check
+#                               and logs a line starting `scarab: warning:`.
 #
 # A fork pull request, or a Run locked out of its Environment's secrets, gets
 # no registry credential, and Scarab tells both Steps so with
@@ -384,14 +391,34 @@ steps:
         odd=$(find "$layout" ! -type f ! -type d | head -n 1)
         [ -z "$odd" ] ||
           fail "the image layout holds $odd, which is not a regular file or a directory"
-        # The layout must hold the image the build Step built: a process a
-        # Dockerfile RUN left behind could rewrite it after BuildKit wrote it.
-        # Its index.json must name one manifest, that manifest's file must
-        # hash to its name, and, when Scarab collects results
-        # (/scarab/results exists), its digest must be the one BuildKit
-        # reported (the build Step's `image` result).
-        [ -f "$layout/index.json" ] || fail "the image layout has no index.json"
-        found=$(grep -o '"digest" *: *"sha256:[0-9a-f]\{64\}"' "$layout/index.json") || found=
+        # The layout must hold the image the build Step built, not a stale,
+        # half-written or swapped one. Its index.json must name one
+        # manifest, that manifest's file must hash to its name, and, when
+        # Scarab collects results (/scarab/results exists), its digest must
+        # be the one BuildKit reported (the build Step's `image` result).
+        # This does not cover a build that rewrites that result too: a
+        # process a Dockerfile RUN left behind can reach the result file as
+        # it reaches the layout.
+        #
+        # grep reads index.json here; crane would read it with Go's JSON
+        # decoder, which matches keys in any case and decodes \u escapes.
+        # So index.json is refused when it holds a backslash, a byte that is
+        # not printable ASCII or a line break, or the word "digest", in any
+        # case, other than once. crane then reads an index.json written
+        # below, not this one.
+        index=$layout/index.json
+        [ -f "$index" ] || fail "the image layout has no index.json"
+        n=$(LC_ALL=C tr -d '\11\12\15\40-\176' < "$index" | wc -c) ||
+          fail "cannot read the image layout's index.json"
+        [ $((n)) -eq 0 ] ||
+          fail "the image layout's index.json holds a byte that is not printable ASCII"
+        if grep -q '\\' "$index"; then
+          fail "the image layout's index.json holds a backslash"
+        fi
+        n=$(LC_ALL=C tr 'A-Z' 'a-z' < "$index" | grep -o digest | grep -c .) || n=0
+        [ "$n" -eq 1 ] ||
+          fail "the image layout's index.json does not name exactly one image"
+        found=$(grep -o '"digest" *: *"sha256:[0-9a-f]\{64\}"' "$index") || found=
         case "$found" in
           "" | *"$nl"*) fail "the image layout's index.json does not name exactly one image" ;;
         esac
@@ -409,8 +436,16 @@ steps:
         elif [ -d /scarab/results ]; then
           fail "the build step reported no image digest (its image result has no containerimage.digest)"
         else
-          echo "scarab: results are not collected, so the layout is not checked against the build step's digest" >&2
+          echo "scarab: warning: results are not collected, so the layout is not checked against the build step's digest" >&2
         fi
+        # crane pushes the manifest index.json names. It reads an index.json
+        # written here, naming only the manifest checked above, by its digest
+        # and size; BuildKit's oci exporter writes OCI media types. The
+        # config and layers are the ones that manifest names, by digest.
+        size=$(wc -c < "$blob") || fail "cannot read the manifest $built"
+        { printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","size":%d}]}\n' "$built" "$((size))" > "$index.scarab" &&
+          mv -f "$index.scarab" "$index"; } ||
+          fail "cannot write the image layout's index.json"
         # crane's --insecure also skips TLS verification, so a registry
         # login (the credential mount, or a profile's /ecr-login) would go
         # to whoever answers at the image's host.

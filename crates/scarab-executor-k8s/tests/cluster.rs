@@ -1883,6 +1883,16 @@ fn build_library_step_run(run: &str, id: &str, needs: Vec<StepId>) -> StepRun {
 /// scheduler renders it at launch (no results of its needs), with the
 /// workspace `inputs`.
 fn build_library_spec(ir: &scarab_pipeline::PipelineIr, id: &str, inputs: Vec<String>) -> StepSpec {
+    build_library_spec_with(ir, id, inputs, &Default::default())
+}
+
+/// [`build_library_spec`], rendered with `results` as its needs' results.
+fn build_library_spec_with(
+    ir: &scarab_pipeline::PipelineIr,
+    id: &str,
+    inputs: Vec<String>,
+    results: &scarab_pipeline::Results,
+) -> StepSpec {
     let s = ir
         .steps
         .iter()
@@ -1899,7 +1909,7 @@ fn build_library_spec(ir: &scarab_pipeline::PipelineIr, id: &str, inputs: Vec<St
         scarab_pipeline::Facts::Launch {
             params: &Default::default(),
             declared: &[],
-            results: &Default::default(),
+            results,
             event: &Default::default(),
         },
     )
@@ -1961,24 +1971,53 @@ fn build_library_spec(ir: &scarab_pipeline::PipelineIr, id: &str, inputs: Vec<St
 /// from a CAS-materialized workspace, as an OCI layout into its workspace;
 /// the push Step reads that workspace and pushes the layout with crane to a
 /// local in-cluster registry; a verification step then reads the
-/// registry's tag list. Needs a registry Service in the cluster (SCARAB_TEST_REGISTRY, e.g.
+/// registry's tag list. Results are collected (the real results sidecar,
+/// posting to a stub listener on the host), so the build Step's `image`
+/// result is BuildKit's own metadata file, and the push Step is rendered
+/// with it: its digest check meets a real BuildKit layout and a real
+/// `containerimage.digest` (git-bug 23a29ab). The same push rendered with
+/// another digest is refused (exit 2). Needs a registry Service in the cluster (SCARAB_TEST_REGISTRY, e.g.
 /// `registry.default.svc.cluster.local:5000`, plain HTTP, hence the
-/// library's `insecure_push` input). `#[ignore]`d + SCARAB_TEST_KUBE gated.
+/// library's `insecure_push` input), SCARAB_TEST_SIDECAR_IMAGE and
+/// SCARAB_TEST_HOST_IP. `#[ignore]`d + SCARAB_TEST_KUBE gated.
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn the_build_library_builds_and_pushes_to_a_local_registry() {
     let ns = enter_tier();
     let registry = tier_var("SCARAB_TEST_REGISTRY");
+    let sidecar_image = tier_var("SCARAB_TEST_SIDECAR_IMAGE");
+    let host_ip = tier_var("SCARAB_TEST_HOST_IP");
     // The build step inherits its context as a workspace input, so the fetcher
     // provisions it (ADR-0061 s3-feed).
     let ws = workspace_fixture();
     let run_id = unique_run("run-build");
 
+    // A stub results API: records the body of every POST the results
+    // sidecars make, whatever the path.
+    let received: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+    let rec = received.clone();
+    let app =
+        axum::Router::new().fallback(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let rec = rec.clone();
+            async move {
+                rec.lock().await.push(body);
+                axum::http::StatusCode::ACCEPTED
+            }
+        });
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
     let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(ws.cas.clone())
         .with_workspace_depot(ws.depot.clone())
-        .with_workspace_service(ws.fetch.clone());
+        .with_workspace_service(ws.fetch.clone())
+        .with_results_egress(scarab_executor_k8s::ResultsEgress {
+            base_url: format!("http://{host_ip}:{port}"),
+            token_secret: b"live-build-results-secret".to_vec(),
+            sidecar_image,
+        });
 
     // The build context: a trivial Dockerfile, ingested as the upstream
     // (checkout) workspace — through the SERVICE, so the fetcher can read it
@@ -2020,14 +2059,80 @@ async fn the_build_library_builds_and_pushes_to_a_local_registry() {
         .await
         .expect("output")
         .expect("the build Step published its workspace");
+    // The build Step's `image` result: what buildctl wrote with
+    // --metadata-file.
+    let mut metadata = None;
+    for _ in 0..60 {
+        metadata = received
+            .lock()
+            .await
+            .iter()
+            .find_map(|body| body.get("image").cloned());
+        if metadata.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let metadata = metadata.expect("the build Step published its image result");
+    let digest = metadata["containerimage.digest"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no containerimage.digest in {metadata}"))
+        .to_string();
+    assert!(digest.starts_with("sha256:"), "{digest}");
+    let reported = |image: serde_json::Value| -> scarab_pipeline::Results {
+        std::collections::BTreeMap::from([(
+            "image/image".to_string(),
+            std::collections::BTreeMap::from([("image".to_string(), image)]),
+        )])
+    };
+    let push_spec = |image: serde_json::Value| {
+        let spec = build_library_spec_with(&ir, "push", vec![built.clone()], &reported(image));
+        assert!(
+            spec.env.iter().any(|(k, _)| k == "SCARAB_BUILD_DIGEST"),
+            "{:?}",
+            spec.env
+        );
+        spec
+    };
+    let real = push_spec(metadata.clone());
+    assert!(
+        real.env
+            .iter()
+            .any(|(k, v)| k == "SCARAB_BUILD_DIGEST" && *v == digest),
+        "{:?}",
+        real.env
+    );
 
     let push = step_run("push", vec![StepId("image/image".into())]);
-    let ph = exec
-        .launch(&push, &spec("push", vec![built]))
-        .await
-        .expect("launch push");
+    let ph = exec.launch(&push, &real).await.expect("launch push");
     let terminal = poll_to_terminal(&exec, &ph, 300).await;
-    assert_eq!(terminal, Some(ExecState::Succeeded), "push step succeeds");
+    assert_eq!(
+        terminal,
+        Some(ExecState::Succeeded),
+        "push step succeeds: BuildKit's layout holds the digest BuildKit reported"
+    );
+
+    // The same layout, with the build Step said to have built another
+    // image: refused before crane runs.
+    let mut other = metadata.clone();
+    other["containerimage.digest"] =
+        serde_json::Value::String(format!("sha256:{}", "0".repeat(64)));
+    let wrong = StepRun {
+        run: RunId(unique_run("run-build-wrong")),
+        ..push.clone()
+    };
+    let wh = exec
+        .launch(&wrong, &push_spec(other))
+        .await
+        .expect("launch push with another digest");
+    match poll_to_terminal(&exec, &wh, 300).await {
+        Some(ExecState::Failed { exit_code, .. }) => assert_eq!(
+            exit_code,
+            Some(2),
+            "a digest other than the layout's is refused (exit 2)"
+        ),
+        other => panic!("push with another digest: expected Failed(2), got {other:?}"),
+    }
 
     // The push is observable: a verification step reads the registry's tag
     // list from inside the cluster.
@@ -2093,6 +2198,9 @@ async fn the_build_library_builds_and_pushes_to_a_local_registry() {
     );
 
     exec.cancel(&vh).await.expect("cleanup verify");
+    exec.cancel(&wh)
+        .await
+        .expect("cleanup push with another digest");
     exec.cancel(&ph).await.expect("cleanup push");
     exec.cancel(&h).await.expect("cleanup build");
 }
