@@ -1,10 +1,13 @@
 // Pure helpers behind the Run page's run tabs (Artifacts, Activity) and the
 // step pane's try tabs: which activity a filter shows and how much it hides,
-// which artifact copies a filter shows and how they group by step, how the try
-// tabs fold the older tries into a menu, and the tries the List view nests
-// under a step. No DOM, so the vitest suite covers them (run-tabs.test.ts).
+// which artifact copies a filter shows and how they group by step, the try
+// tabs' order, and the tries the List view nests under a step. No DOM, so the vitest suite covers them (run-tabs.test.ts).
 import type { RunEvent } from "./api/client";
-import { failureWords, statusWord } from "./run-page";
+import { aboutDuration, failureWords, statusWord, stepDisplayName } from "./run-page";
+import { attemptCauses, attemptPlaces, type AttemptCause } from "./takes";
+import { causeText } from "./attempts";
+import { eventParts, infraReasonText, NODE_WAIT_REASONS } from "./events";
+import { duration } from "./fmt";
 
 // ── Activity ────────────────────────────────────────────────────────────────
 
@@ -52,9 +55,40 @@ export function activityClass(
 const inFilter = (c: ActivityClass, f: ActivityFilter): boolean =>
   f === "all" ? true : f === "infra" ? c !== "step" : c !== "cleared";
 
+/**
+ * The step transitions that repeat what the try before them said: a step that
+ * moved to `succeeded` or `failed` right after its try finished the same way,
+ * with no newer try of that step in between. Keyed by the transition's index,
+ * valued by the finished try's index. A failed try whose step went back to
+ * pending for a retry is not merged: both facts stay.
+ */
+export function mergedTransitions(events: RunEvent[]): Map<number, number> {
+  const out = new Map<number, number>();
+  const last = new Map<string, { idx: number; failed: boolean }>(); // step -> its last finished try
+  events.forEach((e, i) => {
+    const k = tagOf(e);
+    if (!k) return;
+    const step = String(k.v.step ?? "");
+    if (!step) return;
+    if (k.tag === "AttemptStarted") last.delete(step);
+    else if (k.tag === "AttemptFinished") last.set(step, { idx: i, failed: !!k.v.failure });
+    else if (k.tag === "StepTransitioned") {
+      const to = String(k.v.to ?? "");
+      const f = last.get(step);
+      if (f && ((to === "succeeded" && !f.failed) || (to === "failed" && f.failed))) {
+        out.set(i, f.idx);
+        last.delete(step);
+      }
+    }
+  });
+  return out;
+}
+
 export type ActivityView = {
-  /** The events the filter shows, newest first, with their class. */
-  rows: { event: RunEvent; cls: ActivityClass }[];
+  /** The events the filter shows, newest first, with their class. `merged`
+   * marks a finished try that also stands for its step's move to passed or
+   * failed (`mergedTransitions`). */
+  rows: { event: RunEvent; cls: ActivityClass; merged?: boolean }[];
   /** How many events each filter shows. */
   counts: Record<ActivityFilter, number>;
   /** Cleared Pod condition events the current filter hides. */
@@ -68,7 +102,12 @@ export function activityView(
   active: Record<string, { attempt: string; since: number }>,
   filter: ActivityFilter,
 ): ActivityView {
-  const classed = events.map((event) => ({ event, cls: activityClass(event, active) }));
+  const merged = mergedTransitions(events);
+  const into = new Set(merged.values());
+  const classed = events
+    .map((event, i) => ({ event, cls: activityClass(event, active), i }))
+    .filter((r) => !merged.has(r.i))
+    .map(({ event, cls, i }) => (into.has(i) ? { event, cls, merged: true } : { event, cls }));
   const count = (f: ActivityFilter) => classed.filter((r) => inFilter(r.cls, f)).length;
   const rows = classed.filter((r) => inFilter(r.cls, filter)).reverse();
   return {
@@ -79,6 +118,82 @@ export function activityView(
 }
 
 const events = (n: number) => (n === 1 ? "event" : "events");
+
+/** One Activity row in words: the step's display name ("deploy-preview · us",
+ * the raw id in `stepId`) and what happened, with tries counted within their
+ * version ("try 6 started (automatic retry)", "try 5 failed: step error",
+ * "passed in 2m50s on try 6", "waiting for a node: 0/14 nodes are
+ * available", "unschedulable for about 1m: … · cleared"). Built once per
+ * event log; call the result per row. */
+export function activityWords(
+  log: RunEvent[],
+): (e: RunEvent, merged?: boolean) => { step: string | null; stepId: string | null; text: string } {
+  const places = attemptPlaces(log);
+  const starts = new Map<string, number>(); // "step attempt" -> started at
+  for (const e of log) {
+    const k = tagOf(e);
+    if (k?.tag === "AttemptStarted") starts.set(`${String(k.v.step)} ${String(k.v.attempt)}`, e.at);
+  }
+  const causes = new Map<string, Record<string, AttemptCause>>();
+  const causeOf = (step: string, attempt: string): AttemptCause | undefined => {
+    if (!causes.has(step)) causes.set(step, attemptCauses(log, step).causes);
+    return causes.get(step)![attempt];
+  };
+  return (e, merged = false) => {
+    const k = tagOf(e);
+    const base = eventParts(e);
+    const stepId = base.step;
+    const step = stepId ? stepDisplayName(stepId) : null;
+    if (!k || !stepId) return { step, stepId, text: base.text };
+    const v = k.v;
+    const attempt = String(v.attempt ?? "");
+    const n = places[stepId]?.[attempt]?.try;
+    const tryN = n !== undefined ? `try ${n}` : "a try";
+    const took = (): string | null => {
+      const at = starts.get(`${stepId} ${attempt}`);
+      return at !== undefined ? duration(at, e.at) : null;
+    };
+    switch (k.tag) {
+      case "AttemptStarted": {
+        const c = causeOf(stepId, attempt);
+        const why = c && c.kind !== "initial" ? ` (${causeText(c)})` : "";
+        return { step, stepId, text: `${tryN} started${why}` };
+      }
+      case "AttemptFinished": {
+        const d = took();
+        if (v.failure) {
+          const what = failureWords(String(v.failure));
+          return {
+            step,
+            stepId,
+            text: merged ? `failed${d ? ` after ${d}` : ""} on ${tryN}: ${what}` : `${tryN} failed: ${what}`,
+          };
+        }
+        return {
+          step,
+          stepId,
+          text: merged ? `passed${d ? ` in ${d}` : ""} on ${tryN}` : `${tryN} passed${d ? ` in ${d}` : ""}`,
+        };
+      }
+      case "StepTransitioned":
+        return {
+          step,
+          stepId,
+          text: `${statusWord(String(v.from ?? "")).toLowerCase()} → ${statusWord(String(v.to ?? "")).toLowerCase()}`,
+        };
+      case "AttemptReadopted":
+        return { step, stepId, text: `${tryN} re-adopted after a control-plane restart` };
+      case "StepInfraCondition": {
+        const reason = String(v.reason ?? "");
+        const message = v.message ? `: ${String(v.message)}` : "";
+        if (typeof v.held_ms !== "number") return { step, stepId, text: `${infraReasonText(reason)}${message}` };
+        const what = NODE_WAIT_REASONS.has(reason) ? "unschedulable" : infraReasonText(reason);
+        return { step, stepId, text: `${what} for ${aboutDuration(v.held_ms)}${message} · cleared` };
+      }
+    }
+    return { step, stepId, text: base.text };
+  };
+}
 
 /** The line under the Activity rows: the cleared conditions the filter hides
  * and, on an older version, the events after it. Either part is null when

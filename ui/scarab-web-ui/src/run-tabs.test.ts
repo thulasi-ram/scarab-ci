@@ -6,11 +6,13 @@ import {
   activityClass,
   activityHiddenNote,
   activityView,
+  activityWords,
   artifactFilterCounts,
   artifactGroups,
   artifactsInScope,
   copyMark,
   isTriggerEvent,
+  mergedTransitions,
   nestedTries,
   pluralNoun,
   resolutionWords,
@@ -21,7 +23,7 @@ import {
   tryWords,
 } from "./run-tabs";
 import { activeInfraConditions } from "./events";
-import { ev, finished, infraCondition, readoptedEv, started, transitioned } from "./event-fixtures";
+import { ev, finished, infraCondition, readoptedEv, retryRequested, started, transitioned } from "./event-fixtures";
 
 describe("activity filter", () => {
   // build's first try waited for a node and the condition cleared; its second
@@ -94,6 +96,54 @@ describe("activity filter", () => {
       later: "4 later events hidden by this version",
     });
     expect(activityHiddenNote(0, 0)).toEqual({ cleared: null, later: null });
+  });
+});
+
+// Regression: Activity rows read "deploy-preview[region=us] Unschedulable: …",
+// "e2e running → succeeded", "attempt finished".
+describe("activity words", () => {
+  const cell = "deploy[region=us]";
+  const log = [
+    started(0, "e2e", "a1"),
+    finished(60_000, "e2e", "a1", "step"),
+    transitioned(60_001, "e2e", "running", "pending"),
+    started(61_000, "e2e", "a2"),
+    finished(231_000, "e2e", "a2"),
+    transitioned(231_001, "e2e", "running", "succeeded"),
+    started(240_000, cell, "a1"),
+    infraCondition(241_000, cell, "a1", "Unschedulable"),
+    infraCondition(301_000, cell, "a1", "Unschedulable", 60_000),
+    retryRequested(400_000, "e2e", [], "a.kim"),
+    started(401_000, "e2e", "a3"),
+  ];
+  const words = activityWords(log);
+
+  it("merges a step's move to passed into the try that passed, and keeps a retried failure's two facts", () => {
+    expect([...mergedTransitions(log)]).toEqual([[5, 4]]);
+    const v = activityView(log, {}, "all");
+    expect(v.rows.map((r) => r.event.at)).not.toContain(231_001);
+    expect(v.rows.find((r) => r.event.at === 231_000)?.merged).toBe(true);
+    expect(v.rows.map((r) => r.event.at)).toContain(60_001);
+  });
+
+  it("names the step by its display name and counts tries in plain words", () => {
+    expect(words(log[0])).toEqual({ step: "e2e", stepId: "e2e", text: "try 1 started" });
+    expect(words(log[1]).text).toBe("try 1 failed: step error");
+    expect(words(log[2]).text).toBe("running → pending");
+    expect(words(log[3]).text).toBe("try 2 started (automatic retry)");
+    expect(words(log[4], true).text).toBe("passed in 2m50s on try 2");
+    expect(words(log[4]).text).toBe("try 2 passed in 2m50s");
+    expect(words(log[10]).text).toBe("try 3 started (retried by a.kim)");
+  });
+
+  it("says what a Pod condition held up, and for how long once it cleared", () => {
+    const onset = ev(241_000, { StepInfraCondition: { step: cell, attempt: "a1", reason: "Unschedulable", message: "0/14 nodes are available" } });
+    expect(words(onset)).toEqual({
+      step: "deploy · us",
+      stepId: cell,
+      text: "waiting for a node: 0/14 nodes are available",
+    });
+    expect(words(log[8]).text).toBe("unschedulable for about 1m · cleared");
   });
 });
 

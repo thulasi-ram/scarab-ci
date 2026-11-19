@@ -4,11 +4,13 @@
 // back always shows, highlighted. "Infrastructure" shows only the Pod
 // conditions and control-plane re-adoptions; "Everything" shows all of it. The
 // filter only changes what this tab shows. The run's trigger reads
-// "Triggered by …".
-import { createSignal, For, Show } from "solid-js";
+// "Triggered by …". Rows name a step by its display name and count tries
+// within their version; a step's move to passed or failed shows on the row
+// of the try that finished that way.
+import { createMemo, createSignal, For, Show } from "solid-js";
 import type { RunEvent } from "../api/client";
-import { eventCategory, eventParts, EVENT_GLYPH } from "../events";
-import { activityHiddenNote, activityView, isTriggerEvent, type ActivityFilter } from "../run-tabs";
+import { eventCategory, EVENT_GLYPH } from "../events";
+import { activityHiddenNote, activityView, activityWords, isTriggerEvent, type ActivityFilter } from "../run-tabs";
 import { absTime, relTime } from "../fmt";
 
 export default function RunActivity(props: {
@@ -24,6 +26,7 @@ export default function RunActivity(props: {
   const [filter, setFilter] = createSignal<ActivityFilter>("steps");
   const view = () => activityView(props.events, props.active, filter());
   const note = () => activityHiddenNote(view().hiddenCleared, props.later);
+  const words = createMemo(() => activityWords(props.events));
 
   const Chip = (p: { f: ActivityFilter; label: string }) => (
     <button type="button" class="chip" aria-pressed={filter() === p.f} onClick={() => setFilter(p.f)}>
@@ -44,7 +47,7 @@ export default function RunActivity(props: {
         <For each={view().rows} fallback={<div class="tl-empty">No events to show.</div>}>
           {(r) => {
             const cat = eventCategory(r.event);
-            const parts = eventParts(r.event);
+            const parts = words()(r.event, r.merged);
             const trigger = isTriggerEvent(r.event) && props.trigger;
             return (
               <div class="tl-item" classList={{ "tl-active": r.cls === "active", "tl-cleared": r.cls === "cleared" }}>
@@ -58,7 +61,9 @@ export default function RunActivity(props: {
                   <div class="tl-msg">
                     <Show when={!trigger} fallback={<>{trigger}</>}>
                       <Show when={parts.step}>
-                        <b class="tl-step mono">{parts.step}</b>
+                        <b class="tl-step mono" title={parts.stepId ?? undefined}>
+                          {parts.step}
+                        </b>
                       </Show>
                       {parts.text}
                       <Show when={r.cls === "active"}>
