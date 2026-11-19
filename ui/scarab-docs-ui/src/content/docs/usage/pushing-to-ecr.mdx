@@ -401,14 +401,138 @@ role's own AWS token while it runs. Some ways to limit what a copy of either is 
   condition for pushes made with the password from `get-login-password`, not only for ECR API
   calls made with the role's own credentials.
 
+## Private base images in ECR
+
+The build step holds no registry credential, so BuildKit pulls only public base images unless
+the build step's Pod logs in itself. The same setup as the push step works for a pull, with three
+differences: a role that may only pull, a profile without the `registry_auth_only` marker (the
+build step has no `registry_auth`, so a marked profile fails its launch), and an org Policy in
+place of the marker.
+
+**The role and the ServiceAccount.** Give the role `ecr:GetAuthorizationToken` and, on the base
+image repositories only, `ecr:BatchCheckLayerAvailability`, `ecr:BatchGetImage` and
+`ecr:GetDownloadUrlForLayer`. Put it on a ServiceAccount of its own, `scarab-ecr-pull`, in the
+namespace step Pods run in, as in [part 1](#1-the-iam-role-and-the-serviceaccount).
+
+**The profile.** BuildKit reads its login from a docker config, as crane does, and the build step
+runs as uid 1000, so the init container runs as uid 1000 too and writes the file that uid can
+read:
+
+```yaml
+scarab:
+  placement:
+    profiles:
+      - name: ecr-pull
+        k8s:
+          metadata:
+            annotations:
+              eks.amazonaws.com/skip-containers: step,scarab-results-egress,scarab-workspace-init,scarab-workspace-egress
+          spec:
+            serviceAccountName: scarab-ecr-pull
+            volumes:
+              - name: ecr-pull-login
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 1Mi
+            initContainers:
+              - name: ecr-pull-login
+                image: public.ecr.aws/aws-cli/aws-cli@sha256:<digest>
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    set -eu
+                    umask 077
+                    pw=$(aws ecr get-login-password --region "$ECR_REGION")
+                    auth=$(printf 'AWS:%s' "$pw" | base64 | tr -d '\n')
+                    printf '{"auths":{"%s":{"auth":"%s"}}}' "$ECR_REGISTRY" "$auth" > /ecr-pull-login/config.json
+                env:
+                  - name: ECR_REGISTRY
+                    value: 444455556666.dkr.ecr.eu-west-1.amazonaws.com
+                  - name: ECR_REGION
+                    value: eu-west-1
+                  - name: HOME
+                    value: /tmp
+                securityContext:
+                  runAsUser: 1000
+                  runAsNonRoot: true
+                  allowPrivilegeEscalation: false
+                  capabilities:
+                    drop: [ALL]
+                  seccompProfile:
+                    type: RuntimeDefault
+                volumeMounts:
+                  - name: ecr-pull-login
+                    mountPath: /ecr-pull-login
+            containers:
+              - name: step
+                env:
+                  - name: DOCKER_CONFIG
+                    value: /ecr-pull-login
+                volumeMounts:
+                  - name: ecr-pull-login
+                    mountPath: /ecr-pull-login
+                    readOnly: true
+```
+
+Route it to the build step with the map form, next to `ecr-push` on the push step:
+
+```yaml
+    placement_profiles:
+      image: [ecr-pull]
+      push: [ecr-push]
+```
+
+A Pod has one ServiceAccount. If the build step also uses the S3 cache through a profile of its
+own, use one ServiceAccount whose role has both the cache and the pull permissions, and leave
+`step` out of `skip-containers`: BuildKit reaches the cache with the role, and pulls with the
+login file.
+
+**What the build step can read.** A `RUN` in the Dockerfile shares BuildKit's PID namespace and
+can read the pull password (valid for up to 12 hours) and the files in the Pod. So the role is pull
+only, on the base image repositories: a copy lets someone read those images, and nothing else.
+
+**An org Policy.** Without the marker, any step that names `ecr-pull` gets the role, including a
+step a fork pull request adds to the Pipeline file. This Policy refuses a fork pull request's Run
+that names the profile, and a step outside the build library that names it:
+
+```yaml
+kind: policy
+name: ecr-pull
+checkpoint: run.create
+mode: enforce
+rules:
+  - when: "trigger.fork && steps.exists(s, 'ecr-pull' in s.placement_profiles)"
+    effect: deny
+    message: "A fork pull request's Run may not name the ecr-pull placement profile."
+  - when: >-
+      steps.exists(s, 'ecr-pull' in s.placement_profiles
+      && !s.origin.exists(o, o.kind == 'library' && has(o.source)
+      && o.source.startsWith('github.com/thulasi-ram/scarab-ci//libs/build.yaml@')))
+    effect: deny
+    message: "Only the build library's steps may name the ecr-pull placement profile."
+```
+
+A refused Run is not created. Build fork pull requests in a Pipeline that does not name
+`ecr-pull`; their builds fail at a `FROM` that names a private image. As with `ecr-push`, a step's
+`k8s_overlay` can set `serviceAccountName: scarab-ecr-pull` itself: a fork pull request's Run is
+refused any overlay, and other authors need an Environment that permits raw overlays (git-bug
+24a3126).
+
+We have not run this on EKS either, nor checked that BuildKit's `buildctl` reads `DOCKER_CONFIG`
+in the rootless image. Check that the build step's log shows the base image pulled.
+
+A private base image on GHCR, or on another registry that takes a stored login, has no route:
+Scarab has no pull credential of its own for the build step.
+
 ## Costs and limits
 
 - **The image moves through the workspace.** The build step writes the image as an OCI layout to
   the workspace, and the push step receives it from there, so a large image costs a transfer
   through the Data Depot.
-- **No private base images yet.** The build step holds no registry credential, so BuildKit pulls
-  only public base images. A role on the build step's Pod does not change that: BuildKit logs in
-  to a registry with a docker config, not with AWS credentials.
+- **Private base images in ECR only.** The build step holds no registry credential. A pull-only
+  role and a login init container on the build step's Pod reach private ECR base images
+  ([above](#private-base-images-in-ecr)); a private base image elsewhere is not supported yet.
 - **The push step runs as root**, because crane's image has no other user. An org Policy that
   denies run-as-root refuses every Run that invokes the build library.
 - **The layer cache is S3 only**, reached with the build step's own identity. Give it a role of its

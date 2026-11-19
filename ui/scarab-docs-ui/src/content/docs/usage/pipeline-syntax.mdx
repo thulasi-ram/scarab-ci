@@ -466,7 +466,9 @@ Its outputs:
   with forge credentials. With neither, the build still runs and pulls public base images, and
   the push fails at the registry. The build step never receives a credential: BuildKit runs
   without its process sandbox, so a `RUN` in your Dockerfile could read anything the build step
-  holds. For the same reason the build step cannot pull private base images.
+  holds. For the same reason Scarab gives the build step no login to pull private base images;
+  for ECR, a placement profile can
+  ([Private base images in ECR](/scarab-ci/usage/pushing-to-ecr/#private-base-images-in-ecr)).
 - **No registry cache.** The library offers no `cache: registry`: writing a cache to a registry
   needs the push credential in the build step. The S3 cache is reached with the build Pod's own
   identity, such as a ServiceAccount a placement profile sets; Scarab passes no credential.
