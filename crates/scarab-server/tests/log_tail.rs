@@ -523,3 +523,230 @@ async fn an_incomplete_pass_reads_nothing() {
     settle().await;
     assert_eq!(exec.calls(), 1);
 }
+
+/// The live tail's backoff does not delay the read of an ended unit: with a
+/// backoff of an hour, the pass that no longer ensures the step stores its
+/// output at once, before a live viewer's stream ends.
+#[tokio::test]
+async fn the_read_of_an_ended_step_does_not_wait_out_the_backoff() {
+    let exec = ScriptedExec::new(vec![
+        Err(INITIALIZING.into()),
+        Ok(vec![b"short step\n".to_vec()]),
+    ]);
+    let logs = logs();
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_secs(3600));
+
+    // The live tail finds the Pod not ready and backs off for an hour.
+    tailer.ensure(&running_step());
+    tailer.end_pass(true);
+    wait_for(|| exec.calls() == 1).await;
+    settle().await;
+
+    // The step has ended: one pass reads it.
+    tailer.end_pass(true);
+    let (run, s, a) = stream();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while logs.read_all(&run, &s, &a).await.unwrap_or_default() != b"short step\n" {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the ended step's output was stored without waiting out the backoff");
+    assert_eq!(exec.calls(), 2);
+}
+
+// --- Through the converged driver ---------------------------------------------
+
+/// A fake executor driven by the test: `poll` reports Running until `end` is
+/// called, then Succeeded. `log_stream` answers "not ready" while the unit
+/// runs and its output once it has ended.
+struct DrivenExec {
+    ended: std::sync::atomic::AtomicBool,
+    log_opens: AtomicUsize,
+    output: Mutex<Vec<Vec<u8>>>,
+}
+
+impl DrivenExec {
+    fn end(&self) {
+        self.ended.store(true, Ordering::SeqCst);
+    }
+    fn ended(&self) -> bool {
+        self.ended.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Executor for DrivenExec {
+    async fn results_delivery_failure(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+    async fn gate_refusal(&self, _gate: &StepRun) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+    async fn infra_condition(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
+        Ok(None)
+    }
+    async fn take_forge_credential(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
+        Ok(None)
+    }
+    async fn workspace_provisioning(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
+        Ok(None)
+    }
+    async fn launch(&self, step: &StepRun, _spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+        Ok(ExecHandle(step.step.0.clone()))
+    }
+    async fn poll(&self, _h: &ExecHandle) -> Result<ExecState, ExecError> {
+        Ok(if self.ended() {
+            ExecState::Succeeded
+        } else {
+            ExecState::Running
+        })
+    }
+    async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
+        Ok(())
+    }
+    fn unit_handle(&self, _step: &StepRun) -> Option<ExecHandle> {
+        None
+    }
+    async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
+        Ok(true)
+    }
+    async fn log_stream(&self, _step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        self.log_opens.fetch_add(1, Ordering::SeqCst);
+        if !self.ended() {
+            return Err(ExecError::Other(INITIALIZING.into()));
+        }
+        let chunks = std::mem::take(&mut *self.output.lock().unwrap());
+        Ok(Some(Box::new(MockChunks(chunks.into()))))
+    }
+}
+
+/// git-bug 1dee2f3 through `tick_once`: a step whose live tail never got its
+/// log (the Pod was not ready) is Running on one cycle and ended on a later
+/// one; the cycle that no longer sees it Running reads its log, so the
+/// output is stored.
+#[tokio::test]
+async fn the_driver_reads_the_log_of_a_step_that_ended() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use scarab_engine::{Clock, Db};
+    use scarab_server::{converged, router, AppState};
+    use scarab_testkit::FakeClock;
+    use tower::ServiceExt;
+
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let app = router(AppState::new(db.clone(), clock.clone(), logs.clone()));
+    let body = serde_json::json!({
+        "pipeline": {
+            "ir_version": 1,
+            "steps": [{ "id": "build", "image": "busybox:latest", "command": ["echo", "hi"] }]
+        }
+    })
+    .to_string();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let run = RunId(v["id"].as_str().unwrap().to_string());
+
+    let exec = Arc::new(DrivenExec {
+        ended: Default::default(),
+        log_opens: AtomicUsize::new(0),
+        output: Mutex::new(vec![b"short step\n".to_vec()]),
+    });
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    let db_dyn: Arc<dyn Db> = db.clone();
+    let clock_dyn: Arc<dyn Clock> = clock.clone();
+    let exec_dyn: Arc<dyn Executor> = exec.clone();
+    let supervision = scarab_engine::Supervision::new();
+    let health = scarab_engine::TickHealth::new();
+    macro_rules! tick {
+        () => {
+            converged::tick_once(
+                &db_dyn,
+                &clock_dyn,
+                &exec_dyn,
+                None,
+                None,
+                Some(&tailer),
+                None,
+                "log-tail-test",
+                0,
+                3_600_000,
+                None,
+                "http://scarab.test",
+                &supervision,
+                &health,
+            )
+            .await
+            .unwrap()
+        };
+    }
+
+    // Cycles while the step runs: its tail is opened and finds no log.
+    for _ in 0..30 {
+        tick!();
+        settle().await;
+        if exec.log_opens.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+    }
+    assert!(
+        exec.log_opens.load(Ordering::SeqCst) > 0,
+        "the running step was tailed"
+    );
+
+    // The step ends; the next cycles see it leave Running.
+    exec.end();
+    let mut stored = Vec::new();
+    for _ in 0..30 {
+        tick!();
+        settle().await;
+        let step = StepId("build".into());
+        let attempt = db
+            .steps_of_run(&run)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.step == step)
+            .and_then(|s| s.attempts.last().map(|a| a.id.clone()));
+        if let Some(a) = attempt {
+            stored = logs.read_all(&run, &step, &a).await.unwrap();
+        }
+        if !stored.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(stored, b"short step\n");
+}

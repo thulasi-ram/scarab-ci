@@ -149,6 +149,8 @@ struct OpenTail {
     source: TailSource,
     /// Failed reads since the fence's unit ended.
     final_tries: u32,
+    /// A read of the ended unit has started; later ones wait out the backoff.
+    final_started: bool,
 }
 
 /// Per-fence bookkeeping for a tail parked in a benign pre-start state: when the
@@ -179,10 +181,13 @@ impl LogTailer {
     /// was not ensured in this pass belongs to a unit that ended (a step that
     /// left `Running`, a retried attempt, a stopped service): its log is read
     /// once more, so a step that ran and finished inside a retry backoff
-    /// keeps its output (git-bug 1dee2f3). The read is skipped when any
-    /// replica already stored output for the fence, so nothing is appended
-    /// twice. `complete` is false when the pass did not ensure every unit (a
-    /// store error); such a pass only resets the bookkeeping.
+    /// keeps its output (git-bug 1dee2f3). The first such read does not wait
+    /// out a retry backoff left by the live tail. This covers a unit with NO
+    /// stored output only: the read is skipped when any replica already
+    /// stored output for the fence, so nothing is appended twice, and output
+    /// printed after a live tail failed part way through is not read.
+    /// `complete` is false when the pass did not ensure every unit (a store
+    /// error); such a pass only resets the bookkeeping.
     pub fn end_pass(&self, complete: bool) {
         let seen = std::mem::take(&mut *self.seen.lock().unwrap());
         if !complete {
@@ -330,17 +335,35 @@ impl LogTailer {
                     attempt: attempt.clone(),
                     source: source.clone(),
                     final_tries: 0,
+                    final_started: false,
                 });
         }
+        // The first read of an ended unit skips the backoff: the unit has
+        // ended, so there is no Pod to hammer, and a live viewer's stream ends
+        // soon after the Run settles.
+        let first_final = final_read
+            && self
+                .open
+                .lock()
+                .unwrap()
+                .get(&fence)
+                .is_some_and(|t| !t.final_started);
         // Backing off after a recent error — don't hammer a Pod with no log yet.
-        if let Some(at) = self.retry_at.lock().unwrap().get(&fence) {
-            if Instant::now() < *at {
-                return;
+        if !first_final {
+            if let Some(at) = self.retry_at.lock().unwrap().get(&fence) {
+                if Instant::now() < *at {
+                    return;
+                }
             }
         }
         // Claim the fence; bail if a tail is already in flight for it.
         if !self.active.lock().unwrap().insert(fence.clone()) {
             return;
+        }
+        if first_final {
+            if let Some(t) = self.open.lock().unwrap().get_mut(&fence) {
+                t.final_started = true;
+            }
         }
 
         let executor = self.executor.clone();
