@@ -10,6 +10,7 @@ use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
 use scarab_engine::{Attempt, AttemptId, AttemptOutcome, Db, RunId, RunStatus, StepId, Timestamp};
+use scarab_server::log_stream::{Item, LogStream, Scope, Start, BATCH_BYTES, SETTLE};
 use scarab_server::{router, AppState, LogService};
 use scarab_testkit::{FakeClock, InMemoryDb, InMemoryObjectStore};
 
@@ -373,4 +374,280 @@ async fn a_lone_cr_reaches_the_reader_as_a_line_end() {
     let (_, body) = get(&app, "/v1/runs/r1/steps/build/logs", None).await;
     assert_eq!(data_of(&events(&body)), "50%\n60%\ndone\n");
     assert_eq!(raw(&app, "a1").await, chunks.concat());
+}
+
+// --- Bounds and live polls ----------------------------------------------------
+
+/// A finished log whose every chunk ends in a lone UTF-8 lead byte is not
+/// read into one buffer: each batch takes at most one chunk past
+/// `BATCH_BYTES`, the ids advance, and a resume from any id repeats nothing.
+#[tokio::test]
+async fn chunks_that_all_end_inside_a_character_still_come_in_bounded_batches() {
+    const CHUNK: usize = 128 * KIB;
+    let chunks: Vec<Vec<u8>> = (0..8).map(|_| vec![0xE2; CHUNK]).collect();
+    let app = app_with(&[("a1", chunks)]).await;
+
+    let (status, body) = get(&app, "/v1/runs/r1/steps/build/logs", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let evs = events(&body);
+    assert!(evs.len() > 1, "{} data events", evs.len());
+    let max = BATCH_BYTES as usize + 2 * CHUNK;
+    let mut seq = 0u64;
+    for ev in &evs {
+        let id = ev.id.as_deref().unwrap();
+        let next: u64 = id.strip_prefix("a1:").unwrap().parse().unwrap();
+        assert!(next > seq, "ids advance: {id} after a1:{seq}");
+        assert!(
+            (next - seq) as usize * CHUNK <= max,
+            "{id} carries {} stored bytes",
+            (next - seq) as usize * CHUNK
+        );
+        seq = next;
+    }
+    assert_eq!(seq, 8);
+    // Each lone lead byte goes out as one replacement character.
+    assert_eq!(data_of(&evs), "\u{FFFD}".repeat(8 * CHUNK));
+
+    for ev in &evs {
+        let id = ev.id.as_deref().unwrap();
+        let from: usize = id.strip_prefix("a1:").unwrap().parse().unwrap();
+        let (status, body) = get(
+            &app,
+            &format!("/v1/runs/r1/steps/build/logs?from={id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            data_of(&events(&body)),
+            "\u{FFFD}".repeat((8 - from) * CHUNK),
+            "?from={id}"
+        );
+    }
+}
+
+/// Run `r1`, step `build`, with the Run's status (`None`: no Run row) and the
+/// given attempts, each with its outcome and its chunks.
+async fn live_store(
+    status: Option<RunStatus>,
+    attempts: &[(&str, AttemptOutcome, Vec<Vec<u8>>)],
+) -> (Arc<InMemoryDb>, Arc<LogService>) {
+    let db = Arc::new(InMemoryDb::new());
+    let run = RunId("r1".into());
+    let step = StepId("build".into());
+    if let Some(s) = status {
+        db.seed_run(&run, s);
+    }
+    db.create_step_run(&run, &step, None, &[], Timestamp(0))
+        .await
+        .unwrap();
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    for (i, (id, outcome, chunks)) in attempts.iter().enumerate() {
+        let aid = AttemptId((*id).into());
+        db.record_attempt(
+            &run,
+            &step,
+            &Attempt {
+                id: aid.clone(),
+                started_at: Timestamp(10 * (i as i64 + 1)),
+                failure: None,
+                failure_detail: None,
+                outcome: *outcome,
+            },
+        )
+        .await
+        .unwrap();
+        for c in chunks {
+            logs.append(&run, &step, &aid, c).await.unwrap();
+        }
+    }
+    (db, logs)
+}
+
+/// A live stream of step `build`'s attempts.
+async fn open_live(db: &Arc<InMemoryDb>, logs: &Arc<LogService>, start: Start) -> LogStream {
+    let step = StepId("build".into());
+    let opened = LogStream::open(
+        logs.clone(),
+        db.clone() as Arc<dyn Db>,
+        RunId("r1".into()),
+        Scope::Step {
+            step: step.clone(),
+            read_step: step,
+            pinned: None,
+        },
+        start,
+        true,
+    )
+    .await;
+    match opened {
+        Ok(s) => s,
+        Err(_) => panic!("the stream did not open"),
+    }
+}
+
+/// Everything the stream has before it would wait for a live poll.
+async fn opening(s: &mut LogStream) -> Vec<Item> {
+    let mut out = Vec::new();
+    while let Some(item) = s.next(false).await.unwrap() {
+        out.push(item);
+    }
+    out
+}
+
+/// A running attempt's newest chunk that ends inside a character, with
+/// nothing appended after it, is held for at most two passes and then sent
+/// with the cut byte replaced. It starts at a tail cut on a continuation
+/// byte; that byte is still dropped when the held batch goes out.
+#[tokio::test(start_paused = true)]
+async fn a_held_back_chunk_is_sent_after_two_passes() {
+    let (db, logs) = live_store(
+        Some(RunStatus::Running),
+        &[(
+            "a1",
+            AttemptOutcome::Running,
+            vec![b"hello\n".to_vec(), vec![0x82, 0xAC, b'x', 0xE2]],
+        )],
+    )
+    .await;
+    let mut s = open_live(&db, &logs, Start::Tail(4)).await;
+    let head = opening(&mut s).await;
+    assert!(
+        matches!(head.as_slice(), [Item::Truncated { .. }]),
+        "{head:?}"
+    );
+
+    let mut polls = 0;
+    let data = loop {
+        assert!(polls < 3, "no data event within 3 polls");
+        match s.next(true).await.unwrap() {
+            Some(Item::Keepalive) => polls += 1,
+            Some(item) => break item,
+            None => panic!("the stream ended"),
+        }
+    };
+    assert_eq!(
+        data,
+        Item::Data {
+            id: "a1:2".into(),
+            text: "x\u{FFFD}".into(),
+        }
+    );
+    // Sent once: later polls do not read it again.
+    for _ in 0..3 {
+        assert_eq!(s.next(true).await.unwrap(), Some(Item::Keepalive));
+    }
+}
+
+/// A finished attempt is not held back while the Run goes on: its last chunk,
+/// cut inside a character, is sent on the first pass.
+#[tokio::test(start_paused = true)]
+async fn a_finished_attempt_is_not_held_back() {
+    let (db, logs) = live_store(
+        Some(RunStatus::Running),
+        &[("a1", AttemptOutcome::Failed, vec![vec![b'x', 0xE2]])],
+    )
+    .await;
+    let mut s = open_live(&db, &logs, Start::Full).await;
+    assert_eq!(
+        opening(&mut s).await,
+        [Item::Data {
+            id: "a1:1".into(),
+            text: "x\u{FFFD}".into(),
+        }]
+    );
+}
+
+/// A live stream ends one pass after the Run settles, and not before.
+#[tokio::test(start_paused = true)]
+async fn a_live_stream_ends_one_pass_after_the_run_settles() {
+    let (db, logs) = live_store(
+        Some(RunStatus::Running),
+        &[("a1", AttemptOutcome::Running, vec![b"one\n".to_vec()])],
+    )
+    .await;
+    let mut s = open_live(&db, &logs, Start::Full).await;
+    assert_eq!(opening(&mut s).await.len(), 1);
+    for _ in 0..3 {
+        assert_eq!(s.next(true).await.unwrap(), Some(Item::Keepalive));
+    }
+    // Output stored before the Run settled still goes out on the last pass.
+    logs.append(
+        &RunId("r1".into()),
+        &StepId("build".into()),
+        &AttemptId("a1".into()),
+        b"two\n",
+    )
+    .await
+    .unwrap();
+    db.seed_run(&RunId("r1".into()), RunStatus::Succeeded);
+    assert_eq!(
+        s.next(true).await.unwrap(),
+        Some(Item::Data {
+            id: "a1:2".into(),
+            text: "two\n".into(),
+        })
+    );
+    assert_eq!(s.next(true).await.unwrap(), None);
+}
+
+/// A Run row that is gone ends the stream; it does not poll for ever.
+#[tokio::test(start_paused = true)]
+async fn a_stream_whose_run_row_is_gone_ends() {
+    let (db, logs) = live_store(
+        None,
+        &[("a1", AttemptOutcome::Running, vec![b"one\n".to_vec()])],
+    )
+    .await;
+    let mut s = open_live(&db, &logs, Start::Full).await;
+    assert_eq!(opening(&mut s).await.len(), 1);
+    assert_eq!(s.next(true).await.unwrap(), None);
+}
+
+/// An attempt that is no longer running, sent in full and quiet for
+/// `SETTLE`, stops being read on every poll; the running one still is.
+#[tokio::test(start_paused = true)]
+async fn a_settled_attempt_index_is_not_read_on_every_poll() {
+    let (db, logs) = live_store(
+        Some(RunStatus::Running),
+        &[
+            ("a1", AttemptOutcome::Failed, vec![b"one\n".to_vec()]),
+            ("a2", AttemptOutcome::Running, vec![b"two\n".to_vec()]),
+        ],
+    )
+    .await;
+    let mut s = open_live(&db, &logs, Start::Full).await;
+    assert_eq!(opening(&mut s).await.len(), 2);
+    let start = tokio::time::Instant::now();
+    while start.elapsed() < SETTLE + std::time::Duration::from_secs(2) {
+        assert_eq!(s.next(true).await.unwrap(), Some(Item::Keepalive));
+    }
+    let before = s.index_reads();
+    for _ in 0..3 {
+        assert_eq!(s.next(true).await.unwrap(), Some(Item::Keepalive));
+    }
+    assert_eq!(
+        s.index_reads() - before,
+        3,
+        "one index read per poll, for the running attempt only"
+    );
+    // The running attempt is still followed.
+    logs.append(
+        &RunId("r1".into()),
+        &StepId("build".into()),
+        &AttemptId("a2".into()),
+        b"three\n",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        s.next(true).await.unwrap(),
+        Some(Item::Data {
+            id: "a2:2".into(),
+            text: "three\n".into(),
+        })
+    );
 }

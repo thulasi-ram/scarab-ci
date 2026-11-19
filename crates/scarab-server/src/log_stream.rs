@@ -6,8 +6,12 @@
 //! - **Batches.** A `data` event carries consecutive whole chunks of ONE attempt,
 //!   up to [`BATCH_BYTES`]; a bigger chunk goes alone. A batch ends where the
 //!   bytes end on a whole UTF-8 character: if a chunk boundary falls inside one,
-//!   the batch takes the next chunk too. A live attempt's newest chunk that ends
-//!   inside a character waits for the next poll.
+//!   the batch takes the next chunk too, but only one past [`BATCH_BYTES`]; a
+//!   batch still cut inside a character after that ends at its last whole
+//!   boundary, or goes out with the cut bytes replaced. So one batch holds at
+//!   most [`BATCH_BYTES`] plus two chunks. A running attempt's newest chunk that
+//!   ends inside a character waits for the next poll, for at most
+//!   [`HOLD_PASSES`] passes; then it goes out with the cut bytes replaced.
 //! - **Cursor.** Every `data` event has `id: <attempt_id>:<next_seq>`, the
 //!   position after it. A stream opened [`Start::From`] a cursor skips the
 //!   attempts before that one and restarts it at `next_seq`.
@@ -21,7 +25,10 @@
 //!   bytes are replayed, announced by one `truncated` event first.
 //! - **Live.** Polls the durable index every 500 ms (ADR-0051), so any replica
 //!   serves the tail; a keepalive comment when a poll finds nothing; ends one
-//!   poll after the run settles, or after a pinned attempt is no longer latest.
+//!   poll after the run settles or its row is gone, or after a pinned attempt
+//!   is no longer latest. An attempt that is not running stops being polled
+//!   once it has sent everything and nothing new came for [`SETTLE`] (the read
+//!   of an ended unit's log can land a few seconds after it ends).
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -31,7 +38,8 @@ use std::time::Duration;
 use axum::response::sse::{Event, Sse};
 use futures::stream::{self, BoxStream, StreamExt};
 
-use scarab_engine::{AttemptId, Db, LogChunkMeta, RunId, StepId};
+use scarab_engine::{AttemptId, AttemptOutcome, Db, LogChunkMeta, RunId, StepId};
+use tokio::time::Instant;
 
 use crate::logs::{LogError, LogService};
 use crate::ApiError;
@@ -41,6 +49,12 @@ pub const BATCH_BYTES: u64 = 256 * 1024;
 /// The largest `?tail=` honoured; larger values are clamped to this.
 pub const MAX_TAIL: u64 = 64 * 1024 * 1024;
 const POLL: Duration = Duration::from_millis(500);
+/// How many passes a running attempt's newest chunk that ends inside a
+/// character is held back, waiting for the rest of the character.
+pub const HOLD_PASSES: u32 = 2;
+/// How long an attempt that is not running must have sent everything, with no
+/// new chunk, before a live stream stops reading its index.
+pub const SETTLE: Duration = Duration::from_secs(30);
 
 /// A resume position: `<attempt_id>:<next_seq>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,7 +154,7 @@ impl Item {
 struct Source {
     step: StepId,
     attempt: AttemptId,
-    /// The latest attempt of its step: it may still get chunks.
+    /// The latest attempt of its step, still running: it may still get chunks.
     may_grow: bool,
 }
 
@@ -165,9 +179,16 @@ pub struct LogStream {
     /// Index into `sources` this pass is draining, and its index once loaded.
     cur: usize,
     index: Option<Vec<LogChunkMeta>>,
-    /// Drop leading UTF-8 continuation bytes from the next batch (a tail cut
-    /// can land inside a character).
-    strip_lead: bool,
+    /// Drop leading UTF-8 continuation bytes from the next batch sent for this
+    /// source (a tail cut can land inside a character).
+    strip_lead: Option<Key>,
+    /// Per source: a held-back newest chunk ending inside a character, as
+    /// (index length when held, passes held so far).
+    held: HashMap<Key, (u64, u32)>,
+    /// Per source that is not running: since when it has had nothing to send.
+    quiet_since: HashMap<Key, Instant>,
+    /// Chunk-index reads so far.
+    index_reads: u64,
     /// Per `(read step, attempt)`: the last byte sent was `\r`, so a `\n`
     /// that starts the next batch is the rest of a `\r\n` and is dropped.
     /// Missing for a source this stream has not sent yet.
@@ -204,7 +225,10 @@ impl LogStream {
             progress: HashMap::new(),
             cur: 0,
             index: None,
-            strip_lead: false,
+            strip_lead: None,
+            held: HashMap::new(),
+            quiet_since: HashMap::new(),
+            index_reads: 0,
             ends_cr: HashMap::new(),
             pending: VecDeque::new(),
             live,
@@ -241,6 +265,7 @@ impl LogStream {
         let mut indexes = Vec::with_capacity(self.sources.len());
         for src in &self.sources {
             indexes.push(self.logs.chunks(&self.run, &src.step, &src.attempt).await?);
+            self.index_reads += 1;
         }
         let total: u64 = indexes.iter().flatten().map(|c| c.len).sum();
         if total <= tail {
@@ -278,7 +303,7 @@ impl LogStream {
             skipped_bytes: total - kept,
             total_bytes: total,
         });
-        self.strip_lead = true;
+        self.strip_lead = Some(key(&src.step, &src.attempt));
         Ok(())
     }
 
@@ -317,11 +342,18 @@ impl LogStream {
         }
     }
 
+    /// How many times this stream has read a chunk index.
+    pub fn index_reads(&self) -> u64 {
+        self.index_reads
+    }
+
     async fn start_poll(&mut self) {
-        let terminal = matches!(
-            self.db.run_status(&self.run).await,
-            Ok(Some(s)) if s.is_terminal()
-        );
+        // A Run row that is gone ends the stream like a settled one.
+        let terminal = match self.db.run_status(&self.run).await {
+            Ok(Some(s)) => s.is_terminal(),
+            Ok(None) => true,
+            Err(_) => false,
+        };
         // A failed refresh keeps the previous sources for this pass.
         let mut superseded = false;
         if let Ok((sources, latest)) = resolve(self.db.as_ref(), &self.run, &self.scope).await {
@@ -352,33 +384,59 @@ impl LogStream {
         if from == SKIPPED {
             return Ok(None);
         }
+        // An attempt that is not running, sent in full, and quiet for SETTLE:
+        // its index is not read again.
+        if !may_grow
+            && self
+                .quiet_since
+                .get(&k)
+                .is_some_and(|t| t.elapsed() >= SETTLE)
+        {
+            return Ok(None);
+        }
         if self.index.is_none() {
             self.index = Some(self.logs.chunks(&self.run, &step, &attempt).await?);
+            self.index_reads += 1;
         }
         let index = self.index.as_deref().unwrap_or_default();
         let todo: Vec<&LogChunkMeta> = index.iter().filter(|c| c.seq >= from).collect();
         if todo.is_empty() {
+            if may_grow {
+                self.quiet_since.remove(&k);
+            } else {
+                self.quiet_since.entry(k).or_insert_with(Instant::now);
+            }
             return Ok(None);
         }
+        self.quiet_since.remove(&k);
         // A stream resumed from a cursor does not know how the chunk before
         // `from` ended; it reads that chunk if the batch starts with `\n`.
         let before = (from > 0 && !self.ends_cr.contains_key(&k))
             .then(|| index.iter().find(|c| c.seq + 1 == from).cloned())
             .flatten();
+        let end = todo.last().map_or(from, |c| c.seq + 1);
+        let strip = self.strip_lead.as_ref() == Some(&k);
 
         let mut buf: Vec<u8> = Vec::new();
         let mut next = from;
         // (buf length, next seq) at the last chunk boundary on a whole character.
         let mut whole_at: Option<(usize, u64)> = None;
-        for c in &todo {
-            let ends_whole = whole_at.is_some_and(|(len, _)| len == buf.len());
-            if !buf.is_empty() && ends_whole && buf.len() as u64 + c.len > BATCH_BYTES {
-                break;
+        // The batch went past BATCH_BYTES by one chunk to finish a character.
+        let mut extended = false;
+        // The batch stopped before the newest chunk.
+        let mut cut_short = false;
+        for (i, c) in todo.iter().enumerate() {
+            if !buf.is_empty() && buf.len() as u64 + c.len > BATCH_BYTES {
+                let ends_whole = whole_at.is_some_and(|(len, _)| len == buf.len());
+                if ends_whole || extended {
+                    cut_short = true;
+                    break;
+                }
+                extended = true;
             }
             buf.extend(self.logs.read_chunk(c).await?);
             next = c.seq + 1;
-            if self.strip_lead {
-                self.strip_lead = false;
+            if strip && i == 0 {
                 let n = buf
                     .iter()
                     .take(3)
@@ -390,15 +448,36 @@ impl LogStream {
                 whole_at = Some((buf.len(), next));
             }
         }
-        // The newest chunk of a still-growing attempt ends inside a character:
-        // send up to the last whole boundary, and the rest on a later poll.
-        let can_wait = self.live && !self.last_pass && may_grow;
-        if can_wait && incomplete_utf8_tail(&buf) != 0 {
-            let Some((len, n)) = whole_at else {
-                return Ok(None);
-            };
-            buf.truncate(len);
-            next = n;
+        if incomplete_utf8_tail(&buf) == 0 {
+            self.held.remove(&k);
+        } else if cut_short {
+            // Capped while still inside a character: end at the last whole
+            // boundary, else send it with the cut bytes replaced.
+            if let Some((len, n)) = whole_at {
+                buf.truncate(len);
+                next = n;
+            }
+        } else if self.live && !self.last_pass && may_grow {
+            // The newest chunk of a running attempt ends inside a character:
+            // send up to the last whole boundary and wait for the rest, for
+            // at most HOLD_PASSES passes.
+            let held = self.held.entry(k.clone()).or_insert((end, 0));
+            if held.0 != end {
+                *held = (end, 0);
+            }
+            if held.1 < HOLD_PASSES {
+                held.1 += 1;
+                let Some((len, n)) = whole_at else {
+                    return Ok(None);
+                };
+                buf.truncate(len);
+                next = n;
+            } else {
+                self.held.remove(&k);
+            }
+        }
+        if strip {
+            self.strip_lead = None;
         }
         // An empty batch (empty chunks) leaves the last byte sent as it was.
         let sends_bytes = !buf.is_empty();
@@ -447,7 +526,7 @@ async fn resolve(
                     out.push(Source {
                         step: s.step.clone(),
                         attempt: a.id.clone(),
-                        may_grow: i == last,
+                        may_grow: i == last && a.outcome == AttemptOutcome::Running,
                     });
                 }
             }
@@ -458,21 +537,22 @@ async fn resolve(
             read_step,
             pinned,
         } => {
-            let attempts: Vec<AttemptId> = db
+            let attempts = db
                 .steps_of_run(run)
                 .await?
                 .into_iter()
                 .find(|s| &s.step == step)
-                .map(|s| s.attempts.into_iter().map(|a| a.id).collect())
+                .map(|s| s.attempts)
                 .unwrap_or_default();
-            let latest = attempts.last().cloned();
+            let latest = attempts.last().map(|a| a.id.clone());
             let out = attempts
                 .into_iter()
-                .filter(|a| pinned.as_ref().is_none_or(|p| p == a))
+                .filter(|a| pinned.as_ref().is_none_or(|p| p == &a.id))
                 .map(|a| Source {
-                    may_grow: Some(&a) == latest.as_ref(),
+                    may_grow: Some(&a.id) == latest.as_ref()
+                        && a.outcome == AttemptOutcome::Running,
                     step: read_step.clone(),
-                    attempt: a,
+                    attempt: a.id,
                 })
                 .collect();
             Ok((out, latest))
