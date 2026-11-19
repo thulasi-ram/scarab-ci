@@ -1235,6 +1235,39 @@ fn checkpoint_named(name: &str) -> Result<Checkpoint, ApiError> {
 }
 
 /// The forge event admission would see for the Pipeline form's trigger.
+/// The launch parameters Run creation would render a test Run's images
+/// with: none for a webhook Run (Run creation passes none), the declared
+/// inputs' defaults for a manual, api or cron Run (a dispatch or a schedule
+/// resolves them; the policy test supplies no values). An input with no
+/// default is left out, so an image that needs it renders as Run creation
+/// would render it with no value.
+fn test_params(
+    event: &scarab_forge::Event,
+    ir: &scarab_pipeline::PipelineIr,
+) -> BTreeMap<String, Value> {
+    use scarab_forge::Event;
+    if !matches!(
+        event,
+        Event::Manual { .. } | Event::Api { .. } | Event::Cron { .. }
+    ) {
+        return BTreeMap::new();
+    }
+    ir.interface
+        .inputs
+        .iter()
+        .filter_map(|input| {
+            let one = scarab_pipeline::Interface {
+                inputs: vec![input.clone()],
+                ..Default::default()
+            };
+            scarab_pipeline::params::resolve_params(&one, &BTreeMap::new())
+                .ok()
+                .and_then(|mut resolved| resolved.remove(&input.name))
+                .map(|v| (input.name.clone(), v))
+        })
+        .collect()
+}
+
 fn test_event(
     t: PolicyTestTrigger,
     repo: scarab_forge::RepoRef,
@@ -1475,15 +1508,24 @@ async fn pipeline_input(
         Err(crate::TriggerError::Db(e)) => return Err(ApiError::Db(e)),
         Err(e) => return Err(ApiError::Db(DbError::Other(e.to_string()))),
     };
-    // Then each Step's privilege request and `k8s_overlay`, through the
-    // function Run creation admits them with: a Run it would fail for
-    // either is a deny here too. Images render against the event values as
-    // Run creation renders them; the policy test supplies no launch
-    // parameters.
+    // Then each Step's privilege request, `k8s_overlay` and placement
+    // profiles, through the function Run creation admits them with: a Run
+    // it would fail for any of them is a deny here too. Images render
+    // against the event values and the launch parameters as Run creation
+    // renders them: a webhook Run has none; a manual, api or cron Run has
+    // its inputs' defaults, the policy test supplying no values of its own
+    // (RT-R2-5).
     let refusal = refusal.or_else(|| {
         let facts = crate::forge_token::event_facts(&event, None, &ir).unwrap_or_default();
-        let refused =
-            crate::step_privilege_refusals(&ir, &gov, &BTreeMap::new(), &facts, &st.author_overlay);
+        let params = test_params(&event, &ir);
+        let refused = crate::step_privilege_refusals(
+            &ir,
+            &gov,
+            &params,
+            &facts,
+            &st.author_overlay,
+            st.placement.as_deref(),
+        );
         (!refused.is_empty()).then(|| refused.join("; "))
     });
     let compiled = PolicyTestCompiledDto {

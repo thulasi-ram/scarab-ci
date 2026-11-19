@@ -1026,6 +1026,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The keys a step author's `k8s_overlay` may set: Run admission
         // checks an overlay against the same lists the k8s executor applies.
         .with_author_overlay(placement.author_overlay.clone());
+    // The profile registry the k8s executor resolves `placement_profiles`
+    // against: Run admission refuses a name it does not hold. Another
+    // executor applies no placement, so nothing is checked.
+    if matches!(config.executor, ExecutorKind::K8s) {
+        state = state.with_placement(placement.clone());
+    }
     // Anonymous library fetches from public forges (ADR-0076 §4). A client
     // that cannot be built leaves only installs through a connection.
     match scarab_server::library_fetch::HttpsFetcher::new() {

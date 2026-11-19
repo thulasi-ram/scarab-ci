@@ -360,6 +360,11 @@ pub struct AppState {
     /// leaves the shipped default; `main.rs` wires the loaded config with
     /// [`with_author_overlay`](AppState::with_author_overlay).
     pub author_overlay: scarab_executor_k8s::AuthorOverlayConfig,
+    /// The operator's placement config, when this server runs the k8s
+    /// executor: Run admission checks each Step's `placement_profiles`
+    /// against its profile registry ([`PlacementConfig::profile_refusals`](scarab_executor_k8s::PlacementConfig::profile_refusals)).
+    /// `None` (another executor, or a hand-built state): not checked.
+    pub placement: Option<Arc<scarab_executor_k8s::PlacementConfig>>,
 }
 
 impl AppState {
@@ -412,7 +417,16 @@ impl AppState {
             snapshot_retention_days: DEFAULT_SNAPSHOT_RETENTION_DAYS,
             step_up: step_up::StepUpPolicy::Off,
             author_overlay: scarab_executor_k8s::AuthorOverlayConfig::default(),
+            placement: None,
         }
+    }
+
+    /// The placement config the k8s executor applies ([`AppState::placement`]):
+    /// Run admission refuses a profile name its registry does not hold, and
+    /// a `registry_auth_only` profile on a Step without `registry_auth`.
+    pub fn with_placement(mut self, placement: scarab_executor_k8s::PlacementConfig) -> Self {
+        self.placement = Some(Arc::new(placement));
+        self
     }
 
     /// The keys a step author's `k8s_overlay` may set
@@ -528,6 +542,7 @@ impl AppState {
             links: self.actor_links(),
             connections: self.connections.as_deref(),
             author_overlay: Some(&self.author_overlay),
+            placement: self.placement.as_deref(),
         }
     }
 
@@ -2015,6 +2030,16 @@ async fn create_run(
             admit_k8s_overlay(None, step.k8s_overlay.as_ref(), false, &st.author_overlay).map_err(
                 |v| ApiError::BadRequest(format!("step `{}`: {}", step.id, v.join("; "))),
             )?;
+        // An inline step has no `registry_auth`.
+        let refused = placement_profile_refusals(
+            st.placement.as_deref(),
+            &step.id,
+            &step.placement_profiles,
+            false,
+        );
+        if !refused.is_empty() {
+            return Err(ApiError::BadRequest(refused.join("; ")));
+        }
         let spec = StepSpec {
             image: step.image.clone(),
             command: step.command.clone(),
@@ -4976,6 +5001,10 @@ pub struct AdmissionPorts<'a> {
     /// The keys a step author's `k8s_overlay` may set (the placement
     /// config's `author_overlay`). `None`: the shipped default.
     pub author_overlay: Option<&'a scarab_executor_k8s::AuthorOverlayConfig>,
+    /// The placement config the k8s executor applies; Run admission checks
+    /// each Step's `placement_profiles` against its registry. `None`: not
+    /// checked (another executor).
+    pub placement: Option<&'a scarab_executor_k8s::PlacementConfig>,
 }
 
 /// The stores that resolve a webhook actor to a Principal (ADR-0069): the
@@ -5081,6 +5110,7 @@ impl<'a> AdmissionPorts<'a> {
             links: ActorLinks::default(),
             connections: None,
             author_overlay: None,
+            placement: None,
         }
     }
 
@@ -5643,6 +5673,9 @@ struct AdmittedFacts<'a> {
     /// The keys a step author's `k8s_overlay` may set
     /// ([`AdmissionPorts::author_overlay`]).
     author_overlay: &'a scarab_executor_k8s::AuthorOverlayConfig,
+    /// The placement config whose profile registry each Step's
+    /// `placement_profiles` are checked against ([`AdmissionPorts::placement`]).
+    placement: Option<&'a scarab_executor_k8s::PlacementConfig>,
 }
 
 /// The cache scope a new Run gets (git-bug efcec77, 31a2533): its symbolic
@@ -6135,6 +6168,7 @@ async fn admit_unrecorded(
         registry: &registry,
         cache_scope: run_cache_scope(forge, event, ir, &gov).await,
         author_overlay: ports.author_overlay.unwrap_or(&shipped_overlay_keys),
+        placement: ports.placement,
     };
     // Rendered before the Policies are consulted: a key that cannot be
     // rendered refuses the Run before an allow decision naming it is
@@ -7173,16 +7207,19 @@ fn admit_k8s_overlay(
     }
 }
 
-/// Admit one Step's privilege request ([`admit_step_grants`]) and its
-/// `k8s_overlay` ([`admit_k8s_overlay`]) under the Run's governance, against
+/// Admit one Step's privilege request ([`admit_step_grants`]), its
+/// `k8s_overlay` ([`admit_k8s_overlay`]) and its `placement_profiles`
+/// ([`placement_profile_refusals`]) under the Run's governance, against
 /// `image` as Run creation renders it. `Err` is the refusal, naming the Step.
 /// Run creation ([`write_run_from_ir`]) and the policy test
-/// ([`step_privilege_refusals`]) both decide through it.
+/// ([`step_privilege_refusals`]) both decide through it, so `validate
+/// --server` reports what Run creation refuses.
 fn admit_step_privileges(
     step: &scarab_pipeline::StepSpec,
     gov: &RunGovernance,
     image: &str,
     allowed: &scarab_executor_k8s::AuthorOverlayConfig,
+    placement: Option<&scarab_executor_k8s::PlacementConfig>,
 ) -> Result<(scarab_project::AdmittedGrants, Option<serde_json::Value>), String> {
     let locked_out = gov.locked_out();
     let grants = admit_step_grants(
@@ -7205,7 +7242,32 @@ fn admit_step_privileges(
         allowed,
     )
     .map_err(|v| format!("step `{}`: {}", step.id, v.join("; ")))?;
+    // A map left by a Step that was not inlined is refused when the Run is
+    // written; there are no names to check here.
+    if let Ok(names) = step.placement_profiles.compiled() {
+        let refused = placement_profile_refusals(placement, &step.id, names, step.registry_auth);
+        if !refused.is_empty() {
+            return Err(refused.join("; "));
+        }
+    }
     Ok((grants, overlay))
+}
+
+/// What the operator's placement config refuses in a Step's
+/// `placement_profiles` (RT-R2-2): a name its registry does not hold, and a
+/// `registry_auth_only` profile on a Step without `registry_auth`. Each
+/// message names the Step. Both come from the Pipeline file, so the Run is
+/// refused when it is created instead of failing at every launch. `None`:
+/// this server runs no k8s executor, and nothing is checked.
+fn placement_profile_refusals(
+    placement: Option<&scarab_executor_k8s::PlacementConfig>,
+    step: &str,
+    names: &[String],
+    registry_auth: bool,
+) -> Vec<String> {
+    placement
+        .map(|p| p.profile_refusals(step, names, registry_auth))
+        .unwrap_or_default()
 }
 
 /// What [`admit_step_privileges`] refuses across `ir`'s Steps (gates launch
@@ -7217,6 +7279,7 @@ pub(crate) fn step_privilege_refusals(
     params: &std::collections::BTreeMap<String, serde_json::Value>,
     event: &serde_json::Map<String, serde_json::Value>,
     allowed: &scarab_executor_k8s::AuthorOverlayConfig,
+    placement: Option<&scarab_executor_k8s::PlacementConfig>,
 ) -> Vec<String> {
     ir.steps
         .iter()
@@ -7229,7 +7292,7 @@ pub(crate) fn step_privilege_refusals(
                 params,
                 event,
             );
-            admit_step_privileges(step, gov, &image, allowed).err()
+            admit_step_privileges(step, gov, &image, allowed, placement).err()
         })
         .collect()
 }
@@ -7614,9 +7677,14 @@ async fn write_run_from_ir(
                     // Decided at each launch, never at Run creation.
                     credential_eligible: false,
                 });
-            let (granted, k8s_overlay) =
-                admit_step_privileges(step, gov, &image, admitted.author_overlay)
-                    .map_err(TriggerError::Pipeline)?;
+            let (granted, k8s_overlay) = admit_step_privileges(
+                step,
+                gov,
+                &image,
+                admitted.author_overlay,
+                admitted.placement,
+            )
+            .map_err(TriggerError::Pipeline)?;
             let spec = StepSpec {
                 image: step.image.clone(),
                 command: step.command.clone(),
