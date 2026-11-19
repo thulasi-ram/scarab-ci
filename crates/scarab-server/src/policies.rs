@@ -1458,6 +1458,19 @@ async fn pipeline_input(
     .await
     {
         Ok(Ok(_)) => None,
+        // With no forge port this server cannot ask whether the forge mints
+        // tokens, and Run creation always has one: a forge credential is not
+        // checked here rather than refused for a reason Run creation would
+        // not give (AUD-11).
+        Ok(Err(crate::AdmissionRefusal::ForgeToken { messages })) if st.forge.is_none() => {
+            tracing::info!(
+                org,
+                project = %repo.name,
+                ?messages,
+                "policy test: forge credentials not checked, this server has no forge"
+            );
+            None
+        }
         Ok(Err(refusal)) => Some(crate::admission_refusal_message(&refusal, org, &repo.name)),
         Err(crate::TriggerError::Db(e)) => return Err(ApiError::Db(e)),
         Err(e) => return Err(ApiError::Db(DbError::Other(e.to_string()))),

@@ -973,3 +973,284 @@ async fn policy_test_denies_a_run_that_run_creation_refuses_for_the_sandbox() {
     assert_eq!(b["decision"]["outcome"]["kind"], "allow", "{b}");
     assert!(b.get("refusal").is_none(), "{b}");
 }
+
+/// A Pipeline into `prod`, run by push and pull request, whose Step carries
+/// `overlay` as its `k8s_overlay`.
+fn overlay_ci(overlay: &str) -> String {
+    format!(
+        "on: {{ push: {{}}, pull_request: {{}} }}\nenvironment: prod\nsteps:\n  - id: b\n    \
+         image: busybox\n    command: [\"true\"]\n    k8s_overlay: {overlay}\n"
+    )
+}
+
+/// `prod` admits every Project, and `web`'s grant there permits overlays.
+async fn prod_permitting_overlays() -> Arc<scarab_testkit::InMemoryEnvironmentGovernance> {
+    use scarab_project::{
+        EnvironmentGovernanceStore, EnvironmentProjectEligibility, EnvironmentProjectPrivilegeGrant,
+    };
+    let governance = Arc::new(
+        scarab_testkit::InMemoryEnvironmentGovernance::new().with_environment(
+            "acme",
+            "prod",
+            EnvironmentProjectEligibility::AllProjects,
+        ),
+    );
+    governance
+        .put_environment_project_privilege_grant(
+            &EnvironmentProjectPrivilegeGrant {
+                org: "acme".into(),
+                environment: "prod".into(),
+                project: "web".into(),
+                privileged_images: vec![],
+                permit_k8s_overlay: true,
+            },
+            "amy",
+            1,
+        )
+        .await
+        .unwrap();
+    governance
+}
+
+/// The policy test's Pipeline form for `yaml` under `trigger`.
+fn form(yaml: &str, trigger: Value) -> Value {
+    json!({
+        "pipeline": {
+            "yaml": yaml,
+            "path": ".scarab/ci.yaml",
+            "project": "web",
+            "trigger": trigger
+        }
+    })
+}
+
+// git-bug C5: Run creation admits a Step's privilege request and
+// `k8s_overlay` after its Policies are consulted, and the policy test did
+// not run either check, so `validate --server` answered allow for a Run that
+// Run creation then fails. It now runs the same check and answers a deny
+// with the reason Run creation gives.
+#[tokio::test]
+async fn policy_test_denies_a_run_that_run_creation_refuses_for_its_k8s_overlay() {
+    let governance = prod_permitting_overlays().await;
+    let g = governance.clone();
+    let h = harness_with(move |st| {
+        st.with_policies(Arc::new(InMemoryPolicies::new()))
+            .with_environment_governance(g)
+    });
+    let (s, _) = admin(&h).await;
+    let yaml = overlay_ci("{ spec: { hostNetwork: true } }");
+
+    // Run creation refuses it, naming the field.
+    let forge = FakeForge::new()
+        .with_file(".scarab/ci.yaml", yaml.as_str())
+        .with_commit("refs/heads/main", SHA);
+    let err = trigger_runs_from_event(
+        &forge,
+        h.db.as_ref(),
+        &FakeClock::new(1_000),
+        AdmissionPorts::governance(Some(governance.as_ref())),
+        &push(),
+    )
+    .await
+    .expect_err("Run creation refuses the overlay");
+    assert!(err.to_string().contains("`spec.hostNetwork`"), "{err}");
+
+    // The policy test answers a deny with the same reason.
+    let push_trigger = json!({ "kind": "push", "ref": "refs/heads/main", "sha": SHA });
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/policy-test",
+            Some(form(&yaml, push_trigger)),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["decision"]["outcome"]["kind"], "deny", "{b}");
+    let refusal = b["refusal"].as_str().expect("a refusal").to_string();
+    assert!(refusal.contains("`spec.hostNetwork`"), "{b}");
+    assert!(err.to_string().contains(&refusal), "{err} / {refusal}");
+
+    // An allowed overlay from a fork pull request is refused for the
+    // lock-out; the same pull request from the repository is allowed.
+    let yaml = overlay_ci("{ spec: { nodeSelector: { pool: gpu } } }");
+    for (fork, denied) in [(true, true), (false, false)] {
+        let trigger = json!({
+            "kind": "pull_request", "ref": "refs/pull/7/head", "sha": SHA, "fork": fork
+        });
+        let (st, b) = h
+            .cookie(
+                "POST",
+                "/v1/orgs/acme/policy-test",
+                Some(form(&yaml, trigger)),
+                &s,
+            )
+            .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        if denied {
+            assert_eq!(b["decision"]["outcome"]["kind"], "deny", "{b}");
+            assert!(
+                b["refusal"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("fork pull request")),
+                "{b}"
+            );
+        } else {
+            assert_eq!(b["decision"]["outcome"]["kind"], "allow", "{b}");
+            assert!(b.get("refusal").is_none(), "{b}");
+        }
+    }
+}
+
+// AUD-11: the policy test refuses a yanked library version as Run creation
+// does, with the same reason.
+#[tokio::test]
+async fn policy_test_denies_a_run_that_run_creation_refuses_for_a_yanked_version() {
+    use scarab_policy::library::{
+        content_hash, LibraryStore, LibraryVersion, LibraryYank, NewInstallation, Replaces,
+    };
+    let libs = Arc::new(scarab_testkit::InMemoryLibraries::new());
+    libs.put_version(&LibraryVersion {
+        org: "acme".into(),
+        content_hash: content_hash(LIB),
+        content: LIB.into(),
+        source: format!("github.com/acme/libs//deploy.yaml@{}", "3".repeat(40)),
+        name: "acme/deploy".into(),
+        fetched_by: "amy".into(),
+        fetched_at: 1,
+    })
+    .await
+    .unwrap();
+    libs.install(
+        &NewInstallation {
+            org: "acme".into(),
+            name: "acme/deploy".into(),
+            content_hash: content_hash(LIB),
+            installed_by: "amy".into(),
+            installed_at: 1,
+            step_up_ref: None,
+        },
+        &Replaces::Nothing,
+    )
+    .await
+    .unwrap();
+    libs.yank(&LibraryYank {
+        org: "acme".into(),
+        content_hash: content_hash(LIB),
+        reason: "writes the token to the log".into(),
+        yanked_by: "amy".into(),
+        yanked_at: 2,
+    })
+    .await
+    .unwrap();
+    let l = libs.clone();
+    let h = harness_with(move |st| {
+        st.with_policies(Arc::new(InMemoryPolicies::new()))
+            .with_libraries(l)
+    });
+    let (s, _) = admin(&h).await;
+    let yaml = "on: { push: {} }\nsteps:\n  - id: ship\n    invoke: lib:acme/deploy\n";
+
+    let forge = FakeForge::new()
+        .with_file(".scarab/ci.yaml", yaml)
+        .with_commit("refs/heads/main", SHA);
+    let outcome = trigger_runs_from_event(
+        &forge,
+        h.db.as_ref(),
+        &FakeClock::new(1_000),
+        AdmissionPorts::default().with_libraries(libs.as_ref()),
+        &push(),
+    )
+    .await
+    .unwrap();
+    assert!(outcome.runs.is_empty(), "{:?}", outcome.runs);
+    let reason = outcome.refused[0].reason.clone();
+    assert!(reason.contains("writes the token to the log"), "{reason}");
+
+    let trigger = json!({ "kind": "push", "ref": "refs/heads/main", "sha": SHA });
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/policy-test",
+            Some(form(yaml, trigger)),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["decision"]["outcome"]["kind"], "deny", "{b}");
+    assert_eq!(b["refusal"], json!(reason), "{b}");
+}
+
+// AUD-11: a Step of the repository's own Pipeline asking for a forge
+// token. A forge that mints tokens admits it at Run creation and in the
+// policy test; one that hands out a long-lived token refuses it in both,
+// with the same reason. A server with no forge cannot ask, and Run creation
+// always has one, so the policy test leaves it unchecked instead of
+// answering a deny Run creation might not give.
+#[tokio::test]
+async fn policy_test_checks_a_forge_token_as_run_creation_does() {
+    let yaml = "on: { push: {} }\nsteps:\n  - id: t\n    image: busybox\n    command: [\"true\"]\n    forge_token: read\n";
+    let trigger = json!({ "kind": "push", "ref": "refs/heads/main", "sha": SHA });
+    let forge = |mints: bool| {
+        let f = FakeForge::new()
+            .with_file(".scarab/ci.yaml", yaml)
+            .with_commit("refs/heads/main", SHA);
+        if mints {
+            f.with_minted_tokens()
+        } else {
+            f
+        }
+    };
+    for mints in [true, false] {
+        let f = Arc::new(forge(mints));
+        let server_forge = f.clone();
+        let h = harness_with(move |st| {
+            st.with_policies(Arc::new(InMemoryPolicies::new()))
+                .with_forge(server_forge)
+        });
+        let (s, _) = admin(&h).await;
+        let outcome = trigger_runs_from_event(
+            f.as_ref(),
+            h.db.as_ref(),
+            &FakeClock::new(1_000),
+            AdmissionPorts::default(),
+            &push(),
+        )
+        .await
+        .unwrap();
+        let (st, b) = h
+            .cookie(
+                "POST",
+                "/v1/orgs/acme/policy-test",
+                Some(form(yaml, trigger.clone())),
+                &s,
+            )
+            .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        if mints {
+            assert_eq!(outcome.runs.len(), 1, "{outcome:?}");
+            assert_eq!(b["decision"]["outcome"]["kind"], "allow", "{b}");
+        } else {
+            assert!(outcome.runs.is_empty(), "{outcome:?}");
+            let reason = outcome.refused[0].reason.clone();
+            assert!(reason.contains("long-lived token"), "{reason}");
+            assert_eq!(b["decision"]["outcome"]["kind"], "deny", "{b}");
+            assert_eq!(b["refusal"], json!(reason), "{b}");
+        }
+    }
+
+    // No forge on the server: not checked, so no deny for it.
+    let h = harness_with(|st| st.with_policies(Arc::new(InMemoryPolicies::new())));
+    let (s, _) = admin(&h).await;
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/policy-test",
+            Some(form(yaml, trigger)),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["decision"]["outcome"]["kind"], "allow", "{b}");
+    assert!(b.get("refusal").is_none(), "{b}");
+}
