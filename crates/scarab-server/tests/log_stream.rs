@@ -58,9 +58,10 @@ struct Ev {
     data: String,
 }
 
-/// Split an SSE body into events (LF-only, as axum writes it; the test logs
-/// hold no CR).
+/// Split an SSE body into events. A line ends in CRLF, LF or CR, as an
+/// EventSource reads it; axum writes a `\r` in data as a line end of its own.
 fn events(body: &str) -> Vec<Ev> {
+    let body = body.replace("\r\n", "\n").replace('\r', "\n");
     body.split("\n\n")
         .filter(|b| !b.is_empty())
         .filter_map(|block| {
@@ -317,4 +318,59 @@ async fn raw_download_streams_the_whole_try_as_an_attachment() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = get(&app, "/v1/runs/r1/steps/ghost/logs/raw?attempt=a1", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+async fn raw(app: &axum::Router, attempt: &str) -> Vec<u8> {
+    let (status, body) = get(
+        app,
+        &format!("/v1/runs/r1/steps/build/logs/raw?attempt={attempt}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    body.into_bytes()
+}
+
+#[tokio::test]
+async fn crlf_streams_as_one_line_end_even_split_across_chunks() {
+    // c0 | c1 is a batch boundary (200 KiB + 100 KiB > 256 KiB) inside a
+    // `\r\n`; c1 | c2 splits one inside a batch; c1 also holds a whole one.
+    let mut c0 = vec![b'x'; 200 * KIB];
+    c0.push(b'\r');
+    let mut c1 = b"\n".to_vec();
+    c1.extend(fill(b'y', 100 * KIB));
+    c1.extend_from_slice(b"one\r\ntwo\r");
+    let c2 = b"\nthree\n".to_vec();
+    let full: Vec<u8> = [c0.clone(), c1.clone(), c2.clone()].concat();
+    let want = String::from_utf8(full.clone())
+        .unwrap()
+        .replace("\r\n", "\n");
+    let app = app_with(&[("a1", vec![c0, c1, c2])]).await;
+
+    let (_, body) = get(&app, "/v1/runs/r1/steps/build/logs", None).await;
+    let evs = events(&body);
+    assert_eq!(
+        evs.iter().filter_map(|e| e.id.clone()).collect::<Vec<_>>(),
+        ["a1:1", "a1:3"]
+    );
+    assert_eq!(data_of(&evs), want);
+    // No `\r\n` reaches the wire, so no reader sees a blank line inside one.
+    assert!(!body.contains("\r\n"));
+
+    // A stream resumed between the `\r` and the `\n` does not send the `\n`
+    // again as a line of its own.
+    let (_, body) = get(&app, "/v1/runs/r1/steps/build/logs?from=a1:1", None).await;
+    assert_eq!(data_of(&events(&body)), want[evs[0].data.len()..]);
+
+    // The raw download keeps the stored bytes.
+    assert_eq!(raw(&app, "a1").await, full);
+}
+
+#[tokio::test]
+async fn a_lone_cr_reaches_the_reader_as_a_line_end() {
+    let chunks = vec![b"50%\r60%\r".to_vec(), b"done\n".to_vec()];
+    let app = app_with(&[("a1", chunks.clone())]).await;
+    let (_, body) = get(&app, "/v1/runs/r1/steps/build/logs", None).await;
+    assert_eq!(data_of(&events(&body)), "50%\n60%\ndone\n");
+    assert_eq!(raw(&app, "a1").await, chunks.concat());
 }

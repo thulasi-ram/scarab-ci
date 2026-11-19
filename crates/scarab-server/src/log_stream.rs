@@ -11,6 +11,12 @@
 //! - **Cursor.** Every `data` event has `id: <attempt_id>:<next_seq>`, the
 //!   position after it. A stream opened [`Start::From`] a cursor skips the
 //!   attempts before that one and restarts it at `next_seq`.
+//! - **Line ends.** `\r\n` goes out as `\n`, also when the `\r` ends one
+//!   batch and the `\n` starts the next: the stream sends the `\r` and drops
+//!   the `\n`. axum writes each `\r` and `\n` of a `data` event as a line
+//!   break of its own, so a `\r\n` would reach the reader as two. A lone `\r`
+//!   reaches the reader as SSE delivers it, a line break. The raw download
+//!   keeps the stored bytes.
 //! - **Tail.** [`Start::Tail`] skips the earliest whole chunks so at most `tail`
 //!   bytes are replayed, announced by one `truncated` event first.
 //! - **Live.** Polls the durable index every 500 ms (ADR-0051), so any replica
@@ -162,6 +168,10 @@ pub struct LogStream {
     /// Drop leading UTF-8 continuation bytes from the next batch (a tail cut
     /// can land inside a character).
     strip_lead: bool,
+    /// Per `(read step, attempt)`: the last byte sent was `\r`, so a `\n`
+    /// that starts the next batch is the rest of a `\r\n` and is dropped.
+    /// Missing for a source this stream has not sent yet.
+    ends_cr: HashMap<Key, bool>,
     pending: VecDeque<Item>,
     /// Keep polling once the current pass is drained.
     live: bool,
@@ -195,6 +205,7 @@ impl LogStream {
             cur: 0,
             index: None,
             strip_lead: false,
+            ends_cr: HashMap::new(),
             pending: VecDeque::new(),
             live,
             last_pass: false,
@@ -260,6 +271,9 @@ impl LogStream {
         }
         let src = &self.sources[at];
         self.progress.insert(key(&src.step, &src.attempt), seq);
+        // The reader never saw the byte before the cut: keep a leading `\n`
+        // rather than read the chunk before it to decide.
+        self.ends_cr.insert(key(&src.step, &src.attempt), false);
         self.pending.push_back(Item::Truncated {
             skipped_bytes: total - kept,
             total_bytes: total,
@@ -346,6 +360,11 @@ impl LogStream {
         if todo.is_empty() {
             return Ok(None);
         }
+        // A stream resumed from a cursor does not know how the chunk before
+        // `from` ended; it reads that chunk if the batch starts with `\n`.
+        let before = (from > 0 && !self.ends_cr.contains_key(&k))
+            .then(|| index.iter().find(|c| c.seq + 1 == from).cloned())
+            .flatten();
 
         let mut buf: Vec<u8> = Vec::new();
         let mut next = from;
@@ -381,6 +400,22 @@ impl LogStream {
             buf.truncate(len);
             next = n;
         }
+        // An empty batch (empty chunks) leaves the last byte sent as it was.
+        let sends_bytes = !buf.is_empty();
+        if buf.first() == Some(&b'\n') {
+            let after_cr = match (self.ends_cr.get(&k), before) {
+                (Some(&cr), _) => cr,
+                (None, Some(meta)) => self.logs.read_chunk(&meta).await?.last() == Some(&b'\r'),
+                (None, None) => false,
+            };
+            if after_cr {
+                buf.remove(0);
+            }
+        }
+        if sends_bytes {
+            self.ends_cr.insert(k.clone(), buf.last() == Some(&b'\r'));
+        }
+        crlf_to_lf(&mut buf);
         self.progress.insert(k, next);
         Ok(Some(Item::Data {
             id: Cursor::format(&attempt, next),
@@ -443,6 +478,19 @@ async fn resolve(
             Ok((out, latest))
         }
     }
+}
+
+/// Replace each `\r\n` in `buf` with `\n`, in place. A lone `\r` stays.
+pub fn crlf_to_lf(buf: &mut Vec<u8>) {
+    let mut w = 0;
+    for r in 0..buf.len() {
+        if buf[r] == b'\r' && buf.get(r + 1) == Some(&b'\n') {
+            continue;
+        }
+        buf[w] = buf[r];
+        w += 1;
+    }
+    buf.truncate(w);
 }
 
 /// How many trailing bytes of `buf` are the start of a UTF-8 character whose
@@ -548,6 +596,20 @@ mod tests {
         for bad in ["", "a2", ":3", "a2:", "a2:x", "a2:-1"] {
             assert!(Cursor::parse(bad).is_none(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn crlf_becomes_lf_and_a_lone_cr_stays() {
+        let norm = |s: &[u8]| {
+            let mut v = s.to_vec();
+            crlf_to_lf(&mut v);
+            v
+        };
+        assert_eq!(norm(b"a\r\nb\r\n"), b"a\nb\n");
+        assert_eq!(norm(b"50%\r60%\r\n"), b"50%\r60%\n");
+        assert_eq!(norm(b"\r\r\n\n"), b"\r\n\n");
+        assert_eq!(norm(b"end\r"), b"end\r");
+        assert_eq!(norm(b""), b"");
     }
 
     #[test]
