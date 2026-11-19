@@ -149,7 +149,9 @@ mod tests {
     /// the next feed starts a new line.
     #[test]
     fn a_lone_cr_ends_a_line() {
-        let events = parse_all(&[b"data: 50%\r", b"data: 60%\rdata: done\r\r"]);
+        // A CR at the end of the bytes so far may be half of a CRLF, so the
+        // parser decides on the next byte; the trailing comment supplies it.
+        let events = parse_all(&[b"data: 50%\r", b"data: 60%\rdata: done\r\r", b":\n"]);
         assert_eq!(
             events,
             vec![SseEvent {
