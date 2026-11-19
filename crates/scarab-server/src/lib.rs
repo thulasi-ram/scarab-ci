@@ -7020,8 +7020,9 @@ fn cache_config(step: &scarab_pipeline::StepSpec) -> Option<scarab_engine::Cache
 /// ([`admit_step_grants`]), it is honored only where the Project's privilege
 /// grant in the target Environment sets `permit_k8s_overlay` (ADR-0071 §8),
 /// else the run is rejected **fail-closed**. An inline API run (no
-/// Environment) therefore never gets one. Returns the overlay to persist (or
-/// `None`).
+/// Environment) therefore never gets one. A permitted overlay may still set
+/// only the fields in `scarab_executor_k8s::AUTHOR_OVERLAY_FIELDS`. Returns the
+/// overlay to persist (or `None`).
 ///
 /// `locked_out` is the same value the privilege grants are admitted with: a
 /// fork pull request's Run, or a Run locked out of its Environment, is
@@ -7044,7 +7045,9 @@ fn admit_k8s_overlay(
                 grant_scope.flatten(),
             ) =>
         {
-            let refused = k8s_overlay_reserved_keys(o);
+            // The same allowlist the executor applies before it creates the
+            // Pod (git-bug 24a3126): the author learns of a refusal here.
+            let refused = scarab_executor_k8s::author_overlay_refusals(o);
             if refused.is_empty() {
                 Ok(Some(o.clone()))
             } else {
@@ -7058,88 +7061,6 @@ fn admit_k8s_overlay(
                 .to_string(),
         ]),
     }
-}
-
-/// Label and annotation key prefixes a raw `k8s_overlay` may not set or
-/// delete, even under `permit_k8s_overlay` (git-bug da0af59): the Helm
-/// chart's Services select Pods on `app.kubernetes.io/name` + `/instance`, so
-/// a step Pod carrying them would receive the server's traffic, and the
-/// executor reads `scarab.io/*` and `scarab.dev/*` keys to find, harvest and
-/// drain step Pods.
-const K8S_OVERLAY_RESERVED_PREFIXES: [&str; 3] =
-    ["app.kubernetes.io/", "scarab.io/", "scarab.dev/"];
-
-/// `metadata` fields a raw `k8s_overlay` may not set or delete: the executor
-/// names each Pod itself and finds it again by that name, so a renamed Pod
-/// runs on out of its reach; `namespace` moves it the same way;
-/// `ownerReferences` and `finalizers` decide when the Pod is deleted, and a
-/// finalizer keeps a torn-down Pod from ever going.
-const K8S_OVERLAY_RESERVED_METADATA: [&str; 5] = [
-    "name",
-    "generateName",
-    "namespace",
-    "ownerReferences",
-    "finalizers",
-];
-
-/// The reserved prefixes as the refusal messages name them.
-fn k8s_overlay_reserved_prefix_list() -> String {
-    K8S_OVERLAY_RESERVED_PREFIXES
-        .iter()
-        .map(|p| format!("`{p}`"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// One refusal per reserved key the overlay touches under `metadata.labels`
-/// or `metadata.annotations`. The overlay's objects merge as in an RFC-7386
-/// merge patch, so a `null` deletes the key: a `null` (or non-object) `metadata`, `labels` or
-/// `annotations` replaces the whole map, reserved keys included, and is
-/// refused too. Empty when the overlay leaves every reserved key alone.
-fn k8s_overlay_reserved_keys(overlay: &serde_json::Value) -> Vec<String> {
-    let mut refused = Vec::new();
-    let Some(metadata) = overlay.get("metadata") else {
-        return refused;
-    };
-    let prefixes = k8s_overlay_reserved_prefix_list();
-    let Some(metadata) = metadata.as_object() else {
-        refused.push(format!(
-            "raw `k8s_overlay` may not replace or delete `metadata`: it holds the Pod's name \
-             and its reserved {prefixes} labels and annotations"
-        ));
-        return refused;
-    };
-    for field in K8S_OVERLAY_RESERVED_METADATA {
-        if metadata.contains_key(field) {
-            refused.push(format!(
-                "raw `k8s_overlay` may not set or delete `metadata.{field}`: Scarab manages it"
-            ));
-        }
-    }
-    for field in ["labels", "annotations"] {
-        let Some(map) = metadata.get(field) else {
-            continue;
-        };
-        let Some(map) = map.as_object() else {
-            refused.push(format!(
-                "raw `k8s_overlay` may not replace or delete `metadata.{field}`: it holds the \
-                 reserved {prefixes} keys"
-            ));
-            continue;
-        };
-        for key in map.keys() {
-            if K8S_OVERLAY_RESERVED_PREFIXES
-                .iter()
-                .any(|prefix| key.starts_with(prefix))
-            {
-                refused.push(format!(
-                    "raw `k8s_overlay` may not set or delete the reserved `metadata.{field}` key \
-                     `{key}` (keys under {prefixes} are Scarab's)"
-                ));
-            }
-        }
-    }
-    refused
 }
 
 /// Durably materialize a compiled pipeline IR into a Run: store the IR on the
@@ -15376,7 +15297,13 @@ mod grant_admission_tests {
     #[test]
     fn k8s_overlay_refuses_the_pods_identity_and_lifecycle_fields_even_when_permitted() {
         let g = permitting();
-        for field in super::K8S_OVERLAY_RESERVED_METADATA {
+        for field in [
+            "name",
+            "generateName",
+            "namespace",
+            "ownerReferences",
+            "finalizers",
+        ] {
             for value in [
                 serde_json::json!("x"),
                 serde_json::json!(["x"]),
@@ -15402,6 +15329,77 @@ mod grant_admission_tests {
             },
             "spec": {"nodeSelector": {"pool": "ci"}}
         });
+        assert_eq!(
+            admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false).unwrap(),
+            Some(overlay)
+        );
+    }
+
+    /// git-bug 24a3126 / 743545c: a permitting grant covers only the author
+    /// allowlist. A Secret reference, the server's ServiceAccount, its token,
+    /// the host's PID namespace, a hostPath volume and a privileged step are
+    /// each refused at Run creation, naming the field.
+    #[test]
+    fn k8s_overlay_refuses_fields_outside_the_allowlist_even_when_permitted() {
+        let g = permitting();
+        for (overlay, field) in [
+            (
+                serde_json::json!({"spec":{"volumes":[
+                    {"name":"x","secret":{"secretName":"scarab-build-a1-0000-token"}}]}}),
+                "spec.volumes[].secret",
+            ),
+            (
+                serde_json::json!({"spec":{"volumes":[
+                    {"name":"x","projected":{"sources":[{"secret":{"name":"scarab"}}]}}]}}),
+                "spec.volumes[].projected",
+            ),
+            (
+                serde_json::json!({"spec":{"containers":[{"name":"step","env":[
+                    {"name":"T","valueFrom":{"secretKeyRef":{"name":"scarab","key":"k"}}}]}]}}),
+                "spec.containers[step].env[].valueFrom",
+            ),
+            (
+                serde_json::json!({"spec":{"containers":[{"name":"step","envFrom":[
+                    {"secretRef":{"name":"scarab"}}]}]}}),
+                "spec.containers[step].envFrom",
+            ),
+            (
+                serde_json::json!({"spec":{"serviceAccountName":"scarab"}}),
+                "spec.serviceAccountName",
+            ),
+            (
+                serde_json::json!({"spec":{"automountServiceAccountToken":true}}),
+                "spec.automountServiceAccountToken",
+            ),
+            (serde_json::json!({"spec":{"hostPID":true}}), "spec.hostPID"),
+            (
+                serde_json::json!({"spec":{"volumes":[{"name":"r","hostPath":{"path":"/"}}]}}),
+                "spec.volumes[].hostPath",
+            ),
+            (
+                serde_json::json!({"spec":{"containers":[
+                    {"name":"step","securityContext":{"privileged":true}}]}}),
+                "spec.containers[step].securityContext",
+            ),
+        ] {
+            let err = admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false)
+                .expect_err(&format!("{overlay} must be refused"))
+                .join("; ");
+            assert!(err.contains(&format!("`{field}`")), "{overlay}: {err}");
+        }
+    }
+
+    /// An overlay inside the allowlist is admitted as written.
+    #[test]
+    fn k8s_overlay_admits_an_allowed_step_container_change_when_permitted() {
+        let g = permitting();
+        let overlay = serde_json::json!({"spec":{
+            "volumes":[{"name":"scratch","emptyDir":{}}],
+            "containers":[{"name":"step",
+                "resources":{"limits":{"nvidia.com/gpu":"1"}},
+                "env":[{"name":"EXTRA","value":"1"}],
+                "volumeMounts":[{"name":"scratch","mountPath":"/scratch"}]}]
+        }});
         assert_eq!(
             admit_k8s_overlay(Some(g.as_ref()), Some(&overlay), false).unwrap(),
             Some(overlay)
