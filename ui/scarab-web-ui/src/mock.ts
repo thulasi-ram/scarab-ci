@@ -61,6 +61,11 @@ const ENV_GATE_RUN_ID = "0190f8a2000071fb8c00e7a9b0c1d2e3";
 // failed (one on both of its tries, after waiting for a node), so the summary
 // line names two root failures. /acme/scarab/runs/<id>.
 const MATRIX_RUN_ID = "0190f8a2000071fb8c00f00d4a7b1c33";
+// The RETRIES run: a live run whose `unit` step passed on its third try and
+// whose `e2e` step passed on its sixth, with cleared Pod conditions on
+// earlier tries, two matrix cells waiting for a node right now, and artifacts
+// that earlier tries also wrote. /acme/scarab/runs/<id>.
+const RETRIES_RUN_ID = "0190f8a2000071fb8c00a11c3e5d7f34";
 
 // ── /v1/me ────────────────────────────────────────────────────────────────
 // An Owner of the one implicit org, so the Settings gear renders.
@@ -686,6 +691,153 @@ const matrixArtifacts: ArtifactDto[] = MX_CELLS.filter(([, , how]) => how === "o
   size: 22_000 + i * 13_000,
   content_type: "text/plain",
 }));
+
+// ── the RETRIES run (try tabs, Activity filter, earlier artifact copies) ────
+// Times are minutes:seconds before now. `unit` failed, timed out after waiting
+// for a node, then passed when a.kim retried it. `e2e` failed five times (two
+// tries waited for a node first) and passed on its sixth. Both
+// `deploy-preview` cells are waiting for a node right now.
+const ms = (m: number, sec = 0) => (m * 60 + sec) * 1000;
+type MockTry = {
+  id: string;
+  start: number;
+  end: number | null;
+  failure?: string;
+  detail?: string;
+  /** A Pod condition before the try started: [onset, close] (close null = still active). */
+  wait?: [number, number | null];
+};
+const RT_TRIES: Record<string, MockTry[]> = {
+  git: [{ id: "a1", start: ms(20), end: ms(19, 20) }],
+  unit: [
+    { id: "a1", start: ms(19, 10), end: ms(17, 10), failure: "step", detail: "cargo test exited 101: 2 tests failed" },
+    { id: "a2", start: ms(17), end: ms(13, 50), failure: "timeout", detail: "no output for 2m", wait: [ms(16, 59), ms(15, 50)] },
+    { id: "a3", start: ms(12, 55), end: ms(10, 40) },
+  ],
+  e2e: [
+    { id: "a1", start: ms(19, 10), end: ms(18), failure: "step", detail: "playwright: 3 specs failed" },
+    { id: "a2", start: ms(17, 50), end: ms(16), failure: "lost", detail: "the node was drained", wait: [ms(17, 49), ms(17, 10)] },
+    { id: "a3", start: ms(15, 50), end: ms(14), failure: "timeout", detail: "no output for 2m", wait: [ms(15, 49), ms(15, 19)] },
+    { id: "a4", start: ms(13, 50), end: ms(12), failure: "step", detail: "playwright: 1 spec failed" },
+    { id: "a5", start: ms(11, 50), end: ms(10), failure: "step", detail: "playwright: 1 spec failed" },
+    { id: "a6", start: ms(9, 50), end: ms(7) },
+  ],
+  "deploy-preview[region=eu]": [{ id: "a1", start: ms(6, 50), end: null, wait: [ms(6, 45), null] }],
+  "deploy-preview[region=us]": [{ id: "a1", start: ms(6, 50), end: null, wait: [ms(6, 45), null] }],
+};
+const RT_NEEDS: Record<string, string[]> = {
+  git: [],
+  unit: ["git"],
+  e2e: ["git"],
+  "deploy-preview[region=eu]": ["unit", "e2e"],
+  "deploy-preview[region=us]": ["unit", "e2e"],
+};
+const retriesRunStatus: RunStatusDto = {
+  id: RETRIES_RUN_ID,
+  status: "running",
+  run_number: 34,
+  pipeline: "ci",
+  trigger_title: "Retry the flaky checkout tests",
+  origin_pr_base: "main",
+  params: {},
+  snapshot_retention: { retention_days: 14, expired: false, pinned: false },
+  steps: Object.entries(RT_TRIES).map(([id, tries]) => {
+    const last = tries[tries.length - 1]!;
+    return {
+      id,
+      status: last.end === null ? "running" : last.failure ? "failed" : "succeeded",
+      attempts: tries.length,
+      needs: RT_NEEDS[id] ?? [],
+      attempt_list: tries.map((t) => ({
+        id: t.id,
+        started_at: ago(t.start),
+        finished_at: t.end === null ? null : ago(t.end),
+        failed: !!t.failure,
+        ...(t.failure ? { failure: t.failure, failure_detail: t.detail } : {}),
+        outcome: t.end === null ? "running" : t.failure ? "failed" : "succeeded",
+      })),
+    };
+  }),
+};
+const rtv = sse(RETRIES_RUN_ID);
+const retriesEventsBody = (() => {
+  const timed: [number, unknown][] = [
+    [
+      ms(20, 3),
+      {
+        Raw: {
+          trigger: {
+            event: {
+              kind: "pull_request",
+              actor: "a.kim",
+              branch: "fix/flaky-checkout",
+              sha: "9e1c4a7b2d3f5e6a7b8c9d0e1f2a3b4c",
+              repo: { owner: "acme", name: "scarab" },
+              pr: 162,
+            },
+          },
+        },
+      },
+    ],
+    [ms(20, 2), { RunTransitioned: { from: "pending", to: "running" } }],
+    // a.kim retried `unit` after its second try timed out.
+    [ms(13), { StepRetryRequested: { target: "unit", invalidated: [], by: "a.kim" } }],
+  ];
+  const message = "0/9 nodes are available: 9 Insufficient cpu";
+  for (const [step, tries] of Object.entries(RT_TRIES)) {
+    for (const t of tries) {
+      timed.push([t.start, { AttemptStarted: { step, attempt: t.id } }]);
+      if (t.wait) {
+        const [onset, close] = t.wait;
+        timed.push([onset, { StepInfraCondition: { step, attempt: t.id, reason: "Unschedulable", message } }]);
+        if (close !== null)
+          timed.push([
+            close,
+            {
+              StepInfraCondition: {
+                step,
+                attempt: t.id,
+                reason: "Unschedulable",
+                message,
+                held_ms: onset - close,
+                observations: 3,
+              },
+            },
+          ]);
+      }
+      if (t.end !== null)
+        timed.push([t.end, { AttemptFinished: { step, attempt: t.id, ...(t.failure ? { failure: t.failure } : {}) } }]);
+    }
+    const last = tries[tries.length - 1]!;
+    if (last.end !== null)
+      timed.push([
+        last.end - 500,
+        { StepTransitioned: { step, from: "running", to: last.failure ? "failed" : "succeeded" } },
+      ]);
+  }
+  // Oldest first: a larger "before now" is earlier.
+  timed.sort((a, b) => b[0] - a[0]);
+  return timed.map(([before, kind]) => rtv(ago(before), kind)).join("");
+})();
+const rtArtifact = (name: string, step: string, attempt: string, of_record: boolean, size: number, content_type: string) => ({
+  name,
+  step,
+  attempt,
+  of_record,
+  succeeded: !RT_TRIES[step]!.find((t) => t.id === attempt)!.failure,
+  size,
+  content_type,
+});
+const retriesArtifacts: ArtifactDto[] = [
+  rtArtifact("junit.xml", "unit", "a1", false, 18_400, "application/xml"),
+  rtArtifact("junit.xml", "unit", "a3", true, 18_900, "application/xml"),
+  rtArtifact("coverage.txt", "unit", "a3", true, 4_100, "text/plain"),
+  rtArtifact("report.html", "e2e", "a1", false, 310_000, "text/html"),
+  rtArtifact("report.html", "e2e", "a4", false, 305_000, "text/html"),
+  rtArtifact("report.html", "e2e", "a6", true, 298_000, "text/html"),
+  // Only a failed try wrote the trace: nothing is of record for it.
+  rtArtifact("trace.zip", "e2e", "a5", false, 2_400_000, "application/zip"),
+];
 
 const richArtifacts: ArtifactDto[] = [
   {
@@ -2611,6 +2763,16 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     });
   if (p === `/v1/runs/${MATRIX_RUN_ID}/artifacts`) return json(matrixArtifacts);
   if (p === `/v1/runs/${MATRIX_RUN_ID}/services`) return json([]);
+
+  // the RETRIES run
+  if (p === `/v1/runs/${RETRIES_RUN_ID}`) return json(retriesRunStatus);
+  if (p === `/v1/runs/${RETRIES_RUN_ID}/events`)
+    return new Response(retriesEventsBody, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  if (p === `/v1/runs/${RETRIES_RUN_ID}/artifacts`) return json(retriesArtifacts);
+  if (p === `/v1/runs/${RETRIES_RUN_ID}/services`) return json([]);
 
   // the RICH run (Playwright walkthrough fixture)
   if (p === `/v1/runs/${RICH_RUN_ID}`) return json(richRunStatus);
