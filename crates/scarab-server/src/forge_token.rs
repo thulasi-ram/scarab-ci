@@ -825,7 +825,7 @@ impl ForgeCredentialExecutor {
 /// dockerconfigjson itself, each `auth`, `password`, `identitytoken` and
 /// `registrytoken` in it, and the password half of each decoded `auth`; or
 /// the forge-derived token and the `auth` Scarab builds from it.
-fn registry_secret_values(
+pub(crate) fn registry_secret_values(
     json: Option<&str>,
     derived: Option<&scarab_engine::RegistryCredential>,
 ) -> Vec<String> {
@@ -1148,6 +1148,12 @@ impl Executor for ForgeCredentialExecutor {
         self.inner.log_stream(step).await
     }
 
+    async fn log_redactions(&self, step: &StepRun) -> Result<Vec<Vec<u8>>, ExecError> {
+        // Forward: the trait default answers none, which would make every
+        // replica that did not launch a step store its secrets in clear.
+        self.inner.log_redactions(step).await
+    }
+
     async fn sidecar_log_stream(
         &self,
         step: &StepRun,
@@ -1252,5 +1258,29 @@ mod tests {
             .expect("launch_service must forward to inner, not hit the reject default");
 
         assert_eq!(inner.launched_services(), vec![handle.0]);
+    }
+
+    // This decorator must forward `log_redactions`: the trait default answers
+    // none, and a replica that did not launch a step would then store the
+    // step's secrets in its log in clear.
+    #[tokio::test]
+    async fn forwards_log_redactions_to_inner() {
+        let inner = Arc::new(FakeExecutor::new());
+        let forge: Arc<dyn ForgePort> = Arc::new(FakeForge::new());
+        let decorator = ForgeCredentialExecutor::new(inner.clone(), forge);
+        let step = scarab_engine::StepRun {
+            run: RunId("run-1".into()),
+            step: scarab_engine::StepId("build".into()),
+            status: scarab_engine::StepStatus::Running,
+            attempts: vec![],
+            needs: vec![],
+            gate_kind: None,
+        };
+        inner.set_log_redactions(vec![b"s3cr3t".to_vec()]);
+
+        assert_eq!(
+            decorator.log_redactions(&step).await.unwrap(),
+            vec![b"s3cr3t".to_vec()]
+        );
     }
 }

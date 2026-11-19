@@ -835,38 +835,503 @@ async fn redaction_in_the_stored_part_does_not_move_the_resume_point() {
     );
 }
 
-/// git-bug de2bd9b: a re-read that comes back shorter than the stored part
-/// (the kubelet rotated the container's log file and serves only the new
-/// one) cannot tell which of its bytes are new. Nothing is appended, and a
-/// warning says why.
-#[tokio::test]
-async fn a_log_shorter_than_the_stored_part_appends_nothing_and_warns() {
-    use std::io::Write;
+/// Collects formatted log lines, for a test that checks a warning.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
 
-    /// Collects formatted log lines.
-    #[derive(Clone, Default)]
-    struct Captured(Arc<Mutex<Vec<u8>>>);
-    impl Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Captured {
+    /// Route WARN lines of this (single-threaded) test runtime here.
+    fn install(&self) -> tracing::subscriber::DefaultGuard {
+        let writer = self.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::set_default(subscriber)
+    }
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+/// The chunk stored before a source is stored again from its first byte.
+const MARKER: &[u8] = b"\nscarab: the log source restarted; earlier lines may repeat\n";
+
+fn cat(parts: &[&[u8]]) -> Vec<u8> {
+    parts.concat()
+}
+
+fn markers(log: &[u8]) -> usize {
+    log.windows(MARKER.len()).filter(|w| *w == MARKER).count()
+}
+
+/// A fake executor shaped like a followed Kubernetes log: every open reads the
+/// container's log as it is now from its first byte and, while `running`,
+/// waits for more instead of ending. The test replaces the log to model a
+/// rotated log file or a restarted container. An open can break after a
+/// number of chunks; opens past the script read in 4-byte chunks.
+/// `sidecar_log_stream` reads the same log. `log_redactions` answers what
+/// the test set.
+struct LiveLog {
+    log: Arc<Mutex<Vec<u8>>>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    reads: Mutex<VecDeque<Read>>,
+    opens: AtomicUsize,
+    redactions: Mutex<Result<Vec<Vec<u8>>, String>>,
+}
+
+impl LiveLog {
+    fn new(log: &[u8], running: bool, reads: Vec<Read>) -> Arc<Self> {
+        Arc::new(Self {
+            log: Arc::new(Mutex::new(log.to_vec())),
+            running: Arc::new(std::sync::atomic::AtomicBool::new(running)),
+            reads: Mutex::new(reads.into()),
+            opens: AtomicUsize::new(0),
+            redactions: Mutex::new(Ok(Vec::new())),
+        })
+    }
+    fn opens(&self) -> usize {
+        self.opens.load(Ordering::SeqCst)
+    }
+    fn set(&self, log: &[u8]) {
+        *self.log.lock().unwrap() = log.to_vec();
+    }
+    fn print(&self, more: &[u8]) {
+        self.log.lock().unwrap().extend_from_slice(more);
+    }
+    fn stop(&self) {
+        self.running.store(false, Ordering::SeqCst);
+    }
+    fn open(&self) -> Box<dyn LogChunks> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        let read = self.reads.lock().unwrap().pop_front().unwrap_or(Read {
+            chunk: 4,
+            fail_after: None,
+        });
+        Box::new(FollowChunks {
+            log: self.log.clone(),
+            running: self.running.clone(),
+            pos: 0,
+            read,
+            served: 0,
+        })
+    }
+}
+
+struct FollowChunks {
+    log: Arc<Mutex<Vec<u8>>>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    pos: usize,
+    read: Read,
+    served: usize,
+}
+
+#[async_trait]
+impl LogChunks for FollowChunks {
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ExecError> {
+        loop {
+            if self.read.fail_after == Some(self.served) {
+                return Err(ExecError::Other(
+                    "error reading the log stream: connection reset by peer".into(),
+                ));
+            }
+            {
+                let log = self.log.lock().unwrap();
+                if self.pos < log.len() {
+                    let end = (self.pos + self.read.chunk).min(log.len());
+                    let chunk = log[self.pos..end].to_vec();
+                    self.pos = end;
+                    self.served += 1;
+                    return Ok(Some(chunk));
+                }
+            }
+            if !self.running.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
     }
-    let captured = Captured::default();
-    let writer = captured.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .with_max_level(tracing::Level::WARN)
-        .finish();
-    // The test runtime is single-threaded, so spawned tails log here too.
-    let _guard = tracing::subscriber::set_default(subscriber);
+}
 
-    let exec = ContainerLog::new(
+#[async_trait]
+impl Executor for LiveLog {
+    async fn results_delivery_failure(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+    async fn gate_refusal(&self, _gate: &StepRun) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+    async fn infra_condition(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
+        Ok(None)
+    }
+    async fn take_forge_credential(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
+        Ok(None)
+    }
+    async fn workspace_provisioning(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
+        Ok(None)
+    }
+    async fn launch(&self, step: &StepRun, _spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+        Ok(ExecHandle(step.step.0.clone()))
+    }
+    async fn poll(&self, _h: &ExecHandle) -> Result<ExecState, ExecError> {
+        Ok(ExecState::Running)
+    }
+    async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
+        Ok(())
+    }
+    fn unit_handle(&self, _step: &StepRun) -> Option<ExecHandle> {
+        None
+    }
+    async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
+        Ok(true)
+    }
+    async fn log_stream(&self, _step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        Ok(Some(self.open()))
+    }
+    async fn sidecar_log_stream(
+        &self,
+        _step: &StepRun,
+        _container: &str,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        Ok(Some(self.open()))
+    }
+    async fn log_redactions(&self, _step: &StepRun) -> Result<Vec<Vec<u8>>, ExecError> {
+        self.redactions
+            .lock()
+            .unwrap()
+            .clone()
+            .map_err(ExecError::Other)
+    }
+}
+
+/// Wait (bounded) until the stream `{r, build-or-sidecar, a1}` stores `want`.
+async fn wait_stored_in(logs: &LogService, step: &StepId, want: &[u8]) {
+    let (run, _, a) = stream();
+    let mut got = Vec::new();
+    let waited = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            got = logs.read_all(&run, step, &a).await.unwrap_or_default();
+            if got == want {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await;
+    assert!(
+        waited.is_ok(),
+        "stored log never became {:?}; it is {:?}",
+        String::from_utf8_lossy(want),
+        String::from_utf8_lossy(&got)
+    );
+}
+
+/// Call `ensure` (bounded) until `cond` holds.
+async fn ensure_until(tailer: &LogTailer, step: &StepRun, mut cond: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !cond() {
+            tailer.ensure(step);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the condition did not hold in time");
+}
+
+/// git-bug de2bd9b (round 2): after the kubelet rotates the container's log
+/// file, a new read serves the new file only, which does not begin with the
+/// part already stored. Skipping the stored part's length of it would drop
+/// output never stored. The read compares instead: on a difference it stores
+/// a marker and then all of the new file.
+#[tokio::test]
+async fn a_rotated_log_is_stored_again_after_a_marker() {
+    let a = b"aaaa\nbbbb\n";
+    let b = b"cccc\ndddd\neeee\n";
+    let exec = LiveLog::new(
+        a,
+        false,
+        vec![Read {
+            chunk: 5,
+            fail_after: Some(2),
+        }],
+    );
+    let logs = logs();
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    let step = running_step();
+
+    tailer.ensure(&step);
+    wait_stored(&logs, a).await;
+    // Rotated: the API now serves another file.
+    exec.set(b);
+    ensure_until(&tailer, &step, || exec.opens() >= 3).await;
+    wait_stored(&logs, &cat(&[a, MARKER, b])).await;
+
+    // The new file was read to its end: the fence is drained.
+    for _ in 0..3 {
+        tailer.ensure(&step);
+        settle().await;
+    }
+    assert_eq!(
+        exec.opens(),
+        3,
+        "one broken read, one that differed, one reopen"
+    );
+    let (run, s, at) = stream();
+    assert_eq!(
+        logs.read_all(&run, &s, &at).await.unwrap(),
+        cat(&[a, MARKER, b])
+    );
+}
+
+/// The same for a running step: the retry is a follow read, and the read
+/// after the marker becomes the live tail. Output printed after it is stored
+/// while the stream is still open, after one marker.
+#[tokio::test]
+async fn a_rotated_log_of_a_running_step_is_followed_after_one_marker() {
+    let a = b"aaaa\nbbbb\n";
+    let exec = LiveLog::new(
+        a,
+        true,
+        vec![Read {
+            chunk: 5,
+            fail_after: Some(2),
+        }],
+    );
+    let logs = logs();
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    let step = running_step();
+
+    tailer.ensure(&step);
+    wait_stored(&logs, a).await;
+    exec.set(b"BBBB");
+    ensure_until(&tailer, &step, || exec.opens() >= 3).await;
+    wait_stored(&logs, &cat(&[a, MARKER, b"BBBB"])).await;
+
+    exec.print(b"\nmore\n");
+    wait_stored(&logs, &cat(&[a, MARKER, b"BBBB\nmore\n"])).await;
+    for _ in 0..3 {
+        tailer.ensure(&step);
+        settle().await;
+    }
+    assert_eq!(exec.opens(), 3, "the read after the marker is still open");
+
+    exec.stop();
+    settle().await;
+    let (run, s, at) = stream();
+    let stored = logs.read_all(&run, &s, &at).await.unwrap();
+    assert_eq!(stored, cat(&[a, MARKER, b"BBBB\nmore\n"]));
+    assert_eq!(markers(&stored), 1);
+}
+
+/// A sidecar container restarts (`restartPolicy: Always`) after its tail
+/// broke: the new instance's log does not begin with the stored part, and is
+/// stored after a marker.
+#[tokio::test]
+async fn a_restarted_sidecar_is_stored_again_after_a_marker() {
+    let a = b"ready\naccepting\n";
+    let b = b"ready\nrestarted\n";
+    let exec = LiveLog::new(
+        a,
+        false,
+        vec![Read {
+            chunk: 6,
+            fail_after: Some(2),
+        }],
+    );
+    let logs = logs();
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    let step = running_step();
+    let sidecar = scarab_server::logs::sidecar_stream_key(&step.step, 0);
+
+    tailer.ensure_sidecar(&step, 0);
+    wait_stored_in(&logs, &sidecar, b"ready\naccept").await;
+    exec.set(b);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while exec.opens() < 3 {
+            tailer.ensure_sidecar(&step, 0);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the sidecar's tail is opened again");
+    wait_stored_in(&logs, &sidecar, &cat(&[b"ready\naccept", MARKER, b])).await;
+}
+
+/// After a fallback the marker bounds what is compared: a later read of the
+/// same source compares with the part after the marker and appends only its
+/// new bytes. One marker, however many retries.
+#[tokio::test]
+async fn a_retry_after_a_fallback_appends_only_new_output() {
+    let a = b"aaaa\nbbbb\n";
+    let b = b"cccc\ndddd\neeee\n";
+    let exec = LiveLog::new(
+        a,
+        true,
+        vec![
+            Read {
+                chunk: 5,
+                fail_after: Some(2),
+            },
+            // The read that differs.
+            Read {
+                chunk: 5,
+                fail_after: None,
+            },
+            // The read after the marker stores all of `b`, then breaks.
+            Read {
+                chunk: 5,
+                fail_after: Some(3),
+            },
+        ],
+    );
+    let logs = logs();
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    let step = running_step();
+
+    tailer.ensure(&step);
+    wait_stored(&logs, a).await;
+    exec.set(b);
+    let (run, s, at) = stream();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while logs.read_all(&run, &s, &at).await.unwrap() != cat(&[a, MARKER, b]) {
+            tailer.ensure(&step);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the new file is stored after a marker");
+
+    exec.print(b"ffff\n");
+    ensure_until(&tailer, &step, || exec.opens() >= 4).await;
+    wait_stored(&logs, &cat(&[a, MARKER, b, b"ffff\n"])).await;
+    exec.stop();
+    for _ in 0..3 {
+        tailer.ensure(&step);
+        settle().await;
+    }
+    let stored = logs.read_all(&run, &s, &at).await.unwrap();
+    assert_eq!(stored, cat(&[a, MARKER, b, b"ffff\n"]));
+    assert_eq!(markers(&stored), 1, "exactly one marker");
+}
+
+/// A secret split across two chunks of one read is redacted: the read is
+/// redacted as one stream, not chunk by chunk.
+#[tokio::test]
+async fn pump_redacts_a_secret_split_across_chunks() {
+    let logs = logs();
+    let (run, step, attempt) = stream();
+    logs.register_secret(b"token-value");
+    let source = Box::new(MockChunks(VecDeque::from(vec![
+        b"tok".to_vec(),
+        b"en-value\n".to_vec(),
+    ])));
+    pump_log_stream(source, &logs, &run, &step, &attempt)
+        .await
+        .expect("pump");
+    assert_eq!(
+        logs.read_all(&run, &step, &attempt).await.unwrap(),
+        b"***\n"
+    );
+}
+
+/// A read breaks just after the start of a secret: the start is held back,
+/// not stored, and the next read redacts the whole value. No fragment of it
+/// is ever stored, and no marker.
+#[tokio::test]
+async fn a_secret_across_the_resume_point_is_redacted() {
+    let exec = LiveLog::new(
+        b"abc tok",
+        false,
+        vec![Read {
+            chunk: 7,
+            fail_after: Some(1),
+        }],
+    );
+    let logs = logs();
+    logs.register_secret(b"token-value");
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    let step = running_step();
+
+    tailer.ensure(&step);
+    wait_stored(&logs, b"abc ").await;
+    settle().await;
+    let (run, s, at) = stream();
+    assert!(
+        !logs
+            .read_all(&run, &s, &at)
+            .await
+            .unwrap()
+            .ends_with(b"tok"),
+        "the start of the secret is not stored"
+    );
+
+    exec.set(b"abc token-value\n");
+    ensure_until(&tailer, &step, || exec.opens() >= 2).await;
+    wait_stored(&logs, b"abc ***\n").await;
+    settle().await;
+    assert_eq!(logs.read_all(&run, &s, &at).await.unwrap(), b"abc ***\n");
+}
+
+/// REV-R2-2: chunks stored before this release hold `***` for a secret of
+/// any length, with no record of the length as read. A read compares the
+/// redacted source with them, so it resumes at the end of the secret, not
+/// part way into it.
+#[tokio::test]
+async fn chunks_stored_before_the_upgrade_resume_with_no_fragment_of_a_secret() {
+    let secret = b"0123456789abcdefghijklmnopqrstuvwxyzABCD";
+    assert_eq!(secret.len(), 40);
+    let logs = logs();
+    logs.register_secret(secret);
+    let (run, s, at) = stream();
+    // Written as an older server stored it: the redacted line only.
+    logs.append(&run, &s, &at, b"key=***\n").await.unwrap();
+
+    let exec = LiveLog::new(&cat(&[b"key=", secret, b"\nnext\n"]), false, vec![]);
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    tailer.ensure(&running_step());
+    wait_stored(&logs, b"key=***\nnext\n").await;
+    settle().await;
+    let stored = logs.read_all(&run, &s, &at).await.unwrap();
+    assert_eq!(stored, b"key=***\nnext\n");
+    assert!(!stored.windows(4).any(|w| secret.windows(4).any(|x| x == w)));
+}
+
+/// A re-read shorter than the stored part that matches it so far (the
+/// container ended, nothing new) appends nothing, and no marker.
+#[tokio::test]
+async fn a_shorter_log_that_matches_appends_nothing() {
+    let exec = LiveLog::new(
         b"aaaa\nbbbb\ncccc\n",
+        false,
         vec![Read {
             chunk: 5,
             fail_after: Some(2),
@@ -879,33 +1344,131 @@ async fn a_log_shorter_than_the_stored_part_appends_nothing_and_warns() {
 
     tailer.ensure(&step);
     wait_stored(&logs, b"aaaa\nbbbb\n").await;
-    // The log file was rotated: the API now serves a shorter one.
-    *exec.log.lock().unwrap() = b"dd\n".to_vec();
-
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while exec.opens() < 2 {
-            tailer.ensure(&step);
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the broken tail is opened again");
+    exec.set(b"aaaa\n");
+    ensure_until(&tailer, &step, || exec.opens() >= 2).await;
     for _ in 0..3 {
         tailer.ensure(&step);
         settle().await;
     }
+    assert_eq!(exec.opens(), 2, "the fence is drained");
+    let (run, s, at) = stream();
+    assert_eq!(logs.read_all(&run, &s, &at).await.unwrap(), b"aaaa\nbbbb\n");
+}
 
-    let (run, s, a) = stream();
-    assert_eq!(
-        logs.read_all(&run, &s, &a).await.unwrap(),
-        b"aaaa\nbbbb\n",
-        "nothing of the shorter log is appended"
+/// A re-read shorter than the stored part that differs from it (the kubelet
+/// rotated the file and serves a short new one) is stored after a marker,
+/// with a warning that says why.
+#[tokio::test]
+async fn a_shorter_log_that_differs_is_stored_after_a_marker_and_warns() {
+    let captured = Captured::default();
+    let _guard = captured.install();
+
+    let exec = LiveLog::new(
+        b"aaaa\nbbbb\ncccc\n",
+        false,
+        vec![Read {
+            chunk: 5,
+            fail_after: Some(2),
+        }],
     );
-    let out = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let logs = logs();
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    let step = running_step();
+
+    tailer.ensure(&step);
+    wait_stored(&logs, b"aaaa\nbbbb\n").await;
+    exec.set(b"dd\n");
+    ensure_until(&tailer, &step, || exec.opens() >= 3).await;
+    wait_stored(&logs, &cat(&[b"aaaa\nbbbb\n", MARKER, b"dd\n"])).await;
+
+    let out = captured.text();
     assert!(
-        out.contains("WARN") && out.contains("shorter than the part already stored"),
-        "a warning says the log was shorter: {out}"
+        out.contains("WARN") && out.contains("does not begin with the part already stored"),
+        "a warning says the log differed: {out}"
     );
+}
+
+// --- A replica that did not launch the step (J-1) -----------------------------
+
+/// The redactor is process memory, filled at launch. A replica that tails a
+/// step it did not launch reads the step's secret values from the executor
+/// before it reads the log, so it redacts them: the stored part verifies and
+/// the new output is redacted.
+#[tokio::test]
+async fn a_replica_that_did_not_launch_the_step_redacts_its_secrets() {
+    let db = Arc::new(InMemoryDb::new());
+    let store = Arc::new(InMemoryObjectStore::new());
+    let (run, s, at) = stream();
+    // The replica that launched the step stored the first line.
+    let launcher = LogService::new(store.clone(), db.clone());
+    launcher.register_secret(b"s3cr3t-value");
+    launcher
+        .append(&run, &s, &at, b"token=s3cr3t-value\n")
+        .await
+        .unwrap();
+
+    // Another replica takes the tail over.
+    let logs = Arc::new(LogService::new(store, db));
+    let exec = LiveLog::new(b"token=s3cr3t-value\nagain s3cr3t-value\n", false, vec![]);
+    *exec.redactions.lock().unwrap() = Ok(vec![b"s3cr3t-value".to_vec()]);
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    tailer.ensure(&running_step());
+    wait_stored(&logs, b"token=***\nagain ***\n").await;
+    settle().await;
+    assert_eq!(
+        logs.read_all(&run, &s, &at).await.unwrap(),
+        b"token=***\nagain ***\n"
+    );
+}
+
+/// When the executor cannot say what the step's secret values are, nothing
+/// is read: the tail backs off and tries again.
+#[tokio::test]
+async fn a_tail_that_cannot_read_the_secret_values_reads_nothing() {
+    let exec = LiveLog::new(b"token=s3cr3t-value\n", false, vec![]);
+    *exec.redactions.lock().unwrap() =
+        Err("secrets \"scarab-build-a1-secrets\" is forbidden".into());
+    let logs = logs();
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    for _ in 0..5 {
+        tailer.ensure(&running_step());
+        settle().await;
+    }
+    assert_eq!(exec.opens(), 0, "the log is never opened");
+    let (run, s, at) = stream();
+    assert!(logs.read_all(&run, &s, &at).await.unwrap().is_empty());
+}
+
+/// A replica that lacks a secret value the stored part redacted (its Secret
+/// is gone: the attempt settled before this read) sees its source differ
+/// where the stored part holds `***`. It stores nothing more, no marker, and
+/// closes the fence: storing the log again would store the value in clear.
+#[tokio::test]
+async fn a_replica_without_the_secret_values_does_not_store_the_log_again() {
+    let db = Arc::new(InMemoryDb::new());
+    let store = Arc::new(InMemoryObjectStore::new());
+    let (run, s, at) = stream();
+    let launcher = LogService::new(store.clone(), db.clone());
+    launcher.register_secret(b"s3cr3t-value");
+    launcher
+        .append(&run, &s, &at, b"token=s3cr3t-value\n")
+        .await
+        .unwrap();
+
+    let logs = Arc::new(LogService::new(store, db));
+    let exec = LiveLog::new(b"token=s3cr3t-value\nmore\n", false, vec![]);
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    for _ in 0..5 {
+        tailer.ensure(&running_step());
+        settle().await;
+    }
+    assert_eq!(exec.opens(), 1, "the fence is closed after one read");
+    let stored = logs.read_all(&run, &s, &at).await.unwrap();
+    assert_eq!(stored, b"token=***\n");
 }
 
 // --- Through the converged driver ---------------------------------------------

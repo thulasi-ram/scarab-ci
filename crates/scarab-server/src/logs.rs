@@ -79,8 +79,10 @@ pub struct LogService {
     /// Live broadcast channels, one per in-flight stream.
     live: Mutex<HashMap<StreamKey, broadcast::Sender<Vec<u8>>>>,
     /// Secret values to scrub from every chunk before it is stored or streamed
-    /// (ADR-0013, 0032). Registered when secrets are injected into a step.
-    secrets: Mutex<Vec<Vec<u8>>>,
+    /// (ADR-0013, 0032). Registered when secrets are injected into a step,
+    /// and by a log tail from the unit it reads. Shared with every
+    /// [`StreamRedactor`], which reads it at each push.
+    secrets: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl LogService {
@@ -89,7 +91,7 @@ impl LogService {
             store,
             db,
             live: Mutex::new(HashMap::new()),
-            secrets: Mutex::new(Vec::new()),
+            secrets: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -120,14 +122,22 @@ impl LogService {
         String::from_utf8_lossy(&self.redact(text.as_bytes())).into_owned()
     }
 
-    /// Replace every registered secret value in `data` with `***`.
+    /// Replace every registered secret value in `data` with `***`: one
+    /// [`StreamRedactor`] given all of `data` at once.
     fn redact(&self, data: &[u8]) -> Vec<u8> {
-        let secrets = self.secrets.lock().unwrap();
-        let mut out = data.to_vec();
-        for value in secrets.iter() {
-            out = replace_bytes(&out, value, b"***");
-        }
+        let mut redactor = self.redactor();
+        let mut out = redactor.push(data);
+        out.extend(redactor.finish());
         out
+    }
+
+    /// A redactor for one read of a log source, which can split a secret
+    /// value across two chunks. See [`StreamRedactor`].
+    pub fn redactor(&self) -> StreamRedactor {
+        StreamRedactor {
+            secrets: self.secrets.clone(),
+            held: Vec::new(),
+        }
     }
 
     fn sender(&self, key: &StreamKey) -> broadcast::Sender<Vec<u8>> {
@@ -158,9 +168,21 @@ impl LogService {
     ) -> Result<LogChunkMeta, LogError> {
         // Scrub secrets before the bytes touch the store OR the live stream, so
         // a value never reaches stored or streamed logs (ADR-0013, 0032).
-        let source_len = chunk.len() as u64;
         let chunk = self.redact(chunk);
+        self.append_redacted(run, step, attempt, &chunk).await
+    }
 
+    /// [`append`](Self::append) for bytes a [`StreamRedactor`] already
+    /// redacted: stored and streamed exactly as given. A log tail redacts
+    /// its source as one stream, so a secret split across two chunks is
+    /// still replaced.
+    pub(crate) async fn append_redacted(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        chunk: &[u8],
+    ) -> Result<LogChunkMeta, LogError> {
         // Next seq / cumulative uncompressed offset from the newest index row
         // (seqs are dense from 0, so it carries the whole stream's length).
         let (seq, byte_offset) = match self.db.last_log_chunk(run, step, attempt).await? {
@@ -168,17 +190,8 @@ impl LogService {
             None => (0, 0),
         };
 
-        // A tail that re-reads its source skips the stored part by its length
-        // as read, not as stored (git-bug de2bd9b). Recorded before the index
-        // row, which is what makes it count.
-        if chunk.len() as u64 != source_len {
-            self.db
-                .record_log_chunk_source(run, step, attempt, seq, chunk.len() as u64, source_len)
-                .await?;
-        }
-
         let key = object_key(run, step, attempt, seq);
-        let compressed = gzip(&chunk).map_err(|e| LogError::Gzip(e.to_string()))?;
+        let compressed = gzip(chunk).map_err(|e| LogError::Gzip(e.to_string()))?;
         self.store.put(&key, compressed).await?;
 
         let meta = LogChunkMeta {
@@ -192,21 +205,9 @@ impl LogService {
         // Best-effort live fan-out (ignored if there are no subscribers).
         let _ = self
             .sender(&stream_key(run, step, attempt))
-            .send(chunk.clone());
+            .send(chunk.to_vec());
 
         Ok(meta)
-    }
-
-    /// How many bytes of the log source the stream's stored chunks stand for,
-    /// counted before redaction: where a tail that re-reads the source from
-    /// the start resumes (git-bug de2bd9b).
-    pub async fn source_len(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-    ) -> Result<u64, LogError> {
-        Ok(self.db.log_source_len(run, step, attempt).await?)
     }
 
     /// Whether any chunk of the stream is stored, by any replica.
@@ -281,29 +282,155 @@ fn gunzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Replace every occurrence of `needle` in `haystack` with `repl`.
-fn replace_bytes(haystack: &[u8], needle: &[u8], repl: &[u8]) -> Vec<u8> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return haystack.to_vec();
+/// What a redacted secret value is replaced with.
+const REDACTED: &[u8] = b"***";
+
+/// Redacts one log source read as a stream of chunks, so a secret value
+/// split across two chunks is still replaced.
+///
+/// Bytes are scanned left to right; at each position the longest registered
+/// value that matches is replaced by `***`, otherwise one byte is copied.
+/// [`push`](Self::push) holds back the longest suffix of what it has seen
+/// that is a proper prefix of a registered value (at most the longest value
+/// less one byte) until the next push shows whether it is a secret. A chunk
+/// that does not end in the start of a value is emitted whole, so a live
+/// tail is not delayed. The registered values are read at each push.
+///
+/// [`finish`](Self::finish) emits the held bytes, at the clean end of the
+/// source only. A read that fails drops the redactor and its held bytes:
+/// they may be the start of a secret, and the next read sees them again.
+pub struct StreamRedactor {
+    secrets: Arc<Mutex<Vec<Vec<u8>>>>,
+    held: Vec<u8>,
+}
+
+impl StreamRedactor {
+    /// Redact the next chunk of the source; returns what can be emitted now.
+    pub fn push(&mut self, src: &[u8]) -> Vec<u8> {
+        let mut buf = std::mem::take(&mut self.held);
+        buf.extend_from_slice(src);
+        let secrets = self.secrets.lock().unwrap();
+        let (out, held_from) = redact_scan(&buf, &secrets, false);
+        drop(secrets);
+        buf.drain(..held_from);
+        self.held = buf;
+        out
     }
-    let mut out = Vec::with_capacity(haystack.len());
+
+    /// The source ended cleanly: redact and emit the held bytes.
+    pub fn finish(self) -> Vec<u8> {
+        let secrets = self.secrets.lock().unwrap();
+        redact_scan(&self.held, &secrets, true).0
+    }
+}
+
+/// One left-to-right pass of [`StreamRedactor`] over `buf`. Returns the
+/// output and the index where the held suffix starts (`buf.len()` when
+/// nothing is held; always that when `at_end`).
+fn redact_scan(buf: &[u8], values: &[Vec<u8>], at_end: bool) -> (Vec<u8>, usize) {
+    let mut out = Vec::with_capacity(buf.len());
     let mut i = 0;
-    while i < haystack.len() {
-        if i + needle.len() <= haystack.len() && &haystack[i..i + needle.len()] == needle {
-            out.extend_from_slice(repl);
-            i += needle.len();
-        } else {
-            out.push(haystack[i]);
-            i += 1;
+    while i < buf.len() {
+        let rest = &buf[i..];
+        // The rest of the buffer may be the start of a value whose end has
+        // not been read yet: hold it, even when a shorter value matches here,
+        // so the longest match wins as it would on the whole stream.
+        if !at_end
+            && values
+                .iter()
+                .any(|v| v.len() > rest.len() && v.starts_with(rest))
+        {
+            return (out, i);
+        }
+        match values
+            .iter()
+            .filter(|v| rest.starts_with(v))
+            .map(Vec::len)
+            .max()
+        {
+            Some(n) => {
+                out.extend_from_slice(REDACTED);
+                i += n;
+            }
+            None => {
+                out.push(buf[i]);
+                i += 1;
+            }
         }
     }
-    out
+    (out, buf.len())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::sidecar_stream_key;
+    use super::{sidecar_stream_key, StreamRedactor};
     use scarab_engine::StepId;
+    use std::sync::{Arc, Mutex};
+
+    fn redactor(values: &[&[u8]]) -> StreamRedactor {
+        StreamRedactor {
+            secrets: Arc::new(Mutex::new(values.iter().map(|v| v.to_vec()).collect())),
+            held: Vec::new(),
+        }
+    }
+
+    /// Feed `chunks` through one redactor and return everything it emitted.
+    fn run(values: &[&[u8]], chunks: &[&[u8]]) -> Vec<u8> {
+        let mut r = redactor(values);
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend(r.push(c));
+        }
+        out.extend(r.finish());
+        out
+    }
+
+    /// A secret split across two chunks is replaced, as in one chunk.
+    #[test]
+    fn a_secret_split_across_chunks_is_redacted() {
+        assert_eq!(
+            run(&[b"token-value"], &[b"tok", b"en-value\n"]),
+            b"***\n".to_vec()
+        );
+        // Split one byte at a time.
+        let src = b"a token-value b";
+        let chunks: Vec<&[u8]> = src.chunks(1).collect();
+        assert_eq!(run(&[b"token-value"], &chunks), b"a *** b".to_vec());
+    }
+
+    /// Only a suffix that could start a secret is held; a line ending in
+    /// anything else is emitted at once.
+    #[test]
+    fn only_the_start_of_a_secret_is_held() {
+        let mut r = redactor(&[b"token-value"]);
+        assert_eq!(r.push(b"line one\n"), b"line one\n".to_vec());
+        assert_eq!(r.push(b"abc tok"), b"abc ".to_vec());
+        // Not the secret after all: the held bytes are emitted.
+        assert_eq!(r.push(b"io\n"), b"tokio\n".to_vec());
+        assert_eq!(r.finish(), Vec::<u8>::new());
+    }
+
+    /// The longest value wins, also when a shorter one ends inside the held
+    /// part.
+    #[test]
+    fn the_longest_value_wins_across_chunks() {
+        assert_eq!(
+            run(&[b"abc", b"abcdef"], &[b"x abc", b"def y"]),
+            b"x *** y".to_vec()
+        );
+        assert_eq!(
+            run(&[b"abc", b"abcdef"], &[b"x abc", b"dex"]),
+            b"x ***dex".to_vec()
+        );
+    }
+
+    /// At the end of the source the held bytes are emitted, redacted.
+    #[test]
+    fn finish_emits_the_held_bytes() {
+        let mut r = redactor(&[b"token-value"]);
+        assert_eq!(r.push(b"ends in tok"), b"ends in ".to_vec());
+        assert_eq!(r.finish(), b"tok".to_vec());
+    }
 
     #[test]
     fn sidecar_stream_key_namespaces_by_step_and_index() {

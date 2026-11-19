@@ -2112,58 +2112,6 @@ impl Db for PostgresDb {
         Ok(row.as_ref().map(log_chunk_row))
     }
 
-    async fn record_log_chunk_source(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-        seq: u64,
-        len: u64,
-        source_len: u64,
-    ) -> Result<(), DbError> {
-        sqlx::query(
-            "INSERT INTO log_chunk_sources (run_id, step_id, attempt_id, seq, len, source_len)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (run_id, step_id, attempt_id, seq)
-             DO UPDATE SET len = EXCLUDED.len, source_len = EXCLUDED.source_len",
-        )
-        .bind(&run.0)
-        .bind(&step.0)
-        .bind(&attempt.0)
-        .bind(seq as i64)
-        .bind(len as i64)
-        .bind(source_len as i64)
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
-    async fn log_source_len(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-    ) -> Result<u64, DbError> {
-        // A source record counts only beside a chunk row of the same length:
-        // one written for a chunk whose row never landed is ignored.
-        let total: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(CASE WHEN s.len = c.len THEN s.source_len ELSE c.len END), 0)::BIGINT
-             FROM log_chunks c
-             LEFT JOIN log_chunk_sources s
-               ON s.run_id = c.run_id AND s.step_id = c.step_id
-              AND s.attempt_id = c.attempt_id AND s.seq = c.seq
-             WHERE c.run_id = $1 AND c.step_id = $2 AND c.attempt_id = $3",
-        )
-        .bind(&run.0)
-        .bind(&step.0)
-        .bind(&attempt.0)
-        .fetch_one(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(total.max(0) as u64)
-    }
-
     async fn record_step_transition(
         &self,
         run: &RunId,
@@ -2987,11 +2935,6 @@ impl Db for PostgresDb {
     }
 
     async fn delete_log_index_of_run(&self, run: &RunId) -> Result<(), DbError> {
-        sqlx::query("DELETE FROM log_chunk_sources WHERE run_id = $1")
-            .bind(&run.0)
-            .execute(self.pool())
-            .await
-            .map_err(db_err)?;
         sqlx::query("DELETE FROM log_chunks WHERE run_id = $1")
             .bind(&run.0)
             .execute(self.pool())

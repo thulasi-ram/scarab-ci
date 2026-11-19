@@ -3510,6 +3510,29 @@ impl Executor for K8sExecutor {
         })))
     }
 
+    /// The secret values of `step`'s Pod, read back from its `<pod>-secrets`
+    /// Secret (each value) and its `<pod>-registry` Secret (the
+    /// dockerconfigjson), so a control plane that tails the log of a step it
+    /// did not launch redacts them. A Secret that is not there (the step had
+    /// none, or it was deleted when the attempt settled) adds nothing.
+    async fn log_redactions(&self, step: &StepRun) -> Result<Vec<Vec<u8>>, ExecError> {
+        let client = self.client.clone().ok_or(ExecError::Unavailable)?;
+        let secrets: Api<k8s_openapi::api::core::v1::Secret> =
+            Api::namespaced(client, &self.namespace);
+        let pod = pod_name(step);
+        let mut out = Vec::new();
+        for name in [step_secrets_secret_name(&pod), registry_secret_name(&pod)] {
+            let secret = secrets
+                .get_opt(&name)
+                .await
+                .map_err(|e| ExecError::Other(format!("reading secret {name}: {e}")))?;
+            if let Some(data) = secret.and_then(|s| s.data) {
+                out.extend(data.into_values().map(|v| v.0).filter(|v| !v.is_empty()));
+            }
+        }
+        Ok(out)
+    }
+
     /// Open a live tail of ONE of the step Pod's sidecar containers (ADR-0058
     /// evidence) — identical to [`log_stream`](Self::log_stream) but pinned to
     /// `container` (a `service-{i}` sidecar) instead of the main `step` container,

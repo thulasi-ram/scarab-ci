@@ -995,6 +995,12 @@ impl Executor for SecretInjectingExecutor {
         self.inner.log_stream(step).await
     }
 
+    async fn log_redactions(&self, step: &StepRun) -> Result<Vec<Vec<u8>>, ExecError> {
+        // Forward: the trait default answers none, which would make every
+        // replica that did not launch a step store its secrets in clear.
+        self.inner.log_redactions(step).await
+    }
+
     async fn sidecar_log_stream(
         &self,
         step: &StepRun,

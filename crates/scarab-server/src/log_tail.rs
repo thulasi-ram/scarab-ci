@@ -13,11 +13,11 @@
 //! [`LogTailer`] owns the per-fence dedup + task spawning the converged driver
 //! calls once per tick for each running step.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use scarab_engine::{AttemptId, Executor, LogChunks, RunId, StepId, StepRun};
+use scarab_engine::{AttemptId, Executor, LogChunkMeta, LogChunks, RunId, StepId, StepRun};
 
 use crate::logs::{LogError, LogService};
 
@@ -57,17 +57,21 @@ pub enum LogTailError {
     Log(#[from] LogError),
 }
 
-/// Drain a live log tail into the pipeline: read chunks until end-of-stream,
-/// appending each to [`LogService`] under the `{run, step, attempt}` fence.
-/// Redaction and persistence are the pipeline's job ([`LogService::append`]);
-/// this loop only pumps bytes. Returns the number of bytes appended.
-///
-/// A read always starts at the beginning of the container's log: the
-/// Kubernetes log API takes no byte offset. So the first
-/// [`LogService::source_len`] bytes, the part of the log the fence has stored
-/// already, are skipped and only the rest is appended (git-bug de2bd9b). That
-/// count is of the source's bytes, before redaction, so a redacted secret
-/// does not move the point where the read resumes.
+/// The chunk stored before a log source is stored again from its first
+/// byte: the source no longer begins with the part already stored (the
+/// kubelet rotated the container's log file, a sidecar or service container
+/// restarted, or the secret values changed), so its earlier lines may repeat.
+/// Always stored as a chunk of its own, so a read can find it by its length
+/// and body (see `current_part`).
+pub const LOG_SOURCE_RESTARTED: &[u8] =
+    b"\nscarab: the log source restarted; earlier lines may repeat\n";
+
+/// Drain one log source into the pipeline: read chunks until end-of-stream
+/// and append them to [`LogService`] under the `{run, step, attempt}` fence,
+/// redacted as one stream ([`LogService::redactor`]), so a secret split
+/// across two chunks is still replaced. Every byte is appended; this does not
+/// compare with what is stored, which the [`LogTailer`]'s reads do. Returns
+/// the number of bytes appended (after redaction).
 ///
 /// Empty chunks are skipped (a zero-length read is treated as end-of-stream by
 /// the source, but a source that yields an empty-but-not-final chunk shouldn't
@@ -79,57 +83,230 @@ pub async fn pump_log_stream(
     step: &StepId,
     attempt: &AttemptId,
 ) -> Result<u64, LogTailError> {
-    Ok(pump(chunks, logs, run, step, attempt).await?.appended)
+    match pump(chunks, logs, run, step, attempt, Vec::new()).await? {
+        PumpEnd::Done(p) => Ok(p.appended),
+        // An empty stored part has nothing to differ from.
+        PumpEnd::Mismatch { .. } | PumpEnd::Unverifiable { .. } => Ok(0),
+    }
 }
 
 /// What one read of a log source did.
 #[derive(Debug, Clone, Copy)]
 struct Pumped {
-    /// Bytes read from the source, including the skipped prefix.
+    /// Bytes read from the source, including the part already stored.
     read: u64,
-    /// Bytes appended to the pipeline (before redaction).
+    /// Bytes appended to the pipeline (after redaction).
     appended: u64,
 }
 
+/// How one read of a log source ended.
+#[derive(Debug)]
+enum PumpEnd {
+    /// The stream ended cleanly.
+    Done(Pumped),
+    /// The redacted source differs from the stored part at byte `at` of it,
+    /// outside a `***`: the source restarted. Nothing was appended.
+    Mismatch { at: u64 },
+    /// The redacted source differs from the stored part where the stored
+    /// part holds a `***`: this replica does not hold a secret value that
+    /// the replica which stored it held. Nothing was appended.
+    Unverifiable { at: u64 },
+}
+
+/// The **current part** of a stream: every chunk after the newest
+/// [`LOG_SOURCE_RESTARTED`] chunk, or the whole stream when there is none.
+/// The index rows are read whole; a chunk body is read only when its length
+/// is the marker's, newest first. A step that prints the marker text itself
+/// can only make the next read store its log again after a marker; it cannot
+/// make a read skip output.
+async fn current_part(
+    logs: &LogService,
+    run: &RunId,
+    step: &StepId,
+    attempt: &AttemptId,
+) -> Result<Vec<LogChunkMeta>, LogError> {
+    let mut chunks = logs.chunks(run, step, attempt).await?;
+    for i in (0..chunks.len()).rev() {
+        let c = &chunks[i];
+        if c.len == LOG_SOURCE_RESTARTED.len() as u64
+            && logs.read_chunk(c).await? == LOG_SOURCE_RESTARTED
+        {
+            return Ok(chunks.split_off(i + 1));
+        }
+    }
+    Ok(chunks)
+}
+
+/// Compares a read's redacted output with the stored part, one stored chunk
+/// body in memory at a time.
+struct Verify {
+    /// Stored chunks not loaded yet.
+    pending: VecDeque<LogChunkMeta>,
+    /// The loaded chunk body and how far it has matched.
+    body: Vec<u8>,
+    pos: usize,
+    /// Stored bytes matched so far.
+    matched: u64,
+    /// The last two stored bytes matched, to tell whether a difference lies
+    /// inside a `***`.
+    recent: Vec<u8>,
+}
+
+/// What [`Verify::check`] found.
+enum Check {
+    /// All of the output matched; stored bytes may be left.
+    Matched,
+    /// The first `n` bytes of the output matched and the stored part ends
+    /// there: the rest is new.
+    Passed(usize),
+    /// A byte differs at offset `at` of the stored part.
+    Differs { at: u64, in_redaction: bool },
+}
+
+impl Verify {
+    fn new(part: Vec<LogChunkMeta>) -> Self {
+        Self {
+            pending: part.into(),
+            body: Vec::new(),
+            pos: 0,
+            matched: 0,
+            recent: Vec::new(),
+        }
+    }
+
+    /// Load the next stored chunk when the current one is used up. False when
+    /// the stored part is used up.
+    async fn load(&mut self, logs: &LogService) -> Result<bool, LogError> {
+        while self.pos == self.body.len() {
+            match self.pending.pop_front() {
+                Some(meta) => {
+                    self.body = logs.read_chunk(&meta).await?;
+                    self.pos = 0;
+                }
+                None => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    async fn check(&mut self, logs: &LogService, out: &[u8]) -> Result<Check, LogError> {
+        let mut i = 0;
+        while i < out.len() {
+            if !self.load(logs).await? {
+                return Ok(Check::Passed(i));
+            }
+            let n = (out.len() - i).min(self.body.len() - self.pos);
+            let theirs = &self.body[self.pos..self.pos + n];
+            if let Some(d) = (0..n).find(|&k| out[i + k] != theirs[k]) {
+                self.advance(d);
+                let at = self.matched;
+                let in_redaction = self.differs_in_redaction(logs).await?;
+                return Ok(Check::Differs { at, in_redaction });
+            }
+            self.advance(n);
+            i += n;
+        }
+        Ok(Check::Matched)
+    }
+
+    /// Mark `n` bytes of the loaded body as matched.
+    fn advance(&mut self, n: usize) {
+        let matched = &self.body[self.pos..self.pos + n];
+        self.recent
+            .extend_from_slice(&matched[matched.len().saturating_sub(2)..]);
+        let excess = self.recent.len().saturating_sub(2);
+        self.recent.drain(..excess);
+        self.pos += n;
+        self.matched += n as u64;
+    }
+
+    /// Whether a `***` of the stored part covers the differing byte: one
+    /// starting up to two bytes before it, or at it.
+    async fn differs_in_redaction(&mut self, logs: &LogService) -> Result<bool, LogError> {
+        let mut window = self.recent.clone();
+        let before = window.len();
+        while window.len() < before + 3 && self.load(logs).await? {
+            let take = (before + 3 - window.len()).min(self.body.len() - self.pos);
+            window.extend_from_slice(&self.body[self.pos..self.pos + take]);
+            self.pos += take;
+        }
+        Ok((0..=before).any(|s| window.get(s..s + 3) == Some(b"***".as_slice())))
+    }
+
+    /// Stored bytes not matched yet, for the debug line of a read that ended
+    /// inside the stored part.
+    fn left(&self) -> u64 {
+        (self.body.len() - self.pos) as u64 + self.pending.iter().map(|c| c.len).sum::<u64>()
+    }
+}
+
+/// One read of a log source. Every chunk goes through one redactor from the
+/// source's first byte. While `part` (the stored part, from
+/// [`current_part`]) has not all matched, the redacted output is compared
+/// with it and dropped; once it has, the rest is appended. A difference ends
+/// the read with nothing appended. On a clean end the redactor's held bytes
+/// are emitted like any output; on an error they are dropped (they may be the
+/// start of a secret, and the next read sees them again).
+///
+/// Memory: one source chunk, one stored chunk body, the redactor's held bytes
+/// and the stored part's index rows.
 async fn pump(
     mut chunks: Box<dyn LogChunks>,
     logs: &LogService,
     run: &RunId,
     step: &StepId,
     attempt: &AttemptId,
-) -> Result<Pumped, LogTailError> {
-    let stored = logs.source_len(run, step, attempt).await?;
+    part: Vec<LogChunkMeta>,
+) -> Result<PumpEnd, LogTailError> {
+    let mut redactor = Some(logs.redactor());
+    let mut verify = (!part.is_empty()).then(|| Verify::new(part));
     let mut read = 0u64;
     let mut appended = 0u64;
-    while let Some(chunk) = chunks.next_chunk().await? {
-        if chunk.is_empty() {
-            continue;
+    while let Some(r) = redactor.as_mut() {
+        let out = match chunks.next_chunk().await? {
+            Some(chunk) if chunk.is_empty() => continue,
+            Some(chunk) => {
+                read += chunk.len() as u64;
+                r.push(&chunk)
+            }
+            // A clean end: emit the held bytes; the loop ends after them.
+            None => redactor.take().map(|r| r.finish()).unwrap_or_default(),
+        };
+        let mut new_from = 0;
+        if let Some(v) = &mut verify {
+            match v.check(logs, &out).await? {
+                Check::Matched => new_from = out.len(),
+                Check::Passed(n) => new_from = n,
+                Check::Differs { at, in_redaction } => {
+                    return Ok(if in_redaction {
+                        PumpEnd::Unverifiable { at }
+                    } else {
+                        PumpEnd::Mismatch { at }
+                    });
+                }
+            }
+            if new_from < out.len() {
+                verify = None;
+            }
         }
-        let len = chunk.len() as u64;
-        // The part of this chunk inside the stored prefix.
-        let skip = stored.saturating_sub(read).min(len) as usize;
-        read += len;
-        if skip == chunk.len() {
-            continue;
+        let new = &out[new_from..];
+        if !new.is_empty() {
+            if appended == 0 {
+                tracing::info!(run = %run.0, step = %step.0, attempt = %attempt.0, "log tail: receiving output");
+            }
+            logs.append_redacted(run, step, attempt, new).await?;
+            appended += new.len() as u64;
         }
-        if appended == 0 {
-            tracing::info!(run = %run.0, step = %step.0, attempt = %attempt.0, resumed_at = stored, "log tail: receiving output");
-        }
-        logs.append(run, step, attempt, &chunk[skip..]).await?;
-        appended += (chunk.len() - skip) as u64;
     }
-    if read < stored {
-        // The log is shorter than what is stored for it: the kubelet rotated
-        // the container's log file, and the API serves the newest file only.
-        // There is no way to tell which of these bytes are new, so none are
-        // appended rather than storing any twice.
-        tracing::warn!(
-            run = %run.0, step = %step.0, attempt = %attempt.0, read, stored,
-            "log tail: the container log is shorter than the part already stored \
-             (rotated?); nothing appended"
+    if let Some(v) = verify.filter(|v| v.left() > 0) {
+        // The source ended inside the stored part and matched it so far:
+        // every byte read is stored already.
+        tracing::debug!(
+            run = %run.0, step = %step.0, attempt = %attempt.0, read, left = v.left(),
+            "log tail: the log ended inside the part already stored; nothing appended"
         );
     }
-    Ok(Pumped { read, appended })
+    Ok(PumpEnd::Done(Pumped { read, appended }))
 }
 
 /// Identifies one log stream: a single attempt of a step. Matches the pipeline's
@@ -228,11 +405,11 @@ impl LogTailer {
     /// left `Running`, a retried attempt, a stopped service): its log is read
     /// once more, so a step that ran and finished inside a retry backoff
     /// keeps its output (git-bug 1dee2f3). The first such read does not wait
-    /// out a retry backoff left by the live tail. Like every read, it skips
-    /// the part of the log the fence has stored already, by this replica or
-    /// another, and appends the rest: output printed after a live tail failed
-    /// part way through is stored, and nothing is stored twice (git-bug
-    /// de2bd9b).
+    /// out a retry backoff left by the live tail. Like every read, it
+    /// compares the log with the part the fence has stored already, by this
+    /// replica or another, and appends what follows it: output printed after
+    /// a live tail failed part way through is stored, and nothing is stored
+    /// twice (git-bug de2bd9b; see `drain`).
     /// `complete` is false when the pass did not ensure every unit (a store
     /// error); such a pass only resets the bookkeeping.
     pub fn end_pass(&self, complete: bool) {
@@ -562,8 +739,9 @@ impl LogTailer {
                 // state that has outlasted NOT_READY_GRACE (a tail that never
                 // starts must still be visible). Either way, back off before
                 // retrying so we don't hammer the API each tick. What the
-                // tail appended before it failed is stored; the retry skips
-                // it (git-bug de2bd9b).
+                // tail appended before it failed is stored; the retry
+                // compares with it and appends what follows (git-bug
+                // de2bd9b).
                 Err(e) => {
                     let msg = e.to_string();
                     let now = Instant::now();
@@ -695,9 +873,69 @@ enum TailSource {
     },
 }
 
-/// Open the executor's log source for `source` and pump it into the pipeline,
-/// past the part already stored ([`pump`]). A backend with no log source (`Ok(None)` —
-/// e.g. the local/dev executor) is a clean no-op.
+/// Open the executor's log source for `source`. `Ok(None)`: the backend has
+/// no log source (e.g. the local/dev executor).
+async fn open_source(
+    executor: &dyn Executor,
+    source: &TailSource,
+) -> Result<Option<Box<dyn LogChunks>>, LogTailError> {
+    Ok(match source {
+        TailSource::Step(step_run) => executor.log_stream(step_run).await?,
+        TailSource::Service(handle) => executor.service_log_stream(handle).await?,
+        TailSource::Sidecar { step, index } => {
+            // The co-located `service-{index}` container in the step's own Pod.
+            let container = format!("service-{index}");
+            executor.sidecar_log_stream(step, &container).await?
+        }
+    })
+}
+
+/// Register with `logs` the secret values of the unit a tail reads
+/// ([`Executor::log_redactions`]), so a replica that did not launch the unit
+/// (a lease takeover, a server roll while it runs) redacts its log like the
+/// one that did. A registry dockerconfigjson also registers each credential
+/// in it, as the launch does.
+async fn register_unit_secrets(
+    executor: &dyn Executor,
+    logs: &LogService,
+    source: &TailSource,
+) -> Result<(), LogTailError> {
+    let step = match source {
+        TailSource::Step(step) | TailSource::Sidecar { step, .. } => step,
+        TailSource::Service(_) => return Ok(()),
+    };
+    for value in executor.log_redactions(step).await? {
+        logs.register_secret(&value);
+        if let Ok(text) = std::str::from_utf8(&value) {
+            for v in crate::forge_token::registry_secret_values(Some(text), None) {
+                logs.register_secret(v.as_bytes());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read the log of the unit `source` into the pipeline, after the part
+/// already stored (git-bug de2bd9b).
+///
+/// The Kubernetes log API takes no byte offset, so a read starts at the
+/// container log's first byte. The read is redacted from that byte and
+/// compared with the stream's **current part** ([`current_part`]); what
+/// follows it is appended. A source that does not begin with the current part
+/// (a rotated log file, a restarted container, a change in the secret values)
+/// gets a WARN, a [`LOG_SOURCE_RESTARTED`] chunk, and one more read whose
+/// every byte is appended. If that read fails, the marker stays: the next
+/// read compares with the part after it, so a source is never stored twice
+/// and a failing tail does not grow the log on every retry.
+///
+/// A difference where the stored part holds a `***` means this replica lacks
+/// a secret value that the one which stored it held (the unit's Secret is
+/// gone: an ended unit read after its attempt settled). Nothing is appended
+/// and the fence is closed: storing the log again would store that value in
+/// clear.
+///
+/// The unit's secret values are registered first ([`register_unit_secrets`]);
+/// failing that fails the read, before anything is read.
 async fn drain(
     executor: &dyn Executor,
     logs: &LogService,
@@ -706,21 +944,42 @@ async fn drain(
     step: &StepId,
     attempt: &AttemptId,
 ) -> Result<Option<Pumped>, LogTailError> {
-    let chunks = match source {
-        TailSource::Step(step_run) => executor.log_stream(step_run).await?,
-        TailSource::Service(handle) => executor.service_log_stream(handle).await?,
-        TailSource::Sidecar { step, index } => {
-            // The co-located `service-{index}` container in the step's own Pod. The
-            // `step`/`attempt` args below are already the SYNTHETIC sidecar id +
-            // the step's real attempt (the caller passed them), so the pump stores
-            // this under its own stream, keyed like the step's per-attempt logs.
-            let container = format!("service-{index}");
-            executor.sidecar_log_stream(step, &container).await?
-        }
+    register_unit_secrets(executor, logs, source).await?;
+    let Some(chunks) = open_source(executor, source).await? else {
+        return Ok(None);
     };
-    match chunks {
-        Some(chunks) => Ok(Some(pump(chunks, logs, run, step, attempt).await?)),
-        None => Ok(None),
+    let part = current_part(logs, run, step, attempt).await?;
+    let stored: u64 = part.iter().map(|c| c.len).sum();
+    match pump(chunks, logs, run, step, attempt, part).await? {
+        PumpEnd::Done(pumped) => Ok(Some(pumped)),
+        PumpEnd::Unverifiable { at } => {
+            tracing::warn!(
+                run = %run.0, step = %step.0, attempt = %attempt.0, at, stored,
+                "log tail: the log differs from the part already stored where that part \
+                 holds a redacted value, and this server does not hold the value; \
+                 later output of this log is not stored"
+            );
+            // As for a backend with no log source: the fence is closed.
+            Ok(None)
+        }
+        PumpEnd::Mismatch { at } => {
+            tracing::warn!(
+                run = %run.0, step = %step.0, attempt = %attempt.0, at, stored,
+                "log tail: the log does not begin with the part already stored (rotated \
+                 log file, restarted container, or a redaction change); storing it again \
+                 after a marker"
+            );
+            logs.append_redacted(run, step, attempt, LOG_SOURCE_RESTARTED)
+                .await?;
+            let Some(chunks) = open_source(executor, source).await? else {
+                return Ok(None);
+            };
+            match pump(chunks, logs, run, step, attempt, Vec::new()).await? {
+                PumpEnd::Done(pumped) => Ok(Some(pumped)),
+                // An empty stored part has nothing to differ from.
+                PumpEnd::Mismatch { .. } | PumpEnd::Unverifiable { .. } => Ok(None),
+            }
+        }
     }
 }
 

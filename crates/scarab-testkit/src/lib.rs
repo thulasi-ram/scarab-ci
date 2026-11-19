@@ -217,9 +217,6 @@ struct InMemoryState {
     outbox: Vec<OutboxEntry>,
     /// Per-(run, step, attempt) log-chunk index (offsets only, no bodies).
     logs: HashMap<(RunId, StepId, AttemptId), Vec<LogChunkMeta>>,
-    /// `(len, source_len)` of the log chunks redaction changed, by
-    /// `(run, step, attempt, seq)` (git-bug de2bd9b).
-    log_sources: HashMap<(RunId, StepId, AttemptId, u64), (u64, u64)>,
     /// Per-(run, step, attempt) launch handle — the durable "launch happened"
     /// marker (ADR-0047).
     attempt_handles: HashMap<(RunId, StepId, AttemptId), String>,
@@ -1946,48 +1943,6 @@ impl Db for InMemoryDb {
             .and_then(|chunks| chunks.last().cloned()))
     }
 
-    async fn record_log_chunk_source(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-        seq: u64,
-        len: u64,
-        source_len: u64,
-    ) -> Result<(), DbError> {
-        self.state.lock().unwrap().log_sources.insert(
-            (run.clone(), step.clone(), attempt.clone(), seq),
-            (len, source_len),
-        );
-        Ok(())
-    }
-
-    async fn log_source_len(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-    ) -> Result<u64, DbError> {
-        let st = self.state.lock().unwrap();
-        let Some(chunks) = st.logs.get(&(run.clone(), step.clone(), attempt.clone())) else {
-            return Ok(0);
-        };
-        Ok(chunks
-            .iter()
-            .map(|c| {
-                match st
-                    .log_sources
-                    .get(&(run.clone(), step.clone(), attempt.clone(), c.seq))
-                {
-                    // Counts only beside a chunk of the same length, like
-                    // the Postgres store.
-                    Some((len, source_len)) if *len == c.len => *source_len,
-                    _ => c.len,
-                }
-            })
-            .sum())
-    }
-
     async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError> {
         let st = self.state.lock().unwrap();
         if st.poisoned_runs.contains(run) {
@@ -2639,11 +2594,6 @@ impl Db for InMemoryDb {
             .unwrap()
             .logs
             .retain(|(r, _, _), _| r != run);
-        self.state
-            .lock()
-            .unwrap()
-            .log_sources
-            .retain(|(r, _, _, _), _| r != run);
         Ok(())
     }
 
@@ -2903,6 +2853,9 @@ pub struct FakeExecutor {
     /// A one-shot hook the next `poll` awaits — see
     /// [`during_next_poll`](Self::during_next_poll).
     poll_hook: Mutex<Option<LaunchHook>>,
+    /// What `log_redactions` answers for every step — see
+    /// [`set_log_redactions`](Self::set_log_redactions).
+    log_redactions: Mutex<Vec<Vec<u8>>>,
     /// Polls in flight right now, and the most ever in flight at once, for
     /// one handle (git-bug 068cc0b: two replicas driving one unit).
     polls: Mutex<PollCount>,
@@ -2927,7 +2880,14 @@ impl FakeExecutor {
             launch_hook: Mutex::new(None),
             poll_hook: Mutex::new(None),
             polls: Mutex::new(PollCount::default()),
+            log_redactions: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The secret values `log_redactions` answers for every step, as the k8s
+    /// executor reads them back from a unit's Secrets.
+    pub fn set_log_redactions(&self, values: Vec<Vec<u8>>) {
+        *self.log_redactions.lock().unwrap() = values;
     }
 
     /// Run `hook` to completion INSIDE the next `poll`, before it reports
@@ -3393,6 +3353,10 @@ impl Executor for FakeExecutor {
         _gate: &scarab_engine::StepRun,
     ) -> Result<Option<String>, scarab_engine::ExecError> {
         Ok(None)
+    }
+
+    async fn log_redactions(&self, _step: &StepRun) -> Result<Vec<Vec<u8>>, ExecError> {
+        Ok(self.log_redactions.lock().unwrap().clone())
     }
 
     async fn take_forge_credential(

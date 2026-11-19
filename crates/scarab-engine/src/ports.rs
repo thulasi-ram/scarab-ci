@@ -1017,33 +1017,6 @@ pub trait Db: Send + Sync {
         attempt: &AttemptId,
     ) -> Result<Option<LogChunkMeta>, DbError>;
 
-    /// Record that chunk `seq` of the stream, `len` bytes once redacted, was
-    /// `source_len` bytes as read from the log source (git-bug de2bd9b).
-    /// Written only when redaction changed the length, and BEFORE the chunk's
-    /// index row: a record whose chunk row never landed, or whose `len` does
-    /// not match the row's, is ignored by [`Self::log_source_len`].
-    /// Idempotent on `(run, step, attempt, seq)`; a later record replaces it.
-    async fn record_log_chunk_source(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-        seq: u64,
-        len: u64,
-        source_len: u64,
-    ) -> Result<(), DbError>;
-
-    /// How many bytes of the log source the stream's stored chunks stand for:
-    /// the sum of each chunk's `len`, or its recorded `source_len` where
-    /// redaction changed it. A tail that re-reads the source from the start
-    /// skips this many bytes (git-bug de2bd9b).
-    async fn log_source_len(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-    ) -> Result<u64, DbError>;
-
     /// All step projections of a run (with their attempts) — the DAG snapshot
     /// the scheduler folds to decide admission and completion.
     async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError>;
@@ -1744,6 +1717,24 @@ pub trait Executor: Send + Sync {
     /// uses — so the caller needs no handle bookkeeping to start a tail.
     async fn log_stream(&self, _step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         Ok(None)
+    }
+
+    /// The secret values `step`'s fenced unit was launched with, read back
+    /// from the unit, so that whichever control plane tails its log
+    /// ([`log_stream`](Self::log_stream), [`sidecar_log_stream`](Self::sidecar_log_stream))
+    /// can redact them: the log redactor is process memory, filled at launch,
+    /// and a replica that did not launch the unit (a tail-lease takeover, a
+    /// server roll while it runs) would otherwise store them in clear.
+    ///
+    /// Each value is returned as the unit holds it: the step's own secret
+    /// values, and the registry dockerconfigjson whole (the caller extracts
+    /// the credentials in it). `Ok(vec![])` when the unit has none or they are
+    /// gone (the unit ended and its secrets were deleted). An `Err` fails the
+    /// tail before it reads anything; it retries after its backoff. The
+    /// default answers none: a backend without a log source, or whose log
+    /// tail runs only where the unit was launched.
+    async fn log_redactions(&self, _step: &StepRun) -> Result<Vec<Vec<u8>>, ExecError> {
+        Ok(Vec::new())
     }
 
     /// Open a best-effort **live tail** of one of `step`'s co-located sidecar
