@@ -321,6 +321,26 @@ async fn raw_download_streams_the_whole_try_as_an_attachment() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// L15: the raw download is a step's own bytes as `text/plain`; with
+/// `nosniff` a browser does not read them as HTML even when they look like it.
+#[tokio::test]
+async fn raw_download_tells_the_browser_not_to_sniff_the_type() {
+    let app = app_with(&[("a1", vec![b"<html><script>alert(1)</script>\n".to_vec()])]).await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/runs/r1/steps/build/logs/raw?attempt=a1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let h = resp.headers();
+    assert_eq!(h["x-content-type-options"], "nosniff");
+    assert_eq!(h["content-type"], "text/plain; charset=utf-8");
+}
+
 async fn raw(app: &axum::Router, attempt: &str) -> Vec<u8> {
     let (status, body) = get(
         app,
