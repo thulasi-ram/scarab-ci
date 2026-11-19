@@ -145,6 +145,21 @@ mod tests {
         }
     }
 
+    /// A lone CR ends a line, also when it is the last byte of one feed and
+    /// the next feed starts a new line.
+    #[test]
+    fn a_lone_cr_ends_a_line() {
+        let events = parse_all(&[b"data: 50%\r", b"data: 60%\rdata: done\r\r"]);
+        assert_eq!(
+            events,
+            vec![SseEvent {
+                event: None,
+                data: "50%\n60%\ndone".into(),
+                id: None
+            }]
+        );
+    }
+
     #[test]
     fn only_one_leading_space_is_stripped() {
         let events = parse_all(&[b"data:   indented\n\n"]);

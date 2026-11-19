@@ -262,11 +262,21 @@ async fn logs(args: LogsArgs) -> i32 {
                             return 1;
                         }
                         // Each payload is a run of log bytes; print it as is.
+                        // A reader that went away (`scarab logs <run> | head`)
+                        // ends the command; any other write error fails it.
                         None | Some("message") => {
                             use std::io::Write;
                             let mut out = std::io::stdout().lock();
-                            let _ = out.write_all(ev.data.as_bytes());
-                            let _ = out.flush();
+                            let written =
+                                out.write_all(ev.data.as_bytes()).and_then(|()| out.flush());
+                            match written {
+                                Ok(()) => {}
+                                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return 0,
+                                Err(e) => {
+                                    eprintln!("error: writing the log to stdout: {e}");
+                                    return 1;
+                                }
+                            }
                         }
                         Some(_) => {}
                     }

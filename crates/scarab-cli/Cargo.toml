@@ -25,6 +25,8 @@ serde_json = { workspace = true }
 # composition root), hence the path, as in scarab-workspace-client.
 scarab-server = { path = "../scarab-server" }
 scarab-testkit = { workspace = true }
+# `tests/logs.rs` seeds a Run, its attempts and their log index directly.
+scarab-engine = { workspace = true }
 scarab-identity = { workspace = true }
 scarab-forge = { workspace = true }
 # A software passkey: the authenticator is the one true external.
