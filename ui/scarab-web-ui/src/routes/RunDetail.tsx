@@ -95,7 +95,14 @@ import {
   type RunTabParam,
   type RunUrlState,
 } from "../run-page";
-import { activityView, artifactFilterCounts, artifactsInScope, triggerLine } from "../run-tabs";
+import {
+  activityView,
+  artifactFilterCounts,
+  artifactsInScope,
+  triggerLine,
+  waitApprovers,
+  type WaitResolution,
+} from "../run-tabs";
 import { relTime, absTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
 import { triggerIcon, triggerText } from "../trigger";
@@ -953,6 +960,12 @@ export default function RunDetail() {
     return triggerLine({ words: triggerWords(), branch: headBranch(t), sha: t.sha, actor: t.actor });
   };
 
+  // A gate's latest verdict, with who approved that wait.
+  const waitResolutionOf = (stepId: string): WaitResolution | null => {
+    const r = stepList().find((x) => x.id === stepId)?.gate_resolution;
+    return r ? { ...r, approvers: waitApprovers(visibleEvents(), stepId, r.attempt) } : null;
+  };
+
   // Show an earlier version's try (the step pane's "Reused from" link).
   const showTry = (take: number, attempt: string) => {
     pendingTry = attempt;
@@ -1476,7 +1489,7 @@ export default function RunDetail() {
                       triesOf={triesOfStep}
                       activeTry={stripActiveAttempt()}
                       onSelectTry={selectTry}
-                      resolutionOf={(sid) => stepList().find((x) => x.id === sid)?.gate_resolution ?? null}
+                      resolutionOf={waitResolutionOf}
                     />
                   }
                 >

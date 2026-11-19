@@ -8,6 +8,7 @@ import { attemptCauses, attemptPlaces, type AttemptCause } from "./takes";
 import { causeText } from "./attempts";
 import { eventParts, infraReasonText, NODE_WAIT_REASONS } from "./events";
 import { duration } from "./fmt";
+import { isGateExpiry } from "./gates";
 
 // ── Activity ────────────────────────────────────────────────────────────────
 
@@ -332,21 +333,79 @@ export function pluralNoun(noun: string): string {
 export type WaitResolution = {
   passed: boolean;
   reason?: string | null;
-  /** Who released or rejected it, when a person or a plugin did. */
+  /** Who released or rejected it: set by a reject (a person, or
+   * `external:<step>` for an external gate's token) and by a plugin's verdict.
+   * Absent on an approval, a timer and an expiry. */
   by?: string | null;
   /** The wait (attempt id) it resolved. */
   attempt: string;
+  /** Who approved that wait, from the run's events ({@link waitApprovers}). */
+  approvers?: string[];
 };
 
-/** A resolved wait in words: "approved by a.kim", "rejected by a.kim: not
- * today", "expired". Null when the resolution names no one and did not expire
- * (a timer that ran out), so the plain outcome reads instead. */
+// The reasons the engine journals on a pass that an approval caused: the
+// Approve button (or an external gate's token) releases with "released"; an
+// Environment approval gate whose approvals were in releases when its wait
+// timer runs out.
+const APPROVED_REASONS: ReadonlySet<string> = new Set([
+  "released",
+  "approved; the Environment's wait timer ran out",
+]);
+
+/** A resolved wait in words: "approved", "approved by a.kim", "released by
+ * plugin:argocd", "rejected by a.kim: not today", "expired". Null for any
+ * other verdict (a timer gate that ran out, a gate that cannot release), so
+ * the plain outcome reads instead. */
 export function resolutionWords(r: WaitResolution): string | null {
-  const reason = r.reason?.trim();
-  if (r.passed) return r.by ? `approved by ${r.by}` : null;
+  const reason = r.reason?.trim() ?? "";
+  if (r.passed) {
+    // Only a plugin's verdict names who released a passing gate.
+    if (r.by) return `released by ${r.by}`;
+    if (!APPROVED_REASONS.has(reason)) return null;
+    return r.approvers?.length ? `approved by ${r.approvers.join(", ")}` : "approved";
+  }
+  if (isGateExpiry(reason)) return "expired";
   if (r.by) return `rejected by ${r.by}${reason ? `: ${reason}` : ""}`;
-  if (reason && /expire/i.test(reason)) return "expired";
   return null;
+}
+
+/** Whether an event starts a new wait of gate `step`: the gate went back to
+ * pending, its open wait was superseded, or a rerun named it. The engine
+ * counts a wait's approvals from the same boundary. */
+function isGateRearm(e: RunEvent, step: string): boolean {
+  const k = tagOf(e);
+  if (!k) return false;
+  switch (k.tag) {
+    case "StepTransitioned":
+      return k.v.step === step && k.v.to === "pending";
+    case "AttemptSuperseded":
+      return k.v.step === step;
+    case "RunRerunRequested":
+      return Array.isArray(k.v.invalidated) && k.v.invalidated.includes(step);
+    default:
+      return false;
+  }
+}
+
+/** The people who approved the wait of gate `step` that `attempt` closed, in
+ * approval order: the approvals after the gate's last re-arm before that
+ * wait's verdict. Empty when the verdict is not in the events. */
+export function waitApprovers(events: RunEvent[], step: string, attempt: string): string[] {
+  let seen: string[] = [];
+  for (const e of events) {
+    if (isGateRearm(e, step)) {
+      seen = [];
+      continue;
+    }
+    const k = tagOf(e);
+    if (!k || k.v.step !== step) continue;
+    if (k.tag === "GateApproved" && typeof k.v.by === "string" && !seen.includes(k.v.by)) {
+      seen = [...seen, k.v.by];
+    } else if (k.tag === "GateResolved" && k.v.attempt === attempt) {
+      return seen;
+    }
+  }
+  return [];
 }
 
 /** One try in words, numbered from 1: "Try 3 · passed", "Try 2 · failed: step

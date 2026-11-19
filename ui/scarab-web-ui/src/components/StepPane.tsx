@@ -48,6 +48,7 @@ import { levelOf, logBodyState, replayBuffer, streamEndStep } from "../logs";
 import { approvalReleaseIn, type GateStatus } from "../gates";
 import { clock, clockLow, expiryPercent, isYankRefusal, pluginGateState } from "../run-origin";
 import { shortHash } from "../libraries";
+import { waitApprovers, type WaitResolution } from "../run-tabs";
 import { absTime } from "../fmt";
 import Icon from "./Icon";
 import AttemptsDropdown, { type FilmstripTry } from "./AttemptsDropdown";
@@ -227,6 +228,12 @@ export default function StepPane(props: {
   //
   // Every attempt's version and try number, from the event log.
   const places = createMemo(() => attemptPlaces(props.events));
+  // The gate's latest verdict, with who approved that wait.
+  const waitResolution = (): WaitResolution | null => {
+    const r = props.step?.gate_resolution;
+    const s = stepId();
+    return r && s ? { ...r, approvers: waitApprovers(props.events, s, r.attempt) } : null;
+  };
   /** "plan · try 2", or "plan · version 1 · try 2" for another version. */
   const label = (step: string, attempt: string): string =>
     tryLabel(places(), step, attempt, props.viewedTake ?? null);
@@ -664,7 +671,7 @@ export default function StepPane(props: {
                 onSelect={props.onAttemptSelect}
                 noun={noun()}
                 now={props.now ?? Date.now()}
-                resolution={props.step?.gate_resolution ?? null}
+                resolution={waitResolution()}
               />
             </Show>
             {props.note}

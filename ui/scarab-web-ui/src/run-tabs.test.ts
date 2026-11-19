@@ -21,9 +21,19 @@ import {
   triggerLine,
   tryDurationMs,
   tryWords,
+  waitApprovers,
 } from "./run-tabs";
 import { activeInfraConditions } from "./events";
-import { ev, finished, infraCondition, readoptedEv, retryRequested, started, transitioned } from "./event-fixtures";
+import {
+  ev,
+  finished,
+  infraCondition,
+  readoptedEv,
+  rerun,
+  retryRequested,
+  started,
+  transitioned,
+} from "./event-fixtures";
 
 describe("activity filter", () => {
   // build's first try waited for a node and the condition cleared; its second
@@ -232,21 +242,80 @@ describe("try tabs", () => {
     expect(tryWords(1, { outcome: "failed", failure: "gate" }, "Wait")).toBe("Wait 1 · failed: gate failed");
   });
 
-  it("says how a gate's wait was resolved, for the wait the resolution closed", () => {
+  // The engine's own verdicts (crates/scarab-engine/src/scheduler.rs): a
+  // release by the Approve button or an external gate's token has reason
+  // "released" and no `by`; a plugin's release names the plugin in both; an
+  // expiry and a timer name no one; only a reject (and a plugin's fail) sets
+  // `by` on a failure.
+  it("says how a gate's wait was resolved, in the engine's words", () => {
     const wait = { id: "a2", outcome: "failed", failure: "gate" };
+    const passedWait = { id: "a2", outcome: "succeeded" };
     const rejected = { passed: false, reason: "not today", by: "a.kim", attempt: "a2" };
     expect(tryWords(2, wait, "Wait", rejected)).toBe("Wait 2 · rejected by a.kim: not today");
-    expect(tryWords(2, { id: "a2", outcome: "succeeded" }, "Wait", { passed: true, by: "a.kim", attempt: "a2" })).toBe(
-      "Wait 2 · approved by a.kim",
+    expect(tryWords(2, passedWait, "Wait", { passed: true, reason: "released", attempt: "a2" })).toBe(
+      "Wait 2 · approved",
     );
-    expect(tryWords(2, wait, "Wait", { passed: false, reason: "expired after 1800s", attempt: "a2" })).toBe(
-      "Wait 2 · expired",
+    expect(
+      tryWords(2, passedWait, "Wait", { passed: true, reason: "released", attempt: "a2", approvers: ["a.kim"] }),
+    ).toBe("Wait 2 · approved by a.kim");
+    expect(
+      resolutionWords({
+        passed: true,
+        reason: "approved; the Environment's wait timer ran out",
+        attempt: "a2",
+        approvers: ["a.kim", "j.lee"],
+      }),
+    ).toBe("approved by a.kim, j.lee");
+    expect(
+      resolutionWords({
+        passed: true,
+        reason: "released by plugin:argocd-prod",
+        by: "plugin:argocd-prod",
+        attempt: "a2",
+      }),
+    ).toBe("released by plugin:argocd-prod");
+    expect(
+      tryWords(2, wait, "Wait", {
+        passed: false,
+        reason: "not released within 1800s of its needs finishing",
+        attempt: "a2",
+      }),
+    ).toBe("Wait 2 · expired");
+    expect(resolutionWords({ passed: false, reason: "sync failed", by: "plugin:argocd-prod", attempt: "a2" })).toBe(
+      "rejected by plugin:argocd-prod: sync failed",
     );
     // Another wait's resolution, or one that names no one, leaves the outcome.
     expect(tryWords(1, { id: "a1", outcome: "failed", failure: "gate" }, "Wait", rejected)).toBe(
       "Wait 1 · failed: gate failed",
     );
-    expect(resolutionWords({ passed: true, reason: "timer elapsed", attempt: "a1" })).toBeNull();
+    expect(
+      resolutionWords({ passed: true, reason: "timer elapsed (60s after its needs finished)", attempt: "a1" }),
+    ).toBeNull();
+    expect(
+      resolutionWords({ passed: false, reason: "its inputs do not render: no such output", attempt: "a1" }),
+    ).toBeNull();
+  });
+
+  it("finds who approved the wait a verdict closed", () => {
+    const approved = (at: number, by: string) => ev(at, { GateApproved: { step: "ship", by } });
+    const resolved = (at: number, attempt: string, passed: boolean) =>
+      ev(at, { GateResolved: { step: "ship", attempt, passed, reason: passed ? "released" : "no" } });
+    const evs = [
+      approved(1, "j.lee"),
+      resolved(2, "a1", false),
+      transitioned(3, "ship", "failed", "pending"),
+      approved(4, "a.kim"),
+      approved(5, "a.kim"),
+      ev(6, { GateApproved: { step: "other", by: "x.y" } }),
+      approved(7, "b.ray"),
+      resolved(8, "a2", true),
+    ];
+    expect(waitApprovers(evs, "ship", "a2")).toEqual(["a.kim", "b.ray"]);
+    expect(waitApprovers(evs, "ship", "a1")).toEqual(["j.lee"]);
+    expect(waitApprovers(evs, "ship", "a9")).toEqual([]);
+    // A rerun that names the gate starts a new wait.
+    const reran = [approved(1, "j.lee"), rerun(2, "build", ["build", "ship"]), approved(3, "a.kim"), resolved(4, "a2", true)];
+    expect(waitApprovers(reran, "ship", "a2")).toEqual(["a.kim"]);
   });
 
   it("names the plural of a try or a wait", () => {

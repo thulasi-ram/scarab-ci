@@ -2,6 +2,7 @@
 // Run page words them. Pure: the page and its tests agree.
 import { idSegments, type OriginLink } from "./dag-layout";
 import { shortHash } from "./libraries";
+import { isGateExpiry } from "./gates";
 
 /** One part of the origin line under the step pane's stamp. */
 export type OriginPart =
@@ -43,7 +44,7 @@ export function pluginGateState(s: PluginGateLike): PluginGateState {
   if (open) return s.plugin_gate?.plugin_state === "killed" ? "killed" : "waiting";
   const r = s.gate_resolution;
   if (r?.passed || s.status === "succeeded") return "released";
-  if (r && /expire/i.test(r.reason ?? "")) return "expired";
+  if (r && isGateExpiry(r.reason)) return "expired";
   return "rejected";
 }
 

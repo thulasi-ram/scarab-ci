@@ -41,7 +41,7 @@ describe("plugin gate", () => {
     expect(pluginGateState({ status: "pending", plugin_gate: { plugin_state: "enabled" } })).toBe("waiting");
     expect(pluginGateState({ status: "pending", plugin_gate: { plugin_state: "killed" } })).toBe("killed");
     expect(pluginGateState({ status: "succeeded", gate_resolution: { passed: true } })).toBe("released");
-    expect(pluginGateState({ status: "failed", gate_resolution: { passed: false, reason: "expired after 1800s" } })).toBe("expired");
+    expect(pluginGateState({ status: "failed", gate_resolution: { passed: false, reason: "not released within 1800s of its needs finishing" } })).toBe("expired");
     expect(pluginGateState({ status: "failed", gate_resolution: { passed: false, reason: "bad image" } })).toBe("rejected");
   });
   it("counts down and fills its bar", () => {
