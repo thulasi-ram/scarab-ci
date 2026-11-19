@@ -2195,7 +2195,29 @@ fn names_missing_executable(msg: &str) -> bool {
 /// the same strings the workspace token was minted with. The Pod LABELS also
 /// carry these, but sanitized (`sanitize_label`), so they must never be used
 /// to address the drain record.
+///
+/// The env is part of the Pod spec, so it is not trusted alone (git-bug
+/// 13f0c09): the Pod's name is [`pod_name`] of its fence, set by the executor
+/// at create and out of every placement layer's reach, so a fence whose name
+/// is not this Pod's name is refused (`None`).
 fn pod_fence(pod: &Pod) -> Option<(String, String, String)> {
+    let fence = pod_env_fence(pod)?;
+    let named = pod_name_for(&fence.0, &fence.1, &fence.2);
+    if pod.metadata.name.as_deref() != Some(named.as_str()) {
+        tracing::warn!(
+            pod = ?pod.metadata.name,
+            run = %fence.0,
+            step = %fence.1,
+            attempt = %fence.2,
+            "the step container's fence env does not match the Pod's name; refusing it"
+        );
+        return None;
+    }
+    Some(fence)
+}
+
+/// The fence env on the step container, unchecked; see [`pod_fence`].
+fn pod_env_fence(pod: &Pod) -> Option<(String, String, String)> {
     let container = pod
         .spec
         .as_ref()?
@@ -4138,9 +4160,14 @@ pub fn pod_name(step: &StepRun) -> String {
         .current_attempt()
         .map(|a| a.id.0.as_str())
         .unwrap_or("0");
-    let fence = format!("{}/{}/{}", step.run.0, step.step.0, attempt);
+    pod_name_for(&step.run.0, &step.step.0, attempt)
+}
+
+/// The step Pod's name for the fence `{run, step, attempt}`; see [`pod_name`].
+fn pod_name_for(run: &str, step: &str, attempt: &str) -> String {
+    let fence = format!("{run}/{step}/{attempt}");
     let hash = fnv1a(&fence);
-    let slug = truncate(&sanitize_dns(&format!("{}-{}", step.step.0, attempt)), 40);
+    let slug = truncate(&sanitize_dns(&format!("{step}-{attempt}")), 40);
     // `scarab-` prefix + slug + 8-hex hash; always a valid DNS-1123 label.
     format!("scarab-{slug}-{hash:08x}")
 }
@@ -12547,7 +12574,7 @@ mod tests {
         let step = step_with_attempt("Run With Spaces", "build", "a1");
         let fetch = sample_fetch();
         let pod = build_pod(
-            "scarab-x",
+            &pod_name(&step),
             "ns",
             &step,
             &busybox(),
@@ -12565,6 +12592,51 @@ mod tests {
             )),
             "labels sanitize this run id; the fence must not"
         );
+    }
+
+    // Attack (git-bug 13f0c09): the step container's env names another
+    // Attempt's fence, so the drain would read that Attempt's record. Safe
+    // outcome: the fence is refused, because the Pod's name is not the name
+    // of the fence its env claims.
+    #[test]
+    fn pod_fence_refuses_env_that_does_not_match_the_pods_name() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        let fetch = sample_fetch();
+        let built = |name: &str| {
+            build_pod(
+                name,
+                "ns",
+                &step,
+                &busybox(),
+                None,
+                DEFAULT_STEP_TIMEOUT_SECS,
+                true,
+                Some(&fetch),
+            )
+        };
+        // Built under its own name: the fence is read.
+        assert!(pod_fence(&built(&pod_name(&step))).is_some());
+        // A Pod named for another fence: refused.
+        assert_eq!(pod_fence(&built("scarab-x")), None);
+        let other = pod_name(&step_with_attempt("run-1", "build", "a2"));
+        assert_eq!(pod_fence(&built(&other)), None);
+        // The env rewritten to another Attempt's fence: refused.
+        let mut pod = built(&pod_name(&step));
+        let env = pod
+            .spec
+            .as_mut()
+            .unwrap()
+            .containers
+            .iter_mut()
+            .find(|c| c.name == STEP_CONTAINER)
+            .unwrap()
+            .env
+            .as_mut()
+            .unwrap();
+        for e in env.iter_mut().filter(|e| e.name == "SCARAB_ATTEMPT") {
+            e.value = Some("a2".into());
+        }
+        assert_eq!(pod_fence(&pod), None);
     }
 
     /// ADR-0061 s3-feed acceptance, at the grain `build_pod` owns: the feed
