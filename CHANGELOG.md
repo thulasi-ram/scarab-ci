@@ -33,6 +33,24 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Security
 
+- **A step's `k8s_overlay` may set only an allowed list of Pod fields** (git-bug 24a3126, 743545c,
+  5b6b5cf). An Environment that permits raw overlays let a pipeline author set any Pod field: mount
+  the server's Secret or another Run's per-Pod Secret by its name, run as the server's
+  ServiceAccount, use the host's network, PID namespace or filesystem, run privileged, or point
+  the sidecars at another address with `hostAliases` or `dnsConfig`. The overlay may now set the
+  placement fields (`nodeSelector`, `affinity`, `tolerations`, `topologySpreadConstraints`,
+  `priorityClassName`, `schedulerName`), labels and annotations outside the reserved keys, emptyDir
+  volumes, and the step container's `resources`, literal `env` and mounts of those volumes. Any
+  other field is refused when the Run is created, with its path in the error, and again before the
+  Pod is created. The overlay also may no longer change or remove what the placement baseline or a
+  placement profile set, such as a baseline toleration or a profile's variable. **This can refuse
+  an overlay that worked before.** Move such a setting into a placement profile in the operator's
+  placement config (the chart value `scarab.placement.profiles`, under the profile's `k8s`), where
+  these limits do not apply, and name the profile in the step's `placement_profiles`. See
+  [Placement & resources](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#placement--resources).
+- **The workspace drain checks its fence against the Pod's name** (git-bug 13f0c09). The drain read
+  the `{run, step, attempt}` fence from the step container's env, which the Pod spec sets. It now
+  refuses a fence whose step Pod name is not the Pod's own name.
 - **Installing or upgrading a library names the credentials its source's trust gives the new
   commit** (git-bug 8c62098). Trust stays keyed by source, so a new commit from a source trusted
   with forge credentials or the registry credential gets them too, and until now nothing said so.

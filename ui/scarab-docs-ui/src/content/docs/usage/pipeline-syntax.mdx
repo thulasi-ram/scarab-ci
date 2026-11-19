@@ -333,8 +333,25 @@ Without `run_as_root`, a step runs with `runAsNonRoot` and no user id of its own
 `USER` must be a non-zero number (`USER 65532`). The kubelet cannot check that a user name is not
 root, so an image whose `USER` is a name, such as `curlimages/curl`, fails to start with
 `CreateContainerConfigError`. The step fails as a configuration error whose message says to use a
-numeric user. Scarab does not override the image's user: rebuild the image with a numeric `USER`,
-use an image that has one, or ask for `run_as_root`.
+numeric user. Scarab does not override the image's user unless the step names one: rebuild the
+image with a numeric `USER`, use an image that has one, set `run_as_user`, or ask for
+`run_as_root`.
+
+`run_as_user` runs the step as that uid, for an image whose `USER` is root or a name but whose
+program runs as any user. A non-zero uid is self-service and is not a grant: the step still runs
+with `runAsNonRoot`, and it reads and writes `/workspace` through the workspace group, as every
+step does.
+
+```yaml
+- id: push
+  image: gcr.io/go-containerregistry/crane:debug@sha256:…   # its USER is root
+  security:
+    run_as_user: 1000
+```
+
+`run_as_user: 0` is root: it is the same request as `run_as_root: true`, and a Policy sees it in
+the step's `grants` as `run-as-root`. A step cannot set both. A uid is not allowed beside
+`sandbox`, which sets the uid itself.
 
 Some steps are **kinds** with no image that the engine runs on your behalf (you set no `image`/`command`):
 
@@ -1093,13 +1110,7 @@ with `resources`:
 For a rare dynamic per-job Kubernetes need there is a governed `k8s_overlay` escape hatch: a raw
 pod-spec fragment merged last onto the Pod. Writing one grants nothing by itself: it is admitted only
 if the run's target environment permits raw overlays; otherwise the run is rejected (fail-closed). Prefer a named
-profile for anything static. Even where raw overlays are permitted, an overlay cannot set or delete the Pod's
-`metadata.name`, `generateName`, `namespace`, `ownerReferences` or `finalizers`, or labels and annotations
-under `app.kubernetes.io/`, `scarab.io/` or `scarab.dev/`: Scarab uses them to find, route to and clean up the Pod.
-Apart from Scarab's own containers, volumes, mounts and env (below), the rest of the Pod spec is not checked. An overlay can ask for privileged containers, host mounts, the
-host network, or a ServiceAccount token. Step Pods run in Scarab's own namespace by default, so that can
-be Scarab's ServiceAccount. Permit raw overlays only on an Environment whose pipeline authors you trust
-with that.
+profile for anything static.
 
 ```yaml
 - id: heavy
@@ -1108,6 +1119,43 @@ with that.
     spec:
       schedulerName: my-scheduler
 ```
+
+Whoever edits the Pipeline file writes the overlay, so even where raw overlays are permitted it may
+set only these fields. Scarab refuses any other field when the Run is created, and the error names
+its path. The executor checks the same list again before it creates the Pod.
+
+| Field | Why it is allowed |
+|-------|-------------------|
+| `metadata.labels` | Labels for the cluster's own tooling. Keys under `app.kubernetes.io/`, `scarab.io/` and `scarab.dev/` are Scarab's and are refused. |
+| `metadata.annotations` | The same, and the AppArmor and seccomp annotation keys are refused too. |
+| `spec.nodeSelector` | Picks nodes by label. It can only narrow where the Pod runs. |
+| `spec.affinity` | Picks nodes and neighbouring Pods for placement. |
+| `spec.tolerations` | Lets the Pod onto a tainted node pool. A toleration without a `key`, or of a `node-role.kubernetes.io/` taint, is refused: it would let the Pod onto the control-plane nodes. |
+| `spec.topologySpreadConstraints` | Spreads step Pods over zones or nodes. |
+| `spec.priorityClassName` | Picks one of the PriorityClasses the cluster's operator created. |
+| `spec.schedulerName` | Picks a scheduler the cluster runs. |
+| `spec.volumes[]` with `name` and `emptyDir` only | Scratch space that starts empty and holds no credential. |
+| `spec.containers[]` entry `step`: `resources.requests`, `resources.limits` | CPU, memory or an extended resource such as a GPU. |
+| `spec.containers[]` entry `step`: `env[]` with `name` and `value` | A literal value. `valueFrom` and `envFrom` can read a Secret. |
+| `spec.containers[]` entry `step`: `volumeMounts[]` with `name`, `mountPath`, `readOnly` | Mounts an emptyDir volume the same overlay adds. |
+
+Everything else is refused. That includes any Secret reference (a `secret` or `projected` volume,
+`secretKeyRef`, `envFrom`, `imagePullSecrets`), `serviceAccountName`, `serviceAccount` and
+`automountServiceAccountToken`, `hostNetwork`, `hostPID`, `hostIPC`, `hostPath` volumes,
+`hostAliases` and `dnsConfig`, `nodeName`, any `securityContext`, the step container's `image` and
+`command`, and containers of its own (`initContainers`, `ephemeralContainers`, or a `containers`
+entry other than `step`).
+
+The overlay may add to the Pod, but it may not change or remove anything Scarab, the placement
+baseline or a placement profile put there. It can add a toleration or a `nodeSelector` key; it
+cannot remove the baseline's toleration, change a profile's `HTTP_PROXY`, override the baseline's
+`schedulerName`, or add a second node affinity term. Set the step container's CPU and memory with
+`resources:`; when that or the operator's default already set `requests.cpu`, the overlay cannot
+change it.
+
+To use a field the list does not allow, ask the operator to put it in a placement profile and name
+that profile in `placement_profiles`. The baseline and profiles are written by the operator and are
+not limited by this list.
 
 The operator's baseline, each named profile in the order you list them, and then the
 `k8s_overlay` are merged onto the Pod one after another, with a Kubernetes strategic merge:
@@ -1123,10 +1171,10 @@ The operator's baseline, each named profile in the order you list them, and then
   profile cannot drop the baseline's tolerations.
 - Every other list replaces, as in Kubernetes. Node affinity terms are one of them.
 
-So an overlay can change one field of the step container and keep the rest:
+So a profile can change one field of the step container and keep the rest:
 
 ```yaml
-k8s_overlay:
+k8s:
   spec:
     containers:
       - name: step
@@ -1138,8 +1186,8 @@ The step container is the only container Scarab adds that a profile or overlay m
 results sidecar (`scarab-results-egress`), the workspace containers (`scarab-workspace-init`,
 `scarab-workspace-egress`) and service sidecars (`service-0`, `service-1`, ...) carry Scarab's own
 wiring. If the baseline, a profile or an overlay names or removes one, Scarab does not create
-the Pod, and the launch error names the container and the layer. A container with a new name,
-such as an extra init container, is allowed.
+the Pod, and the launch error names the container and the layer. In the baseline or a profile, a
+container with a new name, such as an extra init container, is allowed.
 
 Scarab's volumes, mounts and env are guarded the same way. A layer may not:
 
