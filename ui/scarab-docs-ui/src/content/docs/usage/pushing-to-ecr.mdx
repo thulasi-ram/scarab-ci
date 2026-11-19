@@ -151,9 +151,11 @@ scarab:
                     value: 444455556666.dkr.ecr.eu-west-1.amazonaws.com
                   - name: ECR_REGION
                     value: eu-west-1
+                  - name: HOME
+                    value: /tmp
                 securityContext:
-                  runAsUser: 0
-                  runAsNonRoot: false
+                  runAsUser: 1000
+                  runAsNonRoot: true
                   allowPrivilegeEscalation: false
                   capabilities:
                     drop: [ALL]
@@ -187,9 +189,10 @@ What each part does:
   Kubernetes leaves a `$(...)` that is not a variable reference unchanged, so the shell gets the
   command as written.
 - `DOCKER_CONFIG=/ecr-login` on the push step's container is where crane looks for its login.
-  The push step runs as uid 0 with every capability dropped, so it can read only a file uid 0
-  owns or one its groups may read. `ecr-login` runs as uid 0 too and writes the file with mode
-  `0600`, so crane can read it. No other container mounts the volume.
+  The push step runs as uid 1000 with every capability dropped, so it can read only a file uid
+  1000 owns or one its groups may read. `ecr-login` runs as uid 1000 too, with `HOME` set to a
+  directory that uid can write, and writes the file with mode `0600`, so crane can read it. No
+  other container mounts the volume.
 
 Scarab merges a profile onto the Pod it built with a strategic merge, and refuses a profile that
 changes its own containers, volumes, mounts or env. This one adds only things with names and paths

@@ -462,6 +462,7 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
         // busybox runs as root; without the self-service grant the hardened
         // ADR-0039 baseline rejects the container (CreateContainerConfigError).
         run_as_root: true,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: None,
@@ -534,6 +535,7 @@ async fn sleeping_step_is_killed_at_its_deadline() {
         // baseline rejects the container (CreateContainerConfigError) and the
         // step never starts — this test needs the sleep to actually run.
         run_as_root: true,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(5),
@@ -626,6 +628,7 @@ async fn log_stream_tails_pod_stdout() {
         secrets: vec![],
         // busybox runs as root; the hardened baseline would reject it.
         run_as_root: true,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: None,
@@ -715,6 +718,7 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
         env: vec![],
         secrets: vec![],
         run_as_root: true, // busybox runs as root; fsGroup covers the emptyDir
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(120),
@@ -931,6 +935,7 @@ async fn a_green_attempt_is_backed_by_a_durable_snapshot_at_the_instant_it_goes_
         env: vec![],
         secrets: vec![],
         run_as_root: true,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(120),
@@ -1113,6 +1118,7 @@ async fn a_missing_input_snapshot_fails_the_attempt_instead_of_hanging() {
         env: vec![],
         secrets: vec![],
         run_as_root: true,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(120),
@@ -1205,6 +1211,7 @@ async fn a_step_with_inputs_is_refused_when_no_workspace_service_is_configured()
         env: vec![],
         secrets: vec![],
         run_as_root: true,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(60),
@@ -1317,6 +1324,7 @@ async fn declared_outputs_publish_only_those_paths_through_the_cas() {
         env: vec![],
         secrets: vec![],
         run_as_root: true,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(120),
@@ -1467,6 +1475,7 @@ async fn clone_step_produces_a_source_workspace() {
         env: clone_env(sha.as_str(), "1"),
         secrets: vec![],
         run_as_root: false, // scarab-clone is non-root by construction
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(300),
@@ -1560,6 +1569,7 @@ async fn clone_step_produces_a_source_workspace() {
         env: vec![],
         secrets: vec![],
         run_as_root: false,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(300),
@@ -1636,6 +1646,7 @@ async fn clone_depth_full_exposes_history() {
         env: clone_env(sha.as_str(), "full"),
         secrets: vec![],
         run_as_root: false,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(300),
@@ -1693,6 +1704,7 @@ async fn clone_depth_full_exposes_history() {
         env: vec![],
         secrets: vec![],
         run_as_root: false,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(300),
@@ -1768,6 +1780,7 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
         env: clone_env("0000000000000000000000000000000000000001", "1"),
         secrets: vec![],
         run_as_root: false,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(300),
@@ -1869,11 +1882,7 @@ fn build_library_step_run(run: &str, id: &str, needs: Vec<StepId>) -> StepRun {
 /// The build library's Step `image/<id>` from `ir`, rendered as the
 /// scheduler renders it at launch (no results of its needs), with the
 /// workspace `inputs`.
-fn build_library_spec(
-    ir: &scarab_pipeline::PipelineIr,
-    id: &str,
-    inputs: Vec<String>,
-) -> StepSpec {
+fn build_library_spec(ir: &scarab_pipeline::PipelineIr, id: &str, inputs: Vec<String>) -> StepSpec {
     let s = ir
         .steps
         .iter()
@@ -1908,7 +1917,10 @@ fn build_library_spec(
         command: rendered.command,
         env,
         secrets: vec![],
-        run_as_root: s.security.as_ref().is_some_and(|sec| sec.run_as_root),
+        // As Run creation admits it: `run_as_user: 0` is root, a non-zero
+        // uid rides as itself (git-bug 1a20384).
+        run_as_root: s.security.as_ref().is_some_and(|sec| sec.runs_as_root()),
+        run_as_user: s.security.as_ref().and_then(|sec| sec.non_root_uid()),
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(600),
@@ -2047,6 +2059,7 @@ async fn the_build_library_builds_and_pushes_to_a_local_registry() {
         secrets: vec![],
         // busybox runs as root; the hardened baseline would reject it.
         run_as_root: true,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(120),
@@ -2118,7 +2131,10 @@ async fn the_build_library_refuses_a_committed_symlink_context_out_of_the_worksp
         ));
         let build = build_library_step_run(&run_id, "image", vec![StepId("checkout".into())]);
         let h = exec
-            .launch(&build, &build_library_spec(&ir, "image", vec![root.clone()]))
+            .launch(
+                &build,
+                &build_library_spec(&ir, "image", vec![root.clone()]),
+            )
             .await
             .expect("launch build");
         match poll_to_terminal(&exec, &h, 300).await {
@@ -2210,6 +2226,7 @@ async fn results_sidecar_captures_a_named_result_end_to_end() {
         env: vec![],
         secrets: vec![],
         run_as_root: true, // busybox
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(120),
@@ -2399,6 +2416,7 @@ async fn cancel_tears_down_a_running_pod() {
         env: vec![],
         secrets: vec![],
         run_as_root: true, // busybox
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(600),
@@ -2500,6 +2518,7 @@ async fn artifacts_are_harvested_post_step() {
         env: vec![],
         secrets: vec![],
         run_as_root: true, // busybox
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(120),
@@ -2587,6 +2606,7 @@ async fn artifacts_are_harvested_from_a_failed_step() {
         env: vec![],
         secrets: vec![],
         run_as_root: true, // busybox
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(120),
@@ -2657,6 +2677,7 @@ fn busybox_spec(cmd: &str, run_as_root: bool) -> StepSpec {
         env: vec![],
         secrets: vec![],
         run_as_root,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(600),
@@ -3004,6 +3025,7 @@ async fn fanin_collision_summary_survives_the_termination_log_as_uid_65532() {
         env: vec![],
         secrets: vec![],
         run_as_root: true, // busybox runs as root; fsGroup covers the emptyDir
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(120),

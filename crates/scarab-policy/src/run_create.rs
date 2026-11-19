@@ -171,6 +171,11 @@ policy_struct! {
         /// existed, so a rule reads it as
         /// `has(step.registry_auth) && step.registry_auth`.
         pub registry_auth: Option<bool>,
+        /// The uid the Step asks to run as (`security.run_as_user`). Absent
+        /// when it names none, and from inputs recorded before it existed.
+        /// `0` is also in `grants` as `run-as-root`, as `run_as_root: true`
+        /// is.
+        pub run_as_user: Option<u64>,
         /// The Step uses the Environment's authority (ADR-0075 §5).
         pub uses_environment_authority: bool,
         /// Empty for a Step written in the Pipeline file itself.
@@ -495,7 +500,8 @@ pub fn input_from_pipeline(
         }
         let mut grants = Vec::new();
         if let Some(sec) = &s.security {
-            if sec.run_as_root {
+            // `run_as_user: 0` is the same request as `run_as_root: true`.
+            if sec.runs_as_root() {
                 grants.push("run-as-root".to_string());
             }
             if sec.privileged {
@@ -559,6 +565,11 @@ pub fn input_from_pipeline(
             }),
             sandbox: s.sandbox().map(|x| x.as_str().to_string()),
             registry_auth: Some(s.registry_auth),
+            run_as_user: s
+                .security
+                .as_ref()
+                .and_then(|x| x.run_as_user)
+                .map(u64::from),
             uses_environment_authority: uses_environment_authority(ir, s),
             origin: origin_of(&s.origin, &what)?,
             upstream_gates: capped(upstream_gates, &what, "gates upstream of it")?,

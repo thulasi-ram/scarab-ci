@@ -82,6 +82,13 @@ release.yml uses that version's section as the GitHub Release text. See
   gives that Pod, and the IRSA skip list in the ECR guide does not name `service-N` containers. Such
   a Pipeline no longer compiles. The build library's push step sets no services, so it is
   unaffected.
+- **The build library's push step no longer runs as root** (git-bug 1a20384). It sets
+  `security: { run_as_user: 1000 }` in place of `run_as_root: true`, so its Policy input no longer
+  lists the `run-as-root` grant and an org Policy that denies root no longer refuses every build.
+  The ECR guide's `ecr-login` init container now runs as uid 1000 too, with `HOME=/tmp`, so the
+  push step can read the `0600` login file it writes: an operator who set up that profile from
+  the guide changes its `securityContext` and env to match. Install the library again from the
+  release commit to get this.
 
 ### Enhancement
 
@@ -112,6 +119,12 @@ release.yml uses that version's section as the GitHub Release text. See
   reports the index's digest as `outputs.<id>.index.digest`. Its one step holds the registry
   credential, so an org admin installs it and trusts its source with the registry credential. See
   [Joining images into one multi-architecture image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#joining-images-into-one-multi-architecture-image).
+- **A step can name the uid it runs as** (git-bug 1a20384). `security: { run_as_user: <uid> }`
+  sets the step container's `runAsUser`, for an image whose `USER` is root or a name. A non-zero
+  uid is self-service and still runs with `runAsNonRoot`. `run_as_user: 0` is the same request as
+  `run_as_root: true`: it needs the same grant, and Policies see it as `run-as-root` in the step's
+  `grants`. A step cannot set both, and `run_as_user` cannot be combined with `sandbox`. The
+  `run.create` Policy input has a new `step.run_as_user` field.
 
 ### Bug Fixes
 

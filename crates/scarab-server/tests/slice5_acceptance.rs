@@ -145,6 +145,7 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
         env: vec![],
         secrets: vec![],
         run_as_root: false,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: None,

@@ -190,3 +190,29 @@ steps:
     assert_eq!(by_id("own")["image"], "app@sha256:run");
     assert_eq!(by_id("own")["digest"], "sha256:run");
 }
+
+/// git-bug 1a20384: `run_as_user: 0` is the `run-as-root` request, so a
+/// Policy that denies root refuses it as it refuses `run_as_root: true`; a
+/// non-zero uid is no grant, and `run_as_user` carries the uid either way.
+#[test]
+fn run_as_user_zero_is_the_run_as_root_grant() {
+    let ir = scarab_pipeline::compile_yaml(
+        r#"
+steps:
+  - { id: root, image: busybox, security: { run_as_root: true } }
+  - { id: zero, image: busybox, security: { run_as_user: 0 } }
+  - { id: user, image: busybox, security: { run_as_user: 1000 } }
+  - { id: plain, image: busybox }
+"#,
+    )
+    .unwrap();
+    let input = serde_json::to_value(input_from_pipeline(&ir, facts()).unwrap()).unwrap();
+    let step = |i: usize| &input["steps"][i];
+    assert_eq!(step(0)["grants"], serde_json::json!(["run-as-root"]));
+    assert_eq!(step(0)["run_as_user"], serde_json::Value::Null);
+    assert_eq!(step(1)["grants"], serde_json::json!(["run-as-root"]));
+    assert_eq!(step(1)["run_as_user"], 0);
+    assert_eq!(step(2)["grants"], serde_json::json!([]));
+    assert_eq!(step(2)["run_as_user"], 1000);
+    assert_eq!(step(3)["run_as_user"], serde_json::Value::Null);
+}

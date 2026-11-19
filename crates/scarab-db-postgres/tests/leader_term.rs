@@ -679,6 +679,7 @@ fn spec() -> StepSpec {
         env: vec![],
         secrets: vec![],
         run_as_root: false,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: None,

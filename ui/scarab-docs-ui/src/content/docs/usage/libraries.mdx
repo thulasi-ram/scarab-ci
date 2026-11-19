@@ -193,8 +193,8 @@ clone library, then give its source the trust its steps need:
    that is not a fork pull request), whether or not a `REGISTRY_AUTH` secret exists
    ([Placement & resources](/scarab-ci/usage/pipeline-syntax/#placement--resources)).
 
-The push step runs as root, because crane's image has no other user, so an org Policy that denies
-run-as-root refuses every Run that invokes the library.
+The push step runs as uid 1000 (`security: { run_as_user: 1000 }`), not as root, so an org
+Policy that denies run-as-root does not refuse it.
 
 The library pins the rootless BuildKit image and the crane image by digest. A newer BuildKit or
 crane is a new version of the file: upgrade the installation, and trust carries over because the

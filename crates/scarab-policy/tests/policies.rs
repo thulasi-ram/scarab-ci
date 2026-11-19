@@ -59,6 +59,7 @@ fn step(id: &str) -> Step {
         forge_token: Some(ForgeToken::Read),
         sandbox: None,
         registry_auth: None,
+        run_as_user: None,
         uses_environment_authority: false,
         origin: cap(vec![]),
         upstream_gates: cap(vec![]),

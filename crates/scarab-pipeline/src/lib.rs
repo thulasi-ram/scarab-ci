@@ -1290,6 +1290,13 @@ pub struct StepSecurity {
     /// not escape it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub run_as_root: bool,
+    /// Run as this uid, for an image whose default user is root but whose
+    /// program runs as any user. A non-zero uid is not a grant: the
+    /// container still runs as non-root. `0` asks for root and is the same
+    /// request as [`run_as_root`](Self::run_as_root) (see
+    /// [`runs_as_root`](Self::runs_as_root)); the two cannot both be set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_as_user: Option<u32>,
     /// Linux capabilities to add (e.g. `NET_ADMIN`). Governed: each must be
     /// whitelisted for the image digest by the Environment admin.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1302,16 +1309,32 @@ pub struct StepSecurity {
     /// Only a Step from an installed library may ask for one, and Run
     /// creation admits it only when the org trusts that library's source
     /// for the sandbox. It cannot be combined with `run_as_root`,
-    /// `add_capabilities` or `privileged`. Not an ADR-0039 grant:
+    /// `run_as_user`, `add_capabilities` or `privileged`. Not an ADR-0039 grant:
     /// [`is_baseline`](Self::is_baseline) does not count it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<Sandbox>,
 }
 
 impl StepSecurity {
-    /// Does this request any escalation at all?
+    /// Does this request any escalation at all? A non-zero
+    /// [`run_as_user`](Self::run_as_user) is not one.
     pub fn is_baseline(&self) -> bool {
-        !self.run_as_root && !self.privileged && self.add_capabilities.is_empty()
+        !self.runs_as_root() && !self.privileged && self.add_capabilities.is_empty()
+    }
+
+    /// Whether the Step asks to run as uid 0, by `run_as_root: true` or by
+    /// `run_as_user: 0`. Both are the one `run-as-root` request: admission,
+    /// Policies and the executor read this, never the two fields.
+    pub fn runs_as_root(&self) -> bool {
+        self.run_as_root || self.run_as_user == Some(0)
+    }
+
+    /// The non-zero uid the Step names, which the executor sets as the
+    /// container's `runAsUser`. `None` for `run_as_user: 0`, which is
+    /// [`runs_as_root`](Self::runs_as_root) and reaches the executor only as
+    /// an admitted `run-as-root` grant.
+    pub fn non_root_uid(&self) -> Option<u32> {
+        self.run_as_user.filter(|&uid| uid != 0)
     }
 }
 
@@ -5916,6 +5939,17 @@ fn validate_with(
                 step.id
             ));
         }
+        // `run_as_user: 0` is the `run_as_root` request; both at once name
+        // the uid twice.
+        if let Some(sec) = &step.security {
+            if sec.run_as_root && sec.run_as_user.is_some() {
+                diagnostics.push(format!(
+                    "step `{}`: `security.run_as_user` cannot be combined with \
+                     `security.run_as_root` (`run_as_user: 0` is the same request)",
+                    step.id
+                ));
+            }
+        }
         // The sandbox and the registry credential (ADR-0018, amendment of
         // 2026-11-12) are for a Step that runs an image: a gate runs
         // nothing.
@@ -5930,10 +5964,10 @@ fn validate_with(
             // The sandbox is a fixed Pod shape; an ADR-0039 grant would change
             // it.
             if let Some(sec) = &step.security {
-                if !sec.is_baseline() {
+                if !sec.is_baseline() || sec.run_as_user.is_some() {
                     diagnostics.push(format!(
                         "step `{}`: `security.sandbox: {}` cannot be combined with \
-                         `run_as_root`, `add_capabilities` or `privileged`",
+                         `run_as_root`, `run_as_user`, `add_capabilities` or `privileged`",
                         step.id,
                         sandbox.as_str()
                     ));
@@ -6176,7 +6210,11 @@ fn validate_with(
                     ));
                 }
                 // A gate launches no Pod, so a privilege request is meaningless.
-                if step.security.as_ref().is_some_and(|s| !s.is_baseline()) {
+                if step
+                    .security
+                    .as_ref()
+                    .is_some_and(|s| !s.is_baseline() || s.run_as_user.is_some())
+                {
                     diagnostics.push(format!(
                         "step `{}`: a gate step launches nothing — it must not set `security`",
                         step.id
@@ -7067,6 +7105,51 @@ mod tests {
         assert!(ir2.steps[0].security.is_none());
         let json = serde_json::to_string(&ir2).unwrap();
         assert!(!json.contains("security"));
+    }
+
+    /// git-bug 1a20384: `security.run_as_user` parses and round-trips. A
+    /// non-zero uid is no grant; `0` is the `run-as-root` request.
+    #[test]
+    fn step_run_as_user_parses_and_zero_is_the_run_as_root_request() {
+        let ir = compile("steps: [{ id: a, image: busybox, security: { run_as_user: 1000 } }]");
+        let sec = ir.steps[0].security.as_ref().unwrap();
+        assert_eq!(sec.run_as_user, Some(1000));
+        assert!(!sec.run_as_root && !sec.runs_as_root());
+        assert!(sec.is_baseline(), "a non-zero uid is not a grant");
+        let json = serde_json::to_string(&ir).unwrap();
+        assert!(json.contains("\"run_as_user\":1000"), "{json}");
+        let back: PipelineIr = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.steps[0].security, ir.steps[0].security);
+
+        let ir = compile("steps: [{ id: a, image: busybox, security: { run_as_user: 0 } }]");
+        let sec = ir.steps[0].security.as_ref().unwrap();
+        assert!(sec.runs_as_root(), "uid 0 is root");
+        assert!(!sec.is_baseline(), "uid 0 asks for the run-as-root grant");
+
+        let err = parse_error("steps: [{ id: a, image: x, security: { run_as_user: -1 } }]");
+        assert!(!err.is_empty());
+    }
+
+    /// git-bug 1a20384: `run_as_user` beside `run_as_root` names the uid
+    /// twice and does not compile, `0` included; neither does a uid on a
+    /// gate or beside the sandbox.
+    #[test]
+    fn run_as_user_cannot_be_combined_with_run_as_root_or_set_on_a_gate() {
+        for uid in [0, 1000] {
+            let errs = errors(&format!(
+                "steps: [{{ id: a, image: x, security: {{ run_as_root: true, run_as_user: {uid} }} }}]"
+            ));
+            assert!(
+                errs.iter().any(|e| e.starts_with("step `a`: ")
+                    && e.contains("`security.run_as_user` cannot be combined with")),
+                "{uid}: {errs:?}"
+            );
+        }
+        let errs = errors("steps: [{ id: g, gate: manual, security: { run_as_user: 1000 } }]");
+        assert!(
+            errs.iter().any(|e| e.contains("must not set `security`")),
+            "{errs:?}"
+        );
     }
 
     #[test]
@@ -10254,6 +10337,7 @@ mod tests {
             "{ sandbox: rootless-buildkit, run_as_root: true }",
             "{ sandbox: rootless-buildkit, privileged: true }",
             "{ sandbox: rootless-buildkit, add_capabilities: [NET_ADMIN] }",
+            "{ sandbox: rootless-buildkit, run_as_user: 1000 }",
         ] {
             let lib = SANDBOXED_LIB.replace("{ sandbox: rootless-buildkit }", security);
             let libs = Libraries {
@@ -10345,7 +10429,7 @@ mod tests {
     /// `libs/build.yaml` installs and compiles to two Steps: `image/image`
     /// builds in the sandbox and holds no registry credential, and
     /// `image/push` needs it, holds the credential, has no sandbox and runs
-    /// as root (crane's image has no other user). Both take every input
+    /// as uid 1000, not root. Both take every input
     /// through env; the invoke exposes both results; a list of placement
     /// profiles reaches both Steps and a map routes each list to its Step.
     #[test]
@@ -10393,7 +10477,12 @@ mod tests {
         assert!(!build.registry_auth, "the build Step holds no credential");
         assert!(push.registry_auth);
         assert_eq!(push.sandbox(), None);
-        assert!(push.security.as_ref().is_some_and(|s| s.run_as_root));
+        // git-bug 1a20384: the push Step runs as uid 1000, not as root, so it
+        // asks for no `run-as-root` grant an org Policy might deny.
+        let push_sec = push.security.as_ref().expect("the push Step names its uid");
+        assert_eq!(push_sec.run_as_user, Some(1000));
+        assert!(!push_sec.run_as_root && !push_sec.runs_as_root());
+        assert!(push_sec.is_baseline());
         assert_eq!(push.needs.0, vec!["image/image".to_string()]);
         assert_eq!(build.needs.0, vec!["src".to_string()]);
         for s in [&build, &push] {
@@ -11854,7 +11943,9 @@ steps:
             "{errs:?}"
         );
         // Without `registry_auth` the same services compile.
-        compile("steps: [{ id: push, image: x, command: [y], services: [{ image: postgres:16 }] }]");
+        compile(
+            "steps: [{ id: push, image: x, command: [y], services: [{ image: postgres:16 }] }]",
+        );
     }
 
     #[test]

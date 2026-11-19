@@ -297,9 +297,11 @@ steps:
     image: gcr.io/go-containerregistry/crane:debug@sha256:e78770b31258a3846f878036d9c1f63fbe4c871f9f56990bf77fd95c013e3c1b
     needs: [image]
     registry_auth: true
-    # The image runs as uid 0 and has no non-root user; the Step runs no
-    # repository code, and the baseline's dropped capabilities still apply.
-    security: { run_as_root: true }
+    # The image's default user is root. crane and busybox need no user of
+    # their own, so the Step runs as uid 1000, the build Step's uid. It
+    # reads and cleans the workspace through the workspace group, as every
+    # Step does, and reads the registry login Scarab mounts.
+    security: { run_as_user: 1000 }
     env:
       - [SCARAB_BUILD_IMAGE, "${{ inputs.image }}"]
       - [SCARAB_BUILD_PUSH, "${{ inputs.push }}"]

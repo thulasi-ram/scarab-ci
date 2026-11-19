@@ -686,6 +686,11 @@ pub struct StepSpec {
     /// and nothing more (fail-closed). Default = the restricted baseline.
     #[serde(default)]
     pub run_as_root: bool,
+    /// The uid the Step runs as (`security.run_as_user`), when it names a
+    /// non-zero one. Self-service and not a grant: the container still runs
+    /// with `runAsNonRoot`. Root is [`run_as_root`](Self::run_as_root) alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_as_user: Option<u32>,
     #[serde(default)]
     pub add_capabilities: Vec<String>,
     #[serde(default)]

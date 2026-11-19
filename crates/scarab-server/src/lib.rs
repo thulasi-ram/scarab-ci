@@ -2007,6 +2007,7 @@ async fn create_run(
             // resolves for it anyway.
             secrets: step.secrets.iter().map(|k| k.as_str().into()).collect(),
             run_as_root: admitted.run_as_root,
+            run_as_user: step.security.as_ref().and_then(|s| s.non_root_uid()),
             add_capabilities: admitted.add_capabilities,
             privileged: admitted.privileged,
             timeout_seconds: step.timeout,
@@ -6982,7 +6983,8 @@ fn admit_step_grants(
         return Ok(scarab_project::AdmittedGrants::default());
     };
     let req = scarab_project::GrantRequest {
-        run_as_root: sec.run_as_root,
+        // `run_as_user: 0` is the same request as `run_as_root: true`.
+        run_as_root: sec.runs_as_root(),
         add_capabilities: sec.add_capabilities.clone(),
         privileged: sec.privileged,
     };
@@ -7462,6 +7464,7 @@ async fn write_run_from_ir(
                 env: step.env.clone(),
                 secrets: step.secrets.clone(),
                 run_as_root: admitted.run_as_root,
+                run_as_user: step.security.as_ref().and_then(|s| s.non_root_uid()),
                 add_capabilities: admitted.add_capabilities,
                 privileged: admitted.privileged,
                 timeout_seconds: step.timeout,
@@ -15420,6 +15423,25 @@ mod grant_admission_tests {
         };
         let g = admit_step_grants(None, Some(&sec), IMG, false).unwrap();
         assert!(g.run_as_root);
+    }
+
+    /// git-bug 1a20384: `run_as_user: 0` is admitted exactly as
+    /// `run_as_root: true` is (the executor then pins uid 0); a non-zero uid
+    /// is no grant at all.
+    #[test]
+    fn run_as_user_zero_is_admitted_as_run_as_root() {
+        let zero = StepSecurity {
+            run_as_user: Some(0),
+            ..Default::default()
+        };
+        let g = admit_step_grants(None, Some(&zero), IMG, false).unwrap();
+        assert!(g.run_as_root);
+        let user = StepSecurity {
+            run_as_user: Some(1000),
+            ..Default::default()
+        };
+        let g = admit_step_grants(None, Some(&user), IMG, false).unwrap();
+        assert!(!g.run_as_root && !g.privileged && g.add_capabilities.is_empty());
     }
 
     #[test]

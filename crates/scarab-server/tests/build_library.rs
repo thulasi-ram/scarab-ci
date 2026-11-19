@@ -201,7 +201,10 @@ async fn run_create_admits_the_sandbox_only_from_a_source_trusted_for_it() {
     // credential.
     let push = stored(&db, &out.runs[0], "push").await;
     assert_eq!(push.sandbox, None);
-    assert!(push.run_as_root);
+    // git-bug 1a20384: the push Step runs as uid 1000, with no run-as-root
+    // grant.
+    assert!(!push.run_as_root);
+    assert_eq!(push.run_as_user, Some(1000));
     let auth = push.registry_auth.expect("registry_auth");
     assert_eq!((auth.library, auth.forge_library), (None, None));
     assert!(!auth.locked_out);
@@ -282,6 +285,7 @@ fn build_spec() -> StepSpec {
         env: vec![],
         secrets: vec![],
         run_as_root: false,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: None,
@@ -316,7 +320,7 @@ fn push_spec(forge_library: bool) -> StepSpec {
     StepSpec {
         image: "gcr.io/go-containerregistry/crane:debug@sha256:abc".into(),
         command: vec!["/busybox/sh".into(), "-c".into(), "exit 0".into()],
-        run_as_root: true,
+        run_as_user: Some(1000),
         sandbox: None,
         registry_auth: Some(RegistryAuthConfig {
             owner: "acme".into(),

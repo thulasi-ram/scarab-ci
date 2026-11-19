@@ -817,6 +817,7 @@ fn secret_step() -> (StepRun, StepSpec) {
         env: vec![],
         secrets: vec!["TOKEN".into()],
         run_as_root: false,
+        run_as_user: None,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: None,

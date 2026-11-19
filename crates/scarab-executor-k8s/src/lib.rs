@@ -4463,10 +4463,14 @@ pub fn sandbox_is_launchable(spec: &StepSpec) -> Result<(), String> {
     let Some(sandbox) = &spec.sandbox else {
         return Ok(());
     };
-    if spec.run_as_root || spec.privileged || !spec.add_capabilities.is_empty() {
+    if spec.run_as_root
+        || spec.run_as_user.is_some()
+        || spec.privileged
+        || !spec.add_capabilities.is_empty()
+    {
         return Err(format!(
             "step refused: `security.sandbox: {}` cannot be combined with `run_as_root`, \
-             `add_capabilities` or `privileged`",
+             `run_as_user`, `add_capabilities` or `privileged`",
             sandbox.sandbox.as_str()
         ));
     }
@@ -5426,6 +5430,14 @@ fn registry_auth_only_applies(step: &str, name: &str, spec: &StepSpec) -> Result
             );
             Ok(false)
         }
+        // A sidecar service would run under the profile's ServiceAccount as
+        // `service-N`, which an IRSA skip list does not name (git-bug
+        // d2a8efc). The compiler refuses `services:` beside `registry_auth`;
+        // this covers a spec that reached the executor another way.
+        Some(_) if !spec.services.is_empty() => Err(format!(
+            "placement profile `{name}` carries a registry credential; step `{step}` has \
+             sidecar `services`, which would run with it"
+        )),
         Some(_) => Ok(true),
     }
 }
@@ -6072,9 +6084,15 @@ fn env_var(name: &str, value: &str) -> EnvVar {
 fn step_security_context(spec: &StepSpec) -> SecurityContext {
     SecurityContext {
         // Baseline non-root; only an admitted `run_as_root` opts out (and then we
-        // pin uid 0 explicitly).
+        // pin uid 0 explicitly). A Step's own non-zero `run_as_user` is pinned
+        // under `runAsNonRoot`, so a stored uid 0 that reached here without the
+        // grant fails to start rather than run as root.
         run_as_non_root: Some(!spec.run_as_root),
-        run_as_user: spec.run_as_root.then_some(0),
+        run_as_user: if spec.run_as_root {
+            Some(0)
+        } else {
+            spec.run_as_user.map(i64::from)
+        },
         // Baseline drops everything; admitted capabilities are added back.
         capabilities: Some(Capabilities {
             drop: Some(vec!["ALL".to_string()]),
@@ -7351,6 +7369,7 @@ mod tests {
             env: vec![("FOO".into(), "bar".into())],
             secrets: vec![],
             run_as_root: false,
+            run_as_user: None,
             add_capabilities: vec![],
             privileged: false,
             timeout_seconds: None,
@@ -7461,6 +7480,32 @@ mod tests {
         auth.credential_eligible = true;
         let pod = apply_placement(pod_for(&push), "image/push", &push, &placement).unwrap();
         assert_eq!(service_account(pod).as_deref(), Some("ecr-pusher"));
+    }
+
+    // Attack: a `registry_auth` Step that reached the executor with sidecar services (the compiler refuses the pair) names the push-credential profile, so `service-N` would run under its ServiceAccount, and an IRSA skip list names no `service-N` (git-bug d2a8efc). Safe outcome: the launch fails naming the profile and the Step; the profile is never merged.
+    #[test]
+    fn a_registry_auth_only_profile_fails_a_push_step_with_services() {
+        let placement = with_push_profile();
+        let mut push = busybox();
+        push.placement_profiles = vec!["ecr-push".into()];
+        push.registry_auth = Some(scarab_engine::RegistryAuthConfig {
+            owner: "acme".into(),
+            name: "web".into(),
+            library: Some("ab".repeat(32)),
+            credential_eligible: true,
+            ..Default::default()
+        });
+        push.services = vec![scarab_pipeline::ServiceSpec {
+            image: "postgres:16".into(),
+            ..Default::default()
+        }];
+        let err = apply_placement(pod_for(&push), "image/push", &push, &placement).unwrap_err();
+        assert!(
+            err.contains("`ecr-push`")
+                && err.contains("step `image/push`")
+                && err.contains("services"),
+            "{err}"
+        );
     }
 
     // Attack: a fork pull request's Pipeline (read at the PR head) adds its own Step that names the push-credential profile, with and without `registry_auth: true`, as Run creation stores it. Safe outcome: without `registry_auth` the launch fails; with it, the launch decorator resolves no credential for a Pipeline-file Step, so the profile is left out and the Step never runs with the ServiceAccount.
@@ -7584,12 +7629,12 @@ mod tests {
     }
 
     /// The build library's push Step as the page sets it up: it needs the
-    /// build Step's workspace, runs as root, asks for `registry_auth`, names
+    /// build Step's workspace, runs as uid 1000, asks for `registry_auth`, names
     /// `ecr-push`, and its launch found it eligible with no credential
     /// resolved (no `REGISTRY_AUTH` secret, no forge trust).
     fn ecr_push_step() -> StepSpec {
         let mut spec = full_spec();
-        spec.run_as_root = true;
+        spec.run_as_user = Some(1000);
         spec.placement_profiles = vec!["ecr-push".into()];
         spec.registry_auth = Some(scarab_engine::RegistryAuthConfig {
             owner: "acme".into(),
@@ -7604,7 +7649,7 @@ mod tests {
     /// git-bug ace8135: the page's `ecr-push` profile is marked
     /// `registry_auth_only`, passes the placement guards on an eligible push
     /// Step's Pod, and gives it the ServiceAccount, the login init container
-    /// after Scarab's own (as uid 0, the push Step's uid), the memory volume,
+    /// after Scarab's own (as uid 1000, the push Step's uid), the memory volume,
     /// the read-only mount and `DOCKER_CONFIG` on the step container, and an
     /// IRSA skip annotation naming every container Scarab built, while
     /// Scarab's containers, volumes and the step container's own wiring are
@@ -7661,7 +7706,8 @@ mod tests {
             b.security_context.as_ref().unwrap().run_as_user,
             "the login writes its 0600 file as the push Step's uid"
         );
-        assert_eq!(login_sc.run_as_user, Some(0));
+        assert_eq!(login_sc.run_as_user, Some(1000));
+        assert_eq!(login_sc.run_as_non_root, Some(true));
         assert_eq!(
             login_sc.capabilities.as_ref().unwrap().drop,
             Some(vec!["ALL".to_string()])
@@ -8762,6 +8808,7 @@ mod tests {
             env: vec![],
             secrets: vec![],
             run_as_root: true,
+            run_as_user: None,
             add_capabilities: vec!["NET_ADMIN".into()],
             privileged: true,
             timeout_seconds: None,
@@ -8832,6 +8879,54 @@ mod tests {
         assert_eq!(sc.privileged, Some(false));
         // Self-service root stays unprivileged and non-escalating.
         assert_eq!(sc.allow_privilege_escalation, Some(false));
+    }
+
+    /// git-bug 1a20384: a Step's non-zero `run_as_user` becomes the step
+    /// container's `runAsUser` under `runAsNonRoot`, with the rest of the
+    /// baseline intact; an admitted `run_as_root` still pins uid 0.
+    #[test]
+    fn run_as_user_pins_the_step_uid_under_run_as_non_root() {
+        let step = step_with_attempt("run-1", "push", "a1");
+        let sc_of = |spec: &StepSpec| {
+            build_pod(
+                "scarab-x",
+                "scarab-run-1",
+                &step,
+                spec,
+                None,
+                DEFAULT_STEP_TIMEOUT_SECS,
+                false,
+                None,
+            )
+            .spec
+            .unwrap()
+            .containers[0]
+                .security_context
+                .clone()
+                .unwrap()
+        };
+        let sc = sc_of(&StepSpec {
+            run_as_user: Some(1000),
+            ..busybox()
+        });
+        assert_eq!(sc.run_as_user, Some(1000));
+        assert_eq!(sc.run_as_non_root, Some(true));
+        assert_eq!(sc.privileged, Some(false));
+        assert_eq!(sc.allow_privilege_escalation, Some(false));
+        assert_eq!(sc.capabilities.unwrap().drop, Some(vec!["ALL".to_string()]));
+        assert_eq!(sc.seccomp_profile.unwrap().type_, "RuntimeDefault");
+
+        // A stored uid 0 that reached the executor without the grant stays
+        // under `runAsNonRoot`, so the kubelet refuses it: never root.
+        let sc = sc_of(&StepSpec {
+            run_as_user: Some(0),
+            ..busybox()
+        });
+        assert_eq!(sc.run_as_non_root, Some(true));
+
+        let sc = sc_of(&busybox());
+        assert_eq!(sc.run_as_user, None, "the image's own user");
+        assert_eq!(sc.run_as_non_root, Some(true));
     }
 
     // ADR-0058: a declared sidecar service is injected as a native sidecar
@@ -9753,8 +9848,9 @@ mod tests {
         let mut spec = busybox();
         spec.sandbox = Some(sandbox_config());
         assert_eq!(sandbox_is_launchable(&spec), Ok(()));
-        let grants: [fn(&mut StepSpec); 3] = [
+        let grants: [fn(&mut StepSpec); 4] = [
             |s| s.run_as_root = true,
+            |s| s.run_as_user = Some(1000),
             |s| s.privileged = true,
             |s| s.add_capabilities = vec!["NET_ADMIN".into()],
         ];
@@ -10569,7 +10665,9 @@ mod tests {
         let result = base.join("results/push.json");
         // Another manifest, stored under its own digest: sha256("[]").
         let other = "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945";
-        let other_blob = oci.join("blobs/sha256").join(other.trim_start_matches("sha256:"));
+        let other_blob = oci
+            .join("blobs/sha256")
+            .join(other.trim_start_matches("sha256:"));
         let reset = || {
             let _ = std::fs::remove_dir_all(ws.join(".scarab-build"));
             let _ = std::fs::remove_file(&result);

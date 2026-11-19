@@ -442,6 +442,15 @@
        }
       },
       {
+       "doc": "The uid the Step asks to run as (`security.run_as_user`). Absent when it names none, and from inputs recorded before it existed. `0` is also in `grants` as `run-as-root`, as `run_as_root: true` is.",
+       "max_len": 1024,
+       "name": "run_as_user",
+       "optional": true,
+       "ty": {
+        "kind": "uint"
+       }
+      },
+      {
        "doc": "The Step uses the Environment's authority (ADR-0075 \u00a75).",
        "max_len": 1024,
        "name": "uses_environment_authority",
