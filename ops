@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1795109118,"nonce":"6aXLDGPvP/u/inG5JB3xgDWN4sc=","message":"Closed 2026-11-19 (triage at origin/main 1ce54713): pushing-to-ecr.mdx shipped; the remaining live check is a501c6e.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1795109118,"nonce":"bEzvl/IRPrr8/nN6zbtVTpQfWdY=","status":2}]}
