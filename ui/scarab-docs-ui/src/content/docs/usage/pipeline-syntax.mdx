@@ -467,11 +467,15 @@ Its outputs:
   `containerimage.digest` is the digest of the image it built. Before it pushes, the push step
   checks that the layout's `index.json` names one manifest, that the manifest's file hashes to
   that digest, and that the digest is the build step's `containerimage.digest`. It refuses
-  (exit 2) a layout that fails any of these, for example one that a process left behind by a
-  `RUN` rewrote after BuildKit wrote it, and fails if crane reports another digest, so this digest
-  and `outputs.image.push.digest` are the same. When the server collects no step results, there
-  is no `image` result to compare, and the push step checks only the layout. In `env:` this output
-  becomes that object's compact JSON text.
+  (exit 2) a layout that fails any of these: a stale, half-written or swapped layout. It also
+  refuses an `index.json` that holds a backslash, a byte that is not printable ASCII, or the word
+  `digest` (in any case) other than once, since crane's JSON decoder would read it differently.
+  crane then pushes from an `index.json` the step writes, naming only the checked manifest. The
+  step fails if crane reports another digest, so this digest and `outputs.image.push.digest` are
+  the same. The check does not cover a build that rewrites its own `image` result as well as the
+  layout. When the server collects no step results, there is no `image` result to compare: the
+  push step checks only the layout, pushes, and logs a line starting `scarab: warning:`. In
+  `env:` this output becomes that object's compact JSON text.
 
 - **The registry credential.** Only the push step asks for `registry_auth: true`. It receives a
   credential only when the org trusts the library's source with the registry credential

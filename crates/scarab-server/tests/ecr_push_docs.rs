@@ -37,6 +37,9 @@ use scarab_testkit::{FakeClock, FakeForge, InMemoryDb, InMemoryLibraries, InMemo
 
 const PAGE: &str =
     include_str!("../../../ui/scarab-docs-ui/src/content/docs/usage/pushing-to-ecr.mdx");
+/// The pipeline syntax page, whose image index example is checked here too.
+const SYNTAX_PAGE: &str =
+    include_str!("../../../ui/scarab-docs-ui/src/content/docs/usage/pipeline-syntax.mdx");
 const BUILD: &str = include_str!("../../../libs/build.yaml");
 const CLONE: &str = include_str!("../../../libs/clone.yaml");
 const INDEX: &str = include_str!("../../../libs/image-index.yaml");
@@ -56,10 +59,15 @@ const LIBRARY_RULE: &str =
 /// The page's fenced code blocks of `lang`, with the fence's indent removed
 /// from each line (a block inside a list item is indented).
 fn blocks(lang: &str) -> Vec<String> {
+    page_blocks(PAGE, lang)
+}
+
+/// `page`'s fenced code blocks of `lang`, as [`blocks`] reads them.
+fn page_blocks(page: &str, lang: &str) -> Vec<String> {
     let open = format!("```{lang}");
     let mut out = Vec::new();
     let mut current: Option<(usize, String)> = None;
-    for line in PAGE.lines() {
+    for line in page.lines() {
         let trimmed = line.trim_start();
         let indent = line.len() - trimmed.len();
         match &mut current {
@@ -464,14 +472,9 @@ fn two_architecture_pipeline() -> String {
     serde_yaml::to_string(&doc).unwrap()
 }
 
-/// git-bug 794b3ac: the page's index step launches on a fork pull request,
-/// whose builds push nothing and publish no `push` result: `images` renders
-/// as empty lines (the library's script then exits 0 for a fork). With both
-/// builds pushed it renders their references, one per line, and the index
-/// step needs the builds' push Steps only.
-#[test]
-fn the_page_index_step_renders_with_and_without_pushed_builds() {
-    let libraries = Libraries {
+/// The build, clone and image index libraries, installed.
+fn the_three_libraries() -> Libraries {
+    Libraries {
         installed: BTreeMap::from([
             (
                 "thulasi-ram::scarab-ci::build".to_string(),
@@ -496,9 +499,17 @@ fn the_page_index_step_renders_with_and_without_pushed_builds() {
             ),
         ]),
         ..Default::default()
-    };
-    let ir = scarab_pipeline::compile_with_libraries(&two_architecture_pipeline(), &libraries)
-        .expect("the page's two-architecture Pipeline compiles");
+    }
+}
+
+/// Compile `pipeline` with the three libraries, check that its `app/index`
+/// Step needs the two builds' push Steps only, and render that Step's
+/// `SCARAB_INDEX_IMAGES` at launch: with no `push` result from either build
+/// (a fork pull request) it is blank; with both pushed it is their
+/// references, one per line.
+fn assert_index_step_renders(pipeline: &str) {
+    let ir = scarab_pipeline::compile_with_libraries(pipeline, &the_three_libraries())
+        .unwrap_or_else(|e| panic!("the Pipeline compiles: {e:?}\n{pipeline}"));
     let index = ir
         .steps
         .iter()
@@ -544,6 +555,28 @@ fn the_page_index_step_renders_with_and_without_pushed_builds() {
     }))
     .expect("the index step renders the pushed references");
     assert_eq!(pushed, format!("{repo}@{amd64}\n{repo}@{arm64}\n"));
+}
+
+/// git-bug 794b3ac: the page's index step launches on a fork pull request,
+/// whose builds push nothing and publish no `push` result: `images` renders
+/// as empty lines (the library's script then exits 0 for a fork). With both
+/// builds pushed it renders their references, one per line, and the index
+/// step needs the builds' push Steps only.
+#[test]
+fn the_page_index_step_renders_with_and_without_pushed_builds() {
+    assert_index_step_renders(&two_architecture_pipeline());
+}
+
+/// AUD-15: the pipeline syntax page's image index example compiles with the
+/// libraries and renders as the ECR page's does.
+#[test]
+fn the_pipeline_syntax_index_example_compiles_and_renders() {
+    let found: Vec<String> = page_blocks(SYNTAX_PAGE, "yaml")
+        .into_iter()
+        .filter(|b| b.contains("lib:thulasi-ram::scarab-ci::image-index"))
+        .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_index_step_renders(&found[0]);
 }
 
 /// The page's two-architecture steps: a push to main is admitted under the
