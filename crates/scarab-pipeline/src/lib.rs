@@ -1424,13 +1424,15 @@ impl ServiceSpec {
     }
 }
 
-/// Both of a service's uid fields set: a diagnostic, as for a Step's
-/// `security` block (`run_as_user: 0` is the `run_as_root` request).
+/// A service's `run_as_root: true` beside a non-zero `run_as_user`: a
+/// diagnostic, as for a Step's `security` block. `run_as_user: 0` is the
+/// `run_as_root` request, so `run_as_root: true` with `run_as_user: 0` agree
+/// and compile, as the pair did before this check.
 fn validate_service_uid(svc: &ServiceSpec, what: &str, diagnostics: &mut Vec<String>) {
-    if svc.run_as_root && svc.run_as_user.is_some() {
+    if svc.run_as_root && svc.run_as_user.is_some_and(|uid| uid != 0) {
         diagnostics.push(format!(
-            "{what}: a service's `run_as_user` cannot be combined with its `run_as_root` \
-             (`run_as_user: 0` is the same request)"
+            "{what}: a service's non-zero `run_as_user` contradicts its `run_as_root: true` \
+             (`run_as_user: 0` is the same request as `run_as_root: true`)"
         ));
     }
 }
@@ -5959,13 +5961,14 @@ fn validate_with(
                 step.id
             ));
         }
-        // `run_as_user: 0` is the `run_as_root` request; both at once name
-        // the uid twice.
+        // `run_as_user: 0` is the `run_as_root` request: `run_as_root: true`
+        // beside `run_as_user: 0` agree; beside another uid they contradict.
         if let Some(sec) = &step.security {
-            if sec.run_as_root && sec.run_as_user.is_some() {
+            if sec.run_as_root && sec.run_as_user.is_some_and(|uid| uid != 0) {
                 diagnostics.push(format!(
-                    "step `{}`: `security.run_as_user` cannot be combined with \
-                     `security.run_as_root` (`run_as_user: 0` is the same request)",
+                    "step `{}`: a non-zero `security.run_as_user` contradicts \
+                     `security.run_as_root: true` (`run_as_user: 0` is the same request \
+                     as `run_as_root: true`)",
                     step.id
                 ));
             }
@@ -7156,21 +7159,25 @@ mod tests {
         assert!(!err.is_empty());
     }
 
-    /// git-bug 1a20384: `run_as_user` beside `run_as_root` names the uid
-    /// twice and does not compile, `0` included; neither does a uid on a
-    /// gate or beside the sandbox.
+    /// git-bug 1a20384: a non-zero `run_as_user` beside `run_as_root: true`
+    /// contradicts it and does not compile; `run_as_user: 0` beside it is the
+    /// same request and compiles as root. A uid on a gate does not compile.
     #[test]
-    fn run_as_user_cannot_be_combined_with_run_as_root_or_set_on_a_gate() {
-        for uid in [0, 1000] {
-            let errs = errors(&format!(
-                "steps: [{{ id: a, image: x, security: {{ run_as_root: true, run_as_user: {uid} }} }}]"
-            ));
-            assert!(
-                errs.iter().any(|e| e.starts_with("step `a`: ")
-                    && e.contains("`security.run_as_user` cannot be combined with")),
-                "{uid}: {errs:?}"
-            );
-        }
+    fn run_as_user_cannot_contradict_run_as_root_or_be_set_on_a_gate() {
+        let ir = compile(
+            "steps: [{ id: a, image: x, security: { run_as_root: true, run_as_user: 0 } }]",
+        );
+        let sec = ir.steps[0].security.as_ref().unwrap();
+        assert!(sec.runs_as_root(), "the agreeing pair is root");
+        assert_eq!(sec.non_root_uid(), None);
+        let errs = errors(
+            "steps: [{ id: a, image: x, security: { run_as_root: true, run_as_user: 1000 } }]",
+        );
+        assert!(
+            errs.iter().any(|e| e.starts_with("step `a`: ")
+                && e.contains("contradicts `security.run_as_root: true`")),
+            "{errs:?}"
+        );
         let errs = errors("steps: [{ id: g, gate: manual, security: { run_as_user: 1000 } }]");
         assert!(
             errs.iter().any(|e| e.contains("must not set `security`")),
@@ -11975,8 +11982,9 @@ steps:
     }
 
     /// git-bug 1a20384: a service's `run_as_user: 0` is its `run_as_root`
-    /// request; naming both does not compile, for a sidecar or a shared
-    /// service.
+    /// request. `run_as_root: true` beside `run_as_user: 0` agree and compile
+    /// as root, as they did before (a sidecar or a shared service); beside a
+    /// non-zero uid they contradict and do not compile.
     #[test]
     fn a_service_uid_follows_the_run_as_root_rule() {
         let ir = compile(
@@ -11987,24 +11995,32 @@ steps:
             "steps: [{ id: t, image: x, services: [{ image: postgres:16, run_as_user: 999 }] }]",
         );
         assert!(!ir.steps[0].services[0].runs_as_root());
-        for uid in [0, 999] {
-            let errs = errors(&format!(
-                "steps: [{{ id: t, image: x, services: [{{ image: postgres:16, run_as_root: true, run_as_user: {uid} }}] }}]"
-            ));
-            assert!(
-                errs.iter().any(|e| e.starts_with("step `t`: ")
-                    && e.contains("`run_as_user` cannot be combined with its `run_as_root`")),
-                "{uid}: {errs:?}"
-            );
-            let errs = errors(&format!(
-                "services: [{{ name: db, image: postgres:16, run_as_root: true, run_as_user: {uid} }}]\nsteps: [{{ id: t, image: x, uses: [db] }}]"
-            ));
-            assert!(
-                errs.iter().any(|e| e.starts_with("service `db`: ")
-                    && e.contains("`run_as_user` cannot be combined with its `run_as_root`")),
-                "{uid}: {errs:?}"
-            );
-        }
+        // The agreeing pair compiles and runs as root.
+        let ir = compile(
+            "steps: [{ id: t, image: x, services: [{ image: postgres:16, run_as_root: true, run_as_user: 0 }] }]",
+        );
+        assert!(ir.steps[0].services[0].runs_as_root());
+        let ir = compile(
+            "services: [{ name: db, image: postgres:16, run_as_root: true, run_as_user: 0 }]\nsteps: [{ id: t, image: x, uses: [db] }]",
+        );
+        assert!(ir.services[0].spec.runs_as_root());
+        // The contradicting pair is a diagnostic.
+        let errs = errors(
+            "steps: [{ id: t, image: x, services: [{ image: postgres:16, run_as_root: true, run_as_user: 999 }] }]",
+        );
+        assert!(
+            errs.iter().any(|e| e.starts_with("step `t`: ")
+                && e.contains("contradicts its `run_as_root: true`")),
+            "{errs:?}"
+        );
+        let errs = errors(
+            "services: [{ name: db, image: postgres:16, run_as_root: true, run_as_user: 999 }]\nsteps: [{ id: t, image: x, uses: [db] }]",
+        );
+        assert!(
+            errs.iter().any(|e| e.starts_with("service `db`: ")
+                && e.contains("contradicts its `run_as_root: true`")),
+            "{errs:?}"
+        );
     }
 
     #[test]
