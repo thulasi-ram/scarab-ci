@@ -116,7 +116,7 @@ describe("activity words", () => {
   const log = [
     started(0, "e2e", "a1"),
     finished(60_000, "e2e", "a1", "step"),
-    transitioned(60_001, "e2e", "running", "pending"),
+    transitioned(60_001, "e2e", "running", "ready"),
     started(61_000, "e2e", "a2"),
     finished(231_000, "e2e", "a2"),
     transitioned(231_001, "e2e", "running", "succeeded"),
@@ -152,7 +152,7 @@ describe("activity words", () => {
   it("names the step by its display name and counts tries in plain words", () => {
     expect(words(log[0])).toEqual({ step: "e2e", stepId: "e2e", text: "try 1 started" });
     expect(words(log[1]).text).toBe("try 1 failed: step error");
-    expect(words(log[2]).text).toBe("running → pending");
+    expect(words(log[2]).text).toBe("waiting to retry");
     expect(words(log[3]).text).toBe("try 2 started (automatic retry)");
     expect(words(log[4], true).text).toBe("passed in 2m50s on try 2");
     expect(words(log[4]).text).toBe("try 2 passed in 2m50s");
@@ -167,6 +167,73 @@ describe("activity words", () => {
       text: "waiting for a node: 0/14 nodes are available",
     });
     expect(words(log[8]).text).toBe("unschedulable for about 1m · cleared");
+  });
+});
+
+// Regression: a status change with no try read "running → pending".
+describe("step status changes in words", () => {
+  const skip = (at: number, step: string, reason: string) => ev(at, { StepSkipped: { step, reason } });
+  const text = (log: ReturnType<typeof transitioned>[], needs: Record<string, string[]> = {}) => {
+    const words = activityWords(log, needs);
+    return words(log[log.length - 1]).text;
+  };
+
+  it("words the moves the engine makes, in the engine's casing", () => {
+    expect(text([transitioned(1, "build", "Pending", "Ready")])).toBe("queued");
+    expect(text([transitioned(1, "build", "Running", "Ready")])).toBe("waiting to retry");
+    expect(text([transitioned(1, "build", "Succeeded", "Pending")])).toBe("reset to run again");
+    expect(text([transitioned(1, "build", "Running", "Pending")])).toBe("reset to run again");
+    expect(text([transitioned(1, "build", "Running", "Cancelled")])).toBe("cancelled");
+    expect(text([transitioned(1, "approve", "Pending", "Succeeded")])).toBe("passed");
+  });
+
+  it("names the need a skipped step was skipped for", () => {
+    const needs = { test: ["lint", "build[os=linux]"], deploy: ["test"] };
+    const log = [
+      transitioned(1, "lint", "Running", "Succeeded"),
+      transitioned(2, "build[os=linux]", "Running", "Failed"),
+      transitioned(3, "test", "Pending", "Skipped"),
+      transitioned(4, "deploy", "Pending", "Skipped"),
+    ];
+    const words = activityWords(log, needs);
+    expect(words(log[2]).text).toBe("skipped because build · linux failed");
+    expect(words(log[3]).text).toBe("skipped because test was skipped");
+    expect(text([transitioned(1, "a", "Running", "Cancelled"), transitioned(2, "b", "Pending", "Skipped")], { b: ["a"] })).toBe(
+      "skipped because a was cancelled",
+    );
+  });
+
+  it("a skip with no dead need is its when: condition; with no needs known it gives no reason", () => {
+    expect(text([transitioned(1, "docs", "Pending", "Skipped")], { docs: [] })).toBe("skipped by its when: condition");
+    expect(text([transitioned(1, "docs", "Pending", "Skipped")])).toBe("skipped");
+  });
+
+  it("takes the reason the engine journals beside the move", () => {
+    const reason = "no longer needed: every step that needs it has finished";
+    expect(text([skip(5, "approve", reason), transitioned(5, "approve", "Pending", "Skipped")])).toBe(`skipped: ${reason}`);
+    expect(text([transitioned(9, "approve", "Skipped", "Pending")])).toBe("needed again");
+    expect(text([skip(5, "test", "inputs unchanged"), transitioned(5, "test", "Pending", "Succeeded")])).toBe(
+      "passed without a try: inputs unchanged",
+    );
+    expect(
+      text([
+        ev(5, { StepServicesUnready: { step: "test", reason: "unbound dependency" } }),
+        transitioned(5, "test", "Pending", "Failed"),
+      ]),
+    ).toBe("failed: a shared service it uses never became ready");
+    // A skip event for another step, or at another time, is not this move's reason.
+    expect(text([skip(5, "other", reason), transitioned(5, "approve", "Pending", "Skipped")], { approve: [] })).toBe(
+      "skipped by its when: condition",
+    );
+  });
+
+  it("reads an unknown status as where the step is now", () => {
+    expect(text([transitioned(1, "approve", "pending", "waiting")])).toBe("now waiting");
+  });
+
+  it("merges a try's verdict with the step's move in the engine's casing", () => {
+    const log = [started(0, "b", "a1"), finished(1, "b", "a1"), transitioned(1, "b", "Running", "Succeeded")];
+    expect([...mergedTransitions(log)]).toEqual([[2, 1]]);
   });
 });
 

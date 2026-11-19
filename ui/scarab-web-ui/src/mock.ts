@@ -517,10 +517,10 @@ const richEventsBody = [
   // ── version 1 (original run) ──
   rev(ago(25 * min), { AttemptStarted: { step: "clone", attempt: "a1" } }),
   rev(ago(24 * min + 45000), { AttemptFinished: { step: "clone", attempt: "a1" } }),
-  rev(ago(24 * min + 44000), { StepTransitioned: { step: "clone", from: "running", to: "succeeded" } }),
+  rev(ago(24 * min + 44000), { StepTransitioned: { step: "clone", from: "Running", to: "Succeeded" } }),
   rev(ago(24 * min + 30000), { AttemptStarted: { step: "build", attempt: "a1" } }),
   rev(ago(23 * min + 20000), { AttemptFinished: { step: "build", attempt: "a1" } }),
-  rev(ago(23 * min + 19000), { StepTransitioned: { step: "build", from: "running", to: "succeeded" } }),
+  rev(ago(23 * min + 19000), { StepTransitioned: { step: "build", from: "Running", to: "Succeeded" } }),
   rev(ago(23 * min + 15000), { AttemptStarted: { step: "test", attempt: "a1" } }),
   // ── the boundary: a human reran build; test (in flight) + approve cascade ──
   rev(ago(15 * min), {
@@ -529,15 +529,18 @@ const richEventsBody = [
   // ── version 2 (latest) ──
   rev(ago(14 * min + 55000), { AttemptStarted: { step: "build", attempt: "a2" } }),
   rev(ago(13 * min + 50000), { AttemptFinished: { step: "build", attempt: "a2", failure: "step" } }),
-  rev(ago(13 * min + 49000), { StepTransitioned: { step: "build", from: "running", to: "failed" } }),
+  rev(ago(13 * min + 49000), { StepTransitioned: { step: "build", from: "Running", to: "Ready" } }),
   rev(ago(13 * min + 40000), { AttemptStarted: { step: "build", attempt: "a3" } }),
   rev(ago(12 * min + 30000), { AttemptFinished: { step: "build", attempt: "a3" } }),
-  rev(ago(12 * min + 29000), { StepTransitioned: { step: "build", from: "running", to: "succeeded" } }),
+  rev(ago(12 * min + 29000), { StepTransitioned: { step: "build", from: "Running", to: "Succeeded" } }),
   rev(ago(12 * min + 25000), { AttemptStarted: { step: "test", attempt: "a2" } }),
   rev(ago(10 * min), { AttemptFinished: { step: "test", attempt: "a2" } }),
-  rev(ago(10 * min - 1000), { StepTransitioned: { step: "test", from: "running", to: "succeeded" } }),
-  rev(ago(9 * min + 50000), { StepTransitioned: { step: "approve", from: "pending", to: "waiting" } }),
+  rev(ago(10 * min - 1000), { StepTransitioned: { step: "test", from: "Running", to: "Succeeded" } }),
 ].join("");
+
+// A status as the server's events carry it: the engine's names, `Succeeded`
+// for the DTOs' `succeeded`.
+const wireStatus = (s: string): string => s.replace(/(^|_)([a-z])/g, (_m, _u, c: string) => c.toUpperCase());
 
 // ── the MATRIX run (summary line, matrix labels, retries) ───────────────────
 // checkout `git`, then `plan` over cluster × phase. treebo-production ×
@@ -641,7 +644,7 @@ const matrixEventsBody = (() => {
     }),
     mxv(ago(MX_T0), { AttemptStarted: { step: "git", attempt: "a1" } }),
     mxv(ago(MX_PLAN_AT), { AttemptFinished: { step: "git", attempt: "a1" } }),
-    mxv(ago(MX_PLAN_AT - 500), { StepTransitioned: { step: "git", from: "running", to: "succeeded" } }),
+    mxv(ago(MX_PLAN_AT - 500), { StepTransitioned: { step: "git", from: "Running", to: "Succeeded" } }),
   ];
   const timed: [number, string][] = [];
   for (const s of matrixRunStatus.steps.slice(1)) {
@@ -672,14 +675,14 @@ const matrixEventsBody = (() => {
     timed.push([
       s.attempt_list![s.attempt_list!.length - 1]!.finished_at! + 500,
       mxv(s.attempt_list![s.attempt_list!.length - 1]!.finished_at! + 500, {
-        StepTransitioned: { step: s.id, from: "running", to: s.status },
+        StepTransitioned: { step: s.id, from: "Running", to: wireStatus(s.status) },
       }),
     ]);
   }
   timed.sort((a, b) => a[0] - b[0]);
   const end = Math.max(...timed.map(([at]) => at));
   out.push(...timed.map(([, line]) => line));
-  out.push(mxv(end + 1000, { RunTransitioned: { from: "running", to: "failed" } }));
+  out.push(mxv(end + 1000, { RunTransitioned: { from: "Running", to: "Failed" } }));
   return out.join("");
 })();
 const matrixArtifacts: ArtifactDto[] = MX_CELLS.filter(([, , how]) => how === "ok").map(([cluster, phase], i) => ({
@@ -795,7 +798,7 @@ const retriesEventsBody = (() => {
         },
       },
     ],
-    [ms(20, 2), { RunTransitioned: { from: "pending", to: "running" } }],
+    [ms(20, 2), { RunTransitioned: { from: "Pending", to: "Running" } }],
     // a.kim retried `unit` after its second try timed out.
     [ms(13), { StepRetryRequested: { target: "unit", invalidated: [], by: "a.kim" } }],
   ];
@@ -828,7 +831,7 @@ const retriesEventsBody = (() => {
     if (last.end !== null)
       timed.push([
         last.end - 500,
-        { StepTransitioned: { step, from: "running", to: last.failure ? "failed" : "succeeded" } },
+        { StepTransitioned: { step, from: "Running", to: last.failure ? "Failed" : "Succeeded" } },
       ]);
   }
   // Oldest first: a larger "before now" is earlier.
@@ -993,7 +996,7 @@ const gatesEventsBody = [
   ...["bump", "bump-canary", "bump-eu"].flatMap((s) => [
     gev(ago(5 * min), { AttemptStarted: { step: s, attempt: "a1" } }),
     gev(ago(4 * min + 10000), { AttemptFinished: { step: s, attempt: "a1" } }),
-    gev(ago(4 * min + 9000), { StepTransitioned: { step: s, from: "running", to: "succeeded" } }),
+    gev(ago(4 * min + 9000), { StepTransitioned: { step: s, from: "Running", to: "Succeeded" } }),
   ]),
   ...["live", "live-canary", "live-eu"].map((s) =>
     gev(ago(4 * min), { AttemptStarted: { step: s, attempt: "a1" } }),
@@ -1086,7 +1089,7 @@ const envGateEventsBody = [
   }),
   egv(ago(5 * min), { AttemptStarted: { step: "build", attempt: "a1" } }),
   egv(ago(3 * min + 10000), { AttemptFinished: { step: "build", attempt: "a1" } }),
-  egv(ago(3 * min + 9000), { StepTransitioned: { step: "build", from: "running", to: "succeeded" } }),
+  egv(ago(3 * min + 9000), { StepTransitioned: { step: "build", from: "Running", to: "Succeeded" } }),
   ...["qa", "environment-approval"].map((g) =>
     egv(ago(3 * min), { AttemptStarted: { step: g, attempt: "a1" } }),
   ),

@@ -18,6 +18,28 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Enhancement
+
+- **The server warns at startup when `default_resources` sets one axis only.** With `cpu_millis`
+  and no `memory_mib`, a step container that sets no memory has no `requests.memory` or
+  `limits.memory`; with `memory_mib` and no `cpu_millis`, it has no `requests.cpu`. The warning
+  names the missing field and says that a cluster that requires resource limits (a Kyverno
+  require-resource-limits policy, for example) will refuse those step Pods.
+
+### Bug Fixes
+
+- **The Run page's Activity tab words every step status change.** A change with no try read
+  `running → ready`; it now reads "queued", "waiting to retry", "reset to run again", "needed
+  again", "skipped because build failed", "skipped by its when: condition" or "passed without a
+  try: inputs unchanged".
+- **The Run page reads the status names the server's events carry.** The server sends `Running`,
+  `Succeeded`; the page matched only lowercase names. Activity rows for a status change all had the
+  plain info mark, a finished try and its step's move to passed or failed took two rows, and an
+  earlier version could show a re-armed step that had passed or failed as not run.
+- **Plugin probe Pods have cpu and memory requests and a memory limit.** A namespace that
+  requires resources refused the probe Pods, so the plugin namespace check failed. They now
+  carry the same resources as a Plugin Pod's self-check.
+
 ## [0.4.4] - 2026-11-19
 
 ### Enhancement

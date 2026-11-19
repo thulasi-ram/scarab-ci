@@ -6,7 +6,7 @@ import type { RunEvent } from "./api/client";
 import { aboutDuration, failureWords, statusWord, stepDisplayName } from "./run-page";
 import { attemptCauses, attemptPlaces, type AttemptCause } from "./takes";
 import { causeText } from "./attempts";
-import { eventParts, infraReasonText, NODE_WAIT_REASONS } from "./events";
+import { eventParts, eventStatus, infraReasonText, NODE_WAIT_REASONS } from "./events";
 import { duration } from "./fmt";
 import { isGateExpiry } from "./gates";
 
@@ -75,8 +75,9 @@ export function mergedTransitions(events: RunEvent[]): Map<number, number> {
     if (k.tag === "AttemptStarted") last.delete(step);
     else if (k.tag === "AttemptFinished") last.set(step, { idx: i, failed: !!k.v.failure });
     else if (k.tag === "StepTransitioned") {
-      const to = String(k.v.to ?? "");
-      if (to === "pending") {
+      const to = eventStatus(k.v.to);
+      // Re-armed: back to pending (a rerun or retry) or ready (an automatic retry).
+      if (to === "pending" || to === "ready") {
         last.delete(step);
         return;
       }
@@ -125,16 +126,76 @@ export function activityView(
 
 const events = (n: number) => (n === 1 ? "event" : "events");
 
+const DEAD_NEED: Record<string, string> = { failed: "failed", cancelled: "was cancelled", skipped: "was skipped" };
+
+/**
+ * Every step status change in words, keyed by its event. The engine's moves:
+ * - pending → ready: its needs passed, it waits for a runner ("queued");
+ * - running → ready: its try failed and an automatic retry is due;
+ * - any → pending: a rerun or retry reset it; a gate skipped as no longer
+ *   needed comes back from skipped when a step that needs it runs again;
+ * - pending → skipped: the skip event before it gives the reason, else a need
+ *   that failed, was cancelled or was skipped, else its `when:` excluded it;
+ * - pending → succeeded with "inputs unchanged" before it: passed without a try;
+ * - pending → failed after a shared service never became ready.
+ * `needs` maps a step to the steps it needs; a step missing from it reads
+ * "skipped" with no reason. Anything else reads "now <status>".
+ */
+function transitionWords(log: RunEvent[], needs: Record<string, string[]>): Map<RunEvent, string> {
+  const out = new Map<RunEvent, string>();
+  const status = new Map<string, string>(); // step -> its status so far
+  log.forEach((e, i) => {
+    const k = tagOf(e);
+    if (k?.tag !== "StepTransitioned") return;
+    const step = String(k.v.step ?? "");
+    const from = eventStatus(k.v.from);
+    const to = eventStatus(k.v.to);
+    // The reason the engine journals in the same commit, just before.
+    const p = i > 0 ? tagOf(log[i - 1]) : null;
+    const before = p && String(p.v.step ?? "") === step && log[i - 1].at === e.at ? p : null;
+    out.set(e, ((): string => {
+      switch (to) {
+        case "ready":
+          return from === "running" ? "waiting to retry" : "queued";
+        case "running":
+          return "started";
+        case "pending":
+          return from === "skipped" ? "needed again" : "reset to run again";
+        case "succeeded":
+          return before?.tag === "StepSkipped" ? `passed without a try: ${String(before.v.reason ?? "")}` : "passed";
+        case "failed":
+          return before?.tag === "StepServicesUnready" ? "failed: a shared service it uses never became ready" : "failed";
+        case "cancelled":
+          return "cancelled";
+        case "skipped": {
+          if (before?.tag === "StepSkipped") return `skipped: ${String(before.v.reason ?? "")}`;
+          const own = needs[step];
+          if (!own) return "skipped";
+          const dead = own.find((n) => DEAD_NEED[status.get(n) ?? ""]);
+          if (dead === undefined) return "skipped by its when: condition";
+          return `skipped because ${stepDisplayName(dead)} ${DEAD_NEED[status.get(dead)!]}`;
+        }
+      }
+      return `now ${statusWord(to).toLowerCase()}`;
+    })());
+    status.set(step, to);
+  });
+  return out;
+}
+
 /** One Activity row in words: the step's display name ("deploy-preview · us",
  * the raw id in `stepId`) and what happened, with tries counted within their
  * version ("try 6 started (automatic retry)", "try 5 failed: step error",
- * "passed in 2m50s on try 6", "waiting for a node: 0/14 nodes are
- * available", "unschedulable for about 1m: … · cleared"). Built once per
- * event log; call the result per row. */
+ * "passed in 2m50s on try 6", "waiting to retry", "skipped because build
+ * failed", "waiting for a node: 0/14 nodes are available", "unschedulable for
+ * about 1m: … · cleared"). `needs` maps each step to the steps it needs.
+ * Built once per event log; call the result per row. */
 export function activityWords(
   log: RunEvent[],
+  needs: Record<string, string[]> = {},
 ): (e: RunEvent, merged?: boolean) => { step: string | null; stepId: string | null; text: string } {
   const places = attemptPlaces(log);
+  const moves = transitionWords(log, needs);
   const starts = new Map<string, number>(); // "step attempt" -> started at
   for (const e of log) {
     const k = tagOf(e);
@@ -182,11 +243,7 @@ export function activityWords(
         };
       }
       case "StepTransitioned":
-        return {
-          step,
-          stepId,
-          text: `${statusWord(String(v.from ?? "")).toLowerCase()} → ${statusWord(String(v.to ?? "")).toLowerCase()}`,
-        };
+        return { step, stepId, text: moves.get(e) ?? `now ${statusWord(eventStatus(v.to)).toLowerCase()}` };
       case "AttemptReadopted":
         return { step, stepId, text: `${tryN} re-adopted after a control-plane restart` };
       case "StepInfraCondition": {
@@ -382,7 +439,7 @@ function isGateRearm(e: RunEvent, step: string): boolean {
   if (!k) return false;
   switch (k.tag) {
     case "StepTransitioned":
-      return k.v.step === step && k.v.to === "pending";
+      return k.v.step === step && eventStatus(k.v.to) === "pending";
     case "AttemptSuperseded":
       return k.v.step === step;
     case "RunRerunRequested":

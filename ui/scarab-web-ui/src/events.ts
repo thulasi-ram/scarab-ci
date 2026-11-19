@@ -3,6 +3,15 @@
 import type { RunEvent } from "./api/client";
 import { duration } from "./fmt";
 
+/** A Run or Step status read from an event payload, in the form the UI
+ * compares: the server writes the engine's names (`Running`, `DeadLettered`),
+ * the UI uses `running`, `dead_lettered`. A lowercase status passes through. */
+export function eventStatus(x: unknown): string {
+  return String(x ?? "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase();
+}
+
 export function describeEvent(e: RunEvent): string {
   const k = e.kind;
   if (typeof k === "string") {
@@ -13,9 +22,9 @@ export function describeEvent(e: RunEvent): string {
   const s = (x: unknown) => String(x ?? "");
   switch (tag) {
     case "RunTransitioned":
-      return `Run ${s(v.from)} → ${s(v.to)}`;
+      return `Run ${eventStatus(v.from)} → ${eventStatus(v.to)}`;
     case "StepTransitioned":
-      return `${s(v.step)}: ${s(v.from)} → ${s(v.to)}`;
+      return `${s(v.step)}: ${eventStatus(v.from)} → ${eventStatus(v.to)}`;
     case "AttemptStarted":
       return `${s(v.step)} — attempt started`;
     case "AttemptFinished":
@@ -116,7 +125,7 @@ export function eventParts(e: RunEvent): { step: string | null; text: string } {
   if (!step) return { step: null, text: describeEvent(e) };
   switch (tag) {
     case "StepTransitioned":
-      return { step, text: `${s(v.from)} → ${s(v.to)}` };
+      return { step, text: `${eventStatus(v.from)} → ${eventStatus(v.to)}` };
     case "AttemptStarted":
       return { step, text: "attempt started" };
     case "AttemptFinished":
@@ -149,7 +158,7 @@ export function eventCategory(e: RunEvent): EventCat {
   if (typeof k === "string") return "info";
   const tag = Object.keys(k)[0];
   const v = k[tag] ?? {};
-  const to = String(v.to ?? "");
+  const to = eventStatus(v.to);
   switch (tag) {
     case "RunTransitioned":
     case "StepTransitioned":

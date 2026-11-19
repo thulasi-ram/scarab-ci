@@ -72,10 +72,11 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   // ── (c) the Activity tab is newest-first ─────────────────────────────────
   await page.getByRole("tab", { name: /^Activity/ }).click();
   await expect(page).toHaveURL(/[?&]tab=activity(&|$)/);
-  // The newest event (approve's pending → waiting gate transition) renders
-  // ABOVE the older try events; both strings exist only in the rail.
+  // The newest step event (test's pass on its one try of this version, merged
+  // with its move to passed) renders ABOVE the older try events; both strings
+  // exist only in the rail.
   const bodyText = await page.locator("body").innerText();
-  const newestIdx = bodyText.indexOf("pending → waiting");
+  const newestIdx = bodyText.search(/passed in \S+ on try 1/);
   const olderIdx = bodyText.indexOf("try 1 started");
   expect(newestIdx).toBeGreaterThan(-1);
   expect(olderIdx).toBeGreaterThan(-1);

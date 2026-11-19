@@ -1710,6 +1710,7 @@ export default function RunDetail() {
                 later={events().length - visibleEvents().length}
                 active={heldNow()}
                 trigger={triggerSentence()}
+                needs={Object.fromEntries(stepList().map((s) => [s.id, s.needs ?? []]))}
               />
             </Show>
             <Show when={shellOpen() && sel()}>
