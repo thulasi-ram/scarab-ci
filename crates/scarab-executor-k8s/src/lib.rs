@@ -183,6 +183,30 @@ impl PlacementConfig {
         Ok(())
     }
 
+    /// What the server warns about when it loads the config: `default_resources`
+    /// that sets one axis only. `memory_mib` becomes both the memory request
+    /// and the memory limit, so the fields a step container can miss are
+    /// `requests.memory` + `limits.memory` (cpu set alone) or `requests.cpu`
+    /// (memory set alone). Both set, or neither, is no warning.
+    pub fn warnings(&self) -> Vec<String> {
+        let d = &self.default_resources;
+        let (set, unset, fields) = match (d.cpu_millis, d.memory_mib) {
+            (Some(_), None) => (
+                "cpu_millis",
+                "memory_mib",
+                "requests.memory and limits.memory",
+            ),
+            (None, Some(_)) => ("memory_mib", "cpu_millis", "requests.cpu"),
+            _ => return Vec::new(),
+        };
+        vec![format!(
+            "placement config: default_resources sets {set} but not {unset}, so a step \
+             container whose step sets no {unset} has no {fields}; a cluster that requires \
+             resource limits (e.g. a Kyverno require-resource-limits policy) will refuse \
+             its step Pods"
+        )]
+    }
+
     fn profile(&self, name: &str) -> Option<&scarab_pipeline::PlacementProfile> {
         // The shared named-registry lookup (ADR-0065 consequence): two
         // operator profile types exist now, so the machinery lives in
@@ -7412,6 +7436,37 @@ mod tests {
         let steal2 = stored("steal2");
         let pod = apply_placement(pod_for(&steal2), "steal2", &steal2, &placement).unwrap();
         assert_eq!(service_account(pod), None);
+    }
+
+    /// default_resources with one axis leaves a step container without a
+    /// field a require-resource-limits policy checks (git-bug 9cfeac4).
+    #[test]
+    fn default_resources_with_one_axis_warns_and_names_the_missing_fields() {
+        let with = |cpu_millis, memory_mib| PlacementConfig {
+            default_resources: scarab_pipeline::Resources {
+                cpu_millis,
+                memory_mib,
+            },
+            ..Default::default()
+        };
+        let cpu_only = with(Some(500), None).warnings();
+        assert_eq!(cpu_only.len(), 1);
+        assert!(
+            cpu_only[0].contains("not memory_mib")
+                && cpu_only[0].contains("requests.memory and limits.memory")
+                && cpu_only[0].contains("Kyverno"),
+            "{}",
+            cpu_only[0]
+        );
+        let memory_only = with(None, Some(1024)).warnings();
+        assert_eq!(memory_only.len(), 1);
+        assert!(
+            memory_only[0].contains("not cpu_millis") && memory_only[0].contains("requests.cpu"),
+            "{}",
+            memory_only[0]
+        );
+        assert!(with(Some(500), Some(1024)).warnings().is_empty());
+        assert!(with(None, None).warnings().is_empty());
     }
 
     /// A profile that carries a registry credential cannot be the default:
