@@ -61,7 +61,7 @@ release.yml uses that version's section as the GitHub Release text. See
   **Load full log** reads up to 8 MB, and **Download** saves the try's whole log. The pane keeps at
   most 8 MB, dropping lines from the top. A dropped connection reconnects after 1 s, 2 s, 4 s and
   so on up to 30 s and continues after the last part received; after three reconnects in a row that
-  receive nothing, it loads the last 2 MB again.
+  the server refuses, it loads the last 2 MB again.
 - **The server warns at startup when `default_resources` sets one axis only.** With `cpu_millis`
   and no `memory_mib`, a step container that sets no memory has no `requests.memory` or
   `limits.memory`; with `memory_mib` and no `cpu_millis`, it has no `requests.cpu`. The warning

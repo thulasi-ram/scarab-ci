@@ -21,7 +21,7 @@ Open a Run and pick a step. The Logs tab shows the try in view and follows it wh
   notice counts those too, and the lines that stay keep their numbers.
 - If the connection drops while the try runs, the pane connects again after 1 s, then 2 s, 4 s and
   so on up to 30 s, and continues after the last part it received. After three attempts in a row
-  that receive nothing, it loads the last 2 MB again.
+  that the server refuses, it loads the last 2 MB again.
 
 A `\r\n` line end shows as one line break. A lone `\r`, which a progress bar writes to redraw its
 line, also shows as a line break, so each redraw is a line of its own. Download keeps both as the
