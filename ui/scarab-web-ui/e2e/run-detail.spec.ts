@@ -389,19 +389,19 @@ test("a live run's polls keep focus, the open file and the step tab", async ({ p
   await expect(page).toHaveURL(/[?&]ptab=workspace(&|$)/);
 });
 
-// Regression: when the first read of the events failed, the page applied the
-// URL's selection to a run with no versions and dropped `v` and `try`.
-test("a failed first read of the events keeps the URL's version and try", async ({ page }) => {
-  // Fail the first `/events` read. The mock replaces window.fetch when the app
-  // boots, so wrap whatever it installs.
-  await page.addInitScript(() => {
+// Make the `/events` reads fail: the first `times` of them, or every one
+// when `times` is null. The mock replaces window.fetch when the app boots, so
+// wrap whatever it installs.
+async function failEventReads(page: Page, times: number | null) {
+  await page.addInitScript((limit) => {
     const orig = window.fetch;
     let inner: typeof fetch = orig;
-    let failed = false;
+    let failed = 0;
     const wrapper = ((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      if (!failed && /\/v1\/runs\/[^/]+\/events$/.test(new URL(url, location.origin).pathname)) {
-        failed = true;
+      const events = /\/v1\/runs\/[^/]+\/events$/.test(new URL(url, location.origin).pathname);
+      if (events && (limit === null || failed < limit)) {
+        failed += 1;
         return Promise.resolve(new Response("unavailable", { status: 503 }));
       }
       return inner(input, init);
@@ -413,12 +413,31 @@ test("a failed first read of the events keeps the URL's version and try", async 
         inner = v;
       },
     });
-  });
+  }, times);
+}
+
+// Regression: when the first read of the events failed, the page applied the
+// URL's selection to a run with no versions and dropped `v` and `try`.
+test("a failed first read of the events keeps the URL's version and try", async ({ page }) => {
+  await failEventReads(page, 1);
   await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}?step=1&v=1&try=1`);
   await expect(page.getByText(/Viewing version 1 of 2/)).toBeVisible();
   await expect(page.locator(".sp-head")).toContainText("Try 1 of 1");
   await expect(page).toHaveURL(/[?&]v=1(&|$)/);
   await expect(page).toHaveURL(/[?&]try=1(&|$)/);
+});
+
+// Regression: when every read of the events failed, the page never selected
+// a step and never wrote the URL. After a few failed reads it goes on
+// without them: the step applies, and the version and try (which only the
+// events can confirm) leave the URL.
+test("events that never load still select the URL's step and write the URL", async ({ page }) => {
+  await failEventReads(page, null);
+  await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}?step=1&v=1&try=1`);
+  await expect(page.locator(".sp-name")).toHaveText("build");
+  await expect(page).not.toHaveURL(/[?&]v=/);
+  await expect(page).not.toHaveURL(/[?&]try=/);
+  await expect(page).toHaveURL(/[?&]step=1(&|$)/);
 });
 
 test("Cancel run from the keyboard: the confirm opens on Keep running", async ({ page }) => {

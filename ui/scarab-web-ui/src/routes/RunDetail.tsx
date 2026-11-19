@@ -187,14 +187,19 @@ export default function RunDetail() {
   let pendingTry: string | null = null;
   // A shared service the URL named, applied once the services list loads.
   let pendingService: number | null = null;
+  // The user picked a node or a version before the first selection was
+  // applied: the URL's and the default selection then leave it alone.
+  let userPicked = false;
 
   // Selecting a node (step OR shared service) clears any sidecar focus;
   // clicking a docked sidecar chip selects its step AND focuses that container.
   const selectNode = (target: string) => {
+    userPicked = true;
     setSel(target);
     setFocusSidecar(null);
   };
   const selectSidecar = (stepId: string, index: number) => {
+    userPicked = true;
     setSel(stepId);
     setFocusSidecar(index);
   };
@@ -495,7 +500,8 @@ export default function RunDetail() {
   };
 
   // The first selection: the URL's, where it exists in this run, else the
-  // default (a gate waiting for a decision, the first root failure, …).
+  // default (a gate waiting for a decision, the first root failure, …). A
+  // node or version the user picked while the page waited stays as it is.
   function applyInitialSelection(status: RunStatus, evs: RunEvent[]) {
     const ts = deriveTakes(evs);
     const triesIn = (stepIdx: number, version: number): string[] => {
@@ -509,8 +515,9 @@ export default function RunDetail() {
       versions: ts.length,
       triesOf: (i, v) => triesIn(i, v).length,
     });
+    if (want.from !== undefined && artifactStep() === null) setArtifactStep(status.steps[want.from]!.id);
+    if (userPicked) return;
     if (want.v !== undefined) setViewTake(want.v);
-    if (want.from !== undefined) setArtifactStep(status.steps[want.from]!.id);
     if (want.step !== undefined) {
       if (want.try !== undefined) pendingTry = triesIn(want.step, want.v ?? ts.length)[want.try - 1] ?? null;
       setSel(status.steps[want.step]!.id);
@@ -527,6 +534,12 @@ export default function RunDetail() {
   // published files.
   let finishedTries: number | null = null;
 
+  // Failed reads of the events in a row. After EVENTS_TRIES of them the page
+  // stops waiting: it applies the first selection without the events and
+  // writes the URL. A live run's polls still read the events later.
+  const EVENTS_TRIES = 3;
+  let eventFailures = 0;
+
   async function refresh() {
     const [status, evs] = await Promise.all([
       getRun(id()),
@@ -534,14 +547,17 @@ export default function RunDetail() {
       // replacing them with none.
       fetchEvents(id()).catch(() => null),
     ]);
+    eventFailures = evs ? 0 : eventFailures + 1;
+    const gaveUp = eventFailures >= EVENTS_TRIES;
     batch(() => {
       setRun(status);
       if (evs) setEvents(evs);
       // First load only: later polls never move the selection. It waits for
       // the events: without them the run has one version and no tries, and
-      // the URL's version and try would be dropped. The next poll tries again.
-      if (!loaded() && status.steps.length && evs) {
-        applyInitialSelection(status, evs);
+      // the URL's version and try would be dropped. The next poll tries
+      // again, up to EVENTS_TRIES reads.
+      if (!loaded() && status.steps.length && (evs || gaveUp)) {
+        applyInitialSelection(status, evs ?? []);
         setLoaded(true);
       }
     });
@@ -554,7 +570,8 @@ export default function RunDetail() {
     if (isTerminal(status.status)) {
       if (live()) readArtifacts = true;
       setLive(false);
-      // Keep polling until the events have loaded once.
+      // Keep polling until the first selection is applied (the events
+      // loaded, or the page stopped waiting for them).
       if (poll && (loaded() || !status.steps.length)) {
         clearInterval(poll);
         poll = undefined;
@@ -1117,6 +1134,7 @@ export default function RunDetail() {
                   rows={versions()}
                   live={live() && !timeTraveling()}
                   onSelect={(n) => {
+                    userPicked = true;
                     setViewTake(n);
                     setFocusSidecar(null);
                   }}
