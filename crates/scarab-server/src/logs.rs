@@ -158,6 +158,7 @@ impl LogService {
     ) -> Result<LogChunkMeta, LogError> {
         // Scrub secrets before the bytes touch the store OR the live stream, so
         // a value never reaches stored or streamed logs (ADR-0013, 0032).
+        let source_len = chunk.len() as u64;
         let chunk = self.redact(chunk);
 
         // Next seq / cumulative uncompressed offset from the newest index row
@@ -166,6 +167,15 @@ impl LogService {
             Some(last) => (last.seq + 1, last.byte_offset + last.len),
             None => (0, 0),
         };
+
+        // A tail that re-reads its source skips the stored part by its length
+        // as read, not as stored (git-bug de2bd9b). Recorded before the index
+        // row, which is what makes it count.
+        if chunk.len() as u64 != source_len {
+            self.db
+                .record_log_chunk_source(run, step, attempt, seq, chunk.len() as u64, source_len)
+                .await?;
+        }
 
         let key = object_key(run, step, attempt, seq);
         let compressed = gzip(&chunk).map_err(|e| LogError::Gzip(e.to_string()))?;
@@ -185,6 +195,18 @@ impl LogService {
             .send(chunk.clone());
 
         Ok(meta)
+    }
+
+    /// How many bytes of the log source the stream's stored chunks stand for,
+    /// counted before redaction: where a tail that re-reads the source from
+    /// the start resumes (git-bug de2bd9b).
+    pub async fn source_len(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<u64, LogError> {
+        Ok(self.db.log_source_len(run, step, attempt).await?)
     }
 
     /// Whether any chunk of the stream is stored, by any replica.

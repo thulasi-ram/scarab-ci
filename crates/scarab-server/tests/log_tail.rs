@@ -454,10 +454,10 @@ async fn a_silent_step_stops_being_read_once_it_ends() {
 }
 
 /// A replica that stored the fence's output first (it held the tail lease)
-/// is not repeated: the read of the ended step finds stored output and adds
-/// nothing.
+/// is not repeated: the read of the ended step skips the stored part and
+/// adds nothing.
 #[tokio::test]
-async fn an_ended_step_with_stored_output_is_not_read_again() {
+async fn an_ended_step_with_stored_output_is_not_stored_twice() {
     let exec = ScriptedExec::new(vec![Err(INITIALIZING.into()), Ok(vec![b"once\n".to_vec()])]);
     let logs = logs();
     let tailer =
@@ -473,8 +473,12 @@ async fn an_ended_step_with_stored_output_is_not_read_again() {
     logs.append(&run, &s, &a, b"once\n").await.unwrap();
 
     tailer.end_pass(true);
-    settle().await;
-    assert_eq!(exec.calls(), 1, "stored output is not read again");
+    wait_for(|| exec.calls() == 2).await;
+    for _ in 0..3 {
+        tailer.end_pass(true);
+        settle().await;
+    }
+    assert_eq!(exec.calls(), 2, "the fence is closed after one read");
     assert_eq!(logs.read_all(&run, &s, &a).await.unwrap(), b"once\n");
 }
 
@@ -554,6 +558,354 @@ async fn the_read_of_an_ended_step_does_not_wait_out_the_backoff() {
     .await
     .expect("the ended step's output was stored without waiting out the backoff");
     assert_eq!(exec.calls(), 2);
+}
+
+// --- A tail that broke part way (git-bug de2bd9b) ------------------------------
+
+/// How one open of [`ContainerLog`] reads the log.
+#[derive(Clone, Copy)]
+struct Read {
+    /// Bytes per chunk.
+    chunk: usize,
+    /// Fail with an error after this many chunks; `None` reads to the end.
+    fail_after: Option<usize>,
+}
+
+/// A fake executor shaped like the Kubernetes log API: every open reads the
+/// container's whole log from its first byte (there is no byte offset), in
+/// chunks of the size the open's [`Read`] gives, and the open can break part
+/// way with an error. Opens past the script read to the end in 4-byte chunks.
+struct ContainerLog {
+    log: Mutex<Vec<u8>>,
+    reads: Mutex<VecDeque<Read>>,
+    opens: AtomicUsize,
+}
+
+impl ContainerLog {
+    fn new(log: &[u8], reads: Vec<Read>) -> Arc<Self> {
+        Arc::new(Self {
+            log: Mutex::new(log.to_vec()),
+            reads: Mutex::new(reads.into()),
+            opens: AtomicUsize::new(0),
+        })
+    }
+    fn opens(&self) -> usize {
+        self.opens.load(Ordering::SeqCst)
+    }
+}
+
+/// Chunks of a log, then end-of-stream, or an error after `fail_after` chunks.
+struct BreakingChunks {
+    chunks: VecDeque<Vec<u8>>,
+    fail_after: Option<usize>,
+    served: usize,
+}
+
+#[async_trait]
+impl LogChunks for BreakingChunks {
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ExecError> {
+        if self.fail_after == Some(self.served) {
+            return Err(ExecError::Other(
+                "error reading the log stream: connection reset by peer".into(),
+            ));
+        }
+        self.served += 1;
+        Ok(self.chunks.pop_front())
+    }
+}
+
+#[async_trait]
+impl Executor for ContainerLog {
+    async fn results_delivery_failure(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+    async fn gate_refusal(&self, _gate: &StepRun) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+    async fn infra_condition(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
+        Ok(None)
+    }
+    async fn take_forge_credential(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
+        Ok(None)
+    }
+    async fn workspace_provisioning(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
+        Ok(None)
+    }
+    async fn launch(&self, step: &StepRun, _spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+        Ok(ExecHandle(step.step.0.clone()))
+    }
+    async fn poll(&self, _h: &ExecHandle) -> Result<ExecState, ExecError> {
+        Ok(ExecState::Running)
+    }
+    async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
+        Ok(())
+    }
+    fn unit_handle(&self, _step: &StepRun) -> Option<ExecHandle> {
+        None
+    }
+    async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
+        Ok(true)
+    }
+    async fn log_stream(&self, _step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        let read = self.reads.lock().unwrap().pop_front().unwrap_or(Read {
+            chunk: 4,
+            fail_after: None,
+        });
+        let chunks = self
+            .log
+            .lock()
+            .unwrap()
+            .chunks(read.chunk)
+            .map(<[u8]>::to_vec)
+            .collect();
+        Ok(Some(Box::new(BreakingChunks {
+            chunks,
+            fail_after: read.fail_after,
+            served: 0,
+        })))
+    }
+}
+
+/// Wait (bounded) until the stream's stored log is `want`.
+async fn wait_stored(logs: &LogService, want: &[u8]) {
+    let (run, s, a) = stream();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while logs.read_all(&run, &s, &a).await.unwrap_or_default() != want {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "stored log never became {:?}",
+            String::from_utf8_lossy(want)
+        )
+    });
+}
+
+/// git-bug de2bd9b: the live tail stores the first lines, then the stream
+/// breaks. The step prints the rest and ends inside the retry backoff, so no
+/// live retry runs. The read of the ended step stores the rest, once.
+#[tokio::test]
+async fn output_after_a_broken_tail_is_stored_when_the_step_ends_in_the_backoff() {
+    let full = b"line one\nline two\nline three\n";
+    let exec = ContainerLog::new(
+        full,
+        vec![
+            // The live tail stores "line one\nl" and breaks.
+            Read {
+                chunk: 5,
+                fail_after: Some(2),
+            },
+            // The ended step's read comes in other chunk sizes, so the
+            // stored part ends inside a chunk.
+            Read {
+                chunk: 7,
+                fail_after: None,
+            },
+        ],
+    );
+    let logs = logs();
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_secs(3600));
+
+    tailer.ensure(&running_step());
+    tailer.end_pass(true);
+    wait_stored(&logs, b"line one\nl").await;
+    settle().await;
+
+    // The step has ended: the next pass ensures nothing.
+    tailer.end_pass(true);
+    wait_stored(&logs, full).await;
+    for _ in 0..3 {
+        tailer.end_pass(true);
+        settle().await;
+    }
+    assert_eq!(exec.opens(), 2, "one live tail, one read of the ended step");
+    let (run, s, a) = stream();
+    assert_eq!(logs.read_all(&run, &s, &a).await.unwrap(), full);
+}
+
+/// git-bug de2bd9b: a running step's tail breaks part way and is opened
+/// again after the backoff. The new read starts at the log's first byte; the
+/// stored part is skipped and the lines printed since are appended: no line
+/// twice, none missing.
+#[tokio::test]
+async fn a_running_step_resumes_after_a_broken_tail_without_a_duplicate_or_a_gap() {
+    let exec = ContainerLog::new(
+        b"one\ntwo\nthree\n",
+        vec![
+            Read {
+                chunk: 4,
+                fail_after: Some(2),
+            },
+            Read {
+                chunk: 3,
+                fail_after: None,
+            },
+        ],
+    );
+    let logs = logs();
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    let step = running_step();
+
+    tailer.ensure(&step);
+    wait_stored(&logs, b"one\ntwo\n").await;
+    // The step prints more before the tail is opened again.
+    exec.log.lock().unwrap().extend_from_slice(b"four\n");
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while exec.opens() < 2 {
+            tailer.ensure(&step);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the broken tail is opened again");
+    wait_stored(&logs, b"one\ntwo\nthree\nfour\n").await;
+
+    // The second read reached the end of the stream: the fence is drained.
+    for _ in 0..3 {
+        tailer.ensure(&step);
+        settle().await;
+    }
+    assert_eq!(exec.opens(), 2);
+    let (run, s, a) = stream();
+    assert_eq!(
+        logs.read_all(&run, &s, &a).await.unwrap(),
+        b"one\ntwo\nthree\nfour\n"
+    );
+}
+
+/// git-bug de2bd9b: the stored part is skipped by its length as read from the
+/// container, not as stored. A secret in it is stored as `***`, shorter than
+/// the secret; resuming at the stored length would append part of the
+/// secret's line again.
+#[tokio::test]
+async fn redaction_in_the_stored_part_does_not_move_the_resume_point() {
+    let line = b"token=s3cr3t-value\n";
+    let exec = ContainerLog::new(
+        b"token=s3cr3t-value\nnext line\n",
+        vec![
+            // The first chunk is the whole secret's line; then the tail breaks.
+            Read {
+                chunk: line.len(),
+                fail_after: Some(1),
+            },
+            Read {
+                chunk: 7,
+                fail_after: None,
+            },
+        ],
+    );
+    let logs = logs();
+    logs.register_secret(b"s3cr3t-value");
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_secs(3600));
+
+    tailer.ensure(&running_step());
+    tailer.end_pass(true);
+    wait_stored(&logs, b"token=***\n").await;
+    settle().await;
+
+    tailer.end_pass(true);
+    wait_stored(&logs, b"token=***\nnext line\n").await;
+    for _ in 0..3 {
+        tailer.end_pass(true);
+        settle().await;
+    }
+    let (run, s, a) = stream();
+    assert_eq!(
+        logs.read_all(&run, &s, &a).await.unwrap(),
+        b"token=***\nnext line\n"
+    );
+}
+
+/// git-bug de2bd9b: a re-read that comes back shorter than the stored part
+/// (the kubelet rotated the container's log file and serves only the new
+/// one) cannot tell which of its bytes are new. Nothing is appended, and a
+/// warning says why.
+#[tokio::test]
+async fn a_log_shorter_than_the_stored_part_appends_nothing_and_warns() {
+    use std::io::Write;
+
+    /// Collects formatted log lines.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    // The test runtime is single-threaded, so spawned tails log here too.
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let exec = ContainerLog::new(
+        b"aaaa\nbbbb\ncccc\n",
+        vec![Read {
+            chunk: 5,
+            fail_after: Some(2),
+        }],
+    );
+    let logs = logs();
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    let step = running_step();
+
+    tailer.ensure(&step);
+    wait_stored(&logs, b"aaaa\nbbbb\n").await;
+    // The log file was rotated: the API now serves a shorter one.
+    *exec.log.lock().unwrap() = b"dd\n".to_vec();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while exec.opens() < 2 {
+            tailer.ensure(&step);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the broken tail is opened again");
+    for _ in 0..3 {
+        tailer.ensure(&step);
+        settle().await;
+    }
+
+    let (run, s, a) = stream();
+    assert_eq!(
+        logs.read_all(&run, &s, &a).await.unwrap(),
+        b"aaaa\nbbbb\n",
+        "nothing of the shorter log is appended"
+    );
+    let out = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        out.contains("WARN") && out.contains("shorter than the part already stored"),
+        "a warning says the log was shorter: {out}"
+    );
 }
 
 // --- Through the converged driver ---------------------------------------------

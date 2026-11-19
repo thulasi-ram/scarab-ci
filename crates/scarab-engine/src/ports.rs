@@ -1017,6 +1017,33 @@ pub trait Db: Send + Sync {
         attempt: &AttemptId,
     ) -> Result<Option<LogChunkMeta>, DbError>;
 
+    /// Record that chunk `seq` of the stream, `len` bytes once redacted, was
+    /// `source_len` bytes as read from the log source (git-bug de2bd9b).
+    /// Written only when redaction changed the length, and BEFORE the chunk's
+    /// index row: a record whose chunk row never landed, or whose `len` does
+    /// not match the row's, is ignored by [`Self::log_source_len`].
+    /// Idempotent on `(run, step, attempt, seq)`; a later record replaces it.
+    async fn record_log_chunk_source(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        seq: u64,
+        len: u64,
+        source_len: u64,
+    ) -> Result<(), DbError>;
+
+    /// How many bytes of the log source the stream's stored chunks stand for:
+    /// the sum of each chunk's `len`, or its recorded `source_len` where
+    /// redaction changed it. A tail that re-reads the source from the start
+    /// skips this many bytes (git-bug de2bd9b).
+    async fn log_source_len(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<u64, DbError>;
+
     /// All step projections of a run (with their attempts) — the DAG snapshot
     /// the scheduler folds to decide admission and completion.
     async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError>;

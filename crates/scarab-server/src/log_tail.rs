@@ -60,30 +60,76 @@ pub enum LogTailError {
 /// Drain a live log tail into the pipeline: read chunks until end-of-stream,
 /// appending each to [`LogService`] under the `{run, step, attempt}` fence.
 /// Redaction and persistence are the pipeline's job ([`LogService::append`]);
-/// this loop only pumps bytes. Returns the total number of bytes appended.
+/// this loop only pumps bytes. Returns the number of bytes appended.
+///
+/// A read always starts at the beginning of the container's log: the
+/// Kubernetes log API takes no byte offset. So the first
+/// [`LogService::source_len`] bytes, the part of the log the fence has stored
+/// already, are skipped and only the rest is appended (git-bug de2bd9b). That
+/// count is of the source's bytes, before redaction, so a redacted secret
+/// does not move the point where the read resumes.
 ///
 /// Empty chunks are skipped (a zero-length read is treated as end-of-stream by
 /// the source, but a source that yields an empty-but-not-final chunk shouldn't
 /// create a spurious index row).
 pub async fn pump_log_stream(
-    mut chunks: Box<dyn LogChunks>,
+    chunks: Box<dyn LogChunks>,
     logs: &LogService,
     run: &RunId,
     step: &StepId,
     attempt: &AttemptId,
 ) -> Result<u64, LogTailError> {
-    let mut total = 0u64;
+    Ok(pump(chunks, logs, run, step, attempt).await?.appended)
+}
+
+/// What one read of a log source did.
+#[derive(Debug, Clone, Copy)]
+struct Pumped {
+    /// Bytes read from the source, including the skipped prefix.
+    read: u64,
+    /// Bytes appended to the pipeline (before redaction).
+    appended: u64,
+}
+
+async fn pump(
+    mut chunks: Box<dyn LogChunks>,
+    logs: &LogService,
+    run: &RunId,
+    step: &StepId,
+    attempt: &AttemptId,
+) -> Result<Pumped, LogTailError> {
+    let stored = logs.source_len(run, step, attempt).await?;
+    let mut read = 0u64;
+    let mut appended = 0u64;
     while let Some(chunk) = chunks.next_chunk().await? {
         if chunk.is_empty() {
             continue;
         }
-        if total == 0 {
-            tracing::info!(run = %run.0, step = %step.0, attempt = %attempt.0, "log tail: receiving output");
+        let len = chunk.len() as u64;
+        // The part of this chunk inside the stored prefix.
+        let skip = stored.saturating_sub(read).min(len) as usize;
+        read += len;
+        if skip == chunk.len() {
+            continue;
         }
-        logs.append(run, step, attempt, &chunk).await?;
-        total += chunk.len() as u64;
+        if appended == 0 {
+            tracing::info!(run = %run.0, step = %step.0, attempt = %attempt.0, resumed_at = stored, "log tail: receiving output");
+        }
+        logs.append(run, step, attempt, &chunk[skip..]).await?;
+        appended += (chunk.len() - skip) as u64;
     }
-    Ok(total)
+    if read < stored {
+        // The log is shorter than what is stored for it: the kubelet rotated
+        // the container's log file, and the API serves the newest file only.
+        // There is no way to tell which of these bytes are new, so none are
+        // appended rather than storing any twice.
+        tracing::warn!(
+            run = %run.0, step = %step.0, attempt = %attempt.0, read, stored,
+            "log tail: the container log is shorter than the part already stored \
+             (rotated?); nothing appended"
+        );
+    }
+    Ok(Pumped { read, appended })
 }
 
 /// Identifies one log stream: a single attempt of a step. Matches the pipeline's
@@ -182,10 +228,11 @@ impl LogTailer {
     /// left `Running`, a retried attempt, a stopped service): its log is read
     /// once more, so a step that ran and finished inside a retry backoff
     /// keeps its output (git-bug 1dee2f3). The first such read does not wait
-    /// out a retry backoff left by the live tail. This covers a unit with NO
-    /// stored output only: the read is skipped when any replica already
-    /// stored output for the fence, so nothing is appended twice, and output
-    /// printed after a live tail failed part way through is not read.
+    /// out a retry backoff left by the live tail. Like every read, it skips
+    /// the part of the log the fence has stored already, by this replica or
+    /// another, and appends the rest: output printed after a live tail failed
+    /// part way through is stored, and nothing is stored twice (git-bug
+    /// de2bd9b).
     /// `complete` is false when the pass did not ensure every unit (a store
     /// error); such a pass only resets the bookkeeping.
     pub fn end_pass(&self, complete: bool) {
@@ -429,19 +476,15 @@ impl LogTailer {
                 }
             }
             if final_read {
-                // The unit has ended: one plain read of what it printed, unless
-                // a replica already stored output (no second copy).
-                let result = match logs.has_output(&run, &step_id, &attempt).await {
-                    Ok(true) => Ok(None),
-                    Ok(false) => drain(&*executor, &logs, &source, &run, &step_id, &attempt).await,
-                    Err(e) => Err(e.into()),
-                };
+                // The unit has ended: one read of what it printed after the
+                // part already stored, if any.
+                let result = drain(&*executor, &logs, &source, &run, &step_id, &attempt).await;
                 if let Some(r) = renewer {
                     r.abort();
                 }
                 match result {
-                    Ok(bytes) => {
-                        if let Some(bytes) = bytes.filter(|b| *b > 0) {
+                    Ok(pumped) => {
+                        if let Some(bytes) = pumped.map(|p| p.appended).filter(|b| *b > 0) {
                             tracing::info!(run = %run.0, step = %step_id.0, attempt = %attempt.0, bytes, "log tail: read the log of an ended unit");
                         }
                         close(&fence);
@@ -491,8 +534,10 @@ impl LogTailer {
                 // not ready. A follow read of a running container stays open,
                 // so a silent step costs one empty read per backoff only
                 // between its exit and leaving `Running`; then `end_pass`
-                // reads it once more and closes the fence.
-                Ok(Some(0)) => {
+                // reads it once more and closes the fence. A read that only
+                // re-read the stored part did read something: the stream
+                // closed because the container ended.
+                Ok(Some(Pumped { read: 0, .. })) => {
                     tracing::debug!(run = %run.0, step = %step_id.0, "log tail: the stream ended with no output; retrying");
                     retry_at
                         .lock()
@@ -502,8 +547,8 @@ impl LogTailer {
                 // Stream closed cleanly after output, or the executor has no
                 // log source: we have the step's complete log. Mark the fence
                 // drained so no later tick re-ingests it (dedup fix).
-                Ok(bytes) => {
-                    if let Some(bytes) = bytes {
+                Ok(pumped) => {
+                    if let Some(bytes) = pumped.map(|p| p.appended) {
                         tracing::info!(run = %run.0, step = %step_id.0, attempt = %attempt.0, bytes, "log tail: ended");
                     }
                     close(&fence);
@@ -516,7 +561,9 @@ impl LogTailer {
                 // quietly; only WARN on a genuine tail error, or on a pre-start
                 // state that has outlasted NOT_READY_GRACE (a tail that never
                 // starts must still be visible). Either way, back off before
-                // retrying so we don't hammer the API each tick.
+                // retrying so we don't hammer the API each tick. What the
+                // tail appended before it failed is stored; the retry skips
+                // it (git-bug de2bd9b).
                 Err(e) => {
                     let msg = e.to_string();
                     let now = Instant::now();
@@ -649,7 +696,7 @@ enum TailSource {
 }
 
 /// Open the executor's log source for `source` and pump it into the pipeline,
-/// returning the bytes appended. A backend with no log source (`Ok(None)` —
+/// past the part already stored ([`pump`]). A backend with no log source (`Ok(None)` —
 /// e.g. the local/dev executor) is a clean no-op.
 async fn drain(
     executor: &dyn Executor,
@@ -658,7 +705,7 @@ async fn drain(
     run: &RunId,
     step: &StepId,
     attempt: &AttemptId,
-) -> Result<Option<u64>, LogTailError> {
+) -> Result<Option<Pumped>, LogTailError> {
     let chunks = match source {
         TailSource::Step(step_run) => executor.log_stream(step_run).await?,
         TailSource::Service(handle) => executor.service_log_stream(handle).await?,
@@ -672,9 +719,7 @@ async fn drain(
         }
     };
     match chunks {
-        Some(chunks) => Ok(Some(
-            pump_log_stream(chunks, logs, run, step, attempt).await?,
-        )),
+        Some(chunks) => Ok(Some(pump(chunks, logs, run, step, attempt).await?)),
         None => Ok(None),
     }
 }

@@ -217,6 +217,9 @@ struct InMemoryState {
     outbox: Vec<OutboxEntry>,
     /// Per-(run, step, attempt) log-chunk index (offsets only, no bodies).
     logs: HashMap<(RunId, StepId, AttemptId), Vec<LogChunkMeta>>,
+    /// `(len, source_len)` of the log chunks redaction changed, by
+    /// `(run, step, attempt, seq)` (git-bug de2bd9b).
+    log_sources: HashMap<(RunId, StepId, AttemptId, u64), (u64, u64)>,
     /// Per-(run, step, attempt) launch handle — the durable "launch happened"
     /// marker (ADR-0047).
     attempt_handles: HashMap<(RunId, StepId, AttemptId), String>,
@@ -1943,6 +1946,48 @@ impl Db for InMemoryDb {
             .and_then(|chunks| chunks.last().cloned()))
     }
 
+    async fn record_log_chunk_source(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        seq: u64,
+        len: u64,
+        source_len: u64,
+    ) -> Result<(), DbError> {
+        self.state.lock().unwrap().log_sources.insert(
+            (run.clone(), step.clone(), attempt.clone(), seq),
+            (len, source_len),
+        );
+        Ok(())
+    }
+
+    async fn log_source_len(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<u64, DbError> {
+        let st = self.state.lock().unwrap();
+        let Some(chunks) = st.logs.get(&(run.clone(), step.clone(), attempt.clone())) else {
+            return Ok(0);
+        };
+        Ok(chunks
+            .iter()
+            .map(|c| {
+                match st
+                    .log_sources
+                    .get(&(run.clone(), step.clone(), attempt.clone(), c.seq))
+                {
+                    // Counts only beside a chunk of the same length, like
+                    // the Postgres store.
+                    Some((len, source_len)) if *len == c.len => *source_len,
+                    _ => c.len,
+                }
+            })
+            .sum())
+    }
+
     async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError> {
         let st = self.state.lock().unwrap();
         if st.poisoned_runs.contains(run) {
@@ -2594,6 +2639,11 @@ impl Db for InMemoryDb {
             .unwrap()
             .logs
             .retain(|(r, _, _), _| r != run);
+        self.state
+            .lock()
+            .unwrap()
+            .log_sources
+            .retain(|(r, _, _, _), _| r != run);
         Ok(())
     }
 
