@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1795109117,"nonce":"6lZ8lxuJGeqob96s5sZk1VJRalk=","message":"Closed 2026-11-19 (triage at origin/main 1ce54713): registry-cache half moot (registry cache refused by design); both pinned digests checked: multi-arch indexes including arm64.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1795109117,"nonce":"UBMBF7C5OmLTeYYigoaj0tFEo70=","status":2}]}
