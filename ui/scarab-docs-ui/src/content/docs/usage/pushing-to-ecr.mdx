@@ -321,6 +321,10 @@ has these containers:
 | `scarab-workspace-init` | Scarab's workspace fetch | no |
 | `scarab-workspace-egress` | Scarab's workspace drain | no |
 
+A step's sidecar services run as `service-0`, `service-1` and so on, and the list above does not
+name them. Scarab refuses a step that sets both `registry_auth: true` and `services:`, so the push
+step's Pod never has one.
+
 If the annotation names only `step`, Scarab's three containers get the role too. They run Scarab's
 images, not your code, but the role's token is then in four containers instead of one. The build
 step's Pod does not run as `scarab-ecr-push`, so nothing in it gets the role.

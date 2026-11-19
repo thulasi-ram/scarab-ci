@@ -5968,6 +5968,16 @@ fn validate_with(
                 step.id
             ));
         }
+        // A sidecar service (`service-N`) runs in the Step's Pod, under the
+        // ServiceAccount a `registry_auth_only` placement profile gives that
+        // Pod: it would get the cloud role unless the profile's IRSA skip
+        // list named it.
+        if step.registry_auth && !step.services.is_empty() {
+            diagnostics.push(format!(
+                "step `{}`: a step with `registry_auth` must not set `services:`",
+                step.id
+            ));
+        }
         // The image and command of a Step that holds a forge or registry
         // credential, or runs in the sandbox, are written where the Step is
         // written (ADR-0076 §2): a `${{ … }}` in either would let a value
@@ -11828,6 +11838,23 @@ steps:
             ),
             other => panic!("expected validation error, got {other:?}"),
         }
+    }
+
+    /// git-bug d2a8efc: a sidecar service in a `registry_auth` Step's Pod
+    /// would run under the ServiceAccount a `registry_auth_only` profile
+    /// gives that Pod, so the two do not compile together.
+    #[test]
+    fn a_registry_auth_step_with_sidecar_services_does_not_compile() {
+        let errs = errors(
+            "steps: [{ id: push, image: x, command: [y], registry_auth: true, services: [{ image: postgres:16 }] }]",
+        );
+        assert!(
+            errs.iter().any(|e| e.starts_with("step `push`: ")
+                && e.contains("`registry_auth` must not set `services:`")),
+            "{errs:?}"
+        );
+        // Without `registry_auth` the same services compile.
+        compile("steps: [{ id: push, image: x, command: [y], services: [{ image: postgres:16 }] }]");
     }
 
     #[test]

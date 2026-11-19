@@ -54,6 +54,11 @@ release.yml uses that version's section as the GitHub Release text. See
   image. The input's `validate:` rule and the build step's script both refuse such a name in any
   case, and the script also refuses a control character in a value. The docs now say not to build
   `build_args` from free text. Install the library again from the release commit to get this.
+- **A step with `registry_auth: true` may not set `services:`** (git-bug d2a8efc). A sidecar
+  service runs in the step's Pod, under the ServiceAccount a `registry_auth_only` placement profile
+  gives that Pod, and the IRSA skip list in the ECR guide does not name `service-N` containers. Such
+  a Pipeline no longer compiles. The build library's push step sets no services, so it is
+  unaffected.
 
 ### Enhancement
 
