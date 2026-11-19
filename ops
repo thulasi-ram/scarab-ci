@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1794429373,"nonce":"c+Oq8NICHr3vsiO9yPUBm6kE57c=","added":["type:bug","security","area:executor"],"removed":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1795124069,"nonce":"gUpxxIfn6O6C66W9qXSj5JAp1RI=","message":"Fixed in PR #199 (squash 48d462c2 on main), 2026-11-20; ships in 0.5.0.","files":null}]}
