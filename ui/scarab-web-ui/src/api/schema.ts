@@ -11,7 +11,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** OIDC issuer JWKS (ADR-0015) */
+        /** OIDC issuer JWKS */
         get: operations["jwks"];
         put?: never;
         post?: never;
@@ -28,7 +28,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** OIDC discovery (ADR-0015) */
+        /** OIDC discovery */
         get: operations["openid_configuration"];
         put?: never;
         post?: never;
@@ -45,7 +45,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Liveness: process up (ADR-0053) */
+        /** Liveness: process up */
         get: operations["healthz"];
         put?: never;
         post?: never;
@@ -79,7 +79,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Prometheus gauges (ADR-0053) */
+        /** Prometheus gauges */
         get: operations["metrics"];
         put?: never;
         post?: never;
@@ -96,7 +96,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Readiness: DB + object store reachable (ADR-0053) */
+        /** Readiness: DB + object store reachable */
         get: operations["readyz"];
         put?: never;
         post?: never;
@@ -130,7 +130,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Finish the browser OAuth flow (ADR-0049) */
+        /** Finish the browser OAuth flow */
         get: operations["oauth_callback"];
         put?: never;
         post?: never;
@@ -147,10 +147,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Begin the browser OAuth flow (ADR-0049) */
+        /** Begin the browser OAuth flow */
         get: operations["oauth_login_redirect"];
         put?: never;
-        /** Exchange an OAuth credential for a session (API/CLI, ADR-0049) */
+        /** Exchange an OAuth credential for a session (API/CLI) */
         post: operations["login"];
         delete?: never;
         options?: never;
@@ -167,7 +167,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Revoke the session (ADR-0049) */
+        /** Revoke the session */
         post: operations["logout"];
         delete?: never;
         options?: never;
@@ -182,7 +182,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List login providers (ADR-0069) */
+        /** List login providers */
         get: operations["auth_providers"];
         put?: never;
         post?: never;
@@ -200,7 +200,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Registered forge connections, how many repositories each has enabled, and their health (ADR-0060)
+         * Registered forge connections, how many repositories each has enabled, and their health
          * @description Read-only, and per Org (git-bug 19b0a45): the caller sees the connections
          *     of the Orgs it administers, and a global admin also sees the unassigned
          *     ones. No credential material is ever returned — only whether the handle
@@ -209,7 +209,7 @@ export interface paths {
         get: operations["list_connections"];
         put?: never;
         /**
-         * Create a forge connection, writing its credential through to the secret store (ADR-0060)
+         * Create a forge connection, writing its credential through to the secret store
          * @description This is the manual/UI half of part D and the reason Forgejo can be onboarded
          *     at all: GitHub registers itself when the App is installed, but a Forgejo
          *     instance has no such event, so without this endpoint its only route into the
@@ -240,11 +240,11 @@ export interface paths {
         put?: never;
         post?: never;
         /**
-         * Delete a forge connection and its unreferenced credential (ADR-0060)
+         * Delete a forge connection and its unreferenced credential
          * @description Two deliberate safeties:
          *
          *      1. **Bound repos block the delete** unless `unbind_repos=true`. A Project
-         *         *is* a repo binding (ADR-0046), so deleting a connection deletes
+         *         *is* a repo binding, so deleting a connection deletes
          *         governance — the same reasoning that stops `resync` from ever unbinding.
          *         A one-word query parameter is cheap; a silently deleted Environment is
          *         not recoverable from the UI.
@@ -267,7 +267,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Repos this connection's credential can reach, for the bind pick-list (ADR-0060)
+         * Repos this connection's credential can reach, for the bind pick-list
          * @description The forge is the authority on what a connection covers, so this is a live
          *     call, not a cached view. An adapter that cannot enumerate answers 501 rather
          *     than an empty list: "I cannot look" and "there is nothing there" must not read
@@ -313,7 +313,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Diff a connection's granted permissions and subscribed events against what Scarab needs (ADR-0060)
+         * Diff a connection's granted permissions and subscribed events against what Scarab needs
          * @description This exists because both halves of a misconfigured GitHub App fail
          *     *silently*:
          *
@@ -359,9 +359,9 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Bind a repo to a connection, creating its Project, and register its webhook (ADR-0060)
-         * @description There is no `projects` table: a Project *is* a `forge_repos` binding
-         *     (ADR-0046), so this endpoint is the repo→Project onboarding flow — "Enable"
+         * Bind a repo to a connection, creating its Project, and register its webhook
+         * @description There is no `projects` table: a Project *is* a `forge_repos` binding,
+         *     so this endpoint is the repo→Project onboarding flow — "Enable"
          *     on the org's repositories page — for every forge. After it, the repo appears on `GET /v1/repos`, can hold
          *     Environments and secrets, and its pushes resolve to a tenant. A GitHub
          *     installation makes its repos available but binds none of them, so this is
@@ -391,7 +391,7 @@ export interface paths {
         put?: never;
         post?: never;
         /**
-         * Unbind a repo from a connection, removing its Project (ADR-0060)
+         * Unbind a repo from a connection, removing its Project
          * @description The inverse of the bind above, and destructive in the same measure: the
          *     binding is the Project, so its Environments, scoped secrets and RBAC go with
          *     it. That is why re-sync never does this on a forge's say-so and why this is an
@@ -399,7 +399,7 @@ export interface paths {
          *     or re-sync binds the repo again; only another explicit bind does.
          *
          *     The forge-side webhook is deliberately **left in place**. Deleting hooks is
-         *     not in the port (ADR-0046 exposes registration only), and a stale hook is
+         *     not in the forge port (it exposes registration only), and a stale hook is
          *     harmless: an unbound repo's deliveries resolve to nothing and are dropped.
          */
         delete: operations["unbind_repo"];
@@ -418,7 +418,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Register the forge-side webhook for a bound repo (ADR-0046 register_webhook)
+         * Register the forge-side webhook for a bound repo
          * @description Only for a repo this connection already governs: registering a hook that
          *     points at Scarab for a repo Scarab has no Project for would produce deliveries
          *     that resolve to nothing.
@@ -440,7 +440,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Report the repos the forge reaches that are not enabled, and move this org's Projects off connections that do not serve it (ADR-0060)
+         * Report the repos the forge reaches that are not enabled, and move this org's Projects off connections that do not serve it
          * @description Enabling a repository is opt-in, so re-sync **creates no Project**. A repo
          *     the forge reports that is not bound is listed in `available`; an admin
          *     enables it from the org's repositories page (`POST
@@ -516,9 +516,9 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Begin linking another sign-in account (ADR-0069)
-         * @description A merge of a Principal that holds passkeys also needs one of its passkeys
-         *     (ADR-0079 §2): the callback sends the browser to confirm it
+         * Begin linking another sign-in account
+         * @description A merge of a Principal that holds passkeys also needs one of its passkeys:
+         *     the callback sends the browser to confirm it
          *     (`…/merges/{id}`), and nothing changes until then.
          */
         post: operations["begin_link_identity"];
@@ -535,10 +535,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** A merge waiting for the merged account's passkey (ADR-0079) */
+        /** A merge waiting for the merged account's passkey */
         get: operations["identity_merge"];
         put?: never;
-        /** Confirm a merge with the merged account's passkey (ADR-0079) */
+        /** Confirm a merge with the merged account's passkey */
         post: operations["confirm_identity_merge"];
         delete?: never;
         options?: never;
@@ -556,7 +556,7 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** Unlink a sign-in account (ADR-0069) */
+        /** Unlink a sign-in account */
         delete: operations["unlink_identity"];
         options?: never;
         head?: never;
@@ -572,7 +572,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Finish enrolling a passkey (ADR-0073 §2) */
+        /** Finish enrolling a passkey */
         post: operations["passkey_registration"];
         delete?: never;
         options?: never;
@@ -589,7 +589,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Begin enrolling a passkey (ADR-0073 §2) */
+        /** Begin enrolling a passkey */
         post: operations["passkey_registration_options"];
         delete?: never;
         options?: never;
@@ -607,7 +607,7 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** Remove a passkey (ADR-0073 §2; always-ask step-up) */
+        /** Remove a passkey (always-ask step-up) */
         delete: operations["remove_passkey"];
         options?: never;
         head?: never;
@@ -621,7 +621,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** My passkeys and step-up state (ADR-0073) */
+        /** My passkeys and step-up state */
         get: operations["me_security"];
         put?: never;
         post?: never;
@@ -638,7 +638,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** My security events (ADR-0073 §7) */
+        /** My security events */
         get: operations["my_security_events"];
         put?: never;
         post?: never;
@@ -657,7 +657,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Confirm a step-up with a passkey (ADR-0073 §4) */
+        /** Confirm a step-up with a passkey */
         post: operations["step_up_confirm"];
         delete?: never;
         options?: never;
@@ -674,7 +674,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Begin a step-up: a challenge that opens a 5-minute window (ADR-0073 §4) */
+        /** Begin a step-up: a challenge that opens a 5-minute window */
         post: operations["step_up_options"];
         delete?: never;
         options?: never;
@@ -689,10 +689,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List your own API tokens (ADR-0049) */
+        /** List your own API tokens */
         get: operations["list_own_api_tokens"];
         put?: never;
-        /** Mint a personal API token - the plaintext is returned ONCE (ADR-0049) */
+        /** Mint a personal API token - the plaintext is returned ONCE */
         post: operations["mint_own_api_token"];
         delete?: never;
         options?: never;
@@ -710,7 +710,7 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** Revoke one of your own API tokens (ADR-0049) */
+        /** Revoke one of your own API tokens */
         delete: operations["revoke_own_api_token"];
         options?: never;
         head?: never;
@@ -724,12 +724,12 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List an org's role bindings (ADR-0049) */
+        /** List an org's role bindings */
         get: operations["list_bindings"];
-        /** Natively grant a role (ADR-0049) */
+        /** Natively grant a role */
         put: operations["put_binding"];
         post?: never;
-        /** Natively revoke a role - a durable tombstone (ADR-0049) */
+        /** Natively revoke a role - a durable tombstone */
         delete: operations["delete_binding"];
         options?: never;
         head?: never;
@@ -743,7 +743,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List an org's Environments (ADR-0071) */
+        /** List an org's Environments */
         get: operations["list_org_environments"];
         put?: never;
         post?: never;
@@ -760,10 +760,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** One org Environment (ADR-0071) */
+        /** One org Environment */
         get: operations["get_org_environment"];
         /**
-         * Create or replace an org Environment (ADR-0071)
+         * Create or replace an org Environment
          * @description A create takes the same claim on the name a Duplicate holds, and is
          *     refused (409) while a Duplicate to that name is in progress: that
          *     Duplicate has checked the name is free and may be writing secrets under
@@ -773,9 +773,9 @@ export interface paths {
         put: operations["put_org_environment"];
         post?: never;
         /**
-         * Delete an org Environment, with its overlays, grants and secrets when asked (ADR-0071)
+         * Delete an org Environment, with its overlays, grants and secrets when asked
          * @description Refused (409) while any Project holds an overlay or privilege grant in
-         *     it (ADR-0071 §3, §8: those are never dropped as a side effect), and while
+         *     it (those are never dropped as a side effect), and while
          *     any Project holds a secret in it (git-bug 52964b4): a secret never
          *     outlives its Environment, and is never dropped as a side effect either.
          *     The refusal's JSON body lists them, with a count per kind.
@@ -838,9 +838,9 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Which projects may deploy into an org Environment (ADR-0071 §2) */
+        /** Which projects may deploy into an org Environment */
         get: operations["get_environment_eligibility"];
-        /** Replace which projects may deploy into an org Environment (ADR-0071 §2) */
+        /** Replace which projects may deploy into an org Environment */
         put: operations["put_environment_eligibility"];
         post?: never;
         delete?: never;
@@ -856,7 +856,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Projects with an overlay or privilege grant in an org Environment (ADR-0071 §3, §8) */
+        /** Projects with an overlay or privilege grant in an org Environment */
         get: operations["list_environment_projects"];
         put?: never;
         post?: never;
@@ -873,10 +873,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** A project's tighten-only overlay in an org Environment (ADR-0071 §3) */
+        /** A project's tighten-only overlay in an org Environment */
         get: operations["get_environment_project_overlay"];
         /**
-         * Tighten an org Environment for one project (ADR-0071 §3)
+         * Tighten an org Environment for one project
          * @description Refused (409) for a Project the Environment does not admit and which
          *     holds no overlay there yet: a Project that may not deploy here has
          *     nothing to tighten, and an overlay pins the Environment against deletion
@@ -886,7 +886,7 @@ export interface paths {
          */
         put: operations["put_environment_project_overlay"];
         post?: never;
-        /** Remove a project's overlay in an org Environment (ADR-0071 §3) */
+        /** Remove a project's overlay in an org Environment */
         delete: operations["delete_environment_project_overlay"];
         options?: never;
         head?: never;
@@ -900,12 +900,12 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** A project's privilege grant in an org Environment (ADR-0071 §8) */
+        /** A project's privilege grant in an org Environment */
         get: operations["get_environment_project_privilege_grant"];
-        /** Grant a project privileges in an org Environment (ADR-0071 §8) */
+        /** Grant a project privileges in an org Environment */
         put: operations["put_environment_project_privilege_grant"];
         post?: never;
-        /** Withdraw a project's privilege grant in an org Environment (ADR-0071 §8) */
+        /** Withdraw a project's privilege grant in an org Environment */
         delete: operations["delete_environment_project_privilege_grant"];
         options?: never;
         head?: never;
@@ -919,9 +919,9 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** An org Environment's baseline protection rules (ADR-0071 §1) */
+        /** An org Environment's baseline protection rules */
         get: operations["get_environment_protection"];
-        /** Replace an org Environment's baseline protection rules (ADR-0071 §1) */
+        /** Replace an org Environment's baseline protection rules */
         put: operations["put_environment_protection"];
         post?: never;
         delete?: never;
@@ -938,8 +938,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List the open waits of the gates that name the calling plugin (ADR-0076
-         *     §7). Only a plugin's `scarab-api` token is accepted; another org's list
+         * List the open waits of the gates that name the calling plugin. Only a plugin's `scarab-api` token is accepted; another org's list
          *     is a 404. The query reads current state, so a restarted plugin catches up
          *     with nothing to replay.
          */
@@ -959,7 +958,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** An org's installed libraries (ADR-0076 §4) */
+        /** An org's installed libraries */
         get: operations["list_libraries"];
         put?: never;
         post?: never;
@@ -978,7 +977,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Fetch a library version to review before installing (ADR-0076 §4) */
+        /** Fetch a library version to review before installing */
         post: operations["fetch_library"];
         delete?: never;
         options?: never;
@@ -995,7 +994,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Install or upgrade a library (ADR-0076 §4) */
+        /** Install or upgrade a library */
         post: operations["install_library"];
         delete?: never;
         options?: never;
@@ -1010,11 +1009,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** One installed library, by id (ADR-0076 §4) */
+        /** One installed library, by id */
         get: operations["get_library_installation"];
         put?: never;
         post?: never;
-        /** Remove an installed library (ADR-0076 §4) */
+        /** Remove an installed library */
         delete: operations["remove_library"];
         options?: never;
         head?: never;
@@ -1048,7 +1047,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Yank a library version (ADR-0076 §6) */
+        /** Yank a library version */
         post: operations["yank_library"];
         delete?: never;
         options?: never;
@@ -1066,7 +1065,7 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** Lift a library yank (ADR-0076 §6) */
+        /** Lift a library yank */
         delete: operations["unyank_library"];
         options?: never;
         head?: never;
@@ -1080,7 +1079,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** The Runs in progress that use a library version (ADR-0076 §6) */
+        /** The Runs in progress that use a library version */
         get: operations["get_yank_impact"];
         put?: never;
         post?: never;
@@ -1097,7 +1096,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** One member of an org and their roles (ADR-0080) */
+        /** One member of an org and their roles */
         get: operations["get_member"];
         put?: never;
         post?: never;
@@ -1116,7 +1115,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Reset a member's passkeys (ADR-0073 §10; Owner, always-ask step-up) */
+        /** Reset a member's passkeys (Owner, always-ask step-up) */
         post: operations["reset_member_passkeys"];
         delete?: never;
         options?: never;
@@ -1133,7 +1132,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Fetch a plugin manifest to review before installing (ADR-0072) */
+        /** Fetch a plugin manifest to review before installing */
         post: operations["fetch_plugin_manifest"];
         delete?: never;
         options?: never;
@@ -1148,7 +1147,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** One plugin installation, by id (ADR-0072) */
+        /** One plugin installation, by id */
         get: operations["get_plugin_by_id"];
         put?: never;
         post?: never;
@@ -1165,11 +1164,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List an org's plugin installations (ADR-0072) */
+        /** List an org's plugin installations */
         get: operations["list_plugins"];
         put?: never;
         /**
-         * Install a plugin from a reviewed manifest (ADR-0072)
+         * Install a plugin from a reviewed manifest
          * @description Refused while `SCARAB_PLUGINS=off` (409), and when the source no longer
          *     reads as the reviewed manifest (409).
          */
@@ -1187,11 +1186,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** One plugin installation (ADR-0072) */
+        /** One plugin installation */
         get: operations["get_plugin"];
         put?: never;
         post?: never;
-        /** Uninstall a plugin; its name is retired (ADR-0072) */
+        /** Uninstall a plugin; its name is retired */
         delete: operations["uninstall_plugin"];
         options?: never;
         head?: never;
@@ -1205,7 +1204,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** A plugin's broker journal, newest first (ADR-0072 §5) */
+        /** A plugin's broker journal, newest first */
         get: operations["plugin_broker_journal"];
         put?: never;
         post?: never;
@@ -1222,7 +1221,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** A plugin's connection slots and their bindings (ADR-0072 §5) */
+        /** A plugin's connection slots and their bindings */
         get: operations["list_plugin_connections"];
         put?: never;
         post?: never;
@@ -1241,7 +1240,7 @@ export interface paths {
         };
         get?: never;
         /**
-         * Bind a plugin connection's destination and credential (ADR-0072 §5)
+         * Bind a plugin connection's destination and credential
          * @description The credential is written through to the secret store under a fresh
          *     server-minted key and is never readable back; the previous binding's
          *     credential is deleted once the new binding is stored. A response stream
@@ -1249,7 +1248,7 @@ export interface paths {
          */
         put: operations["put_plugin_connection"];
         post?: never;
-        /** Unbind a plugin connection and delete its credential (ADR-0072 §5) */
+        /** Unbind a plugin connection and delete its credential */
         delete: operations["delete_plugin_connection"];
         options?: never;
         head?: never;
@@ -1265,7 +1264,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Re-enable a killed plugin installation (ADR-0072) */
+        /** Re-enable a killed plugin installation */
         post: operations["enable_plugin"];
         delete?: never;
         options?: never;
@@ -1282,7 +1281,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Kill a plugin installation at once (ADR-0072) */
+        /** Kill a plugin installation at once */
         post: operations["kill_plugin"];
         delete?: never;
         options?: never;
@@ -1299,14 +1298,14 @@ export interface paths {
         };
         get?: never;
         /**
-         * Set a plugin installation's storage claim (ADR-0074)
+         * Set a plugin installation's storage claim
          * @description Adding storage to an installation that has none needs no step-up; moving
-         *     it to another claim or path does (ADR-0073 §3, window), since that
+         *     it to another claim or path does (window), since that
          *     re-aims what the plugin reads and writes.
          */
         put: operations["put_plugin_storage"];
         post?: never;
-        /** Stop mounting a plugin installation's storage claim (ADR-0074) */
+        /** Stop mounting a plugin installation's storage claim */
         delete: operations["delete_plugin_storage"];
         options?: never;
         head?: never;
@@ -1323,9 +1322,9 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Upgrade a plugin installation to a reviewed manifest and image (ADR-0072 §10)
+         * Upgrade a plugin installation to a reviewed manifest and image
          * @description A new image digest is new code and is confirmed like an install, whatever
-         *     the manifest (ADR-0072 §8, §10); so is a manifest that asks for more.
+         *     the manifest; so is a manifest that asks for more.
          *     Only a same-or-narrower manifest on the installed image needs no step-up.
          *     The server decides from the installed installation and the manifest it
          *     reads here. Refused while `SCARAB_PLUGINS=off` (409), as an install is.
@@ -1348,7 +1347,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Fetch a plugin manifest to review an upgrade against the installed one (ADR-0072 §10) */
+        /** Fetch a plugin manifest to review an upgrade against the installed one */
         post: operations["fetch_plugin_upgrade"];
         delete?: never;
         options?: never;
@@ -1363,10 +1362,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List the org's Policies (ADR-0075 §7) */
+        /** List the org's Policies */
         get: operations["list_org_policies"];
         put?: never;
-        /** Add an org Policy (ADR-0075 §4, §10) */
+        /** Add an org Policy */
         post: operations["create_org_policy"];
         delete?: never;
         options?: never;
@@ -1383,7 +1382,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Check a draft org Policy without saving it (ADR-0075 §6) */
+        /** Check a draft org Policy without saving it */
         post: operations["check_org_policy"];
         delete?: never;
         options?: never;
@@ -1398,12 +1397,12 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Read an org Policy (ADR-0075 §11) */
+        /** Read an org Policy */
         get: operations["get_org_policy"];
-        /** Replace an org Policy (ADR-0075 §10, §11) */
+        /** Replace an org Policy */
         put: operations["update_org_policy"];
         post?: never;
-        /** Delete an org Policy (ADR-0075 §10) */
+        /** Delete an org Policy */
         delete: operations["delete_org_policy"];
         options?: never;
         head?: never;
@@ -1417,7 +1416,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** An org Policy's version history (ADR-0075 §11) */
+        /** An org Policy's version history */
         get: operations["list_org_policy_versions"];
         put?: never;
         post?: never;
@@ -1434,7 +1433,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** The org's PolicyDecision log (ADR-0075 §9) */
+        /** The org's PolicyDecision log */
         get: operations["list_org_policy_decisions"];
         put?: never;
         post?: never;
@@ -1451,7 +1450,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Each Policy's decision counts since a time (ADR-0075 §9) */
+        /** Each Policy's decision counts since a time */
         get: operations["org_policy_decision_counts"];
         put?: never;
         post?: never;
@@ -1471,7 +1470,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Evaluate Policies without enforcing or recording (ADR-0075 §9)
+         * Evaluate Policies without enforcing or recording
          * @description Policies: `policy` (a draft, compiled at the org level; a 400 when it
          *     does not compile), `policy_id` (a stored Policy of this org), or neither
          *     (the org's and the input's Project's effective Policies, as the
@@ -1512,7 +1511,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Replay a draft Policy over recorded decisions (ADR-0075 §9) */
+        /** Replay a draft Policy over recorded decisions */
         post: operations["policy_test_replay"];
         delete?: never;
         options?: never;
@@ -1527,7 +1526,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Search users for a grant or approver entry (ADR-0069) */
+        /** Search users for a grant or approver entry */
         get: operations["search_principals"];
         put?: never;
         post?: never;
@@ -1544,10 +1543,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List a Project's typed settings (ADR-0075 §7) */
+        /** List a Project's typed settings */
         get: operations["list_project_policies"];
         put?: never;
-        /** Add a Project typed setting (ADR-0075 §7, §10) */
+        /** Add a Project typed setting */
         post: operations["create_project_policy"];
         delete?: never;
         options?: never;
@@ -1562,12 +1561,12 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Read a Project typed setting (ADR-0075 §11) */
+        /** Read a Project typed setting */
         get: operations["get_project_policy"];
-        /** Replace a Project typed setting (ADR-0075 §10, §11) */
+        /** Replace a Project typed setting */
         put: operations["update_project_policy"];
         post?: never;
-        /** Delete a Project typed setting (ADR-0075 §10) */
+        /** Delete a Project typed setting */
         delete: operations["delete_project_policy"];
         options?: never;
         head?: never;
@@ -1581,7 +1580,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** A Project typed setting's version history (ADR-0075 §11) */
+        /** A Project typed setting's version history */
         get: operations["list_project_policy_versions"];
         put?: never;
         post?: never;
@@ -1643,7 +1642,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** An Org's security event log (ADR-0073 §7) */
+        /** An Org's security event log */
         get: operations["org_security_events"];
         put?: never;
         post?: never;
@@ -1660,7 +1659,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** An Org's step-up posture: admins without a passkey, recent refusals (ADR-0073 §8) */
+        /** An Org's step-up posture: admins without a passkey, recent refusals */
         get: operations["org_security_summary"];
         put?: never;
         post?: never;
@@ -1677,10 +1676,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List the API tokens issued in an org (ADR-0049) */
+        /** List the API tokens issued in an org */
         get: operations["list_api_tokens"];
         put?: never;
-        /** Mint a personal API token in an org - the plaintext is returned ONCE (ADR-0049) */
+        /** Mint a personal API token in an org - the plaintext is returned ONCE */
         post: operations["mint_api_token"];
         delete?: never;
         options?: never;
@@ -1698,7 +1697,7 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** Revoke an issued API token (ADR-0049) */
+        /** Revoke an issued API token */
         delete: operations["revoke_api_token"];
         options?: never;
         head?: never;
@@ -1712,7 +1711,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Each PolicyCheckpoint's input schema (ADR-0075 §2) */
+        /** Each PolicyCheckpoint's input schema */
         get: operations["list_policy_checkpoints"];
         put?: never;
         post?: never;
@@ -1730,7 +1729,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List the registered projects (ADR-0046 registry — what the dashboard's
+         * List the registered projects (what the dashboard's
          *     repo cards render). Scoped: global roles see all; otherwise only orgs/
          *     projects the caller's bindings grant Read on.
          */
@@ -1753,7 +1752,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Seed (and re-sync) bindings from forge collaborators (ADR-0049, ADR-0069)
+         * Seed (and re-sync) bindings from forge collaborators
          * @description Each collaborator is resolved by the forge's **immutable** user id through
          *     the login provider that IS this forge (`forge_url` = the connection's
          *     `base_url`). Someone nobody has signed in as yet becomes an unclaimed
@@ -1784,7 +1783,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Dispatch a named repo pipeline at a ref (ADR-0043 "World B"). Authorized as a
+         * Dispatch a named repo pipeline at a ref. Authorized as a
          *     write (like [`create_run`]); a dispatch is a *trigger*, so a deploy pipeline
          *     still hits its Environment's protection rules at admission. Returns the new
          *     run id (mirrors [`CreateRunResponse`]); creates **no** run on any error.
@@ -1803,7 +1802,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** The environments this project may deploy into, with baseline/overlay/effective rules (ADR-0071) */
+        /** The environments this project may deploy into, with baseline/overlay/effective rules */
         get: operations["list_environments"];
         put?: never;
         post?: never;
@@ -1820,12 +1819,12 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** One environment as this project sees it: baseline, overlay, effective (ADR-0071) */
+        /** One environment as this project sees it: baseline, overlay, effective */
         get: operations["get_environment"];
-        /** Retired: per-repo environments are org-level Environments now (ADR-0071) */
+        /** Retired: per-repo environments are org-level Environments now */
         put: operations["put_environment"];
         post?: never;
-        /** Retired: per-repo environments are org-level Environments now (ADR-0071) */
+        /** Retired: per-repo environments are org-level Environments now */
         delete: operations["delete_environment"];
         options?: never;
         head?: never;
@@ -1840,7 +1839,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * The manually-dispatchable catalog at a ref (ADR-0043 §4). Resolves `ref` to a
+         * The manually-dispatchable catalog at a ref. Resolves `ref` to a
          *     concrete commit (echoed back), enumerates every `.scarab/*.{yaml,yml}` at it
          *     (direct children only — `.scarab/lib/**` is excluded, mirroring webhook
          *     discovery, and so is a file marked `kind: library`), and reports each
@@ -1868,7 +1867,7 @@ export interface paths {
         };
         /**
          * The compiled, typed launch-parameter schema for one selected pipeline
-         *     (ADR-0043 §4) — the on-selection describe. Resolves `ref` to a concrete
+         *     — the on-selection describe. Resolves `ref` to a concrete
          *     commit (echoed back), reads the named pipeline there, and **fully compiles**
          *     it (reusing the shared [`prefetch_libs_and_compile`] — this is where the
          *     lib-prefetch cost is justified), returning `interface.inputs` as typed
@@ -1895,7 +1894,7 @@ export interface paths {
         };
         /**
          * `GET /v1/repos/{org}/{repo}/refs?q=` — the repo's branches and tags for a
-         *     searchable ref picker (ADR-0046), backed by the repo's `ForgeConnection`.
+         *     searchable ref picker, backed by the repo's `ForgeConnection`.
          *     `q`, when set, is a case-insensitive substring the ref name must contain
          *     (applied by the adapter, since neither forge's list API takes a search
          *     param). Branches sort before tags, each group name-ascending, so the picker
@@ -1918,7 +1917,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Triggers that did not become a Run (ADR-0076) */
+        /** Triggers that did not become a Run */
         get: operations["list_refused_runs"];
         put?: never;
         post?: never;
@@ -1936,7 +1935,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * A repo's most recent runs, newest first (ADR-0046) — the dashboard's per-repo
+         * A repo's most recent runs, newest first — the dashboard's per-repo
          *     history and pass/fail chart source. Scoped to the repo's tenant.
          */
         get: operations["list_repo_runs"];
@@ -1973,7 +1972,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * The secret coverage matrix (ADR-0037) - names + status, never values
+         * The secret coverage matrix - names + status, never values
          * @description Names + status only, never values — the same `Administer` capability as
          *     listing secrets. This is the read model behind the Project Secrets editor,
          *     which writes through the scoped `/v1/secrets` endpoints.
@@ -1995,10 +1994,10 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        /** Mark a coverage cell intentionally unset (ADR-0037, advisory) */
+        /** Mark a coverage cell intentionally unset (advisory) */
         put: operations["silence_secret_cell"];
         post?: never;
-        /** Drop an intentionally-unset marker (ADR-0037, advisory) */
+        /** Drop an intentionally-unset marker (advisory) */
         delete: operations["unsilence_secret_cell"];
         options?: never;
         head?: never;
@@ -2012,7 +2011,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** The most recent runs, newest first — the runs-list view (ADR-0013, 0028). */
+        /** The most recent runs, newest first — the runs-list view. */
         get: operations["list_runs"];
         put?: never;
         /** Create and durably persist a new run from an inline pipeline. */
@@ -2047,7 +2046,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List a run's artifact versions (ADR-0052/0056). Read at the run's tenant. */
+        /** List a run's artifact versions. Read at the run's tenant. */
         get: operations["list_artifacts"];
         put?: never;
         post?: never;
@@ -2065,10 +2064,10 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Download one artifact's bytes (ADR-0052). Streams through the server (a
+         * Download one artifact's bytes. Streams through the server (a
          *     presigned-URL fast path can replace this when the store backend supports
          *     signing). Read at the run's tenant; immutable content. The bare name
-         *     resolves to the latest SUCCESSFUL version (ADR-0056); `?step=&attempt=`
+         *     resolves to the latest SUCCESSFUL version; `?step=&attempt=`
          *     pins an exact version.
          */
         get: operations["download_artifact"];
@@ -2090,7 +2089,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Cancel a run (ADR-0054): drive its non-terminal steps and the run to
+         * Cancel a run: drive its non-terminal steps and the run to
          *     `Cancelled` durably and enqueue the Pod-teardown intent the driver
          *     executes (SIGTERM + grace via the backend). Idempotent — cancelling a
          *     terminal run is a 409; an unknown run is a 404.
@@ -2111,7 +2110,7 @@ export interface paths {
         };
         /**
          * Server-Sent-Events tail of the run's append-only event log — the status
-         *     timeline (ADR-0013): RunCreated, transitions, attempt start/finish.
+         *     timeline: RunCreated, transitions, attempt start/finish.
          */
         get: operations["get_events"];
         put?: never;
@@ -2132,13 +2131,13 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's
+         * Approve a `manual` gate. The authenticated principal's
          *     approval is recorded on the event log (append-only, idempotent).
-         * @description An **Environment approval gate** (ADR-0078 §1: a Step after it uses the
+         * @description An **Environment approval gate** (a Step after it uses the
          *     Run's Environment's authority) releases only once the accumulated
          *     approvals satisfy the Environment's effective rules for the run's Project
-         *     (ADR-0071 §3, `admits`) and its wait timer has run out on the gate's wait
-         *     clock (§4). Approvals that complete the rules early are kept: the gate is
+         *     (`admits`) and its wait timer has run out on the gate's wait
+         *     clock. Approvals that complete the rules early are kept: the gate is
          *     released by the scheduler when the timer runs out. On release the
          *     deployment is written to the legacy history. Every other `manual` gate is
          *     a plain gate: it releases on the first approval, with no step-up. If the
@@ -2162,7 +2161,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Reject a waiting gate: fail it with a reason (ADR-0070 §9).
+         * Reject a waiting gate: fail it with a reason.
          * @description For any gate — `manual`, `timer` or `external` — that is pending and
          *     reached (every step it needs has succeeded; slice b, criteria 2 and 3).
          *     The gate's Attempt fails with
@@ -2191,14 +2190,14 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Release an **external** gate by presenting its token (ADR-0034) — the path an
+         * Release an **external** gate by presenting its token — the path an
          *     outside system (a deploy webhook, a change-management tool) uses instead of an
          *     interactive approval. The token is `HMAC-SHA256(secret, "{run}:{step}")`
          *     (`sha256=<hex>`), verified in constant time; no per-gate storage. The endpoint
          *     is 404 when no token secret is configured, and only releases gates of kind
          *     `external` (manual gates stay approval-only). In a Deploy Run, the gate is
          *     held (409) when the run's Environment no longer exists or no longer admits
-         *     its Project (ADR-0071 §2) — the same check `approve_gate` makes. The token
+         *     its Project — the same check `approve_gate` makes. The token
          *     proves who is releasing, not that the deploy is still allowed.
          * @description The same token can instead **fail** the gate with a reason: a body of
          *     `{"passed": false, "reason": "…"}` rejects it (journalled `by
@@ -2220,7 +2219,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Server-Sent-Events of step **log bodies** (ADR-0013): replays every
+         * Server-Sent-Events of step **log bodies**: replays every
          *     committed chunk of every step and attempt (decompressed from the object
          *     store, indexed by Postgres offsets) in batches of up to 256 KiB, then — while
          *     the run is still going — polls the durable index for new chunks. A terminal
@@ -2243,7 +2242,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** A Run's PolicyDecisions (ADR-0075 §9) */
+        /** A Run's PolicyDecisions */
         get: operations["list_run_policy_decisions"];
         put?: never;
         post?: never;
@@ -2261,7 +2260,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * The shared services of a run's **current Take** (ADR-0058), name-ordered —
+         * The shared services of a run's **current Take**, name-ordered —
          *     each with its lifecycle status, for the run detail's Services panel beside the
          *     DAG. A shared service is not a DAG node, so it is never folded into the step
          *     list. Read at the run's tenant. Empty when the pipeline declares no shared
@@ -2284,9 +2283,9 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * SSE of ONE shared service's log output (ADR-0058 evidence), the source for the
+         * SSE of ONE shared service's log output, the source for the
          *     run detail's Services panel "logs" view. Best-effort, the SAME reliability
-         *     class and pipeline as step logs (ADR-0013): replays committed chunks then
+         *     class and pipeline as step logs: replays committed chunks then
          *     live-tails while the run is still going. `?take=` reads an older Take's
          *     instance in isolation; absent = the current Take. Read at the run's tenant.
          */
@@ -2331,7 +2330,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * **Pin** this run's Workspace Snapshots (ADR-0061 s5): keep them past the cold
+         * **Pin** this run's Workspace Snapshots: keep them past the cold
          *     tier's retention TTL, so an investigation is not raced by the GC sweeper.
          * @description The pin acts on the cold tier's **time** bound only. It says nothing about the
          *     warm workspace service, which is bounded by space and evicts least-recently-
@@ -2381,7 +2380,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * An attempt's consumption map (ADR-0056). Bare = the attempt behind the
+         * An attempt's consumption map. Bare = the attempt behind the
          *     step's current evidence; `?attempt=` = that attempt. Read at the run's
          *     tenant. Fetched lazily by the step pane's Outputs tab — deliberately NOT
          *     part of the polled run-status DTO.
@@ -2405,7 +2404,7 @@ export interface paths {
         /**
          * WebSocket: reproduce a **finished** step in a fresh ephemeral Pod — its
          *     image, its output workspace snapshot re-materialized at `/workspace` —
-         *     running `sleep` so the operator can shell in and debug (ADR-0039 world). The
+         *     running `sleep` so the operator can shell in and debug. The
          *     live-attach surface needs a still-running step; this one works after the fact.
          *     Gated behind `Administer`; the debug Pod is TTL-bounded and torn down when
          *     the socket closes. Disabled (404) unless a debug launcher is wired (k8s only).
@@ -2427,7 +2426,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * SSE of ONE step's log bodies (ADR-0013), the source for the run detail's
+         * SSE of ONE step's log bodies, the source for the run detail's
          *     per-step fold. Same machinery as the run-wide `/logs`, scoped to the step —
          *     and, with `?attempt=`, to a single attempt so a rerun's earlier (failed)
          *     output can be read in isolation. Replays committed chunks in batches of up
@@ -2474,7 +2473,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Where a Step comes from (ADR-0076) */
+        /** Where a Step comes from */
         get: operations["get_step_origin"];
         put?: never;
         post?: never;
@@ -2494,8 +2493,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Rerun a step and its transitive descendants (ADR-0027 smart invalidation) —
-         *     **forks a new Take** (ADR-0056). The target and every step depending on it are
+         * Rerun a step and its transitive descendants (smart invalidation) —
+         *     **forks a new Take**. The target and every step depending on it are
          *     re-armed and re-run in dependency order; siblings and ancestors are left
          *     as-is. Rejected `409` if the target's dependencies have not all succeeded (it
          *     could not run).
@@ -2516,7 +2515,7 @@ export interface paths {
         };
         /**
          * Preview a rerun/retry of a step: the resolved scope, and whether expired
-         *     Workspace Snapshots widened it (ADR-0061 s5).
+         *     Workspace Snapshots widened it.
          */
         get: operations["rerun_plan"];
         put?: never;
@@ -2535,23 +2534,23 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * A step's named results (ADR-0041). The read side of the results-ingest
+         * A step's named results. The read side of the results-ingest
          *     write path (`POST …/steps/{step}/results`): the Inspector's Results tab,
          *     and the source the Outputs view derives from. Bare = latest evidence;
-         *     `?attempt=` = that attempt's immutable copy (ADR-0056). Read at the run's
+         *     `?attempt=` = that attempt's immutable copy. Read at the run's
          *     tenant.
          */
         get: operations["get_step_results"];
         put?: never;
         /**
-         * Ingest a step's named results (ADR-0040/0042): the trusted per-Pod egress
+         * Ingest a step's named results: the trusted per-Pod egress
          *     sidecar POSTs `{ name: value, … }` here, authenticated by a fence-scoped
          *     token, and the control plane persists them to `step_runs.results`. The
          *     untrusted step never calls this — only the sidecar holds the token.
          * @description 404 when no token secret is configured; 401 on a bad/missing token; 404 for
          *     an unknown step; 413 for an over-large body; 409 when the attempt is no
          *     longer the step's running frontier. The write is idempotent on the fence
-         *     (a re-drive overwrites deterministically, ADR-0021).
+         *     (a re-drive overwrites deterministically).
          */
         post: operations["ingest_step_results"];
         delete?: never;
@@ -2570,7 +2569,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Retry a **Failed** step (ADR-0056 amendment) — another Attempt **in the
+         * Retry a **Failed** step — another Attempt **in the
          *     current Take** (no fork). Re-arms the target and its dependent cascade;
          *     rejected `409` if the step is not Failed (use rerun instead).
          */
@@ -2589,7 +2588,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List a directory inside a step's output workspace snapshot (ADR-0029). The
+         * List a directory inside a step's output workspace snapshot. The
          *     live Pod workspace is gone once the step ends (`restartPolicy: Never`); what
          *     survives is the content-addressed snapshot, walked read-only here. Read at
          *     the run's tenant.
@@ -2611,7 +2610,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Stream one file's bytes from a step's output workspace snapshot (ADR-0029).
+         * Stream one file's bytes from a step's output workspace snapshot.
          *     Read at the run's tenant; immutable content.
          */
         get: operations["get_workspace_file"];
@@ -2630,16 +2629,16 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List the secret **names** at a scope (ADR-0014) — never the values. */
+        /** List the secret **names** at a scope — never the values. */
         get: operations["list_secrets"];
         put?: never;
         /**
-         * Define (or overwrite) a secret at a scope (ADR-0014). The value is stored
+         * Define (or overwrite) a secret at a scope. The value is stored
          *     envelope-encrypted and is **never** returned by any endpoint. Administering
          *     secrets requires the Administer capability.
          */
         post: operations["put_secret"];
-        /** Delete a secret at a scope (ADR-0014). Idempotent. */
+        /** Delete a secret at a scope. Idempotent. */
         delete: operations["delete_secret"];
         options?: never;
         head?: never;
@@ -2653,7 +2652,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** The install-wide security event log (ADR-0073 §7) */
+        /** The install-wide security event log */
         get: operations["security_events"];
         put?: never;
         post?: never;
@@ -2670,7 +2669,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** A step-up confirmation request (ADR-0073 §6) */
+        /** A step-up confirmation request */
         get: operations["get_request"];
         put?: never;
         post?: never;
@@ -2689,7 +2688,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Confirm a step-up confirmation request: it runs once (ADR-0073 §6) */
+        /** Confirm a step-up confirmation request: it runs once */
         post: operations["confirm_request"];
         delete?: never;
         options?: never;
@@ -2706,7 +2705,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Begin confirming a step-up confirmation request (ADR-0073 §6) */
+        /** Begin confirming a step-up confirmation request */
         post: operations["request_options"];
         delete?: never;
         options?: never;
@@ -2723,7 +2722,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Forgejo webhook ingest (HMAC-verified, ADR-0046) */
+        /** Forgejo webhook ingest (HMAC-verified) */
         post: operations["forgejo_webhook"];
         delete?: never;
         options?: never;
@@ -2740,7 +2739,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** GitHub webhook ingest (HMAC-verified, ADR-0046) */
+        /** GitHub webhook ingest (HMAC-verified) */
         post: operations["github_webhook"];
         delete?: never;
         options?: never;
@@ -2810,7 +2809,7 @@ export interface components {
             owner: components["schemas"]["PersonDto"];
             /**
              * @description The id of the Principal who holds the token and whose live authority
-             *     bounds it (ADR-0080).
+             *     bounds it.
              */
             owner_subject: string;
             /** @description `None` for an org-scoped token. */
@@ -2834,8 +2833,7 @@ export interface components {
             use_count: number;
         };
         /**
-         * @description An Environment's settings for its Environment approval gate (ADR-0078
-         *     §3): the `manual` gate that has a Step using the Environment's
+         * @description An Environment's settings for its Environment approval gate: the `manual` gate that has a Step using the Environment's
          *     authority after it.
          */
         ApprovalGateRulesDto: {
@@ -2862,9 +2860,9 @@ export interface components {
             required_approvals?: number | null;
         };
         /**
-         * @description One artifact **version** in a run's list (ADR-0052, immutable per attempt
-         *     by ADR-0056). `step`/`attempt` are the publishing provenance (empty
-         *     strings on pre-ADR-0056 rows); `succeeded` is that attempt's verdict;
+         * @description One artifact **version** in a run's list (immutable per attempt).
+         *     `step`/`attempt` are the publishing provenance (empty strings on rows
+         *     written before attempts were recorded); `succeeded` is that attempt's verdict;
          *     `of_record` marks the version the bare name-addressed download resolves
          *     to — the latest successful version of that name.
          */
@@ -2887,7 +2885,7 @@ export interface components {
             org: string;
         };
         /**
-         * @description One attempt at executing a step (ADR-0047) — the rerun unit. A step with more
+         * @description One attempt at executing a step — the rerun unit. A step with more
          *     than one attempt is one that failed-and-retried (or was restarted); the last
          *     attempt carries the current outcome.
          */
@@ -2924,7 +2922,7 @@ export interface components {
             finished_at: number | null;
             id: string;
             /**
-             * @description The attempt's recorded outcome (ADR-0056 amendment): `running` |
+             * @description The attempt's recorded outcome: `running` |
              *     `succeeded` | `failed` | `superseded` | `cancelled`. Unlike `failed` this
              *     distinguishes a *superseded* attempt (a rerun/retry replaced its input
              *     while it was still running and its Pod was torn down) from a genuine
@@ -2937,7 +2935,7 @@ export interface components {
              */
             started_at: number;
         };
-        /** @description One login provider, as the login page offers it (ADR-0069). */
+        /** @description One login provider, as the login page offers it. */
         AuthProviderDto: {
             /** @description The one used when a login names none. */
             default: boolean;
@@ -2996,14 +2994,11 @@ export interface components {
              *     know the subject.
              */
             claimed?: boolean | null;
-            /**
-             * @description The Principal's display name, when the identity store knows it
-             *     (ADR-0069).
-             */
+            /** @description The Principal's display name, when the identity store knows it. */
             display_name?: string | null;
             /** @description The Principal's handle (`github:alice`): what people read and type. */
             handle: string;
-            /** @description The Principal's id (ADR-0080): what a member's URL carries. */
+            /** @description The Principal's id: what a member's URL carries. */
             id: string;
             /**
              * @description Who wrote the binding: `native` (granted in Scarab, which a forge
@@ -3131,7 +3126,7 @@ export interface components {
             api: boolean;
             /**
              * @description Set when this single file failed to parse — the rest of the catalog still
-             *     lists (a broken sibling does not fail the whole listing, ADR-0043 §4).
+             *     lists (a broken sibling does not fail the whole listing).
              */
             error?: string | null;
             /** @description This pipeline declares `on: manual` — it appears in the human catalog. */
@@ -3143,7 +3138,7 @@ export interface components {
             name: string;
         };
         /**
-         * @description One compile error with the fields a reader acts on (ADR-0076): the Step,
+         * @description One compile error with the fields a reader acts on: the Step,
          *     the command index and the template it reads, and for a library Step the
          *     library and the caller's binding. `message` is the compiler's text.
          */
@@ -3191,7 +3186,7 @@ export interface components {
             credential: Record<string, never>;
         };
         /**
-         * @description One registered forge connection, as global Settings renders it (ADR-0060).
+         * @description One registered forge connection, as global Settings renders it.
          *
          *     Carries the credential's **handle and whether it resolves** — never the
          *     material. A connection is the unit an operator reasons about ("is my GitHub
@@ -3229,7 +3224,7 @@ export interface components {
             /**
              * Format: int64
              * @description How many repositories are enabled through this connection: its repo
-             *     bindings, each a Project (ADR-0046). A count, not the list: a
+             *     bindings, each a Project. A count, not the list: a
              *     connection can hold thousands. The org's repositories page
              *     (`GET /v1/orgs/{org}/repos?connection=`) lists them.
              */
@@ -3246,14 +3241,14 @@ export interface components {
             /**
              * Format: int64
              * @description Unix-ms of the most recent accepted webhook delivery from this **forge
-             *     kind**, if any. Deliveries are recorded per kind (the ADR-0046 replay
+             *     kind**, if any. Deliveries are recorded per kind (the replay
              *     guard is keyed that way), so with two connections of one kind this is a
              *     per-kind liveness signal, not a per-connection one.
              */
             last_delivery_at?: number | null;
             /**
              * @description Is this connection managed declaratively (config-owned) and therefore
-             *     read-only here (ADR-0060 part D)? A connection has exactly one owner —
+             *     read-only here? A connection has exactly one owner —
              *     the `connections:` config or the database — and this says which, so the
              *     UI never offers an edit the next boot would silently revert.
              */
@@ -3287,7 +3282,7 @@ export interface components {
         };
         /**
          * @description The result of checking a connection's app configuration against what Scarab
-         *     needs (ADR-0060 preflight) — the deeper cut of the same question
+         *     needs (the preflight) — the deeper cut of the same question
          *     `credential_present` answers on the list.
          *
          *     Carries **no credential material**: granted permissions are names and levels,
@@ -3336,12 +3331,12 @@ export interface components {
             read_rules: components["schemas"]["RequestRuleDto"][];
         };
         /**
-         * @description What an attempt consumed (ADR-0056): the map `upstream step id → attempt
+         * @description What an attempt consumed: the map `upstream step id → attempt
          *     id` stamped at its launch — the durable answer to "which generation of
          *     `build` did `test` actually build on?" after a mid-run restart leaves the
          *     run a patchwork of attempt generations. `attempt` names the attempt the
          *     map belongs to; empty map = nothing recorded (no upstream evidence, or a
-         *     pre-ADR-0056 attempt).
+         *     attempt from before consumption was recorded).
          */
         ConsumedDto: {
             attempt: string;
@@ -3350,7 +3345,7 @@ export interface components {
             };
         };
         /**
-         * @description `POST /v1/connections` body (ADR-0060 part D, manual path): the forge to
+         * @description `POST /v1/connections` body (the manual path): the forge to
          *     connect and the credential to reach it with.
          *
          *     `credential` is **write-only** — it is written through to `SecretProvider`
@@ -3368,7 +3363,7 @@ export interface components {
             credential: string;
             /**
              * @description `forgejo`. GitHub is not creatable here — installing the App *is* its
-             *     registration (ADR-0060 part C), so a create form for it could not work.
+             *     registration, so a create form for it could not work.
              */
             kind: string;
             /**
@@ -3381,8 +3376,8 @@ export interface components {
         /** @description `POST …/policies`. */
         CreatePolicyRequest: {
             /**
-             * @description The authored Policy (ADR-0075 §4). At the Project level it must be a
-             *     typed `setting` (§7).
+             * @description The authored Policy. At the Project level it must be a
+             *     typed `setting`.
              */
             policy: Record<string, never>;
             /** @description Why, recorded on the PolicyVersion. At most 2,000 bytes. */
@@ -3390,18 +3385,18 @@ export interface components {
         };
         /**
          * @description `POST /v1/runs` body: an inline pipeline to run immediately, plus any launch
-         *     parameters (ADR-0043) declared by the pipeline's `interface`.
+         *     parameters declared by the pipeline's `interface`.
          */
         CreateRunRequest: {
             /**
-             * @description Supplied launch parameters, `name → value` (ADR-0043). Resolved against
+             * @description Supplied launch parameters, `name → value`. Resolved against
              *     `pipeline.interface.inputs` at creation: coerced to the declared types,
              *     defaults applied, validated fail-closed. Absent = none supplied.
              */
             params?: Record<string, never>;
             pipeline: components["schemas"]["PipelineDto"];
             /**
-             * @description Optional caller-supplied **reason** for this inline run (ADR-0057 §3),
+             * @description Optional caller-supplied **reason** for this inline run,
              *     stamped as the run **Headline** (`trigger_title`) for this `api`-style
              *     dispatch. Accepted and stamped verbatim, no requiredness check. Absent =
              *     no headline.
@@ -3426,15 +3421,15 @@ export interface components {
         };
         /**
          * @description Which trigger a dispatch opts into: a human [`Manual`](DispatchKind::Manual)
-         *     dispatch (the default) or its programmatic [`Api`](DispatchKind::Api) sibling
-         *     (ADR-0043 §4). The named pipeline must declare the matching `on:` trigger to
+         *     dispatch (the default) or its programmatic [`Api`](DispatchKind::Api) sibling.
+         *     The named pipeline must declare the matching `on:` trigger to
          *     be dispatchable.
          * @enum {string}
          */
         DispatchKind: "manual" | "api";
         /**
          * @description `POST /v1/repos/{org}/{repo}/dispatch` body: dispatch a **named** pipeline at
-         *     a `ref`, supplying its declared launch parameters (ADR-0043 "World B"). Unlike
+         *     a `ref`, supplying its declared launch parameters. Unlike
          *     the inline `POST /v1/runs` escape hatch, this rides the read-at-ref → compile
          *     → admission machinery — a dispatched deploy hits Environment governance.
          */
@@ -3445,7 +3440,7 @@ export interface components {
              */
             kind?: components["schemas"]["DispatchKind"];
             /**
-             * @description Supplied launch parameters, `name → value` (ADR-0043). Resolved against
+             * @description Supplied launch parameters, `name → value`. Resolved against
              *     the pipeline's `interface.inputs` at the resolved commit: coerced,
              *     defaulted, validated fail-closed. Absent = none supplied.
              */
@@ -3456,7 +3451,7 @@ export interface components {
              */
             pipeline: string;
             /**
-             * @description Optional operator-supplied **reason** for this dispatch (ADR-0057 §3),
+             * @description Optional operator-supplied **reason** for this dispatch,
              *     stamped as the run **Headline** (`trigger_title`). The endpoint accepts and
              *     stamps it verbatim — it performs **no** requiredness check; requiredness is
              *     an Environment `ProtectionRule` enforced at admission (thread D). Absent =
@@ -3546,7 +3541,7 @@ export interface components {
         };
         /**
          * @description The rules admission enforces for one Project in one Environment: the
-         *     baseline merged with the Project's overlay (ADR-0071 §3), computed by the
+         *     baseline merged with the Project's overlay, computed by the
          *     server so no client re-implements the merge.
          */
         EffectiveProtectionDto: {
@@ -3588,7 +3583,7 @@ export interface components {
             secrets: components["schemas"]["EnvironmentProjectSecretKeysDto"][];
         };
         /**
-         * @description Which Projects may run Deploy Runs into an Environment (ADR-0071 §2):
+         * @description Which Projects may run Deploy Runs into an Environment:
          *     every Project in the org, or exactly those matching one of `projects`
          *     (project-name globs, `*` wildcards).
          */
@@ -3619,7 +3614,7 @@ export interface components {
             /** Format: int32 */
             wait_timer_s: number;
         };
-        /** @description The privileges one Project holds within one Environment (ADR-0071 §8). */
+        /** @description The privileges one Project holds within one Environment. */
         EnvironmentProjectPrivilegeGrantDto: {
             permit_k8s_overlay: boolean;
             privileged_images: components["schemas"]["ImageGrantDto"][];
@@ -3631,30 +3626,30 @@ export interface components {
         };
         /**
          * @description Protection rules as one layer holds them — an Environment's baseline or a
-         *     Project's overlay (ADR-0071 §1, §3).
+         *     Project's overlay.
          */
         EnvironmentProtectionRulesDto: {
             /** @description Ref globs a deploy's symbolic ref must match; empty = any ref. */
             allowed_refs: string[];
             approval_gate?: null | components["schemas"]["ApprovalGateRulesDto"];
             /**
-             * @description Principal handles (stored as ids, ADR-0080). Every one must approve
+             * @description Principal handles (stored as ids). Every one must approve
              *     (AND), unless the baseline's `approval_gate.required_approvals` says
              *     how many of its own must.
              */
             approvers: string[];
-            /** @description A human dispatch must carry a reason (ADR-0057 §3). */
+            /** @description A human dispatch must carry a reason. */
             require_reason: boolean;
             /**
              * Format: int32
              * @description Seconds: a minimum wait on the Environment approval gate, counted on
-             *     the gate's wait clock (ADR-0078 §4). It does nothing where the
+             *     the gate's wait clock. It does nothing where the
              *     effective approvers are empty; a client shows that from `approvers`
              *     (here, or `effective.approvers` for a Project).
              */
             wait_timer_s: number;
         };
-        /** @description One expired Workspace Snapshot behind a widened rerun (ADR-0061 s5). */
+        /** @description One expired Workspace Snapshot behind a widened rerun. */
         ExpiredInputDto: {
             /** @description The step whose input workspace is incomplete. */
             consumer: string;
@@ -3937,7 +3932,7 @@ export interface components {
             /** @description How many of its passkeys the merge deleted. */
             removed_passkeys: number;
         };
-        /** @description One entry of a privilege whitelist (ADR-0039). */
+        /** @description One entry of a privilege whitelist. */
         ImageGrantDto: {
             /** @description The Linux capabilities it may add. */
             capabilities?: string[];
@@ -4053,7 +4048,7 @@ export interface components {
             /** @description The Principal's handle: what people read. */
             handle: string;
             session: string;
-            /** @description The Principal's id (ADR-0080). */
+            /** @description The Principal's id. */
             subject: string;
         };
         /** @description The installed manifest against the new one, group by group. */
@@ -4086,11 +4081,11 @@ export interface components {
             /** @description In both. */
             unchanged: string[];
         };
-        /** @description The authenticated principal (ADR-0049) — powers the UI's identity menu. */
+        /** @description The authenticated principal — powers the UI's identity menu. */
         MeResponse: {
             /**
              * @description The orgs this principal may administer, for the Settings area to act on.
-             *     One entry in practice (single implicit Org, ADR-0060) — a list because
+             *     One entry in practice (single implicit Org) — a list because
              *     `Org` remains the model's real inheritance root, not a collapsed
              *     constant. Empty on a fresh install: an org only exists once a Project is
              *     bound to it, so `can_administer` can be true with nothing to administer
@@ -4098,15 +4093,15 @@ export interface components {
              */
             admin_orgs: string[];
             /**
-             * @description May this principal administer org-level settings (ADR-0060)? The gate on
+             * @description May this principal administer org-level settings? The gate on
              *     the global Settings area — the UI hides the nav entry when false, since
              *     nothing there is actionable or informative without `Administer`.
              *
              *     True for a globally-`Administer` role, or an `Admin`+ binding on the Org
              *     scope of any org the caller can see. Deliberately *not* implied by a
              *     Project-scoped `Administer`: administering one repo does not grant the
-             *     org's secrets or its forge connections (ADR-0049 — Org inherits down,
-             *     never up).
+             *     org's secrets or its forge connections (Org inherits down, never
+             *     up).
              */
             can_administer: boolean;
             /** @description Human display name, when the identity provides one. */
@@ -4123,13 +4118,13 @@ export interface components {
             /** @description The same id, under the name every person response uses. */
             id: string;
             /**
-             * @description The provider accounts this Principal can sign in with (ADR-0069).
+             * @description The provider accounts this Principal can sign in with.
              *     Empty when no identity store is wired (dev).
              */
             identities: components["schemas"]["PrincipalIdentityDto"][];
             /** @description The principal's Scarab-native roles (e.g. `["Owner"]`). */
             roles: string[];
-            /** @description The Principal's id (ADR-0080): stable, random, never shown as a name. */
+            /** @description The Principal's id: stable, random, never shown as a name. */
             subject: string;
             /**
              * @description The orgs this principal may mint a personal API token in, sorted: every
@@ -4170,7 +4165,7 @@ export interface components {
             passkeys_hidden: boolean;
             /** @description `enforce` or `off`. */
             step_up: string;
-            /** @description The caller's Principal id (ADR-0080). */
+            /** @description The caller's Principal id. */
             subject: string;
             /**
              * Format: int64
@@ -4185,7 +4180,7 @@ export interface components {
         };
         /**
          * @description `GET /v1/orgs/{org}/members/{id}`: one person and the roles they hold in
-         *     the org (ADR-0080 §5). The member page reads this by the Principal's id.
+         *     the org. The member page reads this by the Principal's id.
          */
         MemberDto: {
             /** @description Their bindings in the org, org scope first, then by repository. */
@@ -4262,7 +4257,7 @@ export interface components {
         };
         /**
          * @description What Run creation does when a Step that uses the Environment's authority
-         *     has no `manual` gate upstream (ADR-0078 §3).
+         *     has no `manual` gate upstream.
          * @enum {string}
          */
         MissingGateModeDto: "add" | "refuse";
@@ -4279,7 +4274,7 @@ export interface components {
             /** @description What it is done to ("acme/web/prod/DB_PASSWORD"). */
             target: string;
         };
-        /** @description An org-level Environment in its minimal shape (ADR-0071, MMP step 1). */
+        /** @description An org-level Environment in its minimal shape (MMP step 1). */
         OrgEnvironmentDto: {
             /**
              * Format: int64
@@ -4313,9 +4308,8 @@ export interface components {
         OrgLibrariesDto: {
             installations: components["schemas"]["LibraryInstallationDto"][];
             /**
-             * @description The library sources this org trusts, one entry per source and grant
-             *     (ADR-0076 §9, ADR-0018 amendment of 2026-11-12). No library is
-             *     trusted without one.
+             * @description The library sources this org trusts, one entry per source and grant.
+             *     No library is trusted without one.
              */
             trusted_sources: components["schemas"]["TrustedSourceDto"][];
             yanks: components["schemas"]["LibraryYankDto"][];
@@ -4408,7 +4402,7 @@ export interface components {
             content_hash: string;
             /**
              * @description `file`, `library`, `plugin`, or `environment` for the gate an
-             *     Environment added to the Run (ADR-0078 §2).
+             *     Environment added to the Run.
              */
             kind: string;
             /**
@@ -4459,7 +4453,7 @@ export interface components {
         };
         /** @description What a passkey reset removed. */
         PasskeyResetDto: {
-            /** @description Its handle (ADR-0080). */
+            /** @description Its handle. */
             handle: string;
             /**
              * Format: int64
@@ -4506,7 +4500,7 @@ export interface components {
             /** @description Pass as `after` for the next page; absent on the last. */
             next?: string | null;
         };
-        /** @description A person as an API response names them (ADR-0080 §5). */
+        /** @description A person as an API response names them. */
         PersonDto: {
             display_name?: string | null;
             /** @description What people type and read. */
@@ -4519,7 +4513,7 @@ export interface components {
         };
         /**
          * @description `GET /v1/repos/{org}/{repo}/pipelines?ref=` body: the manually-dispatchable
-         *     catalog at a ref (ADR-0043 §4). Lightweight — each entry is an `on:`-only
+         *     catalog at a ref. Lightweight — each entry is an `on:`-only
          *     read, not a full compile. `sha` is the ref resolved to a concrete commit.
          */
         PipelineCatalogResponse: {
@@ -4538,12 +4532,12 @@ export interface components {
         PipelineDto: {
             /**
              * Format: int32
-             * @description Opt-in run budget in seconds (ADR-0047): the run fails once its
+             * @description Opt-in run budget in seconds: the run fails once its
              *     **active** time (gate-suspended time excluded) exceeds this. No default.
              */
             budget?: number | null;
             /**
-             * @description The pipeline's launch/reuse interface (ADR-0038, 0043) — its declared
+             * @description The pipeline's launch/reuse interface — its declared
              *     typed parameters (`inputs`) and exposed outputs. Carried as the pure
              *     `scarab_pipeline::Interface` (opaque object in the schema; the pure crate
              *     cannot derive `ToSchema`). Absent = no parameters.
@@ -4551,15 +4545,14 @@ export interface components {
             interface?: Record<string, never>;
             /**
              * Format: int32
-             * @description IR schema version (ADR-0022).
+             * @description IR schema version.
              */
             ir_version: number;
             steps: components["schemas"]["StepDto"][];
         };
         /**
          * @description `GET /v1/repos/{org}/{repo}/pipelines/{name}/interface?ref=` body: the
-         *     compiled, typed launch-parameter schema for ONE selected pipeline (ADR-0043
-         *     §4). A pure function of the compiled IR — the same compile path dispatch
+         *     compiled, typed launch-parameter schema for ONE selected pipeline. A pure function of the compiled IR — the same compile path dispatch
          *     rides — so the form and the run validate against byte-identical specs.
          */
         PipelineInterfaceResponse: {
@@ -4592,7 +4585,7 @@ export interface components {
              */
             because_of?: string | null;
             /**
-             * @description A gate (ADR-0008): the rerun pauses for approval here — the plan never
+             * @description A gate: the rerun pauses for approval here — the plan never
              *     claims a gate will run.
              */
             is_gate: boolean;
@@ -4602,13 +4595,13 @@ export interface components {
             step: string;
         };
         /**
-         * @description One entry of the closed PluginCapability vocabulary (ADR-0072 §2).
+         * @description One entry of the closed PluginCapability vocabulary.
          * @enum {string}
          */
         PluginCapabilityDto: "report_deployments" | "subscribe_events" | "offer_actions" | "use_connection" | "contribute_ui" | "approve_gates" | "resolve_gates";
         /**
-         * @description One connection slot of an installation and what an admin bound to it
-         *     (ADR-0072 §5). Never carries the credential, nor its secret key.
+         * @description One connection slot of an installation and what an admin bound to it.
+         *     Never carries the credential, nor its secret key.
          */
         PluginConnectionDto: {
             auth_scheme?: string | null;
@@ -4692,7 +4685,7 @@ export interface components {
              */
             waiting_since?: number | null;
         };
-        /** @description A PluginInstallation (ADR-0072 §10). */
+        /** @description A PluginInstallation. */
         PluginInstallationDto: {
             /**
              * Format: int64
@@ -4744,14 +4737,14 @@ export interface components {
         };
         /**
          * @description What the plugin asks for — exactly what an admin approves with the
-         *     digest (ADR-0072 §1-2).
+         *     digest.
          */
         PluginManifestDto: {
             capabilities: components["schemas"]["PluginCapabilityDto"][];
             config_keys: string[];
             connections: components["schemas"]["ConnectionSlotDto"][];
             /**
-             * @description The gates the plugin resolves (ADR-0076 §7), by name; empty without
+             * @description The gates the plugin resolves, by name; empty without
              *     `resolve_gates`.
              */
             gates: components["schemas"]["GateDefinitionDto"][];
@@ -4764,7 +4757,7 @@ export interface components {
             plugin: string;
         };
         /**
-         * @description An installation's storage (ADR-0074 §7): a PersistentVolumeClaim an
+         * @description An installation's storage: a PersistentVolumeClaim an
          *     operator created in the plugin namespace. Scarab mounts it read-write; it
          *     never creates, backs up or reads it.
          */
@@ -4881,7 +4874,7 @@ export interface components {
             /** @description Pass as `before` for the next page; absent on the last one. */
             next?: string | null;
         };
-        /** @description A recorded PolicyDecision (ADR-0075 §9). */
+        /** @description A recorded PolicyDecision. */
         PolicyDecisionRecordDto: {
             /** Format: int64 */
             at: number;
@@ -4936,7 +4929,7 @@ export interface components {
             name: string;
             org: string;
             /**
-             * @description The authored Policy (ADR-0075 §4): `name`, `checkpoint`, `match`,
+             * @description The authored Policy: `name`, `checkpoint`, `match`,
              *     `mode`, and `rules` or `setting`.
              */
             policy: Record<string, never>;
@@ -5089,7 +5082,7 @@ export interface components {
             actor?: string | null;
             /**
              * @description The forge's immutable id of that account (a webhook's `sender.id`),
-             *     which admission resolves to the linked Principal (ADR-0069); webhook
+             *     which admission resolves to the linked Principal; webhook
              *     kinds only. Default none: the Run has no `principal`.
              */
             actor_id?: string | null;
@@ -5112,7 +5105,7 @@ export interface components {
             ref?: string | null;
             sha?: string | null;
         };
-        /** @description One saved version of a Policy (ADR-0075 §11). */
+        /** @description One saved version of a Policy. */
         PolicyVersionDto: {
             /** Format: int64 */
             at: number;
@@ -5128,7 +5121,7 @@ export interface components {
             /** Format: int64 */
             version: number;
         };
-        /** @description A Principal, as the grant/approver typeahead offers it (ADR-0069 §3). */
+        /** @description A Principal, as the grant/approver typeahead offers it. */
         PrincipalDto: {
             /** @description `false` = created by a forge import, not signed into yet. */
             claimed: boolean;
@@ -5136,7 +5129,7 @@ export interface components {
             /** @description What a grant or an approver entry is typed as. */
             handle: string;
             /**
-             * @description The Principal's id (ADR-0080): what a grant or an approver entry
+             * @description The Principal's id: what a grant or an approver entry
              *     stores, and what a URL carries.
              */
             id: string;
@@ -5148,7 +5141,7 @@ export interface components {
             handle: string;
             provider: string;
         };
-        /** @description One registered project (governed repo, ADR-0046) in the repos list. */
+        /** @description One registered project (governed repo) in the repos list. */
         ProjectDto: {
             /**
              * @description The forge connection it is bound through: the `{id}` of
@@ -5159,7 +5152,7 @@ export interface components {
             /**
              * Format: int64
              * @description Epoch millis of the project's most recent run, or `null` if it has never
-             *     run — the dashboard's recency signal (ADR-0046). The domain carries no
+             *     run — the dashboard's recency signal. The domain carries no
              *     push/created_at yet, so never-run repos have no ordering key here.
              */
             last_run_at?: number | null;
@@ -5185,9 +5178,9 @@ export interface components {
             unreachable_since?: number | null;
         };
         /**
-         * @description An org-level Environment as one Project sees it (ADR-0071): the read
-         *     model behind `GET /v1/repos/{org}/{repo}/environments`, which until
-         *     ADR-0071 returned the repo's own per-repo environments.
+         * @description An org-level Environment as one Project sees it: the read
+         *     model behind `GET /v1/repos/{org}/{repo}/environments`, which once
+         *     returned the repo's own per-repo environments.
          */
         ProjectEnvironmentDto: {
             /** @description The Environment's baseline, set by an org admin. */
@@ -5207,7 +5200,7 @@ export interface components {
             privilege_grant?: null | components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
         };
         /**
-         * @description The approval gate settings of a baseline `PUT` (ADR-0078). Each omitted
+         * @description The approval gate settings of a baseline `PUT`. Each omitted
          *     field takes its default.
          */
         PutApprovalGateRules: {
@@ -5222,7 +5215,7 @@ export interface components {
              * @description Seconds an approval stays good for at launch; omitted = 86400.
              */
             max_approval_age_s?: number | null;
-            /** @description `add` (default) or `refuse` (ADR-0078 §3). */
+            /** @description `add` (default) or `refuse`. */
             missing_gate_mode?: components["schemas"]["MissingGateModeDto"];
             /**
              * Format: int32
@@ -5233,7 +5226,7 @@ export interface components {
         };
         /**
          * @description A Project overlay (`…/projects/{project}/overlay`) body: the baseline's
-         *     four rules, which can only **tighten** (ADR-0071 §3). Replaced whole,
+         *     four rules, which can only **tighten**. Replaced whole,
          *     omitted = permissive default, unknown fields refused — as for the
          *     baseline.
          */
@@ -5249,9 +5242,9 @@ export interface components {
          *     body, replaced whole.
          */
         PutEnvironmentProjectPrivilegeGrantRequest: {
-            /** @description May the Project's steps here set a raw `k8s_overlay` (ADR-0055). */
+            /** @description May the Project's steps here set a raw `k8s_overlay`. */
             permit_k8s_overlay?: boolean;
-            /** @description The ADR-0039 whitelist; each digest listed once. */
+            /** @description The privileged-image whitelist; each digest listed once. */
             privileged_images?: components["schemas"]["ImageGrantDto"][];
         };
         /**
@@ -5260,7 +5253,7 @@ export interface components {
          *     takes its default — never the stored value — so `{}` resets the baseline
          *     to permissive (and the approval gate settings to theirs).
          *     Unknown fields are refused, so the retired per-repo shape (`wait_timer`,
-         *     `concurrency`) — and `deployment_concurrency`, which ADR-0074 removed — is
+         *     `concurrency`) — and the removed `deployment_concurrency` — is
          *     a 400, not a silently ignored rule.
          */
         PutEnvironmentProtectionRequest: {
@@ -5272,25 +5265,24 @@ export interface components {
              */
             approval_gate?: components["schemas"]["PutApprovalGateRules"];
             /**
-             * @description Principal handles or ids (ADR-0069, ADR-0080): each must name an
+             * @description Principal handles or ids: each must name an
              *     existing Principal; a merged one is stored as the Principal it now is.
              *     All must approve.
              */
             approvers?: string[];
-            /** @description A human dispatch must carry a reason (ADR-0057 §3). Omitted = off. */
+            /** @description A human dispatch must carry a reason. Omitted = off. */
             require_reason?: boolean;
             /**
              * Format: int32
-             * @description Seconds: a minimum wait on the Environment approval gate (ADR-0078
-             *     §4). Refused (400) above 0 with no approvers.
+             * @description Seconds: a minimum wait on the Environment approval gate. Refused (400) above 0 with no approvers.
              */
             wait_timer_s?: number;
         };
         /**
          * @description `PUT /v1/orgs/{org}/environments/{env}`: the whole Environment, replaced.
          *     An omitted optional field takes its default — it does not keep the stored
-         *     value. Unknown fields are refused, so a misspelt field — or one ADR-0074
-         *     removed (`deployment_deadline_ms`, `deployment_sources`) — is a 4xx rather
+         *     value. Unknown fields are refused, so a misspelt field — or a removed one
+         *     (`deployment_deadline_ms`, `deployment_sources`) — is a 4xx rather
          *     than silently ignored.
          */
         PutOrgEnvironmentRequest: {
@@ -5358,7 +5350,7 @@ export interface components {
         };
         /**
          * @description `GET /v1/repos/{org}/{repo}/refs?q=` body: the repo's branches and tags for a
-         *     searchable ref picker (ADR-0046). Scoped to branches + tags — recent commits
+         *     searchable ref picker. Scoped to branches + tags — recent commits
          *     and open-PR head-refs are a deliberate follow-up, not part of v1.
          */
         RefsResponse: {
@@ -5450,8 +5442,8 @@ export interface components {
         };
         /**
          * @description `GET …/steps/{step}/rerun-plan` body: what a rerun/retry of this step would
-         *     actually execute — **before** the user confirms it (ADR-0061 s5, and
-         *     ADR-0027's rule that smart never means mysterious).
+         *     actually execute — **before** the user confirms it (smart never means
+         *     mysterious).
          *
          *     A read-only dry run. The interesting case is a widened one: a Run reopened
          *     after its Workspace Snapshots expired cannot rerun just the step you pointed
@@ -5550,15 +5542,15 @@ export interface components {
             environment?: null | components["schemas"]["RunEnvironmentDto"];
             id: string;
             /**
-             * @description The PR **base** branch (ADR-0057) — the branch a `pull_request` run
+             * @description The PR **base** branch — the branch a `pull_request` run
              *     targets, rendered `base ← head` in the ref cluster. A discrete origin
              *     fact; absent for non-PR runs and runs created before base-stamping.
              */
             origin_pr_base?: string | null;
             /**
-             * @description The run's frozen launch parameters, `name → typed value` (ADR-0043 §5).
-             *     A run-level constant resolved once at creation; non-secret by contract
-             *     (§6), so safe to expose. Empty when the run took none. Lets the UI's
+             * @description The run's frozen launch parameters, `name → typed value`.
+             *     A run-level constant resolved once at creation; non-secret by contract,
+             *     so safe to expose. Empty when the run took none. Lets the UI's
              *     re-run flow pre-fill the form from the prior run's params.
              */
             params?: Record<string, never>;
@@ -5569,13 +5561,13 @@ export interface components {
             pipeline?: string | null;
             /**
              * Format: int64
-             * @description The **run number** (ADR-0057 amendment) — the per-repo sequential `#N`,
+             * @description The **run number** — the per-repo sequential `#N`,
              *     the human handle shown in the run-detail breadcrumb + gutter. Absent for
              *     untenanted inline runs and pre-allocation runs. Distinct from `id`.
              */
             run_number?: number | null;
             /**
-             * @description This run's **Workspace Snapshot** retention promise (ADR-0061 s5) — the
+             * @description This run's **Workspace Snapshot** retention promise — the
              *     cold tier's time bound, made explicit rather than left implicit in a
              *     sweeper's config, plus any manual pin over it.
              */
@@ -5583,22 +5575,22 @@ export interface components {
             status: string;
             steps: components["schemas"]["StepStatusDto"][];
             /**
-             * @description The run **Headline** (ADR-0057) — the one human line saying what this run
+             * @description The run **Headline** — the one human line saying what this run
              *     is about (a push's commit subject; later a PR title / dispatch reason),
              *     disambiguated by the trigger kind. Display/audit only; absent when the
              *     trigger carried no headline and on runs created before headline-stamping.
              */
             trigger_title?: string | null;
             /**
-             * @description The library versions this Run uses that are yanked in its org now
-             *     (ADR-0076 §6). A Rerun or Retry of a Step from one is refused at
+             * @description The library versions this Run uses that are yanked in its org now.
+             *     A Rerun or Retry of a Step from one is refused at
              *     launch: it reuses the Steps the Run was compiled with. Empty when none.
              */
             yanked_libraries?: components["schemas"]["RunYankDto"][];
         };
         /**
          * @description One run in the list view: identity, status, creation time (epoch millis),
-         *     and — when the run was stamped at creation (ADR-0049) — its owning tenant.
+         *     and — when the run was stamped at creation — its owning tenant.
          */
         RunSummaryDto: {
             /** @description The **Actor** login — who caused the trigger (UI labels it "author"). */
@@ -5606,7 +5598,7 @@ export interface components {
             /** Format: int64 */
             created_at: number;
             /**
-             * @description Whether this is a **deploy Run** (ADR-0074 §2): its pipeline, or one of
+             * @description Whether this is a **deploy Run**: its pipeline, or one of
              *     its Steps, is marked `deploy: true`. Independent of `environment`.
              */
             deploy: boolean;
@@ -5614,11 +5606,11 @@ export interface components {
              * Format: int64
              * @description Run duration in millis: `updated_at - created_at`. For a terminal run
              *     this is its total wall time; for an in-flight run, elapsed-to-last-update.
-             *     Drives the dashboard's per-run bar heights (ADR-0046).
+             *     Drives the dashboard's per-run bar heights.
              */
             duration_ms: number;
             /**
-             * @description The Environment this run deploys into (ADR-0037) — present only for a
+             * @description The Environment this run deploys into — present only for a
              *     deploy run, whose pipeline declared `environment:`.
              */
             environment?: string | null;
@@ -5628,7 +5620,7 @@ export interface components {
             /** @description The owning org, if the run is tenanted (trigger-created). */
             org?: string | null;
             /**
-             * @description The PR **base** branch (ADR-0057) — the branch a `pull_request` run
+             * @description The PR **base** branch — the branch a `pull_request` run
              *     targets, rendered `base ← head` in the ref cluster. A discrete origin
              *     fact; absent for non-PR runs and runs created before base-stamping.
              */
@@ -5647,7 +5639,7 @@ export interface components {
             project?: string | null;
             /**
              * Format: int64
-             * @description The **run number** (ADR-0057 amendment) — the per-repo sequential `#N`,
+             * @description The **run number** — the per-repo sequential `#N`,
              *     the human handle shown in the run-list gutter. Absent for untenanted
              *     inline runs and runs created before run-number allocation. Distinct from
              *     the opaque, unguessable `id`.
@@ -5664,7 +5656,7 @@ export interface components {
              */
             trigger_kind?: string | null;
             /**
-             * @description The run **Headline** (ADR-0057) — the one human line saying what this run
+             * @description The run **Headline** — the one human line saying what this run
              *     is about (a push's commit subject; later a PR title / dispatch reason),
              *     disambiguated by the trigger kind. Display/audit only; absent when the
              *     trigger carried no headline and on runs created before headline-stamping.
@@ -5674,7 +5666,7 @@ export interface components {
              * @description The run's **waiting gates** (git-bug `c489346`): gate steps that are
              *     `Pending`, reached (every need `Succeeded`) and have an open Attempt —
              *     the engine's "waiting gate". Since a waiting gate holds only its
-             *     dependents (ADR-0070 §9), a Run with one can still be `running` while
+             *     dependents, a Run with one can still be `running` while
              *     independent steps run, so this — not `status == suspended` — is what
              *     says a Run waits on a gate. Omitted when empty (and always for a
              *     terminal or queued Run).
@@ -5744,7 +5736,7 @@ export interface components {
         };
         /**
          * @description `GET /v1/repos/{org}/{repo}/secrets/matrix` body: the advisory coverage view
-         *     (ADR-0037 D) and — since ADR-0060 — the model behind the *editor* for repo-
+         *     and the model behind the *editor* for repo-
          *     and environment-scoped values. For each key, its **effective** status per
          *     column after inheritance; never a value.
          */
@@ -5785,7 +5777,7 @@ export interface components {
              *
              *     `set` = a value lives at exactly that scope · `inherited` = none here, but
              *     it resolves from a broader scope · `unset` = resolves to nothing ·
-             *     `silenced` = unset **on purpose** (an ADR-0037 marker). Only a genuinely
+             *     `silenced` = unset **on purpose** (a coverage marker). Only a genuinely
              *     unset cell can be silenced: a marker never hides a real value.
              */
             status: {
@@ -5845,7 +5837,7 @@ export interface components {
             next_cursor?: string | null;
         };
         /**
-         * @description A **shared service** instance of a run (ADR-0058) — the evidence a shared
+         * @description A **shared service** instance of a run — the evidence a shared
          *     service exists and its lifecycle state. A shared service is NOT a DAG node
          *     (it has no `needs`, no rerun action), so it is surfaced in a Services panel
          *     beside the DAG, never inside it. Keyed `{run, take, name}`; a Rerun's new
@@ -5878,10 +5870,9 @@ export interface components {
             key: string;
         };
         /**
-         * @description The cold-tier retention promise over one Run's **Workspace Snapshots**
-         *     (ADR-0061 s5).
+         * @description The cold-tier retention promise over one Run's **Workspace Snapshots**.
          *
-         *     ADR-0061 gives Workspace Snapshots two tiers with two policies. The warm
+         *     Workspace Snapshots have two tiers with two policies. The warm
          *     workspace service is bounded by **space** (LRU) and promises nothing — a miss
          *     there is slower, never wrong. Object storage is the cold tier, bounded by
          *     **time**, and *that* is the guarantee a user is given. Everything in this DTO
@@ -5902,7 +5893,7 @@ export interface components {
              * @description When this run's Workspace Snapshots stop being promised (epoch millis).
              *     `None` while the run is **non-terminal**: a run that has not settled —
              *     including one suspended on a gate for weeks — is never GC-eligible
-             *     regardless of age (ADR-0050), so no expiry applies yet. Also `None` while
+             *     regardless of age, so no expiry applies yet. Also `None` while
              *     **pinned**, because a pin holds the window open indefinitely.
              */
             expires_at?: number | null;
@@ -5933,7 +5924,7 @@ export interface components {
             id: string;
             image: string;
             /**
-             * @description Explicit input workspaces (ADR-0007): the subset of `needs` whose output
+             * @description Explicit input workspaces: the subset of `needs` whose output
              *     workspace this step consumes. Absent = implicit-by-default (inherit every
              *     need's workspace). Naming a subset both restricts what flows in and
              *     sharpens restart invalidation — the skip-if-unchanged signature is then
@@ -5941,55 +5932,55 @@ export interface components {
              */
             inputs?: string[] | null;
             /**
-             * @description Governed raw pod-spec overlay (ADR-0055). Carries no authority; an inline
+             * @description Governed raw pod-spec overlay. Carries no authority; an inline
              *     API run targets no Environment, so any overlay is rejected fail-closed.
              */
             k8s_overlay?: Record<string, never>;
             needs?: string[];
             /**
-             * @description Explicit output workspace paths (ADR-0007): the workspace-relative paths
+             * @description Explicit output workspace paths: the workspace-relative paths
              *     this step publishes downstream. Absent = the whole workspace. A declared
              *     path the step did not produce fails the step (fail-closed), so this is a
              *     contract, not a filter (mirrors `scarab_pipeline::StepSpec`).
              */
             outputs?: string[] | null;
             /**
-             * @description PlacementProfile names this step runs on (ADR-0055); their admin-defined
+             * @description PlacementProfile names this step runs on; their admin-defined
              *     k8s overlays merge onto the Pod in listed order. Empty = the default profile.
              */
             placement_profiles?: string[];
-            /** @description Requested compute resources (ADR-0055): exact `cpu_millis`/`memory_mib`. */
+            /** @description Requested compute resources: exact `cpu_millis`/`memory_mib`. */
             resources?: Record<string, never>;
             /**
-             * @description Opt-in retry policy `{on, max}` (ADR-0047). ⚠ At-least-once: retry
+             * @description Opt-in retry policy `{on, max}`. ⚠ At-least-once: retry
              *     re-runs the whole step at-least-once; enable only if the step is
              *     idempotent or fenced against a cooperating sink. Never-started infra
              *     failures auto-retry regardless.
              */
             retry?: Record<string, never>;
-            /** @description Secret keys to resolve and inject at launch (ADR-0037). */
+            /** @description Secret keys to resolve and inject at launch. */
             secrets?: string[];
             /**
-             * @description Privilege escalation requested above the hardened baseline (ADR-0039).
+             * @description Privilege escalation requested above the hardened baseline.
              *     On an inline API run only the self-service `run_as_root` grant is admitted
              *     (it stays inside the sandbox); governed grants (add-capabilities /
              *     privileged) require a target Environment and are rejected fail-closed.
              */
             security?: Record<string, never>;
             /**
-             * @description Sidecar services (ADR-0058): throwaway backing containers co-located in
+             * @description Sidecar services: throwaway backing containers co-located in
              *     this step's Pod, reachable at `localhost:<port>`, with an optional
              *     readiness probe gating the step's main container start.
              */
             services?: Record<string, never>;
             /**
              * Format: int32
-             * @description Per-step execution deadline in seconds (ADR-0047). Absent = the global
+             * @description Per-step execution deadline in seconds. Absent = the global
              *     default (1h). Exceeding it is a `Timeout` failure.
              */
             timeout?: number | null;
             /**
-             * @description Shared-service opt-in (ADR-0058): names of pipeline-level shared services
+             * @description Shared-service opt-in: names of pipeline-level shared services
              *     this step reaches over the network (DNS `<name>:<port>` + readiness gate).
              */
             uses?: string[];
@@ -6014,7 +6005,7 @@ export interface components {
             step: string;
         };
         /**
-         * @description One named result a step published (ADR-0041) — the `${{ outputs.<step>.<name> }}`
+         * @description One named result a step published — the `${{ outputs.<step>.<name> }}`
          *     values, exposed read-only for the run detail Inspector. `type_name` is a
          *     coarse JSON kind (string/number/bool/object/array/null) so the UI can badge it
          *     without re-deriving.
@@ -6025,7 +6016,7 @@ export interface components {
             value: Record<string, never>;
         };
         /**
-         * @description One of a step's co-located **sidecar services** (ADR-0058) — a throwaway
+         * @description One of a step's co-located **sidecar services** — a throwaway
          *     backing container in the step's own Pod, reachable at `localhost:<port>`.
          *     Positional: identified by its `index` in the step's authored `services:`,
          *     which is also its container ordinal (`service-{index}`) and the `?sidecar=`
@@ -6048,7 +6039,7 @@ export interface components {
              */
             approval_release_at?: number | null;
             /**
-             * @description Per-attempt detail (ADR-0047) — the rerun/retry history in append order.
+             * @description Per-attempt detail — the rerun/retry history in append order.
              *     `attempts` is the count; this is the list, so the UI can show retries (a
              *     failed attempt followed by a succeeding one — the durable-execution story)
              *     and fold a step's logs per attempt. Empty until the step first launches.
@@ -6056,12 +6047,12 @@ export interface components {
             attempt_list?: components["schemas"]["AttemptDto"][];
             attempts: number;
             /**
-             * @description This Step is marked `deploy: true` (ADR-0074 §2) — the Step of a deploy
+             * @description This Step is marked `deploy: true` — the Step of a deploy
              *     Run that deploys. Omitted when false.
              */
             deploy?: boolean;
             /**
-             * @description This `manual` gate is an **Environment approval gate** (ADR-0078 §1):
+             * @description This `manual` gate is an **Environment approval gate**:
              *     a Step after it uses the Run's Environment's authority, so releasing
              *     it needs the Environment's approvers and a step-up. Decided at Run
              *     creation. A gate the Environment added has an `origin` link of kind
@@ -6071,7 +6062,7 @@ export interface components {
              */
             environment_approval_gate?: boolean;
             /**
-             * @description `manual`/`timer`/`external` if this step is a gate (ADR-0008), else
+             * @description `manual`/`timer`/`external` if this step is a gate, else
              *     absent. Gates launch no pod; a waiting
              *     gate holds only the steps that need it.
              */
@@ -6079,20 +6070,20 @@ export interface components {
             gate_resolution?: null | components["schemas"]["GateResolutionDto"];
             id: string;
             /**
-             * @description Upstream step ids this step depends on — the DAG in-edges (ADR-0006). The
+             * @description Upstream step ids this step depends on — the DAG in-edges. The
              *     UI folds these into the run's graph view.
              */
             needs?: string[];
             /**
-             * @description The invoke chain this Step was inlined through, outermost first
-             *     (ADR-0076): the `origin` the compiler recorded, each library version
+             * @description The invoke chain this Step was inlined through, outermost first:
+             *     the `origin` the compiler recorded, each library version
              *     marked when it is yanked in the Run's org. Empty for a Step written in
              *     the Pipeline file itself.
              */
             origin?: components["schemas"]["OriginLinkDto"][];
             plugin_gate?: null | components["schemas"]["PluginGateViewDto"];
             /**
-             * @description Co-located sidecar services (ADR-0058) this step declares — rendered as
+             * @description Co-located sidecar services this step declares — rendered as
              *     sidecar nodes attached to the step, each with its own log stream (fetched
              *     via `?sidecar=<index>` on the step-logs endpoint). Empty for a step with
              *     no `services:`.
@@ -6101,7 +6092,7 @@ export interface components {
             status: string;
             /**
              * @description Names of pipeline-level shared services this step opts into via `uses:`
-             *     (ADR-0058) — the DAG's service edges. Empty for a step that uses none.
+             *     — the DAG's service edges. Empty for a step that uses none.
              */
             uses?: string[];
         };
@@ -6124,14 +6115,14 @@ export interface components {
             /** @description `window` or `action`. */
             kind: string;
         };
-        /** @description The body of a `403 step_up_required` (ADR-0073 §5). */
+        /** @description The body of a `403 step_up_required`. */
         StepUpRefusal: {
             challenge?: null | components["schemas"]["WebauthnChallengeDto"];
             /** @description Always `step_up_required`. */
             code: string;
             /**
              * @description An API token or Bearer-session caller: the one-time link its human
-             *     confirms this exact operation at (ADR-0073 §6).
+             *     confirms this exact operation at.
              */
             confirmation_url?: string | null;
             /** @description Mode `enroll`: where to enroll a passkey. */
@@ -6237,8 +6228,7 @@ export interface components {
             source: string;
         };
         /**
-         * @description A library source the org trusts with one grant (ADR-0076 §9, ADR-0018
-         *     amendment of 2026-11-12). Trust holds across upgrades from the same
+         * @description A library source the org trusts with one grant. Trust holds across upgrades from the same
          *     source; an install that would carry a grant to a new version names it in
          *     `carry_grants`.
          */
@@ -6321,13 +6311,13 @@ export interface components {
         };
         /**
          * @description One entry in a workspace directory listing — the merkle-tree children under a
-         *     step's output snapshot (ADR-0029).
+         *     step's output snapshot.
          */
         WorkspaceEntryDto: {
             /**
              * @description `"dir"` (a sub-tree), `"file"` (a blob), or `"symlink"` (a blob whose
              *     content is the link target path, marked by the symlink file-type bits in
-             *     the entry mode — ADR-0061 s7 keeps git's representation in the CAS).
+             *     the entry mode — the CAS keeps git's representation).
              */
             kind: string;
             name: string;
@@ -6581,9 +6571,9 @@ export interface operations {
     oauth_login_redirect: {
         parameters: {
             query?: {
-                /** @description login provider id (ADR-0069); default = the only, or the unqualified_ids, provider */
+                /** @description login provider id; default = the only, or the unqualified_ids, provider */
                 provider?: string;
-                /** @description a relative path to land on after the callback (ADR-0073); default `/` */
+                /** @description a relative path to land on after the callback; default `/` */
                 next?: string;
             };
             header?: never;
@@ -6749,7 +6739,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description requires Administer on the org; a new org needs a global admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description requires Administer on the org; a new org needs a global admin — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -6772,7 +6762,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -6803,7 +6793,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description requires Administer on the org — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -6826,7 +6816,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -6909,7 +6899,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description requires a global admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description requires a global admin — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -6932,7 +6922,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -7008,7 +6998,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description requires Administer on the org — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -7031,7 +7021,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -7063,7 +7053,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description requires Administer on the org — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -7079,7 +7069,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -7155,7 +7145,7 @@ export interface operations {
                     "application/json": components["schemas"]["ResyncResultDto"];
                 };
             };
-            /** @description `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
+            /** @description `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -7178,7 +7168,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -7267,7 +7257,7 @@ export interface operations {
                     "application/json": components["schemas"]["LinkIdentityResponse"];
                 };
             };
-            /** @description not a browser session — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not a browser session — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -7276,7 +7266,7 @@ export interface operations {
                     "application/json": components["schemas"]["StepUpRefusal"];
                 };
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -7384,7 +7374,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
+            /** @description `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -7400,7 +7390,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -7498,7 +7488,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -7542,7 +7532,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -7778,7 +7768,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description the caller holds no role in the target scope, or is itself a token — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description the caller holds no role in the target scope, or is itself a token — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -7794,7 +7784,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -7880,7 +7870,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
+            /** @description `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -7889,7 +7879,7 @@ export interface operations {
                     "application/json": components["schemas"]["StepUpRefusal"];
                 };
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -7914,7 +7904,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
+            /** @description `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -7923,7 +7913,7 @@ export interface operations {
                     "application/json": components["schemas"]["StepUpRefusal"];
                 };
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -8106,7 +8096,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an org admin, or no step-up — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -8131,7 +8121,7 @@ export interface operations {
                     "application/json": components["schemas"]["EnvironmentDeleteBlockersDto"];
                 };
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -8173,7 +8163,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an org admin, or no step-up — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -8196,7 +8186,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -8276,7 +8266,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an org admin — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -8299,7 +8289,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -8421,7 +8411,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an admin of the project or org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an admin of the project or org — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -8444,7 +8434,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -8476,7 +8466,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an admin of the project or org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an admin of the project or org — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -8492,7 +8482,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -8576,7 +8566,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an org admin — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -8599,7 +8589,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -8718,7 +8708,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an org admin — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -8741,7 +8731,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -8924,7 +8914,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an org admin, or no step-up — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -8947,7 +8937,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -9062,7 +9052,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an org admin, or no step-up — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -9078,7 +9068,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -9207,7 +9197,7 @@ export interface operations {
                     "application/json": components["schemas"]["LibraryYankDto"];
                 };
             };
-            /** @description not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an org admin, or no step-up — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -9223,7 +9213,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -9346,7 +9336,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -9507,7 +9497,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an org admin, no step-up, a host Scarab does not fetch from, or a private repository outside the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an org admin, no step-up, a host Scarab does not fetch from, or a private repository outside the org — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -9530,7 +9520,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -9745,7 +9735,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an org admin — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -9761,7 +9751,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -9838,7 +9828,7 @@ export interface operations {
                     "application/json": components["schemas"]["PluginInstallationDto"];
                 };
             };
-            /** @description not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an org admin — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -9854,7 +9844,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -9934,7 +9924,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an org admin, or a step-up is required — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an org admin, or a step-up is required — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -9957,7 +9947,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -10044,7 +10034,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an org admin, a step-up is required (a new image, or a manifest that asks for more), a host Scarab does not fetch from, or a private repository outside the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an org admin, a step-up is required (a new image, or a manifest that asks for more), a host Scarab does not fetch from, or a private repository outside the org — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -10067,7 +10057,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -10326,7 +10316,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an org admin — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -10349,7 +10339,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -10394,7 +10384,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an org admin — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -10417,7 +10407,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -10747,7 +10737,7 @@ export interface operations {
                     "application/json": components["schemas"]["PolicyDto"];
                 };
             };
-            /** @description not a typed setting (ADR-0075 §7), or it does not compile, or `reason` is over 2,000 bytes */
+            /** @description not a typed setting, or it does not compile, or `reason` is over 2,000 bytes */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -10845,14 +10835,14 @@ export interface operations {
                     "application/json": components["schemas"]["PolicyDto"];
                 };
             };
-            /** @description not a typed setting (ADR-0075 §7), or it does not compile, or `reason` is over 2,000 bytes */
+            /** @description not a typed setting, or it does not compile, or `reason` is over 2,000 bytes */
             400: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description not a Project admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not a Project admin — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -10875,7 +10865,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -10922,7 +10912,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not a Project admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not a Project admin — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -10945,7 +10935,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -11251,7 +11241,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description the caller holds no role in the target scope, or is itself a token — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description the caller holds no role in the target scope, or is itself a token — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -11267,7 +11257,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -11375,7 +11365,7 @@ export interface operations {
                     "application/json": components["schemas"]["BindingDto"][];
                 };
             };
-            /** @description `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
+            /** @description `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -11391,7 +11381,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -11434,7 +11424,7 @@ export interface operations {
                     "application/json": components["schemas"]["CreateRunResponse"];
                 };
             };
-            /** @description the caller may not dispatch, the pipeline's Environment does not exist in the org or does not admit this project (ADR-0071), or a run.create Policy denied the Run (ADR-0075); the body says why. No run is created */
+            /** @description the caller may not dispatch, the pipeline's Environment does not exist in the org or does not admit this project, or a run.create Policy denied the Run; the body says why. No run is created */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -11691,7 +11681,7 @@ export interface operations {
             query?: {
                 /** @description max runs (default 50, capped 200) */
                 limit?: number;
-                /** @description only runs governed by this Environment (ADR-0074); applied before `limit`; must not be empty */
+                /** @description only runs governed by this Environment; applied before `limit`; must not be empty */
                 environment?: string;
                 /** @description true: only deploy Runs (pipeline or a Step marked `deploy: true`); false: only the rest; applied before `limit` */
                 deploy?: boolean;
@@ -12074,7 +12064,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -12143,7 +12133,7 @@ export interface operations {
             };
             cookie?: never;
         };
-        /** @description external gate (`x-scarab-gate-token`): optional, `{"passed": false, "reason": "…"}` fails the gate instead of releasing it. Plugin gate (a plugin's `scarab-api` bearer token, ADR-0076 §7): a `PluginGateRelease`, `{"attempt", "passed": true, "outputs": {…}}` or `{"attempt", "passed": false, "reason": "…"}` */
+        /** @description external gate (`x-scarab-gate-token`): optional, `{"passed": false, "reason": "…"}` fails the gate instead of releasing it. Plugin gate (a plugin's `scarab-api` bearer token): a `PluginGateRelease`, `{"attempt", "passed": true, "outputs": {…}}` or `{"attempt", "passed": false, "reason": "…"}` */
         requestBody?: {
             content: {
                 "application/json": null | components["schemas"]["ExternalGateVerdict"];
@@ -12403,7 +12393,7 @@ export interface operations {
                     "application/json": components["schemas"]["SnapshotRetentionDto"];
                 };
             };
-            /** @description `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
+            /** @description `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -12419,7 +12409,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -12847,7 +12837,7 @@ export interface operations {
             query?: {
                 /** @description sub-path within the snapshot (default = root) */
                 path?: string;
-                /** @description attempt id — that attempt's immutable snapshot instead of the latest (ADR-0056) */
+                /** @description attempt id — that attempt's immutable snapshot instead of the latest */
                 attempt?: string;
             };
             header?: never;
@@ -12883,7 +12873,7 @@ export interface operations {
             query: {
                 /** @description file path within the snapshot */
                 path: string;
-                /** @description attempt id — that attempt's immutable snapshot instead of the latest (ADR-0056) */
+                /** @description attempt id — that attempt's immutable snapshot instead of the latest */
                 attempt?: string;
             };
             header?: never;
@@ -12966,7 +12956,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
+            /** @description `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -12989,7 +12979,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -13023,7 +13013,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
+            /** @description `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -13039,7 +13029,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
             429: {
                 headers: {
                     [name: string]: unknown;

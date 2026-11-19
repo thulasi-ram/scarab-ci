@@ -161,7 +161,7 @@ impl From<PolicyVersion> for PolicyVersionDto {
 #[serde(deny_unknown_fields)]
 pub struct CreatePolicyRequest {
     /// The authored Policy. At the Project level it must be a
-    /// typed `setting` (§7).
+    /// typed `setting`.
     #[schema(value_type = Object)]
     pub policy: Value,
     /// Why, recorded on the PolicyVersion. At most 2,000 bytes.

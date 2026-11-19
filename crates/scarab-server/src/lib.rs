@@ -1155,8 +1155,8 @@ pub struct RunStatusResponse {
     pub run_number: Option<i64>,
     pub steps: Vec<StepStatusDto>,
     /// The run's frozen launch parameters, `name → typed value`.
-    /// A run-level constant resolved once at creation; non-secret by contract
-    /// (§6), so safe to expose. Empty when the run took none. Lets the UI's
+    /// A run-level constant resolved once at creation; non-secret by contract,
+    /// so safe to expose. Empty when the run took none. Lets the UI's
     /// re-run flow pre-fill the form from the prior run's params.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     #[schema(value_type = Object)]
