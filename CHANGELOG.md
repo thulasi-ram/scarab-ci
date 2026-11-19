@@ -104,6 +104,14 @@ release.yml uses that version's section as the GitHub Release text. See
   `limits.memory`; with `memory_mib` and no `cpu_millis`, it has no `requests.cpu`. The warning
   names the missing field and says that a cluster that requires resource limits (a Kyverno
   require-resource-limits policy, for example) will refuse those step Pods.
+- **A library joins per-architecture images into one multi-architecture image** (git-bug
+  794b3ac). `lib:thulasi-ram::scarab-ci::image-index`, the file `libs/image-index.yaml`, runs
+  `crane index append` over images named by digest (one `<repository>@sha256:<digest>` per line,
+  such as each build's `outputs.<id>.push.ref`) and pushes the index under a tag. It refuses an
+  image named by tag, an image that is itself an index, and two images of one platform, and
+  reports the index's digest as `outputs.<id>.index.digest`. Its one step holds the registry
+  credential, so an org admin installs it and trusts its source with the registry credential. See
+  [Joining images into one multi-architecture image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#joining-images-into-one-multi-architecture-image).
 
 ### Bug Fixes
 

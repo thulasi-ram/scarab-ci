@@ -1,0 +1,229 @@
+# Scarab's image index library: join images built for different
+# architectures into one multi-architecture image (an OCI image index) and
+# push it under a tag. An org admin installs it like any library, from
+# github.com/thulasi-ram/scarab-ci//libs/image-index.yaml at a release
+# commit, and trusts that source with the registry credential.
+#
+#   - id: app
+#     invoke: lib:thulasi-ram::scarab-ci::image-index
+#     needs: [amd64, arm64]
+#     with:
+#       image: ghcr.io/acme/app:${{ event.sha }}
+#       images: |
+#         ${{ outputs.amd64.push.ref }}
+#         ${{ outputs.arm64.push.ref }}
+#
+# Its one Step is `app/index` (named after the invoke); `needs: [app]`
+# reaches it. It runs `crane index append`, which writes the index to the
+# registry, so it asks for `registry_auth: true`: Scarab mounts the Run's
+# registry credential at /scarab/registry/config.json and points
+# DOCKER_CONFIG at it, when the org trusts this file's source with the
+# registry credential. It runs no code from the repository and reads nothing
+# from the workspace.
+#
+# Each image is named by digest (`<repository>@sha256:…`), never by tag: a
+# tag can be moved, so an index built from tags could hold other images on a
+# retry. Before it pushes, the Step reads each image's manifest and config
+# from the registry (by digest, which crane checks against the content) and
+# refuses (exit 2) an image that is itself an index, a config that names no
+# os or architecture, and two images of the same platform
+# (os/architecture/variant, and the os.version a Windows image names). crane
+# then copies each image into the index's repository, when it is not
+# already there.
+#
+# Output:
+#   ${{ outputs.app.index }}  {"ref": "<repository>@sha256:…", "digest":
+#                             "sha256:…"}, as crane reported the push.
+#                             Deploy by this digest.
+#
+# A fork pull request, or a Run locked out of its Environment's secrets, gets
+# no registry credential, and Scarab tells the Step so with
+# SCARAB_FORK_PR=true: the Step then pushes nothing and exits 0. A missing
+# SCARAB_FORK_PR is treated the same way.
+#
+# Every input reaches the script through an environment variable, never the
+# command.
+#
+# Inputs:
+#   image     the tag to push the index to, e.g. ghcr.io/acme/app:1.2.0; a
+#             reference with a tag and no digest
+#   images    the images to join, one <repository>@sha256:<digest> per line,
+#             each a different platform
+#   insecure  reach the registry over plain HTTP, for a registry with no TLS
+#             (default false); for a test or development registry only. crane
+#             then skips TLS verification too, so the Step refuses it (exit 2)
+#             when it holds a registry login
+kind: library
+interface:
+  inputs:
+    - name: image
+      type: string
+      validate: 'value.matches("^[a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")'
+      description: the tag to push the index to, with a tag and no digest
+    - name: images
+      type: string
+      validate: 'value.matches("^([a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*@sha256:[a-f0-9]{64}\n)*[a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*@sha256:[a-f0-9]{64}\n?$")'
+      description: the images to join, one <repository>@sha256:<digest> per line
+    - name: insecure
+      type: boolean
+      required: false
+      default: false
+      description: reach the registry over plain HTTP, for a test or development registry with no TLS
+  outputs: [index]
+steps:
+  - id: index
+    # The crane image libs/build.yaml's push Step pins.
+    image: gcr.io/go-containerregistry/crane:debug@sha256:e78770b31258a3846f878036d9c1f63fbe4c871f9f56990bf77fd95c013e3c1b
+    registry_auth: true
+    # The image's default user is root. crane and busybox need no user of
+    # their own, so the Step runs as uid 1000 and reads the registry login
+    # Scarab mounts.
+    security: { run_as_user: 1000 }
+    env:
+      - [SCARAB_INDEX_IMAGE, "${{ inputs.image }}"]
+      - [SCARAB_INDEX_IMAGES, "${{ inputs.images }}"]
+      - [SCARAB_INDEX_INSECURE, "${{ inputs.insecure }}"]
+    command:
+      - /busybox/sh
+      - -c
+      - |
+        set -eu
+        fail() { echo "scarab: index refused: $*" >&2; exit 2; }
+        nl='
+        '
+        # The inputs were checked against their `validate:` rules when the
+        # Step launched; the checks below hold the script to them too.
+        image=${SCARAB_INDEX_IMAGE-}
+        insecure=${SCARAB_INDEX_INSECURE-false}
+        case "$image" in
+          "" | -* | *[!A-Za-z0-9._:/-]*) fail "image $image is not an image reference with a tag" ;;
+        esac
+        case "${image##*/}" in
+          *:?*) ;;
+          *) fail "image $image names no tag; name the tag the index is pushed to" ;;
+        esac
+        case "$insecure" in
+          true | false) ;;
+          *) fail "insecure must be true or false, not $insecure" ;;
+        esac
+        # One <repository>@sha256:<digest> per line. A tag can be moved, so
+        # an index built from tags is not the same index on a retry.
+        sources=
+        count=0
+        while IFS= read -r src; do
+          [ -n "$src" ] || continue
+          case "$src" in
+            -* | *[!a-z0-9._:/@-]*) fail "$src is not an image reference" ;;
+          esac
+          repo=${src%@sha256:*}
+          hex=${src#"$repo"@sha256:}
+          [ -n "$repo" ] && [ "$repo@sha256:$hex" = "$src" ] ||
+            fail "$src is not <repository>@sha256:<digest>; name each image by digest, not by tag"
+          case "$repo" in
+            *@*) fail "$src names more than one digest" ;;
+          esac
+          case "${repo##*/}" in
+            *:*) fail "$src names a tag and a digest; name the image by digest alone" ;;
+          esac
+          case "$hex" in
+            *[!0-9a-f]*) fail "$src has a digest that is not lower-case hex" ;;
+          esac
+          [ "${#hex}" -eq 64 ] || fail "$src has a digest that is not 64 hex characters"
+          case "$nl$sources" in
+            *"$nl$src$nl"*) fail "$src is named twice" ;;
+          esac
+          sources=$sources$src$nl
+          count=$((count + 1))
+        done <<EOF
+        ${SCARAB_INDEX_IMAGES-}
+        EOF
+        [ "$count" -gt 0 ] || fail "images names no image"
+        # Scarab sets SCARAB_FORK_PR on every launch of this Step; a value
+        # other than `false` (none included) is a fork pull request's Run,
+        # or a Run locked out of its Environment's secrets.
+        if [ "${SCARAB_FORK_PR-}" != false ]; then
+          echo "scarab: not pushed: this Run is a fork pull request's, or is locked out of its Environment's secrets"
+          exit 0
+        fi
+        # crane's --insecure also skips TLS verification, so a registry
+        # login would go to whoever answers at the registry's host.
+        if [ "$insecure" = true ] && [ -e "${DOCKER_CONFIG-}/config.json" ]; then
+          fail "insecure is refused when the step holds a registry login"
+        fi
+        tls=
+        [ "$insecure" = false ] || tls=--insecure
+        # Sets v to the string value of key $1 in $2, a JSON document, or to
+        # empty when the key is absent. A key named more than once (a label
+        # named "os", for one) is refused rather than guessed at.
+        field() {
+          v=$(printf '%s\n' "$2" | grep -o "\"$1\" *: *\"[^\"]*\"") || v=
+          case "$v" in
+            *"$nl"*) fail "the config of $src names \"$1\" more than once" ;;
+          esac
+          v=${v%\"}
+          v=${v##*\"}
+        }
+        # Each image must be one image, of a platform no other image has.
+        # crane fetches each by digest and checks the content against it.
+        platforms=
+        set -- index append
+        while IFS= read -r src; do
+          [ -n "$src" ] || continue
+          manifest=$(crane manifest "$src" $tls </dev/null) || {
+            echo "scarab: cannot read the manifest of $src" >&2
+            exit 1
+          }
+          case "$manifest" in
+            *'"manifests"'*) fail "$src is an index, not one image; name each architecture's image by its own digest" ;;
+          esac
+          config=$(crane config "$src" $tls </dev/null) || {
+            echo "scarab: cannot read the config of $src" >&2
+            exit 1
+          }
+          field os "$config"
+          os=$v
+          field architecture "$config"
+          arch=$v
+          field variant "$config"
+          variant=$v
+          field os.version "$config"
+          osversion=$v
+          [ -n "$os" ] && [ -n "$arch" ] ||
+            fail "the config of $src names no os or architecture, so the index could not say which platform it is"
+          case "$os$arch$variant$osversion" in
+            *[!A-Za-z0-9._-]*) fail "the config of $src names a platform that is not letters, digits, '.', '_' or '-'" ;;
+          esac
+          platform=$os/$arch
+          [ -z "$variant" ] || platform=$platform/$variant
+          [ -z "$osversion" ] || platform=$platform:$osversion
+          case "$nl$platforms" in
+            *"$nl$platform$nl"*) fail "$src is $platform, as an image before it is; an index holds one image per platform" ;;
+          esac
+          platforms=$platforms$platform$nl
+          echo "scarab: $src is $platform"
+          set -- "$@" -m "$src"
+        done <<EOF
+        $sources
+        EOF
+        set -- "$@" -t "$image"
+        [ "$insecure" = false ] || set -- "$@" --insecure
+        ref=$(crane "$@")
+        digest=${ref##*@}
+        hex=${digest#sha256:}
+        case "$ref$digest" in
+          *[!A-Za-z0-9._:/@-]*) echo "scarab: crane reported $ref" >&2; exit 1 ;;
+        esac
+        case "$digest" in
+          sha256:*) ;;
+          *) echo "scarab: crane reported $ref, with no digest" >&2; exit 1 ;;
+        esac
+        case "$hex" in
+          *[!0-9a-f]*) echo "scarab: crane reported $ref" >&2; exit 1 ;;
+        esac
+        [ "${#hex}" -eq 64 ] || { echo "scarab: crane reported $ref" >&2; exit 1; }
+        echo "scarab: pushed $ref as $image"
+        # The pushed reference is the Step's `index` result when Scarab
+        # collects results (/scarab/results exists).
+        if [ -d /scarab/results ]; then
+          printf '{"ref":"%s","digest":"%s"}' "$ref" "$digest" > /scarab/results/index.json
+        fi

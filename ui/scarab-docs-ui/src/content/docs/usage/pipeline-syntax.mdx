@@ -540,16 +540,104 @@ Its outputs:
     with: { image: "ghcr.io/acme/app:${{ event.sha }}-arm64", push: true }
   ```
 
-  Joining the tags into one multi-architecture image (`crane index append`,
-  `docker buildx imagetools create`) pushes to the registry, so that step needs the registry
-  credential too, which only a step from a trusted library receives. Scarab has no library for
-  it yet; until it does, the join step comes from a library of your own whose source the org
-  trusts with the registry credential. A list of profiles still reaches both steps, which a
-  per-architecture build needs; keep the push profile in the map's `push` entry.
+  To join them into one multi-architecture image, add Scarab's image index library
+  ([below](#joining-images-into-one-multi-architecture-image)). A list of profiles still
+  reaches both steps, which a per-architecture build needs; keep the push profile in the map's
+  `push` entry.
 
 The `build` step kind is gone. A `build:` step fails the pipeline check with one error that holds
 its replacement, an `invoke: lib:thulasi-ram::scarab-ci::build` step written from the old step's fields. The local executor refuses the build library's build step; it
 needs the Kubernetes executor.
+
+### Joining images into one multi-architecture image
+
+Scarab's image index library, `lib:thulasi-ram::scarab-ci::image-index`, joins images built for
+different architectures into one image index and pushes it under one tag. A client that pulls the
+tag gets the image for its own platform. An org admin installs it and trusts its source with the
+registry credential; no org has it until then
+([Install Scarab's image index library](/scarab-ci/usage/libraries/#install-scarabs-image-index-library)).
+
+This Pipeline builds the image on amd64 and arm64 nodes, joins the two, and deploys the index by
+digest:
+
+```yaml
+on:
+  push:
+    when: "event.branch == 'main'"
+steps:
+  - id: checkout
+    invoke: lib:thulasi-ram::scarab-ci::clone
+
+  - id: amd64
+    invoke: lib:thulasi-ram::scarab-ci::build
+    needs: [checkout]
+    placement_profiles: [amd64]
+    with: { image: "ghcr.io/acme/app:${{ event.sha }}-amd64", push: true }
+
+  - id: arm64
+    invoke: lib:thulasi-ram::scarab-ci::build
+    needs: [checkout]
+    placement_profiles: [arm64]
+    with: { image: "ghcr.io/acme/app:${{ event.sha }}-arm64", push: true }
+
+  - id: app
+    invoke: lib:thulasi-ram::scarab-ci::image-index
+    needs: [amd64, arm64]
+    with:
+      image: "ghcr.io/acme/app:${{ event.sha }}"
+      images: |
+        ${{ outputs.amd64.push.ref }}
+        ${{ outputs.arm64.push.ref }}
+
+  - id: deploy
+    image: alpine:3.20
+    needs: [app]
+    env: [[DIGEST, "${{ outputs.app.index.digest }}"]]
+    command: [sh, -c, 'echo "deploy ghcr.io/acme/app@$DIGEST"']
+```
+
+The library has one step, `app/index`, and `needs: [app]` reaches it. `needs: [amd64, arm64]`
+reaches each build's push step, whose `push` result holds the pushed `<repository>@sha256:…`.
+The step runs `crane index append` with the
+[crane](https://github.com/google/go-containerregistry/tree/main/cmd/crane) image the build
+library pins. It holds the registry credential, runs as uid 1000, runs no code from your
+repository, and reads nothing from the workspace.
+
+Its inputs:
+
+| Input | Default | What it is |
+|---|---|---|
+| `image` | (required) | The tag to push the index to, such as `ghcr.io/acme/app:1.2.0`. It must name a tag, and no digest. |
+| `images` | (required) | The images to join, one `<repository>@sha256:<digest>` per line. Each image is named by digest, never by tag: a tag can be moved, so a retry could join other images. |
+| `insecure` | `false` | Reach the registry over plain HTTP. For a test or development registry with no TLS only. crane then also skips TLS verification, so the step refuses it (exit 2) when it holds a registry login. |
+
+Before it pushes, the step reads each image's manifest and config from the registry, by digest,
+and refuses (exit 2):
+
+- an image that is itself an index (a multi-architecture image, or one with attestations): name
+  each architecture's image by its own digest;
+- an image whose config names no `os` or `architecture`, or names one of them twice (a label
+  called `os`, for example);
+- two images of the same platform: `os/architecture`, then the `variant` (`arm64/v8`, `arm/v7`)
+  and the `os.version` a Windows image names. An index holds one image per platform.
+
+The images may live in other repositories, or other registries, than the index. crane copies
+each image into the index's repository when it is not already there, so the step's credential
+must be able to read each image and push to the index's repository.
+
+Its output: `outputs.app.index` is `{"ref": "<repository>@sha256:…", "digest": "sha256:…"}`,
+as crane reported the push. Deploy by this digest.
+
+A fork pull request, or a Run locked out of its Environment's secrets, pushes nothing: the build
+library writes no `push` result, so the index step, which reads `outputs.amd64.push`, fails
+before it launches. The `when:` on the trigger above keeps the Pipeline to pushes to `main`. A
+Pipeline that also runs for pull requests can give the index step, and the steps that read its
+output, `when: "event.kind == 'push'"`. With images named by literal digests, a fork's index step
+launches and exits 0 without pushing.
+
+The step asks for `registry_auth: true` and is the library's only step, so a profile marked
+`registry_auth_only` (an ECR push role, say) can be named in a plain list:
+`placement_profiles: [ecr-push]`.
 
 ### Forge credentials: `forge_token`
 
