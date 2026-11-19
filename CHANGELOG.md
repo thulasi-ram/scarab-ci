@@ -20,6 +20,12 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Breaking changes
 
+- **An API script that installs or upgrades a library whose source holds a trust grant must
+  send `carry_grants`** (git-bug 8c62098). Copy the list from the `carried_grants` field of the
+  `POST /v1/orgs/{org}/libraries/fetch` answer into the `POST /v1/orgs/{org}/library-installations`
+  body. Without it the install fails with a 400 that names the grants. A source with no grant
+  needs nothing. See
+  [Upgrade](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#upgrade).
 - **Step Pods run in a namespace of their own by default.** An empty `scarab.namespace` now means
   `<release namespace>-steps`, which the chart creates (`scarab.createNamespace`), instead of the
   release namespace, so pipeline code no longer runs beside the server's Secret and
@@ -51,14 +57,13 @@ release.yml uses that version's section as the GitHub Release text. See
 - **The workspace drain checks its fence against the Pod's name** (git-bug 13f0c09). The drain read
   the `{run, step, attempt}` fence from the step container's env, which the Pod spec sets. It now
   refuses a fence whose step Pod name is not the Pod's own name.
-- **Installing or upgrading a library names the credentials its source's trust gives the new
+- **Installing or upgrading a library names the grants its source's trust gives the new
   commit** (git-bug 8c62098). Trust stays keyed by source, so a new commit from a source trusted
-  with forge credentials or the registry credential gets them too, and until now nothing said so.
-  The fetch answer lists them in `carried_grants`; the install must name the same grants in
-  `carry_grants`, or it fails with a 400 that names them. The review page shows one box per
-  grant, and **Upgrade** stays off until each is ticked. The step-up summary and the
-  `op.completed` security event name the grants carried. A script that upgrades a library from
-  a trusted source must now send `carry_grants`. See
+  with forge credentials, the registry credential or the build sandbox gets them too, and until
+  now nothing said so. The fetch answer lists them in `carried_grants`; the install must name the
+  same grants in `carry_grants`, or it fails with a 400 that names them. The review page shows
+  one box per grant, and **Upgrade** stays off until each is ticked. The step-up summary and the
+  `op.completed` security event name the grants carried. See
   [Upgrade](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#upgrade).
 - **The build library's push step pushes only the image the build step built** (git-bug 23a29ab).
   It receives BuildKit's `containerimage.digest` from the build step's `image` result and refuses

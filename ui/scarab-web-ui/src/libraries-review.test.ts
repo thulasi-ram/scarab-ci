@@ -138,7 +138,7 @@ describe("review checks", () => {
   });
 });
 
-describe("credential grants an install carries", () => {
+describe("grants an install carries", () => {
   it("needs every carried grant ticked before it sends them", () => {
     const carried = ["forge_credentials", "registry_credential"] as const;
     expect(carryGrants(carried, new Set())).toBeNull();
@@ -148,11 +148,12 @@ describe("credential grants an install carries", () => {
       "registry_credential",
     ]);
   });
-  it("sends an empty list when the source holds no credential grant", () => {
+  it("sends an empty list when the source holds no grant", () => {
     expect(carryGrants([], new Set())).toEqual([]);
   });
-  it("names what each grant lets a Step receive", () => {
+  it("names what each grant lets a Step do", () => {
     expect(carriedGrantBox("forge_credentials").label).toMatch(/forge credentials/);
     expect(carriedGrantBox("registry_credential").help).toMatch(/registry_auth/);
+    expect(carriedGrantBox("build_sandbox").label).toMatch(/build sandbox/);
   });
 });

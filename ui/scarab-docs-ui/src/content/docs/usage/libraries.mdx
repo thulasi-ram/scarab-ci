@@ -87,25 +87,24 @@ commit of the same file. Scarab shows the diff from the installed version, and *
 review page installs it. The upgrade names the version it replaces, so if someone else changed the
 installation after you fetched, it fails and you fetch again to see the current diff.
 
-**Credentials carry over.** Trust is kept for a source, not a commit
+**Trust carries over.** Trust is kept for a source, not a commit
 ([below](#trusting-a-library-with-forge-credentials)), so a new commit from a trusted source gets
-the same credentials as the installed one. When the org trusts the source with forge credentials
-or the registry credential, the review page lists them under **Credentials**, one box each, and
-**Upgrade** stays off until you tick every box. The fetch answer names them in `carried_grants`,
-and the install must name the same grants in `carry_grants`:
+the same grants as the installed one. When the org trusts the source with forge credentials, the
+registry credential or the build sandbox, the review page lists them under **Trust**, one box
+each, and **Upgrade** stays off until you tick every box. The fetch answer names them in
+`carried_grants`, and the install must name the same grants in `carry_grants`:
 
 ```sh
 curl -X POST "$SCARAB/v1/orgs/acme/library-installations" \
   -d '{"name": "acme::scarab-libs::deploy-helm", "content_hash": "9b2a…", "replaces": "5d1e…",
-       "carry_grants": ["forge_credentials", "registry_credential"]}'
+       "carry_grants": ["build_sandbox", "forge_credentials", "registry_credential"]}'
 ```
 
 Leaving one out, or naming one the source does not hold, fails with a 400 that names the grants
 the source holds. Trust given between your fetch and your install fails the same way: fetch again
 to see it. The same rule applies to a first install from a trusted source, so removing a library
-and installing a new commit does not skip it. The build sandbox is not a credential and is not
-listed. With step-up on, the confirmation your passkey signs and the org's security log name the
-grants carried.
+and installing a new commit does not skip it. With step-up on, the confirmation your passkey
+signs and the org's security log name the grants carried.
 
 A Run keeps the version it was created with. Its inlined Steps record the version's hash in
 `origin`, and a Rerun or Retry uses the stored Steps, so upgrading changes only Runs created after
@@ -248,8 +247,8 @@ curl -X POST "$SCARAB/v1/orgs/acme/library-trust" \
 `grant` is `forge_credentials` when you leave it out.
 
 Trust is for the source without a commit, so it holds when you upgrade the library from the same
-source, and each upgrade still shows you its diff and asks you to confirm the credentials it
-carries ([Upgrade](#upgrade)). Trusting needs a step-up; removing trust
+source, and each upgrade still shows you its diff and asks you to confirm the grants it carries
+([Upgrade](#upgrade)). Trusting needs a step-up; removing trust
 (`DELETE …/library-trust?source=<source>&grant=forge_credentials`) does not. Each row under
 Settings › Libraries says whether its source is trusted, and a trusted source no installed library
 comes from is listed below them.

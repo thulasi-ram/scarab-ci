@@ -11,7 +11,7 @@
 //   /orgs/acme/settings/libraries?libs=empty     the empty state
 //   /orgs/acme/settings/libraries/review?source=…&grants=carry
 //                                                an upgrade whose source holds
-//                                                credential grants to confirm
+//                                                grants to confirm
 //   /acme/edge-gateway/runs/<PLUGIN>?gate=pass | exp | kill
 //   /acme/orders-api/run                         the compile errors (pick release)
 //   /acme/orders-api?status=refused              refused rows
@@ -212,10 +212,10 @@ function lineDiff(a: string, b: string): string {
   return out.join("\n") + "\n";
 }
 
-/** The credential grants the fetched upgrade gets from its source's trust:
- *  both with `?grants=carry`, none otherwise. */
+/** The grants the fetched upgrade gets from its source's trust: all three
+ *  with `?grants=carry`, none otherwise. */
 const carriedGrants = (): S["TrustGrantDto"][] =>
-  page().get("grants") === "carry" ? ["forge_credentials", "registry_credential"] : [];
+  page().get("grants") === "carry" ? ["build_sandbox", "forge_credentials", "registry_credential"] : [];
 
 const fetchedUpgrade = (): S["FetchedLibraryDto"] => ({
   name: "acme::scarab-libs::deploy-helm",
@@ -454,7 +454,7 @@ export function libraryRoute(
     const acked = [...new Set(req.carry_grants ?? [])].sort();
     if (acked.join(",") !== carried.join(",")) {
       return new Response(
-        `the org trusts github.com/acme/scarab-libs//deploy-helm.yaml with ${carried.join(", ") || "no credential"}; name exactly those in carry_grants`,
+        `the org trusts github.com/acme/scarab-libs//deploy-helm.yaml with ${carried.join(", ") || "no grant"}; name exactly those in carry_grants`,
         { status: 400 },
       );
     }

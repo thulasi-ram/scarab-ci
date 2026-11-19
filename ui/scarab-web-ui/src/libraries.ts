@@ -220,10 +220,16 @@ export function grantLabel(grant: string | undefined): string {
   return "forge credentials";
 }
 
-/** One confirm box on the review page for a credential grant the
- *  version gets from its source's trust: what to tick, and what it lets a
- *  Step from the version receive. */
+/** One confirm box on the review page for a grant the version gets from
+ *  its source's trust: what to tick, and what it lets a Step from the
+ *  version do. */
 export function carriedGrantBox(grant: string): { label: string; help: string } {
+  if (grant === "build_sandbox") {
+    return {
+      label: "Give this version the build sandbox",
+      help: "A Step from it may run in a security.sandbox.",
+    };
+  }
   if (grant === "registry_credential") {
     return {
       label: "Give this version the registry credential",
@@ -239,7 +245,7 @@ export function carriedGrantBox(grant: string): { label: string; help: string } 
 /** What the install sends as `carry_grants`: every grant the fetch says
  *  the version gets from its source's trust, once each one is ticked.
  *  `null` while one is not, so Install stays off. An empty list when the
- *  source holds no credential grant. */
+ *  source holds no grant. */
 export function carryGrants<G extends string>(carried: readonly G[], ticked: ReadonlySet<string>): G[] | null {
   return carried.every((g) => ticked.has(g)) ? [...carried] : null;
 }

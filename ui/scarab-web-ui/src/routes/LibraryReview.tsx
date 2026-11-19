@@ -6,8 +6,9 @@
 // compiles as a closed library and stores it) and shows what it is: the
 // facts and checks on one label and value grid, then the file, or the
 // side-by-side diff from the installed version. When the org trusts the
-// source with a credential, the version gets it too (trust is kept per
-// source), so each such grant has a box to tick before Install. Install, in
+// source with a grant (forge credentials, the registry credential, the build
+// sandbox), the version gets it too (trust is kept per source), so each such
+// grant has a box to tick before Install. Install, in
 // the footer row, installs exactly the version shown, naming the version it
 // replaces and the grants ticked, and asks for a step-up.
 //
@@ -97,7 +98,7 @@ function Review(props: { org: string }) {
   const [changing, setChanging] = createSignal(false);
   const [installing, setInstalling] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
-  // The credential grants ticked on the review: cleared for each version
+  // The grants ticked on the review: cleared for each version
   // fetched, so a box ticked for one version is not carried to another.
   const [ticked, setTicked] = createSignal<ReadonlySet<string>>(new Set());
   createEffect(on(() => fetched()?.content_hash, () => setTicked(new Set<string>())));
@@ -246,8 +247,8 @@ function Review(props: { org: string }) {
                     <dt>Runs</dt>
                     <dd>Runs already created keep the Steps they were compiled with.</dd>
                     <Show when={(f().carried_grants ?? []).length > 0}>
-                      <dt>Credentials</dt>
-                      <dd role="group" aria-label="Credentials this version gets">
+                      <dt>Trust</dt>
+                      <dd role="group" aria-label="Trust this version gets">
                         <p style={{ margin: "0 0 8px" }}>
                           The org trusts <span class="mono">{trustKey(f().source)}</span> with these. Trust is kept
                           for the source, not the commit, so {f().current ? "the new version" : "this version"} gets

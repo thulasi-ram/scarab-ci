@@ -681,21 +681,24 @@ test("Install library opens a dialog, and its source is reviewed on its own page
   expect(errors).toEqual([]);
 });
 
-test("an upgrade whose source holds credentials asks to confirm each one", async ({ page }) => {
+test("an upgrade whose source holds trust grants asks to confirm each one", async ({ page }) => {
   const errors = collectErrors(page);
   // The mock's `grants=carry` variant: deploy-helm's source holds forge
-  // credentials and the registry credential, which the new version gets.
+  // credentials, the registry credential and the build sandbox, which the
+  // new version gets.
   await page.goto(
     "/orgs/acme/settings/libraries/review?source=github.com%2Facme%2Fscarab-libs%2F%2Fdeploy-helm.yaml&ref=v1.4.0&grants=carry",
   );
   await expect(page.getByText("5d1e0c7a9b3f → 0c4e7b2a91f5")).toBeVisible();
-  const boxes = page.getByRole("group", { name: "Credentials this version gets" });
+  const boxes = page.getByRole("group", { name: "Trust this version gets" });
   await expect(boxes).toContainText("github.com/acme/scarab-libs//deploy-helm.yaml");
   const upgrade = page.getByRole("button", { name: "Upgrade", exact: true });
   await expect(upgrade).toBeDisabled();
   await boxes.getByText("Give this version forge credentials").click();
   await expect(upgrade).toBeDisabled();
   await boxes.getByText("Give this version the registry credential").click();
+  await expect(upgrade).toBeDisabled();
+  await boxes.getByText("Give this version the build sandbox").click();
   await expect(upgrade).toBeEnabled();
   await upgrade.click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/b72d4f1e06\/manage$/);
