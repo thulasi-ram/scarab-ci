@@ -6,13 +6,14 @@
 //!   latest `GateResolved` in the run's journal. Never re-folded: the verdict
 //!   is the one the engine recorded.
 //!
-//! Cheap by construction: the journal is read only when the run has a gate.
+//! Cheap by construction: the caller reads the run's journal once and hands it
+//! in; the view walks it only when the run has a gate.
 
 use std::collections::HashMap;
 
-use scarab_engine::{AttemptOutcome, EventPayload, RunId, StepRun, StepStatus};
+use scarab_engine::{AttemptOutcome, EventKind, EventPayload, StepRun, StepStatus};
 
-use crate::{ApiError, AppState, GateResolutionDto};
+use crate::{AppState, GateResolutionDto};
 
 /// The gate facts of one step. Every field is `None` for a step with nothing
 /// to say.
@@ -52,18 +53,19 @@ fn needs_met(s: &StepRun, status_of: &HashMap<&str, StepStatus>) -> bool {
         .all(|n| status_of.get(n.0.as_str()) == Some(&StepStatus::Succeeded))
 }
 
-/// The gate view of every step of `run` that has one, by step id.
+/// The gate view of every step that has one, by step id. `events` is the run's
+/// journal, as the store returns it.
 pub(crate) async fn step_gate_views(
     st: &AppState,
-    run: &RunId,
     steps: &[StepRun],
-) -> Result<HashMap<String, StepGateView>, ApiError> {
+    events: &[EventKind],
+) -> HashMap<String, StepGateView> {
     let mut views: HashMap<String, StepGateView> = HashMap::new();
     if !steps.iter().any(StepRun::is_gate) {
-        return Ok(views);
+        return views;
     }
     // Who resolved a gate shows by handle (ADR-0080 §3).
-    let events = crate::people::shown(st.identities.as_deref(), st.db.events(run).await?).await;
+    let events = crate::people::shown(st.identities.as_deref(), events.to_vec()).await;
     for gate in steps
         .iter()
         .filter(|s| s.gate_kind.as_deref() == Some("manual") && s.status == StepStatus::Pending)
@@ -97,5 +99,5 @@ pub(crate) async fn step_gate_views(
             });
         }
     }
-    Ok(views)
+    views
 }

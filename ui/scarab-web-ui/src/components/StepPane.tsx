@@ -1,13 +1,27 @@
-// The merged step pane (ADR-0056): ONE pane for the DAG-selected step, with an
-// attempt strip on top that scopes EVERY tab — Logs, Results, Outputs,
-// Workspace — to the selected (step, attempt). This replaces the old stacked
-// Logs panel + Inspector, whose asymmetry (only logs knew about attempts) let
-// a rerun silently shadow the evidence the other tabs showed. Chips carry each
-// try's cause (auto-retry / you reran / ⟵ cascade) and outcome (failed ✗ /
-// superseded ⊘ / shadowed) from the event log (ADR-0056 amendment); a crash
-// re-adoption renders as a marker INSIDE its chip — same attempt, same fence,
-// never a new execution.
-import { createSignal, createEffect, createMemo, createResource, on, For, Show, onCleanup } from "solid-js";
+// The step pane: one pane for the selected step. Its header names the step,
+// the selected try ("Try 2 of 3"), what that try did ("✕ Failed after
+// 2m06s: step error"), a link to the step's artifacts and the step's actions
+// (Retry step, Rerun from here, Debug pod, handed in by the page). A step with
+// two or more tries gets a row of try tabs under the header, every try,
+// scrolling sideways when they do not fit. A box below
+// says why the try failed, what holds it back, or where a step that did not
+// run in this version was reused from. Every content tab (Logs, Results, Workspace) is
+// scoped to the selected try and says so; Outputs reads the try of record and
+// names it when it is a different one. Causes (first run, automatic retry,
+// retried by, rerun of) and outcomes come from the event log; a crash
+// re-adoption is a marker inside its try, never a new execution.
+import {
+  createSignal,
+  createEffect,
+  createMemo,
+  createResource,
+  on,
+  For,
+  Show,
+  onCleanup,
+  untrack,
+  type JSX,
+} from "solid-js";
 import {
   getStepResults,
   getConsumed,
@@ -20,26 +34,37 @@ import {
   type Attempt,
 } from "../api/client";
 import type { RunEvent } from "../api/client";
-import { ofRecordAttemptId } from "../takes";
+import { attemptPlaces, ofRecordAttemptId, reusedOfRecord, tryLabel } from "../takes";
 import {
   windowAttemptList,
   scopedAttempt,
   stepNotRun,
   ofRecordIndexOf,
+  causeText,
 } from "../attempts";
-import { levelOf } from "../logs";
+import { heldBeforeStart } from "../events";
+import { failureBox, notLatestNote, statusWord, stepName, tryStatusWords } from "../run-page";
+import { levelOf, logBodyState, replayBuffer, streamEndStep } from "../logs";
 import { approvalReleaseIn, type GateStatus } from "../gates";
-import { clock, clockLow, expiryPercent, isYankRefusal, originParts, pluginGateState } from "../run-origin";
+import { clock, clockLow, expiryPercent, isYankRefusal, pluginGateState } from "../run-origin";
 import { shortHash } from "../libraries";
+import { waitApprovers, type WaitResolution } from "../run-tabs";
 import { absTime } from "../fmt";
 import Icon from "./Icon";
 import AttemptsDropdown, { type FilmstripTry } from "./AttemptsDropdown";
+import TryTabs from "./TryTabs";
 import Pill from "./Pill";
 
-type Tab = "logs" | "results" | "outputs" | "workspace" | "origin" | "gate";
+export type PaneTab = "logs" | "results" | "outputs" | "workspace" | "source" | "gate";
 
 // Cap rendered lines so a giant attempt can't blow up the DOM (windowing v1).
 const MAX_LINES = 1500;
+
+/** A memo that notifies only when its value changes by content, for a fetch
+ * key rebuilt as a new object on every poll. */
+function sameKey<T>(fn: () => T): () => T {
+  return createMemo(fn, undefined, { equals: (a, b) => JSON.stringify(a) === JSON.stringify(b) });
+}
 
 /** A compact display of a result value — scalars inline, structures as JSON. */
 function showValue(v: unknown): string {
@@ -55,22 +80,20 @@ export default function StepPane(props: {
   /** The try scoping every tab — chosen in the header filmstrip; null = latest. */
   attempt: string | null;
   /** The selected step's tries, resolved by the caller from the event log — the
-   * header filmstrip renders these (the try axis, ADR-0056 amendment). */
+   * header filmstrip renders these (the try axis). */
   tries: FilmstripTry[];
   /** The try the filmstrip highlights as active (resolved to a concrete id). */
   activeAttempt: string | null;
   /** Pick a try in the filmstrip — scopes every tab to `(step, attempt)`. */
   onAttemptSelect: (id: string | null) => void;
-  /** The viewed version's label — the trailing coordinate in the pane's stamp.
-   * Only carries a value while TIME-TRAVELLING (a rerun label like "you reran
-   * b"); the caller passes `null` on the live/latest view so the stamp doesn't
-   * tag every attempt with a redundant "latest" (the toolbar version dropdown
-   * already says so). */
-  versionLabel: string | null;
+  /** The number of the version (Take) in view, latest included. Attempt ids
+   * are shown as tries counted within their version, and an attempt from
+   * another version names that version. */
+  viewedTake?: number | null;
   /** Viewing a closed Take: pin the strip's default to this frontier attempt
    * and mark attempts beyond it as from a later take. */
   frontierAttempt?: string | null;
-  /** The SELECTED take's attempt-id window (ADR-0056 amendment 2026-07-24) —
+  /** The SELECTED take's attempt-id window —
    * the exact set of tries that belong to this take, scoping EVERY tab's
    * evidence in every view (the latest/live take included). `[]` = the step was
    * carried forward untouched (nothing ran here); `null`/absent = unscoped
@@ -85,46 +108,73 @@ export default function StepPane(props: {
    * attempt's immutable bytes). Absent/`canDebug:false` ⇒ the affordance hides. */
   onDebugPod?: () => void;
   canDebug?: boolean;
-  /** A sidecar container index to focus in the Logs tab on selection (ADR-0058)
+  /** A sidecar container index to focus in the Logs tab on selection
    * — set when the user clicked this step's docked sidecar chip in the DAG.
    * `null`/absent = the step's main container. */
   focusSidecar?: number | null;
   /** The step's gate verdict (gates.ts `gateStatus`) — shown under the stamp. `null` = nothing to say (or viewing
    * an older version, which this line does not describe). */
   gateStatus?: GateStatus | null;
-  /** The Run's pipeline name, for the origin line (ADR-0076). */
+  /** The Run's pipeline name, for the origin line. */
   pipeline?: string | null;
   /** The page's clock tick, for a plugin gate's expiry countdown. */
   now?: number;
   /** For an Environment approval gate: "Environment approval gate · <Environment>"
    * (gates.ts `environmentGateLabel`). `null` for any other step. */
   gateLabel?: string | null;
+  /** The step's actions (Retry step, Rerun from here, Debug pod), right-aligned
+   * in the header. */
+  actions?: JSX.Element;
+  /** A note under the header (the widened-rerun note). */
+  note?: JSX.Element;
+  /** How many files this step published in the version in view. */
+  artifacts?: number;
+  /** Open the run's Artifacts tab filtered to this step. */
+  onShowArtifacts?: () => void;
+  /** The infra condition holding the step's current try back now (live view
+   * only), in words, with the backend's message. */
+  held?: { attempt: string; text: string; message?: string } | null;
+  /** The tab to open on first mount (from the URL). */
+  initialTab?: PaneTab;
+  /** Told whenever the open tab changes, so the page can keep it in the URL. */
+  onTabChange?: (t: PaneTab) => void;
+  /** Show an earlier version's try: the "Reused from version 2, try 1" link. */
+  onShowTry?: (take: number, attempt: string) => void;
+  /** The version in view reused this step: it has a verdict carried forward
+   * and no tries here. A step with no tries that is pending or did not run is
+   * not reused. */
+  reused?: boolean;
 }) {
-  const [tab, setTab] = createSignal<Tab>("logs");
-  // A plugin gate (ADR-0076 §7) opens on its Gate tab; any other step never
+  const [tab, setTab] = createSignal<PaneTab>(props.initialTab ?? "logs");
+  // Two or more tries get the try tabs (a row that scrolls sideways at every
+  // width); the header then names the selected try as text.
+  const tryTabs = () => props.tries.length > 1;
+  createEffect(() => props.onTabChange?.(tab()));
+  // A plugin gate opens on its Gate tab; any other step never
   // stays on one.
   const isPluginGate = () => !!props.step?.plugin_gate;
+  // The selected step's id. A memo, so the 1.2s poll (a new `props.step`
+  // object every tick) does not count as a new selection: the effects keyed on
+  // it below keep the open tab, folder and file across polls.
+  const stepId = createMemo(() => props.step?.id ?? null);
   createEffect(
-    on(
-      () => props.step?.id,
-      () => {
-        if (isPluginGate()) setTab("gate");
-        else if (tab() === "gate" || (tab() === "origin" && (props.step?.origin ?? []).length === 0)) setTab("logs");
-      },
-    ),
+    on(stepId, () => {
+      if (!props.step) return;
+      if (isPluginGate()) setTab("gate");
+      else if (tab() === "gate" || (tab() === "source" && (props.step?.origin ?? []).length === 0)) setTab("logs");
+    }),
   );
   // Where the step comes from: the chain, its bound inputs, and its render.
-  // Read when the Origin or Gate tab is open.
+  // Read when the Source or Gate tab is open.
   const [origin] = createResource(
-    () => {
+    sameKey(() => {
       const s = props.step;
       const t = tab();
-      return s && (t === "origin" || t === "gate") ? { run: props.runId, step: s.id, n: s.attempt_list?.length ?? 0 } : null;
-    },
+      return s && (t === "source" || t === "gate") ? { run: props.runId, step: s.id, n: s.attempt_list?.length ?? 0 } : null;
+    }),
     (k) => stepOrigin(k.run, k.step).catch(() => null),
   );
-  const parts = () => (props.step ? originParts(props.pipeline, props.step) : []);
-  // A launch refused because a library version is yanked (ADR-0076 §6).
+  // A launch refused because a library version is yanked.
   const yankRefusal = () => {
     const a = props.step?.attempt_list?.[props.step.attempt_list.length - 1];
     return a?.failure === "config" && isYankRefusal(a.failure_detail) ? a.failure_detail : null;
@@ -133,8 +183,8 @@ export default function StepPane(props: {
   const [openFile, setOpenFile] = createSignal<string | null>(null);
   const [wrap, setWrap] = createSignal(true);
   // Which container's logs the Logs tab shows: `null` = the step's main
-  // container (default); a number = the sidecar at that `services:` index
-  // (ADR-0058). Reset per selection from `focusSidecar` below.
+  // container (default); a number = the sidecar at that `services:` index.
+  // Reset per selection from `focusSidecar` below.
   const [container, setContainer] = createSignal<number | null>(null);
 
   // A sidecar chip's short label, matching the DAG chip: `redis:7.4` → `redis`.
@@ -146,14 +196,13 @@ export default function StepPane(props: {
   };
   const sidecars = () => props.step?.services ?? [];
 
-  const stepId = () => props.step?.id ?? null;
-  // The attempts this pane's tabs are scoped to. Take-windowed in EVERY view
-  // (ADR-0056 amendment 2026-07-24): when the caller hands a `window` (the
+  // The attempts this pane's tabs are scoped to. Take-windowed in EVERY view:
+  // when the caller hands a `window` (the
   // selected take's attempt-id set), keep only those tries — so a step carried
   // forward untouched (`[]`) reads as "didn't run in this version", and a
   // re-run step shows only THIS take's tries, on the latest/live take too. The
   // `frontierAttempt` ≤-filter stays as the fallback for callers that don't
-  // pass a window (snapshot-at-boundary honesty).
+  // pass a window (so a closed version never shows later tries).
   const attemptsOf = (): Attempt[] =>
     windowAttemptList(props.step?.attempt_list ?? [], props.window, props.frontierAttempt);
 
@@ -166,20 +215,47 @@ export default function StepPane(props: {
   // (already windowed to this version's tries) is empty. Both a time-travel
   // `not_run` step (re-armed but never executed in a superseded version) and a
   // not-yet-launched step land here. Its tabs read a short "didn't run / nothing
-  // of record" line instead of a stale or empty-looking shell (ADR-0056 §3:
-  // never render blank-that-reads-as-success).
+  // of record" line instead of a stale or empty-looking shell (a blank tab
+  // would read as success).
   const notRun = (): boolean => stepNotRun(props.step, props.tries);
 
-  // Of-record (ADR-0056 §3): the Outputs tab shows the latest SUCCESSFUL attempt
+  // Of-record: the Outputs tab shows the latest SUCCESSFUL attempt
   // WITHIN THE VIEWED VERSION, not the selected try — so a failed/superseded/
   // running selected try still surfaces the values a downstream step would read.
   // `attemptsOf()` is already windowed to this version; a not-run step (or one
-  // with no success here) has nothing of record.
+  // with no success here) has nothing of record, except a carried-forward
+  // step (below).
+  //
+  // Every attempt's version and try number, from the event log.
+  const places = createMemo(() => attemptPlaces(props.events));
+  // The gate's latest verdict, with who approved that wait.
+  const waitResolution = (): WaitResolution | null => {
+    const r = props.step?.gate_resolution;
+    const s = stepId();
+    return r && s ? { ...r, approvers: waitApprovers(props.events, s, r.attempt) } : null;
+  };
+  /** "plan · try 2", or "plan · version 1 · try 2" for another version. */
+  const label = (step: string, attempt: string): string =>
+    tryLabel(places(), step, attempt, props.viewedTake ?? null);
+  // A step this version reused was carried forward: downstream steps read the
+  // outputs of an earlier version's attempt, so the Outputs tab shows that
+  // one, labelled with its version and try. A step that is pending or did not
+  // run here has nothing of record.
+  const carried = () => {
+    const id = stepId();
+    if (!id || !notRun()) return null;
+    return reusedOfRecord({
+      reused: !!props.reused,
+      list: props.step?.attempt_list ?? [],
+      places: places()[id],
+      viewedTake: props.viewedTake ?? null,
+    });
+  };
   const ofRecordTry = (): string | null =>
-    notRun() ? null : ofRecordAttemptId(attemptsOf());
+    notRun() ? (carried()?.id ?? null) : ofRecordAttemptId(attemptsOf());
   const ofRecordIndex = (): number => ofRecordIndexOf(attemptsOf());
 
-  // Why the selected try produced no output (ADR-0068). A step whose Pod never
+  // Why the selected try produced no output. A step whose Pod never
   // started — unschedulable, image unpullable, volume unmountable — has an
   // EMPTY log stream by construction: there was no process to print anything.
   // The diagnosis is on the attempt (`failure_detail`, the executor's own read
@@ -194,24 +270,80 @@ export default function StepPane(props: {
     };
   };
 
-  // Reset per-step view state when the DAG selection moves.
-  createEffect(() => {
-    void stepId();
-    setWsPath("");
-    setOpenFile(null);
-  });
+  // ── Header, failure box and tab scope ──
+  // A gate's tries are its waits.
+  const noun = () => (props.step?.gate ? "Wait" : "Try");
+  // The selected try's index in this version's tries, null when none ran.
+  const selIndex = (): number | null => {
+    if (!props.tries.length) return null;
+    const i = props.tries.findIndex((t) => t.id === props.activeAttempt);
+    return i >= 0 ? i : props.tries.length - 1;
+  };
+  const selTry = () => {
+    const i = selIndex();
+    return i === null ? null : props.tries[i];
+  };
+  // The held condition applies only while it holds the selected try.
+  const heldHere = () => (props.held && props.held.attempt === selTry()?.id ? props.held : null);
+  // What the selected try did; with no try in this version, the step's own
+  // status (pending, waiting) or that it was reused from an earlier version.
+  const status = () => {
+    const t = selTry();
+    if (t) return tryStatusWords(t, props.now ?? Date.now(), heldHere()?.text ?? null);
+    if (carried()) return { text: "○ Not run in this version", tone: "muted" };
+    return { text: `○ ${statusWord(props.step?.status ?? "")}`, tone: "muted" };
+  };
+  const box = createMemo(() =>
+    failureBox({
+      tries: props.tries.map((t) => ({
+        outcome: t.outcome,
+        failure: t.failure,
+        failureDetail: t.failureDetail,
+        cause: causeText(t.cause),
+      })),
+      selected: selIndex(),
+      noun: noun(),
+      heldBeforeMs: stepId() && selTry() ? heldBeforeStart(props.events, stepId()!, selTry()!.id) : null,
+      held: heldHere(),
+      carried: carried(),
+      viewedTake: props.viewedTake ?? null,
+    }),
+  );
+  const notLatest = () => notLatestNote(props.tries, selIndex(), noun());
+  // The scope each content tab carries: "try 2".
+  const tryScope = () => {
+    const i = selIndex();
+    return i === null ? null : `${noun().toLowerCase()} ${i + 1}`;
+  };
+  // Outputs read the try of record: name it when it is not the selected one.
+  const outputsScope = (): string | null => {
+    const c = carried();
+    if (c) return `from version ${c.take}, ${noun().toLowerCase()} ${c.try}`;
+    const rec = ofRecordTry();
+    if (!rec) return "none";
+    if (rec === scoped()?.id) return null;
+    return `from ${noun().toLowerCase()} ${ofRecordIndex() + 1}`;
+  };
 
-  // The Logs container follows the selection (ADR-0058): a clicked sidecar chip
+  // Reset per-step view state when the selection moves to another step.
+  createEffect(
+    on(stepId, () => {
+      setWsPath("");
+      setOpenFile(null);
+    }),
+  );
+
+  // The Logs container follows the selection: a clicked sidecar chip
   // (`focusSidecar` set) opens that sidecar's container in the Logs tab; any
   // other step selection resets to the main container. Tracks stepId so
   // re-selecting a step returns to `step`, and focusSidecar so clicking a chip
   // on the current step re-focuses it.
-  createEffect(() => {
-    void stepId();
-    const f = props.focusSidecar ?? null;
-    setContainer(f);
-    if (f != null) setTab("logs");
-  });
+  createEffect(
+    on([stepId, () => props.focusSidecar ?? null], ([, f]) => {
+      setContainer(f);
+      if (f != null) setTab("logs");
+    }),
+  );
 
   // A brief "changed / loading" pulse whenever the scoped (step, try) or tab
   // moves. The evidence pane no longer repeats the step name or try in a header
@@ -241,13 +373,52 @@ export default function StepPane(props: {
   // --- Logs: one buffered SSE stream per (step, attempt); the scoped attempt's
   // buffer renders. Historical attempts replay and close; the live one tails. ---
   const [buffers, setBuffers] = createSignal<Record<string, string>>({});
+  // Streams the server has closed: nothing more will arrive for that key.
+  const [ended, setEnded] = createSignal<Record<string, true>>({});
   const streams = new Map<string, () => void>();
   // Keyed by (step, attempt, container) — the container axis (main vs a sidecar
-  // index) keeps each container's tail in its own buffer/stream (ADR-0058).
+  // index) keeps each container's tail in its own buffer/stream.
   const logKey = (step: string, attempt: string, c: number | null) =>
     `${step} ${attempt} ${c ?? "main"}`;
 
+  // A stream the server ends while its try still reads as running waits one
+  // poll (REOPEN_MS is longer than the run's 1.2s poll): a try that finished
+  // ends its stream before the poll says so, and its log is whole. When the
+  // try still runs after that (the Pod had not started, or the connection
+  // dropped), the stream is opened again. `streamEndStep` decides.
+  // A reopened stream replays from the start into its own buffer, which
+  // replaces the one on screen once it has caught up (`replayBuffer`).
+  const REOPEN_MS = 2000;
+  // Streams that ended while their try read as running, and whose wait ran
+  // out while their step was not in view: decided when it is in view again.
+  const endedRunning = new Set<string>();
+  const reopenTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const replays = new Map<string, string>();
+  const [streamGen, setStreamGen] = createSignal(0);
+  const hasOutput = (key: string) => (untrack(buffers)[key] ?? "").length > 0;
+  const reopen = (key: string) => {
+    clearTimeout(reopenTimers.get(key));
+    reopenTimers.delete(key);
+    endedRunning.delete(key);
+    streams.get(key)?.();
+    streams.delete(key);
+    replays.set(key, "");
+    setEnded((prev) => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+    setStreamGen((n) => n + 1);
+  };
+  onCleanup(() => reopenTimers.forEach((t) => clearTimeout(t)));
+  // The attempt's outcome now, when that step is still the one in view.
+  const outcomeNow = (step: string, attempt: string): string | undefined =>
+    untrack(() =>
+      props.step?.id === step ? props.step.attempt_list?.find((x) => x.id === attempt)?.outcome : undefined,
+    );
+
   createEffect(() => {
+    void streamGen();
     const s = stepId();
     const a = scoped();
     const c = container();
@@ -255,15 +426,63 @@ export default function StepPane(props: {
     // version — never stream it; the Logs tab shows the not-run line instead.
     if (!s || !a || notRun() || tab() !== "logs") return;
     const key = logKey(s, a.id, c);
+    // Its stream ended while it ran, and the wait ran out out of view.
+    if (endedRunning.has(key)) {
+      endedRunning.delete(key);
+      if (streamEndStep({ outcome: a.outcome, graceOver: true, hadOutput: hasOutput(key) }) === "reopen") {
+        reopen(key);
+        return;
+      }
+    }
     if (streams.has(key)) return;
-    const onChunk = (t: string) =>
-      setBuffers((prev) => ({ ...prev, [key]: (prev[key] ?? "") + t + "\n" }));
+    const onChunk = (t: string) => {
+      const replay = replays.get(key);
+      if (replay === undefined) {
+        setBuffers((prev) => ({ ...prev, [key]: (prev[key] ?? "") + t + "\n" }));
+        return;
+      }
+      const next = replayBuffer({ shown: untrack(buffers)[key] ?? "", replay: replay + t + "\n", ended: false });
+      if (next.caughtUp) {
+        replays.delete(key);
+        setBuffers((prev) => ({ ...prev, [key]: next.text }));
+      } else {
+        replays.set(key, replay + t + "\n");
+      }
+    };
+    const onEnd = () => {
+      const replay = replays.get(key);
+      if (replay !== undefined) {
+        replays.delete(key);
+        const next = replayBuffer({ shown: untrack(buffers)[key] ?? "", replay, ended: true });
+        setBuffers((prev) => ({ ...prev, [key]: next.text }));
+      }
+      setEnded((prev) => ({ ...prev, [key]: true }));
+      const now = streamEndStep({
+        outcome: outcomeNow(s, a.id) ?? a.outcome,
+        graceOver: false,
+        hadOutput: hasOutput(key),
+      });
+      if (now !== "wait" || reopenTimers.has(key)) return;
+      reopenTimers.set(
+        key,
+        setTimeout(() => {
+          reopenTimers.delete(key);
+          const outcome = outcomeNow(s, a.id);
+          // Out of view: decided when the step is in view again.
+          if (outcome === undefined) {
+            endedRunning.add(key);
+            return;
+          }
+          if (streamEndStep({ outcome, graceOver: true, hadOutput: hasOutput(key) }) === "reopen") reopen(key);
+        }, REOPEN_MS),
+      );
+    };
     // Sidecar logs share the step's real attempt ids, so the attempt scoping is
     // identical — only the endpoint (`?sidecar=<index>`) differs.
     const close =
       c == null
-        ? streamStepLogs(props.runId, s, { attempt: a.id, onChunk })
-        : streamStepSidecarLogs(props.runId, s, c, { attempt: a.id, onChunk });
+        ? streamStepLogs(props.runId, s, { attempt: a.id, onChunk, onEnd })
+        : streamStepSidecarLogs(props.runId, s, c, { attempt: a.id, onChunk, onEnd });
     streams.set(key, close);
   });
   onCleanup(() => streams.forEach((close) => close()));
@@ -271,7 +490,16 @@ export default function StepPane(props: {
   const logText = () => {
     const s = stepId();
     const a = scoped();
-    return s && a ? (buffers()[logKey(s, a.id, container())] ?? "waiting for output…") : "";
+    return s && a ? (buffers()[logKey(s, a.id, container())] ?? "") : "";
+  };
+  // With no lines: still waiting (stream open, try running), or nothing was
+  // captured (stream ended, or the try finished).
+  const logState = () => {
+    const s = stepId();
+    const a = scoped();
+    if (!s || !a) return "waiting" as const;
+    const key = logKey(s, a.id, container());
+    return logBodyState({ text: buffers()[key], ended: !!ended()[key], outcome: a.outcome });
   };
   const logRows = () => {
     const all = logText().split("\n");
@@ -283,38 +511,41 @@ export default function StepPane(props: {
   };
 
   // --- Results / Logs / Workspace: fetches scoped to the SELECTED try
-  // (`scoped()`), ADR-0056. Outputs read a DIFFERENT (of-record) attempt below. ---
-  const evidenceArg = () => {
+  // (`scoped()`). Outputs read a DIFFERENT (of-record) attempt below. ---
+  // Each fetch key below is compared by value, so a poll that hands in a new
+  // `props.step` with the same ids fetches nothing again. The outcome is part
+  // of the key: a try that finishes is read once more.
+  const evidenceArg = sameKey(() => {
     const s = stepId();
     const a = scoped();
     // Not-run in this version → no per-try evidence to fetch (the tabs render a
     // "didn't run" line); skip the request rather than pull a stale attempt.
-    return s && !notRun() ? { run: props.runId, step: s, attempt: a?.id } : null;
-  };
+    return s && !notRun() ? { run: props.runId, step: s, attempt: a?.id, outcome: a?.outcome } : null;
+  });
   const [results] = createResource(evidenceArg, (a) =>
     getStepResults(a.run, a.step, a.attempt).catch(() => []),
   );
 
-  // Outputs are OF-RECORD, not per-try (ADR-0056 §3): they resolve to the of-
+  // Outputs are OF-RECORD, not per-try: they resolve to the of-
   // record attempt (latest success in this version) via a dedicated arg/resource
   // pair. Null (no success, or not-run) simply doesn't fetch — the tab shows the
   // of-record empty copy. The interpolation view AND the "built on …" consumed
   // line both read these, so what a downstream step would see is what shows.
-  const outputsArg = () => {
+  const outputsArg = sameKey(() => {
     const s = stepId();
     const rec = ofRecordTry();
     return s && rec ? { run: props.runId, step: s, attempt: rec } : null;
-  };
+  });
   const [outResults] = createResource(outputsArg, (a) =>
     getStepResults(a.run, a.step, a.attempt).catch(() => []),
   );
   const [outConsumed] = createResource(outputsArg, (a) =>
     getConsumed(a.run, a.step, a.attempt).catch(() => null),
   );
-  const wsArg = () => {
+  const wsArg = sameKey(() => {
     const base = evidenceArg();
     return base ? { ...base, path: wsPath() } : null;
-  };
+  });
   // Swallow browse failures into an unavailable listing — an uncaught reject
   // here would re-throw while rendering and tear down the whole pane (tabs and
   // all), stranding the user with no way back to Logs/Results.
@@ -324,10 +555,10 @@ export default function StepPane(props: {
     ),
   );
 
-  const fileArg = () => {
+  const fileArg = sameKey(() => {
     const base = evidenceArg();
     return base && openFile() ? { ...base, path: openFile()! } : null;
-  };
+  });
   const [fileBody] = createResource(fileArg, async (a) => {
     // Like the listing above, never let a failed read re-throw during render —
     // a file the CAS can no longer hand back would otherwise tear down the pane.
@@ -378,18 +609,19 @@ export default function StepPane(props: {
     </div>
   );
 
-  const TabBtn = (p: { id: Tab; label: string; count?: number }) => (
+  const TabBtn = (p: { id: PaneTab; label: string; scope?: string | null }) => (
     <button class={`tab ${tab() === p.id ? "active" : ""}`} onClick={() => setTab(p.id)}>
       {p.label}
-      <Show when={p.count !== undefined}>
-        <span class="tcount">{p.count}</span>
+      <Show when={p.scope}>
+        {" "}
+        <span class="tscope">{p.scope}</span>
       </Show>
     </button>
   );
 
   return (
     // `inspector` carries the shared tab styling; `steppane` adds the strip +
-    // in-pane log treatment (ADR-0056).
+    // in-pane log treatment.
     <div class="panel inspector steppane">
       <Show
         when={props.step}
@@ -401,37 +633,48 @@ export default function StepPane(props: {
       >
         {(s) => (
           <>
-            {/* Evidence header. A permanent coordinate stamp names WHERE you are
-                — step · [attempts] · version — so the evidence below never floats
-                context-free (redesign stage 4). The attempts dropdown occupies
-                the "try N" position of the stamp: it names the active try (the
-                one scoping every tab) and, when a step has more than one try,
-                opens a menu to switch between them (design feedback — the compact
-                dropdown replaced the noisier filmstrip). It renders nothing when
-                nothing ran here, so the stamp reads `step · version` for a
-                not-run step. A spinner on the right of the tab row is the only
-                cue that a switch took effect and fresh evidence is loading;
-                dead-letter, being terminal + rare, keeps a badge there. */}
-            <div class="coord-stamp mono">
-              {/* The attempts dropdown leads the stamp (left-most), sitting under
-                  the toolbar's version dropdown so the two run-detail dropdowns
-                  align into one column. The step id follows, then the version
-                  segment — shown ONLY while time-travelling (a redundant
-                  "latest" on the live view is dropped). */}
-              <Show when={props.tries.length > 0}>
-                <AttemptsDropdown
-                  tries={props.tries}
-                  active={props.activeAttempt}
-                  onSelect={props.onAttemptSelect}
-                />
-                <span class="cs-dot">·</span>
+            {/* Step header: the step, the selected try, what it did, the
+                step's files, and its actions. */}
+            <div class="sp-head">
+              <span class="sp-name" title={s().id}>
+                {stepName(s().id).base}
+                <Show when={stepName(s().id).cell}>
+                  {(cell) => <span class="sp-cell"> · {cell()}</span>}
+                </Show>
+              </span>
+              <AttemptsDropdown
+                tries={props.tries}
+                active={props.activeAttempt}
+                onSelect={props.onAttemptSelect}
+                noun={noun()}
+                static={tryTabs()}
+              />
+              <span class={`sp-status ${status().tone}`}>{status().text}</span>
+              <Show when={(props.artifacts ?? 0) > 0}>
+                <button
+                  type="button"
+                  class="linklike sp-files"
+                  onClick={() => props.onShowArtifacts?.()}
+                  title="Open the Artifacts tab, showing this step's files"
+                >
+                  {props.artifacts} {props.artifacts === 1 ? "artifact" : "artifacts"}
+                </button>
               </Show>
-              <span class="cs-step">{s().id}</span>
-              <Show when={props.versionLabel}>
-                <span class="cs-dot">·</span>
-                <span class="cs-ver">{props.versionLabel}</span>
-              </Show>
+              <span class="grow1" />
+              <span class="sp-actions">{props.actions}</span>
             </div>
+            <Show when={tryTabs()}>
+              <TryTabs
+                tries={props.tries}
+                active={props.activeAttempt}
+                ofRecord={notRun() ? null : ofRecordTry()}
+                onSelect={props.onAttemptSelect}
+                noun={noun()}
+                now={props.now ?? Date.now()}
+                resolution={waitResolution()}
+              />
+            </Show>
+            {props.note}
             <Show when={props.gateLabel}>
               {(label) => (
                 <div class="gate-status gate-env-line">
@@ -472,25 +715,43 @@ export default function StepPane(props: {
                 </div>
               )}
             </Show>
-            <Show when={parts().length > 0}>
-              <div class="origin-strip">
-                <span class="k">Origin</span>
-                <For each={parts()}>
-                  {(p, k) => (
+            {/* Why the selected try failed, what holds it back, or where a
+                step that did not run here was reused from. */}
+            <Show when={box() || notLatest()}>
+              <div class={`sp-box ${box()?.tone ?? "info"}`} role="status">
+                <Show when={box()}>
+                  {(b) => (
                     <>
-                      <Show when={k() > 0}>
-                        <span class="sep">›</span>
+                      <span class="sp-box-h">{b().head}</span>
+                      <Show when={b().detail}>
+                        <span class="sp-box-d">{b().detail}</span>
                       </Show>
-                      <Show when={p.kind === "step"}>
-                        <span>step</span>
-                      </Show>
-                      <span class="lnk" classList={{ y: p.kind === "lib" && p.yanked }}>
-                        {p.text}
-                      </span>
-                      <Show when={p.kind === "lib" ? p : null}>{(l) => <span class="h">{l().hash}</span>}</Show>
                     </>
                   )}
-                </For>
+                </Show>
+                <Show when={!selTry() && carried() && props.onShowTry}>
+                  <span class="sp-box-d">
+                    <button
+                      class="linklike"
+                      onClick={() => props.onShowTry!(carried()!.take, carried()!.id)}
+                    >
+                      Show version {carried()!.take}, {noun().toLowerCase()} {carried()!.try}
+                    </button>
+                  </span>
+                </Show>
+                <Show when={notLatest()}>
+                  {(n) => (
+                    <span class="sp-box-d">
+                      {n().text} ·{" "}
+                      <button
+                        class="linklike"
+                        onClick={() => props.onAttemptSelect(props.tries[n().latest].id)}
+                      >
+                        Show {noun().toLowerCase()} {n().latest + 1}
+                      </button>
+                    </span>
+                  )}
+                </Show>
               </div>
             </Show>
             <div class="pane-tabbar">
@@ -499,18 +760,18 @@ export default function StepPane(props: {
                   when={isPluginGate()}
                   fallback={
                     <>
-                      <TabBtn id="logs" label="Logs" />
-                      <TabBtn id="results" label="Results" count={results()?.length ?? 0} />
-                      <TabBtn id="outputs" label="Outputs" count={outResults()?.length ?? 0} />
-                      <TabBtn id="workspace" label="Workspace" />
+                      <TabBtn id="logs" label="Logs" scope={tryScope()} />
+                      <TabBtn id="results" label="Results" scope={tryScope()} />
+                      <TabBtn id="workspace" label="Workspace" scope={tryScope()} />
+                      <TabBtn id="outputs" label="Outputs" scope={outputsScope()} />
                       <Show when={(s().origin ?? []).length > 0}>
-                        <TabBtn id="origin" label="Origin" />
+                        <TabBtn id="source" label="Source" />
                       </Show>
                     </>
                   }
                 >
                   <TabBtn id="gate" label="Gate" />
-                  <TabBtn id="outputs" label="Outputs" count={outResults()?.length ?? 0} />
+                  <TabBtn id="outputs" label="Outputs" scope={outputsScope()} />
                 </Show>
               </div>
               <span class="grow1" />
@@ -536,7 +797,7 @@ export default function StepPane(props: {
               >
               <div class="tabpane logpane">
                 <div class="steplogs-tools">
-                  {/* Container selector (ADR-0058): when the step declares
+                  {/* Container selector: when the step declares
                       sidecars, choose whose logs the pane tails — the step's
                       main container (default) or one sidecar. Same (step,
                       attempt) scope; only the streamed container changes. */}
@@ -573,25 +834,33 @@ export default function StepPane(props: {
                       each={logRows()}
                       fallback={
                         <Show
-                          when={scopedFailure()}
+                          when={logState() !== "waiting"}
                           fallback={
                             <div class="lgrow empty">
                               <span class="lgln" />
-                              <span class="lgtx">no output for this try</span>
+                              <span class="lgtx">waiting for output…</span>
                             </div>
                           }
                         >
-                          {(f) => (
-                            <div class="lgrow empty lgwhy">
-                              <span class="lgln" />
-                              <span class="lgtx">
-                                no output — this try never produced any:{" "}
-                                <span class="lgwhy-reason">
-                                  {f().detail ?? f().failure}
+                          <div class="lgrow empty">
+                            <span class="lgln" />
+                            <span class="lgtx">No log output was captured for this try.</span>
+                          </div>
+                          {/* A Pod that never started (unschedulable, an image
+                              that will not pull, a volume that will not mount)
+                              printed nothing, so the reason is on the attempt:
+                              its failure class and the executor's own account. */}
+                          <Show when={scopedFailure()}>
+                            {(f) => (
+                              <div class="lgrow empty lgwhy">
+                                <span class="lgln" />
+                                <span class="lgtx">
+                                  <span class="lgwhy-reason">{f().failure} failure</span>
+                                  {f().detail ? `: ${f().detail}` : ""}
                                 </span>
-                              </span>
-                            </div>
-                          )}
+                              </div>
+                            )}
+                          </Show>
                         </Show>
                       }
                     >
@@ -629,8 +898,8 @@ export default function StepPane(props: {
                           </div>
                           <div class="kvv mono">{showValue(r.value)}</div>
                           <div class="kvfrom">
-                            from <b>{s().id}</b>
-                            <Show when={scoped()}> @ {scoped()!.id}</Show>
+                            from{" "}
+                            <b>{scoped() ? label(s().id, scoped()!.id) : s().id}</b>
                           </div>
                         </div>
                       )}
@@ -641,7 +910,7 @@ export default function StepPane(props: {
               </div>
             </Show>
 
-            {/* Outputs — OF-RECORD (ADR-0056 §3): the interpolation view + the
+            {/* Outputs — OF-RECORD: the interpolation view + the
                 "built on …" consumed line both read the latest SUCCESSFUL attempt
                 in this version (`ofRecordTry()`), NOT the selected try. So a
                 failed / superseded / running selected try still shows what a
@@ -660,21 +929,31 @@ export default function StepPane(props: {
                     </p>
                   }
                 >
-                  {/* Coordinate note: is the of-record try the one selected? */}
+                  {/* Coordinate note: is the of-record try the one selected? A
+                      carried-forward step names the earlier version's try. */}
                   <div class="ofrec-note mono">
+                    <Show when={carried()}>
+                      {(c) => (
+                        <span class="ofrec-here">
+                          of record · from version {c().take}, {noun().toLowerCase()} {c().try}
+                        </span>
+                      )}
+                    </Show>
+                    <Show when={!carried()}>
                     <Show
                       when={ofRecordTry() === scoped()?.id}
                       fallback={
                         <button
                           class="ofrec-jump"
                           onClick={() => props.onAttemptSelect(ofRecordTry())}
-                          title="jump the selection to the of-record try"
+                          title={`Select the ${noun().toLowerCase()} of record`}
                         >
-                          of record · try {ofRecordIndex() + 1} →
+                          of record · {noun().toLowerCase()} {ofRecordIndex() + 1} →
                         </button>
                       }
                     >
-                      <span class="ofrec-here">of record · this try</span>
+                      <span class="ofrec-here">of record · this {noun().toLowerCase()}</span>
+                    </Show>
                     </Show>
                   </div>
                   <Show when={outConsumed() && Object.keys(outConsumed()!.consumed).length > 0}>
@@ -684,9 +963,7 @@ export default function StepPane(props: {
                         {([up, at], i) => (
                           <>
                             <Show when={i() > 0}> · </Show>
-                            <span class="consumed-edge">
-                              {up}@{at}
-                            </span>
+                            <span class="consumed-edge">{label(up, at)}</span>
                           </>
                         )}
                       </For>
@@ -723,8 +1000,7 @@ export default function StepPane(props: {
                 >
                 <div class="ws-crumbs mono">
                   <button class="crumb" onClick={() => navTo("")}>
-                    {s().id}
-                    <Show when={scoped()}>@{scoped()!.id}</Show>
+                    {scoped() ? label(s().id, scoped()!.id) : s().id}
                   </button>
                   <For each={crumbs()}>
                     {(c, i) => (
@@ -846,7 +1122,7 @@ export default function StepPane(props: {
                               </button>
                             </Show>
                             <span class="fsize mono">{e.kind}</span>
-                            {/* A symlink's honest identity (git-bug 1344d1d):
+                            {/* A symlink's identity (git-bug 1344d1d):
                                 the snapshot stores only the target PATH, so
                                 show it — opening the entry streams that path,
                                 not the target's content. */}
@@ -863,9 +1139,9 @@ export default function StepPane(props: {
               </div>
             </Show>
 
-            {/* Origin (ADR-0076): the invoke chain, the inputs bound in this
-                Step's invocation, and the Step as its launch renders it. */}
-            <Show when={tab() === "origin"}>
+            {/* Source: the invoke chain, the inputs bound in this Step's
+                invocation, and the Step as its launch renders it. */}
+            <Show when={tab() === "source"}>
               <div class="tabpane">
                 <Show when={origin()} fallback={<p class="empty">{origin.loading ? "loading…" : "Could not load where this Step comes from."}</p>}>
                   {(o) => (
@@ -969,7 +1245,7 @@ export default function StepPane(props: {
               </div>
             </Show>
 
-            {/* A plugin gate (ADR-0076 §7): who releases it, its expiry, the
+            {/* A plugin gate: who releases it, its expiry, the
                 inputs rendered when it was reached, and its typed outputs. */}
             <Show when={tab() === "gate" ? s().plugin_gate : null}>
               {(g) => {

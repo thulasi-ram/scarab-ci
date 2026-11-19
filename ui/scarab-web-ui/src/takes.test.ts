@@ -1,4 +1,4 @@
-// Takes (ADR-0056) — the run-level version lens, derived entirely client-side
+// Takes — the run-level version view, derived entirely client-side
 // from the event log. This seam is where the real bugs lived (take-scoped
 // duration, take-scoped live attempts, per-try outcome mapping), so it gets
 // the densest coverage of the no-DOM tier.
@@ -7,6 +7,12 @@ import {
   deriveTakes,
   replayTake,
   attemptCauses,
+  attemptPlaces,
+  tryLabel,
+  carriedOfRecord,
+  reusedOfRecord,
+  rowWhy,
+  artifactCount,
   ofRecordAttemptId,
   attemptN,
   stepTiming,
@@ -160,7 +166,7 @@ describe("replayTake", () => {
     ];
     const ts = deriveTakes(evs);
     const view = replayTake(evs, ts, ts[0]);
-    // No superseded/not_run rewrite on old logs — today's honest "running".
+    // No superseded/not_run rewrite on old logs: the step stays "running".
     expect(view.status["a"]).toBe("running");
   });
 });
@@ -168,14 +174,21 @@ describe("replayTake", () => {
 describe("attemptCauses", () => {
   const events = twoTakeRun();
 
-  it("classifies initial / auto-retry / rerun for the rerun target", () => {
+  it("classifies initial / automatic retry / rerun (with its actor) for the rerun target", () => {
     const { causes } = attemptCauses(events, "b");
-    expect(causes).toEqual({ a1: "initial", a2: "retry", a3: "rerun" });
+    expect(causes).toEqual({
+      a1: { kind: "initial" },
+      a2: { kind: "auto-retry" },
+      a3: { kind: "rerun", by: "a.kim" },
+    });
   });
 
-  it("classifies the dragged-along descendant as cascade and supersedes its cut-short try", () => {
+  it("classifies the dragged-along descendant as cascade, naming the upstream step", () => {
     const { causes, superseded } = attemptCauses(events, "c");
-    expect(causes).toEqual({ a1: "initial", a2: "cascade" });
+    expect(causes).toEqual({
+      a1: { kind: "initial" },
+      a2: { kind: "cascade", by: "a.kim", upstream: "b", via: "rerun" },
+    });
     expect(superseded).toEqual(new Set(["a1"]));
   });
 
@@ -187,15 +200,45 @@ describe("attemptCauses", () => {
     expect(superseded).toEqual(new Set());
   });
 
-  it("StepRetryRequested arms a retry cause (same take) and supersedes an in-flight try", () => {
+  it("StepRetryRequested arms a manual retry (same take) and supersedes an in-flight try", () => {
     const evs = [
       started(1000, "b", "a1"), // in flight when the human retry lands
       retryRequested(2000, "b", []),
       started(3000, "b", "a2"),
     ];
     const { causes, superseded } = attemptCauses(evs, "b");
-    expect(causes).toEqual({ a1: "initial", a2: "retry" });
+    expect(causes).toEqual({ a1: { kind: "initial" }, a2: { kind: "manual-retry", by: null } });
     expect(superseded).toEqual(new Set(["a1"]));
+  });
+
+  // Regression: a human pressing Retry was labelled "auto-retry", the same as
+  // the engine retrying on its own.
+  it("tells a human Retry from the engine's automatic retry and carries who retried", () => {
+    const evs = [
+      started(1000, "b", "a1"),
+      finished(2000, "b", "a1", "step"),
+      started(3000, "b", "a2"), // the engine's own retry: nothing armed it
+      finished(4000, "b", "a2", "step"),
+      retryRequested(5000, "b", ["c"], "a.kim"),
+      started(6000, "b", "a3"),
+    ];
+    const { causes } = attemptCauses(evs, "b");
+    expect(causes.a2).toEqual({ kind: "auto-retry" });
+    expect(causes.a3).toEqual({ kind: "manual-retry", by: "a.kim" });
+  });
+
+  it("a step re-armed by a retry of its upstream is a cascade of that retry", () => {
+    const evs = [
+      started(1000, "c", "a1"),
+      retryRequested(2000, "b", ["c"], "a.kim"),
+      started(3000, "c", "a2"),
+    ];
+    expect(attemptCauses(evs, "c").causes.a2).toEqual({
+      kind: "cascade",
+      by: "a.kim",
+      upstream: "b",
+      via: "retry",
+    });
   });
 
   it("marks re-adopted attempts (crash recovery is a marker, not a new try)", () => {
@@ -206,7 +249,7 @@ describe("attemptCauses", () => {
     ];
     const { causes, readopted } = attemptCauses(evs, "a");
     expect(readopted).toEqual(new Set(["a1"]));
-    expect(causes).toEqual({ a1: "initial" });
+    expect(causes).toEqual({ a1: { kind: "initial" } });
   });
 });
 
@@ -308,11 +351,39 @@ describe("visibleArtifacts", () => {
     const rows = visibleArtifacts(
       [
         art({ name: "x.tar", step: "zz", attempt: "a1" }), // step never ran
-        art({ name: "old.tar", step: "" }), // pre-ADR-0056: no provenance
+        art({ name: "old.tar", step: "" }), // an old row: no provenance
       ],
       tv,
     );
     expect(rows.map((r) => r.name)).toEqual(["old.tar"]);
+  });
+
+  // Regression: an older version hid the files of every step it reused, since
+  // only steps that ran inside the version had a frontier.
+  it("time-travel: a step the version reused keeps its files, of record", () => {
+    const events = [
+      started(1000, "a", "a1"),
+      finished(2000, "a", "a1"),
+      started(3000, "c", "a1"),
+      finished(4000, "c", "a1"),
+      rerun(5000, "c", []),
+      started(6000, "c", "a2"),
+      finished(7000, "c", "a2"),
+      rerun(8000, "c", []),
+      started(9000, "c", "a3"),
+      finished(10000, "c", "a3"),
+    ];
+    const takes = deriveTakes(events);
+    const tv = replayTake(events, takes, takes[1]); // version 2 reran only c
+    const rows = visibleArtifacts(
+      [
+        art({ name: "a.tar", step: "a", attempt: "a1", of_record: true }),
+        art({ name: "c.tar", step: "c", attempt: "a2" }),
+        art({ name: "c.tar", step: "c", attempt: "a3", of_record: true }), // version 3
+      ],
+      tv,
+    );
+    expect(rows.map((r) => `${r.step}@${r.attempt}:${r.of_record}`)).toEqual(["a@a1:true", "c@a2:true"]);
   });
 
   it("of-record within the horizon is the LAST succeeded version of each name", () => {
@@ -365,10 +436,12 @@ describe("versionRows", () => {
     expect(rows[1].summary).toMatchObject({ succeeded: 2, running: 1 });
   });
 
-  it("the latest row's sub names what opened it and who pressed it", () => {
-    const rows = versionRows(events, takes, liveStatuses, null, 1000);
-    expect(rows[1].sub).toContain("you reran b");
+  it("each row says why the version exists, and who opened it", () => {
+    const rows = versionRows(events, takes, liveStatuses, null, 1000, "PR #12");
+    expect(rows[0].why).toBe("PR #12");
+    expect(rows[1].why).toBe("you reran from b");
     expect(rows[1].sub).toContain("by a.kim");
+    expect(versionRows(events, takes, liveStatuses, null, 1000)[0].why).toBe("original run");
   });
 
   it("selection: null selects the latest; a take number selects that row", () => {
@@ -379,5 +452,135 @@ describe("versionRows", () => {
       true,
       false,
     ]);
+  });
+});
+
+// Regression: the Artifacts pill and the step pane printed raw attempt ids
+// (`plan@a4`) while the tries menu counted "try 2" within the version.
+describe("attemptPlaces + tryLabel", () => {
+  const events = twoTakeRun();
+  const places = attemptPlaces(events);
+
+  it("counts tries within each version, restarting after a rerun", () => {
+    expect(places.b).toEqual({
+      a1: { take: 1, try: 1 },
+      a2: { take: 1, try: 2 },
+      a3: { take: 2, try: 1 },
+    });
+    expect(places.c).toEqual({ a1: { take: 1, try: 1 }, a2: { take: 2, try: 1 } });
+  });
+
+  it("agrees with the take windows replayTake derives", () => {
+    const takes = deriveTakes(events);
+    for (const t of takes) {
+      const view = replayTake(events, takes, t);
+      for (const [step, ids] of Object.entries(view.windowAttempts)) {
+        ids.forEach((id, i) => expect(places[step][id]).toEqual({ take: t.n, try: i + 1 }));
+      }
+    }
+  });
+
+  it("a manual retry stays in the version and only advances the try", () => {
+    const p = attemptPlaces([
+      started(1, "b", "a1"),
+      retryRequested(2, "b", []),
+      started(3, "b", "a2"),
+    ]);
+    expect(p.b.a2).toEqual({ take: 1, try: 2 });
+  });
+
+  it("names the version only when the attempt belongs to another one", () => {
+    expect(tryLabel(places, "b", "a3", 2)).toBe("b · try 1");
+    expect(tryLabel(places, "b", "a2", 2)).toBe("b · version 1 · try 2");
+    expect(tryLabel(places, "b", "a2", 1)).toBe("b · try 2");
+    expect(tryLabel(places, "b", "a2", null)).toBe("b · version 1 · try 2");
+  });
+
+  it("falls back to the raw id for an attempt the log does not know", () => {
+    expect(tryLabel(places, "b", "a9", 2)).toBe("b · a9");
+  });
+
+  it("uses the display name in place of the step id when given one", () => {
+    expect(tryLabel(places, "b", "a3", 2, "build · eu")).toBe("build · eu · try 1");
+    expect(tryLabel(places, "b", "a2", 2, "build · eu")).toBe("build · eu · version 1 · try 2");
+  });
+});
+
+// Regression: a step carried forward into a later version showed "nothing of
+// record" under Outputs, though downstream steps read its earlier outputs.
+describe("carriedOfRecord", () => {
+  const events = twoTakeRun();
+  const places = attemptPlaces(events);
+  const att = (id: string, outcome: string) => ({ id, outcome, failed: outcome === "failed" });
+
+  it("resolves the of-record attempt of an earlier version", () => {
+    // `a` ran once in version 1 and was carried into version 2.
+    expect(carriedOfRecord([att("a1", "succeeded")], places.a, 2)).toEqual({
+      id: "a1",
+      take: 1,
+      try: 1,
+    });
+  });
+
+  it("prefers the latest success of the earlier versions", () => {
+    const list = [att("a1", "failed"), att("a2", "succeeded"), att("a3", "succeeded")];
+    // Viewing a hypothetical version 3 where b did not run: version 2's a3 wins.
+    expect(carriedOfRecord(list, places.b, 3)?.id).toBe("a3");
+    // Viewing version 2 as if b had not run there: only version 1 counts.
+    expect(carriedOfRecord(list, places.b, 2)).toEqual({ id: "a2", take: 1, try: 2 });
+  });
+
+  it("never borrows an attempt from the version in view or a later one", () => {
+    expect(carriedOfRecord([att("a1", "succeeded")], places.a, 1)).toBeNull();
+  });
+
+  it("is null when nothing earlier is of record", () => {
+    expect(carriedOfRecord([att("a1", "failed")], { a1: { take: 1, try: 1 } }, 2)).toBeNull();
+    expect(carriedOfRecord([att("a1", "succeeded")], undefined, 2)).toBeNull();
+  });
+});
+
+// Regression: a downstream step a rerun re-armed, still pending, read as
+// "Reused from version 1" and showed version 1's outputs as of record.
+describe("reusedOfRecord", () => {
+  const places = attemptPlaces(twoTakeRun());
+  const list = [{ id: "a1", outcome: "succeeded", failed: false }];
+
+  it("names the earlier try only for a step the version reused", () => {
+    expect(reusedOfRecord({ reused: true, list, places: places.a, viewedTake: 2 })).toEqual({
+      id: "a1",
+      take: 1,
+      try: 1,
+    });
+  });
+
+  it("is null for a step that is pending or did not run in this version", () => {
+    expect(reusedOfRecord({ reused: false, list, places: places.a, viewedTake: 2 })).toBeNull();
+    expect(reusedOfRecord({ reused: true, list, places: places.a, viewedTake: null })).toBeNull();
+  });
+});
+
+describe("rowWhy", () => {
+  it("names the trigger for the first version and the rerun for a later one", () => {
+    const takes = deriveTakes(twoTakeRun());
+    expect(rowWhy(takes, takes[0], "PR #131")).toBe("PR #131");
+    expect(rowWhy(takes, takes[0])).toBe("original run");
+    expect(rowWhy(takes, takes[1], "PR #131")).toBe("you reran from b");
+  });
+});
+
+// Regression: the Artifacts header said "N versions", counting one copy per
+// try, while "version" elsewhere on the page means a run version.
+describe("artifactCount", () => {
+  it("counts distinct file names", () => {
+    expect(artifactCount([{ name: "app.tar" }, { name: "report.html" }])).toBe("2 files");
+    expect(artifactCount([{ name: "app.tar" }])).toBe("1 file");
+    expect(artifactCount([])).toBe("0 files");
+  });
+
+  it("adds the copy count when tries published the same file more than once", () => {
+    expect(
+      artifactCount([{ name: "app.tar" }, { name: "app.tar" }, { name: "report.html" }]),
+    ).toBe("2 files · 3 copies");
   });
 });

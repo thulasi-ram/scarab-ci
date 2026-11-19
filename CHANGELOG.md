@@ -18,8 +18,33 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Enhancement
+
+- **The Run page has run tabs, try tabs and a List view.** Under the summary line, run tabs
+  switch between Pipeline, Artifacts and Activity. Artifacts lists the run's files grouped by the
+  step that published them, the copy of record by default and earlier copies on request.
+  Activity hides the Pod condition events that have cleared and says how many it hides; a
+  condition holding a step back stays in view. A step with two or more tries gets a row of try
+  tabs, newest first, each with its outcome, duration and why it ran. The graph is drawn at full
+  size with nodes wide enough for their names, and a List view shows the steps in dependency
+  order with each step's tries under it. The URL keeps the selected step, version, try and tabs.
+- **Each attempt in the run detail API has `finished_at`.** `GET /v1/runs/{id}` gives every
+  attempt in a step's `attempt_list` the time it finished, read from the run's event log, or null
+  while it runs.
+
 ### Bug Fixes
 
+- **A Pod waiting for a node is one infra condition while only the node counts change.** The
+  scheduler's message changes as nodes come and go (`0/12 nodes` to `0/14 nodes`), and each change
+  closed the condition and opened a new one: one run with 7 steps logged 38 condition events.
+  Messages that differ only in their numbers are now the same condition.
+- **A Pod that is starting no longer shows an old scheduling message.** Once a Pod has a node,
+  `PodInitializing` no longer borrows the message of an earlier `FailedScheduling` event.
+- **A dead-lettered run counts as finished on the Run page.** The page stopped polling it, and no
+  longer shows it as live or offers Cancel run.
+- **A manual Retry is no longer labelled an automatic retry.** The try says who retried it.
+- **A try with no log output shows why it failed.** The Logs tab said "waiting for output…" for
+  good, and the failure reason under it never appeared.
 - **A step whose Pod waits for a new node keeps its logs.** While a Pod has no node (a cluster
   autoscaler such as Karpenter is adding one), Kubernetes answers a log request for it with an
   empty response instead of an error. The server took that as the step's complete log and never

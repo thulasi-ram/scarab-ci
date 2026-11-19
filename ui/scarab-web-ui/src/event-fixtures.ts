@@ -25,8 +25,29 @@ export const rerun = (at: number, target: string, invalidated: string[], by?: st
   ev(at, { RunRerunRequested: { target, invalidated, ...(by ? { by } : {}) } });
 
 /** A human Retry — another attempt in the CURRENT take, no fork. */
-export const retryRequested = (at: number, target: string, invalidated: string[]): RunEvent =>
-  ev(at, { StepRetryRequested: { target, invalidated } });
+export const retryRequested = (
+  at: number,
+  target: string,
+  invalidated: string[],
+  by?: string,
+): RunEvent => ev(at, { StepRetryRequested: { target, invalidated, ...(by ? { by } : {}) } });
+
+/** An infra condition's onset (no `held_ms`) or, with `held_ms`, its close. */
+export const infraCondition = (
+  at: number,
+  step: string,
+  attempt: string,
+  reason: string,
+  held_ms?: number,
+): RunEvent =>
+  ev(at, {
+    StepInfraCondition: {
+      step,
+      attempt,
+      reason,
+      ...(held_ms !== undefined ? { held_ms, observations: 2 } : {}),
+    },
+  });
 
 export const readoptedEv = (at: number, step: string, attempt: string): RunEvent =>
   ev(at, { AttemptReadopted: { step, attempt } });

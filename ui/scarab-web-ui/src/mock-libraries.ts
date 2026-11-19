@@ -223,6 +223,8 @@ const lib = (name: string, hash: string, source: string, yanked = false): S["Ori
 const attempt = (startedMin: number, outcome = "succeeded", failure?: { failure: string; detail: string }): S["AttemptDto"] => ({
   id: "a1",
   started_at: ago(startedMin * min),
+  // eventsOf() logs a finished attempt's AttemptFinished 40s after its start.
+  finished_at: outcome === "running" ? null : ago(startedMin * min) + 40_000,
   failed: !!failure,
   outcome,
   ...(failure ? { failure: failure.failure, failure_detail: failure.detail } : {}),
@@ -285,7 +287,7 @@ function pluginRun(): RunStatusDto {
     needs: ["bump"],
     status: v === "pass" ? "succeeded" : v === "exp" ? "failed" : "pending",
     origin: [{ kind: "plugin", name: "argocd-prod/wait-live", content_hash: h("e40b7c19d2a6") }],
-    attempt_list: [{ id: "a1", started_at: reached, failed: v === "exp", outcome: v === "pass" ? "succeeded" : v === "exp" ? "failed" : "running", ...(v === "exp" ? { failure: "gate", failure_detail: "expired after 1800s with no release from plugin:argocd-prod" } : {}) }],
+    attempt_list: [{ id: "a1", started_at: reached, finished_at: v === "pass" || v === "exp" ? reached + 40_000 : null, failed: v === "exp", outcome: v === "pass" ? "succeeded" : v === "exp" ? "failed" : "running", ...(v === "exp" ? { failure: "gate", failure_detail: "not released within 1800s of its needs finishing" } : {}) }],
     plugin_gate: {
       releaser: "plugin:argocd-prod",
       installation: "argocd-prod",
@@ -301,7 +303,7 @@ function pluginRun(): RunStatusDto {
     ...(v === "pass"
       ? { gate_resolution: { passed: true, reason: "released by plugin:argocd-prod", at: ago(2 * min), attempt: "a1", by: "plugin:argocd-prod" } }
       : v === "exp"
-        ? { gate_resolution: { passed: false, reason: "expired after 1800s with no release from plugin:argocd-prod", at: ago(min), attempt: "a1" } }
+        ? { gate_resolution: { passed: false, reason: "not released within 1800s of its needs finishing", at: ago(min), attempt: "a1" } }
         : {}),
   });
   return runBase(PLUGIN_RUN_ID, 422, v === "exp" ? "failed" : "running", "deploy-prod", "Deploy 1.8.2 to production", [
@@ -309,7 +311,7 @@ function pluginRun(): RunStatusDto {
     step({ id: "build", status: "succeeded", needs: ["checkout/git"], attempt_list: [attempt(8)] }),
     step({ id: "bump", status: "succeeded", deploy: true, needs: ["build"], attempt_list: [attempt(7)] }),
     gateStep,
-    step({ id: "sign-off", gate: "manual", status: "pending", needs: ["bump"], attempt_list: [{ id: "a1", started_at: reached, failed: false, outcome: "running" }] }),
+    step({ id: "sign-off", gate: "manual", status: "pending", needs: ["bump"], attempt_list: [{ id: "a1", started_at: reached, finished_at: null, failed: false, outcome: "running" }] }),
     step({ id: "announce", status: "pending", needs: ["live", "sign-off"] }),
   ]);
 }

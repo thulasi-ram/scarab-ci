@@ -436,7 +436,14 @@ impl K8sExecutor {
     /// the message blank, so this is not a per-tick cost on healthy steps. The
     /// caller treats every error here as "no message" — a missing RBAC grant
     /// must degrade the diagnosis, never the run.
-    async fn pod_warning_event(&self, pod: &str) -> Result<Option<String>, ExecError> {
+    ///
+    /// `scheduled_at` is when the Pod was bound to a node, if it has been:
+    /// see [`latest_warning_message`] for why events before it are dropped.
+    async fn pod_warning_event(
+        &self,
+        pod: &str,
+        scheduled_at: Option<k8s_openapi::jiff::Timestamp>,
+    ) -> Result<Option<String>, ExecError> {
         use k8s_openapi::api::core::v1::Event;
         let client = self.client.clone().ok_or(ExecError::Unavailable)?;
         let events: Api<Event> = Api::namespaced(client, &self.namespace);
@@ -449,17 +456,7 @@ impl K8sExecutor {
             .list(&params)
             .await
             .map_err(|e| ExecError::Other(e.to_string()))?;
-        // Newest wins: a Pod that failed to schedule and then failed to mount
-        // should report the mount, and the API does not guarantee list order.
-        let latest = list
-            .items
-            .into_iter()
-            .filter(|e| e.type_.as_deref() == Some("Warning"))
-            .filter(|e| e.message.as_deref().is_some_and(|m| !m.trim().is_empty()))
-            .max_by_key(|e| e.last_timestamp.as_ref().map(|t| t.0));
-        Ok(latest
-            .and_then(|e| e.message)
-            .map(|m| truncate_message(m.trim())))
+        Ok(latest_warning_message(list.items, scheduled_at))
     }
 
     /// Upsert every per-Pod Secret a step may need before it can run: the forge
@@ -3258,21 +3255,24 @@ impl Executor for K8sExecutor {
         if condition.message.is_some() {
             return Ok(Some(condition));
         }
-        Ok(Some(match self.pod_warning_event(&handle.0).await {
-            Ok(Some(message)) => InfraCondition {
-                message: Some(message),
-                ..condition
+        let scheduled_at = pod_scheduled_at(&pod);
+        Ok(Some(
+            match self.pod_warning_event(&handle.0, scheduled_at).await {
+                Ok(Some(message)) => InfraCondition {
+                    message: Some(message),
+                    ..condition
+                },
+                Ok(None) => condition,
+                Err(e) => {
+                    tracing::debug!(
+                        pod = %handle.0, error = %e,
+                        "could not read Pod events for the infra condition; \
+                         reporting the Pod-derived reason alone"
+                    );
+                    condition
+                }
             },
-            Ok(None) => condition,
-            Err(e) => {
-                tracing::debug!(
-                    pod = %handle.0, error = %e,
-                    "could not read Pod events for the infra condition; \
-                     reporting the Pod-derived reason alone"
-                );
-                condition
-            }
-        }))
+        ))
     }
 
     /// The results-egress sidecar's failed delivery ([`pod_results_delivery_failure`],
@@ -6483,6 +6483,65 @@ pub fn pod_infra_condition(pod: &Pod) -> Option<InfraCondition> {
         ));
     }
     None
+}
+
+/// When the Pod was bound to a node: its `PodScheduled=True` condition's
+/// transition time. `None` while it is unscheduled.
+fn pod_scheduled_at(pod: &Pod) -> Option<k8s_openapi::jiff::Timestamp> {
+    pod.status
+        .as_ref()?
+        .conditions
+        .as_ref()?
+        .iter()
+        .find(|c| c.type_ == "PodScheduled" && c.status == "True")?
+        .last_transition_time
+        .as_ref()
+        .map(|t| t.0)
+}
+
+/// When a Kubernetes Event last fired. A core/v1 `lastTimestamp` is unset on
+/// events written through `events.k8s.io/v1` (the scheduler's
+/// `FailedScheduling` is one), which carry `series.lastObservedTime` or
+/// `eventTime` instead.
+fn event_last_seen(e: &k8s_openapi::api::core::v1::Event) -> Option<k8s_openapi::jiff::Timestamp> {
+    e.last_timestamp
+        .as_ref()
+        .map(|t| t.0)
+        .or_else(|| e.series.as_ref()?.last_observed_time.as_ref().map(|t| t.0))
+        .or_else(|| e.event_time.as_ref().map(|t| t.0))
+        .or_else(|| e.first_timestamp.as_ref().map(|t| t.0))
+}
+
+/// The message of the newest `Warning` Event about a Pod, bounded — the
+/// message for an infra condition whose Pod status gave none.
+///
+/// Once the Pod is scheduled (`scheduled_at` is `Some`), a scheduler event
+/// describes a wait that is over. Without this filter a Pod that was
+/// `Unschedulable` and then sat in `PodInitializing` reported the scheduler's
+/// "0/14 nodes are available" sentence under the `PodInitializing` reason,
+/// since that stale `FailedScheduling` was still the newest Warning. So after
+/// scheduling, `FailedScheduling` events and any event last seen before the
+/// Pod was bound are dropped.
+fn latest_warning_message(
+    events: Vec<k8s_openapi::api::core::v1::Event>,
+    scheduled_at: Option<k8s_openapi::jiff::Timestamp>,
+) -> Option<String> {
+    // Newest wins: a Pod that failed to schedule and then failed to mount
+    // should report the mount, and the API does not guarantee list order.
+    events
+        .into_iter()
+        .filter(|e| e.type_.as_deref() == Some("Warning"))
+        .filter(|e| e.message.as_deref().is_some_and(|m| !m.trim().is_empty()))
+        .filter(|e| match scheduled_at {
+            None => true,
+            Some(bound) => {
+                e.reason.as_deref() != Some("FailedScheduling")
+                    && event_last_seen(e).is_some_and(|seen| seen >= bound)
+            }
+        })
+        .max_by_key(event_last_seen)
+        .and_then(|e| e.message)
+        .map(|m| truncate_message(m.trim()))
 }
 
 /// Classify a `phase: Failed` Pod (ADR-0047).
@@ -13263,9 +13322,10 @@ mod tests {
     mod infra_condition {
         use super::*;
         use k8s_openapi::api::core::v1::{
-            ContainerState, ContainerStateRunning, ContainerStateWaiting, ContainerStatus,
+            ContainerState, ContainerStateRunning, ContainerStateWaiting, ContainerStatus, Event,
             PodCondition, PodStatus,
         };
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 
         fn pod(status: PodStatus) -> Pod {
             Pod {
@@ -13383,6 +13443,78 @@ mod tests {
             let c = pod_infra_condition(&p).expect("a condition");
             assert_eq!(c.reason, "ImagePullBackOff");
             assert!(c.message.unwrap().contains("wsfetch:v2"));
+        }
+
+        fn warning(reason: &str, message: &str, seen: i64) -> Event {
+            Event {
+                type_: Some("Warning".into()),
+                reason: Some(reason.into()),
+                message: Some(message.into()),
+                last_timestamp: Some(Time(
+                    k8s_openapi::jiff::Timestamp::from_second(seen).unwrap(),
+                )),
+                ..Default::default()
+            }
+        }
+
+        /// Seen on a real run: a Pod was `Unschedulable`, got a node, then sat in
+        /// `PodInitializing` (no status message), and the observer reported
+        /// `PodInitializing: 0/14 nodes are available …` because the stale
+        /// `FailedScheduling` was still the Pod's newest Warning. Once the Pod
+        /// is scheduled, scheduler events and events from before the binding
+        /// are not its message.
+        #[test]
+        fn a_scheduled_pod_does_not_take_a_stale_scheduler_message() {
+            let p = pod(PodStatus {
+                phase: Some("Pending".into()),
+                conditions: Some(vec![PodCondition {
+                    type_: "PodScheduled".into(),
+                    status: "True".into(),
+                    last_transition_time: Some(Time(
+                        k8s_openapi::jiff::Timestamp::from_second(1_000).unwrap(),
+                    )),
+                    ..Default::default()
+                }]),
+                init_container_statuses: Some(vec![waiting(
+                    "scarab-workspace-fetch",
+                    "PodInitializing",
+                    None,
+                )]),
+                ..Default::default()
+            });
+            let condition = pod_infra_condition(&p).expect("a condition");
+            assert_eq!(condition.reason, "PodInitializing");
+            let bound = pod_scheduled_at(&p);
+            assert!(bound.is_some(), "the binding time is read from the Pod");
+
+            let scheduler = warning(
+                "FailedScheduling",
+                "0/14 nodes are available: 12 node(s) had untolerated taint(s).",
+                990,
+            );
+            let earlier = warning("BackOff", "an event from before the binding", 995);
+            assert_eq!(
+                latest_warning_message(vec![scheduler.clone(), earlier], bound),
+                None,
+                "no Warning from after the binding: no message"
+            );
+
+            let mount = warning(
+                "FailedMount",
+                "MountVolume.SetUp failed for volume \"ws\"",
+                1_010,
+            );
+            assert_eq!(
+                latest_warning_message(vec![scheduler.clone(), mount], bound).as_deref(),
+                Some("MountVolume.SetUp failed for volume \"ws\""),
+                "a Warning after the binding is the message"
+            );
+
+            // While unscheduled the scheduler's event is the diagnosis.
+            assert_eq!(
+                latest_warning_message(vec![scheduler], None).as_deref(),
+                Some("0/14 nodes are available: 12 node(s) had untolerated taint(s).")
+            );
         }
 
         /// A backend message is bounded before it is stored. A `FailedScheduling`

@@ -57,6 +57,15 @@ const GATES_RUN_ID = "0190f8a2000071fb8c00d3e9107a1616";
 // The ENVIRONMENT GATE run: a deploy into production with a plain QA gate
 // and the approval gate production added. /acme/scarab/runs/<id>.
 const ENV_GATE_RUN_ID = "0190f8a2000071fb8c00e7a9b0c1d2e3";
+// The MATRIX run: a failed plan over a cluster × phase matrix. Two cells
+// failed (one on both of its tries, after waiting for a node), so the summary
+// line names two root failures. /acme/scarab/runs/<id>.
+const MATRIX_RUN_ID = "0190f8a2000071fb8c00f00d4a7b1c33";
+// The RETRIES run: a live run whose `unit` step passed on its third try and
+// whose `e2e` step passed on its sixth, with cleared Pod conditions on
+// earlier tries, two matrix cells waiting for a node right now, and artifacts
+// that earlier tries also wrote. /acme/scarab/runs/<id>.
+const RETRIES_RUN_ID = "0190f8a2000071fb8c00a11c3e5d7f34";
 
 // ── /v1/me ────────────────────────────────────────────────────────────────
 // An Owner of the one implicit org, so the Settings gear renders.
@@ -66,7 +75,7 @@ const ENV_GATE_RUN_ID = "0190f8a2000071fb8c00e7a9b0c1d2e3";
 // administers two orgs, so the org dropdown in Organization settings offers a
 // choice; globex has no connections or repositories of its own.
 /** A mock Principal id (`p_` + 32 hex), fixed per handle so screenshots and
- *  links stay stable. The server mints random ones (ADR-0080). */
+ *  links stay stable. The server mints random ones. */
 function pid(handle: string): string {
   let h = 0x811c9dc5;
   let out = "";
@@ -352,7 +361,9 @@ const runStatus: RunStatusDto = {
       status: "succeeded",
       attempts: 1,
       needs: [],
-      attempt_list: [{ id: "a1", started_at: ago(325000), failed: false, outcome: "succeeded" }],
+      attempt_list: [
+        { id: "a1", started_at: ago(325000), finished_at: ago(298000), failed: false, outcome: "succeeded" },
+      ],
     },
     {
       id: "build",
@@ -360,8 +371,8 @@ const runStatus: RunStatusDto = {
       attempts: 2,
       needs: ["clone"],
       attempt_list: [
-        { id: "a1", started_at: ago(297000), failed: true, failure: "step", outcome: "failed" },
-        { id: "a2", started_at: ago(250000), failed: false, outcome: "succeeded" },
+        { id: "a1", started_at: ago(297000), finished_at: ago(260000), failed: true, failure: "step", outcome: "failed" },
+        { id: "a2", started_at: ago(250000), finished_at: ago(190000), failed: false, outcome: "succeeded" },
       ],
     },
     {
@@ -369,7 +380,7 @@ const runStatus: RunStatusDto = {
       status: "running",
       attempts: 1,
       needs: ["build"],
-      attempt_list: [{ id: "a1", started_at: ago(190000), failed: false, outcome: "running" }],
+      attempt_list: [{ id: "a1", started_at: ago(190000), finished_at: null, failed: false, outcome: "running" }],
     },
   ],
 };
@@ -442,7 +453,7 @@ const richRunStatus: RunStatusDto = {
       attempts: 1,
       needs: [],
       attempt_list: [
-        { id: "a1", started_at: ago(25 * min), failed: false, outcome: "succeeded" },
+        { id: "a1", started_at: ago(25 * min), finished_at: ago(24 * min + 45000), failed: false, outcome: "succeeded" },
       ],
     },
     {
@@ -451,9 +462,16 @@ const richRunStatus: RunStatusDto = {
       attempts: 3,
       needs: ["clone"],
       attempt_list: [
-        { id: "a1", started_at: ago(24 * min + 30000), failed: false, outcome: "succeeded" },
-        { id: "a2", started_at: ago(14 * min + 55000), failed: true, failure: "step", outcome: "failed" },
-        { id: "a3", started_at: ago(13 * min + 40000), failed: false, outcome: "succeeded" },
+        { id: "a1", started_at: ago(24 * min + 30000), finished_at: ago(23 * min + 20000), failed: false, outcome: "succeeded" },
+        {
+          id: "a2",
+          started_at: ago(14 * min + 55000),
+          finished_at: ago(13 * min + 50000),
+          failed: true,
+          failure: "step",
+          outcome: "failed",
+        },
+        { id: "a3", started_at: ago(13 * min + 40000), finished_at: ago(12 * min + 30000), failed: false, outcome: "succeeded" },
       ],
     },
     {
@@ -464,8 +482,8 @@ const richRunStatus: RunStatusDto = {
       services: [{ index: 0, image: "redis:7.4", ports: [6379] }],
       uses: ["postgres"],
       attempt_list: [
-        { id: "a1", started_at: ago(23 * min + 15000), failed: false, outcome: "superseded" },
-        { id: "a2", started_at: ago(12 * min + 25000), failed: false, outcome: "succeeded" },
+        { id: "a1", started_at: ago(23 * min + 15000), finished_at: ago(15 * min), failed: false, outcome: "superseded" },
+        { id: "a2", started_at: ago(12 * min + 25000), finished_at: ago(10 * min), failed: false, outcome: "succeeded" },
       ],
     },
     {
@@ -520,6 +538,322 @@ const richEventsBody = [
   rev(ago(10 * min - 1000), { StepTransitioned: { step: "test", from: "running", to: "succeeded" } }),
   rev(ago(9 * min + 50000), { StepTransitioned: { step: "approve", from: "pending", to: "waiting" } }),
 ].join("");
+
+// ── the MATRIX run (summary line, matrix labels, retries) ───────────────────
+// checkout `git`, then `plan` over cluster × phase. treebo-production ×
+// aws-cluster failed twice (the engine retried it), and its second try waited
+// about a minute for a node first; treebo-production × aws-post-cluster
+// failed once. The other four cells passed and published a plan each.
+const MX_CELLS: [string, string, "ok" | "fail" | "fail2"][] = [
+  ["superhero-tools-common", "aws-cluster", "ok"],
+  ["superhero-tools-common", "aws-post-cluster", "ok"],
+  ["treebo-production", "aws-cluster", "fail2"],
+  ["treebo-production", "aws-post-cluster", "fail"],
+  ["treebo-staging", "aws-cluster", "ok"],
+  ["treebo-staging", "aws-post-cluster", "ok"],
+];
+const mxId = (cluster: string, phase: string) => `plan[cluster=${cluster},phase=${phase}]`;
+const MX_T0 = 12 * min; // the run started 12 minutes ago
+const MX_PLAN_AT = MX_T0 - 61_000; // the plan cells start when git finishes
+const matrixRunStatus: RunStatusDto = {
+  id: MATRIX_RUN_ID,
+  status: "failed",
+  run_number: 33,
+  pipeline: "tofu-plan",
+  trigger_title: "Smoke-run the plan pipelines on the new cluster module",
+  origin_pr_base: "develop",
+  params: {},
+  snapshot_retention: { retention_days: 14, expired: false, pinned: false },
+  steps: [
+    {
+      id: "git",
+      status: "succeeded",
+      attempts: 1,
+      needs: [],
+      attempt_list: [
+        { id: "a1", started_at: ago(MX_T0), finished_at: ago(MX_PLAN_AT), failed: false, outcome: "succeeded" },
+      ],
+    },
+    ...MX_CELLS.map(([cluster, phase, how], i) => {
+      const start = MX_PLAN_AT - 2000;
+      const took = 150_000 + i * 6_000;
+      const attempt_list =
+        how === "ok"
+          ? [{ id: "a1", started_at: ago(start), finished_at: ago(start - took), failed: false, outcome: "succeeded" }]
+          : how === "fail"
+            ? [
+                {
+                  id: "a1",
+                  started_at: ago(start),
+                  finished_at: ago(start - 121_000),
+                  failed: true,
+                  failure: "step",
+                  failure_detail: "tofu plan exited 1: Error acquiring the state lock",
+                  outcome: "failed",
+                },
+              ]
+            : [
+                {
+                  id: "a1",
+                  started_at: ago(start),
+                  finished_at: ago(start - 48_000),
+                  failed: true,
+                  failure: "step",
+                  failure_detail: "tofu init exited 1: registry.terraform.io timed out",
+                  outcome: "failed",
+                },
+                {
+                  id: "a2",
+                  started_at: ago(start - 60_000),
+                  finished_at: ago(start - 60_000 - 126_000),
+                  failed: true,
+                  failure: "step",
+                  failure_detail: "tofu plan exited 1: Error acquiring the state lock",
+                  outcome: "failed",
+                },
+              ];
+      return {
+        id: mxId(cluster, phase),
+        status: how === "ok" ? "succeeded" : "failed",
+        attempts: attempt_list.length,
+        needs: ["git"],
+        attempt_list,
+      };
+    }),
+  ],
+};
+const mxv = sse(MATRIX_RUN_ID);
+const matrixEventsBody = (() => {
+  const out: string[] = [
+    mxv(ago(MX_T0 + 3000), {
+      Raw: {
+        trigger: {
+          event: {
+            kind: "pull_request",
+            actor: "thulasi",
+            branch: "feature/cluster-module",
+            sha: "15f2297b9c0d1e2f3a4b5c6d7e8f9a0b",
+            repo: { owner: "acme", name: "scarab" },
+            pr: 2949,
+          },
+        },
+      },
+    }),
+    mxv(ago(MX_T0), { AttemptStarted: { step: "git", attempt: "a1" } }),
+    mxv(ago(MX_PLAN_AT), { AttemptFinished: { step: "git", attempt: "a1" } }),
+    mxv(ago(MX_PLAN_AT - 500), { StepTransitioned: { step: "git", from: "running", to: "succeeded" } }),
+  ];
+  const timed: [number, string][] = [];
+  for (const s of matrixRunStatus.steps.slice(1)) {
+    for (const a of s.attempt_list ?? []) {
+      timed.push([a.started_at, mxv(a.started_at, { AttemptStarted: { step: s.id, attempt: a.id } })]);
+      if (a.id === "a2") {
+        // The retry waited about a minute for a node before it started.
+        timed.push([
+          a.started_at + 62_000,
+          mxv(a.started_at + 62_000, {
+            StepInfraCondition: {
+              step: s.id,
+              attempt: a.id,
+              reason: "Unschedulable",
+              message: "0/14 nodes are available: 12 node(s) had untolerated taints, 2 node(s) didn't match the node selector",
+              held_ms: 62_000,
+              observations: 4,
+            },
+          }),
+        ]);
+      }
+      const fin = a.finished_at!;
+      timed.push([
+        fin,
+        mxv(fin, { AttemptFinished: { step: s.id, attempt: a.id, ...(a.failed ? { failure: a.failure } : {}) } }),
+      ]);
+    }
+    timed.push([
+      s.attempt_list![s.attempt_list!.length - 1]!.finished_at! + 500,
+      mxv(s.attempt_list![s.attempt_list!.length - 1]!.finished_at! + 500, {
+        StepTransitioned: { step: s.id, from: "running", to: s.status },
+      }),
+    ]);
+  }
+  timed.sort((a, b) => a[0] - b[0]);
+  const end = Math.max(...timed.map(([at]) => at));
+  out.push(...timed.map(([, line]) => line));
+  out.push(mxv(end + 1000, { RunTransitioned: { from: "running", to: "failed" } }));
+  return out.join("");
+})();
+const matrixArtifacts: ArtifactDto[] = MX_CELLS.filter(([, , how]) => how === "ok").map(([cluster, phase], i) => ({
+  name: `plan-${cluster}-${phase}.txt`,
+  step: mxId(cluster, phase),
+  attempt: "a1",
+  of_record: true,
+  succeeded: true,
+  size: 22_000 + i * 13_000,
+  content_type: "text/plain",
+}));
+
+// ── the RETRIES run (try tabs, Activity filter, earlier artifact copies) ────
+// Times are minutes:seconds before now. `unit` failed, timed out after waiting
+// for a node, then passed when a.kim retried it. `e2e` failed five times (two
+// tries waited for a node first) and passed on its sixth. Both
+// `deploy-preview` cells are waiting for a node right now.
+const ms = (m: number, sec = 0) => (m * 60 + sec) * 1000;
+type MockTry = {
+  id: string;
+  start: number;
+  end: number | null;
+  failure?: string;
+  detail?: string;
+  /** A Pod condition before the try started: [onset, close] (close null = still active). */
+  wait?: [number, number | null];
+};
+const RT_TRIES: Record<string, MockTry[]> = {
+  git: [{ id: "a1", start: ms(20), end: ms(19, 20) }],
+  unit: [
+    { id: "a1", start: ms(19, 10), end: ms(17, 10), failure: "step", detail: "cargo test exited 101: 2 tests failed" },
+    { id: "a2", start: ms(17), end: ms(13, 50), failure: "timeout", detail: "no output for 2m", wait: [ms(16, 59), ms(15, 50)] },
+    { id: "a3", start: ms(12, 55), end: ms(10, 40) },
+  ],
+  e2e: [
+    { id: "a1", start: ms(19, 10), end: ms(18), failure: "step", detail: "playwright: 3 specs failed" },
+    { id: "a2", start: ms(17, 50), end: ms(16), failure: "lost", detail: "the node was drained", wait: [ms(17, 49), ms(17, 10)] },
+    { id: "a3", start: ms(15, 50), end: ms(14), failure: "timeout", detail: "no output for 2m", wait: [ms(15, 49), ms(15, 19)] },
+    { id: "a4", start: ms(13, 50), end: ms(12), failure: "step", detail: "playwright: 1 spec failed" },
+    { id: "a5", start: ms(11, 50), end: ms(10), failure: "step", detail: "playwright: 1 spec failed" },
+    { id: "a6", start: ms(9, 50), end: ms(7) },
+  ],
+  "deploy-preview[region=eu]": [{ id: "a1", start: ms(6, 50), end: null, wait: [ms(6, 45), null] }],
+  "deploy-preview[region=us]": [{ id: "a1", start: ms(6, 50), end: null, wait: [ms(6, 45), null] }],
+};
+/** A log stream of run #34 for a try whose Pod still waits for a node: such a
+ * Pod has printed nothing, so the mock streams no lines for it. */
+function unscheduledTry(url: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(url, window.location.origin);
+  } catch {
+    return false;
+  }
+  const m = u.pathname.match(/^\/v1\/runs\/([^/]+)\/steps\/([^/]+)\/logs$/);
+  if (!m || m[1] !== RETRIES_RUN_ID) return false;
+  const tries = RT_TRIES[decodeURIComponent(m[2]!)] ?? [];
+  const attempt = u.searchParams.get("attempt");
+  const t = tries.find((x) => x.id === attempt) ?? tries[tries.length - 1];
+  return !!t?.wait && t.wait[1] === null;
+}
+const RT_NEEDS: Record<string, string[]> = {
+  git: [],
+  unit: ["git"],
+  e2e: ["git"],
+  "deploy-preview[region=eu]": ["unit", "e2e"],
+  "deploy-preview[region=us]": ["unit", "e2e"],
+};
+const retriesRunStatus: RunStatusDto = {
+  id: RETRIES_RUN_ID,
+  status: "running",
+  run_number: 34,
+  pipeline: "ci",
+  trigger_title: "Retry the flaky checkout tests",
+  origin_pr_base: "main",
+  params: {},
+  snapshot_retention: { retention_days: 14, expired: false, pinned: false },
+  steps: Object.entries(RT_TRIES).map(([id, tries]) => {
+    const last = tries[tries.length - 1]!;
+    return {
+      id,
+      status: last.end === null ? "running" : last.failure ? "failed" : "succeeded",
+      attempts: tries.length,
+      needs: RT_NEEDS[id] ?? [],
+      attempt_list: tries.map((t) => ({
+        id: t.id,
+        started_at: ago(t.start),
+        finished_at: t.end === null ? null : ago(t.end),
+        failed: !!t.failure,
+        ...(t.failure ? { failure: t.failure, failure_detail: t.detail } : {}),
+        outcome: t.end === null ? "running" : t.failure ? "failed" : "succeeded",
+      })),
+    };
+  }),
+};
+const rtv = sse(RETRIES_RUN_ID);
+const retriesEventsBody = (() => {
+  const timed: [number, unknown][] = [
+    [
+      ms(20, 3),
+      {
+        Raw: {
+          trigger: {
+            event: {
+              kind: "pull_request",
+              actor: "a.kim",
+              branch: "fix/flaky-checkout",
+              sha: "9e1c4a7b2d3f5e6a7b8c9d0e1f2a3b4c",
+              repo: { owner: "acme", name: "scarab" },
+              pr: 162,
+            },
+          },
+        },
+      },
+    ],
+    [ms(20, 2), { RunTransitioned: { from: "pending", to: "running" } }],
+    // a.kim retried `unit` after its second try timed out.
+    [ms(13), { StepRetryRequested: { target: "unit", invalidated: [], by: "a.kim" } }],
+  ];
+  const message = "0/9 nodes are available: 9 Insufficient cpu";
+  for (const [step, tries] of Object.entries(RT_TRIES)) {
+    for (const t of tries) {
+      timed.push([t.start, { AttemptStarted: { step, attempt: t.id } }]);
+      if (t.wait) {
+        const [onset, close] = t.wait;
+        timed.push([onset, { StepInfraCondition: { step, attempt: t.id, reason: "Unschedulable", message } }]);
+        if (close !== null)
+          timed.push([
+            close,
+            {
+              StepInfraCondition: {
+                step,
+                attempt: t.id,
+                reason: "Unschedulable",
+                message,
+                held_ms: onset - close,
+                observations: 3,
+              },
+            },
+          ]);
+      }
+      if (t.end !== null)
+        timed.push([t.end, { AttemptFinished: { step, attempt: t.id, ...(t.failure ? { failure: t.failure } : {}) } }]);
+    }
+    const last = tries[tries.length - 1]!;
+    if (last.end !== null)
+      timed.push([
+        last.end - 500,
+        { StepTransitioned: { step, from: "running", to: last.failure ? "failed" : "succeeded" } },
+      ]);
+  }
+  // Oldest first: a larger "before now" is earlier.
+  timed.sort((a, b) => b[0] - a[0]);
+  return timed.map(([before, kind]) => rtv(ago(before), kind)).join("");
+})();
+const rtArtifact = (name: string, step: string, attempt: string, of_record: boolean, size: number, content_type: string) => ({
+  name,
+  step,
+  attempt,
+  of_record,
+  succeeded: !RT_TRIES[step]!.find((t) => t.id === attempt)!.failure,
+  size,
+  content_type,
+});
+const retriesArtifacts: ArtifactDto[] = [
+  rtArtifact("junit.xml", "unit", "a1", false, 18_400, "application/xml"),
+  rtArtifact("junit.xml", "unit", "a3", true, 18_900, "application/xml"),
+  rtArtifact("coverage.txt", "unit", "a3", true, 4_100, "text/plain"),
+  rtArtifact("report.html", "e2e", "a1", false, 310_000, "text/html"),
+  rtArtifact("report.html", "e2e", "a4", false, 305_000, "text/html"),
+  rtArtifact("report.html", "e2e", "a6", true, 298_000, "text/html"),
+  // Only a failed try wrote the trace: nothing is of record for it.
+  rtArtifact("trace.zip", "e2e", "a5", false, 2_400_000, "application/zip"),
+];
 
 const richArtifacts: ArtifactDto[] = [
   {
@@ -586,6 +920,8 @@ const externalGate = (id: string, needs: string, status: string, a1: number, out
     {
       id: "a1",
       started_at: ago(a1),
+      // A gate that still waits has not finished; a resolved one closed a minute in.
+      finished_at: outcome === "running" ? null : ago(a1) + 60_000,
       failed: outcome === "failed",
       ...(outcome === "failed"
         ? { failure: "gate", failure_detail: "ImagePullBackOff: sha-a1b2c3d not found in registry" }
@@ -601,7 +937,7 @@ const gatesBump = (id: string, at: number) => ({
   status: "succeeded",
   attempts: 1,
   needs: [],
-  attempt_list: [{ id: "a1", started_at: ago(at), failed: false, outcome: "succeeded" }],
+  attempt_list: [{ id: "a1", started_at: ago(at), finished_at: ago(at) + 50_000, failed: false, outcome: "succeeded" }],
 });
 const gatesRunStatus: RunStatusDto = {
   id: GATES_RUN_ID,
@@ -694,7 +1030,7 @@ const envGate = (id: string, approval: boolean, extra: Record<string, unknown> =
   needs: ["build"],
   gate: "manual",
   ...(approval ? { environment_approval_gate: true } : {}),
-  attempt_list: [{ id: "a1", started_at: ago(3 * min), failed: false, outcome: "running" }],
+  attempt_list: [{ id: "a1", started_at: ago(3 * min), finished_at: null, failed: false, outcome: "running" }],
   ...extra,
 });
 const envGateRunStatus: RunStatusDto = {
@@ -713,7 +1049,9 @@ const envGateRunStatus: RunStatusDto = {
       status: "succeeded",
       attempts: 1,
       needs: [],
-      attempt_list: [{ id: "a1", started_at: ago(5 * min), failed: false, outcome: "succeeded" }],
+      attempt_list: [
+        { id: "a1", started_at: ago(5 * min), finished_at: ago(3 * min + 10000), failed: false, outcome: "succeeded" },
+      ],
     },
     envGate("qa", false),
     { id: "smoke", status: "pending", attempts: 0, needs: ["qa"], attempt_list: [] },
@@ -2432,6 +2770,31 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     return json({ rejected: true }, { status: 202 });
   }
 
+  // the MATRIX run
+  if (p === `/v1/runs/${MATRIX_RUN_ID}`) return json(matrixRunStatus);
+  if (p === `/v1/runs/${MATRIX_RUN_ID}/events`)
+    return new Response(matrixEventsBody, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  if (p === `/v1/runs/${MATRIX_RUN_ID}/artifacts`) return json(matrixArtifacts);
+  if (p === `/v1/runs/${MATRIX_RUN_ID}/services`) return json([]);
+
+  // the RETRIES run
+  if (p === `/v1/runs/${RETRIES_RUN_ID}`) return json(retriesRunStatus);
+  // Cancelling it ends it, for the rest of this page load.
+  if (method === "POST" && p === `/v1/runs/${RETRIES_RUN_ID}/cancel`) {
+    retriesRunStatus.status = "cancelled";
+    return json({}, { status: 202 });
+  }
+  if (p === `/v1/runs/${RETRIES_RUN_ID}/events`)
+    return new Response(retriesEventsBody, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  if (p === `/v1/runs/${RETRIES_RUN_ID}/artifacts`) return json(retriesArtifacts);
+  if (p === `/v1/runs/${RETRIES_RUN_ID}/services`) return json([]);
+
   // the RICH run (Playwright walkthrough fixture)
   if (p === `/v1/runs/${RICH_RUN_ID}`) return json(richRunStatus);
   if (p === `/v1/runs/${RICH_RUN_ID}/events`)
@@ -2467,6 +2830,11 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   }
   if (/\/steps\/[^/]+\/results$/.test(p)) return json(testResults);
   if (/\/steps\/[^/]+\/consumed$/.test(p)) return json(testConsumed);
+  // The RETRIES run kept its workspace snapshots: one file to open.
+  if (p.startsWith(`/v1/runs/${RETRIES_RUN_ID}/steps/`) && p.endsWith("/workspace/file"))
+    return new Response("12 passed, 0 failed\n", { status: 200, headers: { "content-type": "text/plain" } });
+  if (p.startsWith(`/v1/runs/${RETRIES_RUN_ID}/steps/`) && p.endsWith("/workspace"))
+    return json({ available: true, path: "", entries: [{ name: "summary.txt", kind: "file" }] });
   if (/\/steps\/[^/]+\/workspace$/.test(p))
     return json({ available: false, path: "", entries: [] });
 
@@ -2577,7 +2945,9 @@ export function installMock() {
         }
       })();
       const replay =
-        /\/steps\/[^/]+\/logs$/.test(path)
+        unscheduledTry(this.url)
+          ? null
+          : /\/steps\/[^/]+\/logs$/.test(path)
           ? testLogLines
           : /\/services\/[^/]+\/logs$/.test(path)
             ? serviceLogLines

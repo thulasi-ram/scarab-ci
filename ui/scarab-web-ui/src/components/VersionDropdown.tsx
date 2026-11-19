@@ -1,15 +1,11 @@
-// Version dropdown (Proposal B, redesign): the run-history control, folded from
-// the former persistent left rail (VersionRail) into a compact dropdown that
-// lives in the Pipeline component's band toolbar — the `◈ latest ▾` control.
-// One row per version (Take), newest-first, each a whole-run version derived
-// from the event log ("Take"/"attempt" never surface). A row carries its label
-// ("latest" / "original run" / "you reran b"), a provenance sub-line
-// (actor · relTime), and a compact outcome mini-summary (colored count chips per
-// status). The trigger names the version currently in view; picking a row zooms
-// the whole Pipeline component to that version (an older version turns it read-
-// only, flagged by the banner below the toolbar). Selecting the latest row
-// returns to live. This is page chrome (NOT the always-dark DAG canvas) → it
-// reads the PAGE/theme tokens.
+// The version selector in the run header's provenance line. A run with one
+// version reads as plain text, "Version 1 · only version". With more, it is a
+// dropdown, "Version 2 of 3 · latest ▾", with one row per version, newest
+// first: its outcome counts, why it exists (the trigger, or "you reran from
+// build"), who opened it and when. Picking an older version shows the run as
+// it stood then, read-only; picking the latest returns to live. The versions
+// are derived from the event log; "Take" never shows. Page chrome, so it reads
+// the page tokens.
 import { For, Show, createSignal, onMount, onCleanup } from "solid-js";
 
 /** How a version's steps landed, bucketed for the mini-summary. */
@@ -24,33 +20,34 @@ export type OutcomeCounts = {
 
 /** One version row, fully resolved by the caller from the event-log takes. */
 export type VersionRow = {
-  /** 1-based take number — the value emitted to `onSelect` (null when latest). */
+  /** 1-based version number: the value emitted to `onSelect` (null when latest). */
   n: number;
-  /** Primary line: "latest" / "original run" / "you reran b". */
+  /** "latest" / "original run" / "you reran b": the read-only banner's words. */
   label: string;
-  /** Second line: actor · relTime (may be empty for the original run). */
+  /** Why the version exists: the trigger, or "you reran from b". */
+  why: string;
+  /** Who opened it and when ("by a.kim · 15m ago"); may be empty. */
   sub: string;
   /** Per-status tally driving the outcome chips. */
   summary: OutcomeCounts;
-  /** This is the newest (open) version — the live frontier. */
+  /** This is the newest (open) version. */
   isLatest: boolean;
-  /** This version is the one currently in view. */
+  /** This version is the one in view. */
   isSelected: boolean;
 };
 
 // Fixed render order + accent mapping. Only the five named buckets get an
-// accent token; anything else falls to muted-sage "other".
+// accent token; anything else falls to muted "other".
 const CHIPS: { key: keyof OutcomeCounts; glyph: string; cls: string; title: string }[] = [
-  { key: "succeeded", glyph: "✓", cls: "ok", title: "succeeded" },
-  { key: "failed", glyph: "✗", cls: "danger", title: "failed" },
+  { key: "succeeded", glyph: "✓", cls: "ok", title: "passed" },
+  { key: "failed", glyph: "✕", cls: "danger", title: "failed" },
   { key: "running", glyph: "●", cls: "running", title: "running" },
   { key: "superseded", glyph: "⊘", cls: "copper", title: "superseded" },
   { key: "notRun", glyph: "○", cls: "sage", title: "not run" },
   { key: "other", glyph: "·", cls: "other", title: "other" },
 ];
 
-/** The colored count chips (shared with the former rail) — one per non-empty
- * status bucket, using the shared status accent tokens. */
+/** The coloured count chips: one per non-empty status bucket. */
 export function MiniSummary(props: { summary: OutcomeCounts }) {
   const shown = () => CHIPS.filter((c) => props.summary[c.key] > 0);
   return (
@@ -75,11 +72,10 @@ export default function VersionDropdown(props: {
   live: boolean;
 }) {
   const [open, setOpen] = createSignal(false);
-  // Newest-first, regardless of the order the caller assembled them in.
+  let menu: HTMLElement | undefined;
+  // Newest first, whatever order the caller assembled them in.
   const ordered = () => [...props.rows].sort((a, b) => b.n - a.n);
   const selected = () => props.rows.find((r) => r.isSelected) ?? ordered()[0];
-  // The trigger names the version in view; when it isn't the latest we're time-
-  // travelling — tint the trigger copper (echoes the read-only banner's caution).
   const viewingLatest = () => selected()?.isLatest ?? true;
 
   const pick = (row: VersionRow) => {
@@ -87,69 +83,87 @@ export default function VersionDropdown(props: {
     setOpen(false);
   };
 
-  // Escape closes (the backdrop below handles outside-click).
   onMount(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
     document.addEventListener("keydown", onKey);
     onCleanup(() => document.removeEventListener("keydown", onKey));
   });
+  const onMenuKey = (e: KeyboardEvent) => {
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    e.preventDefault();
+    const rows = Array.from(menu?.querySelectorAll<HTMLButtonElement>("[role=menuitemradio]") ?? []);
+    const i = rows.indexOf(document.activeElement as HTMLButtonElement);
+    const next = e.key === "ArrowDown" ? Math.min(rows.length - 1, i + 1) : Math.max(0, i - 1);
+    rows[next]?.focus();
+  };
 
   return (
-    <span class="vdrop">
-      <button
-        type="button"
-        class="vdrop-btn"
-        classList={{ open: open(), traveling: !viewingLatest() }}
-        aria-haspopup="menu"
-        aria-expanded={open()}
-        title="run versions — pick one to view it"
-        onClick={() => setOpen((v) => !v)}
-      >
-        <span class="vdrop-emblem" aria-hidden="true">◈</span>
-        <span class="vdrop-lbl">{selected()?.label ?? "latest"}</span>
-        <Show when={viewingLatest() && props.live}>
-          <span class="vdrop-live" title="live">
-            <span class="dot" />
+    <Show
+      when={props.rows.length > 1}
+      fallback={
+        <span class="vpick static">
+          <span class="k">Version</span> 1 · only version
+        </span>
+      }
+    >
+      <span class="vdrop">
+        <button
+          type="button"
+          class="vpick"
+          classList={{ open: open(), traveling: !viewingLatest() }}
+          aria-haspopup="menu"
+          aria-expanded={open()}
+          title="Pick a version to see the run as it stood then"
+          onClick={() => {
+            setOpen((v) => !v);
+            if (open()) queueMicrotask(() => menu?.querySelector<HTMLButtonElement>("[aria-checked=true]")?.focus());
+          }}
+        >
+          <span class="k">Version</span> {selected()?.n} of {props.rows.length}
+          {viewingLatest() ? " · latest" : ""}
+          <span class="vdrop-caret" aria-hidden="true">
+            ▾
           </span>
-        </Show>
-        <span class="vdrop-caret" aria-hidden="true">▾</span>
-      </button>
+        </button>
 
-      <Show when={open()}>
-        {/* Transparent full-viewport click-catcher, under the menu. */}
-        <div class="vdrop-backdrop" aria-hidden="true" onClick={() => setOpen(false)} />
-        <nav class="vdrop-menu" role="menu" aria-label="run versions">
-          <For each={ordered()}>
-            {(row) => (
-              <button
-                type="button"
-                role="menuitemradio"
-                aria-checked={row.isSelected}
-                class="vdrop-row"
-                classList={{ sel: row.isSelected }}
-                onClick={() => pick(row)}
-                title={row.sub ? `${row.label} · ${row.sub}` : row.label}
-              >
-                <span class="vdrop-pip" />
-                <span class="vdrop-rowbody">
-                  <span class="vdrop-rowtop">
-                    <span class="vdrop-rowlbl">{row.label}</span>
-                    <Show when={row.isLatest && props.live}>
-                      <span class="vdrop-live">
-                        <span class="dot" /> Live
+        <Show when={open()}>
+          <div class="vdrop-backdrop" aria-hidden="true" onClick={() => setOpen(false)} />
+          <nav class="vdrop-menu" role="menu" aria-label="run versions" ref={menu} onKeyDown={onMenuKey}>
+            <For each={ordered()}>
+              {(row) => (
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={row.isSelected}
+                  class="vdrop-row"
+                  classList={{ sel: row.isSelected }}
+                  onClick={() => pick(row)}
+                >
+                  <span class="vdrop-pip" />
+                  <span class="vdrop-rowbody">
+                    <span class="vdrop-rowtop">
+                      <span class="vdrop-rowlbl">
+                        Version {row.n}
+                        {row.isLatest ? " · latest" : ""}
                       </span>
+                      <Show when={row.isLatest && props.live}>
+                        <span class="vdrop-live">
+                          <span class="dot" /> Live
+                        </span>
+                      </Show>
+                    </span>
+                    <span class="vdrop-why">{row.why}</span>
+                    <Show when={row.sub}>
+                      <span class="vdrop-sub">{row.sub}</span>
                     </Show>
+                    <MiniSummary summary={row.summary} />
                   </span>
-                  <Show when={row.sub}>
-                    <span class="vdrop-sub">{row.sub}</span>
-                  </Show>
-                  <MiniSummary summary={row.summary} />
-                </span>
-              </button>
-            )}
-          </For>
-        </nav>
-      </Show>
-    </span>
+                </button>
+              )}
+            </For>
+          </nav>
+        </Show>
+      </span>
+    </Show>
   );
 }

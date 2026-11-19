@@ -2862,6 +2862,14 @@ export interface components {
              *     (or a pre-0041 row). Stored since migration 0041.
              */
             failure_detail?: string | null;
+            /**
+             * Format: int64
+             * @description When this attempt ended (unix-ms); `null` while it runs. Read from the
+             *     run's event log: the attempt's `AttemptFinished` or `AttemptSuperseded`
+             *     entry, or for a `cancelled` attempt the step's cancel (or skip) that
+             *     closed it. Also `null` when the log holds no such entry.
+             */
+            finished_at: number | null;
             id: string;
             /**
              * @description The attempt's recorded outcome (ADR-0056 amendment): `running` |

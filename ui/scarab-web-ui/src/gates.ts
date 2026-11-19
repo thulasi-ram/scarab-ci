@@ -66,6 +66,15 @@ export function approvableGates<T extends GateLike>(steps: readonly T[]): T[] {
 // (`gate_resolution`, the journal's GateResolved). This turns it into the one
 // line the DAG node and the step pane both show.
 
+/** The reason the engine journals when a gate's wait runs past its
+ * `expires_after`: "not released within 1800s of its needs finishing". */
+const EXPIRY_REASON = /^not released within \d+s of its needs finishing$/;
+
+/** Whether a failed gate's reason says its wait expired. */
+export function isGateExpiry(reason: string | null | undefined): boolean {
+  return EXPIRY_REASON.test(reason?.trim() ?? "");
+}
+
 /** The kinds a human can REJECT (fail with a reason): every gate kind. */
 const REJECTABLE_KINDS: ReadonlySet<string> = new Set(["manual", "timer", "external", "plugin"]);
 

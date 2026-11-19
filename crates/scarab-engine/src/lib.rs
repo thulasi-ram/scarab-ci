@@ -1582,6 +1582,8 @@ pub enum EventPayload {
         /// The backend's machine token (`ImagePullBackOff`, `Unschedulable`, …).
         reason: String,
         /// The backend's human sentence, already redacted. `None` if it gave none.
+        /// An episode is keyed by `reason`: the onset carries the first message,
+        /// the closing event the latest one seen under the same reason.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
         /// How long the condition held. `None` marks the onset event; `Some`

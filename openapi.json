@@ -9524,6 +9524,7 @@
         "required": [
           "id",
           "started_at",
+          "finished_at",
           "failed",
           "outcome"
         ],
@@ -9545,6 +9546,14 @@
               "null"
             ],
             "description": "The executor's human-readable cause for a failed attempt (ticket\n4cf03d7) — e.g. \"cold tier refused: connection refused\" — alongside the\nmachine-consumed `failure` class. Absent = the class is the whole story\n(or a pre-0041 row). Stored since migration 0041."
+          },
+          "finished_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When this attempt ended (unix-ms); `null` while it runs. Read from the\nrun's event log: the attempt's `AttemptFinished` or `AttemptSuperseded`\nentry, or for a `cancelled` attempt the step's cancel (or skip) that\nclosed it. Also `null` when the log holds no such entry."
           },
           "id": {
             "type": "string"

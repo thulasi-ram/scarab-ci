@@ -220,12 +220,61 @@ async fn a_cleared_condition_is_closed_with_its_duration() {
     );
 }
 
-/// A *changed* condition closes the old episode before opening the new one, so
-/// the rail reads as a sequence rather than a smear. Keying on the reason alone
-/// would miss this: the same `FailedScheduling` label can carry a genuinely
-/// different problem in its message.
+/// A message that changes under the same reason is the same episode. Seen on a
+/// real run: the scheduler rewrote its node counts every poll as an autoscaler
+/// added nodes (`0/12 nodes are available` → `0/14 …`), and keying the episode
+/// on the message closed and reopened one `Unschedulable` wait every 30s. One
+/// onset, one close, and the close carries the latest message.
 #[tokio::test]
-async fn a_changed_message_under_the_same_reason_opens_a_new_episode() {
+async fn a_changed_message_under_the_same_reason_stays_one_episode() {
+    let h = harness().await;
+    for (i, nodes) in [12, 14, 15].into_iter().enumerate() {
+        if i > 0 {
+            h.clock.advance(POLL_MS);
+        }
+        h.exec.set_infra_condition(
+            "build",
+            InfraCondition::new(
+                "Unschedulable",
+                Some(format!(
+                    "0/{nodes} nodes are available: {} node(s) had untolerated taint(s).",
+                    nodes - 2
+                )),
+            ),
+        );
+        h.observer.observe(&h.step).await.unwrap();
+    }
+    assert_eq!(
+        conditions(&h.db).await.len(),
+        1,
+        "a message change under one reason appends nothing"
+    );
+
+    h.clock.advance(POLL_MS);
+    h.exec.clear_infra_condition("build");
+    h.observer.observe(&h.step).await.unwrap();
+
+    let events = conditions(&h.db).await;
+    assert_eq!(events.len(), 2, "one onset, one close — got {events:?}");
+    assert_eq!(
+        events[0].1.as_deref(),
+        Some("0/12 nodes are available: 10 node(s) had untolerated taint(s)."),
+        "the onset carries the first message"
+    );
+    assert_eq!(
+        events[1].1.as_deref(),
+        Some("0/15 nodes are available: 13 node(s) had untolerated taint(s)."),
+        "the close carries the latest message"
+    );
+    assert_eq!(events[1].2, Some(3 * POLL_MS));
+    assert_eq!(events[1].3, Some(3), "all three polls counted");
+}
+
+/// A message whose WORDS change under the same reason is a new episode: the
+/// same `FailedScheduling` label can carry a different problem, and the rail
+/// should read as a sequence. Only changing numbers stay one episode (above).
+#[tokio::test]
+async fn a_different_problem_under_the_same_reason_opens_a_new_episode() {
     let h = harness().await;
     h.exec.set_infra_condition(
         "build",
@@ -254,6 +303,41 @@ async fn a_changed_message_under_the_same_reason_opens_a_new_episode() {
         events[2].1.as_deref(),
         Some("3 node(s) had untolerated taint {gpu: true}"),
         "the new problem is reported even though its reason is unchanged"
+    );
+}
+
+/// A new reason closes the old episode and opens its own, with its own message:
+/// a `PodInitializing` wait with no message must not inherit the scheduler's
+/// sentence from the `Unschedulable` episode before it.
+#[tokio::test]
+async fn a_new_reason_opens_an_episode_with_its_own_message() {
+    let h = harness().await;
+    h.exec.set_infra_condition(
+        "build",
+        InfraCondition::new(
+            "Unschedulable",
+            Some("0/14 nodes are available: 12 node(s) had untolerated taint(s).".into()),
+        ),
+    );
+    h.observer.observe(&h.step).await.unwrap();
+
+    h.clock.advance(POLL_MS);
+    h.exec
+        .set_infra_condition("build", InfraCondition::new("PodInitializing", None));
+    h.observer.observe(&h.step).await.unwrap();
+
+    let events = conditions(&h.db).await;
+    assert_eq!(events.len(), 3, "onset, close, onset — got {events:?}");
+    assert_eq!(events[1].0, "Unschedulable");
+    assert_eq!(
+        events[1].2,
+        Some(POLL_MS),
+        "the first episode is closed out"
+    );
+    assert_eq!(events[2].0, "PodInitializing");
+    assert_eq!(
+        events[2].1, None,
+        "the new reason does not carry the previous reason's message"
     );
 }
 

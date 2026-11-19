@@ -34,14 +34,14 @@ export function describeEvent(e: RunEvent): string {
       return `${s(v.target)} retried${v.by ? ` by ${s(v.by)}` : ""} — same version`;
     case "AttemptReadopted":
       return `${s(v.step)} — re-adopted after control-plane restart`;
-    // ADR-0061 s5: keeping a run's Workspace Snapshots past the retention window
+    // Keeping a run's Workspace Snapshots past the retention window
     // costs storage, so both directions are recorded and both name who asked.
     case "RunSnapshotsPinned":
       return `Workspace snapshots pinned${v.by ? ` by ${s(v.by)}` : ""} — kept past the retention window`;
     case "RunSnapshotsUnpinned":
       return `Workspace snapshots unpinned${v.by ? ` by ${s(v.by)}` : ""} — back to the retention window`;
-    // Fan-in collisions (ticket 2e1a458): the merge overwrote paths — ADR-0007
-    // last-wins semantics made loud, not an error. `count` is authoritative;
+    // Fan-in collisions (ticket 2e1a458): the merge overwrote paths — the
+    // documented last-input-wins rule made loud, not an error. `count` is authoritative;
     // `sample` is a bounded excerpt (≤8 on k8s), so name the first paths only.
     case "WorkspaceInputCollisions":
       return `${s(v.step)} — ${collisionSummary(v)}`;
@@ -89,7 +89,7 @@ function collisionSummary(v: Record<string, unknown>): string {
   return `${count} workspace input collision${count === 1 ? "" : "s"} — last input wins${paths}`;
 }
 
-/** The human line for a StepInfraCondition payload, step omitted (ADR-0068).
+/** The human line for a StepInfraCondition payload, step omitted.
  *
  * The onset and the close are the same variant distinguished by `held_ms`, and
  * they read differently on purpose: the onset is a live warning, the close is a
@@ -140,7 +140,7 @@ export function eventParts(e: RunEvent): { step: string | null; text: string } {
 
 /** The activity-rail category for an event — drives its glyph and colour. `err`
  * covers a failed attempt (the retry story) and a run/step that ended failed.
- * `take` is a human rerun — the Take boundary (ADR-0056); `recover` is a
+ * `take` is a human rerun — the Take boundary; `recover` is a
  * control-plane crash re-adoption — durability made visible. */
 export type EventCat = "info" | "ok" | "run" | "err" | "gate" | "take" | "recover" | "warning";
 
@@ -197,7 +197,7 @@ export function eventCategory(e: RunEvent): EventCat {
     // could not be applied): a warning, since nothing failed.
     case "Raw":
       return typeof v.note === "string" ? "warning" : "info";
-    // Everything else — including the ADR-0061 s5 snapshot pin/unpin — is `info`.
+    // Everything else — including the snapshot pin/unpin — is `info`.
     // Those two used to have their own arms returning `info`, which was dead code
     // AND untestable: no input could tell the arm from this fall-through, so the
     // test that "covered" them was pinning this line. The decision they encoded
@@ -213,9 +213,116 @@ export const EVENT_GLYPH: Record<EventCat, string> = {
   info: "◆",
   ok: "✓",
   run: "●",
-  err: "↻",
+  // The failure mark the rest of the run page uses (the attempts menu, the
+  // version menu, a failed artifact). A circular arrow here read as "retry".
+  err: "✗",
   gate: "◷",
   take: "◈",
   recover: "⟲",
   warning: "△",
 };
+
+/** A condition still holding a step's attempt back: the onset was logged and
+ * no closing event (the one carrying `held_ms`) has followed yet. */
+export type ActiveInfraCondition = {
+  attempt: string;
+  reason: string;
+  message?: string;
+  /** When the condition started (the onset event's time). */
+  since: number;
+};
+
+/** The infra condition holding each step's CURRENT attempt back right now, by
+ * step id. A step whose latest attempt has no open condition is absent.
+ *
+ * The backend logs an onset (no `held_ms`) when a condition appears and a
+ * closing event (with `held_ms`) when it clears, changes, or the attempt ends;
+ * a change closes the old condition before it opens the new one. An attempt
+ * that finished, or that a newer attempt replaced, holds nothing, even when a
+ * closing event never arrived. */
+export function activeInfraConditions(events: RunEvent[]): Record<string, ActiveInfraCondition> {
+  const latest: Record<string, string> = {}; // step -> current attempt id
+  const open: Record<string, ActiveInfraCondition> = {}; // step -> open condition
+  for (const e of events) {
+    const k = e.kind;
+    if (typeof k === "string") continue;
+    const tag = Object.keys(k)[0];
+    const v = k[tag] ?? {};
+    const step = v.step as string | undefined;
+    if (!step) continue;
+    const attempt = String(v.attempt ?? "");
+    switch (tag) {
+      case "AttemptStarted":
+        latest[step] = attempt;
+        delete open[step];
+        break;
+      case "AttemptFinished":
+        if (open[step]?.attempt === attempt) delete open[step];
+        break;
+      case "StepInfraCondition": {
+        const closing = v.held_ms !== undefined && v.held_ms !== null;
+        if (closing) {
+          if (open[step]?.attempt === attempt) delete open[step];
+        } else if (latest[step] === undefined || latest[step] === attempt) {
+          open[step] = {
+            attempt,
+            reason: String(v.reason ?? ""),
+            ...(v.message ? { message: String(v.message) } : {}),
+            since: e.at,
+          };
+        }
+        break;
+      }
+    }
+  }
+  return open;
+}
+
+/** Reasons that mean the scheduler could not place the Pod on a node. */
+export const NODE_WAIT_REASONS = new Set(["Unschedulable", "NotScheduled", "SchedulingGated"]);
+
+/** How long the scheduler could not place one attempt's Pod, in ms: the sum of
+ * its closed "waiting for a node" conditions. Null when there were none. An
+ * open condition is not counted; the caller shows it as active instead. */
+export function heldBeforeStart(events: RunEvent[], step: string, attempt: string): number | null {
+  let total = 0;
+  for (const e of events) {
+    const k = e.kind;
+    if (typeof k === "string") continue;
+    const v = k.StepInfraCondition;
+    if (!v || v.step !== step || String(v.attempt ?? "") !== attempt) continue;
+    if (typeof v.held_ms !== "number" || !NODE_WAIT_REASONS.has(String(v.reason ?? ""))) continue;
+    total += v.held_ms;
+  }
+  return total > 0 ? total : null;
+}
+
+/** An infra condition's reason token in plain words, for the graph node:
+ * "waiting for a node" for a Pod the scheduler cannot place, and so on. An
+ * unknown token is split into lower-case words ("SomeNewReason" → "some new
+ * reason") rather than hidden. */
+export function infraReasonText(reason: string): string {
+  switch (reason) {
+    case "Unschedulable":
+    case "NotScheduled":
+    case "SchedulingGated":
+      return "waiting for a node";
+    case "ContainerCreating":
+    case "PodInitializing":
+      return "starting its container";
+    case "ImagePullBackOff":
+    case "ErrImagePull":
+      return "cannot pull its image";
+    case "ErrImageNeverPull":
+      return "image not on the node";
+    case "InvalidImageName":
+      return "invalid image name";
+    case "CreateContainerConfigError":
+    case "CreateContainerError":
+      return "cannot create its container";
+    case "CrashLoopBackOff":
+      return "container keeps crashing";
+  }
+  const words = reason.replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().trim();
+  return words || "waiting on infrastructure";
+}

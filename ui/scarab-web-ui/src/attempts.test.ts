@@ -1,4 +1,4 @@
-// Attempt-grain scoping + try mappers (ADR-0056) — the pure seam behind
+// Attempt-grain scoping + try mappers — the pure helpers behind
 // StepPane / AttemptsDropdown: take-window filtering, scoped/of-record try
 // resolution, and the per-try outcome/tone copy.
 import { describe, it, expect } from "vitest";
@@ -9,6 +9,7 @@ import {
   ofRecordIndexOf,
   stripTries,
   causeSuffix,
+  causeText,
   tryTitle,
   tryOutcome,
   tryTone,
@@ -16,7 +17,7 @@ import {
   type FilmstripTry,
 } from "./attempts";
 import { deriveTakes, replayTake } from "./takes";
-import { twoTakeRun } from "./event-fixtures";
+import { twoTakeRun, started, finished, retryRequested } from "./event-fixtures";
 
 const a = (id: string, outcome = "succeeded", failed = false): AttemptLike => ({
   id,
@@ -103,7 +104,7 @@ describe("stripTries", () => {
     expect(tries).toHaveLength(1);
     expect(tries[0].id).toBe("a3");
     expect(tries[0].index).toBe(0); // numbered per-take, not globally
-    expect(tries[0].cause).toBe("rerun");
+    expect(tries[0].cause?.kind).toBe("rerun");
   });
 
   it("an empty window renders no tries (carried-forward step)", () => {
@@ -113,7 +114,7 @@ describe("stripTries", () => {
 
   it("unscoped: carries causes, superseded and shadowed flags off the event log", () => {
     const cTries = stripTries(events, "c", [a("a1", "superseded"), a("a2", "running")], null);
-    expect(cTries.map((t) => t.cause)).toEqual(["initial", "cascade"]);
+    expect(cTries.map((t) => t.cause?.kind)).toEqual(["initial", "cascade"]);
     expect(cTries[0].superseded).toBe(true); // cut short by the rerun of b
     expect(cTries[1].superseded).toBe(false);
 
@@ -140,17 +141,46 @@ describe("try mappers (AttemptsDropdown copy)", () => {
     ...o,
   });
 
-  it("causeSuffix names the human/machine cause", () => {
-    expect(causeSuffix("rerun")).toBe(" · you reran");
-    expect(causeSuffix("cascade")).toBe(" · ⟵ rerun");
-    expect(causeSuffix("retry")).toBe(" · auto-retry");
-    expect(causeSuffix("initial")).toBe("");
+  // Regression: a human Retry read "auto-retry", and any rerun read "you
+  // reran" whoever pressed it.
+  it("causeText says who or what started the try, in plain words", () => {
+    expect(causeText({ kind: "initial" })).toBe("first run");
+    expect(causeText({ kind: "auto-retry" })).toBe("automatic retry");
+    expect(causeText({ kind: "manual-retry", by: "a.kim" })).toBe("retried by a.kim");
+    expect(causeText({ kind: "manual-retry", by: null })).toBe("manual retry");
+    expect(causeText({ kind: "rerun", by: "a.kim" })).toBe("rerun by a.kim");
+    expect(causeText({ kind: "rerun", by: null })).toBe("rerun");
+    expect(causeText({ kind: "cascade", by: "a.kim", upstream: "build", via: "rerun" })).toBe(
+      "rerun of build",
+    );
+    expect(causeText({ kind: "cascade", by: null, upstream: "build", via: "retry" })).toBe(
+      "retry of build",
+    );
+    expect(causeText(undefined)).toBe("");
+  });
+
+  it("causeSuffix prefixes the separator, and is empty for an unknown cause", () => {
+    expect(causeSuffix({ kind: "auto-retry" })).toBe(" · automatic retry");
     expect(causeSuffix(undefined)).toBe("");
   });
 
   it("tryTitle is `try N` + cause", () => {
-    expect(tryTitle(t({ index: 2, cause: "rerun" }))).toBe("try 3 · you reran");
+    expect(tryTitle(t({ index: 2, cause: { kind: "rerun", by: "a.kim" } }))).toBe(
+      "try 3 · rerun by a.kim",
+    );
+    expect(tryTitle(t({ index: 0, cause: { kind: "initial" } }))).toBe("try 1 · first run");
     expect(tryTitle(t({ index: 0 }))).toBe("try 1");
+  });
+
+  it("stripTries carries the manual retry's actor through to the title", () => {
+    const evs = [
+      started(1000, "b", "a1"),
+      finished(2000, "b", "a1", "step"),
+      retryRequested(3000, "b", [], "a.kim"),
+      started(4000, "b", "a2"),
+    ];
+    const tries = stripTries(evs, "b", [a("a1", "failed", true), a("a2", "running")], null);
+    expect(tries.map(tryTitle)).toEqual(["try 1 · first run", "try 2 · retried by a.kim"]);
   });
 
   it("tryOutcome prefers the backend's authoritative outcome", () => {

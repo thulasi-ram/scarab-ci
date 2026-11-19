@@ -390,6 +390,102 @@ async fn run_detail_exposes_attempt_list_for_reruns() {
     );
 }
 
+/// `finished_at` is `null` while an attempt runs and the `at` of its
+/// `AttemptFinished` once it ends, so the UI can show each try's duration
+/// without replaying the event log. A cancelled attempt journals no
+/// attempt-keyed event: its end is the step's cancel.
+#[tokio::test]
+async fn run_detail_attempt_finished_at_is_null_until_the_attempt_ends() {
+    use scarab_engine::{EventKind, EventPayload, StepStatus, EVENT_VERSION};
+    let db = Arc::new(InMemoryDb::new());
+    let run = RunId("r1".into());
+    let build = StepId("build".into());
+    let lint = StepId("lint".into());
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    for step in [&build, &lint] {
+        db.create_step_run(&run, step, None, &[], Timestamp(0))
+            .await
+            .unwrap();
+        db.record_attempt(
+            &run,
+            step,
+            &Attempt {
+                id: AttemptId("a1".into()),
+                started_at: Timestamp(10),
+                failure: None,
+                failure_detail: None,
+                outcome: AttemptOutcome::Running,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let a1 = AttemptId("a1".into());
+    let attempt_of = |v: &serde_json::Value, step: &str| {
+        v["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == step)
+            .unwrap()["attempt_list"][0]
+            .clone()
+    };
+
+    let app = router(state(db.clone(), None));
+    let resp = app.oneshot(get("/v1/runs/r1")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let running = attempt_of(&v, "build");
+    assert!(
+        running.get("finished_at").is_some_and(|f| f.is_null()),
+        "a running attempt serves finished_at: null, got {running}"
+    );
+
+    let journal = |kind, at| EventKind {
+        version: EVENT_VERSION,
+        run: run.clone(),
+        kind,
+        at: Timestamp(at),
+    };
+    db.append_event(&journal(
+        EventPayload::AttemptFinished {
+            step: build.clone(),
+            attempt: a1.clone(),
+            failure: None,
+            cause: None,
+        },
+        131_000,
+    ))
+    .await
+    .unwrap();
+    db.set_attempt_outcome(&run, &build, &a1, AttemptOutcome::Succeeded)
+        .await
+        .unwrap();
+    db.append_event(&journal(
+        EventPayload::StepTransitioned {
+            step: lint.clone(),
+            from: StepStatus::Running,
+            to: StepStatus::Cancelled,
+        },
+        40_000,
+    ))
+    .await
+    .unwrap();
+    db.set_attempt_outcome(&run, &lint, &a1, AttemptOutcome::Cancelled)
+        .await
+        .unwrap();
+
+    let app = router(state(db, None));
+    let resp = app.oneshot(get("/v1/runs/r1")).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(attempt_of(&v, "build")["finished_at"], 131_000);
+    assert_eq!(
+        attempt_of(&v, "lint")["finished_at"],
+        40_000,
+        "a cancelled attempt ends at the step's cancel"
+    );
+}
+
 #[tokio::test]
 async fn step_logs_scope_by_attempt() {
     let db = Arc::new(InMemoryDb::new());
