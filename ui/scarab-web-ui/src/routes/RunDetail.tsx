@@ -512,33 +512,50 @@ export default function RunDetail() {
     setSel(defaultSelection({ steps: status.steps, gates: readyGates(status.steps), held }));
   }
 
+  // How many tries have finished, last time the run was read: the artifact
+  // list is read again when it changes, since a finished try may have
+  // published files.
+  let finishedTries: number | null = null;
+
   async function refresh() {
     const [status, evs] = await Promise.all([
       getRun(id()),
-      fetchEvents(id()).catch(() => [] as RunEvent[]),
+      // A failed read keeps the events already shown (null), rather than
+      // replacing them with none.
+      fetchEvents(id()).catch(() => null),
     ]);
     batch(() => {
       setRun(status);
-      setEvents(evs);
-      // First load only: later polls never move the selection.
-      if (!loaded() && status.steps.length) {
+      if (evs) setEvents(evs);
+      // First load only: later polls never move the selection. It waits for
+      // the events: without them the run has one version and no tries, and
+      // the URL's version and try would be dropped. The next poll tries again.
+      if (!loaded() && status.steps.length && evs) {
         applyInitialSelection(status, evs);
         setLoaded(true);
       }
     });
+    const finished = status.steps.reduce(
+      (n, s) => n + (s.attempt_list ?? []).filter((a) => a.outcome !== "running").length,
+      0,
+    );
+    let readArtifacts = finishedTries !== null && finished !== finishedTries;
+    finishedTries = finished;
     if (isTerminal(status.status)) {
+      if (live()) readArtifacts = true;
       setLive(false);
-      if (poll) {
+      // Keep polling until the events have loaded once.
+      if (poll && (loaded() || !status.steps.length)) {
         clearInterval(poll);
         poll = undefined;
       }
-      void refetchArtifacts();
     }
+    if (readArtifacts) void refetchArtifacts();
   }
 
   onMount(async () => {
     await refresh();
-    if (live()) poll = setInterval(() => void refresh(), POLL_MS);
+    if (live() || !loaded()) poll = setInterval(() => void refresh(), POLL_MS);
   });
   onCleanup(() => {
     if (poll) clearInterval(poll);

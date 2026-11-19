@@ -356,3 +356,35 @@ test("try tabs: newest first, earlier tries in a menu, and tries nested in the L
   await expect(page.getByRole("tablist", { name: "Tries of this step" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: /^Try 2 of 3/ })).toBeVisible();
 });
+
+// Regression: when the first read of the events failed, the page applied the
+// URL's selection to a run with no versions and dropped `v` and `try`.
+test("a failed first read of the events keeps the URL's version and try", async ({ page }) => {
+  // Fail the first `/events` read. The mock replaces window.fetch when the app
+  // boots, so wrap whatever it installs.
+  await page.addInitScript(() => {
+    const orig = window.fetch;
+    let inner: typeof fetch = orig;
+    let failed = false;
+    const wrapper = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (!failed && /\/v1\/runs\/[^/]+\/events$/.test(new URL(url, location.origin).pathname)) {
+        failed = true;
+        return Promise.resolve(new Response("unavailable", { status: 503 }));
+      }
+      return inner(input, init);
+    }) as typeof fetch;
+    Object.defineProperty(window, "fetch", {
+      configurable: true,
+      get: () => (inner === orig ? orig : wrapper),
+      set: (v: typeof fetch) => {
+        inner = v;
+      },
+    });
+  });
+  await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}?step=1&v=1&try=1`);
+  await expect(page.getByText(/Viewing version 1 of 2/)).toBeVisible();
+  await expect(page.locator(".sp-head")).toContainText("Try 1 of 1");
+  await expect(page).toHaveURL(/[?&]v=1(&|$)/);
+  await expect(page).toHaveURL(/[?&]try=1(&|$)/);
+});
