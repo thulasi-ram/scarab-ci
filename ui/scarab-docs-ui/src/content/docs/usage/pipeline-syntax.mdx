@@ -350,8 +350,10 @@ step does.
 ```
 
 `run_as_user: 0` is root: it is the same request as `run_as_root: true`, and a Policy sees it in
-the step's `grants` as `run-as-root`. A step cannot set both. A uid is not allowed beside
-`sandbox`, which sets the uid itself.
+the step's `grants` as `run-as-root`. `run_as_root: true` beside `run_as_user: 0` is the same
+request and compiles; `run_as_root: true` beside a non-zero `run_as_user` contradicts itself and
+does not compile. The same rule holds for a service's `run_as_user` and `run_as_root`. A uid is
+not allowed beside `sandbox`, which sets the uid itself.
 
 Some steps are **kinds** with no image that the engine runs on your behalf (you set no `image`/`command`):
 
@@ -586,8 +588,8 @@ steps:
     with:
       image: "ghcr.io/acme/app:${{ event.sha }}"
       images: |
-        ${{ outputs.amd64.push.ref }}
-        ${{ outputs.arm64.push.ref }}
+        ${{ has(outputs.amd64.push) ? outputs.amd64.push.ref : '' }}
+        ${{ has(outputs.arm64.push) ? outputs.arm64.push.ref : '' }}
 
   - id: deploy
     image: alpine:3.20
@@ -619,7 +621,11 @@ and refuses (exit 2):
 - an image whose config names no `os` or `architecture`, or names one of them twice (a label
   called `os`, for example);
 - two images of the same platform: `os/architecture`, then the `variant` (`arm64/v8`, `arm/v7`)
-  and the `os.version` a Windows image names. An index holds one image per platform.
+  and the `os.version` a Windows image names. An index holds one image per platform;
+- a manifest or config that writes a letter, digit, `.`, `_` or `-` with a `\u` escape, or names
+  `manifests`, `os`, `architecture`, `variant` or `os.version` more than once in any case (`os`
+  and `OS`). crane's JSON decoder reads both forms, so the step would otherwise check another
+  field than the one crane reads.
 
 The images may live in other repositories, or other registries, than the index. crane copies
 each image into the index's repository when it is not already there, so the step's credential
@@ -629,11 +635,12 @@ Its output: `outputs.app.index` is `{"ref": "<repository>@sha256:…", "digest":
 as crane reported the push. Deploy by this digest.
 
 A fork pull request, or a Run locked out of its Environment's secrets, pushes nothing: the build
-library writes no `push` result, so the index step, which reads `outputs.amd64.push`, fails
-before it launches. The `when:` on the trigger above keeps the Pipeline to pushes to `main`. A
-Pipeline that also runs for pull requests can give the index step, and the steps that read its
-output, `when: "event.kind == 'push'"`. With images named by literal digests, a fork's index step
-launches and exits 0 without pushing.
+library's push step writes no `push` result. Each `images` line reads `outputs.<build>.push` only
+when it is there, so on a fork the lines are empty, and the index step pushes nothing and exits 0.
+Anywhere else an empty `images` fails the step, and so does a mix of references and empty lines.
+A line written as `${{ outputs.amd64.push.ref }}` does not render when the build pushed nothing,
+and the index step fails before it launches. The steps that read `outputs.app.index` need
+`when: "event.kind == 'push'"`, or another condition that keeps them off a fork's Run.
 
 The step asks for `registry_auth: true` and is the library's only step, so a profile marked
 `registry_auth_only` (an ECR push role, say) can be named in a plain list:
@@ -1211,20 +1218,41 @@ profile for anything static.
 
 Whoever edits the Pipeline file writes the overlay, so even where raw overlays are permitted it may
 set only these fields. Scarab refuses any other field when the Run is created, and the error names
-its path. The executor checks the same list again before it creates the Pod.
+its path. `scarab validate --server` and the policy test report the same refusals. The executor
+checks the same list again before it creates the Pod; an overlay refused there (after the
+operator changed the lists, for example) fails the step as a configuration error with the reason.
 
 | Field | Why it is allowed |
 |-------|-------------------|
-| `metadata.labels` | Labels for the cluster's own tooling. Keys under `app.kubernetes.io/`, `scarab.io/` and `scarab.dev/` are Scarab's and are refused. |
-| `metadata.annotations` | The same, and the AppArmor and seccomp annotation keys are refused too. |
+| `metadata.labels` | Only keys the operator lists in the placement config's `author_overlay.label_keys`. |
+| `metadata.annotations` | Only keys the operator lists in `author_overlay.annotation_keys`. |
 | `spec.nodeSelector` | Picks nodes by label. It can only narrow where the Pod runs. |
-| `spec.affinity` | Picks nodes and neighbouring Pods for placement. |
-| `spec.tolerations` | Lets the Pod onto a tainted node pool. A toleration without a `key`, or of a `node-role.kubernetes.io/` taint, is refused: it would let the Pod onto the control-plane nodes. |
+| `spec.affinity.nodeAffinity` | Picks nodes for placement. Pod affinity and anti-affinity are refused: a required anti-affinity keeps other Pods off the nodes the step Pod runs on. |
+| `spec.tolerations` | Lets the Pod onto a tainted node pool, for taint keys the operator lists in `author_overlay.toleration_keys`. |
 | `spec.topologySpreadConstraints` | Spreads step Pods over zones or nodes. |
-| `spec.volumes[]` with `name` and `emptyDir` only | Scratch space that starts empty and holds no credential. |
+| `spec.volumes[]` with `name` and `emptyDir` only | Scratch space that starts empty and holds no credential. The name must be new to the Pod and appear once in the overlay. |
 | `spec.containers[]` entry `step`: `resources.requests`, `resources.limits` | CPU, memory or an extended resource such as a GPU. |
 | `spec.containers[]` entry `step`: `env[]` with `name` and `value` | A literal value. `valueFrom` and `envFrom` can read a Secret. |
 | `spec.containers[]` entry `step`: `volumeMounts[]` with `name`, `mountPath`, `readOnly` | Mounts an emptyDir volume the same overlay adds. |
+
+Labels, annotations and tolerations are refused unless the operator lists their key. A label can
+make the Pod match a NetworkPolicy or a Service, and an annotation can ask an admission webhook
+for an IAM role, a Vault or mesh sidecar, or a network attachment, so the operator chooses which
+keys authors may set. Nothing is listed by default. The operator lists keys in the server's
+placement config (the chart value `scarab.placement.author_overlay`):
+
+```yaml
+author_overlay:
+  label_keys: [team, cost-center]
+  annotation_keys: ["karpenter.sh/do-not-disrupt", "prometheus.io/*"]
+  toleration_keys: [nvidia.com/gpu]
+```
+
+Each entry is an exact key, `prefix/*` for every key under that prefix, or `*` for every key with
+no prefix. Some keys stay refused even when listed: labels and annotations under `scarab.io/`,
+`scarab.dev/` and `app.kubernetes.io/`, the AppArmor and seccomp annotations, and tolerations of a
+`node-role.kubernetes.io/` taint or with an empty or missing `key`, which would let the Pod onto
+the control-plane nodes.
 
 Everything else is refused. That includes any Secret reference (a `secret` or `projected` volume,
 `secretKeyRef`, `envFrom`, `imagePullSecrets`), `serviceAccountName`, `serviceAccount` and
@@ -1237,7 +1265,8 @@ workloads), `schedulerName` (a custom scheduler can ignore the operator's taints
 The overlay may add to the Pod, but it may not change or remove anything Scarab, the placement
 baseline or a placement profile put there. It can add a toleration or a `nodeSelector` key; it
 cannot remove the baseline's toleration, change a profile's `HTTP_PROXY`, override the baseline's
-`nodeSelector` value, or add a second node affinity term. Set the step container's CPU and memory with
+`nodeSelector` value, add a second node affinity term, or declare a volume with a name the Pod
+already has. Set the step container's CPU and memory with
 `resources:`; when that or the operator's default already set `requests.cpu`, the overlay cannot
 change it.
 

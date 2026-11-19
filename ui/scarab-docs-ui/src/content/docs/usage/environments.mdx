@@ -144,10 +144,11 @@ stricter than the org baseline, never looser.
 Two governed settings are granted **to one Project within one Environment**, and fail closed: the
 privilege whitelist (which image digests may use the `add-capabilities` or `privileged` grants) and
 permission for a raw `k8s_overlay`. Raw overlay permission lets that Project's pipeline authors
-set the placement fields, labels, scratch volumes and step container resources and env that the
-[`k8s_overlay` list](/scarab-ci/usage/pipeline-syntax/#placement--resources) allows. It never
-reaches a Secret, a ServiceAccount, the host, or a privileged container, and it cannot change what
-the placement baseline or a profile set.
+set the placement fields, scratch volumes and step container resources and env that the
+[`k8s_overlay` list](/scarab-ci/usage/pipeline-syntax/#placement--resources) allows, and the
+labels, annotations and tolerations whose keys the operator lists in the placement config's
+`author_overlay`. It never reaches a Secret, a ServiceAccount, the host, or a privileged
+container, and it cannot change what the placement baseline or a profile set.
 
 A Run that names an Environment is also never cancelled by newest-wins: a newer push to the same
 branch does not cancel it, and its concurrency group queues even if the pipeline declares
