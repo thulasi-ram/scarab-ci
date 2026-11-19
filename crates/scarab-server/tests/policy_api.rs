@@ -1254,3 +1254,240 @@ async fn policy_test_checks_a_forge_token_as_run_creation_does() {
     assert_eq!(b["decision"]["outcome"]["kind"], "allow", "{b}");
     assert!(b.get("refusal").is_none(), "{b}");
 }
+
+/// The operator's placement config: profiles `big` and `ecr-push`, the
+/// second carrying a registry credential.
+fn placement() -> scarab_executor_k8s::PlacementConfig {
+    serde_json::from_value(json!({
+        "profiles": [
+            { "name": "big", "k8s": { "spec": { "nodeSelector": { "pool": "big" } } } },
+            { "name": "ecr-push", "registry_auth_only": true,
+              "k8s": { "spec": { "serviceAccountName": "ecr-pusher" } } }
+        ]
+    }))
+    .unwrap()
+}
+
+// RT-R2-2: a Step's `placement_profiles` come from the Pipeline file, and
+// the executor's error for a name its registry does not hold, or for a
+// `registry_auth_only` profile on a Step without `registry_auth`, was found
+// only at launch: retried for 300 s, then the Run dead-lettered. Run
+// creation now refuses both, naming the Step and the profile, and the policy
+// test (what `validate --server` asks) answers a deny with the same text.
+#[tokio::test]
+async fn run_creation_and_the_policy_test_refuse_a_placement_profile_the_registry_refuses() {
+    let h = harness_with(|st| {
+        st.with_policies(Arc::new(InMemoryPolicies::new()))
+            .with_placement(placement())
+    });
+    let (s, _) = admin(&h).await;
+    let config = placement();
+    let ports = AdmissionPorts {
+        placement: Some(&config),
+        ..AdmissionPorts::default()
+    };
+    for (yaml, says) in [
+        (
+            "on: { push: {} }\nsteps:\n  - { id: b, image: busybox, placement_profiles: [bgi] }\n",
+            vec!["step `b`", "`bgi`", "`big`"],
+        ),
+        (
+            "on: { push: {} }\nsteps:\n  - { id: b, image: busybox, placement_profiles: [ecr-push] }\n",
+            vec!["step `b`", "`ecr-push`", "registry_auth"],
+        ),
+    ] {
+        let forge = FakeForge::new()
+            .with_file(".scarab/ci.yaml", yaml)
+            .with_commit("refs/heads/main", SHA);
+        let err = trigger_runs_from_event(
+            &forge,
+            h.db.as_ref(),
+            &FakeClock::new(1_000),
+            ports,
+            &push(),
+        )
+        .await
+        .expect_err("Run creation refuses the profile");
+        let err = err.to_string();
+        for want in &says {
+            assert!(err.contains(want), "{want}: {err}");
+        }
+
+        let trigger = json!({ "kind": "push", "ref": "refs/heads/main", "sha": SHA });
+        let (st, b) = h
+            .cookie(
+                "POST",
+                "/v1/orgs/acme/policy-test",
+                Some(form(yaml, trigger)),
+                &s,
+            )
+            .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["decision"]["outcome"]["kind"], "deny", "{b}");
+        let refusal = b["refusal"].as_str().expect("a refusal").to_string();
+        assert!(err.contains(&refusal), "{err} / {refusal}");
+    }
+
+    // A name the registry holds, and the push profile on a `registry_auth`
+    // Step, are admitted.
+    let yaml = "on: { push: {} }\nsteps:\n  - { id: b, image: busybox, placement_profiles: [big] }\n  - { id: p, image: busybox, registry_auth: true, placement_profiles: [ecr-push] }\n";
+    let forge = FakeForge::new()
+        .with_file(".scarab/ci.yaml", yaml)
+        .with_commit("refs/heads/main", SHA);
+    let created = trigger_runs_from_event(
+        &forge,
+        h.db.as_ref(),
+        &FakeClock::new(1_000),
+        ports,
+        &push(),
+    )
+    .await
+    .expect("admitted");
+    assert_eq!(created.runs.len(), 1);
+}
+
+// RT-R2-T4: the operator's `author_overlay` lists reach Run creation
+// through `AppState::admission_ports`. Built `with_author_overlay(label_keys:
+// [team])`, a Run whose overlay sets `metadata.labels.team` is admitted; on
+// the shipped default (no label keys) it is refused.
+#[tokio::test]
+async fn run_creation_on_app_state_reads_the_operators_author_overlay_keys() {
+    let governance = prod_permitting_overlays().await;
+    let yaml = overlay_ci("{ metadata: { labels: { team: web } } }");
+    let forge = FakeForge::new()
+        .with_file(".scarab/ci.yaml", yaml.as_str())
+        .with_commit("refs/heads/main", SHA);
+    let state = |listed: bool| {
+        let db = Arc::new(scarab_testkit::InMemoryDb::new());
+        let logs = Arc::new(scarab_server::LogService::new(
+            Arc::new(scarab_testkit::InMemoryObjectStore::new()),
+            db.clone(),
+        ));
+        let st = scarab_server::AppState::new(db, Arc::new(FakeClock::new(1_000)), logs)
+            .with_environment_governance(governance.clone());
+        if listed {
+            st.with_author_overlay(scarab_executor_k8s::AuthorOverlayConfig {
+                label_keys: vec!["team".into()],
+                ..Default::default()
+            })
+        } else {
+            st
+        }
+    };
+
+    let st = state(true);
+    let created = trigger_runs_from_event(
+        &forge,
+        st.db.as_ref(),
+        &FakeClock::new(1_000),
+        st.admission_ports(),
+        &push(),
+    )
+    .await
+    .expect("a listed label key is admitted");
+    assert_eq!(created.runs.len(), 1);
+
+    let st = state(false);
+    let err = trigger_runs_from_event(
+        &forge,
+        st.db.as_ref(),
+        &FakeClock::new(1_000),
+        st.admission_ports(),
+        &push(),
+    )
+    .await
+    .expect_err("the shipped default lists no label key");
+    assert!(
+        err.to_string().contains("author_overlay.label_keys"),
+        "{err}"
+    );
+}
+
+// RT-R2-5: the policy test rendered a Step's image with no launch
+// parameters. A manual Run whose image takes an input default
+// (`reg/x@${{ inputs.digest }}`) is admitted by Run creation, which resolves
+// the default, against a grant naming that digest; the policy test admitted
+// the unrendered template and answered deny. It now renders with the
+// declared defaults and answers allow.
+#[tokio::test]
+async fn policy_test_renders_a_manual_runs_image_with_its_input_defaults() {
+    use scarab_project::{
+        EnvironmentGovernanceStore, EnvironmentProjectEligibility,
+        EnvironmentProjectPrivilegeGrant, ImageGrant,
+    };
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let governance = Arc::new(
+        scarab_testkit::InMemoryEnvironmentGovernance::new().with_environment(
+            "acme",
+            "prod",
+            EnvironmentProjectEligibility::AllProjects,
+        ),
+    );
+    governance
+        .put_environment_project_privilege_grant(
+            &EnvironmentProjectPrivilegeGrant {
+                org: "acme".into(),
+                environment: "prod".into(),
+                project: "web".into(),
+                privileged_images: vec![ImageGrant {
+                    image_digest: digest.clone(),
+                    privileged: true,
+                    capabilities: vec![],
+                }],
+                permit_k8s_overlay: false,
+            },
+            "amy",
+            1,
+        )
+        .await
+        .unwrap();
+    let yaml = format!(
+        "on: {{ manual: {{}} }}\nenvironment: prod\ninterface:\n  inputs:\n    - {{ name: digest, \
+         type: string, required: false, default: \"{digest}\" }}\nsteps:\n  - id: b\n    \
+         image: \"reg/x@${{{{ inputs.digest }}}}\"\n    command: [\"true\"]\n    \
+         security: {{ privileged: true }}\n"
+    );
+
+    // Run creation: a dispatch with no values resolves the default.
+    let forge = FakeForge::new()
+        .with_file(".scarab/ci.yaml", yaml.as_str())
+        .with_commit("refs/heads/main", SHA);
+    let g = governance.clone();
+    let h = harness_with(move |st| {
+        st.with_policies(Arc::new(InMemoryPolicies::new()))
+            .with_environment_governance(g)
+    });
+    scarab_server::dispatch_run(
+        &forge,
+        h.db.as_ref(),
+        &FakeClock::new(1_000),
+        AdmissionPorts::governance(Some(governance.as_ref())),
+        "amy".into(),
+        RepoRef {
+            owner: "acme".into(),
+            name: "web".into(),
+        },
+        "refs/heads/main".into(),
+        "ci".into(),
+        Default::default(),
+        scarab_server::DispatchKind::Manual,
+        None,
+    )
+    .await
+    .expect("Run creation admits the rendered, granted image");
+
+    // The policy test answers as Run creation does.
+    let (s, _) = admin(&h).await;
+    let trigger = json!({ "kind": "manual", "ref": "refs/heads/main", "sha": SHA });
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/policy-test",
+            Some(form(&yaml, trigger)),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert!(b.get("refusal").is_none(), "{b}");
+    assert_eq!(b["decision"]["outcome"]["kind"], "allow", "{b}");
+}
