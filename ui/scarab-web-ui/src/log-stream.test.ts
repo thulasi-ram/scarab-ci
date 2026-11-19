@@ -216,8 +216,8 @@ describe("followLog", () => {
     expect(h.opened[h.opened.length - 1]!.q).toEqual({ from: "a1:2" });
   });
 
-  it("after 3 reopens in a row deliver no event, drops the cursor and opens fresh with the tail", () => {
-    // A cursor the server refuses (400) ends each reopen with no event.
+  it("after 3 reopens in a row fail before opening, drops the cursor and opens fresh with the tail", () => {
+    // A cursor the server refuses (400) ends each reopen before it opens.
     const h = harness({ outcome: () => "running" });
     h.opened[0]!.h.onChunk("x\n", "a1:1");
     const last = () => h.opened[h.opened.length - 1]!;
@@ -247,6 +247,36 @@ describe("followLog", () => {
     expect(h.tick()).toBe(1000);
     expect(last().q).toEqual({ from: "a1:4" });
     expect(h.resets()).toBe(1);
+  });
+
+  it("does not reload a quiet step whose opened streams drop with no event", () => {
+    const h = harness({ outcome: () => "running" });
+    h.opened[0]!.h.onChunk("x\n", "a1:1");
+    const last = () => h.opened[h.opened.length - 1]!;
+    // Opened, then only keepalive comments, then dropped: four times over.
+    for (let i = 0; i < 4; i++) {
+      last().h.onEnd!();
+      h.tick();
+      last().h.onOpen!();
+    }
+    expect(h.opened.slice(1).map((s) => s.q)).toEqual(Array(4).fill({ from: "a1:1" }));
+    expect(h.f.lastId()).toBe("a1:1");
+    expect(h.resets()).toBe(0);
+  });
+
+  it("a reopen that opens resets the count of failed ones", () => {
+    const h = harness({ outcome: () => "running" });
+    h.opened[0]!.h.onChunk("x\n", "a1:1");
+    const last = () => h.opened[h.opened.length - 1]!;
+    // Two fail, one opens, two fail: never three in a row.
+    for (const opens of [false, false, true, false, false]) {
+      last().h.onEnd!();
+      h.tick();
+      if (opens) last().h.onOpen!();
+    }
+    last().h.onEnd!();
+    h.tick();
+    expect(h.opened.slice(1).map((s) => s.q)).toEqual(Array(6).fill({ from: "a1:1" }));
   });
 
   it("stops when the try has ended", () => {

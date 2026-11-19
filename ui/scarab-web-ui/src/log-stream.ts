@@ -21,10 +21,12 @@ export const CLIENT_CAP_BYTES = 8 * MiB;
 export const BACKOFF_INITIAL_MS = 1000;
 export const BACKOFF_MAX_MS = 30_000;
 
-/** Reopens in a row that deliver no event before the pane stops resuming and
- * opens the log fresh. An EventSource cannot tell a cursor the server refused
- * (400) from a dropped connection, so a refused cursor would retry forever. */
-export const EMPTY_REOPENS_BEFORE_FRESH = 3;
+/** Reopens in a row that fail before the stream opens, before the pane stops
+ * resuming and opens the log fresh. A cursor the server refuses (400) fails
+ * every reopen that way, and an EventSource reports it only as an error, so it
+ * would retry forever. A quiet step's stream opens and gets only keepalive
+ * comments, so its drops do not count. */
+export const FAILED_REOPENS_BEFORE_FRESH = 3;
 
 /** The server's `truncated` event: the replay skipped the first `skippedBytes`
  * of a log that was `totalBytes` long when the stream opened. */
@@ -38,6 +40,8 @@ export type LogStreamHandlers = {
   /** A `data` event: the text, and its id (the position after it). */
   onChunk: (text: string, id: string | null) => void;
   onTruncated?: (t: LogTruncation) => void;
+  /** The connection opened: the server accepted the request. */
+  onOpen?: () => void;
   /** The stream closed: the server ended it, it failed, or it dropped. */
   onEnd?: () => void;
 };
@@ -201,8 +205,8 @@ export type LogFollower = {
  * The first stream opens with `tail`. When a stream ends while the try still
  * reads as running, it opens again after a backoff (`backoffDelay`), resuming
  * after the last event id so nothing is sent twice; the backoff resets once a
- * reopened stream delivers an event. After `EMPTY_REOPENS_BEFORE_FRESH`
- * reopens in a row that deliver no event, the cursor is dropped and the next
+ * reopened stream delivers an event. After `FAILED_REOPENS_BEFORE_FRESH`
+ * reopens in a row that end before they open, the cursor is dropped and the next
  * stream opens with `tail` again; `onReset` clears the pane when that stream
  * delivers its first event, so the old text stays up while the server is
  * unreachable. The backoff goes on from where it was. `streamEndStep` decides each end: a try
@@ -235,16 +239,16 @@ export function followLog(opts: {
   let lastId: string | null = null;
   let hadOutput = false;
   let failures = 0;
-  // Reopens in a row that ended with no event.
-  let emptyReopens = 0;
+  // Reopens in a row that ended before they opened.
+  let failedReopens = 0;
   // The stream in flight is a fresh open after resuming failed.
   let resetPending = false;
 
   const start = (reopen: boolean) => {
     if (stopped) return;
-    if (reopen && lastId != null && emptyReopens >= EMPTY_REOPENS_BEFORE_FRESH) {
+    if (reopen && lastId != null && failedReopens >= FAILED_REOPENS_BEFORE_FRESH) {
       lastId = null;
-      emptyReopens = 0;
+      failedReopens = 0;
       resetPending = true;
     }
     // One stream at a time: `current` tells this stream's events from a
@@ -253,13 +257,16 @@ export function followLog(opts: {
     let active: object | null = current;
     let close: (() => void) | null = null;
     const mine = () => active === current && !stopped;
-    let delivered = false;
-    // Any event of this stream: the backoff and the empty-reopen count start
-    // over, and a fresh open after resuming failed clears the pane first.
+    let opened = false;
+    const gotOpen = () => {
+      opened = true;
+      failedReopens = 0;
+    };
+    // Any event of this stream: it opened, the backoff starts over, and a
+    // fresh open after resuming failed clears the pane first.
     const gotEvent = () => {
+      gotOpen();
       failures = 0;
-      emptyReopens = 0;
-      delivered = true;
       if (resetPending) {
         resetPending = false;
         hadOutput = false;
@@ -281,9 +288,13 @@ export function followLog(opts: {
         gotEvent();
         opts.onTruncated(t);
       },
+      onOpen: () => {
+        if (!mine()) return;
+        gotOpen();
+      },
       onEnd: () => {
         if (!mine()) return;
-        if (reopen && !delivered) emptyReopens++;
+        if (reopen && !opened) failedReopens++;
         active = null;
         closeStream = null;
         close?.();

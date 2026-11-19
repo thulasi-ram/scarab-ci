@@ -1461,6 +1461,9 @@ function openLogStream(url: string, opts: LogStreamHandlers): () => void {
       es.close();
     }
   };
+  es.onopen = () => {
+    if (!closed) opts.onOpen?.();
+  };
   es.onmessage = (e) => opts.onChunk(e.data, e.lastEventId || null);
   es.addEventListener("truncated", (e) => {
     try {

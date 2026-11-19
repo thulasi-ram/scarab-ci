@@ -3042,6 +3042,9 @@ export function installMock() {
       super();
       this.url = url.toString();
       const events = mockLogEvents(this.url);
+      queueMicrotask(() => {
+        if (this.readyState !== 2) this.onopen?.(new Event("open"));
+      });
       if (events.length > 0) {
         queueMicrotask(() => {
           for (const ev of events) {
