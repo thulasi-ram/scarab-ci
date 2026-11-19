@@ -3230,7 +3230,9 @@ h1, .crumb-head, .run-title {
    ════════════════════════════════════════════════════════════════════════ */
 
 /* Run header: breadcrumb with `#N` and the title, status, actions. */
-.rh { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+/* Its own layer above the pipeline panel, whose toolbar sets z-index 6: the ⋯
+   menu opens downward over it and must take the clicks. */
+.rh { position: relative; z-index: 20; display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
 .rh-row { display: flex; align-items: center; gap: 12px; min-width: 0; flex-wrap: wrap; }
 .rh-row .grow1 { flex: 1; }
 .rh-crumbs { min-width: 0; flex: 0 1 auto; max-width: 100%; }
