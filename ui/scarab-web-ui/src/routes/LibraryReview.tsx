@@ -5,15 +5,19 @@
 // commit a branch or tag points to now, checks it
 // compiles as a closed library and stores it) and shows what it is: the
 // facts and checks on one label and value grid, then the file, or the
-// side-by-side diff from the installed version. Install, in the footer row,
-// installs exactly the version shown, naming the version it replaces, and
-// asks for a step-up.
+// side-by-side diff from the installed version. When the org trusts the
+// source with a credential, the version gets it too (trust is kept per
+// source), so each such grant has a box to tick before Install. Install, in
+// the footer row, installs exactly the version shown, naming the version it
+// replaces and the grants ticked, and asks for a step-up.
 //
 // Every library takes this one path, whoever publishes it.
-import { createMemo, createResource, createSignal, For, Show } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, on, Show } from "solid-js";
 import { useNavigate, useParams, useSearchParams } from "@solidjs/router";
 import { fetchLibrary, installLibrary, listConnections, listLibraries } from "../api/client";
 import {
+  carriedGrantBox,
+  carryGrants,
   diffLines,
   diffSides,
   foldDiff,
@@ -27,9 +31,11 @@ import {
   defaultLibraryName,
   splitSource,
   toFetchBody,
+  trustKey,
   type FetchForm,
   type SideCell,
 } from "../libraries";
+import { Checkbox } from "../components/Field";
 import Icon from "../components/Icon";
 import InstallLibraryDialog from "../components/LibraryInstall";
 import { decodeParam, orgHref } from "../settings-nav";
@@ -91,10 +97,25 @@ function Review(props: { org: string }) {
   const [changing, setChanging] = createSignal(false);
   const [installing, setInstalling] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
+  // The credential grants ticked on the review: cleared for each version
+  // fetched, so a box ticked for one version is not carried to another.
+  const [ticked, setTicked] = createSignal<ReadonlySet<string>>(new Set());
+  createEffect(on(() => fetched()?.content_hash, () => setTicked(new Set<string>())));
+  const tick = (grant: string, checked: boolean) => {
+    const next = new Set(ticked());
+    if (checked) next.add(grant);
+    else next.delete(grant);
+    setTicked(next);
+  };
+  const carry = () => {
+    const f = fetched();
+    return f ? carryGrants(f.carried_grants ?? [], ticked()) : null;
+  };
 
   const doInstall = async () => {
     const f = fetched();
-    if (!f || installing()) return;
+    const grants = carry();
+    if (!f || !grants || installing()) return;
     setInstalling(true);
     setError(null);
     try {
@@ -102,6 +123,7 @@ function Review(props: { org: string }) {
         name: f.name,
         content_hash: f.content_hash,
         replaces: f.current?.content_hash ?? null,
+        carry_grants: grants,
       });
       nav(libraryManageHref(props.org, done));
     } catch (e) {
@@ -223,6 +245,26 @@ function Review(props: { org: string }) {
                     </dd>
                     <dt>Runs</dt>
                     <dd>Runs already created keep the Steps they were compiled with.</dd>
+                    <Show when={(f().carried_grants ?? []).length > 0}>
+                      <dt>Credentials</dt>
+                      <dd role="group" aria-label="Credentials this version gets">
+                        <p style={{ margin: "0 0 8px" }}>
+                          The org trusts <span class="mono">{trustKey(f().source)}</span> with these. Trust is kept
+                          for the source, not the commit, so {f().current ? "the new version" : "this version"} gets
+                          them too. Tick each one to install it.
+                        </p>
+                        <For each={f().carried_grants}>
+                          {(g) => (
+                            <Checkbox
+                              checked={ticked().has(g)}
+                              onChecked={(v) => tick(g, v)}
+                              label={carriedGrantBox(g).label}
+                              help={carriedGrantBox(g).help}
+                            />
+                          )}
+                        </For>
+                      </dd>
+                    </Show>
                     <dt>Checks</dt>
                     <dd>
                       <ul class="lib-checks">
@@ -313,7 +355,7 @@ function Review(props: { org: string }) {
           <div class="rv-foot">
             <button
               class="btn btn-primary btn-sm"
-              disabled={!fetched() || installing() || same()}
+              disabled={!fetched() || installing() || same() || !carry()}
               onClick={() => void doInstall()}
             >
               <Icon icon={fetched()?.current ? "arrow-up" : "plus"} size={14} />{" "}

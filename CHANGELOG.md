@@ -33,6 +33,15 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Security
 
+- **Installing or upgrading a library names the credentials its source's trust gives the new
+  commit** (git-bug 8c62098). Trust stays keyed by source, so a new commit from a source trusted
+  with forge credentials or the registry credential gets them too, and until now nothing said so.
+  The fetch answer lists them in `carried_grants`; the install must name the same grants in
+  `carry_grants`, or it fails with a 400 that names them. The review page shows one box per
+  grant, and **Upgrade** stays off until each is ticked. The step-up summary and the
+  `op.completed` security event name the grants carried. A script that upgrades a library from
+  a trusted source must now send `carry_grants`. See
+  [Upgrade](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#upgrade).
 - **The build library's push step pushes only the image the build step built** (git-bug 23a29ab).
   It receives BuildKit's `containerimage.digest` from the build step's `image` result and refuses
   (exit 2) a layout whose `index.json` does not name exactly that one manifest, or whose manifest
