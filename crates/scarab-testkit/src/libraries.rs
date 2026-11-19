@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use scarab_pipeline::InstalledLibrary;
 use scarab_policy::library::{
-    LibraryInstallation, LibraryStore, LibraryStoreError, LibraryVersion, LibraryYank,
+    trust_key, LibraryInstallation, LibraryStore, LibraryStoreError, LibraryVersion, LibraryYank,
     NewInstallation, Replaces, TrustGrant, TrustedSource,
 };
 
@@ -32,6 +32,45 @@ struct State {
 }
 
 impl State {
+    /// An install with `replaces` checked; the store's lock held.
+    fn install(
+        &mut self,
+        new: &NewInstallation,
+        replaces: &Replaces,
+    ) -> Result<LibraryInstallation, LibraryStoreError> {
+        if !self
+            .versions
+            .contains_key(&(new.org.clone(), new.content_hash.clone()))
+        {
+            return Err(LibraryStoreError::UnknownVersion(new.content_hash.clone()));
+        }
+        let key = (new.org.clone(), new.name.clone());
+        let current = self
+            .installations
+            .get(&key)
+            .map(|(_, i)| i.content_hash.clone());
+        let ok = match replaces {
+            Replaces::Nothing => current.is_none(),
+            Replaces::Version(h) => current.as_deref() == Some(h.as_str()),
+        };
+        if !ok {
+            return Err(LibraryStoreError::Conflict);
+        }
+        // An upgrade keeps the installation's id; a first install mints one.
+        let id = match self.installations.get(&key) {
+            Some((id, _)) => id.clone(),
+            None => {
+                self.minted += 1;
+                format!("{:010x}", self.minted)
+            }
+        };
+        let row = (id, new.clone());
+        self.installations.insert(key, row.clone());
+        self.installed_once
+            .insert((new.org.clone(), new.content_hash.clone()));
+        Ok(self.full(&row))
+    }
+
     fn full(&self, (id, i): &(String, NewInstallation)) -> LibraryInstallation {
         let v = &self.versions[&(i.org.clone(), i.content_hash.clone())];
         LibraryInstallation {
@@ -86,38 +125,35 @@ impl LibraryStore for InMemoryLibraries {
         new: &NewInstallation,
         replaces: &Replaces,
     ) -> Result<LibraryInstallation, LibraryStoreError> {
+        self.state.lock().unwrap().install(new, replaces)
+    }
+
+    async fn install_carrying(
+        &self,
+        new: &NewInstallation,
+        replaces: &Replaces,
+        carry_grants: &BTreeSet<TrustGrant>,
+    ) -> Result<LibraryInstallation, LibraryStoreError> {
+        // One lock over the trust read and the install, as Postgres holds
+        // one transaction.
         let mut st = self.state.lock().unwrap();
-        if !st
+        let Some(v) = st
             .versions
-            .contains_key(&(new.org.clone(), new.content_hash.clone()))
-        {
+            .get(&(new.org.clone(), new.content_hash.clone()))
+        else {
             return Err(LibraryStoreError::UnknownVersion(new.content_hash.clone()));
-        }
-        let key = (new.org.clone(), new.name.clone());
-        let current = st
-            .installations
-            .get(&key)
-            .map(|(_, i)| i.content_hash.clone());
-        let ok = match replaces {
-            Replaces::Nothing => current.is_none(),
-            Replaces::Version(h) => current.as_deref() == Some(h.as_str()),
         };
-        if !ok {
-            return Err(LibraryStoreError::Conflict);
+        let key = trust_key(&v.source);
+        let held: BTreeSet<TrustGrant> = st
+            .trusted
+            .keys()
+            .filter(|(o, s, _)| *o == new.org && s == key)
+            .map(|(_, _, g)| *g)
+            .collect();
+        if &held != carry_grants {
+            return Err(LibraryStoreError::CarriedGrants(held));
         }
-        // An upgrade keeps the installation's id; a first install mints one.
-        let id = match st.installations.get(&key) {
-            Some((id, _)) => id.clone(),
-            None => {
-                st.minted += 1;
-                format!("{:010x}", st.minted)
-            }
-        };
-        let row = (id, new.clone());
-        st.installations.insert(key, row.clone());
-        st.installed_once
-            .insert((new.org.clone(), new.content_hash.clone()));
-        Ok(st.full(&row))
+        st.install(new, replaces)
     }
 
     async fn installation(

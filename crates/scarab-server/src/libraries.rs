@@ -327,6 +327,7 @@ pub(crate) fn store_api_error(e: LibraryStoreError) -> ApiError {
                 .into(),
         ),
         LibraryStoreError::Invalid(m) => ApiError::BadRequest(m),
+        e @ LibraryStoreError::CarriedGrants(_) => ApiError::BadRequest(e.to_string()),
         LibraryStoreError::Store(m) => ApiError::Db(DbError::Other(m)),
     }
 }
@@ -1190,7 +1191,7 @@ pub(crate) async fn fetch_library(
 )]
 pub(crate) async fn install_library(
     State(st): State<AppState>,
-    guard: Option<Extension<GuardCtx>>,
+    Extension(guard): Extension<GuardCtx>,
     headers: HeaderMap,
     Path(org): Path<String>,
     Json(body): Json<InstallLibraryRequest>,
@@ -1201,7 +1202,6 @@ pub(crate) async fn install_library(
     check_name(&name)?;
     check_hash(&body.content_hash)?;
     let store = store(&st)?;
-    super::note_org(&st, &org).await?;
     let version = store
         .version(&org, &body.content_hash)
         .await
@@ -1212,34 +1212,51 @@ pub(crate) async fn install_library(
     // Checked again: the org's other libraries may have changed since the
     // fetch, and a version fetched under another name is installed here.
     check_compiles(store, &org, &name, &version.content).await?;
+    // Checked before the step-up, so a request that names the wrong grants
+    // is refused without asking for a confirmation (git-bug 9c54b46). The
+    // store checks again in the install's own transaction.
     let carried = carried_grants(store, &org, &version.source).await?;
     let acked: BTreeSet<TrustGrant> = body.carry_grants.iter().map(|&g| g.into()).collect();
     if let Some(why) = carry_refusal(&version.source, &carried, &acked) {
         return Err(ApiError::BadRequest(why));
     }
+    // Installing and upgrading always loosen: a step-up, once the request
+    // is known to be one that can run.
+    guard.require(&st, Vec::new()).await?;
+    super::note_org(&st, &org).await?;
     let replaces = match body.replaces {
         Some(h) => Replaces::Version(h),
         None => Replaces::Nothing,
     };
     let now = st.clock.now().await.0;
     let installed = store
-        .install(
+        .install_carrying(
             &NewInstallation {
                 org: org.clone(),
                 name,
                 content_hash: version.content_hash,
                 installed_by: by,
                 installed_at: now,
-                step_up_ref: guard.as_ref().and_then(|Extension(g)| g.confirmation_id()),
+                step_up_ref: guard.confirmation_id(),
             },
             &replaces,
+            &acked,
         )
         .await
-        .map_err(store_api_error)?;
+        .map_err(|e| match e {
+            // A trust grant made or removed since the check above.
+            LibraryStoreError::CarriedGrants(held) => {
+                match carry_refusal(&version.source, &held, &acked) {
+                    Some(why) => ApiError::BadRequest(why),
+                    None => store_api_error(LibraryStoreError::CarriedGrants(held)),
+                }
+            }
+            e => store_api_error(e),
+        })?;
+    // The install committed with exactly the acknowledged grants.
+    let carried = acked;
     let carried_names: Vec<&str> = carried.iter().map(|g| g.as_str()).collect();
-    if let Some(Extension(g)) = &guard {
-        g.note_completed("carried_grants", serde_json::json!(carried_names));
-    }
+    guard.note_completed("carried_grants", serde_json::json!(carried_names));
     if !carried.is_empty() {
         tracing::warn!(
             org = %org,

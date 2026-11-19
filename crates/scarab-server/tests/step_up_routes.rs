@@ -442,7 +442,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "POST",
         "/v1/orgs/{org}/library-installations",
         "library.install",
-        "CJ-W",
+        "COND-W",
     ),
     (
         "DELETE",

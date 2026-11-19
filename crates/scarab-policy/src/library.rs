@@ -21,7 +21,7 @@
 //!
 //! The caller supplies times, as every store port here does.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -190,6 +190,10 @@ pub enum LibraryStoreError {
     Conflict,
     #[error("invalid: {0}")]
     Invalid(String),
+    /// The org trusts the version's source with other grants than the
+    /// install names in `carry_grants`; these are the grants it holds now.
+    #[error("the org trusts the source with other grants than the install names")]
+    CarriedGrants(BTreeSet<TrustGrant>),
     #[error("library store: {0}")]
     Store(String),
 }
@@ -214,6 +218,38 @@ pub trait LibraryStore: Send + Sync {
         new: &NewInstallation,
         replaces: &Replaces,
     ) -> Result<LibraryInstallation, LibraryStoreError>;
+
+    /// [`install`](Self::install), refused with
+    /// [`LibraryStoreError::CarriedGrants`] unless the org trusts the
+    /// version's source ([`trust_key`]) with exactly `carry_grants`: trust is
+    /// kept per source, so the new version gets those grants. A store reads
+    /// the grants in the install's own transaction, and a trust or untrust
+    /// of the source waits for it to commit, so a grant made at the same time
+    /// never reaches the new version unacknowledged. This default reads and
+    /// then installs, not atomically; the stores override it.
+    async fn install_carrying(
+        &self,
+        new: &NewInstallation,
+        replaces: &Replaces,
+        carry_grants: &BTreeSet<TrustGrant>,
+    ) -> Result<LibraryInstallation, LibraryStoreError> {
+        let version = self
+            .version(&new.org, &new.content_hash)
+            .await?
+            .ok_or_else(|| LibraryStoreError::UnknownVersion(new.content_hash.clone()))?;
+        let key = trust_key(&version.source);
+        let held: BTreeSet<TrustGrant> = self
+            .trusted_sources(&new.org)
+            .await?
+            .into_iter()
+            .filter(|t| t.source == key)
+            .map(|t| t.grant)
+            .collect();
+        if &held != carry_grants {
+            return Err(LibraryStoreError::CarriedGrants(held));
+        }
+        self.install(new, replaces).await
+    }
 
     async fn installation(
         &self,

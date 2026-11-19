@@ -1558,7 +1558,13 @@ pub static LIBRARY_FETCH: Op = op(
 pub static LIBRARY_INSTALL: Op = op(
     "library.install",
     "Install or upgrade a library",
-    Class::CrownJewel(W),
+    // Every install asks; conditional only so the handler asks after it has
+    // checked the request (git-bug 9c54b46: a wrong `carry_grants` is a 400
+    // that costs no confirmation).
+    Class::Conditional {
+        mode: W,
+        rule: "always, once the request is checked",
+    },
     "ADR-0076 §4: installing and upgrading loosen",
     ADMIN,
     OrgOf::Path("org"),

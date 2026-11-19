@@ -6,6 +6,7 @@
 
 mod step_up_harness;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -14,7 +15,11 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use scarab_forge::{ForgeConnection, ForgeConnectionStore, ForgeKind};
-use scarab_policy::library::{content_hash, LibraryStore};
+use scarab_pipeline::InstalledLibrary;
+use scarab_policy::library::{
+    content_hash, trust_key, LibraryInstallation, LibraryStore, LibraryStoreError, LibraryVersion,
+    LibraryYank, NewInstallation, Replaces, TrustGrant, TrustedSource,
+};
 use scarab_server::test_support::{StaticFetcher, CLONE_LIBRARY, CLONE_LIBRARY_SOURCE};
 use scarab_server::{router, AppState, LogService};
 use scarab_testkit::{FakeClock, FakeForge, InMemoryDb, InMemoryLibraries, InMemoryObjectStore};
@@ -1054,4 +1059,240 @@ async fn a_stepped_up_install_records_the_grants_it_carried() {
         json!(["forge_credentials"]),
         "{install:?}"
     );
+}
+
+/// A version of `DEPLOY` from `github.com/acme/libs//deploy.yaml@C1`, stored
+/// in `acme`, its source trusted with forge credentials.
+async fn trusted_version(store: &dyn LibraryStore) -> String {
+    let source = format!("github.com/acme/libs//deploy.yaml@{C1}");
+    store
+        .put_version(&LibraryVersion {
+            org: "acme".into(),
+            content_hash: content_hash(V1),
+            content: V1.into(),
+            source: source.clone(),
+            name: DEPLOY.into(),
+            fetched_by: "amy".into(),
+            fetched_at: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .trust_source(&TrustedSource {
+            org: "acme".into(),
+            source: trust_key(&source).into(),
+            grant: TrustGrant::ForgeCredentials,
+            trusted_by: "amy".into(),
+            trusted_at: 1,
+            step_up_ref: None,
+        })
+        .await
+        .unwrap();
+    source
+}
+
+// git-bug 9c54b46: `carry_grants` is checked before the step-up, so an
+// install that names the wrong grants is a 400 that asks for no
+// confirmation: no challenge, no `step_up.refused`, no `op.authorised`.
+// With the right grants the same install asks, and runs once confirmed.
+#[tokio::test]
+async fn a_wrong_carry_grants_is_refused_before_the_step_up_is_asked() {
+    use scarab_identity::{Role, Scope};
+    let store = Arc::new(InMemoryLibraries::new());
+    trusted_version(store.as_ref()).await;
+    let libs = store.clone();
+    let h = step_up_harness::harness_with(move |st| st.with_libraries(libs));
+    h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
+    let s = h.browser_session(step_up_harness::owner("amy")).await;
+    let mut soft = step_up_harness::passkey();
+    h.enroll(&s, &mut soft, "Laptop").await;
+    // Enrolment may open a window; age it out.
+    h.clock.advance(60 * 60 * 1000);
+    let s = h.browser_session(step_up_harness::owner("amy")).await;
+    let refused_before = h.events("step_up.refused").await.len();
+    let authorised_before = h.events("op.authorised").await.len();
+
+    for carry in [None, Some(json!([])), Some(json!(["build_sandbox"]))] {
+        let mut body = json!({ "name": DEPLOY, "content_hash": content_hash(V1) });
+        if let Some(c) = &carry {
+            body["carry_grants"] = c.clone();
+        }
+        let (st, b) = h
+            .cookie(
+                "POST",
+                "/v1/orgs/acme/library-installations",
+                Some(body),
+                &s,
+            )
+            .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{carry:?}: {b}");
+        assert!(
+            b.to_string().contains("forge_credentials"),
+            "{carry:?}: {b}"
+        );
+    }
+    assert_eq!(h.events("step_up.refused").await.len(), refused_before);
+    assert_eq!(h.events("op.authorised").await.len(), authorised_before);
+    assert!(store.installation("acme", DEPLOY).await.unwrap().is_none());
+
+    let right = json!({
+        "name": DEPLOY,
+        "content_hash": content_hash(V1),
+        "carry_grants": ["forge_credentials"]
+    });
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/library-installations",
+            Some(right.clone()),
+            &s,
+        )
+        .await;
+    step_up_harness::assert_step_up(st, &b, "window");
+    h.open_window(&s, &mut soft).await;
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/library-installations",
+            Some(right),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+}
+
+/// A library store that trusts `deploy.yaml`'s source with the build
+/// sandbox just as an install carrying grants reaches the store: a second
+/// admin's grant landing between the handler's check and the install.
+struct GrantMidInstall(Arc<InMemoryLibraries>);
+
+#[async_trait::async_trait]
+impl LibraryStore for GrantMidInstall {
+    async fn put_version(&self, v: &LibraryVersion) -> Result<LibraryVersion, LibraryStoreError> {
+        self.0.put_version(v).await
+    }
+    async fn version(&self, o: &str, h: &str) -> Result<Option<LibraryVersion>, LibraryStoreError> {
+        self.0.version(o, h).await
+    }
+    async fn install(
+        &self,
+        n: &NewInstallation,
+        r: &Replaces,
+    ) -> Result<LibraryInstallation, LibraryStoreError> {
+        self.0.install(n, r).await
+    }
+    async fn install_carrying(
+        &self,
+        n: &NewInstallation,
+        r: &Replaces,
+        carry: &BTreeSet<TrustGrant>,
+    ) -> Result<LibraryInstallation, LibraryStoreError> {
+        self.0
+            .trust_source(&TrustedSource {
+                org: "acme".into(),
+                source: "github.com/acme/libs//deploy.yaml".into(),
+                grant: TrustGrant::BuildSandbox,
+                trusted_by: "bob".into(),
+                trusted_at: 2,
+                step_up_ref: None,
+            })
+            .await?;
+        self.0.install_carrying(n, r, carry).await
+    }
+    async fn installation(
+        &self,
+        o: &str,
+        n: &str,
+    ) -> Result<Option<LibraryInstallation>, LibraryStoreError> {
+        self.0.installation(o, n).await
+    }
+    async fn installations(&self, o: &str) -> Result<Vec<LibraryInstallation>, LibraryStoreError> {
+        self.0.installations(o).await
+    }
+    async fn installed_for_compile(
+        &self,
+        o: &str,
+    ) -> Result<BTreeMap<String, InstalledLibrary>, LibraryStoreError> {
+        self.0.installed_for_compile(o).await
+    }
+    async fn remove(
+        &self,
+        o: &str,
+        id: &str,
+    ) -> Result<Option<LibraryInstallation>, LibraryStoreError> {
+        self.0.remove(o, id).await
+    }
+    async fn yank(&self, y: &LibraryYank) -> Result<LibraryYank, LibraryStoreError> {
+        self.0.yank(y).await
+    }
+    async fn unyank(&self, o: &str, h: &str) -> Result<Option<LibraryYank>, LibraryStoreError> {
+        self.0.unyank(o, h).await
+    }
+    async fn yanks(&self, o: &str) -> Result<Vec<LibraryYank>, LibraryStoreError> {
+        self.0.yanks(o).await
+    }
+    async fn yanked(&self, o: &str, h: &[String]) -> Result<Vec<LibraryYank>, LibraryStoreError> {
+        self.0.yanked(o, h).await
+    }
+    async fn prune_never_installed(
+        &self,
+        o: &str,
+        keep: usize,
+        except: &str,
+    ) -> Result<u64, LibraryStoreError> {
+        self.0.prune_never_installed(o, keep, except).await
+    }
+    async fn trusted_sources(&self, o: &str) -> Result<Vec<TrustedSource>, LibraryStoreError> {
+        self.0.trusted_sources(o).await
+    }
+    async fn trust_source(&self, t: &TrustedSource) -> Result<TrustedSource, LibraryStoreError> {
+        self.0.trust_source(t).await
+    }
+    async fn untrust_source(
+        &self,
+        o: &str,
+        s: &str,
+        g: TrustGrant,
+    ) -> Result<Option<TrustedSource>, LibraryStoreError> {
+        self.0.untrust_source(o, s, g).await
+    }
+}
+
+// git-bug 9c54b46: the grants are compared again in the install's own
+// transaction. A grant made after the handler's check (the install names
+// forge credentials, the source now also holds the build sandbox) refuses
+// the install with every grant named, and nothing is installed.
+#[tokio::test]
+async fn a_grant_made_between_the_check_and_the_install_is_refused() {
+    let inner = Arc::new(InMemoryLibraries::new());
+    trusted_version(inner.as_ref()).await;
+    let db = Arc::new(InMemoryDb::new());
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let st = AppState::new(db.clone(), Arc::new(FakeClock::new(1_000)), logs)
+        .with_forge(Arc::new(FakeForge::new()))
+        .with_forge_connections(db)
+        .with_libraries(Arc::new(GrantMidInstall(inner.clone())));
+    let app = router(st);
+
+    let (st, b) = call(
+        &app,
+        "POST",
+        "/v1/orgs/acme/library-installations",
+        Some(json!({
+            "name": DEPLOY,
+            "content_hash": content_hash(V1),
+            "carry_grants": ["forge_credentials"]
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    let text = b.to_string();
+    assert!(
+        text.contains("build_sandbox") && text.contains("forge_credentials"),
+        "{text}"
+    );
+    assert!(inner.installation("acme", DEPLOY).await.unwrap().is_none());
 }

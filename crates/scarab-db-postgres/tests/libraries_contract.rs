@@ -7,6 +7,8 @@ mod common;
 
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
+use std::collections::BTreeSet;
+
 use scarab_policy::library::{
     content_hash, LibraryStore, LibraryStoreError, LibraryVersion, LibraryYank, NewInstallation,
     Replaces, TrustGrant, TrustedSource,
@@ -49,6 +51,10 @@ contract_test!(trust_is_per_org_by_source_and_keeps_the_first_record, trust);
 contract_test!(
     an_installation_keeps_its_id_and_is_found_by_it_in_its_org,
     ids
+);
+contract_test!(
+    an_install_carrying_grants_names_exactly_the_grants_its_source_holds,
+    install_carrying
 );
 
 /// Migration 0095 is expand-only: a server from before it reads trust with
@@ -556,4 +562,158 @@ async fn prune_never_installed(store: &dyn LibraryStore) {
     );
     assert!(store.version("acme", &hashes[2]).await.unwrap().is_none());
     assert!(store.version("acme", &hashes[4]).await.unwrap().is_some());
+}
+
+/// git-bug 9c54b46: `install_carrying` installs only when the org trusts
+/// the version's source (without its commit) with exactly the grants it
+/// names, and otherwise refuses with the grants the source holds and
+/// writes nothing. Another source's grants and another org's do not count.
+async fn install_carrying(store: &dyn LibraryStore) {
+    let v1 = version("acme", V1, "github.com/acme/libs//deploy.yaml@aaaa");
+    let v2 = version("acme", V2, "github.com/acme/libs//deploy.yaml@bbbb");
+    store.put_version(&v1).await.unwrap();
+    store.put_version(&v2).await.unwrap();
+    let none = BTreeSet::new();
+    let forge = BTreeSet::from([TrustGrant::ForgeCredentials]);
+    let trust = |org: &str, source: &str, grant: TrustGrant| TrustedSource {
+        org: org.into(),
+        source: source.into(),
+        grant,
+        trusted_by: "user:amy".into(),
+        trusted_at: 1,
+        step_up_ref: None,
+    };
+    // Grants elsewhere: another source in acme, the same source in globex.
+    store
+        .trust_source(&trust(
+            "acme",
+            "github.com/acme/libs//other.yaml",
+            TrustGrant::BuildSandbox,
+        ))
+        .await
+        .unwrap();
+    store
+        .trust_source(&trust(
+            "globex",
+            "github.com/acme/libs//deploy.yaml",
+            TrustGrant::ForgeCredentials,
+        ))
+        .await
+        .unwrap();
+
+    // The source holds no grant: naming one is refused, naming none installs.
+    let err = store
+        .install_carrying(
+            &install("acme", &v1.content_hash, 1),
+            &Replaces::Nothing,
+            &forge,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err, LibraryStoreError::CarriedGrants(BTreeSet::new()));
+    assert!(store
+        .installation("acme", "acme::libs::deploy")
+        .await
+        .unwrap()
+        .is_none());
+    store
+        .install_carrying(
+            &install("acme", &v1.content_hash, 2),
+            &Replaces::Nothing,
+            &none,
+        )
+        .await
+        .unwrap();
+
+    // The source gains grants: an upgrade naming fewer is refused with
+    // what it holds, and the installed version stays.
+    for grant in [TrustGrant::ForgeCredentials, TrustGrant::RegistryCredential] {
+        store
+            .trust_source(&trust("acme", "github.com/acme/libs//deploy.yaml", grant))
+            .await
+            .unwrap();
+    }
+    let held = BTreeSet::from([TrustGrant::ForgeCredentials, TrustGrant::RegistryCredential]);
+    let upgrade = Replaces::Version(v1.content_hash.clone());
+    for carry in [&none, &forge] {
+        let err = store
+            .install_carrying(&install("acme", &v2.content_hash, 3), &upgrade, carry)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            LibraryStoreError::CarriedGrants(held.clone()),
+            "{carry:?}"
+        );
+        assert_eq!(
+            store
+                .installation("acme", "acme::libs::deploy")
+                .await
+                .unwrap()
+                .unwrap()
+                .content_hash,
+            v1.content_hash,
+            "{carry:?}"
+        );
+    }
+    let up = store
+        .install_carrying(&install("acme", &v2.content_hash, 4), &upgrade, &held)
+        .await
+        .unwrap();
+    assert_eq!(up.content_hash, v2.content_hash);
+
+    // An unknown version is that, whatever the grants.
+    let err = store
+        .install_carrying(
+            &install("acme", &"f".repeat(64), 5),
+            &Replaces::Nothing,
+            &none,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, LibraryStoreError::UnknownVersion(_)),
+        "{err:?}"
+    );
+}
+
+/// git-bug 9c54b46, the race: a trust grant made while an install carrying
+/// the source's grants is in its transaction waits for that transaction,
+/// so the install never commits a version the grant reaches unacknowledged.
+/// The install's lock is held here by a transaction that takes the same
+/// advisory lock the store takes.
+#[tokio::test]
+async fn a_trust_grant_waits_for_an_install_holding_the_sources_trust_lock() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    let source = "github.com/acme/libs//deploy.yaml";
+    let mut held = tdb.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("scarab library trust\nacme\n{source}"))
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let grant = TrustedSource {
+        org: "acme".into(),
+        source: source.into(),
+        grant: TrustGrant::BuildSandbox,
+        trusted_by: "user:bob".into(),
+        trusted_at: 1,
+        step_up_ref: None,
+    };
+    let writer = {
+        let db = PostgresDb::with_pool(tdb.pool.clone());
+        tokio::spawn(async move { db.trust_source(&grant).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!writer.is_finished(), "the grant did not wait for the lock");
+    assert!(db.trusted_sources("acme").await.unwrap().is_empty());
+    held.commit().await.unwrap();
+    writer.await.unwrap().unwrap();
+    assert_eq!(db.trusted_sources("acme").await.unwrap().len(), 1);
+    tdb.cleanup().await;
 }
