@@ -3083,12 +3083,10 @@ struct RawLogsQuery {
     sidecar: Option<usize>,
 }
 
-/// The download filename for one try's raw log: ASCII from the run id and the
-/// try number only (a step id is user-authored text).
-fn raw_log_filename(run: &RunId, try_no: usize, sidecar: Option<usize>) -> String {
-    let safe: String = run
-        .0
-        .chars()
+/// `s` cut to 64 characters, each one not an ASCII letter, digit, `-` or `_`
+/// replaced by `_`: safe inside a quoted `Content-Disposition` filename.
+fn ascii_filename_part(s: &str) -> String {
+    s.chars()
         .take(64)
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -3097,11 +3095,72 @@ fn raw_log_filename(run: &RunId, try_no: usize, sidecar: Option<usize>) -> Strin
                 '_'
             }
         })
-        .collect();
+        .collect()
+}
+
+/// The download filename for one try's raw log: ASCII from the run id and the
+/// try number only (a step id is user-authored text).
+fn raw_log_filename(run: &RunId, try_no: usize, sidecar: Option<usize>) -> String {
+    let safe = ascii_filename_part(&run.0);
     match sidecar {
         Some(i) => format!("scarab-{safe}-try{try_no}-sidecar{i}.log"),
         None => format!("scarab-{safe}-try{try_no}.log"),
     }
+}
+
+/// The download filename for one shared service instance's raw log: the run
+/// id and the service name with every character outside `[A-Za-z0-9_-]`
+/// replaced, and the Take.
+fn raw_service_log_filename(run: &RunId, service: &str, take: i64) -> String {
+    format!(
+        "scarab-{}-{}-take{take}.log",
+        ascii_filename_part(&run.0),
+        ascii_filename_part(service)
+    )
+}
+
+/// One stored log stream as a plain-text attachment, streamed chunk by chunk
+/// from the object store. Shared by the step and the service raw routes.
+async fn raw_log_response(
+    st: &AppState,
+    run: &RunId,
+    read_step: &StepId,
+    attempt: &scarab_engine::AttemptId,
+    filename: &str,
+) -> Result<Response, ApiError> {
+    let mut index = st.logs.chunks(run, read_step, attempt).await?.into_iter();
+    // The first chunk is read before the response starts, so a missing body
+    // is a 500 rather than a short download; a later one aborts the body.
+    let first = match index.next() {
+        Some(c) => Some(st.logs.read_chunk(&c).await?),
+        None => None,
+    };
+    let logs = st.logs.clone();
+    let rest = stream::unfold((logs, index), |(logs, mut index)| async move {
+        let c = index.next()?;
+        let item = logs
+            .read_chunk(&c)
+            .await
+            .map(Bytes::from)
+            .map_err(|e| std::io::Error::other(e.to_string()));
+        Some((item, (logs, index)))
+    });
+    let body = stream::iter(first.map(|b| Ok::<_, std::io::Error>(Bytes::from(b)))).chain(rest);
+    Response::builder()
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )
+        .header(
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        // The bytes are a step's or a service's output: a browser must not
+        // sniff them into HTML or script.
+        .header(axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .body(axum::body::Body::from_stream(body))
+        // The headers are built here, not sent: a failure is the server's.
+        .map_err(|e| ApiError::Db(DbError::Other(format!("raw log response: {e}"))))
 }
 
 /// One try's whole log as a plain-text download, streamed chunk by chunk from
@@ -3151,44 +3210,8 @@ async fn get_step_logs_raw(
         Some(i) => crate::logs::sidecar_stream_key(&step, i),
         None => step.clone(),
     };
-    let mut index = st
-        .logs
-        .chunks(&run, &read_step, &attempt)
-        .await?
-        .into_iter();
-    // The first chunk is read before the response starts, so a missing body
-    // is a 500 rather than a short download; a later one aborts the body.
-    let first = match index.next() {
-        Some(c) => Some(st.logs.read_chunk(&c).await?),
-        None => None,
-    };
-    let logs = st.logs.clone();
-    let rest = stream::unfold((logs, index), |(logs, mut index)| async move {
-        let c = index.next()?;
-        let item = logs
-            .read_chunk(&c)
-            .await
-            .map(Bytes::from)
-            .map_err(|e| std::io::Error::other(e.to_string()));
-        Some((item, (logs, index)))
-    });
-    let body = stream::iter(first.map(|b| Ok::<_, std::io::Error>(Bytes::from(b)))).chain(rest);
-    let disposition = format!(
-        "attachment; filename=\"{}\"",
-        raw_log_filename(&run, try_no, q.sidecar)
-    );
-    Response::builder()
-        .header(
-            axum::http::header::CONTENT_TYPE,
-            "text/plain; charset=utf-8",
-        )
-        .header(axum::http::header::CONTENT_DISPOSITION, disposition)
-        // The bytes are a step's output: a browser must not sniff them into
-        // HTML or script.
-        .header(axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-        .body(axum::body::Body::from_stream(body))
-        // The headers are built here, not sent: a failure is the server's.
-        .map_err(|e| ApiError::Db(DbError::Other(format!("raw log response: {e}"))))
+    let filename = raw_log_filename(&run, try_no, q.sidecar);
+    raw_log_response(&st, &run, &read_step, &attempt, &filename).await
 }
 
 /// The shared services of a run's **current Take** (ADR-0058), name-ordered —
@@ -3272,9 +3295,35 @@ async fn get_service_logs(
     authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
     let status = st.db.run_status(&run).await?.ok_or(ApiError::NotFound)?;
     let services = st.db.run_services(&run).await?;
-    // Resolve the instance: a requested Take, else the current (`max`) one. 404
-    // if the run declares no such service (or not at that Take).
-    let take = match q.take {
+    let take = service_take(&services, &service, q.take)?;
+    let (step, attempt) = crate::logs::service_stream_key(&service, take);
+    let cursor = crate::log_stream::cursor_from(q.from.as_deref(), &headers)?;
+    crate::log_stream::sse(
+        &st,
+        run,
+        crate::log_stream::Scope::Fixed { step, attempt },
+        crate::log_stream::start_of(cursor, q.tail),
+        !status.is_terminal(),
+    )
+    .await
+}
+
+/// The `?take=` scope for a shared service's raw log. Absent = the current Take.
+#[derive(Debug, Deserialize)]
+struct ServiceRawLogsQuery {
+    #[serde(default)]
+    take: Option<i64>,
+}
+
+/// The shared service instance a log route reads: a requested Take, else the
+/// current (`max`) one. 404 when the run declares no such service (or not at
+/// that Take).
+fn service_take(
+    services: &[scarab_engine::RunService],
+    service: &str,
+    take: Option<i64>,
+) -> Result<i64, ApiError> {
+    let take = match take {
         Some(t) => t,
         None => services
             .iter()
@@ -3286,16 +3335,41 @@ async fn get_service_logs(
     if !services.iter().any(|s| s.name == service && s.take == take) {
         return Err(ApiError::NotFound);
     }
-    let (step, attempt) = crate::logs::service_stream_key(&service, take);
-    let cursor = crate::log_stream::cursor_from(q.from.as_deref(), &headers)?;
-    crate::log_stream::sse(
-        &st,
-        run,
-        crate::log_stream::Scope::Fixed { step, attempt },
-        crate::log_stream::start_of(cursor, q.tail),
-        !status.is_terminal(),
+    Ok(take)
+}
+
+/// One shared service instance's whole log as a plain-text download, streamed
+/// chunk by chunk from the object store (no tail, no cut), the counterpart of
+/// the step raw route. `?take=` reads an older Take's instance; absent = the
+/// current Take. Same authz as the SSE route. Read at the run's tenant.
+#[utoipa::path(
+    get,
+    path = "/v1/runs/{id}/services/{service}/logs/raw",
+    params(
+        ("id" = String, Path, description = "run id"),
+        ("service" = String, Path, description = "declared service name"),
+        ("take" = Option<i64>, Query, description = "restrict to one Take generation (default = current)")
+    ),
+    responses(
+        (status = 200, description = "the service's log as text/plain, sent as an attachment", content_type = "text/plain"),
+        (status = 404, description = "no such run, or no such service (at that Take)")
     )
-    .await
+)]
+async fn get_service_logs_raw(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((id, service)): Path<(String, String)>,
+    Query(q): Query<ServiceRawLogsQuery>,
+) -> Result<Response, ApiError> {
+    let run = RunId(id);
+    let scope = run_scope(&st, &run).await;
+    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
+    st.db.run_status(&run).await?.ok_or(ApiError::NotFound)?;
+    let services = st.db.run_services(&run).await?;
+    let take = service_take(&services, &service, q.take)?;
+    let (step, attempt) = crate::logs::service_stream_key(&service, take);
+    let filename = raw_service_log_filename(&run, &service, take);
+    raw_log_response(&st, &run, &step, &attempt, &filename).await
 }
 
 /// Map a rerun/retry outcome to the API's error space (the success half rides
@@ -14888,6 +14962,7 @@ impl utoipa::Modify for StepUpResponses {
         get_logs,
         get_step_logs,
         get_step_logs_raw,
+        get_service_logs_raw,
         get_services,
         get_service_logs,
         attach_step,

@@ -1553,6 +1553,14 @@ export function stepLogsRawUrl(id: string, step: string, attempt: string, sideca
   return `${base}?${q.toString()}`;
 }
 
+/** The whole log of one shared service as a plain-text download
+ * (`GET …/services/{service}/logs/raw`); `take` picks an older Take's
+ * instance, absent = the current one. */
+export function serviceLogsRawUrl(id: string, service: string, take?: number | null): string {
+  const base = `/v1/runs/${encodeURIComponent(id)}/services/${encodeURIComponent(service)}/logs/raw`;
+  return take != null ? `${base}?take=${take}` : base;
+}
+
 /**
  * List a run's shared services (`GET /v1/runs/{id}/services`) — the current
  * Take's instances + lifecycle status, for the Services panel beside the DAG.

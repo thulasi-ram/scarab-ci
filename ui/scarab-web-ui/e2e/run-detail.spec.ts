@@ -287,13 +287,22 @@ test("a large log shows its last 2 MB, Load full log reads it all, Download name
 });
 
 // The rich run's shared postgres service logged about 3 MB (30,005 lines).
-// Its pane shows the last 2 MB and can read the whole log.
-test("a large service log offers Load full log", async ({ page }) => {
+// Its pane shows the last 2 MB, can read the whole log, and downloads it.
+test("a large service log offers Load full log and Download", async ({ page }) => {
   await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}`);
   await page.getByRole("button", { name: /postgres/ }).click();
   const pane = page.locator(".servicepane");
   const notice = pane.getByRole("status").filter({ hasText: "Showing the last" });
   await expect(notice).toHaveText(/Showing the last [\d.]+ MB of 2\.\d MB\./);
+  const download = notice.getByRole("link", { name: "Download" });
+  await expect(download).toHaveAttribute("href", /\/services\/postgres\/logs\/raw$/);
+  // The readout offers the download whether the log is cut or not.
+  await expect(pane.locator(".svc-readout").getByRole("link", { name: "Download" })).toBeVisible();
+  // The file is the whole log.
+  const href = await download.getAttribute("href");
+  const raw = await page.evaluate(async (u) => (await fetch(u!)).text(), href);
+  expect(raw.startsWith("PostgreSQL init process complete")).toBe(true);
+  expect(raw.endsWith("LOG:  checkpoint complete: wrote 412 buffers\n")).toBe(true);
   const last = pane.locator(".lgrow", { hasText: "checkpoint complete" });
   await expect(last).toBeVisible();
   await expect(last.locator(".lgln")).not.toHaveText("30005");

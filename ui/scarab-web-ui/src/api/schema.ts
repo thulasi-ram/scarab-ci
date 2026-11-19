@@ -2299,6 +2299,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/runs/{id}/services/{service}/logs/raw": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One shared service instance's whole log as a plain-text download, streamed
+         *     chunk by chunk from the object store (no tail, no cut), the counterpart of
+         *     the step raw route. `?take=` reads an older Take's instance; absent = the
+         *     current Take. Same authz as the SSE route. Read at the run's tenant.
+         */
+        get: operations["get_service_logs_raw"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/runs/{id}/snapshots-pin": {
         parameters: {
             query?: never;
@@ -12287,6 +12309,41 @@ export interface operations {
                 content?: never;
             };
             /** @description no such run or service */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_service_logs_raw: {
+        parameters: {
+            query?: {
+                /** @description restrict to one Take generation (default = current) */
+                take?: number;
+            };
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+                /** @description declared service name */
+                service: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description the service's log as text/plain, sent as an attachment */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": unknown;
+                };
+            };
+            /** @description no such run, or no such service (at that Take) */
             404: {
                 headers: {
                     [name: string]: unknown;

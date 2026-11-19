@@ -908,7 +908,7 @@ const testLogLines = [
 // The mock serves a log as the server does: stored chunks of raw output, each
 // `data` event carrying an id `<attempt>:<next chunk>` to resume after, the
 // last `?tail=` bytes with a `truncated` event first, and the whole log at
-// `…/logs/raw`.
+// `…/logs/raw` (a step try's or a shared service's).
 
 /** The matrix cell whose `tofu plan` printed a large log (about 5 MB): the
  * pane shows its last 2 MB and offers Load full log and Download. */
@@ -945,7 +945,7 @@ function bigLog(): string[] {
 }
 
 /** The rich run's shared `postgres` service logged about 3 MB: the service
- * pane shows its last 2 MB and offers Load full log. */
+ * pane shows its last 2 MB and offers Load full log and Download. */
 let bigServiceLogChunks: string[] | null = null;
 /** The large service log's chunks, built on first use: the start-up lines,
  * 30,000 statement lines, 500 to a chunk, then the ready lines again. */
@@ -2283,8 +2283,8 @@ function json(body: unknown, init?: ResponseInit) {
 function route(pathname: string, search: string, method: string, body = ""): Response | null {
   const p = pathname;
   if (p === "/v1/me") return json(me);
-  // A try's whole log as a file.
-  if (/^\/v1\/runs\/[^/]+\/steps\/[^/]+\/logs\/raw$/.test(p)) {
+  // A try's or a shared service's whole log as a file.
+  if (/^\/v1\/runs\/[^/]+\/(steps|services)\/[^/]+\/logs\/raw$/.test(p)) {
     const chunks = mockLogChunks(p + search);
     return new Response((chunks ?? []).join(""), {
       status: 200,

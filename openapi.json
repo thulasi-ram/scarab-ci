@@ -8031,6 +8031,64 @@
         ]
       }
     },
+    "/v1/runs/{id}/services/{service}/logs/raw": {
+      "get": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "One shared service instance's whole log as a plain-text download, streamed\nchunk by chunk from the object store (no tail, no cut), the counterpart of\nthe step raw route. `?take=` reads an older Take's instance; absent = the\ncurrent Take. Same authz as the SSE route. Read at the run's tenant.",
+        "operationId": "get_service_logs_raw",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "service",
+            "in": "path",
+            "description": "declared service name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "take",
+            "in": "query",
+            "description": "restrict to one Take generation (default = current)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the service's log as text/plain, sent as an attachment",
+            "content": {
+              "text/plain": {}
+            }
+          },
+          "404": {
+            "description": "no such run, or no such service (at that Take)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/runs/{id}/snapshots-pin": {
       "post": {
         "tags": [

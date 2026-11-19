@@ -6,7 +6,7 @@
 // DAG. Page/theme tokens (it sits OUTSIDE the dark DAG canvas), like StepPane;
 // it reuses `.steppane` chrome (coord stamp, log body) for a consistent frame.
 import { createEffect, createMemo, createSignal, onCleanup, Index, Show, untrack } from "solid-js";
-import { probeLogStream, serviceLogStreamUrl, streamServiceLogs } from "../api/client";
+import { probeLogStream, serviceLogsRawUrl, serviceLogStreamUrl, streamServiceLogs } from "../api/client";
 import type { DagService } from "./Dag";
 import {
   appendLog,
@@ -62,6 +62,8 @@ export default function ServicePane(props: { runId: string; service: DagService 
   onCleanup(() => follower?.close());
 
   const logRows = () => tailRows(buffer(), MAX_LINES);
+  // The whole log as a text file: the pane shows at most FULL_LOG_BYTES.
+  const rawUrl = () => serviceLogsRawUrl(props.runId, name());
   const notice = () => logNotice(buffer());
 
   return (
@@ -83,6 +85,9 @@ export default function ServicePane(props: { runId: string; service: DagService 
         </Show>
         <span class="grow1" />
         <span class="svc-readout-hint">Live logs</span>
+        <a class="lgtog" href={rawUrl()} download="" title="The whole log of this service, as a text file">
+          Download
+        </a>
       </div>
 
       {/* Best-effort live log tail. */}
@@ -96,6 +101,9 @@ export default function ServicePane(props: { runId: string; service: DagService 
                   Load full log
                 </button>
               </Show>
+              <a class="linklike" href={rawUrl()} download="">
+                Download
+              </a>
             </div>
           )}
         </Show>

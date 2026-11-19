@@ -341,6 +341,80 @@ async fn raw_download_tells_the_browser_not_to_sniff_the_type() {
     assert_eq!(h["content-type"], "text/plain; charset=utf-8");
 }
 
+/// 5ca1f3c: a shared service's whole log downloads like a step try's: the
+/// current Take by default, `?take=` for an older one, `text/plain` with
+/// `nosniff`, an ASCII filename, and 404 for an unknown run, service or Take.
+#[tokio::test]
+async fn service_raw_download_streams_the_whole_instance_log_as_an_attachment() {
+    let db = Arc::new(InMemoryDb::new());
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let run = RunId("r1".into());
+    db.seed_run(&run, RunStatus::Succeeded);
+    // "db" at Takes 1 and 2; the name holds a character a filename must not.
+    let name = "db ü";
+    for take in [1, 2] {
+        db.create_run_service(None, &run, take, name, Timestamp(0))
+            .await
+            .unwrap();
+    }
+    let (s1, a1) = scarab_server::logs::service_stream_key(name, 1);
+    logs.append(&run, &s1, &a1, b"take one\n").await.unwrap();
+    let (s2, a2) = scarab_server::logs::service_stream_key(name, 2);
+    // Several chunks, one bigger than a stream batch, all in the body.
+    let big = fill(b'x', 300 * KIB);
+    for c in [b"<html>ready\n".to_vec(), big.clone(), b"end\n".to_vec()] {
+        logs.append(&run, &s2, &a2, &c).await.unwrap();
+    }
+    let app = router(AppState::new(db, Arc::new(FakeClock::new(1_000)), logs));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/runs/r1/services/db%20%C3%BC/logs/raw")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let h = resp.headers();
+    assert_eq!(h["content-type"], "text/plain; charset=utf-8");
+    assert_eq!(h["x-content-type-options"], "nosniff");
+    assert_eq!(
+        h["content-disposition"],
+        "attachment; filename=\"scarab-r1-db__-take2.log\""
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let mut want = b"<html>ready\n".to_vec();
+    want.extend_from_slice(&big);
+    want.extend_from_slice(b"end\n");
+    assert_eq!(&bytes[..], &want[..], "the current Take, every chunk");
+
+    let (status, body) = get(
+        &app,
+        "/v1/runs/r1/services/db%20%C3%BC/logs/raw?take=1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "take one\n");
+
+    for uri in [
+        "/v1/runs/r1/services/ghost/logs/raw",
+        "/v1/runs/r1/services/db%20%C3%BC/logs/raw?take=3",
+        "/v1/runs/nope/services/db%20%C3%BC/logs/raw",
+    ] {
+        let (status, _) = get(&app, uri, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+    }
+}
+
 async fn raw(app: &axum::Router, attempt: &str) -> Vec<u8> {
     let (status, body) = get(
         app,

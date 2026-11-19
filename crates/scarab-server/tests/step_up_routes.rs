@@ -174,6 +174,12 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "GET",
+        "/v1/runs/{id}/services/{service}/logs/raw",
+        "read",
+        "READ",
+    ),
+    (
+        "GET",
         "/v1/runs/{id}/steps/{step}/attach",
         "step.attach",
         "CJ-W",
