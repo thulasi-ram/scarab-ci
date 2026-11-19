@@ -7987,8 +7987,8 @@ mod tests {
     const ECR_PAGE: &str =
         include_str!("../../../ui/scarab-docs-ui/src/content/docs/usage/pushing-to-ecr.mdx");
 
-    /// The page's chart values (the one `yaml` block with a top-level
-    /// `scarab:` key), with `scarab.placement` parsed as the server parses
+    /// The page's chart values (the one `yaml` block whose top-level
+    /// `scarab:` key holds the `ecr-push` profile), with `scarab.placement` parsed as the server parses
     /// `SCARAB_PLACEMENT_CONFIG_FILE`: the chart renders that key into the
     /// file verbatim.
     fn ecr_page_placement() -> PlacementConfig {
@@ -8008,9 +8008,13 @@ mod tests {
         let chart: Vec<serde_yaml::Value> = values
             .iter()
             .map(|b| serde_yaml::from_str::<serde_yaml::Value>(b).unwrap())
-            .filter(|v| v.get("scarab").is_some())
+            .filter(|v| {
+                v["scarab"]["placement"]["profiles"]
+                    .as_sequence()
+                    .is_some_and(|ps| ps.iter().any(|p| p["name"] == "ecr-push"))
+            })
             .collect();
-        assert_eq!(chart.len(), 1, "one chart-values block on the page");
+        assert_eq!(chart.len(), 1, "one chart-values block holds the ecr-push profile");
         let placement: PlacementConfig =
             serde_yaml::from_value(chart[0]["scarab"]["placement"].clone())
                 .expect("the page's placement values parse as the server's config");
