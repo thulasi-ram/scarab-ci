@@ -507,7 +507,10 @@ async fn a_policy_denying_root_services_refuses_root_sidecar_and_shared_services
             assert!(outcome.runs.is_empty(), "{ci}");
             assert_eq!(
                 outcome.refused[0].messages,
-                [format!("policy `{}`: {MESSAGE}", policy["name"].as_str().unwrap())],
+                [format!(
+                    "policy `{}`: {MESSAGE}",
+                    policy["name"].as_str().unwrap()
+                )],
                 "{ci}"
             );
         } else {

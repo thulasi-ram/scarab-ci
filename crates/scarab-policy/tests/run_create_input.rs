@@ -293,5 +293,8 @@ steps:
     )
     .unwrap();
     let input = serde_json::to_value(input_from_pipeline(&ir, facts()).unwrap()).unwrap();
-    assert_eq!(input["steps"][0]["grants"], serde_json::json!(["run-as-root"]));
+    assert_eq!(
+        input["steps"][0]["grants"],
+        serde_json::json!(["run-as-root"])
+    );
 }

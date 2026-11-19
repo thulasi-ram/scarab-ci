@@ -593,10 +593,26 @@ fn root_services_are_denied() {
         services: Some(cap(vec![v])),
         ..base()
     };
-    assert!(applies(&s, NO_ROOT_SERVICES, &with_sidecar(sidecar(true, Some(0)))));
-    assert!(applies(&s, NO_ROOT_SERVICES, &with_shared(shared(true, None))));
-    assert!(!applies(&s, NO_ROOT_SERVICES, &with_sidecar(sidecar(false, Some(999)))));
-    assert!(!applies(&s, NO_ROOT_SERVICES, &with_shared(shared(false, Some(999)))));
+    assert!(applies(
+        &s,
+        NO_ROOT_SERVICES,
+        &with_sidecar(sidecar(true, Some(0)))
+    ));
+    assert!(applies(
+        &s,
+        NO_ROOT_SERVICES,
+        &with_shared(shared(true, None))
+    ));
+    assert!(!applies(
+        &s,
+        NO_ROOT_SERVICES,
+        &with_sidecar(sidecar(false, Some(999)))
+    ));
+    assert!(!applies(
+        &s,
+        NO_ROOT_SERVICES,
+        &with_shared(shared(false, Some(999)))
+    ));
     assert!(!applies(&s, NO_ROOT_SERVICES, &base()));
 }
 
