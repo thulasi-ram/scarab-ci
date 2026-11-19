@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1795109117,"nonce":"D6okLLFAjz746+tyvnzONhJuFH4=","message":"Closed 2026-11-19 (triage at origin/main 1ce54713): done in the build library: S3 layer cache (libs/build.yaml:133-156, :252-269); a registry cache is refused on purpose (:66-69).","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1795109117,"nonce":"dRHAGRT5I7FEty4I5o4c9sKgG4s=","status":2}]}
