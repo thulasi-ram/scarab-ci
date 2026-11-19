@@ -12,6 +12,14 @@
 #      is read from, and its config gate refuses the boot when one is unset.
 #      Only the Deployment used to get them, so a login-on install's Depot
 #      crash-looped.
+#   3. The step namespace. Default values: `<release namespace>-steps`, a
+#      Namespace kept on uninstall, the executor's Role and RoleBinding in it
+#      bound to the server's ServiceAccount in the release namespace, and
+#      SCARAB_NAMESPACE naming it. rbac.create=false, createNamespace=false
+#      and executor=local each fall back to the release namespace with no
+#      Namespace; an explicit scarab.namespace is used as given with no
+#      Namespace; a derived name over 63 characters fails the render.
+#   4. scarab.placement.author_overlay reaches the placement ConfigMap.
 #
 # Run by `just check all`. Usage: scripts/chart_render_check.sh [chart-dir]
 # (needs helm, yq v4).
@@ -51,4 +59,61 @@ want
 $want"
 done
 
-echo "chart_render_check: SCARAB_UI_URL and the provider secrets render as expected"
+# 3. The step namespace. `ns_objects` prints "<kind> <name> <namespace>" for
+# each Namespace, Role and RoleBinding the chart renders, sorted.
+base=(--namespace ci --set secrets.workspaceTokenSecret=x)
+ns_objects() {
+  yq -N 'select(.kind == "Namespace" or .kind == "Role" or .kind == "RoleBinding")
+    | .kind + " " + .metadata.name + " " + (.metadata.namespace // "")' <<<"$1" | sort
+}
+exec_ns() {
+  yq -N 'select(.kind == "ConfigMap" and .metadata.name == "t-scarab") | .data.SCARAB_NAMESPACE' <<<"$1"
+}
+check_ns() { # <case> <want SCARAB_NAMESPACE> <want objects> <helm args...>
+  local case=$1 want_ns=$2 want_objs=$3; shift 3
+  local out got
+  out=$(helm template t "$chart" "${base[@]}" "$@")
+  got=$(exec_ns "$out")
+  [ "$got" = "$want_ns" ] || fail "$case: SCARAB_NAMESPACE is '$got', want '$want_ns'"
+  got=$(ns_objects "$out")
+  [ "$got" = "$want_objs" ] || fail "$case: Namespace/Role/RoleBinding are
+$got
+want
+$want_objs"
+}
+
+out=$(helm template t "$chart" "${base[@]}")
+check_ns default ci-steps "Namespace ci-steps 
+Role t-scarab-executor ci-steps
+RoleBinding t-scarab-executor ci-steps"
+got=$(yq -N 'select(.kind == "Namespace") | .metadata.annotations["helm.sh/resource-policy"]' <<<"$out")
+[ "$got" = keep ] || fail "default: the step Namespace's resource-policy is '$got', want keep"
+got=$(yq -N 'select(.kind == "RoleBinding") | .subjects[0].kind + " " + .subjects[0].name + " " + .subjects[0].namespace' <<<"$out")
+[ "$got" = "ServiceAccount t-scarab ci" ] || fail "default: the executor RoleBinding's subject is '$got', want 'ServiceAccount t-scarab ci'"
+
+check_ns "rbac.create=false" ci "" --set rbac.create=false
+check_ns "scarab.createNamespace=false" ci "Role t-scarab-executor ci
+RoleBinding t-scarab-executor ci" --set scarab.createNamespace=false
+check_ns "scarab.namespace=builds" builds "Role t-scarab-executor builds
+RoleBinding t-scarab-executor builds" --set scarab.namespace=builds
+check_ns "scarab.executor=local" ci "Role t-scarab-executor ci
+RoleBinding t-scarab-executor ci" --set scarab.executor=local
+
+long=$(printf 'n%.0s' $(seq 1 60))
+if err=$(helm template t "$chart" --namespace "$long" --set secrets.workspaceTokenSecret=x 2>&1); then
+  fail "a 60-character release namespace rendered; want a failure naming the 66-character step namespace"
+fi
+grep -q "longer than 63 characters" <<<"$err" || fail "a 60-character release namespace failed with: $err"
+helm template t "$chart" --namespace "$long" --set secrets.workspaceTokenSecret=x \
+  --set scarab.namespace=builds >/dev/null \
+  || fail "a 60-character release namespace with scarab.namespace set failed to render"
+
+# 4. The author overlay lists reach the server's placement config.
+out=$(helm template t "$chart" "${base[@]}" \
+  --set-json 'scarab.placement.author_overlay={"label_keys":["team"],"annotation_keys":["karpenter.sh/do-not-disrupt"],"toleration_keys":["nvidia.com/gpu"]}')
+got=$(yq -N 'select(.kind == "ConfigMap" and .metadata.name == "t-scarab-placement") | .data["placement.yaml"]' <<<"$out" \
+  | yq -o=json -I=0 '.author_overlay')
+want='{"annotation_keys":["karpenter.sh/do-not-disrupt"],"label_keys":["team"],"toleration_keys":["nvidia.com/gpu"]}'
+[ "$got" = "$want" ] || fail "the placement ConfigMap's author_overlay is '$got', want '$want'"
+
+echo "chart_render_check: SCARAB_UI_URL, the provider secrets, the step namespace and the placement config render as expected"

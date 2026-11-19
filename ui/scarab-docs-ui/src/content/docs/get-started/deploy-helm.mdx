@@ -306,13 +306,14 @@ Every key in this table exists in `values.yaml`:
 | `scarab.role` | `converged` | `api` / `scheduler` / `executor` / `webhook` / `converged` |
 | `scarab.executor` | `k8s` | `k8s` (prod) or `local` (dev only) |
 | `scarab.namespace` | `<release ns>-steps` | namespace step Pods launch into (RBAC granted there); see [Where step Pods run](#where-step-pods-run) |
-| `scarab.createNamespace` | `true` | render `<release ns>-steps` when `scarab.namespace` is empty |
+| `scarab.createNamespace` | `true` | render `<release ns>-steps` when `scarab.namespace` is empty; `false` runs step Pods in the release namespace |
+| `scarab.placement` | `{}` | step Pod baseline and placement profiles; `author_overlay` lists the label, annotation and toleration keys a step's own `k8s_overlay` may set (see [Placement & resources](/scarab-ci/usage/pipeline-syntax/#placement--resources)) |
 | `scarab.publicUrl` | `http://localhost:8080` | where forges reach Scarab: webhook URLs and the run link in commit statuses |
 | `scarab.uiUrl` | `scarab.publicUrl` | where people open the web UI, when that differs from `publicUrl`; see [The UI URL](#the-ui-url) |
 | `scarab.s3.*` | — | object store; set `bucket` to enable S3/MinIO |
 | `secrets.*` / `secrets.existingSecret` | — | sensitive `SCARAB_*` env (DB URL, S3 keys, master key, webhook secrets) |
 | `secrets.githubAppPemSecret.name` / `.key` | — / `github-app.pem` | mount the GitHub App private key from your own Secret |
-| `rbac.create` | `true` | Role/RoleBinding for Pod execution |
+| `rbac.create` | `true` | Role/RoleBinding for Pod execution; with `false`, an empty `scarab.namespace` means the release namespace |
 | `ingress.enabled` | `false` | expose the HTTP API |
 
 See `deploy/helm/scarab/README.md` and `values.yaml` for every value.
@@ -329,9 +330,18 @@ Step Pods reach the Data Depot and the server through Services.
 - To run step Pods in a namespace you name, set `scarab.namespace` and create the namespace before
   the install: the chart renders the Role into it.
 - To keep the default name and create the namespace yourself (to add a LimitRange, say), set
-  `scarab.createNamespace: false`.
+  `scarab.namespace: <release namespace>-steps` and create it before the install.
 - To keep step Pods beside the server, as up to 0.4.4, set `scarab.namespace` to the release
   namespace.
+- Creating a Namespace needs cluster-wide rights. An installer with rights only in the release
+  namespace sets `scarab.createNamespace: false`, and step Pods run in the release namespace; or
+  it names a namespace that already exists in `scarab.namespace`.
+- With `rbac.create: false` the chart renders no Role, and an empty `scarab.namespace` means the
+  release namespace, where you grant the server's ServiceAccount its rights.
+- With `scarab.executor: local` the chart renders no Namespace.
+
+A release namespace longer than 57 characters makes `<release namespace>-steps` longer than a
+namespace name may be; the render fails and asks you to set `scarab.namespace`.
 
 What you set up for step Pods goes in the step namespace: a LimitRange or ResourceQuota,
 `imagePullSecrets` on its `default` ServiceAccount, and every ServiceAccount a placement profile
@@ -339,15 +349,17 @@ names, such as the one in [Pushing images to Amazon ECR](/scarab-ci/usage/pushin
 `helm uninstall` leaves the namespace and any step Pods in it.
 
 **Upgrading from 0.4.4 or earlier.** Up to 0.4.4 an empty `scarab.namespace` meant the release
-namespace, so if your values leave it empty, the upgrade moves step Pods to
-`<release namespace>-steps`, and the executor's Role moves with them. Step Pods running in the
-release namespace during the upgrade finish there. The new server does not see them: for a step
-that was still running it finds no Pod, marks the Attempt lost, and the step's retry policy decides
-whether a new Attempt runs in the new namespace. It does not delete the old Pods, so upgrade when
-none run (`kubectl -n <release namespace> get pods -l scarab.io/run`) or delete them once they end.
-Recreate what you set up for step Pods in the new namespace first. To keep the old behaviour, set
-`scarab.namespace` to the release namespace. Installs that already set `scarab.namespace` see no
-change.
+namespace. With the default values it now means `<release namespace>-steps`, so the upgrade creates
+that Namespace and moves the executor's Role there. Step Pods running in the release namespace
+during the upgrade stay there, and the new server does not see them: for a step that was still
+running it finds no Pod and marks the Attempt lost, and the step's retry policy decides whether a
+new Attempt runs in the new namespace. It does not delete the old Pods. Let running Runs finish
+before the upgrade (`kubectl -n <release namespace> get pods -l scarab.io/run` lists none), or set
+`scarab.namespace` to the release namespace to keep step Pods where they are. Recreate what you set
+up for step Pods in the new namespace first. If the account that runs `helm upgrade` cannot create
+a Namespace, the upgrade fails: set `scarab.createNamespace: false`, or name an existing namespace
+in `scarab.namespace`. Installs that already set `scarab.namespace`, set `rbac.create: false`, or
+run the local executor see no change.
 
 ### Health checks
 

@@ -36,18 +36,22 @@ scarab:
   # k8s (production, one Pod per step) | local (host processes — dev only).
   executor: k8s
   # Namespace the executor launches step Pods into; the executor's RBAC
-  # (templates/rbac.yaml) is granted there. Empty => `<release namespace>-steps`,
-  # so pipeline code does not run beside the server's Secret and
-  # ServiceAccount. Set it to the release namespace to keep step Pods there,
-  # as the chart did before. A namespace you name here is yours to create,
-  # before the install: the chart renders a Role into it.
+  # (templates/rbac.yaml) is granted there. Empty => `<release namespace>-steps`
+  # with the k8s executor, so pipeline code does not run beside the server's
+  # Secret and ServiceAccount; the release namespace instead when
+  # `rbac.create` or `createNamespace` is false, or the executor is local.
+  # Set it to the release namespace to keep step Pods there, as the chart did
+  # before. A namespace you name here is yours to create, before the install:
+  # the chart renders a Role into it.
   namespace: ""
-  # Render `<release namespace>-steps` when `namespace` is empty. Set false to
-  # create it yourself (a LimitRange or ResourceQuota for step Pods, labels
-  # your cluster requires). The Namespace is kept on `helm uninstall`
-  # (helm.sh/resource-policy: keep), with any step Pods still in it. No Pod
-  # Security label: a `rootless-buildkit` step needs an Unconfined seccomp
-  # profile, which `baseline` refuses.
+  # Render `<release namespace>-steps` when `namespace` is empty. Creating a
+  # Namespace needs cluster-wide rights; set false when the installer has only
+  # rights in the release namespace, and step Pods run there. To create
+  # `<release namespace>-steps` yourself (a LimitRange or ResourceQuota for
+  # step Pods, labels your cluster requires), set `namespace` to its name. The
+  # Namespace is kept on `helm uninstall` (helm.sh/resource-policy: keep), with
+  # any step Pods still in it. No Pod Security label: a `rootless-buildkit`
+  # step needs an Unconfined seccomp profile, which `baseline` refuses.
   createNamespace: true
   # Address scarab-server binds inside the container.
   addr: "0.0.0.0:8080"
@@ -662,7 +666,9 @@ plugins:
   probeImage: ""
 
 # RBAC the k8s executor needs to run one Pod per step in scarab.namespace
-# (`<release namespace>-steps` by default).
+# (`<release namespace>-steps` by default). With `create: false`, you grant
+# the server's ServiceAccount those rights yourself, and an empty
+# scarab.namespace means the release namespace.
 # NOTE: the workspace StatefulSet gets its own ServiceAccount with NO
 # RoleBinding — see templates/serviceaccount-workspace.yaml for why that is
 # deliberate rather than an omission.
