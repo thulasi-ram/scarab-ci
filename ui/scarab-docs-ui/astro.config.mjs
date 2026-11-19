@@ -117,6 +117,7 @@ export default defineConfig({
             { label: 'Libraries', slug: 'usage/libraries' },
             { label: 'Secrets', slug: 'usage/secrets' },
             { label: 'API tokens', slug: 'usage/api-tokens' },
+            { label: 'Run logs', slug: 'usage/run-logs' },
             { label: 'Environments', slug: 'usage/environments' },
             { label: 'Policies', slug: 'usage/policies' },
             { label: 'Deploying with Argo CD', slug: 'usage/deploying-with-argo-cd' },

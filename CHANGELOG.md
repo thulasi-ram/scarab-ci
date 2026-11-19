@@ -48,6 +48,20 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Enhancement
 
+- **Step logs stream in parts and can resume.** The server read a try's whole log into memory and
+  sent it as one event. It now reads the log chunk by chunk and sends events of up to 256 KiB, each
+  with an id (`<attempt_id>:<next_seq>`). `?from=<id>` or the `Last-Event-ID` header continues
+  after that event; an id the server cannot place is a 400. `?tail=<bytes>` (at most 64 MiB) sends
+  only the end of the log, from a chunk boundary, after an `event: truncated` that gives the
+  skipped and total bytes. `GET /v1/runs/{id}/steps/{step}/logs/raw?attempt=<id>` downloads one
+  try's whole log as plain text (git-bug 9ac20c0). See
+  [Run logs](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/).
+- **The Run page loads the last 2 MB of a log.** A notice above a longer log says how much shows
+  and where line numbers start ("Showing the last 2.0 MB of 14.3 MB. Line numbers start here.").
+  **Load full log** reads up to 8 MB, and **Download** saves the try's whole log. The pane keeps at
+  most 8 MB, dropping lines from the top. A dropped connection reconnects after 1 s, 2 s, 4 s and
+  so on up to 30 s and continues after the last part received; after three reconnects in a row that
+  receive nothing, it loads the last 2 MB again.
 - **The server warns at startup when `default_resources` sets one axis only.** With `cpu_millis`
   and no `memory_mib`, a step container that sets no memory has no `requests.memory` or
   `limits.memory`; with `memory_mib` and no `cpu_millis`, it has no `requests.cpu`. The warning
@@ -56,6 +70,12 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Bug Fixes
 
+- **`scarab logs` no longer adds a line break between stored chunks.** It printed each `data:` line with a newline
+  after it, so a line split across two stored chunks came out as two lines. It now joins an
+  event's lines as Server-Sent Events defines and prints the text with nothing added.
+- **A `\r\n` in a step's output shows as one line break**, on the Run page and in `scarab logs`.
+  It showed as two, with a blank line between. A lone `\r` still shows as a line break. The raw
+  download keeps the bytes the step wrote.
 - **A short step keeps its logs.** The log tail read a step only while it was running, and waited
   3 seconds after a read that found the Pod not ready. A step that started and finished inside that
   wait had no logs stored. The server now reads the log of each step, retried attempt and service

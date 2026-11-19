@@ -1,0 +1,57 @@
+---
+title: Run logs
+description: Read a step's log on the Run page, with scarab logs, or through the API. The Run page loads the last 2 MB of a try's log, and Download saves all of it.
+---
+
+Scarab stores each step's output in chunks while the step runs. You can read it on the Run page,
+with `scarab logs`, or through the API.
+
+## On the Run page
+
+Open a Run and pick a step. The Logs tab shows the try in view and follows it while it runs.
+
+- The pane loads the last 2 MB of the try's log. When the log is longer, a notice above it says
+  how much shows, for example "Showing the last 2.0 MB of 14.3 MB. Line numbers start here." Line
+  numbers count from the first line loaded, not from the start of the log.
+- **Load full log** reads the log again, up to 8 MB. It shows only when the whole log is 8 MB or
+  less.
+- **Download** saves the whole log of the try as a text file, with the bytes the step wrote. It is
+  in the log toolbar for every try.
+- The pane keeps at most 8 MB. Past that, it drops lines from the top as new output arrives. The
+  notice counts those too, and the lines that stay keep their numbers.
+- If the connection drops while the try runs, the pane connects again after 1 s, then 2 s, 4 s and
+  so on up to 30 s, and continues after the last part it received. After three attempts in a row
+  that receive nothing, it loads the last 2 MB again.
+
+A `\r\n` line end shows as one line break. A lone `\r`, which a progress bar writes to redraw its
+line, also shows as a line break, so each redraw is a line of its own. Download keeps both as the
+step wrote them.
+
+## With `scarab logs`
+
+```sh
+scarab logs <run-id>
+```
+
+This prints the log of every try of every step of the Run, in step order, and follows the Run until
+it finishes. It prints the whole log, with no 2 MB cut. It exits 1 when a stored part of the log
+cannot be read. It reads `SCARAB_SERVER` and `SCARAB_TOKEN` (see [API tokens](/scarab-ci/usage/api-tokens/)).
+
+## Through the API
+
+| Call | What it returns |
+|------|-----------------|
+| `GET /v1/runs/{id}/steps/{step}/logs` | one step's log as Server-Sent Events. `?attempt=` picks one try, `?tail=<bytes>` asks for the last bytes only (at most 64 MiB), `?from=<event id>` resumes |
+| `GET /v1/runs/{id}/steps/{step}/logs/raw?attempt=<id>` | one try's whole log as `text/plain`, sent as an attachment. `?sidecar=<index>` reads a sidecar's log for the same try. `attempt` is required |
+| `GET /v1/runs/{id}/services/{service}/logs` | one shared service's log, with the same `?tail=` and `?from=` |
+| `GET /v1/runs/{id}/logs` | every step's log, as `scarab logs` reads it. Event ids, no `?tail=` |
+
+Each `data` event carries up to 256 KiB of one try's log and has an id `<attempt_id>:<next_seq>`,
+the position after it. Send it back as `?from=` or in the `Last-Event-ID` header to continue after
+that event. The server answers 400 to an id it cannot place in the log you asked for.
+
+With `?tail=`, when the log is longer than the tail, the stream starts at a chunk boundary and
+first sends `event: truncated` with `{"skipped_bytes":N,"total_bytes":M}`. `event: error` means a
+stored part of the log could not be read, and the stream ends after it.
+
+The stream sends each `\r\n` as `\n`. The raw download returns the stored bytes unchanged.
