@@ -18,6 +18,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-11-19
+
 ### Enhancement
 
 - **The Run page has run tabs, try tabs and a List view.** Under the summary line, run tabs
@@ -1471,7 +1473,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.4...HEAD
+[0.4.4]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.0...v0.4.1
