@@ -18,6 +18,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-20
+
 ### Breaking changes
 
 - **Step Pods run in a namespace of their own by default.** With the k8s executor, `rbac.create`
@@ -197,7 +199,7 @@ release.yml uses that version's section as the GitHub Release text. See
   relaunch, and a replica that did not launch the step reads both back from the step Pod's
   Secrets.
 
-### Enhancement
+### Features
 
 - **Step logs stream in parts and can resume** (git-bug 9ac20c0). The server read a try's whole
   log into memory and sent it as one event. It now reads the log chunk by chunk and sends events of
@@ -229,16 +231,6 @@ release.yml uses that version's section as the GitHub Release text. See
   each character of the run id and service name outside `[A-Za-z0-9_-]` replaced by `_`. The
   service pane has **Download** in its header and in the notice above a longer log. See
   [Run logs](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/).
-- **A live log reads only the new part of its chunk index** (git-bug 209ef14). Each poll of a
-  running step's log, every 500 ms, read the step's whole list of stored chunks; it now reads the
-  rows from its position on. Storing a chunk reads only the newest row.
-- **The server warns at startup when `default_resources` sets one axis only** (git-bug 9cfeac4).
-  With `cpu_millis` and no `memory_mib`, a step container that sets no memory has no
-  `requests.memory` or `limits.memory`; with `memory_mib` and no `cpu_millis`, it has no
-  `requests.cpu`. The warning names the missing field and says that a cluster that requires
-  resource limits (a Kyverno require-resource-limits policy, for example) will refuse those step
-  Pods. See
-  [Placement & resources](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#placement--resources).
 - **A library joins per-architecture images into one multi-architecture image** (git-bug
   794b3ac). `lib:thulasi-ram::scarab-ci::image-index`, the file `libs/image-index.yaml`, runs
   `crane index append` over images named by digest (one `<repository>@sha256:<digest>` per line)
@@ -261,6 +253,19 @@ release.yml uses that version's section as the GitHub Release text. See
   ran under `runAsNonRoot` and the kubelet refused it. Running a service as root stays
   self-service; the Security entry on services in the Policy input says what a Policy sees. See
   [Steps: the step shape](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#steps-the-step-shape).
+
+### Enhancement
+
+- **A live log reads only the new part of its chunk index** (git-bug 209ef14). Each poll of a
+  running step's log, every 500 ms, read the step's whole list of stored chunks; it now reads the
+  rows from its position on. Storing a chunk reads only the newest row.
+- **The server warns at startup when `default_resources` sets one axis only** (git-bug 9cfeac4).
+  With `cpu_millis` and no `memory_mib`, a step container that sets no memory has no
+  `requests.memory` or `limits.memory`; with `memory_mib` and no `cpu_millis`, it has no
+  `requests.cpu`. The warning names the missing field and says that a cluster that requires
+  resource limits (a Kyverno require-resource-limits policy, for example) will refuse those step
+  Pods. See
+  [Placement & resources](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#placement--resources).
 
 ### Bug Fixes
 
@@ -1800,7 +1805,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.4...v0.5.0
 [0.4.4]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.1...v0.4.2
