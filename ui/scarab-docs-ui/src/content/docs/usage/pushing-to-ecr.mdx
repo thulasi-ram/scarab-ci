@@ -36,7 +36,8 @@ and compile, how Run creation admits them, and how the profile merges into the p
 ## Before you start: the ServiceAccount every step shares
 
 Scarab sets no `serviceAccountName` on a step Pod, so the Pod runs as the `default` ServiceAccount
-of the namespace steps run in (`scarab.namespace` in the chart, else the release's namespace),
+of the namespace steps run in (`scarab.namespace` in the chart, `<release namespace>-steps` by
+default; see [Where step Pods run](/scarab-ci/get-started/deploy-helm/#where-step-pods-run)),
 unless the [placement baseline](/scarab-ci/usage/pipeline-syntax/#placement--resources) sets one.
 Scarab also sets `automountServiceAccountToken: false`, so a step gets no Kubernetes API token.
 
@@ -90,7 +91,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: scarab-ecr-push
-  namespace: scarab          # the namespace step Pods run in
+  namespace: scarab-steps    # the namespace step Pods run in
   annotations:
     eks.amazonaws.com/role-arn: arn:aws:iam::111122223333:role/scarab-ecr-push
 automountServiceAccountToken: false

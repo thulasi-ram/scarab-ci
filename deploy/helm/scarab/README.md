@@ -1,7 +1,8 @@
 # scarab Helm chart
 
 Deploys **scarab-server** (one binary, selectable roles) onto Kubernetes,
-with the RBAC it needs to launch one Pod per step in its namespace.
+with the RBAC it needs to launch one Pod per step in the step namespace
+(`<release namespace>-steps` by default).
 
 ## Prerequisites
 
@@ -240,6 +241,34 @@ its repo bindings.
 the running server can store it). `SCARAB_GITHUB_APP_PEM[_FILE]` above is the same
 mechanism, applied kind-wide to GitHub App-mode connections.
 
+## Where step Pods run (`scarab.namespace`)
+
+Step Pods run pipeline code, so by default they run in a namespace of their
+own, `<release namespace>-steps`, not beside the server's Secret, its
+ServiceAccount and the Data Depot. The chart renders that namespace and a Role
+in it for the server's ServiceAccount: step Pods and their logs, exec and
+events, the Secrets the server creates for each Pod, and the Services and
+NetworkPolicies of shared services. Step Pods reach the Data Depot and the
+server's results API through Services by their full DNS names, so the server
+needs no Kubernetes API rights in its own namespace for them.
+
+| Values | Step Pods run in |
+|--------|------------------|
+| `scarab.namespace` empty (default) | `<release namespace>-steps`, which the chart creates |
+| `scarab.namespace` empty, `scarab.createNamespace: false` | `<release namespace>-steps`, which you create before the install |
+| `scarab.namespace: <name>` | `<name>`, which you create before the install; the chart renders the Role into it |
+| `scarab.namespace: <release namespace>` | the release namespace, beside the server (the behaviour up to 0.4.4) |
+
+What you set up for step Pods belongs in the step namespace: a LimitRange or
+ResourceQuota, `imagePullSecrets` on its `default` ServiceAccount, and every
+ServiceAccount a placement profile names (an IRSA role's, for example).
+
+The chart renders no Pod Security label on the namespace: a `rootless-buildkit`
+step needs an Unconfined seccomp profile, which the `baseline` level refuses.
+`helm uninstall` leaves the namespace and any step Pods in it
+(`helm.sh/resource-policy: keep`); a reinstall under the same release name and
+namespace adopts it again.
+
 ## Step Pod placement (`scarab.placement`, ADR-0055)
 
 Step Pods are created by the server at run time, so the chart's `tolerations` /
@@ -377,6 +406,29 @@ The StatefulSet's `serviceName` is unchanged, so upgrading needs no migration.
 
 > **Unverified in this chart version:** per-availability-zone placement.
 
+### Upgrading from 0.4.4 or earlier: step Pods move
+
+Up to 0.4.4 an empty `scarab.namespace` meant the release namespace. Now it
+means `<release namespace>-steps`. If your values leave it empty, the upgrade:
+
+- creates `<release namespace>-steps` and moves the executor's Role and
+  RoleBinding there, so the server has no rights left over step Pods in the
+  release namespace;
+- leaves step Pods that are running in the release namespace where they are,
+  to finish. The new server looks for a step's Pod only in the new namespace:
+  for a step still running it finds none, marks the Attempt lost, and the
+  step's retry policy decides whether a new Attempt runs, in the new
+  namespace. It does not delete the old Pods.
+
+Upgrade when no step Pods run
+(`kubectl -n <release namespace> get pods -l scarab.io/run`), or delete them
+once they end (`kubectl -n <release namespace> delete pods -l scarab.io/run`).
+Before the upgrade, recreate in the new namespace what you set up for step Pods
+([Where step Pods run](#where-step-pods-run-scarabnamespace)).
+
+To keep step Pods in the release namespace, set `scarab.namespace` to it.
+Installs that already set `scarab.namespace` see no change.
+
 ### Upgrading to 0.3.1
 
 Read the Breaking changes of 0.3.1 in `CHANGELOG.md` first. Back up the
@@ -477,7 +529,8 @@ DNS, which must be the usual `kube-system` Pods labelled `k8s-app=kube-dns`.
 | `strategy` | `type: Recreate` | server Deployment update strategy: old server Pods stop before new ones start, so two versions never run Steps side by side. Switch to `RollingUpdate` only where a release's notes say mixed versions are safe |
 | `scarab.role` | `converged` | `api` / `scheduler` / `executor` / `webhook` / `converged` |
 | `scarab.executor` | `k8s` | `k8s` (prod) or `local` (dev only) |
-| `scarab.namespace` | release ns | namespace step Pods launch into (RBAC granted there) |
+| `scarab.namespace` | `<release ns>-steps` | namespace step Pods launch into (RBAC granted there); see [Where step Pods run](#where-step-pods-run-scarabnamespace) |
+| `scarab.createNamespace` | `true` | render `<release ns>-steps` when `scarab.namespace` is empty |
 | `scarab.s3.*` | — | object store; set `bucket` to enable S3/MinIO |
 | `scarab.oauth.*` | — | OAuth/OIDC login: `clientId`, `authorizeUrl`, `tokenUrl`, `userinfoUrl`, `scopes`, `owners`, `issuer` (above) |
 | `scarab.devInsecure` | `false` | ⚠ dev/eval only — no auth; mutually exclusive with `scarab.oauth` |

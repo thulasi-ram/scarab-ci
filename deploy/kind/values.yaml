@@ -27,6 +27,11 @@ extraVolumeMounts:
 scarab:
   role: converged
   executor: k8s
+  # Step Pods stay in the release namespace here, not the chart's default
+  # `<release namespace>-steps`: the e2e and chaos harnesses look for step
+  # Pods, their Secrets, Services and NetworkPolicies in one namespace
+  # (SCARAB_E2E_NAMESPACE, SCARAB_CHAOS_NAMESPACE, chaos.sh's cleanup).
+  namespace: scarab
   s3:
     endpoint: http://scarab-minio:9000
     region: us-east-1

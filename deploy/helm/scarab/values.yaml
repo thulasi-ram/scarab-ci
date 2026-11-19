@@ -35,9 +35,20 @@ scarab:
   role: converged
   # k8s (production, one Pod per step) | local (host processes — dev only).
   executor: k8s
-  # Namespace the executor launches step Pods into. Empty => the release
-  # namespace (.Release.Namespace); the RBAC below is granted there.
+  # Namespace the executor launches step Pods into; the executor's RBAC
+  # (templates/rbac.yaml) is granted there. Empty => `<release namespace>-steps`,
+  # so pipeline code does not run beside the server's Secret and
+  # ServiceAccount. Set it to the release namespace to keep step Pods there,
+  # as the chart did before. A namespace you name here is yours to create,
+  # before the install: the chart renders a Role into it.
   namespace: ""
+  # Render `<release namespace>-steps` when `namespace` is empty. Set false to
+  # create it yourself (a LimitRange or ResourceQuota for step Pods, labels
+  # your cluster requires). The Namespace is kept on `helm uninstall`
+  # (helm.sh/resource-policy: keep), with any step Pods still in it. No Pod
+  # Security label: a `rootless-buildkit` step needs an Unconfined seccomp
+  # profile, which `baseline` refuses.
+  createNamespace: true
   # Address scarab-server binds inside the container.
   addr: "0.0.0.0:8080"
   # Extra plain (non-secret) env vars, e.g. RUST_LOG.
@@ -636,7 +647,8 @@ plugins:
   # verdict is only as good as the image printing it.
   probeImage: ""
 
-# RBAC the k8s executor needs to run one Pod per step in scarab.namespace.
+# RBAC the k8s executor needs to run one Pod per step in scarab.namespace
+# (`<release namespace>-steps` by default).
 # NOTE: the workspace StatefulSet gets its own ServiceAccount with NO
 # RoleBinding — see templates/serviceaccount-workspace.yaml for why that is
 # deliberate rather than an omission.

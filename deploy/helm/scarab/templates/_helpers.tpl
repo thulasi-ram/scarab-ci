@@ -129,9 +129,24 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 {{- end -}}
 
-{{/* Namespace the executor launches step Pods into (defaults to release ns). */}}
+{{/* Namespace the executor launches step Pods into: scarab.namespace, else
+     `<release namespace>-steps`. A derived name longer than a namespace may be
+     fails the render rather than being cut back to the release namespace. */}}
 {{- define "scarab.execNamespace" -}}
-{{- default .Release.Namespace .Values.scarab.namespace -}}
+{{- if .Values.scarab.namespace -}}
+{{- .Values.scarab.namespace -}}
+{{- else -}}
+{{- $ns := printf "%s-steps" .Release.Namespace -}}
+{{- if gt (len $ns) 63 -}}
+{{- fail (printf "scarab: the step namespace `%s` is longer than 63 characters; set scarab.namespace." $ns) -}}
+{{- end -}}
+{{- $ns -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Whether the chart renders the step namespace: only one it named itself. */}}
+{{- define "scarab.createExecNamespace" -}}
+{{- if and .Values.scarab.createNamespace (not .Values.scarab.namespace) -}}true{{- end -}}
 {{- end -}}
 
 {{/* plugins.namespace must be a namespace of its own (ADR-0072 §9). The

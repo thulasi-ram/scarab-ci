@@ -18,6 +18,19 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **Step Pods run in a namespace of their own by default.** An empty `scarab.namespace` now means
+  `<release namespace>-steps`, which the chart creates (`scarab.createNamespace`), instead of the
+  release namespace, so pipeline code no longer runs beside the server's Secret and
+  ServiceAccount. The executor's Role and RoleBinding move with it. Step Pods running during the
+  upgrade finish in the release namespace; the new server does not see or delete them, and marks a
+  step that was still running lost. Upgrade when no step Pods run, and recreate in the new
+  namespace what you set up for step Pods (a LimitRange, `imagePullSecrets`, the ServiceAccounts
+  placement profiles name). To keep the old behaviour, set `scarab.namespace` to the release
+  namespace; installs that set it already see no change. See
+  [Where step Pods run](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#where-step-pods-run).
+
 ### Security
 
 - **The build library's push step pushes only the image the build step built** (git-bug 23a29ab).
