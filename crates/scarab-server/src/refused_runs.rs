@@ -84,7 +84,7 @@ pub struct RefusedRunsQuery {
         ("repo" = String, Path, description = "project (repo) name"),
         ("limit" = Option<u32>, Query, description = "at most this many (default 50, capped 200)")
     ),
-    summary = "Triggers that did not become a Run (ADR-0076)",
+    summary = "Triggers that did not become a Run",
     responses((status = 200, body = RefusedRunListResponse))
 )]
 pub(crate) async fn list_refused_runs(

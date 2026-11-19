@@ -104,9 +104,8 @@ pub struct LibraryInstallationDto {
 pub struct OrgLibrariesDto {
     pub installations: Vec<LibraryInstallationDto>,
     pub yanks: Vec<LibraryYankDto>,
-    /// The library sources this org trusts, one entry per source and grant
-    /// (ADR-0076 §9, ADR-0018 amendment of 2026-11-12). No library is
-    /// trusted without one.
+    /// The library sources this org trusts, one entry per source and grant.
+    /// No library is trusted without one.
     pub trusted_sources: Vec<TrustedSourceDto>,
 }
 
@@ -147,8 +146,7 @@ impl From<TrustGrant> for TrustGrantDto {
     }
 }
 
-/// A library source the org trusts with one grant (ADR-0076 §9, ADR-0018
-/// amendment of 2026-11-12). Trust holds across upgrades from the same
+/// A library source the org trusts with one grant. Trust holds across upgrades from the same
 /// source; an install that would carry a grant to a new version names it in
 /// `carry_grants`.
 #[derive(Debug, Serialize, ToSchema)]
@@ -790,7 +788,7 @@ async fn check_compiles(
     get,
     path = "/v1/orgs/{org}/libraries",
     params(("org" = String, Path, description = "org")),
-    summary = "An org's installed libraries (ADR-0076 §4)",
+    summary = "An org's installed libraries",
     responses(
         (status = 200, body = OrgLibrariesDto),
         (status = 403, description = "no read access to the org"),
@@ -833,7 +831,7 @@ pub(crate) async fn list_libraries(
         ("org" = String, Path, description = "org"),
         ("id" = String, Path, description = "installation id")
     ),
-    summary = "One installed library, by id (ADR-0076 §4)",
+    summary = "One installed library, by id",
     responses(
         (status = 200, body = LibraryInstallationDto),
         (status = 403, description = "no read access to the org"),
@@ -1068,7 +1066,7 @@ pub const MAX_NEVER_INSTALLED_VERSIONS: usize = 50;
     path = "/v1/orgs/{org}/libraries/fetch",
     params(("org" = String, Path, description = "org")),
     request_body = FetchLibraryRequest,
-    summary = "Fetch a library version to review before installing (ADR-0076 §4)",
+    summary = "Fetch a library version to review before installing",
     responses(
         (status = 200, body = FetchedLibraryDto),
         (status = 400, description = "a bad source or name, a fetch that failed, or a file that does not compile as a closed library"),
@@ -1180,7 +1178,7 @@ pub(crate) async fn fetch_library(
     path = "/v1/orgs/{org}/library-installations",
     params(("org" = String, Path, description = "org")),
     request_body = InstallLibraryRequest,
-    summary = "Install or upgrade a library (ADR-0076 §4)",
+    summary = "Install or upgrade a library",
     responses(
         (status = 200, body = LibraryInstallationDto),
         (status = 400, description = "a bad name or hash, a version not fetched into this org, one that no longer compiles here, or `carry_grants` that are not the grants the source holds"),
@@ -1286,7 +1284,7 @@ pub(crate) async fn install_library(
         ("org" = String, Path, description = "org"),
         ("id" = String, Path, description = "installation id")
     ),
-    summary = "Remove an installed library (ADR-0076 §4)",
+    summary = "Remove an installed library",
     responses(
         (status = 204, description = "removed"),
         (status = 403, description = "not an org admin"),
@@ -1317,7 +1315,7 @@ pub(crate) async fn remove_library(
     path = "/v1/orgs/{org}/library-yanks",
     params(("org" = String, Path, description = "org")),
     request_body = YankLibraryRequest,
-    summary = "Yank a library version (ADR-0076 §6)",
+    summary = "Yank a library version",
     responses(
         (status = 200, body = LibraryYankDto),
         (status = 400, description = "a bad hash, an empty or long reason, or a version this org never fetched"),
@@ -1454,7 +1452,7 @@ pub(crate) async fn yank_impact(
         ("org" = String, Path, description = "org"),
         ("hash" = String, Path, description = "content hash")
     ),
-    summary = "The Runs in progress that use a library version (ADR-0076 §6)",
+    summary = "The Runs in progress that use a library version",
     responses(
         (status = 200, body = YankImpactDto),
         (status = 400, description = "not a content hash"),
@@ -1480,7 +1478,7 @@ pub(crate) async fn get_yank_impact(
         ("org" = String, Path, description = "org"),
         ("hash" = String, Path, description = "content hash")
     ),
-    summary = "Lift a library yank (ADR-0076 §6)",
+    summary = "Lift a library yank",
     responses(
         (status = 200, body = LibraryYankDto),
         (status = 403, description = "not an org admin, or no step-up"),

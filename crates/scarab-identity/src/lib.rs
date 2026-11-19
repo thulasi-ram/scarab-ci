@@ -699,8 +699,7 @@ pub enum Placeholder {
     AdoptExact,
 }
 
-/// Durable store of Principals and their pinned provider identities
-/// (ADR-0069).
+/// Durable store of Principals and their pinned provider identities.
 #[async_trait]
 pub trait IdentityStore: Send + Sync {
     /// Sign-in. Returns the id of the Principal pinned to `(provider,

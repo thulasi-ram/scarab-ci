@@ -188,7 +188,7 @@ pub struct Provisioned {
     /// The operator can then delete it explicitly in the UI.
     pub released: Vec<String>,
     /// Repo bindings written this boot (`owner/name`), each of which *is* a
-    /// Project (ADR-0046).
+    /// Project.
     pub bound: Vec<String>,
 }
 

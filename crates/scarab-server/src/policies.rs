@@ -90,7 +90,7 @@ pub struct PolicyDto {
     /// 1 on create; each save, the delete included, adds one. A PUT or
     /// DELETE names it as `expected_version`.
     pub version: u64,
-    /// The authored Policy (ADR-0075 §4): `name`, `checkpoint`, `match`,
+    /// The authored Policy: `name`, `checkpoint`, `match`,
     /// `mode`, and `rules` or `setting`.
     #[schema(value_type = Object)]
     pub policy: Policy,
@@ -124,7 +124,7 @@ impl From<StoredPolicy> for PolicyDto {
     }
 }
 
-/// One saved version of a Policy (ADR-0075 §11).
+/// One saved version of a Policy.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PolicyVersionDto {
     pub version: u64,
@@ -160,7 +160,7 @@ impl From<PolicyVersion> for PolicyVersionDto {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreatePolicyRequest {
-    /// The authored Policy (ADR-0075 §4). At the Project level it must be a
+    /// The authored Policy. At the Project level it must be a
     /// typed `setting` (§7).
     #[schema(value_type = Object)]
     pub policy: Value,
@@ -192,7 +192,7 @@ pub struct DeletePolicyQuery {
     pub reason: Option<String>,
 }
 
-/// A recorded PolicyDecision (ADR-0075 §9).
+/// A recorded PolicyDecision.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PolicyDecisionRecordDto {
     pub id: String,
@@ -350,7 +350,7 @@ pub struct PolicyTestTrigger {
     #[serde(default)]
     pub actor: Option<String>,
     /// The forge's immutable id of that account (a webhook's `sender.id`),
-    /// which admission resolves to the linked Principal (ADR-0069); webhook
+    /// which admission resolves to the linked Principal; webhook
     /// kinds only. Default none: the Run has no `principal`.
     #[serde(default)]
     pub actor_id: Option<String>,
@@ -765,7 +765,7 @@ async fn delete_at(
     get,
     path = "/v1/orgs/{org}/policies",
     params(("org" = String, Path, description = "org")),
-    summary = "List the org's Policies (ADR-0075 §7)",
+    summary = "List the org's Policies",
     responses(
         (status = 200, body = [PolicyDto]),
         (status = 403, description = "no Read on the org"),
@@ -787,7 +787,7 @@ pub(crate) async fn list_org_policies(
     path = "/v1/orgs/{org}/policies",
     params(("org" = String, Path, description = "org")),
     request_body = CreatePolicyRequest,
-    summary = "Add an org Policy (ADR-0075 §4, §10)",
+    summary = "Add an org Policy",
     responses(
         (status = 201, body = PolicyDto),
         (status = 400, description = "not a Policy, or it does not compile (its checkpoint is not yet consulted, a CEL error, an effect the checkpoint does not allow), or `reason` is over 2,000 bytes"),
@@ -813,7 +813,7 @@ pub(crate) async fn create_org_policy(
         ("org" = String, Path, description = "org"),
         ("id" = String, Path, description = "policy id")
     ),
-    summary = "Read an org Policy (ADR-0075 §11)",
+    summary = "Read an org Policy",
     responses(
         (status = 200, body = PolicyDto),
         (status = 403, description = "no Read on the org"),
@@ -839,7 +839,7 @@ pub(crate) async fn get_org_policy(
         ("id" = String, Path, description = "policy id")
     ),
     request_body = UpdatePolicyRequest,
-    summary = "Replace an org Policy (ADR-0075 §10, §11)",
+    summary = "Replace an org Policy",
     responses(
         (status = 200, body = PolicyDto),
         (status = 400, description = "not a Policy, or it does not compile, or `reason` is over 2,000 bytes"),
@@ -868,7 +868,7 @@ pub(crate) async fn update_org_policy(
         ("id" = String, Path, description = "policy id"),
         DeletePolicyQuery
     ),
-    summary = "Delete an org Policy (ADR-0075 §10)",
+    summary = "Delete an org Policy",
     responses(
         (status = 200, body = PolicyDto),
         (status = 400, description = "`reason` is over 2,000 bytes"),
@@ -895,7 +895,7 @@ pub(crate) async fn delete_org_policy(
         ("org" = String, Path, description = "org"),
         ("id" = String, Path, description = "policy id")
     ),
-    summary = "An org Policy's version history (ADR-0075 §11)",
+    summary = "An org Policy's version history",
     responses(
         (status = 200, body = [PolicyVersionDto]),
         (status = 403, description = "no Read on the org"),
@@ -922,7 +922,7 @@ pub(crate) async fn list_org_policy_versions(
         ("org" = String, Path, description = "org"),
         ("project" = String, Path, description = "project")
     ),
-    summary = "List a Project's typed settings (ADR-0075 §7)",
+    summary = "List a Project's typed settings",
     responses(
         (status = 200, body = [PolicyDto]),
         (status = 403, description = "no Read on the Project"),
@@ -947,10 +947,10 @@ pub(crate) async fn list_project_policies(
         ("project" = String, Path, description = "project")
     ),
     request_body = CreatePolicyRequest,
-    summary = "Add a Project typed setting (ADR-0075 §7, §10)",
+    summary = "Add a Project typed setting",
     responses(
         (status = 201, body = PolicyDto),
-        (status = 400, description = "not a typed setting (ADR-0075 §7), or it does not compile, or `reason` is over 2,000 bytes"),
+        (status = 400, description = "not a typed setting, or it does not compile, or `reason` is over 2,000 bytes"),
         (status = 403, description = "not a Project admin"),
         (status = 404, description = "policies not configured"),
         (status = 409, description = "a live Policy here has that name, or the scope holds its 256 Policies")
@@ -974,7 +974,7 @@ pub(crate) async fn create_project_policy(
         ("project" = String, Path, description = "project"),
         ("id" = String, Path, description = "policy id")
     ),
-    summary = "Read a Project typed setting (ADR-0075 §11)",
+    summary = "Read a Project typed setting",
     responses(
         (status = 200, body = PolicyDto),
         (status = 403, description = "no Read on the Project"),
@@ -999,10 +999,10 @@ pub(crate) async fn get_project_policy(
         ("id" = String, Path, description = "policy id")
     ),
     request_body = UpdatePolicyRequest,
-    summary = "Replace a Project typed setting (ADR-0075 §10, §11)",
+    summary = "Replace a Project typed setting",
     responses(
         (status = 200, body = PolicyDto),
-        (status = 400, description = "not a typed setting (ADR-0075 §7), or it does not compile, or `reason` is over 2,000 bytes"),
+        (status = 400, description = "not a typed setting, or it does not compile, or `reason` is over 2,000 bytes"),
         (status = 403, description = "not a Project admin"),
         (status = 404, description = "no such live Policy in this Project, or not configured"),
         (status = 409, description = "`expected_version` is not the stored version, or the name is taken")
@@ -1036,7 +1036,7 @@ pub(crate) async fn update_project_policy(
         ("id" = String, Path, description = "policy id"),
         DeletePolicyQuery
     ),
-    summary = "Delete a Project typed setting (ADR-0075 §10)",
+    summary = "Delete a Project typed setting",
     responses(
         (status = 200, body = PolicyDto),
         (status = 400, description = "`reason` is over 2,000 bytes"),
@@ -1064,7 +1064,7 @@ pub(crate) async fn delete_project_policy(
         ("project" = String, Path, description = "project"),
         ("id" = String, Path, description = "policy id")
     ),
-    summary = "A Project typed setting's version history (ADR-0075 §11)",
+    summary = "A Project typed setting's version history",
     responses(
         (status = 200, body = [PolicyVersionDto]),
         (status = 403, description = "no Read on the Project"),
@@ -1104,7 +1104,7 @@ fn parse_cursor(s: &str) -> Result<DecisionCursor, ApiError> {
     get,
     path = "/v1/orgs/{org}/policy-decisions",
     params(("org" = String, Path, description = "org"), PolicyDecisionsQuery),
-    summary = "The org's PolicyDecision log (ADR-0075 §9)",
+    summary = "The org's PolicyDecision log",
     responses(
         (status = 200, body = PolicyDecisionPageDto),
         (status = 400, description = "`before` is not a cursor, or `checkpoint` is not a checkpoint"),
@@ -1149,7 +1149,7 @@ pub(crate) async fn list_org_policy_decisions(
     get,
     path = "/v1/runs/{id}/policy-decisions",
     params(("id" = String, Path, description = "run id")),
-    summary = "A Run's PolicyDecisions (ADR-0075 §9)",
+    summary = "A Run's PolicyDecisions",
     responses(
         (status = 200, body = [PolicyDecisionRecordDto]),
         (status = 403, description = "no Read on the Run's Project"),
@@ -1631,7 +1631,7 @@ fn reads_of(policies: &[StoredPolicy]) -> Vec<PolicyReadsDto> {
     path = "/v1/orgs/{org}/policy-test",
     params(("org" = String, Path, description = "org")),
     request_body = PolicyTestRequest,
-    summary = "Evaluate Policies without enforcing or recording (ADR-0075 §9)",
+    summary = "Evaluate Policies without enforcing or recording",
     responses(
         (status = 200, body = PolicyTestResponse),
         (status = 400, description = "not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, a Policy at another checkpoint than the input, an input that cannot be matched, or a supplied input with a string or a list over its cap"),
@@ -1861,7 +1861,7 @@ pub(crate) async fn policy_test(
     get,
     path = "/v1/orgs/{org}/policy-decisions/counts",
     params(("org" = String, Path, description = "org"), PolicyDecisionCountsQuery),
-    summary = "Each Policy's decision counts since a time (ADR-0075 §9)",
+    summary = "Each Policy's decision counts since a time",
     responses(
         (status = 200, body = PolicyDecisionCountsDto),
         (status = 403, description = "no Read on the org"),
@@ -1982,7 +1982,7 @@ fn rule_reads(index: usize, r: &RuleIr) -> RuleReadsDto {
     path = "/v1/orgs/{org}/policies/check",
     params(("org" = String, Path, description = "org")),
     request_body = PolicyCheckRequest,
-    summary = "Check a draft org Policy without saving it (ADR-0075 §6)",
+    summary = "Check a draft org Policy without saving it",
     responses(
         (status = 200, body = PolicyCheckResponse),
         (status = 400, description = "not exactly one of `policy` and `yaml`, or `yaml` over 64 KiB"),
@@ -2088,7 +2088,7 @@ pub struct PolicyCheckpointDto {
 #[utoipa::path(
     get,
     path = "/v1/policy-checkpoints",
-    summary = "Each PolicyCheckpoint's input schema (ADR-0075 §2)",
+    summary = "Each PolicyCheckpoint's input schema",
     responses(
         (status = 200, body = [PolicyCheckpointDto]),
         (status = 401, description = "not signed in")
@@ -2281,7 +2281,7 @@ fn replay(
     path = "/v1/orgs/{org}/policy-test/replay",
     params(("org" = String, Path, description = "org")),
     request_body = PolicyReplayRequest,
-    summary = "Replay a draft Policy over recorded decisions (ADR-0075 §9)",
+    summary = "Replay a draft Policy over recorded decisions",
     responses(
         (status = 200, body = PolicyReplayResponse),
         (status = 400, description = "the draft does not compile"),

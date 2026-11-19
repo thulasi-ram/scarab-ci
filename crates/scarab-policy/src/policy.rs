@@ -263,8 +263,7 @@ impl Policy {
         canonical_json(&value)
     }
 
-    /// SHA-256 of [`canonical_json`](Self::canonical_json), lowercase hex
-    /// (ADR-0075 §11).
+    /// SHA-256 of [`canonical_json`](Self::canonical_json), lowercase hex.
     pub fn content_hash(&self) -> String {
         sha256_hex(self.canonical_json().as_bytes())
     }

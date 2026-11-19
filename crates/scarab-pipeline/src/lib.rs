@@ -125,7 +125,7 @@ pub struct PipelineIr {
     /// Distinct from the per-step workspace `inputs:`/`outputs:` (ADR-0007, 0035).
     #[serde(default, skip_serializing_if = "Interface::is_empty")]
     pub interface: Interface,
-    /// Opt-in run budget in seconds (ADR-0047): the run fails once its
+    /// Opt-in run budget in seconds: the run fails once its
     /// **active** time (gate-suspended time excluded) exceeds this. No default
     /// — a run suspended for weeks on a gate is the core feature, not a hang; forward
     /// progress rests on step timeouts and gate expiry.
@@ -863,7 +863,7 @@ pub struct StepSpec {
     pub security: Option<StepSecurity>,
     #[serde(default)]
     pub needs: Needs,
-    /// Explicit input workspaces (ADR-0007): the subset of `needs` whose output
+    /// Explicit input workspaces: the subset of `needs` whose output
     /// workspace this step consumes. Absent = implicit-by-default (inherit every
     /// need's workspace). Naming a subset restricts what flows in *and* sharpens
     /// restart invalidation — the step's skip-if-unchanged signature is computed
@@ -871,7 +871,7 @@ pub struct StepSpec {
     /// not force it to re-run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs: Option<Vec<String>>,
-    /// Explicit output workspace paths (ADR-0007): the workspace-relative paths
+    /// Explicit output workspace paths: the workspace-relative paths
     /// this step publishes downstream. Absent = the whole workspace (the implicit
     /// default). Naming a subset restricts what flows and gives a precise output
     /// hash. Enforced by the post-step CAS snapshot on the live-workspace path
@@ -939,7 +939,7 @@ pub struct StepSpec {
     /// steps authored without a matrix). Consumed later by CEL interpolation.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub matrix_values: BTreeMap<String, String>,
-    /// Sidecar services (ADR-0058): throwaway backing containers co-located in
+    /// Sidecar services: throwaway backing containers co-located in
     /// this Step's Pod, reachable at `localhost:<port>`. Each is a
     /// [`ServiceSpec`]; none is a `needs`-able DAG node. A matrixed Step's
     /// sidecars multiply per instance (each instance's Pod gets its own).

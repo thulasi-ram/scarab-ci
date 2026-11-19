@@ -208,7 +208,7 @@ pub(crate) fn plugin_store_api_error(e: PluginStoreError) -> ApiError {
 // DTOs
 // ---------------------------------------------------------------------------
 
-/// One entry of the closed PluginCapability vocabulary (ADR-0072 §2).
+/// One entry of the closed PluginCapability vocabulary.
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginCapabilityDto {
@@ -268,7 +268,7 @@ pub struct ConnectionSlotDto {
 }
 
 /// What the plugin asks for — exactly what an admin approves with the
-/// digest (ADR-0072 §1-2).
+/// digest.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PluginManifestDto {
     pub plugin: String,
@@ -279,7 +279,7 @@ pub struct PluginManifestDto {
     pub capabilities: Vec<PluginCapabilityDto>,
     pub connections: Vec<ConnectionSlotDto>,
     pub config_keys: Vec<String>,
-    /// The gates the plugin resolves (ADR-0076 §7), by name; empty without
+    /// The gates the plugin resolves, by name; empty without
     /// `resolve_gates`.
     pub gates: Vec<GateDefinitionDto>,
 }
@@ -444,7 +444,7 @@ impl From<RuntimeStatus> for RuntimeStatusDto {
     }
 }
 
-/// A PluginInstallation (ADR-0072 §10).
+/// A PluginInstallation.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PluginInstallationDto {
     /// Server-minted, 10 hex; names the installation's ServiceAccount.
@@ -478,11 +478,11 @@ pub struct PluginInstallationDto {
     pub killed_by: Option<String>,
     /// Unix-ms.
     pub killed_at: Option<i64>,
-    /// The PersistentVolumeClaim its Pod mounts (ADR-0074 §7); absent = none.
+    /// The PersistentVolumeClaim its Pod mounts; absent = none.
     pub storage: Option<PluginStorageDto>,
 }
 
-/// An installation's storage (ADR-0074 §7): a PersistentVolumeClaim an
+/// An installation's storage: a PersistentVolumeClaim an
 /// operator created in the plugin namespace. Scarab mounts it read-write; it
 /// never creates, backs up or reads it.
 #[derive(Debug, Serialize, ToSchema)]
@@ -591,7 +591,7 @@ pub struct InstallPluginRequest {
     /// Values for the manifest's `config_keys`; omitted = none.
     #[serde(default)]
     pub config: BTreeMap<String, String>,
-    /// A PersistentVolumeClaim to mount (ADR-0074 §7); omitted = none.
+    /// A PersistentVolumeClaim to mount; omitted = none.
     #[serde(default)]
     pub storage: Option<PluginStorageRequest>,
 }
@@ -732,8 +732,8 @@ pub struct UninstalledPluginDto {
     pub name: String,
 }
 
-/// One connection slot of an installation and what an admin bound to it
-/// (ADR-0072 §5). Never carries the credential, nor its secret key.
+/// One connection slot of an installation and what an admin bound to it.
+/// Never carries the credential, nor its secret key.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PluginConnectionDto {
     /// The manifest's slot name.
@@ -1055,7 +1055,7 @@ async fn read_manifest(
     path = "/v1/orgs/{org}/plugin-fetch",
     params(("org" = String, Path, description = "org")),
     request_body = FetchPluginManifestRequest,
-    summary = "Fetch a plugin manifest to review before installing (ADR-0072)",
+    summary = "Fetch a plugin manifest to review before installing",
     responses(
         (status = 200, body = FetchedPluginManifestDto),
         (status = 400, description = "a bad source, a fetch that failed, or a file that is not an admissible plugin manifest"),
@@ -1100,7 +1100,7 @@ pub(crate) async fn fetch_plugin_manifest(
     get,
     path = "/v1/orgs/{org}/plugins",
     params(("org" = String, Path, description = "org")),
-    summary = "List an org's plugin installations (ADR-0072)",
+    summary = "List an org's plugin installations",
     responses(
         (status = 200, body = [PluginInstallationDto]),
         (status = 403, description = "not an org admin"),
@@ -1135,7 +1135,7 @@ pub(crate) async fn list_plugins(
     path = "/v1/orgs/{org}/plugins",
     params(("org" = String, Path, description = "org")),
     request_body = InstallPluginRequest,
-    summary = "Install a plugin from a reviewed manifest (ADR-0072)",
+    summary = "Install a plugin from a reviewed manifest",
     responses(
         (status = 201, body = PluginInstallationDto),
         (status = 400, description = "invalid name, image, source, manifest, config or storage"),
@@ -1236,7 +1236,7 @@ pub(crate) async fn install_plugin(
         ("org" = String, Path, description = "org"),
         ("name" = String, Path, description = "installation name")
     ),
-    summary = "One plugin installation (ADR-0072)",
+    summary = "One plugin installation",
     responses(
         (status = 200, body = PluginInstallationDto),
         (status = 403, description = "not an org admin"),
@@ -1267,7 +1267,7 @@ pub(crate) async fn get_plugin(
         ("org" = String, Path, description = "org"),
         ("id" = String, Path, description = "installation id (10 hex)")
     ),
-    summary = "One plugin installation, by id (ADR-0072)",
+    summary = "One plugin installation, by id",
     responses(
         (status = 200, body = PluginInstallationDto),
         (status = 403, description = "not an org admin"),
@@ -1298,7 +1298,7 @@ pub(crate) async fn get_plugin_by_id(
         ("org" = String, Path, description = "org"),
         ("name" = String, Path, description = "installation name")
     ),
-    summary = "Uninstall a plugin; its name is retired (ADR-0072)",
+    summary = "Uninstall a plugin; its name is retired",
     responses(
         (status = 200, body = UninstalledPluginDto),
         (status = 403, description = "not an org admin"),
@@ -1358,7 +1358,7 @@ async fn set_state(
         ("org" = String, Path, description = "org"),
         ("name" = String, Path, description = "installation name")
     ),
-    summary = "Kill a plugin installation at once (ADR-0072)",
+    summary = "Kill a plugin installation at once",
     responses(
         (status = 200, body = PluginInstallationDto),
         (status = 403, description = "not an org admin"),
@@ -1381,7 +1381,7 @@ pub(crate) async fn kill_plugin(
         ("org" = String, Path, description = "org"),
         ("name" = String, Path, description = "installation name")
     ),
-    summary = "Re-enable a killed plugin installation (ADR-0072)",
+    summary = "Re-enable a killed plugin installation",
     responses(
         (status = 200, body = PluginInstallationDto),
         (status = 403, description = "not an org admin"),
@@ -1472,7 +1472,7 @@ fn upgrade_source(
         ("name" = String, Path, description = "installation name")
     ),
     request_body = FetchPluginUpgradeRequest,
-    summary = "Fetch a plugin manifest to review an upgrade against the installed one (ADR-0072 §10)",
+    summary = "Fetch a plugin manifest to review an upgrade against the installed one",
     responses(
         (status = 200, body = FetchedPluginUpgradeDto),
         (status = 400, description = "no source or commit, a bad source or image, a fetch that failed, a file that is not an admissible plugin manifest, another plugin's manifest, or an image the manifest does not name"),
@@ -1544,7 +1544,7 @@ fn same_plugin(current: &PluginInstallation, manifest: &PluginManifest) -> Resul
 /// version replaced is recorded. Administer on the Org.
 ///
 /// A new image digest is new code and is confirmed like an install, whatever
-/// the manifest (ADR-0072 §8, §10); so is a manifest that asks for more.
+/// the manifest; so is a manifest that asks for more.
 /// Only a same-or-narrower manifest on the installed image needs no step-up.
 /// The server decides from the installed installation and the manifest it
 /// reads here. Refused while `SCARAB_PLUGINS=off` (409), as an install is.
@@ -1558,7 +1558,7 @@ fn same_plugin(current: &PluginInstallation, manifest: &PluginManifest) -> Resul
         ("name" = String, Path, description = "installation name")
     ),
     request_body = UpgradePluginRequest,
-    summary = "Upgrade a plugin installation to a reviewed manifest and image (ADR-0072 §10)",
+    summary = "Upgrade a plugin installation to a reviewed manifest and image",
     responses(
         (status = 200, body = PluginInstallationDto),
         (status = 400, description = "a bad image or source, another plugin's manifest, a manifest that is not admissible, or an image the manifest does not name"),
@@ -1665,7 +1665,7 @@ fn describe_storage(s: &PluginStorage) -> String {
 /// not create, back up or read it. Administer on the Org.
 ///
 /// Adding storage to an installation that has none needs no step-up; moving
-/// it to another claim or path does (ADR-0073 §3, window), since that
+/// it to another claim or path does (window), since that
 /// re-aims what the plugin reads and writes.
 #[utoipa::path(
     put,
@@ -1675,7 +1675,7 @@ fn describe_storage(s: &PluginStorage) -> String {
         ("name" = String, Path, description = "installation name")
     ),
     request_body = PluginStorageRequest,
-    summary = "Set a plugin installation's storage claim (ADR-0074)",
+    summary = "Set a plugin installation's storage claim",
     responses(
         (status = 200, body = PluginInstallationDto),
         (status = 400, description = "invalid claim or mount path"),
@@ -1741,7 +1741,7 @@ pub(crate) async fn put_plugin_storage(
         ("org" = String, Path, description = "org"),
         ("name" = String, Path, description = "installation name")
     ),
-    summary = "Stop mounting a plugin installation's storage claim (ADR-0074)",
+    summary = "Stop mounting a plugin installation's storage claim",
     responses(
         (status = 200, body = PluginInstallationDto),
         (status = 403, description = "not an org admin"),
@@ -1842,7 +1842,7 @@ async fn delete_connection_credential(st: &AppState, credential_ref: &str) {
         ("org" = String, Path, description = "org"),
         ("name" = String, Path, description = "installation name")
     ),
-    summary = "A plugin's connection slots and their bindings (ADR-0072 §5)",
+    summary = "A plugin's connection slots and their bindings",
     responses(
         (status = 200, body = [PluginConnectionDto]),
         (status = 403, description = "not an org admin"),
@@ -1893,7 +1893,7 @@ pub(crate) async fn list_plugin_connections(
         ("slot" = String, Path, description = "the manifest's connection slot")
     ),
     request_body = PutPluginConnectionRequest,
-    summary = "Bind a plugin connection's destination and credential (ADR-0072 §5)",
+    summary = "Bind a plugin connection's destination and credential",
     responses(
         (status = 200, body = PluginConnectionDto),
         (status = 400, description = "unknown slot, or a malformed base URL, credential or CA"),
@@ -1999,7 +1999,7 @@ impl crate::people::ShowsPeople for PluginConnectionDto {
         ("name" = String, Path, description = "installation name"),
         ("slot" = String, Path, description = "the manifest's connection slot")
     ),
-    summary = "Unbind a plugin connection and delete its credential (ADR-0072 §5)",
+    summary = "Unbind a plugin connection and delete its credential",
     responses(
         (status = 204, description = "unbound"),
         (status = 400, description = "unknown slot"),
@@ -2041,7 +2041,7 @@ pub(crate) async fn delete_plugin_connection(
         ("name" = String, Path, description = "installation name"),
         BrokerJournalQuery
     ),
-    summary = "A plugin's broker journal, newest first (ADR-0072 §5)",
+    summary = "A plugin's broker journal, newest first",
     responses(
         (status = 200, body = BrokerJournalPage),
         (status = 400, description = "an unreadable query parameter"),

@@ -162,8 +162,7 @@ fn decode_cursor(raw: &str) -> Result<PendingGateKey, ApiError> {
     serde_json::from_slice(&bytes).map_err(|_| bad())
 }
 
-/// List the open waits of the gates that name the calling plugin (ADR-0076
-/// §7). Only a plugin's `scarab-api` token is accepted; another org's list
+/// List the open waits of the gates that name the calling plugin. Only a plugin's `scarab-api` token is accepted; another org's list
 /// is a 404. The query reads current state, so a restarted plugin catches up
 /// with nothing to replay.
 #[utoipa::path(

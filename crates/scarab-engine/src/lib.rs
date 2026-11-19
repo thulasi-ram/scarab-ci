@@ -172,7 +172,7 @@ pub struct RunSummary {
     /// inline runs (no named pipeline) and pre-stamping runs.
     #[serde(default)]
     pub pipeline: Option<String>,
-    /// The run **Headline** (ADR-0057) — the one human line saying what this run
+    /// The run **Headline** — the one human line saying what this run
     /// is about, disambiguated by `trigger_kind` (a push's commit subject; later
     /// a PR title / dispatch reason). Display/audit only. `None` when the trigger
     /// carried no headline and on pre-stamping runs.
@@ -183,7 +183,7 @@ pub struct RunSummary {
     /// context. `None` for ordinary CI runs.
     #[serde(default)]
     pub environment: Option<String>,
-    /// Whether this is a **deploy Run** (ADR-0074 §2): its pipeline, or one of
+    /// Whether this is a **deploy Run**: its pipeline, or one of
     /// its Steps, is marked `deploy: true`. Decided once at creation from the
     /// IR. Independent of `environment`.
     #[serde(default)]
@@ -271,8 +271,7 @@ pub enum FailureKind {
     Timeout,
     /// The backend lost the execution (vanished Pod, node stopped reporting).
     /// Conservatively post-start — it cannot be proven the process never ran —
-    /// so retry is assertion-gated and **counts against the attempt budget**
-    /// (ADR-0047).
+    /// so retry is assertion-gated and **counts against the attempt budget**.
     Lost,
     /// Permanent, author-fixable configuration/admission rejection — see
     /// [`FailureClass::Config`](crate::ports::FailureClass::Config). Never
@@ -771,7 +770,7 @@ pub struct StepSpec {
     /// issuer is not configured.
     #[serde(skip)]
     pub oidc_token: Option<String>,
-    /// Sidecar services (ADR-0058): throwaway backing containers co-located in
+    /// Sidecar services: throwaway backing containers co-located in
     /// this Step's Pod, reachable at `localhost:<port>`. The executor injects
     /// each as a native sidecar (an `initContainer` with `restartPolicy: Always`,
     /// reusing the ADR-0042 machinery); an optional readiness probe gates the

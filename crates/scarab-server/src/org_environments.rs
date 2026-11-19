@@ -43,7 +43,7 @@ use utoipa::ToSchema;
 use super::{authorize_scoped, rbac_scope, resolve_typed_subject, ApiError, AppState};
 use crate::step_up::GuardCtx;
 
-/// An org-level Environment in its minimal shape (ADR-0071, MMP step 1).
+/// An org-level Environment in its minimal shape (MMP step 1).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct OrgEnvironmentDto {
     pub org: String,
@@ -84,8 +84,8 @@ impl From<&OrgEnvironment> for OrgEnvironmentDto {
 
 /// `PUT /v1/orgs/{org}/environments/{env}`: the whole Environment, replaced.
 /// An omitted optional field takes its default — it does not keep the stored
-/// value. Unknown fields are refused, so a misspelt field — or one ADR-0074
-/// removed (`deployment_deadline_ms`, `deployment_sources`) — is a 4xx rather
+/// value. Unknown fields are refused, so a misspelt field — or a removed one
+/// (`deployment_deadline_ms`, `deployment_sources`) — is a 4xx rather
 /// than silently ignored.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -101,23 +101,23 @@ pub struct PutOrgEnvironmentRequest {
 }
 
 /// Protection rules as one layer holds them — an Environment's baseline or a
-/// Project's overlay (ADR-0071 §1, §3).
+/// Project's overlay.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct EnvironmentProtectionRulesDto {
-    /// Principal handles (stored as ids, ADR-0080). Every one must approve
+    /// Principal handles (stored as ids). Every one must approve
     /// (AND), unless the baseline's `approval_gate.required_approvals` says
     /// how many of its own must.
     pub approvers: Vec<String>,
     /// Ref globs a deploy's symbolic ref must match; empty = any ref.
     pub allowed_refs: Vec<String>,
     /// Seconds: a minimum wait on the Environment approval gate, counted on
-    /// the gate's wait clock (ADR-0078 §4). It does nothing where the
+    /// the gate's wait clock. It does nothing where the
     /// effective approvers are empty; a client shows that from `approvers`
     /// (here, or `effective.approvers` for a Project).
     pub wait_timer_s: u32,
-    /// A human dispatch must carry a reason (ADR-0057 §3).
+    /// A human dispatch must carry a reason.
     pub require_reason: bool,
-    /// The Environment approval gate's settings (ADR-0078 §3). Present on a
+    /// The Environment approval gate's settings. Present on a
     /// baseline only: an overlay has none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_gate: Option<ApprovalGateRulesDto>,
@@ -147,7 +147,7 @@ impl EnvironmentProtectionRulesDto {
 }
 
 /// What Run creation does when a Step that uses the Environment's authority
-/// has no `manual` gate upstream (ADR-0078 §3).
+/// has no `manual` gate upstream.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MissingGateModeDto {
@@ -176,8 +176,7 @@ impl From<MissingGateModeDto> for MissingGateMode {
     }
 }
 
-/// An Environment's settings for its Environment approval gate (ADR-0078
-/// §3): the `manual` gate that has a Step using the Environment's
+/// An Environment's settings for its Environment approval gate: the `manual` gate that has a Step using the Environment's
 /// authority after it.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ApprovalGateRulesDto {
@@ -209,7 +208,7 @@ impl From<&scarab_project::ApprovalGateRules> for ApprovalGateRulesDto {
 }
 
 /// The rules admission enforces for one Project in one Environment: the
-/// baseline merged with the Project's overlay (ADR-0071 §3), computed by the
+/// baseline merged with the Project's overlay, computed by the
 /// server so no client re-implements the merge.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct EffectiveProtectionDto {
@@ -239,7 +238,7 @@ impl From<&EffectiveProtection> for EffectiveProtectionDto {
     }
 }
 
-/// One entry of a privilege whitelist (ADR-0039).
+/// One entry of a privilege whitelist.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ImageGrantDto {
@@ -264,7 +263,7 @@ impl From<&ImageGrant> for ImageGrantDto {
     }
 }
 
-/// The privileges one Project holds within one Environment (ADR-0071 §8).
+/// The privileges one Project holds within one Environment.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct EnvironmentProjectPrivilegeGrantDto {
     pub privileged_images: Vec<ImageGrantDto>,
@@ -280,9 +279,9 @@ impl From<&EnvironmentProjectPrivilegeGrant> for EnvironmentProjectPrivilegeGran
     }
 }
 
-/// An org-level Environment as one Project sees it (ADR-0071): the read
-/// model behind `GET /v1/repos/{org}/{repo}/environments`, which until
-/// ADR-0071 returned the repo's own per-repo environments.
+/// An org-level Environment as one Project sees it: the read
+/// model behind `GET /v1/repos/{org}/{repo}/environments`, which once
+/// returned the repo's own per-repo environments.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ProjectEnvironmentDto {
     pub name: String,
@@ -338,7 +337,7 @@ pub(crate) fn org_environment_api_error(e: OrgEnvironmentError) -> ApiError {
     get,
     path = "/v1/orgs/{org}/environments",
     params(("org" = String, Path, description = "org")),
-    summary = "List an org's Environments (ADR-0071)",
+    summary = "List an org's Environments",
     responses(
         (status = 200, body = [OrgEnvironmentDto]),
         (status = 403, description = "no Read on the org"),
@@ -371,7 +370,7 @@ pub(crate) async fn list_org_environments(
         ("org" = String, Path, description = "org"),
         ("env" = String, Path, description = "environment name")
     ),
-    summary = "One org Environment (ADR-0071)",
+    summary = "One org Environment",
     responses(
         (status = 200, body = OrgEnvironmentDto, headers(
             ("ETag" = String, description = "the Environment's entity tag, for `If-Match` on its PUT")
@@ -459,7 +458,7 @@ fn write_precondition(headers: &HeaderMap) -> Result<WritePrecondition, ApiError
     put,
     path = "/v1/orgs/{org}/environments/{env}",
     request_body = PutOrgEnvironmentRequest,
-    summary = "Create or replace an org Environment (ADR-0071)",
+    summary = "Create or replace an org Environment",
     params(
         ("org" = String, Path, description = "org"),
         ("env" = String, Path, description = "environment name"),
@@ -692,7 +691,7 @@ async fn environment_holdings(
 /// step-up (it is irreversible destruction, as deleting a secret is).
 ///
 /// Refused (409) while any Project holds an overlay or privilege grant in
-/// it (ADR-0071 §3, §8: those are never dropped as a side effect), and while
+/// it (those are never dropped as a side effect), and while
 /// any Project holds a secret in it (git-bug 52964b4): a secret never
 /// outlives its Environment, and is never dropped as a side effect either.
 /// The refusal's JSON body lists them, with a count per kind.
@@ -714,7 +713,7 @@ async fn environment_holdings(
         ("env" = String, Path, description = "environment name"),
         DeleteOrgEnvironmentQuery
     ),
-    summary = "Delete an org Environment, with its overlays, grants and secrets when asked (ADR-0071)",
+    summary = "Delete an org Environment, with its overlays, grants and secrets when asked",
     responses(
         (status = 204, description = "deleted"),
         (status = 403, description = "not an org admin, or no step-up"),
@@ -1304,7 +1303,7 @@ async fn duplicate_org_environment_holding(
     ))
 }
 
-/// Which Projects may run Deploy Runs into an Environment (ADR-0071 §2):
+/// Which Projects may run Deploy Runs into an Environment:
 /// every Project in the org, or exactly those matching one of `projects`
 /// (project-name globs, `*` wildcards).
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -1343,7 +1342,7 @@ impl From<&EnvironmentProjectEligibility> for EnvironmentEligibilityDto {
         ("org" = String, Path, description = "org"),
         ("env" = String, Path, description = "environment name")
     ),
-    summary = "Which projects may deploy into an org Environment (ADR-0071 §2)",
+    summary = "Which projects may deploy into an org Environment",
     responses(
         (status = 200, body = EnvironmentEligibilityDto),
         (status = 403, description = "no Read on the org"),
@@ -1378,7 +1377,7 @@ pub(crate) async fn get_environment_eligibility(
         ("env" = String, Path, description = "environment name")
     ),
     request_body = EnvironmentEligibilityDto,
-    summary = "Replace which projects may deploy into an org Environment (ADR-0071 §2)",
+    summary = "Replace which projects may deploy into an org Environment",
     responses(
         (status = 200, body = EnvironmentEligibilityDto),
         (status = 400, description = "an empty, `*`-only or duplicated pattern (after trimming, case ignored), or patterns with all_projects"),
@@ -1485,12 +1484,12 @@ async fn step_up_unless_tightening(
 /// takes its default — never the stored value — so `{}` resets the baseline
 /// to permissive (and the approval gate settings to theirs).
 /// Unknown fields are refused, so the retired per-repo shape (`wait_timer`,
-/// `concurrency`) — and `deployment_concurrency`, which ADR-0074 removed — is
+/// `concurrency`) — and the removed `deployment_concurrency` — is
 /// a 400, not a silently ignored rule.
 #[derive(Debug, Default, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PutEnvironmentProtectionRequest {
-    /// Principal handles or ids (ADR-0069, ADR-0080): each must name an
+    /// Principal handles or ids: each must name an
     /// existing Principal; a merged one is stored as the Principal it now is.
     /// All must approve.
     #[serde(default)]
@@ -1498,11 +1497,10 @@ pub struct PutEnvironmentProtectionRequest {
     /// Ref globs (`refs/heads/main`, `refs/tags/*`); empty = any ref.
     #[serde(default)]
     pub allowed_refs: Vec<String>,
-    /// Seconds: a minimum wait on the Environment approval gate (ADR-0078
-    /// §4). Refused (400) above 0 with no approvers.
+    /// Seconds: a minimum wait on the Environment approval gate. Refused (400) above 0 with no approvers.
     #[serde(default)]
     pub wait_timer_s: u32,
-    /// A human dispatch must carry a reason (ADR-0057 §3). Omitted = off.
+    /// A human dispatch must carry a reason. Omitted = off.
     #[serde(default)]
     pub require_reason: bool,
     /// The approval gate settings, in the shape `GET` returns them under
@@ -1511,12 +1509,12 @@ pub struct PutEnvironmentProtectionRequest {
     pub approval_gate: PutApprovalGateRules,
 }
 
-/// The approval gate settings of a baseline `PUT` (ADR-0078). Each omitted
+/// The approval gate settings of a baseline `PUT`. Each omitted
 /// field takes its default.
 #[derive(Debug, Default, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PutApprovalGateRules {
-    /// `add` (default) or `refuse` (ADR-0078 §3).
+    /// `add` (default) or `refuse`.
     #[serde(default)]
     pub missing_gate_mode: MissingGateModeDto,
     /// Seconds before the gate the Environment adds expires; omitted = it
@@ -1533,7 +1531,7 @@ pub struct PutApprovalGateRules {
 }
 
 /// A Project overlay (`…/projects/{project}/overlay`) body: the baseline's
-/// four rules, which can only **tighten** (ADR-0071 §3). Replaced whole,
+/// four rules, which can only **tighten**. Replaced whole,
 /// omitted = permissive default, unknown fields refused — as for the
 /// baseline.
 #[derive(Debug, Default, Deserialize, ToSchema)]
@@ -1574,10 +1572,10 @@ impl From<&EnvironmentProjectOverlay> for EnvironmentProjectOverlayDto {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PutEnvironmentProjectPrivilegeGrantRequest {
-    /// The ADR-0039 whitelist; each digest listed once.
+    /// The privileged-image whitelist; each digest listed once.
     #[serde(default)]
     pub privileged_images: Vec<ImageGrantDto>,
-    /// May the Project's steps here set a raw `k8s_overlay` (ADR-0055).
+    /// May the Project's steps here set a raw `k8s_overlay`.
     #[serde(default)]
     pub permit_k8s_overlay: bool,
 }
@@ -1703,7 +1701,7 @@ fn refuse_wait_timer_without_approvers(
         ("org" = String, Path, description = "org"),
         ("env" = String, Path, description = "environment name")
     ),
-    summary = "An org Environment's baseline protection rules (ADR-0071 §1)",
+    summary = "An org Environment's baseline protection rules",
     responses(
         (status = 200, body = EnvironmentProtectionRulesDto),
         (status = 403, description = "no Read on the org"),
@@ -1740,7 +1738,7 @@ pub(crate) async fn get_environment_protection(
         ("env" = String, Path, description = "environment name")
     ),
     request_body = PutEnvironmentProtectionRequest,
-    summary = "Replace an org Environment's baseline protection rules (ADR-0071 §1)",
+    summary = "Replace an org Environment's baseline protection rules",
     responses(
         (status = 200, body = OrgEnvironmentDto),
         (status = 400, description = "an approver who is not a Scarab user, or an empty entry"),
@@ -1826,7 +1824,7 @@ pub(crate) async fn put_environment_protection(
         ("org" = String, Path, description = "org"),
         ("env" = String, Path, description = "environment name")
     ),
-    summary = "Projects with an overlay or privilege grant in an org Environment (ADR-0071 §3, §8)",
+    summary = "Projects with an overlay or privilege grant in an org Environment",
     responses(
         (status = 200, body = [EnvironmentProjectDto]),
         (status = 403, description = "no Read on the org"),
@@ -1860,7 +1858,7 @@ pub(crate) async fn list_environment_projects(
         ("env" = String, Path, description = "environment name"),
         ("project" = String, Path, description = "project (repo) name")
     ),
-    summary = "A project's tighten-only overlay in an org Environment (ADR-0071 §3)",
+    summary = "A project's tighten-only overlay in an org Environment",
     responses(
         (status = 200, body = EnvironmentProjectOverlayDto),
         (status = 403, description = "no Read on the project"),
@@ -1906,7 +1904,7 @@ pub(crate) async fn get_environment_project_overlay(
         ("project" = String, Path, description = "project (repo) name")
     ),
     request_body = PutEnvironmentProjectOverlayRequest,
-    summary = "Tighten an org Environment for one project (ADR-0071 §3)",
+    summary = "Tighten an org Environment for one project",
     responses(
         (status = 200, body = EnvironmentProjectOverlayDto),
         (status = 400, description = "an approver who is not a Scarab user, or an empty entry"),
@@ -2010,7 +2008,7 @@ pub(crate) async fn put_environment_project_overlay(
         ("env" = String, Path, description = "environment name"),
         ("project" = String, Path, description = "project (repo) name")
     ),
-    summary = "Remove a project's overlay in an org Environment (ADR-0071 §3)",
+    summary = "Remove a project's overlay in an org Environment",
     responses(
         (status = 204, description = "removed"),
         (status = 403, description = "not an admin of the project or org"),
@@ -2045,7 +2043,7 @@ pub(crate) async fn delete_environment_project_overlay(
         ("env" = String, Path, description = "environment name"),
         ("project" = String, Path, description = "project (repo) name")
     ),
-    summary = "A project's privilege grant in an org Environment (ADR-0071 §8)",
+    summary = "A project's privilege grant in an org Environment",
     responses(
         (status = 200, body = EnvironmentProjectPrivilegeGrantDto),
         (status = 403, description = "no Read on the org"),
@@ -2084,7 +2082,7 @@ pub(crate) async fn get_environment_project_privilege_grant(
         ("project" = String, Path, description = "project (repo) name")
     ),
     request_body = PutEnvironmentProjectPrivilegeGrantRequest,
-    summary = "Grant a project privileges in an org Environment (ADR-0071 §8)",
+    summary = "Grant a project privileges in an org Environment",
     responses(
         (status = 200, body = EnvironmentProjectPrivilegeGrantDto),
         (status = 400, description = "a digest that is not `sha256:…`, or one listed twice"),
@@ -2172,7 +2170,7 @@ pub(crate) async fn put_environment_project_privilege_grant(
         ("env" = String, Path, description = "environment name"),
         ("project" = String, Path, description = "project (repo) name")
     ),
-    summary = "Withdraw a project's privilege grant in an org Environment (ADR-0071 §8)",
+    summary = "Withdraw a project's privilege grant in an org Environment",
     responses(
         (status = 204, description = "withdrawn"),
         (status = 403, description = "not an org admin"),
