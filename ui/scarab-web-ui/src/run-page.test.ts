@@ -5,8 +5,10 @@ import { describe, expect, it } from "vitest";
 import {
   aboutDuration,
   clampRunUrl,
+  compactDuration,
   defaultSelection,
   failureBox,
+  failureWords,
   fitBand,
   matrixHeading,
   nodeMeta,
@@ -17,6 +19,8 @@ import {
   runSummary,
   runUrlParams,
   segmentByMatrix,
+  statusGlyph,
+  stepDisplayName,
   stepName,
   tryStatusWords,
 } from "./run-page";
@@ -392,6 +396,39 @@ describe("notLatestNote", () => {
     expect(notLatestNote(tries, 0)).toEqual({ text: "Not the latest try: try 3 is running", latest: 2 });
     expect(notLatestNote(tries, 2)).toBeNull();
     expect(notLatestNote(tries, null)).toBeNull();
+  });
+});
+
+describe("stepDisplayName", () => {
+  it("joins a matrix cell's values to its step, and leaves any other id alone", () => {
+    expect(stepDisplayName("plan[cluster=prod,phase=aws]")).toBe("plan · prod · aws");
+    expect(stepDisplayName("build")).toBe("build");
+  });
+});
+
+describe("statusGlyph", () => {
+  it("has a glyph per status, and a hollow one for the rest", () => {
+    expect(statusGlyph("succeeded")).toBe("✓");
+    expect(statusGlyph("failed")).toBe("✕");
+    expect(statusGlyph("superseded")).toBe("⊘");
+    expect(statusGlyph("pending")).toBe("○");
+  });
+});
+
+describe("failureWords", () => {
+  it("names a failure class, and passes an unknown one through", () => {
+    expect(failureWords("timeout")).toBe("timed out");
+    expect(failureWords(null)).toBe("failed");
+    expect(failureWords("oom")).toBe("oom");
+  });
+});
+
+describe("compactDuration", () => {
+  it("keeps a tenth of a second under 10s, then whole units", () => {
+    expect(compactDuration(4_200)).toBe("4.2s");
+    expect(compactDuration(72_000)).toBe("1m12s");
+    expect(compactDuration(3_780_000)).toBe("1h03m");
+    expect(compactDuration(-5)).toBe("0.0s");
   });
 });
 
