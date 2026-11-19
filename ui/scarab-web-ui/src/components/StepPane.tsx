@@ -1,9 +1,11 @@
 // The step pane: one pane for the selected step. Its header names the step,
-// the selected try ("Try 2 of 3 ▾"), what that try did ("✕ Failed after
-// 2m06s: step error") and the step's actions (Retry step, Rerun from here,
-// Debug pod, handed in by the page). A box under the header says why the try
-// failed, what holds it back, or where a step that did not run in this
-// version was reused from. Every content tab (Logs, Results, Workspace) is
+// the selected try ("Try 2 of 3"), what that try did ("✕ Failed after
+// 2m06s: step error"), a link to the step's artifacts and the step's actions
+// (Retry step, Rerun from here, Debug pod, handed in by the page). A step with
+// two or more tries gets a row of try tabs under the header; on a narrow
+// screen the header's "Try 2 of 3 ▾" dropdown picks instead. A box below
+// says why the try failed, what holds it back, or where a step that did not
+// run in this version was reused from. Every content tab (Logs, Results, Workspace) is
 // scoped to the selected try and says so; Outputs reads the try of record and
 // names it when it is a different one. Causes (first run, automatic retry,
 // retried by, rerun of) and outcomes come from the event log; a crash
@@ -48,6 +50,7 @@ import { shortHash } from "../libraries";
 import { absTime } from "../fmt";
 import Icon from "./Icon";
 import AttemptsDropdown, { type FilmstripTry } from "./AttemptsDropdown";
+import TryTabs from "./TryTabs";
 import Pill from "./Pill";
 
 export type PaneTab = "logs" | "results" | "outputs" | "workspace" | "source" | "gate";
@@ -118,6 +121,8 @@ export default function StepPane(props: {
   note?: JSX.Element;
   /** How many files this step published in the version in view. */
   artifacts?: number;
+  /** Open the run's Artifacts tab filtered to this step. */
+  onShowArtifacts?: () => void;
   /** The infra condition holding the step's current try back now (live view
    * only), in words, with the backend's message. */
   held?: { attempt: string; text: string; message?: string } | null;
@@ -129,6 +134,15 @@ export default function StepPane(props: {
   onShowTry?: (take: number, attempt: string) => void;
 }) {
   const [tab, setTab] = createSignal<PaneTab>(props.initialTab ?? "logs");
+  // Below 640px the try tabs do not fit: the header's dropdown picks instead.
+  const narrowQuery = typeof window !== "undefined" && window.matchMedia ? window.matchMedia("(max-width: 639px)") : null;
+  const [narrow, setNarrow] = createSignal(narrowQuery?.matches ?? false);
+  if (narrowQuery) {
+    const onNarrow = (e: MediaQueryListEvent) => setNarrow(e.matches);
+    narrowQuery.addEventListener("change", onNarrow);
+    onCleanup(() => narrowQuery.removeEventListener("change", onNarrow));
+  }
+  const tryTabs = () => props.tries.length > 1 && !narrow();
   createEffect(() => props.onTabChange?.(tab()));
   // A plugin gate opens on its Gate tab; any other step never
   // stays on one.
@@ -527,16 +541,32 @@ export default function StepPane(props: {
                 active={props.activeAttempt}
                 onSelect={props.onAttemptSelect}
                 noun={noun()}
+                static={tryTabs()}
               />
               <span class={`sp-status ${status().tone}`}>{status().text}</span>
               <Show when={(props.artifacts ?? 0) > 0}>
-                <span class="sp-files">
+                <button
+                  type="button"
+                  class="linklike sp-files"
+                  onClick={() => props.onShowArtifacts?.()}
+                  title="Open the Artifacts tab, showing this step's files"
+                >
                   {props.artifacts} {props.artifacts === 1 ? "artifact" : "artifacts"}
-                </span>
+                </button>
               </Show>
               <span class="grow1" />
               <span class="sp-actions">{props.actions}</span>
             </div>
+            <Show when={tryTabs()}>
+              <TryTabs
+                tries={props.tries}
+                active={props.activeAttempt}
+                ofRecord={notRun() ? null : ofRecordTry()}
+                onSelect={props.onAttemptSelect}
+                noun={noun()}
+                now={props.now ?? Date.now()}
+              />
+            </Show>
             {props.note}
             <Show when={props.gateLabel}>
               {(label) => (

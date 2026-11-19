@@ -6,10 +6,12 @@
 // - a notice slot: gate approvals, the read-only banner of an older version,
 //   the yank note, the retention note and the run's policy decisions;
 // - a summary line: which steps failed first, or what is running and waiting;
-// - the Pipeline panel: the step graph or the step list;
-// - the step pane for the selected step: its header and actions, the selected
-//   try's failure box, and its content tabs;
-// - the run's Artifacts and Activity.
+// - the run tabs: Pipeline, Artifacts and Activity;
+// - in Pipeline, the step graph or the step list, then the step pane for the
+//   selected step: its header and actions, its try tabs, the selected try's
+//   failure box, and its content tabs. The step pane stays mounted while
+//   another run tab is open, so a log stream does not restart;
+// - in Artifacts, the run's files grouped by step; in Activity, its events.
 // Versions and tries are derived from the event log; "Take" and "Attempt"
 // never show. Picking an older version turns the page into a read-only view
 // of the run as it stood then. The selected step, version, try and tab live in
@@ -52,22 +54,13 @@ import {
   type RerunPlan,
   type RetentionInfo,
 } from "../api/client";
-import {
-  eventParts,
-  eventCategory,
-  EVENT_GLYPH,
-  activeInfraConditions,
-  infraReasonText,
-  type ActiveInfraCondition,
-} from "../events";
+import { activeInfraConditions, infraReasonText, type ActiveInfraCondition } from "../events";
 import {
   deriveTakes,
   replayTake,
   versionRows,
   stepTiming,
   attemptPlaces,
-  tryLabel,
-  artifactCount,
   visibleArtifacts as visibleArtifactsIn,
   type Take,
   type TakeView,
@@ -97,11 +90,12 @@ import {
   parseRunUrl,
   runSummary,
   runUrlParams,
-  stepName,
+  stepDisplayName,
   type PaneTabParam,
   type RunTabParam,
   type RunUrlState,
 } from "../run-page";
+import { activityView, triggerLine } from "../run-tabs";
 import { relTime, absTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
 import { triggerIcon, triggerText } from "../trigger";
@@ -120,26 +114,17 @@ import DebugShell from "../components/DebugShell";
 import RerunConfirm from "../components/RerunConfirm";
 import CancelRunConfirm from "../components/CancelRunConfirm";
 import RunMoreMenu from "../components/RunMoreMenu";
-import Pill from "../components/Pill";
+import RunArtifacts from "../components/RunArtifacts";
+import RunActivity from "../components/RunActivity";
 
 const POLL_MS = 1200;
-
-/** Human byte size. */
-function fmtSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
 
 /** The step tab as the URL names it (absent = Logs; a gate's tab is not kept). */
 const paneTabParam = (t: PaneTab): PaneTabParam | undefined =>
   t === "results" || t === "workspace" || t === "outputs" || t === "source" ? t : undefined;
 
-/** A step's display name for a link: "plan · treebo-production · aws-cluster". */
-const displayName = (id: string): string => {
-  const n = stepName(id);
-  return n.cell ? `${n.base} · ${n.cell}` : n.base;
-};
+/** A run tab: Pipeline (absent from the URL), Artifacts or Activity. */
+type RunTab = "pipeline" | RunTabParam;
 
 export default function RunDetail() {
   const params = useParams();
@@ -151,9 +136,14 @@ export default function RunDetail() {
 
   // The URL's selection, read once: it beats the default selection on load.
   const urlInit: RunUrlState = parseRunUrl(searchParams);
-  // The run tab is part of the URL already; until the run tabs exist it is
-  // kept as given.
-  const runTab: RunTabParam | undefined = urlInit.tab;
+  // The open run tab, and the step the Artifacts tab is narrowed to (set by a
+  // step header's "N artifacts" link, cleared by "Show all").
+  const [runTab, setRunTab] = createSignal<RunTab>(urlInit.tab ?? "pipeline");
+  const [artifactStep, setArtifactStep] = createSignal<string | null>(null);
+  const openArtifacts = (step: string | null) => {
+    setArtifactStep(step);
+    setRunTab("artifacts");
+  };
 
   const [run, setRun] = createSignal<RunStatus | null>(null);
   // A 1s tick for plugin gate expiry clocks and the step header's timers.
@@ -569,7 +559,8 @@ export default function RunDetail() {
     if (!r) return "";
     const s = sel();
     const st: RunUrlState = {};
-    if (runTab) st.tab = runTab;
+    const rt = runTab();
+    if (rt !== "pipeline") st.tab = rt;
     const pt = paneTabParam(paneTab());
     if (pt) st.ptab = pt;
     if (s?.startsWith(SERVICE_PREFIX)) {
@@ -856,6 +847,35 @@ export default function RunDetail() {
       dagSteps().map((s) => ({ id: s.id, status: s.status, needs: s.needs })),
       held,
     );
+  };
+
+  // A step's tries in the version in view, for the List view. Only a step
+  // with more than one try is worth the event-log walk.
+  const triesOfStep = (stepId: string): FilmstripTry[] => {
+    const s = stepList().find((x) => x.id === stepId);
+    if (!s || (s.attempt_list?.length ?? 0) < 2) return [];
+    return stripTriesOf(visibleEvents(), s.id, s.attempt_list ?? [], stepWindow(stepId));
+  };
+  // Open one try of a step (a List view try row): the try is kept like a pick
+  // in the try tabs.
+  const selectTry = (stepId: string, attempt: string) => {
+    if (sel() === stepId) {
+      setSelAttempt(attempt);
+      return;
+    }
+    pendingTry = attempt;
+    selectNode(stepId);
+  };
+
+  // The Activity tab: its count (Run and steps), and on a live run a dot
+  // while a condition holds a step back.
+  const activityCount = createMemo(() => activityView(visibleEvents(), heldNow(), "steps").counts.steps);
+  const activeCondition = () => Object.keys(heldNow()).length > 0;
+  // The trigger event in words, for the Activity tab.
+  const triggerSentence = (): string | null => {
+    const t = triggerInfo();
+    if (!t) return null;
+    return triggerLine({ words: triggerWords(), branch: headBranch(t), sha: t.sha, actor: t.actor });
   };
 
   // Show an earlier version's try (the step pane's "Reused from" link).
@@ -1247,8 +1267,15 @@ export default function RunDetail() {
                     {(sid, i) => (
                       <>
                         {i() > 0 ? ", " : ""}
-                        <button type="button" class="linklike mono" onClick={() => selectNode(sid)}>
-                          {displayName(sid)}
+                        <button
+                          type="button"
+                          class="linklike mono"
+                          onClick={() => {
+                            selectNode(sid);
+                            setRunTab("pipeline");
+                          }}
+                        >
+                          {stepDisplayName(sid)}
                         </button>
                       </>
                     )}
@@ -1270,81 +1297,138 @@ export default function RunDetail() {
               </Show>
               <Show when={distinctNames(visibleArtifacts()) > 0}>
                 <span class="rd-sum-part subtle">
-                  {distinctNames(visibleArtifacts())}{" "}
-                  {distinctNames(visibleArtifacts()) === 1 ? "artifact" : "artifacts"}
+                  ·{" "}
+                  <button type="button" class="linklike" onClick={() => openArtifacts(null)}>
+                    {distinctNames(visibleArtifacts())}{" "}
+                    {distinctNames(visibleArtifacts()) === 1 ? "artifact" : "artifacts"}
+                  </button>
                 </span>
               </Show>
+            </div>
+
+            {/* ── Run tabs ── */}
+            <div class="run-tabs" role="tablist" aria-label="Run">
+              <button
+                type="button"
+                role="tab"
+                class="run-tab"
+                aria-selected={runTab() === "pipeline"}
+                onClick={() => setRunTab("pipeline")}
+              >
+                Pipeline <span class="run-tab-n">{r().steps.length} {r().steps.length === 1 ? "step" : "steps"}</span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                class="run-tab"
+                aria-selected={runTab() === "artifacts"}
+                onClick={() => openArtifacts(null)}
+              >
+                Artifacts{" "}
+                <span class="run-tab-n" classList={{ zero: distinctNames(visibleArtifacts()) === 0 }}>
+                  {distinctNames(visibleArtifacts())}
+                </span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                class="run-tab"
+                aria-selected={runTab() === "activity"}
+                onClick={() => setRunTab("activity")}
+              >
+                Activity{" "}
+                <Show
+                  when={!(live() && !timeTraveling())}
+                  fallback={
+                    <Show when={activeCondition()}>
+                      <span class="run-tab-dot" role="img" aria-label="warning" title="A step is held back right now" />
+                    </Show>
+                  }
+                >
+                  <span class="run-tab-n">{activityCount()}</span>
+                </Show>
+              </button>
             </div>
 
             {/* ── Pipeline panel: the graph or the list ── */}
-            <div class="panel pipeline-panel" classList={{ readonly: timeTraveling() }}>
-              <div class="panel-h pipeline-toolbar">
-                <span class="pv-switch" role="group" aria-label="Pipeline view">
-                  <button
-                    type="button"
-                    class="pv-tab"
-                    aria-pressed={view() === "graph"}
-                    onClick={() => setView("graph")}
-                  >
-                    Graph
-                  </button>
-                  <button
-                    type="button"
-                    class="pv-tab"
-                    aria-pressed={view() === "list"}
-                    onClick={() => setView("list")}
-                  >
-                    List <span class="pv-count">{r().steps.length}</span>
-                  </button>
-                </span>
-                <span class="pt-count">select a step to open it below</span>
-                <span class="grow1" />
-                <Show when={view() === "graph"}>
-                  <span class="dag-zoomctl">
-                    <button type="button" title="Back to the fitted view" onClick={() => dagControls()?.fit()}>
-                      ⤢
+            <Show when={runTab() === "pipeline"}>
+              <div class="panel pipeline-panel" classList={{ readonly: timeTraveling() }}>
+                <div class="panel-h pipeline-toolbar">
+                  <span class="pv-switch" role="group" aria-label="Pipeline view">
+                    <button
+                      type="button"
+                      class="pv-tab"
+                      aria-pressed={view() === "graph"}
+                      onClick={() => setView("graph")}
+                    >
+                      Graph
                     </button>
-                    <button type="button" title="Zoom in" onClick={() => dagControls()?.zoomIn()}>
-                      ＋
-                    </button>
-                    <button type="button" title="Zoom out" onClick={() => dagControls()?.zoomOut()}>
-                      －
+                    <button
+                      type="button"
+                      class="pv-tab"
+                      aria-pressed={view() === "list"}
+                      onClick={() => setView("list")}
+                    >
+                      List <span class="pv-count">{r().steps.length}</span>
                     </button>
                   </span>
+                  <span class="pt-count">select a step to open it below</span>
+                  <span class="grow1" />
+                  <Show when={view() === "graph"}>
+                    <span class="dag-zoomctl">
+                      <button type="button" title="Back to the fitted view" onClick={() => dagControls()?.fit()}>
+                        ⤢
+                      </button>
+                      <button type="button" title="Zoom in" onClick={() => dagControls()?.zoomIn()}>
+                        ＋
+                      </button>
+                      <button type="button" title="Zoom out" onClick={() => dagControls()?.zoomOut()}>
+                        －
+                      </button>
+                    </span>
+                  </Show>
+                </div>
+                <Show
+                  when={view() === "graph"}
+                  fallback={
+                    <StepList
+                      steps={dagSteps()}
+                      services={dagServices()}
+                      selected={sel()}
+                      onSelect={selectNode}
+                      now={nowTick()}
+                      triesOf={triesOfStep}
+                      activeTry={stripActiveAttempt()}
+                      onSelectTry={selectTry}
+                    />
+                  }
+                >
+                  {/* Shared services are copper peers in a lane at the top with
+                      dotted `uses` edges; a step's own sidecars are chips on its
+                      node. */}
+                  <div class="dag-band">
+                    <Dag
+                      steps={dagSteps()}
+                      services={dagServices()}
+                      selected={sel()}
+                      onSelect={selectNode}
+                      onSelectSidecar={selectSidecar}
+                      sidecarFocus={focusSidecar()}
+                      onControls={setDagControls}
+                    />
+                  </div>
                 </Show>
               </div>
-              <Show
-                when={view() === "graph"}
-                fallback={
-                  <StepList
-                    steps={dagSteps()}
-                    services={dagServices()}
-                    selected={sel()}
-                    onSelect={selectNode}
-                    now={nowTick()}
-                  />
-                }
-              >
-                {/* Shared services are copper peers in a lane at the top with
-                    dotted `uses` edges; a step's own sidecars are chips on its
-                    node. */}
-                <div class="dag-band">
-                  <Dag
-                    steps={dagSteps()}
-                    services={dagServices()}
-                    selected={sel()}
-                    onSelect={selectNode}
-                    onSelectSidecar={selectSidecar}
-                    sidecarFocus={focusSidecar()}
-                    onControls={setDagControls}
-                  />
-                </div>
-              </Show>
-            </div>
+            </Show>
 
             {/* ── Step pane: a shared service opens ServicePane; a step,
-                StepPane with its actions. ── */}
-            <div class="rd-evidence" classList={{ readonly: timeTraveling() }}>
+                StepPane with its actions. Hidden, never unmounted, while
+                another run tab is open. ── */}
+            <div
+              class="rd-evidence"
+              classList={{ readonly: timeTraveling() }}
+              style={{ display: runTab() === "pipeline" ? undefined : "none" }}
+            >
               <Show
                 when={isServiceSel()}
                 fallback={
@@ -1370,6 +1454,7 @@ export default function RunDetail() {
                       !timeTraveling() && selectedStep() ? environmentGateLabel(selectedStep()!, runEnv()) : null
                     }
                     artifacts={stepArtifacts(sel())}
+                    onShowArtifacts={() => openArtifacts(sel())}
                     held={(() => {
                       const h = sel() ? heldNow()[sel()!] : undefined;
                       return h
@@ -1510,95 +1595,25 @@ export default function RunDetail() {
               )}
             </Show>
 
-            {/* Artifacts: the run's files of record, immutable per try. The
-                bare download is the of-record copy; an earlier copy downloads
-                by its step and try. */}
-            <div class="panel artifacts-panel">
-              <div class="artifacts-foot">
-                <div class="af-h">
-                  <span>Artifacts</span>
-                  <span class="subtle">{artifactCount(visibleArtifacts())}</span>
-                </div>
-                <Show
-                  when={visibleArtifacts().length > 0}
-                  fallback={<p class="empty">no artifacts published by this run</p>}
-                >
-                  <ul class="filelist">
-                    <For each={visibleArtifacts()}>
-                      {(a) => (
-                        <li class="filerow" classList={{ shadowed: !a.of_record }}>
-                          <span class="fname">
-                            <Icon icon="package" size={14} />
-                            <a
-                              href={
-                                a.of_record || !a.step
-                                  ? artifactUrl(id(), a.name)
-                                  : artifactUrl(id(), a.name, { step: a.step, attempt: a.attempt })
-                              }
-                              download={a.name}
-                            >
-                              {a.name}
-                            </a>
-                          </span>
-                          <Show when={a.step}>
-                            <Pill tone={a.succeeded ? "muted" : "danger"}>
-                              {tryLabel(places(), a.step!, a.attempt, selectedTake()?.n ?? null)}
-                              {a.succeeded ? "" : " ✗"}
-                            </Pill>
-                          </Show>
-                          <Show when={a.of_record}>
-                            <Pill tone="accent" title="what the bare name-addressed download serves">
-                              of record
-                            </Pill>
-                          </Show>
-                          <span class="fsize mono">{fmtSize(a.size)}</span>
-                          <span class="fmeta mono">{a.content_type}</span>
-                        </li>
-                      )}
-                    </For>
-                  </ul>
-                </Show>
-              </div>
-            </div>
-
-            <div class="panel activity-panel">
-              <div class="panel-h">
-                <span>Activity</span>
-                <span class="subtle">
-                  {visibleEvents().length} events
-                  {timeTraveling() ? ` · ${events().length - visibleEvents().length} later hidden by this version` : ""}
-                </span>
-              </div>
-              <div class="tl">
-                {/* Newest first, so a live run's latest activity is in view
-                    without scrolling. `visibleEvents()` stays chronological
-                    for StepPane; only this copy is reversed. */}
-                <For each={[...visibleEvents()].reverse()} fallback={<div class="tl-empty">no events yet</div>}>
-                  {(e) => {
-                    const cat = eventCategory(e);
-                    const parts = eventParts(e);
-                    return (
-                      <div class="tl-item">
-                        <div class="tl-time" title={absTime(e.at)}>
-                          {relTime(e.at)}
-                        </div>
-                        <div class="tl-rail">
-                          <div class={`tl-glyph ${cat}`}>{EVENT_GLYPH[cat]}</div>
-                        </div>
-                        <div class="tl-body">
-                          <div class="tl-msg">
-                            <Show when={parts.step}>
-                              <b class="tl-step mono">{parts.step}</b>
-                            </Show>
-                            {parts.text}
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  }}
-                </For>
-              </div>
-            </div>
+            <Show when={runTab() === "artifacts"}>
+              <RunArtifacts
+                runId={id()}
+                artifacts={visibleArtifacts()}
+                stepOrder={stepList().map((s) => s.id)}
+                places={places()}
+                viewedTake={selectedTake()?.n ?? null}
+                onlyStep={artifactStep()}
+                onShowAll={() => setArtifactStep(null)}
+              />
+            </Show>
+            <Show when={runTab() === "activity"}>
+              <RunActivity
+                events={visibleEvents()}
+                later={events().length - visibleEvents().length}
+                active={heldNow()}
+                trigger={triggerSentence()}
+              />
+            </Show>
             <Show when={shellOpen() && sel()}>
               <DebugShell runId={id()} step={sel()!} mode={shellMode()} onClose={() => setShellOpen(false)} />
             </Show>

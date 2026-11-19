@@ -2,12 +2,15 @@
 // (its definition order, so a step comes after what it needs), the cells of a
 // matrix grouped under one heading, with an All / Failed filter. Each row
 // gives the status glyph, the step's name or its cell values, its status in
-// words and how long it took. Shared services come first, as rows that open
-// the service. For runs too big to read as a graph. Page chrome, so it reads
-// the page tokens.
+// words and how long it took. A step with two or more tries in the version in
+// view lists them under its row, newest first, each opening that try. Shared
+// services come first, as rows that open the service. For runs too big to
+// read as a graph. Page chrome, so it reads the page tokens.
 import { createSignal, For, Show } from "solid-js";
 import type { DagService, DagStep } from "./Dag";
 import { compactDuration, matrixHeading, segmentByMatrix, statusGlyph, statusWord } from "../run-page";
+import { nestedTries, tryDurationMs, tryWords } from "../run-tabs";
+import { causeText, type FilmstripTry } from "../attempts";
 
 /** The words for a row: "Passed · 2 tries", "Waiting for a node". */
 function rowWords(s: DagStep): string {
@@ -28,6 +31,12 @@ export default function StepList(props: {
   selected: string | null;
   onSelect: (id: string) => void;
   now: number;
+  /** A step's tries in the version in view. */
+  triesOf?: (id: string) => FilmstripTry[];
+  /** The selected step's selected try. */
+  activeTry?: string | null;
+  /** Open one try of a step. */
+  onSelectTry?: (step: string, attempt: string) => void;
 }) {
   const [filter, setFilter] = createSignal<"all" | "failed">("all");
   const failedCount = () => props.steps.filter((s) => s.status === "failed").length;
@@ -100,21 +109,45 @@ export default function StepList(props: {
             </Show>
             <For each={seg.items}>
               {(it) => (
-                <button
-                  type="button"
-                  class="slist-row"
-                  classList={{ sel: props.selected === it.item.id, cell: !!seg.matrix }}
-                  aria-pressed={props.selected === it.item.id}
-                  onClick={() => props.onSelect(it.item.id)}
-                  title={it.item.id}
-                >
-                  <span class={`slist-g ${tone(it.item)}`} aria-hidden="true">
-                    {it.item.note?.tone === "warning" ? "◷" : statusGlyph(it.item.status)}
-                  </span>
-                  <span class="slist-name">{it.label}</span>
-                  <span class="slist-words">{rowWords(it.item)}</span>
-                  <span class="slist-dur">{took(it.item)}</span>
-                </button>
+                <>
+                  <button
+                    type="button"
+                    class="slist-row"
+                    classList={{ sel: props.selected === it.item.id, cell: !!seg.matrix }}
+                    aria-pressed={props.selected === it.item.id}
+                    onClick={() => props.onSelect(it.item.id)}
+                    title={it.item.id}
+                  >
+                    <span class={`slist-g ${tone(it.item)}`} aria-hidden="true">
+                      {it.item.note?.tone === "warning" ? "◷" : statusGlyph(it.item.status)}
+                    </span>
+                    <span class="slist-name">{it.label}</span>
+                    <span class="slist-words">{rowWords(it.item)}</span>
+                    <span class="slist-dur">{took(it.item)}</span>
+                  </button>
+                  <For each={props.triesOf ? nestedTries(props.triesOf(it.item.id)) : []}>
+                    {(t) => {
+                      const on = () => props.selected === it.item.id && props.activeTry === t.id;
+                      const dur = () => tryDurationMs(t, props.now);
+                      return (
+                        <button
+                          type="button"
+                          class="slist-try"
+                          classList={{ sel: on(), cell: !!seg.matrix }}
+                          aria-pressed={on()}
+                          onClick={() => props.onSelectTry?.(it.item.id, t.id)}
+                        >
+                          <span class={`slist-g ${t.outcome}`} aria-hidden="true">
+                            {statusGlyph(t.outcome)}
+                          </span>
+                          <span class="slist-try-w">{tryWords(t.index + 1, t, it.item.gate ? "Wait" : "Try")}</span>
+                          <span class="slist-words">{causeText(t.cause)}</span>
+                          <span class="slist-dur">{dur() !== null ? compactDuration(dur()!) : ""}</span>
+                        </button>
+                      );
+                    }}
+                  </For>
+                </>
               )}
             </For>
           </>

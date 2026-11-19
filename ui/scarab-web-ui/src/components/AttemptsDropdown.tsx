@@ -3,10 +3,12 @@
 // 3 ▾", and whose menu lists every try newest first: its outcome and failure,
 // why it exists (first run, automatic retry, retried by someone) and when it
 // started, and how long it took. A gate's tries are its waits: "Wait 2 of 3".
+// The menu itself (`TryMenu`) also serves the try tabs' "Earlier tries" menu.
 // Page chrome, so it reads the page tokens, not the graph canvas ones.
-import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
+import { For, Show, createSignal, onCleanup, onMount, type JSX } from "solid-js";
 import { causeText, type FilmstripTry } from "../attempts";
 import { failureWords, statusGlyph, statusWord } from "../run-page";
+import { pluralNoun } from "../run-tabs";
 import { duration, relTime } from "../fmt";
 
 // One try of the selected step (`FilmstripTry`) is pure, in src/attempts.ts.
@@ -35,22 +37,23 @@ const tone = (t: FilmstripTry): string =>
         ? "running"
         : "copper";
 
-export default function AttemptsDropdown(props: {
-  tries: FilmstripTry[];
+/** A button that opens a menu of tries, newest first. `rows` are the tries the
+ * menu lists; `label` is the trigger's content. */
+export function TryMenu(props: {
+  rows: FilmstripTry[];
   /** The try currently scoping the step pane. */
   active: string | null;
-  /** Pick a try: scopes the step pane to it. */
   onSelect: (id: string | null) => void;
-  /** "Try", or "Wait" for a gate. */
-  noun?: string;
+  noun: string;
+  label: JSX.Element;
+  /** The trigger's class. */
+  class: string;
+  /** Mark the trigger as holding the selection. */
+  selected?: boolean;
 }) {
   const [open, setOpen] = createSignal(false);
-  const noun = () => props.noun ?? "Try";
   let menu: HTMLDivElement | undefined;
-
-  const activeTry = (): FilmstripTry =>
-    props.tries.find((t) => t.id === props.active) ?? props.tries[props.tries.length - 1];
-  const newestFirst = () => [...props.tries].reverse();
+  const newestFirst = () => [...props.rows].sort((a, b) => b.index - a.index);
 
   const pick = (id: string) => {
     props.onSelect(id);
@@ -74,78 +77,114 @@ export default function AttemptsDropdown(props: {
   };
 
   return (
+    <span class="adrop">
+      <button
+        type="button"
+        class={props.class}
+        classList={{ open: open(), on: !!props.selected }}
+        aria-haspopup="menu"
+        aria-expanded={open()}
+        onClick={() => {
+          setOpen((v) => !v);
+          if (open())
+            queueMicrotask(() =>
+              (
+                menu?.querySelector<HTMLButtonElement>("[aria-checked=true]") ??
+                menu?.querySelector<HTMLButtonElement>("[role=menuitemradio]")
+              )?.focus(),
+            );
+        }}
+      >
+        {props.label}
+        <span class="adrop-caret" aria-hidden="true">
+          ▾
+        </span>
+      </button>
+
+      <Show when={open()}>
+        <div class="adrop-backdrop" aria-hidden="true" onClick={() => setOpen(false)} />
+        <div class="adrop-menu" role="menu" aria-label={`${pluralNoun(props.noun)} of this step`} ref={menu} onKeyDown={onMenuKey}>
+          <For each={newestFirst()}>
+            {(t) => {
+              const isActive = () => t.id === props.active;
+              return (
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={isActive()}
+                  class={`adrop-row ${tone(t)}`}
+                  classList={{ shadow: t.shadowed, sel: isActive() }}
+                  onClick={() => pick(t.id)}
+                >
+                  <span class="adrop-n">
+                    {props.noun} {t.index + 1}
+                  </span>
+                  <span class="adrop-body">
+                    <span class="adrop-out">
+                      {statusGlyph(t.outcome)} {outcomeWords(t)}
+                      <Show when={t.readopted}>
+                        {" "}
+                        <Readopt />
+                      </Show>
+                    </span>
+                    <small>
+                      {[causeText(t.cause), t.startedAt ? relTime(t.startedAt) : ""].filter(Boolean).join(" · ")}
+                    </small>
+                  </span>
+                  <span class="adrop-dur">
+                    {t.startedAt && t.finishedAt ? duration(t.startedAt, t.finishedAt) : ""}
+                  </span>
+                </button>
+              );
+            }}
+          </For>
+        </div>
+      </Show>
+    </span>
+  );
+}
+
+export default function AttemptsDropdown(props: {
+  tries: FilmstripTry[];
+  /** The try currently scoping the step pane. */
+  active: string | null;
+  /** Pick a try: scopes the step pane to it. */
+  onSelect: (id: string | null) => void;
+  /** "Try", or "Wait" for a gate. */
+  noun?: string;
+  /** Plain text even with several tries ("Try 2 of 3"): the try tabs under
+   * the header do the picking. */
+  static?: boolean;
+}) {
+  const noun = () => props.noun ?? "Try";
+  const activeTry = (): FilmstripTry =>
+    props.tries.find((t) => t.id === props.active) ?? props.tries[props.tries.length - 1];
+
+  return (
     <Show when={props.tries.length > 0}>
       <Show
-        when={props.tries.length > 1}
+        when={props.tries.length > 1 && !props.static}
         fallback={
           <span class="trypick static">
-            <span class="k">{noun()}</span> 1 of 1
+            <span class="k">{noun()}</span> {activeTry().index + 1} of {props.tries.length}
           </span>
         }
       >
-        <span class="adrop">
-          <button
-            type="button"
-            class="trypick"
-            classList={{ open: open() }}
-            aria-haspopup="menu"
-            aria-expanded={open()}
-            onClick={() => {
-              setOpen((v) => !v);
-              if (open()) queueMicrotask(() => menu?.querySelector<HTMLButtonElement>("[aria-checked=true]")?.focus());
-            }}
-          >
-            <span class="k">{noun()}</span> {activeTry().index + 1} of {props.tries.length}
-            <Show when={activeTry().readopted}>
-              <Readopt />
-            </Show>
-            <span class="adrop-caret" aria-hidden="true">
-              ▾
-            </span>
-          </button>
-
-          <Show when={open()}>
-            <div class="adrop-backdrop" aria-hidden="true" onClick={() => setOpen(false)} />
-            <div class="adrop-menu" role="menu" aria-label={`${noun()}s of this step`} ref={menu} onKeyDown={onMenuKey}>
-              <For each={newestFirst()}>
-                {(t) => {
-                  const isActive = () => t.id === props.active;
-                  return (
-                    <button
-                      type="button"
-                      role="menuitemradio"
-                      aria-checked={isActive()}
-                      class={`adrop-row ${tone(t)}`}
-                      classList={{ shadow: t.shadowed, sel: isActive() }}
-                      onClick={() => pick(t.id)}
-                    >
-                      <span class="adrop-n">
-                        {noun()} {t.index + 1}
-                      </span>
-                      <span class="adrop-body">
-                        <span class="adrop-out">
-                          {statusGlyph(t.outcome)} {outcomeWords(t)}
-                          <Show when={t.readopted}>
-                            {" "}
-                            <Readopt />
-                          </Show>
-                        </span>
-                        <small>
-                          {[causeText(t.cause), t.startedAt ? relTime(t.startedAt) : ""]
-                            .filter(Boolean)
-                            .join(" · ")}
-                        </small>
-                      </span>
-                      <span class="adrop-dur">
-                        {t.startedAt && t.finishedAt ? duration(t.startedAt, t.finishedAt) : ""}
-                      </span>
-                    </button>
-                  );
-                }}
-              </For>
-            </div>
-          </Show>
-        </span>
+        <TryMenu
+          rows={props.tries}
+          active={props.active}
+          onSelect={props.onSelect}
+          noun={noun()}
+          class="trypick"
+          label={
+            <>
+              <span class="k">{noun()}</span> {activeTry().index + 1} of {props.tries.length}
+              <Show when={activeTry().readopted}>
+                <Readopt />
+              </Show>
+            </>
+          }
+        />
       </Show>
     </Show>
   );

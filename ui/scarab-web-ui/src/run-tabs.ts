@@ -194,6 +194,11 @@ export function foldTries<T extends { id: string }>(
   return { shown, earlier, selectedEarlier: selected !== null && earlier.some((t) => t.id === selected) };
 }
 
+/** "Tries", or "Waits" for a gate's tries. */
+export function pluralNoun(noun: string): string {
+  return noun === "Wait" ? "Waits" : "Tries";
+}
+
 /** One try in words, numbered from 1: "Try 3 · passed", "Try 2 · failed: step
  * error", "Wait 1 · running". */
 export function tryWords(n: number, t: { outcome: string; failure?: string | null }, noun = "Try"): string {

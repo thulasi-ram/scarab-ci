@@ -2710,40 +2710,7 @@ h1, .crumb-head, .run-title {
 .ws-fallback .empty { padding: 0; }
 .ws-fallback .subtle { margin: 0; max-width: 46ch; }
 
-/* Artifacts: run-level, no card surface — lays on the page background like the
-   Activity rail below it (consistent run-level footer rhythm). Content aligns to
-   the page content margin (padding-left: 0), same as Activity. */
-.artifacts-panel {
-  background: transparent;
-  border: none;
-  border-radius: 0;
-  overflow: visible;
-}
-.artifacts-panel .panel-h {
-  background: transparent;
-  border-bottom: 1px solid var(--border-soft);
-  padding-left: 0;
-  padding-right: 0;
-}
-.artifacts-panel .empty { padding: 14px 0; }
-.artifacts-panel .filelist { padding: 2px 0; }
-
 /* ── Activity: connected rail ─────────────────────────────────────────────── */
-/* No card surface — the rail lays straight on the page background (it's a log,
-   not a block). Header keeps a hairline rule so the "Activity" label reads. */
-.activity-panel {
-  background: transparent;
-  border: none;
-  border-radius: 0;
-  overflow: visible;
-}
-.activity-panel .panel-h {
-  background: transparent;
-  border-bottom: 1px solid var(--border-soft);
-  padding-left: 0;
-  padding-right: 0;
-}
-.activity-panel .tl { padding-left: 0; padding-right: 0; }
 .tl { padding: 12px 16px; }
 .tl-empty { color: var(--muted-sage); font: var(--t-body); padding: 6px 0; }
 .tl-item { position: relative; display: grid; grid-template-columns: 78px 26px 1fr; gap: 10px; align-items: start; padding: 6px 0; }
@@ -2879,13 +2846,6 @@ h1, .crumb-head, .run-title {
 .dag-zoom {
   position: absolute; top: 0; left: 0; width: max-content;
   transform-origin: 0 0; will-change: transform;
-}
-
-/* Section header for the Artifacts footer: Label in the primary ink, like
-   .panel-h. */
-.artifacts-foot .af-h {
-  font: var(--t-label);
-  color: var(--soft-white);
 }
 
 /* Services panel: a compact evidence section beneath the DAG in the
@@ -3025,18 +2985,6 @@ h1, .crumb-head, .run-title {
 /* Status moved into the top metadata bar (was on the breadcrumb). */
 .prov-status { display: inline-flex; align-items: center; gap: 10px; }
 
-/* Artifacts footer of the Pipeline component — flat, typography-led (matches the
-   flattened step-evidence headers, no surface of its own). */
-.artifacts-foot { border-top: 1px solid var(--border); padding: 2px 12px 10px; }
-.artifacts-foot .af-h {
-  display: flex; align-items: baseline; gap: 10px; padding: 10px 0 2px;
-}
-.artifacts-foot .af-h .subtle {
-  font: var(--t-body);
-  color: var(--muted-sage);
-}
-.artifacts-foot .empty { padding: 8px 0; }
-.artifacts-foot .filelist { padding: 4px 0 2px; }
 .linklike {
   background: none; border: none; padding: 0; cursor: pointer;
   color: var(--emerald); font: inherit; text-decoration: underline dotted;
@@ -3208,16 +3156,8 @@ h1, .crumb-head, .run-title {
   border-color: var(--emerald);
 }
 
-/* Artifact versions: shadowed rows dimmed. */
-.artifacts-panel .filelist { padding: 6px 6px 10px; }
-/* One line per artifact: name, then its provenance and of-record pills, size
-   and type. Some rows have no pills, so a flex line, not the file grid. */
-.artifacts-foot .filerow { display: flex; align-items: center; gap: 12px; }
-.artifacts-foot .filerow .fname { flex: 1; }
-.filerow.shadowed { opacity: 0.62; }
-
-/* Activity glyphs for the two new event kinds: a human Take boundary and a
-   control-plane re-adoption (the durability wedge, visible). */
+/* Activity glyphs for a rerun (a new version) and a control-plane
+   re-adoption. */
 .tl-glyph.take { border-color: var(--copper); color: var(--copper); }
 .tl-glyph.recover { border-color: var(--ok-ink); color: var(--ok-ink); }
 /* Fan-in collision warning (2e1a458): louder than info's copper-on-border-copper,
@@ -3342,13 +3282,13 @@ h1, .crumb-head, .run-title {
   display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
   padding: 10px 12px; border-bottom: 1px solid var(--border-soft);
 }
-.slist .chip {
+.slist .chip, .rt-filters .chip {
   display: inline-flex; align-items: center; gap: 6px;
   font: var(--t-label); color: var(--sage);
   background: var(--emerald-surface); border: 1px solid var(--border); border-radius: 12px;
   padding: 2px 10px; cursor: pointer;
 }
-.slist .chip[aria-pressed="true"] {
+.slist .chip[aria-pressed="true"], .rt-filters .chip[aria-pressed="true"] {
   color: var(--emerald); border-color: var(--emerald);
   background: color-mix(in srgb, var(--emerald) 10%, transparent);
 }
@@ -3411,16 +3351,120 @@ h1, .crumb-head, .run-title {
 /* A content tab's scope: "try 2", "from try 3", "none". */
 .inspector .tab .tscope { font: var(--t-mono); color: var(--muted-sage); }
 
-/* Artifacts as their own panel below the step pane. */
-.artifacts-panel .artifacts-foot { border-top: none; }
-.artifacts-panel .filerow { flex-wrap: wrap; }
-.artifacts-panel .filerow .fname { min-width: 0; overflow-wrap: anywhere; }
+/* List view: the tries nested under a step with more than one. */
+.slist-try {
+  display: grid; grid-template-columns: 16px minmax(0, 1fr) minmax(0, 220px) 72px;
+  align-items: center; gap: 10px; width: 100%; text-align: left;
+  padding: 3px 14px 3px 38px; background: none; border: 0; border-left: 2px solid transparent;
+  cursor: pointer; color: var(--sage); font: var(--t-body);
+}
+.slist-try.cell { padding-left: 48px; }
+.slist-try:hover { background: color-mix(in srgb, var(--emerald) 8%, transparent); }
+.slist-try.sel {
+  background: color-mix(in srgb, var(--emerald) 10%, transparent);
+  border-left-color: var(--emerald); color: var(--soft-white);
+}
+.slist-try-w { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.slist-try .slist-words { color: var(--muted-sage); }
+
+/* Run tabs: Pipeline, Artifacts, Activity. Run scope, so they sit on the page
+   with a heavier underline than a step's content tabs. */
+.run-tabs {
+  display: flex; gap: 6px; overflow-x: auto;
+  border-bottom: 1px solid var(--border); margin: 0 0 14px;
+}
+.run-tab {
+  display: inline-flex; align-items: center; gap: 7px; white-space: nowrap;
+  font: var(--t-label); color: var(--muted-sage);
+  background: none; border: 0; border-bottom: 3px solid transparent; margin-bottom: -1px;
+  padding: 8px 14px 7px 2px; cursor: pointer;
+}
+.run-tab:hover { color: var(--sage); }
+.run-tab[aria-selected="true"] { color: var(--display-ink); border-bottom-color: var(--emerald); }
+.run-tab-n { font: var(--t-mono); color: var(--muted-sage); }
+.run-tab-n.zero { opacity: 0.6; }
+.run-tab-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); display: inline-block; }
+
+/* A run tab's panel and its filter chips. */
+.rt-filters {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  padding: 10px 12px; border-bottom: 1px solid var(--border-soft);
+}
+.rt-filters .subtle { color: var(--muted-sage); }
+.rt-scope { color: var(--sage); margin-left: 8px; }
+.rt-scope .mono { font: var(--t-mono); color: var(--soft-white); }
+.rt-empty { padding: 14px; color: var(--muted-sage); }
+.rt-hidden {
+  display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 14px;
+  border-top: 1px solid var(--border-soft); color: var(--muted-sage);
+}
+
+/* Artifacts tab: files grouped by the step that published them. */
+.art-grp-h { font: var(--t-mono); color: var(--sage); padding: 10px 14px 4px; overflow-wrap: anywhere; }
+.art-row {
+  display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) 72px 150px 120px;
+  align-items: center; gap: 12px; padding: 6px 14px; border-top: 1px solid var(--border-soft);
+}
+.art-group .art-row:first-child { border-top: 0; }
+.art-name { display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--muted-sage); }
+.art-name a {
+  font: var(--t-mono); color: var(--emerald); text-decoration: none;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.art-name a:hover { text-decoration: underline; }
+.art-from { font: var(--t-mono); color: var(--muted-sage); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.art-size, .art-type { font: var(--t-mono); color: var(--muted-sage); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.art-size { text-align: right; }
+.art-mark { white-space: nowrap; text-align: right; }
+.art-rec { font: var(--t-mono); color: var(--ok-ink); border: 1px solid var(--ok-ink); border-radius: 8px; padding: 0 6px; }
+.art-earlier { font: var(--t-mono); color: var(--muted-sage); }
+.art-failed { font: var(--t-mono); color: var(--danger); }
+.art-row.shadowed .art-name a { color: var(--sage); }
+
+/* Activity tab. */
+.rt-tl { padding: 10px 14px; }
+.tl-glyph.warning { border-color: var(--warn); color: var(--warn); }
+.tl-item.tl-active { background: color-mix(in srgb, var(--warn) 10%, transparent); border-radius: var(--radius-sm); }
+.tl-still { color: var(--warn); }
+
+/* Try tabs under the step header. */
+.trytabs {
+  display: flex; align-items: stretch; gap: 2px; overflow-x: auto;
+  padding: 0 8px; border-bottom: 1px solid var(--border-soft);
+}
+.trytabs-list { display: flex; gap: 2px; }
+.tt {
+  display: flex; flex-direction: column; gap: 1px; text-align: left; white-space: nowrap;
+  font: var(--t-label); color: var(--sage);
+  background: none; border: 0; border-bottom: 2px solid transparent;
+  padding: 8px 12px 6px; cursor: pointer;
+}
+.tt:hover { background: color-mix(in srgb, var(--emerald) 6%, transparent); }
+.tt small { font: var(--t-body); color: var(--muted-sage); }
+.tt.on {
+  color: var(--display-ink); border-bottom-color: var(--display-ink);
+  background: color-mix(in srgb, var(--emerald) 10%, transparent);
+}
+.tt-l1 { display: inline-flex; align-items: center; gap: 6px; }
+.tt-g { font: var(--t-mono); }
+.tt-g.passed { color: var(--ok-ink); }
+.tt-g.failed { color: var(--danger); }
+.tt-g.running { color: var(--running-ink); }
+.tt-g.muted { color: var(--muted-sage); }
+.tt-dur { font: var(--t-mono); color: var(--muted-sage); }
+.tt-rec { font: var(--t-mono); color: var(--ok-ink); border: 1px solid var(--ok-ink); border-radius: 8px; padding: 0 6px; }
+.trytabs .adrop { display: flex; }
+.tt.tt-more { flex-direction: row; align-items: center; gap: 6px; color: var(--emerald); }
+.tt.tt-more.on { color: var(--display-ink); }
 
 @media (max-width: 640px) {
   .rh-actions { margin-left: 0; }
-  .slist-row { grid-template-columns: 16px minmax(0, 1fr) 64px; }
+  .slist-row, .slist-try { grid-template-columns: 16px minmax(0, 1fr) 64px; }
   .slist-words { display: none; }
   .adrop-menu { min-width: 0; }
+  .art-row { grid-template-columns: minmax(0, 1fr) auto auto; }
+  .art-from { grid-column: 1 / -1; order: 1; }
+  .art-type { display: none; }
 }
 
 /* --- Sign-in screen -------------------------------------------
