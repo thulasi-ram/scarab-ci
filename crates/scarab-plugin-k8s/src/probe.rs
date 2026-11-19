@@ -409,6 +409,7 @@ fn probe_pod(
                 image: Some(image.to_string()),
                 image_pull_policy: Some("IfNotPresent".to_string()),
                 security_context: Some(restricted_container_security_context()),
+                resources: Some(probe_resources()),
                 volume_mounts: Some(vec![VolumeMount {
                     name: "tmp".to_string(),
                     mount_path: "/tmp".to_string(),
@@ -650,7 +651,6 @@ exit 1
 /// broker URL and nothing else — no config, no token (and no `CANARY_IP`,
 /// so it never checks a canary that is not there).
 pub fn self_check_container(image: &str, broker_url: &str) -> Container {
-    let quantity = |q: &str| Quantity(q.to_string());
     Container {
         name: SELF_CHECK_CONTAINER.to_string(),
         image: Some(image.to_string()),
@@ -665,20 +665,28 @@ pub fn self_check_container(image: &str, broker_url: &str) -> Container {
         // The verdict lines become the termination message the runtime
         // shows when the check keeps failing.
         termination_message_policy: Some("FallbackToLogsOnError".to_string()),
-        resources: Some(ResourceRequirements {
-            requests: Some(BTreeMap::from([
-                ("cpu".to_string(), quantity("10m")),
-                ("memory".to_string(), quantity("16Mi")),
-            ])),
-            limits: Some(BTreeMap::from([
-                (
-                    "cpu".to_string(),
-                    quantity(crate::objects::PLUGIN_CPU_LIMIT),
-                ),
-                ("memory".to_string(), quantity("64Mi")),
-            ])),
-            ..Default::default()
-        }),
+        resources: Some(probe_resources()),
+        ..Default::default()
+    }
+}
+
+/// The resources of every probe container (the namespace probe's Pods and
+/// the self-check): cpu and memory requests and limits, so a namespace that
+/// requires them (a Kyverno require-resource-limits policy) admits the Pod.
+fn probe_resources() -> ResourceRequirements {
+    let quantity = |q: &str| Quantity(q.to_string());
+    ResourceRequirements {
+        requests: Some(BTreeMap::from([
+            ("cpu".to_string(), quantity("10m")),
+            ("memory".to_string(), quantity("16Mi")),
+        ])),
+        limits: Some(BTreeMap::from([
+            (
+                "cpu".to_string(),
+                quantity(crate::objects::PLUGIN_CPU_LIMIT),
+            ),
+            ("memory".to_string(), quantity("64Mi")),
+        ])),
         ..Default::default()
     }
 }
@@ -835,6 +843,33 @@ mod tests {
     fn noise_in_the_log_is_ignored() {
         let noisy = format!("wget: bad address 'x'\nSCARAB_PROBE bogus\n{PLUGIN_OK}");
         assert!(assess(CONTROL_OK, &noisy).passed());
+    }
+
+    /// A namespace that requires resources (a Kyverno
+    /// require-resource-limits policy) refuses a probe Pod without them
+    /// (git-bug dac7953).
+    #[test]
+    fn every_probe_container_sets_requests_and_a_memory_limit() {
+        let pods = [
+            canary_pod("ns", "n1", "img"),
+            control_pod("ns", "n1", "img", "10.0.0.9"),
+            plugin_probe_pod("ns", "n1", "img", "10.0.0.9", "http://10.96.0.20:8090"),
+        ];
+        let containers = pods
+            .iter()
+            .flat_map(|p| p.spec.as_ref().unwrap().containers.clone())
+            .chain([self_check_container("img", "http://10.96.0.20:8090")]);
+        let mut seen = 0;
+        for c in containers {
+            let r = c.resources.as_ref().expect("resources");
+            let requests = r.requests.as_ref().expect("requests");
+            assert!(requests.contains_key("cpu"), "{}", c.name);
+            assert!(requests.contains_key("memory"), "{}", c.name);
+            let limits = r.limits.as_ref().expect("limits");
+            assert!(limits.contains_key("memory"), "{}", c.name);
+            seen += 1;
+        }
+        assert_eq!(seen, 4);
     }
 
     #[test]
