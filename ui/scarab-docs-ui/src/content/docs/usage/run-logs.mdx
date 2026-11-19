@@ -80,11 +80,20 @@ The stream sends each `\r\n` as `\n`. The raw download returns the stored bytes 
 ## How the server stores a log
 
 A server replica reads each step's container log while the step runs and stores it in chunks.
-Before it stores anything, it replaces each of the step's secret values, and its registry
-credential, with `***`. It redacts the log as one stream, so a value split between two chunks of
-output is still replaced. A replica that did not launch the step (after a server roll, for
-example) reads the step's secret values from the step Pod's Secrets first; when it cannot read
-them, it reads no log and tries again later.
+Before it stores anything, it replaces each of the step's secret values, its registry credential,
+its forge token and its OIDC token with `***`. It redacts the log as one stream, so a value split
+between two chunks of output is still replaced. A step's values redact only that step's log (and
+its sidecars' logs), never another step's.
+
+A replica that did not launch the step (after a server roll, for example) reads the step's
+secret values from the step Pod's Secrets before it reads any of the log. When it cannot read
+them while the step runs, it reads no log and tries again later. When the step has ended and the
+replica never read them (the Secrets are deleted when the step's try ends), it stores this line in
+place of the rest of the log, never the output itself:
+
+```text
+scarab: the rest of this log was not stored: its secret values could not be read
+```
 
 When a read breaks part way, or the step stops before its log was read in full, the server reads
 the container's log again from the start and compares it with the part already stored:
@@ -99,10 +108,23 @@ the container's log again from the start and compares it with the part already s
 
   No output is dropped, and lines stored before the marker may show again after it.
 
-A replica that has no values for the step, such as one that reads a step that has ended after
-its Secrets were deleted, may find the log differs from the stored part where the stored part
-holds `***`. Storing the log again would store that value in clear, so the replica stores nothing
-more of that step's log and logs a warning.
+The log can also differ from the stored part where the stored part holds `***`: the replica that
+stored it held a value this one does not (the step was relaunched with a new token), or the step
+printed `***` itself. Storing the log again from the start could store a value in clear, so the
+replica does not. For a step that is still running it stores this line, then the output the step
+prints from then on; what the step printed between the stored part and the line is not stored:
+
+```text
+scarab: earlier output could not be checked; showing output from now on
+```
+
+For a step that has ended it stores this line in place of the rest of the log:
+
+```text
+scarab: the rest of this log was withheld: it could not be checked against the part already stored
+```
+
+Each of these lines comes with a warning in the server log.
 
 Output the kubelet rotated away before the server read it is gone; the marker line does not
 recover it. Each of these reads also reads the stored part back from object storage to compare

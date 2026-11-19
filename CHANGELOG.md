@@ -163,17 +163,38 @@ release.yml uses that version's section as the GitHub Release text. See
   replica launched the step.** The values to redact were held only in the memory of the replica
   that launched the step. When another replica took over the log tail, as on any server roll while
   a step ran, it stored the step's output as printed, secrets included. A replica now reads the
-  step's secret values and its registry credential from the step Pod's Secrets before it reads the
-  log. When it cannot read them, it reads no log and tries again later. When the step has ended
-  and its Secrets are deleted, the replica has no values; if the log then differs from the stored
-  part where that part holds `***`, the replica stores nothing more of that step's log and logs a
-  warning, instead of storing the value in clear. See
+  step's secret values, its registry credential, its forge token and its OIDC token from the step
+  Pod's Secrets before it claims the log tail and before it reads any of the log, and keeps them
+  until the log is complete. A read that fails is never taken as "no secrets": while the step runs,
+  the replica reads no log and tries again later. When the step has ended and the values were
+  never read (its Secrets are deleted when its try ends, or the read keeps failing), the replica
+  stores this line in place of the rest of the log, and logs a warning:
+  `scarab: the rest of this log was not stored: its secret values could not be read`. Before, a
+  replica that a dead replica's tail lease kept away until the step ended read no values and
+  stored the end of the log as printed. When a re-read differs from the stored part where that
+  part holds `***`, the replica no longer stops storing the log with no line saying so: for a
+  running step it stores
+  `scarab: earlier output could not be checked; showing output from now on` and then the output
+  printed from then on (what was printed in between is not stored), and for a step that has
+  ended it stores
+  `scarab: the rest of this log was withheld: it could not be checked against the part already stored`.
+  See
   [Run logs](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/#how-the-server-stores-a-log).
+- **A step's secret values redact only that step's log.** The values were one list per server,
+  for every step of every Run, kept for the life of the process. Every log byte was checked
+  against the whole list, under one lock, so with a forge token or an OIDC token added at each
+  launch, storing logs slowed down the longer the server ran (about 3 s per MiB of log at 1,000
+  values). A step's output equal to another step's secret, in any org, was stored as `***`, which
+  showed which values existed, and made a later re-read of that log differ where nothing had been
+  redacted for it. Each value is now kept for the log of the step try (or sidecar) it was mounted
+  into, and dropped when that log is complete. A failure message or infra condition, which the
+  server reads by Pod and not by log, is redacted with the values of every log not complete yet.
 - **Forge and identity tokens mounted into a step are redacted from its log.** Only the step's
   own secrets and its registry credential were redacted. The forge token a step gets with
   `forge_token:` and the OIDC token Scarab issues to a deploy step were stored as printed. Both
-  are now registered when the step launches, again with the new token on each relaunch, and a
-  replica that did not launch the step reads both back from the step Pod's Secrets.
+  are now registered for the step's log when the step launches, again with the new token on each
+  relaunch, and a replica that did not launch the step reads both back from the step Pod's
+  Secrets.
 
 ### Enhancement
 
