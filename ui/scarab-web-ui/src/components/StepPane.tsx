@@ -17,6 +17,7 @@ import {
   createResource,
   on,
   For,
+  Index,
   Show,
   onCleanup,
   untrack,
@@ -29,6 +30,7 @@ import {
   workspaceFileUrl,
   streamStepLogs,
   streamStepSidecarLogs,
+  stepLogsRawUrl,
   stepOrigin,
   type StepStatus,
   type Attempt,
@@ -44,7 +46,19 @@ import {
 } from "../attempts";
 import { heldBeforeStart } from "../events";
 import { failureBox, notLatestNote, statusWord, stepName, tryStatusWords } from "../run-page";
-import { levelOf, logBodyState, replayBuffer, streamEndStep } from "../logs";
+import { levelOf, logBodyState } from "../logs";
+import {
+  appendLog,
+  DEFAULT_TAIL_BYTES,
+  emptyLogBuffer,
+  followLog,
+  FULL_LOG_BYTES,
+  logNotice,
+  tailRows,
+  truncateLog,
+  type LogBuffer,
+  type LogFollower,
+} from "../log-stream";
 import { approvalReleaseIn, type GateStatus } from "../gates";
 import { clock, clockLow, expiryPercent, isYankRefusal, pluginGateState } from "../run-origin";
 import { shortHash } from "../libraries";
@@ -370,52 +384,47 @@ export default function StepPane(props: {
   );
   onCleanup(() => clearTimeout(switchTimer));
 
-  // --- Logs: one buffered SSE stream per (step, attempt); the scoped attempt's
-  // buffer renders. Historical attempts replay and close; the live one tails. ---
-  const [buffers, setBuffers] = createSignal<Record<string, string>>({});
+  // --- Logs: one followed SSE stream per (step, attempt, container); the
+  // scoped attempt's buffer renders. Historical attempts replay and close; the
+  // live one tails. A log opens on its last DEFAULT_TAIL_BYTES; the pane keeps
+  // at most CLIENT_CAP_BYTES and says when part of a log is not shown. ---
+  const [buffers, setBuffers] = createSignal<Record<string, LogBuffer>>({});
   // Streams the server has closed: nothing more will arrive for that key.
   const [ended, setEnded] = createSignal<Record<string, true>>({});
-  const streams = new Map<string, () => void>();
+  const followers = new Map<string, LogFollower>();
+  // Logs the user asked to read in full (Load full log): their tail.
+  const tails = new Map<string, number>();
   // Keyed by (step, attempt, container) — the container axis (main vs a sidecar
   // index) keeps each container's tail in its own buffer/stream.
   const logKey = (step: string, attempt: string, c: number | null) =>
     `${step} ${attempt} ${c ?? "main"}`;
-
-  // A stream the server ends while its try still reads as running waits one
-  // poll (REOPEN_MS is longer than the run's 1.2s poll): a try that finished
-  // ends its stream before the poll says so, and its log is whole. When the
-  // try still runs after that (the Pod had not started, or the connection
-  // dropped), the stream is opened again. `streamEndStep` decides.
-  // A reopened stream replays from the start into its own buffer, which
-  // replaces the one on screen once it has caught up (`replayBuffer`).
-  const REOPEN_MS = 2000;
-  // Streams that ended while their try read as running, and whose wait ran
-  // out while their step was not in view: decided when it is in view again.
-  const endedRunning = new Set<string>();
-  const reopenTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  const replays = new Map<string, string>();
+  // The log in view, if the Logs tab shows one.
+  const viewedKey = (): string | null => {
+    const s = stepId();
+    const a = scoped();
+    if (!s || !a || notRun() || tab() !== "logs") return null;
+    return logKey(s, a.id, container());
+  };
   const [streamGen, setStreamGen] = createSignal(0);
-  const hasOutput = (key: string) => (untrack(buffers)[key] ?? "").length > 0;
-  const reopen = (key: string) => {
-    clearTimeout(reopenTimers.get(key));
-    reopenTimers.delete(key);
-    endedRunning.delete(key);
-    streams.get(key)?.();
-    streams.delete(key);
-    replays.set(key, "");
+  const updateBuffer = (key: string, f: (b: LogBuffer) => LogBuffer) =>
+    setBuffers((prev) => ({ ...prev, [key]: f(prev[key] ?? emptyLogBuffer()) }));
+  const setEndedKey = (key: string, on: boolean) =>
     setEnded((prev) => {
+      if (on) return { ...prev, [key]: true };
       const next = { ...prev };
       delete next[key];
       return next;
     });
+  // Load full log: read the log again from the start of its last
+  // FULL_LOG_BYTES.
+  const loadFull = (key: string) => {
+    followers.get(key)?.close();
+    followers.delete(key);
+    tails.set(key, FULL_LOG_BYTES);
+    setBuffers((prev) => ({ ...prev, [key]: emptyLogBuffer() }));
+    setEndedKey(key, false);
     setStreamGen((n) => n + 1);
   };
-  onCleanup(() => reopenTimers.forEach((t) => clearTimeout(t)));
-  // The attempt's outcome now, when that step is still the one in view.
-  const outcomeNow = (step: string, attempt: string): string | undefined =>
-    untrack(() =>
-      props.step?.id === step ? props.step.attempt_list?.find((x) => x.id === attempt)?.outcome : undefined,
-    );
 
   createEffect(() => {
     void streamGen();
@@ -424,73 +433,46 @@ export default function StepPane(props: {
     const c = container();
     // A not-run step's `scoped()` may resolve to a stale attempt from a LATER
     // version — never stream it; the Logs tab shows the not-run line instead.
-    if (!s || !a || notRun() || tab() !== "logs") return;
-    const key = logKey(s, a.id, c);
-    // Its stream ended while it ran, and the wait ran out out of view.
-    if (endedRunning.has(key)) {
-      endedRunning.delete(key);
-      if (streamEndStep({ outcome: a.outcome, graceOver: true, hadOutput: hasOutput(key) }) === "reopen") {
-        reopen(key);
-        return;
-      }
+    const key = viewedKey();
+    if (!s || !a || key === null) return;
+    const existing = followers.get(key);
+    if (existing) {
+      // A decision that waited while this log was out of view.
+      existing.inView();
+      return;
     }
-    if (streams.has(key)) return;
-    const onChunk = (t: string) => {
-      const replay = replays.get(key);
-      if (replay === undefined) {
-        setBuffers((prev) => ({ ...prev, [key]: (prev[key] ?? "") + t + "\n" }));
-        return;
-      }
-      const next = replayBuffer({ shown: untrack(buffers)[key] ?? "", replay: replay + t + "\n", ended: false });
-      if (next.caughtUp) {
-        replays.delete(key);
-        setBuffers((prev) => ({ ...prev, [key]: next.text }));
-      } else {
-        replays.set(key, replay + t + "\n");
-      }
-    };
-    const onEnd = () => {
-      const replay = replays.get(key);
-      if (replay !== undefined) {
-        replays.delete(key);
-        const next = replayBuffer({ shown: untrack(buffers)[key] ?? "", replay, ended: true });
-        setBuffers((prev) => ({ ...prev, [key]: next.text }));
-      }
-      setEnded((prev) => ({ ...prev, [key]: true }));
-      const now = streamEndStep({
-        outcome: outcomeNow(s, a.id) ?? a.outcome,
-        graceOver: false,
-        hadOutput: hasOutput(key),
-      });
-      if (now !== "wait" || reopenTimers.has(key)) return;
-      reopenTimers.set(
-        key,
-        setTimeout(() => {
-          reopenTimers.delete(key);
-          const outcome = outcomeNow(s, a.id);
-          // Out of view: decided when the step is in view again.
-          if (outcome === undefined) {
-            endedRunning.add(key);
-            return;
-          }
-          if (streamEndStep({ outcome, graceOver: true, hadOutput: hasOutput(key) }) === "reopen") reopen(key);
-        }, REOPEN_MS),
-      );
-    };
-    // Sidecar logs share the step's real attempt ids, so the attempt scoping is
-    // identical — only the endpoint (`?sidecar=<index>`) differs.
-    const close =
-      c == null
-        ? streamStepLogs(props.runId, s, { attempt: a.id, onChunk, onEnd })
-        : streamStepSidecarLogs(props.runId, s, c, { attempt: a.id, onChunk, onEnd });
-    streams.set(key, close);
+    const attemptId = a.id;
+    followers.set(
+      key,
+      followLog({
+        // Sidecar logs share the step's real attempt ids, so the attempt
+        // scoping is identical — only the endpoint (`?sidecar=<index>`) differs.
+        open: (q, h) =>
+          c == null
+            ? streamStepLogs(props.runId, s, { attempt: attemptId, ...q, ...h })
+            : streamStepSidecarLogs(props.runId, s, c, { attempt: attemptId, ...q, ...h }),
+        tail: tails.get(key) ?? DEFAULT_TAIL_BYTES,
+        // The try's outcome now, only while its log is the one in view: the
+        // pane does not reopen a log it switched away from until it is back.
+        outcome: () =>
+          untrack(() =>
+            viewedKey() === key
+              ? (props.step?.attempt_list?.find((x) => x.id === attemptId)?.outcome ?? a.outcome)
+              : undefined,
+          ),
+        onChunk: (t) => updateBuffer(key, (b) => appendLog(b, t)),
+        onTruncated: (t) => updateBuffer(key, (b) => truncateLog(b, t)),
+        onEnd: () => setEndedKey(key, true),
+        onReopen: () => setEndedKey(key, false),
+      }),
+    );
   });
-  onCleanup(() => streams.forEach((close) => close()));
+  onCleanup(() => followers.forEach((f) => f.close()));
 
-  const logText = () => {
+  const logBuffer = (): LogBuffer | undefined => {
     const s = stepId();
     const a = scoped();
-    return s && a ? (buffers()[logKey(s, a.id, container())] ?? "") : "";
+    return s && a ? buffers()[logKey(s, a.id, container())] : undefined;
   };
   // With no lines: still waiting (stream open, try running), or nothing was
   // captured (stream ended, or the try finished).
@@ -499,15 +481,22 @@ export default function StepPane(props: {
     const a = scoped();
     if (!s || !a) return "waiting" as const;
     const key = logKey(s, a.id, container());
-    return logBodyState({ text: buffers()[key], ended: !!ended()[key], outcome: a.outcome });
+    return logBodyState({ text: buffers()[key]?.text, ended: !!ended()[key], outcome: a.outcome });
   };
   const logRows = () => {
-    const all = logText().split("\n");
-    const sliced = all.length > MAX_LINES ? all.slice(all.length - MAX_LINES) : all;
-    const base = all.length > MAX_LINES ? all.length - MAX_LINES : 0;
-    return sliced
-      .map((line, i) => ({ n: base + i + 1, line, lvl: levelOf(line) }))
-      .filter((r) => r.line.length > 0);
+    const b = logBuffer();
+    return b ? tailRows(b, MAX_LINES).map((r) => ({ ...r, lvl: levelOf(r.line) })) : [];
+  };
+  // "Showing the last 2.0 MB of 14.3 MB." when part of the log is not shown.
+  const notice = () => {
+    const b = logBuffer();
+    return b ? logNotice(b) : null;
+  };
+  // The whole log of the try in view, as a file.
+  const rawUrl = () => {
+    const s = stepId();
+    const a = scoped();
+    return s && a ? stepLogsRawUrl(props.runId, s, a.id, container()) : null;
   };
 
   // --- Results / Logs / Workspace: fetches scoped to the SELECTED try
@@ -824,13 +813,50 @@ export default function StepPane(props: {
                     </div>
                   </Show>
                   <span class="grow1" />
+                  <Show when={rawUrl()}>
+                    {(href) => (
+                      <a class="lgtog" href={href()} download="" title="The whole log of this try, as a text file">
+                        Download
+                      </a>
+                    )}
+                  </Show>
                   <button class={`lgtog ${wrap() ? "on" : ""}`} onClick={() => setWrap((v) => !v)}>
                     Wrap
                   </button>
                 </div>
+                {/* Part of the log is not shown: the server sent only its
+                    end, or the pane dropped its start to stay under its cap. */}
+                <Show when={!switching() && notice()}>
+                  {(n) => (
+                    <div class="lgnotice" role="status">
+                      <span>{n().text}</span>
+                      <Show when={n().loadFull}>
+                        <button
+                          type="button"
+                          class="linklike"
+                          onClick={() => {
+                            const key = viewedKey();
+                            if (key) loadFull(key);
+                          }}
+                        >
+                          Load full log
+                        </button>
+                      </Show>
+                      <Show when={rawUrl()}>
+                        {(href) => (
+                          <a class="linklike" href={href()} download="">
+                            Download
+                          </a>
+                        )}
+                      </Show>
+                    </div>
+                  )}
+                </Show>
                 <Show when={!switching()} fallback={<LogSkeleton />}>
                   <div class="lgbody" classList={{ nowrap: !wrap() }}>
-                    <For
+                    {/* Rows by position: a new chunk updates the rows in
+                        place instead of building every row again. */}
+                    <Index
                       each={logRows()}
                       fallback={
                         <Show
@@ -865,12 +891,12 @@ export default function StepPane(props: {
                       }
                     >
                       {(r) => (
-                        <div class={`lgrow ${r.lvl}`}>
-                          <span class="lgln">{r.n}</span>
-                          <span class="lgtx">{r.line}</span>
+                        <div class={`lgrow ${r().lvl}`}>
+                          <span class="lgln">{r().n}</span>
+                          <span class="lgtx">{r().line}</span>
                         </div>
                       )}
-                    </For>
+                    </Index>
                   </div>
                 </Show>
               </div>

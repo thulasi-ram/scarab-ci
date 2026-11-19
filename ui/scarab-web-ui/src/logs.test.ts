@@ -1,6 +1,6 @@
 // Log-line level classification (extracted from StepPane) — drives row accents.
 import { describe, it, expect } from "vitest";
-import { levelOf, logBodyState, replayBuffer, streamEndStep } from "./logs";
+import { levelOf, logBodyState, streamEndStep } from "./logs";
 
 describe("levelOf", () => {
   it("classifies commands, errors, warnings and success lines", () => {
@@ -79,32 +79,5 @@ describe("streamEndStep", () => {
 
   it("leaves a step that is out of view alone", () => {
     expect(streamEndStep({ outcome: undefined, graceOver: true, hadOutput: false })).toBe("done");
-  });
-});
-
-// Regression: the first chunk of a replay replaced the buffer, so the pane
-// shrank to one line, grew back, and lost its scroll.
-describe("replayBuffer", () => {
-  const shown = "line 1\nline 2\nline 3\n";
-
-  it("keeps the old buffer while the replay is shorter", () => {
-    expect(replayBuffer({ shown, replay: "line 1\n", ended: false })).toEqual({ text: shown, caughtUp: false });
-  });
-
-  it("swaps the replay in once it has caught up", () => {
-    const replay = shown + "line 4\n";
-    expect(replayBuffer({ shown, replay, ended: false })).toEqual({ text: replay, caughtUp: true });
-    expect(replayBuffer({ shown, replay: shown, ended: false })).toEqual({ text: shown, caughtUp: true });
-  });
-
-  it("keeps the longer text when the replay ends short", () => {
-    expect(replayBuffer({ shown, replay: "line 1\n", ended: true })).toEqual({ text: shown, caughtUp: true });
-  });
-
-  it("an empty buffer takes the first chunk", () => {
-    expect(replayBuffer({ shown: "", replay: "line 1\n", ended: false })).toEqual({
-      text: "line 1\n",
-      caughtUp: true,
-    });
   });
 });

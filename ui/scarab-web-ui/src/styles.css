@@ -2635,6 +2635,15 @@ h1, .crumb-head, .run-title {
 .lgrow.ok .lgtx { color: var(--ok); }
 .lgrow.cmd .lgtx { color: var(--terminal-accent); }
 .lgrow.empty { color: var(--muted-sage); padding: 8px 12px; }
+/* Above a log when part of it is not shown: how much shows, and the ways to
+   read the rest. An <a> in the log tools reads like the buttons beside it. */
+.lgnotice {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; padding: 6px 12px;
+  font: var(--t-body); color: var(--terminal-ink);
+  border-bottom: 1px solid var(--terminal-line);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+a.lgtog { text-decoration: none; }
 
 /* Log skeleton — shown for the switch window so a reload is unmistakable even
    when the new try's (cached) output looks like the old. Bars sit in the `.lgtx`

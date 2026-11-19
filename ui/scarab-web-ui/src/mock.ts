@@ -904,6 +904,95 @@ const testLogLines = [
   "test log::pipeline::appends_are_ordered_per_fence ... ok",
 ];
 
+// ── log streams ─────────────────────────────────────────────────────────────
+// The mock serves a log as the server does: stored chunks of raw output, each
+// `data` event carrying an id `<attempt>:<next chunk>` to resume after, the
+// last `?tail=` bytes with a `truncated` event first, and the whole log at
+// `…/logs/raw`.
+
+/** The matrix cell whose `tofu plan` printed a large log (about 5 MB): the
+ * pane shows its last 2 MB and offers Load full log and Download. */
+const BIG_LOG_STEP = mxId("treebo-staging", "aws-cluster");
+let bigLogChunks: string[] | null = null;
+/** The large log's chunks, built on first use: 13,000 planned resources,
+ * 200 to a chunk. */
+function bigLog(): string[] {
+  if (bigLogChunks) return bigLogChunks;
+  const header = "$ tofu plan -input=false -out=plan.tfplan\nOpenTofu will perform the following actions:\n\n";
+  const out: string[] = [];
+  const total = 13_000;
+  let chunk = header;
+  for (let i = 0; i < total; i++) {
+    const az = ["a", "b", "c"][i % 3];
+    chunk +=
+      `  # module.cluster.aws_security_group_rule.node_ingress[${i}] will be created\n` +
+      `  + resource "aws_security_group_rule" "node_ingress" {\n` +
+      `      + cidr_blocks              = ["10.${(i >> 8) & 255}.${i & 255}.0/24"]\n` +
+      `      + from_port                = ${30000 + (i % 2768)}\n` +
+      `      + id                       = (known after apply)\n` +
+      `      + protocol                 = "tcp"\n` +
+      `      + security_group_id        = "sg-0${(i * 2654435761 >>> 0).toString(16).padStart(8, "0")}"\n` +
+      `      + description              = "node port ${i} (eu-west-1${az})"\n` +
+      `    }\n\n`;
+    if ((i + 1) % 200 === 0) {
+      out.push(chunk);
+      chunk = "";
+    }
+  }
+  out.push(chunk + `Plan: ${total} to add, 0 to change, 0 to destroy.\n`);
+  bigLogChunks = out;
+  return out;
+}
+
+/** The stored chunks of the log a step or service stream reads, or null when
+ * it has none (a Pod that never started printed nothing). */
+function mockLogChunks(url: string): string[] | null {
+  let u: URL;
+  try {
+    u = new URL(url, window.location.origin);
+  } catch {
+    return null;
+  }
+  const path = u.pathname.replace(/\/raw$/, "");
+  const step = path.match(/^\/v1\/runs\/([^/]+)\/steps\/([^/]+)\/logs$/);
+  if (step) {
+    if (unscheduledTry(url)) return null;
+    if (step[1] === MATRIX_RUN_ID && decodeURIComponent(step[2]!) === BIG_LOG_STEP) return bigLog();
+    return [testLogLines.join("\n") + "\n"];
+  }
+  if (/^\/v1\/runs\/[^/]+\/services\/[^/]+\/logs$/.test(path)) return [serviceLogLines.join("\n") + "\n"];
+  return null;
+}
+
+/** The events a log stream sends for `url`: where `?from=` or `?tail=` says
+ * to start, a `truncated` event when the tail skipped chunks, then one `data`
+ * event per chunk. */
+function mockLogEvents(url: string): { type: string; data: string; id?: string }[] {
+  const chunks = mockLogChunks(url);
+  if (!chunks) return [];
+  const u = new URL(url, window.location.origin);
+  const attempt = u.searchParams.get("attempt") ?? "a1";
+  const from = u.searchParams.get("from");
+  const tail = u.searchParams.get("tail");
+  const out: { type: string; data: string; id?: string }[] = [];
+  let start = 0;
+  if (from) {
+    start = Number(from.split(":")[1] ?? 0) || 0;
+  } else if (tail) {
+    const sizes = chunks.map((c) => new TextEncoder().encode(c).length);
+    const total = sizes.reduce((a, b) => a + b, 0);
+    let rest = total;
+    while (start < chunks.length - 1 && rest > Number(tail)) rest -= sizes[start++]!;
+    if (start > 0) {
+      out.push({ type: "truncated", data: JSON.stringify({ skipped_bytes: total - rest, total_bytes: total }) });
+    }
+  }
+  for (let i = start; i < chunks.length; i++) {
+    out.push({ type: "message", data: chunks[i]!, id: `${attempt}:${i + 1}` });
+  }
+  return out;
+}
+
 // ── environments / secrets ───────────────────────────────────────────────────
 // A repository's Environments are org Environments: see `orgEnvironments`,
 // `overlays` and `projectEnvironments` below.
@@ -2166,6 +2255,17 @@ function json(body: unknown, init?: ResponseInit) {
 function route(pathname: string, search: string, method: string, body = ""): Response | null {
   const p = pathname;
   if (p === "/v1/me") return json(me);
+  // A try's whole log as a file.
+  if (/^\/v1\/runs\/[^/]+\/steps\/[^/]+\/logs\/raw$/.test(p)) {
+    const chunks = mockLogChunks(p + search);
+    return new Response((chunks ?? []).join(""), {
+      status: 200,
+      headers: {
+        "content-type": "text/plain; charset=utf-8",
+        "content-disposition": 'attachment; filename="log.txt"',
+      },
+    });
+  }
   if (p === "/v1/about") {
     return json({
       version: "0.3.2",
@@ -2926,7 +3026,8 @@ export function installMock() {
     });
   }) as typeof window.fetch;
 
-  // EventSource — step/service log streams. Replays fixture lines then idles.
+  // EventSource — step/service log streams. Replays the fixture's chunks
+  // (`mockLogEvents`) then idles.
   const RealES = window.EventSource;
   class MockES extends EventTarget {
     static readonly CONNECTING = 0;
@@ -2940,26 +3041,13 @@ export function installMock() {
     constructor(url: string | URL) {
       super();
       this.url = url.toString();
-      const path = (() => {
-        try {
-          return new URL(this.url, window.location.origin).pathname;
-        } catch {
-          return this.url;
-        }
-      })();
-      const replay =
-        unscheduledTry(this.url)
-          ? null
-          : /\/steps\/[^/]+\/logs$/.test(path)
-          ? testLogLines
-          : /\/services\/[^/]+\/logs$/.test(path)
-            ? serviceLogLines
-            : null;
-      if (replay) {
+      const events = mockLogEvents(this.url);
+      if (events.length > 0) {
         queueMicrotask(() => {
-          for (const line of replay) {
-            const e = new MessageEvent("message", { data: line });
-            this.onmessage?.(e);
+          for (const ev of events) {
+            if (this.readyState === 2) return;
+            const e = new MessageEvent(ev.type, { data: ev.data, lastEventId: ev.id ?? "" });
+            if (ev.type === "message") this.onmessage?.(e);
             this.dispatchEvent(e);
           }
           // leave open (running step keeps tailing) — no onerror.

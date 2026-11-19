@@ -4,6 +4,7 @@ import createClient from "openapi-fetch";
 import { createSignal } from "solid-js";
 import type { paths, components } from "./schema";
 import type { ParamSpec } from "../params";
+import type { LogStreamHandlers, LogStreamQuery } from "../log-stream";
 import { isDeleteBlockers } from "../org-environments";
 import { askStepUp, errorMessage, shareCeremony, withStepUp } from "../step-up";
 
@@ -1438,21 +1439,20 @@ export function streamLogs(
   return close;
 }
 
-/**
- * Live-stream ONE step's log output (`GET …/steps/{step}/logs`), optionally
- * scoped to a single `attempt` — the per-step fold's source, and how a rerun's
- * earlier (failed) attempt is read in isolation. Replays that scope's committed
- * chunks then live-tails while the run is going and the latest attempt is in
- * scope; the server closes the stream when nothing more will be written. Returns
- * a cleanup fn.
- */
-export function streamStepLogs(
-  id: string,
-  step: string,
-  opts: { attempt?: string; onChunk: (text: string) => void; onEnd?: () => void },
-): () => void {
-  const base = `/v1/runs/${encodeURIComponent(id)}/steps/${encodeURIComponent(step)}/logs`;
-  const url = opts.attempt ? `${base}?attempt=${encodeURIComponent(opts.attempt)}` : base;
+/** The `?from=` / `?tail=` part of a log stream's URL. */
+function logQuery(q: URLSearchParams, opts: LogStreamQuery): URLSearchParams {
+  if (opts.from) q.set("from", opts.from);
+  else if (opts.tail != null) q.set("tail", String(opts.tail));
+  return q;
+}
+
+/** Open one log stream (a step's, a sidecar's or a service's). Each `data`
+ * event is raw output, passed on as it came with its id (the resume cursor);
+ * a `truncated` event says how much of the log the replay skipped. The server
+ * ends the stream when nothing more will be written, which reads as an error
+ * here; the stream is then closed so the browser's EventSource does not open
+ * it again by itself. Returns a cleanup fn. */
+function openLogStream(url: string, opts: LogStreamHandlers): () => void {
   const es = new EventSource(url);
   let closed = false;
   const close = () => {
@@ -1461,12 +1461,41 @@ export function streamStepLogs(
       es.close();
     }
   };
-  es.onmessage = (e) => opts.onChunk(e.data);
+  es.onmessage = (e) => opts.onChunk(e.data, e.lastEventId || null);
+  es.addEventListener("truncated", (e) => {
+    try {
+      const t = JSON.parse((e as MessageEvent).data) as { skipped_bytes?: number; total_bytes?: number };
+      opts.onTruncated?.({ skippedBytes: t.skipped_bytes ?? 0, totalBytes: t.total_bytes ?? 0 });
+    } catch {
+      // A malformed notice hides nothing on screen; skip it.
+    }
+  });
   es.onerror = () => {
+    if (closed) return;
     close();
     opts.onEnd?.();
   };
   return close;
+}
+
+/**
+ * Live-stream ONE step's log output (`GET …/steps/{step}/logs`), optionally
+ * scoped to a single `attempt` — the per-step fold's source, and how a rerun's
+ * earlier (failed) attempt is read in isolation. Replays that scope's committed
+ * chunks (the last `tail` bytes, or after the cursor `from`) then live-tails
+ * while the run is going and the latest attempt is in scope; the server closes
+ * the stream when nothing more will be written. Returns a cleanup fn.
+ */
+export function streamStepLogs(
+  id: string,
+  step: string,
+  opts: { attempt?: string } & LogStreamQuery & LogStreamHandlers,
+): () => void {
+  const base = `/v1/runs/${encodeURIComponent(id)}/steps/${encodeURIComponent(step)}/logs`;
+  const q = new URLSearchParams();
+  if (opts.attempt) q.set("attempt", opts.attempt);
+  const qs = logQuery(q, opts).toString();
+  return openLogStream(qs ? `${base}?${qs}` : base, opts);
 }
 
 /**
@@ -1475,32 +1504,27 @@ export function streamStepLogs(
  * single `attempt`. A sidecar lives inside the step's Pod, so its logs are
  * stored under the step's REAL attempt ids — the same attempt scoping as the
  * step's main container applies unchanged (`?sidecar=` composes with
- * `?attempt=`). Same buffered-SSE contract as `streamStepLogs`; returns a
- * cleanup fn.
+ * `?attempt=`). Same SSE contract as `streamStepLogs`; returns a cleanup fn.
  */
 export function streamStepSidecarLogs(
   id: string,
   step: string,
   index: number,
-  opts: { attempt?: string; onChunk: (text: string) => void; onEnd?: () => void },
+  opts: { attempt?: string } & LogStreamQuery & LogStreamHandlers,
 ): () => void {
   const base = `/v1/runs/${encodeURIComponent(id)}/steps/${encodeURIComponent(step)}/logs`;
   const q = new URLSearchParams({ sidecar: String(index) });
   if (opts.attempt) q.set("attempt", opts.attempt);
-  const es = new EventSource(`${base}?${q.toString()}`);
-  let closed = false;
-  const close = () => {
-    if (!closed) {
-      closed = true;
-      es.close();
-    }
-  };
-  es.onmessage = (e) => opts.onChunk(e.data);
-  es.onerror = () => {
-    close();
-    opts.onEnd?.();
-  };
-  return close;
+  return openLogStream(`${base}?${logQuery(q, opts).toString()}`, opts);
+}
+
+/** The whole log of one try as a plain-text download
+ * (`GET …/steps/{step}/logs/raw`); `sidecar` picks a sidecar's log. */
+export function stepLogsRawUrl(id: string, step: string, attempt: string, sidecar?: number | null): string {
+  const base = `/v1/runs/${encodeURIComponent(id)}/steps/${encodeURIComponent(step)}/logs/raw`;
+  const q = new URLSearchParams({ attempt });
+  if (sidecar != null) q.set("sidecar", String(sidecar));
+  return `${base}?${q.toString()}`;
 }
 
 /**
@@ -1525,24 +1549,13 @@ export async function listServices(id: string): Promise<Service[]> {
 export function streamServiceLogs(
   id: string,
   service: string,
-  opts: { take?: number; onChunk: (text: string) => void; onEnd?: () => void },
+  opts: { take?: number } & LogStreamQuery & LogStreamHandlers,
 ): () => void {
   const base = `/v1/runs/${encodeURIComponent(id)}/services/${encodeURIComponent(service)}/logs`;
-  const url = opts.take != null ? `${base}?take=${opts.take}` : base;
-  const es = new EventSource(url);
-  let closed = false;
-  const close = () => {
-    if (!closed) {
-      closed = true;
-      es.close();
-    }
-  };
-  es.onmessage = (e) => opts.onChunk(e.data);
-  es.onerror = () => {
-    close();
-    opts.onEnd?.();
-  };
-  return close;
+  const q = new URLSearchParams();
+  if (opts.take != null) q.set("take", String(opts.take));
+  const qs = logQuery(q, opts).toString();
+  return openLogStream(qs ? `${base}?${qs}` : base, opts);
 }
 
 /** Parse the SSE wire body into `data:` payloads (one per event block). */

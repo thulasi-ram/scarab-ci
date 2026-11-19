@@ -257,6 +257,35 @@ test("a failed matrix run names where it failed and opens on the first failure",
   await expect(page.locator(".sp-name")).toHaveText("plan · treebo-production · aws-cluster");
 });
 
+// The MATRIX run's treebo-staging × aws-cluster cell printed a large plan
+// (5.5 MB, 130,004 lines). The pane asks for the last 2 MB and says so.
+test("a large log shows its last 2 MB, Load full log reads it all, Download names the try", async ({ page }) => {
+  await page.goto(`/acme/scarab/runs/${MATRIX_RUN_ID}?step=5`);
+  await expect(page.locator(".sp-name")).toHaveText("plan · treebo-staging · aws-cluster");
+
+  const notice = page.getByRole("status").filter({ hasText: "Showing the last" });
+  await expect(notice).toHaveText(/Showing the last 2\.0 MB of 5\.5 MB\./);
+  const download = notice.getByRole("link", { name: "Download" });
+  await expect(download).toHaveAttribute("href", /\/steps\/[^/]+\/logs\/raw\?attempt=a1$/);
+  // The log tools offer the download for every try, cut or not.
+  await expect(page.locator(".steplogs-tools").getByRole("link", { name: "Download" })).toBeVisible();
+  // The file is the whole log.
+  const href = await download.getAttribute("href");
+  const raw = await page.evaluate(async (u) => (await fetch(u!)).text(), href);
+  expect(raw.startsWith("$ tofu plan")).toBe(true);
+  expect(raw.endsWith("Plan: 13000 to add, 0 to change, 0 to destroy.\n")).toBe(true);
+
+  // The plan's last line, numbered from the first line the pane received.
+  const last = page.locator(".lgrow", { hasText: "Plan: 13000 to add" });
+  await expect(last).toBeVisible();
+  await expect(last.locator(".lgln")).not.toHaveText("130004");
+
+  // The whole log fits in 8 MB, so the pane can read all of it.
+  await notice.getByRole("button", { name: "Load full log" }).click();
+  await expect(notice).toHaveCount(0);
+  await expect(last.locator(".lgln")).toHaveText("130004");
+});
+
 test("the run header's ⋯ menu copies the run ID and keeps snapshots", async ({ page, context }) => {
   await context.grantPermissions(["clipboard-read", "clipboard-write"]);
   await page.goto(`/acme/scarab/runs/${MATRIX_RUN_ID}`);

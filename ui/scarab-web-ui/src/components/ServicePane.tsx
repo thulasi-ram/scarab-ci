@@ -1,4 +1,4 @@
-// The evidence pane for a DAG-selected SHARED service (ADR-0058) — a peer node
+// The evidence pane for a DAG-selected SHARED service — a peer node
 // in the services lane, selected as `service:<name>`. Unlike a step it has no
 // attempts, results, or workspace: only a lifecycle readout + a best-effort live
 // log tail (the "why won't my DB come up" evidence). This lifts the fold-open
@@ -8,12 +8,20 @@
 import { createEffect, createMemo, createSignal, onCleanup, For, Show } from "solid-js";
 import { streamServiceLogs } from "../api/client";
 import type { DagService } from "./Dag";
+import {
+  appendLog,
+  DEFAULT_TAIL_BYTES,
+  emptyLogBuffer,
+  logNotice,
+  tailRows,
+  truncateLog,
+} from "../log-stream";
 
 // Cap rendered log lines so a chatty service can't blow up the DOM (windowing).
 const MAX_LINES = 1500;
 
 export default function ServicePane(props: { runId: string; service: DagService }) {
-  const [buffer, setBuffer] = createSignal("");
+  const [buffer, setBuffer] = createSignal(emptyLogBuffer());
   let closeStream: (() => void) | undefined;
 
   // The service NAME as a stable memo: `props.service` is a fresh object each
@@ -28,17 +36,17 @@ export default function ServicePane(props: { runId: string; service: DagService 
     const n = name();
     closeStream?.();
     closeStream = undefined;
-    setBuffer("");
+    setBuffer(emptyLogBuffer());
     closeStream = streamServiceLogs(props.runId, n, {
-      onChunk: (t) => setBuffer((prev) => prev + t + "\n"),
+      tail: DEFAULT_TAIL_BYTES,
+      onChunk: (t) => setBuffer((prev) => appendLog(prev, t)),
+      onTruncated: (t) => setBuffer((prev) => truncateLog(prev, t)),
     });
   });
   onCleanup(() => closeStream?.());
 
-  const logRows = () => {
-    const all = buffer().split("\n").filter((l) => l.length > 0);
-    return all.length > MAX_LINES ? all.slice(all.length - MAX_LINES) : all;
-  };
+  const logRows = () => tailRows(buffer(), MAX_LINES);
+  const notice = () => logNotice(buffer());
 
   return (
     <div class="panel inspector steppane servicepane">
@@ -63,6 +71,13 @@ export default function ServicePane(props: { runId: string; service: DagService 
 
       {/* Best-effort live log tail. */}
       <div class="tabpane logpane">
+        <Show when={notice()}>
+          {(n) => (
+            <div class="lgnotice" role="status">
+              {n().text}
+            </div>
+          )}
+        </Show>
         <div class="lgbody nowrap">
           <For
             each={logRows()}
@@ -73,10 +88,10 @@ export default function ServicePane(props: { runId: string; service: DagService 
               </div>
             }
           >
-            {(line, i) => (
+            {(r) => (
               <div class="lgrow">
-                <span class="lgln">{i() + 1}</span>
-                <span class="lgtx">{line}</span>
+                <span class="lgln">{r.n}</span>
+                <span class="lgtx">{r.line}</span>
               </div>
             )}
           </For>

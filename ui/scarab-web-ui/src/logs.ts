@@ -65,19 +65,3 @@ export function streamEndStep(opts: {
   if (!opts.graceOver || opts.outcome === undefined) return "done";
   return opts.hadOutput ? "done" : "reopen";
 }
-
-/** The text to show while a reopened stream replays a log from the start.
- * The old buffer stays until the replay has as much, so the pane does not
- * shrink and grow back and keeps its scroll. When the replay ends short (the
- * stream also ends on a dropped connection), the longer text stays. */
-export function replayBuffer(opts: {
-  /** The text on screen. */
-  shown: string;
-  /** The replay so far. */
-  replay: string;
-  /** The replaying stream has ended. */
-  ended: boolean;
-}): { text: string; caughtUp: boolean } {
-  if (opts.replay.length >= opts.shown.length) return { text: opts.replay, caughtUp: true };
-  return { text: opts.shown, caughtUp: opts.ended };
-}
