@@ -12,8 +12,13 @@
 /// by the workspace service. Mint and verify live in ONE module on purpose —
 /// the results token's message format is duplicated across two crates and that
 /// is a standing drift hazard, not a pattern to copy.
+mod author_overlay;
 pub mod cache_home;
 pub mod workspace_token;
+
+pub use author_overlay::{
+    author_overlay_refusals, AUTHOR_OVERLAY_FIELDS, RESERVED_METADATA_PREFIXES,
+};
 
 use async_trait::async_trait;
 use futures::io::AsyncBufRead;
@@ -5301,6 +5306,11 @@ pub fn build_pod(
 /// profile is merged); or if a layer names or removes a container Scarab added
 /// to the Pod other than the step container (the results-egress sidecar, the
 /// workspace containers, service sidecars): those carry Scarab's own wiring.
+/// The step author's `k8s_overlay` is held to more: it may set only the fields
+/// in [`AUTHOR_OVERLAY_FIELDS`] ([`author_overlay_refusals`], the same check the
+/// server makes at Run creation), and it may add to the Pod but not change or
+/// remove anything Scarab, the baseline or a profile set. The operator's layers
+/// are not limited by either rule.
 /// Fail-closed, never a silently mis-scheduled or mis-wired Pod. A no-op
 /// (returns the Pod unchanged) when there is no baseline, no profile, no overlay
 /// and no resources, preserving the pre-0055 behavior exactly. `step` names the
@@ -5326,9 +5336,11 @@ fn apply_placement(
     }
 
     // 2. The layers, in order: baseline → named profiles (in order) → k8s_overlay.
-    let mut layers: Vec<(String, &serde_json::Value)> = Vec::new();
+    // The bool marks the step author's overlay, which is held to
+    // `AUTHOR_OVERLAY_FIELDS` and may not change what the layers before it set.
+    let mut layers: Vec<(String, &serde_json::Value, bool)> = Vec::new();
     if let Some(base) = &placement.baseline {
-        layers.push(("the placement baseline".to_string(), base));
+        layers.push(("the placement baseline".to_string(), base, false));
     }
     for name in &spec.placement_profiles {
         let profile = placement
@@ -5338,13 +5350,13 @@ fn apply_placement(
             continue;
         }
         if let Some(k8s) = &profile.k8s {
-            layers.push((format!("placement_profile `{name}`"), k8s));
+            layers.push((format!("placement_profile `{name}`"), k8s, false));
         }
     }
     if let Some(o) = &spec.k8s_overlay {
-        layers.push(("the step's k8s_overlay".to_string(), o));
+        layers.push(("the step's k8s_overlay".to_string(), o, true));
     }
-    layers.retain(|(_, layer)| !layer.is_null());
+    layers.retain(|(_, layer, _)| !layer.is_null());
     if layers.is_empty() {
         return Ok(pod);
     }
@@ -5356,11 +5368,26 @@ fn apply_placement(
     // name the layer that tripped it.
     let mut pod_value = serde_json::to_value(&pod).map_err(|e| format!("pod encode: {e}"))?;
     let built = ScarabOwned::of(&pod_value);
-    for (source, layer) in &layers {
+    for (source, layer, authored) in &layers {
         refuse_patch_directives(source, layer)?;
         built.refuse_named_in(source, layer)?;
+        // The author's overlay: only the allowed fields, and nothing Scarab,
+        // the baseline or a profile set may change (the Pod as it stands
+        // before the overlay is merged).
+        let before = if *authored {
+            let refused = author_overlay_refusals(layer);
+            if !refused.is_empty() {
+                return Err(refused.join("; "));
+            }
+            Some(pod_value.clone())
+        } else {
+            None
+        };
         strategic_merge(&mut pod_value, layer, MergeAt::Pod);
         built.check_kept(source, &pod_value)?;
+        if let Some(before) = &before {
+            author_overlay::refuse_changes(before, &pod_value)?;
+        }
         // Decode after every layer, so a layer that leaves an invalid Pod is
         // the one the error names.
         pod = serde_json::from_value(pod_value.clone())
@@ -7904,11 +7931,11 @@ mod tests {
     }
 
     #[test]
-    fn k8s_overlay_wins_last() {
+    fn k8s_overlay_applies_after_the_operator_layers() {
         let mut spec = busybox();
         spec.k8s_overlay = Some(serde_json::json!({"spec":{"schedulerName":"mine"}}));
         let placement = PlacementConfig {
-            baseline: Some(serde_json::json!({"spec":{"schedulerName":"default-sched"}})),
+            baseline: Some(serde_json::json!({"spec":{"nodeSelector":{"pool":"ci"}}})),
             ..Default::default()
         };
         let ps = apply_placement(pod_for(&spec), "s", &spec, &placement)
@@ -7916,6 +7943,22 @@ mod tests {
             .spec
             .unwrap();
         assert_eq!(ps.scheduler_name.as_deref(), Some("mine"));
+        assert_eq!(ps.node_selector.unwrap()["pool"], "ci");
+    }
+
+    // Attack (git-bug 5b6b5cf): the step's overlay rewrites what the
+    // operator's baseline set. Safe outcome: refused, naming the field.
+    #[test]
+    fn k8s_overlay_may_not_override_the_baseline() {
+        let mut spec = busybox();
+        spec.k8s_overlay = Some(serde_json::json!({"spec":{"schedulerName":"mine"}}));
+        let placement = PlacementConfig {
+            baseline: Some(serde_json::json!({"spec":{"schedulerName":"default-sched"}})),
+            ..Default::default()
+        };
+        let err = apply_placement(pod_for(&spec), "s", &spec, &placement).unwrap_err();
+        assert!(err.contains("`spec.schedulerName`"), "got: {err}");
+        assert!(err.contains("k8s_overlay"), "got: {err}");
     }
 
     /// The fullest step Pod: the results sidecar, the workspace fetcher and
@@ -7990,13 +8033,20 @@ mod tests {
     }
 
     #[test]
-    fn overlay_on_the_step_container_keeps_its_image_command_env_and_mounts() {
+    fn profile_on_the_step_container_keeps_its_image_command_env_and_mounts() {
         let mut spec = full_spec();
-        spec.k8s_overlay = Some(serde_json::json!({"spec":{"containers":[
-            {"name":"step","securityContext":{"seccompProfile":{"type":"Unconfined"}}}
-        ]}}));
+        spec.placement_profiles = vec!["unconfined".into()];
+        let placement = PlacementConfig {
+            profiles: vec![profile(
+                "unconfined",
+                serde_json::json!({"spec":{"containers":[
+                    {"name":"step","securityContext":{"seccompProfile":{"type":"Unconfined"}}}
+                ]}}),
+            )],
+            ..Default::default()
+        };
         let before = full_pod_for(&spec).spec.unwrap();
-        let after = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default())
+        let after = apply_placement(full_pod_for(&spec), "s", &spec, &placement)
             .unwrap()
             .spec
             .unwrap();
@@ -8068,20 +8118,25 @@ mod tests {
     }
 
     #[test]
-    fn overlay_env_merges_by_name_on_the_step_container() {
-        // The baseline adds a variable to the step; the overlay replaces its
-        // value by name and adds one more. The step's built env is untouched.
+    fn layer_env_merges_by_name_on_the_step_container() {
+        // The baseline adds a variable to the step; a profile replaces its
+        // value by name, and the overlay adds one more. The step's built env
+        // is untouched.
         let mut spec = busybox();
+        spec.placement_profiles = vec!["proxy".into()];
         spec.k8s_overlay = Some(serde_json::json!({"spec":{"containers":[
-            {"name":"step","env":[
-                {"name":"HTTP_PROXY","value":"http://overlay:3128"},
-                {"name":"EXTRA","value":"1"}
-            ]}
+            {"name":"step","env":[{"name":"EXTRA","value":"1"}]}
         ]}}));
         let placement = PlacementConfig {
             baseline: Some(serde_json::json!({"spec":{"containers":[
                 {"name":"step","env":[{"name":"HTTP_PROXY","value":"http://baseline:3128"}]}
             ]}})),
+            profiles: vec![profile(
+                "proxy",
+                serde_json::json!({"spec":{"containers":[
+                    {"name":"step","env":[{"name":"HTTP_PROXY","value":"http://overlay:3128"}]}
+                ]}}),
+            )],
             ..Default::default()
         };
         let before = pod_for(&spec).spec.unwrap();
@@ -8156,10 +8211,22 @@ mod tests {
     #[test]
     fn a_layer_deleting_scarabs_init_containers_is_refused() {
         let mut spec = full_spec();
+        spec.placement_profiles = vec!["p".into()];
+        let placement = PlacementConfig {
+            profiles: vec![profile(
+                "p",
+                serde_json::json!({"spec":{"initContainers": null}}),
+            )],
+            ..Default::default()
+        };
+        let err = apply_placement(full_pod_for(&spec), "s", &spec, &placement).unwrap_err();
+        assert!(err.contains("removes container"), "got: {err}");
+        // The step's overlay is refused before it is merged.
+        let mut spec = full_spec();
         spec.k8s_overlay = Some(serde_json::json!({"spec":{"initContainers": null}}));
         let err = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default())
             .unwrap_err();
-        assert!(err.contains("removes container"), "got: {err}");
+        assert!(err.contains("`spec.initContainers`"), "got: {err}");
     }
 
     #[test]
@@ -8182,10 +8249,20 @@ mod tests {
     #[test]
     fn a_layer_deleting_scarabs_volumes_is_refused() {
         let mut spec = full_spec();
+        spec.placement_profiles = vec!["p".into()];
+        let placement = PlacementConfig {
+            profiles: vec![profile("p", serde_json::json!({"spec":{"volumes": null}}))],
+            ..Default::default()
+        };
+        let err = apply_placement(full_pod_for(&spec), "s", &spec, &placement).unwrap_err();
+        assert!(err.contains("removes or changes volume"), "got: {err}");
+        assert!(err.contains("placement_profile `p`"), "got: {err}");
+        // The step's overlay is refused before it is merged.
+        let mut spec = full_spec();
         spec.k8s_overlay = Some(serde_json::json!({"spec":{"volumes": null}}));
         let err = apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default())
             .unwrap_err();
-        assert!(err.contains("removes or changes volume"), "got: {err}");
+        assert!(err.contains("`spec.volumes`"), "got: {err}");
         assert!(err.contains("k8s_overlay"), "got: {err}");
     }
 
@@ -8301,9 +8378,10 @@ mod tests {
                     "nodeSelectorTerms":[term(v)]}}}}})
         };
         let mut spec = busybox();
-        spec.k8s_overlay = Some(affinity("ci-large"));
+        spec.placement_profiles = vec!["large".into()];
         let placement = PlacementConfig {
             baseline: Some(affinity("ci")),
+            profiles: vec![profile("large", affinity("ci-large"))],
             ..Default::default()
         };
         let ps = apply_placement(pod_for(&spec), "s", &spec, &placement)
@@ -8324,6 +8402,313 @@ mod tests {
             .clone()
             .unwrap();
         assert_eq!(values, vec!["ci-large".to_string()]);
+    }
+
+    /// Apply `overlay` as the step's `k8s_overlay` to the fullest step Pod,
+    /// with no operator layers.
+    fn apply_overlay(overlay: serde_json::Value) -> Result<Pod, String> {
+        let mut spec = full_spec();
+        spec.k8s_overlay = Some(overlay);
+        apply_placement(full_pod_for(&spec), "s", &spec, &PlacementConfig::default())
+    }
+
+    // Attack (git-bug 743545c): the overlay mounts a Secret Scarab created for
+    // a Pod, by its computable name, as a volume or a projected source.
+    // Safe outcome: refused, naming the field.
+    #[test]
+    fn overlay_adding_a_volume_sourced_from_a_scarab_secret_is_refused() {
+        let secret = step_secrets_secret_name(&pod_name(&step_with_attempt("run-0", "s", "a1")));
+        for (overlay, field) in [
+            (
+                serde_json::json!({"spec":{"volumes":[
+                    {"name":"x","secret":{"secretName": secret}}]}}),
+                "`spec.volumes[].secret`",
+            ),
+            (
+                serde_json::json!({"spec":{"volumes":[
+                    {"name":"x","projected":{"sources":[{"secret":{"name": secret}}]}}]}}),
+                "`spec.volumes[].projected`",
+            ),
+        ] {
+            let err = apply_overlay(overlay.clone()).expect_err(&format!("accepted {overlay}"));
+            assert!(err.contains(field), "{overlay}: {err}");
+        }
+    }
+
+    // Attack (git-bug 743545c): the overlay reads a Secret into the step's env.
+    // Safe outcome: refused, naming the field.
+    #[test]
+    fn overlay_reading_a_scarab_secret_into_the_step_env_is_refused() {
+        for (overlay, field) in [
+            (
+                serde_json::json!({"spec":{"containers":[{"name":"step","env":[
+                    {"name":"T","valueFrom":{"secretKeyRef":{"name":"scarab-x-token","key":"token"}}}
+                ]}]}}),
+                "`spec.containers[step].env[].valueFrom`",
+            ),
+            (
+                serde_json::json!({"spec":{"containers":[{"name":"step","envFrom":[
+                    {"secretRef":{"name":"scarab-x-secrets"}}]}]}}),
+                "`spec.containers[step].envFrom`",
+            ),
+        ] {
+            let err = apply_overlay(overlay.clone()).expect_err(&format!("accepted {overlay}"));
+            assert!(err.contains(field), "{overlay}: {err}");
+        }
+    }
+
+    // Attack (git-bug 24a3126): Pod and container fields outside the author
+    // allowlist — the server's ServiceAccount and its token, the host's
+    // namespaces and filesystem, privileged mode, containers of its own, DNS
+    // and host entries that point the sidecars elsewhere. Safe outcome: each is
+    // refused, naming its path.
+    #[test]
+    fn overlay_fields_outside_the_allowlist_are_refused() {
+        for (overlay, field) in [
+            (
+                serde_json::json!({"spec":{"serviceAccountName":"scarab"}}),
+                "`spec.serviceAccountName`",
+            ),
+            (
+                serde_json::json!({"spec":{"serviceAccount":"scarab"}}),
+                "`spec.serviceAccount`",
+            ),
+            (
+                serde_json::json!({"spec":{"automountServiceAccountToken":true}}),
+                "`spec.automountServiceAccountToken`",
+            ),
+            (
+                serde_json::json!({"spec":{"hostPID":true}}),
+                "`spec.hostPID`",
+            ),
+            (
+                serde_json::json!({"spec":{"hostNetwork":true}}),
+                "`spec.hostNetwork`",
+            ),
+            (
+                serde_json::json!({"spec":{"hostIPC":true}}),
+                "`spec.hostIPC`",
+            ),
+            (
+                serde_json::json!({"spec":{"shareProcessNamespace":true}}),
+                "`spec.shareProcessNamespace`",
+            ),
+            (
+                serde_json::json!({"spec":{"hostAliases":[
+                    {"ip":"127.0.0.1","hostnames":["scarab-server"]}]}}),
+                "`spec.hostAliases`",
+            ),
+            (
+                serde_json::json!({"spec":{"dnsConfig":{"nameservers":["10.0.0.9"]}}}),
+                "`spec.dnsConfig`",
+            ),
+            (
+                serde_json::json!({"spec":{"imagePullSecrets":[{"name":"scarab-x-registry"}]}}),
+                "`spec.imagePullSecrets`",
+            ),
+            (
+                serde_json::json!({"spec":{"nodeName":"control-plane"}}),
+                "`spec.nodeName`",
+            ),
+            (
+                serde_json::json!({"spec":{"securityContext":{"runAsUser":0}}}),
+                "`spec.securityContext`",
+            ),
+            (
+                serde_json::json!({"spec":{"volumes":[
+                    {"name":"root","hostPath":{"path":"/"}}]}}),
+                "`spec.volumes[].hostPath`",
+            ),
+            (
+                serde_json::json!({"spec":{"containers":[
+                    {"name":"step","securityContext":{"privileged":true}}]}}),
+                "`spec.containers[step].securityContext`",
+            ),
+            (
+                serde_json::json!({"spec":{"containers":[{"name":"step","image":"evil:1"}]}}),
+                "`spec.containers[step].image`",
+            ),
+            (
+                serde_json::json!({"spec":{"containers":[{"name":"mine","image":"evil:1"}]}}),
+                "container `mine`",
+            ),
+            (
+                serde_json::json!({"spec":{"initContainers":[{"name":"mine","image":"evil:1"}]}}),
+                "`spec.initContainers`",
+            ),
+            (
+                serde_json::json!({"spec":{"ephemeralContainers":[
+                    {"name":"mine","image":"evil:1"}]}}),
+                "`spec.ephemeralContainers`",
+            ),
+            (
+                serde_json::json!({"metadata":{"annotations":{
+                    "container.apparmor.security.beta.kubernetes.io/step":"unconfined"}}}),
+                "container.apparmor.security.beta.kubernetes.io/step",
+            ),
+            (
+                serde_json::json!({"metadata":{"name":"scarab-other"}}),
+                "`metadata.name`",
+            ),
+            (
+                serde_json::json!({"spec":{"tolerations":[{"operator":"Exists"}]}}),
+                "without a `key`",
+            ),
+            (
+                serde_json::json!({"spec":{"tolerations":[{
+                    "key":"node-role.kubernetes.io/control-plane",
+                    "operator":"Exists","effect":"NoSchedule"}]}}),
+                "node-role.kubernetes.io/control-plane",
+            ),
+        ] {
+            let err = apply_overlay(overlay.clone()).expect_err(&format!("accepted {overlay}"));
+            assert!(err.contains(field), "{overlay}: {err}");
+        }
+    }
+
+    // Attack: the overlay mounts on the step container a volume it did not
+    // add as an emptyDir (an operator's volume, by name). Safe outcome:
+    // refused.
+    #[test]
+    fn overlay_mounting_a_volume_it_did_not_add_is_refused() {
+        let err = apply_overlay(serde_json::json!({"spec":{"containers":[{"name":"step",
+            "volumeMounts":[{"name":"operator-creds","mountPath":"/creds"}]}]}}))
+        .unwrap_err();
+        assert!(err.contains("`operator-creds`"), "got: {err}");
+    }
+
+    /// An overlay that keeps to the allowlist applies: placement fields,
+    /// labels, extra resources, a literal variable and an emptyDir mount.
+    #[test]
+    fn an_allowed_overlay_still_applies() {
+        let pod = apply_overlay(serde_json::json!({
+            "metadata":{"labels":{"team":"web"},"annotations":{"note":"x"}},
+            "spec":{
+                "nodeSelector":{"pool":"gpu"},
+                "tolerations":[{"key":"gpu","operator":"Exists","effect":"NoSchedule"}],
+                "affinity":{"nodeAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[
+                    {"weight":1,"preference":{"matchExpressions":[
+                        {"key":"zone","operator":"In","values":["a"]}]}}]}},
+                "topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"zone",
+                    "whenUnsatisfiable":"ScheduleAnyway"}],
+                "priorityClassName":"ci-low",
+                "schedulerName":"mine",
+                "volumes":[{"name":"scratch","emptyDir":{"sizeLimit":"1Gi"}}],
+                "containers":[{"name":"step",
+                    "resources":{"limits":{"nvidia.com/gpu":"1"}},
+                    "env":[{"name":"EXTRA","value":"1"}],
+                    "volumeMounts":[{"name":"scratch","mountPath":"/scratch"}]}]
+            }
+        }))
+        .expect("an allowed overlay applies");
+        assert_eq!(
+            pod.metadata
+                .labels
+                .as_ref()
+                .unwrap()
+                .get("team")
+                .map(String::as_str),
+            Some("web")
+        );
+        let ps = pod.spec.unwrap();
+        assert_eq!(ps.node_selector.as_ref().unwrap()["pool"], "gpu");
+        assert_eq!(ps.priority_class_name.as_deref(), Some("ci-low"));
+        assert_eq!(ps.scheduler_name.as_deref(), Some("mine"));
+        assert!(ps.affinity.is_some());
+        assert_eq!(ps.topology_spread_constraints.as_ref().unwrap().len(), 1);
+        assert!(ps
+            .volumes
+            .iter()
+            .flatten()
+            .any(|v| v.name == "scratch" && v.empty_dir.is_some()));
+        let step = step_container(&ps);
+        assert_eq!(
+            step.resources.as_ref().unwrap().limits.as_ref().unwrap()["nvidia.com/gpu"].0,
+            "1"
+        );
+        assert!(step
+            .env
+            .iter()
+            .flatten()
+            .any(|e| e.name == "EXTRA" && e.value.as_deref() == Some("1")));
+        assert!(step
+            .volume_mounts
+            .iter()
+            .flatten()
+            .any(|m| m.name == "scratch" && m.mount_path == "/scratch"));
+        assert_eq!(ps.service_account_name, None);
+        assert_eq!(ps.automount_service_account_token, Some(false));
+    }
+
+    // Attack (git-bug 5b6b5cf): the overlay removes or rewrites what the
+    // operator's baseline or a profile added — a toleration, a container, a
+    // variable, a nodeSelector key, a spread constraint, a required node
+    // affinity it widens with a second term. Safe outcome: each is refused.
+    #[test]
+    fn overlay_changing_what_the_operator_layers_added_is_refused() {
+        let pool = serde_json::json!(
+            {"key":"dedicated","operator":"Equal","value":"ci","effect":"NoSchedule"});
+        let term = |v: &str| serde_json::json!({"matchExpressions":[{"key":"pool","operator":"In","values":[v]}]});
+        let placement = PlacementConfig {
+            baseline: Some(serde_json::json!({"spec":{
+                "tolerations":[pool],
+                "nodeSelector":{"pool":"ci"},
+                "affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{
+                    "nodeSelectorTerms":[term("ci")]}}},
+                "topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"zone",
+                    "whenUnsatisfiable":"DoNotSchedule"}]
+            }})),
+            profiles: vec![profile(
+                "proxy",
+                serde_json::json!({"spec":{
+                    "containers":[
+                        {"name":"step","env":[{"name":"HTTP_PROXY","value":"http://proxy:3128"}]},
+                        {"name":"egress-proxy","image":"proxy:1"}
+                    ]
+                }}),
+            )],
+            ..Default::default()
+        };
+        for overlay in [
+            serde_json::json!({"spec":{"tolerations":null}}),
+            serde_json::json!({"spec":{"nodeSelector":null}}),
+            serde_json::json!({"spec":{"nodeSelector":{"pool":"any"}}}),
+            serde_json::json!({"spec":{"nodeSelector":{"pool":null}}}),
+            serde_json::json!({"spec":{"affinity":null}}),
+            serde_json::json!({"spec":{"affinity":{"nodeAffinity":{
+                "requiredDuringSchedulingIgnoredDuringExecution":{
+                    "nodeSelectorTerms":[term("ci"), term("any")]}}}}}),
+            serde_json::json!({"spec":{"topologySpreadConstraints":[{"maxSkew":9,
+                "topologyKey":"zone","whenUnsatisfiable":"DoNotSchedule"}]}}),
+            serde_json::json!({"spec":{"containers":[{"name":"step","env":[
+                {"name":"HTTP_PROXY","value":"http://mine:3128"}]}]}}),
+            serde_json::json!({"spec":{"containers":[{"name":"egress-proxy","image":"evil:1"}]}}),
+            serde_json::json!({"spec":{"containers":null}}),
+        ] {
+            let mut spec = full_spec();
+            spec.placement_profiles = vec!["proxy".into()];
+            spec.k8s_overlay = Some(overlay.clone());
+            let res = apply_placement(full_pod_for(&spec), "s", &spec, &placement);
+            assert!(res.is_err(), "accepted {overlay}");
+        }
+        // Adding to them is fine: one more toleration and selector key.
+        let mut spec = full_spec();
+        spec.placement_profiles = vec!["proxy".into()];
+        spec.k8s_overlay = Some(serde_json::json!({"spec":{
+            "tolerations":[{"key":"gpu","operator":"Exists","effect":"NoSchedule"}],
+            "nodeSelector":{"gpu":"a100"}
+        }}));
+        let ps = apply_placement(full_pod_for(&spec), "s", &spec, &placement)
+            .expect("adding to the operator layers is allowed")
+            .spec
+            .unwrap();
+        assert_eq!(ps.tolerations.unwrap().len(), 2);
+        let selector = ps.node_selector.unwrap();
+        assert_eq!(
+            (selector["pool"].as_str(), selector["gpu"].as_str()),
+            ("ci", "a100")
+        );
+        assert!(ps.containers.iter().any(|c| c.name == "egress-proxy"));
     }
 
     #[test]
