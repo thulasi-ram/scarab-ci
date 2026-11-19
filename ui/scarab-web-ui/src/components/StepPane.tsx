@@ -44,7 +44,7 @@ import {
 } from "../attempts";
 import { heldBeforeStart } from "../events";
 import { failureBox, notLatestNote, statusWord, stepName, tryStatusWords } from "../run-page";
-import { levelOf, logBodyState } from "../logs";
+import { levelOf, logBodyState, replayBuffer, streamEndStep } from "../logs";
 import { approvalReleaseIn, type GateStatus } from "../gates";
 import { clock, clockLow, expiryPercent, isYankRefusal, pluginGateState } from "../run-origin";
 import { shortHash } from "../libraries";
@@ -374,22 +374,28 @@ export default function StepPane(props: {
   const logKey = (step: string, attempt: string, c: number | null) =>
     `${step} ${attempt} ${c ?? "main"}`;
 
-  // A stream the server ends while its try is still running (the Pod has not
-  // started, or the connection dropped) is opened again after a pause, and
-  // once more when the try finishes, so the log is not left short. A reopened
-  // stream replays from the start: its first chunk replaces the buffer.
+  // A stream the server ends while its try still reads as running waits one
+  // poll (REOPEN_MS is longer than the run's 1.2s poll): a try that finished
+  // ends its stream before the poll says so, and its log is whole. When the
+  // try still runs after that (the Pod had not started, or the connection
+  // dropped), the stream is opened again. `streamEndStep` decides.
+  // A reopened stream replays from the start into its own buffer, which
+  // replaces the one on screen once it has caught up (`replayBuffer`).
   const REOPEN_MS = 2000;
+  // Streams that ended while their try read as running, and whose wait ran
+  // out while their step was not in view: decided when it is in view again.
   const endedRunning = new Set<string>();
   const reopenTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  const replaying = new Set<string>();
+  const replays = new Map<string, string>();
   const [streamGen, setStreamGen] = createSignal(0);
+  const hasOutput = (key: string) => (untrack(buffers)[key] ?? "").length > 0;
   const reopen = (key: string) => {
     clearTimeout(reopenTimers.get(key));
     reopenTimers.delete(key);
     endedRunning.delete(key);
     streams.get(key)?.();
     streams.delete(key);
-    replaying.add(key);
+    replays.set(key, "");
     setEnded((prev) => {
       const next = { ...prev };
       delete next[key];
@@ -413,22 +419,56 @@ export default function StepPane(props: {
     // version — never stream it; the Logs tab shows the not-run line instead.
     if (!s || !a || notRun() || tab() !== "logs") return;
     const key = logKey(s, a.id, c);
-    // Its stream ended while it ran and it has finished since: read it once more.
-    if (endedRunning.has(key) && a.outcome !== "running") {
-      reopen(key);
-      return;
+    // Its stream ended while it ran, and the wait ran out out of view.
+    if (endedRunning.has(key)) {
+      endedRunning.delete(key);
+      if (streamEndStep({ outcome: a.outcome, graceOver: true, hadOutput: hasOutput(key) }) === "reopen") {
+        reopen(key);
+        return;
+      }
     }
     if (streams.has(key)) return;
-    const onChunk = (t: string) =>
-      setBuffers((prev) => {
-        const kept = replaying.delete(key) ? "" : (prev[key] ?? "");
-        return { ...prev, [key]: kept + t + "\n" };
-      });
+    const onChunk = (t: string) => {
+      const replay = replays.get(key);
+      if (replay === undefined) {
+        setBuffers((prev) => ({ ...prev, [key]: (prev[key] ?? "") + t + "\n" }));
+        return;
+      }
+      const next = replayBuffer({ shown: untrack(buffers)[key] ?? "", replay: replay + t + "\n", ended: false });
+      if (next.caughtUp) {
+        replays.delete(key);
+        setBuffers((prev) => ({ ...prev, [key]: next.text }));
+      } else {
+        replays.set(key, replay + t + "\n");
+      }
+    };
     const onEnd = () => {
+      const replay = replays.get(key);
+      if (replay !== undefined) {
+        replays.delete(key);
+        const next = replayBuffer({ shown: untrack(buffers)[key] ?? "", replay, ended: true });
+        setBuffers((prev) => ({ ...prev, [key]: next.text }));
+      }
       setEnded((prev) => ({ ...prev, [key]: true }));
-      if ((outcomeNow(s, a.id) ?? a.outcome) !== "running") return;
-      endedRunning.add(key);
-      if (!reopenTimers.has(key)) reopenTimers.set(key, setTimeout(() => reopen(key), REOPEN_MS));
+      const now = streamEndStep({
+        outcome: outcomeNow(s, a.id) ?? a.outcome,
+        graceOver: false,
+        hadOutput: hasOutput(key),
+      });
+      if (now !== "wait" || reopenTimers.has(key)) return;
+      reopenTimers.set(
+        key,
+        setTimeout(() => {
+          reopenTimers.delete(key);
+          const outcome = outcomeNow(s, a.id);
+          // Out of view: decided when the step is in view again.
+          if (outcome === undefined) {
+            endedRunning.add(key);
+            return;
+          }
+          if (streamEndStep({ outcome, graceOver: true, hadOutput: hasOutput(key) }) === "reopen") reopen(key);
+        }, REOPEN_MS),
+      );
     };
     // Sidecar logs share the step's real attempt ids, so the attempt scoping is
     // identical — only the endpoint (`?sidecar=<index>`) differs.

@@ -1,6 +1,6 @@
 // Log-line level classification (extracted from StepPane) — drives row accents.
 import { describe, it, expect } from "vitest";
-import { levelOf, logBodyState } from "./logs";
+import { levelOf, logBodyState, replayBuffer, streamEndStep } from "./logs";
 
 describe("levelOf", () => {
   it("classifies commands, errors, warnings and success lines", () => {
@@ -49,5 +49,62 @@ describe("logBodyState", () => {
   it("says nothing was captured for a finished try, even before the stream closes", () => {
     expect(logBodyState({ text: undefined, ended: false, outcome: "failed" })).toBe("none");
     expect(logBodyState({ text: undefined, ended: false, outcome: "succeeded" })).toBe("none");
+  });
+});
+
+// Regression: a try that finished ended its stream while the polled outcome
+// still said running, so the pane reopened it and read the whole log again.
+describe("streamEndStep", () => {
+  it("leaves the stream closed when the try finished", () => {
+    expect(streamEndStep({ outcome: "succeeded", graceOver: false, hadOutput: true })).toBe("done");
+    expect(streamEndStep({ outcome: "failed", graceOver: false, hadOutput: false })).toBe("done");
+  });
+
+  it("waits one poll when the try still reads as running", () => {
+    expect(streamEndStep({ outcome: "running", graceOver: false, hadOutput: true })).toBe("wait");
+  });
+
+  it("leaves it closed when the try turned out finished after the wait", () => {
+    expect(streamEndStep({ outcome: "succeeded", graceOver: true, hadOutput: true })).toBe("done");
+  });
+
+  it("reopens when the try still runs after the wait", () => {
+    expect(streamEndStep({ outcome: "running", graceOver: true, hadOutput: true })).toBe("reopen");
+    expect(streamEndStep({ outcome: "running", graceOver: true, hadOutput: false })).toBe("reopen");
+  });
+
+  it("reads a finished try once more when nothing arrived", () => {
+    expect(streamEndStep({ outcome: "failed", graceOver: true, hadOutput: false })).toBe("reopen");
+  });
+
+  it("leaves a step that is out of view alone", () => {
+    expect(streamEndStep({ outcome: undefined, graceOver: true, hadOutput: false })).toBe("done");
+  });
+});
+
+// Regression: the first chunk of a replay replaced the buffer, so the pane
+// shrank to one line, grew back, and lost its scroll.
+describe("replayBuffer", () => {
+  const shown = "line 1\nline 2\nline 3\n";
+
+  it("keeps the old buffer while the replay is shorter", () => {
+    expect(replayBuffer({ shown, replay: "line 1\n", ended: false })).toEqual({ text: shown, caughtUp: false });
+  });
+
+  it("swaps the replay in once it has caught up", () => {
+    const replay = shown + "line 4\n";
+    expect(replayBuffer({ shown, replay, ended: false })).toEqual({ text: replay, caughtUp: true });
+    expect(replayBuffer({ shown, replay: shown, ended: false })).toEqual({ text: shown, caughtUp: true });
+  });
+
+  it("keeps the longer text when the replay ends short", () => {
+    expect(replayBuffer({ shown, replay: "line 1\n", ended: true })).toEqual({ text: shown, caughtUp: true });
+  });
+
+  it("an empty buffer takes the first chunk", () => {
+    expect(replayBuffer({ shown: "", replay: "line 1\n", ended: false })).toEqual({
+      text: "line 1\n",
+      caughtUp: true,
+    });
   });
 });
