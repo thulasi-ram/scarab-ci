@@ -66,7 +66,7 @@ const ENV_GATE_RUN_ID = "0190f8a2000071fb8c00e7a9b0c1d2e3";
 // administers two orgs, so the org dropdown in Organization settings offers a
 // choice; globex has no connections or repositories of its own.
 /** A mock Principal id (`p_` + 32 hex), fixed per handle so screenshots and
- *  links stay stable. The server mints random ones (ADR-0080). */
+ *  links stay stable. The server mints random ones. */
 function pid(handle: string): string {
   let h = 0x811c9dc5;
   let out = "";
@@ -352,7 +352,9 @@ const runStatus: RunStatusDto = {
       status: "succeeded",
       attempts: 1,
       needs: [],
-      attempt_list: [{ id: "a1", started_at: ago(325000), failed: false, outcome: "succeeded" }],
+      attempt_list: [
+        { id: "a1", started_at: ago(325000), finished_at: ago(298000), failed: false, outcome: "succeeded" },
+      ],
     },
     {
       id: "build",
@@ -360,8 +362,8 @@ const runStatus: RunStatusDto = {
       attempts: 2,
       needs: ["clone"],
       attempt_list: [
-        { id: "a1", started_at: ago(297000), failed: true, failure: "step", outcome: "failed" },
-        { id: "a2", started_at: ago(250000), failed: false, outcome: "succeeded" },
+        { id: "a1", started_at: ago(297000), finished_at: ago(260000), failed: true, failure: "step", outcome: "failed" },
+        { id: "a2", started_at: ago(250000), finished_at: ago(190000), failed: false, outcome: "succeeded" },
       ],
     },
     {
@@ -369,7 +371,7 @@ const runStatus: RunStatusDto = {
       status: "running",
       attempts: 1,
       needs: ["build"],
-      attempt_list: [{ id: "a1", started_at: ago(190000), failed: false, outcome: "running" }],
+      attempt_list: [{ id: "a1", started_at: ago(190000), finished_at: null, failed: false, outcome: "running" }],
     },
   ],
 };
@@ -442,7 +444,7 @@ const richRunStatus: RunStatusDto = {
       attempts: 1,
       needs: [],
       attempt_list: [
-        { id: "a1", started_at: ago(25 * min), failed: false, outcome: "succeeded" },
+        { id: "a1", started_at: ago(25 * min), finished_at: ago(24 * min + 45000), failed: false, outcome: "succeeded" },
       ],
     },
     {
@@ -451,9 +453,16 @@ const richRunStatus: RunStatusDto = {
       attempts: 3,
       needs: ["clone"],
       attempt_list: [
-        { id: "a1", started_at: ago(24 * min + 30000), failed: false, outcome: "succeeded" },
-        { id: "a2", started_at: ago(14 * min + 55000), failed: true, failure: "step", outcome: "failed" },
-        { id: "a3", started_at: ago(13 * min + 40000), failed: false, outcome: "succeeded" },
+        { id: "a1", started_at: ago(24 * min + 30000), finished_at: ago(23 * min + 20000), failed: false, outcome: "succeeded" },
+        {
+          id: "a2",
+          started_at: ago(14 * min + 55000),
+          finished_at: ago(13 * min + 50000),
+          failed: true,
+          failure: "step",
+          outcome: "failed",
+        },
+        { id: "a3", started_at: ago(13 * min + 40000), finished_at: ago(12 * min + 30000), failed: false, outcome: "succeeded" },
       ],
     },
     {
@@ -464,8 +473,8 @@ const richRunStatus: RunStatusDto = {
       services: [{ index: 0, image: "redis:7.4", ports: [6379] }],
       uses: ["postgres"],
       attempt_list: [
-        { id: "a1", started_at: ago(23 * min + 15000), failed: false, outcome: "superseded" },
-        { id: "a2", started_at: ago(12 * min + 25000), failed: false, outcome: "succeeded" },
+        { id: "a1", started_at: ago(23 * min + 15000), finished_at: ago(15 * min), failed: false, outcome: "superseded" },
+        { id: "a2", started_at: ago(12 * min + 25000), finished_at: ago(10 * min), failed: false, outcome: "succeeded" },
       ],
     },
     {
@@ -586,6 +595,8 @@ const externalGate = (id: string, needs: string, status: string, a1: number, out
     {
       id: "a1",
       started_at: ago(a1),
+      // A gate that still waits has not finished; a resolved one closed a minute in.
+      finished_at: outcome === "running" ? null : ago(a1) + 60_000,
       failed: outcome === "failed",
       ...(outcome === "failed"
         ? { failure: "gate", failure_detail: "ImagePullBackOff: sha-a1b2c3d not found in registry" }
@@ -601,7 +612,7 @@ const gatesBump = (id: string, at: number) => ({
   status: "succeeded",
   attempts: 1,
   needs: [],
-  attempt_list: [{ id: "a1", started_at: ago(at), failed: false, outcome: "succeeded" }],
+  attempt_list: [{ id: "a1", started_at: ago(at), finished_at: ago(at) + 50_000, failed: false, outcome: "succeeded" }],
 });
 const gatesRunStatus: RunStatusDto = {
   id: GATES_RUN_ID,
@@ -694,7 +705,7 @@ const envGate = (id: string, approval: boolean, extra: Record<string, unknown> =
   needs: ["build"],
   gate: "manual",
   ...(approval ? { environment_approval_gate: true } : {}),
-  attempt_list: [{ id: "a1", started_at: ago(3 * min), failed: false, outcome: "running" }],
+  attempt_list: [{ id: "a1", started_at: ago(3 * min), finished_at: null, failed: false, outcome: "running" }],
   ...extra,
 });
 const envGateRunStatus: RunStatusDto = {
@@ -713,7 +724,9 @@ const envGateRunStatus: RunStatusDto = {
       status: "succeeded",
       attempts: 1,
       needs: [],
-      attempt_list: [{ id: "a1", started_at: ago(5 * min), failed: false, outcome: "succeeded" }],
+      attempt_list: [
+        { id: "a1", started_at: ago(5 * min), finished_at: ago(3 * min + 10000), failed: false, outcome: "succeeded" },
+      ],
     },
     envGate("qa", false),
     { id: "smoke", status: "pending", attempts: 0, needs: ["qa"], attempt_list: [] },

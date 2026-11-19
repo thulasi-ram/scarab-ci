@@ -14,3 +14,27 @@ export function levelOf(line: string): Level {
   if (/\b(finished|passed|ok|success(ful)?)\b/i.test(line)) return "ok";
   return "";
 }
+
+/** What an attempt's log body shows when it has no lines yet:
+ * - `output`  — there is output; render the lines.
+ * - `waiting` — nothing yet, but more may come: the stream is open and the
+ *               try is still running.
+ * - `none`    — nothing came and nothing will: the stream ended, or the try
+ *               has finished. The pane then says no output was captured and,
+ *               for a failed try, why it failed.
+ * A try with no output used to show "waiting for output…" forever, so its
+ * failure reason never appeared. */
+export type LogBodyState = "output" | "waiting" | "none";
+
+export function logBodyState(opts: {
+  /** The buffered text for this (step, attempt, container), if any arrived. */
+  text: string | undefined;
+  /** The log stream closed (the server ends it when nothing more will come). */
+  ended: boolean;
+  /** The attempt's outcome (`running`, `succeeded`, `failed`, …). */
+  outcome: string | undefined;
+}): LogBodyState {
+  if ((opts.text ?? "").split("\n").some((l) => l.length > 0)) return "output";
+  if (opts.ended) return "none";
+  return opts.outcome === undefined || opts.outcome === "running" ? "waiting" : "none";
+}

@@ -1,5 +1,5 @@
 // Run detail — the operator view. A provenance header answers "what is this
-// run"; below it, ONE Pipeline component (ADR-0056 + amendment) holds the DAG,
+// run"; below it, ONE Pipeline component holds the DAG,
 // the selected step's evidence, and a version-aware Artifacts footer. Its header
 // carries the always-present version dropdown — the run's history as a row per
 // Rerun (derived purely from the event log; "Take"/"attempt" never surface).
@@ -8,7 +8,7 @@
 // a read-only snapshot-at-boundary. The Activity rail stays separate — the
 // unfiltered, cross-version event log where reruns, retries, and crash
 // re-adoptions are witnessed.
-import { createSignal, createEffect, createResource, onMount, onCleanup, For, Show } from "solid-js";
+import { createSignal, createEffect, createMemo, createResource, onMount, onCleanup, For, Show } from "solid-js";
 import { A, useParams, useNavigate } from "@solidjs/router";
 import {
   getRun,
@@ -35,13 +35,22 @@ import {
   type RerunPlan,
   type RetentionInfo,
 } from "../api/client";
-import { eventParts, eventCategory, EVENT_GLYPH } from "../events";
+import {
+  eventParts,
+  eventCategory,
+  EVENT_GLYPH,
+  activeInfraConditions,
+  infraReasonText,
+} from "../events";
 import {
   deriveTakes,
   replayTake,
   rowLabel,
   versionRows,
   stepTiming,
+  attemptPlaces,
+  tryLabel,
+  artifactCount,
   visibleArtifacts as visibleArtifactsIn,
   type Take,
   type TakeView,
@@ -88,6 +97,7 @@ import { type FilmstripTry } from "../components/AttemptsDropdown";
 import DebugShell from "../components/DebugShell";
 import TriggerCell from "../components/TriggerCell";
 import RerunConfirm from "../components/RerunConfirm";
+import CancelRunConfirm from "../components/CancelRunConfirm";
 import Pill from "../components/Pill";
 
 const POLL_MS = 1200;
@@ -107,7 +117,7 @@ export default function RunDetail() {
   const repo = () => params.repo!;
 
   const [run, setRun] = createSignal<RunStatus | null>(null);
-  // A 1s tick for plugin gate expiry clocks (ADR-0076 §7).
+  // A 1s tick for plugin gate expiry clocks.
   const [nowTick, setNowTick] = createSignal(Date.now());
   const clockTimer = setInterval(() => setNowTick(Date.now()), 1000);
   onCleanup(() => clearInterval(clockTimer));
@@ -123,7 +133,7 @@ export default function RunDetail() {
   const [sel, setSel] = createSignal<string | null>(null);
   const [approving, setApproving] = createSignal<string | null>(null);
   const [gateNotes, setGateNotes] = createSignal<Record<string, string>>({});
-  // Reject (ADR-0070 §9): the gate whose in-page reason form is open, its
+  // Reject: the gate whose in-page reason form is open, its
   // draft reason, and the gate a reject is in flight for. Confirmation is the
   // form itself — a required reason and an explicit second click — never a
   // browser `confirm()` (the artifact/embedded viewers refuse dialogs).
@@ -131,7 +141,7 @@ export default function RunDetail() {
   const [rejectReason, setRejectReason] = createSignal("");
   const [rejecting, setRejecting] = createSignal<string | null>(null);
   const [selAttempt, setSelAttempt] = createSignal<string | null>(null);
-  // A step's docked sidecar the user clicked (ADR-0058): its `services:` index,
+  // A step's docked sidecar the user clicked: its `services:` index,
   // or null. Focuses that container in the StepPane Logs tab. Cleared whenever
   // the selection moves to a node (a plain step/service click) or the version
   // changes — so a stale sidecar focus never carries across.
@@ -155,12 +165,12 @@ export default function RunDetail() {
   const [rerunning, setRerunning] = createSignal<string | null>(null);
   const [retrying, setRetrying] = createSignal<string | null>(null);
   const [cancelling, setCancelling] = createSignal(false);
-  // ADR-0061 s5. The rerun PREVIEW for the selected step: whether expired
+  // The rerun PREVIEW for the selected step: whether expired
   // workspace snapshots widen the rerun upstream, resolved before the click so
-  // the button can say which it is (ADR-0027 — smart never means mysterious).
+  // the button can say which it is (a smart rerun must never be a mysterious one).
   const [plan, setPlan] = createSignal<RerunPlan | null>(null);
   // Distinguishes "preview still loading" from "preview FAILED" for the confirm
-  // popover: the first renders a loading line, the second an honest
+  // popover: the first renders a loading line, the second an
   // "unavailable" — both still allow confirm (disclosure, never prevention).
   const [planFailed, setPlanFailed] = createSignal(false);
   // The workspace-snapshot pin, mirrored locally so the toggle is optimistic
@@ -171,12 +181,12 @@ export default function RunDetail() {
   // The viewed Take (1-based), or null = latest. Only a CLOSED take is a
   // time-travel view; selecting the latest take clears back to live. Driven by
   // the VersionDropdown in the Pipeline band toolbar (Proposal B): a row per
-  // Rerun (ADR-0056 amendment), folded from the former persistent left rail.
+  // Rerun, folded from the former persistent left rail.
   const [viewTake, setViewTake] = createSignal<number | null>(null);
 
   const stepList = (): StepStatus[] => run()?.steps ?? [];
 
-  // --- Takes (ADR-0056): derived from the event log, stored nowhere. ---
+  // --- Takes: derived from the event log, stored nowhere. ---
   const takes = (): Take[] => deriveTakes(events());
   const latestTakeN = () => takes().length;
   const viewing = (): Take | null => {
@@ -196,8 +206,8 @@ export default function RunDetail() {
   // The take whose lens scopes the attempt-grain reads (tries strip, evidence
   // pane, ×N badges) — the SELECTED take INCLUDING the latest/open one, unlike
   // `viewing()`/`takeView()` which are null on the latest so the header can tell
-  // live from time-travel. Attempts are Take-scoped in EVERY view (ADR-0056
-  // amendment 2026-07-24): each Take shows only the attempts that belong to it,
+  // live from time-travel. Attempts are Take-scoped in EVERY view:
+  // each Take shows only the attempts that belong to it,
   // never tries carried over from prior Takes — the latest included.
   const selectedTake = (): Take | null => {
     const ts = takes();
@@ -227,7 +237,7 @@ export default function RunDetail() {
     return t ? events().slice(0, t.endIdx) : events();
   };
 
-  // Selection id space (ADR-0058): a step is `"<stepId>"`; a shared service is
+  // Selection id space: a step is `"<stepId>"`; a shared service is
   // `"service:<name>"`. A service selection routes to ServicePane, not StepPane,
   // and disables the step-only mutations (rerun/retry/debug).
   const SERVICE_PREFIX = "service:";
@@ -246,7 +256,7 @@ export default function RunDetail() {
     return selectedStep()?.status;
   };
   const selectedRunning = () => selectedStatus() === "running" && !timeTraveling();
-  // Rerun/retry are blocked when a prerequisite FAILED (ADR-0056 amendment):
+  // Rerun/retry are blocked when a prerequisite FAILED:
   // only {succeeded, skipped} prerequisites permit the action. Uses live
   // statuses (the action targets the latest version).
   const prereqBlocker = (stepId: string | null): string | null => {
@@ -269,7 +279,7 @@ export default function RunDetail() {
   const runningCount = () => stepList().filter((s) => s.status === "running").length;
 
   // Per-step wall-clock from the event log: first AttemptStarted → last
-  // AttemptFinished — Take-scoped (ADR-0056). Only THIS take's attempts count,
+  // AttemptFinished — Take-scoped. Only THIS take's attempts count,
   // so a step's duration is the current take's wall-clock, not summed across
   // takes (a rerun must not keep growing the displayed step time). Scoped via
   // the take's `windowAttempts` so it matches the ×N attempt badge; while
@@ -284,12 +294,17 @@ export default function RunDetail() {
     const timing = timingOf();
     const tv = takeView();
     const sv = scopedView();
+    // Conditions holding a step's current attempt back right now (no node, an
+    // image that will not pull). Only meaningful on the live view.
+    const infra = tv ? {} : activeInfraConditions(events());
     return stepList().map((s) => {
       const t = timing[s.id];
+      const latestAttempt = s.attempt_list?.[s.attempt_list.length - 1]?.id;
+      const held = infra[s.id];
       // Status stays LIVE (backend-authoritative) on the latest take; a closed
       // take replays it as of the boundary.
       const status = tv ? (tv.status[s.id] ?? "pending") : s.status;
-      // Attempt count is Take-scoped in EVERY view now (ADR-0056 amendment):
+      // Attempt count is Take-scoped in EVERY view now:
       // the ×N badge counts only THIS take's tries, not every take's summed. For
       // a single-take run the window covers everything, so this equals
       // `s.attempts` — no change to the common case.
@@ -316,7 +331,14 @@ export default function RunDetail() {
         // version (the statuses there are a replay; this is not).
         note: tv
           ? null
-          : (gateStatus(s) ??
+          : ((s.status === "running" && held && (!latestAttempt || held.attempt === latestAttempt)
+              ? {
+                  tone: "warning" as const,
+                  text: infraReasonText(held.reason),
+                  detail: held.message ? `${held.reason}: ${held.message}` : held.reason,
+                }
+              : null) ??
+            gateStatus(s) ??
             (s.attempt_list?.[s.attempt_list.length - 1]?.failure === "config" &&
             isYankRefusal(s.attempt_list[s.attempt_list.length - 1]!.failure_detail)
               ? { tone: "failed" as const, text: "refused · yanked" }
@@ -334,8 +356,8 @@ export default function RunDetail() {
             ? s.attempt_list?.[s.attempt_list.length - 1]?.started_at ?? null
             : null,
         durationMs: t?.start != null && t?.end != null ? t.end - t.start : null,
-        // Sidecars dock ON the node; `uses` names source the dotted service edges
-        // (ADR-0058). Both come straight off the step's live status projection.
+        // Sidecars dock ON the node; `uses` names source the dotted service edges.
+        // Both come straight off the step's live status projection.
         services: s.services,
         uses: s.uses,
         origin: s.origin,
@@ -343,14 +365,14 @@ export default function RunDetail() {
     });
   };
 
-  // A library version this Run uses that is yanked now (ADR-0076 §6): a
+  // A library version this Run uses that is yanked now: a
   // Rerun or Retry that would launch a Step from it is refused every time.
   const yanks = () => run()?.yanked_libraries ?? [];
   const rerunBlockedByYank = () =>
     rerunYank(sel(), stepList().map((s) => ({ id: s.id, needs: s.needs ?? [] })), yanks());
 
   // The selected step's tries, resolved from the event log — the markers the
-  // attempts filmstrip renders in the evidence-pane header (ADR-0056 amendment).
+  // attempts filmstrip renders in the evidence-pane header.
   // While viewing a closed Take, tries after the boundary are hidden (they
   // belong to a later version and never existed in this snapshot), and causes
   // are derived over the truncated log to match. Mirrors StepPane's
@@ -359,8 +381,7 @@ export default function RunDetail() {
     const s = selectedStep();
     if (!s) return [];
     // The tries strip shows only the SELECTED Take's attempts in EVERY view —
-    // the latest/live take included (per-Take scoping, ADR-0056 amendment
-    // 2026-07-24). A step carried forward untouched shows none; a re-run step
+    // the latest/live take included (per-Take scoping). A step carried forward untouched shows none; a re-run step
     // shows only this take's tries, numbered per-take. The latest take's window
     // grows with the streaming log, so new attempts appear live. Pure
     // derivation, extracted to attempts.ts.
@@ -386,7 +407,7 @@ export default function RunDetail() {
     listArtifacts(rid).catch(() => [] as Artifact[]),
   );
 
-  // Shared services (ADR-0058) now render as PEER NODES in the DAG (a lane at the
+  // Shared services now render as PEER NODES in the DAG (a lane at the
   // top) rather than a panel beside it. Poll alongside a live run for lifecycle
   // updates; a terminal run's set is fixed. Empty (the common case) → no lane.
   const [svcTick, setSvcTick] = createSignal(0);
@@ -471,7 +492,7 @@ export default function RunDetail() {
     setSelAttempt(null);
   });
 
-  // Fetch the rerun PREVIEW for the selected step (ADR-0061 s5 + git-bug
+  // Fetch the rerun PREVIEW for the selected step (git-bug
   // 4afaa3e). Lazy and per-selection rather than folded into the run resource:
   // the preview asks the object store whether each input snapshot is still
   // there, which is far too expensive to put on a 1.2s poll. Fetched for LIVE
@@ -583,7 +604,7 @@ export default function RunDetail() {
     }
   }
 
-  // Retry (ADR-0056 amendment): another Attempt in the CURRENT Take, no fork.
+  // Retry: another Attempt in the CURRENT Take, no fork.
   // Failed steps only (the button is gated so; the server also 409s otherwise).
   async function onRetry(step: string) {
     const previewed = planFor(step);
@@ -600,7 +621,7 @@ export default function RunDetail() {
     }
   }
 
-  // --- Gate approval (ADR-0008) -------------------------------------------
+  // --- Gate approval -------------------------------------------
   // A manual gate holds StepStatus::Pending until release flips it to
   // Succeeded, so (gate === "manual" && status === "pending") is the server's
   // OWN definition of "awaiting approval" — scheduler::GateNotPending rejects
@@ -671,7 +692,13 @@ export default function RunDetail() {
     }
   }
 
+  // Cancel run asks first, like Rerun and Retry: the first click opens a
+  // confirm popover anchored under the button.
+  const [confirmingCancel, setConfirmingCancel] = createSignal<{ top: number; left: number } | null>(
+    null,
+  );
   async function onCancel() {
+    setConfirmingCancel(null);
     setCancelling(true);
     try {
       await cancelRun(id());
@@ -681,7 +708,7 @@ export default function RunDetail() {
     }
   }
 
-  // Version-dropdown row copy (ADR-0056 amendment): the run history is a row per
+  // Version-dropdown row copy: the run history is a row per
   // Rerun, never surfacing "Take"/"attempt". Take 1 is the "original run"; every
   // later Take is named by the Rerun that OPENED it — the previous Take's closing
   // target (deriveTakes records it as `closedByTarget`) and time.
@@ -721,12 +748,21 @@ export default function RunDetail() {
     return null;
   };
 
+  // A PR run's head branch for the "base ← head" fact. The head commit is
+  // already the commit fact, so a branch that is only the sha is not repeated.
+  const headBranch = (t: { branch?: string; sha?: string }): string | null =>
+    t.branch && t.branch !== t.sha ? t.branch : null;
+
+  // Every attempt's version and try number, so an artifact names the try that
+  // published it the way the step pane does ("plan · try 2").
+  const places = createMemo(() => attemptPlaces(events()));
+
   const viewedLabel = (): string => {
     const v = viewing();
     return v ? rowLabel(takes(), v) : "latest";
   };
 
-  // The version rail's rows (ADR-0056 amendment): one per Take. The latest/open
+  // The version rail's rows: one per Take. The latest/open
   // Take tallies live `run().steps[].status`; a closed Take tallies its
   // snapshot-at-boundary replay. Pure derivation (row copy, outcome tallies,
   // selection flags), extracted to takes.ts.
@@ -752,7 +788,7 @@ export default function RunDetail() {
                 <HomeCrumb size={20} sepClass="crumb-head-sep" />
                 <RepoCrumb org={org()} repo={repo()} link />
                 <Icon icon="chevron-right" size={20} class="crumb-head-sep" />
-                {/* The per-repo run number `#N` is the human handle (ADR-0057);
+                {/* The per-repo run number `#N` is the human handle;
                     fall back to the short internal id for untenanted runs. */}
                 <span class="crumb-head-title" title={id()}>
                   {r().run_number != null ? `#${r().run_number}` : `run ${id().slice(0, 8)}`}
@@ -760,7 +796,7 @@ export default function RunDetail() {
               </h1>
             </div>
 
-            {/* Gates awaiting a decision (ADR-0008). Listed per gate, because a
+            {/* Gates awaiting a decision. Listed per gate, because a
                 run can be suspended on more than one and "approve" has to say
                 WHICH. Hidden while time-travelling: an older version is
                 read-only. */}
@@ -906,7 +942,7 @@ export default function RunDetail() {
               </div>
             </Show>
             <div class="run-toolbar">
-              {/* Two "agains" (ADR-0056 amendment): "Retry step" gives a FAILED
+              {/* Two "agains": "Retry step" gives a FAILED
                   step another attempt in the CURRENT version (no fork); "Rerun
                   pipeline from this step" re-runs this step + everything
                   downstream as a NEW version. "New run" mints a whole new run.
@@ -934,12 +970,12 @@ export default function RunDetail() {
                   <Icon icon="rotate-cw" size={13} /> {retrying() ? "retrying…" : "Retry step"}
                 </button>
               </Show>
-              {/* The rerun label is NOT a constant (ADR-0061 s5): when the
+              {/* The rerun label is NOT a constant: when the
                   selected step's input workspace snapshots have expired, rerunning
                   that step alone is impossible, so the button says which it is —
                   "Inputs expired — this re-runs from clone" — and names the whole
                   scope in its title. A rerun that quietly re-ran the pipeline from
-                  the start would be exactly the mystery ADR-0027 forbids. */}
+                  the start is the mystery a smart rerun must never be. */}
               <button
                 class="btn btn-ghost btn-sm"
                 classList={{ widened: isWidened(plan()) }}
@@ -994,7 +1030,10 @@ export default function RunDetail() {
               >
                 <button
                   class="btn btn-danger btn-sm"
-                  onClick={() => void onCancel()}
+                  onClick={(e) => {
+                    const b = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                    setConfirmingCancel({ top: b.bottom + 6, left: b.left });
+                  }}
                   disabled={cancelling()}
                   title="cancel this run and tear down its steps"
                 >
@@ -1016,7 +1055,7 @@ export default function RunDetail() {
                 <Icon icon="terminal" size={13} />{" "}
                 {selectedRunning() ? "Debug shell" : "Debug pod"}
               </button>
-              {/* The manual PIN (ADR-0061 s5): "keep this Run's workspaces", for an
+              {/* The manual PIN: "keep this Run's workspaces", for an
                   investigation that would otherwise be raced by the retention
                   sweeper. Acts on the time-bounded archive only — the title says so
                   rather than letting a reader assume it also pins a cache. */}
@@ -1035,7 +1074,7 @@ export default function RunDetail() {
                 )}
               </Show>
             </div>
-            {/* A version this Run uses was yanked (ADR-0076 §6): say what ran,
+            {/* A version this Run uses was yanked: say what ran,
                 what was refused, and offer a new run, which compiles against the
                 installed version. */}
             <Show when={!timeTraveling() && yankNote(yanks(), stepList(), (ms) => new Date(ms).toLocaleTimeString())}>
@@ -1076,6 +1115,16 @@ export default function RunDetail() {
                 />
               )}
             </Show>
+            <Show when={confirmingCancel()}>
+              {(anchor) => (
+                <CancelRunConfirm
+                  anchor={anchor()}
+                  busy={cancelling()}
+                  onCancel={() => setConfirmingCancel(null)}
+                  onConfirm={() => void onCancel()}
+                />
+              )}
+            </Show>
             {/* The TOCTOU disclosure: the executed plan diverged from the one
                 the popover previewed (a snapshot expired mid-confirm). */}
             <Show when={toast()}>
@@ -1090,7 +1139,7 @@ export default function RunDetail() {
             </Show>
             {/* The widened scope, stated WITHOUT a hover: a rerun that quietly
                 grew is still a surprise, even if the tooltip would have explained
-                it (ADR-0027 — smart never means mysterious). */}
+                it: a smart rerun must never be a mysterious one. */}
             <Show when={widenedNote(plan())}>
               {(note) => (
                 <p class="subtle rd-widened">
@@ -1098,7 +1147,7 @@ export default function RunDetail() {
                 </p>
               )}
             </Show>
-            {/* The cold tier's TIME bound, said out loud (ADR-0061 s5). Shown only
+            {/* The cold tier's TIME bound, said out loud. Shown only
                 once the promise matters — a pinned run, or one whose window has
                 lapsed; a run comfortably inside its window needs no notice. */}
             <Show when={retention()} keyed>
@@ -1112,7 +1161,7 @@ export default function RunDetail() {
               )}
             </Show>
 
-            {/* Provenance bar (ADR-0057 A·2): the SAME two-line body as a runs-
+            {/* Provenance bar: the SAME two-line body as a runs-
                 list row — the Headline on top, an icon-chip fact strip beneath
                 (no labels; the icon + hover title carry the meaning). The `#N`
                 handle lives in the breadcrumb; status floats right. Commit + PR
@@ -1153,7 +1202,7 @@ export default function RunDetail() {
                               <span class="mono sha">{t().sha!.slice(0, 8)}</span>
                             </a>
                           </Show>
-                          {/* base ← head on PR runs (ADR-0057); else branch/ref. */}
+                          {/* base ← head on PR runs; else branch/ref. */}
                           <Show
                             when={r().origin_pr_base}
                             fallback={
@@ -1166,11 +1215,20 @@ export default function RunDetail() {
                             }
                           >
                             {(base) => (
-                              <span class="pfact" title="base ← head">
+                              // The head commit is the commit fact above, so it
+                              // is not repeated here: the head branch is named
+                              // when the trigger carries one.
+                              <span class="pfact" title={headBranch(t()) ? "base ← head" : "base branch"}>
                                 <Icon icon="git-branch" size={12} />
                                 <span class="mono">{base()}</span>
-                                <span class="pr-arrow">←</span>
-                                <span class="mono sha">{(t().sha ?? "").slice(0, 8)}</span>
+                                <Show when={headBranch(t())}>
+                                  {(head) => (
+                                    <>
+                                      <span class="pr-arrow">←</span>
+                                      <span class="mono">{head()}</span>
+                                    </>
+                                  )}
+                                </Show>
                               </span>
                             )}
                           </Show>
@@ -1302,7 +1360,7 @@ export default function RunDetail() {
               </Show>
 
               {/* Blueprint band (full-width, always-dark canvas): shared services
-                  + sidecars live AS NODES in the graph (ADR-0058) — shared
+                  + sidecars live AS NODES in the graph — shared
                   services as copper peers in a lane at the top with dotted `uses`
                   edges; a step's own sidecars as docked chips on its node.
                   Selecting a service opens ServicePane in the pinned evidence
@@ -1322,7 +1380,7 @@ export default function RunDetail() {
               {/* Evidence pinned directly below the band, full-width, always
                   visible (Proposal B). A shared-service node opens ServicePane
                   (readiness + logs); every other selection is a step → StepPane
-                  (ADR-0058) — the same slot, switched by the `service:` selection
+                  — the same slot, switched by the `service:` selection
                   id. */}
               <div class="evidence-pinned">
                 <Show
@@ -1337,6 +1395,7 @@ export default function RunDetail() {
                       activeAttempt={stripActiveAttempt()}
                       onAttemptSelect={setSelAttempt}
                       versionLabel={timeTraveling() ? viewedLabel() : null}
+                      viewedTake={selectedTake()?.n ?? null}
                       window={stepWindow(sel())}
                       frontierAttempt={sel() ? scopedView()?.frontier[sel()!] ?? null : null}
                       deadLettered={r().status === "dead_lettered"}
@@ -1360,14 +1419,14 @@ export default function RunDetail() {
                 </Show>
               </div>
 
-              {/* Artifacts — run-level files of record, immutable per try
-                  (ADR-0056): version-aware footer of the Pipeline component; the
+              {/* Artifacts — run-level files of record, immutable per try:
+                  version-aware footer of the Pipeline component; the
                   bare download is the of-record resolution, shadowed/failed
                   versions download by pinned version. */}
               <div class="artifacts-foot">
                 <div class="af-h">
                   <span>Artifacts</span>
-                  <span class="subtle">{visibleArtifacts().length} versions</span>
+                  <span class="subtle">{artifactCount(visibleArtifacts())}</span>
                 </div>
               <Show
                 when={visibleArtifacts().length > 0}
@@ -1392,7 +1451,7 @@ export default function RunDetail() {
                         </span>
                         <Show when={a.step}>
                           <Pill tone={a.succeeded ? "muted" : "danger"}>
-                            {a.step}@{a.attempt}
+                            {tryLabel(places(), a.step!, a.attempt, selectedTake()?.n ?? null)}
                             {a.succeeded ? "" : " ✗"}
                           </Pill>
                         </Show>

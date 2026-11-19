@@ -1,8 +1,24 @@
 // Activity-rail event rendering: categorisation (glyph/colour) and the
 // step-chip split, over representative event shapes.
 import { describe, it, expect } from "vitest";
-import { describeEvent, eventParts, eventCategory, EVENT_GLYPH } from "./events";
-import { ev, started, finished, transitioned, rerun, retryRequested, readoptedEv } from "./event-fixtures";
+import {
+  describeEvent,
+  eventParts,
+  eventCategory,
+  EVENT_GLYPH,
+  activeInfraConditions,
+  infraReasonText,
+} from "./events";
+import {
+  ev,
+  started,
+  finished,
+  transitioned,
+  rerun,
+  retryRequested,
+  readoptedEv,
+  infraCondition,
+} from "./event-fixtures";
 
 describe("eventCategory", () => {
   it("unit variants (bare string kind) are info", () => {
@@ -67,7 +83,7 @@ describe("describeEvent / eventParts", () => {
     expect(parts.text).toBe("b reran by a.kim — new version");
   });
 
-  it("names the snapshot pin and unpin, with their actor (ADR-0061 s5)", () => {
+  it("names the snapshot pin and unpin, with their actor", () => {
     // Keeping a run's Workspace Snapshots past the retention window costs storage, so the
     // rail records both directions and attributes both. Neither is an execution
     // event, so neither gets a louder category than `info`.
@@ -118,8 +134,8 @@ describe("WorkspaceInputCollisions (ticket 2e1a458)", () => {
     // unfalsifiable (same trap the pin/unpin test documents).
     expect(EVENT_GLYPH[cat]).toBeTruthy();
     expect(EVENT_GLYPH[cat]).not.toBe(EVENT_GLYPH["info"]);
-    // And it is NOT an error: nothing failed — last-wins is ADR-0007
-    // semantics, the event only makes it loud.
+    // And it is NOT an error: nothing failed — last-input-wins is the
+    // documented rule, the event only makes it loud.
     expect(cat).not.toBe("err");
   });
 
@@ -160,7 +176,7 @@ describe("WorkspaceInputCollisions (ticket 2e1a458)", () => {
   });
 });
 
-// The infra-condition channel (ADR-0068). These events exist because a step
+// The infra-condition channel. These events exist because a step
 // whose Pod never started has an empty log stream by construction, so the
 // activity rail is the only place its diagnosis can appear.
 describe("StepInfraCondition", () => {
@@ -279,5 +295,107 @@ describe("GateResolved (slice b: gates fail with a reason)", () => {
     });
     expect(eventParts(rejected)).toEqual({ step: "approve", text: "gate rejected by j.lee — wrong build" });
     expect(eventCategory(rejected)).toBe("err");
+  });
+});
+
+// Regression: a failed event used the circular-arrow glyph, which reads as
+// "retry". It now uses the failure mark the rest of the run page uses.
+describe("EVENT_GLYPH err", () => {
+  it("is the failure mark, not a retry arrow", () => {
+    expect(EVENT_GLYPH[eventCategory(finished(1, "b", "a1", "step"))]).toBe("✗");
+    expect(EVENT_GLYPH.err).not.toBe("↻");
+  });
+});
+
+// Regression: a step whose Pod waited for a node read as "running" on the
+// graph. The graph reads the open condition of each step's current attempt.
+describe("activeInfraConditions", () => {
+  it("an onset with no close is active on the step's current attempt", () => {
+    const evs = [started(1, "build", "a1"), infraCondition(2, "build", "a1", "Unschedulable")];
+    expect(activeInfraConditions(evs)).toEqual({
+      build: { attempt: "a1", reason: "Unschedulable" },
+    });
+  });
+
+  it("carries the backend's message when it gave one", () => {
+    const onset = ev(2, {
+      StepInfraCondition: {
+        step: "build",
+        attempt: "a1",
+        reason: "Unschedulable",
+        message: "0/3 nodes are available",
+      },
+    });
+    expect(activeInfraConditions([started(1, "build", "a1"), onset]).build?.message).toBe(
+      "0/3 nodes are available",
+    );
+  });
+
+  it("the closing event (with held_ms) clears it", () => {
+    const evs = [
+      started(1, "build", "a1"),
+      infraCondition(2, "build", "a1", "Unschedulable"),
+      infraCondition(3, "build", "a1", "Unschedulable", 120_000),
+    ];
+    expect(activeInfraConditions(evs)).toEqual({});
+  });
+
+  it("a changed condition replaces the old one (close, then a new onset)", () => {
+    const evs = [
+      started(1, "build", "a1"),
+      infraCondition(2, "build", "a1", "Unschedulable"),
+      infraCondition(3, "build", "a1", "Unschedulable", 60_000),
+      infraCondition(3, "build", "a1", "ImagePullBackOff"),
+    ];
+    expect(activeInfraConditions(evs).build?.reason).toBe("ImagePullBackOff");
+  });
+
+  it("a finished attempt or a newer attempt holds nothing, even with no close", () => {
+    const finishedEvs = [
+      started(1, "build", "a1"),
+      infraCondition(2, "build", "a1", "Unschedulable"),
+      finished(3, "build", "a1", "infra"),
+    ];
+    expect(activeInfraConditions(finishedEvs)).toEqual({});
+    const replaced = [
+      started(1, "build", "a1"),
+      infraCondition(2, "build", "a1", "Unschedulable"),
+      started(3, "build", "a2"),
+    ];
+    expect(activeInfraConditions(replaced)).toEqual({});
+  });
+
+  it("a late onset for an older attempt does not mark the current one", () => {
+    const evs = [
+      started(1, "build", "a1"),
+      started(2, "build", "a2"),
+      infraCondition(3, "build", "a1", "Unschedulable"),
+    ];
+    expect(activeInfraConditions(evs)).toEqual({});
+  });
+
+  it("keeps steps apart", () => {
+    const evs = [
+      started(1, "build", "a1"),
+      started(1, "test", "a1"),
+      infraCondition(2, "test", "a1", "ContainerCreating"),
+    ];
+    expect(Object.keys(activeInfraConditions(evs))).toEqual(["test"]);
+  });
+});
+
+describe("infraReasonText", () => {
+  it("says a Pod the scheduler cannot place is waiting for a node", () => {
+    expect(infraReasonText("Unschedulable")).toBe("waiting for a node");
+    expect(infraReasonText("NotScheduled")).toBe("waiting for a node");
+  });
+
+  it("names the common container waits in plain words", () => {
+    expect(infraReasonText("ImagePullBackOff")).toBe("cannot pull its image");
+    expect(infraReasonText("ContainerCreating")).toBe("starting its container");
+  });
+
+  it("splits an unknown token into words rather than hiding it", () => {
+    expect(infraReasonText("SomeNewReason")).toBe("some new reason");
   });
 });

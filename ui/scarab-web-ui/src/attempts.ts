@@ -1,4 +1,4 @@
-// Attempt-grain derivations (ADR-0056): pure helpers over a step's ordered
+// Attempt-grain derivations: pure helpers over a step's ordered
 // attempt list + the event log — Take-window scoping, the scoped/of-record
 // try resolution, and the filmstrip/dropdown try mappers. Extracted from
 // StepPane / RunDetail / AttemptsDropdown so the seam where the real bugs
@@ -15,18 +15,18 @@ export type AttemptLike = {
   failed: boolean;
   failure?: string | null;
   /** The executor's human-readable cause (`attempts.failure_detail`) — WHAT
-   * happened, where `failure` is only which retry policy applied (ADR-0068).
+   * happened, where `failure` is only which retry policy applied.
    * This field existed on the API for months and no view read it, which is why
    * a dead-lettered step showed "no output for this try" and nothing else. */
   failure_detail?: string | null;
 };
 
-/** The attempts a step pane's tabs are scoped to. Take-windowed in EVERY view
- * (ADR-0056 amendment 2026-07-24): when the caller hands a `window` (the
+/** The attempts a step pane's tabs are scoped to. Take-windowed in EVERY view:
+ * when the caller hands a `window` (the
  * selected take's attempt-id set), keep only those tries — so a step carried
  * forward untouched (`[]`) reads as "didn't run in this version". The
  * `frontier` ≤-filter stays as the fallback for callers that don't pass a
- * window (snapshot-at-boundary honesty). */
+ * window (so a closed version never shows later tries). */
 export function windowAttemptList<A extends { id: string }>(
   list: A[],
   window: string[] | null | undefined,
@@ -75,7 +75,7 @@ export type FilmstripTry = {
   outcome: string;
   failed: boolean;
   failure?: string;
-  /** The executor's human-readable cause, when it reported one (ADR-0068). */
+  /** The executor's human-readable cause, when it reported one. */
   failureDetail?: string;
   /** Cut short by a rerun of an ancestor (started, never finished). */
   superseded: boolean;
@@ -113,10 +113,33 @@ export function stripTries(
   }));
 }
 
-/** Plain-english cause suffix (ADR-0056 amendment) — the machine's own retry vs
- * a human rerun of this step vs a rerun of an ancestor that dragged it along. */
-export const causeSuffix = (c?: AttemptCause): string =>
-  c === "rerun" ? " · you reran" : c === "cascade" ? " · ⟵ rerun" : c === "retry" ? " · auto-retry" : "";
+/** Why a try exists, in plain words: "first run", "automatic retry",
+ * "retried by <actor>", "rerun by <actor>", or "rerun of <step>" when a rerun
+ * of an upstream step re-armed it. The actor is shown as the server recorded
+ * it, the same as the event log and gate verdicts show it; with no actor
+ * recorded (auth off) the words stand alone. */
+export function causeText(c?: AttemptCause): string {
+  if (!c) return "";
+  const by = c.by ? ` by ${c.by}` : "";
+  switch (c.kind) {
+    case "initial":
+      return "first run";
+    case "auto-retry":
+      return "automatic retry";
+    case "manual-retry":
+      return c.by ? `retried${by}` : "manual retry";
+    case "rerun":
+      return `rerun${by}`;
+    case "cascade":
+      return `${c.via === "retry" ? "retry" : "rerun"} of ${c.upstream ?? "an upstream step"}`;
+  }
+}
+
+/** The cause as a title suffix: " · <cause>", or "" when the cause is unknown. */
+export const causeSuffix = (c?: AttemptCause): string => {
+  const t = causeText(c);
+  return t ? ` · ${t}` : "";
+};
 
 /** The dropdown row's title: `try N` + its cause suffix. */
 export const tryTitle = (t: FilmstripTry): string => `try ${t.index + 1}${causeSuffix(t.cause)}`;

@@ -1,4 +1,4 @@
-// The run's step DAG (ADR-0006/0028) — the differentiating surface, "blueprint
+// The run's step DAG — the differentiating surface, "blueprint
 // spine" treatment. Steps lay out in dependency layers (longest-path from the
 // roots); `needs` in-edges are drawn as measured orthogonal connectors on an SVG
 // under the nodes, and the edge feeding a running step animates a dashed flow.
@@ -16,6 +16,14 @@ import { shortHash } from "../libraries";
 import Icon from "./Icon";
 import Pill from "./Pill";
 
+/** A node's meta line and the tone it renders in. */
+export type DagNote = {
+  tone: GateStatus["tone"] | "warning";
+  text: string;
+  /** The full account for the hover title, when the text shortens it. */
+  detail?: string;
+};
+
 export type DagStep = {
   id: string;
   status: string;
@@ -26,22 +34,23 @@ export type DagStep = {
   reused?: boolean;
   needs: string[];
   gate?: string | null;
-  /** This step is marked `deploy: true` (ADR-0074 §2) — the step that deploys. */
+  /** This step is marked `deploy: true` — the step that deploys. */
   deploy?: boolean;
-  /** A gate's verdict — the line `gateStatus` (gates.ts) derives.
-   * Shown as the node's meta line in place of the generic one. */
-  note?: GateStatus | null;
+  /** A line shown as the node's meta in place of the generic one: a gate's
+   * verdict (`gateStatus` in gates.ts), a hold, or, in the `warning` tone, an
+   * infra condition holding a running step back ("waiting for a node"). */
+  note?: DagNote | null;
   /** When the current (running) attempt started, epoch-ms — drives live elapsed. */
   runningSince?: number | null;
   /** Wall-clock a finished step took (ms), derived from the event log. */
   durationMs?: number | null;
-  /** This step's co-located SIDECAR services (ADR-0058), rendered as docked
+  /** This step's co-located SIDECAR services, rendered as docked
    * chips ON the node (they live inside the step's Pod — never floated peers). */
   services?: { index: number; image: string }[];
   /** Names of pipeline-level SHARED services this step opts into via `uses:`
-   * (ADR-0058) — the source of the dotted service→step edges. */
+   * — the source of the dotted service→step edges. */
   uses?: string[];
-  /** The invoke chain this Step was inlined through (ADR-0076): a Step from
+  /** The invoke chain this Step was inlined through: a Step from
    * a library is drawn inside a box per invocation. */
   origin?: OriginLink[] | null;
   /** An Environment approval gate: its approvers release it. */
@@ -50,7 +59,7 @@ export type DagStep = {
   addedBy?: string | null;
 };
 
-/** A pipeline-level SHARED service (ADR-0058) — a PEER node in the services lane
+/** A pipeline-level SHARED service — a PEER node in the services lane
  * at the top of the DAG, with its own lifecycle. Distinct from a step's docked
  * sidecars: a shared service is one instance many steps reach via `uses:`. */
 export type DagService = {
@@ -105,13 +114,13 @@ export type DagControls = {
 
 export default function Dag(props: {
   steps: DagStep[];
-  /** Shared services (ADR-0058) — rendered as peer nodes in a lane at the top. */
+  /** Shared services — rendered as peer nodes in a lane at the top. */
   services?: DagService[];
   /** Selection id: a step is `"<stepId>"`; a shared service is `"service:<name>"`. */
   selected: string | null;
   onSelect: (id: string) => void;
   /** Click a step's docked sidecar chip — selects the step + focuses that
-   * sidecar's container in the Logs tab (ADR-0058). */
+   * sidecar's container in the Logs tab. */
   onSelectSidecar?: (stepId: string, index: number) => void;
   /** The sidecar index whose logs are currently active on the SELECTED step —
    * drives the docked chip's selected outline. */
@@ -167,7 +176,7 @@ export default function Dag(props: {
 
   // Dependency layers: a step sits one column right of its deepest dependency,
   // and a library invocation's Steps sit in one box that is a unit of its
-  // parent's layering (ADR-0076). Pure, in dag-layout.ts.
+  // parent's layering. Pure, in dag-layout.ts.
   const layers = () => layoutGroups(props.steps);
 
   // A node's UNSCALED box in graph space (transform-invariant — see `offsetIn`).
@@ -204,7 +213,7 @@ export default function Dag(props: {
         });
       }
     }
-    // Dashed `uses` edges (ADR-0058): from each shared-service peer node down to
+    // Dashed `uses` edges: from each shared-service peer node down to
     // every step that opts into it. A service edge is never "hot" — a service is
     // infra, not part of the running-step flow highlight. The services lane stays
     // a band at the TOP, so this edge drops from the service node's BOTTOM into
@@ -374,6 +383,9 @@ export default function Dag(props: {
 
   // A short status meta line under the node id.
   const meta = (s: DagStep): string => {
+    // A running step whose Pod is held back (no node, an image that will not
+    // pull) is not running yet: say what it waits for instead of a clock.
+    if (s.note?.tone === "warning") return s.note.text;
     if (s.status === "running") {
       return s.runningSince ? `running · ${elapsed(s.runningSince, now())}` : "running";
     }
@@ -388,7 +400,7 @@ export default function Dag(props: {
       const mark = s.status === "succeeded" ? "✓" : "✕";
       return `${mark} ${fmtDur(s.durationMs)}`;
     }
-    // Time-travel display statuses (ADR-0056): prettify the underscore form.
+    // Time-travel display statuses: prettify the underscore form.
     if (s.status === "superseded") return "superseded";
     if (s.status === "not_run") return "not run";
     return s.status;
@@ -408,7 +420,7 @@ export default function Dag(props: {
     return colon >= 0 ? seg.slice(0, colon) : seg;
   };
 
-  // One Step node. A plugin gate (ADR-0076 §7) is dashed and names its
+  // One Step node. A plugin gate is dashed and names its
   // plugin under its id.
   const StepNode = (p: { s: DagStep }) => {
     const s = p.s;
@@ -426,7 +438,7 @@ export default function Dag(props: {
         </span>
         <span class="dnode-main" title={s.id}>
           <span class="dnode-id">{s.id}</span>
-          <span class={`dnode-meta ${s.note ? `gnote ${s.note.tone}` : ""}`} title={s.note?.text}>
+          <span class={`dnode-meta ${s.note ? `gnote ${s.note.tone}` : ""}`} title={s.note?.detail ?? s.note?.text}>
             {meta(s)}
           </span>
           <Show when={plugin()}>
@@ -456,7 +468,7 @@ export default function Dag(props: {
         <Show when={s.status === "running"}>
           <span class="dnode-prog" />
         </Show>
-        {/* Docked SIDECARS (ADR-0058): each of the step's own `services:` as a
+        {/* Docked SIDECARS: each of the step's own `services:` as a
             small copper chip INSIDE the node — they die with the step, so
             never a floated peer with an edge. A chip is its own clickable
             target (stopPropagation); a `<span role=button>` because it nests
@@ -497,7 +509,7 @@ export default function Dag(props: {
   };
 
   // Dependency columns; a library invocation is a box holding its own
-  // columns, nested for an inner invocation (ADR-0076).
+  // columns, nested for an inner invocation.
   const Cols = (p: { cols: DagCell<DagStep>[][] }) => (
     <div class="dag-cols">
       <For each={p.cols}>
@@ -588,7 +600,7 @@ export default function Dag(props: {
           of depth layers and each `.dag-col` stacks its siblings vertically; the
           column wrapper keeps the lane spanning the width above that flow. */}
       <div class="dag-graph" ref={graph}>
-        {/* Services lane (ADR-0058): shared services are PEERS, not steps — a
+        {/* Services lane: shared services are PEERS, not steps — a
             band at the top, above dependency layer 0, with dotted `uses` edges
             dropping to each consuming step. They carry no `needs` depth, so the
             lane holds them all. Registered in `nodes` (keyed `service:<name>`) so

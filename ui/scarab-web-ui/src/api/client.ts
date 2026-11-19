@@ -1675,9 +1675,16 @@ export async function rejectGate(id: string, step: string, reason: string): Prom
   }
 }
 
-/** Whether a run status is terminal (no further updates will stream). */
+/** Whether a run status is terminal (no further updates will stream). A
+ * dead-lettered run is terminal too: the engine gave up on it, so the page
+ * stops polling, drops the Live mark and offers no Cancel. */
 export function isTerminal(status: string): boolean {
-  return status === "succeeded" || status === "failed" || status === "cancelled";
+  return (
+    status === "succeeded" ||
+    status === "failed" ||
+    status === "cancelled" ||
+    status === "dead_lettered"
+  );
 }
 
 // --- Secrets. Values are write-only; the API never returns them. ---

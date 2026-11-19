@@ -1,6 +1,6 @@
 // Log-line level classification (extracted from StepPane) — drives row accents.
 import { describe, it, expect } from "vitest";
-import { levelOf } from "./logs";
+import { levelOf, logBodyState } from "./logs";
 
 describe("levelOf", () => {
   it("classifies commands, errors, warnings and success lines", () => {
@@ -20,5 +20,28 @@ describe("levelOf", () => {
 
   it("error outranks a success word on the same line", () => {
     expect(levelOf("error: test failed, ok count 3")).toBe("err");
+  });
+});
+
+// Regression: a try with no log output showed "waiting for output…" forever,
+// so the failure reason under it never rendered.
+describe("logBodyState", () => {
+  it("any non-empty line is output", () => {
+    expect(logBodyState({ text: "hello\n", ended: false, outcome: "running" })).toBe("output");
+  });
+
+  it("waits while the stream is open and the try is running", () => {
+    expect(logBodyState({ text: undefined, ended: false, outcome: "running" })).toBe("waiting");
+    expect(logBodyState({ text: undefined, ended: false, outcome: undefined })).toBe("waiting");
+  });
+
+  it("says nothing was captured once the stream ended", () => {
+    expect(logBodyState({ text: undefined, ended: true, outcome: "running" })).toBe("none");
+    expect(logBodyState({ text: "\n", ended: true, outcome: "failed" })).toBe("none");
+  });
+
+  it("says nothing was captured for a finished try, even before the stream closes", () => {
+    expect(logBodyState({ text: undefined, ended: false, outcome: "failed" })).toBe("none");
+    expect(logBodyState({ text: undefined, ended: false, outcome: "succeeded" })).toBe("none");
   });
 });

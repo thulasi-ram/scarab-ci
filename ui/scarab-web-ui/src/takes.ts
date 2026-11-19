@@ -1,11 +1,11 @@
-// Takes (ADR-0056): the run-level version lens, derived ENTIRELY client-side
+// Takes: the run-level version view, derived ENTIRELY client-side
 // from the event log — no take is stored anywhere. A Take is the span of a
 // run between two human interventions (`RunRerunRequested` events); Take N's
 // view is a pure replay of the log up to its closing boundary, so a closed
 // Take shows the run exactly as it stood the instant Rerun was pressed
 // (snapshot-at-boundary). An attempt that straddles a boundary — started in
 // Take N, still in flight when Rerun was pressed — shows as `superseded` when
-// that Rerun re-armed its step (it was cut short), else honestly as `running`.
+// that Rerun re-armed its step (it was cut short), else as `running`.
 import type { RunEvent, Artifact } from "./api/client";
 import type { OutcomeCounts, VersionRow } from "./components/VersionDropdown";
 import { relTime } from "./fmt";
@@ -163,17 +163,32 @@ export function ofRecordAttemptId(
   return null;
 }
 
-/** Why one try (Attempt) of a step exists (ADR-0056 amendment):
- * - `initial`  — the step's first-ever execution.
- * - `retry`    — the engine auto-retrying a not-yet-succeeded step (within
- *                budget); same history row, no fork.
- * - `rerun`    — a human reran THIS step (it was the rerun target): a fork.
- * - `cascade`  — a human reran an ANCESTOR and this step was dragged along by
- *                smart invalidation (ADR-0027) — "you did one thing; the rest
- *                followed" (points back at the rerun with "⟵ …").
- * The discriminator is the step's state + who acted, all read off the event
- * log — nothing is stored. */
-export type AttemptCause = "initial" | "retry" | "rerun" | "cascade";
+/** Why one try (Attempt) of a step exists:
+ * - `initial`      — the step's first-ever execution.
+ * - `auto-retry`   — the engine retrying a not-yet-succeeded step within its
+ *                    retry budget; same version, no fork.
+ * - `manual-retry` — a human pressed Retry on this step (`StepRetryRequested`):
+ *                    another try in the same version. `by` names who.
+ * - `rerun`        — a human reran THIS step (it was the rerun target): a new
+ *                    version. `by` names who.
+ * - `cascade`      — a human reran or retried an UPSTREAM step and this one was
+ *                    re-armed with it. `upstream` names that step and `via`
+ *                    says which action it was.
+ * A control-plane re-adoption is not a cause: it is the same try, so it stays
+ * a marker (`readopted` below). Everything is read off the event log; nothing
+ * is stored. */
+export type AttemptCauseKind = "initial" | "auto-retry" | "manual-retry" | "rerun" | "cascade";
+
+export type AttemptCause = {
+  kind: AttemptCauseKind;
+  /** Who pressed Retry or Rerun (`manual-retry`, `rerun`, `cascade`); null
+   * when the server recorded no actor (auth off). */
+  by?: string | null;
+  /** `cascade` only: the step the human acted on. */
+  upstream?: string;
+  /** `cascade` only: whether that action was a rerun or a retry. */
+  via?: "rerun" | "retry";
+};
 
 /** Attempt-grain derivations for one step, all from the event log:
  * - `causes`     — per-attempt cause (above).
@@ -187,7 +202,7 @@ export type AttemptCause = "initial" | "retry" | "rerun" | "cascade";
  * NOTE: the backend's `AttemptDto.outcome` is now authoritative for
  * running/succeeded/failed/superseded (the fan reads it directly); this
  * derivation stays as the fallback for older events/servers, and `shadowed`
- * (an of-record lens over successes) remains client-derived here. */
+ * (an of-record view over successes) remains client-derived here. */
 export function attemptCauses(
   events: RunEvent[],
   step: string,
@@ -206,22 +221,25 @@ export function attemptCauses(
   const finished = new Set<string>(); // ids that got an AttemptFinished
   const succeeded: string[] = []; // ids that finished WITHOUT a failure, in order
 
-  // A rerun naming this step arms the NEXT attempt of it — as a `rerun` when
-  // this step IS the target, else as a `cascade` (dragged in via invalidated).
+  // A human rerun or retry naming this step arms the NEXT attempt of it: as a
+  // `rerun` / `manual-retry` when this step IS the target, else as a `cascade`
+  // (re-armed through `invalidated`). An attempt that starts with nothing armed
+  // is the engine's own automatic retry.
   let armedBy: AttemptCause | null = null;
   let seen = 0;
   for (const e of events) {
     const k = kindOf(e);
     if (!k) continue;
-    // A rerun (Take fork) OR a retry (in-Take, ADR-0056 amendment 2026-07-22)
-    // both re-arm the target + its dependent cascade. The target's next attempt
-    // is a `rerun` (fork) or a `retry` (same-Take try); dragged descendants are
-    // `cascade`. Either way, an attempt still in flight is cut short → superseded.
+    // A rerun (new version) OR a retry (same version) both re-arm the target
+    // and its dependent cascade. Either way, an attempt still in flight is cut
+    // short, so it is superseded.
     if (k.tag === "RunRerunRequested" || k.tag === "StepRetryRequested") {
       const invalidated = (k.v.invalidated as string[]) ?? [];
       const target = k.v.target as string;
-      if (target === step) armedBy = k.tag === "StepRetryRequested" ? "retry" : "rerun";
-      else if (invalidated.includes(step)) armedBy = "cascade";
+      const by = (k.v.by as string | null | undefined) ?? null;
+      const via = k.tag === "StepRetryRequested" ? "retry" : "rerun";
+      if (target === step) armedBy = { kind: via === "retry" ? "manual-retry" : "rerun", by };
+      else if (invalidated.includes(step)) armedBy = { kind: "cascade", by, upstream: target, via };
       else continue;
       for (const id of started) if (!finished.has(id)) superseded.add(id);
       continue;
@@ -230,7 +248,7 @@ export function attemptCauses(
     if (k.tag === "AttemptStarted") {
       const id = String(k.v.attempt ?? "");
       seen += 1;
-      causes[id] = seen === 1 ? "initial" : (armedBy ?? "retry");
+      causes[id] = seen === 1 ? { kind: "initial" } : (armedBy ?? { kind: "auto-retry" });
       armedBy = null;
       started.push(id);
     } else if (k.tag === "AttemptFinished") {
@@ -247,6 +265,84 @@ export function attemptCauses(
   for (let i = 0; i < succeeded.length - 1; i++) shadowed.add(succeeded[i]);
 
   return { causes, readopted, superseded, shadowed };
+}
+
+/** Where one attempt sits: the version (Take) it started in and its 1-based
+ * try number within that version. */
+export type AttemptPlace = { take: number; try: number };
+
+/** Every attempt's version and try number, keyed `step -> attempt -> place`.
+ * Tries are counted within a version, the same windows `replayTake` uses: a
+ * version opens at the previous `RunRerunRequested`, and an `AttemptStarted`
+ * at or after it belongs to that version. A manual retry stays in the current
+ * version, so it only advances the try count. */
+export function attemptPlaces(events: RunEvent[]): Record<string, Record<string, AttemptPlace>> {
+  const out: Record<string, Record<string, AttemptPlace>> = {};
+  const counts: Record<string, number> = {}; // per step, within the current take
+  let take = 1;
+  for (const e of events) {
+    const k = kindOf(e);
+    if (!k) continue;
+    if (k.tag === "RunRerunRequested") {
+      take += 1;
+      for (const s of Object.keys(counts)) counts[s] = 0;
+      continue;
+    }
+    if (k.tag !== "AttemptStarted") continue;
+    const step = k.v.step as string | undefined;
+    if (!step) continue;
+    const id = String(k.v.attempt ?? "");
+    counts[step] = (counts[step] ?? 0) + 1;
+    (out[step] ??= {})[id] = { take, try: counts[step] };
+  }
+  return out;
+}
+
+/** An attempt named the way the run page counts tries: "plan · try 2" when it
+ * belongs to the version in view, "plan · version 1 · try 2" when it belongs
+ * to another one. Falls back to the raw id when the event log does not know
+ * the attempt (an old run, or a log still loading). `viewedTake` null = no
+ * version context, so the version is always named. */
+export function tryLabel(
+  places: Record<string, Record<string, AttemptPlace>>,
+  step: string,
+  attempt: string,
+  viewedTake: number | null,
+): string {
+  const p = places[step]?.[attempt];
+  if (!p) return `${step} · ${attempt}`;
+  if (viewedTake !== null && p.take === viewedTake) return `${step} · try ${p.try}`;
+  return `${step} · version ${p.take} · try ${p.try}`;
+}
+
+/** The of-record attempt of a step that did not run in the version in view
+ * (carried forward from an earlier one): the latest of-record attempt among
+ * those started in EARLIER versions. Attempts from later versions never count,
+ * so an older version's view does not borrow a newer version's outputs. Null
+ * when no earlier attempt is of record. */
+export function carriedOfRecord<A extends { id: string; outcome: string; failed: boolean }>(
+  list: A[],
+  places: Record<string, AttemptPlace> | undefined,
+  viewedTake: number,
+): { id: string; take: number; try: number } | null {
+  if (!places) return null;
+  const earlier = list.filter((a) => {
+    const p = places[a.id];
+    return p !== undefined && p.take < viewedTake;
+  });
+  const id = ofRecordAttemptId(earlier);
+  if (!id) return null;
+  const p = places[id]!;
+  return { id, take: p.take, try: p.try };
+}
+
+/** The Artifacts header count. A file published by several tries has one copy
+ * per try, so the header counts distinct names and adds the copies only when
+ * there are more of them: "3 files", "3 files · 5 copies". */
+export function artifactCount(rows: { name: string }[]): string {
+  const files = new Set(rows.map((r) => r.name)).size;
+  const label = `${files} ${files === 1 ? "file" : "files"}`;
+  return rows.length > files ? `${label} · ${rows.length} copies` : label;
 }
 
 /** Numeric part of an attempt id (`a3` → 3) for as-of-boundary comparisons. */
@@ -288,7 +384,7 @@ export function stepTiming(
 export function visibleArtifacts(all: Artifact[], tv: TakeView | null): Artifact[] {
   if (!tv) return all;
   const rows = all.filter((a) => {
-    if (!a.step) return true; // pre-ADR-0056 row: no provenance to judge
+    if (!a.step) return true; // a row from before artifacts carried provenance
     const frontier = tv.frontier[a.step];
     return frontier !== undefined && attemptN(a.attempt) <= attemptN(frontier);
   });
@@ -299,7 +395,7 @@ export function visibleArtifacts(all: Artifact[], tv: TakeView | null): Artifact
   return rows.map((a, i) => ({ ...a, of_record: ofRecord.get(a.name) === i }));
 }
 
-// --- Version rows (ADR-0056 amendment): the run history is a row per Rerun,
+// --- Version rows: the run history is a row per Rerun,
 // never surfacing "Take"/"attempt". Take 1 is the "original run"; every later
 // Take is named by the Rerun that OPENED it — the previous Take's closing
 // target and time. Extracted from RunDetail. ---

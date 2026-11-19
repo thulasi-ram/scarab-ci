@@ -223,6 +223,8 @@ const lib = (name: string, hash: string, source: string, yanked = false): S["Ori
 const attempt = (startedMin: number, outcome = "succeeded", failure?: { failure: string; detail: string }): S["AttemptDto"] => ({
   id: "a1",
   started_at: ago(startedMin * min),
+  // eventsOf() logs a finished attempt's AttemptFinished 40s after its start.
+  finished_at: outcome === "running" ? null : ago(startedMin * min) + 40_000,
   failed: !!failure,
   outcome,
   ...(failure ? { failure: failure.failure, failure_detail: failure.detail } : {}),
@@ -285,7 +287,7 @@ function pluginRun(): RunStatusDto {
     needs: ["bump"],
     status: v === "pass" ? "succeeded" : v === "exp" ? "failed" : "pending",
     origin: [{ kind: "plugin", name: "argocd-prod/wait-live", content_hash: h("e40b7c19d2a6") }],
-    attempt_list: [{ id: "a1", started_at: reached, failed: v === "exp", outcome: v === "pass" ? "succeeded" : v === "exp" ? "failed" : "running", ...(v === "exp" ? { failure: "gate", failure_detail: "expired after 1800s with no release from plugin:argocd-prod" } : {}) }],
+    attempt_list: [{ id: "a1", started_at: reached, finished_at: v === "pass" || v === "exp" ? reached + 40_000 : null, failed: v === "exp", outcome: v === "pass" ? "succeeded" : v === "exp" ? "failed" : "running", ...(v === "exp" ? { failure: "gate", failure_detail: "expired after 1800s with no release from plugin:argocd-prod" } : {}) }],
     plugin_gate: {
       releaser: "plugin:argocd-prod",
       installation: "argocd-prod",
@@ -309,7 +311,7 @@ function pluginRun(): RunStatusDto {
     step({ id: "build", status: "succeeded", needs: ["checkout/git"], attempt_list: [attempt(8)] }),
     step({ id: "bump", status: "succeeded", deploy: true, needs: ["build"], attempt_list: [attempt(7)] }),
     gateStep,
-    step({ id: "sign-off", gate: "manual", status: "pending", needs: ["bump"], attempt_list: [{ id: "a1", started_at: reached, failed: false, outcome: "running" }] }),
+    step({ id: "sign-off", gate: "manual", status: "pending", needs: ["bump"], attempt_list: [{ id: "a1", started_at: reached, finished_at: null, failed: false, outcome: "running" }] }),
     step({ id: "announce", status: "pending", needs: ["live", "sign-off"] }),
   ]);
 }

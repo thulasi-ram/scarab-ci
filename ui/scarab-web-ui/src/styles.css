@@ -852,6 +852,8 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 }
 .gate-status.passed, .dnode-meta.gnote.passed { color: var(--ok-ink); }
 .gate-status.failed, .dnode-meta.gnote.failed { color: var(--danger); }
+/* A running step held back by its infrastructure ("waiting for a node"). */
+.dnode-meta.gnote.warning { color: var(--warn); }
 .run-toolbar .btn-sm {
   display: inline-flex;
   align-items: center;

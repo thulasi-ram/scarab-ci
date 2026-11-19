@@ -1,7 +1,7 @@
 // Run-detail walkthrough over the RICH mock fixture (src/mock.ts): one run
 // carrying every multi-take surface — a RunRerunRequested boundary (two
-// versions, superseded/shadowed attempts), a shared service + docked sidecar
-// (ADR-0058), a pending manual gate, and an artifact of record. All selectors
+// versions, superseded/shadowed attempts), a shared service + docked sidecar,
+// a pending manual gate, and an artifact of record. All selectors
 // are role/text-based (glossary copy, ARIA roles) — no CSS-class coupling, no
 // pixel snapshots.
 import { test, expect, type Page } from "@playwright/test";
@@ -9,7 +9,7 @@ import { test, expect, type Page } from "@playwright/test";
 // The rich run's id in src/mock.ts.
 const RICH_RUN_ID = "0190f8a2000071fb8c0099887766ccdd";
 
-// Glossary (ADR-0056 amendment): the words "Take" and "Attempt" NEVER surface
+// Glossary: the words "Take" and "Attempt" NEVER surface
 // in user-facing copy — rows say "original run" / "you reran X", tries say
 // "try N". (Lowercase "attempt started" in the raw activity log is event
 // language, not the version/try lens — the ban is on the capitalized terms.)
@@ -87,9 +87,9 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   await triesBtn.click();
   const try1 = page.getByRole("menuitemradio", { name: /try 1/ });
   const try2 = page.getByRole("menuitemradio", { name: /try 2/ });
-  await expect(try1).toContainText("you reran"); // the rerun target's fork try
+  await expect(try1).toContainText("rerun by a.kim"); // the rerun target's fork try
   await expect(try1).toContainText("✗ failed");
-  await expect(try2).toContainText("auto-retry"); // the engine's in-version retry
+  await expect(try2).toContainText("automatic retry"); // the engine's in-version retry
   await expect(try2).toContainText("✓ succeeded");
   // The glossary ban again, WITH the tries menu in the DOM.
   await expectGlossaryClean(page);
@@ -98,7 +98,9 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   // ── (f) artifacts section lists the artifact of record ───────────────────
   await expect(page.getByText("Artifacts", { exact: true })).toBeVisible();
   await expect(page.getByRole("link", { name: "scarab-dist.tar.gz" })).toBeVisible();
-  await expect(page.getByText("build@a3")).toBeVisible();
+  // The pill names the try the way the tries menu counts it: build's a3 is
+  // its second try in the latest version.
+  await expect(page.getByText("build · try 2", { exact: true })).toBeVisible();
   await expect(page.getByText("of record", { exact: true })).toBeVisible();
 });
 
