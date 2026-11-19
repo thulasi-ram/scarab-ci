@@ -717,3 +717,91 @@ async fn a_trust_grant_waits_for_an_install_holding_the_sources_trust_lock() {
     assert_eq!(db.trusted_sources("acme").await.unwrap().len(), 1);
     tdb.cleanup().await;
 }
+
+/// Take `org`'s trust lock on `key` in a transaction of its own, as the
+/// store does, and hold it until the transaction ends.
+async fn hold_trust_lock(
+    pool: &sqlx::PgPool,
+    org: &str,
+    key: &str,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("scarab library trust\n{org}\n{key}"))
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    held
+}
+
+/// git-bug 9c54b46 (RT-R2-T3), the store's side: an install carrying a
+/// source's grants takes the source's trust lock itself, keyed on the source
+/// without its `@commit` (the key a trust grant locks), and an untrust takes
+/// it too. Each waits while another transaction holds it. Without the lock
+/// in the install, a trust committed between its grant read and its commit
+/// would be installed unacknowledged.
+#[tokio::test]
+async fn an_install_and_an_untrust_wait_for_the_sources_trust_lock() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    let key = "github.com/acme/libs//deploy.yaml";
+    let v1 = version("acme", V1, &format!("{key}@aaaa"));
+    db.put_version(&v1).await.unwrap();
+
+    // The install.
+    let held = hold_trust_lock(&tdb.pool, "acme", key).await;
+    let installer = {
+        let db = PostgresDb::with_pool(tdb.pool.clone());
+        let new = install("acme", &v1.content_hash, 1);
+        tokio::spawn(async move {
+            db.install_carrying(&new, &Replaces::Nothing, &BTreeSet::new())
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !installer.is_finished(),
+        "the install did not wait for the source's trust lock"
+    );
+    assert!(db
+        .installation("acme", "acme::libs::deploy")
+        .await
+        .unwrap()
+        .is_none());
+    held.commit().await.unwrap();
+    installer.await.unwrap().unwrap();
+
+    // The untrust.
+    db.trust_source(&TrustedSource {
+        org: "acme".into(),
+        source: key.into(),
+        grant: TrustGrant::BuildSandbox,
+        trusted_by: "user:bob".into(),
+        trusted_at: 1,
+        step_up_ref: None,
+    })
+    .await
+    .unwrap();
+    let held = hold_trust_lock(&tdb.pool, "acme", key).await;
+    let untruster = {
+        let db = PostgresDb::with_pool(tdb.pool.clone());
+        tokio::spawn(async move {
+            db.untrust_source("acme", key, TrustGrant::BuildSandbox)
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !untruster.is_finished(),
+        "the untrust did not wait for the source's trust lock"
+    );
+    assert_eq!(db.trusted_sources("acme").await.unwrap().len(), 1);
+    held.commit().await.unwrap();
+    assert!(untruster.await.unwrap().unwrap().is_some());
+    assert!(db.trusted_sources("acme").await.unwrap().is_empty());
+    tdb.cleanup().await;
+}
