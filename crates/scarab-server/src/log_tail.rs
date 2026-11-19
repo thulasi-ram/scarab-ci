@@ -72,6 +72,9 @@ pub async fn pump_log_stream(
         if chunk.is_empty() {
             continue;
         }
+        if total == 0 {
+            tracing::info!(run = %run.0, step = %step.0, attempt = %attempt.0, "log tail: receiving output");
+        }
         logs.append(run, step, attempt, &chunk).await?;
         total += chunk.len() as u64;
     }
@@ -120,6 +123,9 @@ pub struct LogTailer {
     /// loudly we've reported it. Lets a legitimately-slow start stay quiet while
     /// a Pod stuck in `PodInitializing` forever still surfaces (c653742).
     not_ready: Arc<Mutex<HashMap<Fence, NotReady>>>,
+    /// Wait before re-tailing a fence whose last tail errored or read
+    /// nothing ([`RETRY_BACKOFF`] unless a test shortens it).
+    retry_backoff: Duration,
 }
 
 /// Per-fence bookkeeping for a tail parked in a benign pre-start state: when the
@@ -140,7 +146,15 @@ impl LogTailer {
             drained: Arc::new(Mutex::new(HashSet::new())),
             retry_at: Arc::new(Mutex::new(HashMap::new())),
             not_ready: Arc::new(Mutex::new(HashMap::new())),
+            retry_backoff: RETRY_BACKOFF,
         }
+    }
+
+    /// Wait `backoff` instead of [`RETRY_BACKOFF`] before re-tailing a fence
+    /// whose last tail errored or read nothing.
+    pub fn with_retry_backoff(mut self, backoff: Duration) -> Self {
+        self.retry_backoff = backoff;
+        self
     }
 
     /// Enable the claim-to-tail lease (ADR-0051): required for 2+ replicas.
@@ -256,6 +270,7 @@ impl LogTailer {
         let retry_at = self.retry_at.clone();
         let not_ready = self.not_ready.clone();
         let lease = self.lease.clone();
+        let retry_backoff = self.retry_backoff;
 
         tokio::spawn(async move {
             // Claim-to-tail (ADR-0051): only the lease holder tails this
@@ -290,7 +305,7 @@ impl LogTailer {
                         retry_at
                             .lock()
                             .unwrap()
-                            .insert(fence.clone(), Instant::now() + RETRY_BACKOFF);
+                            .insert(fence.clone(), Instant::now() + retry_backoff);
                         active.lock().unwrap().remove(&fence);
                         return;
                     }
@@ -301,9 +316,28 @@ impl LogTailer {
                 r.abort();
             }
             match result {
-                // Stream closed cleanly: we have the step's complete log. Mark the
-                // fence drained so no later tick re-ingests it (dedup fix).
-                Ok(()) => {
+                // The stream closed cleanly having read nothing. That is not a
+                // complete log (git-bug 1dee2f3): Kubernetes answers a log
+                // request for a Pod with no node yet (one waiting for an
+                // autoscaler to add a node) with an empty stream, not an
+                // error, so marking it drained lost every line the step
+                // printed later. Retry after the backoff, like a Pod that is
+                // not ready. A step that prints nothing is re-read every few
+                // seconds while it runs, which costs one empty request each.
+                Ok(Some(0)) => {
+                    tracing::debug!(run = %run.0, step = %step_id.0, "log tail: the stream ended with no output; retrying");
+                    retry_at
+                        .lock()
+                        .unwrap()
+                        .insert(fence.clone(), Instant::now() + retry_backoff);
+                }
+                // Stream closed cleanly after output, or the executor has no
+                // log source: we have the step's complete log. Mark the fence
+                // drained so no later tick re-ingests it (dedup fix).
+                Ok(bytes) => {
+                    if let Some(bytes) = bytes {
+                        tracing::info!(run = %run.0, step = %step_id.0, attempt = %attempt.0, bytes, "log tail: ended");
+                    }
                     drained.lock().unwrap().insert(fence.clone());
                     retry_at.lock().unwrap().remove(&fence);
                     not_ready.lock().unwrap().remove(&fence);
@@ -363,7 +397,7 @@ impl LogTailer {
                     retry_at
                         .lock()
                         .unwrap()
-                        .insert(fence.clone(), Instant::now() + RETRY_BACKOFF);
+                        .insert(fence.clone(), Instant::now() + retry_backoff);
                 }
             }
             active.lock().unwrap().remove(&fence);
@@ -399,7 +433,10 @@ fn classify_tail_error(
     if !is_pod_not_ready(err) {
         return TailErrorClass::Failed;
     }
-    if not_ready_for < NOT_READY_GRACE {
+    // A Pod waiting for a node is not wedged: the executor's unschedulable
+    // grace fails the step if no node comes, and the infra observer says
+    // why it waits (git-bug 1dee2f3).
+    if err.contains("PodScheduling") || not_ready_for < NOT_READY_GRACE {
         return TailErrorClass::Quiet;
     }
     match since_last_warn {
@@ -416,7 +453,9 @@ fn classify_tail_error(
 /// to start:" prefix — that prefix also carries the reasons we DO want to warn
 /// about (ImagePullBackOff, ErrImagePull, CrashLoopBackOff, …).
 fn is_pod_not_ready(err: &str) -> bool {
-    const NOT_READY: [&str; 2] = ["PodInitializing", "ContainerCreating"];
+    // `PodScheduling` is the k8s executor's own reason for a Pod with no
+    // node yet (git-bug 1dee2f3), such as one waiting for an autoscaler.
+    const NOT_READY: [&str; 3] = ["PodInitializing", "ContainerCreating", "PodScheduling"];
     NOT_READY.iter().any(|m| err.contains(m))
 }
 
@@ -436,9 +475,9 @@ enum TailSource {
     },
 }
 
-/// Open the executor's log source for `source` and pump it into the pipeline. A
-/// backend with no log source (`Ok(None)` — e.g. the local/dev executor) is a
-/// clean no-op.
+/// Open the executor's log source for `source` and pump it into the pipeline,
+/// returning the bytes appended. A backend with no log source (`Ok(None)` —
+/// e.g. the local/dev executor) is a clean no-op.
 async fn drain(
     executor: &dyn Executor,
     logs: &LogService,
@@ -446,7 +485,7 @@ async fn drain(
     run: &RunId,
     step: &StepId,
     attempt: &AttemptId,
-) -> Result<(), LogTailError> {
+) -> Result<Option<u64>, LogTailError> {
     let chunks = match source {
         TailSource::Step(step_run) => executor.log_stream(step_run).await?,
         TailSource::Service(handle) => executor.service_log_stream(handle).await?,
@@ -460,11 +499,10 @@ async fn drain(
         }
     };
     match chunks {
-        Some(chunks) => {
-            pump_log_stream(chunks, logs, run, step, attempt).await?;
-            Ok(())
-        }
-        None => Ok(()),
+        Some(chunks) => Ok(Some(
+            pump_log_stream(chunks, logs, run, step, attempt).await?,
+        )),
+        None => Ok(None),
     }
 }
 
@@ -517,6 +555,20 @@ mod tests {
 
     /// …but the warning is not simply deleted: a tail that NEVER starts has to
     /// surface, so past the grace window the pre-start state escalates to WARN.
+    /// git-bug 1dee2f3: a Pod with no node yet (waiting for an autoscaler)
+    /// is retried quietly however long it waits; its own grace fails it.
+    #[test]
+    fn a_pod_waiting_for_a_node_stays_quiet() {
+        const SCHEDULING: &str = "executor error: exec error: container \"step\" in pod \
+                                  \"scarab-plan-a1-1\" is waiting to start: PodScheduling: the \
+                                  Pod has no node yet";
+        assert!(is_pod_not_ready(SCHEDULING));
+        assert_eq!(
+            classify_tail_error(SCHEDULING, NOT_READY_GRACE * 5, None),
+            TailErrorClass::Quiet
+        );
+    }
+
     #[test]
     fn a_pod_stuck_past_the_grace_window_warns() {
         assert_eq!(

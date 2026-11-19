@@ -406,6 +406,27 @@ impl K8sExecutor {
         self.stream_pods().unwrap_or_else(|_| pods.clone())
     }
 
+    /// Fails with a `PodScheduling` reason while `pod` has no node (git-bug
+    /// 1dee2f3). Kubernetes answers a log request for such a Pod with an
+    /// empty stream, not an error, so a log tail opened then would read
+    /// nothing and stop; this makes it wait and retry like a Pod that is
+    /// still initializing. A Pod that is gone is left to the log request to
+    /// report.
+    async fn require_node(&self, pod: &str, container: &str) -> Result<(), ExecError> {
+        let found = self
+            .pods()?
+            .get_opt(pod)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?;
+        match found {
+            Some(p) if !has_node(&p) => Err(ExecError::Other(format!(
+                "container \"{container}\" in pod \"{pod}\" is waiting to start: PodScheduling: \
+                 the Pod has no node yet"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// The most recent `Warning` Event about `pod`, as a bounded message — the
     /// text `kubectl describe pod` prints under Events, and the only place
     /// `FailedScheduling` / `FailedMount` / `FailedCreatePodSandBox` detail
@@ -3397,8 +3418,9 @@ impl Executor for K8sExecutor {
     /// pipeline. Best-effort: if the Pod's log is not yet available (still Pending,
     /// container not started) this errors and the caller retries on a later tick.
     async fn log_stream(&self, step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        let pods = self.stream_pods()?;
         let name = pod_name(step);
+        self.require_node(&name, STEP_CONTAINER).await?;
+        let pods = self.stream_pods()?;
         let params = LogParams {
             follow: true,
             container: Some(STEP_CONTAINER.to_string()),
@@ -3424,8 +3446,9 @@ impl Executor for K8sExecutor {
         step: &StepRun,
         container: &str,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        let pods = self.stream_pods()?;
         let name = pod_name(step);
+        self.require_node(&name, container).await?;
+        let pods = self.stream_pods()?;
         let params = LogParams {
             follow: true,
             container: Some(container.to_string()),
@@ -3546,6 +3569,7 @@ impl Executor for K8sExecutor {
         &self,
         handle: &ExecHandle,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        self.require_node(&handle.0, SERVICE_POD_CONTAINER).await?;
         let pods = self.stream_pods()?;
         let params = LogParams {
             follow: true,
@@ -4059,6 +4083,14 @@ fn build_debug_pod(
     };
     pass_through_k8s_expansion(&mut pod);
     pod
+}
+
+/// Whether the Kubernetes scheduler has placed `pod` on a node.
+fn has_node(pod: &Pod) -> bool {
+    pod.spec
+        .as_ref()
+        .and_then(|s| s.node_name.as_deref())
+        .is_some_and(|n| !n.is_empty())
 }
 
 pub fn pod_name(step: &StepRun) -> String {
@@ -7021,6 +7053,20 @@ fn fnv1a(s: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// git-bug 1dee2f3: a Pod waiting for a node has no `nodeName`; the log
+    /// tail waits for one before it opens the stream.
+    #[test]
+    fn a_pod_has_a_node_only_once_it_is_scheduled() {
+        let mut pod = Pod::default();
+        assert!(!has_node(&pod), "no spec");
+        pod.spec = Some(k8s_openapi::api::core::v1::PodSpec::default());
+        assert!(!has_node(&pod), "not scheduled");
+        pod.spec.as_mut().unwrap().node_name = Some(String::new());
+        assert!(!has_node(&pod), "empty node name");
+        pod.spec.as_mut().unwrap().node_name = Some("ip-10-150-161-100".into());
+        assert!(has_node(&pod));
+    }
     use scarab_engine::{Attempt, AttemptId, AttemptOutcome, RunId, StepId, StepStatus, Timestamp};
 
     fn step_with_attempt(run: &str, step: &str, attempt: &str) -> StepRun {
