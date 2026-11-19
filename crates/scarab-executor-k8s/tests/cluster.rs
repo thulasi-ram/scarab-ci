@@ -3070,7 +3070,13 @@ async fn a_debug_pod_rematerialises_a_finished_steps_snapshot() {
     // both the late-created token Secret mounted and the `debug` fence's token
     // accepted by the service. ---
     let dp = exec
-        .launch_debug(&a, "busybox:latest", Some(&root_a), 300)
+        .launch_debug(
+            &a,
+            "busybox:latest",
+            &scarab_pipeline::Resources::default(),
+            Some(&root_a),
+            300,
+        )
         .await
         .expect("the debug Pod reaches Running with its snapshot fed");
 

@@ -37,9 +37,10 @@ metadata:
 spec:
   limits:
     - type: Container
-      # What a container that declares nothing gets. Every container in a step
-      # Pod is covered — the step itself, the clone init container, the wsfetch
-      # fetch init container, the results sidecar, the wsfetch hold sidecar.
+      # What a container that declares nothing gets: the step container and
+      # any sidecar service. The containers Scarab adds (the wsfetch fetch init
+      # container, the results sidecar, the wsfetch hold sidecar) declare their
+      # own requests and memory limit since git-bug e8b5967.
       defaultRequest:
         # A REQUEST, so the scheduler can see the Pod and refuse to pack more
         # onto two cores than fit. Deliberately not a matching `default` cpu

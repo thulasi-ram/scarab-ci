@@ -53,6 +53,25 @@ release.yml uses that version's section as the GitHub Release text. See
   autoscaled clusters. The server now waits until the Pod has a node, and a log read that ends
   with no output is tried again. The server log has an INFO line when a step's output starts
   arriving and when its log read ends, with the byte count.
+- **Scarab's own helper containers set resource requests and a memory limit** (git-bug e8b5967).
+  The results sidecar and the workspace fetch and drain helpers had none, so a cluster that
+  enforces a require-resource-limits policy (Kyverno, for one) refused or held the Pod. The
+  results sidecar now requests 10m CPU and 16Mi memory with a 64Mi limit. With
+  `workspace.helperCpuMillis` and `workspace.helperMemoryMib` unset, the workspace helpers request
+  50m CPU and 64Mi memory with a 4096Mi memory limit and no CPU limit; a value you set still
+  applies as both request and limit. A workspace step Pod's request grows by up to 60m CPU and
+  80Mi memory, from the two sidecars; the fetch init container does not raise it.
+
+  The other containers are not covered by this fix. The step container and the shell of a debug
+  Pod pass such a policy only when the step's `resources` or the placement config's
+  `default_resources` set both `cpu_millis` and `memory_mib` (each set axis becomes both the
+  request and the limit). Service containers carry no resources, since a service has no
+  `resources` setting yet, so such a policy still refuses a step with services.
+
+  The 4096Mi default limit on the workspace helpers has two effects in a namespace that limits
+  memory. A LimitRange with a maximum container memory below 4Gi, or a maximum limit-to-request
+  ratio below 64, refuses the Pod. A ResourceQuota on `limits.memory` counts the 4096Mi against
+  the quota. Set `workspace.helperMemoryMib` to a lower value to fit either.
 
 ## [0.4.3] - 2026-11-17
 
