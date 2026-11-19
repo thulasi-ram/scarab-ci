@@ -279,7 +279,7 @@ export function activeInfraConditions(events: RunEvent[]): Record<string, Active
 }
 
 /** Reasons that mean the scheduler could not place the Pod on a node. */
-const NODE_WAIT_REASONS = new Set(["Unschedulable", "NotScheduled", "SchedulingGated"]);
+export const NODE_WAIT_REASONS = new Set(["Unschedulable", "NotScheduled", "SchedulingGated"]);
 
 /** How long the scheduler could not place one attempt's Pod, in ms: the sum of
  * its closed "waiting for a node" conditions. Null when there were none. An

@@ -725,6 +725,22 @@ const RT_TRIES: Record<string, MockTry[]> = {
   "deploy-preview[region=eu]": [{ id: "a1", start: ms(6, 50), end: null, wait: [ms(6, 45), null] }],
   "deploy-preview[region=us]": [{ id: "a1", start: ms(6, 50), end: null, wait: [ms(6, 45), null] }],
 };
+/** A log stream of run #34 for a try whose Pod still waits for a node: such a
+ * Pod has printed nothing, so the mock streams no lines for it. */
+function unscheduledTry(url: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(url, window.location.origin);
+  } catch {
+    return false;
+  }
+  const m = u.pathname.match(/^\/v1\/runs\/([^/]+)\/steps\/([^/]+)\/logs$/);
+  if (!m || m[1] !== RETRIES_RUN_ID) return false;
+  const tries = RT_TRIES[decodeURIComponent(m[2]!)] ?? [];
+  const attempt = u.searchParams.get("attempt");
+  const t = tries.find((x) => x.id === attempt) ?? tries[tries.length - 1];
+  return !!t?.wait && t.wait[1] === null;
+}
 const RT_NEEDS: Record<string, string[]> = {
   git: [],
   unit: ["git"],
@@ -2929,7 +2945,9 @@ export function installMock() {
         }
       })();
       const replay =
-        /\/steps\/[^/]+\/logs$/.test(path)
+        unscheduledTry(this.url)
+          ? null
+          : /\/steps\/[^/]+\/logs$/.test(path)
           ? testLogLines
           : /\/services\/[^/]+\/logs$/.test(path)
             ? serviceLogLines

@@ -54,7 +54,7 @@ import {
   type RerunPlan,
   type RetentionInfo,
 } from "../api/client";
-import { activeInfraConditions, infraReasonText, type ActiveInfraCondition } from "../events";
+import { activeInfraConditions, infraReasonText, NODE_WAIT_REASONS, type ActiveInfraCondition } from "../events";
 import {
   deriveTakes,
   replayTake,
@@ -330,6 +330,12 @@ export default function RunDetail() {
     const tv = takeView();
     const status = tv ? (tv.status[id] ?? "pending") : selectedStep()?.status;
     return isReused(status, sv ? (sv.attempts[id] ?? 0) : (selectedStep()?.attempts ?? 0));
+  };
+
+  // The selected step's Pod has no node yet: there is nothing to shell into.
+  const unscheduled = (): boolean => {
+    const h = sel() ? heldNow()[sel()!] : undefined;
+    return !!h && NODE_WAIT_REASONS.has(h.reason);
   };
 
   // Graph nodes: the graph shape + status. Live: the run object. An older
@@ -1485,7 +1491,7 @@ export default function RunDetail() {
                     window={stepWindow(sel())}
                     frontierAttempt={sel() ? (scopedView()?.frontier[sel()!] ?? null) : null}
                     deadLettered={r().status === "dead_lettered"}
-                    canDebug={canShell() && !olderTrySelected()}
+                    canDebug={canShell() && !olderTrySelected() && !unscheduled()}
                     onDebugPod={() => setShellOpen(true)}
                     focusSidecar={focusSidecar()}
                     gateStatus={!timeTraveling() && selectedStep() ? gateStatus(selectedStep()!) : null}
@@ -1573,13 +1579,15 @@ export default function RunDetail() {
                         <button
                           class="btn btn-ghost btn-sm"
                           onClick={() => setShellOpen(true)}
-                          disabled={!canShell() || olderTrySelected()}
+                          disabled={!canShell() || olderTrySelected() || unscheduled()}
                           title={
                             !canShell()
                               ? "Select a running or finished step"
                               : olderTrySelected()
                                 ? "Select the latest try to debug; Debug pod reproduces the latest try."
-                                : selectedRunning()
+                                : unscheduled()
+                                  ? "The Pod has not been scheduled yet"
+                                  : selectedRunning()
                                   ? `shell into the running ${sel()} Pod`
                                   : `reproduce ${sel()} in a fresh debug Pod and shell in`
                           }
