@@ -2,10 +2,11 @@
 //!
 //! An org admin lets a Project's steps carry a `k8s_overlay` in an Environment
 //! (`permit_k8s_overlay`), but the overlay is written by whoever edits the
-//! Pipeline file. The step Pod runs in the release namespace beside the
-//! server's Secret and ServiceAccount, so an open overlay could mount a
-//! Secret, take the server's ServiceAccount, share the host's namespaces, or
-//! point the sidecars at a listener of its own. The overlay may therefore set
+//! Pipeline file. Step Pods share a namespace with the per-Pod Secrets of
+//! other Runs, and an install that runs them in the release namespace puts
+//! them beside the server's Secret and ServiceAccount too, so an open overlay
+//! could mount a Secret, take a ServiceAccount, share the host's namespaces,
+//! or point the sidecars at a listener of its own. The overlay may therefore set
 //! only the fields in [`AUTHOR_OVERLAY_FIELDS`], and it may add to the Pod but
 //! not change or remove what Scarab, the placement baseline or a placement
 //! profile put there ([`refuse_changes`]). The operator's baseline and
