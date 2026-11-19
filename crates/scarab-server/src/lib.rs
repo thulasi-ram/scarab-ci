@@ -1600,6 +1600,12 @@ pub struct AttemptDto {
     pub id: String,
     /// When this attempt started (unix-ms).
     pub started_at: i64,
+    /// When this attempt ended (unix-ms); `null` while it runs. Read from the
+    /// run's event log: the attempt's `AttemptFinished` or `AttemptSuperseded`
+    /// entry, or for a `cancelled` attempt the step's cancel (or skip) that
+    /// closed it. Also `null` when the log holds no such entry.
+    #[schema(required = true)]
+    pub finished_at: Option<i64>,
     /// `true` if this attempt ended in a classified failure. A later attempt may
     /// still have succeeded — that divergence is exactly the retry story worth
     /// showing. Retained for back-compat; prefer `outcome` for the full picture
@@ -1626,8 +1632,75 @@ pub struct AttemptDto {
     pub outcome: String,
 }
 
+/// When each attempt of one run ended, read from the run's event log. The
+/// `attempts` table stores no end time; every close of an attempt journals an
+/// event in the same transaction, and that event's `at` is the end.
+#[derive(Default)]
+struct AttemptEnds {
+    /// `(step, attempt)` → the `at` of its first `AttemptFinished` or
+    /// `AttemptSuperseded`.
+    by_attempt: std::collections::HashMap<(String, String), i64>,
+    /// step → the `at` of each move to `Cancelled` or `Skipped`, in log order.
+    /// A cancelled attempt journals no attempt-keyed event: the step's cancel
+    /// (or a gate's "no longer needed" skip) closes it.
+    step_closes: std::collections::HashMap<String, Vec<i64>>,
+}
+
+impl AttemptEnds {
+    fn from_events(events: &[EventKind]) -> Self {
+        let mut ends = Self::default();
+        for e in events {
+            match &e.kind {
+                EventPayload::AttemptFinished { step, attempt, .. }
+                | EventPayload::AttemptSuperseded { step, attempt, .. } => {
+                    ends.by_attempt
+                        .entry((step.0.clone(), attempt.0.clone()))
+                        .or_insert(e.at.0);
+                }
+                EventPayload::StepTransitioned { step, to, .. }
+                    if matches!(to, StepStatus::Cancelled | StepStatus::Skipped) =>
+                {
+                    ends.step_closes
+                        .entry(step.0.clone())
+                        .or_default()
+                        .push(e.at.0);
+                }
+                _ => {}
+            }
+        }
+        ends
+    }
+
+    /// When attempt `a` of `step` ended; `None` while it runs.
+    fn finished_at(&self, step: &str, a: &scarab_engine::Attempt) -> Option<i64> {
+        use scarab_engine::AttemptOutcome;
+        if a.outcome == AttemptOutcome::Running {
+            return None;
+        }
+        let own = self
+            .by_attempt
+            .get(&(step.to_string(), a.id.0.clone()))
+            .copied();
+        if a.outcome != AttemptOutcome::Cancelled {
+            return own;
+        }
+        // The cancel that closed it is the first step close at or after its
+        // start. A Pod that reports in after the cancel may still journal an
+        // `AttemptFinished`; the cancel is the earlier of the two.
+        let cancel = self
+            .step_closes
+            .get(step)
+            .and_then(|closes| closes.iter().copied().find(|&at| at >= a.started_at.0));
+        match (cancel, own) {
+            (Some(c), Some(o)) => Some(c.min(o)),
+            (c, o) => c.or(o),
+        }
+    }
+}
+
 /// Project a durable [`scarab_engine::Attempt`] to its wire DTO.
-fn attempt_dto(a: &scarab_engine::Attempt) -> AttemptDto {
+/// `finished_at` comes from [`AttemptEnds::finished_at`].
+fn attempt_dto(a: &scarab_engine::Attempt, finished_at: Option<i64>) -> AttemptDto {
     let failure = a.failure.as_ref().map(|f| {
         match f {
             scarab_engine::FailureKind::Infra { .. } => "infra",
@@ -1643,6 +1716,7 @@ fn attempt_dto(a: &scarab_engine::Attempt) -> AttemptDto {
     AttemptDto {
         id: a.id.0.clone(),
         started_at: a.started_at.0,
+        finished_at,
         failed: a.failure.is_some(),
         failure,
         failure_detail: a.failure_detail.clone(),
@@ -2744,6 +2818,7 @@ async fn get_run(
     } = run_origin::step_views(&st, &run, &steps).await?;
     let deploy_steps = st.db.deploy_steps_of_run(&run).await?;
     let environment = run_origin::run_environment(&st, &run, environment).await?;
+    let attempt_ends = AttemptEnds::from_events(&st.db.events(&run).await?);
     let mut step_dtos = Vec::with_capacity(steps.len());
     for s in steps {
         let view = gate_views.remove(&s.step.0).unwrap_or_default();
@@ -2764,11 +2839,16 @@ async fn get_run(
             ),
             None => (Vec::new(), Vec::new()),
         };
+        let attempt_list = s
+            .attempts
+            .iter()
+            .map(|a| attempt_dto(a, attempt_ends.finished_at(&s.step.0, a)))
+            .collect();
         step_dtos.push(StepStatusDto {
             id: s.step.0,
             status: step_status_name(s.status).to_string(),
             attempts: s.attempts.len(),
-            attempt_list: s.attempts.iter().map(attempt_dto).collect(),
+            attempt_list,
             needs: s.needs.into_iter().map(|n| n.0).collect(),
             gate: s.gate_kind,
             gate_resolution: view.gate_resolution,
