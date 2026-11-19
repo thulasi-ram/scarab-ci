@@ -592,6 +592,8 @@ export default function RunDetail() {
 
   // The URL follows the selection, with `replace` so a click adds no history
   // entry. Compared as a string so a poll that changes nothing writes nothing.
+  // A key to remove is `undefined`, which JSON drops, so it travels as `null`
+  // and turns back into `undefined` for the router.
   const urlState = createMemo((): string => {
     if (!loaded()) return "";
     const r = run();
@@ -621,12 +623,15 @@ export default function RunDetail() {
     }
     const v = viewing();
     if (v) st.v = v.n;
-    return JSON.stringify(runUrlParams(st));
+    return JSON.stringify(runUrlParams(st), (_k, v: unknown) => (v === undefined ? null : v));
   });
   createEffect(
     on(urlState, (json) => {
       if (!json) return;
-      setSearchParams(JSON.parse(json) as Record<string, string | undefined>, { replace: true, scroll: false });
+      const parsed = JSON.parse(json) as Record<string, string | null>;
+      const next: Record<string, string | undefined> = {};
+      for (const [k, v] of Object.entries(parsed)) next[k] = v ?? undefined;
+      setSearchParams(next, { replace: true, scroll: false });
     }),
   );
 

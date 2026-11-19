@@ -147,6 +147,9 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   await page.getByRole("button", { name: "Show all" }).click();
   await expect(page.getByText("Showing artifacts from build")).toHaveCount(0);
   await expect(page).not.toHaveURL(/[?&]from=/);
+  // Back on the Pipeline tab, the tab leaves the URL.
+  await page.getByRole("tab", { name: /^Pipeline/ }).click();
+  await expect(page).not.toHaveURL(/[?&]tab=/);
 });
 
 // The ENVIRONMENT GATE run in src/mock.ts: a deploy into production with a
