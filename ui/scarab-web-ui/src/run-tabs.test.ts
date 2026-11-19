@@ -136,6 +136,19 @@ describe("activity words", () => {
     expect(v.rows.map((r) => r.event.at)).toContain(60_001);
   });
 
+  // Regression: a failed try, a move back to pending, then a fail with no
+  // new try (a retry that never started) hid the second fail under the try.
+  it("keeps a fail that follows a move back to pending with no new try", () => {
+    const evs = [
+      started(0, "e2e", "a1"),
+      finished(1, "e2e", "a1", "step"),
+      transitioned(2, "e2e", "running", "pending"),
+      transitioned(3, "e2e", "pending", "failed"),
+    ];
+    expect([...mergedTransitions(evs)]).toEqual([]);
+    expect(activityView(evs, {}, "all").rows.map((r) => r.event.at)).toEqual([3, 2, 1, 0]);
+  });
+
   it("names the step by its display name and counts tries in plain words", () => {
     expect(words(log[0])).toEqual({ step: "e2e", stepId: "e2e", text: "try 1 started" });
     expect(words(log[1]).text).toBe("try 1 failed: step error");

@@ -60,8 +60,9 @@ const inFilter = (c: ActivityClass, f: ActivityFilter): boolean =>
  * The step transitions that repeat what the try before them said: a step that
  * moved to `succeeded` or `failed` right after its try finished the same way,
  * with no newer try of that step in between. Keyed by the transition's index,
- * valued by the finished try's index. A failed try whose step went back to
- * pending for a retry is not merged: both facts stay.
+ * valued by the finished try's index. A step that went back to pending since
+ * its try finished is not merged, even when it fails again with no new try
+ * (a retry that never started): both facts stay.
  */
 export function mergedTransitions(events: RunEvent[]): Map<number, number> {
   const out = new Map<number, number>();
@@ -75,6 +76,10 @@ export function mergedTransitions(events: RunEvent[]): Map<number, number> {
     else if (k.tag === "AttemptFinished") last.set(step, { idx: i, failed: !!k.v.failure });
     else if (k.tag === "StepTransitioned") {
       const to = String(k.v.to ?? "");
+      if (to === "pending") {
+        last.delete(step);
+        return;
+      }
       const f = last.get(step);
       if (f && ((to === "succeeded" && !f.failed) || (to === "failed" && f.failed))) {
         out.set(i, f.idx);
