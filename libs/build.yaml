@@ -190,6 +190,8 @@ steps:
       - -c
       - |
         set -eu
+        # Bracket ranges in `case` follow the locale; C keeps [a-z] to a-z.
+        export LC_ALL=C
         root=/workspace
         fail() { echo "scarab: build refused: $*" >&2; exit 2; }
         nl='
@@ -321,6 +323,8 @@ steps:
       - -c
       - |
         set -eu
+        # Bracket ranges in `case` follow the locale; C keeps [a-z] to a-z.
+        export LC_ALL=C
         root=/workspace
         fail() { echo "scarab: push refused: $*" >&2; exit 2; }
         nl='

@@ -109,6 +109,8 @@ steps:
       - -c
       - |
         set -eu
+        # Bracket ranges in `case` follow the locale; C keeps [a-z] to a-z.
+        export LC_ALL=C
         fail() { echo "scarab: index refused: $*" >&2; exit 2; }
         nl='
         '
