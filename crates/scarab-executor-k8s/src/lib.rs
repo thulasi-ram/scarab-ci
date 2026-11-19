@@ -86,9 +86,12 @@ pub struct WorkspaceFetch {
     /// against the wall under node pressure (an OOM-kill classifies Transient
     /// and loops). Operator-owned (`SCARAB_WSFETCH_CPU_MILLIS` /
     /// `SCARAB_WSFETCH_MEMORY_MIB`, chart `workspace.helper*`), never
-    /// per-pipeline. Empty axes are simply not set (pre-ticket behavior).
+    /// per-pipeline. An axis left empty gets the defaults in
+    /// [`helper_resource_requirements`] (git-bug e8b5967: a container with
+    /// no requests or memory limit is refused by clusters that enforce a
+    /// require-resource-limits policy).
     ///
-    /// The memory limit also derives the drain's upload byte budget
+    /// A configured memory limit also derives the drain's upload byte budget
     /// ([`scarab_workspace_client::TRANSFER_BYTE_BUDGET_ENV`] = half the
     /// limit), so the two cannot be raised apart. Residual, disclosed: the
     /// drain whole-reads each file, so a SINGLE output file approaching the
@@ -4490,8 +4493,8 @@ fn workspace_fetch_container(
         env: Some(env),
         // Operator helper resources (ticket 16a7768 item 1): same knob as the
         // egress helper — both containers wear the wsfetch image and both
-        // move the whole workspace.
-        resources: helper_resource_requirements(&fetch.helper_resources),
+        // move the whole workspace. Defaults when unset (git-bug e8b5967).
+        resources: Some(helper_resource_requirements(&fetch.helper_resources)),
         volume_mounts: Some(vec![
             ws_mount.clone(),
             VolumeMount {
@@ -5076,7 +5079,12 @@ pub fn build_pod(
             // this container was invisible to the scheduler and unbounded —
             // the drain's peak tracked workspace content, and node pressure
             // OOM-killed it into a Transient loop with nothing naming why.
-            resources: fetch.and_then(|f| helper_resource_requirements(&f.helper_resources)),
+            // Defaults when unset (git-bug e8b5967).
+            resources: Some(helper_resource_requirements(
+                &fetch
+                    .map(|f| f.helper_resources.clone())
+                    .unwrap_or_default(),
+            )),
             // Pinned root, deliberately: root-read is the privilege the drain
             // has ALWAYS had — the busybox barrier this replaces ran as root,
             // and the control plane's `tar` read the workspace through it. A
@@ -5781,13 +5789,105 @@ fn resource_requirements(cpu_millis: Option<u32>, memory_mib: Option<u32>) -> Re
     }
 }
 
-/// [`resource_requirements`] for the wsfetch helper containers, from the
-/// operator's [`WorkspaceFetch::helper_resources`] — `None` when neither axis
-/// is set, so an unconfigured deployment keeps the pre-ticket-16a7768 Pod
-/// shape byte for byte.
-fn helper_resource_requirements(res: &scarab_pipeline::Resources) -> Option<ResourceRequirements> {
-    (res.cpu_millis.is_some() || res.memory_mib.is_some())
-        .then(|| resource_requirements(res.cpu_millis, res.memory_mib))
+/// `ResourceRequirements` with a CPU request, an optional CPU limit, and a
+/// memory request and limit: the three fields a require-resource-limits
+/// admission policy checks (`requests.cpu`, `requests.memory`,
+/// `limits.memory`) are always set. Used for every container Scarab adds to
+/// a Pod (git-bug e8b5967).
+fn helper_requirements(
+    cpu_request_millis: u32,
+    cpu_limit_millis: Option<u32>,
+    memory_request_mib: u32,
+    memory_limit_mib: u32,
+) -> ResourceRequirements {
+    let mut requests = std::collections::BTreeMap::new();
+    requests.insert(
+        "cpu".to_string(),
+        Quantity(format!("{cpu_request_millis}m")),
+    );
+    requests.insert(
+        "memory".to_string(),
+        Quantity(format!("{memory_request_mib}Mi")),
+    );
+    let mut limits = std::collections::BTreeMap::new();
+    if let Some(c) = cpu_limit_millis {
+        limits.insert("cpu".to_string(), Quantity(format!("{c}m")));
+    }
+    limits.insert(
+        "memory".to_string(),
+        Quantity(format!("{memory_limit_mib}Mi")),
+    );
+    ResourceRequirements {
+        requests: Some(requests),
+        limits: Some(limits),
+        ..Default::default()
+    }
+}
+
+/// CPU request of a wsfetch helper container when the operator sets no CPU
+/// (`workspace.helperCpuMillis` empty). The egress helper idles through the
+/// step and works only after it; the fetcher runs before it. 50m lets the
+/// scheduler count them without reserving a core per Pod. No CPU limit by
+/// default: it throttles the drain's hashing, and the drain clock is already
+/// the liveness bound.
+const HELPER_DEFAULT_CPU_REQUEST_MILLIS: u32 = 50;
+/// Memory request of a wsfetch helper container when the operator sets no
+/// memory (`workspace.helperMemoryMib` empty). The holding egress helper uses
+/// a few MiB; its drain peak comes after the step container has exited and
+/// released its own memory, so the request stays small and the limit below
+/// carries the peak.
+const HELPER_DEFAULT_MEMORY_REQUEST_MIB: u32 = 64;
+/// Memory limit of a wsfetch helper container when the operator sets no
+/// memory. The helper holds up to the wsfetch default transfer budget
+/// ([`scarab_workspace_client::DEFAULT_TRANSFER_BYTE_BUDGET`], 256 MiB) in
+/// flight and reads each file whole, so its peak is about the larger of the
+/// budget and the largest single workspace file. Before git-bug e8b5967 there
+/// was no limit at all, and a 512 MiB default was rejected (e140121 review)
+/// because it would OOM-kill a workspace holding one large file. 4 GiB keeps that
+/// case working for files up to about 3.5 GiB and is not counted by the
+/// scheduler; an operator who wants a tighter bound sets
+/// `workspace.helperMemoryMib`. It does not derive the transfer budget: only
+/// a configured value does.
+const HELPER_DEFAULT_MEMORY_LIMIT_MIB: u32 = 4096;
+
+/// Resources for the wsfetch helper containers (the fetch init container and
+/// the egress hold/drain sidecar), from the operator's
+/// [`WorkspaceFetch::helper_resources`]. A configured axis is applied
+/// requests==limits (ticket 16a7768); an empty axis gets the defaults above,
+/// so the container always has a CPU request, a memory request and a memory
+/// limit (git-bug e8b5967).
+fn helper_resource_requirements(res: &scarab_pipeline::Resources) -> ResourceRequirements {
+    let (cpu_request, cpu_limit) = match res.cpu_millis {
+        Some(c) => (c, Some(c)),
+        None => (HELPER_DEFAULT_CPU_REQUEST_MILLIS, None),
+    };
+    let (memory_request, memory_limit) = match res.memory_mib {
+        Some(m) => (m, m),
+        None => (
+            HELPER_DEFAULT_MEMORY_REQUEST_MIB,
+            HELPER_DEFAULT_MEMORY_LIMIT_MIB,
+        ),
+    };
+    helper_requirements(cpu_request, cpu_limit, memory_request, memory_limit)
+}
+
+/// Resources for the results-egress sidecar (ADR-0042, git-bug e8b5967). It
+/// runs `sh` in a one-second sleep loop through the step, then `jq` over
+/// `/scarab/results/*.json` and one `curl` POST. The server refuses results
+/// over 64 KiB, so 64 MiB leaves room for `jq` and `curl` with TLS, and the
+/// requests are what the idle loop uses. No CPU limit, as for the wsfetch
+/// helpers. Not configurable: nothing the step does changes this
+/// container's needs beyond what the server accepts.
+fn results_egress_resources() -> ResourceRequirements {
+    const CPU_REQUEST_MILLIS: u32 = 10;
+    const MEMORY_REQUEST_MIB: u32 = 16;
+    const MEMORY_LIMIT_MIB: u32 = 64;
+    helper_requirements(
+        CPU_REQUEST_MILLIS,
+        None,
+        MEMORY_REQUEST_MIB,
+        MEMORY_LIMIT_MIB,
+    )
 }
 
 /// The drain/fetch transfer byte budget derived from the helper's memory
@@ -5833,6 +5933,7 @@ fn egress_sidecar(
         // Native sidecar: an initContainer that keeps running alongside the step.
         restart_policy: Some("Always".to_string()),
         env: Some(env),
+        resources: Some(results_egress_resources()),
         // Read-only view of the step's results.
         volume_mounts: Some(vec![VolumeMount {
             read_only: Some(true),
@@ -8903,6 +9004,112 @@ mod tests {
         }
     }
 
+    /// git-bug e8b5967: a cluster that enforces a require-resource-limits
+    /// policy (Kyverno's checks `requests.cpu`, `requests.memory` and
+    /// `limits.memory` on every container and init container) refused the
+    /// checkout Pod, because the containers Scarab adds carried no resources.
+    /// Every container Scarab adds must set all three, on the fullest Step
+    /// Pod (results sidecar, workspace fetcher, workspace egress helper), on
+    /// the checkout shape (workspace, no inputs) and on a debug Pod with a
+    /// snapshot to fetch. Sidecar services are the author's containers and
+    /// are not checked here.
+    #[test]
+    fn every_container_scarab_adds_sets_requests_and_a_memory_limit() {
+        let egress = ResultsEgress {
+            base_url: "http://scarab-server".into(),
+            token_secret: b"secret".to_vec(),
+            sidecar_image: "ghcr.io/acme/scarab-sidecar:1".into(),
+        };
+        let step = step_with_attempt("run-1", "build", "a1");
+        let fetch = sample_fetch();
+        let mut full = busybox();
+        full.workspace_inputs = vec!["tree-a".into()];
+        full.services = vec![scarab_pipeline::ServiceSpec {
+            image: "postgres:16".into(),
+            ..Default::default()
+        }];
+        let checkout = busybox();
+        let pod_for = |spec: &StepSpec| {
+            build_pod(
+                "scarab-x",
+                "ns",
+                &step,
+                spec,
+                Some(&egress),
+                DEFAULT_STEP_TIMEOUT_SECS,
+                true,
+                Some(&fetch),
+            )
+        };
+        let ws_mount = VolumeMount {
+            name: WORKSPACE_VOLUME.to_string(),
+            mount_path: WORKSPACE_MOUNT_PATH.to_string(),
+            ..Default::default()
+        };
+        let debug_pod = build_debug_pod(
+            "scarab-debug-x",
+            "ns",
+            &step,
+            "busybox",
+            300,
+            vec![workspace_fetch_container(
+                "scarab-debug-x",
+                &fetch,
+                &["tree-a".to_string()],
+                &[],
+                None,
+                &ws_mount,
+                DEFAULT_STEP_TIMEOUT_SECS,
+            )],
+            vec![workspace_token_volume("scarab-debug-x")],
+        );
+        for (what, pod, expected) in [
+            (
+                "full step",
+                pod_for(&full),
+                vec![
+                    RESULTS_EGRESS_CONTAINER,
+                    WORKSPACE_INIT_CONTAINER,
+                    WORKSPACE_EGRESS_CONTAINER,
+                ],
+            ),
+            (
+                "checkout",
+                pod_for(&checkout),
+                vec![RESULTS_EGRESS_CONTAINER, WORKSPACE_EGRESS_CONTAINER],
+            ),
+            ("debug", debug_pod, vec![WORKSPACE_INIT_CONTAINER]),
+        ] {
+            let scarab_added: Vec<&Container> = pod
+                .spec
+                .as_ref()
+                .unwrap()
+                .init_containers
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|c| !c.name.starts_with(SERVICE_CONTAINER_PREFIX))
+                .collect();
+            let names: Vec<&str> = scarab_added.iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(names, expected, "{what}: the containers Scarab adds");
+            for c in scarab_added {
+                let res = c
+                    .resources
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{what}/{}: no resources", c.name));
+                let requests = res.requests.as_ref().unwrap();
+                let limits = res.limits.as_ref().unwrap();
+                for (field, value) in [
+                    ("requests.cpu", requests.get("cpu")),
+                    ("requests.memory", requests.get("memory")),
+                    ("limits.memory", limits.get("memory")),
+                ] {
+                    assert!(value.is_some(), "{what}/{}: {field} unset", c.name);
+                }
+            }
+        }
+    }
+
     /// The ADR-0061 workspace service, as a Step Pod is told about it.
     fn sample_fetch() -> WorkspaceFetch {
         WorkspaceFetch {
@@ -11770,13 +11977,22 @@ mod tests {
         }
     }
 
-    /// With no helper resources configured, the Pod keeps the pre-16a7768
-    /// shape byte for byte: no resources on the helpers and no budget env —
-    /// the wsfetch binary's own default budget carries the in-flight cap.
+    /// With no helper resources configured, both wsfetch helpers get the
+    /// defaults (git-bug e8b5967): a CPU request and no CPU limit, a memory
+    /// request and a memory limit. The transfer budget env stays off — only
+    /// a configured memory limit derives it, so the wsfetch binary's own
+    /// default budget still applies. A partly configured knob keeps the
+    /// configured axis requests==limits and defaults the other.
     #[test]
-    fn unconfigured_helper_resources_leave_the_helper_shape_alone() {
+    fn unconfigured_helper_axes_get_the_defaults_and_no_budget() {
         let egress = egress_of(&drain_shape_pod());
-        assert!(egress.resources.is_none(), "no knob, no resources");
+        let res = egress.resources.as_ref().expect("defaults when unset");
+        let requests = res.requests.as_ref().unwrap();
+        let limits = res.limits.as_ref().unwrap();
+        assert_eq!(requests.get("cpu"), Some(&Quantity("50m".into())));
+        assert_eq!(requests.get("memory"), Some(&Quantity("64Mi".into())));
+        assert_eq!(limits.get("memory"), Some(&Quantity("4096Mi".into())));
+        assert_eq!(limits.get("cpu"), None, "a CPU limit throttles the drain");
         assert!(
             egress
                 .env
@@ -11784,8 +12000,19 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|e| e.name != scarab_workspace_client::TRANSFER_BYTE_BUDGET_ENV),
-            "no memory limit, no derived budget — the client default rules"
+            "a default memory limit derives no budget — the client default rules"
         );
+
+        let partial = helper_resource_requirements(&scarab_pipeline::Resources {
+            cpu_millis: None,
+            memory_mib: Some(512),
+        });
+        let requests = partial.requests.as_ref().unwrap();
+        let limits = partial.limits.as_ref().unwrap();
+        assert_eq!(requests.get("memory"), Some(&Quantity("512Mi".into())));
+        assert_eq!(limits.get("memory"), Some(&Quantity("512Mi".into())));
+        assert_eq!(requests.get("cpu"), Some(&Quantity("50m".into())));
+        assert_eq!(limits.get("cpu"), None);
     }
 
     /// Kills the token-volume coupling: a step with NO inputs used to get no

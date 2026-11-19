@@ -53,6 +53,14 @@ release.yml uses that version's section as the GitHub Release text. See
   autoscaled clusters. The server now waits until the Pod has a node, and a log read that ends
   with no output is tried again. The server log has an INFO line when a step's output starts
   arriving and when its log read ends, with the byte count.
+- **The containers Scarab adds to a step Pod set resource requests and a memory limit** (git-bug
+  e8b5967). The results sidecar and the workspace fetch and drain helpers had none, so a cluster
+  that enforces a require-resource-limits policy (Kyverno, for one) refused or held the Pod. The
+  results sidecar now requests 10m CPU and 16Mi memory with a 64Mi limit. With
+  `workspace.helperCpuMillis` and `workspace.helperMemoryMib` unset, the workspace helpers request
+  50m CPU and 64Mi memory with a 4096Mi memory limit and no CPU limit; a value you set still
+  applies as both request and limit. A workspace step Pod's request grows by up to 60m CPU and
+  80Mi memory, from the two sidecars; the fetch init container does not raise it.
 
 ## [0.4.3] - 2026-11-17
 

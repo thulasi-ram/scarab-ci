@@ -304,7 +304,8 @@ scarab:
   # Results-egress sidecar image injected into step Pods (ADR-0042). Only used
   # once the results token is set — `secrets.resultsTokenSecret`, or a
   # SCARAB_RESULTS_TOKEN_SECRET key in `secrets.existingSecret`. Pin it (a tag or
-  # digest) in production: the default floats.
+  # digest) in production: the default floats. The sidecar has fixed
+  # resources: a 10m CPU request, a 16Mi memory request and a 64Mi memory limit.
   sidecarImage: "ghcr.io/thulasi-ram/scarab-results-sidecar:edge"
   # Base URL step-Pod sidecars POST results back to. Empty => the in-cluster
   # Service DNS name derived from the release.
@@ -470,15 +471,17 @@ workspace:
   # Residual, disclosed: the helper whole-reads each file, so a SINGLE
   # workspace file approaching this limit needs it raised.
   #
-  # OPT-IN (e140121 review): "" = NO k8s limit and no derived budget — the
-  # pre-16a7768 Pod shape, byte for byte. The wsfetch binary's own 256 MiB
-  # transfer budget still bounds fetch/drain memory (without a kill attached),
-  # so unconfigured deployments are bounded but never OOM-killed by a default
-  # a large single artifact could exceed. 0 = explicitly unset (same effect).
+  # "" = the defaults: a 64Mi request and a 4096Mi limit (git-bug e8b5967:
+  # clusters that enforce a require-resource-limits policy refuse a container
+  # with no memory limit). The default limit is high on purpose: a 512Mi
+  # default was rejected because it would OOM-kill a workspace holding one
+  # large file (e140121 review), and 4096Mi fits files up to about 3.5 GiB. It derives no budget; the wsfetch
+  # binary's own 256 MiB transfer budget applies. Set a value to get
+  # requests==limits and the derived budget. 0 = explicitly unset (same as "").
   helperMemoryMib: ""
-  # Millicpu for the same two containers, requests==limits. "" = unset (the
-  # default: a CPU limit throttles the drain's hashing, and the drain clock is
-  # already the liveness bound). 0 = explicitly unset.
+  # Millicpu for the same two containers, requests==limits. "" = a 50m request
+  # and no CPU limit (the default: a CPU limit throttles the drain's hashing,
+  # and the drain clock is already the liveness bound). 0 = explicitly unset.
   helperCpuMillis: ""
   # Warm space bound in PLAIN BYTES (git-bug cba7165) — over it the service's
   # LRU sweep evicts back to 80% of the bound: committed-durable content first
