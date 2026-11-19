@@ -318,6 +318,20 @@ export default function RunDetail() {
     return out;
   });
 
+  // Reused: a step with a carried-forward verdict but no tries in the version
+  // in view (a partial rerun left it alone). A step with no tries that is
+  // pending (re-armed by a rerun, not started yet) was not reused.
+  const isReused = (status: string | undefined, attempts: number): boolean =>
+    !!scopedView() && attempts === 0 && ["succeeded", "failed", "skipped"].includes(status ?? "");
+  const selectedReused = (): boolean => {
+    const id = sel();
+    if (!id) return false;
+    const sv = scopedView();
+    const tv = takeView();
+    const status = tv ? (tv.status[id] ?? "pending") : selectedStep()?.status;
+    return isReused(status, sv ? (sv.attempts[id] ?? 0) : (selectedStep()?.attempts ?? 0));
+  };
+
   // Graph nodes: the graph shape + status. Live: the run object. An older
   // version: the replayed statuses and try counts as of its boundary.
   const dagSteps = (): DagStep[] => {
@@ -335,9 +349,7 @@ export default function RunDetail() {
       const failedTries = (s.attempt_list ?? []).filter(
         (a) => (win === null || win.includes(a.id)) && a.outcome === "failed",
       ).length;
-      // Reused: a step with a carried-forward verdict but no tries in this
-      // version (a partial rerun left it alone): drawn muted.
-      const reused = !!sv && attempts === 0 && ["succeeded", "failed", "skipped"].includes(status ?? "");
+      const reused = isReused(status, attempts);
       return {
         id: s.id,
         status,
@@ -1464,6 +1476,7 @@ export default function RunDetail() {
                     initialTab={paneTab()}
                     onTabChange={setPaneTab}
                     onShowTry={showTry}
+                    reused={selectedReused()}
                     note={
                       <Show when={widenedNote(plan())}>
                         {(note) => (

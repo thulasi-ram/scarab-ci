@@ -10,6 +10,8 @@ import {
   attemptPlaces,
   tryLabel,
   carriedOfRecord,
+  reusedOfRecord,
+  rowWhy,
   artifactCount,
   ofRecordAttemptId,
   attemptN,
@@ -507,6 +509,35 @@ describe("carriedOfRecord", () => {
   it("is null when nothing earlier is of record", () => {
     expect(carriedOfRecord([att("a1", "failed")], { a1: { take: 1, try: 1 } }, 2)).toBeNull();
     expect(carriedOfRecord([att("a1", "succeeded")], undefined, 2)).toBeNull();
+  });
+});
+
+// Regression: a downstream step a rerun re-armed, still pending, read as
+// "Reused from version 1" and showed version 1's outputs as of record.
+describe("reusedOfRecord", () => {
+  const places = attemptPlaces(twoTakeRun());
+  const list = [{ id: "a1", outcome: "succeeded", failed: false }];
+
+  it("names the earlier try only for a step the version reused", () => {
+    expect(reusedOfRecord({ reused: true, list, places: places.a, viewedTake: 2 })).toEqual({
+      id: "a1",
+      take: 1,
+      try: 1,
+    });
+  });
+
+  it("is null for a step that is pending or did not run in this version", () => {
+    expect(reusedOfRecord({ reused: false, list, places: places.a, viewedTake: 2 })).toBeNull();
+    expect(reusedOfRecord({ reused: true, list, places: places.a, viewedTake: null })).toBeNull();
+  });
+});
+
+describe("rowWhy", () => {
+  it("names the trigger for the first version and the rerun for a later one", () => {
+    const takes = deriveTakes(twoTakeRun());
+    expect(rowWhy(takes, takes[0], "PR #131")).toBe("PR #131");
+    expect(rowWhy(takes, takes[0])).toBe("original run");
+    expect(rowWhy(takes, takes[1], "PR #131")).toBe("you reran from b");
   });
 });
 

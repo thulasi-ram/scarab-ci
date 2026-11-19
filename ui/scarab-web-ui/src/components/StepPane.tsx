@@ -33,7 +33,7 @@ import {
   type Attempt,
 } from "../api/client";
 import type { RunEvent } from "../api/client";
-import { attemptPlaces, carriedOfRecord, ofRecordAttemptId, tryLabel } from "../takes";
+import { attemptPlaces, ofRecordAttemptId, reusedOfRecord, tryLabel } from "../takes";
 import {
   windowAttemptList,
   scopedAttempt,
@@ -132,6 +132,10 @@ export default function StepPane(props: {
   onTabChange?: (t: PaneTab) => void;
   /** Show an earlier version's try: the "Reused from version 2, try 1" link. */
   onShowTry?: (take: number, attempt: string) => void;
+  /** The version in view reused this step: it has a verdict carried forward
+   * and no tries here. A step with no tries that is pending or did not run is
+   * not reused. */
+  reused?: boolean;
 }) {
   const [tab, setTab] = createSignal<PaneTab>(props.initialTab ?? "logs");
   // Below 640px the try tabs do not fit: the header's dropdown picks instead.
@@ -225,13 +229,19 @@ export default function StepPane(props: {
   /** "plan · try 2", or "plan · version 1 · try 2" for another version. */
   const label = (step: string, attempt: string): string =>
     tryLabel(places(), step, attempt, props.viewedTake ?? null);
-  // A step that did not run in this version was carried forward: downstream
-  // steps read the outputs of an earlier version's attempt, so the Outputs
-  // tab shows that one, labelled with its version and try.
+  // A step this version reused was carried forward: downstream steps read the
+  // outputs of an earlier version's attempt, so the Outputs tab shows that
+  // one, labelled with its version and try. A step that is pending or did not
+  // run here has nothing of record.
   const carried = () => {
     const id = stepId();
-    if (!id || !notRun() || props.viewedTake == null) return null;
-    return carriedOfRecord(props.step?.attempt_list ?? [], places()[id], props.viewedTake);
+    if (!id || !notRun()) return null;
+    return reusedOfRecord({
+      reused: !!props.reused,
+      list: props.step?.attempt_list ?? [],
+      places: places()[id],
+      viewedTake: props.viewedTake ?? null,
+    });
   };
   const ofRecordTry = (): string | null =>
     notRun() ? (carried()?.id ?? null) : ofRecordAttemptId(attemptsOf());

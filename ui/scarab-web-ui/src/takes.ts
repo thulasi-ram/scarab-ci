@@ -338,6 +338,21 @@ export function carriedOfRecord<A extends { id: string; outcome: string; failed:
   return { id, take: p.take, try: p.try };
 }
 
+/** The try a step that the version in view REUSED was carried forward from
+ * (`carriedOfRecord`). Only a reused step has one: a step with a verdict
+ * carried forward and no tries in this version. A step with no tries that is
+ * still pending (a rerun re-armed it and it has not started) or that did not
+ * run has nothing of record, even when an earlier version ran it. */
+export function reusedOfRecord<A extends { id: string; outcome: string; failed: boolean }>(o: {
+  reused: boolean;
+  list: A[];
+  places: Record<string, AttemptPlace> | undefined;
+  viewedTake: number | null;
+}): { id: string; take: number; try: number } | null {
+  if (!o.reused || o.viewedTake === null) return null;
+  return carriedOfRecord(o.list, o.places, o.viewedTake);
+}
+
 /** The Artifacts header count. A file published by several tries has one copy
  * per try, so the header counts distinct names and adds the copies only when
  * there are more of them: "3 files", "3 files · 5 copies". */

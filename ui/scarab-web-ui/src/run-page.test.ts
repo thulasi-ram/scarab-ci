@@ -369,6 +369,13 @@ describe("failureBox", () => {
     expect(failureBox({ tries: [], selected: null })).toBeNull();
   });
 
+  // Regression: a downstream step a rerun re-armed, still pending, read as
+  // "Reused from version 1". The pane passes `carried` only for a step the
+  // version reused (takes.ts `reusedOfRecord`), so a pending step has no box.
+  it("has nothing to say for a step that is pending in this version", () => {
+    expect(failureBox({ tries: [], selected: null, carried: null, viewedTake: 2 })).toBeNull();
+  });
+
   it("shows an active condition in the warning tone, and a gate's waits as waits", () => {
     expect(
       failureBox({ tries: [{ outcome: "running" }], selected: 0, held: { text: "waiting for a node", message: "0/14 nodes" } }),
