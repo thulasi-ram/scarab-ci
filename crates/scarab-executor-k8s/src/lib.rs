@@ -229,6 +229,49 @@ impl PlacementConfig {
         )]
     }
 
+    /// What Run creation refuses in a Step's `placement_profiles`, one
+    /// message per name, each naming the Step: a name the registry does not
+    /// hold, and a `registry_auth_only` profile on a Step without
+    /// `registry_auth`. Both come from the Pipeline file and no retry of the
+    /// launch changes them, so the author learns of them when the Run is
+    /// created. The launch checks them again ([`apply_placement`]).
+    pub fn profile_refusals(
+        &self,
+        step: &str,
+        names: &[String],
+        registry_auth: bool,
+    ) -> Vec<String> {
+        names
+            .iter()
+            .filter_map(|name| match self.profile(name) {
+                None => Some(self.unknown_profile(step, name)),
+                Some(p) if p.registry_auth_only && !registry_auth => {
+                    Some(registry_auth_only_refusal(step, name))
+                }
+                Some(_) => None,
+            })
+            .collect()
+    }
+
+    /// The refusal for a profile name the registry does not hold, naming
+    /// the profiles it does hold.
+    fn unknown_profile(&self, step: &str, name: &str) -> String {
+        let held = if self.profiles.is_empty() {
+            "it holds none".to_string()
+        } else {
+            let names: Vec<String> = self
+                .profiles
+                .iter()
+                .map(|p| format!("`{}`", p.name))
+                .collect();
+            format!("it holds {}", names.join(", "))
+        };
+        format!(
+            "step `{step}` names placement profile `{name}`, which is not in the operator's \
+             placement config ({held})"
+        )
+    }
+
     fn profile(&self, name: &str) -> Option<&scarab_pipeline::PlacementProfile> {
         // The shared named-registry lookup (ADR-0065 consequence): two
         // operator profile types exist now, so the machinery lives in
@@ -677,6 +720,40 @@ impl K8sExecutor {
             &fetch.token_secret,
             &step_token_claims(step, spec, attempt, exp),
         )
+    }
+
+    /// Whether the step Pod built without the step's `k8s_overlay` (the
+    /// baseline and profiles still merged) passes a dry-run create: the
+    /// API server validates it and stores nothing. `false` when it does not
+    /// build or the dry run fails for any reason.
+    async fn passes_without_overlay(
+        &self,
+        pods: &Api<Pod>,
+        unplaced: Pod,
+        step: &str,
+        spec: &StepSpec,
+    ) -> bool {
+        let mut without = spec.clone();
+        without.k8s_overlay = None;
+        let Ok(pod) = apply_placement(unplaced, step, &without, &self.placement) else {
+            return false;
+        };
+        let pod = with_unschedulable_grace(pod, self.unschedulable_grace_secs);
+        let dry_run = PostParams {
+            dry_run: true,
+            ..Default::default()
+        };
+        match pods.create(&dry_run, &pod).await {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::info!(
+                    %step,
+                    error = %e,
+                    "the step Pod without its k8s_overlay fails a dry-run create too"
+                );
+                false
+            }
+        }
     }
 
     /// Upsert the per-Pod Secret carrying a Step's forge credential (ADR-0076
@@ -2951,6 +3028,9 @@ impl Executor for K8sExecutor {
         // A refusal of the step author's overlay is the step's to fail with
         // (`Refused` → a `Config` failure naming the field), not a launch
         // error the scheduler retries until it dead-letters the Run.
+        // Kept to ask the API server, if it refuses the Pod, whether the
+        // step's overlay is the cause (below).
+        let unplaced = spec.k8s_overlay.is_some().then(|| pod.clone());
         let pod = apply_placement(pod, &step.step.0, spec, &self.placement)
             .map_err(PlacementError::into_exec_error)?;
         let pod = with_unschedulable_grace(pod, self.unschedulable_grace_secs);
@@ -2976,7 +3056,26 @@ impl Executor for K8sExecutor {
                 }
                 Ok(ExecHandle(name))
             }
-            Err(e) => Err(ExecError::Launch(e.to_string())),
+            // An overlay that keeps to the author's fields can still make a
+            // Pod the API server refuses (a label value it does not accept, a
+            // memory request above the limit). Ask it whether the Pod passes
+            // without the overlay; if it does, the overlay is the cause and
+            // the step fails with the API's reason instead of a launch error
+            // the scheduler retries until the Run dead-letters. An invalid
+            // operator baseline or profile fails the dry run too and stays a
+            // launch error.
+            Err(e) => {
+                let refusal = match (&e, unplaced) {
+                    (kube::Error::Api(ae), Some(unplaced)) if overlay_may_be_refused(ae.code) => {
+                        let passes = self
+                            .passes_without_overlay(&pods, unplaced, &step.step.0, spec)
+                            .await;
+                        overlay_refusal(ae.code, &ae.message, Some(passes))
+                    }
+                    _ => None,
+                };
+                Err(refusal.unwrap_or_else(|| ExecError::Launch(e.to_string())))
+            }
         }
     }
 
@@ -5393,10 +5492,16 @@ fn apply_placement(
         layers.push(("the placement baseline".to_string(), base, false));
     }
     for name in &spec.placement_profiles {
+        // Not the author's fault once Run creation checked the name: the
+        // operator removed the profile after the Run was created, or two
+        // replicas hold different config during a roll, which a retry covers.
         let profile = placement
             .profile(name)
-            .ok_or_else(|| format!("unknown placement_profile `{name}` (not in the registry)"))?;
-        if profile.registry_auth_only && !registry_auth_only_applies(step, name, spec)? {
+            .ok_or_else(|| placement.unknown_profile(step, name))?;
+        // The Step as the Pipeline file wrote it: no retry changes it.
+        if profile.registry_auth_only
+            && !registry_auth_only_applies(step, name, spec).map_err(PlacementError::authored)?
+        {
             continue;
         }
         if let Some(k8s) = &profile.k8s {
@@ -5437,11 +5542,13 @@ fn apply_placement(
 /// Why [`apply_placement`] did not build the step Pod.
 #[derive(Debug)]
 struct PlacementError {
-    /// The step author's `k8s_overlay` was refused: a field it may not set,
-    /// a change to what the layers before it set, or a Pod that does not
-    /// decode once it is merged. The step fails with the reason. Otherwise
-    /// the operator's config or Scarab's wiring is at fault (an unknown
-    /// profile, a profile that changes Scarab's containers).
+    /// The Step as its author wrote it was refused: its `k8s_overlay` (a
+    /// field it may not set, a change to what the layers before it set, or a
+    /// Pod that does not decode once it is merged), or a
+    /// `registry_auth_only` profile named on a Step that may not have it.
+    /// The step fails with the reason. Otherwise the operator's config or
+    /// Scarab's wiring is at fault (an unknown profile, a profile that
+    /// changes Scarab's containers).
     authored: bool,
     message: String,
 }
@@ -5462,6 +5569,14 @@ impl std::fmt::Display for PlacementError {
 }
 
 impl PlacementError {
+    /// A refusal of the Step as its author wrote it.
+    fn authored(message: String) -> Self {
+        PlacementError {
+            authored: true,
+            message,
+        }
+    }
+
     /// The launch's error: [`ExecError::Refused`] for the author's overlay,
     /// which the scheduler records as the step's `Config` failure with this
     /// reason, [`ExecError::Launch`] for the rest.
@@ -5512,13 +5627,39 @@ fn merge_layer(
         .map_err(|e| format!("{source} leaves a Pod that does not decode: {e}"))
 }
 
+/// Whether a `pods.create` answered with `code` may be the step's
+/// `k8s_overlay`'s fault: 400 or 422, an object the API server will not
+/// accept. A 403 (a quota, an RBAC or admission denial) can pass on a retry
+/// and is left a launch error.
+fn overlay_may_be_refused(code: u16) -> bool {
+    matches!(code, 400 | 422)
+}
+
+/// The step's failure when `pods.create` answered `code` with `message`
+/// for a step with a `k8s_overlay`, or `None` to keep the launch error.
+/// `passes_without_overlay` is whether the same Pod without the overlay
+/// passed a dry-run create (`None`: not asked). Only a Pod that passes
+/// without the overlay puts the fault on it.
+fn overlay_refusal(
+    code: u16,
+    message: &str,
+    passes_without_overlay: Option<bool>,
+) -> Option<ExecError> {
+    (overlay_may_be_refused(code) && passes_without_overlay == Some(true)).then(|| {
+        ExecError::Refused(format!(
+            "the step's k8s_overlay makes a Pod Kubernetes refuses: {message}"
+        ))
+    })
+}
+
 /// Whether a `registry_auth_only` profile (one that carries a registry
 /// credential, such as a ServiceAccount with a push role) applies to `spec`.
 /// An author names profiles, so the operator's marker is what keeps such a
 /// profile off a Step that runs repository code:
 ///
 /// - a Step without `registry_auth` (a run Step, the build library's
-///   sandboxed build Step) may not name it: `Err`, which fails the launch;
+///   sandboxed build Step) may not name it: `Err`, which fails the Step
+///   (Run creation refuses the Run first, [`PlacementConfig::profile_refusals`]);
 /// - a `registry_auth` Step the launch did not find eligible for a
 ///   credential (a fork pull request, a Run locked out of its Environment, a
 ///   Step from the Pipeline file or an untrusted library) runs without it:
@@ -5527,11 +5668,7 @@ fn merge_layer(
 ///   it, whether or not a credential resolved: `Ok(true)`.
 fn registry_auth_only_applies(step: &str, name: &str, spec: &StepSpec) -> Result<bool, String> {
     match &spec.registry_auth {
-        None => Err(format!(
-            "placement profile `{name}` carries a registry credential and applies only to a \
-             step with `registry_auth`; step `{step}` has none. Name it only for the step that \
-             pushes (for an invoke, `placement_profiles: {{ push: [{name}] }}`)"
-        )),
+        None => Err(registry_auth_only_refusal(step, name)),
         Some(auth) if !auth.credential_eligible => {
             tracing::info!(
                 %step,
@@ -5552,6 +5689,16 @@ fn registry_auth_only_applies(step: &str, name: &str, spec: &StepSpec) -> Result
         )),
         Some(_) => Ok(true),
     }
+}
+
+/// The refusal for a `registry_auth_only` profile named on a Step without
+/// `registry_auth`, at Run creation and at launch.
+fn registry_auth_only_refusal(step: &str, name: &str) -> String {
+    format!(
+        "placement profile `{name}` carries a registry credential and applies only to a step \
+         with `registry_auth`; step `{step}` has none. Name it only for the step that pushes \
+         (for an invoke, `placement_profiles: {{ push: [{name}] }}`)"
+    )
 }
 
 /// Refuse a layer that holds a key starting with `$` anywhere: Kubernetes'
@@ -8095,9 +8242,77 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("unknown placement_profile `ghost`"),
+            err.contains("placement profile `ghost`") && err.contains("it holds none"),
             "got: {err}"
         );
+    }
+
+    // RT-R2-2: the profile names a Step gives come from the Pipeline file,
+    // so Run creation checks them against the registry the executor reads.
+    // An unknown name is refused naming the names the registry holds; a
+    // `registry_auth_only` profile on a Step without `registry_auth` with the
+    // text the launch uses.
+    #[test]
+    fn profile_refusals_name_the_step_the_profile_and_the_registry() {
+        let mut placement = with_push_profile();
+        placement
+            .profiles
+            .push(profile("big", serde_json::json!({"spec":{}})));
+        let refused = placement.profile_refusals("build", &["bgi".into()], false);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0].contains("step `build`")
+                && refused[0].contains("`bgi`")
+                && refused[0].contains("`big`"),
+            "{refused:?}"
+        );
+        let refused = placement.profile_refusals("steal", &["ecr-push".into()], false);
+        assert_eq!(
+            refused,
+            vec![registry_auth_only_refusal("steal", "ecr-push")]
+        );
+        assert!(placement
+            .profile_refusals("image/push", &["ecr-push".into(), "big".into()], true)
+            .is_empty());
+    }
+
+    // RT-R2-2: a `registry_auth_only` profile named on a Step without
+    // `registry_auth` is the Step's as its author wrote it; no retry changes
+    // it. The launch fails the step (`Refused`), not a launch error the
+    // scheduler retries until the Run dead-letters.
+    #[test]
+    fn a_registry_auth_only_profile_on_a_step_without_registry_auth_fails_the_step() {
+        let placement = with_push_profile();
+        let mut run = busybox();
+        run.placement_profiles = vec!["ecr-push".into()];
+        let err = apply_placement(pod_for(&run), "steal", &run, &placement).unwrap_err();
+        assert!(err.authored, "{err}");
+        assert!(matches!(err.into_exec_error(), ExecError::Refused(m) if m.contains("`ecr-push`")),);
+    }
+
+    // RT-R2-1: an overlay that keeps to the author's fields can make a Pod
+    // the API server refuses. Only a 400 or 422 for a Pod that passes a dry
+    // run without the overlay fails the step with the API's reason; a dry
+    // run that fails too (an invalid operator baseline), a step with no
+    // overlay (not asked) and a 403 (a quota or RBAC denial a retry can pass)
+    // stay launch errors.
+    #[test]
+    fn a_pod_kubernetes_refuses_fails_the_step_only_when_the_overlay_is_the_cause() {
+        let message =
+            "Pod \"x\" is invalid: spec.nodeSelector: Invalid value: \"not a label value!\"";
+        for code in [400, 422] {
+            match overlay_refusal(code, message, Some(true)) {
+                Some(ExecError::Refused(m)) => {
+                    assert!(m.contains("k8s_overlay") && m.contains(message), "{m}")
+                }
+                other => panic!("{code}: {other:?}"),
+            }
+            assert!(overlay_refusal(code, message, Some(false)).is_none());
+            assert!(overlay_refusal(code, message, None).is_none());
+        }
+        assert!(overlay_refusal(403, "exceeded quota", Some(true)).is_none());
+        assert!(overlay_refusal(500, "etcd", Some(true)).is_none());
+        assert!(!overlay_may_be_refused(403));
     }
 
     #[test]
@@ -8905,6 +9120,47 @@ mod tests {
         }
     }
 
+    // RT-R2-T5: the AppArmor annotation, which `unconfined` lifts, stays
+    // refused when the operator lists its prefix.
+    #[test]
+    fn apparmor_annotation_stays_refused_when_listed() {
+        let key = "container.apparmor.security.beta.kubernetes.io/step";
+        let placement = listing(
+            &[],
+            &["container.apparmor.security.beta.kubernetes.io/*"],
+            &[],
+        );
+        let overlay = serde_json::json!({"metadata":{"annotations":{key:"unconfined"}}});
+        let err = apply_overlay_with(overlay, &placement).expect_err("accepted the AppArmor key");
+        assert!(err.contains(key) && err.contains("reserved"), "{err}");
+    }
+
+    // RT-R2-T2: an exact entry matches that key only, never a key it is the
+    // start of; a `prefix/*` entry matches only keys under `prefix/`.
+    #[test]
+    fn a_listed_key_does_not_cover_a_key_that_starts_with_it() {
+        let placement = listing(&["team"], &["a.io/*"], &["gpu"]);
+        for overlay in [
+            serde_json::json!({"metadata":{"labels":{"team-admin":"x"}}}),
+            serde_json::json!({"metadata":{"labels":{"teams":"x"}}}),
+            serde_json::json!({"metadata":{"annotations":{"a.io.evil/x":"x"}}}),
+            serde_json::json!({"spec":{"tolerations":[{"key":"gpu2","operator":"Exists"}]}}),
+        ] {
+            assert!(
+                apply_overlay_with(overlay.clone(), &placement).is_err(),
+                "accepted {overlay}"
+            );
+        }
+        for overlay in [
+            serde_json::json!({"metadata":{"labels":{"team":"x"}}}),
+            serde_json::json!({"metadata":{"annotations":{"a.io/x":"x"}}}),
+            serde_json::json!({"spec":{"tolerations":[{"key":"gpu","operator":"Exists"}]}}),
+        ] {
+            apply_overlay_with(overlay.clone(), &placement)
+                .unwrap_or_else(|e| panic!("refused {overlay}: {e}"));
+        }
+    }
+
     // Attack (RT-4): a toleration of a taint the operator keeps for something
     // else (`CriticalAddonsOnly`). Safe outcome: refused under the shipped
     // default; applied once the operator lists the key.
@@ -8996,7 +9252,8 @@ mod tests {
             }))
             .is_err()
         );
-        for bad in ["", "team*", "a/*/b", "*/x"] {
+        // `a/b/*`: a key holds one `/` at most, so no key matches it.
+        for bad in ["", "team*", "a/*/b", "*/x", "a/b/*", "example.com/x/*"] {
             assert!(
                 listing(&[bad], &[], &[]).validate().is_err(),
                 "accepted `{bad}`"

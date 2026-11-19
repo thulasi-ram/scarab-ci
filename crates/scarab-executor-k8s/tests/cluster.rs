@@ -3617,3 +3617,131 @@ async fn a_needs_step_with_a_uid_pinned_service_can_write_its_workspace() {
         exec.cancel(&h).await.expect("cleanup");
     }
 }
+
+/// LIVE (J-1, round 2 judge S7): a control plane that tails a step it did not
+/// launch reads the step's secret values back from the step's own Secrets,
+/// so it redacts them as the launching replica does. A second executor (a
+/// fresh client, nothing in memory from the launch) returns the step's
+/// secret values and the registry dockerconfigjson; a Pod with no secrets
+/// returns none; once the Attempt ends and its Secrets are deleted it
+/// returns none.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn log_redactions_reads_the_values_back_from_another_executor() {
+    let ns = enter_tier();
+
+    let launcher = K8sExecutor::with_client(ns.clone(), kube_client().await);
+    let peer = K8sExecutor::with_client(ns, kube_client().await);
+
+    let step = step_run_of(&unique_run("run-redact"), "redact");
+    let mut spec = busybox_spec("sleep 30", true);
+    spec.secrets = vec!["DB_PASSWORD".into()];
+    spec.resolved_secrets =
+        scarab_engine::ResolvedSecrets(vec![("DB_PASSWORD".into(), "sekret-db-redact".into())]);
+    spec.registry_auth = Some(scarab_engine::RegistryAuthConfig {
+        owner: "acme".into(),
+        name: "web".into(),
+        library: Some("ab".repeat(32)),
+        credential_eligible: true,
+        derived_auth: Some(scarab_engine::RegistryCredential {
+            registry: "ghcr.io".into(),
+            username: "x-access-token".into(),
+            token: "sekret-registry-token".into(),
+        }),
+        ..Default::default()
+    });
+    let h = launcher.launch(&step, &spec).await.expect("launch");
+
+    let values = peer.log_redactions(&step).await.expect("log_redactions");
+    assert!(
+        values.iter().any(|v| v == b"sekret-db-redact"),
+        "the step secret: {values:?}"
+    );
+    // The launching replica registers the token and `base64(user:token)`;
+    // the server extracts both from the dockerconfigjson returned here.
+    use base64::Engine as _;
+    let auth =
+        base64::engine::general_purpose::STANDARD.encode("x-access-token:sekret-registry-token");
+    assert!(
+        values.iter().any(|v| {
+            serde_json::from_slice::<serde_json::Value>(v)
+                .is_ok_and(|j| j["auths"]["ghcr.io"]["auth"] == auth.as_str())
+        }),
+        "the registry dockerconfigjson: {:?}",
+        values
+            .iter()
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .collect::<Vec<_>>()
+    );
+
+    // The Attempt ends: its Secrets are deleted, and nothing is read back.
+    launcher
+        .take_forge_credential(&h)
+        .await
+        .expect("attempt-end hook");
+    let mut after = peer.log_redactions(&step).await.expect("log_redactions");
+    for _ in 0..10 {
+        if after.iter().all(|v| v != b"sekret-db-redact") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        after = peer.log_redactions(&step).await.expect("log_redactions");
+    }
+    assert!(
+        after.iter().all(|v| v != b"sekret-db-redact"),
+        "the step secret is gone: {after:?}"
+    );
+    launcher.cancel(&h).await.expect("cleanup");
+
+    // A Pod with no secrets: none.
+    let plain = step_run_of(&unique_run("run-redact-none"), "plain");
+    let hp = launcher
+        .launch(&plain, &busybox_spec("true", true))
+        .await
+        .expect("launch");
+    assert_eq!(
+        peer.log_redactions(&plain).await.expect("log_redactions"),
+        Vec::<Vec<u8>>::new()
+    );
+    launcher.cancel(&hp).await.expect("cleanup");
+}
+
+/// LIVE (RT-R2-1): an overlay that keeps to the author's fields and makes a
+/// Pod the API server refuses (a node selector value that is not a label
+/// value) fails the step with the API's reason (`Refused`, which the
+/// scheduler records as the step's `Config` failure), not a launch error
+/// the scheduler retries until the Run dead-letters. No Pod is left behind:
+/// the dry run that put the fault on the overlay stores nothing.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn an_overlay_kubernetes_refuses_fails_the_step() {
+    let ns = enter_tier();
+
+    let client = kube_client().await;
+    let exec = K8sExecutor::with_client(ns.clone(), client.clone());
+    use kube::api::Api;
+    let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client, &ns);
+
+    let step = step_run_of(&unique_run("run-badoverlay"), "badoverlay");
+    let mut spec = busybox_spec("true", true);
+    spec.k8s_overlay = Some(serde_json::json!({
+        "spec": { "nodeSelector": { "pool": "not a label value!" } }
+    }));
+    let err = exec
+        .launch(&step, &spec)
+        .await
+        .expect_err("the API server refuses the Pod");
+    match &err {
+        scarab_engine::ExecError::Refused(m) => {
+            assert!(
+                m.contains("k8s_overlay") && m.contains("nodeSelector"),
+                "{m}"
+            )
+        }
+        other => panic!("expected Refused, got {other:?}"),
+    }
+    assert!(
+        pods.get_opt(&pod_name(&step)).await.expect("get").is_none(),
+        "no Pod was created"
+    );
+}

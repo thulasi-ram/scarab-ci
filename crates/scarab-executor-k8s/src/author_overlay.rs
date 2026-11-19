@@ -175,18 +175,26 @@ impl Default for AuthorOverlayConfig {
 }
 
 impl AuthorOverlayConfig {
-    /// A malformed entry: a `*` anywhere but alone or after the last `/`.
+    /// A malformed entry: a `*` anywhere but alone or after the last `/`,
+    /// or a `prefix/*` whose prefix holds a `/` of its own (`a/b/*`): a
+    /// label, annotation or taint key has at most one `/`, so no key
+    /// Kubernetes accepts can match it.
     pub(crate) fn validate(&self) -> Result<(), String> {
         for (field, keys) in self.lists() {
             for key in keys {
                 let ok = match key.find('*') {
                     None => !key.is_empty(),
-                    Some(at) => key == "*" || (at == key.len() - 1 && key.ends_with("/*")),
+                    Some(at) => {
+                        key == "*"
+                            || (at == key.len() - 1
+                                && key.ends_with("/*")
+                                && !key[..at - 1].contains('/'))
+                    }
                 };
                 if !ok {
                     return Err(format!(
                         "placement config: `author_overlay.{field}` entry `{key}` is not a key, \
-                         `prefix/*` or `*`"
+                         `prefix/*` or `*` (a prefix holds no `/` of its own)"
                     ));
                 }
             }
