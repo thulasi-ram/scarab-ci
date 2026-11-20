@@ -291,9 +291,14 @@ pub struct K8sExecutor {
     /// answers fails instead of holding the scheduler driver (git-bug
     /// afa9f07).
     client: Option<kube::Client>,
-    /// For log tails and exec/attach sessions, which can stay quiet for
-    /// minutes: the same connection settings with no read timeout.
+    /// For exec/attach sessions, which can stay quiet for minutes: the same
+    /// connection settings with no read timeout.
     stream_client: Option<kube::Client>,
+    /// For followed log reads: the same connection settings with a read
+    /// timeout of [`LOG_FOLLOW_READ_TIMEOUT`] from
+    /// [`connect`](Self::connect), so a follow whose connection went
+    /// half-open errors instead of waiting for ever.
+    log_client: Option<kube::Client>,
     namespace: String,
     results_egress: Option<ResultsEgress>,
     /// Global default step deadline in seconds (ADR-0047), applied when a step
@@ -365,6 +370,7 @@ impl K8sExecutor {
         Self {
             client: None,
             stream_client: None,
+            log_client: None,
             namespace: namespace.into(),
             results_egress: None,
             default_step_timeout_secs: DEFAULT_STEP_TIMEOUT_SECS,
@@ -381,6 +387,7 @@ impl K8sExecutor {
     pub fn with_client(namespace: impl Into<String>, client: kube::Client) -> Self {
         Self {
             stream_client: Some(client.clone()),
+            log_client: Some(client.clone()),
             client: Some(client),
             namespace: namespace.into(),
             results_egress: None,
@@ -472,14 +479,25 @@ impl K8sExecutor {
         let config = kube::Config::infer()
             .await
             .map_err(|e| ExecError::Other(e.to_string()))?;
-        let stream =
-            kube::Client::try_from(config.clone()).map_err(|e| ExecError::Other(e.to_string()))?;
-        let mut requests = config;
-        requests.read_timeout = Some(KUBE_READ_TIMEOUT);
-        let client =
-            kube::Client::try_from(requests).map_err(|e| ExecError::Other(e.to_string()))?;
-        let mut executor = Self::with_client(namespace, client);
-        executor.stream_client = Some(stream);
+        Self::from_config(namespace, config, LOG_FOLLOW_READ_TIMEOUT)
+    }
+
+    /// The three clients over `config`: requests with
+    /// [`KUBE_READ_TIMEOUT`], exec sessions with none, followed log reads
+    /// with `log_read_timeout`.
+    fn from_config(
+        namespace: impl Into<String>,
+        config: kube::Config,
+        log_read_timeout: std::time::Duration,
+    ) -> Result<Self, ExecError> {
+        let client_with = |read_timeout: Option<std::time::Duration>| {
+            let mut c = config.clone();
+            c.read_timeout = read_timeout;
+            kube::Client::try_from(c).map_err(|e| ExecError::Other(e.to_string()))
+        };
+        let mut executor = Self::with_client(namespace, client_with(Some(KUBE_READ_TIMEOUT))?);
+        executor.stream_client = Some(client_with(None)?);
+        executor.log_client = Some(client_with(Some(log_read_timeout))?);
         Ok(executor)
     }
 
@@ -488,8 +506,8 @@ impl K8sExecutor {
         Ok(Api::namespaced(client, &self.namespace))
     }
 
-    /// Pods through the client with no read timeout, for log tails and
-    /// exec/attach sessions.
+    /// Pods through the client with no read timeout, for exec/attach
+    /// sessions.
     fn stream_pods(&self) -> Result<Api<Pod>, ExecError> {
         let client = self.stream_client.clone().ok_or(ExecError::Unavailable)?;
         Ok(Api::namespaced(client, &self.namespace))
@@ -499,6 +517,13 @@ impl K8sExecutor {
     /// stream client.
     fn stream_pods_or(&self, pods: &Api<Pod>) -> Api<Pod> {
         self.stream_pods().unwrap_or_else(|_| pods.clone())
+    }
+
+    /// Pods through the client for followed log reads
+    /// ([`LOG_FOLLOW_READ_TIMEOUT`]).
+    fn log_pods(&self) -> Result<Api<Pod>, ExecError> {
+        let client = self.log_client.clone().ok_or(ExecError::Unavailable)?;
+        Ok(Api::namespaced(client, &self.namespace))
     }
 
     /// The Pod whose `container` log a tail is about to read, checked: it
@@ -529,14 +554,17 @@ impl K8sExecutor {
         }
     }
 
-    /// Open a followed read of `container` in the checked Pod `pod`.
+    /// Open a followed read of `container` in the checked Pod `pod`. The
+    /// read errors when no byte arrives for [`LOG_FOLLOW_READ_TIMEOUT`]; the
+    /// tail then opens it again and compares what it reads with what it
+    /// stored.
     async fn open_ledger_log(
         &self,
         pod: &str,
         container: &str,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         let checked = self.ledger_pod(pod, container).await?;
-        let pods = self.stream_pods()?;
+        let pods = self.log_pods()?;
         let reader = pods
             .log_stream(pod, &follow_params(container, LogFrom::Start))
             .await
@@ -7558,6 +7586,14 @@ pub const DEFAULT_UNSCHEDULABLE_GRACE_SECS: u32 = 300;
 /// after 60 seconds on its side; a response that stops arriving for this
 /// long will not arrive. Log tails and exec sessions do not use it.
 pub const KUBE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a followed log read may wait for its next bytes before it
+/// fails. A step that prints nothing for this long costs one read opened
+/// again; a connection that went half-open (a node or a load balancer
+/// dropped it without a reset) is noticed within this time instead of
+/// never, while the step runs. kube 4.0 has no TCP keepalive setting, so
+/// this read timeout is the only way to notice a dead connection.
+pub const LOG_FOLLOW_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// `pod` with its Unschedulable grace stamped on as
 /// [`ANNOTATION_UNSCHEDULABLE_GRACE`].
@@ -15634,6 +15670,36 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         kube::Config::new(format!("http://{addr}").parse().unwrap())
+    }
+
+    /// REV-m8: a followed log read over a connection that went half-open
+    /// (bytes, then nothing, the connection still open) errors once no byte
+    /// has come for the log read timeout, and the tail opens it again; it
+    /// does not wait while the step runs. The timeout is 300 ms here, 5
+    /// minutes in [`K8sExecutor::connect`]. Kills: the follow read through
+    /// the client with no read timeout.
+    #[tokio::test]
+    async fn a_follow_that_goes_silent_errors_after_the_read_timeout() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        let config = fake_log_api(pod_name(&step), &["u1"]).await;
+        let exec =
+            K8sExecutor::from_config("ci-steps", config, std::time::Duration::from_millis(300))
+                .unwrap();
+        let mut chunks = exec
+            .log_stream(&step, LogFrom::Start)
+            .await
+            .expect("the log opens")
+            .expect("a reader");
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), chunks.next_chunk())
+            .await
+            .expect("the first bytes")
+            .expect("read")
+            .expect("bytes");
+        assert_eq!(first, b"hello\n");
+        let silent = tokio::time::timeout(std::time::Duration::from_secs(10), chunks.next_chunk())
+            .await
+            .expect("the silent read errors instead of waiting");
+        assert!(silent.is_err(), "{silent:?}");
     }
 
     /// RT-M3: the log is read from the Pod whose label was checked. A Pod
