@@ -345,6 +345,10 @@ pub struct LogUnitRow {
     /// When the row was created: of two units with one handle (a Pod name
     /// hash collision), the newer is the one a handle names.
     pub created_at: i64,
+    /// How many streams the unit has: its main container and one per
+    /// sidecar service of its step. Its ledger is purged after its last
+    /// stream ends only once this many stream rows are terminal.
+    pub stream_count: i32,
 }
 
 /// One sealed generation of a unit's ledger.
@@ -385,7 +389,44 @@ pub struct PendingFinalRead {
     /// The unit has rows stored, or was seen running: a stream of a unit
     /// with no ledger gets `not_stored` then, else nothing.
     pub started: bool,
+    /// The unit's `stream_count` (1 for a unit with no ledger: its sidecars
+    /// are read from its step's spec).
+    pub stream_count: i32,
 }
+
+/// Where each leg of the pending-final-read query resumes: after the last
+/// key a pass read, or from the start (`None`). A leg that returned fewer
+/// rows than its limit starts again from the start (it wraps), so a window
+/// of units that keep failing cannot hide the units behind it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingReadCursor {
+    /// Units with a ledger (`log_units`), by `(run, step, attempt)`.
+    pub ledger: Option<LogStreamId>,
+    /// Units an earlier version launched (`log_legacy_units`).
+    pub legacy: Option<LogStreamId>,
+    /// Step attempts claimed since the log store's epoch with no ledger, by
+    /// `(started_at, run, step, attempt)`.
+    pub recent: Option<(i64, LogStreamId)>,
+}
+
+/// One page of the pending-final-read query and the cursor for the next.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingReads {
+    pub reads: Vec<PendingFinalRead>,
+    pub next: PendingReadCursor,
+}
+
+/// How far before the log store's epoch (the migration that added the
+/// ledger) a step attempt with no ledger is still read once more: the
+/// server's clock (`attempts.started_at`) and the database's (the epoch)
+/// may differ by this much. An attempt this wrongly includes is closed
+/// with `not_stored`, which stores nothing.
+pub const PENDING_EPOCH_SKEW_MS: i64 = 120_000;
+
+/// How long after its claim a step attempt with no ledger is still read
+/// once more: the longest step timeout and a day.
+pub const PENDING_RECENT_WINDOW_MS: i64 =
+    (scarab_pipeline::MAX_STEP_TIMEOUT_SECS as i64 + 24 * 3600) * 1000;
 
 /// What kind of value a launch mounts into a unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

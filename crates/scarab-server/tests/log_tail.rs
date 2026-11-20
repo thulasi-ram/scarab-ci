@@ -800,6 +800,8 @@ async fn a_unit_without_a_ledger_stores_one_marker_and_no_bytes() {
 async fn an_ended_unit_without_a_ledger_is_closed_by_the_pending_query() {
     let w = World::new().await;
     let logs = w.logs();
+    // Running when the ledger was added (migration 0099 records it).
+    w.db.seed_log_legacy_unit(&stream());
     w.db.mark_attempt_execution_started(
         &run(),
         &StepId(STEP.into()),
@@ -1678,4 +1680,271 @@ async fn ledger_rows_hold_no_plaintext_and_open_only_under_their_unit() {
         Err(scarab_server::logs::LedgerError::Local(_))
     ));
     tdb.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// Review findings (b2): purge, pending reads, read ends, failure causes
+// ---------------------------------------------------------------------------
+
+/// A step with one sidecar: the main container from `main`, the sidecar
+/// container `service-0` from `side`. Until `main_ready` is set, opening the
+/// main log fails as a Pod still initializing does.
+struct TwoSources {
+    main: Arc<LiveLog>,
+    side: Arc<LiveLog>,
+    main_ready: AtomicBool,
+}
+
+impl TwoSources {
+    fn new(main: Arc<LiveLog>, side: Arc<LiveLog>, main_ready: bool) -> Arc<Self> {
+        Arc::new(Self {
+            main,
+            side,
+            main_ready: AtomicBool::new(main_ready),
+        })
+    }
+}
+
+#[async_trait]
+impl Executor for TwoSources {
+    async fn launch(&self, s: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+        self.main.launch(s, spec).await
+    }
+    async fn poll(&self, h: &ExecHandle) -> Result<ExecState, ExecError> {
+        self.main.poll(h).await
+    }
+    async fn cancel(&self, h: &ExecHandle) -> Result<(), ExecError> {
+        self.main.cancel(h).await
+    }
+    fn unit_handle(&self, s: &StepRun) -> Option<ExecHandle> {
+        self.main.unit_handle(s)
+    }
+    async fn torn_down(&self, h: &ExecHandle) -> Result<bool, ExecError> {
+        self.main.torn_down(h).await
+    }
+    async fn results_delivery_failure(&self, h: &ExecHandle) -> Result<Option<String>, ExecError> {
+        self.main.results_delivery_failure(h).await
+    }
+    async fn workspace_provisioning(
+        &self,
+        h: &ExecHandle,
+    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
+        self.main.workspace_provisioning(h).await
+    }
+    async fn gate_refusal(&self, g: &StepRun) -> Result<Option<String>, ExecError> {
+        self.main.gate_refusal(g).await
+    }
+    async fn infra_condition(
+        &self,
+        h: &ExecHandle,
+    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
+        self.main.infra_condition(h).await
+    }
+    async fn delete_unit_secrets(&self, h: &ExecHandle) -> Result<(), ExecError> {
+        self.main.delete_unit_secrets(h).await
+    }
+    async fn log_source_state(&self, s: &LogSourceRef) -> Result<LogSourceState, ExecError> {
+        match s {
+            LogSourceRef::Sidecar { .. } => self.side.log_source_state(s).await,
+            _ => self.main.log_source_state(s).await,
+        }
+    }
+    async fn log_stream(
+        &self,
+        _s: &StepRun,
+        _f: LogFrom,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        if !self.main_ready.load(Ordering::SeqCst) {
+            return Err(ExecError::Other(
+                "container \"step\" in pod \"p\" is waiting to start: PodInitializing".into(),
+            ));
+        }
+        self.main.open()
+    }
+    async fn sidecar_log_stream(
+        &self,
+        _s: &StepRun,
+        _c: &str,
+        _f: LogFrom,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        self.side.open()
+    }
+}
+
+fn spec_with_sidecar() -> StepSpec {
+    let mut s = spec();
+    s.services = vec![scarab_pipeline::ServiceSpec {
+        image: "postgres:16".into(),
+        ..Default::default()
+    }];
+    s
+}
+
+/// RT-M1: a short step with a sidecar. The sidecar's log completes while
+/// the main container's log has stored nothing yet (its Pod was still
+/// initializing at the first open); the unit is settled and revoked. The
+/// ledger must not be purged until the main stream is terminal too, so the
+/// main log is stored, not replaced by a `not_stored` marker. Kills: a
+/// purge that counts only stream rows that exist.
+#[tokio::test]
+async fn a_short_step_with_a_sidecar_keeps_its_log() {
+    let w = World::new().await;
+    let logs = w.logs();
+    let main = LiveLog::new(b"built\n", true);
+    let side = LiveLog::new(b"db up\n", true);
+    let exec = TwoSources::new(main.clone(), side.clone(), false);
+    let stack = build_executor_stack(
+        exec.clone(),
+        logs.clone(),
+        Arc::new(scarab_testkit::FakeClock::new(now_ms())),
+        {
+            let (db, l) = (w.db.clone() as Arc<dyn Db>, logs.clone());
+            move |ledger| SecretInjectingExecutor::new(ledger, db, Arc::new(FakeSecrets::new()), l)
+        },
+        {
+            let forge = w.forge.clone() as Arc<dyn ForgePort>;
+            move |with_secrets| {
+                scarab_server::forge_token::ForgeCredentialExecutor::new(with_secrets, forge)
+            }
+        },
+    );
+    stack.launch(&running(), &spec_with_sidecar()).await.unwrap();
+    let tailer = w.tailer(exec.clone(), &logs, "a");
+    tailer.ensure(&running());
+    tailer.ensure_sidecar(&running(), 0);
+    until("the sidecar's line", || async {
+        w.stored(&logs, &sidecar_stream()).await == b"db up\n"
+    })
+    .await;
+    assert!(w.db.log_stream_row(&stream()).await.unwrap().is_none());
+    // The step exits: the attempt-end poll attempts the revocation, the
+    // attempt ends and the unit settles.
+    main.stop();
+    *main.poll_state.lock().unwrap() = ExecState::Succeeded;
+    stack.poll(&ExecHandle("pod-build".into())).await.unwrap();
+    w.end_attempt().await;
+    w.db.settle_log_units(Timestamp(now_ms())).await.unwrap();
+    // The sidecar's container ends: its stream completes first.
+    side.stop();
+    until("the sidecar completes", || async {
+        w.state(&sidecar_stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    // Now the main log can be read.
+    exec.main_ready.store(true, Ordering::SeqCst);
+    drive_until(
+        &tailer,
+        &step_run(AttemptOutcome::Succeeded),
+        "the main stream is terminal",
+        || async {
+            w.state(&stream())
+                .await
+                .is_some_and(|s| s != LogStreamState::Open)
+        },
+    )
+    .await;
+    assert!(w.markers(&stream()).await.is_empty(), "{:?}", w.rows(&stream()).await);
+    assert_eq!(w.state(&stream()).await, Some(LogStreamState::Complete));
+    assert_eq!(w.stored(&logs, &stream()).await, b"built\n");
+}
+
+/// RT-m3 / REV-m2: a sidecar stream left open when every replica that read
+/// it went away, with the main stream already complete, is read by the
+/// pending-final-read query of a new process. Kills: a pending query that
+/// looks at the main stream only.
+#[tokio::test]
+async fn a_sidecar_stream_left_open_across_a_restart_is_read() {
+    let w = World::new().await;
+    let logs = w.logs();
+    let main = LiveLog::new(b"built\n", false);
+    let side = LiveLog::new(b"db up\n", true);
+    side.script(ReadScript {
+        chunk: 64,
+        fail_after: Some(1),
+        ..Default::default()
+    });
+    let exec = TwoSources::new(main.clone(), side.clone(), true);
+    let stack = build_executor_stack(
+        exec.clone(),
+        logs.clone(),
+        Arc::new(scarab_testkit::FakeClock::new(now_ms())),
+        {
+            let (db, l) = (w.db.clone() as Arc<dyn Db>, logs.clone());
+            move |ledger| SecretInjectingExecutor::new(ledger, db, Arc::new(FakeSecrets::new()), l)
+        },
+        {
+            let forge = w.forge.clone() as Arc<dyn ForgePort>;
+            move |with_secrets| {
+                scarab_server::forge_token::ForgeCredentialExecutor::new(with_secrets, forge)
+            }
+        },
+    );
+    stack.launch(&running(), &spec_with_sidecar()).await.unwrap();
+    // The old process: the main log completes, the sidecar's read breaks
+    // after its first line; then the process is gone.
+    let old = w.tailer(exec.clone(), &logs, "old");
+    old.ensure(&running());
+    old.ensure_sidecar(&running(), 0);
+    until("the old process's reads", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+            && w.stored(&logs, &sidecar_stream()).await == b"db up\n"
+    })
+    .await;
+    side.print(b"db down\n");
+    side.stop();
+    w.end_attempt().await;
+    w.db.settle_log_units(Timestamp(now_ms())).await.unwrap();
+    // A new process reads what the pending query names.
+    let fresh = w.tailer(exec.clone(), &logs, "fresh");
+    until("the sidecar stream completes", || async {
+        fresh.pending_pass().await;
+        w.state(&sidecar_stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    assert_eq!(
+        w.stored(&logs, &sidecar_stream()).await,
+        b"db up\ndb down\n"
+    );
+}
+
+/// RT-m8: a gate attempt (no container, no ledger) that ended gets no log
+/// marker from the pending-final-read query.
+#[tokio::test]
+async fn a_gate_attempt_gets_no_log_marker() {
+    let w = World::new().await;
+    let logs = w.logs();
+    let gate = StepId("approve".into());
+    w.db.create_step_run(&run(), &gate, None, &[], Timestamp(0))
+        .await
+        .unwrap();
+    w.db.record_attempt(
+        &run(),
+        &gate,
+        &Attempt {
+            id: AttemptId(ATTEMPT.into()),
+            started_at: Timestamp(now_ms()),
+            failure: None,
+            failure_detail: None,
+            outcome: AttemptOutcome::Running,
+        },
+    )
+    .await
+    .unwrap();
+    w.db.set_attempt_outcome(
+        &run(),
+        &gate,
+        &AttemptId(ATTEMPT.into()),
+        AttemptOutcome::Succeeded,
+    )
+    .await
+    .unwrap();
+    let live = LiveLog::new(b"", false);
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    let gate_stream = LogStreamId::new(&run(), &gate, &AttemptId(ATTEMPT.into()));
+    for _ in 0..20 {
+        tailer.pending_pass().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(w.rows(&gate_stream).await.is_empty());
+    assert_eq!(live.opens(), 0);
 }

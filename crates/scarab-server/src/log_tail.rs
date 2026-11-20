@@ -76,8 +76,11 @@ const NOT_READY_GRACE: Duration = Duration::from_secs(180);
 /// Once past [`NOT_READY_GRACE`], restate a stuck tail at most this often.
 const STUCK_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How often the pending-final-read query and the ledger sweep run.
+/// How often the settle pass and the pending-final-read query run.
 const SWEEP_EVERY: Duration = Duration::from_secs(30);
+
+/// Units per leg of one pending-final-read pass.
+const PENDING_PAGE: u32 = 64;
 
 /// Timing of the read state machine. [`TailTiming::default`] is production;
 /// tests shorten it.
@@ -233,6 +236,8 @@ pub struct LogTailer {
     /// Revokes a unit's minted tokens before the sweep purges its ledger.
     forge: Option<Arc<dyn scarab_forge::ForgePort>>,
     last_sweep: Mutex<Option<Instant>>,
+    /// Where the next pending-final-read pass resumes.
+    pending_cursor: Mutex<scarab_engine::PendingReadCursor>,
 }
 
 impl LogTailer {
@@ -246,6 +251,7 @@ impl LogTailer {
             state: Arc::new(Mutex::new(TailState::default())),
             forge: None,
             last_sweep: Mutex::new(None),
+            pending_cursor: Mutex::new(Default::default()),
         }
     }
 
@@ -363,23 +369,42 @@ impl LogTailer {
         sweep_ledgers(&self.logs, self.forge.as_deref(), now).await;
     }
 
-    /// Read the units the pending-final-read query names.
+    /// Read the units the pending-final-read query names: one page of each
+    /// of its legs, resuming where the last pass stopped (a leg that ran
+    /// out starts again from its first key), so units that keep failing
+    /// here cannot hide the ones behind them.
     pub async fn pending_pass(&self) {
-        let pending = match self.db.pending_final_reads(64).await {
+        let cursor = self.pending_cursor.lock().unwrap().clone();
+        let page = match self
+            .db
+            .pending_final_reads(Timestamp(now_ms()), &cursor, PENDING_PAGE)
+            .await
+        {
             Ok(p) => p,
             Err(e) => {
                 tracing::debug!(error = %e, "log tail: the pending-final-read query failed");
                 return;
             }
         };
-        for p in pending {
+        *self.pending_cursor.lock().unwrap() = page.next;
+        for p in page.reads {
             let unit = p.unit.clone();
+            let service = unit.step.0.starts_with("service:");
             if !p.has_ledger {
-                self.spawn_no_ledger_close(unit, p.started);
+                // Its sidecars, from the step's spec: a unit with no ledger
+                // recorded no stream count.
+                let sidecars = if service {
+                    0
+                } else {
+                    match self.db.step_spec(&unit.run, &unit.step).await {
+                        Ok(spec) => spec.map_or(0, |s| s.services.len()),
+                        Err(_) => continue,
+                    }
+                };
+                self.spawn_no_ledger_close(unit, p.started, sidecars);
                 continue;
             }
-            if let Some(name_take) = unit.step.0.strip_prefix("service:") {
-                let _ = name_take;
+            if service {
                 if let Some(h) = p.handle.clone() {
                     self.spawn_tail(
                         unit,
@@ -389,66 +414,60 @@ impl LogTailer {
                 }
                 continue;
             }
+            // Every stream of the unit, whatever the state of the others: a
+            // read of a terminal stream ends at its row.
             let step = step_run_of(&unit);
             self.spawn_tail(unit.clone(), TailSource::Step(step.clone()), true);
-            if let Ok(Some(spec)) = self.db.step_spec(&unit.run, &unit.step).await {
-                for i in 0..spec.services.len() {
-                    let syn = crate::logs::sidecar_stream_key(&unit.step, i);
-                    let fence = LogStreamId::new(&unit.run, &syn, &unit.attempt);
-                    self.spawn_tail(
-                        fence,
-                        TailSource::Sidecar {
-                            step: step.clone(),
-                            index: i,
-                        },
-                        true,
-                    );
-                }
+            for i in 0..(p.stream_count.max(1) as usize - 1) {
+                let syn = crate::logs::sidecar_stream_key(&unit.step, i);
+                let fence = LogStreamId::new(&unit.run, &syn, &unit.attempt);
+                self.spawn_tail(
+                    fence,
+                    TailSource::Sidecar {
+                        step: step.clone(),
+                        index: i,
+                    },
+                    true,
+                );
             }
         }
     }
 
-    /// Close the stream of a unit that has no ledger and left `Running`
-    /// (an earlier version launched it, or it never launched): one
-    /// `not_stored` marker if it started, else nothing, and `closed`. No
-    /// source byte is read.
-    fn spawn_no_ledger_close(&self, fence: LogStreamId, started: bool) {
-        if !self.state.lock().unwrap().active.insert(fence.clone()) {
+    /// Close the streams of a unit that has no ledger and left `Running`
+    /// (an earlier version launched it, or it never launched): its
+    /// `sidecars` sidecar streams, then its main stream, each with one
+    /// `not_stored` marker if the unit started, else none, and `closed`. No
+    /// source byte is read. Once all are closed the unit's
+    /// `log_legacy_units` row, if any, is deleted.
+    fn spawn_no_ledger_close(&self, unit: LogStreamId, started: bool, sidecars: usize) {
+        if !self.state.lock().unwrap().active.insert(unit.clone()) {
             return;
         }
         let ctx = self.ctx();
         tokio::spawn(async move {
-            let resource = tail_lease_resource(&fence.run, &fence.step, &fence.attempt);
-            if let Ok(writer) = claim(&ctx, &resource).await {
-                let now = Timestamp(now_ms());
-                let r = if started {
-                    ctx.logs
-                        .append_marker(
-                            &fence,
-                            LogRowKind::NotStored,
-                            Some(NotStoredReason::NoLedger),
-                            &writer,
-                            Some(LogStreamState::Closed),
-                            now,
-                        )
-                        .await
-                        .map(|_| ())
-                } else {
-                    ctx.db
-                        .set_log_stream_state(&fence, &writer, LogStreamState::Closed, now)
-                        .await
-                };
-                match r {
-                    Ok(()) | Err(LogAppendError::Closed) => {
-                        ctx.state.lock().unwrap().done.insert(fence.clone());
-                    }
-                    Err(e) => {
-                        tracing::debug!(error = %e, "log tail: closing a stream with no ledger failed")
-                    }
+            let mut fences: Vec<LogStreamId> = (0..sidecars)
+                .map(|i| {
+                    LogStreamId::new(
+                        &unit.run,
+                        &crate::logs::sidecar_stream_key(&unit.step, i),
+                        &unit.attempt,
+                    )
+                })
+                .collect();
+            fences.push(unit.clone());
+            let mut closed = true;
+            for fence in &fences {
+                if !close_no_ledger(&ctx, fence, started).await {
+                    closed = false;
+                    break;
                 }
-                give_up_lease(&ctx, &resource, ctx.timing.retry_backoff).await;
             }
-            ctx.state.lock().unwrap().active.remove(&fence);
+            if closed {
+                if let Err(e) = ctx.db.forget_log_legacy_unit(&unit).await {
+                    tracing::debug!(error = %e, "log tail: forgetting a closed earlier-version unit failed; closed again later");
+                }
+            }
+            ctx.state.lock().unwrap().active.remove(&unit);
         });
     }
 
@@ -585,6 +604,46 @@ async fn give_up_lease(ctx: &Ctx, resource: &str, backoff: Duration) {
     if let Err(e) = ctx.db.lease(resource, &ctx.owner, ttl_ms).await {
         tracing::debug!(resource, error = %e, "log tail: could not shorten the tail lease; it expires");
     }
+}
+
+/// Close `fence`, a stream of a unit with no ledger, under its tail lease:
+/// one `not_stored` (`no_ledger`) marker if the unit `started`, else none,
+/// and `closed`. No source byte is read. Whether it is closed now.
+async fn close_no_ledger(ctx: &Ctx, fence: &LogStreamId, started: bool) -> bool {
+    let resource = tail_lease_resource(&fence.run, &fence.step, &fence.attempt);
+    let Ok(writer) = claim(ctx, &resource).await else {
+        return false;
+    };
+    let now = Timestamp(now_ms());
+    let r = if started {
+        ctx.logs
+            .append_marker(
+                fence,
+                LogRowKind::NotStored,
+                Some(NotStoredReason::NoLedger),
+                &writer,
+                Some(LogStreamState::Closed),
+                now,
+            )
+            .await
+            .map(|_| ())
+    } else {
+        ctx.db
+            .set_log_stream_state(fence, &writer, LogStreamState::Closed, now)
+            .await
+    };
+    let closed = match r {
+        Ok(()) | Err(LogAppendError::Closed) => {
+            ctx.state.lock().unwrap().done.insert(fence.clone());
+            true
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "log tail: closing a stream with no ledger failed");
+            false
+        }
+    };
+    give_up_lease(ctx, &resource, ctx.timing.retry_backoff).await;
+    closed
 }
 
 /// Renew `resource` every third of its TTL while a read runs; set `lost`

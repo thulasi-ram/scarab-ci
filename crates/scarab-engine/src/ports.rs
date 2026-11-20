@@ -1101,9 +1101,24 @@ pub trait Db: Send + Sync {
     /// set `purged`. A purged unit reads as "not ledger-complete".
     async fn purge_log_unit(&self, unit: &crate::LogStreamId) -> Result<(), DbError>;
 
-    /// Whether any stream of `unit` (its main stream and its sidecar
-    /// streams) is still `open`.
-    async fn log_unit_has_open_stream(&self, unit: &crate::LogStreamId) -> Result<bool, DbError>;
+    /// Record how many streams `unit` has (its main stream and one per
+    /// sidecar service), before its launch writes anything the unit can
+    /// read. A unit whose launch never recorded it has 1.
+    async fn set_log_unit_stream_count(
+        &self,
+        unit: &crate::LogStreamId,
+        count: i32,
+    ) -> Result<(), DbError>;
+
+    /// Whether every stream of `unit` is terminal: `stream_count` of its
+    /// streams (its main stream and its sidecar streams) have a row in
+    /// `complete` or `closed`, and none is `open`. A stream that has stored
+    /// nothing yet has no row, so it is not terminal. `false` for a unit
+    /// with no `log_units` row.
+    async fn log_unit_streams_all_terminal(
+        &self,
+        unit: &crate::LogStreamId,
+    ) -> Result<bool, DbError>;
 
     /// Units not purged that the purge sweep may purge at `now`: settled
     /// more than [`LEDGER_SETTLED_KEEP_MS`](crate::LEDGER_SETTLED_KEEP_MS)
@@ -1119,15 +1134,27 @@ pub trait Db: Send + Sync {
 
     /// Units that left `Running` with a stream that is not terminal, so a
     /// replica reads them once more though no tail of this process saw them
-    /// end: settled `log_units` rows not purged, of a run not pruned, whose
-    /// main stream is not terminal; and step attempts that have an outcome,
-    /// no `log_units` row and a main stream that is not terminal, which ran
-    /// across the migration that added the ledger or started after it. At
-    /// most `limit`.
+    /// end, in three legs of at most `limit` each, each resuming after
+    /// `cursor`'s key for it:
+    /// - settled `log_units` rows not purged, of a run not pruned, with
+    ///   fewer than `stream_count` terminal streams (a stream with no row
+    ///   is not terminal);
+    /// - `log_legacy_units` (units running when the ledger was added) that
+    ///   are no longer running;
+    /// - step attempts claimed since [`PENDING_EPOCH_SKEW_MS`](crate::PENDING_EPOCH_SKEW_MS)
+    ///   before the log store's epoch and within
+    ///   [`PENDING_RECENT_WINDOW_MS`](crate::PENDING_RECENT_WINDOW_MS) of
+    ///   `now`, that have an outcome, no `log_units` row, no legacy row,
+    ///   and a main stream that is not terminal.
     async fn pending_final_reads(
         &self,
+        now: Timestamp,
+        cursor: &crate::PendingReadCursor,
         limit: u32,
-    ) -> Result<Vec<crate::PendingFinalRead>, DbError>;
+    ) -> Result<crate::PendingReads, DbError>;
+
+    /// Forget a unit of `log_legacy_units` once its streams are closed.
+    async fn forget_log_legacy_unit(&self, unit: &crate::LogStreamId) -> Result<(), DbError>;
 
     /// All step projections of a run (with their attempts) — the DAG snapshot
     /// the scheduler folds to decide admission and completion.
@@ -1447,11 +1474,12 @@ pub trait Db: Send + Sync {
     async fn run_settlements(&self, runs: &[RunId]) -> Result<Vec<RunSettlement>, DbError>;
 
     /// Prune a run's log index in one transaction (ADR-0050): tombstone
-    /// every stream of the run (`closed`, `pruned`), purge its units'
-    /// ledgers, delete its index rows, and note the run for a second delete
+    /// every stream of the run (`closed`, `pruned`), delete its units'
+    /// ledgers (`log_units`, their generations and `log_legacy_units`
+    /// rows), delete its index rows, and note the run for a second delete
     /// of its bodies later. A late fenced append is refused by the
-    /// tombstone. The caller deletes the bodies by prefix `logs/{run}/`
-    /// after it.
+    /// tombstone, and no new stream row is made for the run. The caller
+    /// deletes the bodies by prefix `logs/{run}/` after it.
     async fn prune_log_run(&self, run: &RunId, now: Timestamp) -> Result<(), DbError>;
 
     /// Runs whose log index was pruned before `before` and whose bodies are

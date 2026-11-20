@@ -142,6 +142,23 @@ fn mem_stream_row(
     row
 }
 
+/// How many streams of the unit `k` (its main stream and its sidecar
+/// streams) have a row that is terminal, and how many one that is open.
+fn mem_unit_streams(st: &InMemoryState, k: &(RunId, StepId, AttemptId)) -> (usize, usize) {
+    let sidecar = format!("{}::service-", k.1 .0);
+    let mut out = (0, 0);
+    for ((r, s, a), row) in &st.log_streams {
+        if r == &k.0 && a == &k.2 && (s == &k.1 || s.0.starts_with(&sidecar)) {
+            if row.state == scarab_engine::LogStreamState::Open {
+                out.1 += 1;
+            } else {
+                out.0 += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Whether a unit is still running in the store: its run is not terminal,
 /// and its step attempt has no outcome, or its shared service is live.
 fn mem_unit_running(st: &InMemoryState, k: &(RunId, StepId, AttemptId)) -> bool {
@@ -317,6 +334,11 @@ struct InMemoryState {
     log_unit_values: HashMap<(RunId, StepId, AttemptId), Vec<scarab_engine::SealedGeneration>>,
     /// Runs whose log index was pruned, by when.
     log_prune_pending: HashMap<RunId, Timestamp>,
+    /// Units an earlier version launched (`log_legacy_units`).
+    log_legacy_units: std::collections::HashSet<(RunId, StepId, AttemptId)>,
+    /// When the log store's ledger was added (`log_store_epoch`): when this
+    /// store was made.
+    log_store_epoch: i64,
     /// Per-(run, step, attempt) launch handle — the durable "launch happened"
     /// marker (ADR-0047).
     attempt_handles: HashMap<(RunId, StepId, AttemptId), String>,
@@ -443,10 +465,32 @@ pub type DbHook =
 
 impl InMemoryDb {
     pub fn new() -> Self {
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
         Self {
-            state: Mutex::new(InMemoryState::default()),
+            state: Mutex::new(InMemoryState {
+                log_store_epoch: epoch,
+                ..InMemoryState::default()
+            }),
             interleave: Mutex::new(None),
         }
+    }
+
+    /// Record `unit` as running when the ledger was added (what migration
+    /// 0099 writes to `log_legacy_units`): an earlier version launched it.
+    pub fn seed_log_legacy_unit(&self, unit: &scarab_engine::LogStreamId) {
+        self.state
+            .lock()
+            .unwrap()
+            .log_legacy_units
+            .insert(log_key(unit));
+    }
+
+    /// The log store's epoch (`log_store_epoch.at`), ms.
+    pub fn log_store_epoch(&self) -> i64 {
+        self.state.lock().unwrap().log_store_epoch
     }
 
     /// Run `hook` to completion at the start of the next call of `method`
@@ -2166,6 +2210,7 @@ impl Db for InMemoryDb {
                 revoke_attempted_at: None,
                 purged: false,
                 created_at: now.0,
+                stream_count: 1,
             });
         if let Some(h) = handle {
             u.handle = Some(h.to_string());
@@ -2275,18 +2320,27 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
-    async fn log_unit_has_open_stream(
+    async fn set_log_unit_stream_count(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+        count: i32,
+    ) -> Result<(), DbError> {
+        if let Some(u) = self.state.lock().unwrap().log_units.get_mut(&log_key(unit)) {
+            u.stream_count = count;
+        }
+        Ok(())
+    }
+
+    async fn log_unit_streams_all_terminal(
         &self,
         unit: &scarab_engine::LogStreamId,
     ) -> Result<bool, DbError> {
         let st = self.state.lock().unwrap();
-        let sidecar = format!("{}::service-", unit.step.0);
-        Ok(st.log_streams.iter().any(|((r, s, a), row)| {
-            r == &unit.run
-                && a == &unit.attempt
-                && (s == &unit.step || s.0.starts_with(&sidecar))
-                && row.state == scarab_engine::LogStreamState::Open
-        }))
+        let Some(u) = st.log_units.get(&log_key(unit)) else {
+            return Ok(false);
+        };
+        let (terminal, open) = mem_unit_streams(&st, &log_key(unit));
+        Ok(terminal >= u.stream_count as usize && open == 0)
     }
 
     async fn log_units_to_purge(
@@ -2330,53 +2384,130 @@ impl Db for InMemoryDb {
 
     async fn pending_final_reads(
         &self,
+        now: Timestamp,
+        cursor: &scarab_engine::PendingReadCursor,
         limit: u32,
-    ) -> Result<Vec<scarab_engine::PendingFinalRead>, DbError> {
+    ) -> Result<scarab_engine::PendingReads, DbError> {
+        type Key = (RunId, StepId, AttemptId);
         let st = self.state.lock().unwrap();
-        let open = |k: &(RunId, StepId, AttemptId)| {
+        let after = |k: &Key, c: &Option<scarab_engine::LogStreamId>| {
+            c.as_ref()
+                .is_none_or(|c| (&k.0 .0, &k.1 .0, &k.2 .0) > (&c.run.0, &c.step.0, &c.attempt.0))
+        };
+        let id = |k: &Key| scarab_engine::LogStreamId::new(&k.0, &k.1, &k.2);
+        let open = |k: &Key| {
             st.log_streams
                 .get(k)
                 .is_none_or(|s| s.state == scarab_engine::LogStreamState::Open)
         };
-        let mut out = Vec::new();
-        for (k, u) in &st.log_units {
-            if u.settled_at.is_some()
-                && !u.purged
-                && open(k)
-                && !st.log_prune_pending.contains_key(&k.0)
-            {
-                out.push(scarab_engine::PendingFinalRead {
-                    unit: scarab_engine::LogStreamId::new(&k.0, &k.1, &k.2),
-                    handle: u
-                        .handle
-                        .clone()
-                        .or_else(|| st.attempt_handles.get(k).cloned()),
-                    has_ledger: true,
-                    started: u.started_at.is_some(),
-                });
-            }
+        let has_chunks = |k: &Key| st.logs.get(k).is_some_and(|c| !c.is_empty());
+        let mut out = scarab_engine::PendingReads::default();
+
+        let mut ledger: Vec<(&Key, &scarab_engine::LogUnitRow)> = st
+            .log_units
+            .iter()
+            .filter(|(k, u)| {
+                u.settled_at.is_some()
+                    && !u.purged
+                    && after(k, &cursor.ledger)
+                    && mem_unit_streams(&st, k).0 < u.stream_count as usize
+                    && !st.log_prune_pending.contains_key(&k.0)
+            })
+            .collect();
+        ledger.sort_by(|a, b| (&a.0 .0 .0, &a.0 .1 .0, &a.0 .2 .0).cmp(&(&b.0 .0 .0, &b.0 .1 .0, &b.0 .2 .0)));
+        ledger.truncate(limit as usize);
+        out.next.ledger = (ledger.len() as u32 >= limit)
+            .then(|| ledger.last().map(|(k, _)| id(k)))
+            .flatten();
+        for (k, u) in ledger {
+            out.reads.push(scarab_engine::PendingFinalRead {
+                unit: id(k),
+                handle: u
+                    .handle
+                    .clone()
+                    .or_else(|| st.attempt_handles.get(k).cloned()),
+                has_ledger: true,
+                started: u.started_at.is_some(),
+                stream_count: u.stream_count,
+            });
         }
+
+        let mut legacy: Vec<&Key> = st
+            .log_legacy_units
+            .iter()
+            .filter(|k| {
+                after(k, &cursor.legacy)
+                    && !st.log_units.contains_key(*k)
+                    && !st.log_prune_pending.contains_key(&k.0)
+                    && !mem_unit_running(&st, k)
+            })
+            .collect();
+        legacy.sort_by(|a, b| (&a.0 .0, &a.1 .0, &a.2 .0).cmp(&(&b.0 .0, &b.1 .0, &b.2 .0)));
+        legacy.truncate(limit as usize);
+        out.next.legacy = (legacy.len() as u32 >= limit)
+            .then(|| legacy.last().map(|k| id(k)))
+            .flatten();
+        for k in legacy {
+            out.reads.push(scarab_engine::PendingFinalRead {
+                unit: id(k),
+                handle: st.attempt_handles.get(k).cloned(),
+                has_ledger: false,
+                started: st.attempt_execution_started.contains_key(k) || has_chunks(k),
+                stream_count: 1,
+            });
+        }
+
+        let floor = (st.log_store_epoch - scarab_engine::PENDING_EPOCH_SKEW_MS)
+            .max(now.0 - scarab_engine::PENDING_RECENT_WINDOW_MS);
+        let mut recent: Vec<(i64, Key)> = Vec::new();
         for ((run, step), rec) in &st.steps {
             for a in &rec.attempts {
                 let k = (run.clone(), step.clone(), a.id.clone());
-                if a.outcome == scarab_engine::AttemptOutcome::Running
-                    || st.log_units.contains_key(&k)
-                    || !open(&k)
-                    || st.log_prune_pending.contains_key(run)
-                {
-                    continue;
-                }
-                out.push(scarab_engine::PendingFinalRead {
-                    unit: scarab_engine::LogStreamId::new(run, step, &a.id),
-                    handle: st.attempt_handles.get(&k).cloned(),
-                    has_ledger: false,
-                    started: st.attempt_execution_started.contains_key(&k)
-                        || st.logs.get(&k).is_some_and(|c| !c.is_empty()),
+                let at = a.started_at.0;
+                let past = cursor.recent.as_ref().is_none_or(|(c_at, c)| {
+                    (at, &run.0, &step.0, &a.id.0) > (*c_at, &c.run.0, &c.step.0, &c.attempt.0)
                 });
+                if at >= floor
+                    && past
+                    && a.outcome != scarab_engine::AttemptOutcome::Running
+                    && open(&k)
+                    && !st.log_units.contains_key(&k)
+                    && !st.log_legacy_units.contains(&k)
+                    && !st.log_prune_pending.contains_key(run)
+                {
+                    recent.push((at, k));
+                }
             }
         }
-        out.truncate(limit as usize);
+        recent.sort_by(|a, b| {
+            (a.0, &a.1 .0 .0, &a.1 .1 .0, &a.1 .2 .0).cmp(&(b.0, &b.1 .0 .0, &b.1 .1 .0, &b.1 .2 .0))
+        });
+        recent.truncate(limit as usize);
+        out.next.recent = (recent.len() as u32 >= limit)
+            .then(|| recent.last().map(|(at, k)| (*at, id(k))))
+            .flatten();
+        for (_, k) in &recent {
+            out.reads.push(scarab_engine::PendingFinalRead {
+                unit: id(k),
+                handle: st.attempt_handles.get(k).cloned(),
+                has_ledger: false,
+                started: st.attempt_execution_started.contains_key(k) || has_chunks(k),
+                stream_count: 1,
+            });
+        }
         Ok(out)
+    }
+
+    async fn forget_log_legacy_unit(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+    ) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .log_legacy_units
+            .remove(&log_key(unit));
+        Ok(())
     }
 
     async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError> {
@@ -3050,11 +3181,8 @@ impl Db for InMemoryDb {
             }
         }
         st.log_unit_values.retain(|(r, _, _), _| r != run);
-        for ((r, _, _), u) in st.log_units.iter_mut() {
-            if r == run {
-                u.purged = true;
-            }
-        }
+        st.log_units.retain(|(r, _, _), _| r != run);
+        st.log_legacy_units.retain(|(r, _, _)| r != run);
         st.logs.retain(|(r, _, _), _| r != run);
         st.log_prune_pending.insert(run.clone(), now);
         Ok(())

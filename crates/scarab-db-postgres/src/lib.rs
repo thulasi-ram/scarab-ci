@@ -2404,7 +2404,7 @@ impl Db for PostgresDb {
         // One statement, one snapshot: the row and its generations agree.
         let rows = sqlx::query(
             "SELECT u.gen, u.handle, u.started_at, u.settled_at, u.revoke_attempted_at,
-                    u.purged, u.created_at AS unit_created_at,
+                    u.purged, u.created_at AS unit_created_at, u.stream_count,
                     v.gen AS value_gen, v.sealed, v.created_at
              FROM log_units u
              LEFT JOIN log_unit_values v
@@ -2538,23 +2538,44 @@ impl Db for PostgresDb {
         Ok(())
     }
 
-    async fn log_unit_has_open_stream(
+    async fn set_log_unit_stream_count(
         &self,
         unit: &scarab_engine::LogStreamId,
-    ) -> Result<bool, DbError> {
-        let r = sqlx::query(
-            "SELECT EXISTS (SELECT 1 FROM log_streams
-               WHERE run_id = $1 AND attempt_id = $3 AND state = 'open'
-                 AND (step_id = $2 OR left(step_id, length($2) + 10) = $2 || '::service-'))
-             AS open",
+        count: i32,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE log_units SET stream_count = $4
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
         )
         .bind(&unit.run.0)
         .bind(&unit.step.0)
         .bind(&unit.attempt.0)
-        .fetch_one(self.pool())
+        .bind(count)
+        .execute(self.pool())
         .await
         .map_err(db_err)?;
-        Ok(r.get::<bool, _>("open"))
+        Ok(())
+    }
+
+    async fn log_unit_streams_all_terminal(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+    ) -> Result<bool, DbError> {
+        let r = sqlx::query(&format!(
+            "SELECT {TERMINAL_STREAMS} >= u.stream_count AND NOT EXISTS (
+                      SELECT 1 FROM log_streams s
+                      WHERE s.run_id = u.run_id AND s.attempt_id = u.attempt_id
+                        AND s.state = 'open' AND {STREAM_OF_UNIT}) AS done
+             FROM log_units u
+             WHERE u.run_id = $1 AND u.step_id = $2 AND u.attempt_id = $3"
+        ))
+        .bind(&unit.run.0)
+        .bind(&unit.step.0)
+        .bind(&unit.attempt.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(r.is_some_and(|r| r.get::<bool, _>("done")))
     }
 
     async fn log_units_to_purge(
@@ -2585,7 +2606,7 @@ impl Db for PostgresDb {
                FROM log_units u WHERE NOT u.purged
              )
              SELECT run_id, step_id, attempt_id, gen, handle, started_at, settled_at,
-                    revoke_attempted_at, purged,
+                    revoke_attempted_at, purged, created_at, stream_count,
                     (NOT running AND oldest IS NOT NULL AND oldest < $1 - $2) AS past_cap
              FROM c
              WHERE (settled_at IS NOT NULL AND settled_at < $1 - $3)
@@ -2612,53 +2633,157 @@ impl Db for PostgresDb {
 
     async fn pending_final_reads(
         &self,
+        now: Timestamp,
+        cursor: &scarab_engine::PendingReadCursor,
         limit: u32,
-    ) -> Result<Vec<scarab_engine::PendingFinalRead>, DbError> {
+    ) -> Result<scarab_engine::PendingReads, DbError> {
+        let key = |c: &Option<scarab_engine::LogStreamId>| {
+            c.as_ref().map_or((String::new(), String::new(), String::new()), |k| {
+                (k.run.0.clone(), k.step.0.clone(), k.attempt.0.clone())
+            })
+        };
+        let read = |r: &sqlx::postgres::PgRow, has_ledger: bool| scarab_engine::PendingFinalRead {
+            unit: log_unit_id(r),
+            handle: r.get::<Option<String>, _>("handle"),
+            has_ledger,
+            started: r.get::<bool, _>("started"),
+            stream_count: r.get::<i32, _>("stream_count"),
+        };
+        let mut out = scarab_engine::PendingReads::default();
+
+        // Units with a ledger: settled, not purged, run not pruned, fewer
+        // than `stream_count` terminal streams.
+        let (r0, s0, a0) = key(&cursor.ledger);
         let rows = sqlx::query(&format!(
-            "(SELECT u.run_id, u.step_id, u.attempt_id,
-                     COALESCE(u.handle, a.handle) AS handle, true AS has_ledger,
-                     (u.started_at IS NOT NULL) AS started
-              FROM log_units u
-              LEFT JOIN attempts a ON a.run_id = u.run_id AND a.step_id = u.step_id
-                                  AND a.attempt_id = u.attempt_id
-              LEFT JOIN log_streams s ON s.run_id = u.run_id AND s.step_id = u.step_id
-                                     AND s.attempt_id = u.attempt_id
-              WHERE u.settled_at IS NOT NULL AND NOT u.purged
-                AND (s.state IS NULL OR s.state = 'open')
-                AND NOT EXISTS (SELECT 1 FROM log_prune_pending p WHERE p.run_id = u.run_id)
-              LIMIT $1)
-             UNION ALL
-             (SELECT a.run_id, a.step_id, a.attempt_id, a.handle, false AS has_ledger,
-                     (a.execution_started_at IS NOT NULL OR EXISTS (
-                        SELECT 1 FROM log_chunks c WHERE c.run_id = a.run_id
-                          AND c.step_id = a.step_id AND c.attempt_id = a.attempt_id))
-                     AS started
-              FROM attempts a
-              LEFT JOIN log_streams s ON s.run_id = a.run_id AND s.step_id = a.step_id
-                                     AND s.attempt_id = a.attempt_id
-              WHERE NOT {ATTEMPT_IS_RUNNING}
-                AND (s.state IS NULL OR s.state = 'open')
-                AND NOT EXISTS (SELECT 1 FROM log_units u WHERE u.run_id = a.run_id
-                                  AND u.step_id = a.step_id AND u.attempt_id = a.attempt_id)
-                AND (a.started_at >= (SELECT at FROM log_store_epoch WHERE id = 1)
-                     OR EXISTS (SELECT 1 FROM log_legacy_units l WHERE l.run_id = a.run_id
-                                  AND l.step_id = a.step_id AND l.attempt_id = a.attempt_id))
-                AND NOT EXISTS (SELECT 1 FROM log_prune_pending p WHERE p.run_id = a.run_id)
-              LIMIT $1)"
+            "SELECT u.run_id, u.step_id, u.attempt_id,
+                    COALESCE(u.handle, a.handle) AS handle,
+                    (u.started_at IS NOT NULL) AS started, u.stream_count
+             FROM log_units u
+             LEFT JOIN attempts a ON a.run_id = u.run_id AND a.step_id = u.step_id
+                                 AND a.attempt_id = u.attempt_id
+             WHERE u.settled_at IS NOT NULL AND NOT u.purged
+               AND (u.run_id, u.step_id, u.attempt_id) > ($1, $2, $3)
+               AND {TERMINAL_STREAMS} < u.stream_count
+               AND NOT EXISTS (SELECT 1 FROM log_prune_pending p WHERE p.run_id = u.run_id)
+             ORDER BY u.run_id, u.step_id, u.attempt_id
+             LIMIT $4"
         ))
+        .bind(&r0)
+        .bind(&s0)
+        .bind(&a0)
         .bind(i64::from(limit))
         .fetch_all(self.pool())
         .await
         .map_err(db_err)?;
-        Ok(rows
-            .iter()
-            .map(|r| scarab_engine::PendingFinalRead {
-                unit: log_unit_id(r),
-                handle: r.get::<Option<String>, _>("handle"),
-                has_ledger: r.get::<bool, _>("has_ledger"),
-                started: r.get::<bool, _>("started"),
+        out.next.ledger = (rows.len() as u32 >= limit)
+            .then(|| rows.last().map(log_unit_id))
+            .flatten();
+        out.reads.extend(rows.iter().map(|r| read(r, true)));
+
+        // Units running when the ledger was added, no longer running.
+        let (r0, s0, a0) = key(&cursor.legacy);
+        let rows = sqlx::query(
+            "SELECT l.run_id, l.step_id, l.attempt_id,
+                    COALESCE(a.handle, sv.handle) AS handle, 1 AS stream_count,
+                    (a.execution_started_at IS NOT NULL OR sv.handle IS NOT NULL
+                     OR EXISTS (SELECT 1 FROM log_chunks c WHERE c.run_id = l.run_id
+                                  AND c.step_id = l.step_id AND c.attempt_id = l.attempt_id))
+                    AS started
+             FROM log_legacy_units l
+             LEFT JOIN attempts a ON a.run_id = l.run_id AND a.step_id = l.step_id
+                                 AND a.attempt_id = l.attempt_id
+             LEFT JOIN run_services sv ON sv.run_id = l.run_id
+                                      AND 'service:' || sv.name = l.step_id
+                                      AND 't' || sv.take = l.attempt_id
+             WHERE (l.run_id, l.step_id, l.attempt_id) > ($1, $2, $3)
+               AND NOT EXISTS (SELECT 1 FROM log_units u WHERE u.run_id = l.run_id
+                                 AND u.step_id = l.step_id AND u.attempt_id = l.attempt_id)
+               AND NOT EXISTS (SELECT 1 FROM log_prune_pending p WHERE p.run_id = l.run_id)
+               AND (EXISTS (SELECT 1 FROM runs r WHERE r.id = l.run_id
+                              AND r.status IN ('succeeded', 'failed', 'cancelled', 'dead_lettered'))
+                    OR (a.run_id IS NOT NULL
+                        AND NOT (a.outcome = 'running' OR (a.outcome IS NULL AND a.failure IS NULL)))
+                    OR (sv.run_id IS NOT NULL AND sv.status IN ('torn-down', 'failed'))
+                    OR (a.run_id IS NULL AND sv.run_id IS NULL))
+             ORDER BY l.run_id, l.step_id, l.attempt_id
+             LIMIT $4",
+        )
+        .bind(&r0)
+        .bind(&s0)
+        .bind(&a0)
+        .bind(i64::from(limit))
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        out.next.legacy = (rows.len() as u32 >= limit)
+            .then(|| rows.last().map(log_unit_id))
+            .flatten();
+        out.reads.extend(rows.iter().map(|r| read(r, false)));
+
+        // Step attempts claimed since the epoch (less the clock allowance)
+        // and within the window, with no ledger: through the
+        // `attempts (started_at)` index (0100).
+        let (at0, (r0, s0, a0)) = match &cursor.recent {
+            Some((at, k)) => (*at, key(&Some(k.clone()))),
+            None => (i64::MIN, key(&None)),
+        };
+        let rows = sqlx::query(&format!(
+            "SELECT a.run_id, a.step_id, a.attempt_id, a.handle, a.started_at, 1 AS stream_count,
+                    (a.execution_started_at IS NOT NULL OR EXISTS (
+                       SELECT 1 FROM log_chunks c WHERE c.run_id = a.run_id
+                         AND c.step_id = a.step_id AND c.attempt_id = a.attempt_id))
+                    AS started
+             FROM attempts a
+             LEFT JOIN log_streams s ON s.run_id = a.run_id AND s.step_id = a.step_id
+                                    AND s.attempt_id = a.attempt_id
+             WHERE a.started_at >= GREATEST(
+                     (SELECT at FROM log_store_epoch WHERE id = 1) - $5, $6 - $7)
+               AND (a.started_at, a.run_id, a.step_id, a.attempt_id) > ($8, $1, $2, $3)
+               AND NOT {ATTEMPT_IS_RUNNING}
+               AND (s.state IS NULL OR s.state = 'open')
+               AND NOT EXISTS (SELECT 1 FROM log_units u WHERE u.run_id = a.run_id
+                                 AND u.step_id = a.step_id AND u.attempt_id = a.attempt_id)
+               AND NOT EXISTS (SELECT 1 FROM log_legacy_units l WHERE l.run_id = a.run_id
+                                 AND l.step_id = a.step_id AND l.attempt_id = a.attempt_id)
+               AND NOT EXISTS (SELECT 1 FROM log_prune_pending p WHERE p.run_id = a.run_id)
+             ORDER BY a.started_at, a.run_id, a.step_id, a.attempt_id
+             LIMIT $4"
+        ))
+        .bind(&r0)
+        .bind(&s0)
+        .bind(&a0)
+        .bind(i64::from(limit))
+        .bind(scarab_engine::PENDING_EPOCH_SKEW_MS)
+        .bind(now.0)
+        .bind(scarab_engine::PENDING_RECENT_WINDOW_MS)
+        .bind(at0)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        out.next.recent = (rows.len() as u32 >= limit)
+            .then(|| {
+                rows.last()
+                    .map(|r| (r.get::<i64, _>("started_at"), log_unit_id(r)))
             })
-            .collect())
+            .flatten();
+        out.reads.extend(rows.iter().map(|r| read(r, false)));
+        Ok(out)
+    }
+
+    async fn forget_log_legacy_unit(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "DELETE FROM log_legacy_units WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&unit.run.0)
+        .bind(&unit.step.0)
+        .bind(&unit.attempt.0)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
     }
 
     async fn record_step_transition(
@@ -3499,16 +3624,15 @@ impl Db for PostgresDb {
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-        sqlx::query("DELETE FROM log_unit_values WHERE run_id = $1")
-            .bind(&run.0)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        sqlx::query("UPDATE log_units SET purged = true WHERE run_id = $1")
-            .bind(&run.0)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
+        // The run's ledgers go with its log: the rows, not only their
+        // values (generations cascade with their unit).
+        for table in ["log_unit_values", "log_units", "log_legacy_units"] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE run_id = $1"))
+                .bind(&run.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        }
         sqlx::query("DELETE FROM log_chunks WHERE run_id = $1")
             .bind(&run.0)
             .execute(&mut *tx)
@@ -4648,6 +4772,17 @@ fn attempt_from_row(r: &sqlx::postgres::PgRow) -> Result<Attempt, DbError> {
 /// (NULL `outcome`) is running unless it recorded a failure — the same
 /// derivation [`attempts_on`] applies on read.
 const ATTEMPT_IS_RUNNING: &str = "(outcome = 'running' OR (outcome IS NULL AND failure IS NULL))";
+
+/// Whether a `log_streams` row `s` is a stream of the `log_units` row `u`:
+/// its main stream or one of its sidecar streams (`<step>::service-<i>`).
+const STREAM_OF_UNIT: &str = "(s.step_id = u.step_id
+     OR left(s.step_id, length(u.step_id) + 10) = u.step_id || '::service-')";
+
+/// How many streams of the `log_units` row `u` are terminal.
+const TERMINAL_STREAMS: &str = "(SELECT count(*) FROM log_streams s
+     WHERE s.run_id = u.run_id AND s.attempt_id = u.attempt_id AND s.state <> 'open'
+       AND (s.step_id = u.step_id
+            OR left(s.step_id, length(u.step_id) + 10) = u.step_id || '::service-'))";
 
 /// The guarded run-status CAS on any executor: `true` iff the row was in
 /// `from` and is now `to`. Zero rows means a concurrent/duplicate writer
@@ -6194,5 +6329,6 @@ fn log_unit_row(r: &sqlx::postgres::PgRow) -> scarab_engine::LogUnitRow {
             .try_get::<i64, _>("unit_created_at")
             .or_else(|_| r.try_get::<i64, _>("created_at"))
             .unwrap_or(0),
+        stream_count: r.get("stream_count"),
     }
 }

@@ -27,8 +27,9 @@ pub use logstore::{
     marker_text, registry_secret_values, tail_lease_resource, LogAppendError, LogBody,
     LogLease, LogLedgerRows, LogRowKind, LogStreamId, LogStreamRow, LogStreamState, LogUnitRow,
     LogWriter, MountedRepo, MountedValue,
-    MountedValueKind, NewLogRow, NotStoredReason, PendingFinalRead, PurgeCandidate,
-    SealedGeneration, LEDGER_HARD_CAP_MS, LEDGER_SETTLED_KEEP_MS,
+    MountedValueKind, NewLogRow, NotStoredReason, PendingFinalRead, PendingReadCursor,
+    PendingReads, PurgeCandidate, SealedGeneration, LEDGER_HARD_CAP_MS, LEDGER_SETTLED_KEEP_MS,
+    PENDING_EPOCH_SKEW_MS, PENDING_RECENT_WINDOW_MS,
 };
 pub use ports::{
     Clock, Db, Executor, LeaderTerm, LogChunks, LogFrom, LogSourceRef, LogSourceState,

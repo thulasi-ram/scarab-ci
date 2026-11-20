@@ -1257,9 +1257,9 @@ contract_test!(
     markers_are_rows_and_terminal_streams_take_none
 );
 
-/// I7: the store says whether any stream of a unit, its sidecars included,
-/// is open — the close-triggered purge waits for all of them. Kills: a
-/// purge on the first closed stream.
+/// I7: the store says whether every stream of a unit, its sidecars
+/// included, is terminal: the close-triggered purge waits for all of them.
+/// Kills: a purge on the first closed stream.
 async fn the_purge_waits_for_every_stream_of_the_unit(db: &dyn Db) {
     let unit = stream_id("build", "a1");
     let sidecar = stream_id("build::service-0", "a1");
@@ -1267,6 +1267,7 @@ async fn the_purge_waits_for_every_stream_of_the_unit(db: &dyn Db) {
     db.write_log_unit(&unit, None, 0, None, Timestamp(0))
         .await
         .unwrap();
+    db.set_log_unit_stream_count(&unit, 2).await.unwrap();
     for s in [&unit, &sidecar, &other] {
         let w = writer(db, s, "a", 60_000).await;
         db.append_log_row(
@@ -1283,7 +1284,7 @@ async fn the_purge_waits_for_every_stream_of_the_unit(db: &dyn Db) {
         .await
         .unwrap();
     assert!(
-        db.log_unit_has_open_stream(&unit).await.unwrap(),
+        !db.log_unit_streams_all_terminal(&unit).await.unwrap(),
         "the sidecar is open"
     );
     let w = writer(db, &sidecar, "a", 60_000).await;
@@ -1291,14 +1292,155 @@ async fn the_purge_waits_for_every_stream_of_the_unit(db: &dyn Db) {
         .await
         .unwrap();
     assert!(
-        !db.log_unit_has_open_stream(&unit).await.unwrap(),
+        db.log_unit_streams_all_terminal(&unit).await.unwrap(),
         "`buildx` is another unit"
     );
+    assert!(!db
+        .log_unit_streams_all_terminal(&stream_id("nope", "a1"))
+        .await
+        .unwrap());
 }
 
 contract_test!(
     log_purge_waits_for_streams,
     the_purge_waits_for_every_stream_of_the_unit
+);
+
+/// RT-M1 / REV-m3: a unit with a sidecar whose stream has stored nothing
+/// yet (no row) is not done when its main stream completes, however
+/// settled and revoked it is; the pending-final-read query names it until
+/// both are terminal. Kills: counting only stream rows that exist.
+async fn the_purge_waits_for_a_stream_that_has_no_row_yet(db: &dyn Db) {
+    seed_log_run(db).await;
+    let unit = stream_id("build", "a1");
+    let sidecar = stream_id("build::service-0", "a1");
+    db.write_log_unit(&unit, Some("h"), 0, None, Timestamp(0))
+        .await
+        .unwrap();
+    db.set_log_unit_stream_count(&unit, 2).await.unwrap();
+    db.set_attempt_outcome(
+        &unit.run,
+        &unit.step,
+        &unit.attempt,
+        AttemptOutcome::Succeeded,
+    )
+    .await
+    .unwrap();
+    db.settle_log_units(Timestamp(5)).await.unwrap();
+    db.mark_log_unit_revoked(&unit, Timestamp(5)).await.unwrap();
+    let w = writer(db, &unit, "a", 60_000).await;
+    db.append_log_row(
+        &unit,
+        &NewLogRow::output(body("k", 3), 0).then(LogStreamState::Complete),
+        &w,
+        Timestamp(6),
+    )
+    .await
+    .unwrap();
+    assert!(!db.log_unit_streams_all_terminal(&unit).await.unwrap());
+    let pending = db
+        .pending_final_reads(Timestamp(now_ms()), &Default::default(), 100)
+        .await
+        .unwrap()
+        .reads;
+    let p = pending
+        .iter()
+        .find(|p| p.unit == unit)
+        .unwrap_or_else(|| panic!("the unit is pending: {pending:?}"));
+    assert_eq!(p.stream_count, 2);
+    let w = writer(db, &sidecar, "a", 60_000).await;
+    db.set_log_stream_state(&sidecar, &w, LogStreamState::Complete, Timestamp(7))
+        .await
+        .unwrap();
+    assert!(db.log_unit_streams_all_terminal(&unit).await.unwrap());
+    let pending = db
+        .pending_final_reads(Timestamp(now_ms()), &Default::default(), 100)
+        .await
+        .unwrap()
+        .reads;
+    assert!(!pending.iter().any(|p| p.unit == unit), "{pending:?}");
+}
+
+contract_test!(
+    log_purge_waits_for_a_stream_with_no_row,
+    the_purge_waits_for_a_stream_that_has_no_row_yet
+);
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// REV-M2 / REV-m15: step attempts with no ledger are read once more only
+/// when claimed since the log store's epoch (less the clock allowance):
+/// an attempt from before 0.7 is never returned. Kills: a pending query
+/// over every attempt.
+async fn the_pending_read_query_does_not_return_attempts_from_before_the_epoch(db: &dyn Db) {
+    let run = RunId("lr".into());
+    let step = StepId("build".into());
+    seed_run_and_step(db, &run, &step).await;
+    let now = now_ms();
+    for (a, at) in [("old", now - 600_000), ("new", now)] {
+        db.record_attempt(&run, &step, &attempt(a, at)).await.unwrap();
+        db.set_attempt_outcome(&run, &step, &AttemptId(a.into()), AttemptOutcome::Succeeded)
+            .await
+            .unwrap();
+    }
+    let pending = db
+        .pending_final_reads(Timestamp(now), &Default::default(), 100)
+        .await
+        .unwrap()
+        .reads;
+    assert!(pending.iter().any(|p| p.unit == stream_id("build", "new")));
+    assert!(
+        !pending.iter().any(|p| p.unit == stream_id("build", "old")),
+        "{pending:?}"
+    );
+}
+
+contract_test!(
+    log_pending_skips_attempts_before_the_epoch,
+    the_pending_read_query_does_not_return_attempts_from_before_the_epoch
+);
+
+/// RT-m4: the pending-final-read query pages by key: 64 units at the front
+/// that keep failing do not hide the 65th, and a leg that ran out starts
+/// again from its first key. Kills: a query with no order and no cursor.
+async fn sixty_four_units_that_fail_locally_do_not_hide_the_sixty_fifth(db: &dyn Db) {
+    let run = RunId("lr".into());
+    let step = StepId("build".into());
+    seed_run_and_step(db, &run, &step).await;
+    for i in 0..65 {
+        let a = format!("a{i:03}");
+        db.record_attempt(&run, &step, &attempt(&a, 0)).await.unwrap();
+        db.set_attempt_outcome(&run, &step, &AttemptId(a.clone()), AttemptOutcome::Failed)
+            .await
+            .unwrap();
+        db.write_log_unit(&stream_id("build", &a), None, 0, None, Timestamp(0))
+            .await
+            .unwrap();
+    }
+    db.settle_log_units(Timestamp(1)).await.unwrap();
+    let now = Timestamp(now_ms());
+    let first = db
+        .pending_final_reads(now, &Default::default(), 64)
+        .await
+        .unwrap();
+    assert_eq!(first.reads.len(), 64);
+    assert_eq!(first.next.ledger, Some(stream_id("build", "a063")));
+    let second = db.pending_final_reads(now, &first.next, 64).await.unwrap();
+    let units: Vec<_> = second.reads.iter().map(|p| p.unit.clone()).collect();
+    assert_eq!(units, [stream_id("build", "a064")]);
+    assert_eq!(second.next.ledger, None, "the leg wraps");
+    let third = db.pending_final_reads(now, &second.next, 64).await.unwrap();
+    assert_eq!(third.reads[0].unit, stream_id("build", "a000"));
+}
+
+contract_test!(
+    log_pending_pages_by_key,
+    sixty_four_units_that_fail_locally_do_not_hide_the_sixty_fifth
 );
 
 /// I7: a unit that is not running in the store is purged by age even with
@@ -1360,7 +1502,11 @@ async fn units_are_purged_by_age_only_when_not_running(db: &dyn Db) {
     let ledger = db.log_unit_ledger(&ended).await.unwrap().unwrap();
     assert_eq!(ledger.unit.settled_at, Some(5));
     // Pending final reads: the settled unit's stream is not terminal.
-    let pending = db.pending_final_reads(100).await.unwrap();
+    let pending = db
+        .pending_final_reads(Timestamp(now_ms()), &Default::default(), 100)
+        .await
+        .unwrap()
+        .reads;
     assert!(pending.iter().any(|p| p.unit == ended && p.has_ledger));
     assert!(!pending.iter().any(|p| p.unit == running));
 }
@@ -1484,7 +1630,11 @@ async fn an_ended_attempt_with_no_ledger_is_pending(db: &dyn Db) {
     db.mark_attempt_execution_started(&run, &step, &AttemptId("ran".into()), Timestamp(now))
         .await
         .unwrap();
-    let pending = db.pending_final_reads(100).await.unwrap();
+    let pending = db
+        .pending_final_reads(Timestamp(now_ms()), &Default::default(), 100)
+        .await
+        .unwrap()
+        .reads;
     let find = |a: &str| {
         pending
             .iter()
@@ -1503,7 +1653,11 @@ async fn an_ended_attempt_with_no_ledger_is_pending(db: &dyn Db) {
     )
     .await
     .unwrap();
-    let pending = db.pending_final_reads(100).await.unwrap();
+    let pending = db
+        .pending_final_reads(Timestamp(now_ms()), &Default::default(), 100)
+        .await
+        .unwrap()
+        .reads;
     assert!(!pending
         .iter()
         .any(|p| p.unit == stream_id("build", "never")));
@@ -1535,7 +1689,10 @@ async fn retention_tombstones_streams_and_refuses_late_appends(db: &dyn Db) {
         .is_empty());
     let st = db.log_stream_row(&s).await.unwrap().unwrap();
     assert!(st.pruned && st.state == LogStreamState::Closed);
-    assert!(db.log_unit_ledger(&s).await.unwrap().unwrap().unit.purged);
+    assert!(
+        db.log_unit_ledger(&s).await.unwrap().is_none(),
+        "the run's ledger rows are deleted"
+    );
     assert!(matches!(
         db.append_log_row(
             &s,
@@ -1788,6 +1945,106 @@ contract_test!(
     log_unit_handle_newest,
     two_units_with_one_handle_resolve_to_the_newer
 );
+
+/// REV-m15: a step attempt claimed by a server whose clock is behind the
+/// database's, just before the epoch, is still read once more (and closed
+/// with no source read); one claimed well before it is not. Kills: an
+/// epoch compared with no allowance for clock skew.
+#[tokio::test]
+async fn an_attempt_claimed_just_before_the_epoch_by_clock_skew_is_closed() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    let epoch: i64 = sqlx::query_scalar("SELECT at FROM log_store_epoch WHERE id = 1")
+        .fetch_one(&tdb.pool)
+        .await
+        .unwrap();
+    let run = RunId("lr".into());
+    let step = StepId("build".into());
+    seed_run_and_step(&db, &run, &step).await;
+    for (a, at) in [("skewed", epoch - 60_000), ("before", epoch - 600_000)] {
+        db.record_attempt(&run, &step, &attempt(a, at)).await.unwrap();
+        db.set_attempt_outcome(&run, &step, &AttemptId(a.into()), AttemptOutcome::Succeeded)
+            .await
+            .unwrap();
+    }
+    let pending = db
+        .pending_final_reads(Timestamp(now_ms()), &Default::default(), 100)
+        .await
+        .unwrap()
+        .reads;
+    let skewed = pending
+        .iter()
+        .find(|p| p.unit == stream_id("build", "skewed"))
+        .unwrap_or_else(|| panic!("the skewed attempt is pending: {pending:?}"));
+    assert!(!skewed.has_ledger);
+    assert!(!pending.iter().any(|p| p.unit == stream_id("build", "before")));
+    tdb.cleanup().await;
+}
+
+/// REV-m2: a shared service running when the ledger was added (a
+/// `log_legacy_units` row the migration wrote) is read once more after it
+/// is torn down, as a unit with no ledger, and is forgotten once closed.
+/// Kills: legacy rows for steps only.
+#[tokio::test]
+async fn a_legacy_shared_service_is_pending_once_torn_down_and_forgotten_after() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    let run = RunId("lr".into());
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.create_run_service(None, &run, 1, "db", Timestamp(0))
+        .await
+        .unwrap();
+    db.set_run_service(
+        None,
+        &run,
+        1,
+        "db",
+        scarab_engine::ServiceStatus::Running,
+        Some("svc-h"),
+    )
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO log_legacy_units VALUES ('lr', 'service:db', 't1')")
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
+    let unit = stream_id("service:db", "t1");
+    async fn pending(db: &PostgresDb) -> Vec<scarab_engine::PendingFinalRead> {
+        db.pending_final_reads(Timestamp(now_ms()), &Default::default(), 100)
+            .await
+            .unwrap()
+            .reads
+    }
+    assert!(!pending(&db).await.iter().any(|p| p.unit == unit), "still running");
+    db.set_run_service(
+        None,
+        &run,
+        1,
+        "db",
+        scarab_engine::ServiceStatus::TornDown,
+        Some("svc-h"),
+    )
+    .await
+    .unwrap();
+    let got = pending(&db).await;
+    let p = got
+        .iter()
+        .find(|p| p.unit == unit)
+        .unwrap_or_else(|| panic!("torn down: {got:?}"));
+    assert!(!p.has_ledger && p.started);
+    assert_eq!(p.handle.as_deref(), Some("svc-h"));
+    db.forget_log_legacy_unit(&unit).await.unwrap();
+    assert!(!pending(&db).await.iter().any(|p| p.unit == unit));
+    tdb.cleanup().await;
+}
 
 /// REV-M3: migration 0099 adds no CHECK on `log_chunks` that Postgres
 /// validates by scanning the table under the ALTER's lock. Kills: a column

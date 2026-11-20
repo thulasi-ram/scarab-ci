@@ -124,6 +124,13 @@ impl Executor for RedactionLedgerExecutor {
             )
             .await
             .map_err(ledger_launch_error)?;
+        // How many streams the unit has: its ledger is purged only once
+        // each of them is terminal, the ones that stored nothing yet too.
+        self.logs
+            .db()
+            .set_log_unit_stream_count(&unit, 1 + spec.services.len() as i32)
+            .await
+            .map_err(|e| ExecError::Launch(format!("recording the unit's streams: {e}")))?;
         // A launch error after the write keeps the generation: its values
         // may be mounted already.
         let launched = self.inner.launch(step, spec).await?;

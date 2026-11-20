@@ -378,7 +378,8 @@ impl LogService {
         }
     }
 
-    /// Purge `unit`'s ledger if its last open stream just closed, it has
+    /// Purge `unit`'s ledger if every one of its `stream_count` streams is
+    /// terminal (a stream that has stored nothing yet is not), it has
     /// settled, and every minted token in it was revoked (or it holds none).
     /// Best-effort: the purge sweep covers what this misses.
     pub async fn purge_if_done(&self, unit: &LogStreamId, values: Option<&ValueSet>) {
@@ -390,7 +391,7 @@ impl LogService {
         if rows.unit.purged || rows.unit.settled_at.is_none() || !revoked {
             return;
         }
-        if !matches!(self.db.log_unit_has_open_stream(unit).await, Ok(false)) {
+        if !matches!(self.db.log_unit_streams_all_terminal(unit).await, Ok(true)) {
             return;
         }
         if let Err(e) = self.db.purge_log_unit(unit).await {
