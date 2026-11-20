@@ -81,8 +81,16 @@ struct FenceValues {
     loaded: AtomicBool,
 }
 
-fn object_key(run: &RunId, step: &StepId, attempt: &AttemptId, seq: u64) -> String {
-    format!("logs/{}/{}/{}/{seq:08}.gz", run.0, step.0, attempt.0)
+/// A body's object key: its content address, so a PUT to a key always
+/// carries the same bytes and a committed body is never rewritten.
+fn object_key(run: &RunId, step: &StepId, attempt: &AttemptId, sha256: &[u8]) -> String {
+    let hex: String = sha256.iter().map(|b| format!("{b:02x}")).collect();
+    format!("logs/{}/{}/{}/{hex}.gz", run.0, step.0, attempt.0)
+}
+
+fn sha256(data: &[u8]) -> Vec<u8> {
+    use sha2::Digest;
+    sha2::Sha256::digest(data).to_vec()
 }
 
 /// Map a **shared-service** instance `{run, take, name}` (ADR-0058) onto the log
@@ -130,6 +138,8 @@ pub struct LogService {
     /// to one launch. A [`StreamRedactor`] holds its stream's entry and reads
     /// it at each push.
     secrets: Mutex<HashMap<StreamKey, Arc<FenceValues>>>,
+    /// This process's lease owner id for the interim writer.
+    owner: String,
 }
 
 impl LogService {
@@ -139,6 +149,7 @@ impl LogService {
             db,
             live: Mutex::new(HashMap::new()),
             secrets: Mutex::new(HashMap::new()),
+            owner: format!("logsvc-{}", uuid::Uuid::new_v4()),
         }
     }
 
@@ -305,24 +316,35 @@ impl LogService {
         attempt: &AttemptId,
         chunk: &[u8],
     ) -> Result<LogChunkMeta, LogError> {
-        // Next seq / cumulative uncompressed offset from the newest index row
-        // (seqs are dense from 0, so it carries the whole stream's length).
-        let (seq, byte_offset) = match self.db.last_log_chunk(run, step, attempt).await? {
-            Some(last) => (last.seq + 1, last.byte_offset + last.len),
-            None => (0, 0),
-        };
-
-        let key = object_key(run, step, attempt, seq);
+        // Interim writer (replaced by the fenced tail writer): a lease of
+        // this process over the stream, and a unit row with no values.
+        let stream = scarab_engine::LogStreamId::new(run, step, attempt);
+        let resource = format!("logsvc:{}:{}:{}", run.0, step.0, attempt.0);
+        let lease = self.db.lease(&resource, &self.owner, 45_000).await?;
+        let writer = lease
+            .held_by(&resource, &self.owner)
+            .ok_or(LogError::Db(scarab_engine::DbError::NotLeader))?;
+        let gen = self
+            .db
+            .write_log_unit(&stream.unit(), None, 0, None, scarab_engine::Timestamp(0))
+            .await?;
+        let digest = sha256(chunk);
+        let key = object_key(run, step, attempt, &digest);
         let compressed = gzip(chunk).map_err(|e| LogError::Gzip(e.to_string()))?;
         self.store.put(&key, compressed).await?;
-
-        let meta = LogChunkMeta {
-            seq,
-            byte_offset,
-            len: chunk.len() as u64,
-            object_key: key,
-        };
-        self.db.append_log_chunk(run, step, attempt, &meta).await?;
+        let row = scarab_engine::NewLogRow::output(
+            scarab_engine::LogBody {
+                object_key: key,
+                len: chunk.len() as u64,
+                sha256: digest,
+            },
+            gen,
+        );
+        let meta = self
+            .db
+            .append_log_row(&stream, &row, &writer, scarab_engine::Timestamp(0))
+            .await
+            .map_err(|e| LogError::Db(scarab_engine::DbError::Other(e.to_string())))?;
 
         // Best-effort live fan-out (ignored if there are no subscribers).
         let _ = self
@@ -339,7 +361,12 @@ impl LogService {
         step: &StepId,
         attempt: &AttemptId,
     ) -> Result<bool, LogError> {
-        Ok(self.db.last_log_chunk(run, step, attempt).await?.is_some())
+        Ok(self
+            .db
+            .log_chunks(run, step, attempt)
+            .await?
+            .iter()
+            .any(|c| c.is_output()))
     }
 
     /// A stream's chunk index, in `seq` order (durable, replica-agnostic:
@@ -370,7 +397,10 @@ impl LogService {
 
     /// Fetch and decompress one indexed chunk.
     pub async fn read_chunk(&self, meta: &LogChunkMeta) -> Result<Vec<u8>, LogError> {
-        let blob = self.store.get(&meta.object_key).await?;
+        let Some(key) = &meta.object_key else {
+            return Ok(Vec::new());
+        };
+        let blob = self.store.get(key).await?;
         gunzip(&blob).map_err(|e| LogError::Gzip(e.to_string()))
     }
 
@@ -388,7 +418,10 @@ impl LogService {
             .map(move |c| {
                 let store = store.clone();
                 async move {
-                    let blob = store.get(&c.object_key).await?;
+                    let Some(key) = &c.object_key else {
+                        return Ok(Vec::new());
+                    };
+                    let blob = store.get(key).await?;
                     gunzip(&blob).map_err(|e| LogError::Gzip(e.to_string()))
                 }
             })

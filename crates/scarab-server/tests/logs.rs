@@ -42,8 +42,9 @@ async fn full_replay_after_completion_keeps_bodies_out_of_postgres() {
     assert_eq!(idx.len(), 2);
     assert_eq!((idx[0].seq, idx[0].byte_offset, idx[0].len), (0, 0, 6));
     assert_eq!((idx[1].seq, idx[1].byte_offset, idx[1].len), (1, 6, 6));
-    assert!(idx[0].object_key.ends_with(".gz"));
-    assert!(!idx[0].object_key.contains("hello"));
+    let key = idx[0].object_key.as_deref().unwrap();
+    assert!(key.ends_with(".gz"));
+    assert!(!key.contains("hello"));
 }
 
 /// A subscriber receives chunks live as they are appended (the during-run tail).

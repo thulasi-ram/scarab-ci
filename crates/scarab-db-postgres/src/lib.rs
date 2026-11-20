@@ -139,6 +139,72 @@ impl PostgresDb {
         }
     }
 
+    /// A transaction bounded like [`begin_fenced`](Self::begin_fenced),
+    /// without its lease check: `scarab_append_log_row` holds the lease row
+    /// `FOR SHARE` itself.
+    async fn begin_bounded(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, DbError> {
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        let bound = format!("{}ms", self.leader_tx_bound.as_millis().max(1));
+        sqlx::query(
+            "SELECT set_config('lock_timeout', $1, true),
+                    set_config('statement_timeout', $1, true),
+                    set_config('idle_in_transaction_session_timeout', $1, true)",
+        )
+        .bind(&bound)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        Ok(tx)
+    }
+
+    /// A transaction fenced on a stream's tail lease, holding its
+    /// `log_streams` row (created when missing) `FOR UPDATE`, refused when
+    /// the stream is not `open`.
+    async fn begin_stream_fenced(
+        &self,
+        stream: &scarab_engine::LogStreamId,
+        writer: &LeaderTerm,
+        now: Timestamp,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, scarab_engine::LogAppendError> {
+        use scarab_engine::LogAppendError;
+        let mut tx = match self.begin_fenced(writer).await {
+            Ok(tx) => tx,
+            Err(DbError::NotLeader) => return Err(LogAppendError::NotWriter),
+            Err(e) => return Err(e.into()),
+        };
+        sqlx::query(
+            "INSERT INTO log_streams (run_id, step_id, attempt_id, next_seq, byte_len, updated_at)
+             SELECT $1, $2, $3, COALESCE(max(c.seq) + 1, 0),
+                    COALESCE(max(c.byte_offset + c.len), 0), $4
+             FROM log_chunks c
+             WHERE c.run_id = $1 AND c.step_id = $2 AND c.attempt_id = $3
+             ON CONFLICT (run_id, step_id, attempt_id) DO NOTHING",
+        )
+        .bind(&stream.run.0)
+        .bind(&stream.step.0)
+        .bind(&stream.attempt.0)
+        .bind(now.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let state: String = sqlx::query(
+            "SELECT state FROM log_streams
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3 FOR UPDATE",
+        )
+        .bind(&stream.run.0)
+        .bind(&stream.step.0)
+        .bind(&stream.attempt.0)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .get("state");
+        if state != "open" {
+            let _ = tx.rollback().await;
+            return Err(LogAppendError::Closed);
+        }
+        Ok(tx)
+    }
+
     /// [`begin_fenced`](Self::begin_fenced) with a leader, a plain
     /// transaction without one.
     async fn begin_maybe_fenced(
@@ -2082,31 +2148,133 @@ impl Db for PostgresDb {
         }
     }
 
-    async fn append_log_chunk(
+    async fn append_log_row(
         &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-        meta: &LogChunkMeta,
-    ) -> Result<(), DbError> {
-        // Offsets only — the body is in the object store. Idempotent on the seq.
-        sqlx::query(
-            "INSERT INTO log_chunks
-               (run_id, step_id, attempt_id, seq, byte_offset, len, object_key, at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, (extract(epoch from now()) * 1000)::bigint)
-             ON CONFLICT (run_id, step_id, attempt_id, seq) DO NOTHING",
+        stream: &scarab_engine::LogStreamId,
+        row: &scarab_engine::NewLogRow,
+        writer: &LeaderTerm,
+        now: Timestamp,
+    ) -> Result<LogChunkMeta, scarab_engine::LogAppendError> {
+        use scarab_engine::LogAppendError;
+        let unit = stream.unit();
+        let mut tx = self.begin_bounded().await?;
+        let r = sqlx::query(
+            "SELECT outcome, out_seq, out_offset, out_gen FROM scarab_append_log_row(
+               $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         )
-        .bind(&run.0)
-        .bind(&step.0)
-        .bind(&attempt.0)
-        .bind(meta.seq as i64)
-        .bind(meta.byte_offset as i64)
-        .bind(meta.len as i64)
-        .bind(&meta.object_key)
-        .execute(self.pool())
+        .bind(&stream.run.0)
+        .bind(&stream.step.0)
+        .bind(&stream.attempt.0)
+        .bind(&unit.step.0)
+        .bind(writer.resource())
+        .bind(writer.owner())
+        .bind(writer.term())
+        .bind(row.kind.as_str())
+        .bind(row.reason.map(|r| r.as_str()))
+        .bind(row.body.as_ref().map(|b| b.object_key.clone()))
+        .bind(row.body.as_ref().map_or(0, |b| b.len as i64))
+        .bind(row.body.as_ref().map(|b| b.sha256.clone()))
+        .bind(row.values_gen)
+        .bind(row.then.map(|s| s.as_str()))
+        .bind(now.0)
+        .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
+        let outcome: String = r.get("outcome");
+        let refused = match outcome.as_str() {
+            "ok" => None,
+            "not_writer" => Some(LogAppendError::NotWriter),
+            "closed" => Some(LogAppendError::Closed),
+            "no_ledger" => Some(LogAppendError::NoLedger),
+            "ledger_purged" => Some(LogAppendError::LedgerPurged),
+            "values_changed" => Some(LogAppendError::ValuesChanged {
+                gen: r.get::<Option<i64>, _>("out_gen").unwrap_or(0),
+            }),
+            other => Some(LogAppendError::Db(DbError::Other(format!(
+                "unknown append outcome {other:?}"
+            )))),
+        };
+        if let Some(e) = refused {
+            // Nothing was written; end the transaction.
+            let _ = tx.rollback().await;
+            return Err(e);
+        }
+        let seq = r.get::<Option<i64>, _>("out_seq").unwrap_or(0) as u64;
+        let byte_offset = r.get::<Option<i64>, _>("out_offset").unwrap_or(0) as u64;
+        tx.commit().await.map_err(db_err)?;
+        Ok(LogChunkMeta {
+            seq,
+            byte_offset,
+            len: row.body.as_ref().map_or(0, |b| b.len),
+            object_key: row.body.as_ref().map(|b| b.object_key.clone()),
+            kind: row.kind,
+            reason: row.reason,
+            digest: row.body.as_ref().map(|b| b.sha256.clone()),
+        })
+    }
+
+    async fn set_log_stream_state(
+        &self,
+        stream: &scarab_engine::LogStreamId,
+        writer: &LeaderTerm,
+        state: scarab_engine::LogStreamState,
+        now: Timestamp,
+    ) -> Result<(), scarab_engine::LogAppendError> {
+        let mut tx = self.begin_stream_fenced(stream, writer, now).await?;
+        sqlx::query(
+            "UPDATE log_streams SET state = $4, updated_at = $5
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&stream.run.0)
+        .bind(&stream.step.0)
+        .bind(&stream.attempt.0)
+        .bind(state.as_str())
+        .bind(now.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
         Ok(())
+    }
+
+    async fn start_log_final_budget(
+        &self,
+        stream: &scarab_engine::LogStreamId,
+        writer: &LeaderTerm,
+        now: Timestamp,
+    ) -> Result<i64, scarab_engine::LogAppendError> {
+        let mut tx = self.begin_stream_fenced(stream, writer, now).await?;
+        let r = sqlx::query(
+            "UPDATE log_streams SET final_since = COALESCE(final_since, $4)
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
+             RETURNING final_since",
+        )
+        .bind(&stream.run.0)
+        .bind(&stream.step.0)
+        .bind(&stream.attempt.0)
+        .bind(now.0)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(r.get::<i64, _>("final_since"))
+    }
+
+    async fn log_stream_row(
+        &self,
+        stream: &scarab_engine::LogStreamId,
+    ) -> Result<Option<scarab_engine::LogStreamRow>, DbError> {
+        let r = sqlx::query(
+            "SELECT next_seq, byte_len, part_start_seq, state, pruned, final_since
+             FROM log_streams WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&stream.run.0)
+        .bind(&stream.step.0)
+        .bind(&stream.attempt.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        r.map(|r| log_stream_row(&r)).transpose()
     }
 
     async fn log_chunks_from(
@@ -2118,7 +2286,7 @@ impl Db for PostgresDb {
     ) -> Result<Vec<LogChunkMeta>, DbError> {
         // A range scan on the primary key (run_id, step_id, attempt_id, seq).
         let rows = sqlx::query(
-            "SELECT seq, byte_offset, len, object_key FROM log_chunks
+            "SELECT seq, byte_offset, len, object_key, kind, reason, digest FROM log_chunks
              WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3 AND seq >= $4
              ORDER BY seq",
         )
@@ -2132,24 +2300,339 @@ impl Db for PostgresDb {
         Ok(rows.iter().map(log_chunk_row).collect())
     }
 
-    async fn last_log_chunk(
+    async fn write_log_unit(
         &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-    ) -> Result<Option<LogChunkMeta>, DbError> {
-        let row = sqlx::query(
-            "SELECT seq, byte_offset, len, object_key FROM log_chunks
-             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
-             ORDER BY seq DESC LIMIT 1",
+        unit: &scarab_engine::LogStreamId,
+        handle: Option<&str>,
+        expected_gen: i64,
+        sealed: Option<&[u8]>,
+        now: Timestamp,
+    ) -> Result<i64, DbError> {
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        sqlx::query(
+            "INSERT INTO log_units (run_id, step_id, attempt_id, handle)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (run_id, step_id, attempt_id)
+             DO UPDATE SET handle = COALESCE(EXCLUDED.handle, log_units.handle)",
         )
-        .bind(&run.0)
-        .bind(&step.0)
-        .bind(&attempt.0)
+        .bind(&unit.run.0)
+        .bind(&unit.step.0)
+        .bind(&unit.attempt.0)
+        .bind(handle)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let r = sqlx::query(
+            "SELECT gen, purged FROM log_units
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3 FOR UPDATE",
+        )
+        .bind(&unit.run.0)
+        .bind(&unit.step.0)
+        .bind(&unit.attempt.0)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let gen: i64 = r.get("gen");
+        if r.get::<bool, _>("purged") {
+            return Err(DbError::Conflict);
+        }
+        let Some(sealed) = sealed else {
+            tx.commit().await.map_err(db_err)?;
+            return Ok(gen);
+        };
+        if gen != expected_gen {
+            return Err(DbError::Conflict);
+        }
+        let next = gen + 1;
+        sqlx::query(
+            "INSERT INTO log_unit_values (run_id, step_id, attempt_id, gen, sealed, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&unit.run.0)
+        .bind(&unit.step.0)
+        .bind(&unit.attempt.0)
+        .bind(next)
+        .bind(sealed)
+        .bind(now.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query(
+            "UPDATE log_units SET gen = $4
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&unit.run.0)
+        .bind(&unit.step.0)
+        .bind(&unit.attempt.0)
+        .bind(next)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(next)
+    }
+
+    async fn log_unit_ledger(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+    ) -> Result<Option<scarab_engine::LogLedgerRows>, DbError> {
+        // One statement, one snapshot: the row and its generations agree.
+        let rows = sqlx::query(
+            "SELECT u.gen, u.handle, u.started_at, u.settled_at, u.revoke_attempted_at,
+                    u.purged, v.gen AS value_gen, v.sealed, v.created_at
+             FROM log_units u
+             LEFT JOIN log_unit_values v
+               ON v.run_id = u.run_id AND v.step_id = u.step_id AND v.attempt_id = u.attempt_id
+             WHERE u.run_id = $1 AND u.step_id = $2 AND u.attempt_id = $3
+             ORDER BY v.gen",
+        )
+        .bind(&unit.run.0)
+        .bind(&unit.step.0)
+        .bind(&unit.attempt.0)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        let Some(first) = rows.first() else {
+            return Ok(None);
+        };
+        let unit_row = log_unit_row(first);
+        let generations = rows
+            .iter()
+            .filter_map(|r| {
+                Some(scarab_engine::SealedGeneration {
+                    gen: r.get::<Option<i64>, _>("value_gen")?,
+                    sealed: r.get::<Option<Vec<u8>>, _>("sealed")?,
+                    created_at: r.get::<Option<i64>, _>("created_at")?,
+                })
+            })
+            .collect();
+        Ok(Some(scarab_engine::LogLedgerRows {
+            unit: unit_row,
+            generations,
+        }))
+    }
+
+    async fn log_unit_by_handle(
+        &self,
+        handle: &str,
+    ) -> Result<Option<scarab_engine::LogStreamId>, DbError> {
+        let r = sqlx::query(
+            "SELECT run_id, step_id, attempt_id FROM log_units WHERE handle = $1
+             ORDER BY run_id, step_id, attempt_id LIMIT 1",
+        )
+        .bind(handle)
         .fetch_optional(self.pool())
         .await
         .map_err(db_err)?;
-        Ok(row.as_ref().map(log_chunk_row))
+        Ok(r.map(|r| log_unit_id(&r)))
+    }
+
+    async fn mark_log_unit_started(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+        at: Timestamp,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE log_units SET started_at = $4
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3 AND started_at IS NULL",
+        )
+        .bind(&unit.run.0)
+        .bind(&unit.step.0)
+        .bind(&unit.attempt.0)
+        .bind(at.0)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn mark_log_unit_revoked(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+        at: Timestamp,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE log_units SET revoke_attempted_at = COALESCE(revoke_attempted_at, $4)
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&unit.run.0)
+        .bind(&unit.step.0)
+        .bind(&unit.attempt.0)
+        .bind(at.0)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn settle_log_units(&self, now: Timestamp) -> Result<u64, DbError> {
+        let r = sqlx::query(&format!(
+            "UPDATE log_units u SET settled_at = $1
+             WHERE u.settled_at IS NULL AND (
+               EXISTS (SELECT 1 FROM runs r WHERE r.id = u.run_id
+                         AND r.status IN ('succeeded', 'failed', 'cancelled', 'dead_lettered'))
+               OR EXISTS (SELECT 1 FROM attempts a
+                          WHERE a.run_id = u.run_id AND a.step_id = u.step_id
+                            AND a.attempt_id = u.attempt_id AND NOT {ATTEMPT_IS_RUNNING})
+               OR EXISTS (SELECT 1 FROM run_services s
+                          WHERE s.run_id = u.run_id AND 'service:' || s.name = u.step_id
+                            AND 't' || s.take = u.attempt_id
+                            AND s.status IN ('torn-down', 'failed'))
+             )"
+        ))
+        .bind(now.0)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(r.rows_affected())
+    }
+
+    async fn purge_log_unit(&self, unit: &scarab_engine::LogStreamId) -> Result<(), DbError> {
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        sqlx::query(
+            "DELETE FROM log_unit_values WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&unit.run.0)
+        .bind(&unit.step.0)
+        .bind(&unit.attempt.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query(
+            "UPDATE log_units SET purged = true
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&unit.run.0)
+        .bind(&unit.step.0)
+        .bind(&unit.attempt.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn log_unit_has_open_stream(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+    ) -> Result<bool, DbError> {
+        let r = sqlx::query(
+            "SELECT EXISTS (SELECT 1 FROM log_streams
+               WHERE run_id = $1 AND attempt_id = $3 AND state = 'open'
+                 AND (step_id = $2 OR left(step_id, length($2) + 10) = $2 || '::service-'))
+             AS open",
+        )
+        .bind(&unit.run.0)
+        .bind(&unit.step.0)
+        .bind(&unit.attempt.0)
+        .fetch_one(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(r.get::<bool, _>("open"))
+    }
+
+    async fn log_units_to_purge(
+        &self,
+        now: Timestamp,
+        hard_cap_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<scarab_engine::PurgeCandidate>, DbError> {
+        let rows = sqlx::query(&format!(
+            "WITH c AS (
+               SELECT u.*,
+                 (SELECT min(v.created_at) FROM log_unit_values v
+                   WHERE v.run_id = u.run_id AND v.step_id = u.step_id
+                     AND v.attempt_id = u.attempt_id) AS oldest,
+                 (EXISTS (SELECT 1 FROM attempts a
+                            WHERE a.run_id = u.run_id AND a.step_id = u.step_id
+                              AND a.attempt_id = u.attempt_id AND {ATTEMPT_IS_RUNNING})
+                  OR EXISTS (SELECT 1 FROM run_services s
+                            WHERE s.run_id = u.run_id AND 'service:' || s.name = u.step_id
+                              AND 't' || s.take = u.attempt_id
+                              AND s.status NOT IN ('torn-down', 'failed')))
+                 AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.id = u.run_id
+                   AND r.status IN ('succeeded', 'failed', 'cancelled', 'dead_lettered'))
+                 AS running,
+                 (SELECT r.updated_at FROM runs r WHERE r.id = u.run_id
+                   AND r.status IN ('succeeded', 'failed', 'cancelled', 'dead_lettered'))
+                 AS run_ended
+               FROM log_units u WHERE NOT u.purged
+             )
+             SELECT run_id, step_id, attempt_id, gen, handle, started_at, settled_at,
+                    revoke_attempted_at, purged,
+                    (NOT running AND oldest IS NOT NULL AND oldest < $1 - $2) AS past_cap
+             FROM c
+             WHERE (settled_at IS NOT NULL AND settled_at < $1 - $3)
+                OR (run_ended IS NOT NULL AND run_ended < $1 - $3)
+                OR (NOT running AND oldest IS NOT NULL AND oldest < $1 - $2)
+             LIMIT $4"
+        ))
+        .bind(now.0)
+        .bind(hard_cap_ms)
+        .bind(scarab_engine::LEDGER_SETTLED_KEEP_MS)
+        .bind(i64::from(limit))
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .iter()
+            .map(|r| scarab_engine::PurgeCandidate {
+                unit: log_unit_id(r),
+                row: log_unit_row(r),
+                past_cap: r.get::<bool, _>("past_cap"),
+            })
+            .collect())
+    }
+
+    async fn pending_final_reads(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<scarab_engine::PendingFinalRead>, DbError> {
+        let rows = sqlx::query(&format!(
+            "(SELECT u.run_id, u.step_id, u.attempt_id,
+                     COALESCE(u.handle, a.handle) AS handle, true AS has_ledger,
+                     (u.started_at IS NOT NULL) AS started
+              FROM log_units u
+              LEFT JOIN attempts a ON a.run_id = u.run_id AND a.step_id = u.step_id
+                                  AND a.attempt_id = u.attempt_id
+              LEFT JOIN log_streams s ON s.run_id = u.run_id AND s.step_id = u.step_id
+                                     AND s.attempt_id = u.attempt_id
+              WHERE u.settled_at IS NOT NULL AND NOT u.purged
+                AND (s.state IS NULL OR s.state = 'open')
+                AND NOT EXISTS (SELECT 1 FROM log_prune_pending p WHERE p.run_id = u.run_id)
+              LIMIT $1)
+             UNION ALL
+             (SELECT a.run_id, a.step_id, a.attempt_id, a.handle, false AS has_ledger,
+                     (a.execution_started_at IS NOT NULL OR EXISTS (
+                        SELECT 1 FROM log_chunks c WHERE c.run_id = a.run_id
+                          AND c.step_id = a.step_id AND c.attempt_id = a.attempt_id))
+                     AS started
+              FROM attempts a
+              LEFT JOIN log_streams s ON s.run_id = a.run_id AND s.step_id = a.step_id
+                                     AND s.attempt_id = a.attempt_id
+              WHERE NOT {ATTEMPT_IS_RUNNING}
+                AND (s.state IS NULL OR s.state = 'open')
+                AND NOT EXISTS (SELECT 1 FROM log_units u WHERE u.run_id = a.run_id
+                                  AND u.step_id = a.step_id AND u.attempt_id = a.attempt_id)
+                AND (a.started_at >= (SELECT at FROM log_store_epoch WHERE id = 1)
+                     OR EXISTS (SELECT 1 FROM log_legacy_units l WHERE l.run_id = a.run_id
+                                  AND l.step_id = a.step_id AND l.attempt_id = a.attempt_id))
+                AND NOT EXISTS (SELECT 1 FROM log_prune_pending p WHERE p.run_id = a.run_id)
+              LIMIT $1)"
+        ))
+        .bind(i64::from(limit))
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .iter()
+            .map(|r| scarab_engine::PendingFinalRead {
+                unit: log_unit_id(r),
+                handle: r.get::<Option<String>, _>("handle"),
+                has_ledger: r.get::<bool, _>("has_ledger"),
+                started: r.get::<bool, _>("started"),
+            })
+            .collect())
     }
 
     async fn record_step_transition(
@@ -2962,20 +3445,84 @@ impl Db for PostgresDb {
             .collect()
     }
 
-    async fn log_object_keys_of_run(&self, run: &RunId) -> Result<Vec<String>, DbError> {
-        let rows = sqlx::query("SELECT object_key FROM log_chunks WHERE run_id = $1")
+    async fn prune_log_run(&self, run: &RunId, now: Timestamp) -> Result<(), DbError> {
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        // Tombstone every stream of the run, including one that has rows but
+        // no `log_streams` row yet (stored before 0.7): a late fenced append
+        // locks this row and is refused.
+        sqlx::query(
+            "INSERT INTO log_streams (run_id, step_id, attempt_id, next_seq, byte_len,
+                                      state, pruned, updated_at)
+             SELECT run_id, step_id, attempt_id, max(seq) + 1, max(byte_offset + len),
+                    'closed', true, $2
+             FROM log_chunks WHERE run_id = $1 GROUP BY run_id, step_id, attempt_id
+             ON CONFLICT (run_id, step_id, attempt_id)
+             DO UPDATE SET state = 'closed', pruned = true, updated_at = $2",
+        )
+        .bind(&run.0)
+        .bind(now.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query(
+            "UPDATE log_streams SET state = 'closed', pruned = true, updated_at = $2
+             WHERE run_id = $1",
+        )
+        .bind(&run.0)
+        .bind(now.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query("DELETE FROM log_unit_values WHERE run_id = $1")
             .bind(&run.0)
-            .fetch_all(self.pool())
+            .execute(&mut *tx)
             .await
             .map_err(db_err)?;
+        sqlx::query("UPDATE log_units SET purged = true WHERE run_id = $1")
+            .bind(&run.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        sqlx::query("DELETE FROM log_chunks WHERE run_id = $1")
+            .bind(&run.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        sqlx::query(
+            "INSERT INTO log_prune_pending (run_id, pruned_at) VALUES ($1, $2)
+             ON CONFLICT (run_id) DO UPDATE SET pruned_at = $2",
+        )
+        .bind(&run.0)
+        .bind(now.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn log_runs_to_redelete(
+        &self,
+        before: Timestamp,
+        limit: u32,
+    ) -> Result<Vec<RunId>, DbError> {
+        let rows = sqlx::query(
+            "SELECT run_id FROM log_prune_pending WHERE pruned_at < $1
+             ORDER BY pruned_at LIMIT $2",
+        )
+        .bind(before.0)
+        .bind(i64::from(limit))
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
         Ok(rows
             .into_iter()
-            .map(|r| r.get::<String, _>("object_key"))
+            .map(|r| RunId(r.get::<String, _>("run_id")))
             .collect())
     }
 
-    async fn delete_log_index_of_run(&self, run: &RunId) -> Result<(), DbError> {
-        sqlx::query("DELETE FROM log_chunks WHERE run_id = $1")
+    async fn forget_log_run_redelete(&self, run: &RunId) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM log_prune_pending WHERE run_id = $1")
             .bind(&run.0)
             .execute(self.pool())
             .await
@@ -5569,12 +6116,53 @@ impl scarab_identity::ApiTokenStore for PostgresDb {
     }
 }
 
-/// One `log_chunks` index row (seq, byte_offset, len, object_key).
+/// One `log_chunks` index row.
 fn log_chunk_row(r: &sqlx::postgres::PgRow) -> LogChunkMeta {
     LogChunkMeta {
         seq: r.get::<i64, _>("seq") as u64,
         byte_offset: r.get::<i64, _>("byte_offset") as u64,
         len: r.get::<i64, _>("len") as u64,
-        object_key: r.get::<String, _>("object_key"),
+        object_key: r.get::<Option<String>, _>("object_key"),
+        kind: scarab_engine::LogRowKind::parse(&r.get::<String, _>("kind")).unwrap_or_default(),
+        reason: r
+            .get::<Option<String>, _>("reason")
+            .as_deref()
+            .and_then(scarab_engine::NotStoredReason::parse),
+        digest: r.get::<Option<Vec<u8>>, _>("digest"),
+    }
+}
+
+/// One `log_streams` row.
+fn log_stream_row(r: &sqlx::postgres::PgRow) -> Result<scarab_engine::LogStreamRow, DbError> {
+    let state: String = r.get("state");
+    Ok(scarab_engine::LogStreamRow {
+        next_seq: r.get::<i64, _>("next_seq") as u64,
+        byte_len: r.get::<i64, _>("byte_len") as u64,
+        part_start_seq: r.get::<i64, _>("part_start_seq") as u64,
+        state: scarab_engine::LogStreamState::parse(&state)
+            .ok_or_else(|| DbError::Other(format!("unknown log stream state {state:?}")))?,
+        pruned: r.get("pruned"),
+        final_since: r.get("final_since"),
+    })
+}
+
+/// The `(run_id, step_id, attempt_id)` of a row.
+fn log_unit_id(r: &sqlx::postgres::PgRow) -> scarab_engine::LogStreamId {
+    scarab_engine::LogStreamId {
+        run: RunId(r.get("run_id")),
+        step: StepId(r.get("step_id")),
+        attempt: AttemptId(r.get("attempt_id")),
+    }
+}
+
+/// One `log_units` row.
+fn log_unit_row(r: &sqlx::postgres::PgRow) -> scarab_engine::LogUnitRow {
+    scarab_engine::LogUnitRow {
+        gen: r.get("gen"),
+        handle: r.get("handle"),
+        started_at: r.get("started_at"),
+        settled_at: r.get("settled_at"),
+        revoke_attempted_at: r.get("revoke_attempted_at"),
+        purged: r.get("purged"),
     }
 }
