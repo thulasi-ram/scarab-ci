@@ -6,7 +6,7 @@
 // `skipped_bytes`, `total_bytes`), so the pane's own cap and the server's
 // cutoff add up in one notice.
 
-import { streamEndStep } from "./logs";
+import { streamEndStep, type StreamEnd } from "./logs";
 
 const MiB = 1024 * 1024;
 
@@ -28,6 +28,19 @@ export const BACKOFF_MAX_MS = 30_000;
  * keepalive comments, so its drops do not count. */
 export const FAILED_REOPENS_BEFORE_FRESH = 3;
 
+/** How long a log stream may take to open before the pane says it could not
+ * load the log. The server reads the start of the stored log before it
+ * answers, so a store read that hangs, or a proxy that holds the request,
+ * shows as a stream that does not open. Silence after the stream opened is
+ * not a failure: keepalive comments do not reach the page, and a finished
+ * try's stream can stay open and quiet while its run goes on. */
+export const LOG_OPEN_TIMEOUT_MS = 20_000;
+
+/** How long an open stream may stay quiet before the pane takes the log as
+ * empty for now. The first `data` event can arrive a moment after the stream
+ * opens; without this wait a finished try would flash "no output" first. */
+export const LOG_QUIET_MS = 1000;
+
 /** The server's `truncated` event: the replay skipped the first `skippedBytes`
  * of a log that was `totalBytes` long when the stream opened. */
 export type LogTruncation = { skippedBytes: number; totalBytes: number };
@@ -47,6 +60,9 @@ export type LogStreamHandlers = {
   onStoring?: (storing: boolean, waitOver: boolean) => void;
   /** The connection opened: the server accepted the request. */
   onOpen?: () => void;
+  /** The server's `error` event: reading the stored log failed. The stream
+   * ends right after it. */
+  onError?: (message: string) => void;
   /** The stream closed: the server ended it, it failed, or it dropped. */
   onEnd?: () => void;
 };
@@ -305,12 +321,33 @@ export function followLog(opts: {
    * status, or null when the server did not answer. Without it the cursor is
    * always kept. */
   probe?: (q: LogStreamQuery) => Promise<number | null>;
+  /** The server answered for this log: a stream delivered an event, ended
+   * after it opened, or stayed open and quiet for `LOG_QUIET_MS`. Until then
+   * the pane says it is loading the log. Called once. */
+  onLoaded?: () => void;
+  /** The log could not be read, and why; `null` once a later stream opens or
+   * delivers an event. Reported when the server sent an `error` event, when
+   * a finished try's stream closed before it opened, when a running try's
+   * stream failed to open `FAILED_REOPENS_BEFORE_FRESH` times in a row (it
+   * goes on trying), and when a stream did not open within
+   * `LOG_OPEN_TIMEOUT_MS`. */
+  onError?: (reason: string | null) => void;
   timers?: Timers;
   random?: () => number;
 }): LogFollower {
   const timers = opts.timers ?? realTimers;
   let closeStream: (() => void) | null = null;
   let timer: unknown = null;
+  // The open timeout and the quiet wait of the stream in flight.
+  let openTimer: unknown = null;
+  let quietTimer: unknown = null;
+  let loaded = false;
+  let error: string | null = null;
+  // Streams in a row that ended before they opened.
+  let failedOpens = 0;
+  // Bumped by each stream, so a late probe answer about an older one is
+  // dropped.
+  let streamSeq = 0;
   let stopped = false;
   let deferred = false;
   let lastId: string | null = null;
@@ -326,6 +363,22 @@ export function followLog(opts: {
   // stopped waiting for it.
   let storing = false;
   let waitOver = false;
+
+  const clearTimer = (t: unknown) => {
+    if (t !== null) timers.clear(t);
+    return null;
+  };
+  const markLoaded = () => {
+    quietTimer = clearTimer(quietTimer);
+    if (loaded) return;
+    loaded = true;
+    opts.onLoaded?.();
+  };
+  const report = (reason: string | null) => {
+    if (stopped || error === reason) return;
+    error = reason;
+    opts.onError?.(reason);
+  };
 
   const start = (reopen: boolean) => {
     if (stopped) return;
@@ -349,8 +402,26 @@ export function followLog(opts: {
     openStream(reopen);
   };
 
+  // A finished try's stream closed before it opened: ask the server why, if
+  // it can be asked, and say so unless another stream started meanwhile.
+  const reportClosed = (q: LogStreamQuery, seq: number) => {
+    const say = (status: number | null) => {
+      if (seq !== streamSeq) return;
+      report(
+        status === null
+          ? "the server did not answer"
+          : status >= 400
+            ? `the server answered ${status}`
+            : "the stream closed before it opened",
+      );
+    };
+    if (!opts.probe) return say(200);
+    opts.probe(q).then(say, () => say(null));
+  };
+
   const openStream = (reopen: boolean) => {
     if (stopped) return;
+    const seq = ++streamSeq;
     // One stream at a time: `current` tells this stream's events from a
     // closed one's.
     const current = {};
@@ -363,6 +434,15 @@ export function followLog(opts: {
       if (!opened) openedAt = timers.now();
       opened = true;
       failedReopens = 0;
+      failedOpens = 0;
+      openTimer = clearTimer(openTimer);
+      report(null);
+      if (!loaded && quietTimer === null) {
+        quietTimer = timers.set(() => {
+          quietTimer = null;
+          markLoaded();
+        }, LOG_QUIET_MS);
+      }
     };
     // Any event of this stream: it opened, the backoff starts over, and a
     // fresh open after resuming failed clears the pane first.
@@ -379,6 +459,8 @@ export function followLog(opts: {
     // Each stream says it again if the log is still being stored.
     storing = false;
     waitOver = false;
+    openTimer = clearTimer(openTimer);
+    quietTimer = clearTimer(quietTimer);
     if (reopen) opts.onReopen?.();
     close = opts.open(q, {
       onChunk: (text, id) => {
@@ -387,9 +469,12 @@ export function followLog(opts: {
         if (id) lastId = id;
         if (text.length > 0) hadOutput = true;
         opts.onChunk(text);
+        markLoaded();
       },
       onTruncated: (t) => {
         if (!mine()) return;
+        // The tail's first `data` event comes right after this one: the log
+        // is not loaded yet.
         gotEvent();
         opts.onTruncated(t);
       },
@@ -399,13 +484,21 @@ export function followLog(opts: {
         storing = s;
         waitOver = w;
         opts.onStoring?.(s, w);
+        markLoaded();
       },
       onOpen: () => {
         if (!mine()) return;
         gotOpen();
       },
+      onError: (message) => {
+        if (!mine()) return;
+        report(message);
+      },
       onEnd: () => {
         if (!mine()) return;
+        openTimer = clearTimer(openTimer);
+        if (!opened) failedOpens++;
+        else markLoaded();
         if (reopen && !opened) failedReopens++;
         // A quiet stream that stayed open longer than the wait before it was
         // not a failure: the backoff starts over.
@@ -414,7 +507,12 @@ export function followLog(opts: {
         closeStream = null;
         close?.();
         opts.onEnd();
-        decide(false);
+        const step = decide(false);
+        if (opened) return;
+        if (step === "done") reportClosed(q, seq);
+        else if (failedOpens === FAILED_REOPENS_BEFORE_FRESH) {
+          report(`the stream closed before it opened, ${failedOpens} times in a row; trying again`);
+        }
       },
     });
     // The stream ended before `open` returned.
@@ -426,14 +524,20 @@ export function followLog(opts: {
       active = null;
       close?.();
     };
+    if (!opened) {
+      openTimer = timers.set(() => {
+        openTimer = null;
+        if (mine() && !opened) report(`no answer from the server in ${LOG_OPEN_TIMEOUT_MS / 1000} s`);
+      }, LOG_OPEN_TIMEOUT_MS);
+    }
   };
 
-  const decide = (graceOver: boolean) => {
-    if (stopped) return;
+  const decide = (graceOver: boolean): StreamEnd | undefined => {
+    if (stopped) return undefined;
     const outcome = opts.outcome();
     if (outcome === undefined) {
       deferred = true;
-      return;
+      return undefined;
     }
     // The server says `storing: false` before it ends a stream whose log is
     // whole: a stream that ended while the log was still being stored
@@ -451,14 +555,16 @@ export function followLog(opts: {
         decide(true);
       }, wait);
     }
+    return step;
   };
 
   start(false);
   return {
     close: () => {
       stopped = true;
-      if (timer !== null) timers.clear(timer);
-      timer = null;
+      timer = clearTimer(timer);
+      openTimer = clearTimer(openTimer);
+      quietTimer = clearTimer(quietTimer);
       closeStream?.();
       closeStream = null;
     },

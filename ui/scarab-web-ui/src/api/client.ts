@@ -1495,7 +1495,8 @@ function logQuery(q: URLSearchParams, opts: LogStreamQuery): URLSearchParams {
 /** Open one log stream (a step's, a sidecar's or a service's). Each `data`
  * event is raw output, passed on as it came with its id (the resume cursor);
  * a `truncated` event says how much of the log the replay skipped, and a
- * `storing` event whether the log is still being stored after its try ended. The server
+ * `storing` event whether the log is still being stored after its try ended,
+ * and an `error` event that reading the stored log failed. The server
  * ends the stream when nothing more will be written, which reads as an error
  * here; the stream is then closed so the browser's EventSource does not open
  * it again by itself. Returns a cleanup fn. */
@@ -1528,9 +1529,16 @@ function openLogStream(url: string, opts: LogStreamHandlers): () => void {
       // A malformed notice changes nothing on screen; skip it.
     }
   });
-  es.onerror = () => {
+  // A dropped or refused connection and the server's own `error` event
+  // (reading the stored log failed) both arrive here; only the server's
+  // carries a message.
+  es.onerror = (e) => {
     if (closed) return;
     close();
+    if (e instanceof MessageEvent) {
+      const msg = typeof e.data === "string" ? e.data.trim() : "";
+      opts.onError?.(msg || "the server could not read the log");
+    }
     opts.onEnd?.();
   };
   return close;

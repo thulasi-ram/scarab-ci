@@ -17,19 +17,26 @@ export function levelOf(line: string): Level {
 
 /** What an attempt's log body shows when it has no lines yet:
  * - `output`  — there is output; render the lines.
+ * - `error`   — the log could not be read: the server said reading the
+ *               stored log failed, the stream would not open, or it did not
+ *               open in time. The pane says why and offers to try again.
+ * - `loading` — the server has not answered for this log yet: no event, no
+ *               end, no quiet open stream. The pane says it is loading.
  * - `waiting` — nothing yet, but more may come: the try is still running
  *               (even when its stream ended: the pane opens it again), or
  *               the stream is open and the outcome is not known yet.
  * - `storing` — the try ended and the server says its log is still being
  *               stored: a log tail can store the end of a log after the step
  *               ended. The pane says so and keeps following.
- * - `none`    — nothing came and nothing will: the try has finished, or the
- *               stream ended and the outcome is not known. The pane then says
- *               no output was captured and, for a failed try, why it failed.
+ * - `none`    — nothing came and nothing will: the server answered for a
+ *               finished try with no output, or the stream ended and the
+ *               outcome is not known. The pane then says no output was
+ *               captured and, for a failed try, why it failed.
  * A try with no output used to show "waiting for output…" forever, so its
  * failure reason never appeared. A try whose log was still being stored
- * used to say no output was captured. */
-export type LogBodyState = "output" | "waiting" | "storing" | "none";
+ * used to say no output was captured, and so did a finished try whose log
+ * had not arrived yet. */
+export type LogBodyState = "output" | "error" | "loading" | "waiting" | "storing" | "none";
 
 export function logBodyState(opts: {
   /** The buffered text for this (step, attempt, container), if any arrived. */
@@ -38,16 +45,22 @@ export function logBodyState(opts: {
   ended: boolean;
   /** The attempt's outcome (`running`, `succeeded`, `failed`, …). */
   outcome: string | undefined;
+  /** The server answered for this log (see `followLog`'s `onLoaded`). */
+  loaded: boolean;
+  /** Why the log could not be read, while it could not. */
+  error?: string | null;
   /** The server's last `storing` event said the log is still being stored
    * (also when it said it stopped waiting for it). */
   storing?: boolean;
 }): LogBodyState {
   if ((opts.text ?? "").split("\n").some((l) => l.length > 0)) return "output";
-  if (opts.outcome === "running") return "waiting";
+  if (opts.error) return "error";
   // The server sends `storing: false` before it ends a stream whose log is
   // whole, so a stream that ended while still storing dropped, and the pane
   // opens it again.
-  if (opts.storing) return "storing";
+  if (opts.storing && opts.outcome !== "running") return "storing";
+  if (!opts.loaded) return "loading";
+  if (opts.outcome === "running") return "waiting";
   if (opts.ended) return "none";
   return opts.outcome === undefined ? "waiting" : "none";
 }

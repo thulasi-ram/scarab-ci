@@ -26,39 +26,61 @@ describe("levelOf", () => {
 // Regression: a try with no log output showed "waiting for output…" forever,
 // so the failure reason under it never rendered.
 describe("logBodyState", () => {
+  const st = (o: Partial<Parameters<typeof logBodyState>[0]>) =>
+    logBodyState({ text: undefined, ended: false, outcome: undefined, loaded: true, ...o });
+
   it("any non-empty line is output", () => {
-    expect(logBodyState({ text: "hello\n", ended: false, outcome: "running" })).toBe("output");
+    expect(st({ text: "hello\n", outcome: "running" })).toBe("output");
+    expect(st({ text: "hello\n", outcome: "failed", loaded: false, error: "boom" })).toBe("output");
   });
 
-  it("waits while the stream is open and the try is running", () => {
-    expect(logBodyState({ text: undefined, ended: false, outcome: "running" })).toBe("waiting");
-    expect(logBodyState({ text: undefined, ended: false, outcome: undefined })).toBe("waiting");
+  // Regression: while a finished try's log was still on its way the pane
+  // said "No log output was captured for this try."
+  it("is loading until the server answers, for finished and running tries", () => {
+    expect(st({ outcome: "succeeded", loaded: false })).toBe("loading");
+    expect(st({ outcome: "failed", loaded: false })).toBe("loading");
+    expect(st({ outcome: "running", loaded: false })).toBe("loading");
+    expect(st({ outcome: undefined, loaded: false })).toBe("loading");
+    // A stream that closed before it opened is not an answer: the error
+    // follows.
+    expect(st({ outcome: "failed", loaded: false, ended: true })).toBe("loading");
   });
 
-  it("says nothing was captured once the stream ended", () => {
-    expect(logBodyState({ text: undefined, ended: true, outcome: undefined })).toBe("none");
-    expect(logBodyState({ text: "\n", ended: true, outcome: "failed" })).toBe("none");
+  it("waits once the stream answered and the try is running", () => {
+    expect(st({ outcome: "running" })).toBe("waiting");
+    expect(st({ outcome: undefined })).toBe("waiting");
+  });
+
+  it("says nothing was captured once the server answered with no output", () => {
+    expect(st({ ended: true, outcome: undefined })).toBe("none");
+    expect(st({ text: "\n", ended: true, outcome: "failed" })).toBe("none");
+    expect(st({ outcome: "failed" })).toBe("none");
+    expect(st({ outcome: "succeeded" })).toBe("none");
   });
 
   // Regression: a stream the server ended while the try still ran said "no
   // log output was captured" for a try that went on to print.
   it("keeps waiting while the try runs, even after its stream ended", () => {
-    expect(logBodyState({ text: undefined, ended: true, outcome: "running" })).toBe("waiting");
-  });
-
-  it("says nothing was captured for a finished try, even before the stream closes", () => {
-    expect(logBodyState({ text: undefined, ended: false, outcome: "failed" })).toBe("none");
-    expect(logBodyState({ text: undefined, ended: false, outcome: "succeeded" })).toBe("none");
+    expect(st({ ended: true, outcome: "running" })).toBe("waiting");
   });
 
   // Regression: for ~90 s after a step ended the pane said "No log output was
   // captured for this try" while the server was still storing its log.
   it("says the log is still being stored while the server says so", () => {
-    expect(logBodyState({ text: undefined, ended: false, outcome: "succeeded", storing: true })).toBe("storing");
+    expect(st({ outcome: "succeeded", storing: true })).toBe("storing");
     // A stream that dropped while storing is opened again: still storing.
-    expect(logBodyState({ text: undefined, ended: true, outcome: "failed", storing: true })).toBe("storing");
-    expect(logBodyState({ text: "hello\n", ended: false, outcome: "succeeded", storing: true })).toBe("output");
-    expect(logBodyState({ text: undefined, ended: true, outcome: "succeeded", storing: false })).toBe("none");
+    expect(st({ ended: true, outcome: "failed", storing: true })).toBe("storing");
+    expect(st({ text: "hello\n", outcome: "succeeded", storing: true })).toBe("output");
+    expect(st({ ended: true, outcome: "succeeded", storing: false })).toBe("none");
+  });
+
+  it("says the log could not be read while there is an error, and not after it clears", () => {
+    expect(st({ outcome: "failed", loaded: false, error: "the server answered 500" })).toBe("error");
+    expect(st({ outcome: "running", error: "log storage read failed: timeout" })).toBe("error");
+    expect(st({ outcome: "succeeded", ended: true, error: "x" })).toBe("error");
+    // A later event clears the error: the state follows what came.
+    expect(st({ outcome: "succeeded", error: null })).toBe("none");
+    expect(st({ outcome: "succeeded", error: null, text: "late\n" })).toBe("output");
   });
 });
 

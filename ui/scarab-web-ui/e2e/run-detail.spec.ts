@@ -473,6 +473,45 @@ async function failEventReads(page: Page, times: number | null) {
   }, times);
 }
 
+// Slow or break the mock's step log streams (see `__scarabMockLogs` in
+// src/mock.ts) before the app boots.
+async function mockStepLogs(page: Page, knobs: { delayMs?: number; failStreams?: number }) {
+  await page.addInitScript((k) => {
+    (window as unknown as { __scarabMockLogs: object }).__scarabMockLogs = { match: "/steps/", ...k };
+  }, knobs);
+}
+
+// Regression: while a finished step's log was on its way, the pane said "No
+// log output was captured for this try."
+test("a finished step's log says it is loading until it arrives", async ({ page }) => {
+  await mockStepLogs(page, { delayMs: 3000 });
+  // Record whether the empty-log line ever shows, however briefly.
+  await page.addInitScript(() => {
+    const w = window as unknown as { sawNoOutput?: boolean };
+    new MutationObserver(() => {
+      if (document.body?.textContent?.includes("No log output was captured")) w.sawNoOutput = true;
+    }).observe(document, { subtree: true, childList: true, characterData: true });
+  });
+  await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}?step=1`);
+  await expect(page.locator(".sp-name")).toHaveText("build");
+  await expect(page.getByRole("status").filter({ hasText: "Loading the log…" })).toBeVisible();
+  await expect(page.locator(".lgrow", { hasText: "cargo test --workspace" })).toBeVisible();
+  await expect(page.getByText("Loading the log…")).toHaveCount(0);
+  expect(await page.evaluate(() => (window as unknown as { sawNoOutput?: boolean }).sawNoOutput)).toBeFalsy();
+});
+
+test("a log stream that fails says why and Retry loads the log", async ({ page }) => {
+  await mockStepLogs(page, { failStreams: 1 });
+  await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}?step=1`);
+  await expect(page.locator(".sp-name")).toHaveText("build");
+  const alert = page.getByRole("alert").filter({ hasText: "Could not load the log" });
+  await expect(alert).toHaveText(/Could not load the log: the server answered 503\. Retry/);
+  await expect(page.getByText("No log output was captured")).toHaveCount(0);
+  await alert.getByRole("button", { name: "Retry" }).click();
+  await expect(page.locator(".lgrow", { hasText: "cargo test --workspace" })).toBeVisible();
+  await expect(alert).toHaveCount(0);
+});
+
 // Regression: when the first read of the events failed, the page applied the
 // URL's selection to a run with no versions and dropped `v` and `try`.
 test("a failed first read of the events keeps the URL's version and try", async ({ page }) => {

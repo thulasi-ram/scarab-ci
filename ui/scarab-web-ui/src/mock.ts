@@ -3041,6 +3041,9 @@ export function installMock() {
   if (adminOrgs) me.admin_orgs = adminOrgs.split(",").filter(Boolean);
 
   const realFetch = window.fetch.bind(window);
+  // The last log stream the mock opened failed (see `__scarabMockLogs`
+  // below): the pane's probe of a log stream gets a 503.
+  let logStreamDown = false;
   window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
     let pathname = "";
     let search = "";
@@ -3052,6 +3055,9 @@ export function installMock() {
       /* fall through to real fetch */
     }
     if (!pathname) return realFetch(input as RequestInfo, init);
+    if (logStreamDown && /^\/v1\/runs\/[^/]+\/(steps|services)\/[^/]+\/logs$/.test(pathname)) {
+      return Promise.resolve(new Response("unavailable", { status: 503 }));
+    }
     const method = methodOf(input, init);
     // A body is read only for the writes the fixture records.
     const reads = method === "POST" || method === "PUT";
@@ -3063,6 +3069,17 @@ export function installMock() {
 
   // EventSource — step/service log streams. Replays the fixture's chunks
   // (`mockLogEvents`) then idles.
+  //
+  // A spec can slow or break the streams whose URL contains `match` (all of
+  // them without it) by setting `window.__scarabMockLogs` before the app boots:
+  // `delayMs` holds back each stream's open and events that long, and
+  // `failStreams` fails that many streams before they open (a connection the
+  // server refused), each counted down as it fails.
+  type MockLogKnobs = { match?: string; delayMs?: number; failStreams?: number };
+  const knobsFor = (url: string): MockLogKnobs | null => {
+    const k = (window as unknown as { __scarabMockLogs?: MockLogKnobs }).__scarabMockLogs;
+    return k && (!k.match || url.includes(k.match)) ? k : null;
+  };
   const RealES = window.EventSource;
   class MockES extends EventTarget {
     static readonly CONNECTING = 0;
@@ -3076,12 +3093,25 @@ export function installMock() {
     constructor(url: string | URL) {
       super();
       this.url = url.toString();
+      const knobs = knobsFor(this.url);
+      logStreamDown = !!knobs?.failStreams;
+      if (knobs?.failStreams) {
+        knobs.failStreams -= 1;
+        setTimeout(() => {
+          if (this.readyState === 2) return;
+          this.readyState = 2;
+          this.onerror?.(new Event("error"));
+        }, knobs.delayMs ?? 0);
+        return;
+      }
+      const later = (fn: () => void) =>
+        knobs?.delayMs ? setTimeout(fn, knobs.delayMs) : queueMicrotask(fn);
       const events = mockLogEvents(this.url);
-      queueMicrotask(() => {
+      later(() => {
         if (this.readyState !== 2) this.onopen?.(new Event("open"));
       });
       if (events.length > 0) {
-        queueMicrotask(() => {
+        later(() => {
           for (const ev of events) {
             if (this.readyState === 2) return;
             const e = new MessageEvent(ev.type, { data: ev.data, lastEventId: ev.id ?? "" });

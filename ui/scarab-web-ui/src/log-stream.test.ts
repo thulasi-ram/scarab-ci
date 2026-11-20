@@ -5,6 +5,8 @@ import {
   emptyLogBuffer,
   followLog,
   formatSize,
+  LOG_OPEN_TIMEOUT_MS,
+  LOG_QUIET_MS,
   logNotice,
   tailRows,
   truncateLog,
@@ -214,29 +216,33 @@ describe("tailRows", () => {
 });
 
 /** A fake server: each `open` is one stream the test drives by hand.
- * `probe` answers the follower's question about a cursor. */
+ * `probe` answers the follower's question about a cursor. Timers run only by
+ * `tick`, earliest first. */
 function harness(opts: {
   outcome: () => string | undefined;
   tail?: number;
   probe?: (q: LogStreamQuery) => Promise<number | null>;
 }) {
   const opened: { q: LogStreamQuery; h: LogStreamHandlers; closed: boolean }[] = [];
-  const pending: { fn: () => void; ms: number; cleared: boolean }[] = [];
+  type T = { fn: () => void; ms: number; due: number; cleared: boolean };
+  const all: T[] = [];
   let clock = 0;
   const timers: Timers = {
     set: (fn, ms) => {
-      const t = { fn, ms, cleared: false };
-      pending.push(t);
+      const t = { fn, ms, due: clock + ms, cleared: false };
+      all.push(t);
       return t;
     },
     clear: (t) => {
-      (t as { cleared: boolean }).cleared = true;
+      (t as T).cleared = true;
     },
     now: () => clock,
   };
   const shown: string[] = [];
+  const errors: (string | null)[] = [];
   let ends = 0;
   let resets = 0;
+  let loaded = 0;
   const f = followLog({
     open: (q, h) => {
       const s = { q, h, closed: false };
@@ -251,23 +257,43 @@ function harness(opts: {
     onTruncated: () => {},
     onEnd: () => ends++,
     onReset: () => resets++,
+    onLoaded: () => loaded++,
+    onError: (r) => errors.push(r),
     probe: opts.probe,
     timers,
     random: () => 0,
   });
-  /** Run the next timer that is due, moving the clock to it. */
+  /** The timers set and not cleared nor run. */
+  const live = () => all.filter((t) => !t.cleared);
+  /** Run the timer that is due first, moving the clock to it. A cleared
+   * timer runs nothing. */
   const tick = () => {
-    const t = pending.shift();
-    expect(t).toBeDefined();
-    clock += t!.ms;
-    if (!t!.cleared) t!.fn();
-    return t!.ms;
+    const pool = live().length > 0 ? live() : all;
+    expect(pool.length).toBeGreaterThan(0);
+    const t = pool.reduce((a, b) => (b.due < a.due ? b : a));
+    all.splice(all.indexOf(t), 1);
+    clock = Math.max(clock, t.due);
+    if (!t.cleared) t.fn();
+    return t.ms;
   };
   /** Move the clock on. */
   const advance = (ms: number) => {
     clock += ms;
   };
-  return { f, opened, pending, shown, tick, advance, ends: () => ends, resets: () => resets };
+  return {
+    f,
+    opened,
+    get pending() {
+      return live();
+    },
+    shown,
+    errors,
+    tick,
+    advance,
+    ends: () => ends,
+    resets: () => resets,
+    loaded: () => loaded,
+  };
 }
 
 /** Let a probe's answer arrive. */
@@ -477,5 +503,102 @@ describe("followLog", () => {
     // Events from a closed stream are ignored.
     h.opened[0]!.h.onChunk("late\n", "a1:9");
     expect(h.shown).toEqual([]);
+  });
+});
+
+// Regression: a finished try's log that was still on its way showed "No log
+// output was captured for this try.", and a log that could not be read said
+// the same.
+describe("followLog: loading and errors", () => {
+  it("is loaded on the first data, not on the tail notice before it", () => {
+    const h = harness({ outcome: () => "succeeded" });
+    h.opened[0]!.h.onOpen!();
+    h.opened[0]!.h.onTruncated!({ skippedBytes: 10, totalBytes: 20 });
+    expect(h.loaded()).toBe(0);
+    h.opened[0]!.h.onChunk("x\n", "a1:1");
+    expect(h.loaded()).toBe(1);
+    h.opened[0]!.h.onChunk("y\n", "a1:2");
+    expect(h.loaded()).toBe(1);
+  });
+
+  it("is loaded once an open stream stays quiet, or ends after it opened", () => {
+    const h = harness({ outcome: () => "failed" });
+    h.opened[0]!.h.onOpen!();
+    expect(h.loaded()).toBe(0);
+    expect(h.tick()).toBe(LOG_QUIET_MS);
+    expect(h.loaded()).toBe(1);
+    const h2 = harness({ outcome: () => "failed" });
+    h2.opened[0]!.h.onOpen!();
+    h2.opened[0]!.h.onEnd!();
+    expect(h2.loaded()).toBe(1);
+    expect(h2.errors).toEqual([]);
+  });
+
+  it("reports the server's error event; a later stream that opens clears it", () => {
+    const h = harness({ outcome: () => "running" });
+    h.opened[0]!.h.onOpen!();
+    h.opened[0]!.h.onError!("log storage read failed: timed out");
+    h.opened[0]!.h.onEnd!();
+    expect(h.errors).toEqual(["log storage read failed: timed out"]);
+    h.tick();
+    expect(h.opened).toHaveLength(2);
+    h.opened[1]!.h.onOpen!();
+    expect(h.errors).toEqual(["log storage read failed: timed out", null]);
+  });
+
+  it("a finished try's stream that closes before it opens is an error, with the server's status", async () => {
+    const h = harness({ outcome: () => "succeeded", probe: async () => 500 });
+    h.opened[0]!.h.onEnd!();
+    await settle();
+    expect(h.errors).toEqual(["the server answered 500"]);
+    expect(h.loaded()).toBe(0);
+    const down = harness({ outcome: () => "failed", probe: async () => null });
+    down.opened[0]!.h.onEnd!();
+    await settle();
+    expect(down.errors).toEqual(["the server did not answer"]);
+    const noProbe = harness({ outcome: () => "failed" });
+    noProbe.opened[0]!.h.onEnd!();
+    expect(noProbe.errors).toEqual(["the stream closed before it opened"]);
+  });
+
+  it("a running try's streams that keep failing to open are an error, and it keeps trying", () => {
+    const h = harness({ outcome: () => "running" });
+    for (let i = 0; i < 2; i++) {
+      h.opened[h.opened.length - 1]!.h.onEnd!();
+      h.tick();
+    }
+    expect(h.errors).toEqual([]);
+    h.opened[h.opened.length - 1]!.h.onEnd!();
+    expect(h.errors).toEqual(["the stream closed before it opened, 3 times in a row; trying again"]);
+    h.tick();
+    expect(h.opened).toHaveLength(4);
+    h.opened[3]!.h.onChunk("x\n", "a1:1");
+    expect(h.errors.at(-1)).toBeNull();
+    expect(h.loaded()).toBe(1);
+  });
+
+  it("a stream that does not open in time is an error, cleared when it opens late", () => {
+    const h = harness({ outcome: () => "succeeded" });
+    expect(h.tick()).toBe(LOG_OPEN_TIMEOUT_MS);
+    expect(h.errors).toEqual(["no answer from the server in 20 s"]);
+    h.opened[0]!.h.onChunk("x\n", "a1:1");
+    expect(h.errors).toEqual(["no answer from the server in 20 s", null]);
+    expect(h.shown).toEqual(["x\n"]);
+  });
+
+  it("a stream that opened and stays quiet past the timeout is not an error", () => {
+    const h = harness({ outcome: () => "succeeded" });
+    h.opened[0]!.h.onOpen!();
+    h.tick();
+    h.advance(LOG_OPEN_TIMEOUT_MS * 3);
+    expect(h.pending).toHaveLength(0);
+    expect(h.errors).toEqual([]);
+  });
+
+  it("close stops the open timeout", () => {
+    const h = harness({ outcome: () => "succeeded" });
+    h.f.close();
+    expect(h.pending).toHaveLength(0);
+    expect(h.errors).toEqual([]);
   });
 });

@@ -18,6 +18,17 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-20
+
+### Bug Fixes
+
+- **The log pane shows "Loading the log…" while a try's log is fetched.** It said "No log output
+  was captured for this try." before the first byte arrived. It says so now only after the server
+  ended the stream with nothing stored, or the stream stayed open and quiet. When the server
+  reports a read failure, the stream cannot be opened, or it does not open within 20 seconds, the
+  pane says "Could not load the log: <reason>." with a Retry button. Step, sidecar and service
+  logs.
+
 ## [0.6.0] - 2026-11-20
 
 ### Breaking changes
@@ -1928,7 +1939,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.4...v0.5.0
 [0.4.4]: https://github.com/thulasi-ram/scarab-ci/compare/v0.4.3...v0.4.4
