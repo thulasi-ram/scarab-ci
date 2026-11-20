@@ -177,7 +177,7 @@ async fn results_and_logs_go_through_a_step_key() {
 
         let resp = app
             .clone()
-            .oneshot(get(&format!("/v1/runs/r1/steps/{key}/logs/raw")))
+            .oneshot(get(&format!("/v1/runs/r1/steps/{key}/logs/raw?attempt=a1")))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "{id}");
@@ -220,7 +220,7 @@ async fn a_key_that_names_no_step_of_the_run_is_a_404() {
     for key in [&unknown, &other["build"]] {
         for path in [
             format!("/v1/runs/r1/steps/{key}/results"),
-            format!("/v1/runs/r1/steps/{key}/logs/raw"),
+            format!("/v1/runs/r1/steps/{key}/logs/raw?attempt=a1"),
         ] {
             let resp = app.clone().oneshot(get(&path)).await.unwrap();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
@@ -260,30 +260,26 @@ async fn gated_run() -> (
         db.clone(),
     ));
     let app = router(AppState::new(db.clone(), clock.clone(), logs));
-    let body = serde_json::json!({
-        "pipeline": {
-            "ir_version": 1,
-            "steps": [
-                { "id": "build", "image": "busybox", "command": ["true"] },
-                { "id": "approve", "gate": "manual", "needs": ["build"] }
-            ]
-        }
-    });
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/runs")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
+    // Seeded as the other gate tests seed one (run_gate_view.rs): `build`,
+    // then a manual gate `approve` that needs it.
+    let run = RunId("rg".into());
+    let now = clock.now().await;
+    let spec: scarab_engine::StepSpec = serde_json::from_value(
+        serde_json::json!({ "image": "busybox", "command": ["true"], "env": [] }),
+    )
+    .unwrap();
+    let build = StepId("build".into());
+    let approve = StepId("approve".into());
+    db.create_run(&run, 2, 1, now).await.unwrap();
+    db.create_step_run(&run, &build, Some(&spec), &[], now)
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let created: serde_json::Value = serde_json::from_str(&text(resp).await).unwrap();
-    let run = RunId(created["id"].as_str().unwrap().to_string());
+    db.create_step_run(&run, &approve, None, std::slice::from_ref(&build), now)
+        .await
+        .unwrap();
+    db.set_step_gate(&run, &approve, "manual", None)
+        .await
+        .unwrap();
     exec.script_outcome(ExecState::Succeeded);
     let sched = Scheduler::new(&*db as &dyn Db, &*clock as &dyn Clock, &*exec, "sched");
     for _ in 0..5 {
