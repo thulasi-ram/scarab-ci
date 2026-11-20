@@ -4,10 +4,21 @@
 
 use std::sync::Arc;
 
-use scarab_engine::{AttemptId, RunId, StepId};
+use scarab_engine::{AttemptId, MountedValue, MountedValueKind, RunId, StepId, Timestamp};
 use scarab_secrets::SecretScope;
-use scarab_server::{resolve_step_secrets, LogFence, LogService};
+use scarab_server::{resolve_step_secrets, LogService};
 use scarab_testkit::{FakeSecrets, InMemoryDb, InMemoryObjectStore};
+
+fn secret_values(env: &[(String, Vec<u8>)]) -> Vec<MountedValue> {
+    env.iter()
+        .map(|(_, v)| MountedValue {
+            kind: MountedValueKind::Secret,
+            value: v.clone(),
+            repo: None,
+            minted: None,
+        })
+        .collect()
+}
 
 fn scope() -> SecretScope {
     SecretScope::Repo {
@@ -22,28 +33,21 @@ async fn injected_secret_is_redacted_from_stored_and_streamed_logs() {
     let logs = LogService::new(Arc::new(InMemoryObjectStore::new()), db);
     let secrets = FakeSecrets::new().with_secret(&scope(), "TOKEN", b"sup3r-s3cret");
 
-    // Resolve the step's secret: it comes back as env AND is registered with the
-    // redactor.
+    // Resolve the step's secret; the launch records it in the unit's value
+    // ledger.
     let (run, step, attempt) = (
         RunId("run-1".into()),
         StepId("build".into()),
         AttemptId("a1".into()),
     );
-    let fence = LogFence::new(&run, &step, &attempt);
-    let env = resolve_step_secrets(
-        &secrets,
-        &logs,
-        Some(&fence),
-        &scope(),
-        &["TOKEN".to_string()],
-        false,
-    )
-    .await
-    .unwrap();
+    let env = resolve_step_secrets(&secrets, &scope(), &["TOKEN".to_string()], false)
+        .await
+        .unwrap();
     assert_eq!(env, vec![("TOKEN".to_string(), b"sup3r-s3cret".to_vec())]);
-
-    // Subscribe to the live stream before the step "logs" the secret.
-    let mut live = logs.subscribe(&run, &step, &attempt);
+    let unit = scarab_engine::LogStreamId::new(&run, &step, &attempt);
+    logs.record_launch_values(&unit, Some("h1"), secret_values(&env), Timestamp(0))
+        .await
+        .unwrap();
 
     // The step echoes its secret to stdout.
     logs.append(
@@ -54,15 +58,6 @@ async fn injected_secret_is_redacted_from_stored_and_streamed_logs() {
     )
     .await
     .unwrap();
-
-    // Streamed (live) chunk is redacted.
-    let streamed = live.try_recv().expect("a live chunk");
-    let streamed = String::from_utf8_lossy(&streamed);
-    assert!(
-        !streamed.contains("sup3r-s3cret"),
-        "streamed log leaked the secret: {streamed}"
-    );
-    assert!(streamed.contains("TOKEN=***"));
 
     // Stored (replayed) log is redacted too.
     let stored = logs.read_all(&run, &step, &attempt).await.unwrap();
@@ -89,20 +84,25 @@ async fn a_backend_diagnostic_is_redacted_like_a_log_chunk() {
         Arc::new(InMemoryObjectStore::new()),
         Arc::new(InMemoryDb::new()),
     );
-    logs.register_secret(
-        &LogFence::new(
-            &RunId("run-1".into()),
-            &StepId("build".into()),
-            &AttemptId("a1".into()),
-        ),
-        b"sup3r-s3cret",
+    let unit = scarab_engine::LogStreamId::new(
+        &RunId("run-1".into()),
+        &StepId("build".into()),
+        &AttemptId("a1".into()),
     );
+    logs.record_launch_values(
+        &unit,
+        Some("h1"),
+        secret_values(&[("T".into(), b"sup3r-s3cret".to_vec())]),
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
 
     // The shape a registry rejection actually takes: the credential is inside
     // the message the kubelet reports.
     let cause = "ErrImagePull: failed to pull \
                  https://user:sup3r-s3cret@registry.example.com/acme/builder:v9";
-    let redacted = logs.redact_text(cause);
+    let redacted = logs.redact_text_for_handle("h1", cause).await;
 
     assert!(
         !redacted.contains("sup3r-s3cret"),

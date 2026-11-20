@@ -31,8 +31,9 @@ pub struct RefusedRunDto {
     /// The trigger's headline: a push's commit subject, a dispatch reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// `compile`, `yanked`, `policy`, `environment`, `event_field`,
-    /// `forge_token`, `schedule` or `upstream` (a loop or too long a chain
+    /// `compile`, `when` (a `when:` that could not be decided), `yanked`,
+    /// `policy`, `environment`, `event_field`, `forge_token`, `sandbox`,
+    /// `approval_gate`, `schedule` or `upstream` (a loop or too long a chain
     /// of follow-ups).
     pub reason_kind: String,
     pub message: String,

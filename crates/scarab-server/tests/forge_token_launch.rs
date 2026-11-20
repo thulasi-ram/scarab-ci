@@ -35,6 +35,37 @@ fn step_run(id: &str) -> StepRun {
     }
 }
 
+/// The production stack `Forge(SecretInjecting(Ledger(inner)))` over
+/// `inner`, with its value ledger in `logs`: revocation reads the tokens
+/// from the ledger.
+fn stack(
+    inner: Arc<FakeExecutor>,
+    forge: Arc<FakeForge>,
+    logs: &Arc<LogService>,
+) -> Arc<dyn Executor> {
+    let db = logs.db().clone();
+    let secret_logs = logs.clone();
+    scarab_server::build_executor_stack(
+        inner,
+        logs.clone(),
+        Arc::new(scarab_testkit::FakeClock::new(1_000)),
+        move |ledger| {
+            scarab_server::SecretInjectingExecutor::new(
+                ledger,
+                db,
+                Arc::new(scarab_testkit::FakeSecrets::new()),
+                secret_logs,
+            )
+        },
+        move |with_secrets| ForgeCredentialExecutor::new(with_secrets, forge),
+    )
+}
+
+fn ledger_logs() -> Arc<LogService> {
+    let db: Arc<dyn Db> = Arc::new(InMemoryDb::new());
+    Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), db))
+}
+
 fn token_spec(access: ForgeToken) -> StepSpec {
     StepSpec {
         image: "ghcr.io/thulasi-ram/scarab-clone@sha256:abc".into(),
@@ -124,11 +155,10 @@ async fn each_launch_mints_a_credential_that_is_never_stored() {
 /// it stores `***`. A re-drive mints a new token, which is redacted too.
 #[tokio::test]
 async fn a_printed_forge_token_is_stored_redacted() {
-    let db: Arc<dyn Db> = Arc::new(InMemoryDb::new());
-    let logs = Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), db));
+    let logs = ledger_logs();
     let inner = Arc::new(FakeExecutor::new());
     let forge = Arc::new(FakeForge::new().with_minted_tokens());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge).with_logs(logs.clone());
+    let exec = stack(inner.clone(), forge, &logs);
     let spec = token_spec(ForgeToken::Read);
     let (run, step, attempt) = (
         RunId("r1".into()),
@@ -175,7 +205,7 @@ async fn a_minted_token_is_revoked_when_the_attempt_ends() {
     ] {
         let inner = Arc::new(FakeExecutor::new());
         let forge = Arc::new(FakeForge::new().with_minted_tokens());
-        let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
+        let exec = stack(inner.clone(), forge.clone(), &ledger_logs());
         let handle = exec
             .launch(&step_run("push"), &token_spec(ForgeToken::Write))
             .await
@@ -209,12 +239,34 @@ async fn a_minted_token_is_revoked_when_the_attempt_ends() {
 async fn a_cancelled_attempt_revokes_its_tokens_including_a_re_drives() {
     let inner = Arc::new(FakeExecutor::new());
     let forge = Arc::new(FakeForge::new().with_minted_tokens());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
+    let exec = stack(inner.clone(), forge.clone(), &ledger_logs());
     let spec = token_spec(ForgeToken::Read);
     let handle = exec.launch(&step_run("checkout/git"), &spec).await.unwrap();
+    let first = inner
+        .launched_spec(&handle)
+        .unwrap()
+        .forge_token
+        .unwrap()
+        .credential
+        .unwrap()
+        .token;
     exec.launch(&step_run("checkout/git"), &spec).await.unwrap();
+    let second = inner
+        .launched_spec(&handle)
+        .unwrap()
+        .forge_token
+        .unwrap()
+        .credential
+        .unwrap()
+        .token;
+    // The re-drive ends the token it replaced at once.
+    assert_eq!(forge.revoked(), vec![first.clone()]);
     exec.cancel(&handle).await.unwrap();
-    assert_eq!(forge.revoked().len(), 2, "both launches' tokens end");
+    let revoked = forge.revoked();
+    assert!(
+        revoked.contains(&first) && revoked.contains(&second),
+        "both launches' tokens end: {revoked:?}"
+    );
 }
 
 /// A library from a source `acme` trusts, stored in `acme`; its hash.

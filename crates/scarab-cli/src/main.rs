@@ -281,6 +281,16 @@ async fn logs(args: LogsArgs) -> i32 {
                                 }
                             }
                         }
+                        // The server's note about the log (a restarted
+                        // source, a part not stored): on stderr, so stdout
+                        // holds the step output only.
+                        Some("marker") => {
+                            let text = serde_json::from_str::<serde_json::Value>(&ev.data)
+                                .ok()
+                                .and_then(|v| v["text"].as_str().map(str::to_string))
+                                .unwrap_or(ev.data.clone());
+                            eprintln!("[scarab] {text}");
+                        }
                         Some(_) => {}
                     }
                 }

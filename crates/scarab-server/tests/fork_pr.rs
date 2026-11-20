@@ -2,13 +2,11 @@
 //! secrets and its OIDC subject is downgraded to `env/none`, while a trusted
 //! (same-repo) run keeps its secrets and target environment. Hermetic.
 
-use std::sync::Arc;
-
 use scarab_forge::{Event, RepoRef};
 use scarab_identity::Claims;
 use scarab_secrets::SecretScope;
-use scarab_server::{fork_policy, resolve_step_secrets, LogService};
-use scarab_testkit::{FakeSecrets, InMemoryDb, InMemoryObjectStore};
+use scarab_server::{fork_policy, resolve_step_secrets};
+use scarab_testkit::FakeSecrets;
 
 fn scope() -> SecretScope {
     SecretScope::Repo {
@@ -35,8 +33,6 @@ fn pr(fork: bool) -> Event {
 
 #[tokio::test]
 async fn fork_pr_is_locked_out_of_secrets_and_gets_env_none() {
-    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
-    let logs = LogService::new(Arc::new(InMemoryObjectStore::new()), db);
     let secrets = FakeSecrets::new().with_secret(&scope(), "TOKEN", b"top-secret");
     let keys = vec!["TOKEN".to_string()];
 
@@ -45,16 +41,9 @@ async fn fork_pr_is_locked_out_of_secrets_and_gets_env_none() {
     assert!(policy.secrets_locked_out);
     assert_eq!(policy.oidc_env, "none");
 
-    let env = resolve_step_secrets(
-        &secrets,
-        &logs,
-        None,
-        &scope(),
-        &keys,
-        policy.secrets_locked_out,
-    )
-    .await
-    .unwrap();
+    let env = resolve_step_secrets(&secrets, &scope(), &keys, policy.secrets_locked_out)
+        .await
+        .unwrap();
     assert!(env.is_empty(), "a fork PR must read no secrets");
 
     let subject = Claims::run_subject("acme", "app", &policy.oidc_env, "refs/pull/1/head");
@@ -67,15 +56,8 @@ async fn fork_pr_is_locked_out_of_secrets_and_gets_env_none() {
     let trusted = fork_policy(&pr(false), "prod");
     assert!(!trusted.secrets_locked_out);
     assert_eq!(trusted.oidc_env, "prod");
-    let env = resolve_step_secrets(
-        &secrets,
-        &logs,
-        None,
-        &scope(),
-        &keys,
-        trusted.secrets_locked_out,
-    )
-    .await
-    .unwrap();
+    let env = resolve_step_secrets(&secrets, &scope(), &keys, trusted.secrets_locked_out)
+        .await
+        .unwrap();
     assert_eq!(env, vec![("TOKEN".to_string(), b"top-secret".to_vec())]);
 }

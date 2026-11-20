@@ -2954,6 +2954,13 @@ pub const MAX_INVOKE_DEPTH: usize = 8;
 /// stops as soon as a count passes this, instead of building the whole list.
 pub const MAX_COMPILED_STEPS: usize = 1024;
 
+/// What the server puts between a step id and a sidecar's index to name the
+/// sidecar's log stream (`<step>::service-<i>`), and splits on to find the
+/// step again. A compiled step id may not contain it: the stream of a step
+/// `t[v=1]::service-0]` (a matrix value `1]::service-0`) would be read as a
+/// sidecar of step `t[v=1]` and redacted with that step's values.
+pub const SIDECAR_LOG_SEPARATOR: &str = "::service-";
+
 /// The most combinations one `matrix:` may have before `exclude` removes
 /// any. Kept combinations count against [`MAX_COMPILED_STEPS`]; this bounds
 /// the work of building and filtering the rest.
@@ -5896,6 +5903,40 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
     validate_with(ir, &BTreeMap::new())
 }
 
+/// One diagnostic for each compiled step id that contains
+/// [`SIDECAR_LOG_SEPARATOR`]: naming the matrix value that put it there
+/// (once, however many copies of the step carry it), else the id as
+/// written.
+fn sidecar_separator_errors(ir: &PipelineIr) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for step in ir
+        .steps
+        .iter()
+        .filter(|s| s.id.contains(SIDECAR_LOG_SEPARATOR))
+    {
+        let from_matrix = step
+            .matrix_values
+            .iter()
+            .find(|(k, v)| k.contains(SIDECAR_LOG_SEPARATOR) || v.contains(SIDECAR_LOG_SEPARATOR));
+        let message = match from_matrix {
+            Some((key, value)) => format!(
+                "step `{}`: matrix value `{key}: {value}` contains `{SIDECAR_LOG_SEPARATOR}`, \
+                 which Scarab uses to name a step's sidecar logs; a step id may not contain it",
+                step.id.split('[').next().unwrap_or(&step.id)
+            ),
+            None => format!(
+                "step `{}`: a step id may not contain `{SIDECAR_LOG_SEPARATOR}`, which Scarab \
+                 uses to name a step's sidecar logs",
+                step.id
+            ),
+        };
+        if !out.contains(&message) {
+            out.push(message);
+        }
+    }
+    out
+}
+
 /// [`validate`], given the `needs` each `build:` Step was written with
 /// (by id), for the replacement its diagnostic suggests; a Step not listed
 /// uses its compiled `needs`.
@@ -5940,6 +5981,7 @@ fn validate_with(
         }
         ids.insert(step.id.as_str());
     }
+    diagnostics.extend(sidecar_separator_errors(ir));
 
     let mut retired_builds = BTreeSet::new();
     for step in &ir.steps {
@@ -7425,6 +7467,50 @@ mod tests {
             .unwrap();
         assert_eq!(linux_amd.matrix_values.get("os").unwrap(), "linux");
         assert_eq!(linux_amd.matrix_values.get("arch").unwrap(), "amd64");
+    }
+
+    /// RT-m1: a matrix value holding the separator the server names sidecar
+    /// log streams with gives a step id whose stream reads as a sidecar of
+    /// another step (`t[v=1]::service-0]` of `t[v=1]`). The compiler
+    /// refuses it with one diagnostic naming the value; a step id written
+    /// with the separator is refused too.
+    #[test]
+    fn a_matrix_value_containing_the_sidecar_separator_is_refused() {
+        let diags = errors(
+            r#"
+            steps:
+              - id: t
+                image: busybox
+                matrix:
+                  dimensions:
+                    v: ["1", "1]::service-0"]
+                    os: [linux, mac]
+            "#,
+        );
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(
+            diags[0].contains("step `t`: matrix value `v: 1]::service-0` contains `::service-`"),
+            "{diags:?}"
+        );
+
+        let diags = errors("steps: [{ id: \"a::service-0\", image: busybox }]");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(
+            diags[0].contains("step `a::service-0`: a step id may not contain `::service-`"),
+            "{diags:?}"
+        );
+
+        // A value without the whole separator compiles.
+        compile(
+            r#"
+            steps:
+              - id: t
+                image: busybox
+                matrix:
+                  dimensions:
+                    v: ["a::b", "service-1", "x::service"]
+            "#,
+        );
     }
 
     #[test]

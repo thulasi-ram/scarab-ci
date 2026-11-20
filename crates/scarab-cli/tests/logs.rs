@@ -7,9 +7,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use scarab_engine::{
-    Attempt, AttemptId, AttemptOutcome, Db, LogChunkMeta, RunId, RunStatus, StepId, Timestamp,
-};
+use scarab_engine::{Attempt, AttemptId, AttemptOutcome, Db, RunId, RunStatus, StepId, Timestamp};
 use scarab_server::{router, AppState, LogService};
 use scarab_testkit::{FakeClock, InMemoryDb, InMemoryObjectStore};
 
@@ -114,19 +112,15 @@ async fn logs_exits_1_on_an_error_event() {
     let c0 = vec![b'a'; 300 * KIB];
     let (server, db, _) = serve(RunStatus::Succeeded, &[c0]).await;
     // A second chunk whose body is not in the object store.
-    db.append_log_chunk(
+    scarab_testkit::seed_log_row(
+        db.as_ref(),
         &RunId("r1".into()),
         &StepId("build".into()),
         &AttemptId("a1".into()),
-        &LogChunkMeta {
-            seq: 1,
-            byte_offset: 300 * KIB as u64,
-            len: 10,
-            object_key: "logs/missing".into(),
-        },
+        "logs/missing",
+        10,
     )
-    .await
-    .unwrap();
+    .await;
 
     let mut cmd = scarab_logs(&server);
     let out = tokio::task::spawn_blocking(move || cmd.output().expect("run scarab"))

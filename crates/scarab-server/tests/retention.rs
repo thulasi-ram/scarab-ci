@@ -16,9 +16,7 @@ use std::sync::Arc;
 
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
-use scarab_engine::{
-    AttemptId, Clock, Db, LogChunkMeta, RunId, RunStatus, StepId, StepStatus, Timestamp,
-};
+use scarab_engine::{AttemptId, Clock, Db, RunId, RunStatus, StepId, StepStatus, Timestamp};
 use scarab_server::retention::{sweep_retention, RetentionConfig};
 use scarab_storage::ObjectStore;
 use scarab_testkit::{FakeClock, InMemoryObjectStore};
@@ -47,19 +45,15 @@ async fn seed_run_with_log(
     }
     let key = format!("logs/{id}/s1/a1/0");
     store.put(&key, b"log-bytes".to_vec()).await.unwrap();
-    db.append_log_chunk(
+    scarab_testkit::seed_log_row(
+        db,
         &run,
         &StepId("s1".into()),
         &scarab_engine::AttemptId("a1".into()),
-        &LogChunkMeta {
-            seq: 0,
-            byte_offset: 0,
-            len: 9,
-            object_key: key,
-        },
+        &key,
+        9,
     )
-    .await
-    .unwrap();
+    .await;
 }
 
 #[tokio::test]
@@ -186,7 +180,14 @@ async fn sweeps_only_terminal_runs_past_ttl_and_keeps_metadata() {
         "blob deleted"
     );
     assert!(
-        db.log_object_keys_of_run(&gone).await.unwrap().is_empty(),
+        db.log_chunks(
+            &gone,
+            &StepId("s1".into()),
+            &scarab_engine::AttemptId("a1".into())
+        )
+        .await
+        .unwrap()
+        .is_empty(),
         "index dropped"
     );
     assert_eq!(
@@ -202,19 +203,27 @@ async fn sweeps_only_terminal_runs_past_ttl_and_keeps_metadata() {
     // The suspended run — same age — is untouched (lifecycle-keyed).
     assert!(store.get("logs/r-old-suspended/s1/a1/0").await.is_ok());
     assert_eq!(
-        db.log_object_keys_of_run(&RunId("r-old-suspended".into()))
-            .await
-            .unwrap()
-            .len(),
+        db.log_chunks(
+            &RunId("r-old-suspended".into()),
+            &StepId("s1".into()),
+            &scarab_engine::AttemptId("a1".into())
+        )
+        .await
+        .unwrap()
+        .len(),
         1
     );
 
     // The fresh terminal run is untouched (within TTL).
     assert_eq!(
-        db.log_object_keys_of_run(&RunId("r-fresh-done".into()))
-            .await
-            .unwrap()
-            .len(),
+        db.log_chunks(
+            &RunId("r-fresh-done".into()),
+            &StepId("s1".into()),
+            &scarab_engine::AttemptId("a1".into())
+        )
+        .await
+        .unwrap()
+        .len(),
         1
     );
 

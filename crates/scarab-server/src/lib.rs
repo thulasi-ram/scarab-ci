@@ -93,6 +93,7 @@ pub mod forge_token;
 pub mod infra_observer;
 pub mod libraries;
 pub mod library_fetch;
+pub mod log_ledger;
 pub mod log_stream;
 pub mod log_tail;
 pub mod logs;
@@ -132,8 +133,9 @@ pub mod step_up;
 pub mod workspaced;
 
 pub use infra_observer::{live_fences, InfraObserver};
+pub use log_ledger::{build_executor_stack, RedactionLedgerExecutor};
 pub use log_tail::{pump_log_stream, LogTailer};
-pub use logs::{LogFence, LogService};
+pub use logs::LogService;
 pub use secret_executor::SecretInjectingExecutor;
 
 /// The cold-tier Workspace-Snapshot retention default, in days — mirrors
@@ -2979,7 +2981,7 @@ async fn get_events(
     get,
     path = "/v1/runs/{id}/logs",
     params(("id" = String, Path, description = "run id")),
-    responses((status = 200, description = "SSE stream of step log output"))
+    responses((status = 200, description = "SSE stream of step log output (`data` events), with `event: marker` for each note the server stored with the log (data `{\"kind\",\"reason\"?,\"text\"}`, an id like a data event's)"))
 )]
 async fn get_logs(
     State(st): State<AppState>,
@@ -3046,7 +3048,7 @@ struct StepLogsQuery {
         ("tail" = Option<u64>, Query, description = "without a cursor, replay from the stored chunk that holds the byte this many bytes before the end: at least this many bytes, or the whole log (clamped to 1..67108864)")
     ),
     responses(
-        (status = 200, description = "SSE stream of this step's log output"),
+        (status = 200, description = "SSE stream of this step's log output (`data` events), with `event: marker` for each note the server stored with the log (data `{\"kind\",\"reason\"?,\"text\"}`, an id like a data event's)"),
         (status = 400, description = "malformed cursor, or a cursor naming an attempt outside the selection"),
         (status = 404, description = "no such run or step")
     )
@@ -3116,7 +3118,26 @@ struct RawLogsQuery {
     attempt: String,
     #[serde(default)]
     sidecar: Option<usize>,
+    /// `none`: the stored output bytes only, no marker lines.
+    #[serde(default)]
+    markers: Option<String>,
 }
+
+/// Whether a raw download writes marker lines: yes, unless `?markers=none`.
+/// Any other value is a 400.
+fn raw_markers(q: Option<&str>) -> Result<bool, ApiError> {
+    match q {
+        None | Some("lines") => Ok(true),
+        Some("none") => Ok(false),
+        Some(other) => Err(ApiError::BadRequest(format!(
+            "markers must be `none` or `lines`, not {other:?}"
+        ))),
+    }
+}
+
+/// The header a raw download carries: how many marker rows the stored log
+/// has, whether or not their lines are in the body.
+pub const LOG_MARKERS_HEADER: &str = "x-scarab-log-markers";
 
 /// `s` cut to 64 characters, each one not an ASCII letter, digit, `-` or `_`
 /// replaced by `_`: safe inside a quoted `Content-Disposition` filename.
@@ -3154,9 +3175,12 @@ fn raw_service_log_filename(run: &RunId, service: &str, take: i64) -> String {
     )
 }
 
-/// One stored log stream as a plain-text attachment, streamed in chunk order
-/// from the object store with the next chunks fetched ahead
-/// ([`LogService::read_chunks`]). Shared by the step and the service raw
+/// One stored log stream as a plain-text attachment, streamed in row order
+/// from the object store with the next bodies fetched ahead
+/// ([`LogService::read_chunks`]). A marker row is written as
+/// `\n[scarab] <text>\n` unless `markers` is false (`?markers=none`: the
+/// stored output bytes exactly); the count of marker rows is in the
+/// [`LOG_MARKERS_HEADER`] either way. Shared by the step and the service raw
 /// routes.
 async fn raw_log_response(
     st: &AppState,
@@ -3164,10 +3188,27 @@ async fn raw_log_response(
     read_step: &StepId,
     attempt: &scarab_engine::AttemptId,
     filename: &str,
+    markers: bool,
 ) -> Result<Response, ApiError> {
     let index = st.logs.chunks(run, read_step, attempt).await?;
-    let mut bodies = st.logs.read_chunks(index);
-    // The first chunk is read before the response starts, so a missing body
+    let marker_count = index.iter().filter(|r| !r.is_output()).count();
+    let index: Vec<_> = index
+        .into_iter()
+        .filter(|r| markers || r.is_output())
+        .collect();
+    let lines: Vec<Option<Vec<u8>>> = index
+        .iter()
+        .map(|r| (!r.is_output()).then(|| crate::logs::marker_line(r)))
+        .collect();
+    let mut bodies = st
+        .logs
+        .read_chunks(index)
+        .zip(stream::iter(lines))
+        .map(|(body, line)| match line {
+            Some(line) => Ok(line),
+            None => body,
+        });
+    // The first row is read before the response starts, so a missing body
     // is a 500 rather than a short download; a later one aborts the body.
     let first = bodies.next().await.transpose()?;
     let rest = bodies.map(|item| {
@@ -3176,6 +3217,7 @@ async fn raw_log_response(
     });
     let body = stream::iter(first.map(|b| Ok::<_, std::io::Error>(Bytes::from(b)))).chain(rest);
     Response::builder()
+        .header(LOG_MARKERS_HEADER, marker_count.to_string())
         .header(
             axum::http::header::CONTENT_TYPE,
             "text/plain; charset=utf-8",
@@ -3202,11 +3244,12 @@ async fn raw_log_response(
         ("id" = String, Path, description = "run id"),
         ("step" = String, Path, description = "a step key (preferred) or the authored step id, percent-encoded"),
         ("attempt" = String, Query, description = "the attempt id (required)"),
-        ("sidecar" = Option<usize>, Query, description = "a sidecar service by its index in the step's services (default = the step's main container)")
+        ("sidecar" = Option<usize>, Query, description = "a sidecar service by its index in the step's services (default = the step's main container)"),
+        ("markers" = Option<String>, Query, description = "`none`: the stored output bytes exactly, with no `[scarab] …` marker lines; default: marker rows are written as `[scarab] <text>` lines")
     ),
     responses(
-        (status = 200, description = "the try's log as text/plain, sent as an attachment", content_type = "text/plain"),
-        (status = 400, description = "no attempt given"),
+        (status = 200, description = "the try's log as text/plain, sent as an attachment; the X-Scarab-Log-Markers header counts the log's marker rows", content_type = "text/plain"),
+        (status = 400, description = "no attempt given, or `markers` is not `none` or `lines`"),
         (status = 404, description = "no such run, step or attempt")
     )
 )]
@@ -3240,7 +3283,8 @@ async fn get_step_logs_raw(
         None => step.clone(),
     };
     let filename = raw_log_filename(&run, try_no, q.sidecar);
-    raw_log_response(&st, &run, &read_step, &attempt, &filename).await
+    let markers = raw_markers(q.markers.as_deref())?;
+    raw_log_response(&st, &run, &read_step, &attempt, &filename, markers).await
 }
 
 /// The shared services of a run's **current Take**, name-ordered —
@@ -3309,7 +3353,7 @@ struct ServiceLogsQuery {
         ("tail" = Option<u64>, Query, description = "without a cursor, replay from the stored chunk that holds the byte this many bytes before the end: at least this many bytes, or the whole log (clamped to 1..67108864)")
     ),
     responses(
-        (status = 200, description = "SSE stream of this service's log output"),
+        (status = 200, description = "SSE stream of this service's log output (`data` events), with `event: marker` for each note the server stored with the log (data `{\"kind\",\"reason\"?,\"text\"}`, an id like a data event's)"),
         (status = 400, description = "malformed cursor, or a cursor for another Take"),
         (status = 404, description = "no such run or service")
     )
@@ -3343,6 +3387,9 @@ async fn get_service_logs(
 struct ServiceRawLogsQuery {
     #[serde(default)]
     take: Option<i64>,
+    /// `none`: the stored output bytes only, no marker lines.
+    #[serde(default)]
+    markers: Option<String>,
 }
 
 /// The shared service instance a log route reads: a requested Take, else the
@@ -3378,10 +3425,12 @@ fn service_take(
     params(
         ("id" = String, Path, description = "run id"),
         ("service" = String, Path, description = "declared service name"),
-        ("take" = Option<i64>, Query, description = "restrict to one Take generation (default = current)")
+        ("take" = Option<i64>, Query, description = "restrict to one Take generation (default = current)"),
+        ("markers" = Option<String>, Query, description = "`none`: the stored output bytes exactly, with no `[scarab] …` marker lines; default: marker rows are written as `[scarab] <text>` lines")
     ),
     responses(
-        (status = 200, description = "the service's log as text/plain, sent as an attachment", content_type = "text/plain"),
+        (status = 200, description = "the service's log as text/plain, sent as an attachment; the X-Scarab-Log-Markers header counts the log's marker rows", content_type = "text/plain"),
+        (status = 400, description = "`markers` is not `none` or `lines`"),
         (status = 404, description = "no such run, or no such service (at that Take)")
     )
 )]
@@ -3399,7 +3448,8 @@ async fn get_service_logs_raw(
     let take = service_take(&services, &service, q.take)?;
     let (step, attempt) = crate::logs::service_stream_key(&service, take);
     let filename = raw_service_log_filename(&run, &service, take);
-    raw_log_response(&st, &run, &step, &attempt, &filename).await
+    let markers = raw_markers(q.markers.as_deref())?;
+    raw_log_response(&st, &run, &step, &attempt, &filename, markers).await
 }
 
 /// Map a rerun/retry outcome to the API's error space (the success half rides
@@ -4960,11 +5010,13 @@ fn origin_pr_base(event: &scarab_forge::Event) -> Option<String> {
 /// (empty when there is no config, or no pipeline's trigger matches).
 ///
 /// Pipelines are evaluated independently and in a deterministic (path-sorted)
-/// order; a file that fails to compile fails the whole trigger (a broken
-/// pipeline is a submit-time error, ADR-0009), so a repo's CI is all-or-nothing
-/// per delivery rather than silently partial. A pipeline that admission
+/// order. Every file is compiled before any Run is created: a file that
+/// fails to compile fails the whole trigger and nothing runs (a broken
+/// pipeline is a submit-time error, ADR-0009), and the check of every
+/// pipeline the event would have started fails on the commit. A pipeline
+/// whose `when:` cannot be decided, or that admission
 /// **refuses** (a disallowed ref, an unknown Environment, an ineligible
-/// Project — ADR-0037, ADR-0071) is skipped on its own and never aborts the
+/// Project — ADR-0037, ADR-0071), is skipped on its own and never aborts the
 /// delivery: the other pipelines still run.
 ///
 /// `ports` are the stores admission reads ([`AdmissionPorts`]).
@@ -5167,8 +5219,9 @@ pub struct RefusedPipeline {
     pub messages: Vec<String>,
 }
 
-/// What one delivery did: the Runs it created and the deploy pipelines the
-/// Environment refused. A `RefNotAllowed` skip is not listed — a
+/// What one delivery did: the Runs it created and the pipelines refused (by
+/// an Environment, a Policy, or a `when:` that could not be decided). A
+/// `RefNotAllowed` skip is not listed — a
 /// branch-scoped Environment ignoring other branches is the rule working.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TriggerOutcome {
@@ -5281,11 +5334,15 @@ pub(crate) async fn trigger_runs_from_files(
     let installed = installed_libraries(ports.libraries, ports.plugins, &repo.owner)
         .await
         .map_err(TriggerError::Db)?;
+    // Every Pipeline file is compiled before any Run is created. A file that
+    // does not compile fails the whole delivery and nothing runs (ADR-0009).
+    let mut compiled: Vec<(&String, scarab_pipeline::PipelineIr)> = Vec::new();
+    let mut broken: Vec<(&String, &str, String)> = Vec::new();
     for (path, yaml) in files {
         let yaml = yaml.as_str();
         // A library (`kind: library`, ADR-0076 §2) runs only where it is
         // invoked, wherever it sits under `.scarab/`.
-        if scarab_pipeline::is_library(&yaml) {
+        if scarab_pipeline::is_library(yaml) {
             continue;
         }
         // A follow-up already started by an earlier delivery of the same
@@ -5295,42 +5352,55 @@ pub(crate) async fn trigger_runs_from_files(
         {
             continue;
         }
-
         // Pre-fetch transitive `invoke:` libraries at this ref and compile
         // (ADR-0038) — the shared read-at-ref → compile primitive also used by
         // the manual/api dispatch path.
-        let ir = record_compile_failure(
+        match prefetch_libs_and_compile(forge, repo, &git_ref, yaml, &installed).await {
+            Ok(ir) => compiled.push((path, ir)),
+            Err(TriggerError::Pipeline(text)) => broken.push((path, yaml, text)),
+            Err(e) => return Err(e),
+        }
+    }
+    if let Some((first_broken, _, first_text)) = broken.first() {
+        let error = TriggerError::Pipeline(first_text.clone());
+        let delivery = DeliveryTrigger {
+            forge,
+            event,
+            kind: kind.as_str(),
+        };
+        refuse_uncompiled_delivery(
             db,
             clock,
-            event,
-            path,
-            prefetch_libs_and_compile(forge, repo, &git_ref, &yaml, &installed).await,
+            &delivery,
+            &compiled,
+            &broken,
+            (&mut ctx, &mut paths),
         )
-        .await?;
+        .await;
+        tracing::warn!(
+            org = %repo.owner,
+            project = %repo.name,
+            pipeline = %first_broken,
+            "no pipeline run: a pipeline file does not compile"
+        );
+        return Err(error);
+    }
 
-        // The trigger is matched first, with a pull request's paths not yet
-        // asked for (unknown), so a Pipeline whose trigger does not match
-        // (another kind, a false branch test) costs no files request. Only a
-        // match that may have rested on the unknown paths asks, once per
-        // delivery, and is decided again with the answer.
-        let trigger_matches = |ctx: &serde_json::Value| {
-            scarab_pipeline::matches_trigger(&ir, kind.as_str(), ctx)
-                .map_err(|e| TriggerError::Pipeline(e.to_string()))
-        };
-        if !trigger_matches(&ctx)? {
-            continue;
-        }
-        if let (
-            scarab_forge::ChangedPaths::Unknown(scarab_forge::PathsUnknown::NotFetched),
-            scarab_forge::Event::PullRequest { number, .. },
-        ) = (&paths, event)
-        {
-            if scarab_pipeline::reads_changed_paths(&ir, kind.as_str()) {
-                paths = pull_request_paths(forge, repo, *number).await;
-                paths.apply_to(&mut ctx);
-                if !trigger_matches(&ctx)? {
-                    continue;
-                }
+    let delivery = DeliveryTrigger {
+        forge,
+        event,
+        kind: kind.as_str(),
+    };
+    for (path, ir) in compiled {
+        // A `when:` that cannot be decided refuses this Pipeline only: it is
+        // recorded and its check fails, and the files after it are still
+        // evaluated (git-bug 2a680c8).
+        match delivery.decide(&ir, &mut ctx, &mut paths).await {
+            TriggerDecision::Matches => {}
+            TriggerDecision::NoMatch => continue,
+            TriggerDecision::Undecided(message) => {
+                refuse_undecided_when(db, clock, event, path, &ir, message, &mut outcome).await;
+                continue;
             }
         }
         // A chain of follow-ups stops at a pipeline already in it (a loop)
@@ -5354,6 +5424,16 @@ pub(crate) async fn trigger_runs_from_files(
                 None
             };
             if let Some(message) = refusal {
+                enqueue_refusal_status(
+                    db,
+                    clock,
+                    event,
+                    path,
+                    &name,
+                    &message,
+                    &repo_page_path(&repo.owner, &repo.name),
+                )
+                .await;
                 let errors = vec![CompileErrorDto::other(message.clone())];
                 record_refusal(db, clock, event, path, "upstream", message, &errors).await;
                 continue;
@@ -5363,9 +5443,16 @@ pub(crate) async fn trigger_runs_from_files(
         // Step-level `when:` guards against the event context (ADR-0009, 0033):
         // guarded-off steps are kept in the DAG but marked Skipped, so the engine
         // transitively skips their descendants. A pipeline whose every step is
-        // excluded starts no run.
-        let excluded = scarab_pipeline::excluded_steps(&ir, &ctx)
-            .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
+        // excluded starts no run. A guard that cannot be decided refuses this
+        // Pipeline only, as a trigger's `when:` does.
+        let excluded = match scarab_pipeline::excluded_steps(&ir, &ctx) {
+            Ok(excluded) => excluded,
+            Err(e) => {
+                let message = format!("a Step's `when:` could not be decided: {e}");
+                refuse_undecided_when(db, clock, event, path, &ir, message, &mut outcome).await;
+                continue;
+            }
+        };
         if excluded.len() == ir.steps.len() {
             continue;
         }
@@ -5376,9 +5463,28 @@ pub(crate) async fn trigger_runs_from_files(
         // skips this pipeline only (the dispatch path turns the same refusal
         // into a fail-closed error). Webhook-triggered runs supply no launch
         // parameters.
-        match admit_and_create_run(forge, db, clock, ports, event, &ir, path, &excluded, None)
-            .await?
-        {
+        let admission =
+            admit_and_create_run(forge, db, clock, ports, event, &ir, path, &excluded, None)
+                .await?;
+        // A refused Pipeline posts its check as `failure`, saying why, so a
+        // required check does not wait for a Run that will not come.
+        if let Admission::Refused(refusal) = &admission {
+            if let Some((description, target_path)) =
+                admission_refusal_status(refusal, &repo.owner, &repo.name)
+            {
+                enqueue_refusal_status(
+                    db,
+                    clock,
+                    event,
+                    path,
+                    &run_pipeline_name(&ir, path),
+                    &description,
+                    &target_path,
+                )
+                .await;
+            }
+        }
+        match admission {
             Admission::Created(run) => {
                 record_path_filter_note(db, clock, &run, &ir, kind.as_str(), &ctx, &paths).await;
                 if complete {
@@ -5414,17 +5520,6 @@ pub(crate) async fn trigger_runs_from_files(
                     decision_id: None,
                     messages: Vec::new(),
                 });
-                // The commit shows it too: a `failure` status on the check
-                // line this pipeline's Runs use.
-                enqueue_refusal_status(
-                    db,
-                    clock,
-                    event,
-                    path,
-                    &run_pipeline_name(&ir, path),
-                    refusal,
-                )
-                .await;
             }
             // ADR-0075 §9: a `run.create` Policy denied this Run. Its
             // decision is in the org's decision log; the body names it and
@@ -6015,29 +6110,300 @@ async fn record_compile_failure<T>(
     compiled
 }
 
-/// Outbox kind of the commit status for a pipeline an Environment refused on
-/// a forge event. [`drain_forge_statuses`] posts it beside the Runs'
-/// statuses, with the same retries and dead-lettering.
+/// Outbox kind of the commit status for a pipeline refused on a forge
+/// event: it did not compile, its `when:` could not be decided, a chain of
+/// follow-ups refused it, or admission refused it. [`drain_forge_statuses`]
+/// posts it beside the Runs' statuses, with the same retries and
+/// dead-lettering.
 pub const REFUSAL_STATUS: &str = "refusal_status";
 
-/// Queue a `failure` commit status on the event's commit for a deploy
-/// pipeline refused as `UnknownEnvironment` or `NotEligible`, under the
-/// context a Run of the pipeline posts under, so the refusal shows on the
-/// check line the Run would have used. The text says what an org admin must
-/// do, and the link opens the org's Environment settings.
+/// The `failure` status text and link for an admission refusal: what an
+/// org admin must do and the org's Environment settings for an Environment
+/// refusal, the refusal's message and the repository page (where the
+/// refused Run is listed) for every other one.
 ///
-/// Every other refusal queues nothing: `RefNotAllowed` is a branch-scoped
-/// Environment ignoring other branches, and a red status on every feature
-/// branch push would say nothing new. An event with no commit has nothing to
-/// post on. A failed enqueue is logged and the delivery goes on.
+/// `RefNotAllowed` posts nothing: it is a branch-scoped Environment
+/// ignoring other branches, and a red status on every feature branch push
+/// would say nothing new.
+fn admission_refusal_status(
+    refusal: &AdmissionRefusal,
+    org: &str,
+    project: &str,
+) -> Option<(String, String)> {
+    match refusal {
+        AdmissionRefusal::RefNotAllowed => None,
+        AdmissionRefusal::UnknownEnvironment { environment } => Some((
+            format!(
+                "environment `{environment}` does not exist in org `{org}`: an org admin must \
+                 create it and make `{project}` eligible"
+            ),
+            format!("/orgs/{org}/settings/environments"),
+        )),
+        AdmissionRefusal::NotEligible { environment } => Some((
+            format!(
+                "`{project}` may not deploy to environment `{environment}`: an org admin must \
+                 make `{project}` eligible"
+            ),
+            format!("/orgs/{org}/settings/environments/{environment}"),
+        )),
+        AdmissionRefusal::PolicyDenied { .. }
+        | AdmissionRefusal::LibraryYanked { .. }
+        | AdmissionRefusal::EventField { .. }
+        | AdmissionRefusal::ForgeToken { .. }
+        | AdmissionRefusal::Sandbox { .. }
+        | AdmissionRefusal::MissingApprovalGate { .. } => Some((
+            admission_refusal_message(refusal, org, project),
+            repo_page_path(org, project),
+        )),
+    }
+}
+
+/// The web UI's page for a repository, `/<org>/<repo>`: its Runs list shows
+/// the refused Runs.
+fn repo_page_path(org: &str, project: &str) -> String {
+    format!(
+        "/{}/{}",
+        scarab_pipeline::url_path_segment(org),
+        scarab_pipeline::url_path_segment(project)
+    )
+}
+
+/// The `name:` a Pipeline file declares, read without compiling it, else its
+/// file name: the name a Run of it would post its status under. For a file
+/// that did not compile.
+fn declared_pipeline_name(yaml: &str, path: &str) -> String {
+    #[derive(Deserialize)]
+    struct ShallowName {
+        #[serde(default)]
+        name: Option<String>,
+    }
+    serde_yaml::from_str::<ShallowName>(yaml)
+        .ok()
+        .and_then(|s| s.name)
+        .unwrap_or_else(|| bare_pipeline_name(path))
+}
+
+/// Whether a Pipeline file that did not compile may still be meant for a
+/// `kind` event: its `on:` names `kind`, or `on:` itself cannot be read.
+/// A broken manual-only Pipeline does not fail a check on every push.
+fn may_trigger_on(yaml: &str, kind: &str) -> bool {
+    match scarab_pipeline::triggers_of(yaml) {
+        Ok(on) => on.0.contains_key(kind),
+        Err(_) => true,
+    }
+}
+
+/// The first diagnostic of a compile error's text, on one line.
+fn first_diagnostic(text: &str) -> String {
+    let first = compile_errors(text)
+        .into_iter()
+        .next()
+        .map_or_else(|| text.to_string(), |e| e.message);
+    first.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// How a compiled Pipeline's trigger answers one delivery.
+#[derive(Debug, PartialEq)]
+enum TriggerDecision {
+    /// The trigger matches: the delivery starts a Run of the Pipeline,
+    /// unless a later rule (a Step's `when:`, admission) refuses it.
+    Matches,
+    /// The trigger does not match: the delivery starts nothing for it.
+    NoMatch,
+    /// The trigger's `when:` could not be decided; the text says why.
+    Undecided(String),
+}
+
+/// The delivery whose Pipelines' triggers are decided: the event, its
+/// trigger kind, and the forge a pull request's changed paths are asked of.
+struct DeliveryTrigger<'a> {
+    forge: &'a dyn scarab_forge::ForgePort,
+    event: &'a scarab_forge::Event,
+    kind: &'a str,
+}
+
+impl DeliveryTrigger<'_> {
+    /// Decide `ir`'s trigger for this delivery: the one rule for a delivery
+    /// that starts Runs and for one a file that does not compile stopped
+    /// ([`refuse_uncompiled_delivery`]), so the two cannot answer
+    /// differently.
+    ///
+    /// The trigger is matched first with a pull request's paths not yet
+    /// asked for (unknown), so a Pipeline whose trigger does not match
+    /// (another kind, a false branch test) costs no files request. Only a
+    /// match that may have rested on the unknown paths asks, once per
+    /// delivery (`ctx` and `paths` keep the answer for the next Pipeline),
+    /// and is decided again with the answer.
+    async fn decide(
+        &self,
+        ir: &scarab_pipeline::PipelineIr,
+        ctx: &mut serde_json::Value,
+        paths: &mut scarab_forge::ChangedPaths,
+    ) -> TriggerDecision {
+        let kind = self.kind;
+        let decide = |ctx: &serde_json::Value| match scarab_pipeline::matches_trigger(ir, kind, ctx)
+        {
+            Ok(true) => TriggerDecision::Matches,
+            Ok(false) => TriggerDecision::NoMatch,
+            Err(e) => TriggerDecision::Undecided(format!(
+                "the `when:` of its `{kind}` trigger could not be decided: {e}"
+            )),
+        };
+        let first = decide(ctx);
+        if first != TriggerDecision::Matches {
+            return first;
+        }
+        if let (
+            scarab_forge::ChangedPaths::Unknown(scarab_forge::PathsUnknown::NotFetched),
+            scarab_forge::Event::PullRequest { repo, number, .. },
+        ) = (&*paths, self.event)
+        {
+            if scarab_pipeline::reads_changed_paths(ir, kind) {
+                *paths = pull_request_paths(self.forge, repo, *number).await;
+                paths.apply_to(ctx);
+                return decide(ctx);
+            }
+        }
+        first
+    }
+}
+
+/// A delivery in which a Pipeline file does not compile starts no Run
+/// (ADR-0009), and no required check may wait on the commit for one: each
+/// file that does not compile is recorded as a refused Run and fails its
+/// check with its first diagnostic, and every other Pipeline this delivery
+/// would have started fails its check as not run, naming the file that
+/// broke the delivery (git-bug e5089fd).
+///
+/// "Would have started" is its trigger decided as a delivery that starts
+/// Runs decides it ([`DeliveryTrigger::decide`], with the same one pull
+/// request paths request): a match fails the check; a trigger that does not
+/// match posts nothing, so a Pipeline kept to `main` by its `when:` gets no
+/// red check on a feature branch because another file is broken; a `when:`
+/// that cannot be decided fails the check, as the Pipeline may have run. A
+/// file that does not compile cannot be decided: it fails its check when
+/// its `on:` names the event or cannot be read ([`may_trigger_on`]).
+async fn refuse_uncompiled_delivery(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    delivery: &DeliveryTrigger<'_>,
+    compiled: &[(&String, scarab_pipeline::PipelineIr)],
+    broken: &[(&String, &str, String)],
+    (ctx, paths): (&mut serde_json::Value, &mut scarab_forge::ChangedPaths),
+) {
+    let (event, kind) = (delivery.event, delivery.kind);
+    let Some(repo) = event.repo() else {
+        return;
+    };
+    let Some((first_broken, _, _)) = broken.first() else {
+        return;
+    };
+    let target_path = repo_page_path(&repo.owner, &repo.name);
+    for (path, yaml, text) in broken {
+        if may_trigger_on(yaml, kind) {
+            enqueue_refusal_status(
+                db,
+                clock,
+                event,
+                path,
+                &declared_pipeline_name(yaml, path),
+                &first_diagnostic(text),
+                &target_path,
+            )
+            .await;
+        }
+        let message = format!("pipeline: {text}");
+        let errors = compile_errors(&message);
+        record_refusal(db, clock, event, path, "compile", message, &errors).await;
+    }
+    let not_run = format!("not run: {first_broken} failed to compile");
+    for (path, ir) in compiled {
+        // A `when:` that cannot be decided fails closed: the Pipeline may
+        // have run.
+        if delivery.decide(ir, ctx, paths).await != TriggerDecision::NoMatch {
+            enqueue_refusal_status(
+                db,
+                clock,
+                event,
+                path,
+                &run_pipeline_name(ir, path),
+                &not_run,
+                &target_path,
+            )
+            .await;
+        }
+    }
+}
+
+/// Refuse a Pipeline whose `when:` (its trigger's or a Step's) could not be
+/// decided for `event`: the refused Run is recorded, the delivery body names
+/// it, and its check fails on the commit. The files after it are still
+/// evaluated (git-bug 2a680c8).
+async fn refuse_undecided_when(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    event: &scarab_forge::Event,
+    path: &str,
+    ir: &scarab_pipeline::PipelineIr,
+    message: String,
+    outcome: &mut TriggerOutcome,
+) {
+    let Some(repo) = event.repo() else {
+        return;
+    };
+    tracing::warn!(
+        org = %repo.owner,
+        project = %repo.name,
+        pipeline = %path,
+        trigger = event.trigger_kind().as_str(),
+        "pipeline not run: {message}"
+    );
+    enqueue_refusal_status(
+        db,
+        clock,
+        event,
+        path,
+        &run_pipeline_name(ir, path),
+        &format!("{path}: {message}"),
+        &repo_page_path(&repo.owner, &repo.name),
+    )
+    .await;
+    outcome.refused.push(RefusedPipeline {
+        pipeline: path.to_string(),
+        environment: ir.environment.clone(),
+        reason: message.clone(),
+        decision_id: None,
+        messages: Vec::new(),
+    });
+    let errors = vec![CompileErrorDto::other(message.clone())];
+    record_refusal(db, clock, event, path, "when", message, &errors).await;
+}
+
+/// Queue a `failure` commit status on the event's commit for a pipeline
+/// that `event` did not start, under the context a Run of the pipeline
+/// posts under, so the check line the Run would have used resolves.
+/// `description` says why (capped to what a forge accepts); `target_path`
+/// is the UI page that shows it.
+///
+/// The idempotency key is the repository, commit, context, description and
+/// the id `event` gives a Run of the pipeline ([`run_id_for`]). A
+/// redelivered `run_finished` derives the same id and queues nothing new (a
+/// redelivered webhook is stopped earlier, by the replay guard). Every other
+/// event gets a new id, so a refusal on a commit where a later Run of the
+/// pipeline has since posted its own status is posted again, and the check
+/// does not keep that Run's status (git-bug e5089fd). An event with no
+/// commit has nothing to post on. A failed enqueue is logged and the
+/// delivery goes on.
 async fn enqueue_refusal_status(
     db: &dyn Db,
     clock: &dyn Clock,
     event: &scarab_forge::Event,
     path: &str,
     pipeline_name: &str,
-    refusal: &AdmissionRefusal,
+    description: &str,
+    target_path: &str,
 ) {
+    use sha2::{Digest, Sha256};
     let Some(repo) = event.repo() else {
         return;
     };
@@ -6046,36 +6412,26 @@ async fn enqueue_refusal_status(
         return;
     };
     let (org, project) = (&repo.owner, &repo.name);
-    let (description, target_path) = match refusal {
-        AdmissionRefusal::UnknownEnvironment { environment } => (
-            format!(
-                "environment `{environment}` does not exist in org `{org}`: an org admin must \
-                 create it and make `{project}` eligible"
-            ),
-            format!("/orgs/{org}/settings/environments"),
-        ),
-        AdmissionRefusal::NotEligible { environment } => (
-            format!(
-                "`{project}` may not deploy to environment `{environment}`: an org admin must \
-                 make `{project}` eligible"
-            ),
-            format!("/orgs/{org}/settings/environments/{environment}"),
-        ),
-        _ => return,
-    };
+    let context = status_context(Some(pipeline_name));
+    let description = scarab_forge::cap_status_description(description);
     let run = run_id_for(event, path);
+    let digest = Sha256::digest(format!(
+        "{org}/{project}\n{sha}\n{context}\n{description}\n{}",
+        run.0
+    ));
+    let key: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
     let msg = scarab_engine::OutboxMessage {
         id: scarab_engine::OutboxId(0),
-        run: run.clone(),
+        run,
         kind: REFUSAL_STATUS.to_string(),
         payload: serde_json::json!({
             "repo": { "owner": org, "name": project },
             "sha": sha,
-            "context": status_context(Some(pipeline_name)),
-            "description": scarab_forge::cap_status_description(&description),
+            "context": context,
+            "description": description,
             "target_path": target_path,
         }),
-        idempotency_key: format!("{REFUSAL_STATUS}:{}", run.0),
+        idempotency_key: format!("{REFUSAL_STATUS}:{key}"),
         at: clock.now().await,
     };
     if let Err(e) = db.enqueue_outbox(&msg).await {
@@ -7817,12 +8173,14 @@ async fn write_run_from_ir(
 /// idempotent on the forge). Returns how many statuses were posted.
 ///
 /// It posts the [`REFUSAL_STATUS`] messages the same way: the `failure` on a
-/// commit whose deploy pipeline an Environment refused.
+/// commit whose pipeline the event did not start (it did not compile, or was
+/// refused).
 ///
 /// `public_url` is Scarab's public base URL: every status carries the
 /// **required** deep-link back to its run (`{public_url}/<org>/<repo>/runs/{id}`,
 /// ADR-0046) — a status without a way back to its run is a dead end. A
-/// refusal has no Run; its link opens the org's Environment settings.
+/// refusal has no Run; its link opens the repository page, or the org's
+/// Environment settings for an Environment refusal.
 pub async fn drain_forge_statuses(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
@@ -8486,6 +8844,10 @@ async fn github_webhook(
         Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => {
             return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true }))));
         }
+        // A supported event that starts nothing (a closed pull request, ...).
+        Err(scarab_forge::ForgeError::Ignored(why)) => {
+            return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": why }))));
+        }
         Err(e) => return Err(ApiError::BadRequest(e.to_string())),
     };
     ingest_event(&st, event).await
@@ -8548,6 +8910,9 @@ async fn forgejo_webhook(
         Ok(e) => e,
         Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => {
             return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true }))));
+        }
+        Err(scarab_forge::ForgeError::Ignored(why)) => {
+            return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": why }))));
         }
         Err(e) => return Err(ApiError::BadRequest(e.to_string())),
     };
@@ -14416,15 +14781,13 @@ pub async fn connection_credential(
 }
 
 /// Resolve a step's scoped secrets and prepare them for injection (ADR-0014,
-/// 0013): fetch each `key` at `scope` from `provider`, **register its value with
-/// the log redactor** for the step's log stream `fence` so it can never appear
-/// in its stored or streamed log, and return the values as `(key, value)`
-/// pairs, the value bytes as stored. The executor writes each one as a file
-/// under `/scarab/secrets/`.
+/// 0013): fetch each `key` at `scope` from `provider` and return the values
+/// as `(key, value)` pairs, the value bytes as stored. The executor writes
+/// each one as a file under `/scarab/secrets/`. The value ledger records
+/// them from the launch spec before the executor writes them, so the log
+/// pipeline redacts them (git-bug 2d78464).
 pub async fn resolve_step_secrets(
     provider: &dyn scarab_secrets::SecretProvider,
-    logs: &LogService,
-    fence: Option<&LogFence>,
     scope: &scarab_secrets::SecretScope,
     keys: &[String],
     locked_out: bool,
@@ -14439,9 +14802,6 @@ pub async fn resolve_step_secrets(
         // `resolve` (not `get`) so an env-scoped run inherits repo/org secrets
         // (ADR-0037); the exact scope is tried first, so exact hits are unchanged.
         let secret = provider.resolve(scope, key).await?;
-        if let Some(fence) = fence {
-            logs.register_secret(fence, &secret.value);
-        }
         env.push((key.clone(), secret.value));
     }
     Ok(env)

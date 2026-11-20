@@ -140,11 +140,18 @@ impl scarab_engine::Executor for RefusingExec {
         Ok(None)
     }
 
-    async fn take_forge_credential(
+    async fn delete_unit_secrets(
         &self,
         _handle: &scarab_engine::ports::ExecHandle,
-    ) -> Result<Option<scarab_engine::MountedForgeCredential>, scarab_engine::ExecError> {
-        Ok(None)
+    ) -> Result<(), scarab_engine::ExecError> {
+        Ok(())
+    }
+
+    async fn log_source_state(
+        &self,
+        _src: &scarab_engine::LogSourceRef,
+    ) -> Result<scarab_engine::LogSourceState, scarab_engine::ExecError> {
+        Ok(scarab_engine::LogSourceState::Gone)
     }
     async fn workspace_provisioning(
         &self,

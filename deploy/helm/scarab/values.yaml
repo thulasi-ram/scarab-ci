@@ -215,7 +215,9 @@ scarab:
   # cluster refuses a Pod that:
   #   - mounts or reads (Secret volume, projected Secret, env secretKeyRef,
   #     envFrom secretRef) a Secret other than its own per-Pod Secrets
-  #     (`<pod>-secrets`, `-token`, `-registry`, `-oidc`, `-workspace`) or one
+  #     (`<pod>-v-secrets`, `-v-token`, `-v-registry`, `-v-oidc`, `-workspace`,
+  #     and the names a server before 0.7 wrote: `<pod>-secrets`, `-token`,
+  #     `-registry`, `-oidc`) or one
   #     `placement` names;
   #   - runs as a ServiceAccount other than `default` or one `placement` names;
   #   - has a hostPath volume, hostNetwork, hostPID or hostIPC.

@@ -849,6 +849,110 @@ async fn an_install_of_a_version_fetched_again_since_its_review_is_refused() {
     assert_eq!(i["resolved_commit"], C2);
 }
 
+/// A tag moved to a commit where the file did not change: the fetch stores
+/// no new version. It says the content is unchanged and answers the new ref
+/// and commit; an install naming the same hash in `replaces` moves the
+/// installation there, its source too, and keeps its id. Pipelines compiled
+/// after the move inline the same content. The same ref and commit again
+/// would change nothing and is refused.
+#[tokio::test]
+async fn the_same_file_at_another_commit_moves_the_installation() {
+    let h = harness();
+    for (git_ref, commit) in [("v1.1.0", C1), ("v1.2.0", C2)] {
+        h.http.serve_url(
+            &format!("https://api.github.com/repos/acme/libs/commits?sha={git_ref}&per_page=1"),
+            &format!(r#"[{{"sha":"{commit}","commit":{{"message":"one"}}}}]"#),
+        );
+        h.http
+            .serve_url(&raw("acme", "libs", commit, "deploy.yaml"), V1);
+    }
+    let file = "github.com/acme/libs//deploy.yaml";
+    let (st, b) = fetch(&h, json!({ "source": file, "ref": "v1.1.0" })).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["content_unchanged"], false, "nothing is installed: {b}");
+    let (st, i) = install(
+        &h,
+        json!({
+            "name": DEPLOY,
+            "content_hash": content_hash(V1),
+            "requested_ref": b["requested_ref"],
+            "resolved_commit": b["resolved_commit"],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{i}");
+    assert_eq!(i["source"], format!("{file}@{C1}"));
+
+    let (st, b) = fetch(&h, json!({ "source": file, "ref": "v1.2.0" })).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["content_hash"], content_hash(V1));
+    assert_eq!(b["content_unchanged"], true, "{b}");
+    assert_eq!(b["requested_ref"], "v1.2.0");
+    assert_eq!(b["resolved_commit"], C2);
+    assert_eq!(b["source"], format!("{file}@{C2}"));
+    assert_eq!(b["current"]["requested_ref"], "v1.1.0");
+    assert_eq!(b["current"]["resolved_commit"], C1);
+    assert_eq!(b["current"]["source"], format!("{file}@{C1}"));
+    let diff = b["diff"].as_str().unwrap();
+    assert!(
+        !diff.lines().any(|l| l.starts_with(['+', '-'])),
+        "no line changed: {diff}"
+    );
+
+    let move_to_v120 = json!({
+        "name": DEPLOY,
+        "content_hash": content_hash(V1),
+        "replaces": content_hash(V1),
+        "requested_ref": b["requested_ref"],
+        "resolved_commit": b["resolved_commit"],
+    });
+    let (st, moved) = install(&h, move_to_v120.clone()).await;
+    assert_eq!(st, StatusCode::OK, "{moved}");
+    assert_eq!(moved["id"], i["id"], "a move keeps the installation's id");
+    assert_eq!(moved["content_hash"], content_hash(V1));
+    assert_eq!(moved["requested_ref"], "v1.2.0");
+    assert_eq!(moved["resolved_commit"], C2);
+    assert_eq!(moved["source"], format!("{file}@{C2}"));
+    let (st, all) = call(&h.app, "GET", "/v1/orgs/acme/libraries", None).await;
+    assert_eq!(st, StatusCode::OK, "{all}");
+    assert_eq!(all["installations"][0]["requested_ref"], "v1.2.0");
+    assert_eq!(all["installations"][0]["resolved_commit"], C2);
+    assert_eq!(all["installations"][0]["source"], format!("{file}@{C2}"));
+    // Runs inline by content: the same file, now named at the new commit.
+    let compiled = h.store.installed_for_compile("acme").await.unwrap();
+    assert_eq!(compiled[DEPLOY].content, V1);
+    assert_eq!(compiled[DEPLOY].source, format!("{file}@{C2}"));
+
+    // Installed at v1.2.0 already: nothing would change.
+    let (st, b) = install(&h, move_to_v120).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    let why = b.to_string();
+    assert!(why.contains("nothing would change"), "{why}");
+    assert!(why.contains("v1.2.0 → 2222222"), "{why}");
+    let (st, b) = fetch(&h, json!({ "source": file, "ref": "v1.2.0" })).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["content_unchanged"], true, "{b}");
+    assert_eq!(b["current"]["resolved_commit"], C2);
+
+    // Back to v1.1.0 is a move like any other.
+    let (st, b) = fetch(&h, json!({ "source": file, "ref": "v1.1.0" })).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    let (st, back) = install(
+        &h,
+        json!({
+            "name": DEPLOY,
+            "content_hash": content_hash(V1),
+            "replaces": content_hash(V1),
+            "requested_ref": b["requested_ref"],
+            "resolved_commit": b["resolved_commit"],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{back}");
+    assert_eq!(back["requested_ref"], "v1.1.0");
+    assert_eq!(back["resolved_commit"], C1);
+}
+
 /// The org's connection cannot reach the repository (a GitHub App not
 /// installed on it answers 404). A public file is still read, anonymously;
 /// a file that is not public either is refused with both reasons.
@@ -1363,6 +1467,141 @@ async fn a_wrong_carry_grants_is_refused_before_the_step_up_is_asked() {
         )
         .await;
     assert_eq!(st, StatusCode::OK, "{b}");
+}
+
+/// Moving an installation to another commit of a file that did not change
+/// goes through the same checks as an upgrade: the source's grants carry,
+/// so the install names them, before any step-up is asked; the step-up and
+/// the `op.completed` record name both commits. Asked to move where it is
+/// already, it is refused, and nothing is confirmed.
+#[tokio::test]
+async fn moving_to_another_commit_carries_grants_and_names_both_commits() {
+    use scarab_identity::{Role, Scope};
+    let store = Arc::new(InMemoryLibraries::new());
+    let source = trusted_version(store.as_ref()).await;
+    let libs = store.clone();
+    let h = step_up_harness::harness_with(move |st| st.with_libraries(libs));
+    h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
+    let s = h.browser_session(step_up_harness::owner("amy")).await;
+    let mut soft = step_up_harness::passkey();
+    h.enroll(&s, &mut soft, "Laptop").await;
+    h.open_window(&s, &mut soft).await;
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/library-installations",
+            Some(json!({
+                "name": DEPLOY,
+                "content_hash": content_hash(V1),
+                "carry_grants": ["forge_credentials"]
+            })),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["resolved_commit"], C1);
+
+    // The same file fetched at v1.2.0, which points to C2.
+    store
+        .put_version(&LibraryVersion {
+            org: "acme".into(),
+            content_hash: content_hash(V1),
+            content: V1.into(),
+            source: format!("{}@{C2}", trust_key(&source)),
+            name: DEPLOY.into(),
+            fetched_by: "amy".into(),
+            fetched_at: 2,
+            requested_ref: Some("v1.2.0".into()),
+            resolved_commit: C2.into(),
+        })
+        .await
+        .unwrap();
+    // A new session, the window aged out.
+    h.clock.advance(60 * 60 * 1000);
+    let s = h.browser_session(step_up_harness::owner("amy")).await;
+    let move_body = |carry: Value| {
+        json!({
+            "name": DEPLOY,
+            "content_hash": content_hash(V1),
+            "replaces": content_hash(V1),
+            "requested_ref": "v1.2.0",
+            "resolved_commit": C2,
+            "carry_grants": carry,
+        })
+    };
+    let refused_before = h.events("step_up.refused").await.len();
+    let authorised_before = h.events("op.authorised").await.len();
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/library-installations",
+            Some(move_body(json!([]))),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    assert!(b.to_string().contains("forge_credentials"), "{b}");
+    assert_eq!(h.events("step_up.refused").await.len(), refused_before);
+    assert_eq!(h.events("op.authorised").await.len(), authorised_before);
+
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/library-installations",
+            Some(move_body(json!(["forge_credentials"]))),
+            &s,
+        )
+        .await;
+    step_up_harness::assert_step_up(st, &b, "window");
+    h.open_window(&s, &mut soft).await;
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/library-installations",
+            Some(move_body(json!(["forge_credentials"]))),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["requested_ref"], "v1.2.0");
+    assert_eq!(b["resolved_commit"], C2);
+    assert_eq!(b["source"], format!("{}@{C2}", trust_key(&source)));
+
+    let authorised = h.events("op.authorised").await;
+    let moved = authorised
+        .iter()
+        .filter(|e| e.op.as_deref() == Some("library.install"))
+        .find(|e| e.detail.to_string().contains("v1.2.0"))
+        .unwrap_or_else(|| panic!("no authorised move: {authorised:?}"));
+    assert_eq!(
+        moved.detail["summary"]["changes"][1],
+        "fetched at = 1111111 to v1.2.0 → 2222222"
+    );
+    let completed = h.events("op.completed").await;
+    let moved = completed
+        .iter()
+        .filter(|e| e.op.as_deref() == Some("library.install"))
+        .find(|e| e.detail["replaced"].is_object())
+        .unwrap_or_else(|| panic!("no completed move: {completed:?}"));
+    assert_eq!(moved.detail["carried_grants"], json!(["forge_credentials"]));
+    assert_eq!(moved.detail["replaced"]["content_hash"], content_hash(V1));
+    assert_eq!(moved.detail["replaced"]["resolved_commit"], C1);
+    assert_eq!(moved.detail["replaced"]["fetched_as"], "1111111");
+    assert_eq!(moved.detail["version"]["resolved_commit"], C2);
+    assert_eq!(moved.detail["version"]["fetched_as"], "v1.2.0 → 2222222");
+
+    // Where it is already: refused, nothing confirmed.
+    let authorised_before = h.events("op.authorised").await.len();
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/library-installations",
+            Some(move_body(json!(["forge_credentials"]))),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    assert_eq!(h.events("op.authorised").await.len(), authorised_before);
 }
 
 /// A library store that trusts `deploy.yaml`'s source with the build

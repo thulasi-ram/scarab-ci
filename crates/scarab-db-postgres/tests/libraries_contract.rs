@@ -60,6 +60,10 @@ contract_test!(
     an_installation_keeps_the_ref_and_commit_it_was_installed_with,
     refs
 );
+contract_test!(
+    the_same_content_installed_over_itself_moves_to_its_new_commit,
+    moves
+);
 
 const C_MAIN: &str = "1a2b3c4d5e6f7a8b9c0d1a2b3c4d5e6f7a8b9c0d";
 const C_TAG: &str = "9f8e7d6c5b4a39281706f9e8d7c6b5a493827160";
@@ -151,6 +155,65 @@ async fn refs(store: &dyn LibraryStore) {
     assert_eq!(up.id, i.id);
     assert_eq!(up.requested_ref.as_deref(), Some("v1.3.0"));
     assert_eq!(up.resolved_commit, C_TAG);
+}
+
+/// The same content fetched from the same file at another commit, then
+/// installed over itself: the installation moves to that ref and commit, its
+/// source pinned there, and keeps its id. What Pipelines compile against
+/// names the same commit. The version keeps its first source.
+async fn moves(store: &dyn LibraryStore) {
+    let file = "github.com/acme/libs//deploy.yaml";
+    let v = store
+        .put_version(&LibraryVersion {
+            requested_ref: Some("v1.1.0".into()),
+            ..version("acme", V1, &format!("{file}@{C_MAIN}"))
+        })
+        .await
+        .unwrap();
+    let mut new = install("acme", &v.content_hash, 10);
+    new.requested_ref = v.requested_ref.clone();
+    new.resolved_commit = v.resolved_commit.clone();
+    let i = store.install(&new, &Replaces::Nothing).await.unwrap();
+    assert_eq!(i.source, format!("{file}@{C_MAIN}"));
+
+    let v = store
+        .put_version(&LibraryVersion {
+            requested_ref: Some("v1.2.0".into()),
+            ..version("acme", V1, &format!("{file}@{C_TAG}"))
+        })
+        .await
+        .unwrap();
+    assert_eq!(v.source, format!("{file}@{C_MAIN}"));
+    assert_eq!(v.pinned_source(), format!("{file}@{C_TAG}"));
+    let mut moved = install("acme", &v.content_hash, 11);
+    moved.requested_ref = v.requested_ref.clone();
+    moved.resolved_commit = v.resolved_commit.clone();
+    let m = store
+        .install(&moved, &Replaces::Version(v.content_hash.clone()))
+        .await
+        .unwrap();
+    assert_eq!(m.id, i.id);
+    assert_eq!(m.content_hash, i.content_hash);
+    assert_eq!(m.requested_ref.as_deref(), Some("v1.2.0"));
+    assert_eq!(m.resolved_commit, C_TAG);
+    assert_eq!(m.source, format!("{file}@{C_TAG}"));
+    assert_eq!(m.installed_at, 11);
+    for found in [
+        store
+            .installation("acme", "acme::libs::deploy")
+            .await
+            .unwrap(),
+        store.installation_by_id("acme", &i.id).await.unwrap(),
+        store.installations("acme").await.unwrap().pop(),
+    ] {
+        assert_eq!(found.as_ref(), Some(&m));
+    }
+    let compiled = store.installed_for_compile("acme").await.unwrap();
+    assert_eq!(compiled["acme::libs::deploy"].content, V1);
+    assert_eq!(
+        compiled["acme::libs::deploy"].source,
+        format!("{file}@{C_TAG}")
+    );
 }
 
 /// Migration 0095 is expand-only: a server from before it reads trust with

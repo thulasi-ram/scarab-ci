@@ -45,11 +45,15 @@ impl Executor for CapturingExec {
         Ok(None)
     }
 
-    async fn take_forge_credential(
+    async fn delete_unit_secrets(&self, _handle: &ExecHandle) -> Result<(), ExecError> {
+        Ok(())
+    }
+
+    async fn log_source_state(
         &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
-        Ok(None)
+        _src: &scarab_engine::LogSourceRef,
+    ) -> Result<scarab_engine::LogSourceState, ExecError> {
+        Ok(scarab_engine::LogSourceState::Gone)
     }
 
     async fn workspace_provisioning(
@@ -113,13 +117,26 @@ fn step_in_attempt(run: &str) -> StepRun {
     }
 }
 
-/// Some open log stream, so a diagnostic is redacted with its values.
-fn any_fence() -> scarab_server::LogFence {
-    scarab_server::LogFence::new(
-        &RunId("r1".into()),
-        &StepId("s1".into()),
-        &scarab_engine::AttemptId("a1".into()),
+/// Give the unit behind handle `h` a ledger holding `value`, as its launch
+/// would: a diagnostic about it is redacted with its values.
+async fn ledger_for_h(logs: &LogService, value: &[u8]) {
+    logs.record_launch_values(
+        &scarab_engine::LogStreamId::new(
+            &RunId("r1".into()),
+            &StepId("s1".into()),
+            &scarab_engine::AttemptId("a1".into()),
+        ),
+        Some("h"),
+        vec![scarab_engine::MountedValue {
+            kind: scarab_engine::MountedValueKind::Secret,
+            value: value.to_vec(),
+            repo: None,
+            minted: None,
+        }],
+        scarab_engine::Timestamp(0),
     )
+    .await
+    .unwrap();
 }
 
 fn spec_with_secret() -> StepSpec {
@@ -324,11 +341,15 @@ impl Executor for SpecCapturingExec {
         Ok(None)
     }
 
-    async fn take_forge_credential(
+    async fn delete_unit_secrets(&self, _handle: &ExecHandle) -> Result<(), ExecError> {
+        Ok(())
+    }
+
+    async fn log_source_state(
         &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
-        Ok(None)
+        _src: &scarab_engine::LogSourceRef,
+    ) -> Result<scarab_engine::LogSourceState, ExecError> {
+        Ok(scarab_engine::LogSourceState::Gone)
     }
 
     async fn workspace_provisioning(
@@ -453,8 +474,14 @@ async fn a_printed_oidc_token_is_stored_redacted() {
     let issuer = Arc::new(Rs256Issuer::generate("https://scarab.example").unwrap());
     let inner = Arc::new(SpecCapturingExec::default());
     let logs = logs(db.clone());
-    let exec = SecretInjectingExecutor::new(
+    // The ledger layer under it records the token before the backend.
+    let ledger = Arc::new(scarab_server::RedactionLedgerExecutor::new(
         inner.clone(),
+        logs.clone(),
+        Arc::new(scarab_testkit::FakeClock::new(1_000)),
+    ));
+    let exec = SecretInjectingExecutor::new(
+        ledger,
         db.clone() as Arc<dyn Db>,
         Arc::new(FakeSecrets::new()),
         logs.clone(),
@@ -590,11 +617,15 @@ impl Executor for ConditionExec {
         )))
     }
 
-    async fn take_forge_credential(
+    async fn delete_unit_secrets(&self, _handle: &ExecHandle) -> Result<(), ExecError> {
+        Ok(())
+    }
+
+    async fn log_source_state(
         &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
-        Ok(None)
+        _src: &scarab_engine::LogSourceRef,
+    ) -> Result<scarab_engine::LogSourceState, ExecError> {
+        Ok(scarab_engine::LogSourceState::Gone)
     }
 
     async fn workspace_provisioning(
@@ -645,7 +676,7 @@ impl Executor for ConditionExec {
 async fn the_decorator_forwards_and_scrubs_the_infra_condition() {
     let db = Arc::new(InMemoryDb::new());
     let logs = logs(db.clone());
-    logs.register_secret(&any_fence(), b"sup3r-s3cret");
+    ledger_for_h(&logs, b"sup3r-s3cret").await;
     let exec = SecretInjectingExecutor::new(
         Arc::new(ConditionExec),
         db.clone() as Arc<dyn Db>,
@@ -673,7 +704,7 @@ async fn the_decorator_forwards_and_scrubs_the_infra_condition() {
 async fn the_decorator_scrubs_the_failure_cause() {
     let db = Arc::new(InMemoryDb::new());
     let logs = logs(db.clone());
-    logs.register_secret(&any_fence(), b"sup3r-s3cret");
+    ledger_for_h(&logs, b"sup3r-s3cret").await;
     let exec = SecretInjectingExecutor::new(
         Arc::new(ConditionExec),
         db.clone() as Arc<dyn Db>,

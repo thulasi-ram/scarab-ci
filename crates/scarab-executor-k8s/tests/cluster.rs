@@ -26,7 +26,7 @@
 //! code recorded, and a second `launch` of the same fence re-attaches to the
 //! existing Pod rather than creating a new one.
 
-use scarab_engine::ports::{ExecHandle, ExecState, FailureClass, LogFrom, LogRedactions};
+use scarab_engine::ports::{ExecHandle, ExecState, FailureClass, LogFrom};
 use scarab_engine::{
     Attempt, AttemptId, AttemptOutcome, Executor, RunId, StepId, StepRun, StepSpec, StepStatus,
     Timestamp,
@@ -3649,116 +3649,60 @@ async fn a_needs_step_with_a_uid_pinned_service_can_write_its_workspace() {
     }
 }
 
-/// LIVE (J-1, round 2 judge S7): a control plane that tails a step it did not
-/// launch reads the step's secret values back from the step's own Secrets,
-/// so it redacts them as the launching replica does. A second executor (a
-/// fresh client, nothing in memory from the launch) returns the step's
-/// secret values, the registry dockerconfigjson, the forge token and the
-/// OIDC token; a Pod with no secrets
-/// returns none; once the Attempt ends and its Secrets are deleted it
-/// answers `Gone`, never "none".
+/// LIVE (85b29e0): a step Pod carries the value-ledger label and mounts its
+/// credentials from the `-v-` Secrets; a second executor (nothing in memory
+/// from the launch) opens its log and reads its source state without
+/// reading any Secret; the Attempt-end delete removes the Secrets by name.
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
-async fn log_redactions_reads_the_values_back_from_another_executor() {
+async fn a_labelled_step_pod_is_read_by_another_executor() {
     let ns = enter_tier();
+    let client = kube_client().await;
+    let launcher = K8sExecutor::with_client(ns.clone(), client.clone());
+    let peer = K8sExecutor::with_client(ns.clone(), kube_client().await);
 
-    let launcher = K8sExecutor::with_client(ns.clone(), kube_client().await);
-    let peer = K8sExecutor::with_client(ns, kube_client().await);
-
-    let step = step_run_of(&unique_run("run-redact"), "redact");
-    let mut spec = busybox_spec("sleep 30", true);
+    let step = step_run_of(&unique_run("run-ledger"), "ledger");
+    let mut spec = busybox_spec("echo hello; sleep 5", true);
     spec.secrets = vec!["DB_PASSWORD".into()];
     spec.resolved_secrets =
-        scarab_engine::ResolvedSecrets(vec![("DB_PASSWORD".into(), "sekret-db-redact".into())]);
-    spec.registry_auth = Some(scarab_engine::RegistryAuthConfig {
-        owner: "acme".into(),
-        name: "web".into(),
-        library: Some("ab".repeat(32)),
-        credential_eligible: true,
-        derived_auth: Some(scarab_engine::RegistryCredential {
-            registry: "ghcr.io".into(),
-            username: "x-access-token".into(),
-            token: "sekret-registry-token".into(),
-        }),
-        ..Default::default()
-    });
-    spec.forge_token = Some(scarab_engine::ForgeTokenConfig {
-        access: scarab_pipeline::ForgeToken::Read,
-        owner: "acme".into(),
-        name: "web".into(),
-        read_only: false,
-        trusted_library: None,
-        credential: Some(scarab_engine::ForgeCredential {
-            username: "x-access-token".into(),
-            token: "sekret-forge-redact".into(),
-            minted: false,
-        }),
-    });
-    spec.oidc_token = Some("sekret-oidc-redact".into());
+        scarab_engine::ResolvedSecrets(vec![("DB_PASSWORD".into(), "sekret-db-ledger".into())]);
     let h = launcher.launch(&step, &spec).await.expect("launch");
+    let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+        kube::Api::namespaced(client.clone(), &ns);
+    let pod = pods.get(&h.0).await.expect("the Pod");
+    assert!(scarab_executor_k8s::has_value_ledger_label(&pod));
 
-    let values = match peer.log_redactions(&step).await.expect("log_redactions") {
-        LogRedactions::Values(values) => values,
-        LogRedactions::Gone => panic!("the Secrets exist"),
-    };
-    for value in [
-        &b"sekret-db-redact"[..],
-        b"sekret-forge-redact",
-        b"sekret-oidc-redact",
-    ] {
-        assert!(
-            values.iter().any(|v| v == value),
-            "{}: {values:?}",
-            String::from_utf8_lossy(value)
-        );
-    }
-    // The forge username is not a credential.
-    assert!(values.iter().all(|v| v != b"x-access-token"));
-    // The launching replica registers the token and `base64(user:token)`;
-    // the server extracts both from the dockerconfigjson returned here.
-    use base64::Engine as _;
-    let auth =
-        base64::engine::general_purpose::STANDARD.encode("x-access-token:sekret-registry-token");
-    assert!(
-        values.iter().any(|v| {
-            serde_json::from_slice::<serde_json::Value>(v)
-                .is_ok_and(|j| j["auths"]["ghcr.io"]["auth"] == auth.as_str())
-        }),
-        "the registry dockerconfigjson: {:?}",
-        values
-            .iter()
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .collect::<Vec<_>>()
-    );
-
-    // The Attempt ends: its Secrets are deleted. The Pod still references
-    // them, so the answer is `Gone`, not "no values".
-    launcher
-        .take_forge_credential(&h)
-        .await
-        .expect("attempt-end hook");
-    let mut after = peer.log_redactions(&step).await.expect("log_redactions");
-    for _ in 0..10 {
-        if after == LogRedactions::Gone {
+    let mut chunks = None;
+    for _ in 0..60 {
+        if let Ok(Some(c)) = peer.log_stream(&step, LogFrom::Start).await {
+            chunks = Some(c);
             break;
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        after = peer.log_redactions(&step).await.expect("log_redactions");
     }
-    assert_eq!(after, LogRedactions::Gone);
-    launcher.cancel(&h).await.expect("cleanup");
-
-    // A Pod with no secrets: none.
-    let plain = step_run_of(&unique_run("run-redact-none"), "plain");
-    let hp = launcher
-        .launch(&plain, &busybox_spec("true", true))
+    let mut chunks = chunks.expect("the log opens");
+    let first = chunks.next_chunk().await.expect("read").expect("bytes");
+    assert!(String::from_utf8_lossy(&first).contains("hello"));
+    let state = peer
+        .log_source_state(&scarab_engine::LogSourceRef::Step(step.clone()))
         .await
-        .expect("launch");
-    assert_eq!(
-        peer.log_redactions(&plain).await.expect("log_redactions"),
-        LogRedactions::Values(Vec::new())
+        .expect("state");
+    assert!(
+        !matches!(state, scarab_engine::LogSourceState::Gone),
+        "{state:?}"
     );
-    launcher.cancel(&hp).await.expect("cleanup");
+
+    launcher
+        .delete_unit_secrets(&h)
+        .await
+        .expect("attempt-end hook");
+    let secrets: kube::Api<k8s_openapi::api::core::v1::Secret> = kube::Api::namespaced(client, &ns);
+    assert!(secrets
+        .get_opt(&format!("{}-v-secrets", h.0))
+        .await
+        .expect("get")
+        .is_none());
+    launcher.cancel(&h).await.expect("cleanup");
 }
 
 /// LIVE (RT-R2-1): an overlay that keeps to the author's fields and makes a
@@ -3807,13 +3751,16 @@ async fn an_overlay_kubernetes_refuses_fails_the_step() {
 /// ServiceAccount, and no host namespace or path. The test impersonates that
 /// ServiceAccount (`SCARAB_TEST_SERVER_USER`, in `SCARAB_TEST_STEP_NAMESPACE`):
 ///
-/// - a Pod the executor builds is admitted, and so is one that mounts all
-///   five of its own per-Pod Secrets (a dry run: admission runs, nothing is
-///   stored);
+/// - a Pod the executor builds with per-Pod Secrets (`-v-secrets`,
+///   `-v-oidc`) is admitted, and so is one that mounts all nine names a
+///   Pod's own Secrets may have: the four `-v-` names and `-workspace` this
+///   version writes, and the four a server before 0.7 wrote (a dry run:
+///   admission runs, nothing is stored);
 /// - a Pod that mounts the server's Secret (the chart names it, like the
-///   ServiceAccount, after the release), reads it through envFrom or
-///   secretKeyRef, runs as the server's ServiceAccount, or asks for
-///   hostPath or hostNetwork is refused, naming the policy;
+///   ServiceAccount, after the release) or another Pod's `-v-` Secret,
+///   reads it through envFrom or secretKeyRef, runs as the server's
+///   ServiceAccount, or asks for hostPath or hostNetwork is refused, naming
+///   the policy;
 /// - the same refused Pod created by the test's own (admin) user is
 ///   admitted: the policy holds only the server's creates;
 /// - the executor's launch of a step the policy refuses (a placement
@@ -3862,32 +3809,54 @@ async fn the_step_pod_admission_policy_holds_server_created_pods_to_their_own_se
         serde_json::from_value(value).expect("a Pod")
     };
 
-    // Admitted: all five per-Pod Secrets, by every kind of reference.
-    let own: Vec<String> = ["secrets", "token", "registry", "oidc", "workspace"]
-        .iter()
-        .map(|s| format!("{name}-{s}"))
-        .collect();
+    // Admitted: all nine names of its own per-Pod Secrets, by every kind of
+    // reference.
+    let own: Vec<String> = [
+        "v-secrets",
+        "v-token",
+        "v-registry",
+        "v-oidc",
+        "workspace",
+        "secrets",
+        "token",
+        "registry",
+        "oidc",
+    ]
+    .iter()
+    .map(|s| format!("{name}-{s}"))
+    .collect();
     let admitted = pod(serde_json::json!({
         "volumes": [
             {"name": "s", "secret": {"secretName": own[0]}},
             {"name": "p", "projected": {"sources": [{"secret": {"name": own[1]}}, {"secret": {"name": own[2]}}]}},
             {"name": "w", "secret": {"secretName": own[4]}},
+            {"name": "legacy-s", "secret": {"secretName": own[5]}},
+            {"name": "legacy-p", "projected": {"sources": [{"secret": {"name": own[6]}}, {"secret": {"name": own[7]}}]}},
         ],
         "containers": [{
             "name": "step", "image": "busybox:latest", "command": ["true"],
-            "env": [{"name": "T", "valueFrom": {"secretKeyRef": {"name": own[3], "key": "token"}}}],
-            "envFrom": [{"secretRef": {"name": own[0]}}],
+            "env": [
+                {"name": "T", "valueFrom": {"secretKeyRef": {"name": own[3], "key": "token"}}},
+                {"name": "U", "valueFrom": {"secretKeyRef": {"name": own[8], "key": "token"}}},
+            ],
+            "envFrom": [{"secretRef": {"name": own[0]}}, {"secretRef": {"name": own[5]}}],
         }],
     }));
     server_pods
         .create(&dry_run, &admitted)
         .await
         .expect("a Pod with its own per-Pod Secrets is admitted");
+    // Another Pod's `-v-` Secret is not one of them.
+    let other_v_secret = format!("{}-other-v-secrets", unique_run("scarab-vap"));
 
     let refused = [
         (
             "a Secret volume",
             serde_json::json!({"volumes": [{"name": "s", "secret": {"secretName": server_secret}}]}),
+        ),
+        (
+            "another Pod's -v- Secret",
+            serde_json::json!({"volumes": [{"name": "s", "secret": {"secretName": other_v_secret}}]}),
         ),
         (
             "a projected Secret",
@@ -3934,12 +3903,45 @@ async fn the_step_pod_admission_policy_holds_server_created_pods_to_their_own_se
             .unwrap_or_else(|e| panic!("{what}: the admin's create was refused: {e}"));
     }
 
-    // The executor, as the server: a step Pod it builds is admitted...
+    // The executor, as the server: a step Pod it builds, mounting its
+    // `-v-` Secrets, is admitted...
     let exec = K8sExecutor::with_client(ns.clone(), as_server.clone());
     let admitted_step = step("vap-ok");
-    exec.launch(&admitted_step, &busybox_spec("true", false))
+    let mut credentialed = busybox_spec("true", false);
+    credentialed.secrets = vec!["DB_PASSWORD".into()];
+    credentialed.resolved_secrets =
+        scarab_engine::ResolvedSecrets(vec![("DB_PASSWORD".into(), "sekret-vap".into())]);
+    credentialed.oidc_token = Some("eyJ.vap.sig".into());
+    exec.launch(&admitted_step, &credentialed)
         .await
         .expect("a step Pod the executor builds is admitted");
+    let launched = admin_pods
+        .get(&pod_name(&admitted_step))
+        .await
+        .expect("the admitted Pod");
+    let mounted: Vec<String> = launched
+        .spec
+        .iter()
+        .flat_map(|s| s.volumes.iter().flatten())
+        .flat_map(|v| {
+            let projected = v
+                .projected
+                .iter()
+                .flat_map(|p| p.sources.iter().flatten())
+                .filter_map(|src| src.secret.as_ref().map(|s| s.name.clone()));
+            v.secret
+                .iter()
+                .filter_map(|s| s.secret_name.clone())
+                .chain(projected)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    for suffix in ["-v-secrets", "-v-oidc"] {
+        assert!(
+            mounted.iter().any(|n| n.ends_with(suffix)),
+            "the launched Pod mounts no {suffix} Secret: {mounted:?}"
+        );
+    }
     let _ = admin_pods
         .delete(&pod_name(&admitted_step), &DeleteParams::default())
         .await;
@@ -3969,4 +3971,88 @@ async fn the_step_pod_admission_policy_holds_server_created_pods_to_their_own_se
             .is_none(),
         "no Pod was created"
     );
+}
+
+/// LIVE (2d78464): a log read that ends cleanly is confirmed as the
+/// container's end on a real kubelet. 40 short step Pods, 10 at a time,
+/// each read to its end: the source state reaches `Ended` within the
+/// tail's end wait (10 s) of the read's end, and its `finished_at` is no
+/// more than the tail's skew allowance (2 s) after it, so the tail stores
+/// the log as complete and writes no `incomplete` marker. Kills: a kubelet
+/// state mapped to something other than `Ended`; a `finished_at` the tail
+/// would read as "the read ended before the container did".
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn a_clean_end_is_confirmed_on_a_real_kubelet() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    /// The tail's `end_wait` and `end_skew_ms` (crates/scarab-server
+    /// log_tail.rs `TailTiming::default`).
+    const END_WAIT: Duration = Duration::from_secs(10);
+    const END_SKEW_MS: i64 = 2_000;
+    const PODS: usize = 40;
+    const AT_ONCE: usize = 10;
+
+    let ns = enter_tier();
+    let exec = Arc::new(K8sExecutor::with_client(ns, kube_client().await));
+    let run = unique_run("run-ends");
+    let now_ms = || {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap()
+    };
+    for wave in 0..PODS / AT_ONCE {
+        let mut reads = tokio::task::JoinSet::new();
+        for i in 0..AT_ONCE {
+            let n = wave * AT_ONCE + i;
+            let exec = exec.clone();
+            let step = step_run_of(&run, &format!("end-{n}"));
+            reads.spawn(async move {
+                let spec = busybox_spec(&format!("echo start-{n}; sleep 2; echo done-{n}"), false);
+                let h = exec.launch(&step, &spec).await.expect("launch");
+                let mut opened = None;
+                for _ in 0..120 {
+                    if let Ok(Some(c)) = exec.log_stream(&step, LogFrom::Start).await {
+                        opened = Some(c);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                let log = drain_to_end(opened.expect("the log opens")).await;
+                let read_end = now_ms();
+                assert!(
+                    String::from_utf8_lossy(&log).contains(&format!("done-{n}")),
+                    "pod {n}: the read ended before the last line: {:?}",
+                    String::from_utf8_lossy(&log)
+                );
+                let src = scarab_engine::LogSourceRef::Step(step.clone());
+                let deadline = tokio::time::Instant::now() + END_WAIT;
+                let finished_at = loop {
+                    match exec.log_source_state(&src).await.expect("state") {
+                        scarab_engine::LogSourceState::Ended { finished_at, .. } => {
+                            break finished_at.0
+                        }
+                        other => assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "pod {n}: not Ended within {END_WAIT:?} of the read's end: {other:?}"
+                        ),
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                };
+                assert!(
+                    finished_at <= read_end + END_SKEW_MS,
+                    "pod {n}: finished at {finished_at}, {} ms after the read ended at {read_end}",
+                    finished_at - read_end
+                );
+                exec.cancel(&h).await.expect("cleanup");
+            });
+        }
+        while let Some(done) = reads.join_next().await {
+            done.expect("a Pod's read");
+        }
+    }
 }

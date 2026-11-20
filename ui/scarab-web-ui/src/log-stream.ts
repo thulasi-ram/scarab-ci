@@ -45,6 +45,28 @@ export const LOG_QUIET_MS = 1000;
  * of a log that was `totalBytes` long when the stream opened. */
 export type LogTruncation = { skippedBytes: number; totalBytes: number };
 
+/** The server's `marker` event: a note about the stored log, never step
+ * output. `kind` is `source_restarted` (lines before it may be missing or
+ * repeat), `not_stored` (the rest of the log was not stored; `reason` says
+ * why) or `incomplete` (the end of the log could not be read). The pane shows
+ * the server's `text`. */
+export type LogMarker = { kind: string; reason?: string; text: string };
+
+/** A `marker` event's data, or null when it is not a marker with a text. */
+export function parseLogMarker(data: string): LogMarker | null {
+  try {
+    const m = JSON.parse(data) as { kind?: unknown; reason?: unknown; text?: unknown } | null;
+    if (typeof m?.text !== "string" || m.text.trim() === "") return null;
+    return {
+      kind: typeof m.kind === "string" ? m.kind : "",
+      ...(typeof m.reason === "string" ? { reason: m.reason } : {}),
+      text: m.text,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /** Where a log stream starts: after the event `from` names (a cursor the
  * server sent as an event id), or else the last `tail` bytes. */
 export type LogStreamQuery = { from?: string; tail?: number };
@@ -53,6 +75,9 @@ export type LogStreamHandlers = {
   /** A `data` event: the text, and its id (the position after it). */
   onChunk: (text: string, id: string | null) => void;
   onTruncated?: (t: LogTruncation) => void;
+  /** A `marker` event: a note about the stored log, and its id (the
+   * position after it, a cursor like a `data` event's). */
+  onMarker?: (marker: LogMarker, id: string | null) => void;
   /** The server's `storing` event: the log is still being stored after its
    * try ended (`true`), or no longer is (`false`). `waitOver`: the server
    * stops waiting for it and ends the stream with the log still being
@@ -117,10 +142,22 @@ export type LogBuffer = {
   droppedBytes: number;
   /** Lines the pane dropped, so line numbers stay put after a drop. */
   droppedLines: number;
+  /** The server's notes about the log, in order. `at`: the output lines
+   * before the note, counted like line numbers (dropped lines included). */
+  markers: { at: number; marker: LogMarker }[];
 };
 
 export function emptyLogBuffer(): LogBuffer {
-  return { text: "", bytes: 0, newlines: 0, skippedBytes: 0, totalBytes: 0, droppedBytes: 0, droppedLines: 0 };
+  return {
+    text: "",
+    bytes: 0,
+    newlines: 0,
+    skippedBytes: 0,
+    totalBytes: 0,
+    droppedBytes: 0,
+    droppedLines: 0,
+    markers: [],
+  };
 }
 
 /** Record the server's tail cutoff. */
@@ -160,6 +197,7 @@ export function appendLog(buf: LogBuffer, chunk: string, cap = CLIENT_CAP_BYTES)
   let newlines = buf.newlines + countNewlines(chunk);
   let droppedBytes = buf.droppedBytes;
   let droppedLines = buf.droppedLines;
+  let markers = buf.markers;
   if (bytes > cap) {
     const excess = bytes - cap;
     let cut = 0;
@@ -177,6 +215,10 @@ export function appendLog(buf: LogBuffer, chunk: string, cap = CLIENT_CAP_BYTES)
     newlines -= cutLines;
     droppedBytes += cutBytes;
     droppedLines += cutLines;
+    // Notes above the lines that are left go with the lines.
+    if (buf.markers.length > 0 && buf.markers[0]!.at < droppedLines) {
+      markers = buf.markers.filter((m) => m.at >= droppedLines);
+    }
     // A log with no line breaks: what is left is one line. Cut its start.
     if (bytes > 2 * cap) {
       const head = headOf(text, bytes - cap);
@@ -185,7 +227,15 @@ export function appendLog(buf: LogBuffer, chunk: string, cap = CLIENT_CAP_BYTES)
       droppedBytes += head.bytes;
     }
   }
-  return { ...buf, text, bytes, newlines, droppedBytes, droppedLines };
+  return { ...buf, text, bytes, newlines, droppedBytes, droppedLines, markers };
+}
+
+/** Add the server's note about the log after the output so far. A note is
+ * never part of a line: when the output ends mid-line, that line ends here
+ * (a line break is added) and the output after the note starts a new one. */
+export function addMarker(buf: LogBuffer, marker: LogMarker, cap = CLIENT_CAP_BYTES): LogBuffer {
+  const b = buf.text.length > 0 && !buf.text.endsWith("\n") ? appendLog(buf, "\n", cap) : buf;
+  return { ...b, markers: [...b.markers, { at: b.droppedLines + b.newlines, marker }] };
 }
 
 /** What the pane says while a try's log is still being stored after the try
@@ -207,7 +257,8 @@ export type StoreState = "storing" | "wait_over";
  * its log is still being stored, the size is named as the size so far.
  * `store` counts only for a try that is not running: a running try's log is
  * always still being stored, which the notice does not need to say. With no
- * output yet the log body says it instead, so the notice does not.
+ * output and no note from the server yet the log body says it instead, so
+ * the notice does not.
  *
  * Line numbers count from the first line the pane received. After the
  * server's cutoff that is not line 1 of the log, so the notice says where the
@@ -217,7 +268,7 @@ export function logNotice(
   opts: { outcome?: string; store?: StoreState } = {},
 ): { text: string; loadFull: boolean } | null {
   const running = opts.outcome === "running";
-  const store = !running && buf.bytes > 0 ? opts.store : undefined;
+  const store = !running && (buf.bytes > 0 || buf.markers.length > 0) ? opts.store : undefined;
   const stored = store === "wait_over" ? STORING_WAIT_OVER_TEXT : store === "storing" ? STORING_TEXT : "";
   const hidden = buf.skippedBytes + buf.droppedBytes;
   if (hidden === 0) return stored ? { text: stored, loadFull: false } : null;
@@ -231,10 +282,17 @@ export function logNotice(
   return { text, loadFull: !store && total <= FULL_LOG_BYTES };
 }
 
+/** One row of the log body: an output line and its number, or a note from
+ * the server about the log, which has no number. */
+export type LogRow =
+  | { n: number; line: string; marker?: undefined }
+  | { marker: LogMarker; n?: undefined; line?: undefined };
+
 /** The last `max` lines of the buffer, numbered from the log's first line the
- * pane received. Empty lines keep their number but are not rows. Splits only
- * the tail, not the whole buffer. */
-export function tailRows(buf: LogBuffer, max: number): { n: number; line: string }[] {
+ * pane received, with the server's notes among them where they came. Empty
+ * lines keep their number but are not rows. Splits only the tail, not the
+ * whole buffer. */
+export function tailRows(buf: LogBuffer, max: number): LogRow[] {
   const text = buf.text;
   let start = 0;
   // A final newline ends the last line; it does not start a row of its own.
@@ -251,7 +309,19 @@ export function tailRows(buf: LogBuffer, max: number): { n: number; line: string
   }
   const lines = text.slice(start).split("\n");
   const before = buf.droppedLines + buf.newlines - (lines.length - 1);
-  return lines.map((line, i) => ({ n: before + i + 1, line })).filter((r) => r.line.length > 0);
+  const marks = buf.markers;
+  // The first note in view: one above the first line shown or after it.
+  let k = 0;
+  while (k < marks.length && marks[k]!.at < before) k++;
+  const rows: LogRow[] = [];
+  lines.forEach((line, i) => {
+    const n = before + i + 1;
+    // The notes that came before line `n`.
+    for (; k < marks.length && marks[k]!.at < n; k++) rows.push({ marker: marks[k]!.marker });
+    if (line.length > 0) rows.push({ n, line });
+  });
+  for (; k < marks.length; k++) rows.push({ marker: marks[k]!.marker });
+  return rows;
 }
 
 /** The wait before the `failures`+1-th reopen in a row: 1s, 2s, 4s … at most
@@ -308,6 +378,9 @@ export function followLog(opts: {
   outcome: () => string | undefined;
   onChunk: (text: string) => void;
   onTruncated: (t: LogTruncation) => void;
+  /** The server's `marker` event: a note about the log. Its id moves the
+   * resume cursor like a `data` event's. */
+  onMarker?: (marker: LogMarker) => void;
   /** The server's `storing` event (see `LogStreamHandlers`). */
   onStoring?: (storing: boolean, waitOver: boolean) => void;
   /** A stream ended. */
@@ -469,6 +542,13 @@ export function followLog(opts: {
         if (id) lastId = id;
         if (text.length > 0) hadOutput = true;
         opts.onChunk(text);
+        markLoaded();
+      },
+      onMarker: (m, id) => {
+        if (!mine()) return;
+        gotEvent();
+        if (id) lastId = id;
+        opts.onMarker?.(m);
         markLoaded();
       },
       onTruncated: (t) => {

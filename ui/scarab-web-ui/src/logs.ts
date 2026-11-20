@@ -16,7 +16,8 @@ export function levelOf(line: string): Level {
 }
 
 /** What an attempt's log body shows when it has no lines yet:
- * - `output`  — there is output; render the lines.
+ * - `output`  — there is output, or a note from the server about the log (a
+ *               marker); render the rows.
  * - `error`   — the log could not be read: the server said reading the
  *               stored log failed, the stream would not open, or it did not
  *               open in time. The pane says why and offers to try again.
@@ -41,6 +42,9 @@ export type LogBodyState = "output" | "error" | "loading" | "waiting" | "storing
 export function logBodyState(opts: {
   /** The buffered text for this (step, attempt, container), if any arrived. */
   text: string | undefined;
+  /** The server's notes about the log held with it (markers). A note shows
+   * as a row, so a log with only a note is not empty. */
+  markers?: number;
   /** The log stream closed (the server ends it when nothing more will come). */
   ended: boolean;
   /** The attempt's outcome (`running`, `succeeded`, `failed`, …). */
@@ -53,7 +57,7 @@ export function logBodyState(opts: {
    * (also when it said it stopped waiting for it). */
   storing?: boolean;
 }): LogBodyState {
-  if ((opts.text ?? "").split("\n").some((l) => l.length > 0)) return "output";
+  if ((opts.markers ?? 0) > 0 || (opts.text ?? "").split("\n").some((l) => l.length > 0)) return "output";
   if (opts.error) return "error";
   // The server sends `storing: false` before it ends a stream whose log is
   // whole, so a stream that ended while still storing dropped, and the pane

@@ -18,6 +18,104 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **Let running Runs finish before you upgrade.** Scarab now stores a step's log only when it
+  launched the step with a value ledger (below). The log of a step or shared service that runs
+  across the upgrade ends with a note, "the rest of this log was not stored: this step was started
+  by an earlier Scarab version, so its secret values are not known", after the part stored before
+  the upgrade. See [Upgrading from Scarab 0.6](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/#upgrading-from-scarab-06).
+- **Roll back only with no step running.** Migration 0099 adds a check that refuses log chunks
+  from a server built before it, so an older server stores no logs on the new schema. Do not drop
+  the `log_chunks_fenced` check while steps launched by the new version run: the old server would
+  store their output without redacting their secrets. Every replica must use the same master keys.
+- **Step Pods mount their credentials from Secrets named `<pod>-v-secrets`, `<pod>-v-registry`,
+  `<pod>-v-token` and `<pod>-v-oidc`, and carry the label `scarab.io/value-ledger: "1"`.** A
+  policy or tool that matched the old names (`<pod>-secrets`, `<pod>-token`, …) needs the new
+  ones. A re-drive that finds a Pod without the label writes no Secret to it; one whose containers
+  never started is deleted and created again.
+- **A raw log download writes the server's notes as `[scarab] <text>` lines.** Add
+  `?markers=none` to get the stored output bytes only. The `X-Scarab-Log-Markers` header counts the
+  notes either way. See [Run logs](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/#through-the-api).
+
+### Security
+
+- **A step's log is redacted with every secret value any launch of it was given, on every
+  replica.** Each launch stores the values it hands the step (secrets, registry credential, forge
+  token, OIDC token), encrypted with the master key, in Postgres before it creates the Pod or any
+  Secret; the replica that reads the log loads them from there. A re-drive that minted a new forge
+  token on another replica no longer leaves the old one unredacted, and a failed re-launch no
+  longer drops the values of the running step. The ledger is deleted once the step's logs are
+  stored and its tokens revoked, or an hour after the step ends (up to a day while a revocation
+  keeps failing).
+- **Scarab no longer reads secret values back from Kubernetes Secrets.** Neither the log tail nor
+  forge token revocation reads them; the Secrets are deleted by name when a try ends.
+- **Every minted forge token a step was given is revoked, whichever replica minted it.** A
+  re-drive revokes the token it replaced; the end of the try revokes the rest, and a failed
+  revocation is retried until the ledger is deleted.
+- **A failure cause or infra message is redacted with the values of the step it is about**, loaded
+  by the step's handle. A cause about a step with no ledger is replaced by "the cause was not
+  stored: it may quote secret values that could not be checked".
+
+### Features
+
+- **The server's notes in a log are their own rows.** A restarted log source, a part not stored
+  and an end that could not be read are stored as index rows, not text in the log, so a step that
+  prints the same text changes nothing. The Run page shows each as a row set apart from the
+  output, the log stream sends `event: marker`, and `scarab logs` prints them on stderr. See
+  [Notes in a log](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/#notes-in-a-log).
+
+### Bug Fixes
+
+- **A Pipeline that a push or pull request does not start now fails its check on the commit.** A
+  Pipeline file that did not compile created no Run and posted no commit status, so a required
+  check waited for good. It now posts `failure` under the Pipeline's usual check name, on GitHub
+  and Forgejo, with the first compile error as the description and a link to the repository page,
+  where the refused Run is listed. A broken file still stops every Pipeline in the delivery, and
+  now before any of them starts a Run: each other Pipeline whose `on:` names the event posts
+  `failure` with "not run: <file> failed to compile". A Pipeline refused by a Policy, a sandbox or library rule, a
+  missing approval gate, or a loop of follow-up Runs posts the same way; an Environment refusal
+  already did. A branch-scoped Environment skipping another branch still posts nothing. The same
+  delivery sent twice posts once.
+- **A `when:` that cannot be decided refuses its own Pipeline only.** A trigger or Step `when:`
+  that failed to evaluate (for example, one reading an event field that is not there) stopped the
+  whole delivery, so the Pipeline files after it in `.scarab/` were not evaluated. That Pipeline is
+  now listed as a refused Run with the error and fails its check, and the other files still start
+  their Runs.
+- **Two replicas no longer write one log at once.** Every log chunk is stored under the reader's
+  lease term, and the database refuses a chunk from a replica whose lease was taken over, so chunks
+  are no longer dropped, reordered or pointed at another replica's body. Chunk bodies are stored
+  under their content hash, so a second read never overwrites a stored body.
+- **A log is complete only when its container ended.** A read that ended while the container still
+  ran (a kubelet restart, a dropped connection) was taken as the end of the log, so output after it
+  was lost. The server now asks Kubernetes and reads again. A crashed sidecar or shared service
+  keeps the output of its next run.
+- **The rest of a log is no longer lost or withheld after a broken read.** The "from now on" and
+  "withheld" fallbacks are gone: the server compares a new read with the stored part by digests,
+  stores the source again after a note when it differs, and no longer fetches every stored chunk
+  on each retry.
+- **A value cut at the end of a log, or at the start of a part after a restart, is stored as
+  `***`.**
+- **A step that ended while no server ran, or whose read hung, still gets its log stored or
+  closed**, within 30 minutes of the step ending.
+
+- **A closed or merged pull request no longer runs its `pull_request` Pipelines again.** Scarab
+  started Runs for every pull request webhook, so closing or merging a pull request, or labelling
+  it, ran the Pipeline again, and a build Pipeline with `push: true` pushed its images again. A
+  pull request now starts Runs only when it is opened or reopened, gets new commits, or is edited
+  to target another base branch. Other deliveries start no Run and post no status, and the
+  webhook response names the action it ignored. GitHub and Forgejo.
+- **A library can move to a new commit when its file did not change.** A tag or branch that
+  moved to a commit with the same library file produced no diff, and the review page showed
+  "This version is installed already" with Upgrade turned off, so the installation stayed at the
+  old ref and commit. The review page now says the file is the same at the new commit, and
+  **Move to this commit** moves the installation there, with the same passkey confirmation and
+  trust boxes as an upgrade; the security log names both commits. The fetch answer has
+  `content_unchanged`, an installation's `source` names the commit it is at, and an install at
+  the ref and commit already installed is refused with 409. Runs inline the same content, and
+  Runs created before the move do not change. See
+  [Upgrade](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#upgrade).
+
 ## [0.6.1] - 2026-11-20
 
 ### Bug Fixes

@@ -58,11 +58,15 @@ impl Executor for TwoChunkExec {
         Ok(None)
     }
 
-    async fn take_forge_credential(
+    async fn delete_unit_secrets(&self, _handle: &ExecHandle) -> Result<(), ExecError> {
+        Ok(())
+    }
+
+    async fn log_source_state(
         &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
-        Ok(None)
+        _src: &scarab_engine::LogSourceRef,
+    ) -> Result<scarab_engine::LogSourceState, ExecError> {
+        Ok(scarab_engine::LogSourceState::Gone)
     }
 
     async fn workspace_provisioning(
@@ -137,8 +141,25 @@ async fn two_replicas_tail_a_step_exactly_once() {
     let store = Arc::new(InMemoryObjectStore::new());
     let exec = Arc::new(TwoChunkExec::default());
 
-    let logs_a = Arc::new(LogService::new(store.clone(), db.clone()));
-    let logs_b = Arc::new(LogService::new(store.clone(), db.clone()));
+    // Both replicas seal and open the ledger with the same keys.
+    let sealer: Arc<dyn scarab_secrets::Sealer> =
+        Arc::new(scarab_secrets_postgres::KeySealer::ephemeral());
+    let logs_a = Arc::new(LogService::new(store.clone(), db.clone()).with_sealer(sealer.clone()));
+    let logs_b = Arc::new(LogService::new(store.clone(), db.clone()).with_sealer(sealer));
+    // The launch gave the unit a ledger (no values).
+    logs_a
+        .record_launch_values(
+            &scarab_engine::LogStreamId::new(
+                &RunId("r1".into()),
+                &StepId("s1".into()),
+                &AttemptId("a1".into()),
+            ),
+            None,
+            Vec::new(),
+            Timestamp(0),
+        )
+        .await
+        .unwrap();
     let tailer_a = LogTailer::new(exec.clone(), logs_a).with_lease(db.clone(), "replica-a");
     let tailer_b = LogTailer::new(exec.clone(), logs_b).with_lease(db.clone(), "replica-b");
 

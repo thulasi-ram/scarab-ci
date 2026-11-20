@@ -978,17 +978,57 @@ pub trait Db: Send + Sync {
     /// The run's append-only event log, in append order (the SSE tail source).
     async fn events(&self, run: &RunId) -> Result<Vec<EventKind>, DbError>;
 
-    /// Record the index of a persisted log chunk (offsets only — the body lives
-    /// in the object store). Idempotent on `(run, step, attempt, seq)`.
-    async fn append_log_chunk(
+    /// Append one row to `stream`'s index, fenced on `writer` (I3): the
+    /// lease of `writer.lease`'s kind **for this stream**, whose resource the
+    /// store derives from the stream id ([`crate::LogLease::resource`]), held
+    /// by `(owner, term)`. In one transaction: that lease row is held `FOR
+    /// SHARE`; the `log_streams` row is locked, or created from the rows
+    /// already stored when missing, unless the run's log was pruned (then
+    /// [`LogAppendError::Closed`]); a stream that is not `open` refuses
+    /// ([`LogAppendError::Closed`]); an `Output` row refuses a unit with no
+    /// `log_units` row, a purged one, or a `values_gen` that is not the
+    /// unit's current generation; the row takes the next `seq` and
+    /// `byte_offset` (a conflict is an error, never dropped); the stream's
+    /// `next_seq`, `byte_len`, `part_start_seq` (after a `source_restarted`
+    /// row) and `state` (`row.then`) are updated. The unit is the one the
+    /// stream belongs to ([`LogStreamId::unit`](crate::LogStreamId::unit)).
+    async fn append_log_row(
         &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-        meta: &LogChunkMeta,
-    ) -> Result<(), DbError>;
+        stream: &crate::LogStreamId,
+        row: &crate::NewLogRow,
+        writer: &crate::LogWriter,
+        now: Timestamp,
+    ) -> Result<LogChunkMeta, crate::LogAppendError>;
 
-    /// The log-chunk index for one attempt's stream, ordered by `seq`.
+    /// Set `stream`'s state to `Complete` or `Closed`, fenced like
+    /// [`append_log_row`](Self::append_log_row). A stream already terminal
+    /// refuses ([`LogAppendError::Closed`](crate::LogAppendError::Closed)).
+    /// Creates the row when missing.
+    async fn set_log_stream_state(
+        &self,
+        stream: &crate::LogStreamId,
+        writer: &crate::LogWriter,
+        state: crate::LogStreamState,
+        now: Timestamp,
+    ) -> Result<(), crate::LogAppendError>;
+
+    /// Start `stream`'s durable final-read budget at `now` if it has not
+    /// started, fenced like [`append_log_row`](Self::append_log_row); returns
+    /// when it started.
+    async fn start_log_final_budget(
+        &self,
+        stream: &crate::LogStreamId,
+        writer: &crate::LogWriter,
+        now: Timestamp,
+    ) -> Result<i64, crate::LogAppendError>;
+
+    /// `stream`'s `log_streams` row, if it has one.
+    async fn log_stream_row(
+        &self,
+        stream: &crate::LogStreamId,
+    ) -> Result<Option<crate::LogStreamRow>, DbError>;
+
+    /// The index rows of one attempt's stream, ordered by `seq`.
     async fn log_chunks(
         &self,
         run: &RunId,
@@ -1009,15 +1049,134 @@ pub trait Db: Send + Sync {
         from_seq: u64,
     ) -> Result<Vec<LogChunkMeta>, DbError>;
 
-    /// The newest row of the stream's index (highest `seq`), or `None` when
-    /// the stream has no chunk. An append computes the next seq and offset
-    /// from it without reading the whole index.
-    async fn last_log_chunk(
+    /// Write a unit's ledger at launch (I7): in one transaction, upsert its
+    /// `log_units` row (setting `handle` when given) and, with `sealed`,
+    /// insert generation `expected_gen + 1` sealed under that number.
+    /// [`DbError::Conflict`] when the unit's generation is no longer
+    /// `expected_gen` (another launch wrote one; the caller reloads), or
+    /// when the unit is purged. Returns the unit's generation after it.
+    async fn write_log_unit(
         &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-    ) -> Result<Option<LogChunkMeta>, DbError>;
+        unit: &crate::LogStreamId,
+        handle: Option<&str>,
+        expected_gen: i64,
+        sealed: Option<&[u8]>,
+        now: Timestamp,
+    ) -> Result<i64, DbError>;
+
+    /// A unit's ledger as stored: its row and every generation present.
+    /// `None`: the unit has no `log_units` row.
+    async fn log_unit_ledger(
+        &self,
+        unit: &crate::LogStreamId,
+    ) -> Result<Option<crate::LogLedgerRows>, DbError>;
+
+    /// The unit whose `log_units.handle` is `handle`; of several (a Pod
+    /// name hash collision), the newest row.
+    async fn log_unit_by_handle(&self, handle: &str)
+        -> Result<Option<crate::LogStreamId>, DbError>;
+
+    /// Record that the unit's process started (first write wins).
+    async fn mark_log_unit_started(
+        &self,
+        unit: &crate::LogStreamId,
+        at: Timestamp,
+    ) -> Result<(), DbError>;
+
+    /// Record that every minted forge token of generation `gen` of `unit`'s
+    /// ledger was revoked (first write wins): it is not revoked again.
+    async fn mark_log_generation_revoked(
+        &self,
+        unit: &crate::LogStreamId,
+        gen: i64,
+        at: Timestamp,
+    ) -> Result<(), DbError>;
+
+    /// Record a failed revocation of `unit`'s tokens by the ledger sweep:
+    /// one more failure, and no retry before
+    /// [`ledger_revoke_backoff_ms`](crate::ledger_revoke_backoff_ms) after
+    /// `now`.
+    async fn record_log_unit_revoke_failure(
+        &self,
+        unit: &crate::LogStreamId,
+        now: Timestamp,
+    ) -> Result<(), DbError>;
+
+    /// Record that every revocation of the unit's minted tokens succeeded.
+    async fn mark_log_unit_revoked(
+        &self,
+        unit: &crate::LogStreamId,
+        at: Timestamp,
+    ) -> Result<(), DbError>;
+
+    /// Set `settled_at = now` on every unit that has none and is no longer
+    /// running in the store: a step attempt that has an outcome, a shared
+    /// service that is torn down or failed, or any unit of a terminal run.
+    /// Every settle path reaches it, because it reads the settled state
+    /// rather than being called by each path. Returns how many it set.
+    async fn settle_log_units(&self, now: Timestamp) -> Result<u64, DbError>;
+
+    /// Purge a unit's ledger in one transaction: delete its generations and
+    /// set `purged`. A purged unit reads as "not ledger-complete".
+    async fn purge_log_unit(&self, unit: &crate::LogStreamId) -> Result<(), DbError>;
+
+    /// Record how many streams `unit` has (its main stream and one per
+    /// sidecar service), before its launch writes anything the unit can
+    /// read. A unit whose launch never recorded it has 1.
+    async fn set_log_unit_stream_count(
+        &self,
+        unit: &crate::LogStreamId,
+        count: i32,
+    ) -> Result<(), DbError>;
+
+    /// Whether every stream of `unit` is terminal: `stream_count` of its
+    /// streams (its main stream and its sidecar streams) have a row in
+    /// `complete` or `closed`, and none is `open`. A stream that has stored
+    /// nothing yet has no row, so it is not terminal. `false` for a unit
+    /// with no `log_units` row.
+    async fn log_unit_streams_all_terminal(
+        &self,
+        unit: &crate::LogStreamId,
+    ) -> Result<bool, DbError>;
+
+    /// Units not purged that the purge sweep may purge at `now`: settled
+    /// more than [`LEDGER_SETTLED_KEEP_MS`](crate::LEDGER_SETTLED_KEEP_MS)
+    /// ago, of a run terminal that long, or not running in the store with
+    /// their oldest generation older than `hard_cap_ms`. A step still
+    /// running, or a live shared service, is never returned by age. A unit
+    /// whose revocation is backing off (`revoke_retry_at` after `now`) is
+    /// left out unless it is past the cap. Oldest first: by `settled_at`
+    /// (none first), then `(run, step, attempt)`.
+    async fn log_units_to_purge(
+        &self,
+        now: Timestamp,
+        hard_cap_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<crate::PurgeCandidate>, DbError>;
+
+    /// Units that left `Running` with a stream that is not terminal, so a
+    /// replica reads them once more though no tail of this process saw them
+    /// end, in three legs of at most `limit` each, each resuming after
+    /// `cursor`'s key for it:
+    /// - settled `log_units` rows not purged, of a run not pruned, with
+    ///   fewer than `stream_count` terminal streams (a stream with no row
+    ///   is not terminal);
+    /// - `log_legacy_units` (units running when the ledger was added) that
+    ///   are no longer running;
+    /// - step attempts claimed since [`PENDING_EPOCH_SKEW_MS`](crate::PENDING_EPOCH_SKEW_MS)
+    ///   before the log store's epoch and within
+    ///   [`PENDING_RECENT_WINDOW_MS`](crate::PENDING_RECENT_WINDOW_MS) of
+    ///   `now`, that have an outcome, no `log_units` row, no legacy row,
+    ///   and a main stream that is not terminal.
+    async fn pending_final_reads(
+        &self,
+        now: Timestamp,
+        cursor: &crate::PendingReadCursor,
+        limit: u32,
+    ) -> Result<crate::PendingReads, DbError>;
+
+    /// Forget a unit of `log_legacy_units` once its streams are closed.
+    async fn forget_log_legacy_unit(&self, unit: &crate::LogStreamId) -> Result<(), DbError>;
 
     /// All step projections of a run (with their attempts) — the DAG snapshot
     /// the scheduler folds to decide admission and completion.
@@ -1336,14 +1495,26 @@ pub trait Db: Send + Sync {
     /// delete.
     async fn run_settlements(&self, runs: &[RunId]) -> Result<Vec<RunSettlement>, DbError>;
 
-    /// Every log-chunk object key a run holds (across steps/attempts) — what
-    /// the sweeper deletes from the object store before dropping the index.
-    async fn log_object_keys_of_run(&self, run: &RunId) -> Result<Vec<String>, DbError>;
+    /// Prune a run's log index in one transaction (ADR-0050): tombstone
+    /// every stream of the run (`closed`, `pruned`), delete its units'
+    /// ledgers (`log_units`, their generations and `log_legacy_units`
+    /// rows), delete its index rows, and note the run for a second delete
+    /// of its bodies later. A late fenced append is refused by the
+    /// tombstone, and no new stream row is made for the run. The caller
+    /// deletes the bodies by prefix `logs/{run}/` after it.
+    async fn prune_log_run(&self, run: &RunId, now: Timestamp) -> Result<(), DbError>;
 
-    /// Drop a run's entire log-chunk INDEX (bodies are deleted from the object
-    /// store first — at-least-once: a crash between the two re-sweeps). Run
-    /// metadata (state row, event log) is retained for audit (ADR-0050).
-    async fn delete_log_index_of_run(&self, run: &RunId) -> Result<(), DbError>;
+    /// Runs whose log index was pruned before `before` and whose bodies are
+    /// due their second delete by prefix (a writer refused after its PUT
+    /// can leave a body behind the first one).
+    async fn log_runs_to_redelete(
+        &self,
+        before: Timestamp,
+        limit: u32,
+    ) -> Result<Vec<RunId>, DbError>;
+
+    /// The second delete of `run`'s bodies is done.
+    async fn forget_log_run_redelete(&self, run: &RunId) -> Result<(), DbError>;
 
     /// Current run counts by status token (ADR-0053 metrics gauge).
     async fn run_status_counts(&self) -> Result<Vec<(String, u64)>, DbError>;
@@ -1487,25 +1658,41 @@ pub trait LogChunks: Send {
 }
 
 /// Where a log read starts: [`Executor::log_stream`] and its sidecar and
-/// service forms.
+/// service forms. A read always starts at the container log's first byte:
+/// the log store compares it with what it stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFrom {
     /// The container log's first byte.
     Start,
-    /// Output printed after the read opens; nothing printed before it.
-    Now,
 }
 
-/// The secret values a unit was launched with, as
-/// [`Executor::log_redactions`] reads them back.
+/// The log source a [`Executor::log_source_state`] question is about.
+#[derive(Debug, Clone)]
+pub enum LogSourceRef {
+    /// A step's main container.
+    Step(StepRun),
+    /// A sidecar container (`service-<i>`) of a step's unit.
+    Sidecar { step: StepRun, container: String },
+    /// A shared service instance's container, by launch handle.
+    Service(ExecHandle),
+}
+
+/// What the backend says about a log source's container now. A log read
+/// that ended cleanly asks it, to tell the container's end from a dropped
+/// connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LogRedactions {
-    /// Every value the unit holds. Empty: the unit references no credential
-    /// Secret.
-    Values(Vec<Vec<u8>>),
-    /// The unit references a credential Secret that does not exist: it was
-    /// deleted when the attempt settled, or the launch has not written it
-    /// yet. Its values cannot be read.
+pub enum LogSourceState {
+    /// The container runs. `container_id` names this run of it.
+    Running { container_id: Option<String> },
+    /// The container ended and will start again (a restartable sidecar or
+    /// shared service).
+    Restarting,
+    /// The container ended for good, at `finished_at` (backend clock).
+    Ended {
+        finished_at: Timestamp,
+        container_id: Option<String>,
+    },
+    /// The unit is gone.
     Gone,
 }
 
@@ -1727,24 +1914,29 @@ pub trait Executor: Send + Sync {
         handle: &ExecHandle,
     ) -> Result<Option<crate::InfraCondition>, ExecError>;
 
-    /// Remove the forge credential `handle`'s unit holds from the backend,
-    /// and return it (ADR-0076 §9). Called once the Attempt has ended, so
-    /// the control plane that sees the end can revoke a minted token,
-    /// whichever replica minted it, and a long-lived token does not stay
-    /// stored for as long as the unit is kept. On k8s that is the per-Pod
-    /// token Secret. `Ok(None)`: the unit holds none, or it was taken
-    /// already. A backend that never mounts one answers `Ok(None)`. A
-    /// backend also removes the unit's other stored secret values here: on
-    /// k8s, the per-Pod Secret that holds the Step's own secrets.
+    /// Delete the per-unit Secrets `handle`'s unit was given (the forge
+    /// credential, the step's own secrets, the registry auth, the OIDC
+    /// token), by name, without reading them. Called once the Attempt has
+    /// ended; the forge tokens to revoke come from the unit's value ledger,
+    /// never from the backend. Missing Secrets are not an error. A backend
+    /// that stores none answers `Ok(())`.
     ///
     /// **Deliberately REQUIRED — no default**, for the reason spelled out on
     /// [`workspace_provisioning`](Self::workspace_provisioning): a decorator
-    /// that inherited a `None` default would leave every token of the
-    /// executor it wraps unrevoked, and nothing would fail.
-    async fn take_forge_credential(
-        &self,
-        handle: &ExecHandle,
-    ) -> Result<Option<crate::MountedForgeCredential>, ExecError>;
+    /// that inherited a no-op default would leave every credential of the
+    /// executor it wraps stored for as long as its unit is kept.
+    async fn delete_unit_secrets(&self, handle: &ExecHandle) -> Result<(), ExecError>;
+
+    /// The state of a log source's container now (see [`LogSourceState`]).
+    /// A log tail asks it when a read ends cleanly, and when a read of an
+    /// ended unit goes quiet.
+    ///
+    /// **Deliberately REQUIRED — no default**: a decorator that answered a
+    /// default would tell every tail the container ended (or never did), and
+    /// the log store would close or re-read streams on a wrong answer.
+    /// Decorators forward it; a backend without a log source answers
+    /// [`LogSourceState::Gone`].
+    async fn log_source_state(&self, src: &LogSourceRef) -> Result<LogSourceState, ExecError>;
 
     /// Open a best-effort **live tail** of the unit's stdout/stderr for `step`,
     /// keyed by its fence (ADR-0013). The control plane drains the returned
@@ -1755,34 +1947,16 @@ pub trait Executor: Send + Sync {
     /// because the source is derived from the fence — the same derivation `launch`
     /// uses — so the caller needs no handle bookkeeping to start a tail.
     ///
-    /// `from` says where the read starts: [`LogFrom::Now`] skips what the
-    /// unit printed before the read opened.
+    /// A unit that may not be read (see
+    /// [`ExecError::NotLedgerComplete`](crate::ExecError::NotLedgerComplete))
+    /// answers that error; the check is made on the same object whose log is
+    /// then read.
     async fn log_stream(
         &self,
         _step: &StepRun,
         _from: LogFrom,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         Ok(None)
-    }
-
-    /// The secret values `step`'s fenced unit was launched with, read back
-    /// from the unit, so that whichever control plane tails its log
-    /// ([`log_stream`](Self::log_stream), [`sidecar_log_stream`](Self::sidecar_log_stream))
-    /// can redact them: the log redactor is process memory, filled at launch,
-    /// and a replica that did not launch the unit (a tail-lease takeover, a
-    /// server roll while it runs) would otherwise store them in clear.
-    ///
-    /// Each value is returned as the unit holds it: the step's own secret
-    /// values, and the registry dockerconfigjson whole (the caller extracts
-    /// the credentials in it). [`LogRedactions::Values`] with no values when
-    /// the unit references no credential Secret; [`LogRedactions::Gone`]
-    /// when it references one that does not exist (deleted when the attempt
-    /// settled, or not written yet). An `Err` (the unit or a Secret could
-    /// not be read) is never "none": the tail reads nothing until the values
-    /// load. The default answers no values: a backend without a log source,
-    /// or whose log tail runs only where the unit was launched.
-    async fn log_redactions(&self, _step: &StepRun) -> Result<LogRedactions, ExecError> {
-        Ok(LogRedactions::Values(Vec::new()))
     }
 
     /// Open a best-effort **live tail** of one of `step`'s co-located sidecar

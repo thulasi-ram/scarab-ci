@@ -35,8 +35,8 @@
 //! The Run's `event` values are fixed here too ([`event_facts`]), including
 //! `event.repo.clone_url`, computed from the connection registry.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use scarab_engine::ports::{ExecHandle, ExecState, LogChunks};
@@ -430,18 +430,13 @@ pub struct ForgeCredentialExecutor {
         Arc<dyn Db>,
         Arc<dyn scarab_project::EnvironmentGovernanceStore>,
     )>,
-    /// The tokens this process minted for each launched unit, so a re-drive
-    /// that replaces one can revoke it. When the Attempt ends the token is
-    /// also read back from the unit itself
-    /// ([`Executor::take_forge_credential`]), so a control plane that did
-    /// not mint it, or restarted since, still revokes it.
-    minted: Mutex<HashMap<String, Vec<(RepoRef, String)>>>,
     /// What an approval's age is measured to at launch (ADR-0078 §5).
     clock: Arc<dyn scarab_engine::Clock>,
     /// Principals: a recorded approver set compares as ids (ADR-0080 §3).
     identities: Option<Arc<dyn scarab_identity::IdentityStore>>,
-    /// The log pipeline's redactor: the forge token and a resolved registry
-    /// credential are registered with it before the Step launches.
+    /// The log pipeline: its value ledger holds every forge token a unit
+    /// was given, by whichever replica minted it; the tokens revoked come
+    /// from there (git-bug 2d78464).
     logs: Option<Arc<crate::LogService>>,
 }
 
@@ -453,15 +448,14 @@ impl ForgeCredentialExecutor {
             secrets: None,
             libraries: None,
             governance: None,
-            minted: Mutex::new(HashMap::new()),
             clock: Arc::new(crate::SystemClock),
             identities: None,
             logs: None,
         }
     }
 
-    /// Register the forge token and each registry credential resolved at
-    /// launch with `logs`' redactor, so a Step that prints one shows `***`.
+    /// Revoke forge tokens from the units' value ledgers in `logs`.
+    /// [`crate::log_ledger::build_executor_stack`] sets it.
     pub fn with_logs(mut self, logs: Arc<crate::LogService>) -> Self {
         self.logs = Some(logs);
         self
@@ -551,42 +545,52 @@ impl ForgeCredentialExecutor {
         }
     }
 
-    /// Revoke every token minted for `handle`'s unit: the ones this process
-    /// minted, and the one the unit holds, which the executor removes as it
-    /// hands it back. A long-lived token is removed and never revoked. A
-    /// failed revocation is logged: the token still expires on its own.
+    /// Attempt a revoke of every minted forge token in the ledger of the
+    /// unit behind `handle`, except `keep`, and return whether every call
+    /// succeeded (none to make counts). The ledger holds every token a
+    /// labelled unit was given, whichever replica minted it. A token not
+    /// revoked here is retried by the purge sweep; it expires on its own.
+    async fn revoke_from_ledger(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+        keep: Option<&str>,
+    ) -> bool {
+        let Some(logs) = &self.logs else {
+            return true;
+        };
+        let values = match logs.reload_values(unit).await {
+            Ok(v) => v,
+            // No ledger: nothing this version minted for it.
+            Err(crate::logs::LedgerError::NotLedgerComplete(_)) => return true,
+            Err(e) => {
+                tracing::warn!(error = %e, "reading a unit's ledger to revoke its forge tokens failed; retried later");
+                return false;
+            }
+        };
+        revoke_tokens(self.forge.as_ref(), &values, keep).await
+    }
+
+    /// The Attempt behind `handle` ended: revoke every minted token in its
+    /// ledger, record that when every call succeeded, and delete the unit's
+    /// Secrets by name (never reading them).
     async fn revoke(&self, handle: &ExecHandle) {
-        let mut tokens = self
-            .minted
-            .lock()
-            .unwrap()
-            .remove(&handle.0)
-            .unwrap_or_default();
-        match self.inner.take_forge_credential(handle).await {
-            Ok(Some(held)) if held.credential.minted => {
-                if !tokens.iter().any(|(_, t)| *t == held.credential.token) {
-                    let repo = RepoRef {
-                        owner: held.owner,
-                        name: held.name,
-                    };
-                    tokens.push((repo, held.credential.token));
+        if let Some(logs) = &self.logs {
+            if let Ok(Some(unit)) = logs.db().log_unit_by_handle(&handle.0).await {
+                // Revoked already, by this replica or another (a later poll).
+                let done = matches!(
+                    logs.db().log_unit_ledger(&unit).await,
+                    Ok(Some(l)) if l.unit.revoke_attempted_at.is_some()
+                );
+                if !done && self.revoke_from_ledger(&unit, None).await {
+                    let now = self.clock.now().await;
+                    if let Err(e) = logs.db().mark_log_unit_revoked(&unit, now).await {
+                        tracing::debug!(error = %e, "recording a unit's revocation failed; the sweep retries");
+                    }
                 }
             }
-            Ok(_) => {}
-            Err(e) => tracing::warn!(
-                unit = %handle.0,
-                error = %e,
-                "reading back a unit's forge token failed; it expires on its own"
-            ),
         }
-        for (repo, token) in tokens {
-            if let Err(e) = self.forge.revoke_credential(&repo, &token).await {
-                tracing::warn!(
-                    repo = %format!("{}/{}", repo.owner, repo.name),
-                    error = %e,
-                    "revoking a forge token failed; it expires on its own"
-                );
-            }
+        if let Err(e) = self.inner.delete_unit_secrets(handle).await {
+            tracing::warn!(unit = %handle.0, error = %e, "deleting a unit's Secrets failed; they are removed with its Pod");
         }
     }
 
@@ -771,8 +775,8 @@ impl ForgeCredentialExecutor {
     /// trusts with the registry credential (or never did: a Step the
     /// repository wrote); else the `REGISTRY_AUTH` secret, or the
     /// forge-derived credential when the org still trusts the Step's
-    /// library with forge credentials too. Each value is registered with
-    /// the log redactor.
+    /// library with forge credentials too. The value ledger records each
+    /// value from the final spec.
     async fn step_registry_auth(
         &self,
         step: &StepRun,
@@ -810,55 +814,46 @@ impl ForgeCredentialExecutor {
         let (json, derived) = self
             .resolve_registry_auth(&config.owner, &config.name, forge_derived)
             .await;
-        if let (Some(logs), Some(fence)) = (&self.logs, crate::LogFence::of_step(step)) {
-            for value in registry_secret_values(json.as_deref(), derived.as_ref()) {
-                logs.register_secret(&fence, value.as_bytes());
-            }
-        }
         out.registry_auth_json = json;
         out.derived_auth = derived;
         Ok(out)
     }
 }
 
-/// The values in a registry credential that a log must never show: the
-/// dockerconfigjson itself, each `auth`, `password`, `identitytoken` and
-/// `registrytoken` in it, and the password half of each decoded `auth`; or
-/// the forge-derived token and the `auth` Scarab builds from it.
-pub(crate) fn registry_secret_values(
-    json: Option<&str>,
-    derived: Option<&scarab_engine::RegistryCredential>,
-) -> Vec<String> {
-    use base64::Engine;
-    let b64 = base64::engine::general_purpose::STANDARD;
-    let mut out = Vec::new();
-    if let Some(json) = json {
-        out.push(json.to_string());
-        let parsed: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
-        if let Some(auths) = parsed.get("auths").and_then(|a| a.as_object()) {
-            for entry in auths.values() {
-                for key in ["auth", "password", "identitytoken", "registrytoken"] {
-                    if let Some(v) = entry.get(key).and_then(|v| v.as_str()) {
-                        out.push(v.to_string());
-                    }
-                }
-                let decoded = entry
-                    .get("auth")
-                    .and_then(|v| v.as_str())
-                    .and_then(|a| b64.decode(a).ok())
-                    .and_then(|d| String::from_utf8(d).ok());
-                if let Some((_, password)) = decoded.as_deref().and_then(|d| d.split_once(':')) {
-                    out.push(password.to_string());
-                }
-            }
+/// Attempt a revoke of every minted forge token in `values` except `keep`;
+/// whether every call succeeded. A failure is logged with the repository,
+/// never the token.
+pub async fn revoke_tokens(
+    forge: &dyn ForgePort,
+    values: &crate::logs::ValueSet,
+    keep: Option<&str>,
+) -> bool {
+    let mut all = true;
+    for t in values.minted_forge_tokens() {
+        let token = String::from_utf8_lossy(&t.value).into_owned();
+        if keep == Some(token.as_str()) {
+            continue;
+        }
+        let repo = t.repo.as_ref().map_or(
+            RepoRef {
+                owner: String::new(),
+                name: String::new(),
+            },
+            |r| RepoRef {
+                owner: r.owner.clone(),
+                name: r.name.clone(),
+            },
+        );
+        if let Err(e) = forge.revoke_credential(&repo, &token).await {
+            all = false;
+            tracing::warn!(
+                repo = %format!("{}/{}", repo.owner, repo.name),
+                error = %e,
+                "revoking a forge token failed; retried until the ledger is purged"
+            );
         }
     }
-    if let Some(cred) = derived {
-        out.push(cred.token.clone());
-        out.push(b64.encode(format!("{}:{}", cred.username, cred.token)));
-    }
-    out.retain(|v| !v.is_empty());
-    out
+    all
 }
 
 #[async_trait]
@@ -881,13 +876,17 @@ impl Executor for ForgeCredentialExecutor {
         self.inner.infra_condition(handle).await
     }
 
-    async fn take_forge_credential(
+    async fn delete_unit_secrets(&self, handle: &ExecHandle) -> Result<(), ExecError> {
+        // Forward. This decorator deletes them itself when the Attempt ends
+        // (`revoke`).
+        self.inner.delete_unit_secrets(handle).await
+    }
+
+    async fn log_source_state(
         &self,
-        handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
-        // Forward. This decorator takes the credential itself when the
-        // Attempt ends (`revoke`); nothing else calls this through it.
-        self.inner.take_forge_credential(handle).await
+        src: &scarab_engine::LogSourceRef,
+    ) -> Result<scarab_engine::LogSourceState, ExecError> {
+        self.inner.log_source_state(src).await
     }
 
     async fn workspace_provisioning(
@@ -901,194 +900,158 @@ impl Executor for ForgeCredentialExecutor {
     }
 
     async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
-        // Every value this launch mounts is registered for the step's log
-        // stream by the time the wrapped launch returns: the forge token and
-        // registry values here, the OIDC token and secrets in the wrapped
-        // `SecretInjectingExecutor`. A launch that succeeded marks them
-        // loaded, so this process's tail of the stream does not wait for the
-        // unit's Secrets, which are deleted when the attempt settles. A
-        // failed launch drops them: its tail reads them back from the unit.
-        let fence = crate::LogFence::of_step(step);
+        // Every value this launch mounts is recorded in the unit's value
+        // ledger by the innermost layer, from the final spec, before the
+        // backend writes it anywhere (`log_ledger`).
         let result: Result<ExecHandle, ExecError> = async {
-        // Only a forge-token, sandboxed or `registry_auth` Step asks for a
-        // credential or a trust here; the yank check for every other Step is
-        // SecretInjecting's.
-        // Environment re-admission (ADR-0071 §2) likewise comes before the
-        // credential here, not only in SecretInjecting.
-        if spec.forge_token.is_some() || spec.sandbox.is_some() || spec.registry_auth.is_some() {
-            self.ensure_not_yanked(step).await?;
-            if let Some((db, governance)) = &self.governance {
-                // The `step.admit` decision is recorded by SecretInjecting;
-                // the Environment's re-check is made here as well.
-                crate::secret_executor::ensure_deploy_still_admitted(
-                    db.as_ref(),
-                    governance.as_ref(),
-                    None,
-                    self.identities.as_deref(),
-                    step,
-                    // The grants are re-checked by SecretInjecting, which
-                    // every launch passes through after this one.
-                    None,
-                    self.clock.now().await.0,
-                )
-                .await?;
-            }
-        }
-        // A sandboxed Step (ADR-0018, amendment of 2026-11-12): the org must
-        // still trust its library for the sandbox, checked before any
-        // credential is asked for.
-        if let Some(sandbox) = &spec.sandbox {
-            if let Some(reason) = self.sandbox_refusal(sandbox).await? {
-                return Err(ExecError::Refused(reason));
-            }
-        }
-        // A `registry_auth` Step: its registry credential, in memory only.
-        // A sandboxed or `registry_auth` Step: whether it runs for a fork
-        // pull request (or a Run locked out of its Environment's secrets), as
-        // `SCARAB_FORK_PR`, so a build library neither exports its cache from
-        // the build Step nor pushes from the push Step for one.
-        let with_registry;
-        let spec = if spec.registry_auth.is_some() || spec.sandbox.is_some() {
-            let mut enriched = spec.clone();
-            if let Some(config) = &spec.registry_auth {
-                enriched.registry_auth = Some(self.step_registry_auth(step, config).await?);
-            }
-            let fork = enriched
-                .registry_auth
-                .as_ref()
-                .is_some_and(|r| r.locked_out)
-                || self.run_is_fork_pr(step).await?;
-            enriched
-                .env
-                .retain(|(name, _)| name != scarab_pipeline::FORK_PR_ENV);
-            enriched
-                .env
-                .push((scarab_pipeline::FORK_PR_ENV.to_string(), fork.to_string()));
-            with_registry = enriched;
-            &with_registry
-        } else {
-            spec
-        };
-        let Some(config) = &spec.forge_token else {
-            return self.inner.launch(step, spec).await;
-        };
-        let repo = RepoRef {
-            owner: config.owner.clone(),
-            name: config.name.clone(),
-        };
-        // The access was fixed at Run creation; a fork pull request's, or a
-        // Run locked out of its Environment's secrets, is `read` at every
-        // launch.
-        let access = if config.read_only {
-            ForgeToken::Read
-        } else {
-            config.access
-        };
-        // The token goes to the URL the Run's clone library fetches from:
-        // never over plain HTTP.
-        self.ensure_https_clone_url(step).await?;
-        // Whether this Step may hold the token is checked again here, from
-        // what the connection is now (see `long_lived_refusal`). A Step that
-        // may hold only a minted token asks first whether the connection
-        // mints, so a long-lived token is not fetched for it at all. A forge
-        // that cannot say is treated as handing out a long-lived token.
-        let refusal = self.long_lived_refusal(config, access).await?;
-        if let Some(reason) = &refusal {
-            if !self.forge.mints_repo_tokens(&repo).await.unwrap_or(false) {
-                return Err(ExecError::Refused(reason.clone()));
-            }
-        }
-        // Minted fresh for each launch (short TTL by contract).
-        let credential = match access {
-            // A read credential that cannot be minted (no connection, no
-            // credential material) degrades to none: a public repository
-            // still clones, a private one fails at git with an auth error.
-            ForgeToken::Read => match self.forge.mint_checkout_credential(&repo, true).await {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    tracing::warn!(
-                        repo = %format!("{}/{}", repo.owner, repo.name),
-                        error = %e,
-                        "forge credential unavailable — launching without one"
-                    );
-                    None
+            // Only a forge-token, sandboxed or `registry_auth` Step asks for a
+            // credential or a trust here; the yank check for every other Step is
+            // SecretInjecting's.
+            // Environment re-admission (ADR-0071 §2) likewise comes before the
+            // credential here, not only in SecretInjecting.
+            if spec.forge_token.is_some() || spec.sandbox.is_some() || spec.registry_auth.is_some()
+            {
+                self.ensure_not_yanked(step).await?;
+                if let Some((db, governance)) = &self.governance {
+                    // The `step.admit` decision is recorded by SecretInjecting;
+                    // the Environment's re-check is made here as well.
+                    crate::secret_executor::ensure_deploy_still_admitted(
+                        db.as_ref(),
+                        governance.as_ref(),
+                        None,
+                        self.identities.as_deref(),
+                        step,
+                        // The grants are re-checked by SecretInjecting, which
+                        // every launch passes through after this one.
+                        None,
+                        self.clock.now().await.0,
+                    )
+                    .await?;
                 }
-            },
-            // A write credential Run creation admitted and the forge will
-            // not mint now is the Step's failure, never a silent downgrade.
-            ForgeToken::Write => Some(
-                self.forge
-                    .mint_write_credential(&repo)
-                    .await
-                    .map_err(|e| ExecError::Launch(format!("minting a write forge token: {e}")))?,
-            ),
-        };
-        // The decision rests on the credential the forge handed over, not on
-        // the answer `mints_repo_tokens` gave: the connection may have been
-        // swapped between the two calls. A long-lived token for a Step that
-        // may hold only a minted one is dropped, and the Step fails.
-        if let (Some(reason), Some(c)) = (&refusal, &credential) {
-            if !c.minted {
-                return Err(ExecError::Refused(format!(
-                    "{reason} (the connection handed over a long-lived token although it said \
+            }
+            // A sandboxed Step (ADR-0018, amendment of 2026-11-12): the org must
+            // still trust its library for the sandbox, checked before any
+            // credential is asked for.
+            if let Some(sandbox) = &spec.sandbox {
+                if let Some(reason) = self.sandbox_refusal(sandbox).await? {
+                    return Err(ExecError::Refused(reason));
+                }
+            }
+            // A `registry_auth` Step: its registry credential, in memory only.
+            // A sandboxed or `registry_auth` Step: whether it runs for a fork
+            // pull request (or a Run locked out of its Environment's secrets), as
+            // `SCARAB_FORK_PR`, so a build library neither exports its cache from
+            // the build Step nor pushes from the push Step for one.
+            let with_registry;
+            let spec = if spec.registry_auth.is_some() || spec.sandbox.is_some() {
+                let mut enriched = spec.clone();
+                if let Some(config) = &spec.registry_auth {
+                    enriched.registry_auth = Some(self.step_registry_auth(step, config).await?);
+                }
+                let fork = enriched
+                    .registry_auth
+                    .as_ref()
+                    .is_some_and(|r| r.locked_out)
+                    || self.run_is_fork_pr(step).await?;
+                enriched
+                    .env
+                    .retain(|(name, _)| name != scarab_pipeline::FORK_PR_ENV);
+                enriched
+                    .env
+                    .push((scarab_pipeline::FORK_PR_ENV.to_string(), fork.to_string()));
+                with_registry = enriched;
+                &with_registry
+            } else {
+                spec
+            };
+            let Some(config) = &spec.forge_token else {
+                return self.inner.launch(step, spec).await;
+            };
+            let repo = RepoRef {
+                owner: config.owner.clone(),
+                name: config.name.clone(),
+            };
+            // The access was fixed at Run creation; a fork pull request's, or a
+            // Run locked out of its Environment's secrets, is `read` at every
+            // launch.
+            let access = if config.read_only {
+                ForgeToken::Read
+            } else {
+                config.access
+            };
+            // The token goes to the URL the Run's clone library fetches from:
+            // never over plain HTTP.
+            self.ensure_https_clone_url(step).await?;
+            // Whether this Step may hold the token is checked again here, from
+            // what the connection is now (see `long_lived_refusal`). A Step that
+            // may hold only a minted token asks first whether the connection
+            // mints, so a long-lived token is not fetched for it at all. A forge
+            // that cannot say is treated as handing out a long-lived token.
+            let refusal = self.long_lived_refusal(config, access).await?;
+            if let Some(reason) = &refusal {
+                if !self.forge.mints_repo_tokens(&repo).await.unwrap_or(false) {
+                    return Err(ExecError::Refused(reason.clone()));
+                }
+            }
+            // Minted fresh for each launch (short TTL by contract).
+            let credential = match access {
+                // A read credential that cannot be minted (no connection, no
+                // credential material) degrades to none: a public repository
+                // still clones, a private one fails at git with an auth error.
+                ForgeToken::Read => match self.forge.mint_checkout_credential(&repo, true).await {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        tracing::warn!(
+                            repo = %format!("{}/{}", repo.owner, repo.name),
+                            error = %e,
+                            "forge credential unavailable — launching without one"
+                        );
+                        None
+                    }
+                },
+                // A write credential Run creation admitted and the forge will
+                // not mint now is the Step's failure, never a silent downgrade.
+                ForgeToken::Write => {
+                    Some(self.forge.mint_write_credential(&repo).await.map_err(|e| {
+                        ExecError::Launch(format!("minting a write forge token: {e}"))
+                    })?)
+                }
+            };
+            // The decision rests on the credential the forge handed over, not on
+            // the answer `mints_repo_tokens` gave: the connection may have been
+            // swapped between the two calls. A long-lived token for a Step that
+            // may hold only a minted one is dropped, and the Step fails.
+            if let (Some(reason), Some(c)) = (&refusal, &credential) {
+                if !c.minted {
+                    return Err(ExecError::Refused(format!(
+                        "{reason} (the connection handed over a long-lived token although it said \
                      it mints short-lived ones; it changed during the launch)"
-                )));
-            }
-        }
-        // The token is mounted into the step container: a step that prints
-        // it shows `***`. A re-drive mints a new one and registers it here
-        // too. A peer replica reads it back from the unit
-        // (`Executor::log_redactions`).
-        if let (Some(logs), Some(c), Some(fence)) = (&self.logs, &credential, &fence) {
-            logs.register_secret(fence, c.token.as_bytes());
-        }
-        let mut enriched = spec.clone();
-        if let Some(f) = enriched.forge_token.as_mut() {
-            f.access = access;
-        }
-        if let (Some(f), Some(c)) = (enriched.forge_token.as_mut(), &credential) {
-            f.credential = Some(ForgeCredential {
-                username: c.username.clone(),
-                token: c.token.clone(),
-                minted: c.minted,
-            });
-        }
-        let launched = self.inner.launch(step, &enriched).await;
-        // A long-lived token is never revoked: only a minted one is tracked.
-        if let Some(c) = credential.filter(|c| c.minted) {
-            match &launched {
-                // A re-drive of the same Attempt replaces the token the unit
-                // holds (the executor writes the new one over it): the one
-                // it replaces ends now, not when the Attempt ends.
-                Ok(handle) => {
-                    let replaced = self
-                        .minted
-                        .lock()
-                        .unwrap()
-                        .insert(handle.0.clone(), vec![(repo.clone(), c.token)]);
-                    for (repo, token) in replaced.into_iter().flatten() {
-                        if let Err(e) = self.forge.revoke_credential(&repo, &token).await {
-                            tracing::warn!(error = %e, "revoking a replaced forge token failed");
-                        }
-                    }
-                }
-                // Nothing holds it: end it now.
-                Err(_) => {
-                    if let Err(e) = self.forge.revoke_credential(&repo, &c.token).await {
-                        tracing::warn!(error = %e, "revoking an unused forge token failed");
-                    }
+                    )));
                 }
             }
-        }
-        launched
+            let mut enriched = spec.clone();
+            if let Some(f) = enriched.forge_token.as_mut() {
+                f.access = access;
+            }
+            if let (Some(f), Some(c)) = (enriched.forge_token.as_mut(), &credential) {
+                f.credential = Some(ForgeCredential {
+                    username: c.username.clone(),
+                    token: c.token.clone(),
+                    minted: c.minted,
+                });
+            }
+            let launched = self.inner.launch(step, &enriched).await?;
+            // A re-drive of the same Attempt replaced the token the unit holds:
+            // every other minted token in its ledger, minted by this replica or
+            // another, ends now. A launch that failed revokes nothing (its token
+            // may be mounted); the Attempt's end and the purge sweep cover it.
+            if let Some(unit) = crate::log_ledger::step_unit(step) {
+                let mounted = credential.as_ref().map(|c| c.token.as_str());
+                self.revoke_from_ledger(&unit, mounted).await;
+            }
+            Ok(launched)
         }
         .await;
-        if let (Some(logs), Some(fence)) = (&self.logs, &fence) {
-            match &result {
-                Ok(_) => logs.mark_values_loaded(fence),
-                Err(_) => logs.forget_secrets(fence),
-            }
-        }
         result
     }
 
@@ -1175,15 +1138,6 @@ impl Executor for ForgeCredentialExecutor {
         from: scarab_engine::LogFrom,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         self.inner.log_stream(step, from).await
-    }
-
-    async fn log_redactions(
-        &self,
-        step: &StepRun,
-    ) -> Result<scarab_engine::LogRedactions, ExecError> {
-        // Forward: the trait default answers none, which would make every
-        // replica that did not launch a step store its secrets in clear.
-        self.inner.log_redactions(step).await
     }
 
     async fn sidecar_log_stream(
@@ -1292,75 +1246,5 @@ mod tests {
             .expect("launch_service must forward to inner, not hit the reject default");
 
         assert_eq!(inner.launched_services(), vec![handle.0]);
-    }
-
-    // J-1: a replica that tails a step it did not launch registers what
-    // `log_redactions` reads back from the Pod's `<pod>-registry` Secret,
-    // run through `registry_secret_values` (log_tail.rs). It must cover what
-    // the launching replica registered (`step_registry_auth`). For a
-    // forge-derived credential the Secret holds the dockerconfigjson the k8s
-    // executor builds (`registry_dockerconfig`); for the `REGISTRY_AUTH`
-    // secret it holds that JSON as stored. The forge and OIDC tokens are
-    // checked by `log_tail::tests::a_peer_registers_every_token_the_launch_registers`.
-    #[test]
-    fn a_peer_registers_every_registry_value_the_launch_registers() {
-        use base64::Engine;
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let derived = scarab_engine::RegistryCredential {
-            registry: "ghcr.io".into(),
-            username: "x-access-token".into(),
-            token: "ghs_derivedtoken".into(),
-        };
-        let built = serde_json::json!({ "auths": { "ghcr.io": {
-            "auth": b64.encode("x-access-token:ghs_derivedtoken")
-        } } })
-        .to_string();
-        let stored = serde_json::json!({ "auths": { "registry.corp": {
-            "auth": b64.encode("ci:s3cret"), "identitytoken": "idtok"
-        } } })
-        .to_string();
-        for (launch, unit) in [
-            (registry_secret_values(None, Some(&derived)), built),
-            (registry_secret_values(Some(&stored), None), stored.clone()),
-        ] {
-            let peer = registry_secret_values(Some(&unit), None);
-            assert!(!launch.is_empty());
-            for value in &launch {
-                assert!(peer.contains(value), "{value} not in {peer:?}");
-            }
-        }
-    }
-
-    // This decorator must forward `log_redactions`: the trait default answers
-    // none, and a replica that did not launch a step would then store the
-    // step's secrets in its log in clear.
-    #[tokio::test]
-    async fn forwards_log_redactions_to_inner() {
-        let inner = Arc::new(FakeExecutor::new());
-        let forge: Arc<dyn ForgePort> = Arc::new(FakeForge::new());
-        let decorator = ForgeCredentialExecutor::new(inner.clone(), forge);
-        let step = scarab_engine::StepRun {
-            key: None,
-            run: RunId("run-1".into()),
-            step: scarab_engine::StepId("build".into()),
-            status: scarab_engine::StepStatus::Running,
-            attempts: vec![],
-            needs: vec![],
-            gate_kind: None,
-        };
-        inner.set_log_redactions(vec![b"s3cr3t".to_vec()]);
-
-        assert_eq!(
-            decorator.log_redactions(&step).await.unwrap(),
-            scarab_engine::LogRedactions::Values(vec![b"s3cr3t".to_vec()])
-        );
-        // `Gone` and an error pass through as they are, never as "none".
-        inner.set_log_redactions_answer(Ok(scarab_engine::LogRedactions::Gone));
-        assert_eq!(
-            decorator.log_redactions(&step).await.unwrap(),
-            scarab_engine::LogRedactions::Gone
-        );
-        inner.set_log_redactions_answer(Err("forbidden".into()));
-        assert!(decorator.log_redactions(&step).await.is_err());
     }
 }

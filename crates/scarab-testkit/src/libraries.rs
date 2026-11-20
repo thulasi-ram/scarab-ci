@@ -9,8 +9,8 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use scarab_pipeline::InstalledLibrary;
 use scarab_policy::library::{
-    trust_key, LibraryInstallation, LibraryStore, LibraryStoreError, LibraryVersion, LibraryYank,
-    NewInstallation, Replaces, TrustGrant, TrustedSource,
+    pinned_at, trust_key, LibraryInstallation, LibraryStore, LibraryStoreError, LibraryVersion,
+    LibraryYank, NewInstallation, Replaces, TrustGrant, TrustedSource,
 };
 
 #[derive(Default)]
@@ -78,7 +78,8 @@ impl State {
             org: i.org.clone(),
             name: i.name.clone(),
             content_hash: i.content_hash.clone(),
-            source: v.source.clone(),
+            // The version's file at the installation's own commit.
+            source: pinned_at(&v.source, &i.resolved_commit),
             installed_by: i.installed_by.clone(),
             installed_at: i.installed_at,
             step_up_ref: i.step_up_ref.clone(),
@@ -207,7 +208,7 @@ impl LibraryStore for InMemoryLibraries {
                     n.clone(),
                     InstalledLibrary {
                         content: v.content.clone(),
-                        source: v.source.clone(),
+                        source: pinned_at(&v.source, &i.resolved_commit),
                     },
                 )
             })

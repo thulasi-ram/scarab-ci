@@ -287,6 +287,33 @@ test("a large log shows its last 2 MiB, Load full log reads it all, Download nam
   await expect(last.locator(".lgln")).toHaveText("130004");
 });
 
+// The rich run's test step: its log source restarted part way through, and
+// the server's note about it is a row of its own between two output lines.
+test("the server's note about a log is a row of its own, not an output line", async ({ page }) => {
+  await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}?step=2`);
+  await expect(page.locator(".sp-name")).toHaveText("test");
+  const note = page.locator(".lgbody").getByRole("note");
+  await expect(note).toHaveCount(1);
+  await expect(note).toHaveText(
+    "[scarab] the log source restarted; lines before this point may be missing or repeat",
+  );
+  // It has no line number, and the lines around it keep theirs: the note did
+  // not split or join them.
+  await expect(note.locator(".lgln")).toHaveText("");
+  const before = note.locator("xpath=preceding-sibling::div[1]");
+  const after = note.locator("xpath=following-sibling::div[1]");
+  await expect(before.locator(".lgtx")).toHaveText("running 214 tests");
+  await expect(before.locator(".lgln")).toHaveText("7");
+  await expect(after.locator(".lgtx")).toHaveText("test executor::retry::backoff_is_exponential ... ok");
+  await expect(after.locator(".lgln")).toHaveText("8");
+  // The raw log writes the note as a `[scarab]` line in the same place.
+  const href = await page.locator(".steplogs-tools").getByRole("link", { name: "Download" }).getAttribute("href");
+  const raw = await page.evaluate(async (u) => (await fetch(u!)).text(), href);
+  expect(raw).toContain(
+    "running 214 tests\n[scarab] the log source restarted; lines before this point may be missing or repeat\ntest executor",
+  );
+});
+
 // The rich run's shared postgres service logged about 2.5 MiB (30,005 lines).
 // Its pane shows the last 2 MiB, can read the whole log, and downloads it.
 test("a large service log offers Load full log and Download", async ({ page }) => {

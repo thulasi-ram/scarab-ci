@@ -94,13 +94,16 @@ pub struct LibraryInstallationDto {
     /// The library name, as `invoke: lib:<name>` writes it.
     pub name: String,
     pub content_hash: String,
+    /// The file the installed version was read from, pinned to
+    /// `resolved_commit`.
     pub source: String,
     /// The branch, tag or commit the admin fetched the installed version
     /// at, as typed. `null` when the fetch named the commit in the source
     /// (`…@<commit>`), and for an install from before Scarab kept it.
     pub requested_ref: Option<String>,
-    /// The full commit the fetch read the file at. The same file can be at
-    /// more than one commit, so it may differ from the commit in `source`.
+    /// The full commit the fetch read the file at. An install of the same
+    /// content fetched at another commit moves the installation to that
+    /// commit.
     pub resolved_commit: String,
     pub installed_by: String,
     pub installed_at: i64,
@@ -261,6 +264,7 @@ pub struct FetchLibraryRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct InstalledVersionDto {
     pub content_hash: String,
+    /// Pinned to `resolved_commit`.
     pub source: String,
     /// The branch, tag or commit the installed version was fetched at;
     /// `null` when its fetch named the commit in the source.
@@ -273,7 +277,8 @@ pub struct InstalledVersionDto {
 pub struct FetchedLibraryDto {
     pub name: String,
     pub content_hash: String,
-    /// Pinned to the commit of the first fetch of this content in the org.
+    /// The file, pinned to `resolved_commit`. When this content was stored
+    /// already from another file, that file.
     pub source: String,
     /// The `ref` of the request, trimmed; `null` when the source named the
     /// commit. When this content was stored already from another file, the
@@ -289,6 +294,12 @@ pub struct FetchedLibraryDto {
     /// The change from `current`, one line per entry, each starting with
     /// `+`, `-` or a space. Empty when nothing is installed.
     pub diff: String,
+    /// `current` has this content: the file is the same at this commit.
+    /// Installing it, with `replaces` naming the same hash, moves the
+    /// installation to this fetch's `requested_ref`, `resolved_commit` and
+    /// `source`; when those are the installation's already, the install is
+    /// refused with 409. `false` when nothing is installed under the name.
+    pub content_unchanged: bool,
     /// The grants (`forge_credentials`, `registry_credential`,
     /// `build_sandbox`) the org trusts this version's source with. Trust is
     /// kept per source, not per commit, so installing this version gives it
@@ -305,6 +316,8 @@ pub struct InstallLibraryRequest {
     /// A version fetched into this org.
     pub content_hash: String,
     /// The hash installed now (an upgrade), or omitted for a first install.
+    /// The same hash as `content_hash` moves the installation to the
+    /// version's ref and commit: the file is the same there.
     #[serde(default)]
     pub replaces: Option<String>,
     /// The grants the version's source holds, which the version
@@ -1189,10 +1202,13 @@ pub(crate) async fn fetch_library(
         None => String::new(),
     };
     let carried = carried_grants(store, &org, &stored.source).await?;
+    let content_unchanged = current
+        .as_ref()
+        .is_some_and(|c| c.content_hash == stored.content_hash);
     Ok(Json(FetchedLibraryDto {
         name,
+        source: stored.pinned_source(),
         content_hash: stored.content_hash,
-        source: stored.source,
         requested_ref: stored.requested_ref,
         resolved_commit: stored.resolved_commit,
         content,
@@ -1203,16 +1219,21 @@ pub(crate) async fn fetch_library(
             resolved_commit: c.resolved_commit,
         }),
         diff,
+        content_unchanged,
         carried_grants: carried.into_iter().map(Into::into).collect(),
     }))
 }
 
 /// Install or upgrade `lib:<name>` to a fetched version. Needs a step-up:
 /// installing and upgrading loosen (ADR-0076 §4). `replaces` must be the
-/// hash installed now, or omitted when nothing is. When the org trusts the
+/// hash installed now, or omitted when nothing is. The hash installed now,
+/// fetched again at another ref or commit, moves the installation to that
+/// ref and commit, as an upgrade does; at the ref and commit installed, it
+/// is refused with 409. When the org trusts the
 /// version's source with any grant, `carry_grants` must name exactly
 /// those grants: trust is kept per source, so the new version gets them, and
-/// the admin says so. The `op.completed` event names the grants carried.
+/// the admin says so. The `op.completed` event names the grants carried,
+/// the version installed and the one it replaced.
 /// Administer on the org.
 #[utoipa::path(
     post,
@@ -1225,7 +1246,7 @@ pub(crate) async fn fetch_library(
         (status = 400, description = "a bad name or hash, a version not fetched into this org, one that no longer compiles here, or `carry_grants` that are not the grants the source holds"),
         (status = 403, description = "not an org admin, or no step-up"),
         (status = 404, description = "libraries not configured"),
-        (status = 409, description = "`replaces` is not what is installed now, or the version was fetched again at another ref or commit than `requested_ref` and `resolved_commit` name")
+        (status = 409, description = "`replaces` is not what is installed now, the version is installed already at the same ref and commit, or the version was fetched again at another ref or commit than `requested_ref` and `resolved_commit` name")
     )
 )]
 pub(crate) async fn install_library(
@@ -1290,16 +1311,30 @@ pub(crate) async fn install_library(
         None => {}
     }
     let fetched = fetched_as(version.requested_ref.as_deref(), &version_commit);
+    let current = store
+        .installation(&org, &name)
+        .await
+        .map_err(store_api_error)?;
+    // The same content at another ref or commit moves the installation
+    // there; the same content at the same ref and commit changes nothing.
+    if let Some(c) = &current {
+        if c.content_hash == version.content_hash
+            && c.resolved_commit == version_commit
+            && c.requested_ref == version.requested_ref
+        {
+            return Err(ApiError::Conflict(format!(
+                "`lib:{name}` is installed at this version already, fetched at {fetched};                  nothing would change"
+            )));
+        }
+    }
     let replaced = match &body.replaces {
-        Some(h) => store
-            .installation(&org, &name)
-            .await
-            .map_err(store_api_error)?
-            .filter(|i| &i.content_hash == h)
-            .map(|i| fetched_as(i.requested_ref.as_deref(), &i.resolved_commit)),
+        Some(h) => current.filter(|i| &i.content_hash == h),
         None => None,
     };
-    let fetch_line = match &replaced {
+    let replaced_as = replaced
+        .as_ref()
+        .map(|i| fetched_as(i.requested_ref.as_deref(), &i.resolved_commit));
+    let fetch_line = match &replaced_as {
         Some(old) => format!("fetched at = {old} to {fetched}"),
         None => format!("fetched at = {fetched}"),
     };
@@ -1350,15 +1385,23 @@ pub(crate) async fn install_library(
             "resolved_commit": installed.resolved_commit,
         }),
     );
-    if let Some(old) = &replaced {
-        guard.note_completed("replaced", serde_json::json!({ "fetched_as": old }));
+    if let (Some(old), Some(old_as)) = (&replaced, &replaced_as) {
+        guard.note_completed(
+            "replaced",
+            serde_json::json!({
+                "fetched_as": old_as,
+                "content_hash": old.content_hash,
+                "requested_ref": old.requested_ref,
+                "resolved_commit": old.resolved_commit,
+            }),
+        );
     }
     tracing::info!(
         org = %org,
         library = %installed.name,
         content_hash = %installed.content_hash,
         fetched_as = %fetched,
-        replaced = replaced.as_deref().unwrap_or("nothing"),
+        replaced = replaced_as.as_deref().unwrap_or("nothing"),
         "library installed"
     );
     if !carried.is_empty() {
