@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  addMarker,
   appendLog,
   backoffDelay,
   emptyLogBuffer,
@@ -8,9 +9,11 @@ import {
   LOG_OPEN_TIMEOUT_MS,
   LOG_QUIET_MS,
   logNotice,
+  parseLogMarker,
   tailRows,
   truncateLog,
   utf8Length,
+  type LogMarker,
   type LogStreamHandlers,
   type LogStreamQuery,
   type Timers,
@@ -215,6 +218,93 @@ describe("tailRows", () => {
   });
 });
 
+describe("parseLogMarker", () => {
+  it("reads the server's note: its kind, its reason, and its text", () => {
+    expect(parseLogMarker('{"kind":"source_restarted","text":"the log source restarted"}')).toEqual({
+      kind: "source_restarted",
+      text: "the log source restarted",
+    });
+    expect(parseLogMarker('{"kind":"not_stored","reason":"ledger_purged","text":"the rest was not stored"}')).toEqual({
+      kind: "not_stored",
+      reason: "ledger_purged",
+      text: "the rest was not stored",
+    });
+    // A kind this pane does not know still shows its text.
+    expect(parseLogMarker('{"kind":"later_kind","text":"a note"}')?.text).toBe("a note");
+  });
+
+  it("is null for data that is not a note with a text", () => {
+    for (const data of ["", "not json", "null", "[]", '{"kind":"incomplete"}', '{"kind":"incomplete","text":"  "}']) {
+      expect(parseLogMarker(data)).toBeNull();
+    }
+  });
+});
+
+describe("addMarker", () => {
+  const restarted: LogMarker = { kind: "source_restarted", text: "the log source restarted" };
+  const incomplete: LogMarker = { kind: "incomplete", text: "the end of this log could not be read" };
+
+  it("is a row of its own between the lines, with no number of its own", () => {
+    let b = appendLog(emptyLogBuffer(), "one\ntwo\n");
+    b = addMarker(b, restarted);
+    b = appendLog(b, "three\n");
+    expect(tailRows(b, 10)).toEqual([
+      { n: 1, line: "one" },
+      { n: 2, line: "two" },
+      { marker: restarted },
+      { n: 3, line: "three" },
+    ]);
+    // The note is not output: the text and its size are the output's.
+    expect(b.text).toBe("one\ntwo\nthree\n");
+  });
+
+  it("ends the line the output was in the middle of, and the output after it starts a new line", () => {
+    let b = appendLog(emptyLogBuffer(), "one\ntw");
+    b = addMarker(b, restarted);
+    b = appendLog(b, "o\n");
+    expect(tailRows(b, 10)).toEqual([
+      { n: 1, line: "one" },
+      { n: 2, line: "tw" },
+      { marker: restarted },
+      { n: 3, line: "o" },
+    ]);
+  });
+
+  it("shows notes at the start, at the end, and with no output at all", () => {
+    let b = addMarker(emptyLogBuffer(), restarted);
+    expect(tailRows(b, 10)).toEqual([{ marker: restarted }]);
+    b = appendLog(b, "one\n");
+    b = addMarker(b, incomplete);
+    expect(tailRows(b, 10)).toEqual([{ marker: restarted }, { n: 1, line: "one" }, { marker: incomplete }]);
+  });
+
+  it("leaves out a note above the last `max` lines, and drops one with the lines above it", () => {
+    let b = appendLog(emptyLogBuffer(), "l1\n", 9);
+    b = addMarker(b, restarted, 9);
+    b = appendLog(b, "l2\nl3\n", 9);
+    expect(tailRows(b, 1)).toEqual([{ n: 3, line: "l3" }]);
+    expect(tailRows(b, 2)).toEqual([{ marker: restarted }, { n: 2, line: "l2" }, { n: 3, line: "l3" }]);
+    // 12 bytes over a cap of 9: "l1\n" goes, and the note after it stays.
+    b = appendLog(b, "l4\n", 9);
+    expect(b.droppedLines).toBe(1);
+    expect(tailRows(b, 10)[0]).toEqual({ marker: restarted });
+    // "l2\n" goes too: the note above it goes with it.
+    b = appendLog(b, "l5\n", 9);
+    expect(b.droppedLines).toBe(2);
+    expect(b.markers).toEqual([]);
+    expect(tailRows(b, 10)).toEqual([
+      { n: 3, line: "l3" },
+      { n: 4, line: "l4" },
+      { n: 5, line: "l5" },
+    ]);
+  });
+
+  it("lets the notice say a log with only a note is still being stored", () => {
+    const b = addMarker(emptyLogBuffer(), restarted);
+    expect(logNotice(b, { outcome: "succeeded", store: "storing" })?.text).toBe("The log is still being stored.");
+  });
+});
+
 /** A fake server: each `open` is one stream the test drives by hand.
  * `probe` answers the follower's question about a cursor. Timers run only by
  * `tick`, earliest first. */
@@ -239,6 +329,7 @@ function harness(opts: {
     now: () => clock,
   };
   const shown: string[] = [];
+  const marks: LogMarker[] = [];
   const errors: (string | null)[] = [];
   let ends = 0;
   let resets = 0;
@@ -254,6 +345,7 @@ function harness(opts: {
     tail: opts.tail ?? 2 * MiB,
     outcome: opts.outcome,
     onChunk: (t) => shown.push(t),
+    onMarker: (m) => marks.push(m),
     onTruncated: () => {},
     onEnd: () => ends++,
     onReset: () => resets++,
@@ -287,6 +379,7 @@ function harness(opts: {
       return live();
     },
     shown,
+    marks,
     errors,
     tick,
     advance,
@@ -311,6 +404,23 @@ describe("followLog", () => {
     expect(h.opened).toHaveLength(2);
     expect(h.opened[1]!.q).toEqual({ from: "a1:2" });
     expect(h.f.lastId()).toBe("a1:2");
+  });
+
+  // The server's note has an id like a data event's: a stream that drops
+  // right after it resumes after the note, so the note does not show twice.
+  it("resumes after a marker's id, and a marker is an answer for the log", () => {
+    const h = harness({ outcome: () => "running" });
+    const m: LogMarker = { kind: "source_restarted", text: "the log source restarted" };
+    h.opened[0]!.h.onChunk("one\n", "a1:1");
+    h.opened[0]!.h.onMarker!(m, "a1:2");
+    expect(h.marks).toEqual([m]);
+    expect(h.f.lastId()).toBe("a1:2");
+    h.opened[0]!.h.onEnd!();
+    h.tick();
+    expect(h.opened[1]!.q).toEqual({ from: "a1:2" });
+    const only = harness({ outcome: () => "failed" });
+    only.opened[0]!.h.onMarker!(m, "a1:1");
+    expect(only.loaded()).toBe(1);
   });
 
   it("backs off 1s, 2s, 4s while reopened streams deliver nothing, and resets once one does", () => {

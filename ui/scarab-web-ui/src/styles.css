@@ -2635,6 +2635,17 @@ h1, .crumb-head, .run-title {
 .lgrow.ok .lgtx { color: var(--ok); }
 .lgrow.cmd .lgtx { color: var(--terminal-accent); }
 .lgrow.empty { color: var(--muted-sage); padding: 8px 12px; }
+/* The server's note about a stored log (the log source restarted, the rest
+   was not stored): a row of its own between the output lines, tinted like
+   the notice above the log and muted, so it does not read as step output.
+   It wraps even when the output lines do not. */
+.lgrow.lgmark {
+  margin: 2px 0;
+  border-block: 1px dashed var(--terminal-line);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+.lgrow.lgmark .lgtx { color: var(--muted-sage); white-space: pre-wrap; }
+.lgrow.lgmark .lgmark-tag { color: var(--warn); }
 /* Above a log when part of it is not shown: how much shows, and the ways to
    read the rest. An <a> in the log tools reads like the buttons beside it. */
 .lgnotice {

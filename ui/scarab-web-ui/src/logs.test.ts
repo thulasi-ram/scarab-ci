@@ -34,6 +34,14 @@ describe("logBodyState", () => {
     expect(st({ text: "hello\n", outcome: "failed", loaded: false, error: "boom" })).toBe("output");
   });
 
+  // A log whose only row is the server's note ("the rest of this log was not
+  // stored") shows the note, not "No log output was captured".
+  it("a note from the server is a row to show, with no output", () => {
+    expect(st({ markers: 1, ended: true, outcome: "succeeded" })).toBe("output");
+    expect(st({ text: "\n", markers: 1, outcome: "failed", storing: true })).toBe("output");
+    expect(st({ markers: 0, ended: true, outcome: "succeeded" })).toBe("none");
+  });
+
   // Regression: while a finished try's log was still on its way the pane
   // said "No log output was captured for this try."
   it("is loading until the server answers, for finished and running tries", () => {
