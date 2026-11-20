@@ -68,6 +68,12 @@ impl LibraryVersion {
             self.resolved_commit.clone()
         }
     }
+
+    /// The version's file pinned to [`commit`](Self::commit): what its most
+    /// recent fetch from that file read, and what an install of it records.
+    pub fn pinned_source(&self) -> String {
+        pinned_at(&self.source, &self.commit())
+    }
 }
 
 /// The version an org uses under one library name.
@@ -82,7 +88,10 @@ pub struct LibraryInstallation {
     /// The library name, as `invoke: lib:` names it.
     pub name: String,
     pub content_hash: String,
-    /// The installed version's source.
+    /// The installed version's file, pinned to
+    /// [`resolved_commit`](Self::resolved_commit) ([`pinned_at`]): moving the
+    /// installation to another commit of a file that did not change moves
+    /// this too.
     pub source: String,
     pub installed_by: String,
     pub installed_at: i64,
@@ -226,6 +235,16 @@ pub fn pinned_commit(source: &str) -> &str {
     match source.rsplit_once('@') {
         Some((_, commit)) if !commit.contains('/') => commit,
         _ => "",
+    }
+}
+
+/// `source` pinned to `commit` in place of the commit it names: the same
+/// file at another commit. `source` itself when `commit` is empty.
+pub fn pinned_at(source: &str, commit: &str) -> String {
+    if commit.is_empty() {
+        source.to_string()
+    } else {
+        format!("{}@{commit}", trust_key(source))
     }
 }
 
@@ -508,6 +527,14 @@ mod tests {
             c
         );
         assert_eq!(pinned_commit("github.com/acme/libs//deploy.yaml"), "");
+        assert_eq!(
+            pinned_at(&format!("github.com/acme/libs//deploy.yaml@{c}"), "9f8e7d6"),
+            "github.com/acme/libs//deploy.yaml@9f8e7d6"
+        );
+        assert_eq!(
+            pinned_at("github.com/acme/libs//deploy.yaml@9f8e7d6", ""),
+            "github.com/acme/libs//deploy.yaml@9f8e7d6"
+        );
     }
 
     #[test]
