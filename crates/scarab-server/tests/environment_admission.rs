@@ -804,6 +804,7 @@ impl Executor for RecordingExec {
 
 fn secret_step() -> (StepRun, StepSpec) {
     let step = StepRun {
+        key: None,
         run: RunId("r1".into()),
         step: StepId("ship".into()),
         status: StepStatus::Running,

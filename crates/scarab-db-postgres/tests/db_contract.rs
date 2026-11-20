@@ -1031,3 +1031,93 @@ contract_test!(
     log_chunk_index_contract,
     log_chunk_index_reads_are_bounded_by_seq
 );
+
+// ---------------------------------------------------------------------------
+// Step keys: the store mints a key when it makes a step row — 12 characters of
+// lowercase base32, distinct within the run — and the key never changes: a
+// new attempt, a rerun's re-arm and a step added later (a new Take) leave the
+// keys already handed out alone. `step_by_key` finds a step by its key within
+// its own run only.
+// ---------------------------------------------------------------------------
+
+async fn step_keys_are_minted_unique_and_stable(db: &dyn Db) {
+    let (run, other) = (RunId("r-keys".into()), RunId("r-keys-other".into()));
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.create_run(&other, 1, 1, Timestamp(0)).await.unwrap();
+    let ids = ["build", "amd64/image", "test[os=linux,arch=arm64]"];
+    for id in ids {
+        db.create_step_run(&run, &StepId(id.into()), None, &[], Timestamp(0))
+            .await
+            .unwrap();
+    }
+    db.create_step_run(&other, &StepId("build".into()), None, &[], Timestamp(0))
+        .await
+        .unwrap();
+
+    let keys_of = |steps: Vec<scarab_engine::StepRun>| {
+        steps
+            .into_iter()
+            .map(|s| (s.step.0, s.key.expect("steps_of_run reads the key")))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let before = keys_of(db.steps_of_run(&run).await.unwrap());
+    assert_eq!(before.len(), 3);
+    for (id, key) in &before {
+        assert!(scarab_engine::is_step_key_shape(key), "{id}: {key}");
+        assert_eq!(
+            db.step_key(&run, &StepId(id.clone()))
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(key)
+        );
+        assert_eq!(
+            db.step_by_key(&run, key).await.unwrap(),
+            Some(StepId(id.clone()))
+        );
+        // A key names a step of its own run only.
+        assert_eq!(db.step_by_key(&other, key).await.unwrap(), None);
+    }
+    let distinct: std::collections::BTreeSet<_> = before.values().collect();
+    assert_eq!(
+        distinct.len(),
+        3,
+        "keys are distinct within a run: {before:?}"
+    );
+    assert_eq!(db.step_by_key(&run, "aaaaaaaaaaaa").await.unwrap(), None);
+    assert_eq!(
+        db.step_key(&run, &StepId("missing".into())).await.unwrap(),
+        None
+    );
+
+    // A first attempt, a failure, a rerun's re-arm and a second attempt.
+    let build = StepId("build".into());
+    db.record_step_transition(&run, &build, StepStatus::Pending, StepStatus::Running)
+        .await
+        .unwrap();
+    db.record_attempt(&run, &build, &attempt("a1", 1))
+        .await
+        .unwrap();
+    db.record_step_transition(&run, &build, StepStatus::Running, StepStatus::Failed)
+        .await
+        .unwrap();
+    db.record_step_transition(&run, &build, StepStatus::Failed, StepStatus::Pending)
+        .await
+        .unwrap();
+    db.record_attempt(&run, &build, &attempt("a2", 2))
+        .await
+        .unwrap();
+    // A later Take adds a step to the same run.
+    db.create_step_run(&run, &StepId("publish".into()), None, &[], Timestamp(3))
+        .await
+        .unwrap();
+
+    let mut after = keys_of(db.steps_of_run(&run).await.unwrap());
+    let publish = after.remove("publish").expect("the added step has a key");
+    assert_eq!(after, before, "keys survive attempts, reruns and new steps");
+    assert!(!before.values().any(|k| *k == publish));
+    let batched = db.steps_of_runs(std::slice::from_ref(&run)).await.unwrap();
+    assert!(batched[&run].iter().all(|s| s.key.is_some()));
+}
+
+contract_test!(step_keys, step_keys_are_minted_unique_and_stable);

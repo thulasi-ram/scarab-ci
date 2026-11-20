@@ -120,6 +120,50 @@ api.use({
   },
 });
 
+// --- Step keys. A step route names its step by key: 12 random characters
+// the server gives each step of a run, listed in the run detail. An authored
+// step id can hold `/` (`amd64/image`) or `[`, `,` and `=` (a matrix step),
+// and a proxy in front of the server may turn an encoded `/` back into a path
+// separator; a key needs no encoding. `getRun` and the run lists record the
+// keys they read, and every step request names the step by its key. A step
+// whose key this page has not read goes by its id, percent-encoded, which
+// the server also takes. ---
+
+const stepKeys = new Map<string, Map<string, string>>();
+
+/** Record the keys of a run's steps, as the run detail or a waiting gate
+ * lists them. */
+export function rememberStepKeys(runId: string, steps: readonly { id: string; key?: string | null }[]): void {
+  let keys = stepKeys.get(runId);
+  if (!keys) {
+    keys = new Map();
+    stepKeys.set(runId, keys);
+  }
+  for (const s of steps) if (s.key) keys.set(s.id, s.key);
+}
+
+/** The `{step}` of a step route for the step `step` of run `runId`: its key
+ * when known, else the id. Not encoded: openapi-fetch encodes a path param,
+ * and `stepPath` encodes it for a URL built by hand. */
+export function stepSegment(runId: string, step: string): string {
+  return stepKeys.get(runId)?.get(step) ?? step;
+}
+
+/** `/v1/runs/{id}/steps/{step}` for a URL built by hand. */
+function stepPath(runId: string, step: string): string {
+  return `/v1/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(stepSegment(runId, step))}`;
+}
+
+/** Record the keys of the waiting gates of `runs`. */
+function rememberGateKeys(runs: readonly RunSummary[]): void {
+  for (const r of runs) {
+    rememberStepKeys(
+      r.id,
+      (r.waiting_gates ?? []).map((g) => ({ id: g.step, key: g.key })),
+    );
+  }
+}
+
 /** List recent runs, newest first (dogfoods `GET /v1/runs`). */
 export async function listRuns(limit = 50, org?: string): Promise<RunSummary[]> {
   const { data, error } = await api.GET("/v1/runs", {
@@ -128,6 +172,7 @@ export async function listRuns(limit = 50, org?: string): Promise<RunSummary[]> 
   if (error || !data) {
     throw new Error("failed to list runs");
   }
+  rememberGateKeys(data.runs);
   return data.runs;
 }
 
@@ -166,6 +211,7 @@ export async function listRepoRuns(
   if (error || !data) {
     throw new Error(`failed to list runs for ${org}/${repo}`);
   }
+  rememberGateKeys(data.runs);
   return data.runs;
 }
 
@@ -357,7 +403,7 @@ export async function openShellSocket(
   step: string,
   mode: "attach" | "debug-pod",
 ): Promise<WebSocket | string> {
-  const path = `/v1/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(step)}/${mode}`;
+  const path = `${stepPath(runId, step)}/${mode}`;
   const csrf = csrfToken();
   const init: RequestInit = { headers: csrf ? { "x-csrf-token": csrf } : {} };
   let probe: Response;
@@ -539,7 +585,7 @@ export async function getStepResults(
   attempt?: string,
 ): Promise<StepResult[]> {
   const { data, error } = await api.GET("/v1/runs/{id}/steps/{step}/results", {
-    params: { path: { id, step }, query: attempt ? { attempt } : {} },
+    params: { path: { id, step: stepSegment(id, step) }, query: attempt ? { attempt } : {} },
   });
   if (error || !data) {
     throw new Error(`failed to load results for ${step}`);
@@ -556,7 +602,7 @@ export async function getConsumed(
   attempt?: string,
 ): Promise<{ attempt: string; consumed: Record<string, string> }> {
   const { data, error } = await api.GET("/v1/runs/{id}/steps/{step}/consumed", {
-    params: { path: { id, step }, query: attempt ? { attempt } : {} },
+    params: { path: { id, step: stepSegment(id, step) }, query: attempt ? { attempt } : {} },
   });
   if (error || !data) {
     throw new Error(`failed to load consumption for ${step}`);
@@ -574,7 +620,7 @@ export async function listWorkspace(
   attempt?: string,
 ): Promise<WorkspaceListing> {
   const { data, error } = await api.GET("/v1/runs/{id}/steps/{step}/workspace", {
-    params: { path: { id, step }, query: attempt ? { path, attempt } : { path } },
+    params: { path: { id, step: stepSegment(id, step) }, query: attempt ? { path, attempt } : { path } },
   });
   if (error || !data) {
     throw new Error(`failed to browse workspace for ${step}`);
@@ -592,8 +638,7 @@ export function workspaceFileUrl(
   attempt?: string,
 ): string {
   const base =
-    `/v1/runs/${encodeURIComponent(id)}/steps/${encodeURIComponent(step)}` +
-    `/workspace/file?path=${encodeURIComponent(path)}`;
+    `${stepPath(id, step)}/workspace/file?path=${encodeURIComponent(path)}`;
   return attempt ? `${base}&attempt=${encodeURIComponent(attempt)}` : base;
 }
 
@@ -1209,6 +1254,7 @@ export async function getRun(id: string): Promise<RunStatus> {
   if (error || !data) {
     throw new Error(`failed to load run ${id}`);
   }
+  rememberStepKeys(id, data.steps);
   return data;
 }
 
@@ -1373,7 +1419,7 @@ export type StepOrigin = components["schemas"]["StepOriginDto"];
 /** Where a Step comes from (`GET /v1/runs/{id}/steps/{step}/origin`). */
 export async function stepOrigin(run: string, step: string): Promise<StepOrigin> {
   const { data, error, response } = await api.GET("/v1/runs/{id}/steps/{step}/origin", {
-    params: { path: { id: run, step } },
+    params: { path: { id: run, step: stepSegment(run, step) } },
   });
   if (error || !data) throw new Error(errorText(error) || `could not load where ${step} comes from (${response.status})`);
   return data;
@@ -1448,7 +1494,8 @@ function logQuery(q: URLSearchParams, opts: LogStreamQuery): URLSearchParams {
 
 /** Open one log stream (a step's, a sidecar's or a service's). Each `data`
  * event is raw output, passed on as it came with its id (the resume cursor);
- * a `truncated` event says how much of the log the replay skipped. The server
+ * a `truncated` event says how much of the log the replay skipped, and a
+ * `storing` event whether the log is still being stored after its try ended. The server
  * ends the stream when nothing more will be written, which reads as an error
  * here; the stream is then closed so the browser's EventSource does not open
  * it again by itself. Returns a cleanup fn. */
@@ -1471,6 +1518,14 @@ function openLogStream(url: string, opts: LogStreamHandlers): () => void {
       opts.onTruncated?.({ skippedBytes: t.skipped_bytes ?? 0, totalBytes: t.total_bytes ?? 0 });
     } catch {
       // A malformed notice hides nothing on screen; skip it.
+    }
+  });
+  es.addEventListener("storing", (e) => {
+    try {
+      const t = JSON.parse((e as MessageEvent).data) as { storing?: boolean; wait_over?: boolean };
+      opts.onStoring?.(t.storing === true, t.wait_over === true);
+    } catch {
+      // A malformed notice changes nothing on screen; skip it.
     }
   });
   es.onerror = () => {
@@ -1503,7 +1558,7 @@ export function stepLogStreamUrl(
   step: string,
   opts: { attempt?: string; sidecar?: number | null } & LogStreamQuery,
 ): string {
-  const base = `/v1/runs/${encodeURIComponent(id)}/steps/${encodeURIComponent(step)}/logs`;
+  const base = `${stepPath(id, step)}/logs`;
   const q = new URLSearchParams();
   if (opts.sidecar != null) q.set("sidecar", String(opts.sidecar));
   if (opts.attempt) q.set("attempt", opts.attempt);
@@ -1547,7 +1602,7 @@ export function streamStepSidecarLogs(
 /** The whole log of one try as a plain-text download
  * (`GET …/steps/{step}/logs/raw`); `sidecar` picks a sidecar's log. */
 export function stepLogsRawUrl(id: string, step: string, attempt: string, sidecar?: number | null): string {
-  const base = `/v1/runs/${encodeURIComponent(id)}/steps/${encodeURIComponent(step)}/logs/raw`;
+  const base = `${stepPath(id, step)}/logs/raw`;
   const q = new URLSearchParams({ attempt });
   if (sidecar != null) q.set("sidecar", String(sidecar));
   return `${base}?${q.toString()}`;
@@ -1638,7 +1693,7 @@ export async function fetchEvents(id: string): Promise<RunEvent[]> {
  * the mock's catch-all) — the caller treats that as "nothing to compare". */
 export async function rerunStep(id: string, step: string): Promise<RerunPlan | null> {
   const { data, error } = await api.POST("/v1/runs/{id}/steps/{step}/rerun", {
-    params: { path: { id, step } },
+    params: { path: { id, step: stepSegment(id, step) } },
   });
   if (error) throw new Error(`failed to rerun ${step}`);
   return data && Array.isArray(data.invalidated) ? data : null;
@@ -1649,7 +1704,7 @@ export async function rerunStep(id: string, step: string): Promise<RerunPlan | n
  * EXECUTED plan like `rerunStep`. */
 export async function retryStep(id: string, step: string): Promise<RerunPlan | null> {
   const { data, error } = await api.POST("/v1/runs/{id}/steps/{step}/retry", {
-    params: { path: { id, step } },
+    params: { path: { id, step: stepSegment(id, step) } },
   });
   if (error) throw new Error(`failed to retry ${step}`);
   return data && Array.isArray(data.invalidated) ? data : null;
@@ -1660,7 +1715,7 @@ export async function retryStep(id: string, step: string): Promise<RerunPlan | n
  * upstream. Read BEFORE the rerun, so a widened rerun is never a surprise. */
 export async function fetchRerunPlan(id: string, step: string): Promise<RerunPlan> {
   const { data, error } = await api.GET("/v1/runs/{id}/steps/{step}/rerun-plan", {
-    params: { path: { id, step } },
+    params: { path: { id, step: stepSegment(id, step) } },
   });
   if (error || !data) throw new Error(`failed to plan rerun of ${step}`);
   return data;
@@ -1709,7 +1764,7 @@ export type GateApproval = components["schemas"]["GateApprovalDto"];
  * NOT approvable — they release by other means. */
 export async function approveGate(id: string, step: string): Promise<GateApproval> {
   const { data, error } = await api.POST("/v1/runs/{id}/gates/{step}/approve", {
-    params: { path: { id, step } },
+    params: { path: { id, step: stepSegment(id, step) } },
   });
   if (error || !data) throw new Error(`failed to approve gate ${step}`);
   return data;
@@ -1723,7 +1778,7 @@ export async function approveGate(id: string, step: string): Promise<GateApprova
  * 409 for a gate that is not rejectable, not pending, or not reached yet. */
 export async function rejectGate(id: string, step: string, reason: string): Promise<void> {
   const { error, response } = await api.POST("/v1/runs/{id}/gates/{step}/reject", {
-    params: { path: { id, step } },
+    params: { path: { id, step: stepSegment(id, step) } },
     body: { reason },
   });
   if (error !== undefined || !response.ok) {

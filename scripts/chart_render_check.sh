@@ -34,6 +34,8 @@
 #      for a host field, when step Pods share the release namespace with a
 #      server whose ServiceAccount the policy allows, and on an `enabled`
 #      that is not auto, true or false.
+#   6. The server's startupProbe (/livez, 30 minutes by default), so a long
+#      migration before the server listens is not killed by liveness.
 #
 # Run by `just check all`. Usage: scripts/chart_render_check.sh [chart-dir]
 # (needs helm, yq v4).
@@ -231,4 +233,11 @@ check_vap "a shared namespace, serviceAccount.name=builder" "$vap_want" "${vap_a
 check_vap "the step namespace, the server on default" "$vap_want" "${vap_api[@]}" --set serviceAccount.create=false
 refuses "admissionPolicy.enabled=maybe" "it takes auto, true or false" --set scarab.admissionPolicy.enabled=maybe
 
-echo "chart_render_check: SCARAB_UI_URL, the provider secrets, the step namespace, the placement config and the step Pod admission policy render as expected"
+# 6. The startupProbe: /livez, and at least 30 minutes before liveness counts.
+probe=$(yq 'select(.kind == "Deployment") | .spec.template.spec.containers[0].startupProbe' <<<"$plain")
+[ "$(yq '.httpGet.path' <<<"$probe")" = /livez ] || fail "the server's startupProbe is
+$probe"
+budget=$(yq '.periodSeconds * .failureThreshold' <<<"$probe")
+[ "$budget" -ge 1800 ] || fail "the server's startupProbe allows ${budget}s, want at least 1800s"
+
+echo "chart_render_check: SCARAB_UI_URL, the provider secrets, the step namespace, the placement config, the step Pod admission policy and the server's startupProbe render as expected"

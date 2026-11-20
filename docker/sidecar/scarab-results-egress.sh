@@ -32,18 +32,36 @@ drain() {
   fi
   # Confirmed POST: bounded retries — the window is the Pod's termination
   # grace period, and the write is idempotent on the fence (ADR-0021).
-  if curl -fsS -m 10 --retry 5 --retry-delay 1 --retry-all-errors \
+  #
+  # Only the ingest's own answer, 202, counts as posted. Any other answer is
+  # a failure and is retried, a 2xx included: a URL that matches no API
+  # route used to reach the server's web UI, which answered 200 with HTML,
+  # and the sidecar reported results it had not delivered.
+  tries=0
+  while :; do
+    tries=$((tries + 1))
+    # The reply's body, then a last line `<status> <content type>`.
+    out=$(curl -sS -m 10 -w '\n%{http_code} %{content_type}' \
       -X POST \
       -H "content-type: application/json" \
       -H "x-scarab-results-token: ${SCARAB_RESULTS_TOKEN:?}" \
       -H "x-scarab-attempt: ${SCARAB_ATTEMPT:-0}" \
       -d "$payload" \
-      "${SCARAB_RESULTS_URL:?}" >/dev/null; then
-    echo "scarab-results-egress: results posted" >&2
-  else
-    echo "scarab-results-egress: POST failed after retries" >&2
-    return 1
-  fi
+      "${SCARAB_RESULTS_URL:?}") || out="$out (curl exit $?)"
+    answer=$(printf '%s\n' "$out" | tail -n 1)
+    reply=$(printf '%s\n' "$out" | sed '$d' | head -c 200)
+    code=${answer%% *}
+    if [ "$code" = "202" ]; then
+      echo "scarab-results-egress: results posted" >&2
+      return 0
+    fi
+    echo "scarab-results-egress: POST to ${SCARAB_RESULTS_URL} answered ${answer} (try ${tries} of 6): ${reply}" >&2
+    if [ "$tries" -ge 6 ]; then
+      echo "scarab-results-egress: POST failed after retries; the results were NOT delivered" >&2
+      return 1
+    fi
+    sleep 1
+  done
 }
 
 terminated=0

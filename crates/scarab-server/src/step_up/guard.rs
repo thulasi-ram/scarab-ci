@@ -139,7 +139,10 @@ pub async fn guard_with(table: &[RouteEntry], st: AppState, req: Request, next: 
     let pattern = matched.unwrap_or_default();
     let path = parts.uri.path().to_string();
     let raw_query = parts.uri.query().unwrap_or_default().to_string();
-    let params = path_params(&pattern, &path);
+    let mut params = path_params(&pattern, &path);
+    // A step route names its step by key; the summary a person confirms
+    // shows the step's authored id.
+    resolve_step_param(&st, &mut params).await;
     let query = sorted_query(&raw_query);
     // Fail closed on a body the guard cannot read: a typed `Json<T>`
     // extractor skips an unknown field without serde_json's recursion limit
@@ -375,6 +378,27 @@ async fn reaches_min_role(st: &AppState, caller: &Caller, op: &Op) -> bool {
         None => live,
     };
     effective.is_some_and(|r| r >= min)
+}
+
+/// Replace a `step` path parameter that is a key of a step of the `id` run
+/// with that step's authored id, as the route's handler resolves it
+/// ([`crate::step_path::resolve_step`]). A store error leaves the segment.
+async fn resolve_step_param(st: &AppState, params: &mut [(String, String)]) {
+    let Some(run) = params
+        .iter()
+        .find(|(k, _)| k == "id")
+        .map(|(_, v)| v.clone())
+    else {
+        return;
+    };
+    for (name, value) in params.iter_mut() {
+        if name == "step" {
+            let run = scarab_engine::RunId(run.clone());
+            if let Ok(step) = crate::step_path::resolve_step(st, &run, value.clone()).await {
+                *value = step.0;
+            }
+        }
+    }
 }
 
 /// The path parameters of `path` under axum pattern `pattern`, decoded.

@@ -147,6 +147,7 @@ fn executor(url: &str) -> K8sExecutor {
 
 fn step() -> StepRun {
     StepRun {
+        key: None,
         run: RunId("r1".into()),
         step: StepId("deploy".into()),
         status: StepStatus::Running,

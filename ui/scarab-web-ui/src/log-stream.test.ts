@@ -103,7 +103,7 @@ describe("logNotice", () => {
     let b = truncateLog(emptyLogBuffer(), { skippedBytes: 12.3 * MiB, totalBytes: 14.3 * MiB });
     b = appendLog(b, "x".repeat(2 * MiB - 1) + "\n");
     expect(logNotice(b)).toEqual({
-      text: "Showing the last 2.0 MB of 14.3 MB. Line numbers start here.",
+      text: "Showing the last 2.0 MiB of 14.3 MiB. Line numbers start here.",
       loadFull: false,
     });
     // Line numbers stay relative: the first line shown is 1.
@@ -117,27 +117,80 @@ describe("logNotice", () => {
     expect(tailRows(b, 5)).toEqual([{ n: 2, line: "bbbb" }]);
   });
 
-  it("offers Load full log when the whole log fits in 8 MB", () => {
+  it("offers Load full log when the whole log fits in 8 MiB", () => {
     let b = truncateLog(emptyLogBuffer(), { skippedBytes: 3 * MiB, totalBytes: 5 * MiB });
     b = appendLog(b, "x".repeat(2 * MiB - 1) + "\n");
     expect(logNotice(b)).toEqual({
-      text: "Showing the last 2.0 MB of 5.0 MB. Line numbers start here.",
+      text: "Showing the last 2.0 MiB of 5.0 MiB. Line numbers start here.",
       loadFull: true,
     });
   });
 
+  // Regression: with the server's last 2 MiB of a 19,800,019-byte log still
+  // arriving, the notice added what had come (1.0 MiB) to what was skipped
+  // and said "Showing the last 1.0 MB of 17.9 MB".
+  it("names the server's size while the tail is still arriving, and a bigger one as more comes", () => {
+    const total = 19_800_019;
+    let b = truncateLog(emptyLogBuffer(), { skippedBytes: total - 2 * MiB, totalBytes: total });
+    b = appendLog(b, "x".repeat(MiB - 1) + "\n");
+    expect(logNotice(b)?.text).toBe("Showing the last 1.0 MiB of 18.9 MiB. Line numbers start here.");
+    b = appendLog(b, "y".repeat(MiB - 1) + "\n");
+    expect(logNotice(b)?.text).toBe("Showing the last 2.0 MiB of 18.9 MiB. Line numbers start here.");
+    // Stored after the stream opened: the whole size grows with it.
+    b = appendLog(b, "z".repeat(MiB - 1) + "\n");
+    expect(logNotice(b, { outcome: "running" })?.text).toBe(
+      "Showing the last 3.0 MiB of 19.9 MiB so far. Line numbers start here.",
+    );
+  });
+
+  it("says the log is still being stored after its try ended, and offers no Load full log then", () => {
+    let b = truncateLog(emptyLogBuffer(), { skippedBytes: 3 * MiB, totalBytes: 5 * MiB });
+    b = appendLog(b, "x".repeat(2 * MiB - 1) + "\n");
+    expect(logNotice(b, { outcome: "succeeded", store: "storing" })).toEqual({
+      text: "Showing the last 2.0 MiB of 5.0 MiB so far. Line numbers start here. The log is still being stored.",
+      loadFull: false,
+    });
+    // Nothing hidden: only that it is still being stored.
+    const line = appendLog(emptyLogBuffer(), "line\n");
+    expect(logNotice(line, { outcome: "failed", store: "storing" })).toEqual({
+      text: "The log is still being stored.",
+      loadFull: false,
+    });
+    // The server stopped waiting for it: reload to check again.
+    expect(logNotice(line, { outcome: "failed", store: "wait_over" })?.text).toBe(
+      "The log is still being stored; reload to check again.",
+    );
+    // With no output yet the log body says it, not the notice.
+    expect(logNotice(emptyLogBuffer(), { outcome: "failed", store: "storing" })).toBeNull();
+  });
+
+  // Regression: a running try's tail holds its lease while it reads, and the
+  // notice said "The log is still being stored." for every running step and
+  // hid Load full log.
+  it("says nothing about storing for a running try, and keeps Load full log", () => {
+    let b = truncateLog(emptyLogBuffer(), { skippedBytes: 3 * MiB, totalBytes: 5 * MiB });
+    b = appendLog(b, "x".repeat(2 * MiB - 1) + "\n");
+    expect(logNotice(b, { outcome: "running", store: "storing" })).toEqual({
+      text: "Showing the last 2.0 MiB of 5.0 MiB so far. Line numbers start here.",
+      loadFull: true,
+    });
+    expect(logNotice(appendLog(emptyLogBuffer(), "line\n"), { outcome: "running", store: "storing" })).toBeNull();
+  });
+
   it("counts lines the pane dropped, whose numbers stay put", () => {
     const b = appendLog(appendLog(emptyLogBuffer(), "a".repeat(1023) + "\n", 2048), "b".repeat(1500) + "\n", 2048);
-    expect(logNotice(b)?.text).toBe("Showing the last 1.5 KB of 2.5 KB.");
+    expect(logNotice(b)?.text).toBe("Showing the last 1.5 KiB of 2.5 KiB.");
   });
 });
 
 describe("formatSize", () => {
-  it("uses powers of 1024 with one decimal", () => {
+  it("uses powers of 1024 with one decimal, named KiB, MiB and GiB", () => {
     expect(formatSize(512)).toBe("512 B");
-    expect(formatSize(1536)).toBe("1.5 KB");
-    expect(formatSize(2 * MiB)).toBe("2.0 MB");
-    expect(formatSize(3 * 1024 * MiB)).toBe("3.0 GB");
+    expect(formatSize(1536)).toBe("1.5 KiB");
+    expect(formatSize(2 * MiB)).toBe("2.0 MiB");
+    expect(formatSize(3 * 1024 * MiB)).toBe("3.0 GiB");
+    // The reported log: 19,800,019 bytes stored.
+    expect(formatSize(19_800_019)).toBe("18.9 MiB");
   });
 });
 
@@ -384,6 +437,35 @@ describe("followLog", () => {
     h.f.inView();
     expect(h.opened).toHaveLength(2);
     expect(h.opened[1]!.q).toEqual({ from: "a1:1" });
+  });
+
+  // Regression: a stream that ended while the server said the log was still
+  // being stored was taken as the whole log of a finished try.
+  it("reopens a finished try's stream that ended while its log was still being stored", () => {
+    const h = harness({ outcome: () => "succeeded" });
+    h.opened[0]!.h.onStoring!(true, false);
+    h.opened[0]!.h.onChunk("x\n", "a1:1");
+    h.opened[0]!.h.onEnd!();
+    h.tick();
+    expect(h.opened).toHaveLength(2);
+    expect(h.opened[1]!.q).toEqual({ from: "a1:1" });
+    // The server says it is whole, then ends: done.
+    h.opened[1]!.h.onStoring!(false, false);
+    h.opened[1]!.h.onEnd!();
+    expect(h.pending).toHaveLength(0);
+    expect(h.opened).toHaveLength(2);
+  });
+
+  // A tail that hangs keeps its lease: the server stops waiting after 10
+  // minutes and says so. The pane does not reopen for another 10 minutes.
+  it("does not reopen a stream the server ended because it stopped waiting for the log", () => {
+    const h = harness({ outcome: () => "succeeded" });
+    h.opened[0]!.h.onStoring!(true, false);
+    h.opened[0]!.h.onChunk("x\n", "a1:1");
+    h.opened[0]!.h.onStoring!(true, true);
+    h.opened[0]!.h.onEnd!();
+    expect(h.pending).toHaveLength(0);
+    expect(h.opened).toHaveLength(1);
   });
 
   it("close stops the stream and any reopen", () => {

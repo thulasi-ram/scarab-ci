@@ -318,8 +318,15 @@ async fn a_running_run_lists_the_gate_it_waits_on(w: World) {
 
     let listed = w.run_summary("rm").await;
     assert_eq!(listed["status"], "running", "{listed}");
+    // Each waiting gate also carries the step's key, a random value.
+    let mut gates = listed["waiting_gates"].clone();
+    let key = gates[0]
+        .as_object_mut()
+        .and_then(|g| g.remove("key"))
+        .expect("a waiting gate names its step key");
+    assert_eq!(key.as_str().map(str::len), Some(12), "{listed}");
     assert_eq!(
-        listed["waiting_gates"],
+        gates,
         json!([{ "step": "approve", "kind": "manual", "since": opened.started_at.0 }]),
         "{listed}"
     );

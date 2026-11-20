@@ -214,8 +214,12 @@ async fn a_bad_cursor_is_400_not_a_full_replay() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// The tail cut starts at the chunk that holds the `tail`-th byte from the
+/// end: at least `min(tail, total)` bytes are sent, and less than one chunk
+/// more. A cut after that chunk sent up to a chunk less than `tail`, so a log
+/// stored in big chunks showed much less than the notice said.
 #[tokio::test]
-async fn tail_starts_at_a_chunk_boundary_and_reports_the_cut() {
+async fn tail_starts_at_the_chunk_that_holds_the_cut_and_reports_it() {
     // a1: 10 + 20 bytes; a2: 30 + 40 bytes. Total 100.
     let app = app_with(&[
         ("a1", vec![fill(b'a', 10), fill(b'b', 20)]),
@@ -224,11 +228,11 @@ async fn tail_starts_at_a_chunk_boundary_and_reports_the_cut() {
     .await;
     let text = |parts: &[Vec<u8>]| String::from_utf8(parts.concat()).unwrap();
     let cases = [
-        // 40 + 30 fit in 75, + 20 does not: a1 is skipped whole.
-        (75, 30, text(&[fill(b'c', 30), fill(b'd', 40)])),
-        // 40 + 30 + 20 = 90 fit in 95; the cut lands inside a1.
+        // 40 + 30 is exactly 70: a1 is skipped whole.
+        (70, 30, text(&[fill(b'c', 30), fill(b'd', 40)])),
+        // The 75th byte from the end is in a1's second chunk: it is sent.
         (
-            95,
+            75,
             10,
             text(&[fill(b'b', 20), fill(b'c', 30), fill(b'd', 40)]),
         ),
@@ -250,13 +254,23 @@ async fn tail_starts_at_a_chunk_boundary_and_reports_the_cut() {
             cut,
             serde_json::json!({"skipped_bytes": skipped, "total_bytes": 100})
         );
-        assert_eq!(data_of(&evs[1..]), kept, "tail={tail}");
+        let sent = data_of(&evs[1..]);
+        assert_eq!(sent, kept, "tail={tail}");
+        assert!(sent.len() >= tail, "tail={tail}: {} bytes sent", sent.len());
     }
-    // A tail the log fits in: no truncated event, everything replays.
-    let (_, body) = get(&app, "/v1/runs/r1/steps/build/logs?tail=100", None).await;
-    let evs = events(&body);
-    assert!(evs.iter().all(|e| e.event.is_none()));
-    assert_eq!(data_of(&evs).len(), 100);
+    // A tail the log fits in, or whose cut lands in the first chunk: no
+    // truncated event, everything replays.
+    for tail in [100, 95] {
+        let (_, body) = get(
+            &app,
+            &format!("/v1/runs/r1/steps/build/logs?tail={tail}"),
+            None,
+        )
+        .await;
+        let evs = events(&body);
+        assert!(evs.iter().all(|e| e.event.is_none()), "tail={tail}");
+        assert_eq!(data_of(&evs).len(), 100, "tail={tail}");
+    }
 }
 
 #[tokio::test]
@@ -339,6 +353,103 @@ async fn raw_download_tells_the_browser_not_to_sniff_the_type() {
     let h = resp.headers();
     assert_eq!(h["x-content-type-options"], "nosniff");
     assert_eq!(h["content-type"], "text/plain; charset=utf-8");
+}
+
+/// An object store whose reads take longer for earlier keys, so fetches in
+/// flight together finish in reverse order. Counts the reads in flight.
+struct SlowStore {
+    inner: InMemoryObjectStore,
+    in_flight: std::sync::atomic::AtomicUsize,
+    most_in_flight: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl scarab_storage::ObjectStore for SlowStore {
+    async fn get(&self, key: &str) -> Result<Vec<u8>, scarab_storage::StorageError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+        self.most_in_flight.fetch_max(now, SeqCst);
+        // logs/r1/build/a1/00000123.gz: the seq sets the delay.
+        let seq: u64 = key
+            .rsplit('/')
+            .next()
+            .and_then(|f| f.strip_suffix(".gz"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        tokio::time::sleep(std::time::Duration::from_millis(20 - seq % 20)).await;
+        let out = self.inner.get(key).await;
+        self.in_flight.fetch_sub(1, SeqCst);
+        out
+    }
+    async fn put(&self, key: &str, data: Vec<u8>) -> Result<(), scarab_storage::StorageError> {
+        self.inner.put(key, data).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), scarab_storage::StorageError> {
+        self.inner.delete(key).await
+    }
+    async fn list_objects(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<scarab_storage::StoredObject>, scarab_storage::StorageError> {
+        self.inner.list_objects(prefix).await
+    }
+}
+
+/// A log tailed in many small chunks downloads with the next chunks fetched
+/// ahead, at most `PREFETCH_CHUNKS` at once, and still in order: the body is
+/// the stored bytes exactly, though later fetches finish first. The SSE
+/// replay of the same log is the same bytes.
+#[tokio::test(start_paused = true)]
+async fn raw_download_of_many_small_chunks_is_prefetched_in_order() {
+    let db = Arc::new(InMemoryDb::new());
+    let run = RunId("r1".into());
+    let step = StepId("build".into());
+    let attempt = AttemptId("a1".into());
+    db.seed_run(&run, RunStatus::Succeeded);
+    db.create_step_run(&run, &step, None, &[], Timestamp(0))
+        .await
+        .unwrap();
+    db.record_attempt(
+        &run,
+        &step,
+        &Attempt {
+            id: attempt.clone(),
+            started_at: Timestamp(10),
+            failure: None,
+            failure_detail: None,
+            outcome: AttemptOutcome::Succeeded,
+        },
+    )
+    .await
+    .unwrap();
+    let store = Arc::new(SlowStore {
+        inner: InMemoryObjectStore::new(),
+        in_flight: Default::default(),
+        most_in_flight: Default::default(),
+    });
+    let logs = Arc::new(LogService::new(store.clone(), db.clone()));
+    let mut want = Vec::new();
+    for i in 0..500 {
+        let line = format!("line {i:04} {}\n", "x".repeat(i % 7));
+        logs.append(&run, &step, &attempt, line.as_bytes())
+            .await
+            .unwrap();
+        want.extend_from_slice(line.as_bytes());
+    }
+    let app = router(AppState::new(db, Arc::new(FakeClock::new(1_000)), logs));
+
+    let body = raw(&app, "a1").await;
+    assert_eq!(body, want, "every chunk, in seq order");
+    let most = store
+        .most_in_flight
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        most > 1 && most <= scarab_server::logs::PREFETCH_CHUNKS,
+        "{most} reads in flight"
+    );
+
+    let (_, sse) = get(&app, "/v1/runs/r1/steps/build/logs", None).await;
+    assert_eq!(data_of(&events(&sse)).as_bytes(), &want[..]);
 }
 
 /// 5ca1f3c: a shared service's whole log downloads like a step try's: the
@@ -782,4 +893,144 @@ async fn a_settled_attempt_index_is_not_read_on_every_poll() {
             text: "three\n".into(),
         })
     );
+}
+
+/// The stream of an attempt whose log is still being stored (its tail lease
+/// is live) does not end when the run has settled: it opens live, says the
+/// log is being stored, follows the chunks still stored, and says when that
+/// stops and ends one pass after the lease is given up.
+#[tokio::test(start_paused = true)]
+async fn a_stream_does_not_end_while_the_log_is_still_being_stored() {
+    let (db, logs) = live_store(
+        Some(RunStatus::Succeeded),
+        &[("a1", AttemptOutcome::Succeeded, vec![b"one\n".to_vec()])],
+    )
+    .await;
+    let run = RunId("r1".into());
+    let step = StepId("build".into());
+    let attempt = AttemptId("a1".into());
+    let resource = scarab_server::log_tail::tail_lease_resource(&run, &step, &attempt);
+    assert_eq!(resource, "tail:r1:build:a1");
+    db.lease(&resource, "replica-a", 45_000).await.unwrap();
+
+    // The route opens a settled run's stream as a replay (`live` false).
+    let opened = LogStream::open(
+        logs.clone(),
+        db.clone() as Arc<dyn Db>,
+        run.clone(),
+        Scope::Step {
+            step: step.clone(),
+            read_step: step.clone(),
+            pinned: Some(attempt.clone()),
+        },
+        Start::Full,
+        false,
+    )
+    .await;
+    let Ok(mut s) = opened else {
+        panic!("the stream did not open")
+    };
+    assert_eq!(
+        opening(&mut s).await,
+        [
+            Item::Storing(true),
+            Item::Data {
+                id: "a1:1".into(),
+                text: "one\n".into(),
+            }
+        ]
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            s.next(true).await.unwrap(),
+            Some(Item::Keepalive),
+            "still being stored"
+        );
+    }
+    logs.append(&run, &step, &attempt, b"two\n").await.unwrap();
+    assert_eq!(
+        s.next(true).await.unwrap(),
+        Some(Item::Data {
+            id: "a1:2".into(),
+            text: "two\n".into(),
+        })
+    );
+    // Quiet past SETTLE: still followed while the lease is live.
+    let start = tokio::time::Instant::now();
+    while start.elapsed() < SETTLE + std::time::Duration::from_secs(2) {
+        assert_eq!(s.next(true).await.unwrap(), Some(Item::Keepalive));
+    }
+    logs.append(&run, &step, &attempt, b"three\n")
+        .await
+        .unwrap();
+    db.release_lease(&resource, "replica-a").await.unwrap();
+    assert_eq!(s.next(true).await.unwrap(), Some(Item::Storing(false)));
+    assert_eq!(
+        s.next(true).await.unwrap(),
+        Some(Item::Data {
+            id: "a1:3".into(),
+            text: "three\n".into(),
+        }),
+        "what was stored before the lease was given up still goes out"
+    );
+    assert_eq!(s.next(true).await.unwrap(), None);
+}
+
+/// A stream that waits on a tail lease that is never given up (a tail that
+/// hangs) ends `STORE_WAIT` after it would have ended, and says so.
+#[tokio::test(start_paused = true)]
+async fn a_stream_waits_for_a_stuck_lease_at_most_store_wait() {
+    let (db, logs) = live_store(
+        Some(RunStatus::Succeeded),
+        &[("a1", AttemptOutcome::Succeeded, vec![b"one\n".to_vec()])],
+    )
+    .await;
+    db.lease("tail:r1:build:a1", "stuck", 3_600_000)
+        .await
+        .unwrap();
+    let mut s = open_live(&db, &logs, Start::Full).await;
+    assert_eq!(opening(&mut s).await.len(), 2, "storing, then the data");
+    let start = tokio::time::Instant::now();
+    let mut wait_over = 0;
+    loop {
+        match s.next(true).await.unwrap() {
+            Some(Item::Keepalive) => {}
+            Some(Item::StoreWaitOver) => wait_over += 1,
+            None => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(wait_over, 1, "the stream says it stopped waiting, once");
+    let waited = start.elapsed();
+    assert!(
+        waited >= scarab_server::log_stream::STORE_WAIT
+            && waited < scarab_server::log_stream::STORE_WAIT + std::time::Duration::from_secs(5),
+        "{waited:?}"
+    );
+}
+
+/// The running attempt's tail holds its lease for as long as it reads: that
+/// is not "still being stored". A running step's stream sends no `storing`
+/// event, and its log is followed as before.
+#[tokio::test(start_paused = true)]
+async fn a_running_attempt_with_a_live_tail_lease_is_not_storing() {
+    let (db, logs) = live_store(
+        Some(RunStatus::Running),
+        &[("a1", AttemptOutcome::Running, vec![b"one\n".to_vec()])],
+    )
+    .await;
+    db.lease("tail:r1:build:a1", "replica-a", 3_600_000)
+        .await
+        .unwrap();
+    let mut s = open_live(&db, &logs, Start::Full).await;
+    assert_eq!(
+        opening(&mut s).await,
+        [Item::Data {
+            id: "a1:1".into(),
+            text: "one\n".into(),
+        }]
+    );
+    for _ in 0..3 {
+        assert_eq!(s.next(true).await.unwrap(), Some(Item::Keepalive));
+    }
 }

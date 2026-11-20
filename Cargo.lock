@@ -3102,6 +3102,7 @@ dependencies = [
  "scarab-storage",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

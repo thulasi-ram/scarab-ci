@@ -50,6 +50,16 @@ describe("logBodyState", () => {
     expect(logBodyState({ text: undefined, ended: false, outcome: "failed" })).toBe("none");
     expect(logBodyState({ text: undefined, ended: false, outcome: "succeeded" })).toBe("none");
   });
+
+  // Regression: for ~90 s after a step ended the pane said "No log output was
+  // captured for this try" while the server was still storing its log.
+  it("says the log is still being stored while the server says so", () => {
+    expect(logBodyState({ text: undefined, ended: false, outcome: "succeeded", storing: true })).toBe("storing");
+    // A stream that dropped while storing is opened again: still storing.
+    expect(logBodyState({ text: undefined, ended: true, outcome: "failed", storing: true })).toBe("storing");
+    expect(logBodyState({ text: "hello\n", ended: false, outcome: "succeeded", storing: true })).toBe("output");
+    expect(logBodyState({ text: undefined, ended: true, outcome: "succeeded", storing: false })).toBe("none");
+  });
 });
 
 // Regression: a try that finished ended its stream while the polled outcome

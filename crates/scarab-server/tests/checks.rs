@@ -125,12 +125,14 @@ async fn run_start_and_success_post_pending_then_success() {
     let states: Vec<StatusState> = forge.statuses().iter().map(|s| s.state).collect();
     assert_eq!(states, vec![StatusState::Pending, StatusState::Success]);
     assert!(forge.statuses().iter().all(|s| s.context == "scarab/ci"));
-    // Every status carries the REQUIRED run deep-link (ADR-0046).
+    // Every status carries the REQUIRED run deep-link (ADR-0046): the web
+    // UI's `/<org>/<repo>/runs/<id>` page. A bare `/runs/<id>` matched the
+    // UI's `/:org/:repo` route and opened an empty repository view.
     assert!(
         forge
             .statuses()
             .iter()
-            .all(|s| s.target_url == format!("http://scarab.test/runs/{}", run.0)),
+            .all(|s| s.target_url == format!("http://scarab.test/acme/app/runs/{}", run.0)),
         "statuses deep-link to the run: {:?}",
         forge.statuses()
     );

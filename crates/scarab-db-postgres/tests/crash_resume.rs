@@ -78,6 +78,7 @@ async fn crash_mid_run_resumes_and_runs_step_exactly_once() {
 
     // The deterministic launch fence/handle for this step's first attempt.
     let fenced = StepRun {
+        key: None,
         run: run.clone(),
         step: step.clone(),
         status: StepStatus::Running,

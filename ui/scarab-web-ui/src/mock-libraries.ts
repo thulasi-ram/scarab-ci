@@ -19,6 +19,7 @@
 //   /acme/orders-api/run                         the compile errors (pick release)
 //   /acme/orders-api?status=refused              refused rows
 import type { components } from "./api/schema";
+import { mockStepId, mockStepKey } from "./mock-step-keys";
 
 type S = components["schemas"];
 type RunStatusDto = S["RunStatusResponse"];
@@ -266,6 +267,7 @@ const attempt = (startedMin: number, outcome = "succeeded", failure?: { failure:
   ...(failure ? { failure: failure.failure, failure_detail: failure.detail } : {}),
 });
 const step = (o: Partial<StepStatusDto> & Pick<StepStatusDto, "id" | "status">): StepStatusDto => ({
+  key: mockStepKey(o.id),
   attempts: o.attempt_list?.length ?? 0,
   attempt_list: [],
   needs: [],
@@ -541,7 +543,7 @@ export function libraryRoute(
     return json([]);
   }
   if ((m = p.match(/^\/v1\/runs\/([^/]+)\/steps\/([^/]+)\/origin$/))) {
-    const o = stepOrigin(m[1]!, decodeURIComponent(m[2]!));
+    const o = stepOrigin(m[1]!, mockStepId(m[2]!));
     return o ? json(o) : null;
   }
   if (/^\/v1\/repos\/[^/]+\/orders-api\/refused-runs$/.test(p)) return json({ refused });

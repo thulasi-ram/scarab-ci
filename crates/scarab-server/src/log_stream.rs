@@ -1,8 +1,10 @@
 //! Lazy, batched, resumable log streams (ADR-0013) — the one replay + live-tail
 //! machine behind the run-wide, per-step and shared-service SSE routes.
 //!
-//! - **Lazy.** The index is read up front; bodies are fetched and gunzipped one
-//!   chunk at a time as the stream is polled. At most one batch is in memory.
+//! - **Lazy.** The index is read up front; bodies are fetched and gunzipped
+//!   batch by batch as the stream is polled, the chunks of one batch fetched
+//!   ahead in order (up to [`PREFETCH_CHUNKS`](crate::logs::PREFETCH_CHUNKS)
+//!   at once). At most one batch is in memory.
 //! - **Batches.** A `data` event carries consecutive whole chunks of ONE attempt,
 //!   up to [`BATCH_BYTES`]; a bigger chunk goes alone. A batch ends where the
 //!   bytes end on a whole UTF-8 character: if a chunk boundary falls inside one,
@@ -21,8 +23,10 @@
 //!   break of its own, so a `\r\n` would reach the reader as two. A lone `\r`
 //!   reaches the reader as SSE delivers it, a line break. The raw download
 //!   keeps the stored bytes.
-//! - **Tail.** [`Start::Tail`] skips the earliest whole chunks so at most `tail`
-//!   bytes are replayed, announced by one `truncated` event first.
+//! - **Tail.** [`Start::Tail`] starts at the chunk that holds the `tail`-th
+//!   byte from the end, so at least `min(tail, total)` bytes are replayed and
+//!   at most one chunk more than `tail`, announced by one `truncated` event
+//!   first. Its `total_bytes` is the stored length when the stream opened.
 //! - **Live.** Polls the durable index every 500 ms (ADR-0051), so any replica
 //!   serves the tail; a poll reads only the index rows from the last one sent
 //!   on; a keepalive comment when a poll finds nothing; ends one
@@ -30,6 +34,19 @@
 //!   is no longer latest. An attempt that is not running stops being polled
 //!   once it has sent everything and nothing new came for [`SETTLE`] (the read
 //!   of an ended unit's log can land a few seconds after it ends).
+//! - **Still being stored.** An attempt that is not running and whose tail
+//!   lease is live
+//!   ([`tail_lease_resource`]) is still being read into the store: a log
+//!   tail can fall behind a step that prints fast and store its end long
+//!   after the step ended. Such a source is followed like a running one, and
+//!   the stream does not end while one is, for at most [`STORE_WAIT`] after
+//!   it would have ended; a stream of a settled run opens live while one is.
+//!   A `storing` event says when that starts (`{"storing":true}`) and when it
+//!   stops (`{"storing":false}`), so a reader can tell a log still being
+//!   stored from one with no output; `{"storing":true,"wait_over":true}`
+//!   says the stream ends after [`STORE_WAIT`] with the log still being
+//!   stored. The running attempt never counts: its tail holds its lease for
+//!   as long as it runs.
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -42,6 +59,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use scarab_engine::{AttemptId, AttemptOutcome, Db, LogChunkMeta, RunId, StepId};
 use tokio::time::Instant;
 
+use crate::log_tail::tail_lease_resource;
 use crate::logs::{LogError, LogService};
 use crate::ApiError;
 
@@ -56,6 +74,10 @@ pub const HOLD_PASSES: u32 = 2;
 /// How long an attempt that is not running must have sent everything, with no
 /// new chunk, before a live stream stops reading its index.
 pub const SETTLE: Duration = Duration::from_secs(30);
+/// How long a stream that would end (its run settled, or its pinned attempt
+/// is no longer latest) still waits for a source whose log is still being
+/// stored.
+pub const STORE_WAIT: Duration = Duration::from_secs(600);
 
 /// A resume position: `<attempt_id>:<next_seq>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,7 +126,8 @@ pub enum Start {
     Full,
     /// Resume after a cursor the client already holds.
     From(Cursor),
-    /// At most this many bytes from the end (clamped to `[1, MAX_TAIL]`).
+    /// From the chunk that holds this many bytes before the end (clamped to
+    /// `[1, MAX_TAIL]`): at least that many bytes, or the whole log.
     Tail(u64),
 }
 
@@ -119,6 +142,12 @@ pub enum Item {
         id: String,
         text: String,
     },
+    /// Whether a source of the stream that is not running is still being
+    /// stored; sent when it changes, starting from `false`.
+    Storing(bool),
+    /// The stream ends while a source is still being stored: it waited
+    /// [`STORE_WAIT`] for it.
+    StoreWaitOver,
     Keepalive,
     Error(String),
 }
@@ -146,6 +175,12 @@ impl Item {
                 };
                 ev.data(text)
             }
+            Item::Storing(storing) => Event::default()
+                .event("storing")
+                .data(serde_json::json!({ "storing": storing }).to_string()),
+            Item::StoreWaitOver => Event::default()
+                .event("storing")
+                .data(serde_json::json!({ "storing": true, "wait_over": true }).to_string()),
             Item::Keepalive => Event::default().comment("keepalive"),
             Item::Error(msg) => Event::default().event("error").data(msg),
         }
@@ -157,6 +192,15 @@ struct Source {
     attempt: AttemptId,
     /// The latest attempt of its step, still running: it may still get chunks.
     may_grow: bool,
+    /// Its tail lease was live at the last check: its log is still being
+    /// stored, so it may still get chunks too.
+    storing: bool,
+}
+
+impl Source {
+    fn grows(&self) -> bool {
+        self.may_grow || self.storing
+    }
 }
 
 type Key = (String, String);
@@ -206,6 +250,11 @@ pub struct LogStream {
     polled: bool,
     sent_in_pass: bool,
     done: bool,
+    /// Since when the stream would have ended but for a source still being
+    /// stored.
+    ending_since: Option<Instant>,
+    /// What the last `storing` event said (none sent: `false`).
+    storing_sent: bool,
 }
 
 impl LogStream {
@@ -241,7 +290,14 @@ impl LogStream {
             polled: false,
             sent_in_pass: false,
             done: false,
+            ending_since: None,
+            storing_sent: false,
         };
+        // A settled run's log may still be being stored: follow it until it
+        // is, as a running one is.
+        if s.check_storing().await && !s.live {
+            s.live = true;
+        }
         match start {
             Start::Full => {}
             Start::From(c) => {
@@ -276,17 +332,16 @@ impl LogStream {
         if total <= tail {
             return Ok(());
         }
-        // Walk back from the end; the start is the earliest chunk boundary
-        // whose suffix fits. If the last chunk alone is bigger, start there.
+        // Walk back from the end to the chunk that holds the `tail`-th byte
+        // from the end, and start at it: at least `tail` bytes are sent, and
+        // less than one chunk more. Starting after it instead sent up to a
+        // chunk less than `tail`, and a log stored in big chunks showed much
+        // less than the notice's tail.
         let mut kept = 0u64;
         let mut start: Option<(usize, u64)> = None;
         'walk: for (i, chunks) in indexes.iter().enumerate().rev() {
             for c in chunks.iter().rev() {
-                if kept + c.len > tail {
-                    if start.is_none() {
-                        start = Some((i, c.seq));
-                        kept = c.len;
-                    }
+                if kept >= tail {
                     break 'walk;
                 }
                 kept += c.len;
@@ -296,6 +351,9 @@ impl LogStream {
         let Some((at, seq)) = start else {
             return Ok(());
         };
+        if kept >= total {
+            return Ok(());
+        }
         for src in &self.sources[..at] {
             self.progress.insert(key(&src.step, &src.attempt), SKIPPED);
         }
@@ -352,6 +410,34 @@ impl LogStream {
         self.index_reads
     }
 
+    /// Check the tail lease of every source, mark the ones that are not
+    /// running and still being stored, and say whether any is; queue a
+    /// `storing` event when that changed. A failed check marks none.
+    async fn check_storing(&mut self) -> bool {
+        let resources: Vec<String> = self
+            .sources
+            .iter()
+            .map(|src| tail_lease_resource(&self.run, &src.step, &src.attempt))
+            .collect();
+        let live = if resources.is_empty() {
+            Vec::new()
+        } else {
+            self.db.live_leases(&resources).await.unwrap_or_default()
+        };
+        // Only a source that cannot grow otherwise counts: the running
+        // attempt's tail always holds its lease while it reads.
+        let mut any = false;
+        for (src, resource) in self.sources.iter_mut().zip(&resources) {
+            src.storing = !src.may_grow && live.contains(resource);
+            any |= src.storing;
+        }
+        if any != self.storing_sent {
+            self.storing_sent = any;
+            self.pending.push_back(Item::Storing(any));
+        }
+        any
+    }
+
     async fn start_poll(&mut self) {
         // A Run row that is gone ends the stream like a settled one.
         let terminal = match self.db.run_status(&self.run).await {
@@ -370,7 +456,19 @@ impl LogStream {
                 superseded = latest.as_ref() != Some(p);
             }
         }
-        self.last_pass = terminal || superseded;
+        let storing = self.check_storing().await;
+        let ending = terminal || superseded;
+        if !ending {
+            // A rerun made the run go on: a later end waits STORE_WAIT anew.
+            self.ending_since = None;
+        }
+        let waited_out = ending
+            && storing
+            && self.ending_since.get_or_insert_with(Instant::now).elapsed() >= STORE_WAIT;
+        if waited_out {
+            self.pending.push_back(Item::StoreWaitOver);
+        }
+        self.last_pass = ending && (!storing || waited_out);
         self.cur = 0;
         self.index = None;
         self.polled = true;
@@ -383,7 +481,7 @@ impl LogStream {
     async fn next_batch(&mut self) -> Result<Option<Item>, LogError> {
         let (step, attempt, may_grow) = {
             let src = &self.sources[self.cur];
-            (src.step.clone(), src.attempt.clone(), src.may_grow)
+            (src.step.clone(), src.attempt.clone(), src.grows())
         };
         let k = key(&step, &attempt);
         let from = self.progress.get(&k).copied().unwrap_or(0);
@@ -429,6 +527,24 @@ impl LogStream {
         let end = todo.last().map_or(from, |c| c.seq + 1);
         let strip = self.strip_lead.as_ref() == Some(&k);
 
+        // The chunks this batch can take, fetched ahead in order. The loop
+        // below reads at most the first chunk that takes its buffer past
+        // BATCH_BYTES (and never past the second chunk); its buffer is at
+        // most 3 bytes shorter than the chunks' lengths (a stripped cut
+        // character), so it never reads past the first chunk whose end lies
+        // past BATCH_BYTES + 3, or the second chunk when that is the first.
+        let mut sum = 0u64;
+        let take = todo
+            .iter()
+            .position(|c| {
+                sum += c.len;
+                sum > BATCH_BYTES + 3
+            })
+            .map_or(todo.len(), |k| (k.max(1) + 1).min(todo.len()));
+        let mut bodies = self
+            .logs
+            .read_chunks(todo[..take].iter().map(|c| (*c).clone()).collect());
+
         let mut buf: Vec<u8> = Vec::new();
         let mut next = from;
         // (buf length, next seq) at the last chunk boundary on a whole character.
@@ -446,7 +562,12 @@ impl LogStream {
                 }
                 extended = true;
             }
-            buf.extend(self.logs.read_chunk(c).await?);
+            let Some(body) = bodies.next().await else {
+                // Not reached (see `take`); stop as if capped.
+                cut_short = true;
+                break;
+            };
+            buf.extend(body?);
             next = c.seq + 1;
             if strip && i == 0 {
                 let n = buf
@@ -527,6 +648,7 @@ async fn resolve(
                 step: step.clone(),
                 attempt: attempt.clone(),
                 may_grow: true,
+                storing: false,
             }],
             None,
         )),
@@ -539,6 +661,7 @@ async fn resolve(
                         step: s.step.clone(),
                         attempt: a.id.clone(),
                         may_grow: i == last && a.outcome == AttemptOutcome::Running,
+                        storing: false,
                     });
                 }
             }
@@ -563,6 +686,7 @@ async fn resolve(
                 .map(|a| Source {
                     may_grow: Some(&a.id) == latest.as_ref()
                         && a.outcome == AttemptOutcome::Running,
+                    storing: false,
                     step: read_step.clone(),
                     attempt: a.id,
                 })

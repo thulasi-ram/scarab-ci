@@ -7643,7 +7643,7 @@
           {
             "name": "step",
             "in": "path",
-            "description": "gate step id",
+            "description": "the gate step's key (preferred) or its authored step id, percent-encoded",
             "required": true,
             "schema": {
               "type": "string"
@@ -7712,7 +7712,7 @@
           {
             "name": "step",
             "in": "path",
-            "description": "gate step id",
+            "description": "the gate step's key (preferred) or its authored step id, percent-encoded",
             "required": true,
             "schema": {
               "type": "string"
@@ -7774,7 +7774,7 @@
           {
             "name": "step",
             "in": "path",
-            "description": "gate step id",
+            "description": "the gate step's key (preferred) or its authored step id, percent-encoded",
             "required": true,
             "schema": {
               "type": "string"
@@ -8001,7 +8001,7 @@
           {
             "name": "tail",
             "in": "query",
-            "description": "without a cursor, replay at most this many bytes from the end, in whole chunks (clamped to 1..67108864)",
+            "description": "without a cursor, replay from the stored chunk that holds the byte this many bytes before the end: at least this many bytes, or the whole log (clamped to 1..67108864)",
             "required": false,
             "schema": {
               "type": "integer",
@@ -8207,7 +8207,7 @@
           {
             "name": "step",
             "in": "path",
-            "description": "step id",
+            "description": "a step key (preferred) or the authored step id, percent-encoded",
             "required": true,
             "schema": {
               "type": "string"
@@ -8255,7 +8255,7 @@
           {
             "name": "step",
             "in": "path",
-            "description": "step id",
+            "description": "a step key (preferred) or the authored step id, percent-encoded",
             "required": true,
             "schema": {
               "type": "string"
@@ -8315,7 +8315,7 @@
           {
             "name": "step",
             "in": "path",
-            "description": "step id",
+            "description": "a step key (preferred) or the authored step id, percent-encoded",
             "required": true,
             "schema": {
               "type": "string"
@@ -8363,7 +8363,7 @@
           {
             "name": "step",
             "in": "path",
-            "description": "step id",
+            "description": "a step key (preferred) or the authored step id, percent-encoded",
             "required": true,
             "schema": {
               "type": "string"
@@ -8400,7 +8400,7 @@
           {
             "name": "tail",
             "in": "query",
-            "description": "without a cursor, replay at most this many bytes from the end, in whole chunks (clamped to 1..67108864)",
+            "description": "without a cursor, replay from the stored chunk that holds the byte this many bytes before the end: at least this many bytes, or the whole log (clamped to 1..67108864)",
             "required": false,
             "schema": {
               "type": "integer",
@@ -8450,7 +8450,7 @@
           {
             "name": "step",
             "in": "path",
-            "description": "step id",
+            "description": "a step key (preferred) or the authored step id, percent-encoded",
             "required": true,
             "schema": {
               "type": "string"
@@ -8520,7 +8520,7 @@
           {
             "name": "step",
             "in": "path",
-            "description": "step id",
+            "description": "a step key (preferred) or the authored step id, percent-encoded",
             "required": true,
             "schema": {
               "type": "string"
@@ -8572,7 +8572,7 @@
           {
             "name": "step",
             "in": "path",
-            "description": "step id",
+            "description": "a step key (preferred) or the authored step id, percent-encoded",
             "required": true,
             "schema": {
               "type": "string"
@@ -8627,7 +8627,7 @@
           {
             "name": "step",
             "in": "path",
-            "description": "step id",
+            "description": "a step key (preferred) or the authored step id, percent-encoded",
             "required": true,
             "schema": {
               "type": "string"
@@ -8679,7 +8679,7 @@
           {
             "name": "step",
             "in": "path",
-            "description": "step id",
+            "description": "a step key (preferred) or the authored step id, percent-encoded",
             "required": true,
             "schema": {
               "type": "string"
@@ -8709,7 +8709,7 @@
             }
           },
           "404": {
-            "description": "no such run"
+            "description": "no such run or step"
           }
         },
         "security": [
@@ -8741,7 +8741,7 @@
           {
             "name": "step",
             "in": "path",
-            "description": "step id",
+            "description": "a step key (preferred) or the authored step id, percent-encoded",
             "required": true,
             "schema": {
               "type": "string"
@@ -8792,7 +8792,7 @@
           {
             "name": "step",
             "in": "path",
-            "description": "step id",
+            "description": "a step key (preferred) or the authored step id, percent-encoded",
             "required": true,
             "schema": {
               "type": "string"
@@ -8847,7 +8847,7 @@
           {
             "name": "step",
             "in": "path",
-            "description": "step id",
+            "description": "a step key (preferred) or the authored step id, percent-encoded",
             "required": true,
             "schema": {
               "type": "string"
@@ -8917,7 +8917,7 @@
           {
             "name": "step",
             "in": "path",
-            "description": "step id",
+            "description": "a step key (preferred) or the authored step id, percent-encoded",
             "required": true,
             "schema": {
               "type": "string"
@@ -12723,6 +12723,13 @@
             "type": "object",
             "description": "The gate's inputs, rendered when it was reached."
           },
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The gate's step key: the `{step}` of the release route,\n`POST /v1/runs/{run}/gates/{key}/release`. Absent from a server\nbefore step keys; name the step by its id then, percent-encoded."
+          },
           "run": {
             "type": "string"
           },
@@ -15651,6 +15658,7 @@
         "type": "object",
         "required": [
           "id",
+          "key",
           "status",
           "attempts"
         ],
@@ -15702,6 +15710,10 @@
           },
           "id": {
             "type": "string"
+          },
+          "key": {
+            "type": "string",
+            "description": "The step's key: 12 random characters of lowercase base32, unique\nwithin the run and fixed for its life. A step route's `{step}`\n(`/v1/runs/{id}/steps/{step}/…`) names the step by this key, which\nneeds no percent-encoding, where an authored id such as `amd64/image`\nneeds a `%2F` that a proxy may rewrite."
           },
           "needs": {
             "type": "array",
@@ -16155,10 +16167,15 @@
         "description": "One waiting gate of a run in the list view ([`RunSummaryDto::waiting_gates`]).",
         "required": [
           "step",
+          "key",
           "kind",
           "since"
         ],
         "properties": {
+          "key": {
+            "type": "string",
+            "description": "The gate step's key: how a step route's `{step}` names it."
+          },
           "kind": {
             "type": "string",
             "description": "The gate kind: `manual` / `timer` / `external`."

@@ -19,6 +19,7 @@ use scarab_testkit::{FakeExecutor, FakeForge, InMemoryDb, InMemoryLibraries, InM
 
 fn step_run(id: &str) -> StepRun {
     StepRun {
+        key: None,
         run: RunId("r1".into()),
         step: StepId(id.into()),
         status: StepStatus::Running,

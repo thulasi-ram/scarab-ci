@@ -338,6 +338,37 @@ pub struct StepRun {
     /// (ADR-0008, slice b). `None` for ordinary executed steps.
     #[serde(default)]
     pub gate_kind: Option<String>,
+    /// The step's **key**: a random, URL-safe id ([`STEP_KEY_LEN`] characters
+    /// of [`STEP_KEY_ALPHABET`]) unique within its run, minted by the store
+    /// when the step row is created and never changed after. API paths name a
+    /// step by its key, because an authored step id can hold `/`, `[`, `,`
+    /// and `=` that a proxy may rewrite. `None` when the reader did not load it
+    /// (a step rebuilt from an outbox message, a payload written before keys).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+/// The characters of a step key: RFC 4648 base32, lowercase.
+pub const STEP_KEY_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+
+/// The length of a step key: 12 characters, 60 random bits.
+pub const STEP_KEY_LEN: usize = 12;
+
+/// The step key for 12 random bytes: each byte's low 5 bits pick one
+/// character of [`STEP_KEY_ALPHABET`]. The caller draws the bytes from a
+/// CSPRNG (the engine does no I/O); 256 is a multiple of 32, so a uniform
+/// byte gives a uniform character.
+pub fn step_key_from_bytes(bytes: [u8; STEP_KEY_LEN]) -> String {
+    bytes
+        .iter()
+        .map(|b| STEP_KEY_ALPHABET[usize::from(b & 31)] as char)
+        .collect()
+}
+
+/// Whether `s` has the shape of a step key. A route resolves a path segment
+/// of this shape against the run's keys before it tries it as an authored id.
+pub fn is_step_key_shape(s: &str) -> bool {
+    s.len() == STEP_KEY_LEN && s.bytes().all(|b| STEP_KEY_ALPHABET.contains(&b))
 }
 
 /// One attempt at executing a step.
@@ -1938,6 +1969,7 @@ impl StepRun {
             attempts: Vec::new(),
             needs: Vec::new(),
             gate_kind: None,
+            key: None,
         }
     }
 
@@ -2300,6 +2332,20 @@ mod tests {
             input_signature(&needs, None, &base),
             "signing over [b] differs from signing over all needs"
         );
+    }
+
+    #[test]
+    fn a_step_key_is_twelve_base32_characters() {
+        let key = step_key_from_bytes([0, 1, 31, 32, 33, 255, 26, 27, 7, 64, 100, 200]);
+        assert_eq!(key, "ab7ab723haei");
+        assert!(is_step_key_shape(&key));
+        // An authored id is not a key: a capital, a `/`, the wrong length.
+        assert!(!is_step_key_shape("AB7AB723HAEI"));
+        assert!(!is_step_key_shape("amd64/image"));
+        assert!(!is_step_key_shape("build"));
+        assert!(!is_step_key_shape("ab7ab723haei2"));
+        // 0, 1, 8 and 9 are not base32.
+        assert!(!is_step_key_shape("ab7ab723hae1"));
     }
 
     /// Diamond: A -> {B, C} -> D. Rerunning B invalidates B and its descendant
