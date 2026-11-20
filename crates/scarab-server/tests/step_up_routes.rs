@@ -906,6 +906,32 @@ async fn the_debug_shell_needs_a_step_up() {
     }
 }
 
+/// A step route named by its step key: the guard asks for the same step-up
+/// as for the authored id, and the summary the person confirms names the
+/// step by its authored id, not the key.
+#[tokio::test]
+async fn the_debug_shell_through_a_step_key_names_the_step_by_its_id() {
+    use scarab_engine::{Db, RunId, StepId, Timestamp};
+    let h = harness();
+    h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
+    let s = h.browser_session(owner("amy")).await;
+    let mut soft = passkey();
+    h.enroll(&s, &mut soft, "Laptop").await;
+    let (run, step) = (RunId("r1".into()), StepId("amd64/image".into()));
+    h.db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    h.db.create_step_run(&run, &step, None, &[], Timestamp(0))
+        .await
+        .unwrap();
+    let key = h.db.step_key(&run, &step).await.unwrap().unwrap();
+    for (path, op) in [("attach", "step.attach"), ("debug-pod", "step.debug_pod")] {
+        let uri = format!("/v1/runs/r1/steps/{key}/{path}");
+        let (st, b) = h.cookie("GET", &uri, None, &s).await;
+        assert_step_up(st, &b, "window");
+        assert_eq!(b["op"], op, "{b}");
+        assert_eq!(b["summary"]["target"], "r1/amd64/image", "{b}");
+    }
+}
+
 /// The status of a WebSocket handshake to `path` on `app`, served on a
 /// loopback socket so the upgrade is real. `protocols` is the
 /// `Sec-WebSocket-Protocol` list a browser's `new WebSocket(url, protocols)`

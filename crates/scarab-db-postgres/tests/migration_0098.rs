@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 
 use common::fresh_db;
 use scarab_db_postgres::{PostgresDb, MIGRATOR};
-use scarab_engine::{is_step_key_shape, Db, RunId, StepId};
+use scarab_engine::{is_step_key_shape, Db, RunId, StepId, Timestamp};
 use sqlx::PgPool;
 
 const VERSION: i64 = 98;
@@ -102,5 +102,134 @@ async fn every_step_from_before_0098_gets_its_own_key() {
     .execute(&pool)
     .await;
     assert!(dup.is_err(), "a run's keys are unique");
+    tdb.cleanup().await;
+}
+
+/// The text of the migration's statement that starts at `from` and ends with
+/// `to` (both included), so a test runs the migration's own SQL.
+fn migration_part(from: &str, to: &str) -> String {
+    let sql = &MIGRATOR
+        .iter()
+        .find(|m| m.version == VERSION)
+        .expect("migration 0098")
+        .sql;
+    let start = sql.find(from).unwrap_or_else(|| panic!("`{from}` in 0098"));
+    let len = sql[start..]
+        .find(to)
+        .unwrap_or_else(|| panic!("`{to}` after `{from}` in 0098"));
+    sql[start..start + len + to.len()].to_string()
+}
+
+/// Steps of one run that drew the same key at the backfill: the migration's
+/// re-mint loop keeps the key on the step with the least id and mints the
+/// others again until the run's keys are distinct, leaves a run whose key
+/// only repeats another run's alone, and the unique index then builds.
+#[tokio::test]
+async fn the_backfill_mints_again_until_a_runs_keys_are_distinct() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pool = tdb.pool.clone();
+    apply(&pool, |v| v <= VERSION).await;
+    seed_run(&pool, "r1").await;
+    seed_run(&pool, "r2").await;
+    for step in ["a", "b", "c", "d"] {
+        seed_step(&pool, "r1", step).await;
+    }
+    seed_step(&pool, "r2", "a").await;
+
+    // As if the backfill had drawn one key for every row.
+    sqlx::raw_sql(
+        "DROP INDEX step_runs_run_id_step_key;
+         UPDATE step_runs SET step_key = 'aaaaaaaaaaaa';",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(&migration_part("DO $$", "END\n$$;"))
+        .execute(&pool)
+        .await
+        .expect("the re-mint loop");
+    sqlx::raw_sql(&migration_part("CREATE UNIQUE INDEX", ";"))
+        .execute(&pool)
+        .await
+        .expect("the unique index builds");
+
+    let rows: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT run_id, step_id, step_key FROM step_runs ORDER BY run_id, step_id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let r1: Vec<&(String, String, String)> = rows.iter().filter(|r| r.0 == "r1").collect();
+    assert_eq!(r1[0].2, "aaaaaaaaaaaa", "the least step id keeps its key");
+    let keys: BTreeSet<&str> = r1.iter().map(|r| r.2.as_str()).collect();
+    assert_eq!(keys.len(), 4, "distinct within the run: {rows:?}");
+    assert!(keys.iter().all(|k| is_step_key_shape(k)), "{rows:?}");
+    let r2 = rows.iter().find(|r| r.0 == "r2").unwrap();
+    assert_eq!(r2.2, "aaaaaaaaaaaa", "another run's same key is left alone");
+    tdb.cleanup().await;
+}
+
+/// An insert whose drawn key another step of the run already holds is made
+/// again with a fresh draw; a run of draws that all collide gives up with an
+/// error, not a loop.
+#[tokio::test]
+async fn create_step_run_draws_again_on_a_key_collision() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pool = tdb.pool.clone();
+    let db = PostgresDb::with_pool(pool.clone());
+    db.migrate().await.unwrap();
+    let run = RunId("r1".into());
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+
+    // The first two draws are the same key, then random ones.
+    sqlx::raw_sql(
+        "CREATE SEQUENCE key_draws;
+         CREATE OR REPLACE FUNCTION scarab_step_key() RETURNS TEXT LANGUAGE sql VOLATILE AS $$
+             SELECT CASE WHEN nextval('key_draws') <= 2 THEN 'aaaaaaaaaaaa'
+                         ELSE substr(md5(random()::text), 1, 12) END
+         $$;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    db.create_step_run(&run, &StepId("a".into()), None, &[], Timestamp(0))
+        .await
+        .unwrap();
+    db.create_step_run(&run, &StepId("b".into()), None, &[], Timestamp(0))
+        .await
+        .expect("the second draw collides, the third does not");
+    let draws: i64 = sqlx::query_scalar("SELECT last_value FROM key_draws")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(draws, 3, "the colliding insert drew once more");
+    let a = db.step_key(&run, &StepId("a".into())).await.unwrap();
+    let b = db.step_key(&run, &StepId("b".into())).await.unwrap();
+    assert_eq!(a.as_deref(), Some("aaaaaaaaaaaa"));
+    assert!(b.is_some() && b != a, "{a:?} {b:?}");
+
+    // Every draw collides: the insert fails after its tries.
+    sqlx::raw_sql(
+        "CREATE OR REPLACE FUNCTION scarab_step_key() RETURNS TEXT LANGUAGE sql VOLATILE AS $$
+             SELECT 'aaaaaaaaaaaa'
+         $$;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let err = db
+        .create_step_run(&run, &StepId("c".into()), None, &[], Timestamp(0))
+        .await
+        .expect_err("every draw collides");
+    assert!(
+        format!("{err:?}").contains("step_runs_run_id_step_key"),
+        "{err:?}"
+    );
+    assert_eq!(db.step_key(&run, &StepId("c".into())).await.unwrap(), None);
     tdb.cleanup().await;
 }

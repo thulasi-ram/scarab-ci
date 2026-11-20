@@ -5,28 +5,34 @@
 -- percent-encoded path segment. The key never changes: a rerun, a retry and a
 -- new Take keep the row and so keep its key.
 --
--- `scarab_step_key()` draws the bytes from two version 4 UUIDs
--- (`gen_random_uuid()`, a CSPRNG built into Postgres 13 and later). The first
--- 6 bytes of a version 4 UUID are all random; each byte's low 5 bits pick one
--- character, and 256 is a multiple of 32, so every character is uniform.
--- The server mints keys the same way in Rust for its in-memory store.
+-- `scarab_step_key()` is one expression, so Postgres inlines it into the
+-- statement that evaluates the DEFAULT: 9 random bytes (the first 6 of one
+-- version 4 UUID and the first 3 of another; `gen_random_uuid()` is a CSPRNG
+-- built into Postgres 13 and later, and those bytes of a version 4 UUID are
+-- all random) are base64-encoded to exactly 12 characters, and `translate`
+-- maps each of the 64 base64 characters to the key alphabet character at its
+-- index mod 32. 64 is twice 32, so every character is uniform: 60 random
+-- bits. The server's in-memory store mints keys with the same alphabet and
+-- length from the OS CSPRNG. On Postgres 16 this costs about 5 us a call,
+-- against 9 us for a body that aggregated one character at a time.
 --
 -- The DEFAULT mints the key. Adding the column with a volatile default
--- computes it once per existing row, so every step made before this
--- migration gets its own key here. The store relies on the same default for
--- new rows, and so does a binary from before this migration, which inserts
--- without naming the column.
+-- rewrites the table and computes it once per existing row, so every step
+-- made before this migration gets its own key here; the rewrite holds an
+-- ACCESS EXCLUSIVE lock on `step_runs`, and its time grows with the table
+-- (about 7 us a row on Postgres 16, index rebuild included). The store relies
+-- on the same default for new rows, and so does a binary from before this
+-- migration, which inserts without naming the column.
 --
 -- Expand step (ADR-0003): one function, one column and one index added,
 -- nothing dropped.
 
 CREATE FUNCTION scarab_step_key() RETURNS TEXT LANGUAGE sql VOLATILE AS $$
-    SELECT string_agg(
-               substr('abcdefghijklmnopqrstuvwxyz234567', (get_byte(b, i) & 31) + 1, 1),
-               '' ORDER BY i)
-    FROM (SELECT substring(uuid_send(gen_random_uuid()) FROM 1 FOR 6)
-              || substring(uuid_send(gen_random_uuid()) FROM 1 FOR 6) AS b) AS bytes,
-         generate_series(0, 11) AS i
+    SELECT translate(
+        encode(substring(uuid_send(gen_random_uuid()) FROM 1 FOR 6)
+               || substring(uuid_send(gen_random_uuid()) FROM 1 FOR 3), 'base64'),
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',
+        'abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwxyz234567')
 $$;
 
 ALTER TABLE step_runs

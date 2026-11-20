@@ -239,3 +239,153 @@ async fn a_key_that_names_no_step_of_the_run_is_a_404() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// A run whose `build` step succeeded and whose `approve` gate waits, driven
+/// by the real scheduler, and the keys its run detail lists.
+async fn gated_run() -> (
+    axum::Router,
+    Arc<InMemoryDb>,
+    RunId,
+    std::collections::BTreeMap<String, String>,
+    Arc<FakeClock>,
+    Arc<scarab_testkit::FakeExecutor>,
+) {
+    use scarab_engine::ports::ExecState;
+    use scarab_engine::{Clock, RunStatus, Scheduler};
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let exec = Arc::new(scarab_testkit::FakeExecutor::new());
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let app = router(AppState::new(db.clone(), clock.clone(), logs));
+    let body = serde_json::json!({
+        "pipeline": {
+            "ir_version": 1,
+            "steps": [
+                { "id": "build", "image": "busybox", "command": ["true"] },
+                { "id": "approve", "gate": "manual", "needs": ["build"] }
+            ]
+        }
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created: serde_json::Value = serde_json::from_str(&text(resp).await).unwrap();
+    let run = RunId(created["id"].as_str().unwrap().to_string());
+    exec.script_outcome(ExecState::Succeeded);
+    let sched = Scheduler::new(&*db as &dyn Db, &*clock as &dyn Clock, &*exec, "sched");
+    for _ in 0..5 {
+        sched.tick_all().await.unwrap();
+    }
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Suspended),
+        "precondition: the gate waits"
+    );
+    let keys = keys(&app, &run.0).await;
+    (app, db, run, keys, clock, exec)
+}
+
+fn post(path: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_gate_is_approved_and_a_step_rerun_through_their_keys() {
+    use scarab_engine::{Clock, RunStatus, Scheduler};
+    let (app, db, run, keys, clock, exec) = gated_run().await;
+
+    let resp = app
+        .clone()
+        .oneshot(post(&format!(
+            "/v1/runs/{}/gates/{}/approve",
+            run.0, keys["approve"]
+        )))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body: serde_json::Value = serde_json::from_str(&text(resp).await).unwrap();
+    assert_eq!(body["released"], true, "{body}");
+    let approved = db
+        .events(&run)
+        .await
+        .unwrap()
+        .into_iter()
+        .any(|e| matches!(e.kind, scarab_engine::EventPayload::GateApproved { .. }));
+    assert!(
+        approved,
+        "the approval is recorded on the gate the key names"
+    );
+    let sched = Scheduler::new(&*db as &dyn Db, &*clock as &dyn Clock, &*exec, "sched");
+    for _ in 0..5 {
+        sched.tick_all().await.unwrap();
+    }
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded),
+        "the released gate let the run finish"
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(post(&format!(
+            "/v1/runs/{}/steps/{}/rerun",
+            run.0, keys["build"]
+        )))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let target = db
+        .events(&run)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|e| match e.kind {
+            scarab_engine::EventPayload::RunRerunRequested { target, .. } => Some(target),
+            _ => None,
+        });
+    assert_eq!(target, Some(StepId("build".into())));
+    // The rerun keeps every key.
+    assert_eq!(self::keys(&app, &run.0).await, keys);
+}
+
+/// A key-shaped `{step}` that names no step of the run (here, the gate's key
+/// in another server's run) approves nothing.
+#[tokio::test]
+async fn an_unknown_key_approves_nothing() {
+    let (app, db, run, _keys, _clock, _exec) = gated_run().await;
+    let (_, _, _, elsewhere, _, _) = gated_run().await;
+    let resp = app
+        .clone()
+        .oneshot(post(&format!(
+            "/v1/runs/{}/gates/{}/approve",
+            run.0, elsewhere["approve"]
+        )))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let approved = db
+        .events(&run)
+        .await
+        .unwrap()
+        .into_iter()
+        .any(|e| matches!(e.kind, scarab_engine::EventPayload::GateApproved { .. }));
+    assert!(!approved);
+}
