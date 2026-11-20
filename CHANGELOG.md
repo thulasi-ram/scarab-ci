@@ -18,6 +18,21 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Security
+
+- **The chart installs an admission policy that holds step Pods to their own Secrets and
+  ServiceAccount.** A ValidatingAdmissionPolicy refuses a Pod the server's ServiceAccount creates
+  in the step namespace when it names a Secret other than its own per-Pod Secrets and the ones
+  `scarab.placement` names, runs as a ServiceAccount other than `default` and the placement
+  profiles' ones, or asks for `hostPath`, `hostNetwork`, `hostPID` or `hostIPC`. It holds both
+  namespace modes, `<release namespace>-steps` and `scarab.namespace` set to the release
+  namespace. A step whose Pod it refuses fails with the policy's reason. It needs Kubernetes
+  1.30+; on an older cluster the chart skips it and the install notes say so. Set
+  `scarab.admissionPolicy.validationActions: [Audit]` to try it first, or
+  `scarab.admissionPolicy.enabled: false` to leave it out. A placement profile with a `hostPath`
+  volume or a host namespace is now refused. See
+  [The step Pod admission policy](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#the-step-pod-admission-policy).
+
 ### Features
 
 - **A library keeps the ref it was fetched at and the commit that ref resolved to.** The library
