@@ -2981,7 +2981,7 @@ async fn get_events(
     get,
     path = "/v1/runs/{id}/logs",
     params(("id" = String, Path, description = "run id")),
-    responses((status = 200, description = "SSE stream of step log output"))
+    responses((status = 200, description = "SSE stream of step log output (`data` events), with `event: marker` for each note the server stored with the log (data `{\"kind\",\"reason\"?,\"text\"}`, an id like a data event's)"))
 )]
 async fn get_logs(
     State(st): State<AppState>,
@@ -3048,7 +3048,7 @@ struct StepLogsQuery {
         ("tail" = Option<u64>, Query, description = "without a cursor, replay from the stored chunk that holds the byte this many bytes before the end: at least this many bytes, or the whole log (clamped to 1..67108864)")
     ),
     responses(
-        (status = 200, description = "SSE stream of this step's log output"),
+        (status = 200, description = "SSE stream of this step's log output (`data` events), with `event: marker` for each note the server stored with the log (data `{\"kind\",\"reason\"?,\"text\"}`, an id like a data event's)"),
         (status = 400, description = "malformed cursor, or a cursor naming an attempt outside the selection"),
         (status = 404, description = "no such run or step")
     )
@@ -3353,7 +3353,7 @@ struct ServiceLogsQuery {
         ("tail" = Option<u64>, Query, description = "without a cursor, replay from the stored chunk that holds the byte this many bytes before the end: at least this many bytes, or the whole log (clamped to 1..67108864)")
     ),
     responses(
-        (status = 200, description = "SSE stream of this service's log output"),
+        (status = 200, description = "SSE stream of this service's log output (`data` events), with `event: marker` for each note the server stored with the log (data `{\"kind\",\"reason\"?,\"text\"}`, an id like a data event's)"),
         (status = 400, description = "malformed cursor, or a cursor for another Take"),
         (status = 404, description = "no such run or service")
     )

@@ -7845,7 +7845,7 @@
         ],
         "responses": {
           "200": {
-            "description": "SSE stream of step log output"
+            "description": "SSE stream of step log output (`data` events), with `event: marker` for each note the server stored with the log (data `{\"kind\",\"reason\"?,\"text\"}`, an id like a data event's)"
           }
         },
         "security": [
@@ -8012,7 +8012,7 @@
         ],
         "responses": {
           "200": {
-            "description": "SSE stream of this service's log output"
+            "description": "SSE stream of this service's log output (`data` events), with `event: marker` for each note the server stored with the log (data `{\"kind\",\"reason\"?,\"text\"}`, an id like a data event's)"
           },
           "400": {
             "description": "malformed cursor, or a cursor for another Take"
@@ -8423,7 +8423,7 @@
         ],
         "responses": {
           "200": {
-            "description": "SSE stream of this step's log output"
+            "description": "SSE stream of this step's log output (`data` events), with `event: marker` for each note the server stored with the log (data `{\"kind\",\"reason\"?,\"text\"}`, an id like a data event's)"
           },
           "400": {
             "description": "malformed cursor, or a cursor naming an attempt outside the selection"

@@ -12249,7 +12249,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description SSE stream of step log output */
+            /** @description SSE stream of step log output (`data` events), with `event: marker` for each note the server stored with the log (data `{"kind","reason"?,"text"}`, an id like a data event's) */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -12344,7 +12344,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description SSE stream of this service's log output */
+            /** @description SSE stream of this service's log output (`data` events), with `event: marker` for each note the server stored with the log (data `{"kind","reason"?,"text"}`, an id like a data event's) */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -12617,7 +12617,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description SSE stream of this step's log output */
+            /** @description SSE stream of this step's log output (`data` events), with `event: marker` for each note the server stored with the log (data `{"kind","reason"?,"text"}`, an id like a data event's) */
             200: {
                 headers: {
                     [name: string]: unknown;
