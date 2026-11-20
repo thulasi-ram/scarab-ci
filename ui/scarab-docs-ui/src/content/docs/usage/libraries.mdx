@@ -58,7 +58,20 @@ each installation:
 `requested_ref` is `null` when the source named the commit, and for libraries installed before
 Scarab kept it; `resolved_commit` is always the full commit. A version keeps the `source` of its
 first fetch, so when the same content was fetched before at another commit, `resolved_commit` can
-differ from the commit in `source`. Both commits hold the same file.
+differ from the commit in `source`. Both commits hold the same file, and the library's page says
+so.
+
+The install can name the fetch you reviewed, as the review page does: send the fetch answer's
+`requested_ref` and `resolved_commit` with the install. When someone fetched the same content again
+in between, under another ref or at another commit, the install fails with a 409 that names both,
+and nothing is installed; fetch again and review it. Without them, the install records the most
+recent fetch of the version.
+
+```sh
+curl -X POST "$SCARAB/v1/orgs/acme/library-installations" \
+  -d '{"name": "acme::scarab-libs::deploy-helm", "content_hash": "5d1e…",
+       "requested_ref": "v1.4.0", "resolved_commit": "8c2f4e1a9d7b3c5e0f6a2b8d4c1e7f9a3b5d2c6e"}'
+```
 
 Installing takes two steps:
 

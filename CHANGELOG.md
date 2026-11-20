@@ -27,7 +27,9 @@ release.yml uses that version's section as the GitHub Release text. See
   to the fetched ones, and Upgrade starts from the installed ref. The fetch answer and every
   installation carry `requested_ref` and `resolved_commit`, and the install's passkey
   confirmation and security log name them. An installation records the ones of the fetch it
-  installed: fetching the same content again under another ref does not change it. Migration
+  installed: fetching the same content again under another ref does not change it. An install
+  that names the fetch it reviewed is refused with a 409 when the same content was fetched again
+  in between at another ref or commit. Migration
   `0097` adds nullable columns and fills in the commit of every library installed before it; their
   ref stays empty. See
   [The ref and the commit](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#the-ref-and-the-commit).
