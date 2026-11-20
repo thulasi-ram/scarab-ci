@@ -870,6 +870,30 @@ impl GuardCtx {
         Ok(())
     }
 
+    /// [`require`](Self::require), with `notes` (each a `label = value`
+    /// line) put right after the summary's first change: what the handler
+    /// read from its state that the request does not say, such as the
+    /// commit a library version was fetched at. A replay re-reads them, so
+    /// a note that changed since the human confirmed refuses it.
+    pub(crate) async fn require_noting(
+        &self,
+        st: &AppState,
+        notes: Vec<String>,
+    ) -> Result<(), ApiError> {
+        let Some(p) = &self.prepared else {
+            *self.ticket.lock().unwrap() = Ticket::Exempt("step-up is off");
+            return Ok(());
+        };
+        let mut summary = p.summary.clone();
+        let at = summary.changes.len().min(1);
+        summary
+            .changes
+            .splice(at..at, notes.iter().map(|n| ops::escape_invisible(n)));
+        let confirmation = authorise(st, self.op, p, &summary).await?;
+        *self.ticket.lock().unwrap() = Ticket::Authorised(confirmation);
+        Ok(())
+    }
+
     /// The change does not loosen anything: no step-up.
     pub(crate) fn exempt(&self, why: &'static str) {
         *self.ticket.lock().unwrap() = Ticket::Exempt(why);

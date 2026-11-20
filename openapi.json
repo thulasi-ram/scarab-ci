@@ -11161,6 +11161,7 @@
           "name",
           "content_hash",
           "source",
+          "resolved_commit",
           "content",
           "diff",
           "carried_grants"
@@ -11197,8 +11198,20 @@
           "name": {
             "type": "string"
           },
+          "requested_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The `ref` of the request, trimmed; `null` when the source named the\ncommit. When this content was stored already from another file, the\nstored version's, as `source` is."
+          },
+          "resolved_commit": {
+            "type": "string",
+            "description": "The full commit the file was read at: what `ref` points to now, or\nthe commit in the source. What an install of this version records."
+          },
           "source": {
-            "type": "string"
+            "type": "string",
+            "description": "Pinned to the commit of the first fetch of this content in the org."
           }
         }
       },
@@ -11697,11 +11710,23 @@
         "type": "object",
         "required": [
           "content_hash",
-          "source"
+          "source",
+          "resolved_commit"
         ],
         "properties": {
           "content_hash": {
             "type": "string"
+          },
+          "requested_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The branch, tag or commit the installed version was fetched at;\n`null` when its fetch named the commit in the source."
+          },
+          "resolved_commit": {
+            "type": "string",
+            "description": "The full commit the installed version was read at."
           },
           "source": {
             "type": "string"
@@ -11715,6 +11740,7 @@
           "name",
           "content_hash",
           "source",
+          "resolved_commit",
           "installed_by",
           "installed_at"
         ],
@@ -11736,6 +11762,17 @@
           "name": {
             "type": "string",
             "description": "The library name, as `invoke: lib:<name>` writes it."
+          },
+          "requested_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The branch, tag or commit the admin fetched the installed version\nat, as typed. `null` when the fetch named the commit in the source\n(`…@<commit>`), and for an install from before Scarab kept it."
+          },
+          "resolved_commit": {
+            "type": "string",
+            "description": "The full commit the fetch read the file at. The same file can be at\nmore than one commit, so it may differ from the commit in `source`."
           },
           "source": {
             "type": "string"

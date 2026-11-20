@@ -82,6 +82,8 @@ impl State {
             installed_by: i.installed_by.clone(),
             installed_at: i.installed_at,
             step_up_ref: i.step_up_ref.clone(),
+            requested_ref: i.requested_ref.clone(),
+            resolved_commit: i.resolved_commit.clone(),
         }
     }
 }
@@ -101,11 +103,20 @@ impl InMemoryLibraries {
 impl LibraryStore for InMemoryLibraries {
     async fn put_version(&self, v: &LibraryVersion) -> Result<LibraryVersion, LibraryStoreError> {
         let mut st = self.state.lock().unwrap();
-        Ok(st
+        let stored = st
             .versions
             .entry((v.org.clone(), v.content_hash.clone()))
-            .or_insert_with(|| v.clone())
-            .clone())
+            .or_insert_with(|| LibraryVersion {
+                resolved_commit: v.commit(),
+                ..v.clone()
+            });
+        // The first fetch's record stays; a fetch from the same file
+        // records its own ref and commit.
+        if trust_key(&stored.source) == trust_key(&v.source) {
+            stored.requested_ref = v.requested_ref.clone();
+            stored.resolved_commit = v.commit();
+        }
+        Ok(stored.clone())
     }
 
     async fn version(

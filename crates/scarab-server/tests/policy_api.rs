@@ -891,6 +891,8 @@ async fn policy_test_denies_a_run_that_run_creation_refuses_for_the_sandbox() {
         name: "evil/build".into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
+        requested_ref: None,
+        resolved_commit: String::new(),
     })
     .await
     .unwrap();
@@ -902,6 +904,8 @@ async fn policy_test_denies_a_run_that_run_creation_refuses_for_the_sandbox() {
             installed_by: "amy".into(),
             installed_at: 1,
             step_up_ref: None,
+            requested_ref: None,
+            resolved_commit: String::new(),
         },
         &Replaces::Nothing,
     )
@@ -1118,6 +1122,8 @@ async fn policy_test_denies_a_run_that_run_creation_refuses_for_a_yanked_version
         name: "acme/deploy".into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
+        requested_ref: None,
+        resolved_commit: String::new(),
     })
     .await
     .unwrap();
@@ -1129,6 +1135,8 @@ async fn policy_test_denies_a_run_that_run_creation_refuses_for_a_yanked_version
             installed_by: "amy".into(),
             installed_at: 1,
             step_up_ref: None,
+            requested_ref: None,
+            resolved_commit: String::new(),
         },
         &Replaces::Nothing,
     )

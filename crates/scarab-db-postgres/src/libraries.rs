@@ -1,5 +1,5 @@
 //! [`LibraryStore`] on Postgres (ADR-0076 §4, §6; migrations 0071, 0072,
-//! 0090, 0096).
+//! 0090, 0096, 0097).
 //!
 //! An install takes the installation row `FOR UPDATE` (or finds none),
 //! compares it with what the caller expects to replace, and writes in the
@@ -25,8 +25,8 @@ use sqlx::Row;
 
 use scarab_pipeline::InstalledLibrary;
 use scarab_policy::library::{
-    trust_key, LibraryInstallation, LibraryStore, LibraryStoreError, LibraryVersion, LibraryYank,
-    NewInstallation, Replaces, TrustGrant, TrustedSource,
+    pinned_commit, trust_key, LibraryInstallation, LibraryStore, LibraryStoreError, LibraryVersion,
+    LibraryYank, NewInstallation, Replaces, TrustGrant, TrustedSource,
 };
 
 use crate::PostgresDb;
@@ -47,36 +47,52 @@ fn sqlstate(e: &sqlx::Error) -> Option<String> {
     }
 }
 
-const VERSION_COLUMNS: &str = "org, content_hash, content, source, name, fetched_by, fetched_at";
+const VERSION_COLUMNS: &str = "org, content_hash, content, source, name, fetched_by, fetched_at, \
+     requested_ref, resolved_commit";
+
+/// The commit in `source` when `resolved_commit` is NULL: a row written by a
+/// binary from before migration 0097.
+fn commit_or_source(resolved_commit: Option<String>, source: &str) -> String {
+    resolved_commit.unwrap_or_else(|| pinned_commit(source).to_string())
+}
 
 fn version_from_row(r: &PgRow) -> LibraryVersion {
+    let source: String = r.get("source");
     LibraryVersion {
         org: r.get("org"),
         content_hash: r.get("content_hash"),
         content: r.get("content"),
-        source: r.get("source"),
         name: r.get("name"),
         fetched_by: r.get("fetched_by"),
         fetched_at: r.get("fetched_at"),
+        requested_ref: r.get("requested_ref"),
+        resolved_commit: commit_or_source(r.get("resolved_commit"), &source),
+        source,
     }
 }
 
-/// An installation joined with its version.
+/// An installation joined with its version. Its ref and commit are its own,
+/// copied at install; an install made by a binary from before migration
+/// 0097 has neither, and reads the commit in its version's source.
 const INSTALLATION_SELECT: &str = "SELECT i.id, i.org, i.name, i.content_hash, \
-     v.source, i.installed_by, i.installed_at, i.step_up_ref \
+     v.source, i.installed_by, i.installed_at, i.step_up_ref, \
+     i.requested_ref, i.resolved_commit \
      FROM library_installations i \
      JOIN library_versions v ON v.org = i.org AND v.content_hash = i.content_hash";
 
 fn installation_from_row(r: &PgRow) -> LibraryInstallation {
+    let source: String = r.get("source");
     LibraryInstallation {
         id: r.get("id"),
         org: r.get("org"),
         name: r.get("name"),
         content_hash: r.get("content_hash"),
-        source: r.get("source"),
         installed_by: r.get("installed_by"),
         installed_at: r.get("installed_at"),
         step_up_ref: r.get("step_up_ref"),
+        requested_ref: r.get("requested_ref"),
+        resolved_commit: commit_or_source(r.get("resolved_commit"), &source),
+        source,
     }
 }
 
@@ -95,10 +111,18 @@ fn yank_from_row(r: &PgRow) -> LibraryYank {
 #[async_trait]
 impl LibraryStore for PostgresDb {
     async fn put_version(&self, v: &LibraryVersion) -> Result<LibraryVersion, LibraryStoreError> {
+        // A fetch of stored content keeps the first fetch's record; one from
+        // the same file records its own ref and commit. `$10` is the trust
+        // key of the fetched source: the stored source is that and `@` and
+        // a commit.
         sqlx::query(&format!(
             "INSERT INTO library_versions ({VERSION_COLUMNS}) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
-             ON CONFLICT (org, content_hash) DO NOTHING"
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT (org, content_hash) DO UPDATE \
+               SET requested_ref = EXCLUDED.requested_ref, \
+                   resolved_commit = EXCLUDED.resolved_commit \
+               WHERE left(library_versions.source, length($10::text) + 1) = $10::text || '@' \
+                 AND strpos(substr(library_versions.source, length($10::text) + 2), '/') = 0"
         ))
         .bind(&v.org)
         .bind(&v.content_hash)
@@ -107,6 +131,9 @@ impl LibraryStore for PostgresDb {
         .bind(&v.name)
         .bind(&v.fetched_by)
         .bind(v.fetched_at)
+        .bind(&v.requested_ref)
+        .bind(v.commit())
+        .bind(trust_key(&v.source))
         .execute(self.pool())
         .await
         .map_err(|e| match sqlstate(&e).as_deref() {
@@ -580,8 +607,9 @@ impl PostgresDb {
                 for _ in 0..3 {
                     written = sqlx::query(
                         "INSERT INTO library_installations \
-                         (org, name, content_hash, installed_by, installed_at, step_up_ref) \
-                         VALUES ($1, $2, $3, $4, $5, $6) \
+                         (org, name, content_hash, installed_by, installed_at, step_up_ref, \
+                          requested_ref, resolved_commit) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
                          ON CONFLICT (id) DO NOTHING",
                     )
                     .bind(&new.org)
@@ -590,6 +618,8 @@ impl PostgresDb {
                     .bind(&new.installed_by)
                     .bind(new.installed_at)
                     .bind(&new.step_up_ref)
+                    .bind(&new.requested_ref)
+                    .bind(&new.resolved_commit)
                     .execute(&mut *tx)
                     .await
                     .map_err(map_write)?
@@ -607,7 +637,8 @@ impl PostgresDb {
             }
             Replaces::Version(h) => sqlx::query(
                 "UPDATE library_installations SET \
-                   content_hash = $3, installed_by = $4, installed_at = $5, step_up_ref = $6 \
+                   content_hash = $3, installed_by = $4, installed_at = $5, step_up_ref = $6, \
+                   requested_ref = $8, resolved_commit = $9 \
                  WHERE org = $1 AND name = $2 AND content_hash = $7",
             )
             .bind(&new.org)
@@ -617,6 +648,8 @@ impl PostgresDb {
             .bind(new.installed_at)
             .bind(&new.step_up_ref)
             .bind(h)
+            .bind(&new.requested_ref)
+            .bind(&new.resolved_commit)
             .execute(&mut *tx)
             .await
             .map_err(map_write)?

@@ -227,6 +227,8 @@ async fn trusted_library(libs: &InMemoryLibraries) -> String {
         name: "acme/git".into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
+        requested_ref: None,
+        resolved_commit: String::new(),
     })
     .await
     .unwrap();
@@ -358,6 +360,8 @@ async fn a_clone_library_launch_gets_the_long_lived_token_only_once_its_source_i
         name: "thulasi-ram::scarab-ci::clone".into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
+        requested_ref: None,
+        resolved_commit: String::new(),
     })
     .await
     .unwrap();

@@ -10,8 +10,8 @@ use scarab_db_postgres::PostgresDb;
 use std::collections::BTreeSet;
 
 use scarab_policy::library::{
-    content_hash, LibraryStore, LibraryStoreError, LibraryVersion, LibraryYank, NewInstallation,
-    Replaces, TrustGrant, TrustedSource,
+    content_hash, pinned_commit, LibraryStore, LibraryStoreError, LibraryVersion, LibraryYank,
+    NewInstallation, Replaces, TrustGrant, TrustedSource,
 };
 use scarab_testkit::InMemoryLibraries;
 
@@ -56,6 +56,102 @@ contract_test!(
     an_install_carrying_grants_names_exactly_the_grants_its_source_holds,
     install_carrying
 );
+contract_test!(
+    an_installation_keeps_the_ref_and_commit_it_was_installed_with,
+    refs
+);
+
+const C_MAIN: &str = "1a2b3c4d5e6f7a8b9c0d1a2b3c4d5e6f7a8b9c0d";
+const C_TAG: &str = "9f8e7d6c5b4a39281706f9e8d7c6b5a493827160";
+
+/// A fetch records its ref and commit on the version; a fetch of the same
+/// content from the same file replaces them, and one from another file does
+/// not. An install keeps what it was given, and no later fetch changes it.
+async fn refs(store: &dyn LibraryStore) {
+    let file = "github.com/acme/libs//deploy.yaml";
+    let at_main = LibraryVersion {
+        requested_ref: Some("main".into()),
+        ..version("acme", V1, &format!("{file}@{C_MAIN}"))
+    };
+    let v = store.put_version(&at_main).await.unwrap();
+    assert_eq!(v.requested_ref.as_deref(), Some("main"));
+    assert_eq!(v.resolved_commit, C_MAIN);
+
+    let mut new = install("acme", &v.content_hash, 10);
+    new.requested_ref = v.requested_ref.clone();
+    new.resolved_commit = v.resolved_commit.clone();
+    let i = store.install(&new, &Replaces::Nothing).await.unwrap();
+    assert_eq!(i.requested_ref.as_deref(), Some("main"));
+    assert_eq!(i.resolved_commit, C_MAIN);
+
+    // The same content fetched again, as a tag at another commit of the
+    // same file: the version says so, and keeps its first source.
+    let at_tag = LibraryVersion {
+        requested_ref: Some("v1.2.0".into()),
+        resolved_commit: C_TAG.into(),
+        fetched_by: "user:bob".into(),
+        ..version("acme", V1, &format!("{file}@{C_TAG}"))
+    };
+    let v = store.put_version(&at_tag).await.unwrap();
+    assert_eq!(v.requested_ref.as_deref(), Some("v1.2.0"));
+    assert_eq!(v.resolved_commit, C_TAG);
+    assert_eq!(v.source, format!("{file}@{C_MAIN}"));
+    assert_eq!(v.fetched_by, "user:amy");
+
+    // The installation still says what it was installed with.
+    for found in [
+        store
+            .installation("acme", "acme::libs::deploy")
+            .await
+            .unwrap(),
+        store.installation_by_id("acme", &i.id).await.unwrap(),
+        store.installations("acme").await.unwrap().pop(),
+    ] {
+        let found = found.expect("installed");
+        assert_eq!(found.requested_ref.as_deref(), Some("main"));
+        assert_eq!(found.resolved_commit, C_MAIN);
+    }
+
+    // Pinned (no ref), from the same file: the ref goes, the commit is the
+    // pinned one.
+    let pinned = version("acme", V1, &format!("{file}@{C_TAG}"));
+    let v = store.put_version(&pinned).await.unwrap();
+    assert_eq!(v.requested_ref, None);
+    assert_eq!(v.resolved_commit, C_TAG);
+
+    // The same content from another file leaves the version's ref and
+    // commit: they are about its own file.
+    let elsewhere = LibraryVersion {
+        requested_ref: Some("dev".into()),
+        ..version(
+            "acme",
+            V1,
+            &format!("github.com/globex/libs//deploy.yaml@{C_MAIN}"),
+        )
+    };
+    let v = store.put_version(&elsewhere).await.unwrap();
+    assert_eq!(v.requested_ref, None);
+    assert_eq!(v.resolved_commit, C_TAG);
+
+    // An upgrade records the new version's ref and commit.
+    let v2 = store
+        .put_version(&LibraryVersion {
+            requested_ref: Some("v1.3.0".into()),
+            ..version("acme", V2, &format!("{file}@{C_TAG}"))
+        })
+        .await
+        .unwrap();
+    let mut up = install("acme", &v2.content_hash, 11);
+    up.requested_ref = v2.requested_ref.clone();
+    up.resolved_commit = v2.resolved_commit.clone();
+    let up = store
+        .install(&up, &Replaces::Version(i.content_hash.clone()))
+        .await
+        .unwrap();
+    assert_eq!(up.id, i.id);
+    assert_eq!(up.requested_ref.as_deref(), Some("v1.3.0"));
+    assert_eq!(up.resolved_commit, C_TAG);
+}
 
 /// Migration 0095 is expand-only: a server from before it reads trust with
 /// forge credentials from `library_trusted_sources` alone. A source trusted
@@ -272,6 +368,8 @@ fn version(org: &str, content: &str, source: &str) -> LibraryVersion {
         name: "acme::libs::deploy".into(),
         fetched_by: "user:amy".into(),
         fetched_at: 1_000,
+        requested_ref: None,
+        resolved_commit: pinned_commit(source).into(),
     }
 }
 
@@ -283,6 +381,8 @@ fn install(org: &str, hash: &str, at: i64) -> NewInstallation {
         installed_by: "user:amy".into(),
         installed_at: at,
         step_up_ref: Some("su-1".into()),
+        requested_ref: None,
+        resolved_commit: String::new(),
     }
 }
 
