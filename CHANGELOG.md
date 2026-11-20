@@ -18,19 +18,36 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **The chart's new step Pod admission policy is cluster-scoped.** On Kubernetes 1.30+ the chart
+  now creates a ValidatingAdmissionPolicy and a ValidatingAdmissionPolicyBinding
+  (`admissionregistration.k8s.io`), so the account that runs `helm upgrade` needs rights to create
+  them. With `scarab.createNamespace: false`, the setting for an installer with rights in the
+  release namespace only, the chart leaves the policy out and the install notes say how to turn it
+  on (`scarab.admissionPolicy.enabled: true`). Any other install without those rights sets
+  `scarab.admissionPolicy.enabled: false`. See [The step Pod admission policy](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#the-step-pod-admission-policy).
+- **The render fails when the placement config asks for a host field while the policy is on.** A
+  `scarab.placement` baseline or profile with a `hostPath` volume, `hostNetwork`, `hostPID` or
+  `hostIPC` would have every step Pod it places refused, so `helm upgrade` now fails naming the
+  baseline or profile. Remove the field, or set `scarab.admissionPolicy.enabled: false`. The render
+  also fails when step Pods share the release namespace and the server's ServiceAccount is
+  `default` (`serviceAccount.create: false` with no name) or another name the policy allows: give
+  the server its own ServiceAccount, run step Pods in another namespace, or turn the policy off.
+
 ### Security
 
 - **The chart installs an admission policy that holds step Pods to their own Secrets and
   ServiceAccount.** A ValidatingAdmissionPolicy refuses a Pod the server's ServiceAccount creates
   in the step namespace when it names a Secret other than its own per-Pod Secrets and the ones
-  `scarab.placement` names, runs as a ServiceAccount other than `default` and the placement
-  profiles' ones, or asks for `hostPath`, `hostNetwork`, `hostPID` or `hostIPC`. It holds both
-  namespace modes, `<release namespace>-steps` and `scarab.namespace` set to the release
-  namespace. A step whose Pod it refuses fails with the policy's reason. It needs Kubernetes
-  1.30+; on an older cluster the chart skips it and the install notes say so. Set
-  `scarab.admissionPolicy.validationActions: [Audit]` to try it first, or
-  `scarab.admissionPolicy.enabled: false` to leave it out. A placement profile with a `hostPath`
-  volume or a host namespace is now refused. See
+  `scarab.placement` or `scarab.admissionPolicy.allowSecrets` names, runs as a ServiceAccount
+  other than `default` and the ones the placement profiles or
+  `scarab.admissionPolicy.allowServiceAccounts` name, or asks for `hostPath`, `hostNetwork`,
+  `hostPID` or `hostIPC`. It holds both namespace modes, `<release namespace>-steps` and
+  `scarab.namespace` set to the release namespace. A step, shared service or debug shell whose Pod
+  it refuses fails with the policy's reason. It needs Kubernetes 1.30+; on an older cluster the
+  chart skips it and the install notes say so. Set
+  `scarab.admissionPolicy.validationActions: [Audit]` to try it first. See
   [The step Pod admission policy](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#the-step-pod-admission-policy).
 
 ### Features
