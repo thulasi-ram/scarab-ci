@@ -1174,9 +1174,8 @@ fn assert_compile_failure_status(statuses: &[scarab_forge::Status]) {
 
 /// git-bug e5089fd: a GitHub push whose Pipeline does not compile creates no
 /// Run, so no Run posts its check, and a required check waited for good.
-/// The refusal posts it, `failure`, once: a second delivery of the same push
-/// (here under a new delivery id, which the replay guard does not stop)
-/// queues nothing new.
+/// The refusal posts it, `failure`, once: a replay of the delivery queues
+/// nothing new.
 #[tokio::test]
 async fn a_github_push_whose_pipeline_does_not_compile_fails_its_check_once() {
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
@@ -1195,10 +1194,10 @@ async fn a_github_push_whose_pipeline_does_not_compile_fails_its_check_once() {
 
     let resp = app
         .clone()
-        .oneshot(push_request("gh-broken-2"))
+        .oneshot(push_request("gh-broken-1"))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK, "a replay is acknowledged");
     assert_compile_failure_status(&statuses_on_push(&forge, &db).await);
 }
 
@@ -1229,10 +1228,10 @@ async fn a_forgejo_push_whose_pipeline_does_not_compile_fails_its_check_once() {
 
     let resp = app
         .clone()
-        .oneshot(forgejo_request("push", "fj-broken-2", &body, &sig))
+        .oneshot(forgejo_request("push", "fj-broken-1", &body, &sig))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK, "a replay is acknowledged");
     assert_compile_failure_status(&statuses_on_push(&forge, &db).await);
 }
 
@@ -1293,8 +1292,8 @@ async fn an_undecidable_when_refuses_its_pipeline_and_the_next_file_still_runs()
 /// A delivery with a Pipeline file that does not compile starts no Run, not
 /// even for the files before it (ADR-0009), and no check waits on the
 /// commit: the broken `checks` fails with its diagnostic, and the CI
-/// Pipeline beside it fails as not run, naming the broken file. A second
-/// delivery of the same push posts nothing new.
+/// Pipeline beside it fails as not run, naming the broken file. A replay of
+/// the delivery posts nothing new.
 #[tokio::test]
 async fn a_broken_pipeline_fails_the_check_of_every_pipeline_in_the_delivery_once() {
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
@@ -1306,9 +1305,10 @@ async fn a_broken_pipeline_fails_the_check_of_every_pipeline_in_the_delivery_onc
     );
     let app = multi_forge_app_arc(db.clone(), forge.clone());
 
-    for delivery in ["gh-two-1", "gh-two-2"] {
-        let resp = app.clone().oneshot(push_request(delivery)).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // The delivery, then its replay.
+    for expected in [StatusCode::BAD_REQUEST, StatusCode::OK] {
+        let resp = app.clone().oneshot(push_request("gh-two-1")).await.unwrap();
+        assert_eq!(resp.status(), expected);
         assert!(db.active_runs().await.unwrap().is_empty(), "no Run at all");
 
         let statuses = statuses_on_push(&forge, &db).await;
@@ -1471,6 +1471,112 @@ async fn an_undecidable_when_in_a_broken_delivery_still_fails_its_check() {
         failed_contexts(&forge, &db).await,
         ["scarab/a", "scarab/checks"]
     );
+}
+
+/// A deploy Pipeline into `prod`, with the approval gate an Environment
+/// deploy carries.
+const DEPLOY_YAML: &str = r#"
+name: deploy
+on:
+  push: {}
+environment: prod
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+  - { id: approve, gate: manual, needs: [build] }
+  - { id: ship, image: busybox, command: ["true"], needs: [approve] }
+"#;
+
+/// REV-m10: a refusal is posted on every event refused, not once per
+/// commit. `prod` does not admit `app`: the first push fails the deploy
+/// check. An admin admits `app`, a second delivery on the same commit starts
+/// a Run, and the Run's `success` is posted under that context (here
+/// straight to the forge, as the status drain posts it when the Run
+/// succeeds). The admin takes `app` out again and a third delivery is
+/// refused for the same reason: its `failure` is posted again, so the check
+/// does not keep the earlier Run's `success`.
+#[tokio::test]
+async fn a_refusal_after_a_later_success_on_the_same_commit_is_posted_again() {
+    use scarab_project::{EnvironmentGovernanceStore, EnvironmentProjectEligibility};
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let checkout_only = EnvironmentProjectEligibility::Projects(vec!["checkout".into()]);
+    let governance = Arc::new(
+        scarab_testkit::InMemoryEnvironmentGovernance::new().with_environment(
+            "acme",
+            "prod",
+            checkout_only.clone(),
+        ),
+    );
+    let forge = Arc::new(FakeForge::new().with_file(".scarab/deploy.yaml", DEPLOY_YAML));
+    let store = Arc::new(InMemoryObjectStore::new());
+    let logs = Arc::new(LogService::new(store, db.clone()));
+    let forge_port: Arc<dyn ForgePort> = forge.clone();
+    let app = router(
+        AppState::new(db.clone(), Arc::new(FakeClock::new(1_000)), logs)
+            .with_github_webhook_secret(SECRET.to_vec())
+            .with_forge_connections(db.clone())
+            .with_environment_governance(governance.clone())
+            .with_forge(forge_port),
+    );
+    // The last status posted under the deploy Pipeline's context.
+    let deploy_check = || async {
+        statuses_on_push(&forge, &db)
+            .await
+            .into_iter()
+            .filter(|s| s.context == "scarab/deploy")
+            .next_back()
+            .expect("a deploy status")
+    };
+    let set = |eligibility: EnvironmentProjectEligibility| {
+        let governance = governance.clone();
+        async move {
+            governance
+                .put_environment_eligibility("acme", "prod", &eligibility, "admin", 2_000)
+                .await
+                .expect("eligibility")
+        }
+    };
+
+    let resp = app.clone().oneshot(push_request("gh-env-1")).await.unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+    let refused = deploy_check().await;
+    assert_eq!(refused.state, scarab_forge::StatusState::Failure);
+
+    set(EnvironmentProjectEligibility::AllProjects).await;
+    let resp = app.clone().oneshot(push_request("gh-env-2")).await.unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+    assert_eq!(db.active_runs().await.unwrap().len(), 1, "the deploy ran");
+    let app_repo = scarab_forge::RepoRef {
+        owner: "acme".into(),
+        name: "app".into(),
+    };
+    forge
+        .set_status(
+            &app_repo,
+            &scarab_forge::Commit {
+                sha: "abc123".into(),
+                message: String::new(),
+            },
+            scarab_forge::Status {
+                context: "scarab/deploy".into(),
+                state: scarab_forge::StatusState::Success,
+                target_url: "https://scarab.example/acme/app/runs/1".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        deploy_check().await.state,
+        scarab_forge::StatusState::Success
+    );
+
+    set(checkout_only).await;
+    let resp = app.clone().oneshot(push_request("gh-env-3")).await.unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+    let again = deploy_check().await;
+    assert_eq!(again.state, scarab_forge::StatusState::Failure);
+    assert_eq!(again.description, refused.description);
 }
 
 // ---------------------------------------------------------------------------

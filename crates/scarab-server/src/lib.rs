@@ -6385,10 +6385,15 @@ async fn refuse_undecided_when(
 /// `description` says why (capped to what a forge accepts); `target_path`
 /// is the UI page that shows it.
 ///
-/// The idempotency key is the repository, commit, context and description:
-/// a redelivered event, or another event on the same commit refused for the
-/// same reason, queues nothing new. An event with no commit has nothing to
-/// post on. A failed enqueue is logged and the delivery goes on.
+/// The idempotency key is the repository, commit, context, description and
+/// the id `event` gives a Run of the pipeline ([`run_id_for`]). A
+/// redelivered `run_finished` derives the same id and queues nothing new (a
+/// redelivered webhook is stopped earlier, by the replay guard). Every other
+/// event gets a new id, so a refusal on a commit where a later Run of the
+/// pipeline has since posted its own status is posted again, and the check
+/// does not keep that Run's status (git-bug e5089fd). An event with no
+/// commit has nothing to post on. A failed enqueue is logged and the
+/// delivery goes on.
 async fn enqueue_refusal_status(
     db: &dyn Db,
     clock: &dyn Clock,
@@ -6409,11 +6414,15 @@ async fn enqueue_refusal_status(
     let (org, project) = (&repo.owner, &repo.name);
     let context = status_context(Some(pipeline_name));
     let description = scarab_forge::cap_status_description(description);
-    let digest = Sha256::digest(format!("{org}/{project}\n{sha}\n{context}\n{description}"));
+    let run = run_id_for(event, path);
+    let digest = Sha256::digest(format!(
+        "{org}/{project}\n{sha}\n{context}\n{description}\n{}",
+        run.0
+    ));
     let key: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
     let msg = scarab_engine::OutboxMessage {
         id: scarab_engine::OutboxId(0),
-        run: run_id_for(event, path),
+        run,
         kind: REFUSAL_STATUS.to_string(),
         payload: serde_json::json!({
             "repo": { "owner": org, "name": project },
