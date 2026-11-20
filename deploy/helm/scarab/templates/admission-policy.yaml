@@ -1,0 +1,129 @@
+{{- if include "scarab.admissionPolicyRenders" . -}}
+{{- /*
+  A ValidatingAdmissionPolicy and its binding that hold the Pods the Scarab
+  server creates in the step namespace to their own per-Pod Secrets and to
+  the step ServiceAccounts (git-bug 07f0de3). Any Pod can mount any Secret
+  and run as any ServiceAccount in its namespace: the kubelet resolves those
+  references without asking the Pod's ServiceAccount, and RBAC cannot narrow
+  `create pods` by what the Pod refers to. Scarab's Pod builder and the
+  author_overlay allowlist keep a step Pod off the server's Secret and
+  ServiceAccount; this makes the cluster refuse such a Pod too, if Scarab has
+  a bug.
+
+  Matched: Pod CREATE in the step namespace by the server's ServiceAccount,
+  the only creator of step Pods, shared-service Pods and debug Pods. When
+  scarab.namespace is the release namespace, the server's own Deployment Pods
+  and the Depot's StatefulSet Pods are created by the ReplicaSet and
+  StatefulSet controllers, not by the server's ServiceAccount, so they are
+  not matched.
+
+  Not matched: plugin and isolation-probe Pods. They run in plugins.namespace,
+  which the chart refuses to make the release or the step namespace
+  (scarab.validatePlugins), labelled Pod Security `restricted`.
+
+  Refused:
+    - a Secret volume, a projected Secret source, an env secretKeyRef or an
+      envFrom secretRef naming a Secret other than the Pod's own per-Pod
+      Secrets (`<pod>-secrets`, `-token`, `-registry`, `-oidc`, `-workspace`;
+      crates/scarab-executor-k8s) or one the operator placement config
+      (scarab.placement baseline and profiles) or
+      scarab.admissionPolicy.allowSecrets names;
+    - a serviceAccountName other than `default` (a step Pod sets none) or one
+      the placement config or scarab.admissionPolicy.allowServiceAccounts
+      names;
+    - a hostPath volume, hostNetwork, hostPID or hostIPC.
+  The chart refuses to render a placement config that asks for a host field,
+  and a shared namespace where `default` is the server's ServiceAccount
+  (scarab.validateAdmissionPolicy).
+  Privileged containers and added capabilities are left to Pod Security:
+  Scarab allows them by a governed grant per step, which this policy cannot
+  see.
+
+  Every message starts with "Scarab step Pod policy:" and the policy's name
+  with "scarab-step-pods.": the executor fails the step with the reason when
+  a create is refused by this policy, instead of retrying the launch.
+*/ -}}
+{{- include "scarab.validateAdmissionPolicy" . -}}
+{{- $allowed := include "scarab.admissionPolicyAllowed" . | fromJson -}}
+{{- $name := printf "scarab-step-pods.%s.%s" .Release.Namespace (include "scarab.fullname" .) -}}
+{{- $own := "(n in variables.ownSecrets || n in variables.placementSecrets)" -}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "scarab.labels" . | nindent 4 }}
+spec:
+  failurePolicy: {{ .Values.scarab.admissionPolicy.failurePolicy }}
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: created-by-the-scarab-server
+      expression: >-
+        request.userInfo.username == 'system:serviceaccount:{{ .Release.Namespace }}:{{ include "scarab.serviceAccountName" . }}'
+  variables:
+    - name: ownSecrets
+      expression: >-
+        ['secrets', 'token', 'registry', 'oidc', 'workspace'].map(s, object.metadata.name + '-' + s)
+    - name: placementSecrets
+      expression: {{ $allowed.secrets | toJson | quote }}
+    - name: serviceAccounts
+      expression: {{ $allowed.serviceAccounts | toJson | quote }}
+  validations:
+    - reason: Forbidden
+      message: "Scarab step Pod policy: a Secret volume names a Secret that is not the Pod's own"
+      expression: >-
+        !has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.secret) ||
+        (has(v.secret.secretName) && {{ $own | replace "n in" "v.secret.secretName in" }}))
+    - reason: Forbidden
+      message: "Scarab step Pod policy: a projected volume names a Secret that is not the Pod's own"
+      expression: >-
+        !has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.projected) ||
+        !has(v.projected.sources) || v.projected.sources.all(p, !has(p.secret) ||
+        (has(p.secret.name) && {{ $own | replace "n in" "p.secret.name in" }})))
+    {{- range $list := list "containers" "initContainers" }}
+    - reason: Forbidden
+      message: "Scarab step Pod policy: an env secretKeyRef or envFrom secretRef in {{ $list }} names a Secret that is not the Pod's own"
+      expression: >-
+        !has(object.spec.{{ $list }}) || object.spec.{{ $list }}.all(c,
+        (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef) ||
+        (has(e.valueFrom.secretKeyRef.name) && {{ $own | replace "n in" "e.valueFrom.secretKeyRef.name in" }}))) &&
+        (!has(c.envFrom) || c.envFrom.all(f, !has(f.secretRef) ||
+        (has(f.secretRef.name) && {{ $own | replace "n in" "f.secretRef.name in" }}))))
+    {{- end }}
+    - reason: Forbidden
+      message: "Scarab step Pod policy: the Pod's ServiceAccount is not the step ServiceAccount or one a placement profile names"
+      expression: >-
+        !has(object.spec.serviceAccountName) || object.spec.serviceAccountName in variables.serviceAccounts
+    - reason: Forbidden
+      message: "Scarab step Pod policy: a hostPath volume"
+      expression: >-
+        !has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath))
+    - reason: Forbidden
+      message: "Scarab step Pod policy: hostNetwork, hostPID or hostIPC"
+      expression: >-
+        !(has(object.spec.hostNetwork) && object.spec.hostNetwork) &&
+        !(has(object.spec.hostPID) && object.spec.hostPID) &&
+        !(has(object.spec.hostIPC) && object.spec.hostIPC)
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "scarab.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $name }}
+  validationActions:
+    {{- toYaml .Values.scarab.admissionPolicy.validationActions | nindent 4 }}
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: [{{ include "scarab.execNamespace" . | quote }}]
+{{- end }}

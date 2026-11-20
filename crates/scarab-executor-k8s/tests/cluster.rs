@@ -3769,3 +3769,173 @@ async fn an_overlay_kubernetes_refuses_fails_the_step() {
         "no Pod was created"
     );
 }
+
+/// git-bug 07f0de3: the chart's step Pod admission policy, on the kind
+/// release. A Pod the server's ServiceAccount creates in the release's step
+/// namespace may name only its own per-Pod Secrets and the step
+/// ServiceAccount, and no host namespace or path. The test impersonates that
+/// ServiceAccount (`SCARAB_TEST_SERVER_USER`, in `SCARAB_TEST_STEP_NAMESPACE`):
+///
+/// - a Pod the executor builds is admitted, and so is one that mounts all
+///   five of its own per-Pod Secrets (a dry run: admission runs, nothing is
+///   stored);
+/// - a Pod that mounts the server's Secret (the chart names it, like the
+///   ServiceAccount, after the release), reads it through envFrom or
+///   secretKeyRef, runs as the server's ServiceAccount, or asks for
+///   hostPath or hostNetwork is refused, naming the policy;
+/// - the same refused Pod created by the test's own (admin) user is
+///   admitted: the policy holds only the server's creates;
+/// - the executor's launch of a step the policy refuses (a placement
+///   baseline that mounts the server's Secret) fails the step with
+///   `Refused` and the policy's reason, not a launch error the scheduler
+///   would retry until the Run dead-letters.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn the_step_pod_admission_policy_holds_server_created_pods_to_their_own_secrets() {
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::api::{Api, DeleteParams, PostParams};
+    enter_tier();
+    let ns = tier_var("SCARAB_TEST_STEP_NAMESPACE");
+    let server = tier_var("SCARAB_TEST_SERVER_USER");
+    // system:serviceaccount:<release namespace>:<name>
+    let server_sa = server
+        .rsplit(':')
+        .next()
+        .expect("a ServiceAccount user")
+        .to_string();
+    let server_secret = server_sa.clone();
+
+    let mut config = kube::Config::infer().await.expect("kube config");
+    config.auth_info.impersonate = Some(server.clone());
+    let as_server = kube::Client::try_from(config).expect("impersonating client");
+    let server_pods: Api<Pod> = Api::namespaced(as_server.clone(), &ns);
+    let admin_pods: Api<Pod> = Api::namespaced(kube_client().await, &ns);
+    let dry_run = PostParams {
+        dry_run: true,
+        ..Default::default()
+    };
+    let name = unique_run("scarab-vap");
+    // A busybox Pod with `spec`'s fields set over the defaults.
+    let pod = |spec: serde_json::Value| -> Pod {
+        let mut value = serde_json::json!({
+            "metadata": {"name": name},
+            "spec": {
+                "automountServiceAccountToken": false,
+                "restartPolicy": "Never",
+                "containers": [{"name": "step", "image": "busybox:latest", "command": ["true"]}],
+            },
+        });
+        for (k, v) in spec.as_object().expect("a spec fragment") {
+            value["spec"][k] = v.clone();
+        }
+        serde_json::from_value(value).expect("a Pod")
+    };
+
+    // Admitted: all five per-Pod Secrets, by every kind of reference.
+    let own: Vec<String> = ["secrets", "token", "registry", "oidc", "workspace"]
+        .iter()
+        .map(|s| format!("{name}-{s}"))
+        .collect();
+    let admitted = pod(serde_json::json!({
+        "volumes": [
+            {"name": "s", "secret": {"secretName": own[0]}},
+            {"name": "p", "projected": {"sources": [{"secret": {"name": own[1]}}, {"secret": {"name": own[2]}}]}},
+            {"name": "w", "secret": {"secretName": own[4]}},
+        ],
+        "containers": [{
+            "name": "step", "image": "busybox:latest", "command": ["true"],
+            "env": [{"name": "T", "valueFrom": {"secretKeyRef": {"name": own[3], "key": "token"}}}],
+            "envFrom": [{"secretRef": {"name": own[0]}}],
+        }],
+    }));
+    server_pods
+        .create(&dry_run, &admitted)
+        .await
+        .expect("a Pod with its own per-Pod Secrets is admitted");
+
+    let refused = [
+        (
+            "a Secret volume",
+            serde_json::json!({"volumes": [{"name": "s", "secret": {"secretName": server_secret}}]}),
+        ),
+        (
+            "a projected Secret",
+            serde_json::json!({"volumes": [{"name": "p", "projected": {"sources": [{"secret": {"name": server_secret}}]}}]}),
+        ),
+        (
+            "envFrom",
+            serde_json::json!({"containers": [{"name": "step", "image": "busybox:latest",
+                "envFrom": [{"secretRef": {"name": server_secret}}]}]}),
+        ),
+        (
+            "an init container's secretKeyRef",
+            serde_json::json!({"initContainers": [{"name": "init", "image": "busybox:latest",
+                "env": [{"name": "X", "valueFrom": {"secretKeyRef": {"name": server_secret, "key": "SCARAB_MASTER_KEY"}}}]}]}),
+        ),
+        (
+            "the server's ServiceAccount",
+            serde_json::json!({"serviceAccountName": server_sa}),
+        ),
+        (
+            "a hostPath volume",
+            serde_json::json!({"volumes": [{"name": "root", "hostPath": {"path": "/"}}]}),
+        ),
+        ("hostNetwork", serde_json::json!({"hostNetwork": true})),
+    ];
+    for (what, spec) in refused {
+        let p = pod(spec);
+        match server_pods.create(&dry_run, &p).await {
+            Err(kube::Error::Api(ae)) => {
+                assert_eq!(ae.code, 403, "{what}: {}", ae.message);
+                assert!(
+                    ae.message
+                        .contains("ValidatingAdmissionPolicy 'scarab-step-pods.")
+                        && ae.message.contains("Scarab step Pod policy:"),
+                    "{what}: {}",
+                    ae.message
+                );
+            }
+            other => panic!("{what}: the server's create was not refused: {other:?}"),
+        }
+        admin_pods
+            .create(&dry_run, &p)
+            .await
+            .unwrap_or_else(|e| panic!("{what}: the admin's create was refused: {e}"));
+    }
+
+    // The executor, as the server: a step Pod it builds is admitted...
+    let exec = K8sExecutor::with_client(ns.clone(), as_server.clone());
+    let admitted_step = step("vap-ok");
+    exec.launch(&admitted_step, &busybox_spec("true", false))
+        .await
+        .expect("a step Pod the executor builds is admitted");
+    let _ = admin_pods
+        .delete(&pod_name(&admitted_step), &DeleteParams::default())
+        .await;
+
+    // ...and one the policy refuses fails the step.
+    let placement: scarab_executor_k8s::PlacementConfig =
+        serde_json::from_value(serde_json::json!({"baseline": {"spec": {"volumes": [
+            {"name": "stolen", "secret": {"secretName": server_secret}}
+        ]}}}))
+        .expect("placement");
+    let exec = K8sExecutor::with_client(ns.clone(), as_server).with_placement(placement);
+    let refused_step = step("vap-refused");
+    match exec
+        .launch(&refused_step, &busybox_spec("true", false))
+        .await
+    {
+        Err(scarab_engine::ExecError::Refused(m)) => {
+            assert!(m.contains("Scarab step Pod policy:"), "{m}")
+        }
+        other => panic!("the refused step Pod: {other:?}"),
+    }
+    assert!(
+        admin_pods
+            .get_opt(&pod_name(&refused_step))
+            .await
+            .expect("get")
+            .is_none(),
+        "no Pod was created"
+    );
+}

@@ -567,6 +567,8 @@ async fn yanked_world() -> Option<World> {
         name: "acme/deploy".into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
+        requested_ref: None,
+        resolved_commit: String::new(),
     })
     .await
     .unwrap();
@@ -578,6 +580,8 @@ async fn yanked_world() -> Option<World> {
             installed_by: "amy".into(),
             installed_at: 1,
             step_up_ref: None,
+            requested_ref: None,
+            resolved_commit: String::new(),
         },
         &Replaces::Nothing,
     )

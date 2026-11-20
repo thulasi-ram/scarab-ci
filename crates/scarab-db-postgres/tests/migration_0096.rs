@@ -128,6 +128,8 @@ async fn an_installed_library_keeps_its_id_hash_and_yank_under_publisher_slash_n
         installed_by: "user:amy".into(),
         installed_at: 4,
         step_up_ref: None,
+        requested_ref: None,
+        resolved_commit: String::new(),
     };
     assert_eq!(
         db.install(&new("thulasi-ram/clone"), &Replaces::Nothing)

@@ -86,6 +86,8 @@ async fn installed(content: &str) -> InMemoryLibraries {
         name: "acme/deploy".into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
+        requested_ref: None,
+        resolved_commit: String::new(),
     })
     .await
     .unwrap();
@@ -97,6 +99,8 @@ async fn installed(content: &str) -> InMemoryLibraries {
             installed_by: "amy".into(),
             installed_at: 1,
             step_up_ref: None,
+            requested_ref: None,
+            resolved_commit: String::new(),
         },
         &Replaces::Nothing,
     )
@@ -495,6 +499,8 @@ async fn an_installation_is_read_by_its_id_in_its_own_org_only() {
             name: "acme/deploy".into(),
             fetched_by: "amy".into(),
             fetched_at: 1,
+            requested_ref: None,
+            resolved_commit: String::new(),
         })
         .await
         .unwrap();
@@ -508,6 +514,8 @@ async fn an_installation_is_read_by_its_id_in_its_own_org_only() {
                 installed_by: "amy".into(),
                 installed_at: 1,
                 step_up_ref: None,
+                requested_ref: None,
+                resolved_commit: String::new(),
             },
             &Replaces::Nothing,
         )

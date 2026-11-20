@@ -3019,8 +3019,13 @@ impl Executor for K8sExecutor {
             // the step fails with the API's reason instead of a launch error
             // the scheduler retries until the Run dead-letters. An invalid
             // operator baseline or profile fails the dry run too and stays a
-            // launch error.
+            // launch error. A Pod the chart's step Pod admission policy
+            // refuses (git-bug 07f0de3) fails the step the same way: the
+            // refusal is permanent, so a retry would only dead-letter the Run.
             Err(e) => {
+                if let Some(refused) = admission_policy_refusal(&e) {
+                    return Err(refused);
+                }
                 let refusal = match (&e, unplaced) {
                     (kube::Error::Api(ae), Some(unplaced)) if overlay_may_be_refused(ae.code) => {
                         let passes = self
@@ -3662,7 +3667,13 @@ impl Executor for K8sExecutor {
         let pod = build_service_pod(&run.0, name, take, &self.namespace, spec);
         let handle = pod.metadata.name.clone().unwrap_or_default();
         // Ignore 409 (adopt existing) on every object — launch is idempotent.
-        adopt_conflict(pods.create(&PostParams::default(), &pod).await)?;
+        // A denial by the step Pod admission policy is the service's
+        // `Refused`, with the policy's reason (git-bug 07f0de3).
+        let created = pods.create(&PostParams::default(), &pod).await;
+        if let Some(refused) = created.as_ref().err().and_then(admission_policy_refusal) {
+            return Err(refused);
+        }
+        adopt_conflict(created)?;
         adopt_conflict(
             services
                 .create(
@@ -4148,7 +4159,10 @@ impl DebugLauncher for K8sExecutor {
         );
         pods.create(&PostParams::default(), &pod)
             .await
-            .map_err(|e| ExecError::Other(format!("create debug pod: {e}")))?;
+            .map_err(|e| {
+                admission_policy_refusal(&e)
+                    .unwrap_or_else(|| ExecError::Other(format!("create debug pod: {e}")))
+            })?;
 
         // The token Secret must exist before the kubelet mounts it, but the Pod
         // must exist before the Secret can be owner-referenced to it — the same
@@ -5600,6 +5614,34 @@ fn merge_layer(
 /// and is left a launch error.
 fn overlay_may_be_refused(code: u16) -> bool {
     matches!(code, 400 | 422)
+}
+
+/// The name every step Pod admission policy the chart renders starts with
+/// (deploy/helm/scarab/templates/admission-policy.yaml), as the API server
+/// quotes it in a denial: `ValidatingAdmissionPolicy '<name>' with binding
+/// '<name>' denied request: <message>`.
+const STEP_POD_POLICY_DENIAL: &str = "ValidatingAdmissionPolicy 'scarab-step-pods.";
+
+/// The step's failure when `pods.create` was denied by the chart's step Pod
+/// admission policy (git-bug 07f0de3), or `None` for any other error. The
+/// policy refuses a Pod that names another Secret or ServiceAccount, or a
+/// host namespace or path; that does not pass on a retry, so the step fails
+/// with the API server's reason instead of a launch error the scheduler
+/// retries until the Run dead-letters. A denial is a 403 (the policy's
+/// `reason: Forbidden`) or a 422 (a validation with no reason, or one that
+/// could not be evaluated under `failurePolicy: Fail`).
+fn admission_policy_refusal(e: &kube::Error) -> Option<ExecError> {
+    match e {
+        kube::Error::Api(ae)
+            if matches!(ae.code, 403 | 422) && ae.message.contains(STEP_POD_POLICY_DENIAL) =>
+        {
+            Some(ExecError::Refused(format!(
+                "the cluster's step Pod admission policy refused the step Pod: {}",
+                ae.message
+            )))
+        }
+        _ => None,
+    }
 }
 
 /// The step's failure when `pods.create` answered `code` with `message`
@@ -8443,6 +8485,117 @@ mod tests {
         assert!(overlay_refusal(403, "exceeded quota", Some(true)).is_none());
         assert!(overlay_refusal(500, "etcd", Some(true)).is_none());
         assert!(!overlay_may_be_refused(403));
+    }
+
+    /// `launch` against a fake API server that has no Pod and answers the
+    /// Pod create with `code` and `message`, as Kubernetes does: a `Status`.
+    /// Returns the errors of a step launch, a shared-service launch and a
+    /// debug Pod launch, in that order.
+    async fn launch_refused_with(
+        code: u16,
+        reason: &'static str,
+        message: &'static str,
+    ) -> [ExecError; 3] {
+        use axum::http::{Method, StatusCode};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let status = |code: u16, reason: &str, message: &str| {
+            (
+                StatusCode::from_u16(code).unwrap(),
+                axum::Json(serde_json::json!({
+                    "kind": "Status", "apiVersion": "v1", "metadata": {},
+                    "status": "Failure", "message": message, "reason": reason, "code": code,
+                })),
+            )
+        };
+        let app = axum::Router::new().fallback(move |method: Method| async move {
+            if method == Method::POST {
+                status(code, reason, message)
+            } else {
+                status(404, "NotFound", "pods \"scarab-x\" not found")
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = kube::Config::new(format!("http://{addr}").parse().unwrap());
+        let client = kube::Client::try_from(config).unwrap();
+        let exec = K8sExecutor::with_client("ci-steps", client);
+        let step = step_with_attempt("run-1", "build", "a1");
+        let service = scarab_pipeline::ServiceSpec {
+            image: "postgres:16".into(),
+            ports: vec![5432],
+            ..Default::default()
+        };
+        [
+            exec.launch(&step, &busybox()).await.expect_err("step"),
+            exec.launch_service(&step.run, 0, "db", &service)
+                .await
+                .expect_err("service"),
+            exec.launch_debug(&step, "busybox:latest", &Default::default(), None, 60)
+                .await
+                .err()
+                .expect("debug"),
+        ]
+    }
+
+    // git-bug 07f0de3: the chart's step Pod admission policy denies the
+    // Pod create (a step Pod naming another Secret, say). The refusal does
+    // not pass on a retry, so the step fails with the API's reason
+    // (`Refused`) instead of a launch error the scheduler retries until the
+    // Run dead-letters; a shared-service Pod and a debug Pod get the same
+    // `Refused`. A 403 from anything else (a quota, RBAC, another policy)
+    // stays what it was: a launch error (`Other` for the debug Pod).
+    #[tokio::test]
+    async fn a_pod_the_step_pod_admission_policy_denies_fails_the_step() {
+        let denial = "pods \"scarab-build-a1-0\" is forbidden: ValidatingAdmissionPolicy \
+            'scarab-step-pods.ci.scarab' with binding 'scarab-step-pods.ci.scarab' denied \
+            request: Scarab step Pod policy: a Secret volume names a Secret that is not the \
+            Pod's own";
+        for code in [403, 422] {
+            for (what, err) in ["step", "service", "debug"]
+                .into_iter()
+                .zip(launch_refused_with(code, "Forbidden", denial).await)
+            {
+                match err {
+                    ExecError::Refused(m) => {
+                        assert!(
+                            m.contains("Scarab step Pod policy: a Secret volume"),
+                            "{what}: {m}"
+                        )
+                    }
+                    other => panic!("{what} {code}: {other:?}"),
+                }
+            }
+        }
+        for (code, message) in [
+            (
+                403,
+                "pods \"x\" is forbidden: exceeded quota: steps, requested: pods=1",
+            ),
+            (
+                403,
+                "pods \"x\" is forbidden: ValidatingAdmissionPolicy 'other' with binding \
+                 'other' denied request: no",
+            ),
+            (
+                500,
+                "ValidatingAdmissionPolicy 'scarab-step-pods.ci.scarab' etcd timeout",
+            ),
+        ] {
+            let [step, service, debug] = launch_refused_with(code, "Forbidden", message).await;
+            assert!(
+                matches!(step, ExecError::Launch(_)),
+                "{code} {message}: {step:?}"
+            );
+            assert!(
+                matches!(service, ExecError::Launch(_)),
+                "{code} {message}: {service:?}"
+            );
+            assert!(
+                matches!(debug, ExecError::Other(_)),
+                "{code} {message}: {debug:?}"
+            );
+        }
     }
 
     #[test]

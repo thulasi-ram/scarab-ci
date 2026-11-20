@@ -389,7 +389,10 @@ fn short_hash(h: &str) -> String {
 /// (`version = 5d1e0c7a9b3f → 0c4e7b2a91f5`), then the grants the new version
 /// gets from its source's trust when `carry_grants` names any
 /// (`grants carried to this version = forge_credentials`), then
-/// the full hashes.
+/// the full hashes. The handler puts a `fetched at = main → 1a2b3c4` line
+/// (for an upgrade, `fetched at = v1.1.0 → 9f8e7d6 to v1.2.0 → 1a2b3c4`)
+/// right after the version change, read from the stored version
+/// (`GuardCtx::require_noting`).
 pub fn describe_library_install(op: &Op, input: &OpInput) -> OpSummary {
     let generic = describe_generic(op, input);
     let (Some(org), Some(name)) = (input.param("org"), input.body_str("/name")) else {

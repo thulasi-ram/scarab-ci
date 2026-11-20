@@ -99,6 +99,8 @@ async fn build_library(grants: &[TrustGrant]) -> InMemoryLibraries {
         name: "thulasi-ram::scarab-ci::build".into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
+        requested_ref: None,
+        resolved_commit: String::new(),
     })
     .await
     .unwrap();
@@ -110,6 +112,8 @@ async fn build_library(grants: &[TrustGrant]) -> InMemoryLibraries {
             installed_by: "amy".into(),
             installed_at: 1,
             step_up_ref: None,
+            requested_ref: None,
+            resolved_commit: String::new(),
         },
         &Replaces::Nothing,
     )
@@ -592,6 +596,8 @@ async fn install(libs: &InMemoryLibraries, name: &str, source: &str, content: &s
         name: name.into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
+        requested_ref: None,
+        resolved_commit: String::new(),
     })
     .await
     .unwrap();
@@ -603,6 +609,8 @@ async fn install(libs: &InMemoryLibraries, name: &str, source: &str, content: &s
             installed_by: "amy".into(),
             installed_at: 1,
             step_up_ref: None,
+            requested_ref: None,
+            resolved_commit: String::new(),
         },
         &Replaces::Nothing,
     )

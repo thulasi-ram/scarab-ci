@@ -1160,6 +1160,58 @@ async fn a_replay_cannot_apply_a_loosening_the_human_never_saw() {
     assert_eq!(now.allowed_refs, vec!["main".to_string()]);
 }
 
+/// A token raises a library install; its human confirms a summary that
+/// names the ref and commit the version was fetched at. Before the confirm,
+/// the same content is fetched again under another ref, so the replay's
+/// summary names a fetch the human never saw: it is refused, and nothing is
+/// installed.
+#[tokio::test]
+async fn a_replay_is_refused_when_the_library_was_fetched_again_under_another_ref() {
+    use scarab_policy::library::{content_hash, LibraryStore, LibraryVersion};
+    const CONTENT: &str =
+        "kind: library\nsteps:\n  - id: helm\n    image: alpine/helm@sha256:aaaa\n";
+    let commit = "1".repeat(40);
+    let libs = Arc::new(scarab_testkit::InMemoryLibraries::new());
+    let fetched = |git_ref: &str, at: i64| LibraryVersion {
+        org: "acme".into(),
+        content_hash: content_hash(CONTENT),
+        content: CONTENT.into(),
+        source: format!("github.com/acme/libs//deploy.yaml@{commit}"),
+        name: "acme::libs::deploy".into(),
+        fetched_by: "amy".into(),
+        fetched_at: at,
+        requested_ref: Some(git_ref.into()),
+        resolved_commit: commit.clone(),
+    };
+    libs.put_version(&fetched("main", 1)).await.unwrap();
+    let wired = libs.clone();
+    let h = harness_with(move |st| st.with_libraries(wired));
+    h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
+    let (amy, mut soft) = amy_in_browser(&h).await;
+    let token = pat(&h, "t1", Scope::Org("acme".into()), Role::Admin).await;
+    let (st, b) = h
+        .bearer(
+            "POST",
+            "/v1/orgs/acme/library-installations",
+            Some(json!({ "name": "acme::libs::deploy", "content_hash": content_hash(CONTENT) })),
+            &token,
+        )
+        .await;
+    assert!(is_step_up(st, &b), "{st} {b}");
+    let id = b["request_id"].as_str().expect("a request").to_string();
+    assert_eq!(
+        b["summary"]["changes"][1], "fetched at = main → 1111111",
+        "{b}"
+    );
+
+    libs.put_version(&fetched("dev", 2)).await.unwrap();
+
+    let (st, done) = confirm(&h, &amy, &mut soft, &id).await;
+    assert_eq!(st, StatusCode::OK, "{done}");
+    assert_eq!(done["state"], "failed", "{done}");
+    assert!(libs.installations("acme").await.unwrap().is_empty());
+}
+
 /// The control: a concurrent change that leaves the loosenings within what
 /// the human confirmed (another allowed ref, still widened to "any") runs.
 #[tokio::test]

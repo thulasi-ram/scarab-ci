@@ -292,3 +292,99 @@ true
 {{- include "scarab.fullname" . -}}
 {{- end -}}
 {{- end -}}
+
+{{/* Whether the values ask for the step Pod admission policy
+     (admission-policy.yaml, git-bug 07f0de3), with the k8s executor.
+     scarab.admissionPolicy.enabled is `auto` (default), `true` or `false`.
+     `auto` is on unless scarab.createNamespace is false: that is the setting
+     for an installer with rights in the release namespace only, and the
+     policy and its binding are cluster-scoped objects such an installer
+     cannot create. */}}
+{{- define "scarab.admissionPolicyWanted" -}}
+{{- $a := .Values.scarab.admissionPolicy | default dict -}}
+{{- $enabled := toString (hasKey $a "enabled" | ternary $a.enabled "auto") -}}
+{{- if not (has $enabled (list "auto" "true" "false")) -}}
+{{- fail (printf "scarab.admissionPolicy.enabled is %q; it takes auto, true or false." $enabled) -}}
+{{- end -}}
+{{- if and (eq .Values.scarab.executor "k8s") (or (eq $enabled "true") (and (eq $enabled "auto") .Values.scarab.createNamespace)) -}}true{{- end -}}
+{{- end -}}
+
+{{/* Whether the step Pod admission policy renders: the values ask for it
+     (above), and either the cluster serves admissionregistration.k8s.io/v1
+     ValidatingAdmissionPolicy (Kubernetes 1.30+) or
+     scarab.admissionPolicy.force is set. `helm template` without a cluster
+     sees the API only with
+     `--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy`
+     or `force`. */}}
+{{- define "scarab.admissionPolicyRenders" -}}
+{{- $a := .Values.scarab.admissionPolicy | default dict -}}
+{{- if and (include "scarab.admissionPolicyWanted" .) (or $a.force (.Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy")) -}}true{{- end -}}
+{{- end -}}
+
+{{/* The placement config's Pod fragments, as JSON [{"where": ..., "spec":
+     {...}}]: the baseline and each profile's `k8s`. */}}
+{{- define "scarab.placementFragments" -}}
+{{- $placement := .Values.scarab.placement | default dict -}}
+{{- $fragments := list -}}
+{{- with $placement.baseline }}{{- $fragments = append $fragments (dict "where" "the baseline" "spec" (.spec | default dict)) -}}{{- end -}}
+{{- range $p := $placement.profiles }}{{- with $p.k8s }}{{- $fragments = append $fragments (dict "where" (printf "profile %q" (toString $p.name)) "spec" (.spec | default dict)) -}}{{- end -}}{{- end -}}
+{{- toJson $fragments -}}
+{{- end -}}
+
+{{/* The ServiceAccounts and Secrets the step Pod admission policy allows
+     besides a Pod's own per-Pod Secrets, as JSON {"serviceAccounts": [...],
+     "secrets": [...]}: `default` (the ServiceAccount of a step Pod that names
+     none), what the placement config (the baseline and each profile's `k8s`)
+     puts on step Pods, and scarab.admissionPolicy.allowServiceAccounts and
+     .allowSecrets, for names the chart cannot see (a placement file mounted
+     another way). The policy allows them on any step Pod: it cannot tell
+     which profile a Pod was placed with. */}}
+{{- define "scarab.admissionPolicyAllowed" -}}
+{{- $a := .Values.scarab.admissionPolicy | default dict -}}
+{{- $sas := concat (list "default") ($a.allowServiceAccounts | default list) -}}
+{{- $secrets := $a.allowSecrets | default list -}}
+{{- range $fragment := include "scarab.placementFragments" . | fromJsonArray -}}
+{{- $spec := $fragment.spec -}}
+{{- with $spec.serviceAccountName }}{{- $sas = append $sas . -}}{{- end -}}
+{{- with $spec.serviceAccount }}{{- $sas = append $sas . -}}{{- end -}}
+{{- range $v := $spec.volumes -}}
+{{- if $v.secret }}{{- with $v.secret.secretName }}{{- $secrets = append $secrets . -}}{{- end -}}{{- end -}}
+{{- if $v.projected -}}
+{{- range $s := $v.projected.sources -}}
+{{- if $s.secret }}{{- with $s.secret.name }}{{- $secrets = append $secrets . -}}{{- end -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- range $c := concat ($spec.containers | default list) ($spec.initContainers | default list) -}}
+{{- range $e := $c.env -}}
+{{- if and $e.valueFrom $e.valueFrom.secretKeyRef }}{{- with $e.valueFrom.secretKeyRef.name }}{{- $secrets = append $secrets . -}}{{- end -}}{{- end -}}
+{{- end -}}
+{{- range $f := $c.envFrom -}}
+{{- if $f.secretRef }}{{- with $f.secretRef.name }}{{- $secrets = append $secrets . -}}{{- end -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- dict "serviceAccounts" ($sas | uniq) "secrets" ($secrets | uniq) | toJson -}}
+{{- end -}}
+
+{{/* Refuse, at render time, values under which the step Pod admission policy
+     would refuse every step Pod placement puts a host field on, or would let
+     a step Pod run as the server's own ServiceAccount. Included by
+     admission-policy.yaml, so it runs only when the policy renders. */}}
+{{- define "scarab.validateAdmissionPolicy" -}}
+{{- $uses := list -}}
+{{- range $fragment := include "scarab.placementFragments" . | fromJsonArray -}}
+{{- $spec := $fragment.spec -}}
+{{- $fields := list -}}
+{{- range $v := $spec.volumes }}{{- if $v.hostPath }}{{- $fields = append $fields (printf "hostPath volume %q" $v.name) -}}{{- end -}}{{- end -}}
+{{- range $f := list "hostNetwork" "hostPID" "hostIPC" }}{{- if get $spec $f }}{{- $fields = append $fields $f -}}{{- end -}}{{- end -}}
+{{- if $fields }}{{- $uses = append $uses (printf "%s (%s)" $fragment.where (join ", " $fields)) -}}{{- end -}}
+{{- end -}}
+{{- if $uses -}}
+{{- fail (printf "scarab.placement: %s asks for what the step Pod admission policy refuses, so every step Pod placed with it would fail. Remove the field from the placement config, or set scarab.admissionPolicy.enabled=false to leave the policy out." (join "; " $uses)) -}}
+{{- end -}}
+{{- $serverSa := include "scarab.serviceAccountName" . -}}
+{{- if and (eq (include "scarab.execNamespace" .) .Release.Namespace) (has $serverSa (include "scarab.admissionPolicyAllowed" . | fromJson).serviceAccounts) -}}
+{{- fail (printf "scarab: step Pods run in the release namespace %q, where the server's ServiceAccount is %q, and the step Pod admission policy allows step Pods to run as %q (a step Pod that names none runs as `default`; a placement profile or scarab.admissionPolicy.allowServiceAccounts can name others). A step Pod could then run as the server. Give the server its own ServiceAccount (serviceAccount.create=true, or serviceAccount.name), run step Pods in another namespace (scarab.namespace), or set scarab.admissionPolicy.enabled=false." .Release.Namespace $serverSa $serverSa) -}}
+{{- end -}}
+{{- end -}}

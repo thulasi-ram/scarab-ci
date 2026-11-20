@@ -6,7 +6,7 @@ with the RBAC it needs to launch one Pod per step in the step namespace
 
 ## Prerequisites
 
-- Kubernetes 1.25+
+- Kubernetes 1.25+; 1.30+ for the step Pod admission policy
 - A Postgres database (the durable outbox / coordination bus). Without it the
   server runs API-only.
 - An S3-compatible object store for logs/artifacts (AWS S3 or in-cluster MinIO)
@@ -281,6 +281,91 @@ step needs an Unconfined seccomp profile, which the `baseline` level refuses.
 `helm uninstall` leaves the namespace and any step Pods in it
 (`helm.sh/resource-policy: keep`); a reinstall under the same release name and
 namespace adopts it again.
+
+## The step Pod admission policy (`scarab.admissionPolicy`)
+
+Any Pod can mount any Secret and run as any ServiceAccount in its own namespace: the kubelet
+resolves those references without asking the Pod's ServiceAccount, and RBAC cannot limit `create
+pods` by what the Pod refers to. Scarab's Pod builder keeps step Pods off the server's Secret and
+ServiceAccount. The chart also installs a ValidatingAdmissionPolicy, so the cluster refuses such a
+Pod if Scarab has a bug.
+
+The policy holds every Pod the server's ServiceAccount creates in the step namespace, in both
+namespace modes: `<release namespace>-steps`, and `scarab.namespace` set to the release namespace.
+It refuses a Pod that:
+
+- names a Secret in a Secret volume, a projected volume, an env `secretKeyRef` or an `envFrom`
+  `secretRef`, other than the Pod's own per-Pod Secrets (`<pod>-secrets`, `<pod>-token`,
+  `<pod>-registry`, `<pod>-oidc`, `<pod>-workspace`), the Secrets your `scarab.placement`
+  baseline and profiles name, and `scarab.admissionPolicy.allowSecrets`;
+- runs as a ServiceAccount other than `default`, the ServiceAccounts your placement baseline and
+  profiles name, and `scarab.admissionPolicy.allowServiceAccounts`;
+- has a `hostPath` volume, `hostNetwork`, `hostPID` or `hostIPC`.
+
+The policy cannot tell which profile a Pod was placed with, so a Secret or ServiceAccount any
+profile names is allowed on every step Pod. It does not check `privileged` or added capabilities:
+Scarab allows those per step by grant, which the policy cannot see. Use Pod Security on the step
+namespace for those (see above for why the chart sets no label). It does not check `imagePullSecrets`. Nor does it check CSI
+`nodePublishSecretRef`, the Secret references of the older in-tree volume types, or ConfigMap
+references: when step Pods share the release namespace, the server's ConfigMaps sit beside them.
+
+The server's own Pods are not held by it when they share the namespace: the ReplicaSet and
+StatefulSet controllers create the server's and the Data Depot's Pods, not the server's
+ServiceAccount. Plugin Pods and the plugin isolation probe run in `plugins.namespace`, which the
+chart keeps apart from the step namespace and labels Pod Security `restricted`.
+
+The two allow lists are for names the chart cannot see, such as the profiles of a placement file
+you mount through `extraVolumes` instead of `scarab.placement`.
+
+A step whose Pod the policy refuses fails with the policy's reason, for example `Scarab step Pod
+policy: a Secret volume names a Secret that is not the Pod's own`; the Run does not retry the
+launch.
+
+The policy and its binding are cluster-scoped: the account that runs `helm install` or `helm
+upgrade` needs rights to create `validatingadmissionpolicies` and
+`validatingadmissionpolicybindings` (`admissionregistration.k8s.io`). With `scarab.createNamespace:
+false`, the setting for an installer with rights in the release namespace only, the chart leaves
+the policy out and the install notes say so; set `scarab.admissionPolicy.enabled: true` to install
+it anyway. `enabled: auto` (the default) means on unless `scarab.createNamespace` is false.
+
+The policy needs Kubernetes 1.30 or later (`admissionregistration.k8s.io/v1`). On an older cluster
+the chart installs no policy and the install notes say so. `helm template` without a cluster
+cannot see the API: pass `--api-versions
+admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy` or set `scarab.admissionPolicy.force:
+true`.
+
+To try it before it refuses anything, run it in Audit mode: the API server creates the Pod and records what it
+would have refused in its audit log (when the API server has audit logging on).
+
+```yaml
+scarab:
+  admissionPolicy:
+    validationActions: [Audit]
+```
+
+When the audit log shows no `scarab-step-pods.*` refusals for your pipelines, set it back to
+`[Deny]`.
+
+With the policy on, the render fails when:
+
+- your placement baseline or a profile sets a `hostPath` volume, `hostNetwork`, `hostPID` or
+  `hostIPC`: every step Pod placed with it would be refused. The error names the baseline or the
+  profile. Remove the field, or set `scarab.admissionPolicy.enabled: false`.
+- step Pods share the release namespace and the server's ServiceAccount is one the policy allows:
+  `default` (with `serviceAccount.create: false` and no `serviceAccount.name`), or a name in a
+  profile or `allowServiceAccounts`. A step Pod could then run as the server. Give the server its
+  own ServiceAccount, run step Pods in another namespace, or turn the policy off.
+
+| Key | Default | Notes |
+|-----|---------|-------|
+| `scarab.admissionPolicy.enabled` | `auto` | `auto`: on unless `scarab.createNamespace` is false; `true`; `false` |
+| `scarab.admissionPolicy.force` | `false` | install it even when Helm cannot see the API |
+| `scarab.admissionPolicy.validationActions` | `[Deny]` | `[Audit]` for a trial, `[Warn]` to warn the server only |
+| `scarab.admissionPolicy.failurePolicy` | `Fail` | `Fail` refuses a Pod when the policy cannot be evaluated |
+| `scarab.admissionPolicy.allowSecrets` | `[]` | Secrets a step Pod may name besides its own and the placement config's |
+| `scarab.admissionPolicy.allowServiceAccounts` | `[]` | ServiceAccounts a step Pod may run as besides `default` and the placement config's |
+
+The policy is `templates/admission-policy.yaml`.
 
 ## Step Pod placement (`scarab.placement`, ADR-0055)
 

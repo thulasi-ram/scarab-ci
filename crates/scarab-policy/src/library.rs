@@ -44,6 +44,30 @@ pub struct LibraryVersion {
     pub name: String,
     pub fetched_by: String,
     pub fetched_at: i64,
+    /// The branch, tag or commit the most recent fetch of this content from
+    /// this version's file asked for; `None` when that fetch named the
+    /// commit in `source` itself (`…@<commit>`). An install copies it, so
+    /// the installation says what the admin reviewed.
+    #[serde(default)]
+    pub requested_ref: Option<String>,
+    /// The full commit that fetch read the file at. The same file can be at
+    /// more than one commit, so it may differ from the commit in `source`,
+    /// which is the first fetch's. Empty in a record from before it was
+    /// kept; [`LibraryVersion::commit`] then reads the one in `source`.
+    #[serde(default)]
+    pub resolved_commit: String,
+}
+
+impl LibraryVersion {
+    /// [`resolved_commit`](Self::resolved_commit), or the commit in
+    /// `source` when none was recorded.
+    pub fn commit(&self) -> String {
+        if self.resolved_commit.is_empty() {
+            pinned_commit(&self.source).to_string()
+        } else {
+            self.resolved_commit.clone()
+        }
+    }
 }
 
 /// The version an org uses under one library name.
@@ -64,6 +88,16 @@ pub struct LibraryInstallation {
     pub installed_at: i64,
     /// The StepUpConfirmation that approved the install, when one was needed.
     pub step_up_ref: Option<String>,
+    /// The branch, tag or commit the fetch of the installed version asked
+    /// for, copied at install: a later fetch of the same content under
+    /// another ref does not change it. `None` when that fetch named the
+    /// commit in the source, and for an install from before it was kept.
+    #[serde(default)]
+    pub requested_ref: Option<String>,
+    /// The full commit that fetch read the file at, copied at install. For
+    /// an install from before it was kept, the commit in `source`.
+    #[serde(default)]
+    pub resolved_commit: String,
 }
 
 /// An install or upgrade.
@@ -76,6 +110,12 @@ pub struct NewInstallation {
     pub installed_by: String,
     pub installed_at: i64,
     pub step_up_ref: Option<String>,
+    /// The version's [`requested_ref`](LibraryVersion::requested_ref), as the
+    /// caller read it: what the installation records.
+    pub requested_ref: Option<String>,
+    /// The version's [`commit`](LibraryVersion::commit), as the caller read
+    /// it.
+    pub resolved_commit: String,
 }
 
 /// What the caller expects to replace.
@@ -180,6 +220,37 @@ pub fn trust_key(source: &str) -> &str {
     }
 }
 
+/// The commit a pinned source names: what follows its last `@`, or `""`
+/// when it has none.
+pub fn pinned_commit(source: &str) -> &str {
+    match source.rsplit_once('@') {
+        Some((_, commit)) if !commit.contains('/') => commit,
+        _ => "",
+    }
+}
+
+/// How a person reads a fetch: `main → 1a2b3c4`, the ref and the first 7
+/// characters of the commit it resolved to; the commit alone when no ref was
+/// asked for, or the ref was that commit or a prefix of it of 7 or more hex
+/// characters.
+pub fn fetched_as(requested_ref: Option<&str>, commit: &str) -> String {
+    let short: String = commit.chars().take(7).collect();
+    match requested_ref {
+        Some(r) if !r.is_empty() && !names_commit(r, commit) => format!("{r} → {short}"),
+        _ => short,
+    }
+}
+
+/// Whether `git_ref` is `commit`, or a prefix of it of 7 or more lowercase
+/// hex characters.
+fn names_commit(git_ref: &str, commit: &str) -> bool {
+    git_ref.len() >= 7
+        && git_ref
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && commit.starts_with(git_ref)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LibraryStoreError {
     /// No such version in the org (for an install or a yank).
@@ -201,8 +272,11 @@ pub enum LibraryStoreError {
 #[async_trait]
 pub trait LibraryStore: Send + Sync {
     /// Stores a version, or returns the one already stored at
-    /// `(org, content_hash)` unchanged: the content is the same, and the
-    /// first fetch's record is kept.
+    /// `(org, content_hash)`: the content is the same, and the first fetch's
+    /// record is kept, except that a fetch from the same file
+    /// ([`trust_key`] of `source`) replaces `requested_ref` and
+    /// `resolved_commit` with its own. An installation keeps the ones it
+    /// copied.
     async fn put_version(&self, v: &LibraryVersion) -> Result<LibraryVersion, LibraryStoreError>;
 
     async fn version(
@@ -415,6 +489,25 @@ mod tests {
             yanked_by: "user:amy".into(),
             yanked_at: 1,
         }
+    }
+
+    #[test]
+    fn a_fetch_reads_as_its_ref_and_short_commit() {
+        let c = "1a2b3c4d5e6f".repeat(3) + "7a8b";
+        assert_eq!(fetched_as(Some("main"), &c), "main → 1a2b3c4");
+        assert_eq!(fetched_as(None, &c), "1a2b3c4");
+        assert_eq!(fetched_as(Some(&c), &c), "1a2b3c4", "a commit as the ref");
+        assert_eq!(
+            fetched_as(Some("1a2b3c4d"), &c),
+            "1a2b3c4",
+            "a short commit"
+        );
+        assert_eq!(fetched_as(Some("1a2b3c"), &c), "1a2b3c → 1a2b3c4");
+        assert_eq!(
+            pinned_commit(&format!("github.com/acme/libs//deploy.yaml@{c}")),
+            c
+        );
+        assert_eq!(pinned_commit("github.com/acme/libs//deploy.yaml"), "");
     }
 
     #[test]

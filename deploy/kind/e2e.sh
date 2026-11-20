@@ -164,6 +164,12 @@ export SCARAB_TEST_CLONE_IMAGE=scarab-clone:dev
 export SCARAB_TEST_SIDECAR_IMAGE=scarab-results-sidecar:dev
 export SCARAB_TEST_REGISTRY="registry.$tns.svc.cluster.local:5000"
 export SCARAB_TEST_HOST_IP="$pod_host"
+# The step Pod admission policy case (git-bug 07f0de3) creates Pods as the
+# server's ServiceAccount in the release's step namespace: deploy/kind/values.yaml
+# sets scarab.namespace to the release namespace, and the chart names the
+# ServiceAccount after the release.
+export SCARAB_TEST_STEP_NAMESPACE="$ns"
+export SCARAB_TEST_SERVER_USER="system:serviceaccount:$ns:$release"
 # The Depot's cold store: the e2e mode's bucket, through the port-forward.
 export SCARAB_S3_BUCKET=scarab-e2e
 export SCARAB_S3_ENDPOINT="http://127.0.0.1:$s3_port"

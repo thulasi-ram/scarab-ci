@@ -651,6 +651,15 @@ test("Install library opens a dialog, and its source is reviewed on its own page
   const table = page.getByRole("table", { name: "Installed libraries" });
   await expect(table.getByRole("row")).toHaveCount(6);
   await expect(table.getByRole("row").filter({ hasText: "lib:platform::scarab-libs::kaniko-build" })).toContainText("yanked");
+  // Each row names the ref it was fetched at and the commit that resolved
+  // to; the full commit is the short one's title. Fetched pinned: the
+  // commit alone.
+  const helm = table.getByRole("row").filter({ hasText: "lib:acme::scarab-libs::deploy-helm" });
+  await expect(helm).toContainText("v1.1.0 → 8c2f4e1");
+  await expect(helm.getByRole("button", { name: "Copy commit 8c2f4e1a9d7b3c5e0f6a2b8d4c1e7f9a3b5d2c6e" })).toHaveAttribute("title", /^8c2f4e1a9d7b3c5e0f6a2b8d4c1e7f9a3b5d2c6e/);
+  const probe = table.getByRole("row").filter({ hasText: "lib:acme::scarab-libs::http-probe" });
+  await expect(probe).toContainText("8c2f4e1");
+  await expect(probe).not.toContainText("→");
   // A yank of a removed library and a trusted source that no installation
   // holds stay on the list.
   await expect(page.getByRole("list", { name: "Yanks of removed libraries" })).toContainText("lib:acme::scarab-libs::slack-notify");
@@ -675,6 +684,10 @@ test("Install library opens a dialog, and its source is reviewed on its own page
   // The mock answers every fetch with an upgrade of deploy-helm.
   await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Libraries\s*lib:acme::scarab-libs::deploy-helm$/);
   await expect(page.getByText("5d1e0c7a9b3f → 0c4e7b2a91f5")).toBeVisible();
+  // The ref and commit installed now, and the ones just fetched.
+  await expect(page.getByTestId("review-ref")).toHaveText("from v1.1.0 → 8c2f4e1 to v1.4.0 → d41f07b");
+  await expect(page.locator(".sbs-h").first()).toContainText("installed 5d1e0c7a9b3f · v1.1.0 → 8c2f4e1");
+  await expect(page.locator(".sbs-h").last()).toContainText("fetched 0c4e7b2a91f5 · v1.4.0 → d41f07b");
   await page.getByRole("button", { name: "Upgrade", exact: true }).click();
   // The manage page's URL carries the installation's id.
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/b72d4f1e06\/manage$/);
@@ -721,6 +734,8 @@ test("a library's manage page holds its version, trust, yank and remove", async 
     await expect(panel.getByRole("button", { name: "Trust source" })).toBeVisible();
   }
   await expect(page.getByRole("button", { name: "Yank this version" })).toBeVisible();
+  // Fetched pinned to a commit: the commit alone, no ref.
+  await expect(page.getByRole("button", { name: "Copy commit 8c2f4e1a9d7b3c5e0f6a2b8d4c1e7f9a3b5d2c6e" })).toHaveText("8c2f4e1");
 
   // Upgrade opens the install dialog with the installed source in it.
   await page.getByRole("button", { name: "Upgrade" }).click();
@@ -737,6 +752,39 @@ test("a library's manage page holds its version, trust, yank and remove", async 
   await remove.getByRole("textbox").fill("lib:acme::scarab-libs::http-probe");
   await confirm.click();
   await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries$/);
+  expect(errors).toEqual([]);
+});
+
+test("a library's manage page names the ref it was fetched at, and Upgrade fetches that ref again", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/libraries/b72d4f1e06/manage");
+  await expect(page.locator(".lib-at").first()).toHaveText("v1.1.0 → 8c2f4e1");
+  await page.getByRole("button", { name: "Upgrade" }).click();
+  const upgrade = page.getByRole("dialog");
+  await expect(upgrade.getByRole("textbox", { name: "Ref" })).toHaveValue("v1.1.0");
+  await upgrade.getByRole("button", { name: "Cancel" }).click();
+  expect(errors).toEqual([]);
+});
+
+test("a library's page says when its source and the commit it was fetched at differ", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/libraries/e4a61b8c39/manage");
+  await expect(page.locator(".lib-at").first()).toHaveText("main → 7d3e9a1");
+  await expect(page.getByTestId("manage-commits-differ")).toContainText("The source names 51c3b8e");
+  // A library fetched pinned names one commit: no such line.
+  await page.goto("/orgs/acme/settings/libraries/5c09e3a7d4/manage");
+  await expect(page.locator(".lib-at").first()).toHaveText("8c2f4e1");
+  await expect(page.getByTestId("manage-commits-differ")).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test("the review page says when the stored content answers another ref than the one asked for", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto(
+    "/orgs/acme/settings/libraries/review?source=github.com%2Facme%2Fscarab-libs%2F%2Fdeploy-helm.yaml&ref=v1.4.0&stored=elsewhere",
+  );
+  await expect(page.getByTestId("review-ref")).toContainText("to main → d41f07b");
+  await expect(page.getByTestId("review-ref-other")).toContainText("You asked for v1.4.0");
   expect(errors).toEqual([]);
 });
 

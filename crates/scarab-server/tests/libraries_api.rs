@@ -659,6 +659,8 @@ async fn a_branch_or_tag_is_pinned_to_its_commit_when_fetched() {
         format!("github.com/acme/libs//deploy.yaml@{C1}")
     );
     assert_eq!(b["content_hash"], content_hash(V1));
+    assert_eq!(b["requested_ref"], "v1.0");
+    assert_eq!(b["resolved_commit"], C1);
 
     let (st, b) = fetch(
         &h,
@@ -670,6 +672,8 @@ async fn a_branch_or_tag_is_pinned_to_its_commit_when_fetched() {
         b["source"],
         format!("github.com/acme/libs//deploy.yaml@{C2}")
     );
+    assert_eq!(b["requested_ref"], "release/2");
+    assert_eq!(b["resolved_commit"], C2);
 
     let asked = h.http.asked().len();
     let (st, b) = fetch(
@@ -710,6 +714,139 @@ async fn a_branch_or_tag_is_pinned_to_its_commit_when_fetched() {
     .await;
     assert!(st.is_client_error(), "{st}");
     assert_ne!(st, StatusCode::OK);
+}
+
+/// A fetch answers the ref it was asked for and the commit it read; a
+/// pinned source has no ref. An installation keeps the ref and commit of the
+/// fetch it installed, and a later fetch of the same content under another
+/// ref, or pinned, does not change it.
+#[tokio::test]
+async fn an_installation_keeps_the_ref_and_commit_it_was_fetched_at() {
+    let h = harness();
+    h.http.serve_url(
+        "https://api.github.com/repos/acme/libs/commits?sha=v1.0&per_page=1",
+        &format!(r#"[{{"sha":"{C1}","commit":{{"message":"one"}}}}]"#),
+    );
+    h.http
+        .serve_url(&raw("acme", "libs", C1, "deploy.yaml"), V1);
+    h.http
+        .serve_url(&raw("acme", "libs", C2, "deploy.yaml"), V1);
+
+    let (st, b) = fetch(
+        &h,
+        json!({ "source": "github.com/acme/libs//deploy.yaml", "ref": " v1.0 " }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["requested_ref"], "v1.0", "trimmed");
+    assert_eq!(b["resolved_commit"], C1);
+    let (st, i) = install(
+        &h,
+        json!({ "name": DEPLOY, "content_hash": content_hash(V1) }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{i}");
+    assert_eq!(i["requested_ref"], "v1.0");
+    assert_eq!(i["resolved_commit"], C1);
+    let id = i["id"].as_str().unwrap().to_string();
+
+    // The same file pinned at another commit, with the same content: no
+    // ref, the commit given. The installed version still says v1.0.
+    let (st, b) = fetch(
+        &h,
+        json!({ "source": format!("github.com/acme/libs//deploy.yaml@{C2}") }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert!(b["requested_ref"].is_null(), "{b}");
+    assert_eq!(b["resolved_commit"], C2);
+    assert_eq!(b["current"]["requested_ref"], "v1.0");
+    assert_eq!(b["current"]["resolved_commit"], C1);
+
+    let (st, one) = call(
+        &h.app,
+        "GET",
+        &format!("/v1/orgs/acme/library-installations/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{one}");
+    assert_eq!(one["requested_ref"], "v1.0");
+    assert_eq!(one["resolved_commit"], C1);
+    let (st, all) = call(&h.app, "GET", "/v1/orgs/acme/libraries", None).await;
+    assert_eq!(st, StatusCode::OK, "{all}");
+    assert_eq!(all["installations"][0]["requested_ref"], "v1.0");
+    assert_eq!(all["installations"][0]["resolved_commit"], C1);
+}
+
+/// An install names the fetch it reviewed. When the same content was
+/// fetched again since, at another ref or commit, the install is refused
+/// with both named, and nothing is installed; installing what the page
+/// shows after a new review records exactly that.
+#[tokio::test]
+async fn an_install_of_a_version_fetched_again_since_its_review_is_refused() {
+    let h = harness();
+    h.http.serve_url(
+        "https://api.github.com/repos/acme/libs/commits?sha=v1.0&per_page=1",
+        &format!(r#"[{{"sha":"{C1}","commit":{{"message":"one"}}}}]"#),
+    );
+    h.http
+        .serve_url(&raw("acme", "libs", C1, "deploy.yaml"), V1);
+    h.http
+        .serve_url(&raw("acme", "libs", C2, "deploy.yaml"), V1);
+
+    let (st, reviewed) = fetch(
+        &h,
+        json!({ "source": "github.com/acme/libs//deploy.yaml", "ref": "v1.0" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{reviewed}");
+    // Someone fetches the same content pinned to another commit.
+    let (st, again) = fetch(
+        &h,
+        json!({ "source": format!("github.com/acme/libs//deploy.yaml@{C2}") }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{again}");
+
+    let (st, b) = install(
+        &h,
+        json!({
+            "name": DEPLOY,
+            "content_hash": content_hash(V1),
+            "requested_ref": reviewed["requested_ref"],
+            "resolved_commit": reviewed["resolved_commit"],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    let why = b.to_string();
+    assert!(why.contains("v1.0 → 1111111"), "{why}");
+    assert!(why.contains("now reads 2222222"), "{why}");
+    assert!(h.store.installations("acme").await.unwrap().is_empty());
+
+    // A ref without its commit names no fetch.
+    let (st, b) = install(
+        &h,
+        json!({ "name": DEPLOY, "content_hash": content_hash(V1), "requested_ref": "v1.0" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+
+    // Reviewed again: what the page shows now installs, and is recorded.
+    let (st, i) = install(
+        &h,
+        json!({
+            "name": DEPLOY,
+            "content_hash": content_hash(V1),
+            "requested_ref": again["requested_ref"],
+            "resolved_commit": again["resolved_commit"],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{i}");
+    assert!(i["requested_ref"].is_null(), "{i}");
+    assert_eq!(i["resolved_commit"], C2);
 }
 
 /// The org's connection cannot reach the repository (a GitHub App not
@@ -1014,6 +1151,22 @@ async fn a_stepped_up_install_records_the_grants_it_carried() {
             name: DEPLOY.into(),
             fetched_by: "amy".into(),
             fetched_at: 1,
+            requested_ref: Some("main".into()),
+            resolved_commit: C1.into(),
+        })
+        .await
+        .unwrap();
+    store
+        .put_version(&LibraryVersion {
+            org: "acme".into(),
+            content_hash: content_hash(V2),
+            content: V2.into(),
+            source: format!("github.com/acme/libs//deploy.yaml@{C2}"),
+            name: DEPLOY.into(),
+            fetched_by: "amy".into(),
+            fetched_at: 2,
+            requested_ref: Some("v1.2.0".into()),
+            resolved_commit: C2.into(),
         })
         .await
         .unwrap();
@@ -1059,6 +1212,55 @@ async fn a_stepped_up_install_records_the_grants_it_carried() {
         json!(["forge_credentials"]),
         "{install:?}"
     );
+    // The confirmation and the record name the ref and the commit.
+    assert_eq!(
+        install.detail["version"]["fetched_as"], "main → 1111111",
+        "{install:?}"
+    );
+    assert_eq!(install.detail["version"]["resolved_commit"], C1);
+    let authorised = h.events("op.authorised").await;
+    let changes = &authorised
+        .iter()
+        .find(|e| e.op.as_deref() == Some("library.install"))
+        .unwrap_or_else(|| panic!("no authorised install: {authorised:?}"))
+        .detail["summary"]["changes"];
+    assert_eq!(changes[1], "fetched at = main → 1111111", "{changes}");
+
+    // An upgrade names both: what it replaces and what it installs.
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/library-installations",
+            Some(json!({
+                "name": DEPLOY,
+                "content_hash": content_hash(V2),
+                "replaces": content_hash(V1),
+                "carry_grants": ["forge_credentials"]
+            })),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["requested_ref"], "v1.2.0");
+    assert_eq!(b["resolved_commit"], C2);
+    let authorised = h.events("op.authorised").await;
+    let upgrade = authorised
+        .iter()
+        .filter(|e| e.op.as_deref() == Some("library.install"))
+        .find(|e| e.detail.to_string().contains("v1.2.0"))
+        .unwrap_or_else(|| panic!("no authorised upgrade: {authorised:?}"));
+    assert_eq!(
+        upgrade.detail["summary"]["changes"][1],
+        "fetched at = main → 1111111 to v1.2.0 → 2222222"
+    );
+    let completed = h.events("op.completed").await;
+    let upgrade = completed
+        .iter()
+        .filter(|e| e.op.as_deref() == Some("library.install"))
+        .find(|e| e.detail["replaced"].is_object())
+        .unwrap_or_else(|| panic!("no completed upgrade: {completed:?}"));
+    assert_eq!(upgrade.detail["replaced"]["fetched_as"], "main → 1111111");
+    assert_eq!(upgrade.detail["version"]["fetched_as"], "v1.2.0 → 2222222");
 }
 
 /// A version of `DEPLOY` from `github.com/acme/libs//deploy.yaml@C1`, stored
@@ -1074,6 +1276,8 @@ async fn trusted_version(store: &dyn LibraryStore) -> String {
             name: DEPLOY.into(),
             fetched_by: "amy".into(),
             fetched_at: 1,
+            requested_ref: None,
+            resolved_commit: String::new(),
         })
         .await
         .unwrap();

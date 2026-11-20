@@ -26,8 +26,9 @@ use axum::{Extension, Json};
 use scarab_engine::DbError;
 use scarab_identity::Action;
 use scarab_policy::library::{
-    content_hash, library_name_error, LibraryInstallation, LibraryStore, LibraryStoreError,
-    LibraryVersion, LibraryYank, NewInstallation, Replaces, TrustGrant, TrustedSource,
+    content_hash, fetched_as, library_name_error, LibraryInstallation, LibraryStore,
+    LibraryStoreError, LibraryVersion, LibraryYank, NewInstallation, Replaces, TrustGrant,
+    TrustedSource,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -94,6 +95,13 @@ pub struct LibraryInstallationDto {
     pub name: String,
     pub content_hash: String,
     pub source: String,
+    /// The branch, tag or commit the admin fetched the installed version
+    /// at, as typed. `null` when the fetch named the commit in the source
+    /// (`…@<commit>`), and for an install from before Scarab kept it.
+    pub requested_ref: Option<String>,
+    /// The full commit the fetch read the file at. The same file can be at
+    /// more than one commit, so it may differ from the commit in `source`.
+    pub resolved_commit: String,
     pub installed_by: String,
     pub installed_at: i64,
     /// The installed version is yanked in this org.
@@ -254,13 +262,26 @@ pub struct FetchLibraryRequest {
 pub struct InstalledVersionDto {
     pub content_hash: String,
     pub source: String,
+    /// The branch, tag or commit the installed version was fetched at;
+    /// `null` when its fetch named the commit in the source.
+    pub requested_ref: Option<String>,
+    /// The full commit the installed version was read at.
+    pub resolved_commit: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct FetchedLibraryDto {
     pub name: String,
     pub content_hash: String,
+    /// Pinned to the commit of the first fetch of this content in the org.
     pub source: String,
+    /// The `ref` of the request, trimmed; `null` when the source named the
+    /// commit. When this content was stored already from another file, the
+    /// stored version's, as `source` is.
+    pub requested_ref: Option<String>,
+    /// The full commit the file was read at: what `ref` points to now, or
+    /// the commit in the source. What an install of this version records.
+    pub resolved_commit: String,
     pub content: String,
     /// What is installed under this name now, if anything: pass its hash as
     /// `replaces` to upgrade.
@@ -293,6 +314,17 @@ pub struct InstallLibraryRequest {
     /// omitted when the source holds none.
     #[serde(default)]
     pub carry_grants: Vec<TrustGrantDto>,
+    /// The fetch answer's `requested_ref`, as reviewed: `null` or omitted
+    /// when the fetch named the commit. Sent only with `resolved_commit`.
+    #[serde(default)]
+    pub requested_ref: Option<String>,
+    /// The fetch answer's `resolved_commit`, as reviewed. When given, an
+    /// install of a version fetched again since, under another ref or at
+    /// another commit, is refused with 409 naming both, and the
+    /// installation records exactly these. Omitted: it records the ref and
+    /// commit of the version's most recent fetch.
+    #[serde(default)]
+    pub resolved_commit: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -384,6 +416,8 @@ fn installation_dto(i: &LibraryInstallation, yanks: &[LibraryYank]) -> LibraryIn
         name: i.name.clone(),
         content_hash: i.content_hash.clone(),
         source: i.source.clone(),
+        requested_ref: i.requested_ref.clone(),
+        resolved_commit: i.resolved_commit.clone(),
         installed_by: i.installed_by.clone(),
         installed_at: i.installed_at,
         yanked: yanks
@@ -1083,7 +1117,8 @@ pub(crate) async fn fetch_library(
     let by = org_caller(&st, &headers, &org, Action::Administer).await?;
     super::refuse_reserved_org(&org, "install a library")?;
     let store = store(&st)?;
-    let src = match body.git_ref.as_deref().map(str::trim) {
+    let requested_ref = body.git_ref.as_deref().map(str::trim);
+    let src = match requested_ref {
         None => LibrarySource::parse(&body.source).map_err(ApiError::BadRequest)?,
         Some(git_ref) => {
             let unpinned =
@@ -1123,6 +1158,8 @@ pub(crate) async fn fetch_library(
             name: name.clone(),
             fetched_by: by,
             fetched_at: now,
+            requested_ref: requested_ref.map(str::to_string),
+            resolved_commit: src.commit.clone(),
         })
         .await
         .map_err(store_api_error)?;
@@ -1156,10 +1193,14 @@ pub(crate) async fn fetch_library(
         name,
         content_hash: stored.content_hash,
         source: stored.source,
+        requested_ref: stored.requested_ref,
+        resolved_commit: stored.resolved_commit,
         content,
         current: current.map(|c| InstalledVersionDto {
             content_hash: c.content_hash,
             source: c.source,
+            requested_ref: c.requested_ref,
+            resolved_commit: c.resolved_commit,
         }),
         diff,
         carried_grants: carried.into_iter().map(Into::into).collect(),
@@ -1184,7 +1225,7 @@ pub(crate) async fn fetch_library(
         (status = 400, description = "a bad name or hash, a version not fetched into this org, one that no longer compiles here, or `carry_grants` that are not the grants the source holds"),
         (status = 403, description = "not an org admin, or no step-up"),
         (status = 404, description = "libraries not configured"),
-        (status = 409, description = "`replaces` is not what is installed now")
+        (status = 409, description = "`replaces` is not what is installed now, or the version was fetched again at another ref or commit than `requested_ref` and `resolved_commit` name")
     )
 )]
 pub(crate) async fn install_library(
@@ -1218,9 +1259,53 @@ pub(crate) async fn install_library(
     if let Some(why) = carry_refusal(&version.source, &carried, &acked) {
         return Err(ApiError::BadRequest(why));
     }
+    // What the admin fetched, and what it replaces: the step-up names them,
+    // and the installation records the ones confirmed here, whatever a
+    // fetch after this read changes on the version. A client that names
+    // the fetch it reviewed is refused when the version was fetched again
+    // since, at another ref or commit.
+    let version_commit = version.commit();
+    let reviewed_ref = body
+        .requested_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty());
+    match body.resolved_commit.as_deref() {
+        Some(reviewed_commit) => {
+            if reviewed_ref != version.requested_ref.as_deref() || reviewed_commit != version_commit
+            {
+                return Err(ApiError::Conflict(format!(
+                    "this version was fetched again since you reviewed it: you reviewed {}, and \
+                     it now reads {}; fetch again and review it",
+                    fetched_as(reviewed_ref, reviewed_commit),
+                    fetched_as(version.requested_ref.as_deref(), &version_commit)
+                )));
+            }
+        }
+        None if reviewed_ref.is_some() => {
+            return Err(ApiError::BadRequest(
+                "`requested_ref` names the reviewed fetch only with its `resolved_commit`".into(),
+            ));
+        }
+        None => {}
+    }
+    let fetched = fetched_as(version.requested_ref.as_deref(), &version_commit);
+    let replaced = match &body.replaces {
+        Some(h) => store
+            .installation(&org, &name)
+            .await
+            .map_err(store_api_error)?
+            .filter(|i| &i.content_hash == h)
+            .map(|i| fetched_as(i.requested_ref.as_deref(), &i.resolved_commit)),
+        None => None,
+    };
+    let fetch_line = match &replaced {
+        Some(old) => format!("fetched at = {old} to {fetched}"),
+        None => format!("fetched at = {fetched}"),
+    };
     // Installing and upgrading always loosen: a step-up, once the request
     // is known to be one that can run.
-    guard.require(&st, Vec::new()).await?;
+    guard.require_noting(&st, vec![fetch_line]).await?;
     super::note_org(&st, &org).await?;
     let replaces = match body.replaces {
         Some(h) => Replaces::Version(h),
@@ -1236,6 +1321,8 @@ pub(crate) async fn install_library(
                 installed_by: by,
                 installed_at: now,
                 step_up_ref: guard.confirmation_id(),
+                requested_ref: version.requested_ref.clone(),
+                resolved_commit: version_commit.clone(),
             },
             &replaces,
             &acked,
@@ -1255,6 +1342,25 @@ pub(crate) async fn install_library(
     let carried = acked;
     let carried_names: Vec<&str> = carried.iter().map(|g| g.as_str()).collect();
     guard.note_completed("carried_grants", serde_json::json!(carried_names));
+    guard.note_completed(
+        "version",
+        serde_json::json!({
+            "fetched_as": fetched,
+            "requested_ref": installed.requested_ref,
+            "resolved_commit": installed.resolved_commit,
+        }),
+    );
+    if let Some(old) = &replaced {
+        guard.note_completed("replaced", serde_json::json!({ "fetched_as": old }));
+    }
+    tracing::info!(
+        org = %org,
+        library = %installed.name,
+        content_hash = %installed.content_hash,
+        fetched_as = %fetched,
+        replaced = replaced.as_deref().unwrap_or("nothing"),
+        "library installed"
+    );
     if !carried.is_empty() {
         tracing::warn!(
             org = %org,

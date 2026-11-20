@@ -92,6 +92,8 @@ async fn install_in(libs: &InMemoryLibraries, org: &str, name: &str, content: &s
         name: name.into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
+        requested_ref: None,
+        resolved_commit: String::new(),
     })
     .await
     .unwrap();
@@ -109,6 +111,8 @@ async fn install_in(libs: &InMemoryLibraries, org: &str, name: &str, content: &s
             installed_by: "amy".into(),
             installed_at: 1,
             step_up_ref: None,
+            requested_ref: None,
+            resolved_commit: String::new(),
         },
         &current,
     )

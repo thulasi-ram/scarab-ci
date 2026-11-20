@@ -3760,6 +3760,18 @@ export interface components {
              */
             diff: string;
             name: string;
+            /**
+             * @description The `ref` of the request, trimmed; `null` when the source named the
+             *     commit. When this content was stored already from another file, the
+             *     stored version's, as `source` is.
+             */
+            requested_ref?: string | null;
+            /**
+             * @description The full commit the file was read at: what `ref` points to now, or
+             *     the commit in the source. What an install of this version records.
+             */
+            resolved_commit: string;
+            /** @description Pinned to the commit of the first fetch of this content in the org. */
             source: string;
         };
         /** @description A plugin manifest read for review. Nothing is stored or installed. */
@@ -3959,6 +3971,19 @@ export interface components {
             name: string;
             /** @description The hash installed now (an upgrade), or omitted for a first install. */
             replaces?: string | null;
+            /**
+             * @description The fetch answer's `requested_ref`, as reviewed: `null` or omitted
+             *     when the fetch named the commit. Sent only with `resolved_commit`.
+             */
+            requested_ref?: string | null;
+            /**
+             * @description The fetch answer's `resolved_commit`, as reviewed. When given, an
+             *     install of a version fetched again since, under another ref or at
+             *     another commit, is refused with 409 naming both, and the
+             *     installation records exactly these. Omitted: it records the ref and
+             *     commit of the version's most recent fetch.
+             */
+            resolved_commit?: string | null;
         };
         /** @description `POST /v1/orgs/{org}/plugins`. */
         InstallPluginRequest: {
@@ -4000,6 +4025,13 @@ export interface components {
         };
         InstalledVersionDto: {
             content_hash: string;
+            /**
+             * @description The branch, tag or commit the installed version was fetched at;
+             *     `null` when its fetch named the commit in the source.
+             */
+            requested_ref?: string | null;
+            /** @description The full commit the installed version was read at. */
+            resolved_commit: string;
             source: string;
         };
         LibraryInstallationDto: {
@@ -4014,6 +4046,17 @@ export interface components {
             installed_by: string;
             /** @description The library name, as `invoke: lib:<name>` writes it. */
             name: string;
+            /**
+             * @description The branch, tag or commit the admin fetched the installed version
+             *     at, as typed. `null` when the fetch named the commit in the source
+             *     (`…@<commit>`), and for an install from before Scarab kept it.
+             */
+            requested_ref?: string | null;
+            /**
+             * @description The full commit the fetch read the file at. The same file can be at
+             *     more than one commit, so it may differ from the commit in `source`.
+             */
+            resolved_commit: string;
             source: string;
             yanked?: null | components["schemas"]["LibraryYankDto"];
         };
@@ -8930,7 +8973,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description `replaces` is not what is installed now */
+            /** @description `replaces` is not what is installed now, or the version was fetched again at another ref or commit than `requested_ref` and `resolved_commit` name */
             409: {
                 headers: {
                     [name: string]: unknown;

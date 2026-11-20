@@ -90,6 +90,8 @@ async fn install_in(
         name: "thulasi-ram::scarab-ci::clone".into(),
         fetched_by: "amy".into(),
         fetched_at: 1,
+        requested_ref: None,
+        resolved_commit: String::new(),
     })
     .await
     .unwrap();
@@ -101,6 +103,8 @@ async fn install_in(
             installed_by: "amy".into(),
             installed_at: 1,
             step_up_ref: None,
+            requested_ref: None,
+            resolved_commit: String::new(),
         },
         &Replaces::Nothing,
     )

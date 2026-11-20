@@ -83,6 +83,8 @@ async fn seed(libs: &dyn LibraryStore, org: &str, name: &str, content: &str) {
             installed_by: "seed".into(),
             installed_at: 1,
             step_up_ref: None,
+            requested_ref: None,
+            resolved_commit: String::new(),
         },
         &Replaces::Nothing,
     )
@@ -100,6 +102,8 @@ fn version(org: &str, name: &str, content: &str, at: i64) -> LibraryVersion {
         name: format!("acme/{name}"),
         fetched_by: "amy".into(),
         fetched_at: at,
+        requested_ref: None,
+        resolved_commit: String::new(),
     }
 }
 
@@ -112,6 +116,8 @@ fn new_install(org: &str, name: &str, content: &str) -> NewInstallation {
         installed_by: "bob".into(),
         installed_at: 2,
         step_up_ref: None,
+        requested_ref: None,
+        resolved_commit: String::new(),
     }
 }
 

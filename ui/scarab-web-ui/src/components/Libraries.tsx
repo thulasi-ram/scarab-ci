@@ -1,5 +1,6 @@
 // Libraries: the Settings section listing an org's installed libraries, one
-// row each, with its version, its state tags and a link to its own page.
+// row each, with the ref and commit it was fetched at, its version, its state
+// tags and a link to its own page.
 //
 // Install, top right, opens a dialog for the source; the file is then read
 // and reviewed on its own page (`…/settings/libraries/review`,
@@ -29,6 +30,7 @@ import {
 } from "../libraries";
 import { relTime, absTime } from "../fmt";
 import Chips from "./Chips";
+import FetchedAt from "./FetchedAt";
 import Icon from "./Icon";
 import InstallLibraryDialog from "./LibraryInstall";
 import { ConfirmAction } from "./ConfirmDestructive";
@@ -104,6 +106,7 @@ export default function Libraries(props: { org: string }) {
                   <thead>
                     <tr>
                       <th>Library</th>
+                      <th>Ref</th>
                       <th>Version</th>
                       <th>State</th>
                       <th>Installed</th>
@@ -118,6 +121,9 @@ export default function Libraries(props: { org: string }) {
                             <A class="mono oenv-link" href={libraryManageHref(props.org, l)}>
                               {libraryId(l)}
                             </A>
+                          </td>
+                          <td>
+                            <FetchedAt v={l} />
                           </td>
                           <td>
                             <span class="lib-hash" title={l.content_hash}>

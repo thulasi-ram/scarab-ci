@@ -398,6 +398,8 @@ async fn seed(libs: &InMemoryLibraries, org: &str, name: &str, content: &str) ->
         name: format!("acme/{name}"),
         fetched_by: "seed".into(),
         fetched_at: 1,
+        requested_ref: None,
+        resolved_commit: String::new(),
     })
     .await
     .unwrap();
@@ -409,6 +411,8 @@ async fn seed(libs: &InMemoryLibraries, org: &str, name: &str, content: &str) ->
             installed_by: "seed".into(),
             installed_at: 1,
             step_up_ref: None,
+            requested_ref: None,
+            resolved_commit: String::new(),
         },
         &Replaces::Nothing,
     )
@@ -1067,6 +1071,8 @@ async fn race_a_second_first_install_does_not_overwrite_the_first() {
             name: "acme/x".into(),
             fetched_by: "amy".into(),
             fetched_at: 1,
+            requested_ref: None,
+            resolved_commit: String::new(),
         })
         .await
         .unwrap();
@@ -1096,6 +1102,8 @@ async fn race_a_second_first_install_does_not_overwrite_the_first() {
                     installed_by: "bob".into(),
                     installed_at: 2,
                     step_up_ref: None,
+                    requested_ref: None,
+                    resolved_commit: String::new(),
                 },
                 &Replaces::Nothing,
             )
