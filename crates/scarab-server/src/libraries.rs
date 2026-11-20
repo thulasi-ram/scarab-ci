@@ -314,6 +314,17 @@ pub struct InstallLibraryRequest {
     /// omitted when the source holds none.
     #[serde(default)]
     pub carry_grants: Vec<TrustGrantDto>,
+    /// The fetch answer's `requested_ref`, as reviewed: `null` or omitted
+    /// when the fetch named the commit. Sent only with `resolved_commit`.
+    #[serde(default)]
+    pub requested_ref: Option<String>,
+    /// The fetch answer's `resolved_commit`, as reviewed. When given, an
+    /// install of a version fetched again since, under another ref or at
+    /// another commit, is refused with 409 naming both, and the
+    /// installation records exactly these. Omitted: it records the ref and
+    /// commit of the version's most recent fetch.
+    #[serde(default)]
+    pub resolved_commit: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1214,7 +1225,7 @@ pub(crate) async fn fetch_library(
         (status = 400, description = "a bad name or hash, a version not fetched into this org, one that no longer compiles here, or `carry_grants` that are not the grants the source holds"),
         (status = 403, description = "not an org admin, or no step-up"),
         (status = 404, description = "libraries not configured"),
-        (status = 409, description = "`replaces` is not what is installed now")
+        (status = 409, description = "`replaces` is not what is installed now, or the version was fetched again at another ref or commit than `requested_ref` and `resolved_commit` name")
     )
 )]
 pub(crate) async fn install_library(
@@ -1250,8 +1261,34 @@ pub(crate) async fn install_library(
     }
     // What the admin fetched, and what it replaces: the step-up names them,
     // and the installation records the ones confirmed here, whatever a
-    // fetch after this read changes on the version.
+    // fetch after this read changes on the version. A client that names
+    // the fetch it reviewed is refused when the version was fetched again
+    // since, at another ref or commit.
     let version_commit = version.commit();
+    let reviewed_ref = body
+        .requested_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty());
+    match body.resolved_commit.as_deref() {
+        Some(reviewed_commit) => {
+            if reviewed_ref != version.requested_ref.as_deref() || reviewed_commit != version_commit
+            {
+                return Err(ApiError::Conflict(format!(
+                    "this version was fetched again since you reviewed it: you reviewed {}, and \
+                     it now reads {}; fetch again and review it",
+                    fetched_as(reviewed_ref, reviewed_commit),
+                    fetched_as(version.requested_ref.as_deref(), &version_commit)
+                )));
+            }
+        }
+        None if reviewed_ref.is_some() => {
+            return Err(ApiError::BadRequest(
+                "`requested_ref` names the reviewed fetch only with its `resolved_commit`".into(),
+            ));
+        }
+        None => {}
+    }
     let fetched = fetched_as(version.requested_ref.as_deref(), &version_commit);
     let replaced = match &body.replaces {
         Some(h) => store

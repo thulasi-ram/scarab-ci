@@ -231,13 +231,24 @@ pub fn pinned_commit(source: &str) -> &str {
 
 /// How a person reads a fetch: `main → 1a2b3c4`, the ref and the first 7
 /// characters of the commit it resolved to; the commit alone when no ref was
-/// asked for, or the ref was that commit.
+/// asked for, or the ref was that commit or a prefix of it of 7 or more hex
+/// characters.
 pub fn fetched_as(requested_ref: Option<&str>, commit: &str) -> String {
     let short: String = commit.chars().take(7).collect();
     match requested_ref {
-        Some(r) if !r.is_empty() && r != commit => format!("{r} → {short}"),
+        Some(r) if !r.is_empty() && !names_commit(r, commit) => format!("{r} → {short}"),
         _ => short,
     }
+}
+
+/// Whether `git_ref` is `commit`, or a prefix of it of 7 or more lowercase
+/// hex characters.
+fn names_commit(git_ref: &str, commit: &str) -> bool {
+    git_ref.len() >= 7
+        && git_ref
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && commit.starts_with(git_ref)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -486,6 +497,12 @@ mod tests {
         assert_eq!(fetched_as(Some("main"), &c), "main → 1a2b3c4");
         assert_eq!(fetched_as(None, &c), "1a2b3c4");
         assert_eq!(fetched_as(Some(&c), &c), "1a2b3c4", "a commit as the ref");
+        assert_eq!(
+            fetched_as(Some("1a2b3c4d"), &c),
+            "1a2b3c4",
+            "a short commit"
+        );
+        assert_eq!(fetched_as(Some("1a2b3c"), &c), "1a2b3c → 1a2b3c4");
         assert_eq!(
             pinned_commit(&format!("github.com/acme/libs//deploy.yaml@{c}")),
             c

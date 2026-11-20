@@ -3971,6 +3971,19 @@ export interface components {
             name: string;
             /** @description The hash installed now (an upgrade), or omitted for a first install. */
             replaces?: string | null;
+            /**
+             * @description The fetch answer's `requested_ref`, as reviewed: `null` or omitted
+             *     when the fetch named the commit. Sent only with `resolved_commit`.
+             */
+            requested_ref?: string | null;
+            /**
+             * @description The fetch answer's `resolved_commit`, as reviewed. When given, an
+             *     install of a version fetched again since, under another ref or at
+             *     another commit, is refused with 409 naming both, and the
+             *     installation records exactly these. Omitted: it records the ref and
+             *     commit of the version's most recent fetch.
+             */
+            resolved_commit?: string | null;
         };
         /** @description `POST /v1/orgs/{org}/plugins`. */
         InstallPluginRequest: {
@@ -8960,7 +8973,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description `replaces` is not what is installed now */
+            /** @description `replaces` is not what is installed now, or the version was fetched again at another ref or commit than `requested_ref` and `resolved_commit` name */
             409: {
                 headers: {
                     [name: string]: unknown;

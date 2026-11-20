@@ -3137,7 +3137,7 @@
             "description": "libraries not configured"
           },
           "409": {
-            "description": "`replaces` is not what is installed now"
+            "description": "`replaces` is not what is installed now, or the version was fetched again at another ref or commit than `requested_ref` and `resolved_commit` name"
           },
           "429": {
             "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting"
@@ -11617,6 +11617,20 @@
               "null"
             ],
             "description": "The hash installed now (an upgrade), or omitted for a first install."
+          },
+          "requested_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The fetch answer's `requested_ref`, as reviewed: `null` or omitted\nwhen the fetch named the commit. Sent only with `resolved_commit`."
+          },
+          "resolved_commit": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The fetch answer's `resolved_commit`, as reviewed. When given, an\ninstall of a version fetched again since, under another ref or at\nanother commit, is refused with 409 naming both, and the\ninstallation records exactly these. Omitted: it records the ref and\ncommit of the version's most recent fetch."
           }
         },
         "additionalProperties": false

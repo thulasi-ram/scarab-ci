@@ -779,6 +779,76 @@ async fn an_installation_keeps_the_ref_and_commit_it_was_fetched_at() {
     assert_eq!(all["installations"][0]["resolved_commit"], C1);
 }
 
+/// An install names the fetch it reviewed. When the same content was
+/// fetched again since, at another ref or commit, the install is refused
+/// with both named, and nothing is installed; installing what the page
+/// shows after a new review records exactly that.
+#[tokio::test]
+async fn an_install_of_a_version_fetched_again_since_its_review_is_refused() {
+    let h = harness();
+    h.http.serve_url(
+        "https://api.github.com/repos/acme/libs/commits?sha=v1.0&per_page=1",
+        &format!(r#"[{{"sha":"{C1}","commit":{{"message":"one"}}}}]"#),
+    );
+    h.http
+        .serve_url(&raw("acme", "libs", C1, "deploy.yaml"), V1);
+    h.http
+        .serve_url(&raw("acme", "libs", C2, "deploy.yaml"), V1);
+
+    let (st, reviewed) = fetch(
+        &h,
+        json!({ "source": "github.com/acme/libs//deploy.yaml", "ref": "v1.0" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{reviewed}");
+    // Someone fetches the same content pinned to another commit.
+    let (st, again) = fetch(
+        &h,
+        json!({ "source": format!("github.com/acme/libs//deploy.yaml@{C2}") }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{again}");
+
+    let (st, b) = install(
+        &h,
+        json!({
+            "name": DEPLOY,
+            "content_hash": content_hash(V1),
+            "requested_ref": reviewed["requested_ref"],
+            "resolved_commit": reviewed["resolved_commit"],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    let why = b.to_string();
+    assert!(why.contains("v1.0 → 1111111"), "{why}");
+    assert!(why.contains("now reads 2222222"), "{why}");
+    assert!(h.store.installations("acme").await.unwrap().is_empty());
+
+    // A ref without its commit names no fetch.
+    let (st, b) = install(
+        &h,
+        json!({ "name": DEPLOY, "content_hash": content_hash(V1), "requested_ref": "v1.0" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+
+    // Reviewed again: what the page shows now installs, and is recorded.
+    let (st, i) = install(
+        &h,
+        json!({
+            "name": DEPLOY,
+            "content_hash": content_hash(V1),
+            "requested_ref": again["requested_ref"],
+            "resolved_commit": again["resolved_commit"],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{i}");
+    assert!(i["requested_ref"].is_null(), "{i}");
+    assert_eq!(i["resolved_commit"], C2);
+}
+
 /// The org's connection cannot reach the repository (a GitHub App not
 /// installed on it answers 404). A public file is still read, anonymously;
 /// a file that is not public either is refused with both reasons.

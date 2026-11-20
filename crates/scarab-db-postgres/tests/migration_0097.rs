@@ -5,8 +5,10 @@
 //! A database migrated up to just before 0097 holds a version installed in
 //! `acme`. Then 0097 runs, and the store reads the rows back through its own
 //! code. A row a binary from before 0097 writes after it ran (no ref, no
-//! commit) reads the same way. Skips cleanly when `SCARAB_TEST_DATABASE_URL`
-//! is unset.
+//! commit) reads the same way, and so does an installation such a binary
+//! upgrades: it changes the content hash and leaves the previous version's
+//! ref and commit, which must not be read as the new version's. Skips
+//! cleanly when `SCARAB_TEST_DATABASE_URL` is unset.
 
 mod common;
 
@@ -101,6 +103,45 @@ async fn rows_from_before_read_the_commit_in_their_source_and_no_ref() {
     assert_eq!(i.resolved_commit, LATER);
     let v = db.version("acme", &old_binary).await.unwrap().unwrap();
     assert_eq!(v.resolved_commit, LATER);
+
+    // `deploy` installed by this binary at a ref; then a binary from before
+    // 0097 upgrades it to a version read at another commit, writing only
+    // the columns it knows.
+    sqlx::query(
+        "UPDATE library_installations SET requested_ref = 'v1.1.0' \
+         WHERE org = 'acme' AND name = 'deploy'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let i = db.installation("acme", "deploy").await.unwrap().unwrap();
+    assert_eq!(i.requested_ref.as_deref(), Some("v1.1.0"));
+    let upgraded = "c".repeat(64);
+    sqlx::query(
+        "INSERT INTO library_versions \
+         (org, content_hash, content, source, name, fetched_by, fetched_at) \
+         VALUES ('acme', $1, 'steps: [{}]', $2, 'deploy', 'user:amy', 3)",
+    )
+    .bind(&upgraded)
+    .bind(format!("github.com/acme/libs//deploy.yaml@{LATER}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    // The upgrade a binary from before 0097 runs.
+    sqlx::query(
+        "UPDATE library_installations SET \
+           content_hash = $1, installed_by = 'user:bob', installed_at = 4, step_up_ref = 'su-2' \
+         WHERE org = 'acme' AND name = 'deploy' AND content_hash = $2",
+    )
+    .bind(&upgraded)
+    .bind(&before)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let i = db.installation("acme", "deploy").await.unwrap().unwrap();
+    assert_eq!(i.content_hash, upgraded);
+    assert_eq!(i.requested_ref, None, "not the replaced version's ref");
+    assert_eq!(i.resolved_commit, LATER, "the new version's commit");
 
     tdb.cleanup().await;
 }

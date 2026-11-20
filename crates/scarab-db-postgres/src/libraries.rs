@@ -72,11 +72,14 @@ fn version_from_row(r: &PgRow) -> LibraryVersion {
 }
 
 /// An installation joined with its version. Its ref and commit are its own,
-/// copied at install; an install made by a binary from before migration
-/// 0097 has neither, and reads the commit in its version's source.
+/// copied at install, and read only while `ref_for_hash` names its
+/// content: an install or upgrade by a binary from before migration 0097
+/// writes none of them, and reads as no ref and the commit in its version's
+/// source.
 const INSTALLATION_SELECT: &str = "SELECT i.id, i.org, i.name, i.content_hash, \
      v.source, i.installed_by, i.installed_at, i.step_up_ref, \
-     i.requested_ref, i.resolved_commit \
+     CASE WHEN i.ref_for_hash = i.content_hash THEN i.requested_ref END AS requested_ref, \
+     CASE WHEN i.ref_for_hash = i.content_hash THEN i.resolved_commit END AS resolved_commit \
      FROM library_installations i \
      JOIN library_versions v ON v.org = i.org AND v.content_hash = i.content_hash";
 
@@ -115,14 +118,15 @@ impl LibraryStore for PostgresDb {
         // the same file records its own ref and commit. `$10` is the trust
         // key of the fetched source: the stored source is that and `@` and
         // a commit.
-        sqlx::query(&format!(
+        let written = sqlx::query(&format!(
             "INSERT INTO library_versions ({VERSION_COLUMNS}) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
              ON CONFLICT (org, content_hash) DO UPDATE \
                SET requested_ref = EXCLUDED.requested_ref, \
                    resolved_commit = EXCLUDED.resolved_commit \
                WHERE left(library_versions.source, length($10::text) + 1) = $10::text || '@' \
-                 AND strpos(substr(library_versions.source, length($10::text) + 2), '/') = 0"
+                 AND strpos(substr(library_versions.source, length($10::text) + 2), '/') = 0 \
+             RETURNING {VERSION_COLUMNS}"
         ))
         .bind(&v.org)
         .bind(&v.content_hash)
@@ -134,12 +138,18 @@ impl LibraryStore for PostgresDb {
         .bind(&v.requested_ref)
         .bind(v.commit())
         .bind(trust_key(&v.source))
-        .execute(self.pool())
+        .fetch_optional(self.pool())
         .await
         .map_err(|e| match sqlstate(&e).as_deref() {
             Some("23514") => LibraryStoreError::Invalid(e.to_string()),
             _ => store_err(e),
         })?;
+        // The row this statement wrote, so a fetch answers its own ref and
+        // commit even when another fetch of the same content follows it.
+        // Nothing returned: stored before from another file, and kept.
+        if let Some(row) = written {
+            return Ok(version_from_row(&row));
+        }
         self.version(&v.org, &v.content_hash)
             .await?
             .ok_or_else(|| LibraryStoreError::Store("a stored version vanished".into()))
@@ -608,8 +618,8 @@ impl PostgresDb {
                     written = sqlx::query(
                         "INSERT INTO library_installations \
                          (org, name, content_hash, installed_by, installed_at, step_up_ref, \
-                          requested_ref, resolved_commit) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                          requested_ref, resolved_commit, ref_for_hash) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $3) \
                          ON CONFLICT (id) DO NOTHING",
                     )
                     .bind(&new.org)
@@ -638,7 +648,7 @@ impl PostgresDb {
             Replaces::Version(h) => sqlx::query(
                 "UPDATE library_installations SET \
                    content_hash = $3, installed_by = $4, installed_at = $5, step_up_ref = $6, \
-                   requested_ref = $8, resolved_commit = $9 \
+                   requested_ref = $8, resolved_commit = $9, ref_for_hash = $3 \
                  WHERE org = $1 AND name = $2 AND content_hash = $7",
             )
             .bind(&new.org)
