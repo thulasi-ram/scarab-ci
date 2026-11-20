@@ -18,6 +18,22 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **A Pipeline that a push or pull request does not start now fails its check on the commit.** A
+  Pipeline file that did not compile created no Run and posted no commit status, so a required
+  check waited for good. It now posts `failure` under the Pipeline's usual check name, on GitHub
+  and Forgejo, with the first compile error as the description and a link to the repository page,
+  where the refused Run is listed. A Pipeline refused by a Policy, a sandbox or library rule, a
+  missing approval gate, or a loop of follow-up Runs posts the same way; an Environment refusal
+  already did. A branch-scoped Environment skipping another branch still posts nothing. The same
+  delivery sent twice posts once.
+- **A `when:` that cannot be decided refuses its own Pipeline only.** A trigger or Step `when:`
+  that failed to evaluate (for example, one reading an event field that is not there) stopped the
+  whole delivery, so the Pipeline files after it in `.scarab/` were not evaluated. That Pipeline is
+  now listed as a refused Run with the error and fails its check, and the other files still start
+  their Runs.
+
 ## [0.6.1] - 2026-11-20
 
 ### Bug Fixes

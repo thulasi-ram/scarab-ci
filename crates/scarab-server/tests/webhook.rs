@@ -1102,3 +1102,190 @@ async fn manual_dispatch_of_an_unreachable_repo_is_refused() {
     assert!(msg.contains("unreachable"), "{msg}");
     assert!(db.active_runs().await.unwrap().is_empty(), "no run");
 }
+
+// ---------------------------------------------------------------------------
+// A Pipeline that does not become a Run still posts its check (git-bug
+// e5089fd, 2a680c8)
+// ---------------------------------------------------------------------------
+
+/// A Pipeline named `checks` that runs on push and does not compile: its one
+/// Step needs a Step that is not there.
+const BROKEN_YAML: &str = r#"
+name: checks
+on:
+  push: {}
+steps:
+  - { id: build, image: busybox, command: ["true"], needs: [ghost] }
+"#;
+
+/// A Pipeline whose push trigger's `when:` compiles but cannot be decided:
+/// the event has no field `nope`.
+const UNDECIDABLE_WHEN_YAML: &str = r#"
+on:
+  push:
+    when: 'event.nope == "x"'
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+"#;
+
+/// [`multi_forge_app`] over a forge the test keeps, to drain its statuses.
+fn multi_forge_app_arc(db: Arc<InMemoryDb>, forge: Arc<FakeForge>) -> axum::Router {
+    let clock = Arc::new(FakeClock::new(1_000));
+    let store = Arc::new(InMemoryObjectStore::new());
+    let logs = Arc::new(LogService::new(store, db.clone()));
+    let forge: Arc<dyn ForgePort> = forge;
+    router(
+        AppState::new(db.clone(), clock, logs)
+            .with_github_webhook_secret(SECRET.to_vec())
+            .with_forgejo_webhook_secret(b"forgejo-secret".to_vec())
+            .with_forge_connections(db)
+            .with_forge(forge),
+    )
+}
+
+/// Post every queued commit status the way the server's tick does, and
+/// return every status on the pushed commit (`abc123`) so far.
+async fn statuses_on_push(forge: &FakeForge, db: &InMemoryDb) -> Vec<scarab_forge::Status> {
+    scarab_server::drain_forge_statuses(forge, db, "test", 100, 0, "https://scarab.example/")
+        .await
+        .expect("drain");
+    forge.statuses_on("abc123")
+}
+
+/// The one `failure` the broken `checks` Pipeline posts: under the context
+/// its Runs post under, with its first diagnostic, linking to the repository
+/// page that lists the refused Run.
+fn assert_compile_failure_status(statuses: &[scarab_forge::Status]) {
+    assert_eq!(statuses.len(), 1, "{statuses:?}");
+    let status = &statuses[0];
+    assert_eq!(status.context, "scarab/checks");
+    assert_eq!(status.state, scarab_forge::StatusState::Failure);
+    assert_eq!(status.target_url, "https://scarab.example/acme/app");
+    let description = status.description.as_deref().unwrap_or_default();
+    assert!(
+        description.contains("needs unknown step `ghost`"),
+        "{description}"
+    );
+    assert!(
+        description.chars().count() <= scarab_forge::STATUS_DESCRIPTION_MAX,
+        "{description}"
+    );
+}
+
+/// git-bug e5089fd: a GitHub push whose Pipeline does not compile creates no
+/// Run, so no Run posts its check, and a required check waited for good.
+/// The refusal posts it, `failure`, once: a second delivery of the same push
+/// (here under a new delivery id, which the replay guard does not stop)
+/// queues nothing new.
+#[tokio::test]
+async fn a_github_push_whose_pipeline_does_not_compile_fails_its_check_once() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = Arc::new(FakeForge::new().with_file(".scarab/checks.yaml", BROKEN_YAML));
+    let app = multi_forge_app_arc(db.clone(), forge.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(push_request("gh-broken-1"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(db.active_runs().await.unwrap().is_empty());
+    assert_compile_failure_status(&statuses_on_push(&forge, &db).await);
+
+    let resp = app
+        .clone()
+        .oneshot(push_request("gh-broken-2"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_compile_failure_status(&statuses_on_push(&forge, &db).await);
+}
+
+/// The same through the Forgejo endpoint.
+#[tokio::test]
+async fn a_forgejo_push_whose_pipeline_does_not_compile_fails_its_check_once() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::Forgejo).await;
+    let forge = Arc::new(FakeForge::new().with_file(".scarab/checks.yaml", BROKEN_YAML));
+    let app = multi_forge_app_arc(db.clone(), forge.clone());
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "ref": "refs/heads/main",
+        "after": "abc123",
+        "repository": { "name": "app", "owner": { "username": "acme" } }
+    }))
+    .unwrap();
+    let sig = scarab_forge_forgejo::sign_hex(b"forgejo-secret", &body);
+
+    let resp = app
+        .clone()
+        .oneshot(forgejo_request("push", "fj-broken-1", &body, &sig))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(db.active_runs().await.unwrap().is_empty());
+    assert_compile_failure_status(&statuses_on_push(&forge, &db).await);
+
+    let resp = app
+        .clone()
+        .oneshot(forgejo_request("push", "fj-broken-2", &body, &sig))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_compile_failure_status(&statuses_on_push(&forge, &db).await);
+}
+
+/// git-bug 2a680c8: a `when:` that cannot be decided in the first Pipeline
+/// file stopped the delivery, so the second file, whose trigger matches,
+/// never ran. Now the first is refused on its own (recorded, named in the
+/// body, its check failed) and the second starts its Run.
+#[tokio::test]
+async fn an_undecidable_when_refuses_its_pipeline_and_the_next_file_still_runs() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = Arc::new(
+        FakeForge::new()
+            .with_file(".scarab/a.yaml", UNDECIDABLE_WHEN_YAML)
+            .with_file(".scarab/b.yaml", CI_YAML),
+    );
+    let app = multi_forge_app_arc(db.clone(), forge.clone());
+
+    let resp = app.oneshot(push_request("gh-when-1")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let v = json_of(resp).await;
+    assert_eq!(v["run_ids"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(db.active_runs().await.unwrap().len(), 1);
+    let refused = v["refused"].as_array().expect("refused listed");
+    assert_eq!(refused.len(), 1, "{v}");
+    assert_eq!(refused[0]["pipeline"], ".scarab/a.yaml");
+    assert!(
+        refused[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("`when:` of its `push` trigger could not be decided"),
+        "{v}"
+    );
+
+    let rows = db.refused_runs_for_tenant("acme", "app", 10).await.unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].pipeline, ".scarab/a.yaml");
+    assert_eq!(rows[0].reason_kind, "when");
+
+    let failed: Vec<_> = statuses_on_push(&forge, &db)
+        .await
+        .into_iter()
+        .filter(|s| s.state == scarab_forge::StatusState::Failure)
+        .collect();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].context, "scarab/a");
+    assert_eq!(failed[0].target_url, "https://scarab.example/acme/app");
+    assert!(
+        failed[0]
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with(".scarab/a.yaml: "),
+        "{failed:?}"
+    );
+}

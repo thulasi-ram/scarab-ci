@@ -14481,7 +14481,7 @@
           },
           "reason_kind": {
             "type": "string",
-            "description": "`compile`, `yanked`, `policy`, `environment`, `event_field`,\n`forge_token`, `schedule` or `upstream` (a loop or too long a chain\nof follow-ups)."
+            "description": "`compile`, `when` (a `when:` that could not be decided), `yanked`,\n`policy`, `environment`, `event_field`, `forge_token`, `sandbox`,\n`approval_gate`, `schedule` or `upstream` (a loop or too long a chain\nof follow-ups)."
           },
           "sha": {
             "type": [

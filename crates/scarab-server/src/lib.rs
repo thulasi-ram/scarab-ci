@@ -4961,10 +4961,10 @@ fn origin_pr_base(event: &scarab_forge::Event) -> Option<String> {
 ///
 /// Pipelines are evaluated independently and in a deterministic (path-sorted)
 /// order; a file that fails to compile fails the whole trigger (a broken
-/// pipeline is a submit-time error, ADR-0009), so a repo's CI is all-or-nothing
-/// per delivery rather than silently partial. A pipeline that admission
+/// pipeline is a submit-time error, ADR-0009), and its check fails on the
+/// commit. A pipeline whose `when:` cannot be decided, or that admission
 /// **refuses** (a disallowed ref, an unknown Environment, an ineligible
-/// Project — ADR-0037, ADR-0071) is skipped on its own and never aborts the
+/// Project — ADR-0037, ADR-0071), is skipped on its own and never aborts the
 /// delivery: the other pipelines still run.
 ///
 /// `ports` are the stores admission reads ([`AdmissionPorts`]).
@@ -5167,8 +5167,9 @@ pub struct RefusedPipeline {
     pub messages: Vec<String>,
 }
 
-/// What one delivery did: the Runs it created and the deploy pipelines the
-/// Environment refused. A `RefNotAllowed` skip is not listed — a
+/// What one delivery did: the Runs it created and the pipelines refused (by
+/// an Environment, a Policy, or a `when:` that could not be decided). A
+/// `RefNotAllowed` skip is not listed — a
 /// branch-scoped Environment ignoring other branches is the rule working.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TriggerOutcome {
@@ -5299,26 +5300,49 @@ pub(crate) async fn trigger_runs_from_files(
         // Pre-fetch transitive `invoke:` libraries at this ref and compile
         // (ADR-0038) — the shared read-at-ref → compile primitive also used by
         // the manual/api dispatch path.
-        let ir = record_compile_failure(
-            db,
-            clock,
-            event,
-            path,
-            prefetch_libs_and_compile(forge, repo, &git_ref, &yaml, &installed).await,
-        )
-        .await?;
+        let compiled = prefetch_libs_and_compile(forge, repo, &git_ref, &yaml, &installed).await;
+        // A file that does not compile creates no Run, so no Run posts its
+        // check: the refusal posts it, `failure` with the first diagnostic,
+        // or a required check waits on the commit for good (git-bug
+        // e5089fd).
+        if let Err(TriggerError::Pipeline(text)) = &compiled {
+            if may_trigger_on(&yaml, kind.as_str()) {
+                enqueue_refusal_status(
+                    db,
+                    clock,
+                    event,
+                    path,
+                    &declared_pipeline_name(&yaml, path),
+                    &first_diagnostic(text),
+                    &repo_page_path(&repo.owner, &repo.name),
+                )
+                .await;
+            }
+        }
+        let ir = record_compile_failure(db, clock, event, path, compiled).await?;
 
         // The trigger is matched first, with a pull request's paths not yet
         // asked for (unknown), so a Pipeline whose trigger does not match
         // (another kind, a false branch test) costs no files request. Only a
         // match that may have rested on the unknown paths asks, once per
         // delivery, and is decided again with the answer.
-        let trigger_matches = |ctx: &serde_json::Value| {
-            scarab_pipeline::matches_trigger(&ir, kind.as_str(), ctx)
-                .map_err(|e| TriggerError::Pipeline(e.to_string()))
-        };
-        if !trigger_matches(&ctx)? {
-            continue;
+        //
+        // A `when:` that cannot be decided refuses this Pipeline only: it is
+        // recorded and its check fails, and the files after it are still
+        // evaluated (git-bug 2a680c8).
+        let trigger_matches =
+            |ctx: &serde_json::Value| scarab_pipeline::matches_trigger(&ir, kind.as_str(), ctx);
+        match trigger_matches(&ctx) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                let message = format!(
+                    "the `when:` of its `{}` trigger could not be decided: {e}",
+                    kind.as_str()
+                );
+                refuse_undecided_when(db, clock, event, path, &ir, message, &mut outcome).await;
+                continue;
+            }
         }
         if let (
             scarab_forge::ChangedPaths::Unknown(scarab_forge::PathsUnknown::NotFetched),
@@ -5328,8 +5352,18 @@ pub(crate) async fn trigger_runs_from_files(
             if scarab_pipeline::reads_changed_paths(&ir, kind.as_str()) {
                 paths = pull_request_paths(forge, repo, *number).await;
                 paths.apply_to(&mut ctx);
-                if !trigger_matches(&ctx)? {
-                    continue;
+                match trigger_matches(&ctx) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(e) => {
+                        let message = format!(
+                            "the `when:` of its `{}` trigger could not be decided: {e}",
+                            kind.as_str()
+                        );
+                        refuse_undecided_when(db, clock, event, path, &ir, message, &mut outcome)
+                            .await;
+                        continue;
+                    }
                 }
             }
         }
@@ -5354,6 +5388,16 @@ pub(crate) async fn trigger_runs_from_files(
                 None
             };
             if let Some(message) = refusal {
+                enqueue_refusal_status(
+                    db,
+                    clock,
+                    event,
+                    path,
+                    &name,
+                    &message,
+                    &repo_page_path(&repo.owner, &repo.name),
+                )
+                .await;
                 let errors = vec![CompileErrorDto::other(message.clone())];
                 record_refusal(db, clock, event, path, "upstream", message, &errors).await;
                 continue;
@@ -5363,9 +5407,16 @@ pub(crate) async fn trigger_runs_from_files(
         // Step-level `when:` guards against the event context (ADR-0009, 0033):
         // guarded-off steps are kept in the DAG but marked Skipped, so the engine
         // transitively skips their descendants. A pipeline whose every step is
-        // excluded starts no run.
-        let excluded = scarab_pipeline::excluded_steps(&ir, &ctx)
-            .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
+        // excluded starts no run. A guard that cannot be decided refuses this
+        // Pipeline only, as a trigger's `when:` does.
+        let excluded = match scarab_pipeline::excluded_steps(&ir, &ctx) {
+            Ok(excluded) => excluded,
+            Err(e) => {
+                let message = format!("a Step's `when:` could not be decided: {e}");
+                refuse_undecided_when(db, clock, event, path, &ir, message, &mut outcome).await;
+                continue;
+            }
+        };
         if excluded.len() == ir.steps.len() {
             continue;
         }
@@ -5376,9 +5427,28 @@ pub(crate) async fn trigger_runs_from_files(
         // skips this pipeline only (the dispatch path turns the same refusal
         // into a fail-closed error). Webhook-triggered runs supply no launch
         // parameters.
-        match admit_and_create_run(forge, db, clock, ports, event, &ir, path, &excluded, None)
-            .await?
-        {
+        let admission =
+            admit_and_create_run(forge, db, clock, ports, event, &ir, path, &excluded, None)
+                .await?;
+        // A refused Pipeline posts its check as `failure`, saying why, so a
+        // required check does not wait for a Run that will not come.
+        if let Admission::Refused(refusal) = &admission {
+            if let Some((description, target_path)) =
+                admission_refusal_status(refusal, &repo.owner, &repo.name)
+            {
+                enqueue_refusal_status(
+                    db,
+                    clock,
+                    event,
+                    path,
+                    &run_pipeline_name(&ir, path),
+                    &description,
+                    &target_path,
+                )
+                .await;
+            }
+        }
+        match admission {
             Admission::Created(run) => {
                 record_path_filter_note(db, clock, &run, &ir, kind.as_str(), &ctx, &paths).await;
                 if complete {
@@ -5414,17 +5484,6 @@ pub(crate) async fn trigger_runs_from_files(
                     decision_id: None,
                     messages: Vec::new(),
                 });
-                // The commit shows it too: a `failure` status on the check
-                // line this pipeline's Runs use.
-                enqueue_refusal_status(
-                    db,
-                    clock,
-                    event,
-                    path,
-                    &run_pipeline_name(&ir, path),
-                    refusal,
-                )
-                .await;
             }
             // ADR-0075 §9: a `run.create` Policy denied this Run. Its
             // decision is in the org's decision log; the body names it and
@@ -6015,20 +6074,151 @@ async fn record_compile_failure<T>(
     compiled
 }
 
-/// Outbox kind of the commit status for a pipeline an Environment refused on
-/// a forge event. [`drain_forge_statuses`] posts it beside the Runs'
-/// statuses, with the same retries and dead-lettering.
+/// Outbox kind of the commit status for a pipeline refused on a forge
+/// event: it did not compile, its `when:` could not be decided, a chain of
+/// follow-ups refused it, or admission refused it. [`drain_forge_statuses`]
+/// posts it beside the Runs' statuses, with the same retries and
+/// dead-lettering.
 pub const REFUSAL_STATUS: &str = "refusal_status";
 
-/// Queue a `failure` commit status on the event's commit for a deploy
-/// pipeline refused as `UnknownEnvironment` or `NotEligible`, under the
-/// context a Run of the pipeline posts under, so the refusal shows on the
-/// check line the Run would have used. The text says what an org admin must
-/// do, and the link opens the org's Environment settings.
+/// The `failure` status text and link for an admission refusal: what an
+/// org admin must do and the org's Environment settings for an Environment
+/// refusal, the refusal's message and the repository page (where the
+/// refused Run is listed) for every other one.
 ///
-/// Every other refusal queues nothing: `RefNotAllowed` is a branch-scoped
-/// Environment ignoring other branches, and a red status on every feature
-/// branch push would say nothing new. An event with no commit has nothing to
+/// `RefNotAllowed` posts nothing: it is a branch-scoped Environment
+/// ignoring other branches, and a red status on every feature branch push
+/// would say nothing new.
+fn admission_refusal_status(
+    refusal: &AdmissionRefusal,
+    org: &str,
+    project: &str,
+) -> Option<(String, String)> {
+    match refusal {
+        AdmissionRefusal::RefNotAllowed => None,
+        AdmissionRefusal::UnknownEnvironment { environment } => Some((
+            format!(
+                "environment `{environment}` does not exist in org `{org}`: an org admin must \
+                 create it and make `{project}` eligible"
+            ),
+            format!("/orgs/{org}/settings/environments"),
+        )),
+        AdmissionRefusal::NotEligible { environment } => Some((
+            format!(
+                "`{project}` may not deploy to environment `{environment}`: an org admin must \
+                 make `{project}` eligible"
+            ),
+            format!("/orgs/{org}/settings/environments/{environment}"),
+        )),
+        AdmissionRefusal::PolicyDenied { .. }
+        | AdmissionRefusal::LibraryYanked { .. }
+        | AdmissionRefusal::EventField { .. }
+        | AdmissionRefusal::ForgeToken { .. }
+        | AdmissionRefusal::Sandbox { .. }
+        | AdmissionRefusal::MissingApprovalGate { .. } => Some((
+            admission_refusal_message(refusal, org, project),
+            repo_page_path(org, project),
+        )),
+    }
+}
+
+/// The web UI's page for a repository, `/<org>/<repo>`: its Runs list shows
+/// the refused Runs.
+fn repo_page_path(org: &str, project: &str) -> String {
+    format!(
+        "/{}/{}",
+        scarab_pipeline::url_path_segment(org),
+        scarab_pipeline::url_path_segment(project)
+    )
+}
+
+/// The `name:` a Pipeline file declares, read without compiling it, else its
+/// file name: the name a Run of it would post its status under. For a file
+/// that did not compile.
+fn declared_pipeline_name(yaml: &str, path: &str) -> String {
+    #[derive(Deserialize)]
+    struct ShallowName {
+        #[serde(default)]
+        name: Option<String>,
+    }
+    serde_yaml::from_str::<ShallowName>(yaml)
+        .ok()
+        .and_then(|s| s.name)
+        .unwrap_or_else(|| bare_pipeline_name(path))
+}
+
+/// Whether a Pipeline file that did not compile may still be meant for a
+/// `kind` event: its `on:` names `kind`, or `on:` itself cannot be read.
+/// A broken manual-only Pipeline does not fail a check on every push.
+fn may_trigger_on(yaml: &str, kind: &str) -> bool {
+    match scarab_pipeline::triggers_of(yaml) {
+        Ok(on) => on.0.contains_key(kind),
+        Err(_) => true,
+    }
+}
+
+/// The first diagnostic of a compile error's text, on one line.
+fn first_diagnostic(text: &str) -> String {
+    let first = compile_errors(text)
+        .into_iter()
+        .next()
+        .map_or_else(|| text.to_string(), |e| e.message);
+    first.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Refuse a Pipeline whose `when:` (its trigger's or a Step's) could not be
+/// decided for `event`: the refused Run is recorded, the delivery body names
+/// it, and its check fails on the commit. The files after it are still
+/// evaluated (git-bug 2a680c8).
+async fn refuse_undecided_when(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    event: &scarab_forge::Event,
+    path: &str,
+    ir: &scarab_pipeline::PipelineIr,
+    message: String,
+    outcome: &mut TriggerOutcome,
+) {
+    let Some(repo) = event.repo() else {
+        return;
+    };
+    tracing::warn!(
+        org = %repo.owner,
+        project = %repo.name,
+        pipeline = %path,
+        trigger = event.trigger_kind().as_str(),
+        "pipeline not run: {message}"
+    );
+    enqueue_refusal_status(
+        db,
+        clock,
+        event,
+        path,
+        &run_pipeline_name(ir, path),
+        &format!("{path}: {message}"),
+        &repo_page_path(&repo.owner, &repo.name),
+    )
+    .await;
+    outcome.refused.push(RefusedPipeline {
+        pipeline: path.to_string(),
+        environment: ir.environment.clone(),
+        reason: message.clone(),
+        decision_id: None,
+        messages: Vec::new(),
+    });
+    let errors = vec![CompileErrorDto::other(message.clone())];
+    record_refusal(db, clock, event, path, "when", message, &errors).await;
+}
+
+/// Queue a `failure` commit status on the event's commit for a pipeline
+/// that `event` did not start, under the context a Run of the pipeline
+/// posts under, so the check line the Run would have used resolves.
+/// `description` says why (capped to what a forge accepts); `target_path`
+/// is the UI page that shows it.
+///
+/// The idempotency key is the repository, commit, context and description:
+/// a redelivered event, or another event on the same commit refused for the
+/// same reason, queues nothing new. An event with no commit has nothing to
 /// post on. A failed enqueue is logged and the delivery goes on.
 async fn enqueue_refusal_status(
     db: &dyn Db,
@@ -6036,8 +6226,10 @@ async fn enqueue_refusal_status(
     event: &scarab_forge::Event,
     path: &str,
     pipeline_name: &str,
-    refusal: &AdmissionRefusal,
+    description: &str,
+    target_path: &str,
 ) {
+    use sha2::{Digest, Sha256};
     let Some(repo) = event.repo() else {
         return;
     };
@@ -6046,36 +6238,22 @@ async fn enqueue_refusal_status(
         return;
     };
     let (org, project) = (&repo.owner, &repo.name);
-    let (description, target_path) = match refusal {
-        AdmissionRefusal::UnknownEnvironment { environment } => (
-            format!(
-                "environment `{environment}` does not exist in org `{org}`: an org admin must \
-                 create it and make `{project}` eligible"
-            ),
-            format!("/orgs/{org}/settings/environments"),
-        ),
-        AdmissionRefusal::NotEligible { environment } => (
-            format!(
-                "`{project}` may not deploy to environment `{environment}`: an org admin must \
-                 make `{project}` eligible"
-            ),
-            format!("/orgs/{org}/settings/environments/{environment}"),
-        ),
-        _ => return,
-    };
-    let run = run_id_for(event, path);
+    let context = status_context(Some(pipeline_name));
+    let description = scarab_forge::cap_status_description(description);
+    let digest = Sha256::digest(format!("{org}/{project}\n{sha}\n{context}\n{description}"));
+    let key: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
     let msg = scarab_engine::OutboxMessage {
         id: scarab_engine::OutboxId(0),
-        run: run.clone(),
+        run: run_id_for(event, path),
         kind: REFUSAL_STATUS.to_string(),
         payload: serde_json::json!({
             "repo": { "owner": org, "name": project },
             "sha": sha,
-            "context": status_context(Some(pipeline_name)),
-            "description": scarab_forge::cap_status_description(&description),
+            "context": context,
+            "description": description,
             "target_path": target_path,
         }),
-        idempotency_key: format!("{REFUSAL_STATUS}:{}", run.0),
+        idempotency_key: format!("{REFUSAL_STATUS}:{key}"),
         at: clock.now().await,
     };
     if let Err(e) = db.enqueue_outbox(&msg).await {
@@ -7817,12 +7995,14 @@ async fn write_run_from_ir(
 /// idempotent on the forge). Returns how many statuses were posted.
 ///
 /// It posts the [`REFUSAL_STATUS`] messages the same way: the `failure` on a
-/// commit whose deploy pipeline an Environment refused.
+/// commit whose pipeline the event did not start (it did not compile, or was
+/// refused).
 ///
 /// `public_url` is Scarab's public base URL: every status carries the
 /// **required** deep-link back to its run (`{public_url}/<org>/<repo>/runs/{id}`,
 /// ADR-0046) — a status without a way back to its run is a dead end. A
-/// refusal has no Run; its link opens the org's Environment settings.
+/// refusal has no Run; its link opens the repository page, or the org's
+/// Environment settings for an Environment refusal.
 pub async fn drain_forge_statuses(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,

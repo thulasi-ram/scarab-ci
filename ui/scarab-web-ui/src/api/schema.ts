@@ -5420,8 +5420,9 @@ export interface components {
             /** @description The pipeline file, `.scarab/<name>.yaml`. */
             pipeline: string;
             /**
-             * @description `compile`, `yanked`, `policy`, `environment`, `event_field`,
-             *     `forge_token`, `schedule` or `upstream` (a loop or too long a chain
+             * @description `compile`, `when` (a `when:` that could not be decided), `yanked`,
+             *     `policy`, `environment`, `event_field`, `forge_token`, `sandbox`,
+             *     `approval_gate`, `schedule` or `upstream` (a loop or too long a chain
              *     of follow-ups).
              */
             reason_kind: string;
