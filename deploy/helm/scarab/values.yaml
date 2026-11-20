@@ -209,6 +209,34 @@ scarab:
   #     toleration_keys: [nvidia.com/gpu]
   placement: {}
 
+  # --- step Pod admission policy (git-bug 07f0de3) -------------------------
+  # A ValidatingAdmissionPolicy and binding (templates/admission-policy.yaml)
+  # on Pod CREATE by the server's ServiceAccount in the step namespace. The
+  # cluster refuses a Pod that:
+  #   - mounts or reads (Secret volume, projected Secret, env secretKeyRef,
+  #     envFrom secretRef) a Secret other than its own per-Pod Secrets
+  #     (`<pod>-secrets`, `-token`, `-registry`, `-oidc`, `-workspace`) or one
+  #     `placement` names;
+  #   - runs as a ServiceAccount other than `default` or one `placement` names;
+  #   - has a hostPath volume, hostNetwork, hostPID or hostIPC.
+  # Privileged containers and capabilities are left to Pod Security: Scarab
+  # allows them per step by grant, which the policy cannot see.
+  #
+  # Rendered only when the cluster serves admissionregistration.k8s.io/v1
+  # ValidatingAdmissionPolicy (Kubernetes 1.30+); on an older cluster the
+  # chart renders none and NOTES.txt says so. `force: true` renders it
+  # anyway, for `helm template` without a cluster (or pass
+  # `--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy`).
+  admissionPolicy:
+    enabled: true
+    force: false
+    # [Deny] refuses the Pod and fails the step. [Audit] only records what
+    # would be refused in the API server's audit log: use it for a trial, then
+    # switch to [Deny]. [Warn] returns a warning to the server.
+    validationActions: [Deny]
+    # Fail: a Pod is refused when the policy cannot be evaluated.
+    failurePolicy: Fail
+
   # Object store (logs, artifacts, the workspace CAS cold tier). EFFECTIVELY
   # MANDATORY (ADR-0067 part 1): the server no longer falls back to a local
   # directory when bucket is empty — it refuses to boot (MissingObjectStore),

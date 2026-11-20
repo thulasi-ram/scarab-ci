@@ -20,6 +20,14 @@
 #      Namespace; an explicit scarab.namespace is used as given with no
 #      Namespace; a derived name over 63 characters fails the render.
 #   4. scarab.placement.author_overlay reaches the placement ConfigMap.
+#   5. The step Pod admission policy (git-bug 07f0de3). It renders when the
+#      cluster serves admissionregistration.k8s.io/v1 ValidatingAdmissionPolicy
+#      (here: --api-versions) or scarab.admissionPolicy.force is set, and not
+#      otherwise, nor when disabled or with the local executor. Its binding
+#      selects the step namespace in both modes (`<release namespace>-steps`
+#      and scarab.namespace = the release namespace), it matches the server's
+#      ServiceAccount, and its allowed ServiceAccounts and Secrets carry what
+#      the placement profiles name.
 #
 # Run by `just check all`. Usage: scripts/chart_render_check.sh [chart-dir]
 # (needs helm, yq v4).
@@ -116,4 +124,68 @@ got=$(yq -N 'select(.kind == "ConfigMap" and .metadata.name == "t-scarab-placeme
 want='{"annotation_keys":["karpenter.sh/do-not-disrupt"],"label_keys":["team"],"toleration_keys":["nvidia.com/gpu"]}'
 [ "$got" = "$want" ] || fail "the placement ConfigMap's author_overlay is '$got', want '$want'"
 
-echo "chart_render_check: SCARAB_UI_URL, the provider secrets, the step namespace and the placement config render as expected"
+# 5. The step Pod admission policy. `vap_objects` prints "<kind> <name>" for
+# the policy and its binding, sorted.
+vap_api=(--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy)
+vap_objects() {
+  yq -N 'select(.kind == "ValidatingAdmissionPolicy" or .kind == "ValidatingAdmissionPolicyBinding")
+    | .kind + " " + .metadata.name' <<<"$1" | sort
+}
+vap_want="ValidatingAdmissionPolicy scarab-step-pods.ci.t-scarab
+ValidatingAdmissionPolicyBinding scarab-step-pods.ci.t-scarab"
+check_vap() { # <case> <want objects> <helm args...>
+  local case=$1 want=$2; shift 2
+  local got
+  got=$(vap_objects "$(helm template t "$chart" "${base[@]}" "$@")")
+  [ "$got" = "$want" ] || fail "$case: the admission policy objects are
+$got
+want
+$want"
+}
+check_vap "no ValidatingAdmissionPolicy API" ""
+check_vap "the API served" "$vap_want" "${vap_api[@]}"
+check_vap "admissionPolicy.force" "$vap_want" --set scarab.admissionPolicy.force=true
+check_vap "admissionPolicy.enabled=false" "" "${vap_api[@]}" --set scarab.admissionPolicy.force=true \
+  --set scarab.admissionPolicy.enabled=false
+check_vap "scarab.executor=local" "" "${vap_api[@]}" --set scarab.executor=local
+check_vap "scarab.namespace=ci" "$vap_want" "${vap_api[@]}" --set scarab.namespace=ci
+
+vap_field() { # <kind> <yq path> <rendered>
+  yq -N -o=json -I=0 "select(.kind == \"$1\") | $2" <<<"$3"
+}
+for mode in "ci-steps" "ci --set scarab.namespace=ci"; do
+  # shellcheck disable=SC2086
+  set -- $mode
+  want_ns=$1; shift
+  out=$(helm template t "$chart" "${base[@]}" "${vap_api[@]}" "$@")
+  got=$(vap_field ValidatingAdmissionPolicyBinding '.spec.matchResources.namespaceSelector.matchExpressions' "$out")
+  want="[{\"key\":\"kubernetes.io/metadata.name\",\"operator\":\"In\",\"values\":[\"$want_ns\"]}]"
+  [ "$got" = "$want" ] || fail "step namespace $want_ns: the binding selects '$got', want '$want'"
+  got=$(vap_field ValidatingAdmissionPolicy '.spec.matchConditions[0].expression' "$out")
+  want='"request.userInfo.username == '"'"'system:serviceaccount:ci:t-scarab'"'"'"'
+  [ "$got" = "$want" ] || fail "step namespace $want_ns: the policy matches '$got', want '$want'"
+done
+out=$(helm template t "$chart" "${base[@]}" "${vap_api[@]}")
+got=$(vap_field ValidatingAdmissionPolicyBinding '.spec.validationActions' "$out")
+[ "$got" = '["Deny"]' ] || fail "the default validationActions are '$got', want [\"Deny\"]"
+got=$(vap_field ValidatingAdmissionPolicy '.spec.failurePolicy' "$out")
+[ "$got" = '"Fail"' ] || fail "the default failurePolicy is '$got', want Fail"
+got=$(vap_field ValidatingAdmissionPolicy '.spec.variables[] | select(.name == "serviceAccounts") | .expression' "$out")
+[ "$got" = '"[\"default\"]"' ] || fail "with no placement the allowed ServiceAccounts are $got, want [\"default\"]"
+got=$(vap_field ValidatingAdmissionPolicy '.spec.variables[] | select(.name == "ownSecrets") | .expression' "$out")
+[ "$got" = "\"['secrets', 'token', 'registry', 'oidc', 'workspace'].map(s, object.metadata.name + '-' + s)\"" ] \
+  || fail "the per-Pod Secrets are $got"
+
+out=$(helm template t "$chart" "${base[@]}" "${vap_api[@]}" \
+  --set-json 'scarab.admissionPolicy.validationActions=["Audit"]' \
+  --set-json 'scarab.placement={"baseline":{"spec":{"volumes":[{"name":"ca","secret":{"secretName":"ca-bundle"}}]}},"profiles":[{"name":"ecr-push","registry_auth_only":true,"k8s":{"spec":{"serviceAccountName":"ecr-pusher","initContainers":[{"name":"login","env":[{"name":"T","valueFrom":{"secretKeyRef":{"name":"login-token","key":"t"}}}]}]}}},{"name":"gpu","k8s":{"spec":{"serviceAccountName":"gpu-runner","volumes":[{"name":"p","projected":{"sources":[{"secret":{"name":"gpu-license"}}]}}]}}},{"name":"big"}]}')
+got=$(vap_field ValidatingAdmissionPolicyBinding '.spec.validationActions' "$out")
+[ "$got" = '["Audit"]' ] || fail "validationActions=[Audit] renders '$got'"
+got=$(vap_field ValidatingAdmissionPolicy '.spec.variables[] | select(.name == "serviceAccounts") | .expression' "$out")
+[ "$got" = '"[\"default\",\"ecr-pusher\",\"gpu-runner\"]"' ] \
+  || fail "the allowed ServiceAccounts are $got, want default and the profiles' ecr-pusher and gpu-runner"
+got=$(vap_field ValidatingAdmissionPolicy '.spec.variables[] | select(.name == "placementSecrets") | .expression' "$out")
+[ "$got" = '"[\"ca-bundle\",\"login-token\",\"gpu-license\"]"' ] \
+  || fail "the placement Secrets are $got, want ca-bundle, login-token and gpu-license"
+
+echo "chart_render_check: SCARAB_UI_URL, the provider secrets, the step namespace, the placement config and the step Pod admission policy render as expected"

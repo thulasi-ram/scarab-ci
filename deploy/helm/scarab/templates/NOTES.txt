@@ -4,6 +4,26 @@ scarab-server is deployed as release "{{ .Release.Name }}" in namespace "{{ .Rel
   Executor: {{ .Values.scarab.executor }}  (step Pods launch into "{{ include "scarab.execNamespace" . }}")
   Image:    {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
 
+{{- if eq .Values.scarab.executor "k8s" }}
+{{- if include "scarab.admissionPolicyRenders" . }}
+  Admission: scarab-step-pods.{{ .Release.Namespace }}.{{ include "scarab.fullname" . }} ({{ join ", " .Values.scarab.admissionPolicy.validationActions }})
+{{- if include "scarab.placementUsesHost" . }}
+
+  ⚠  scarab.placement sets a hostPath volume, hostNetwork, hostPID or
+     hostIPC, which the step Pod admission policy refuses: those step Pods
+     will fail. Remove them from the placement config, or set
+     scarab.admissionPolicy.enabled=false.
+{{- end }}
+{{- else if .Values.scarab.admissionPolicy.enabled }}
+
+  ⚠  The step Pod admission policy is NOT installed: this cluster does not
+     serve admissionregistration.k8s.io/v1 ValidatingAdmissionPolicy
+     (Kubernetes 1.30+). Only Scarab's own Pod builder keeps step Pods off
+     the server's Secrets and ServiceAccount. Set
+     scarab.admissionPolicy.force=true if the API is there but Helm cannot
+     see it (helm template without a cluster).
+{{- end }}
+{{- end }}
 {{- if not .Values.secrets.existingSecret }}
 {{- if not .Values.secrets.databaseUrl }}
 

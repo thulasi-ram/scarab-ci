@@ -292,3 +292,66 @@ true
 {{- include "scarab.fullname" . -}}
 {{- end -}}
 {{- end -}}
+
+{{/* Whether the step Pod admission policy (admission-policy.yaml, git-bug
+     07f0de3) renders: scarab.admissionPolicy.enabled, the k8s executor, and
+     either the cluster serves admissionregistration.k8s.io/v1
+     ValidatingAdmissionPolicy (Kubernetes 1.30+) or scarab.admissionPolicy.force
+     is set. `helm template` without a cluster sees the API only with
+     `--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy`
+     or `force`. */}}
+{{- define "scarab.admissionPolicyRenders" -}}
+{{- $a := .Values.scarab.admissionPolicy | default dict -}}
+{{- if and $a.enabled (eq .Values.scarab.executor "k8s") (or $a.force (.Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy")) -}}true{{- end -}}
+{{- end -}}
+
+{{/* The ServiceAccounts and Secrets the operator placement config
+     (scarab.placement: the baseline and each profile's `k8s`) puts on step
+     Pods, as JSON {"serviceAccounts": [...], "secrets": [...]}. The admission
+     policy allows them on any step Pod: it cannot tell which profile a Pod
+     was placed with. `default` is the ServiceAccount of a step Pod that names
+     none. */}}
+{{- define "scarab.admissionPolicyAllowed" -}}
+{{- $sas := list "default" -}}
+{{- $secrets := list -}}
+{{- $placement := .Values.scarab.placement | default dict -}}
+{{- $fragments := list -}}
+{{- with $placement.baseline }}{{- $fragments = append $fragments . -}}{{- end -}}
+{{- range $placement.profiles }}{{- with .k8s }}{{- $fragments = append $fragments . -}}{{- end -}}{{- end -}}
+{{- range $fragment := $fragments -}}
+{{- $spec := $fragment.spec | default dict -}}
+{{- with $spec.serviceAccountName }}{{- $sas = append $sas . -}}{{- end -}}
+{{- with $spec.serviceAccount }}{{- $sas = append $sas . -}}{{- end -}}
+{{- range $v := $spec.volumes -}}
+{{- if $v.secret }}{{- with $v.secret.secretName }}{{- $secrets = append $secrets . -}}{{- end -}}{{- end -}}
+{{- if $v.projected -}}
+{{- range $s := $v.projected.sources -}}
+{{- if $s.secret }}{{- with $s.secret.name }}{{- $secrets = append $secrets . -}}{{- end -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- range $c := concat ($spec.containers | default list) ($spec.initContainers | default list) -}}
+{{- range $e := $c.env -}}
+{{- if and $e.valueFrom $e.valueFrom.secretKeyRef }}{{- with $e.valueFrom.secretKeyRef.name }}{{- $secrets = append $secrets . -}}{{- end -}}{{- end -}}
+{{- end -}}
+{{- range $f := $c.envFrom -}}
+{{- if $f.secretRef }}{{- with $f.secretRef.name }}{{- $secrets = append $secrets . -}}{{- end -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- dict "serviceAccounts" ($sas | uniq) "secrets" ($secrets | uniq) | toJson -}}
+{{- end -}}
+
+{{/* Whether the placement config asks for what the admission policy refuses
+     (a hostPath volume, hostNetwork, hostPID, hostIPC): NOTES.txt warns. */}}
+{{- define "scarab.placementUsesHost" -}}
+{{- $placement := .Values.scarab.placement | default dict -}}
+{{- $fragments := list -}}
+{{- with $placement.baseline }}{{- $fragments = append $fragments . -}}{{- end -}}
+{{- range $placement.profiles }}{{- with .k8s }}{{- $fragments = append $fragments . -}}{{- end -}}{{- end -}}
+{{- range $fragment := $fragments -}}
+{{- $spec := $fragment.spec | default dict -}}
+{{- if or $spec.hostNetwork $spec.hostPID $spec.hostIPC }}true{{- end -}}
+{{- range $v := $spec.volumes }}{{- if $v.hostPath }}true{{- end -}}{{- end -}}
+{{- end -}}
+{{- end -}}
