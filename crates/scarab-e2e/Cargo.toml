@@ -21,6 +21,8 @@ serde_json = { workspace = true }
 # Registry seeding for the dispatch-driven scenario, against the e2e database.
 scarab-db-postgres = { workspace = true }
 scarab-forge = { workspace = true }
+# crash_resume's log cases create an Environment through the store traits.
+scarab-project = { workspace = true }
 # The in-test fake Forgejo the dispatch scenario points a connection at.
 axum = { workspace = true }
 # crash_resume signals the server from the kind node the way the fault tier
