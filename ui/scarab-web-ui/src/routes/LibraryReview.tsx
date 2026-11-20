@@ -19,6 +19,7 @@ import { createEffect, createMemo, createResource, createSignal, For, on, Show }
 import { useNavigate, useParams, useSearchParams } from "@solidjs/router";
 import { fetchLibrary, installLibrary, listConnections, listLibraries } from "../api/client";
 import {
+  askedOtherRef,
   carriedGrantBox,
   carryGrants,
   diffLines,
@@ -128,6 +129,9 @@ function Review(props: { org: string }) {
         content_hash: f.content_hash,
         replaces: f.current?.content_hash ?? null,
         carry_grants: grants,
+        // The fetch shown: refused if the version was fetched again since.
+        requested_ref: f.requested_ref ?? null,
+        resolved_commit: f.resolved_commit,
       });
       nav(libraryManageHref(props.org, done));
     } catch (e) {
@@ -229,6 +233,13 @@ function Review(props: { org: string }) {
                             from <FetchedAt v={cur()} /> to <FetchedAt v={f()} />
                           </>
                         )}
+                      </Show>
+                      <Show when={askedOtherRef(askedRef(), f())}>
+                        <p class="subtle" style={{ margin: "6px 0 0" }} data-testid="review-ref-other">
+                          You asked for <span class="mono">{askedRef()}</span>. Scarab stored this content
+                          before, from <span class="mono">{trustKey(f().source)}</span>, and installing it
+                          records that fetch's ref and commit.
+                        </p>
                       </Show>
                     </dd>
                   </>

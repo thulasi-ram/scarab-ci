@@ -766,6 +766,28 @@ test("a library's manage page names the ref it was fetched at, and Upgrade fetch
   expect(errors).toEqual([]);
 });
 
+test("a library's page says when its source and the commit it was fetched at differ", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/libraries/e4a61b8c39/manage");
+  await expect(page.locator(".lib-at").first()).toHaveText("main → 7d3e9a1");
+  await expect(page.getByTestId("manage-commits-differ")).toContainText("The source names 51c3b8e");
+  // A library fetched pinned names one commit: no such line.
+  await page.goto("/orgs/acme/settings/libraries/5c09e3a7d4/manage");
+  await expect(page.locator(".lib-at").first()).toHaveText("8c2f4e1");
+  await expect(page.getByTestId("manage-commits-differ")).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test("the review page says when the stored content answers another ref than the one asked for", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto(
+    "/orgs/acme/settings/libraries/review?source=github.com%2Facme%2Fscarab-libs%2F%2Fdeploy-helm.yaml&ref=v1.4.0&stored=elsewhere",
+  );
+  await expect(page.getByTestId("review-ref")).toContainText("to main → d41f07b");
+  await expect(page.getByTestId("review-ref-other")).toContainText("You asked for v1.4.0");
+  expect(errors).toEqual([]);
+});
+
 test("a library's yanked versions are on its manage page; the list keeps a removed library's", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/libraries");

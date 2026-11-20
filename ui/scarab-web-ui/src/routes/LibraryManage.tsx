@@ -37,6 +37,7 @@ import {
   libraryChips,
   libraryId,
   shortHash,
+  sourceCommit,
   grantLabel,
   untrustEffect,
   trustKey,
@@ -192,6 +193,12 @@ function Installation(props: {
           <dt>Ref</dt>
           <dd>
             <FetchedAt v={l()} />
+            <Show when={sourceCommit(l().source) && sourceCommit(l().source) !== l().resolved_commit}>
+              <p class="subtle" style={{ margin: "6px 0 0" }} data-testid="manage-commits-differ">
+                The source names <span class="mono">{sourceCommit(l().source).slice(0, 7)}</span>, the commit
+                this content was first fetched at. The file is the same at both commits.
+              </p>
+            </Show>
           </dd>
           <dt>Source</dt>
           <dd class="m">{l().source}</dd>
@@ -393,7 +400,7 @@ function Installation(props: {
         <InstallLibraryDialog
           org={props.org}
           upgrade
-          initial={{ source: l().source, ref: fetchedAt(l()).ref ?? undefined, name: l().name }}
+          initial={{ source: l().source, ref: fetchedAt(l()).ref ?? l().resolved_commit, name: l().name }}
           onClose={() => setUpgrading(false)}
         />
       </Show>

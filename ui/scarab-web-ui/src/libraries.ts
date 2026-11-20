@@ -520,7 +520,8 @@ export function removedLibraryYanks<Y extends YankOf>(
 
 /** What a fetch of a version asked for and what it read: the branch, tag or
  *  commit typed (`ref`, `null` when the source named the commit, or the ref
- *  was the commit itself) and the full commit, with its first 7 characters. */
+ *  was the commit or a prefix of it of 7 or more hex characters) and the
+ *  full commit, with its first 7 characters. */
 export function fetchedAt(v: { requested_ref?: string | null; resolved_commit: string }): {
   ref: string | null;
   commit: string;
@@ -528,7 +529,8 @@ export function fetchedAt(v: { requested_ref?: string | null; resolved_commit: s
 } {
   const commit = v.resolved_commit;
   const ref = v.requested_ref?.trim() || null;
-  return { ref: ref && ref !== commit ? ref : null, commit, short: commit.slice(0, 7) };
+  const namesCommit = !!ref && ref.length >= 7 && /^[0-9a-f]+$/.test(ref) && commit.startsWith(ref);
+  return { ref: ref && !namesCommit ? ref : null, commit, short: commit.slice(0, 7) };
 }
 
 /** {@link fetchedAt} as one line: `v1.2.0 → 1a2b3c4`, or `1a2b3c4` alone
@@ -536,6 +538,22 @@ export function fetchedAt(v: { requested_ref?: string | null; resolved_commit: s
 export function fetchedAtLabel(v: { requested_ref?: string | null; resolved_commit: string }): string {
   const f = fetchedAt(v);
   return f.ref ? `${f.ref} → ${f.short}` : f.short;
+}
+
+/** Whether the ref asked for in the review page's URL is not the one the
+ *  fetch answered: the same content was stored before, from another file,
+ *  and the version keeps that fetch's ref and commit. A full commit asked
+ *  for matches a fetch with no ref at that commit. */
+export function askedOtherRef(asked: string, f: { requested_ref?: string | null; resolved_commit: string }): boolean {
+  const a = asked.trim();
+  if (!a) return false;
+  return a !== (f.requested_ref ?? f.resolved_commit);
+}
+
+/** The commit a pinned source names, or `""`. */
+export function sourceCommit(source: string): string {
+  const at = source.lastIndexOf("@");
+  return at < 0 ? "" : source.slice(at + 1);
 }
 
 /** A version as a person reads it: its source with the commit cut to 7

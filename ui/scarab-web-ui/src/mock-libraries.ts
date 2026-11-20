@@ -12,6 +12,9 @@
 //   /orgs/acme/settings/libraries/review?source=…&grants=carry
 //                                                an upgrade whose source holds
 //                                                grants to confirm
+//   /orgs/acme/settings/libraries/review?source=…&ref=…&stored=elsewhere
+//                                                content stored before from
+//                                                another fetch, under `main`
 //   /acme/edge-gateway/runs/<PLUGIN>?gate=pass | exp | kill
 //   /acme/orders-api/run                         the compile errors (pick release)
 //   /acme/orders-api?status=refused              refused rows
@@ -82,7 +85,17 @@ const fullLibraries: S["OrgLibrariesDto"] = {
     installation({ id: "b72d4f1e06", name: "acme::scarab-libs::deploy-helm", content_hash: HELM, source: HELM_SRC, requested_ref: "v1.1.0" }),
     // Fetched pinned to a commit: no ref.
     installation({ id: "5c09e3a7d4", name: "acme::scarab-libs::http-probe", content_hash: PROBE, source: "github.com/acme/scarab-libs//http-probe.yaml@8c2f4e1a9d7b3c5e0f6a2b8d4c1e7f9a3b5d2c6e", installed_by: "j.lee" }),
-    installation({ id: "e4a61b8c39", name: "acme::scarab-libs::git-tag", content_hash: h("6a0d3e9f2b17"), source: "github.com/acme/scarab-libs//git-tag.yaml@51c3b8e0f2a4d6c8e0b2a4c6e8f0a2b4c6d8e0f2", requested_ref: "main", installed_at: ago(3 * day) }),
+    installation({
+      id: "e4a61b8c39",
+      name: "acme::scarab-libs::git-tag",
+      content_hash: h("6a0d3e9f2b17"),
+      source: "github.com/acme/scarab-libs//git-tag.yaml@51c3b8e0f2a4d6c8e0b2a4c6e8f0a2b4c6d8e0f2",
+      // Fetched again under `main` after it moved; the file did not change,
+      // so the source keeps the first fetch's commit.
+      requested_ref: "main",
+      resolved_commit: "7d3e9a1c5b8f2e4a6c0d9b3f5e7a1c2d4b6f8e0a",
+      installed_at: ago(3 * day),
+    }),
     installation({
       id: "91d7f05b2c",
       name: "platform::scarab-libs::kaniko-build",
@@ -461,7 +474,7 @@ export function libraryRoute(
   }
   if (/^\/v1\/orgs\/[^/]+\/libraries\/fetch$/.test(p)) {
     const req = JSON.parse(body || "{}") as { ref?: string };
-    return json(fetchedUpgrade(req.ref?.trim() || null));
+    return json(fetchedUpgrade(page().get("stored") === "elsewhere" ? "main" : req.ref?.trim() || null));
   }
   if (/^\/v1\/orgs\/[^/]+\/library-installations$/.test(p) && method === "POST") {
     // Install echoes the reviewed version as installed now. Nothing is kept.

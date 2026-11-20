@@ -3847,7 +3847,10 @@ a.lgtog { text-decoration: none; }
 .lib-src { font: var(--t-mono); color: var(--muted-sage); word-break: break-all; }
 /* A version's ref and the commit it resolved to: `v1.2.0 → 1a2b3c4`. */
 .lib-at { white-space: nowrap; }
-.lib-at .lib-ref { color: var(--sage); }
+.lib-at .lib-ref {
+  color: var(--sage); display: inline-block; max-width: 24ch; overflow: hidden;
+  text-overflow: ellipsis; vertical-align: bottom;
+}
 .lib-at .lib-arrow { color: var(--muted-sage); }
 .lib-commit {
   font: var(--t-mono); color: var(--sage); background: none; border: 0; padding: 0; cursor: copy;

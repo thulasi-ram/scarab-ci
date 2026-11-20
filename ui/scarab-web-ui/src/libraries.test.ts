@@ -11,8 +11,10 @@ import {
   strayTrust,
   trustedSourceRows,
   versionLabel,
+  askedOtherRef,
   fetchedAt,
   fetchedAtLabel,
+  sourceCommit,
   yanksOfLibrary,
   shortHash,
   refError,
@@ -210,6 +212,17 @@ describe("the list and manage pages", () => {
     expect(fetchedAtLabel({ resolved_commit: C })).toBe("0123456");
     expect(fetchedAtLabel({ requested_ref: C, resolved_commit: C })).toBe("0123456");
     expect(fetchedAt({ requested_ref: " ", resolved_commit: C }).ref).toBeNull();
+    // A short commit as the ref reads as the commit; a 6-character one does not.
+    expect(fetchedAtLabel({ requested_ref: "0123456789", resolved_commit: C })).toBe("0123456");
+    expect(fetchedAtLabel({ requested_ref: "012345", resolved_commit: C })).toBe("012345 → 0123456");
+  });
+  it("says when the fetch answered another ref than the one asked for", () => {
+    expect(askedOtherRef("v1.4.0", { requested_ref: "v1.4.0", resolved_commit: C })).toBe(false);
+    expect(askedOtherRef(C, { requested_ref: null, resolved_commit: C })).toBe(false);
+    expect(askedOtherRef("v1.4.0", { requested_ref: "main", resolved_commit: C })).toBe(true);
+    expect(askedOtherRef("", { requested_ref: "main", resolved_commit: C })).toBe(false);
+    expect(sourceCommit(`github.com/acme/libs//x.yaml@${C}`)).toBe(C);
+    expect(sourceCommit("github.com/acme/libs//x.yaml")).toBe("");
   });
   it("names a version by its source and a short commit", () => {
     expect(versionLabel(`github.com/acme/libs//x.yaml@${C}`)).toBe("github.com/acme/libs//x.yaml@0123456");
