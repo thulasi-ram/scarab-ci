@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use futures::stream::{self, BoxStream, StreamExt};
 use tokio::sync::broadcast;
 
 use scarab_engine::{AttemptId, Db, LogChunkMeta, RunId, StepId};
@@ -373,9 +374,31 @@ impl LogService {
         gunzip(&blob).map_err(|e| LogError::Gzip(e.to_string()))
     }
 
+    /// Fetch and decompress `chunks` in the order given, with up to
+    /// [`PREFETCH_CHUNKS`] fetches in flight. One fetch per chunk in a row
+    /// spends a store round trip on each: a log tailed in small chunks
+    /// downloaded at a few KB/s. At most [`PREFETCH_CHUNKS`] bodies are held
+    /// ahead of the reader.
+    pub fn read_chunks(
+        &self,
+        chunks: Vec<LogChunkMeta>,
+    ) -> BoxStream<'static, Result<Vec<u8>, LogError>> {
+        let store = self.store.clone();
+        stream::iter(chunks)
+            .map(move |c| {
+                let store = store.clone();
+                async move {
+                    let blob = store.get(&c.object_key).await?;
+                    gunzip(&blob).map_err(|e| LogError::Gzip(e.to_string()))
+                }
+            })
+            .buffered(PREFETCH_CHUNKS)
+            .boxed()
+    }
+
     /// A stream's whole log in one buffer. For tests and small reads; the
-    /// HTTP routes stream chunk by chunk ([`chunks`](Self::chunks) +
-    /// [`read_chunk`](Self::read_chunk)).
+    /// HTTP routes stream it ([`chunks`](Self::chunks) +
+    /// [`read_chunks`](Self::read_chunks)).
     pub async fn read_all(
         &self,
         run: &RunId,
@@ -383,12 +406,17 @@ impl LogService {
         attempt: &AttemptId,
     ) -> Result<Vec<u8>, LogError> {
         let mut out = Vec::new();
-        for c in self.chunks(run, step, attempt).await? {
-            out.extend(self.read_chunk(&c).await?);
+        let mut bodies = self.read_chunks(self.chunks(run, step, attempt).await?);
+        while let Some(body) = bodies.next().await {
+            out.extend(body?);
         }
         Ok(out)
     }
 }
+
+/// Chunk bodies a reader of a stored log fetches ahead of what it has used
+/// ([`LogService::read_chunks`]).
+pub const PREFETCH_CHUNKS: usize = 16;
 
 fn gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut e = GzEncoder::new(Vec::new(), Compression::default());

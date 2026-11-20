@@ -124,6 +124,7 @@ pub mod schedules;
 pub mod test_support;
 pub use routes::{route_table, RouteEntry};
 pub mod secret_executor;
+pub mod step_path;
 pub mod step_pods;
 pub mod step_up;
 /// `--role workspace`: the ADR-0061 workspace service. Its own router, its own
@@ -1360,6 +1361,8 @@ pub struct RunSummaryDto {
 pub struct WaitingGateDto {
     /// The gate step's id.
     pub step: String,
+    /// The gate step's key: how a step route's `{step}` names it.
+    pub key: String,
     /// The gate kind: `manual` / `timer` / `external`.
     pub kind: String,
     /// When its wait opened (epoch millis): its open Attempt's start.
@@ -1397,6 +1400,7 @@ async fn run_summaries(
                 .filter_map(|s| {
                     Some(WaitingGateDto {
                         step: s.step.0.clone(),
+                        key: s.key.clone().unwrap_or_else(|| s.step.0.clone()),
                         kind: s.gate_kind.clone()?,
                         since: s.attempts.last()?.started_at.0,
                     })
@@ -1528,6 +1532,12 @@ pub struct SilenceCellRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct StepStatusDto {
     pub id: String,
+    /// The step's key: 12 random characters of lowercase base32, unique
+    /// within the run and fixed for its life. A step route's `{step}`
+    /// (`/v1/runs/{id}/steps/{step}/…`) names the step by this key, which
+    /// needs no percent-encoding, where an authored id such as `amd64/image`
+    /// needs a `%2F` that a proxy may rewrite.
+    pub key: String,
     pub status: String,
     pub attempts: usize,
     /// Per-attempt detail — the rerun/retry history in append order.
@@ -2895,6 +2905,7 @@ async fn get_run(
             .map(|a| attempt_dto(a, attempt_ends.finished_at(&s.step.0, a)))
             .collect();
         step_dtos.push(StepStatusDto {
+            key: s.key.unwrap_or_else(|| s.step.0.clone()),
             id: s.step.0,
             status: step_status_name(s.status).to_string(),
             attempts: s.attempts.len(),
@@ -3007,8 +3018,9 @@ struct StepLogsQuery {
     /// Absent = the `Last-Event-ID` header, else no cursor.
     #[serde(default)]
     from: Option<String>,
-    /// Without a cursor, replay at most this many bytes from the end (whole
-    /// chunks; clamped to 1 B..64 MiB). Absent = everything.
+    /// Without a cursor, replay from the stored chunk that holds the byte
+    /// this many bytes before the end: at least this many bytes, or the whole
+    /// log (clamped to 1 B..64 MiB). Absent = everything.
     #[serde(default)]
     tail: Option<u64>,
 }
@@ -3027,11 +3039,11 @@ struct StepLogsQuery {
     path = "/v1/runs/{id}/steps/{step}/logs",
     params(
         ("id" = String, Path, description = "run id"),
-        ("step" = String, Path, description = "step id"),
+        ("step" = String, Path, description = "a step key (preferred) or the authored step id, percent-encoded"),
         ("attempt" = Option<String>, Query, description = "restrict to one attempt id (default = all)"),
         ("sidecar" = Option<usize>, Query, description = "restrict to a sidecar service by its index in the step's services (default = the step's main container)"),
         ("from" = Option<String>, Query, description = "resume after this cursor (`<attempt_id>:<next_seq>`, an event id); default = the Last-Event-ID header"),
-        ("tail" = Option<u64>, Query, description = "without a cursor, replay at most this many bytes from the end, in whole chunks (clamped to 1..67108864)")
+        ("tail" = Option<u64>, Query, description = "without a cursor, replay from the stored chunk that holds the byte this many bytes before the end: at least this many bytes, or the whole log (clamped to 1..67108864)")
     ),
     responses(
         (status = 200, description = "SSE stream of this step's log output"),
@@ -3042,7 +3054,7 @@ struct StepLogsQuery {
 async fn get_step_logs(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Path((id, step)): Path<(String, String)>,
+    crate::step_path::RunStep { run: id, step }: crate::step_path::RunStep,
     Query(q): Query<StepLogsQuery>,
 ) -> Result<Sse<BoxStream<'static, Result<Event, Infallible>>>, ApiError> {
     let run = RunId(id);
@@ -3142,8 +3154,10 @@ fn raw_service_log_filename(run: &RunId, service: &str, take: i64) -> String {
     )
 }
 
-/// One stored log stream as a plain-text attachment, streamed chunk by chunk
-/// from the object store. Shared by the step and the service raw routes.
+/// One stored log stream as a plain-text attachment, streamed in chunk order
+/// from the object store with the next chunks fetched ahead
+/// ([`LogService::read_chunks`]). Shared by the step and the service raw
+/// routes.
 async fn raw_log_response(
     st: &AppState,
     run: &RunId,
@@ -3151,22 +3165,14 @@ async fn raw_log_response(
     attempt: &scarab_engine::AttemptId,
     filename: &str,
 ) -> Result<Response, ApiError> {
-    let mut index = st.logs.chunks(run, read_step, attempt).await?.into_iter();
+    let index = st.logs.chunks(run, read_step, attempt).await?;
+    let mut bodies = st.logs.read_chunks(index);
     // The first chunk is read before the response starts, so a missing body
     // is a 500 rather than a short download; a later one aborts the body.
-    let first = match index.next() {
-        Some(c) => Some(st.logs.read_chunk(&c).await?),
-        None => None,
-    };
-    let logs = st.logs.clone();
-    let rest = stream::unfold((logs, index), |(logs, mut index)| async move {
-        let c = index.next()?;
-        let item = logs
-            .read_chunk(&c)
-            .await
-            .map(Bytes::from)
-            .map_err(|e| std::io::Error::other(e.to_string()));
-        Some((item, (logs, index)))
+    let first = bodies.next().await.transpose()?;
+    let rest = bodies.map(|item| {
+        item.map(Bytes::from)
+            .map_err(|e| std::io::Error::other(e.to_string()))
     });
     let body = stream::iter(first.map(|b| Ok::<_, std::io::Error>(Bytes::from(b)))).chain(rest);
     Response::builder()
@@ -3194,7 +3200,7 @@ async fn raw_log_response(
     path = "/v1/runs/{id}/steps/{step}/logs/raw",
     params(
         ("id" = String, Path, description = "run id"),
-        ("step" = String, Path, description = "step id"),
+        ("step" = String, Path, description = "a step key (preferred) or the authored step id, percent-encoded"),
         ("attempt" = String, Query, description = "the attempt id (required)"),
         ("sidecar" = Option<usize>, Query, description = "a sidecar service by its index in the step's services (default = the step's main container)")
     ),
@@ -3207,7 +3213,7 @@ async fn raw_log_response(
 async fn get_step_logs_raw(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Path((id, step)): Path<(String, String)>,
+    crate::step_path::RunStep { run: id, step }: crate::step_path::RunStep,
     Query(q): Query<RawLogsQuery>,
 ) -> Result<Response, ApiError> {
     let run = RunId(id);
@@ -3281,7 +3287,8 @@ struct ServiceLogsQuery {
     /// Absent = the `Last-Event-ID` header, else no cursor.
     #[serde(default)]
     from: Option<String>,
-    /// Without a cursor, replay at most this many bytes from the end.
+    /// Without a cursor, replay from the stored chunk that holds the byte
+    /// this many bytes before the end.
     #[serde(default)]
     tail: Option<u64>,
 }
@@ -3299,7 +3306,7 @@ struct ServiceLogsQuery {
         ("service" = String, Path, description = "declared service name"),
         ("take" = Option<i64>, Query, description = "restrict to one Take generation (default = current)"),
         ("from" = Option<String>, Query, description = "resume after this cursor (an event id); default = the Last-Event-ID header"),
-        ("tail" = Option<u64>, Query, description = "without a cursor, replay at most this many bytes from the end, in whole chunks (clamped to 1..67108864)")
+        ("tail" = Option<u64>, Query, description = "without a cursor, replay from the stored chunk that holds the byte this many bytes before the end: at least this many bytes, or the whole log (clamped to 1..67108864)")
     ),
     responses(
         (status = 200, description = "SSE stream of this service's log output"),
@@ -3432,7 +3439,7 @@ fn rerun_outcome<T>(res: Result<T, RerunError>) -> Result<T, ApiError> {
     path = "/v1/runs/{id}/steps/{step}/rerun",
     params(
         ("id" = String, Path, description = "run id"),
-        ("step" = String, Path, description = "step id")
+        ("step" = String, Path, description = "a step key (preferred) or the authored step id, percent-encoded")
     ),
     responses(
         (status = 202, description = "rerun accepted — the body is the EXECUTED plan", body = RerunPlanResponse),
@@ -3443,7 +3450,7 @@ fn rerun_outcome<T>(res: Result<T, RerunError>) -> Result<T, ApiError> {
 async fn rerun_step(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Path((id, step)): Path<(String, String)>,
+    crate::step_path::RunStep { run: id, step }: crate::step_path::RunStep,
 ) -> Result<(StatusCode, Json<RerunPlanResponse>), ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
@@ -3496,7 +3503,7 @@ fn snapshot_oracle(st: &AppState) -> Option<Box<dyn scarab_engine::WorkspaceSnap
     path = "/v1/runs/{id}/steps/{step}/retry",
     params(
         ("id" = String, Path, description = "run id"),
-        ("step" = String, Path, description = "step id")
+        ("step" = String, Path, description = "a step key (preferred) or the authored step id, percent-encoded")
     ),
     responses(
         (status = 202, description = "retry accepted — the body is the EXECUTED plan", body = RerunPlanResponse),
@@ -3507,7 +3514,7 @@ fn snapshot_oracle(st: &AppState) -> Option<Box<dyn scarab_engine::WorkspaceSnap
 async fn retry_step(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Path((id, step)): Path<(String, String)>,
+    crate::step_path::RunStep { run: id, step }: crate::step_path::RunStep,
 ) -> Result<(StatusCode, Json<RerunPlanResponse>), ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
@@ -3646,7 +3653,7 @@ pub struct ExpiredInputDto {
     path = "/v1/runs/{id}/steps/{step}/rerun-plan",
     params(
         ("id" = String, Path, description = "run id"),
-        ("step" = String, Path, description = "step id")
+        ("step" = String, Path, description = "a step key (preferred) or the authored step id, percent-encoded")
     ),
     responses(
         (status = 200, body = RerunPlanResponse),
@@ -3656,7 +3663,7 @@ pub struct ExpiredInputDto {
 async fn rerun_plan(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Path((id, step)): Path<(String, String)>,
+    crate::step_path::RunStep { run: id, step }: crate::step_path::RunStep,
 ) -> Result<Json<RerunPlanResponse>, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
@@ -4290,15 +4297,15 @@ pub struct AttemptQuery {
     path = "/v1/runs/{id}/steps/{step}/results",
     params(
         ("id" = String, Path, description = "run id"),
-        ("step" = String, Path, description = "step id"),
+        ("step" = String, Path, description = "a step key (preferred) or the authored step id, percent-encoded"),
         AttemptQuery
     ),
-    responses((status = 200, body = [StepResultDto]), (status = 404, description = "no such run"))
+    responses((status = 200, body = [StepResultDto]), (status = 404, description = "no such run or step"))
 )]
 async fn get_step_results(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Path((id, step)): Path<(String, String)>,
+    crate::step_path::RunStep { run: id, step }: crate::step_path::RunStep,
     Query(q): Query<AttemptQuery>,
 ) -> Result<Json<Vec<StepResultDto>>, ApiError> {
     let run = RunId(id);
@@ -4308,6 +4315,11 @@ async fn get_step_results(
         return Err(ApiError::NotFound);
     }
     let step = StepId(step);
+    // A `{step}` that names no step of the run (an unknown key, another
+    // run's key, an unknown id) is a 404, not an empty list.
+    if st.db.step_key(&run, &step).await?.is_none() {
+        return Err(ApiError::NotFound);
+    }
     // `?attempt=` scopes to one attempt's immutable evidence (ADR-0056) — how
     // a Take view reads a superseded attempt; bare reads the latest evidence.
     let results = match q.attempt {
@@ -4347,7 +4359,7 @@ pub struct ConsumedDto {
     path = "/v1/runs/{id}/steps/{step}/consumed",
     params(
         ("id" = String, Path, description = "run id"),
-        ("step" = String, Path, description = "step id"),
+        ("step" = String, Path, description = "a step key (preferred) or the authored step id, percent-encoded"),
         AttemptQuery
     ),
     responses((status = 200, body = ConsumedDto), (status = 404, description = "no such run or no attempt"))
@@ -4355,7 +4367,7 @@ pub struct ConsumedDto {
 async fn get_attempt_consumed(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Path((id, step)): Path<(String, String)>,
+    crate::step_path::RunStep { run: id, step }: crate::step_path::RunStep,
     Query(q): Query<AttemptQuery>,
 ) -> Result<Json<ConsumedDto>, ApiError> {
     let run = RunId(id);
@@ -4496,7 +4508,7 @@ async fn step_snapshot_root(
     path = "/v1/runs/{id}/steps/{step}/workspace",
     params(
         ("id" = String, Path, description = "run id"),
-        ("step" = String, Path, description = "step id"),
+        ("step" = String, Path, description = "a step key (preferred) or the authored step id, percent-encoded"),
         ("path" = Option<String>, Query, description = "sub-path within the snapshot (default = root)"),
         ("attempt" = Option<String>, Query, description = "attempt id — that attempt's immutable snapshot instead of the latest")
     ),
@@ -4505,7 +4517,7 @@ async fn step_snapshot_root(
 async fn list_workspace(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Path((id, step)): Path<(String, String)>,
+    crate::step_path::RunStep { run: id, step }: crate::step_path::RunStep,
     Query(q): Query<WorkspacePathQuery>,
 ) -> Result<Json<WorkspaceListing>, ApiError> {
     use scarab_storage::TreeTarget;
@@ -4580,7 +4592,7 @@ async fn list_workspace(
     path = "/v1/runs/{id}/steps/{step}/workspace/file",
     params(
         ("id" = String, Path, description = "run id"),
-        ("step" = String, Path, description = "step id"),
+        ("step" = String, Path, description = "a step key (preferred) or the authored step id, percent-encoded"),
         ("path" = String, Query, description = "file path within the snapshot"),
         ("attempt" = Option<String>, Query, description = "attempt id — that attempt's immutable snapshot instead of the latest")
     ),
@@ -4594,7 +4606,7 @@ async fn list_workspace(
 async fn get_workspace_file(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Path((id, step)): Path<(String, String)>,
+    crate::step_path::RunStep { run: id, step }: crate::step_path::RunStep,
     Query(q): Query<WorkspacePathQuery>,
 ) -> Result<Response, ApiError> {
     use scarab_storage::TreeTarget;
@@ -4651,7 +4663,7 @@ async fn get_workspace_file(
     path = "/v1/runs/{id}/steps/{step}/attach",
     params(
         ("id" = String, Path, description = "run id"),
-        ("step" = String, Path, description = "step id")
+        ("step" = String, Path, description = "a step key (preferred) or the authored step id, percent-encoded")
     ),
     responses(
         (status = 101, description = "WebSocket upgrade — interactive TTY into the running step's Pod"),
@@ -4663,7 +4675,7 @@ async fn attach_step(
     ws: WebSocketUpgrade,
     State(st): State<AppState>,
     headers: HeaderMap,
-    Path((id, step)): Path<(String, String)>,
+    crate::step_path::RunStep { run: id, step }: crate::step_path::RunStep,
 ) -> Result<Response, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
@@ -4742,7 +4754,7 @@ async fn bridge_attach(socket: WebSocket, io: scarab_executor_k8s::AttachIo) {
     path = "/v1/runs/{id}/steps/{step}/debug-pod",
     params(
         ("id" = String, Path, description = "run id"),
-        ("step" = String, Path, description = "step id")
+        ("step" = String, Path, description = "a step key (preferred) or the authored step id, percent-encoded")
     ),
     responses(
         (status = 101, description = "WebSocket upgrade — interactive TTY into a fresh reproduction Pod"),
@@ -4754,7 +4766,7 @@ async fn debug_pod_step(
     ws: WebSocketUpgrade,
     State(st): State<AppState>,
     headers: HeaderMap,
-    Path((id, step)): Path<(String, String)>,
+    crate::step_path::RunStep { run: id, step }: crate::step_path::RunStep,
 ) -> Result<Response, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
@@ -7808,7 +7820,7 @@ async fn write_run_from_ir(
 /// commit whose deploy pipeline an Environment refused.
 ///
 /// `public_url` is Scarab's public base URL: every status carries the
-/// **required** deep-link back to its run (`{public_url}/runs/{id}`,
+/// **required** deep-link back to its run (`{public_url}/<org>/<repo>/runs/{id}`,
 /// ADR-0046) — a status without a way back to its run is a dead end. A
 /// refusal has no Run; its link opens the org's Environment settings.
 pub async fn drain_forge_statuses(
@@ -7923,7 +7935,7 @@ async fn run_status_post(
     let status = scarab_forge::Status {
         context: status_context(db.run_pipeline(&msg.run).await?.as_deref()),
         state: run_status_to_forge(to),
-        target_url: format!("{}/runs/{}", public_url.trim_end_matches('/'), msg.run.0),
+        target_url: run_page_url(public_url, &repo, &msg.run),
         description: None,
     };
     let commit = scarab_forge::Commit {
@@ -7931,6 +7943,21 @@ async fn run_status_post(
         message: String::new(),
     };
     Ok(Some((repo, commit, status)))
+}
+
+/// The web UI's page for `run` of `repo`: `/<org>/<repo>/runs/<id>`. The UI
+/// has no `/runs/<id>` route: that path matched its `/:org/:repo` route and
+/// opened an empty repository view for an org named `runs`. A Run triggered
+/// from a forge belongs to the Scarab org named for the repository's owner,
+/// so the owner and name are the page's org and repo.
+fn run_page_url(public_url: &str, repo: &scarab_forge::RepoRef, run: &RunId) -> String {
+    format!(
+        "{}/{}/{}/runs/{}",
+        public_url.trim_end_matches('/'),
+        scarab_pipeline::url_path_segment(&repo.owner),
+        scarab_pipeline::url_path_segment(&repo.name),
+        scarab_pipeline::url_path_segment(&run.0)
+    )
 }
 
 /// The `failure` status a [`REFUSAL_STATUS`] message posts
@@ -11075,7 +11102,7 @@ pub struct GateApprovalDto {
     path = "/v1/runs/{id}/gates/{step}/approve",
     params(
         ("id" = String, Path, description = "run id"),
-        ("step" = String, Path, description = "gate step id")
+        ("step" = String, Path, description = "the gate step's key (preferred) or its authored step id, percent-encoded")
     ),
     responses(
         (status = 202, body = GateApprovalDto, description = "approval recorded: the gate released, or it waits for more approvals or for its wait timer"),
@@ -11088,7 +11115,7 @@ async fn approve_gate(
     State(st): State<AppState>,
     Extension(guard): Extension<crate::step_up::GuardCtx>,
     headers: HeaderMap,
-    Path((id, step)): Path<(String, String)>,
+    crate::step_path::RunStep { run: id, step }: crate::step_path::RunStep,
 ) -> Result<Response, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
@@ -11499,7 +11526,7 @@ fn gate_reject_reason(reason: &str) -> Result<&str, ApiError> {
     path = "/v1/runs/{id}/gates/{step}/reject",
     params(
         ("id" = String, Path, description = "run id"),
-        ("step" = String, Path, description = "gate step id")
+        ("step" = String, Path, description = "the gate step's key (preferred) or its authored step id, percent-encoded")
     ),
     request_body = RejectGateRequest,
     responses(
@@ -11512,7 +11539,7 @@ fn gate_reject_reason(reason: &str) -> Result<&str, ApiError> {
 async fn reject_gate(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Path((id, step)): Path<(String, String)>,
+    crate::step_path::RunStep { run: id, step }: crate::step_path::RunStep,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let run = RunId(id);
@@ -11635,7 +11662,7 @@ impl Default for ExternalGateVerdict {
     path = "/v1/runs/{id}/gates/{step}/release",
     params(
         ("id" = String, Path, description = "run id"),
-        ("step" = String, Path, description = "gate step id")
+        ("step" = String, Path, description = "the gate step's key (preferred) or its authored step id, percent-encoded")
     ),
     request_body(content = Option<ExternalGateVerdict>, description = "external gate (`x-scarab-gate-token`): optional, `{\"passed\": false, \"reason\": \"…\"}` fails the gate instead of releasing it. Plugin gate (a plugin's `scarab-api` bearer token): a `PluginGateRelease`, `{\"attempt\", \"passed\": true, \"outputs\": {…}}` or `{\"attempt\", \"passed\": false, \"reason\": \"…\"}`"),
     responses(
@@ -11649,7 +11676,7 @@ impl Default for ExternalGateVerdict {
 async fn release_gate_external(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Path((id, step)): Path<(String, String)>,
+    crate::step_path::RunStep { run: id, step }: crate::step_path::RunStep,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     // A plugin answering one of its own gates (ADR-0076 §7) presents its
@@ -11777,7 +11804,7 @@ pub fn results_token_message(run: &str, step: &str, attempt: &str) -> String {
     path = "/v1/runs/{id}/steps/{step}/results",
     params(
         ("id" = String, Path, description = "run id"),
-        ("step" = String, Path, description = "step id")
+        ("step" = String, Path, description = "a step key (preferred) or the authored step id, percent-encoded")
     ),
     responses(
         (status = 202, description = "results recorded"),
@@ -11789,7 +11816,7 @@ pub fn results_token_message(run: &str, step: &str, attempt: &str) -> String {
 async fn ingest_step_results(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Path((id, step)): Path<(String, String)>,
+    crate::step_path::RunStep { run: id, step }: crate::step_path::RunStep,
     Json(results): Json<std::collections::BTreeMap<String, serde_json::Value>>,
 ) -> Result<StatusCode, ApiError> {
     // A Step's results are its own output: a NUL in one is replaced, not
@@ -15286,9 +15313,11 @@ fn router_inner(state: AppState) -> Router {
             state.clone(),
             step_up::guard::guard,
         ))
-        // The embedded web UI (ADR-0054): everything no API route claimed
+        // The embedded web UI (ADR-0054): a GET or HEAD no API route claimed
         // falls through here — a real file from dist/, else index.html (SPA
-        // client routing). Same-origin by construction: no CORS anywhere.
+        // client routing). Under `/v1`, `/webhooks` and `/.well-known`, and
+        // for any other method, it answers a JSON 404 instead ([`serve_ui`]).
+        // Same-origin by construction: no CORS anywhere.
         .fallback(serve_ui)
         // Request-id correlation on every route (ADR-0053).
         .layer(axum::middleware::from_fn(request_id_middleware))
@@ -15298,13 +15327,25 @@ fn router_inner(state: AppState) -> Router {
 /// Serve the SPA (ADR-0054): a request for a real file under the dist dir
 /// gets it; anything else (a client-side route like `/acme/web/runs/…`) gets
 /// index.html. Path traversal is rejected by segment sanitization. With no
-/// UI dir configured (dev API-only), non-API paths are plain 404s.
+/// UI dir configured (dev API-only), non-API paths are plain 404s. A path
+/// under an API prefix, or a method other than GET or HEAD, is a JSON 404
+/// ([`no_api_route`]) whether or not a UI is configured.
 ///
 /// Every answer forbids framing (`frame-ancestors 'none'`, `X-Frame-Options:
 /// DENY`): the step-up confirm page is a human's last look at what a token
 /// asked to run, and a framed one could be click-jacked (ADR-0073 §6).
-async fn serve_ui(State(st): State<AppState>, uri: axum::http::Uri) -> Response {
-    let mut resp = serve_ui_file(&st, &uri).await;
+async fn serve_ui(
+    State(st): State<AppState>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+) -> Response {
+    let mut resp = if is_api_path(uri.path())
+        || !matches!(method, axum::http::Method::GET | axum::http::Method::HEAD)
+    {
+        no_api_route(&method, &uri)
+    } else {
+        serve_ui_file(&st, &uri).await
+    };
     let headers = resp.headers_mut();
     headers.insert(
         axum::http::header::CONTENT_SECURITY_POLICY,
@@ -15315,6 +15356,36 @@ async fn serve_ui(State(st): State<AppState>, uri: axum::http::Uri) -> Response 
         axum::http::HeaderValue::from_static("DENY"),
     );
     resp
+}
+
+/// Is `path` under a prefix only the API answers (`/v1`, `/webhooks`,
+/// `/.well-known`)? No web UI route lives there, so the fallback must not
+/// answer it with index.html.
+fn is_api_path(path: &str) -> bool {
+    ["/v1", "/webhooks", "/.well-known"]
+        .iter()
+        .any(|p| path == *p || path.starts_with(&format!("{p}/")))
+}
+
+/// The answer for a request no route matched under an API prefix, or with
+/// a method other than GET or HEAD: a JSON 404, never the web UI. The web
+/// UI's 200 used to answer these, so a client that sent a Step id with a
+/// raw `/` in its URL (`/v1/runs/r/steps/amd64/image/results`) was told it
+/// succeeded: the results sidecar logged "results posted" and nothing was
+/// stored.
+fn no_api_route(method: &axum::http::Method, uri: &axum::http::Uri) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "code": "not_found",
+            "message": format!(
+                "no API route for {method} {}: name a step by its key, and \
+                 percent-encode (`%2F`) a path segment that holds `/`",
+                uri.path()
+            ),
+        })),
+    )
+        .into_response()
 }
 
 async fn serve_ui_file(st: &AppState, uri: &axum::http::Uri) -> Response {

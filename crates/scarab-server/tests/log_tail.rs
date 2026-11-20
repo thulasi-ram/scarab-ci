@@ -109,6 +109,7 @@ async fn pump_skips_empty_chunks() {
 
 fn running_step() -> StepRun {
     StepRun {
+        key: None,
         run: RunId("r".into()),
         step: StepId("build".into()),
         status: StepStatus::Running,
@@ -1291,6 +1292,89 @@ async fn pump_redacts_a_secret_split_across_chunks() {
         logs.read_all(&run, &step, &attempt).await.unwrap(),
         b"***\n"
     );
+}
+
+/// The tail stores what it reads in chunks of up to `TAIL_CHUNK_BYTES`, not
+/// one chunk per read: a source read in small pieces, with a secret split
+/// across pieces many times, is stored as the same redacted bytes in a few
+/// chunks.
+#[tokio::test]
+async fn small_reads_are_stored_in_few_chunks_with_the_same_bytes() {
+    use scarab_server::log_tail::TAIL_CHUNK_BYTES;
+    let logs = logs();
+    let (run, step, attempt) = stream();
+    logs.register_secret(&fence(), b"token-value");
+    let mut source = Vec::new();
+    let mut want = Vec::new();
+    for i in 0..4000 {
+        let line = format!("line {i:05} token-value {}\n", "x".repeat(i % 50));
+        source.extend_from_slice(line.as_bytes());
+        want.extend_from_slice(line.replace("token-value", "***").as_bytes());
+    }
+    // Pieces of 7 bytes: most secrets are cut across two of them.
+    let pieces: VecDeque<Vec<u8>> = source.chunks(7).map(<[u8]>::to_vec).collect();
+    let n = pump_log_stream(Box::new(MockChunks(pieces)), &logs, &run, &step, &attempt)
+        .await
+        .expect("pump");
+
+    assert_eq!(n, want.len() as u64);
+    assert_eq!(logs.read_all(&run, &step, &attempt).await.unwrap(), want);
+    let chunks = logs.chunks(&run, &step, &attempt).await.unwrap();
+    assert_eq!(
+        chunks.len(),
+        want.len().div_ceil(TAIL_CHUNK_BYTES),
+        "{} bytes in {} chunks",
+        want.len(),
+        chunks.len()
+    );
+    assert!(chunks.iter().all(|c| c.len < (TAIL_CHUNK_BYTES + 7) as u64));
+}
+
+/// A step that prints a line and then nothing more has the line stored
+/// while its read stays open: what a read gathered is stored after
+/// `TAIL_FLUSH_INTERVAL`, not only at `TAIL_CHUNK_BYTES` or the end.
+#[tokio::test]
+async fn a_quiet_step_has_its_output_stored_while_the_read_is_open() {
+    let exec = LiveLog::new(b"one\n", true, vec![]);
+    let logs = logs();
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    tailer.ensure(&running_step());
+    wait_stored(&logs, b"one\n").await;
+    exec.print(b"two\n");
+    wait_stored(&logs, b"one\ntwo\n").await;
+    assert_eq!(exec.opens(), 1, "one read, still open");
+    let (run, s, at) = stream();
+    assert_eq!(logs.chunks(&run, &s, &at).await.unwrap().len(), 2);
+    exec.stop();
+}
+
+/// A read that breaks stores what it gathered before the break, and the
+/// next read appends only what follows (git-bug de2bd9b), with a secret
+/// that the break cut still redacted whole.
+#[tokio::test]
+async fn a_broken_read_stores_what_it_gathered() {
+    let logs = logs();
+    logs.register_secret(&fence(), b"token-value");
+    let exec = LiveLog::new(
+        b"one\ntwo tok",
+        true,
+        vec![Read {
+            chunk: 4,
+            fail_after: Some(3),
+        }],
+    );
+    let tailer =
+        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
+    let step = running_step();
+    tailer.ensure(&step);
+    // The break comes before the read's flush interval: "one\ntwo " is
+    // stored at the break, "tok" is held back as the start of the secret.
+    wait_stored(&logs, b"one\ntwo ").await;
+    exec.print(b"en-value three\n");
+    ensure_until(&tailer, &step, || exec.opens() >= 2).await;
+    wait_stored(&logs, b"one\ntwo *** three\n").await;
+    exec.stop();
 }
 
 /// A read breaks just after the start of a secret: the start is held back,

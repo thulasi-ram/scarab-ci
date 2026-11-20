@@ -247,7 +247,7 @@ impl Db for PostgresDb {
                  FOR UPDATE SKIP LOCKED
                  LIMIT $1
              )
-             RETURNING run_id, step_id, status, needs, gate_kind",
+             RETURNING run_id, step_id, status, needs, gate_kind, step_key",
         )
         .bind(limit as i64)
         .fetch_all(&mut *tx)
@@ -261,6 +261,7 @@ impl Db for PostgresDb {
             let status = step_status_from_str(r.get::<String, _>("status"))?;
             let needs = needs_from_value(r.get::<Value, _>("needs"))?;
             let gate_kind = r.get::<Option<String>, _>("gate_kind");
+            let key = r.get::<String, _>("step_key");
             let attempts = attempts_on(&mut *tx, &run, &step).await?;
             let step_run = StepRun {
                 run,
@@ -269,6 +270,7 @@ impl Db for PostgresDb {
                 attempts,
                 needs,
                 gate_kind,
+                key: Some(key),
             };
             let launch = mint(&step_run)?;
             insert_attempt(&mut tx, &step_run.run, &step_run.step, &launch.attempt).await?;
@@ -367,20 +369,53 @@ impl Db for PostgresDb {
             .map(|s| serde_json::to_value(s).map_err(|e| DbError::Other(e.to_string())))
             .transpose()?;
         let needs_json = needs_to_value(needs);
-        sqlx::query(
-            "INSERT INTO step_runs (run_id, step_id, status, spec, needs, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $6)",
-        )
-        .bind(&run.0)
-        .bind(&step.0)
-        .bind(step_status_str(StepStatus::Pending))
-        .bind(spec_json)
-        .bind(needs_json)
-        .bind(at.0)
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(())
+        // The column's DEFAULT (`scarab_step_key()`, migration 0098) mints
+        // the step's key. Two steps of one run drawing the same 60 bits fails
+        // the unique index; the insert then runs again with a fresh draw.
+        let mut tries = 0;
+        loop {
+            let inserted = sqlx::query(
+                "INSERT INTO step_runs (run_id, step_id, status, spec, needs, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $6)",
+            )
+            .bind(&run.0)
+            .bind(&step.0)
+            .bind(step_status_str(StepStatus::Pending))
+            .bind(&spec_json)
+            .bind(&needs_json)
+            .bind(at.0)
+            .execute(self.pool())
+            .await;
+            match inserted {
+                Ok(_) => return Ok(()),
+                Err(sqlx::Error::Database(d))
+                    if tries < STEP_KEY_TRIES && d.constraint() == Some(STEP_KEY_INDEX) =>
+                {
+                    tries += 1;
+                }
+                Err(e) => return Err(db_err(e)),
+            }
+        }
+    }
+
+    async fn step_key(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError> {
+        let row = sqlx::query("SELECT step_key FROM step_runs WHERE run_id = $1 AND step_id = $2")
+            .bind(&run.0)
+            .bind(&step.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(row.map(|r| r.get::<String, _>("step_key")))
+    }
+
+    async fn step_by_key(&self, run: &RunId, key: &str) -> Result<Option<StepId>, DbError> {
+        let row = sqlx::query("SELECT step_id FROM step_runs WHERE run_id = $1 AND step_key = $2")
+            .bind(&run.0)
+            .bind(key)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(row.map(|r| StepId(r.get::<String, _>("step_id"))))
     }
 
     async fn store_run_ir(&self, run: &RunId, ir: &serde_json::Value) -> Result<(), DbError> {
@@ -1943,7 +1978,8 @@ impl Db for PostgresDb {
 
     async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError> {
         let rows = sqlx::query(
-            "SELECT step_id, status, needs, gate_kind FROM step_runs WHERE run_id = $1 ORDER BY step_id",
+            "SELECT step_id, status, needs, gate_kind, step_key FROM step_runs
+             WHERE run_id = $1 ORDER BY step_id",
         )
         .bind(&run.0)
         .fetch_all(self.pool())
@@ -1955,6 +1991,7 @@ impl Db for PostgresDb {
             let status = step_status_from_str(r.get::<String, _>("status"))?;
             let needs = needs_from_value(r.get::<Value, _>("needs"))?;
             let gate_kind = r.get::<Option<String>, _>("gate_kind");
+            let key = r.get::<String, _>("step_key");
             let attempts = self.attempts(run, &step).await?;
             steps.push(StepRun {
                 run: run.clone(),
@@ -1963,6 +2000,7 @@ impl Db for PostgresDb {
                 attempts,
                 needs,
                 gate_kind,
+                key: Some(key),
             });
         }
         Ok(steps)
@@ -1981,7 +2019,7 @@ impl Db for PostgresDb {
         // Two queries for the whole page, in `steps_of_run`'s orders: steps by
         // id, each step's attempts by their `a{n}` number.
         let rows = sqlx::query(
-            "SELECT run_id, step_id, status, needs, gate_kind FROM step_runs
+            "SELECT run_id, step_id, status, needs, gate_kind, step_key FROM step_runs
              WHERE run_id = ANY($1) ORDER BY run_id, step_id",
         )
         .bind(&ids)
@@ -2012,6 +2050,7 @@ impl Db for PostgresDb {
             let status = step_status_from_str(r.get::<String, _>("status"))?;
             let needs = needs_from_value(r.get::<Value, _>("needs"))?;
             let gate_kind = r.get::<Option<String>, _>("gate_kind");
+            let key = r.get::<String, _>("step_key");
             let step_attempts = attempts
                 .remove(&(run.clone(), step.clone()))
                 .unwrap_or_default();
@@ -2022,6 +2061,7 @@ impl Db for PostgresDb {
                 attempts: step_attempts,
                 needs,
                 gate_kind,
+                key: Some(key),
             });
         }
         Ok(out)
@@ -3105,6 +3145,25 @@ impl Db for PostgresDb {
         .await
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)
+    }
+
+    async fn live_leases(&self, resources: &[String]) -> Result<Vec<String>, DbError> {
+        if resources.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT resource FROM leases
+             WHERE resource = ANY($1)
+               AND expires_at >= (extract(epoch from now()) * 1000)::bigint",
+        )
+        .bind(resources)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("resource"))
+            .collect())
     }
 
     async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
@@ -4265,6 +4324,11 @@ fn db_err(e: sqlx::Error) -> DbError {
         other => DbError::Other(other.to_string()),
     }
 }
+
+/// The unique index on a step's key within its run (migration 0098).
+const STEP_KEY_INDEX: &str = "step_runs_run_id_step_key";
+/// How many times [`Db::create_step_run`] draws a new key after a collision.
+const STEP_KEY_TRIES: u32 = 4;
 
 /// SQLSTATE `lock_not_available`: a lock wait passed `lock_timeout`.
 const LOCK_NOT_AVAILABLE: &str = "55P03";

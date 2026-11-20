@@ -234,7 +234,10 @@ fn lint(args: &FileArgs) -> i32 {
 /// closes the stream. An `error` event goes to stderr and exits 1.
 async fn logs(args: LogsArgs) -> i32 {
     let base = args.server.trim_end_matches('/');
-    let url = format!("{base}/v1/runs/{}/logs", args.run);
+    let url = format!(
+        "{base}/v1/runs/{}/logs",
+        scarab_pipeline::url_path_segment(&args.run)
+    );
     let client = reqwest::Client::new();
     let resp = match with_auth(client.get(&url), &args.token).send().await {
         Ok(r) => r,
@@ -294,8 +297,20 @@ async fn logs(args: LogsArgs) -> i32 {
 /// `scarab rerun <run> <step>`: re-arm a step + its dependents (ADR-0027).
 async fn rerun(args: RerunArgs) -> i32 {
     let base = args.server.trim_end_matches('/');
-    let url = format!("{base}/v1/runs/{}/steps/{}/rerun", args.run, args.step);
     let client = reqwest::Client::new();
+    let run = scarab_pipeline::url_path_segment(&args.run);
+    // The URL names the step by its key, read from the run: a Step id can
+    // hold `/`, `[`, `]`, `,` or `=` (an invoked library's Steps, a matrix
+    // Step), and a proxy may turn an encoded `/` back into a path separator.
+    // Without a key (the run's read failed, or a server from before keys)
+    // the id goes as one encoded path segment.
+    let run_url = format!("{base}/v1/runs/{run}");
+    let detail = match with_auth(client.get(&run_url), &args.token).send().await {
+        Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok(),
+        _ => None,
+    };
+    let step = step_segment(detail.as_ref(), &args.step);
+    let url = format!("{base}/v1/runs/{run}/steps/{step}/rerun");
     let resp = match with_auth(client.post(&url), &args.token).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -312,6 +327,19 @@ async fn rerun(args: RerunArgs) -> i32 {
         security::print_failure("rerun", base, status, &text);
         1
     }
+}
+
+/// The `{step}` path segment for the step `id` of a run: its key from the
+/// run's detail (`GET /v1/runs/{id}`), or the id percent-encoded when the
+/// detail is missing or names no key for it.
+fn step_segment(detail: Option<&serde_json::Value>, id: &str) -> String {
+    detail
+        .and_then(|d| d["steps"].as_array())
+        .and_then(|steps| steps.iter().find(|s| s["id"].as_str() == Some(id)))
+        .and_then(|s| s["key"].as_str())
+        .filter(|k| !k.is_empty())
+        .map(scarab_pipeline::url_path_segment)
+        .unwrap_or_else(|| scarab_pipeline::url_path_segment(id))
 }
 
 /// Attach the bearer token, when one is configured, to a request.
@@ -510,6 +538,28 @@ fn read_data(d: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rerun_names_the_step_by_its_key() {
+        let detail = serde_json::json!({
+            "id": "r1",
+            "steps": [
+                {"id": "build", "key": "b2qzk7aamx3d"},
+                {"id": "amd64/image", "key": "q4mmz2c7eh5a"},
+                {"id": "test[os=linux]"}
+            ]
+        });
+        assert_eq!(
+            super::step_segment(Some(&detail), "amd64/image"),
+            "q4mmz2c7eh5a"
+        );
+        // No key for the step, or no detail: the id, encoded.
+        assert_eq!(
+            super::step_segment(Some(&detail), "test[os=linux]"),
+            "test%5Bos%3Dlinux%5D"
+        );
+        assert_eq!(super::step_segment(None, "amd64/image"), "amd64%2Fimage");
+    }
+
     use super::*;
 
     #[test]

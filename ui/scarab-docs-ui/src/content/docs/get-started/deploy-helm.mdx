@@ -315,7 +315,8 @@ Every key in this table exists in `values.yaml`:
 | `secrets.*` / `secrets.existingSecret` | — | sensitive `SCARAB_*` env (DB URL, S3 keys, master key, webhook secrets) |
 | `secrets.githubAppPemSecret.name` / `.key` | — / `github-app.pem` | mount the GitHub App private key from your own Secret |
 | `rbac.create` | `true` | Role/RoleBinding for Pod execution; with `false`, an empty `scarab.namespace` means the release namespace |
-| `ingress.enabled` | `false` | expose the HTTP API |
+| `ingress.enabled` | `false` | expose the HTTP API. Scarab's clients name a Step by its key; an API caller that sends a Step id with `/` needs a proxy that keeps `%2F` (see [A proxy in front of Scarab](#a-proxy-in-front-of-scarab)) |
+| `scarab.resultsApiUrl` | the in-cluster Service | where step Pods post results; leave it empty, or point it at the in-cluster Service |
 
 See `deploy/helm/scarab/README.md` and `values.yaml` for every value.
 
@@ -672,6 +673,66 @@ on `127.0.0.1` is sent to the `localhost` address first, so the sign-in keeps it
 
 Session cookies are marked `Secure`. Chrome and Firefox accept them on `http://localhost`;
 Safari may not, so sign in to a plain-`http` local install with Chrome or Firefox.
+
+### A proxy in front of Scarab
+
+The Steps of an invoked library and matrix Steps have ids that hold `/` (`amd64/image`) or `[`,
+`,` and `=` (`test[os=linux]`). Scarab's own clients (the web UI, `scarab rerun` and the results
+sidecar) do not put such an id in a URL: they name a Step by its key, so they need nothing from a
+proxy, ingress controller or gateway in front of Scarab.
+
+#### Step keys
+
+Each Step of a Run has a key: 12 characters of `a` to `z` and `2` to `7`, random, unique within
+the Run, and fixed for the Run's life (a retry, a rerun or a new Take keeps it). `GET
+/v1/runs/{id}` lists it as `key` on each entry of `steps`, and a waiting gate in a run list has
+one too. Every Step route takes it as `{step}`:
+
+```
+GET /v1/runs/{id}                                → steps[].key, e.g. "q4mmz2c7eh5a"
+GET /v1/runs/{id}/steps/q4mmz2c7eh5a/logs/raw?attempt=a1
+```
+
+A Step route also takes the Step's id, percent-encoded as one path segment
+(`/v1/runs/{id}/steps/amd64%2Fimage/results`). A `{step}` that is neither a key nor an id of a
+Step of that Run gets a 404 from a read.
+
+#### Keeping `%2F` for API callers that send a Step id
+
+An API caller that puts a Step id holding `/` in a path sends it as `%2F`, and the proxy must
+pass `%2F` on unchanged. One that decodes it, or redirects to the decoded path, sends the request
+to a path no route matches, and Scarab answers 404. Send the key instead and the proxy does not
+matter.
+
+Envoy Gateway redirects to the decoded path by default (`UnescapeAndRedirect`). To keep `%2F`, set
+`escapedSlashesAction: KeepUnchanged` in a `ClientTrafficPolicy` on the Gateway that routes to
+Scarab:
+
+```yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: scarab-keep-escaped-slashes
+  namespace: <gateway namespace>
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: <gateway name>
+  path:
+    escapedSlashesAction: KeepUnchanged
+```
+
+With an nginx you configure yourself, write `proxy_pass` with no URI part
+(`proxy_pass http://scarab;`), so nginx passes the path as the client sent it.
+
+#### Where step Pods post results
+
+Step Pods post their results to `scarab.resultsApiUrl`. Leave it empty: the chart then points it
+at the release's in-cluster Service, `http://<release fullname>.<release namespace>.svc`, so the
+results do not go through the proxy at all. If you set it, point it at that Service too. The
+results sidecar counts only the server's `202` as delivered; a gateway that redirects or rewrites
+the path makes every try fail, and the Step fails after the sixth.
 
 ### Grant the first roles
 

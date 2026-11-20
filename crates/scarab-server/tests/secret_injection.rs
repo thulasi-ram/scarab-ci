@@ -89,6 +89,7 @@ impl Executor for CapturingExec {
 
 fn step(run: &str) -> StepRun {
     StepRun {
+        key: None,
         run: RunId(run.into()),
         step: StepId("s1".into()),
         status: StepStatus::Running,

@@ -265,6 +265,7 @@ async fn forge_credentials_reach_registry_auth_only_by_their_own_grant_and_never
 /// Run `r1`'s build library Step `id` (`image` or `push`), running.
 fn step_run(id: &str) -> StepRun {
     StepRun {
+        key: None,
         run: RunId("r1".into()),
         step: StepId(format!("image/{id}")),
         status: StepStatus::Running,

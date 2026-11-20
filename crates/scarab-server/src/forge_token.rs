@@ -1340,6 +1340,7 @@ mod tests {
         let forge: Arc<dyn ForgePort> = Arc::new(FakeForge::new());
         let decorator = ForgeCredentialExecutor::new(inner.clone(), forge);
         let step = scarab_engine::StepRun {
+            key: None,
             run: RunId("run-1".into()),
             step: scarab_engine::StepId("build".into()),
             status: scarab_engine::StepStatus::Running,

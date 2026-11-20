@@ -2516,9 +2516,10 @@ const RESULTS_EGRESS_CONTAINER: &str = "scarab-results-egress";
 /// On k8s a step's named results are NOT handed back through
 /// `Executor::results` (the port default, empty): the sidecar, SIGTERMed by
 /// the kubelet after the step container exits, drains `/scarab/results` and
-/// POSTs it to the fence-scoped ingest endpoint, which answers 2xx only after
-/// `Db::set_step_results` committed — and the sidecar's `curl -f` exits only
-/// after that answer (or after its bounded retries failed, exit non-zero). So
+/// POSTs it to the fence-scoped ingest endpoint, which answers 202 only after
+/// `Db::set_step_results` committed — and the sidecar exits 0 only after that
+/// 202 (any other answer, a 200 included, is retried, and when its bounded
+/// retries fail it exits non-zero). So
 /// "terminated" means "committed, or the drain failed"; anything before it may
 /// be a drain whose results are not in the store yet. The engine completes a
 /// step's DeploymentRequests from the stored results at `Succeeded`, so
@@ -2573,7 +2574,7 @@ fn results_draining(pod: &Pod) -> bool {
 /// How the results-egress drain **failed** on this Pod, or `None` (ADR-0042;
 /// git-bug `0cb5895`). `Some` when the Pod's spec declares the
 /// [`RESULTS_EGRESS_CONTAINER`] native sidecar and its status shows it
-/// terminated non-zero — its bounded `curl -f` retries gave up (exit 1), or the
+/// terminated non-zero — its bounded POST retries gave up (exit 1), or the
 /// kubelet SIGKILLed it at the termination grace (137) — either now or as its
 /// previous termination while it waits (a crash-looping sidecar the kubelet
 /// will not restart once the step is done). The clause names the exit code and
@@ -6278,6 +6279,20 @@ fn helper_transfer_budget_bytes(res: &scarab_pipeline::Resources) -> Option<u64>
         .map(|bytes| bytes.max(1))
 }
 
+/// The results ingest URL for `step` of `run`:
+/// `{base}/v1/runs/{run}/steps/{step}/results`, each one percent-encoded
+/// path segment ([`scarab_pipeline::url_path_segment`]). `step` is the step's
+/// key when it has one (a key is plain base32 and needs no encoding); the
+/// authored id, encoded, otherwise.
+fn results_ingest_url(base: &str, run: &str, step: &str) -> String {
+    format!(
+        "{}/v1/runs/{}/steps/{}/results",
+        base.trim_end_matches('/'),
+        scarab_pipeline::url_path_segment(run),
+        scarab_pipeline::url_path_segment(step)
+    )
+}
+
 /// The trusted results-egress sidecar (ADR-0042). A native sidecar sharing the
 /// results volume, carrying the fence-scoped token and the results API URL, that
 /// drains `/scarab/results` with a confirmed write after the step exits. The
@@ -6292,12 +6307,14 @@ fn egress_sidecar(
 ) -> Container {
     let message = format!("{}:{}:{}", step.run.0, step.step.0, attempt);
     let token = scarab_forge_github::sign_hex(&egress.token_secret, message.as_bytes());
-    let url = format!(
-        "{}/v1/runs/{}/steps/{}/results",
-        egress.base_url.trim_end_matches('/'),
-        step.run.0,
-        step.step.0
-    );
+    // The token signs the authored step id. The URL names the step by its
+    // key, which the server resolves to the step before it checks the
+    // token: an authored id such as `amd64/image` needs a `%2F` that a proxy
+    // in front of the server may rewrite to `/`. A step without a key (one
+    // launched from an outbox message written before keys) falls back to
+    // its id, percent-encoded.
+    let segment = step.key.as_deref().unwrap_or(&step.step.0);
+    let url = results_ingest_url(&egress.base_url, &step.run.0, segment);
     let env = vec![
         env_var("SCARAB_RESULTS", RESULTS_MOUNT_PATH),
         env_var("SCARAB_RESULTS_URL", &url),
@@ -7775,6 +7792,7 @@ mod tests {
 
     fn step_with_attempt(run: &str, step: &str, attempt: &str) -> StepRun {
         StepRun {
+            key: None,
             run: RunId(run.into()),
             step: StepId(step.into()),
             status: StepStatus::Running,
@@ -10464,6 +10482,116 @@ mod tests {
             side.volume_mounts.as_ref().unwrap()[0].read_only,
             Some(true),
             "sidecar reads results read-only"
+        );
+    }
+
+    /// An invoked library's Step (`amd64/image`) and a matrix Step
+    /// (`test[os=linux,arch=arm64]`) each reach the ingest route as ONE path
+    /// segment, and the token still signs the raw id, as the server checks
+    /// it after `Path` decodes the segment. A raw `/` added a segment, the
+    /// POST matched no route, and the web UI fallback answered 200, so the
+    /// sidecar logged "results posted" and nothing was stored.
+    #[test]
+    fn the_results_url_carries_a_step_id_as_one_encoded_segment() {
+        let egress = ResultsEgress {
+            base_url: "http://scarab-server/".into(),
+            token_secret: b"secret".to_vec(),
+            sidecar_image: "ghcr.io/acme/scarab-sidecar:1".into(),
+        };
+        for (step_id, url) in [
+            (
+                "amd64/image",
+                "http://scarab-server/v1/runs/run-1/steps/amd64%2Fimage/results",
+            ),
+            (
+                "test[os=linux,arch=arm64]",
+                "http://scarab-server/v1/runs/run-1/steps/\
+                 test%5Bos%3Dlinux%2Carch%3Darm64%5D/results",
+            ),
+        ] {
+            let step = step_with_attempt("run-1", step_id, "a1");
+            let pod = build_pod(
+                "scarab-x",
+                "scarab-run-1",
+                &step,
+                &busybox(),
+                Some(&egress),
+                DEFAULT_STEP_TIMEOUT_SECS,
+                false,
+                None,
+            );
+            let spec = pod.spec.unwrap();
+            let side = spec
+                .init_containers
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|c| c.name == RESULTS_EGRESS_CONTAINER)
+                .unwrap();
+            let env = |k: &str| {
+                side.env
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e.name == k)
+                    .and_then(|e| e.value.clone())
+            };
+            assert_eq!(env("SCARAB_RESULTS_URL").as_deref(), Some(url));
+            let message = format!("run-1:{step_id}:a1");
+            assert_eq!(
+                env("SCARAB_RESULTS_TOKEN"),
+                Some(scarab_forge_github::sign_hex(b"secret", message.as_bytes()))
+            );
+        }
+    }
+
+    /// A step with a key: the results URL names the step by its key, and the
+    /// token still signs the authored id the server resolves the key to.
+    #[test]
+    fn the_results_url_carries_the_step_key() {
+        let egress = ResultsEgress {
+            base_url: "http://scarab-server".into(),
+            token_secret: b"secret".to_vec(),
+            sidecar_image: "ghcr.io/acme/scarab-sidecar:1".into(),
+        };
+        let mut step = step_with_attempt("run-1", "amd64/image", "a1");
+        step.key = Some("k3ycqx7m2abz".into());
+        let pod = build_pod(
+            "scarab-x",
+            "scarab-run-1",
+            &step,
+            &busybox(),
+            Some(&egress),
+            DEFAULT_STEP_TIMEOUT_SECS,
+            false,
+            None,
+        );
+        let spec = pod.spec.unwrap();
+        let side = spec
+            .init_containers
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|c| c.name == RESULTS_EGRESS_CONTAINER)
+            .unwrap();
+        let env = |k: &str| {
+            side.env
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|e| e.name == k)
+                .and_then(|e| e.value.clone())
+        };
+        assert_eq!(
+            env("SCARAB_RESULTS_URL").as_deref(),
+            Some("http://scarab-server/v1/runs/run-1/steps/k3ycqx7m2abz/results")
+        );
+        assert_eq!(
+            env("SCARAB_RESULTS_TOKEN"),
+            Some(scarab_forge_github::sign_hex(
+                b"secret",
+                b"run-1:amd64/image:a1"
+            ))
         );
     }
 

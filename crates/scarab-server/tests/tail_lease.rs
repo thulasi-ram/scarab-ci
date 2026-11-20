@@ -114,6 +114,7 @@ impl Executor for TwoChunkExec {
 
 fn running_step() -> StepRun {
     StepRun {
+        key: None,
         run: RunId("r1".into()),
         step: StepId("s1".into()),
         status: StepStatus::Running,
@@ -150,7 +151,8 @@ async fn two_replicas_tail_a_step_exactly_once() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     // Exactly one stream was opened, and the durable index holds the two
-    // chunks exactly once — no duplicate ingestion.
+    // reads exactly once — no duplicate ingestion. The tail stores what it
+    // read as one chunk.
     assert_eq!(
         exec.opened.load(Ordering::SeqCst),
         1,
@@ -164,7 +166,8 @@ async fn two_replicas_tail_a_step_exactly_once() {
         )
         .await
         .unwrap();
-    assert_eq!(chunks.len(), 2, "two chunks, ingested once: {chunks:?}");
+    assert_eq!(chunks.len(), 1, "one batch, ingested once: {chunks:?}");
+    assert_eq!(chunks[0].len, b"line-1\nline-2\n".len() as u64);
 }
 
 #[tokio::test]
@@ -247,6 +250,7 @@ async fn sse_live_tail_is_replica_agnostic() {
 
 fn running_step_with_run(run: &str) -> StepRun {
     StepRun {
+        key: None,
         run: RunId(run.into()),
         step: StepId("s1".into()),
         status: StepStatus::Running,

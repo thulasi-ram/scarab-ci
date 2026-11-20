@@ -66,6 +66,66 @@ release.yml uses that version's section as the GitHub Release text. See
   ref stays empty. See
   [The ref and the commit](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#the-ref-and-the-commit).
 
+- **Step keys.** Each Step of a Run has a key: 12 random characters of `a`-`z` and `2`-`7`,
+  unique within the Run and kept across retries, reruns and Takes. `GET /v1/runs/{id}` lists it
+  as `steps[].key`, and every `/v1/runs/{id}/steps/{step}/…` and `/v1/runs/{id}/gates/{step}/…`
+  route takes it as `{step}`. A Step id, percent-encoded, still works. Migration 0098 gives every
+  existing Step a key. See
+  [Step keys](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#step-keys).
+
+### Bug Fixes
+
+- **Results of a Step whose id holds `/`, `[`, `]`, `,` or `=` are stored.** Every Step of an
+  invoked library has such an id (`amd64/image`), and so does a matrix Step (`test[os=linux]`). On
+  Kubernetes the results sidecar put the raw id in its URL, the request matched no API route, and
+  the server answered it with the web UI and a 200. The sidecar logged "results posted", nothing
+  was stored, the Run page said the try published no results, and a later Step that read them got
+  an empty value: the build library's push Step refused with an empty `SCARAB_BUILD_DIGEST`. The
+  results sidecar now names the Step by its key, and `scarab.resultsApiUrl` should point at the
+  in-cluster Service (see
+  [A proxy in front of Scarab](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#a-proxy-in-front-of-scarab)).
+- **Step requests no longer need a proxy that keeps `%2F`.** The web UI, `scarab rerun` and the
+  results sidecar name a Step by its key, so the Run page shows the logs and results of an invoked
+  or matrix Step, and reruns it, behind a gateway that decodes `%2F` or redirects to the decoded
+  path (Envoy Gateway's default). Only an API caller that sends a Step id holding `/` still needs
+  the proxy to keep `%2F`.
+- **The results sidecar counts only the server's 202 as delivered.** Any other answer, a 200 or a
+  redirect included, is logged with its status and retried. After 6 tries the sidecar's log says
+  the results were not delivered and it exits 1 instead of 0, and the Step fails: a Step whose
+  results were lost in 0.5.0 without a word now fails. A `scarab.resultsApiUrl` that points at a
+  gateway that redirects or rewrites the path is the likely cause.
+- **An unknown `/v1/…` path answers a JSON 404.** The web UI answered every request no route
+  matched, under `/v1` and for every method, with its page and a 200. Requests under `/v1`,
+  `/webhooks` and `/.well-known`, and requests with a method other than GET or HEAD, now get
+  `404 {"code":"not_found",…}`. An org named `v1` or `webhooks` loses its deep links: opening or
+  reloading `/v1/<repo>` or `/webhooks/<repo>/…` gets the JSON 404 instead of the page. An uptime
+  check aimed at a path Scarab never served now gets a 404 too; the chart's probes use `/livez`
+  and `/readyz`.
+- **The Details link of a commit status opens the Run.** It pointed at `/runs/<id>`, which the web
+  UI showed as an empty repository; it is now `/<org>/<repo>/runs/<id>`. Statuses posted by an
+  earlier version keep the old link.
+- **A long log downloads and loads at the speed of the object store.** The raw download and the
+  Run page fetched a log's stored chunks one at a time, and the log tail stored one chunk per
+  read of the container log (at most 8 KiB, often one line), so a 19.8 MB log was thousands of
+  chunks and downloaded at about 22 KB/s. The tail now stores chunks of up to 256 KiB (or what it
+  read in 250 ms), and readers fetch up to 16 chunks ahead, in order. Logs stored by an earlier
+  version keep their small chunks.
+- **A step's log is stored while the step prints, not minutes after it ended.** The tail wrote
+  each small read to the object store and the database in turn, so a step that printed fast
+  ended long before its log was stored. With 256 KiB chunks it keeps up.
+- **The Run page follows a log that is still being stored.** For a try that had ended while its
+  log was still being stored, the page said "No log output was captured for this try", and the
+  log stream of a finished Run ended with the part stored so far. The stream now follows the log
+  of an ended try until the replica storing it is done (at most 10 minutes past the Run's end),
+  sends a `storing` event, and the page says "The log is still being stored." until then, or
+  "reload to check again" once the server stops waiting.
+- **The log notice gives the log's size and the part shown.** The pane loads at least the last
+  2 MiB (from the stored chunk that holds the cut, where it used to start after it), and the
+  notice takes the log's size from the server, so it no longer says "Showing the last 1.0 MB of
+  17.9 MB" for a 19.8 MB log whose end is still loading. The size grows as more is stored, says
+  "so far" while the try runs, and is named in KiB, MiB and GiB, the powers of 1024 it is
+  counted in.
+
 ## [0.5.0] - 2026-11-20
 
 ### Breaking changes

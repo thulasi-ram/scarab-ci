@@ -126,6 +126,11 @@ pub struct PendingGateDto {
     pub run: String,
     /// The gate's step id in the Run.
     pub step: String,
+    /// The gate's step key: the `{step}` of the release route,
+    /// `POST /v1/runs/{run}/gates/{key}/release`. Absent from a server
+    /// before step keys; name the step by its id then, percent-encoded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     /// The gate's name in the plugin's manifest.
     pub gate: String,
     /// The wait's Attempt: a release names it, and an answer to another wait
@@ -241,9 +246,15 @@ pub async fn list_pending_gates(
             .and_then(|e| e.get("gate_expires_after"))
             .and_then(|t| t.as_i64())
             .map(|secs| w.started_at.0.saturating_add(secs.saturating_mul(1000)));
+        let key = st
+            .db
+            .step_key(&w.run, &w.step)
+            .await
+            .map_err(ApiError::Db)?;
         gates.push(PendingGateDto {
             run: w.run.0,
             step: w.step.0,
+            key,
             gate,
             attempt: w.attempt.0,
             waiting_since: w.started_at.0,
@@ -350,7 +361,7 @@ pub(crate) async fn release(
 pub async fn release_on_broker(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Path((id, step)): Path<(String, String)>,
+    crate::step_path::RunStep { run: id, step }: crate::step_path::RunStep,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     release(&st, &headers, &id, &step, &body).await

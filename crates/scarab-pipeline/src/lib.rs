@@ -567,6 +567,43 @@ pub const RETIRED_DEPLOYMENTS: &str = "deployments are no longer recorded by Sca
 /// is `true`. No Step may set it.
 pub const FORK_PR_ENV: &str = "SCARAB_FORK_PR";
 
+/// `id` as one URL path segment: every byte but RFC 3986's unreserved
+/// characters (`A-Z a-z 0-9 - . _ ~`) is percent-encoded. A Step id can hold
+/// `/` (an invoked library's Steps are `{invoke id}/{id}`) and a matrix
+/// Step's id holds `[`, `]`, `,` and `=` (`base[k=v,…]`), so a URL that
+/// carries one raw gains path segments and matches no route. Every URL that
+/// carries a Step id, a service name or another id puts it through this; the
+/// server's `Path` extractor decodes it back.
+pub fn url_path_segment(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    for b in id.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod url_path_segment_tests {
+    use super::url_path_segment;
+
+    #[test]
+    fn a_step_id_is_one_path_segment() {
+        assert_eq!(url_path_segment("build"), "build");
+        assert_eq!(url_path_segment("amd64/image"), "amd64%2Fimage");
+        assert_eq!(
+            url_path_segment("test[os=linux,arch=arm64]"),
+            "test%5Bos%3Dlinux%2Carch%3Darm64%5D"
+        );
+        assert_eq!(url_path_segment("a b%"), "a%20b%25");
+        assert_eq!(url_path_segment("é"), "%C3%A9");
+    }
+}
+
 /// The env names Scarab itself sets in a Step's Pod or process: the
 /// executors' fence, results, artifacts, OIDC and workspace variables, and
 /// one `SCARAB_PARAM_<NAME>` per input (ADR-0008). A Step's own `env:`

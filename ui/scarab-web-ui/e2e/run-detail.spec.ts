@@ -258,13 +258,14 @@ test("a failed matrix run names where it failed and opens on the first failure",
 });
 
 // The MATRIX run's treebo-staging × aws-cluster cell printed a large plan
-// (5.5 MB, 130,004 lines). The pane asks for the last 2 MB and says so.
-test("a large log shows its last 2 MB, Load full log reads it all, Download names the try", async ({ page }) => {
+// (5.5 MiB, 130,004 lines). The pane asks for the last 2 MiB and says so; it
+// gets them from the start of the stored chunk that holds the cut.
+test("a large log shows its last 2 MiB, Load full log reads it all, Download names the try", async ({ page }) => {
   await page.goto(`/acme/scarab/runs/${MATRIX_RUN_ID}?step=5`);
   await expect(page.locator(".sp-name")).toHaveText("plan · treebo-staging · aws-cluster");
 
   const notice = page.getByRole("status").filter({ hasText: "Showing the last" });
-  await expect(notice).toHaveText(/Showing the last 2\.0 MB of 5\.5 MB\./);
+  await expect(notice).toHaveText(/Showing the last 2\.\d MiB of 5\.5 MiB( so far)?\./);
   const download = notice.getByRole("link", { name: "Download" });
   await expect(download).toHaveAttribute("href", /\/steps\/[^/]+\/logs\/raw\?attempt=a1$/);
   // The log tools offer the download for every try, cut or not.
@@ -280,20 +281,20 @@ test("a large log shows its last 2 MB, Load full log reads it all, Download name
   await expect(last).toBeVisible();
   await expect(last.locator(".lgln")).not.toHaveText("130004");
 
-  // The whole log fits in 8 MB, so the pane can read all of it.
+  // The whole log fits in 8 MiB, so the pane can read all of it.
   await notice.getByRole("button", { name: "Load full log" }).click();
   await expect(notice).toHaveCount(0);
   await expect(last.locator(".lgln")).toHaveText("130004");
 });
 
-// The rich run's shared postgres service logged about 3 MB (30,005 lines).
-// Its pane shows the last 2 MB, can read the whole log, and downloads it.
+// The rich run's shared postgres service logged about 2.5 MiB (30,005 lines).
+// Its pane shows the last 2 MiB, can read the whole log, and downloads it.
 test("a large service log offers Load full log and Download", async ({ page }) => {
   await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}`);
   await page.getByRole("button", { name: /postgres/ }).click();
   const pane = page.locator(".servicepane");
   const notice = pane.getByRole("status").filter({ hasText: "Showing the last" });
-  await expect(notice).toHaveText(/Showing the last [\d.]+ MB of 2\.\d MB\./);
+  await expect(notice).toHaveText(/Showing the last [\d.]+ MiB of 2\.\d MiB\./);
   const download = notice.getByRole("link", { name: "Download" });
   await expect(download).toHaveAttribute("href", /\/services\/postgres\/logs\/raw$/);
   // The readout offers the download whether the log is cut or not.

@@ -3642,6 +3642,7 @@ impl<'a> Scheduler<'a> {
             }],
             needs: Vec::new(),
             gate_kind: None,
+            key: None,
         };
         let Some(handle) = self.executor.unit_handle(&fenced) else {
             return Ok(());
@@ -3863,7 +3864,10 @@ impl<'a> Scheduler<'a> {
                         }
                     };
 
-                    // Reconstruct the fenced StepRun the executor needs.
+                    // Reconstruct the fenced StepRun the executor needs. Its
+                    // key names the step in the URLs the executor hands the
+                    // step's Pod (the results sidecar's).
+                    let key = self.db.step_key(&run, &step).await?;
                     let step_run = StepRun {
                         run: run.clone(),
                         step: step.clone(),
@@ -3877,6 +3881,7 @@ impl<'a> Scheduler<'a> {
                         }],
                         needs: Vec::new(),
                         gate_kind: None,
+                        key,
                     };
                     let handle = match self.executor.launch(&step_run, &spec).await {
                         Ok(handle) => handle,

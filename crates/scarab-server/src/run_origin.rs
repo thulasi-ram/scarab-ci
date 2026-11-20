@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -503,7 +503,7 @@ fn bound_inputs(scope: Option<&serde_json::Value>) -> Vec<BoundInputDto> {
     path = "/v1/runs/{id}/steps/{step}/origin",
     params(
         ("id" = String, Path, description = "run id"),
-        ("step" = String, Path, description = "step id")
+        ("step" = String, Path, description = "a step key (preferred) or the authored step id, percent-encoded")
     ),
     summary = "Where a Step comes from",
     responses(
@@ -514,7 +514,7 @@ fn bound_inputs(scope: Option<&serde_json::Value>) -> Vec<BoundInputDto> {
 pub(crate) async fn get_step_origin(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Path((id, step)): Path<(String, String)>,
+    crate::step_path::RunStep { run: id, step }: crate::step_path::RunStep,
 ) -> Result<Json<StepOriginDto>, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;

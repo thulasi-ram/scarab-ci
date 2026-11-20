@@ -54,6 +54,10 @@ const MAX_API_BODY_BYTES: usize = 8 * 1024 * 1024;
 pub struct PendingGate {
     pub run: String,
     pub step: String,
+    /// The step's key, which names it in the release URL. Absent from a
+    /// server before step keys.
+    #[serde(default)]
+    pub key: Option<String>,
     pub gate: String,
     pub attempt: String,
     #[serde(default)]
@@ -229,7 +233,7 @@ impl GateApi {
             "{}/v1/runs/{}/gates/{}/release",
             self.base,
             encode_component(&gate.run),
-            encode_component(&gate.step)
+            encode_component(gate.key.as_deref().unwrap_or(&gate.step))
         );
         self.send(
             self.http

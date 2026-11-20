@@ -660,7 +660,7 @@ pub struct Config {
     /// `Running` at once (ADR-0011). `None` (unset or `0`) = no cap.
     pub project_run_cap: Option<u32>,
     /// Scarab's public base URL (ADR-0046): the run deep-link every forge
-    /// status carries (`{public_url}/runs/{id}`). Dev default
+    /// status carries (`{public_url}/<org>/<repo>/runs/{id}`). Dev default
     /// `http://localhost:8080`.
     pub public_url: String,
     /// The URL people open the web UI at (`SCARAB_UI_URL`), no trailing

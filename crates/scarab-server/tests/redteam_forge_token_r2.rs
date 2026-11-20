@@ -126,6 +126,7 @@ async fn install_in(
 
 fn step_run(run: &str, id: &str) -> StepRun {
     StepRun {
+        key: None,
         run: RunId(run.into()),
         step: StepId(id.into()),
         status: StepStatus::Running,

@@ -20,12 +20,16 @@ export function levelOf(line: string): Level {
  * - `waiting` — nothing yet, but more may come: the try is still running
  *               (even when its stream ended: the pane opens it again), or
  *               the stream is open and the outcome is not known yet.
+ * - `storing` — the try ended and the server says its log is still being
+ *               stored: a log tail can store the end of a log after the step
+ *               ended. The pane says so and keeps following.
  * - `none`    — nothing came and nothing will: the try has finished, or the
  *               stream ended and the outcome is not known. The pane then says
  *               no output was captured and, for a failed try, why it failed.
  * A try with no output used to show "waiting for output…" forever, so its
- * failure reason never appeared. */
-export type LogBodyState = "output" | "waiting" | "none";
+ * failure reason never appeared. A try whose log was still being stored
+ * used to say no output was captured. */
+export type LogBodyState = "output" | "waiting" | "storing" | "none";
 
 export function logBodyState(opts: {
   /** The buffered text for this (step, attempt, container), if any arrived. */
@@ -34,9 +38,16 @@ export function logBodyState(opts: {
   ended: boolean;
   /** The attempt's outcome (`running`, `succeeded`, `failed`, …). */
   outcome: string | undefined;
+  /** The server's last `storing` event said the log is still being stored
+   * (also when it said it stopped waiting for it). */
+  storing?: boolean;
 }): LogBodyState {
   if ((opts.text ?? "").split("\n").some((l) => l.length > 0)) return "output";
   if (opts.outcome === "running") return "waiting";
+  // The server sends `storing: false` before it ends a stream whose log is
+  // whole, so a stream that ended while still storing dropped, and the pane
+  // opens it again.
+  if (opts.storing) return "storing";
   if (opts.ended) return "none";
   return opts.outcome === undefined ? "waiting" : "none";
 }

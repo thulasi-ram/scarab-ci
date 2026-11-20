@@ -20,9 +20,14 @@
 import type { components } from "./api/schema";
 import { libraryRoute, libraryRunSummaries } from "./mock-libraries";
 import { policyRoute } from "./mock-policies";
+import { mockStepId, mockStepKey, withStepKeys } from "./mock-step-keys";
 import { paginate } from "./org-page";
 
-type RunStatusDto = components["schemas"]["RunStatusResponse"];
+/** A run detail fixture. Its steps carry no key: the route that serves it
+ * adds them ([`withStepKeys`]). */
+type RunStatusDto = Omit<components["schemas"]["RunStatusResponse"], "steps"> & {
+  steps: Omit<components["schemas"]["StepStatusDto"], "key">[];
+};
 type RunSummaryDto = components["schemas"]["RunSummaryDto"];
 type ArtifactDto = components["schemas"]["ArtifactDto"];
 type ServiceStatusDto = components["schemas"]["ServiceStatusDto"];
@@ -258,7 +263,7 @@ const runs = [
     org: "acme",
     project: "scarab",
     created_at: ago(12 * 60000),
-    waiting_gates: [{ step: "approve", kind: "manual", since: ago(10 * 60000) }],
+    waiting_gates: [{ step: "approve", key: mockStepKey("approve"), kind: "manual", since: ago(10 * 60000) }],
   }),
   summary({
     id: "01984f22bb334d8e9a1122cd44ef6600",
@@ -266,7 +271,7 @@ const runs = [
     org: "acme",
     project: "billing",
     created_at: ago(27 * 60000),
-    waiting_gates: [{ step: "release", kind: "manual", since: ago(20 * 60000) }],
+    waiting_gates: [{ step: "release", key: mockStepKey("release"), kind: "manual", since: ago(20 * 60000) }],
   }),
   // git-bug c489346: a gate holds only its dependents, so this run is still
   // `running` (its `version` sibling runs) while its `approve` gate waits.
@@ -276,7 +281,7 @@ const runs = [
     org: "acme",
     project: "orders-api",
     created_at: ago(6 * 60000),
-    waiting_gates: [{ step: "approve", kind: "manual", since: ago(4 * 60000) }],
+    waiting_gates: [{ step: "approve", key: mockStepKey("approve"), kind: "manual", since: ago(4 * 60000) }],
   }),
   // A running run with no reached gate: not in the inbox.
   summary({
@@ -739,7 +744,7 @@ function unscheduledTry(url: string): boolean {
   }
   const m = u.pathname.match(/^\/v1\/runs\/([^/]+)\/steps\/([^/]+)\/logs$/);
   if (!m || m[1] !== RETRIES_RUN_ID) return false;
-  const tries = RT_TRIES[decodeURIComponent(m[2]!)] ?? [];
+  const tries = RT_TRIES[mockStepId(m[2]!)] ?? [];
   const attempt = u.searchParams.get("attempt");
   const t = tries.find((x) => x.id === attempt) ?? tries[tries.length - 1];
   return !!t?.wait && t.wait[1] === null;
@@ -907,11 +912,12 @@ const testLogLines = [
 // ── log streams ─────────────────────────────────────────────────────────────
 // The mock serves a log as the server does: stored chunks of raw output, each
 // `data` event carrying an id `<attempt>:<next chunk>` to resume after, the
-// last `?tail=` bytes with a `truncated` event first, and the whole log at
+// end of the log from the chunk that holds the `?tail=`-th byte from the end
+// with a `truncated` event first, and the whole log at
 // `…/logs/raw` (a step try's or a shared service's).
 
-/** The matrix cell whose `tofu plan` printed a large log (about 5 MB): the
- * pane shows its last 2 MB and offers Load full log and Download. */
+/** The matrix cell whose `tofu plan` printed a large log (about 5.5 MiB): the
+ * pane shows its last 2 MiB and offers Load full log and Download. */
 const BIG_LOG_STEP = mxId("treebo-staging", "aws-cluster");
 let bigLogChunks: string[] | null = null;
 /** The large log's chunks, built on first use: 13,000 planned resources,
@@ -944,8 +950,8 @@ function bigLog(): string[] {
   return out;
 }
 
-/** The rich run's shared `postgres` service logged about 3 MB: the service
- * pane shows its last 2 MB and offers Load full log and Download. */
+/** The rich run's shared `postgres` service logged about 2.5 MiB: the service
+ * pane shows its last 2 MiB and offers Load full log and Download. */
 let bigServiceLogChunks: string[] | null = null;
 /** The large service log's chunks, built on first use: the start-up lines,
  * 30,000 statement lines, 500 to a chunk, then the ready lines again. */
@@ -981,7 +987,7 @@ function mockLogChunks(url: string): string[] | null {
   const step = path.match(/^\/v1\/runs\/([^/]+)\/steps\/([^/]+)\/logs$/);
   if (step) {
     if (unscheduledTry(url)) return null;
-    if (step[1] === MATRIX_RUN_ID && decodeURIComponent(step[2]!) === BIG_LOG_STEP) return bigLog();
+    if (step[1] === MATRIX_RUN_ID && mockStepId(step[2]!) === BIG_LOG_STEP) return bigLog();
     return [testLogLines.join("\n") + "\n"];
   }
   const service = path.match(/^\/v1\/runs\/([^/]+)\/services\/([^/]+)\/logs$/);
@@ -1009,8 +1015,9 @@ function mockLogEvents(url: string): { type: string; data: string; id?: string }
   } else if (tail) {
     const sizes = chunks.map((c) => new TextEncoder().encode(c).length);
     const total = sizes.reduce((a, b) => a + b, 0);
+    // Start at the chunk that holds the `tail`-th byte from the end.
     let rest = total;
-    while (start < chunks.length - 1 && rest > Number(tail)) rest -= sizes[start++]!;
+    while (start < chunks.length - 1 && rest - sizes[start]! >= Number(tail)) rest -= sizes[start++]!;
     if (start > 0) {
       out.push({ type: "truncated", data: JSON.stringify({ skipped_bytes: total - rest, total_bytes: total }) });
     }
@@ -2854,7 +2861,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   }
 
   // run-scoped
-  if (p === `/v1/runs/${RUN_ID}`) return json(runStatus);
+  if (p === `/v1/runs/${RUN_ID}`) return json(withStepKeys(runStatus));
   if (p === `/v1/runs/${RUN_ID}/events`)
     return new Response(eventsBody, {
       status: 200,
@@ -2864,7 +2871,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   if (p === `/v1/runs/${RUN_ID}/services`) return json([]);
 
   // the GATES run (external gates: waiting, passed, failed)
-  if (p === `/v1/runs/${GATES_RUN_ID}`) return json(gatesRunStatus);
+  if (p === `/v1/runs/${GATES_RUN_ID}`) return json(withStepKeys(gatesRunStatus));
   if (p === `/v1/runs/${GATES_RUN_ID}/events`)
     return new Response(gatesEventsBody, {
       status: 200,
@@ -2873,7 +2880,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   if (p === `/v1/runs/${GATES_RUN_ID}/artifacts`) return json([]);
   if (p === `/v1/runs/${GATES_RUN_ID}/services`) return json([]);
   // the ENVIRONMENT GATE run
-  if (p === `/v1/runs/${ENV_GATE_RUN_ID}`) return json(envGateRunStatus);
+  if (p === `/v1/runs/${ENV_GATE_RUN_ID}`) return json(withStepKeys(envGateRunStatus));
   if (p === `/v1/runs/${ENV_GATE_RUN_ID}/events`)
     return new Response(envGateEventsBody, {
       status: 200,
@@ -2882,7 +2889,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   if (p === `/v1/runs/${ENV_GATE_RUN_ID}/artifacts`) return json([]);
   if (p === `/v1/runs/${ENV_GATE_RUN_ID}/services`) return json([]);
   if (method === "POST" && (m = p.match(/^\/v1\/runs\/([^/]+)\/gates\/([^/]+)\/approve$/))) {
-    const step = envGateRunStatus.steps.find((s) => s.id === decodeURIComponent(m![2]!));
+    const step = envGateRunStatus.steps.find((s) => s.id === mockStepId(m![2]!));
     if (m[1] !== ENV_GATE_RUN_ID || !step) return json({ released: true }, { status: 202 });
     if (!step.environment_approval_gate) {
       // A plain gate: the first approval by anyone with write releases it.
@@ -2902,7 +2909,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   }
 
   // the MATRIX run
-  if (p === `/v1/runs/${MATRIX_RUN_ID}`) return json(matrixRunStatus);
+  if (p === `/v1/runs/${MATRIX_RUN_ID}`) return json(withStepKeys(matrixRunStatus));
   if (p === `/v1/runs/${MATRIX_RUN_ID}/events`)
     return new Response(matrixEventsBody, {
       status: 200,
@@ -2912,7 +2919,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   if (p === `/v1/runs/${MATRIX_RUN_ID}/services`) return json([]);
 
   // the RETRIES run
-  if (p === `/v1/runs/${RETRIES_RUN_ID}`) return json(retriesRunStatus);
+  if (p === `/v1/runs/${RETRIES_RUN_ID}`) return json(withStepKeys(retriesRunStatus));
   // Cancelling it ends it, for the rest of this page load.
   if (method === "POST" && p === `/v1/runs/${RETRIES_RUN_ID}/cancel`) {
     retriesRunStatus.status = "cancelled";
@@ -2927,7 +2934,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   if (p === `/v1/runs/${RETRIES_RUN_ID}/services`) return json([]);
 
   // the RICH run (Playwright walkthrough fixture)
-  if (p === `/v1/runs/${RICH_RUN_ID}`) return json(richRunStatus);
+  if (p === `/v1/runs/${RICH_RUN_ID}`) return json(withStepKeys(richRunStatus));
   if (p === `/v1/runs/${RICH_RUN_ID}/events`)
     return new Response(richEventsBody, {
       status: 200,
@@ -2941,7 +2948,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   // chain (clone → build → test → approve[gate]) rather than understating the
   // scope as just the target. An off-chain target degrades to itself.
   if ((m = p.match(/^\/v1\/runs\/[^/]+\/steps\/([^/]+)\/rerun-plan$/))) {
-    const target = m[1];
+    const target = mockStepId(m[1]!);
     const chain = ["clone", "build", "test", "approve"];
     const from = chain.indexOf(target);
     const members = from >= 0 ? chain.slice(from) : [target];

@@ -153,6 +153,24 @@ struct StepRec {
     /// Which attempt produced the denormalized `output`/`results` above —
     /// the consumption-provenance stamp (ADR-0056).
     evidence_attempt: Option<AttemptId>,
+    /// The step's key ([`StepRun::key`]), minted when the row is made.
+    key: String,
+}
+
+/// A new step key for a step of `run`, distinct from every key the run's
+/// steps hold: 12 bytes from two version 4 UUIDs (the OS CSPRNG), drawn again
+/// on a collision, as the Postgres store does.
+fn mint_step_key(steps: &HashMap<(RunId, StepId), StepRec>, run: &RunId) -> String {
+    loop {
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let mut bytes = [0u8; scarab_engine::STEP_KEY_LEN];
+        bytes[..6].copy_from_slice(&a.as_bytes()[..6]);
+        bytes[6..].copy_from_slice(&b.as_bytes()[..6]);
+        let key = scarab_engine::step_key_from_bytes(bytes);
+        if !steps.iter().any(|((r, _), rec)| r == run && rec.key == key) {
+            return key;
+        }
+    }
 }
 
 /// One attempt's immutable evidence (ADR-0056): its own output snapshot,
@@ -396,9 +414,15 @@ impl InMemoryDb {
         status: StepStatus,
         spec: Option<StepSpec>,
     ) {
-        self.state.lock().unwrap().steps.insert(
+        let mut st = self.state.lock().unwrap();
+        let key = match st.steps.get(&(run.clone(), step.clone())) {
+            Some(rec) => rec.key.clone(),
+            None => mint_step_key(&st.steps, run),
+        };
+        st.steps.insert(
             (run.clone(), step.clone()),
             StepRec {
+                key,
                 status: Some(status),
                 spec,
                 needs: Vec::new(),
@@ -420,9 +444,15 @@ impl InMemoryDb {
     pub fn seed_ready(&self, steps: Vec<StepRun>) {
         let mut st = self.state.lock().unwrap();
         for s in steps {
+            let key = match (&s.key, st.steps.get(&(s.run.clone(), s.step.clone()))) {
+                (Some(key), _) => key.clone(),
+                (None, Some(rec)) => rec.key.clone(),
+                (None, None) => mint_step_key(&st.steps, &s.run),
+            };
             st.steps.insert(
                 (s.run.clone(), s.step.clone()),
                 StepRec {
+                    key,
                     status: Some(StepStatus::Ready),
                     spec: None,
                     needs: s.needs,
@@ -753,6 +783,7 @@ impl Db for InMemoryDb {
                 attempts,
                 needs: rec.needs.clone(),
                 gate_kind: rec.gate_kind.clone(),
+                key: Some(rec.key.clone()),
             };
             launches.push(mint(&step)?);
             claimed.push(step);
@@ -839,9 +870,16 @@ impl Db for InMemoryDb {
         needs: &[StepId],
         _at: Timestamp,
     ) -> Result<(), DbError> {
-        self.state.lock().unwrap().steps.insert(
+        let mut st = self.state.lock().unwrap();
+        // A step row made again keeps its key, as the row's key never changes.
+        let key = match st.steps.get(&(run.clone(), step.clone())) {
+            Some(rec) => rec.key.clone(),
+            None => mint_step_key(&st.steps, run),
+        };
+        st.steps.insert(
             (run.clone(), step.clone()),
             StepRec {
+                key,
                 status: Some(StepStatus::Pending),
                 spec: spec.cloned(),
                 needs: needs.to_vec(),
@@ -1966,12 +2004,30 @@ impl Db for InMemoryDb {
                         attempts,
                         needs: rec.needs.clone(),
                         gate_kind: rec.gate_kind.clone(),
+                        key: Some(rec.key.clone()),
                     }
                 })
             })
             .collect();
         out.sort_by(|a, b| a.step.0.cmp(&b.step.0));
         Ok(out)
+    }
+
+    async fn step_key(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .steps
+            .get(&(run.clone(), step.clone()))
+            .map(|rec| rec.key.clone()))
+    }
+
+    async fn step_by_key(&self, run: &RunId, key: &str) -> Result<Option<StepId>, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .steps
+            .iter()
+            .find(|((r, _), rec)| r == run && rec.key == key)
+            .map(|((_, s), _)| s.clone()))
     }
 
     async fn steps_of_runs(&self, runs: &[RunId]) -> Result<HashMap<RunId, Vec<StepRun>>, DbError> {
@@ -2720,6 +2776,20 @@ impl Db for InMemoryDb {
             }
         }
         Ok(())
+    }
+
+    async fn live_leases(&self, resources: &[String]) -> Result<Vec<String>, DbError> {
+        let st = self.state.lock().unwrap();
+        let now = std::time::Instant::now();
+        Ok(resources
+            .iter()
+            .filter(|r| {
+                st.leases
+                    .get(*r)
+                    .is_some_and(|(_, expires, _)| now < *expires)
+            })
+            .cloned()
+            .collect())
     }
 
     async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {

@@ -431,6 +431,7 @@ fn clone_forge_token() -> Option<scarab_engine::ForgeTokenConfig> {
 /// running sibling test sharing the fixture.
 fn step(run_prefix: &str) -> StepRun {
     StepRun {
+        key: None,
         run: RunId(unique_run(run_prefix)),
         step: StepId("echo".into()),
         status: StepStatus::Running,
@@ -513,6 +514,7 @@ async fn sleeping_step_is_killed_at_its_deadline() {
     let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns.clone(), client.clone());
     let step = StepRun {
+        key: None,
         run: RunId(unique_run("run-timeout")),
         step: StepId("sleeper".into()),
         status: StepStatus::Running,
@@ -699,6 +701,7 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
     // One unique run id for both steps: they share the run's workspace.
     let run = unique_run("run-ws");
     let step_run = |id: &str, attempt: &str| StepRun {
+        key: None,
         run: RunId(run.clone()),
         step: StepId(id.into()),
         status: StepStatus::Running,
@@ -912,6 +915,7 @@ async fn a_green_attempt_is_backed_by_a_durable_snapshot_at_the_instant_it_goes_
         .with_workspace_service(ws.fetch.clone());
 
     let step = StepRun {
+        key: None,
         run: RunId(unique_run("run-ws-durable")),
         step: StepId("produce".into()),
         status: StepStatus::Running,
@@ -1097,6 +1101,7 @@ async fn a_missing_input_snapshot_fails_the_attempt_instead_of_hanging() {
         .with_workspace_service(ws.fetch.clone());
 
     let step = StepRun {
+        key: None,
         run: RunId(unique_run("run-ws-missing")),
         step: StepId("consume".into()),
         status: StepStatus::Running,
@@ -1192,6 +1197,7 @@ async fn a_step_with_inputs_is_refused_when_no_workspace_service_is_configured()
     let exec = K8sExecutor::with_client(ns, client).with_workspace_cas(cas);
 
     let step = StepRun {
+        key: None,
         run: RunId(unique_run("run-ws-unconfigured")),
         step: StepId("consume".into()),
         status: StepStatus::Running,
@@ -1305,6 +1311,7 @@ async fn declared_outputs_publish_only_those_paths_through_the_cas() {
         .with_workspace_service(ws.fetch.clone());
 
     let step_run = |id: &str| StepRun {
+        key: None,
         run: RunId(run_id.clone()),
         step: StepId(id.into()),
         status: StepStatus::Running,
@@ -1456,6 +1463,7 @@ async fn clone_step_produces_a_source_workspace() {
         .with_workspace_service(ws.fetch.clone());
 
     let step = StepRun {
+        key: None,
         run: RunId(run_id.clone()),
         step: StepId("checkout".into()),
         status: StepStatus::Running,
@@ -1535,6 +1543,7 @@ async fn clone_step_produces_a_source_workspace() {
     // AND its .git materialize into /workspace (clone → CAS → materialize),
     // and HEAD is the pinned SHA — asserted from inside the cluster.
     let build = StepRun {
+        key: None,
         run: RunId(run_id.clone()),
         step: StepId("build".into()),
         status: StepStatus::Running,
@@ -1627,6 +1636,7 @@ async fn clone_depth_full_exposes_history() {
         .with_workspace_service(ws.fetch.clone());
 
     let step = StepRun {
+        key: None,
         run: RunId(run_id.clone()),
         step: StepId("checkout".into()),
         status: StepStatus::Running,
@@ -1678,6 +1688,7 @@ async fn clone_depth_full_exposes_history() {
         .expect("workspace snapshot");
 
     let count = StepRun {
+        key: None,
         run: RunId(run_id.clone()),
         step: StepId("history".into()),
         status: StepStatus::Running,
@@ -1761,6 +1772,7 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
         .with_workspace_service(ws.fetch.clone());
 
     let step = StepRun {
+        key: None,
         run: RunId(unique_run("run-clone-gone")),
         step: StepId("checkout".into()),
         status: StepStatus::Running,
@@ -1864,6 +1876,7 @@ fn build_library_ir(with: &str) -> scarab_pipeline::PipelineIr {
 /// The running fence of the build library's Step `image/<id>` in `run`.
 fn build_library_step_run(run: &str, id: &str, needs: Vec<StepId>) -> StepRun {
     StepRun {
+        key: None,
         run: RunId(run.to_string()),
         step: StepId(format!("image/{id}")),
         status: StepStatus::Running,
@@ -1992,18 +2005,28 @@ async fn the_build_library_builds_and_pushes_to_a_local_registry() {
     let ws = workspace_fixture();
     let run_id = unique_run("run-build");
 
-    // A stub results API: records the body of every POST the results
-    // sidecars make, whatever the path.
-    let received: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+    // A stub results API on the server's own route: records the Step id
+    // `Path` decodes and the body of every POST the results sidecars make.
+    // The library's Steps are `image/<id>`, so the sidecar's URL must carry
+    // the id as ONE encoded segment. This stub used to accept any path, and
+    // so did not see the raw `/` that sent every invoked Step's results to
+    // the server's web UI fallback (a 200 that stored nothing).
+    let received: std::sync::Arc<tokio::sync::Mutex<Vec<(String, serde_json::Value)>>> =
+        Default::default();
     let rec = received.clone();
-    let app =
-        axum::Router::new().fallback(move |axum::Json(body): axum::Json<serde_json::Value>| {
-            let rec = rec.clone();
-            async move {
-                rec.lock().await.push(body);
-                axum::http::StatusCode::ACCEPTED
-            }
-        });
+    let app = axum::Router::new().route(
+        "/v1/runs/{run}/steps/{step}/results",
+        axum::routing::post(
+            move |axum::extract::Path((_run, step)): axum::extract::Path<(String, String)>,
+                  axum::Json(body): axum::Json<serde_json::Value>| {
+                let rec = rec.clone();
+                async move {
+                    rec.lock().await.push((step, body));
+                    axum::http::StatusCode::ACCEPTED
+                }
+            },
+        ),
+    );
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -2067,7 +2090,8 @@ async fn the_build_library_builds_and_pushes_to_a_local_registry() {
             .lock()
             .await
             .iter()
-            .find_map(|body| body.get("image").cloned());
+            .filter(|(step, _)| step == "image/image")
+            .find_map(|(_, body)| body.get("image").cloned());
         if metadata.is_some() {
             break;
         }
@@ -2137,6 +2161,7 @@ async fn the_build_library_builds_and_pushes_to_a_local_registry() {
     // The push is observable: a verification step reads the registry's tag
     // list from inside the cluster.
     let verify = StepRun {
+        key: None,
         run: RunId(run_id.clone()),
         step: StepId("verify".into()),
         status: StepStatus::Running,
@@ -2496,6 +2521,7 @@ async fn results_sidecar_captures_a_named_result_end_to_end() {
     );
 
     let step = StepRun {
+        key: None,
         run: RunId(run_id.clone()),
         step: StepId("emit".into()),
         status: StepStatus::Running,
@@ -2690,6 +2716,7 @@ async fn cancel_tears_down_a_running_pod() {
     let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns.clone(), client.clone());
     let step = StepRun {
+        key: None,
         run: RunId(run_id.clone()),
         step: StepId("sleeper".into()),
         status: StepStatus::Running,
@@ -2785,6 +2812,7 @@ async fn artifacts_are_harvested_post_step() {
         .with_artifact_store(storage.clone());
 
     let step = StepRun {
+        key: None,
         run: RunId(run_id.clone()),
         step: StepId("emit".into()),
         status: StepStatus::Running,
@@ -2947,6 +2975,7 @@ async fn artifacts_are_harvested_from_a_failed_step() {
 /// — the shape every live test hand-builds; shared by the Phase-2 cases below.
 fn step_run_of(run: &str, step: &str) -> StepRun {
     StepRun {
+        key: None,
         run: RunId(run.into()),
         step: StepId(step.into()),
         status: StepStatus::Running,
@@ -3182,6 +3211,7 @@ async fn rerun_supersede_tears_down_the_in_flight_descendant_pod() {
     // Launch c's Pod for real: a sleeper that outlives the test if orphaned.
     let sleeper = busybox_spec("sleep 300", true); // busybox runs as root
     let c_run = StepRun {
+        key: None,
         run: run.clone(),
         step: c.clone(),
         status: StepStatus::Running,
@@ -3299,6 +3329,7 @@ async fn fanin_collision_summary_survives_the_termination_log_as_uid_65532() {
 
     let run_id = unique_run("run-fanin");
     let step_run = |id: &str| StepRun {
+        key: None,
         run: RunId(run_id.clone()),
         step: StepId(id.into()),
         status: StepStatus::Running,

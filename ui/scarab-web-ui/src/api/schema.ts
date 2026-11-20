@@ -4528,6 +4528,12 @@ export interface components {
             gate: string;
             /** @description The gate's inputs, rendered when it was reached. */
             inputs: Record<string, never>;
+            /**
+             * @description The gate's step key: the `{step}` of the release route,
+             *     `POST /v1/runs/{run}/gates/{key}/release`. Absent from a server
+             *     before step keys; name the step by its id then, percent-encoded.
+             */
+            key?: string | null;
             run: string;
             /** @description The gate's step id in the Run. */
             step: string;
@@ -6113,6 +6119,14 @@ export interface components {
             gate_resolution?: null | components["schemas"]["GateResolutionDto"];
             id: string;
             /**
+             * @description The step's key: 12 random characters of lowercase base32, unique
+             *     within the run and fixed for its life. A step route's `{step}`
+             *     (`/v1/runs/{id}/steps/{step}/…`) names the step by this key, which
+             *     needs no percent-encoding, where an authored id such as `amd64/image`
+             *     needs a `%2F` that a proxy may rewrite.
+             */
+            key: string;
+            /**
              * @description Upstream step ids this step depends on — the DAG in-edges. The
              *     UI folds these into the run's graph view.
              */
@@ -6327,6 +6341,8 @@ export interface components {
         };
         /** @description One waiting gate of a run in the list view ([`RunSummaryDto::waiting_gates`]). */
         WaitingGateDto: {
+            /** @description The gate step's key: how a step route's `{step}` names it. */
+            key: string;
             /** @description The gate kind: `manual` / `timer` / `external`. */
             kind: string;
             /**
@@ -12068,7 +12084,7 @@ export interface operations {
             path: {
                 /** @description run id */
                 id: string;
-                /** @description gate step id */
+                /** @description the gate step's key (preferred) or its authored step id, percent-encoded */
                 step: string;
             };
             cookie?: never;
@@ -12123,7 +12139,7 @@ export interface operations {
             path: {
                 /** @description run id */
                 id: string;
-                /** @description gate step id */
+                /** @description the gate step's key (preferred) or its authored step id, percent-encoded */
                 step: string;
             };
             cookie?: never;
@@ -12171,7 +12187,7 @@ export interface operations {
             path: {
                 /** @description run id */
                 id: string;
-                /** @description gate step id */
+                /** @description the gate step's key (preferred) or its authored step id, percent-encoded */
                 step: string;
             };
             cookie?: never;
@@ -12313,7 +12329,7 @@ export interface operations {
                 take?: number;
                 /** @description resume after this cursor (an event id); default = the Last-Event-ID header */
                 from?: string;
-                /** @description without a cursor, replay at most this many bytes from the end, in whole chunks (clamped to 1..67108864) */
+                /** @description without a cursor, replay from the stored chunk that holds the byte this many bytes before the end: at least this many bytes, or the whole log (clamped to 1..67108864) */
                 tail?: number;
             };
             header?: never;
@@ -12468,7 +12484,7 @@ export interface operations {
             path: {
                 /** @description run id */
                 id: string;
-                /** @description step id */
+                /** @description a step key (preferred) or the authored step id, percent-encoded */
                 step: string;
             };
             cookie?: never;
@@ -12507,7 +12523,7 @@ export interface operations {
             path: {
                 /** @description run id */
                 id: string;
-                /** @description step id */
+                /** @description a step key (preferred) or the authored step id, percent-encoded */
                 step: string;
             };
             cookie?: never;
@@ -12538,7 +12554,7 @@ export interface operations {
             path: {
                 /** @description run id */
                 id: string;
-                /** @description step id */
+                /** @description a step key (preferred) or the authored step id, percent-encoded */
                 step: string;
             };
             cookie?: never;
@@ -12577,14 +12593,14 @@ export interface operations {
                 sidecar?: number;
                 /** @description resume after this cursor (`<attempt_id>:<next_seq>`, an event id); default = the Last-Event-ID header */
                 from?: string;
-                /** @description without a cursor, replay at most this many bytes from the end, in whole chunks (clamped to 1..67108864) */
+                /** @description without a cursor, replay from the stored chunk that holds the byte this many bytes before the end: at least this many bytes, or the whole log (clamped to 1..67108864) */
                 tail?: number;
             };
             header?: never;
             path: {
                 /** @description run id */
                 id: string;
-                /** @description step id */
+                /** @description a step key (preferred) or the authored step id, percent-encoded */
                 step: string;
             };
             cookie?: never;
@@ -12626,7 +12642,7 @@ export interface operations {
             path: {
                 /** @description run id */
                 id: string;
-                /** @description step id */
+                /** @description a step key (preferred) or the authored step id, percent-encoded */
                 step: string;
             };
             cookie?: never;
@@ -12665,7 +12681,7 @@ export interface operations {
             path: {
                 /** @description run id */
                 id: string;
-                /** @description step id */
+                /** @description a step key (preferred) or the authored step id, percent-encoded */
                 step: string;
             };
             cookie?: never;
@@ -12696,7 +12712,7 @@ export interface operations {
             path: {
                 /** @description run id */
                 id: string;
-                /** @description step id */
+                /** @description a step key (preferred) or the authored step id, percent-encoded */
                 step: string;
             };
             cookie?: never;
@@ -12735,7 +12751,7 @@ export interface operations {
             path: {
                 /** @description run id */
                 id: string;
-                /** @description step id */
+                /** @description a step key (preferred) or the authored step id, percent-encoded */
                 step: string;
             };
             cookie?: never;
@@ -12768,7 +12784,7 @@ export interface operations {
             path: {
                 /** @description run id */
                 id: string;
-                /** @description step id */
+                /** @description a step key (preferred) or the authored step id, percent-encoded */
                 step: string;
             };
             cookie?: never;
@@ -12783,7 +12799,7 @@ export interface operations {
                     "application/json": components["schemas"]["StepResultDto"][];
                 };
             };
-            /** @description no such run */
+            /** @description no such run or step */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -12799,7 +12815,7 @@ export interface operations {
             path: {
                 /** @description run id */
                 id: string;
-                /** @description step id */
+                /** @description a step key (preferred) or the authored step id, percent-encoded */
                 step: string;
             };
             cookie?: never;
@@ -12843,7 +12859,7 @@ export interface operations {
             path: {
                 /** @description run id */
                 id: string;
-                /** @description step id */
+                /** @description a step key (preferred) or the authored step id, percent-encoded */
                 step: string;
             };
             cookie?: never;
@@ -12887,7 +12903,7 @@ export interface operations {
             path: {
                 /** @description run id */
                 id: string;
-                /** @description step id */
+                /** @description a step key (preferred) or the authored step id, percent-encoded */
                 step: string;
             };
             cookie?: never;
@@ -12923,7 +12939,7 @@ export interface operations {
             path: {
                 /** @description run id */
                 id: string;
-                /** @description step id */
+                /** @description a step key (preferred) or the authored step id, percent-encoded */
                 step: string;
             };
             cookie?: never;

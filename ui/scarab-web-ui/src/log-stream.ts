@@ -40,6 +40,11 @@ export type LogStreamHandlers = {
   /** A `data` event: the text, and its id (the position after it). */
   onChunk: (text: string, id: string | null) => void;
   onTruncated?: (t: LogTruncation) => void;
+  /** The server's `storing` event: the log is still being stored after its
+   * try ended (`true`), or no longer is (`false`). `waitOver`: the server
+   * stops waiting for it and ends the stream with the log still being
+   * stored. */
+  onStoring?: (storing: boolean, waitOver: boolean) => void;
   /** The connection opened: the server accepted the request. */
   onOpen?: () => void;
   /** The stream closed: the server ended it, it failed, or it dropped. */
@@ -71,12 +76,13 @@ function countNewlines(s: string): number {
   return n;
 }
 
-/** A size for the notice: `512 B`, `1.5 KB`, `2.0 MB` (powers of 1024). */
+/** A size for the notice: `512 B`, `1.5 KiB`, `2.0 MiB` (powers of 1024,
+ * named as such: a 19,800,019-byte log is 18.9 MiB, or 19.8 MB). */
 export function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
-  if (bytes < MiB) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * MiB) return `${(bytes / MiB).toFixed(1)} MB`;
-  return `${(bytes / (1024 * MiB)).toFixed(1)} GB`;
+  if (bytes < MiB) return `${(bytes / 1024).toFixed(1)} KiB`;
+  if (bytes < 1024 * MiB) return `${(bytes / MiB).toFixed(1)} MiB`;
+  return `${(bytes / (1024 * MiB)).toFixed(1)} GiB`;
 }
 
 /** One log as the pane holds it. */
@@ -89,6 +95,8 @@ export type LogBuffer = {
   newlines: number;
   /** Bytes at the start of the log the server did not send (`tail`). */
   skippedBytes: number;
+  /** The log's stored length when the server cut it (`tail`), else 0. */
+  totalBytes: number;
   /** Bytes the pane received and dropped to stay under its cap. */
   droppedBytes: number;
   /** Lines the pane dropped, so line numbers stay put after a drop. */
@@ -96,12 +104,12 @@ export type LogBuffer = {
 };
 
 export function emptyLogBuffer(): LogBuffer {
-  return { text: "", bytes: 0, newlines: 0, skippedBytes: 0, droppedBytes: 0, droppedLines: 0 };
+  return { text: "", bytes: 0, newlines: 0, skippedBytes: 0, totalBytes: 0, droppedBytes: 0, droppedLines: 0 };
 }
 
 /** Record the server's tail cutoff. */
 export function truncateLog(buf: LogBuffer, t: LogTruncation): LogBuffer {
-  return { ...buf, skippedBytes: t.skippedBytes };
+  return { ...buf, skippedBytes: t.skippedBytes, totalBytes: t.totalBytes };
 }
 
 /** The start of `s` that is at least `bytes` UTF-8 bytes long, cut on a
@@ -164,21 +172,47 @@ export function appendLog(buf: LogBuffer, chunk: string, cap = CLIENT_CAP_BYTES)
   return { ...buf, text, bytes, newlines, droppedBytes, droppedLines };
 }
 
-/** The notice above a log when part of it is not shown, or null. `loadFull`:
- * the whole log fits under `FULL_LOG_BYTES`, so the pane can ask for all of it.
+/** What the pane says while a try's log is still being stored after the try
+ * ended, and once the server stopped waiting for it. */
+export const STORING_TEXT = "The log is still being stored.";
+export const STORING_WAIT_OVER_TEXT = "The log is still being stored; reload to check again.";
+
+/** Where the server's `storing` events left a log: still being stored, or
+ * the server stopped waiting for it with the log still being stored. */
+export type StoreState = "storing" | "wait_over";
+
+/** The notice above a log when part of it is not shown, or while it is still
+ * being stored after its try ended; else null. `loadFull`: the whole log fits
+ * under `FULL_LOG_BYTES`, so the pane can ask for all of it.
+ *
+ * The whole size is the server's stored length when it cut the log, or more
+ * once more has arrived: while the server's tail is still arriving, what came
+ * so far plus what was skipped is less than the log. While the try runs, or
+ * its log is still being stored, the size is named as the size so far.
+ * `store` counts only for a try that is not running: a running try's log is
+ * always still being stored, which the notice does not need to say. With no
+ * output yet the log body says it instead, so the notice does not.
  *
  * Line numbers count from the first line the pane received. After the
  * server's cutoff that is not line 1 of the log, so the notice says where the
  * numbers start. Lines the pane dropped itself keep their numbers. */
-export function logNotice(buf: LogBuffer): { text: string; loadFull: boolean } | null {
+export function logNotice(
+  buf: LogBuffer,
+  opts: { outcome?: string; store?: StoreState } = {},
+): { text: string; loadFull: boolean } | null {
+  const running = opts.outcome === "running";
+  const store = !running && buf.bytes > 0 ? opts.store : undefined;
+  const stored = store === "wait_over" ? STORING_WAIT_OVER_TEXT : store === "storing" ? STORING_TEXT : "";
   const hidden = buf.skippedBytes + buf.droppedBytes;
-  if (hidden === 0) return null;
-  const total = hidden + buf.bytes;
-  let text = `Showing the last ${formatSize(buf.bytes)} of ${formatSize(total)}.`;
+  if (hidden === 0) return stored ? { text: stored, loadFull: false } : null;
+  const total = Math.max(buf.totalBytes, hidden + buf.bytes);
+  const sofar = running || store ? " so far" : "";
+  let text = `Showing the last ${formatSize(buf.bytes)} of ${formatSize(total)}${sofar}.`;
   if (buf.skippedBytes > 0) {
     text += buf.droppedLines > 0 ? " Line numbers start at the first line loaded." : " Line numbers start here.";
   }
-  return { text, loadFull: total <= FULL_LOG_BYTES };
+  if (stored) text += ` ${stored}`;
+  return { text, loadFull: !store && total <= FULL_LOG_BYTES };
 }
 
 /** The last `max` lines of the buffer, numbered from the log's first line the
@@ -246,7 +280,9 @@ export type LogFollower = {
  * When the server is unreachable or answers anything else, the cursor is
  * kept. The backoff goes on from where it was. `streamEndStep` decides each end: a try
  * that finished is done, and one that finished with no output is read once
- * more. `outcome()` is undefined while the log is out of view; the decision
+ * more. A stream that ends while its last `storing` event said the log is
+ * still being stored is reopened like a running try's, unless that event
+ * said the server stopped waiting for it. `outcome()` is undefined while the log is out of view; the decision
  * then waits for `inView()`, and the pane stops reopening a try it switched
  * away from. */
 export function followLog(opts: {
@@ -256,6 +292,8 @@ export function followLog(opts: {
   outcome: () => string | undefined;
   onChunk: (text: string) => void;
   onTruncated: (t: LogTruncation) => void;
+  /** The server's `storing` event (see `LogStreamHandlers`). */
+  onStoring?: (storing: boolean, waitOver: boolean) => void;
   /** A stream ended. */
   onEnd: () => void;
   /** A stream opened again. */
@@ -284,6 +322,10 @@ export function followLog(opts: {
   let resetPending = false;
   // The wait before the stream in flight opened.
   let lastWait = 0;
+  // The stream in flight said the log is still being stored, and that it
+  // stopped waiting for it.
+  let storing = false;
+  let waitOver = false;
 
   const start = (reopen: boolean) => {
     if (stopped) return;
@@ -334,6 +376,9 @@ export function followLog(opts: {
       }
     };
     const q: LogStreamQuery = lastId != null ? { from: lastId } : { tail: opts.tail };
+    // Each stream says it again if the log is still being stored.
+    storing = false;
+    waitOver = false;
     if (reopen) opts.onReopen?.();
     close = opts.open(q, {
       onChunk: (text, id) => {
@@ -347,6 +392,13 @@ export function followLog(opts: {
         if (!mine()) return;
         gotEvent();
         opts.onTruncated(t);
+      },
+      onStoring: (s, w) => {
+        if (!mine()) return;
+        gotEvent();
+        storing = s;
+        waitOver = w;
+        opts.onStoring?.(s, w);
       },
       onOpen: () => {
         if (!mine()) return;
@@ -383,7 +435,12 @@ export function followLog(opts: {
       deferred = true;
       return;
     }
-    const step = streamEndStep({ outcome, graceOver, hadOutput });
+    // The server says `storing: false` before it ends a stream whose log is
+    // whole: a stream that ended while the log was still being stored
+    // dropped. Follow it like a running try. When the server said it stopped
+    // waiting (a tail that hangs), do not: the pane says to reload.
+    const follow = storing && !waitOver;
+    const step = streamEndStep({ outcome: follow ? "running" : outcome, graceOver, hadOutput });
     if (step === "reopen") {
       start(true);
     } else if (step === "wait" && timer === null) {

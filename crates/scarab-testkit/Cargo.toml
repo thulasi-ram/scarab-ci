@@ -22,5 +22,8 @@ serde_json = { workspace = true }
 # fence holds across a write (git-bug aaf4e3e). Every consumer of this crate
 # is a tokio test already.
 tokio = { workspace = true }
+# The in-memory store mints step keys from the OS CSPRNG, as Postgres's
+# `gen_random_uuid()` does for the Postgres store.
+uuid = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }

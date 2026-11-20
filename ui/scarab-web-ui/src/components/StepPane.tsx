@@ -56,10 +56,13 @@ import {
   followLog,
   FULL_LOG_BYTES,
   logNotice,
+  STORING_TEXT,
+  STORING_WAIT_OVER_TEXT,
   tailRows,
   truncateLog,
   type LogBuffer,
   type LogFollower,
+  type StoreState,
 } from "../log-stream";
 import { approvalReleaseIn, type GateStatus } from "../gates";
 import { clock, clockLow, expiryPercent, isYankRefusal, pluginGateState } from "../run-origin";
@@ -393,6 +396,9 @@ export default function StepPane(props: {
   const [buffers, setBuffers] = createSignal<Record<string, LogBuffer>>({});
   // Streams the server has closed: nothing more will arrive for that key.
   const [ended, setEnded] = createSignal<Record<string, true>>({});
+  // Logs the server says are still being stored after their try ended, or
+  // that it stopped waiting for.
+  const [storing, setStoring] = createSignal<Record<string, StoreState>>({});
   const followers = new Map<string, LogFollower>();
   // Logs the user asked to read in full (Load full log): their tail.
   const tails = new Map<string, number>();
@@ -417,6 +423,14 @@ export default function StepPane(props: {
       delete next[key];
       return next;
     });
+  const setStoringKey = (key: string, on: StoreState | null) =>
+    setStoring((prev) => {
+      if (on) return { ...prev, [key]: on };
+      if (!prev[key]) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
   // Load full log: read the log again from the start of its last
   // FULL_LOG_BYTES.
   const loadFull = (key: string) => {
@@ -425,6 +439,7 @@ export default function StepPane(props: {
     tails.set(key, FULL_LOG_BYTES);
     setBuffers((prev) => ({ ...prev, [key]: emptyLogBuffer() }));
     setEndedKey(key, false);
+    setStoringKey(key, null);
     setStreamGen((n) => n + 1);
   };
 
@@ -465,8 +480,12 @@ export default function StepPane(props: {
           ),
         onChunk: (t) => updateBuffer(key, (b) => appendLog(b, t)),
         onTruncated: (t) => updateBuffer(key, (b) => truncateLog(b, t)),
+        onStoring: (on, waitOver) => setStoringKey(key, waitOver ? "wait_over" : on ? "storing" : null),
         onEnd: () => setEndedKey(key, true),
-        onReopen: () => setEndedKey(key, false),
+        onReopen: () => {
+          setEndedKey(key, false);
+          setStoringKey(key, null);
+        },
         onReset: () => updateBuffer(key, () => emptyLogBuffer()),
       }),
     );
@@ -485,17 +504,32 @@ export default function StepPane(props: {
     const a = scoped();
     if (!s || !a) return "waiting" as const;
     const key = logKey(s, a.id, container());
-    return logBodyState({ text: buffers()[key]?.text, ended: !!ended()[key], outcome: a.outcome });
+    return logBodyState({
+      text: buffers()[key]?.text,
+      ended: !!ended()[key],
+      outcome: a.outcome,
+      storing: !!storing()[key],
+    });
   };
   const logRows = () => {
     const b = logBuffer();
     return b ? tailRows(b, MAX_LINES).map((r) => ({ ...r, lvl: levelOf(r.line) })) : [];
   };
-  // "Showing the last 2.0 MB of 14.3 MB. Line numbers start here." when part
-  // of the log is not shown.
+  // "Showing the last 2.0 MiB of 14.3 MiB. Line numbers start here." when
+  // part of the log is not shown; "so far" while more may be stored, and
+  // "The log is still being stored." after the try ended.
   const notice = () => {
+    const s = stepId();
+    const a = scoped();
     const b = logBuffer();
-    return b ? logNotice(b) : null;
+    if (!s || !a || !b) return null;
+    return logNotice(b, { outcome: a.outcome, store: storing()[logKey(s, a.id, container())] });
+  };
+  const storingText = () => {
+    const s = stepId();
+    const a = scoped();
+    const st = s && a ? storing()[logKey(s, a.id, container())] : undefined;
+    return st === "wait_over" ? STORING_WAIT_OVER_TEXT : STORING_TEXT;
   };
   // The whole log of the try in view, as a file.
   const rawUrl = () => {
@@ -865,11 +899,13 @@ export default function StepPane(props: {
                       each={logRows()}
                       fallback={
                         <Show
-                          when={logState() !== "waiting"}
+                          when={logState() !== "waiting" && logState() !== "storing"}
                           fallback={
                             <div class="lgrow empty">
                               <span class="lgln" />
-                              <span class="lgtx">waiting for output…</span>
+                              <span class="lgtx">
+                                {logState() === "storing" ? storingText() : "waiting for output…"}
+                              </span>
                             </div>
                           }
                         >

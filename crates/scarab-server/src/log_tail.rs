@@ -13,13 +13,15 @@
 //! [`LogTailer`] owns the per-fence dedup + task spawning the converged driver
 //! calls once per tick for each running step.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use scarab_engine::{
     AttemptId, Executor, LogChunkMeta, LogChunks, LogFrom, LogRedactions, RunId, StepId, StepRun,
 };
+
+use futures::stream::{BoxStream, StreamExt};
 
 use crate::logs::{LogError, LogFence, LogService};
 
@@ -182,11 +184,13 @@ async fn current_part(
     })
 }
 
-/// Compares a read's redacted output with the stored part, one stored chunk
-/// body in memory at a time.
+/// Compares a read's redacted output with the stored part, the stored chunk
+/// bodies fetched ahead in order ([`LogService::read_chunks`]).
 struct Verify {
-    /// Stored chunks not loaded yet.
-    pending: VecDeque<LogChunkMeta>,
+    /// Stored chunk bodies not loaded yet.
+    bodies: BoxStream<'static, Result<Vec<u8>, LogError>>,
+    /// Stored bytes not loaded yet.
+    unloaded: u64,
     /// The loaded chunk body and how far it has matched.
     body: Vec<u8>,
     pos: usize,
@@ -209,9 +213,10 @@ enum Check {
 }
 
 impl Verify {
-    fn new(part: Vec<LogChunkMeta>) -> Self {
+    fn new(logs: &LogService, part: Vec<LogChunkMeta>) -> Self {
         Self {
-            pending: part.into(),
+            unloaded: part.iter().map(|c| c.len).sum(),
+            bodies: logs.read_chunks(part),
             body: Vec::new(),
             pos: 0,
             matched: 0,
@@ -221,12 +226,13 @@ impl Verify {
 
     /// Load the next stored chunk when the current one is used up. False when
     /// the stored part is used up.
-    async fn load(&mut self, logs: &LogService) -> Result<bool, LogError> {
+    async fn load(&mut self) -> Result<bool, LogError> {
         while self.pos == self.body.len() {
-            match self.pending.pop_front() {
-                Some(meta) => {
-                    self.body = logs.read_chunk(&meta).await?;
+            match self.bodies.next().await {
+                Some(body) => {
+                    self.body = body?;
                     self.pos = 0;
+                    self.unloaded = self.unloaded.saturating_sub(self.body.len() as u64);
                 }
                 None => return Ok(false),
             }
@@ -234,10 +240,10 @@ impl Verify {
         Ok(true)
     }
 
-    async fn check(&mut self, logs: &LogService, out: &[u8]) -> Result<Check, LogError> {
+    async fn check(&mut self, out: &[u8]) -> Result<Check, LogError> {
         let mut i = 0;
         while i < out.len() {
-            if !self.load(logs).await? {
+            if !self.load().await? {
                 return Ok(Check::Passed(i));
             }
             let n = (out.len() - i).min(self.body.len() - self.pos);
@@ -245,7 +251,7 @@ impl Verify {
             if let Some(d) = (0..n).find(|&k| out[i + k] != theirs[k]) {
                 self.advance(d);
                 let at = self.matched;
-                let in_redaction = self.differs_in_redaction(logs).await?;
+                let in_redaction = self.differs_in_redaction().await?;
                 return Ok(Check::Differs { at, in_redaction });
             }
             self.advance(n);
@@ -267,10 +273,10 @@ impl Verify {
 
     /// Whether a `***` of the stored part covers the differing byte: one
     /// starting up to two bytes before it, or at it.
-    async fn differs_in_redaction(&mut self, logs: &LogService) -> Result<bool, LogError> {
+    async fn differs_in_redaction(&mut self) -> Result<bool, LogError> {
         let mut window = self.recent.clone();
         let before = window.len();
-        while window.len() < before + 3 && self.load(logs).await? {
+        while window.len() < before + 3 && self.load().await? {
             let take = (before + 3 - window.len()).min(self.body.len() - self.pos);
             window.extend_from_slice(&self.body[self.pos..self.pos + take]);
             self.pos += take;
@@ -281,9 +287,16 @@ impl Verify {
     /// Stored bytes not matched yet, for the debug line of a read that ended
     /// inside the stored part.
     fn left(&self) -> u64 {
-        (self.body.len() - self.pos) as u64 + self.pending.iter().map(|c| c.len).sum::<u64>()
+        (self.body.len() - self.pos) as u64 + self.unloaded
     }
 }
+
+/// Bytes a log tail gathers before it stores them as one chunk.
+pub const TAIL_CHUNK_BYTES: usize = 256 * 1024;
+
+/// The longest a log tail holds bytes it has read before it stores them, so
+/// a live viewer sees a quiet step's output within this time.
+pub const TAIL_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 
 /// One read of a log source. Every chunk goes through one redactor from the
 /// source's first byte. While `part` (the stored part, from
@@ -294,8 +307,20 @@ impl Verify {
 /// start of a secret, and the next read sees them again). `lead` is appended
 /// before the first bytes the read appends, if any.
 ///
-/// Memory: one source chunk, one stored chunk body, the redactor's held bytes
-/// and the stored part's index rows.
+/// The bytes to append are gathered and stored as one chunk once they reach
+/// [`TAIL_CHUNK_BYTES`], [`TAIL_FLUSH_INTERVAL`] after the first of them was
+/// read, and when the read ends, cleanly or with an error. A source read in
+/// small pieces (the kubelet hands over at most 8 KiB per read, often one
+/// line) is then not one object-store PUT and two index queries per piece,
+/// which let the tail fall minutes behind a step that prints fast. What is
+/// gathered is redactor output only, so the stored bytes are the same bytes
+/// in the same order as before, in fewer chunks; the held-back start of a
+/// possible secret is never in it. The comparison with the stored part is
+/// done before bytes are gathered, so nothing is gathered while it runs and
+/// a difference still appends nothing.
+///
+/// Memory: one source chunk, the gathered bytes, the stored chunk bodies
+/// fetched ahead, the redactor's held bytes and the stored part's index rows.
 async fn pump(
     mut chunks: Box<dyn LogChunks>,
     logs: &LogService,
@@ -303,14 +328,49 @@ async fn pump(
     step: &StepId,
     attempt: &AttemptId,
     part: Vec<LogChunkMeta>,
-    mut lead: Option<&'static [u8]>,
+    lead: Option<&'static [u8]>,
 ) -> Result<PumpEnd, LogTailError> {
     let mut redactor = Some(logs.redactor(&LogFence::new(run, step, attempt)));
-    let mut verify = (!part.is_empty()).then(|| Verify::new(part));
+    let mut verify = (!part.is_empty()).then(|| Verify::new(logs, part));
     let mut read = 0u64;
-    let mut appended = 0u64;
+    let mut batch = Batch {
+        logs,
+        run,
+        step,
+        attempt,
+        lead,
+        bytes: Vec::new(),
+        due: None,
+        appended: 0,
+    };
     while let Some(r) = redactor.as_mut() {
-        let out = match chunks.next_chunk().await? {
+        let next = {
+            let fut = chunks.next_chunk();
+            tokio::pin!(fut);
+            loop {
+                let Some(at) = batch.due else {
+                    break fut.await;
+                };
+                tokio::select! {
+                    next = &mut fut => break next,
+                    () = tokio::time::sleep_until(at) => batch.store().await?,
+                }
+            }
+        };
+        let next = match next {
+            Ok(next) => next,
+            Err(e) => {
+                // What was gathered is redacted output that follows the
+                // stored part: store it, so the next read compares with it
+                // instead of reading it again. If that fails too, the next
+                // read finds it missing and appends it.
+                if let Err(store) = batch.store().await {
+                    tracing::debug!(run = %run.0, step = %step.0, error = %store, "log tail: could not store the bytes read before the read failed");
+                }
+                return Err(e.into());
+            }
+        };
+        let out = match next {
             Some(chunk) if chunk.is_empty() => continue,
             Some(chunk) => {
                 read += chunk.len() as u64;
@@ -321,7 +381,7 @@ async fn pump(
         };
         let mut new_from = 0;
         if let Some(v) = &mut verify {
-            match v.check(logs, &out).await? {
+            match v.check(&out).await? {
                 Check::Matched => new_from = out.len(),
                 Check::Passed(n) => new_from = n,
                 Check::Differs { at, in_redaction } => {
@@ -336,18 +396,9 @@ async fn pump(
                 verify = None;
             }
         }
-        let new = &out[new_from..];
-        if !new.is_empty() {
-            if appended == 0 {
-                tracing::info!(run = %run.0, step = %step.0, attempt = %attempt.0, "log tail: receiving output");
-            }
-            if let Some(marker) = lead.take() {
-                logs.append_redacted(run, step, attempt, marker).await?;
-            }
-            logs.append_redacted(run, step, attempt, new).await?;
-            appended += new.len() as u64;
-        }
+        batch.push(&out[new_from..]).await?;
     }
+    batch.store().await?;
     if let Some(v) = verify.filter(|v| v.left() > 0) {
         // The source ended inside the stored part and matched it so far:
         // every byte read is stored already.
@@ -356,7 +407,66 @@ async fn pump(
             "log tail: the log ended inside the part already stored; nothing appended"
         );
     }
-    Ok(PumpEnd::Done(Pumped { read, appended }))
+    Ok(PumpEnd::Done(Pumped {
+        read,
+        appended: batch.appended,
+    }))
+}
+
+/// The bytes one read of a log source has gathered and not stored yet.
+struct Batch<'a> {
+    logs: &'a LogService,
+    run: &'a RunId,
+    step: &'a StepId,
+    attempt: &'a AttemptId,
+    /// A marker to store before the first bytes, as a chunk of its own.
+    lead: Option<&'static [u8]>,
+    bytes: Vec<u8>,
+    /// When the gathered bytes are stored at the latest.
+    due: Option<tokio::time::Instant>,
+    /// Bytes stored so far (after redaction).
+    appended: u64,
+}
+
+impl Batch<'_> {
+    /// Gather `new`; store the batch once it is [`TAIL_CHUNK_BYTES`].
+    async fn push(&mut self, new: &[u8]) -> Result<(), LogError> {
+        if new.is_empty() {
+            return Ok(());
+        }
+        if self.bytes.is_empty() {
+            self.due = Some(tokio::time::Instant::now() + TAIL_FLUSH_INTERVAL);
+        }
+        self.bytes.extend_from_slice(new);
+        if self.bytes.len() >= TAIL_CHUNK_BYTES {
+            self.store().await?;
+        }
+        Ok(())
+    }
+
+    /// Store the gathered bytes as one chunk, after the lead marker if it
+    /// has not been stored yet.
+    async fn store(&mut self) -> Result<(), LogError> {
+        self.due = None;
+        if self.bytes.is_empty() {
+            return Ok(());
+        }
+        let (run, step, attempt) = (self.run, self.step, self.attempt);
+        if self.appended == 0 {
+            tracing::info!(run = %run.0, step = %step.0, attempt = %attempt.0, "log tail: receiving output");
+        }
+        if let Some(marker) = self.lead.take() {
+            self.logs
+                .append_redacted(run, step, attempt, marker)
+                .await?;
+        }
+        self.logs
+            .append_redacted(run, step, attempt, &self.bytes)
+            .await?;
+        self.appended += self.bytes.len() as u64;
+        self.bytes.clear();
+        Ok(())
+    }
 }
 
 /// Identifies one log stream: a single attempt of a step. Matches the pipeline's
@@ -365,6 +475,19 @@ type Fence = (String, String, String);
 
 fn fence_of(run: &RunId, step: &StepId, attempt: &AttemptId) -> Fence {
     (run.0.clone(), step.0.clone(), attempt.0.clone())
+}
+
+/// The tail lease (ADR-0051) of the stream `{run, step, attempt}`, where
+/// `step` is the stream's step key (a step, [`crate::logs::sidecar_stream_key`]
+/// or [`crate::logs::service_stream_key`]). A replica holds it while it reads
+/// that stream's source and cuts it short when the read ends
+/// ([`give_up_lease`]), so a live lease means the stream may still grow
+/// (`log_stream` reads it).
+pub fn tail_lease_resource(run: &RunId, step: &StepId, attempt: &AttemptId) -> String {
+    match step.0.rsplit_once("::service-") {
+        Some((owner, index)) => format!("tail:{}:{owner}:sidecar-{index}:{}", run.0, attempt.0),
+        None => format!("tail:{}:{}:{}", run.0, step.0, attempt.0),
+    }
 }
 
 /// The tail-lease TTL (ADR-0051): long enough to survive a slow tick, short
@@ -528,7 +651,7 @@ impl LogTailer {
         };
         let attempt = attempt.id.clone();
         let fence = fence_of(&step.run, &step.step, &attempt);
-        let resource = format!("tail:{}:{}:{}", step.run.0, step.step.0, attempt.0);
+        let resource = tail_lease_resource(&step.run, &step.step, &attempt);
         self.spawn_tail(
             fence,
             resource,
@@ -548,7 +671,7 @@ impl LogTailer {
     pub fn ensure_service(&self, run: &RunId, take: i64, name: &str, handle: &str) {
         let (step, attempt) = crate::logs::service_stream_key(name, take);
         let fence = fence_of(run, &step, &attempt);
-        let resource = format!("tail:{}:service:{}:{}", run.0, name, attempt.0);
+        let resource = tail_lease_resource(run, &step, &attempt);
         self.spawn_tail(
             fence,
             resource,
@@ -575,10 +698,7 @@ impl LogTailer {
         let attempt = attempt.id.clone();
         let syn_step = crate::logs::sidecar_stream_key(&step.step, index);
         let fence = fence_of(&step.run, &syn_step, &attempt);
-        let resource = format!(
-            "tail:{}:{}:sidecar-{index}:{}",
-            step.run.0, step.step.0, attempt.0
-        );
+        let resource = tail_lease_resource(&step.run, &syn_step, &attempt);
         self.spawn_tail(
             fence,
             resource,
@@ -760,9 +880,7 @@ impl LogTailer {
                     }
                     Values::Failed(e) => Err(e),
                 };
-                if let Some(r) = renewer {
-                    r.abort();
-                }
+                give_up_lease(renewer, lease.as_ref(), &resource, retry_backoff).await;
                 match result {
                     Ok(pumped) => {
                         if let Some(bytes) = pumped.map(|p| p.appended).filter(|b| *b > 0) {
@@ -810,9 +928,7 @@ impl LogTailer {
                 return;
             }
             let result = drain(&*executor, &logs, &source, &run, &step_id, &attempt, false).await;
-            if let Some(r) = renewer {
-                r.abort();
-            }
+            give_up_lease(renewer, lease.as_ref(), &resource, retry_backoff).await;
             match result {
                 // The stream closed cleanly having read nothing. That is not a
                 // complete log (git-bug 1dee2f3): Kubernetes answers a log
@@ -885,6 +1001,39 @@ async fn claim_lease(
             })))
         }
         _ => Err(()),
+    }
+}
+
+/// How much longer than the retry backoff a tail lease lasts once its read
+/// has ended (see [`give_up_lease`]).
+const TAIL_DONE_MARGIN: Duration = Duration::from_secs(2);
+
+/// Stop renewing the tail lease a read held and cut it to the retry backoff
+/// plus [`TAIL_DONE_MARGIN`]. A live lease then means a read is in progress,
+/// ended less than that ago, or its replica stopped less than a TTL ago: a
+/// reader of the log waits for it (`log_stream`). Outlasting the backoff
+/// covers the wait before the retry of a read that failed, and the driver
+/// pass before the read of an ended unit, so the lease does not lapse
+/// between two reads of a log that is not whole. It also keeps a peer that
+/// ensured the fence in the same driver pass from reading it again at once;
+/// a peer that reads it later compares with what is stored and appends only
+/// what follows it (git-bug de2bd9b), as it did when the lease expired after
+/// [`TAIL_LEASE_TTL_MS`].
+async fn give_up_lease(
+    renewer: Option<tokio::task::JoinHandle<()>>,
+    lease: Option<&(Arc<dyn scarab_engine::Db>, String)>,
+    resource: &str,
+    retry_backoff: Duration,
+) {
+    let Some(r) = renewer else {
+        return;
+    };
+    r.abort();
+    if let Some((db, owner)) = lease {
+        let ttl_ms = (retry_backoff + TAIL_DONE_MARGIN).as_millis() as i64;
+        if let Err(e) = db.lease(resource, owner, ttl_ms).await {
+            tracing::debug!(resource, error = %e, "log tail: could not shorten the tail lease; it expires");
+        }
     }
 }
 
@@ -1345,8 +1494,8 @@ mod tests {
             .unwrap();
         let part = logs.chunks(&run, &starred, &attempt).await.unwrap();
         for (source, want_at) in [(&b"a Q\n"[..], 2), (b"a *Q\n", 3), (b"a **Q\n", 4)] {
-            let mut v = Verify::new(part.clone());
-            match v.check(&logs, source).await.unwrap() {
+            let mut v = Verify::new(&logs, part.clone());
+            match v.check(source).await.unwrap() {
                 Check::Differs { at, in_redaction } => {
                     assert_eq!(at, want_at, "{}", String::from_utf8_lossy(source));
                     assert!(in_redaction, "{}", String::from_utf8_lossy(source));
@@ -1360,7 +1509,7 @@ mod tests {
             .await
             .unwrap();
         let part = logs.chunks(&run, &plain, &attempt).await.unwrap();
-        match Verify::new(part).check(&logs, b"ab X").await.unwrap() {
+        match Verify::new(&logs, part).check(b"ab X").await.unwrap() {
             Check::Differs { at, in_redaction } => {
                 assert_eq!(at, 3);
                 assert!(!in_redaction);
@@ -1425,6 +1574,7 @@ mod tests {
         .with_logs(launching.clone());
 
         let step = StepRun {
+            key: None,
             run: RunId("r1".into()),
             step: StepId("deploy".into()),
             status: StepStatus::Running,

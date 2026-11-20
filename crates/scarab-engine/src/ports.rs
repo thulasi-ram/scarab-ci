@@ -331,6 +331,8 @@ pub trait Db: Send + Sync {
 
     /// Create a step projection in `Pending`, storing its durable launch `spec`
     /// and its `needs` (dependency in-edges) for dependency-aware admission.
+    /// The store mints the step's key ([`StepRun::key`]): random, unique
+    /// within the run, and kept for the life of the row.
     async fn create_step_run(
         &self,
         run: &RunId,
@@ -1021,6 +1023,14 @@ pub trait Db: Send + Sync {
     /// the scheduler folds to decide admission and completion.
     async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError>;
 
+    /// The key of `step` of `run` ([`StepRun::key`]), or `None` for an
+    /// unknown step.
+    async fn step_key(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError>;
+
+    /// The step of `run` whose key is `key`, or `None` when no step of that
+    /// run has it. A key of another run's step is `None`.
+    async fn step_by_key(&self, run: &RunId, key: &str) -> Result<Option<StepId>, DbError>;
+
     /// [`Self::steps_of_run`] for many runs in a fixed number of round trips
     /// (review fit-F8 / safety S9): each run with steps maps to exactly what
     /// `steps_of_run` returns for it; a run with none (or unknown) is absent.
@@ -1455,6 +1465,12 @@ pub trait Db: Send + Sync {
     /// starts the next term, as any takeover does. A lease `owner` does not
     /// hold is left alone. For a holder shutting down cleanly.
     async fn release_lease(&self, resource: &str, owner: &str) -> Result<(), DbError>;
+
+    /// Which of `resources` have a lease that has not expired, by any owner.
+    /// Read only: it takes no lease and waits for no holder. A reader of a
+    /// log asks it for the tail leases of the streams it follows, to tell a
+    /// log still being stored from a whole one.
+    async fn live_leases(&self, resources: &[String]) -> Result<Vec<String>, DbError>;
 }
 
 /// A best-effort **live tail** of a running unit's combined stdout/stderr, pulled
