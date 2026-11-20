@@ -18,6 +18,15 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **A closed or merged pull request no longer runs its `pull_request` Pipelines again.** Scarab
+  started Runs for every pull request webhook, so closing or merging a pull request, or labelling
+  it, ran the Pipeline again, and a build Pipeline with `push: true` pushed its images again. A
+  pull request now starts Runs only when it is opened or reopened, gets new commits, or is edited
+  to target another base branch. Other deliveries start no Run and post no status, and the
+  webhook response names the action it ignored. GitHub and Forgejo.
+
 ## [0.6.1] - 2026-11-20
 
 ### Bug Fixes
