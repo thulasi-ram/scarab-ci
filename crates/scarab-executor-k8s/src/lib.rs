@@ -3667,7 +3667,13 @@ impl Executor for K8sExecutor {
         let pod = build_service_pod(&run.0, name, take, &self.namespace, spec);
         let handle = pod.metadata.name.clone().unwrap_or_default();
         // Ignore 409 (adopt existing) on every object — launch is idempotent.
-        adopt_conflict(pods.create(&PostParams::default(), &pod).await)?;
+        // A denial by the step Pod admission policy is the service's
+        // `Refused`, with the policy's reason (git-bug 07f0de3).
+        let created = pods.create(&PostParams::default(), &pod).await;
+        if let Some(refused) = created.as_ref().err().and_then(admission_policy_refusal) {
+            return Err(refused);
+        }
+        adopt_conflict(created)?;
         adopt_conflict(
             services
                 .create(
@@ -4153,7 +4159,10 @@ impl DebugLauncher for K8sExecutor {
         );
         pods.create(&PostParams::default(), &pod)
             .await
-            .map_err(|e| ExecError::Other(format!("create debug pod: {e}")))?;
+            .map_err(|e| {
+                admission_policy_refusal(&e)
+                    .unwrap_or_else(|| ExecError::Other(format!("create debug pod: {e}")))
+            })?;
 
         // The token Secret must exist before the kubelet mounts it, but the Pod
         // must exist before the Secret can be owner-referenced to it — the same
@@ -8480,11 +8489,13 @@ mod tests {
 
     /// `launch` against a fake API server that has no Pod and answers the
     /// Pod create with `code` and `message`, as Kubernetes does: a `Status`.
+    /// Returns the errors of a step launch, a shared-service launch and a
+    /// debug Pod launch, in that order.
     async fn launch_refused_with(
         code: u16,
         reason: &'static str,
         message: &'static str,
-    ) -> ExecError {
+    ) -> [ExecError; 3] {
         use axum::http::{Method, StatusCode};
         let _ = rustls::crypto::ring::default_provider().install_default();
         let status = |code: u16, reason: &str, message: &str| {
@@ -8509,17 +8520,31 @@ mod tests {
         let config = kube::Config::new(format!("http://{addr}").parse().unwrap());
         let client = kube::Client::try_from(config).unwrap();
         let exec = K8sExecutor::with_client("ci-steps", client);
-        exec.launch(&step_with_attempt("run-1", "build", "a1"), &busybox())
-            .await
-            .expect_err("the fake API refuses every Pod create")
+        let step = step_with_attempt("run-1", "build", "a1");
+        let service = scarab_pipeline::ServiceSpec {
+            image: "postgres:16".into(),
+            ports: vec![5432],
+            ..Default::default()
+        };
+        [
+            exec.launch(&step, &busybox()).await.expect_err("step"),
+            exec.launch_service(&step.run, 0, "db", &service)
+                .await
+                .expect_err("service"),
+            exec.launch_debug(&step, "busybox:latest", &Default::default(), None, 60)
+                .await
+                .err()
+                .expect("debug"),
+        ]
     }
 
     // git-bug 07f0de3: the chart's step Pod admission policy denies the
     // Pod create (a step Pod naming another Secret, say). The refusal does
     // not pass on a retry, so the step fails with the API's reason
     // (`Refused`) instead of a launch error the scheduler retries until the
-    // Run dead-letters. A 403 from anything else (a quota, RBAC, another
-    // policy) stays a launch error.
+    // Run dead-letters; a shared-service Pod and a debug Pod get the same
+    // `Refused`. A 403 from anything else (a quota, RBAC, another policy)
+    // stays what it was: a launch error (`Other` for the debug Pod).
     #[tokio::test]
     async fn a_pod_the_step_pod_admission_policy_denies_fails_the_step() {
         let denial = "pods \"scarab-build-a1-0\" is forbidden: ValidatingAdmissionPolicy \
@@ -8527,11 +8552,19 @@ mod tests {
             request: Scarab step Pod policy: a Secret volume names a Secret that is not the \
             Pod's own";
         for code in [403, 422] {
-            match launch_refused_with(code, "Forbidden", denial).await {
-                ExecError::Refused(m) => {
-                    assert!(m.contains("Scarab step Pod policy: a Secret volume"), "{m}")
+            for (what, err) in ["step", "service", "debug"]
+                .into_iter()
+                .zip(launch_refused_with(code, "Forbidden", denial).await)
+            {
+                match err {
+                    ExecError::Refused(m) => {
+                        assert!(
+                            m.contains("Scarab step Pod policy: a Secret volume"),
+                            "{what}: {m}"
+                        )
+                    }
+                    other => panic!("{what} {code}: {other:?}"),
                 }
-                other => panic!("{code}: {other:?}"),
             }
         }
         for (code, message) in [
@@ -8549,10 +8582,19 @@ mod tests {
                 "ValidatingAdmissionPolicy 'scarab-step-pods.ci.scarab' etcd timeout",
             ),
         ] {
-            match launch_refused_with(code, "Forbidden", message).await {
-                ExecError::Launch(_) => {}
-                other => panic!("{code} {message}: {other:?}"),
-            }
+            let [step, service, debug] = launch_refused_with(code, "Forbidden", message).await;
+            assert!(
+                matches!(step, ExecError::Launch(_)),
+                "{code} {message}: {step:?}"
+            );
+            assert!(
+                matches!(service, ExecError::Launch(_)),
+                "{code} {message}: {service:?}"
+            );
+            assert!(
+                matches!(debug, ExecError::Other(_)),
+                "{code} {message}: {debug:?}"
+            );
         }
     }
 
