@@ -4,7 +4,8 @@
 // (a branch, tag or commit) are two fields; the server reads a branch or
 // tag at the commit it points to when fetched, and the review page shows
 // that commit. Upgrade opens the same dialog with the installed source
-// filled in: change the ref and fetch.
+// filled in, and the branch or tag it was fetched at when there was one:
+// fetch again, or change the ref and fetch.
 //
 // The Name field starts as `<owner>::<repo>::<file name>`, the name the
 // server gives when none is sent, and follows the File field until someone
@@ -40,7 +41,8 @@ export default function InstallLibraryDialog(props: {
     () => props.org,
     (o) => listConnections(o).catch(() => []),
   );
-  // An installed source arrives as `…@<commit>`: the commit goes in Ref.
+  // An installed source arrives as `…@<commit>`: the commit goes in Ref,
+  // unless the caller gives the branch or tag it was fetched at.
   const start = splitSource(props.initial?.source ?? "");
   const [form, setForm] = createSignal<FetchForm>({
     connection: "",

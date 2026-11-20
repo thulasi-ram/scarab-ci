@@ -11,6 +11,8 @@ import {
   strayTrust,
   trustedSourceRows,
   versionLabel,
+  fetchedAt,
+  fetchedAtLabel,
   yanksOfLibrary,
   shortHash,
   refError,
@@ -199,6 +201,15 @@ describe("the list and manage pages", () => {
     expect(
       strayTrust([{ source: "github.com/acme/libs//x.yaml" }, { source: "github.com/acme/libs//y.yaml" }], installed),
     ).toEqual([{ source: "github.com/acme/libs//y.yaml" }]);
+  });
+  it("names a fetch by its ref and the commit it resolved to", () => {
+    expect(fetchedAtLabel({ requested_ref: "v1.2.0", resolved_commit: C })).toBe("v1.2.0 → 0123456");
+    expect(fetchedAt({ requested_ref: "main", resolved_commit: C })).toEqual({ ref: "main", commit: C, short: "0123456" });
+    // Fetched pinned to a commit, or with the commit as the ref: the commit alone.
+    expect(fetchedAtLabel({ requested_ref: null, resolved_commit: C })).toBe("0123456");
+    expect(fetchedAtLabel({ resolved_commit: C })).toBe("0123456");
+    expect(fetchedAtLabel({ requested_ref: C, resolved_commit: C })).toBe("0123456");
+    expect(fetchedAt({ requested_ref: " ", resolved_commit: C }).ref).toBeNull();
   });
   it("names a version by its source and a short commit", () => {
     expect(versionLabel(`github.com/acme/libs//x.yaml@${C}`)).toBe("github.com/acme/libs//x.yaml@0123456");

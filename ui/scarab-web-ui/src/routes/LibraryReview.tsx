@@ -4,8 +4,10 @@
 // it); the page fetches it (the server reads it at its commit, or at the
 // commit a branch or tag points to now, checks it
 // compiles as a closed library and stores it) and shows what it is: the
-// facts and checks on one label and value grid, then the file, or the
-// side-by-side diff from the installed version. When the org trusts the
+// facts and checks on one label and value grid (the ref asked for and the
+// commit it resolved to among them, and for an upgrade the installed
+// version's too), then the file, or the side-by-side diff from the installed
+// version. When the org trusts the
 // source with a grant (forge credentials, the registry credential, the build
 // sandbox), the version gets it too (trust is kept per source), so each such
 // grant has a box to tick before Install. Install, in
@@ -37,6 +39,7 @@ import {
   type SideCell,
 } from "../libraries";
 import { Checkbox } from "../components/Field";
+import FetchedAt from "../components/FetchedAt";
 import Icon from "../components/Icon";
 import InstallLibraryDialog from "../components/LibraryInstall";
 import { decodeParam, orgHref } from "../settings-nav";
@@ -207,19 +210,29 @@ function Review(props: { org: string }) {
               <dd class="m">{title().startsWith("lib:") ? title() : "<owner>::<repo>::<file name>"}</dd>
               <dt>Source</dt>
               <dd class="m">{fetched()?.source ?? form().source}</dd>
-              <Show when={askedRef() && !isFullCommit(askedRef())}>
-                <dt>Ref</dt>
-                <dd>
-                  <span class="mono">{askedRef()}</span>
-                  <Show when={fetched()}>
-                    {(f) => (
-                      <>
-                        {" "}
-                        at <span class="lib-hash">{shortHash(splitSource(f().source).ref)}</span> when fetched
-                      </>
-                    )}
+              <Show
+                when={fetched()}
+                fallback={
+                  <Show when={askedRef() && !isFullCommit(askedRef())}>
+                    <dt>Ref</dt>
+                    <dd class="m">{askedRef()}</dd>
                   </Show>
-                </dd>
+                }
+              >
+                {(f) => (
+                  <>
+                    <dt>Ref</dt>
+                    <dd data-testid="review-ref">
+                      <Show when={f().current} fallback={<FetchedAt v={f()} />}>
+                        {(cur) => (
+                          <>
+                            from <FetchedAt v={cur()} /> to <FetchedAt v={f()} />
+                          </>
+                        )}
+                      </Show>
+                    </dd>
+                  </>
+                )}
               </Show>
               <dt>Connection</dt>
               <dd>{connectionLabel()}</dd>
@@ -329,8 +342,8 @@ function Review(props: { org: string }) {
                       <div class="sbs rv-code">
                         <div>
                           <div class="sbs-h">
-                            installed <span class="lib-hash">{shortHash(cur().content_hash)}</span> · @
-                            {shortHash(cur().source.split("@").pop() ?? "")}
+                            installed <span class="lib-hash">{shortHash(cur().content_hash)}</span> ·{" "}
+                            <FetchedAt v={cur()} />
                           </div>
                           <div class="ud">
                             <For each={sides().left}>{(c) => <Cell c={c} side="old" />}</For>
@@ -338,8 +351,8 @@ function Review(props: { org: string }) {
                         </div>
                         <div>
                           <div class="sbs-h">
-                            fetched <span class="lib-hash">{shortHash(f().content_hash)}</span> · @
-                            {shortHash(f().source.split("@").pop() ?? "")}
+                            fetched <span class="lib-hash">{shortHash(f().content_hash)}</span> ·{" "}
+                            <FetchedAt v={f()} />
                           </div>
                           <div class="ud">
                             <For each={sides().right}>{(c) => <Cell c={c} side="new" />}</For>

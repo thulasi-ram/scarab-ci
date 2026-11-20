@@ -2,7 +2,8 @@
 // inside the settings frame with Libraries marked in the sidebar. The id is
 // the installation's; an upgrade keeps it.
 //
-// It holds everything done to the installation: its version and source,
+// It holds everything done to the installation: its version, the ref and
+// commit it was fetched at, and its source,
 // Upgrade (the install dialog with the source filled in, then the review
 // page), trust in its source with forge credentials and with the build
 // sandbox (each given on its own), yanking the installed
@@ -31,6 +32,7 @@ import {
   type TrustGrant,
 } from "../api/client";
 import {
+  fetchedAt,
   impactRunLabel,
   libraryChips,
   libraryId,
@@ -48,6 +50,7 @@ import { absTime, relTime } from "../fmt";
 import { decodeParam, orgHref } from "../settings-nav";
 import { SettingsCrumbs, SettingsFrame } from "./Settings";
 import Chips from "../components/Chips";
+import FetchedAt from "../components/FetchedAt";
 import Icon from "../components/Icon";
 import InstallLibraryDialog from "../components/LibraryInstall";
 import Modal, { ModalMessage } from "../components/Modal";
@@ -185,6 +188,10 @@ function Installation(props: {
             <span class="lib-hash" title={l().content_hash}>
               {shortHash(l().content_hash)}
             </span>
+          </dd>
+          <dt>Ref</dt>
+          <dd>
+            <FetchedAt v={l()} />
           </dd>
           <dt>Source</dt>
           <dd class="m">{l().source}</dd>
@@ -386,7 +393,7 @@ function Installation(props: {
         <InstallLibraryDialog
           org={props.org}
           upgrade
-          initial={{ source: l().source, name: l().name }}
+          initial={{ source: l().source, ref: fetchedAt(l()).ref ?? undefined, name: l().name }}
           onClose={() => setUpgrading(false)}
         />
       </Show>

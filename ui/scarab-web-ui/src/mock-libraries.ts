@@ -55,10 +55,17 @@ const YANK_REASON =
   "scarab-clone 0.4.0 writes the forge token to the log when a fetch fails; upgrade to b4d0f2a8c6e3 (v0.4.1)";
 
 // ── Settings › Libraries ─────────────────────────────────────────────────
+/** The commit a pinned source names. */
+const commitOf = (source: string) => source.slice(source.lastIndexOf("@") + 1);
+
+/** An installation fetched at `requested_ref` (a branch or tag), or pinned
+ *  to its source's commit when none is given. */
 const installation = (o: Partial<S["LibraryInstallationDto"]> & Pick<S["LibraryInstallationDto"], "id" | "name" | "content_hash" | "source">): S["LibraryInstallationDto"] => ({
   installed_by: "a.kim",
   installed_at: ago(6 * day),
   yanked: null,
+  requested_ref: null,
+  resolved_commit: commitOf(o.source),
   ...o,
 });
 
@@ -69,16 +76,19 @@ const fullLibraries: S["OrgLibrariesDto"] = {
       name: "thulasi-ram::scarab-ci::clone",
       content_hash: CLONE,
       source: CLONE_SRC,
+      requested_ref: "v0.4.0",
       installed_at: ago(20 * day),
     }),
-    installation({ id: "b72d4f1e06", name: "acme::scarab-libs::deploy-helm", content_hash: HELM, source: HELM_SRC }),
+    installation({ id: "b72d4f1e06", name: "acme::scarab-libs::deploy-helm", content_hash: HELM, source: HELM_SRC, requested_ref: "v1.1.0" }),
+    // Fetched pinned to a commit: no ref.
     installation({ id: "5c09e3a7d4", name: "acme::scarab-libs::http-probe", content_hash: PROBE, source: "github.com/acme/scarab-libs//http-probe.yaml@8c2f4e1a9d7b3c5e0f6a2b8d4c1e7f9a3b5d2c6e", installed_by: "j.lee" }),
-    installation({ id: "e4a61b8c39", name: "acme::scarab-libs::git-tag", content_hash: h("6a0d3e9f2b17"), source: "github.com/acme/scarab-libs//git-tag.yaml@51c3b8e0f2a4d6c8e0b2a4c6e8f0a2b4c6d8e0f2", installed_at: ago(3 * day) }),
+    installation({ id: "e4a61b8c39", name: "acme::scarab-libs::git-tag", content_hash: h("6a0d3e9f2b17"), source: "github.com/acme/scarab-libs//git-tag.yaml@51c3b8e0f2a4d6c8e0b2a4c6e8f0a2b4c6d8e0f2", requested_ref: "main", installed_at: ago(3 * day) }),
     installation({
       id: "91d7f05b2c",
       name: "platform::scarab-libs::kaniko-build",
       content_hash: KANIKO,
       source: KANIKO_SRC,
+      requested_ref: "release/1.23",
       installed_by: "j.lee",
       installed_at: ago(12 * day),
       yanked: KANIKO_YANK,
@@ -217,12 +227,16 @@ function lineDiff(a: string, b: string): string {
 const carriedGrants = (): S["TrustGrantDto"][] =>
   page().get("grants") === "carry" ? ["build_sandbox", "forge_credentials", "registry_credential"] : [];
 
-const fetchedUpgrade = (): S["FetchedLibraryDto"] => ({
+/** Every fetch answers an upgrade of deploy-helm, at the ref it asked for
+ *  (none when the source named a commit). */
+const fetchedUpgrade = (ref: string | null): S["FetchedLibraryDto"] => ({
   name: "acme::scarab-libs::deploy-helm",
   content_hash: HELM_NEW,
   source: HELM_NEW_SRC,
+  requested_ref: ref,
+  resolved_commit: commitOf(HELM_NEW_SRC),
   content: NEW,
-  current: { content_hash: HELM, source: HELM_SRC },
+  current: { content_hash: HELM, source: HELM_SRC, requested_ref: "v1.1.0", resolved_commit: commitOf(HELM_SRC) },
   diff: lineDiff(OLD, NEW),
   carried_grants: carriedGrants(),
 });
@@ -445,7 +459,10 @@ export function libraryRoute(
     const found = orgLibraries().installations.find((l) => l.id === id);
     return found ? json(found) : new Response("not found", { status: 404 });
   }
-  if (/^\/v1\/orgs\/[^/]+\/libraries\/fetch$/.test(p)) return json(fetchedUpgrade());
+  if (/^\/v1\/orgs\/[^/]+\/libraries\/fetch$/.test(p)) {
+    const req = JSON.parse(body || "{}") as { ref?: string };
+    return json(fetchedUpgrade(req.ref?.trim() || null));
+  }
   if (/^\/v1\/orgs\/[^/]+\/library-installations$/.test(p) && method === "POST") {
     // Install echoes the reviewed version as installed now. Nothing is kept.
     const req = JSON.parse(body || "{}") as { name?: string; content_hash?: string; carry_grants?: string[] };
@@ -466,6 +483,8 @@ export function libraryRoute(
         name,
         content_hash: req.content_hash ?? HELM_NEW,
         source: req.content_hash === HELM_NEW ? HELM_NEW_SRC : (was?.source ?? HELM_NEW_SRC),
+        requested_ref: req.content_hash === HELM_NEW ? "v1.2.0" : (was?.requested_ref ?? null),
+        resolved_commit: commitOf(req.content_hash === HELM_NEW ? HELM_NEW_SRC : (was?.source ?? HELM_NEW_SRC)),
         installed_at: now,
       }),
     );

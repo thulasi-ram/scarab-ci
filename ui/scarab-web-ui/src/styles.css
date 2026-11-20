@@ -3845,6 +3845,15 @@ a.lgtog { text-decoration: none; }
 /* --- Libraries: proposed badges --- */
 .lib-hash { font: var(--t-mono); color: var(--copper); }
 .lib-src { font: var(--t-mono); color: var(--muted-sage); word-break: break-all; }
+/* A version's ref and the commit it resolved to: `v1.2.0 → 1a2b3c4`. */
+.lib-at { white-space: nowrap; }
+.lib-at .lib-ref { color: var(--sage); }
+.lib-at .lib-arrow { color: var(--muted-sage); }
+.lib-commit {
+  font: var(--t-mono); color: var(--sage); background: none; border: 0; padding: 0; cursor: copy;
+  text-decoration: underline dotted var(--muted-sage); text-underline-offset: 3px;
+}
+.lib-commit:hover { color: var(--soft-white); }
 .lib-notice { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .lib-notice.yank { color: var(--danger); }
 /* table variant */

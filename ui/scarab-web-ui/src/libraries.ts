@@ -518,6 +518,26 @@ export function removedLibraryYanks<Y extends YankOf>(
   return yanks.filter((y) => !installed.some((i) => yanksOfLibrary([y], i).length > 0));
 }
 
+/** What a fetch of a version asked for and what it read: the branch, tag or
+ *  commit typed (`ref`, `null` when the source named the commit, or the ref
+ *  was the commit itself) and the full commit, with its first 7 characters. */
+export function fetchedAt(v: { requested_ref?: string | null; resolved_commit: string }): {
+  ref: string | null;
+  commit: string;
+  short: string;
+} {
+  const commit = v.resolved_commit;
+  const ref = v.requested_ref?.trim() || null;
+  return { ref: ref && ref !== commit ? ref : null, commit, short: commit.slice(0, 7) };
+}
+
+/** {@link fetchedAt} as one line: `v1.2.0 → 1a2b3c4`, or `1a2b3c4` alone
+ *  with no ref. */
+export function fetchedAtLabel(v: { requested_ref?: string | null; resolved_commit: string }): string {
+  const f = fetchedAt(v);
+  return f.ref ? `${f.ref} → ${f.short}` : f.short;
+}
+
 /** A version as a person reads it: its source with the commit cut to 7
  *  characters, `github.com/acme/libs//deploy.yaml@8c2f4e1`. */
 export function versionLabel(source: string): string {
