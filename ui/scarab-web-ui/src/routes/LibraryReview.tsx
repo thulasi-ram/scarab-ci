@@ -12,10 +12,13 @@
 // sandbox), the version gets it too (trust is kept per source), so each such
 // grant has a box to tick before Install. Install, in
 // the footer row, installs exactly the version shown, naming the version it
-// replaces and the grants ticked, and asks for a step-up.
+// replaces and the grants ticked, and asks for a step-up. When the file is
+// the same as the installed one at another ref or commit, there is no diff:
+// the page says so, and Move to this commit moves the installed library to
+// the fetch's ref and commit.
 //
 // Every library takes this one path, whoever publishes it.
-import { createEffect, createMemo, createResource, createSignal, For, on, Show } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, Match, on, Show, Switch } from "solid-js";
 import { useNavigate, useParams, useSearchParams } from "@solidjs/router";
 import { fetchLibrary, installLibrary, listConnections, listLibraries } from "../api/client";
 import {
@@ -28,6 +31,8 @@ import {
   inputsChange,
   libraryManageHref,
   numberDiff,
+  reviewAction,
+  reviewActionLabel,
   reviewChecks,
   isFullCommit,
   shortHash,
@@ -147,10 +152,13 @@ function Review(props: { org: string }) {
     add: lines().filter((l) => l.sign === "+").length,
     del: lines().filter((l) => l.sign === "-").length,
   });
-  const same = () => {
+  /** What Install does for the fetch shown; `null` before it is fetched. */
+  const action = () => {
     const f = fetched();
-    return !!f && f.current?.content_hash === f.content_hash;
+    return f ? reviewAction(f) : null;
   };
+  /** The same file as the installed one: no diff to show. */
+  const unchanged = () => action() === "move" || action() === "installed";
   const checks = () => {
     const f = fetched();
     return f ? reviewChecks(f.content, libs()?.installations ?? []) : [];
@@ -179,7 +187,11 @@ function Review(props: { org: string }) {
         sub={
           <>
             <span class="mono">{props.org}</span> ·{" "}
-            {fetched()?.current ? "review an upgrade" : "review a library before installing it"}
+            {unchanged()
+              ? "review a move to another commit"
+              : fetched()?.current
+                ? "review an upgrade"
+                : "review a library before installing it"}
             <Show when={fetched()}> · fetched by {me()?.handle}</Show>
           </>
         }
@@ -204,7 +216,7 @@ function Review(props: { org: string }) {
         <div class="rv">
           <div class="panel">
             <div class="panel-h">
-              <span>{fetched()?.current ? "Upgrade" : "Install"}</span>
+              <span>{unchanged() ? "Move to another commit" : fetched()?.current ? "Upgrade" : "Install"}</span>
               <button class="btn btn-ghost btn-sm" onClick={() => setChanging(true)}>
                 Change source
               </button>
@@ -253,8 +265,13 @@ function Review(props: { org: string }) {
                     <dt>Version</dt>
                     <dd>
                       <Show
-                        when={f().current}
-                        fallback={<span class="lib-hash">{shortHash(f().content_hash)}</span>}
+                        when={f().current && !unchanged() ? f().current : null}
+                        fallback={
+                          <>
+                            <span class="lib-hash">{shortHash(f().content_hash)}</span>
+                            <Show when={unchanged()}> · the same as installed</Show>
+                          </>
+                        }
                       >
                         {(cur) => (
                           <>
@@ -275,7 +292,8 @@ function Review(props: { org: string }) {
                       <dd role="group" aria-label="Trust this version gets">
                         <p style={{ margin: "0 0 8px" }}>
                           The org trusts <span class="mono">{trustKey(f().source)}</span> with these. Trust is kept
-                          for the source, not the commit, so {f().current ? "the new version" : "this version"} gets
+                          for the source, not the commit, so{" "}
+                          {unchanged() ? "the version at this commit" : f().current ? "the new version" : "this version"} gets
                           them too. Tick each one to install it.
                         </p>
                         <For each={f().carried_grants}>
@@ -343,35 +361,54 @@ function Review(props: { org: string }) {
                 }
               >
                 {(cur) => (
-                  <Show when={!same()} fallback={<p class="empty">This version is installed already.</p>}>
-                    <div class="panel">
-                      <div class="panel-h">
-                        <span>
-                          Diff · {counts().add} lines added, {counts().del} removed · unchanged lines folded
-                        </span>
+                  <Switch>
+                    <Match when={action() === "installed"}>
+                      <p class="empty" data-testid="review-installed">
+                        This version is installed already, at <FetchedAt v={cur()} />. Nothing would change.
+                      </p>
+                    </Match>
+                    <Match when={action() === "move"}>
+                      <div class="panel">
+                        <div class="panel-h">
+                          <span>Content · {f().content.split("\n").length} lines, the same as installed</span>
+                        </div>
+                        <p class="kv-note kv-lead" data-testid="review-move">
+                          The file is the same at this commit; installing moves{" "}
+                          <span class="mono">lib:{f().name}</span> from <FetchedAt v={cur()} /> to{" "}
+                          <FetchedAt v={f()} />.
+                        </p>
                       </div>
-                      <div class="sbs rv-code">
-                        <div>
-                          <div class="sbs-h">
-                            installed <span class="lib-hash">{shortHash(cur().content_hash)}</span> ·{" "}
-                            <FetchedAt v={cur()} />
+                    </Match>
+                    <Match when={action() === "upgrade"}>
+                      <div class="panel">
+                        <div class="panel-h">
+                          <span>
+                            Diff · {counts().add} lines added, {counts().del} removed · unchanged lines folded
+                          </span>
+                        </div>
+                        <div class="sbs rv-code">
+                          <div>
+                            <div class="sbs-h">
+                              installed <span class="lib-hash">{shortHash(cur().content_hash)}</span> ·{" "}
+                              <FetchedAt v={cur()} />
+                            </div>
+                            <div class="ud">
+                              <For each={sides().left}>{(c) => <Cell c={c} side="old" />}</For>
+                            </div>
                           </div>
-                          <div class="ud">
-                            <For each={sides().left}>{(c) => <Cell c={c} side="old" />}</For>
+                          <div>
+                            <div class="sbs-h">
+                              fetched <span class="lib-hash">{shortHash(f().content_hash)}</span> ·{" "}
+                              <FetchedAt v={f()} />
+                            </div>
+                            <div class="ud">
+                              <For each={sides().right}>{(c) => <Cell c={c} side="new" />}</For>
+                            </div>
                           </div>
                         </div>
-                        <div>
-                          <div class="sbs-h">
-                            fetched <span class="lib-hash">{shortHash(f().content_hash)}</span> ·{" "}
-                            <FetchedAt v={f()} />
-                          </div>
-                          <div class="ud">
-                            <For each={sides().right}>{(c) => <Cell c={c} side="new" />}</For>
-                          </div>
-                        </div>
                       </div>
-                    </div>
-                  </Show>
+                    </Match>
+                  </Switch>
                 )}
               </Show>
             )}
@@ -380,11 +417,14 @@ function Review(props: { org: string }) {
           <div class="rv-foot">
             <button
               class="btn btn-primary btn-sm"
-              disabled={!fetched() || installing() || same() || !carry()}
+              disabled={!fetched() || installing() || action() === "installed" || !carry()}
               onClick={() => void doInstall()}
             >
-              <Icon icon={fetched()?.current ? "arrow-up" : "plus"} size={14} />{" "}
-              {installing() ? "Installing…" : fetched()?.current ? "Upgrade" : "Install"}
+              <Icon
+                icon={unchanged() ? "git-commit-horizontal" : fetched()?.current ? "arrow-up" : "plus"}
+                size={14}
+              />{" "}
+              {installing() ? "Installing…" : reviewActionLabel(action() ?? "install")}
             </button>
             <button class="btn btn-ghost btn-sm" onClick={() => nav(back())}>
               Discard

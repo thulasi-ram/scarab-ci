@@ -14,7 +14,8 @@ import {
   askedOtherRef,
   fetchedAt,
   fetchedAtLabel,
-  sourceCommit,
+  reviewAction,
+  reviewActionLabel,
   yanksOfLibrary,
   shortHash,
   refError,
@@ -221,8 +222,29 @@ describe("the list and manage pages", () => {
     expect(askedOtherRef(C, { requested_ref: null, resolved_commit: C })).toBe(false);
     expect(askedOtherRef("v1.4.0", { requested_ref: "main", resolved_commit: C })).toBe(true);
     expect(askedOtherRef("", { requested_ref: "main", resolved_commit: C })).toBe(false);
-    expect(sourceCommit(`github.com/acme/libs//x.yaml@${C}`)).toBe(C);
-    expect(sourceCommit("github.com/acme/libs//x.yaml")).toBe("");
+  });
+  it("moves the installed file to a new commit when only the commit changed", () => {
+    const D = "f".repeat(40);
+    const installed = { content_hash: "h1", requested_ref: "v1.1.0", resolved_commit: C };
+    const at = (requested_ref: string | null, resolved_commit: string, content_unchanged = true) => ({
+      content_hash: "h1",
+      requested_ref,
+      resolved_commit,
+      content_unchanged,
+      current: installed,
+    });
+    expect(reviewAction({ ...at("v1.1.0", C), current: null, content_unchanged: false })).toBe("install");
+    expect(reviewAction(at("v1.2.0", D, false))).toBe("upgrade");
+    // The same file: at a new commit, under a new ref, or pinned, it moves.
+    expect(reviewAction(at("v1.2.0", D))).toBe("move");
+    expect(reviewAction(at("v1.2.0", C))).toBe("move");
+    expect(reviewAction(at(null, C))).toBe("move");
+    // At the ref and commit installed, nothing would change.
+    expect(reviewAction(at("v1.1.0", C))).toBe("installed");
+    expect(reviewAction({ ...at(null, C), current: { ...installed, requested_ref: undefined } })).toBe("installed");
+    expect(reviewActionLabel("move")).toBe("Move to this commit");
+    expect(reviewActionLabel("upgrade")).toBe("Upgrade");
+    expect(reviewActionLabel("install")).toBe("Install");
   });
   it("names a version by its source and a short commit", () => {
     expect(versionLabel(`github.com/acme/libs//x.yaml@${C}`)).toBe("github.com/acme/libs//x.yaml@0123456");

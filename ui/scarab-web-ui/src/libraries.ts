@@ -540,6 +540,27 @@ export function fetchedAtLabel(v: { requested_ref?: string | null; resolved_comm
   return f.ref ? `${f.ref} → ${f.short}` : f.short;
 }
 
+/** What installing a fetched version does: a first `install`; an `upgrade`
+ *  to other content; a `move` of the installed content to the fetch's ref
+ *  and commit, where the file is the same; or nothing, when it is
+ *  `installed` already at that ref and commit (the server refuses it). */
+export type ReviewAction = "install" | "upgrade" | "move" | "installed";
+
+type Fetched = { requested_ref?: string | null; resolved_commit: string };
+
+export function reviewAction(f: Fetched & { content_unchanged: boolean; current?: Fetched | null }): ReviewAction {
+  const cur = f.current;
+  if (!cur) return "install";
+  if (!f.content_unchanged) return "upgrade";
+  const sameRef = (cur.requested_ref ?? null) === (f.requested_ref ?? null);
+  return sameRef && cur.resolved_commit === f.resolved_commit ? "installed" : "move";
+}
+
+/** The review page's install button for each {@link ReviewAction}. */
+export function reviewActionLabel(a: ReviewAction): string {
+  return a === "install" ? "Install" : a === "move" ? "Move to this commit" : "Upgrade";
+}
+
 /** Whether the ref asked for in the review page's URL is not the one the
  *  fetch answered: the same content was stored before, from another file,
  *  and the version keeps that fetch's ref and commit. A full commit asked
@@ -548,12 +569,6 @@ export function askedOtherRef(asked: string, f: { requested_ref?: string | null;
   const a = asked.trim();
   if (!a) return false;
   return a !== (f.requested_ref ?? f.resolved_commit);
-}
-
-/** The commit a pinned source names, or `""`. */
-export function sourceCommit(source: string): string {
-  const at = source.lastIndexOf("@");
-  return at < 0 ? "" : source.slice(at + 1);
 }
 
 /** A version as a person reads it: its source with the commit cut to 7
