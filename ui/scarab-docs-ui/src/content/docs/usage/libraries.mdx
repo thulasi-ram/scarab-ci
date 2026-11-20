@@ -39,6 +39,27 @@ installation is pinned to that commit and to the content you reviewed: a branch 
 changes nothing until you upgrade. The API takes the same two fields, `source` and `ref`, or a
 `source` that ends in `@<full commit id>`.
 
+### The ref and the commit
+
+Scarab keeps the ref you asked for and the commit it read the file at. The library list, the
+library's page and the review page show them as `v1.4.0 → 8c2f4e1`: the ref, then the first 7
+characters of the commit. Hover the commit to see all of it, or click it to copy it. A library
+fetched with a source that ends in `@<commit>` has no ref, and shows the commit alone.
+
+The installation records the ref and commit of the fetch you installed. Fetching the same file
+again under another ref, or at another commit that holds the same content, does not change what
+an installed library says. The API answers both, in the fetch answer (and its `current`) and in
+each installation:
+
+```json
+{"requested_ref": "v1.4.0", "resolved_commit": "8c2f4e1a9d7b3c5e0f6a2b8d4c1e7f9a3b5d2c6e"}
+```
+
+`requested_ref` is `null` when the source named the commit, and for libraries installed before
+Scarab kept it; `resolved_commit` is always the full commit. A version keeps the `source` of its
+first fetch, so when the same content was fetched before at another commit, `resolved_commit` can
+differ from the commit in `source`. Both commits hold the same file.
+
 Installing takes two steps:
 
 1. **Fetch and review.** Scarab reads the file, checks that it is a library, that it invokes only
@@ -52,7 +73,8 @@ Installing takes two steps:
 ```sh
 curl -X POST "$SCARAB/v1/orgs/acme/libraries/fetch" \
   -d '{"source": "github.com/acme/scarab-libs//deploy-helm.yaml@8c2f…"}'
-# → {"name": "acme::scarab-libs::deploy-helm", "content_hash": "5d1e…", "content": "…"}
+# → {"name": "acme::scarab-libs::deploy-helm", "content_hash": "5d1e…", "requested_ref": null,
+#    "resolved_commit": "8c2f…", "content": "…"}
 
 curl -X POST "$SCARAB/v1/orgs/acme/library-installations" \
   -d '{"name": "acme::scarab-libs::deploy-helm", "content_hash": "5d1e…"}'
@@ -83,8 +105,11 @@ for a public repository; for a private one, give the connection access to it. Se
 Each installed library has its own page, reached from its row under Settings › Libraries
 (`/orgs/<org>/settings/libraries/<id>/manage`, where the id is the installation's and stays the
 same across upgrades). Its **Upgrade** asks for the newer
-commit of the same file. Scarab shows the diff from the installed version, and **Upgrade** on the
-review page installs it. The upgrade names the version it replaces, so if someone else changed the
+commit of the same file, and starts from the branch or tag the installed version was fetched at,
+so fetching again reads where that ref points now. Scarab shows the diff from the installed
+version, and the ref and commit before and after (`from v1.1.0 → 9f8e7d6 to v1.2.0 → 1a2b3c4`),
+and **Upgrade** on the review page installs it. The passkey confirmation and the org's security
+log name both. The upgrade names the version it replaces, so if someone else changed the
 installation after you fetched, it fails and you fetch again to see the current diff.
 
 **Trust carries over.** Trust is kept for a source, not a commit

@@ -18,6 +18,20 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Features
+
+- **A library keeps the ref it was fetched at and the commit that ref resolved to.** The library
+  list, each library's page, the review page and the upgrade diff show them as
+  `v1.2.0 → 1a2b3c4` (the commit alone for a source pinned with `@<commit>`), with the full commit
+  in the commit's title and a click to copy it. An upgrade reads from the installed ref and commit
+  to the fetched ones, and Upgrade starts from the installed ref. The fetch answer and every
+  installation carry `requested_ref` and `resolved_commit`, and the install's passkey
+  confirmation and security log name them. An installation records the ones of the fetch it
+  installed: fetching the same content again under another ref does not change it. Migration
+  `0097` adds nullable columns and fills in the commit of every library installed before it; their
+  ref stays empty. See
+  [The ref and the commit](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#the-ref-and-the-commit).
+
 ## [0.5.0] - 2026-11-20
 
 ### Breaking changes
