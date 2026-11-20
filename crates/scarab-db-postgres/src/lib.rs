@@ -2405,7 +2405,8 @@ impl Db for PostgresDb {
         let rows = sqlx::query(
             "SELECT u.gen, u.handle, u.started_at, u.settled_at, u.revoke_attempted_at,
                     u.purged, u.created_at AS unit_created_at, u.stream_count,
-                    v.gen AS value_gen, v.sealed, v.created_at
+                    u.revoke_failures, u.revoke_retry_at,
+                    v.gen AS value_gen, v.sealed, v.created_at, v.revoked_at
              FROM log_units u
              LEFT JOIN log_unit_values v
                ON v.run_id = u.run_id AND v.step_id = u.step_id AND v.attempt_id = u.attempt_id
@@ -2429,6 +2430,7 @@ impl Db for PostgresDb {
                     gen: r.get::<Option<i64>, _>("value_gen")?,
                     sealed: r.get::<Option<Vec<u8>>, _>("sealed")?,
                     created_at: r.get::<Option<i64>, _>("created_at")?,
+                    revoked_at: r.get::<Option<i64>, _>("revoked_at"),
                 })
             })
             .collect();
@@ -2466,6 +2468,53 @@ impl Db for PostgresDb {
         .bind(&unit.step.0)
         .bind(&unit.attempt.0)
         .bind(at.0)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn mark_log_generation_revoked(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+        gen: i64,
+        at: Timestamp,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE log_unit_values SET revoked_at = COALESCE(revoked_at, $5)
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3 AND gen = $4",
+        )
+        .bind(&unit.run.0)
+        .bind(&unit.step.0)
+        .bind(&unit.attempt.0)
+        .bind(gen)
+        .bind(at.0)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn record_log_unit_revoke_failure(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+        now: Timestamp,
+    ) -> Result<(), DbError> {
+        // The wait doubles from LEDGER_REVOKE_BACKOFF_MS with each failure
+        // (`ledger_revoke_backoff_ms`), up to the maximum.
+        sqlx::query(
+            "UPDATE log_units SET
+               revoke_failures = revoke_failures + 1,
+               revoke_retry_at = $4 + LEAST(
+                 $5 * power(2, LEAST(revoke_failures, 16))::bigint, $6)
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&unit.run.0)
+        .bind(&unit.step.0)
+        .bind(&unit.attempt.0)
+        .bind(now.0)
+        .bind(scarab_engine::LEDGER_REVOKE_BACKOFF_MS)
+        .bind(scarab_engine::LEDGER_REVOKE_BACKOFF_MAX_MS)
         .execute(self.pool())
         .await
         .map_err(db_err)?;
@@ -2607,11 +2656,15 @@ impl Db for PostgresDb {
              )
              SELECT run_id, step_id, attempt_id, gen, handle, started_at, settled_at,
                     revoke_attempted_at, purged, created_at, stream_count,
+                    revoke_failures, revoke_retry_at,
                     (NOT running AND oldest IS NOT NULL AND oldest < $1 - $2) AS past_cap
              FROM c
-             WHERE (settled_at IS NOT NULL AND settled_at < $1 - $3)
-                OR (run_ended IS NOT NULL AND run_ended < $1 - $3)
-                OR (NOT running AND oldest IS NOT NULL AND oldest < $1 - $2)
+             WHERE ((settled_at IS NOT NULL AND settled_at < $1 - $3)
+                    OR (run_ended IS NOT NULL AND run_ended < $1 - $3)
+                    OR (NOT running AND oldest IS NOT NULL AND oldest < $1 - $2))
+               AND (revoke_retry_at IS NULL OR revoke_retry_at <= $1
+                    OR (NOT running AND oldest IS NOT NULL AND oldest < $1 - $2))
+             ORDER BY COALESCE(settled_at, 0), run_id, step_id, attempt_id
              LIMIT $4"
         ))
         .bind(now.0)
@@ -6330,5 +6383,7 @@ fn log_unit_row(r: &sqlx::postgres::PgRow) -> scarab_engine::LogUnitRow {
             .or_else(|_| r.try_get::<i64, _>("created_at"))
             .unwrap_or(0),
         stream_count: r.get("stream_count"),
+        revoke_failures: r.get("revoke_failures"),
+        revoke_retry_at: r.get("revoke_retry_at"),
     }
 }

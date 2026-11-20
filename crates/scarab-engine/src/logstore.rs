@@ -349,6 +349,9 @@ pub struct LogUnitRow {
     /// sidecar service of its step. Its ledger is purged after its last
     /// stream ends only once this many stream rows are terminal.
     pub stream_count: i32,
+    /// Failed revocations by the ledger sweep, and when it tries again.
+    pub revoke_failures: i32,
+    pub revoke_retry_at: Option<i64>,
 }
 
 /// One sealed generation of a unit's ledger.
@@ -357,6 +360,9 @@ pub struct SealedGeneration {
     pub gen: i64,
     pub sealed: Vec<u8>,
     pub created_at: i64,
+    /// When every minted forge token in it was revoked: it is not revoked
+    /// again.
+    pub revoked_at: Option<i64>,
 }
 
 /// A unit's ledger as stored: its row and every generation present.
@@ -596,6 +602,19 @@ pub const LEDGER_HARD_CAP_MS: i64 = (scarab_pipeline::MAX_STEP_TIMEOUT_SECS as i
 /// How long after a unit settles (or its run ends) its ledger is kept at
 /// most, whatever its streams.
 pub const LEDGER_SETTLED_KEEP_MS: i64 = 3600 * 1000;
+
+/// The ledger sweep's wait after a unit's first failed revocation; it
+/// doubles with each failure up to [`LEDGER_REVOKE_BACKOFF_MAX_MS`].
+pub const LEDGER_REVOKE_BACKOFF_MS: i64 = 60 * 1000;
+pub const LEDGER_REVOKE_BACKOFF_MAX_MS: i64 = 3600 * 1000;
+
+/// The wait after `failures` failed revocations of a unit.
+pub fn ledger_revoke_backoff_ms(failures: i32) -> i64 {
+    let doublings = failures.saturating_sub(1).clamp(0, 16) as u32;
+    LEDGER_REVOKE_BACKOFF_MS
+        .saturating_mul(1 << doublings)
+        .min(LEDGER_REVOKE_BACKOFF_MAX_MS)
+}
 
 #[cfg(test)]
 mod tests {

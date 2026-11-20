@@ -1780,6 +1780,48 @@ fn spec_with_sidecar() -> StepSpec {
     s
 }
 
+fn tokens_launched(live: &LiveLog) -> Vec<String> {
+    live.launched
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            s.forge_token
+                .as_ref()
+                .unwrap()
+                .credential
+                .as_ref()
+                .unwrap()
+                .token
+                .clone()
+        })
+        .collect()
+}
+
+/// RT-M2: a failure cause is redacted with the ledger as it is now, not a
+/// cached set one generation old. B loads generation 1; A re-drives and
+/// records generation 2 with a new token; B redacts a cause that quotes
+/// it. Kills: redaction from the process cache.
+#[tokio::test]
+async fn a_failure_cause_quoting_a_token_minted_after_this_replica_cached_is_redacted() {
+    let w = World::new().await;
+    let (a, b) = (w.logs(), w.logs());
+    let live = LiveLog::new(b"", true);
+    w.stack(live.clone(), &a)
+        .launch(&running(), &forge_spec())
+        .await
+        .unwrap();
+    assert_eq!(b.load_values(&stream()).await.unwrap().gen(), 1);
+    w.stack(live.clone(), &a)
+        .launch(&running(), &forge_spec())
+        .await
+        .unwrap();
+    let t2 = tokens_launched(&live)[1].clone();
+    let cause = format!("clone failed: https://x-access-token:{t2}@github.com/acme/web.git");
+    let redacted = b.redact_text_for_handle("pod-build", &cause).await;
+    assert!(!redacted.contains(&t2), "{redacted}");
+}
+
 /// RT-M1: a short step with a sidecar. The sidecar's log completes while
 /// the main container's log has stored nothing yet (its Pod was still
 /// initializing at the first open); the unit is settled and revoked. The
@@ -1907,6 +1949,101 @@ async fn a_sidecar_stream_left_open_across_a_restart_is_read() {
     );
 }
 
+/// REV-m1: a unit cancelled while Pending (it never started) whose first
+/// final read failed (the Pod was terminating) and then found the Pod gone
+/// gets no marker: the stream row the budget created has no rows. Kills:
+/// "has rows" read as "has a stream row".
+#[tokio::test]
+async fn a_step_cancelled_while_pending_gets_no_marker_after_a_failed_final_read() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    w.end_attempt().await;
+    w.db.settle_log_units(Timestamp(now_ms())).await.unwrap();
+    let live = LiveLog::new(b"", false);
+    live.set_state(Some(LogSourceState::Running { container_id: None }));
+    let tailer = w.tailer(Arc::new(GoneSource(live.clone())), &logs, "a");
+    until("the final-read budget started", || async {
+        tailer.pending_pass().await;
+        w.db.log_stream_row(&stream())
+            .await
+            .unwrap()
+            .is_some_and(|r| r.final_since.is_some())
+    })
+    .await;
+    live.set_state(Some(LogSourceState::Gone));
+    until("closed", || async {
+        tailer.pending_pass().await;
+        w.state(&stream()).await == Some(LogStreamState::Closed)
+    })
+    .await;
+    assert!(w.rows(&stream()).await.is_empty(), "{:?}", w.rows(&stream()).await);
+}
+
+/// REV-m6 (path row 20): a unit an earlier version launched (no ledger
+/// row) that started, whose Pod is gone when its final read runs, gets
+/// `not_stored` (`no_ledger`), not `incomplete` and not nothing. Kills: the
+/// gone branch taken before the no-ledger close.
+#[tokio::test]
+async fn a_0_6_unit_whose_pod_is_gone_gets_not_stored_not_incomplete() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.db.mark_attempt_execution_started(
+        &run(),
+        &StepId(STEP.into()),
+        &AttemptId(ATTEMPT.into()),
+        Timestamp(5),
+    )
+    .await
+    .unwrap();
+    let live = LiveLog::new(b"", false);
+    live.set_state(Some(LogSourceState::Gone));
+    let tailer = w.tailer(Arc::new(GoneSource(live.clone())), &logs, "a");
+    tailer.ensure(&running());
+    w.end_attempt().await;
+    drive_until(
+        &tailer,
+        &step_run(AttemptOutcome::Succeeded),
+        "closed",
+        || async { w.state(&stream()).await == Some(LogStreamState::Closed) },
+    )
+    .await;
+    let rows = w.rows(&stream()).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].kind, LogRowKind::NotStored);
+    assert_eq!(rows[0].reason, Some(NotStoredReason::NoLedger));
+}
+
+/// REV-m4: a sidecar in a crash loop (its container ended and waits to
+/// start again) is not opened again on every driver tick: the read backs
+/// off. Kills: `Again` (no wait) on a container waiting to restart.
+#[tokio::test]
+async fn a_crash_looping_sidecar_is_not_reopened_every_tick() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    let live = LiveLog::new(b"crashed\n", false);
+    live.restartable.store(true, Ordering::SeqCst);
+    let mut t = timing();
+    t.retry_backoff = Duration::from_millis(50);
+    t.final_backoff = Duration::from_millis(50);
+    t.final_backoff_max = Duration::from_millis(400);
+    let tailer = LogTailer::new(live.clone(), logs.clone())
+        .with_lease(w.db.clone() as Arc<dyn Db>, "a")
+        .with_timing(t);
+    for _ in 0..20 {
+        tailer.ensure_sidecar(&running(), 0);
+        tailer.end_pass(true);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(live.opens() <= 5, "{} opens in 20 ticks", live.opens());
+    assert_eq!(
+        w.stored(&logs, &sidecar_stream()).await,
+        b"crashed\n",
+        "the ended container's log is stored once"
+    );
+}
+
 /// RT-m8: a gate attempt (no container, no ledger) that ended gets no log
 /// marker from the pending-final-read query.
 #[tokio::test]
@@ -1947,4 +2084,52 @@ async fn a_gate_attempt_gets_no_log_marker() {
     }
     assert!(w.rows(&gate_stream).await.is_empty());
     assert_eq!(live.opens(), 0);
+}
+
+/// REV-M1: a forge that never answers a revocation does not hold the
+/// scheduler's tick: the ledger sweep is not part of it. Kills: the sweep
+/// awaited inside `tick_cycle`.
+#[tokio::test]
+async fn a_forge_that_hangs_on_revoke_does_not_hold_the_tick() {
+    let w = World::new().await;
+    let logs = w.logs();
+    let live = LiveLog::new(b"", false);
+    w.stack(live.clone(), &logs)
+        .launch(&running(), &forge_spec())
+        .await
+        .unwrap();
+    // The attempt ended over an hour ago: its ledger is due a purge, and
+    // its minted token was never revoked.
+    w.end_attempt().await;
+    w.db.settle_log_units(Timestamp(0)).await.unwrap();
+    w.forge.hang_revocations(true);
+    let tailer = w
+        .tailer(live.clone(), &logs, "a")
+        .with_forge(w.forge.clone() as Arc<dyn ForgePort>);
+    let db = w.db.clone() as Arc<dyn Db>;
+    let clock: Arc<dyn scarab_engine::Clock> = Arc::new(scarab_testkit::FakeClock::new(now_ms()));
+    let exec: Arc<dyn Executor> = live.clone();
+    let (supervision, health) = (
+        scarab_engine::Supervision::new(),
+        scarab_engine::TickHealth::new(),
+    );
+    let tick = scarab_server::converged::tick_once(
+        &db,
+        &clock,
+        &exec,
+        None,
+        None,
+        Some(&tailer),
+        None,
+        "owner",
+        30_000,
+        3_600_000,
+        None,
+        "http://scarab.test",
+        &supervision,
+        &health,
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(5), tick)
+        .await
+        .expect("the tick returned while the forge hangs");
 }

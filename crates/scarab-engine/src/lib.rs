@@ -28,9 +28,11 @@ pub use logstore::{
     LogLease, LogLedgerRows, LogRowKind, LogStreamId, LogStreamRow, LogStreamState, LogUnitRow,
     LogWriter, MountedRepo, MountedValue,
     MountedValueKind, NewLogRow, NotStoredReason, PendingFinalRead, PendingReadCursor,
-    PendingReads, PurgeCandidate, SealedGeneration, LEDGER_HARD_CAP_MS, LEDGER_SETTLED_KEEP_MS,
+    PendingReads, PurgeCandidate, SealedGeneration, LEDGER_HARD_CAP_MS,
+    LEDGER_REVOKE_BACKOFF_MAX_MS, LEDGER_REVOKE_BACKOFF_MS, LEDGER_SETTLED_KEEP_MS,
     PENDING_EPOCH_SKEW_MS, PENDING_RECENT_WINDOW_MS,
 };
+pub use logstore::ledger_revoke_backoff_ms;
 pub use ports::{
     Clock, Db, Executor, LeaderTerm, LogChunks, LogFrom, LogSourceRef, LogSourceState,
     RunSettlement, SnapshotRetention, StepLaunch, WorkspaceSnapshots, LEADER_TX_BOUND_MS,

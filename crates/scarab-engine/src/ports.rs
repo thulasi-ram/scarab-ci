@@ -1083,6 +1083,25 @@ pub trait Db: Send + Sync {
         at: Timestamp,
     ) -> Result<(), DbError>;
 
+    /// Record that every minted forge token of generation `gen` of `unit`'s
+    /// ledger was revoked (first write wins): it is not revoked again.
+    async fn mark_log_generation_revoked(
+        &self,
+        unit: &crate::LogStreamId,
+        gen: i64,
+        at: Timestamp,
+    ) -> Result<(), DbError>;
+
+    /// Record a failed revocation of `unit`'s tokens by the ledger sweep:
+    /// one more failure, and no retry before
+    /// [`ledger_revoke_backoff_ms`](crate::ledger_revoke_backoff_ms) after
+    /// `now`.
+    async fn record_log_unit_revoke_failure(
+        &self,
+        unit: &crate::LogStreamId,
+        now: Timestamp,
+    ) -> Result<(), DbError>;
+
     /// Record that every revocation of the unit's minted tokens succeeded.
     async fn mark_log_unit_revoked(
         &self,
@@ -1124,7 +1143,10 @@ pub trait Db: Send + Sync {
     /// more than [`LEDGER_SETTLED_KEEP_MS`](crate::LEDGER_SETTLED_KEEP_MS)
     /// ago, of a run terminal that long, or not running in the store with
     /// their oldest generation older than `hard_cap_ms`. A step still
-    /// running, or a live shared service, is never returned by age.
+    /// running, or a live shared service, is never returned by age. A unit
+    /// whose revocation is backing off (`revoke_retry_at` after `now`) is
+    /// left out unless it is past the cap. Oldest first: by `settled_at`
+    /// (none first), then `(run, step, attempt)`.
     async fn log_units_to_purge(
         &self,
         now: Timestamp,

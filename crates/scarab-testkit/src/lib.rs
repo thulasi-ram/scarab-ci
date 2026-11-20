@@ -2211,6 +2211,8 @@ impl Db for InMemoryDb {
                 purged: false,
                 created_at: now.0,
                 stream_count: 1,
+                revoke_failures: 0,
+                revoke_retry_at: None,
             });
         if let Some(h) = handle {
             u.handle = Some(h.to_string());
@@ -2233,6 +2235,7 @@ impl Db for InMemoryDb {
                 gen,
                 sealed: sealed.to_vec(),
                 created_at: now.0,
+                revoked_at: None,
             });
         Ok(gen)
     }
@@ -2281,6 +2284,36 @@ impl Db for InMemoryDb {
     ) -> Result<(), DbError> {
         if let Some(u) = self.state.lock().unwrap().log_units.get_mut(&log_key(unit)) {
             u.started_at.get_or_insert(at.0);
+        }
+        Ok(())
+    }
+
+    async fn mark_log_generation_revoked(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+        gen: i64,
+        at: Timestamp,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(g) = st
+            .log_unit_values
+            .get_mut(&log_key(unit))
+            .and_then(|gens| gens.iter_mut().find(|g| g.gen == gen))
+        {
+            g.revoked_at.get_or_insert(at.0);
+        }
+        Ok(())
+    }
+
+    async fn record_log_unit_revoke_failure(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+        now: Timestamp,
+    ) -> Result<(), DbError> {
+        if let Some(u) = self.state.lock().unwrap().log_units.get_mut(&log_key(unit)) {
+            u.revoke_failures += 1;
+            u.revoke_retry_at =
+                Some(now.0 + scarab_engine::ledger_revoke_backoff_ms(u.revoke_failures));
         }
         Ok(())
     }
@@ -2370,7 +2403,8 @@ impl Db for InMemoryDb {
             let due = u.settled_at.is_some_and(|s| s < now.0 - keep)
                 || run_ended.is_some_and(|e| e < now.0 - keep)
                 || past_cap;
-            if due {
+            let backing_off = u.revoke_retry_at.is_some_and(|at| at > now.0);
+            if due && (!backing_off || past_cap) {
                 out.push(scarab_engine::PurgeCandidate {
                     unit: scarab_engine::LogStreamId::new(&k.0, &k.1, &k.2),
                     row: u.clone(),
@@ -2378,6 +2412,21 @@ impl Db for InMemoryDb {
                 });
             }
         }
+        // Oldest first, as Postgres orders them.
+        out.sort_by(|a, b| {
+            (
+                a.row.settled_at.unwrap_or(0),
+                &a.unit.run.0,
+                &a.unit.step.0,
+                &a.unit.attempt.0,
+            )
+                .cmp(&(
+                    b.row.settled_at.unwrap_or(0),
+                    &b.unit.run.0,
+                    &b.unit.step.0,
+                    &b.unit.attempt.0,
+                ))
+        });
         out.truncate(limit as usize);
         Ok(out)
     }
