@@ -80,6 +80,11 @@ reuse, deploys, and the operational settings.
 `tag`, `release`, `comment`, `cron`, `manual`, `api`, and `upstream`. An empty `on:` means the
 pipeline has no automatic triggers: it runs only when launched explicitly.
 
+A `pull_request` trigger fires when a pull request is opened or reopened, when new commits reach
+it, and when it is edited to target another base branch. Closing or merging it, a label, an
+assignee, a review request, marking it ready for review, or an edit of its title or description
+starts no Run.
+
 ```yaml
 on:
   push: {}

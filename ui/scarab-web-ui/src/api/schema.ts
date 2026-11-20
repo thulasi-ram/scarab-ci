@@ -3753,6 +3753,14 @@ export interface components {
             carried_grants: components["schemas"]["TrustGrantDto"][];
             content: string;
             content_hash: string;
+            /**
+             * @description `current` has this content: the file is the same at this commit.
+             *     Installing it, with `replaces` naming the same hash, moves the
+             *     installation to this fetch's `requested_ref`, `resolved_commit` and
+             *     `source`; when those are the installation's already, the install is
+             *     refused with 409. `false` when nothing is installed under the name.
+             */
+            content_unchanged: boolean;
             current?: null | components["schemas"]["InstalledVersionDto"];
             /**
              * @description The change from `current`, one line per entry, each starting with
@@ -3771,7 +3779,10 @@ export interface components {
              *     the commit in the source. What an install of this version records.
              */
             resolved_commit: string;
-            /** @description Pinned to the commit of the first fetch of this content in the org. */
+            /**
+             * @description The file, pinned to `resolved_commit`. When this content was stored
+             *     already from another file, that file.
+             */
             source: string;
         };
         /** @description A plugin manifest read for review. Nothing is stored or installed. */
@@ -3969,7 +3980,11 @@ export interface components {
             content_hash: string;
             /** @description The library name to install under, as `invoke: lib:<name>` writes it. */
             name: string;
-            /** @description The hash installed now (an upgrade), or omitted for a first install. */
+            /**
+             * @description The hash installed now (an upgrade), or omitted for a first install.
+             *     The same hash as `content_hash` moves the installation to the
+             *     version's ref and commit: the file is the same there.
+             */
             replaces?: string | null;
             /**
              * @description The fetch answer's `requested_ref`, as reviewed: `null` or omitted
@@ -4032,6 +4047,7 @@ export interface components {
             requested_ref?: string | null;
             /** @description The full commit the installed version was read at. */
             resolved_commit: string;
+            /** @description Pinned to `resolved_commit`. */
             source: string;
         };
         LibraryInstallationDto: {
@@ -4053,10 +4069,15 @@ export interface components {
              */
             requested_ref?: string | null;
             /**
-             * @description The full commit the fetch read the file at. The same file can be at
-             *     more than one commit, so it may differ from the commit in `source`.
+             * @description The full commit the fetch read the file at. An install of the same
+             *     content fetched at another commit moves the installation to that
+             *     commit.
              */
             resolved_commit: string;
+            /**
+             * @description The file the installed version was read from, pinned to
+             *     `resolved_commit`.
+             */
             source: string;
             yanked?: null | components["schemas"]["LibraryYankDto"];
         };
@@ -8990,7 +9011,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description `replaces` is not what is installed now, or the version was fetched again at another ref or commit than `requested_ref` and `resolved_commit` name */
+            /** @description `replaces` is not what is installed now, the version is installed already at the same ref and commit, or the version was fetched again at another ref or commit than `requested_ref` and `resolved_commit` name */
             409: {
                 headers: {
                     [name: string]: unknown;

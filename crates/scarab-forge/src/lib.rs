@@ -198,6 +198,37 @@ pub fn is_commit_sha(s: &str) -> bool {
     (4..=64).contains(&s.len()) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// Whether a `pull_request` webhook delivery with this `action` starts Runs.
+/// The one place that decides it for every forge adapter.
+///
+/// A delivery starts Runs only when it changes the code a Run would test:
+/// the pull request was opened or reopened, its head moved (GitHub's
+/// `synchronize`, Forgejo/Gitea's `synchronized`), or it was `edited` to
+/// target another base branch. `base_changed` is that last fact, read by the
+/// adapter from its own payload (GitHub's `changes.base`, Forgejo's
+/// `changes.ref`). Every other action (closed or merged, labelled, assigned,
+/// a review requested, an edit of the title or body, `ready_for_review`, ...)
+/// is [`ForgeError::Ignored`] with the reason, so a closed pull request does
+/// not run its Pipelines again.
+///
+/// `ready_for_review` is ignored: Scarab runs draft pull requests like any
+/// other, so marking one ready does not change what was tested.
+pub fn pull_request_action_starts_runs(action: &str, base_changed: bool) -> Result<(), ForgeError> {
+    match action {
+        "opened" | "reopened" | "synchronize" | "synchronized" => Ok(()),
+        "edited" if base_changed => Ok(()),
+        "edited" => Err(ForgeError::Ignored(
+            "pull_request action `edited` did not change the base branch".into(),
+        )),
+        "" => Err(ForgeError::Ignored(
+            "pull_request delivery has no action".into(),
+        )),
+        other => Err(ForgeError::Ignored(format!(
+            "pull_request action `{other}` does not change the code under test"
+        ))),
+    }
+}
+
 /// Percent-encode `s` as one URL path segment or one query value: every byte
 /// except the RFC 3986 unreserved characters (`A-Z a-z 0-9 - . _ ~`) is
 /// written as `%XX`, `/` included. For a value a caller typed, such as a
@@ -1004,6 +1035,11 @@ pub enum ForgeError {
     BadSignature,
     #[error("unsupported event: {0}")]
     UnsupportedEvent(String),
+    /// A delivery of a supported event that starts nothing, such as a closed
+    /// pull request (see [`pull_request_action_starts_runs`]). The caller
+    /// acknowledges it and answers with the reason.
+    #[error("ignored delivery: {0}")]
+    Ignored(String),
     #[error("malformed webhook payload: {0}")]
     Malformed(String),
     /// This adapter cannot offer the capability at all — distinct from

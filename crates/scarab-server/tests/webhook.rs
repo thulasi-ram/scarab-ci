@@ -1339,3 +1339,183 @@ async fn a_broken_pipeline_fails_the_check_of_every_pipeline_in_the_delivery_onc
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// pull_request actions: only code-changing ones start Runs
+// ---------------------------------------------------------------------------
+
+/// A Pipeline that runs on pull requests only, like a `push: true` image
+/// build gated to PRs.
+const PR_ONLY_YAML: &str = r#"
+on:
+  pull_request: {}
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+"#;
+
+const PR_HEAD: &str = "feedface";
+
+/// Both forge endpoints over `forge`, which the test keeps to read the
+/// statuses Scarab posted.
+fn pr_app(db: Arc<InMemoryDb>, forge: Arc<FakeForge>) -> axum::Router {
+    let clock = Arc::new(FakeClock::new(1_000));
+    let store = Arc::new(InMemoryObjectStore::new());
+    let logs = Arc::new(LogService::new(store, db.clone()));
+    router(
+        AppState::new(db.clone(), clock, logs)
+            .with_github_webhook_secret(SECRET.to_vec())
+            .with_forgejo_webhook_secret(b"forgejo-secret".to_vec())
+            .with_forge_connections(db)
+            .with_forge(forge),
+    )
+}
+
+fn pr_payload(action: &str, changes: serde_json::Value, merged: bool) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "action": action,
+        "number": 7,
+        "changes": changes,
+        "pull_request": {
+            "number": 7,
+            "state": if action == "closed" { "closed" } else { "open" },
+            "merged": merged,
+            "title": "feat: the widget",
+            "base": { "ref": "main" },
+            "head": { "sha": PR_HEAD, "repo": { "full_name": "acme/app" } }
+        },
+        "repository": { "name": "app", "owner": { "login": "acme" }, "full_name": "acme/app" },
+        "sender": { "login": "octocat" }
+    }))
+    .unwrap()
+}
+
+fn github_pr_request(delivery: &str, body: &[u8]) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/webhooks/github")
+        .header("content-type", "application/json")
+        .header("x-github-event", "pull_request")
+        .header("x-github-delivery", delivery)
+        .header(
+            "x-hub-signature-256",
+            scarab_forge_github::sign_hex(SECRET, body),
+        )
+        .body(Body::from(body.to_vec()))
+        .unwrap()
+}
+
+/// Closing or merging a pull request re-ran its `pull_request` Pipelines,
+/// and a build Pipeline pushed its images again (reported on 0.6.1). Such a
+/// delivery is acknowledged with the reason and starts nothing: no Run, no
+/// commit status, no refused Run. New commits, a reopen and a base branch
+/// change still start Runs.
+#[tokio::test]
+async fn a_closed_or_merged_pull_request_starts_no_run_and_posts_no_status() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", PR_ONLY_YAML));
+    let app = pr_app(db.clone(), forge.clone());
+
+    let none = serde_json::Value::Null;
+    let ignored = [
+        ("closed", none.clone(), false),
+        ("closed", none.clone(), true),
+        ("labeled", none.clone(), false),
+        ("ready_for_review", none.clone(), false),
+        (
+            "edited",
+            serde_json::json!({ "title": { "from": "old" } }),
+            false,
+        ),
+    ];
+    for (i, (action, changes, merged)) in ignored.iter().enumerate() {
+        let body = pr_payload(action, changes.clone(), *merged);
+        let resp = app
+            .clone()
+            .oneshot(github_pr_request(&format!("ign-{i}"), &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{action}");
+        let reply = json_of(resp).await;
+        assert!(
+            reply["ignored"]
+                .as_str()
+                .is_some_and(|s| s.contains(action)),
+            "{action} (merged {merged}) is ignored with its reason: {reply}"
+        );
+    }
+    assert!(db.active_runs().await.unwrap().is_empty(), "no Run");
+    assert!(forge.statuses().is_empty(), "no commit status");
+    assert!(
+        db.refused_runs_for_tenant("acme", "app", 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "no refused Run"
+    );
+
+    let base = serde_json::json!({ "base": { "ref": { "from": "develop" } } });
+    let started = [
+        ("synchronize", none.clone()),
+        ("reopened", none.clone()),
+        ("edited", base),
+    ];
+    for (i, (action, changes)) in started.iter().enumerate() {
+        let body = pr_payload(action, changes.clone(), false);
+        let resp = app
+            .clone()
+            .oneshot(github_pr_request(&format!("run-{i}"), &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED, "{action} starts a Run");
+        assert_eq!(db.active_runs().await.unwrap().len(), i + 1, "{action}");
+    }
+}
+
+/// Forgejo sends new commits as `synchronized` and labels as
+/// `label_updated`, under the same `pull_request` event.
+#[tokio::test]
+async fn forgejo_pull_request_actions_start_runs_only_for_new_code() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::Forgejo).await;
+    let forge = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", PR_ONLY_YAML));
+    let app = pr_app(db.clone(), forge.clone());
+    let send = |delivery: &str, body: Vec<u8>| {
+        let sig = scarab_forge_forgejo::sign_hex(b"forgejo-secret", &body);
+        app.clone()
+            .oneshot(forgejo_request("pull_request", delivery, &body, &sig))
+    };
+
+    let none = serde_json::Value::Null;
+    for (i, (action, merged)) in [
+        ("closed", true),
+        ("closed", false),
+        ("label_updated", false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let resp = send(
+            &format!("fj-ign-{i}"),
+            pr_payload(action, none.clone(), merged),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{action}");
+        let reply = json_of(resp).await;
+        assert!(
+            reply["ignored"]
+                .as_str()
+                .is_some_and(|s| s.contains(action)),
+            "{action}: {reply}"
+        );
+    }
+    assert!(db.active_runs().await.unwrap().is_empty(), "no Run");
+    assert!(forge.statuses().is_empty(), "no commit status");
+
+    let resp = send("fj-sync", pr_payload("synchronized", none, false))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_eq!(db.active_runs().await.unwrap().len(), 1);
+}

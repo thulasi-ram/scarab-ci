@@ -8774,6 +8774,10 @@ async fn github_webhook(
         Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => {
             return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true }))));
         }
+        // A supported event that starts nothing (a closed pull request, ...).
+        Err(scarab_forge::ForgeError::Ignored(why)) => {
+            return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": why }))));
+        }
         Err(e) => return Err(ApiError::BadRequest(e.to_string())),
     };
     ingest_event(&st, event).await
@@ -8836,6 +8840,9 @@ async fn forgejo_webhook(
         Ok(e) => e,
         Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => {
             return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true }))));
+        }
+        Err(scarab_forge::ForgeError::Ignored(why)) => {
+            return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": why }))));
         }
         Err(e) => return Err(ApiError::BadRequest(e.to_string())),
     };

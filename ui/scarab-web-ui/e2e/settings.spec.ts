@@ -766,18 +766,6 @@ test("a library's manage page names the ref it was fetched at, and Upgrade fetch
   expect(errors).toEqual([]);
 });
 
-test("a library's page says when its source and the commit it was fetched at differ", async ({ page }) => {
-  const errors = collectErrors(page);
-  await page.goto("/orgs/acme/settings/libraries/e4a61b8c39/manage");
-  await expect(page.locator(".lib-at").first()).toHaveText("main → 7d3e9a1");
-  await expect(page.getByTestId("manage-commits-differ")).toContainText("The source names 51c3b8e");
-  // A library fetched pinned names one commit: no such line.
-  await page.goto("/orgs/acme/settings/libraries/5c09e3a7d4/manage");
-  await expect(page.locator(".lib-at").first()).toHaveText("8c2f4e1");
-  await expect(page.getByTestId("manage-commits-differ")).toHaveCount(0);
-  expect(errors).toEqual([]);
-});
-
 test("the review page says when the stored content answers another ref than the one asked for", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto(
@@ -785,6 +773,40 @@ test("the review page says when the stored content answers another ref than the 
   );
   await expect(page.getByTestId("review-ref")).toContainText("to main → d41f07b");
   await expect(page.getByTestId("review-ref-other")).toContainText("You asked for v1.4.0");
+  expect(errors).toEqual([]);
+});
+
+test("the review page moves an installed library to a new commit when only the commit changed", async ({ page }) => {
+  const errors = collectErrors(page);
+  const review = "/orgs/acme/settings/libraries/review?source=github.com%2Facme%2Fscarab-libs%2F%2Fdeploy-helm.yaml&ref=v1.2.0&same=moved";
+  await page.goto(review);
+  await expect(page.getByTestId("review-move")).toHaveText(
+    "The file is the same at this commit; installing moves lib:acme::scarab-libs::deploy-helm from v1.1.0 → 8c2f4e1 to v1.2.0 → 1a2b3c4.",
+  );
+  await expect(page.getByText(/lines added/)).toHaveCount(0);
+  const move = page.getByRole("button", { name: "Move to this commit" });
+  await expect(move).toBeEnabled();
+  await move.click();
+  await expect(page).toHaveURL(/\/orgs\/acme\/settings\/libraries\/b72d4f1e06\/manage$/);
+
+  // The source's grants carry to the version at the new commit too: each
+  // is ticked before the move.
+  await page.goto(`${review}&grants=carry`);
+  const boxes = page.getByRole("group", { name: "Trust this version gets" });
+  await expect(page.getByRole("button", { name: "Move to this commit" })).toBeDisabled();
+  await boxes.getByText("Give this version forge credentials").click();
+  await boxes.getByText("Give this version the registry credential").click();
+  await boxes.getByText("Give this version the build sandbox").click();
+  await expect(page.getByRole("button", { name: "Move to this commit" })).toBeEnabled();
+
+  // At the ref and commit installed, nothing would change.
+  await page.goto(
+    "/orgs/acme/settings/libraries/review?source=github.com%2Facme%2Fscarab-libs%2F%2Fdeploy-helm.yaml&ref=v1.1.0&same=installed",
+  );
+  await expect(page.getByTestId("review-installed")).toHaveText(
+    "This version is installed already, at v1.1.0 → 8c2f4e1. Nothing would change.",
+  );
+  await expect(page.getByRole("button", { name: "Upgrade", exact: true })).toBeDisabled();
   expect(errors).toEqual([]);
 });
 

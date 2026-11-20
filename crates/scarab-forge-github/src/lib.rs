@@ -102,6 +102,12 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
             }
         }
         "pull_request" => {
+            // Closed, merged, labelled, ... deliveries start nothing. An
+            // `edited` one starts Runs only when its base branch changed
+            // (`changes.base`).
+            let action = p.get("action").and_then(Value::as_str).unwrap_or_default();
+            let base_changed = p.pointer("/changes/base").is_some_and(|v| !v.is_null());
+            scarab_forge::pull_request_action_starts_runs(action, base_changed)?;
             let repo = repo_of(p)?;
             let number = p
                 .pointer("/pull_request/number")
@@ -1650,6 +1656,7 @@ mod tests {
     fn normalizes_pull_request_and_detects_fork() {
         // Same-repo PR (head repo == base) → not a fork.
         let internal = json!({
+            "action": "opened",
             "pull_request": {
                 "number": 42,
                 "title": "feat: add the widget",
@@ -1680,6 +1687,7 @@ mod tests {
 
         // Head repo differs from base → a fork PR.
         let fork = json!({
+            "action": "opened",
             "pull_request": {
                 "number": 7,
                 "head": { "sha": "abc1234", "repo": { "full_name": "contributor/app" } }
@@ -1913,6 +1921,7 @@ mod tests {
                 "push after {sha:?} was accepted"
             );
             let pr = json!({
+                "action": "synchronize",
                 "pull_request": {
                     "number": 7,
                     "head": { "sha": sha, "repo": { "full_name": "acme/app" } }
@@ -1925,6 +1934,60 @@ mod tests {
                     Err(ForgeError::Malformed(_))
                 ),
                 "pull request head {sha:?} was accepted"
+            );
+        }
+    }
+
+    /// Only actions that change the code under test start Runs: opened,
+    /// reopened, synchronize, and edited with a base branch change. A closed
+    /// (or merged) pull request ran its Pipelines again before (0.6.1).
+    #[test]
+    fn only_code_changing_pull_request_actions_normalize() {
+        let pr = |action: &str, changes: Value| {
+            json!({
+                "action": action,
+                "changes": changes,
+                "pull_request": {
+                    "number": 7,
+                    "merged": action == "closed",
+                    "head": { "sha": "feedface", "repo": { "full_name": "acme/app" } }
+                },
+                "repository": { "name": "app", "owner": { "login": "acme" }, "full_name": "acme/app" }
+            })
+        };
+        for action in ["opened", "reopened", "synchronize"] {
+            assert!(
+                matches!(
+                    normalize(&delivery("pull_request", pr(action, Value::Null))),
+                    Ok(Event::PullRequest { number: 7, .. })
+                ),
+                "{action} starts Runs"
+            );
+        }
+        let base =
+            json!({ "base": { "ref": { "from": "develop" }, "sha": { "from": "abc1234" } } });
+        assert!(matches!(
+            normalize(&delivery("pull_request", pr("edited", base))),
+            Ok(Event::PullRequest { .. })
+        ));
+        for (action, changes) in [
+            ("edited", json!({ "title": { "from": "old" } })),
+            ("edited", Value::Null),
+            ("closed", Value::Null),
+            ("labeled", Value::Null),
+            ("unlabeled", Value::Null),
+            ("assigned", Value::Null),
+            ("review_requested", Value::Null),
+            ("ready_for_review", Value::Null),
+            ("converted_to_draft", Value::Null),
+            ("", Value::Null),
+        ] {
+            assert!(
+                matches!(
+                    normalize(&delivery("pull_request", pr(action, changes.clone()))),
+                    Err(ForgeError::Ignored(_))
+                ),
+                "{action:?} with changes {changes} must start nothing"
             );
         }
     }

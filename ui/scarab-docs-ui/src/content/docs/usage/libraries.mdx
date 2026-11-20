@@ -46,20 +46,18 @@ library's page and the review page show them as `v1.4.0 → 8c2f4e1`: the ref, t
 characters of the commit. Hover the commit to see all of it, or click it to copy it. A library
 fetched with a source that ends in `@<commit>` has no ref, and shows the commit alone.
 
-The installation records the ref and commit of the fetch you installed. Fetching the same file
-again under another ref, or at another commit that holds the same content, does not change what
-an installed library says. The API answers both, in the fetch answer (and its `current`) and in
-each installation:
+The installation records the ref and commit of the fetch you installed, and its `source` names
+that commit. Fetching the same file again under another ref, or at another commit that holds the
+same content, does not change what an installed library says until you install that fetch
+([Upgrade](#upgrade)). The API answers both, in the fetch answer (and its `current`) and in each
+installation:
 
 ```json
 {"requested_ref": "v1.4.0", "resolved_commit": "8c2f4e1a9d7b3c5e0f6a2b8d4c1e7f9a3b5d2c6e"}
 ```
 
 `requested_ref` is `null` when the source named the commit, and for libraries installed before
-Scarab kept it; `resolved_commit` is always the full commit. A version keeps the `source` of its
-first fetch, so when the same content was fetched before at another commit, `resolved_commit` can
-differ from the commit in `source`. Both commits hold the same file, and the library's page says
-so.
+Scarab kept it; `resolved_commit` is always the full commit.
 
 The install can name the fetch you reviewed, as the review page does: send the fetch answer's
 `requested_ref` and `resolved_commit` with the install. When someone fetched the same content again
@@ -124,6 +122,16 @@ version, and the ref and commit before and after (`from v1.1.0 → 9f8e7d6 to v1
 and **Upgrade** on the review page installs it. The passkey confirmation and the org's security
 log name both. The upgrade names the version it replaces, so if someone else changed the
 installation after you fetched, it fails and you fetch again to see the current diff.
+
+**A new commit with the same file.** When the ref points to a new commit and the file did not
+change there, there is no diff. The review page says so ("The file is the same at this commit;
+installing moves `lib:…` from `v1.1.0 → 9f8e7d6` to `v1.2.0 → 1a2b3c4`") and **Move to this
+commit** moves the installation to the new ref and commit, with the same passkey confirmation and
+the same trust boxes as an upgrade. The fetch answer has `"content_unchanged": true`, and the
+install names the installed hash as both `content_hash` and `replaces`. Pipelines run the same
+content, and Runs created after the move name the new commit in their Steps' `origin`. Fetching
+the ref and commit already installed shows nothing to do, and the API refuses that install with a
+409.
 
 **Trust carries over.** Trust is kept for a source, not a commit
 ([below](#trusting-a-library-with-forge-credentials)), so a new commit from a trusted source gets

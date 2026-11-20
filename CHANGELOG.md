@@ -99,6 +99,23 @@ release.yml uses that version's section as the GitHub Release text. See
 - **A step that ended while no server ran, or whose read hung, still gets its log stored or
   closed**, within 30 minutes of the step ending.
 
+- **A closed or merged pull request no longer runs its `pull_request` Pipelines again.** Scarab
+  started Runs for every pull request webhook, so closing or merging a pull request, or labelling
+  it, ran the Pipeline again, and a build Pipeline with `push: true` pushed its images again. A
+  pull request now starts Runs only when it is opened or reopened, gets new commits, or is edited
+  to target another base branch. Other deliveries start no Run and post no status, and the
+  webhook response names the action it ignored. GitHub and Forgejo.
+- **A library can move to a new commit when its file did not change.** A tag or branch that
+  moved to a commit with the same library file produced no diff, and the review page showed
+  "This version is installed already" with Upgrade turned off, so the installation stayed at the
+  old ref and commit. The review page now says the file is the same at the new commit, and
+  **Move to this commit** moves the installation there, with the same passkey confirmation and
+  trust boxes as an upgrade; the security log names both commits. The fetch answer has
+  `content_unchanged`, an installation's `source` names the commit it is at, and an install at
+  the ref and commit already installed is refused with 409. Runs inline the same content, and
+  Runs created before the move do not change. See
+  [Upgrade](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#upgrade).
+
 ## [0.6.1] - 2026-11-20
 
 ### Bug Fixes
