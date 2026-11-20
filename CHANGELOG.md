@@ -34,6 +34,19 @@ release.yml uses that version's section as the GitHub Release text. See
   also fails when step Pods share the release namespace and the server's ServiceAccount is
   `default` (`serviceAccount.create: false` with no name) or another name the policy allows: give
   the server its own ServiceAccount, run step Pods in another namespace, or turn the policy off.
+- **Migration 0098 rewrites the `step_runs` table; plan the upgrade window.** It gives every
+  existing Step a key, which rewrites the table under a lock that blocks every read and write of
+  Steps until it ends: at least 7 µs a Step on Postgres 16 (measured on narrow rows; Steps with
+  large stored specs take longer), so 7 s or more for a million Steps. The server runs it before it
+  listens, and the chart's new `startupProbe` gives it 30 minutes before liveness counts; raise
+  `startupProbe.failureThreshold` for a larger database. With more than one replica and a rolling
+  update, the replicas still on the old version wait on the lock, and until the rollout ends an old
+  replica takes a key in a step URL for an unknown Step id: a results POST gets a 401, which the
+  results sidecar retries, and a read gets a 404 or an empty answer. Once 0098 has run, a 0.5.x
+  server refuses to start on the database, so a rollback needs a database backup from before the
+  upgrade.
+- **`GET /v1/runs/{id}/steps/{step}/results` for a Step the Run does not have answers 404.** It
+  answered `200 []`. A script that polls results for a Step name that is not in the Run gets a 404.
 
 ### Security
 

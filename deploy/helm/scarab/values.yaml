@@ -751,6 +751,19 @@ resources:
   limits:
     memory: 512Mi
 
+# The server runs the database migrations before it listens. One that
+# rewrites a large table (0098 rewrites step_runs, about 7 us a row) can take
+# minutes, and a liveness failure in that time would kill the container, roll
+# the migration back and start it again from the beginning. The startupProbe
+# holds liveness and readiness off until /livez first answers: up to 30
+# minutes (180 x 10 s) here. Raise failureThreshold for a larger database.
+startupProbe:
+  httpGet:
+    path: /livez
+    port: http
+  periodSeconds: 10
+  failureThreshold: 180
+
 # /livez answers from memory, with no database call: 200 while the process
 # is up, 503 when this replica holds the scheduler lease and its scheduler
 # loop has made no progress for 90 seconds. Runs then wait with nothing
