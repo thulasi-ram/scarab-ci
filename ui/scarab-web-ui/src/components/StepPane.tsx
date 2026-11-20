@@ -18,6 +18,8 @@ import {
   on,
   For,
   Index,
+  Match,
+  Switch,
   Show,
   onCleanup,
   untrack,
@@ -73,6 +75,7 @@ import Icon from "./Icon";
 import AttemptsDropdown, { type FilmstripTry } from "./AttemptsDropdown";
 import TryTabs from "./TryTabs";
 import Pill from "./Pill";
+import { LogError, LogLoading, LogSkeleton } from "./LogStates";
 
 export type PaneTab = "logs" | "results" | "outputs" | "workspace" | "source" | "gate";
 
@@ -399,6 +402,11 @@ export default function StepPane(props: {
   // Logs the server says are still being stored after their try ended, or
   // that it stopped waiting for.
   const [storing, setStoring] = createSignal<Record<string, StoreState>>({});
+  // Logs the server has answered for (see followLog's onLoaded); until then
+  // the pane says it is loading the log.
+  const [loadedLogs, setLoadedLogs] = createSignal<Record<string, true>>({});
+  // Logs that could not be read, and why.
+  const [logErrors, setLogErrors] = createSignal<Record<string, string>>({});
   const followers = new Map<string, LogFollower>();
   // Logs the user asked to read in full (Load full log): their tail.
   const tails = new Map<string, number>();
@@ -431,16 +439,41 @@ export default function StepPane(props: {
       delete next[key];
       return next;
     });
-  // Load full log: read the log again from the start of its last
-  // FULL_LOG_BYTES.
-  const loadFull = (key: string) => {
+  const setLoadedKey = (key: string, on: boolean) =>
+    setLoadedLogs((prev) => {
+      if (on) return prev[key] ? prev : { ...prev, [key]: true };
+      if (!prev[key]) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  const setErrorKey = (key: string, reason: string | null) =>
+    setLogErrors((prev) => {
+      if (reason) return { ...prev, [key]: reason };
+      if (!(key in prev)) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  // Read a log again from scratch: Retry, and Load full log with a larger
+  // tail.
+  const reopenLog = (key: string, tail?: number) => {
     followers.get(key)?.close();
     followers.delete(key);
-    tails.set(key, FULL_LOG_BYTES);
+    if (tail != null) tails.set(key, tail);
     setBuffers((prev) => ({ ...prev, [key]: emptyLogBuffer() }));
     setEndedKey(key, false);
     setStoringKey(key, null);
+    setLoadedKey(key, false);
+    setErrorKey(key, null);
     setStreamGen((n) => n + 1);
+  };
+  // Load full log: read the log again from the start of its last
+  // FULL_LOG_BYTES.
+  const loadFull = (key: string) => reopenLog(key, FULL_LOG_BYTES);
+  const retryLog = () => {
+    const key = viewedKey();
+    if (key) reopenLog(key);
   };
 
   createEffect(() => {
@@ -487,6 +520,8 @@ export default function StepPane(props: {
           setStoringKey(key, null);
         },
         onReset: () => updateBuffer(key, () => emptyLogBuffer()),
+        onLoaded: () => setLoadedKey(key, true),
+        onError: (reason) => setErrorKey(key, reason),
       }),
     );
   });
@@ -497,19 +532,26 @@ export default function StepPane(props: {
     const a = scoped();
     return s && a ? buffers()[logKey(s, a.id, container())] : undefined;
   };
-  // With no lines: still waiting (stream open, try running), or nothing was
-  // captured (stream ended, or the try finished).
+  // With no lines: loading (the server has not answered yet), could not be
+  // read, still waiting (try running), or nothing was captured.
   const logState = () => {
     const s = stepId();
     const a = scoped();
-    if (!s || !a) return "waiting" as const;
+    if (!s || !a) return "loading" as const;
     const key = logKey(s, a.id, container());
     return logBodyState({
       text: buffers()[key]?.text,
       ended: !!ended()[key],
       outcome: a.outcome,
+      loaded: !!loadedLogs()[key],
+      error: logErrors()[key],
       storing: !!storing()[key],
     });
+  };
+  // Why the log in view could not be read, if it could not.
+  const logError = () => {
+    const key = viewedKey();
+    return key ? logErrors()[key] : undefined;
   };
   const logRows = () => {
     const b = logBuffer();
@@ -614,28 +656,15 @@ export default function StepPane(props: {
   // flight — drives the tab-bar spinner.
   const loading = () =>
     switching() ||
+    (viewedKey() !== null && logState() === "loading") ||
     results.loading ||
     outResults.loading ||
     outConsumed.loading ||
     ws.loading;
 
-  // Shimmer stand-in for the log body during a switch. Cached tries swap
-  // instantly and often look near-identical (both cargo output) — the skeleton
-  // makes it unmistakable that the content reloaded. Reuses the `.lgrow` gutter
-  // grid so it lands exactly where real lines will. Varied widths read as text.
-  const SKELETON_WIDTHS = [46, 72, 58, 83, 35, 64, 77, 50, 69, 40, 61, 74, 44, 67];
-  const LogSkeleton = () => (
-    <div class="lgbody lgskel" aria-hidden="true">
-      <For each={SKELETON_WIDTHS}>
-        {(w, i) => (
-          <div class="lgrow">
-            <span class="lgln">{i() + 1}</span>
-            <span class="lgskel-bar" style={{ width: `${w}%`, "animation-delay": `${i() * 40}ms` }} />
-          </div>
-        )}
-      </For>
-    </div>
-  );
+  // The log skeleton (LogStates) stands in for the log body during a switch.
+  // Cached tries swap instantly and often look near-identical (both cargo
+  // output) — the skeleton makes it unmistakable that the content reloaded.
 
   const TabBtn = (p: { id: PaneTab; label: string; scope?: string | null }) => (
     <button class={`tab ${tab() === p.id ? "active" : ""}`} onClick={() => setTab(p.id)}>
@@ -893,13 +922,16 @@ export default function StepPane(props: {
                 </Show>
                 <Show when={!switching()} fallback={<LogSkeleton />}>
                   <div class="lgbody" classList={{ nowrap: !wrap() }}>
+                    {/* Part of the log arrived, then reading it failed. */}
+                    <Show when={logState() === "output" && logError()}>
+                      {(reason) => <LogError reason={reason()} onRetry={retryLog} rest />}
+                    </Show>
                     {/* Rows by position: a new chunk updates the rows in
                         place instead of building every row again. */}
                     <Index
                       each={logRows()}
                       fallback={
-                        <Show
-                          when={logState() !== "waiting" && logState() !== "storing"}
+                        <Switch
                           fallback={
                             <div class="lgrow empty">
                               <span class="lgln" />
@@ -909,26 +941,34 @@ export default function StepPane(props: {
                             </div>
                           }
                         >
-                          <div class="lgrow empty">
-                            <span class="lgln" />
-                            <span class="lgtx">No log output was captured for this try.</span>
-                          </div>
-                          {/* A Pod that never started (unschedulable, an image
-                              that will not pull, a volume that will not mount)
-                              printed nothing, so the reason is on the attempt:
-                              its failure class and the executor's own account. */}
-                          <Show when={scopedFailure()}>
-                            {(f) => (
-                              <div class="lgrow empty lgwhy">
-                                <span class="lgln" />
-                                <span class="lgtx">
-                                  <span class="lgwhy-reason">{f().failure} failure</span>
-                                  {f().detail ? `: ${f().detail}` : ""}
-                                </span>
-                              </div>
-                            )}
-                          </Show>
-                        </Show>
+                          <Match when={logState() === "loading"}>
+                            <LogLoading />
+                          </Match>
+                          <Match when={logState() === "error" && logError()}>
+                            {(reason) => <LogError reason={reason()} onRetry={retryLog} />}
+                          </Match>
+                          <Match when={logState() === "none"}>
+                            <div class="lgrow empty">
+                              <span class="lgln" />
+                              <span class="lgtx">No log output was captured for this try.</span>
+                            </div>
+                            {/* A Pod that never started (unschedulable, an image
+                                that will not pull, a volume that will not mount)
+                                printed nothing, so the reason is on the attempt:
+                                its failure class and the executor's own account. */}
+                            <Show when={scopedFailure()}>
+                              {(f) => (
+                                <div class="lgrow empty lgwhy">
+                                  <span class="lgln" />
+                                  <span class="lgtx">
+                                    <span class="lgwhy-reason">{f().failure} failure</span>
+                                    {f().detail ? `: ${f().detail}` : ""}
+                                  </span>
+                                </div>
+                              )}
+                            </Show>
+                          </Match>
+                        </Switch>
                       }
                     >
                       {(r) => (

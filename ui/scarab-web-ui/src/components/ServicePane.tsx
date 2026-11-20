@@ -5,7 +5,7 @@
 // logs the retired ServicesPanel showed into a full evidence pane beside the
 // DAG. Page/theme tokens (it sits OUTSIDE the dark DAG canvas), like StepPane;
 // it reuses `.steppane` chrome (coord stamp, log body) for a consistent frame.
-import { createEffect, createMemo, createSignal, onCleanup, Index, Show, untrack } from "solid-js";
+import { createEffect, createMemo, createSignal, onCleanup, Index, Match, Show, Switch, untrack } from "solid-js";
 import { probeLogStream, serviceLogsRawUrl, serviceLogStreamUrl, streamServiceLogs } from "../api/client";
 import type { DagService } from "./Dag";
 import {
@@ -19,17 +19,29 @@ import {
   truncateLog,
   type LogFollower,
 } from "../log-stream";
+import { logBodyState } from "../logs";
+import { LogError, LogLoading } from "./LogStates";
 
 // Cap rendered log lines so a chatty service can't blow up the DOM (windowing).
 const MAX_LINES = 1500;
 
 // Lifecycle states in which a service may still print.
 const LIVE_STATUSES = new Set(["starting", "ready", "running"]);
+// States in which a service has not printed yet but may: the pane waits for
+// output instead of saying none was captured.
+const NOT_DONE_STATUSES = new Set([...LIVE_STATUSES, "pending", "probing"]);
 
 export default function ServicePane(props: { runId: string; service: DagService }) {
   const [buffer, setBuffer] = createSignal(emptyLogBuffer());
   // The service whose log the user asked to read in full (Load full log).
   const [fullFor, setFullFor] = createSignal<string | null>(null);
+  // The log stream's state: the server answered, the stream ended, or the
+  // log could not be read and why.
+  const [loaded, setLoaded] = createSignal(false);
+  const [ended, setEnded] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+  // Bumped by Retry: read the log again.
+  const [retries, setRetries] = createSignal(0);
   let follower: LogFollower | undefined;
 
   // The service NAME as a stable memo: `props.service` is a fresh object each
@@ -45,8 +57,12 @@ export default function ServicePane(props: { runId: string; service: DagService 
   createEffect(() => {
     const n = name();
     const tail = fullFor() === n ? FULL_LOG_BYTES : DEFAULT_TAIL_BYTES;
+    void retries();
     follower?.close();
     setBuffer(emptyLogBuffer());
+    setLoaded(false);
+    setEnded(false);
+    setError(null);
     const runId = props.runId;
     follower = followLog({
       open: (q, h) => streamServiceLogs(runId, n, { ...q, ...h }),
@@ -55,8 +71,11 @@ export default function ServicePane(props: { runId: string; service: DagService 
       outcome: () => untrack(() => (LIVE_STATUSES.has(props.service.status) ? "running" : "ended")),
       onChunk: (t) => setBuffer((prev) => appendLog(prev, t)),
       onTruncated: (t) => setBuffer((prev) => truncateLog(prev, t)),
-      onEnd: () => {},
+      onEnd: () => setEnded(true),
+      onReopen: () => setEnded(false),
       onReset: () => setBuffer(emptyLogBuffer()),
+      onLoaded: () => setLoaded(true),
+      onError: setError,
     });
   });
   onCleanup(() => follower?.close());
@@ -65,6 +84,17 @@ export default function ServicePane(props: { runId: string; service: DagService 
   // The whole log as a text file: the pane shows at most FULL_LOG_BYTES.
   const rawUrl = () => serviceLogsRawUrl(props.runId, name());
   const notice = () => logNotice(buffer());
+  // With no lines: loading, could not be read, waiting while the service
+  // may still print, or nothing was captured.
+  const logState = () =>
+    logBodyState({
+      text: buffer().text,
+      ended: ended(),
+      outcome: NOT_DONE_STATUSES.has(props.service.status) ? "running" : "ended",
+      loaded: loaded(),
+      error: error(),
+    });
+  const retry = () => setRetries((n) => n + 1);
 
   return (
     <div class="panel inspector steppane servicepane">
@@ -108,15 +138,36 @@ export default function ServicePane(props: { runId: string; service: DagService 
           )}
         </Show>
         <div class="lgbody nowrap">
+          {/* Part of the log arrived, then reading it failed. */}
+          <Show when={logState() === "output" && error()}>
+            {(reason) => <LogError reason={reason()} onRetry={retry} rest />}
+          </Show>
           {/* Rows by position: a new chunk updates the rows in place instead
               of building every row again. */}
           <Index
             each={logRows()}
             fallback={
-              <div class="lgrow empty">
-                <span class="lgln" />
-                <span class="lgtx">waiting for output…</span>
-              </div>
+              <Switch
+                fallback={
+                  <div class="lgrow empty">
+                    <span class="lgln" />
+                    <span class="lgtx">waiting for output…</span>
+                  </div>
+                }
+              >
+                <Match when={logState() === "loading"}>
+                  <LogLoading />
+                </Match>
+                <Match when={logState() === "error" && error()}>
+                  {(reason) => <LogError reason={reason()} onRetry={retry} />}
+                </Match>
+                <Match when={logState() === "none"}>
+                  <div class="lgrow empty">
+                    <span class="lgln" />
+                    <span class="lgtx">No log output was captured for this service.</span>
+                  </div>
+                </Match>
+              </Switch>
             }
           >
             {(r) => (
