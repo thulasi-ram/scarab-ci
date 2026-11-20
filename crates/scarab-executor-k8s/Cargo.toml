@@ -52,3 +52,6 @@ tokio = { workspace = true, features = ["io-util"] }
 # first handshake; tests/cluster.rs installs `ring` (git-bug 2852828), as
 # scarab-plugin-k8s's tier and scarab-server's main.rs do.
 rustls = { workspace = true }
+# The chart's step Pod admission policy is CEL: a unit test evaluates its
+# `ownSecrets` expression against the Secret names the Pod builder writes.
+cel = { workspace = true }

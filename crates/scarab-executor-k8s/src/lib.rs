@@ -15414,6 +15414,244 @@ mod tests {
         assert!(names.contains(&format!("scarab-x-{}", "token")));
     }
 
+    /// The `-v-` Secrets the launch writes for `spec` on Pod `scarab-x`.
+    fn written_v_secrets(spec: &StepSpec) -> Vec<k8s_openapi::api::core::v1::Secret> {
+        let p = Pod::default();
+        [
+            step_secrets_secret("scarab-x", "ns", &p, spec),
+            registry_secret("scarab-x", "ns", &p, spec),
+            forge_token_secret("scarab-x", "ns", &p, spec),
+            oidc_secret("scarab-x", "ns", &p, spec),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// RT-M3 (85b29e0): a step whose registry credential Scarab derives
+    /// from the forge (a token that can write packages) mounts a
+    /// dockerconfigjson the executor builds; the value ledger builds its
+    /// own copy of that JSON. Every value of every `-v-` Secret the launch
+    /// writes is in `mounted_secret_values()`. Kills: the derived branch of
+    /// `mounted_secret_values` removed; the ledger's JSON drifting from
+    /// `registry_dockerconfig`'s.
+    #[test]
+    fn a_forge_derived_registry_credential_is_in_mounted_secret_values() {
+        let mut spec = credentialed_spec();
+        spec.registry_auth = Some(scarab_engine::RegistryAuthConfig {
+            owner: "acme".into(),
+            name: "web".into(),
+            derived_auth: Some(scarab_engine::RegistryCredential {
+                registry: "ghcr.io".into(),
+                username: "x-access-token".into(),
+                token: "ghs_registry_write".into(),
+            }),
+            ..Default::default()
+        });
+        let written = written_v_secrets(&spec);
+        assert!(
+            written
+                .iter()
+                .any(|s| s.metadata.name.as_deref() == Some(&registry_secret_name("scarab-x"))),
+            "the derived credential's Secret is written"
+        );
+        let ledger: Vec<Vec<u8>> = spec
+            .mounted_secret_values()
+            .into_iter()
+            .map(|v| v.value)
+            .collect();
+        for secret in &written {
+            let name = secret.metadata.name.clone().unwrap_or_default();
+            assert!(name.starts_with("scarab-x-v-"), "{name}");
+            let values = secret
+                .string_data
+                .iter()
+                .flatten()
+                .map(|(k, v)| (k.clone(), v.clone().into_bytes()))
+                .chain(
+                    secret
+                        .data
+                        .iter()
+                        .flatten()
+                        .map(|(k, v)| (k.clone(), v.0.clone())),
+                );
+            for (key, value) in values {
+                if value == b"x-access-token" {
+                    continue; // the forge username is not a credential
+                }
+                assert!(
+                    ledger.contains(&value),
+                    "{name}/{key} is written but not in the ledger: {}",
+                    String::from_utf8_lossy(&value)
+                );
+            }
+        }
+        let pod = build_pod(
+            "scarab-x",
+            "ns",
+            &step_with_attempt("run-1", "push", "a1"),
+            &spec,
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            false,
+            None,
+        );
+        assert!(pod_secret_names(&pod).contains(&registry_secret_name("scarab-x")));
+    }
+
+    /// The `ownSecrets` CEL expression of the chart's step Pod admission
+    /// policy, as written in the template (it is not templated).
+    fn admission_policy_own_secrets() -> String {
+        let template = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/helm/scarab/templates/admission-policy.yaml"
+        ))
+        .expect("the admission policy template");
+        let mut lines = template
+            .lines()
+            .skip_while(|l| l.trim() != "- name: ownSecrets")
+            .skip(1);
+        let header = lines.next().expect("the ownSecrets expression");
+        assert_eq!(header.trim(), "expression: >-", "{header}");
+        let indent = |l: &str| l.len() - l.trim_start().len();
+        let base = indent(header);
+        let expression = lines
+            .take_while(|l| indent(l) > base)
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !expression.is_empty() && !expression.contains("{{"),
+            "{expression}"
+        );
+        expression
+    }
+
+    /// RT-M3 (fcf59617, no cluster): the Secret names the chart's admission
+    /// policy lets a step Pod mount, evaluated with the CEL interpreter for
+    /// a Pod named `scarab-x`, are exactly the names a Pod this version
+    /// builds with every credential and a workspace refers to, plus the four
+    /// names a server before 0.7 wrote. Another Pod's `-v-` Secret is not
+    /// one of them. Kills: a `-v-` name missing from the policy (every such
+    /// Pod refused on upgrade); a new per-Pod Secret the policy does not
+    /// know.
+    #[test]
+    fn the_admission_policy_allows_exactly_the_secrets_a_step_pod_mounts() {
+        let program = cel::Program::compile(&admission_policy_own_secrets()).expect("CEL");
+        let mut ctx = cel::Context::default();
+        ctx.add_variable(
+            "object",
+            serde_json::json!({ "metadata": { "name": "scarab-x" } }),
+        )
+        .expect("bind object");
+        let allowed: std::collections::BTreeSet<String> = serde_json::from_value(
+            program
+                .execute(&ctx)
+                .expect("evaluates")
+                .json()
+                .expect("JSON"),
+        )
+        .expect("a list of names");
+
+        let spec = credentialed_spec();
+        let fetch = WorkspaceFetch {
+            url: "http://depot".into(),
+            token_secret: b"k".to_vec(),
+            fetcher_image: "wsfetch".into(),
+            helper_resources: Default::default(),
+            cache_home: Default::default(),
+        };
+        let built = build_pod(
+            "scarab-x",
+            "ns",
+            &step_with_attempt("run-1", "deploy", "a1"),
+            &spec,
+            Some(&ResultsEgress {
+                sidecar_image: "egress".into(),
+                base_url: "http://results".into(),
+                token_secret: b"r".to_vec(),
+            }),
+            DEFAULT_STEP_TIMEOUT_SECS,
+            true,
+            Some(&fetch),
+        );
+        let pod = apply_placement(built, "deploy", &spec, &PlacementConfig::default()).unwrap();
+        let mut expected = pod_secret_names(&pod);
+        for referenced in &expected {
+            assert!(
+                allowed.contains(referenced),
+                "the policy refuses {referenced}: {allowed:?}"
+            );
+        }
+        expected.extend(
+            ["secrets", "token", "registry", "oidc"]
+                .iter()
+                .map(|s| format!("scarab-x-{s}")),
+        );
+        assert_eq!(allowed, expected);
+        assert!(!allowed.contains("scarab-y-v-secrets"));
+        assert!(!allowed.iter().any(|n| !n.starts_with("scarab-x-")));
+    }
+
+    /// A fake API server for one scheduled, labelled Pod `pod` in
+    /// `ci-steps`. Its `n`th GET answers with uid `uids[n]` (the last one
+    /// repeats). Its log answers `hello\n` and then sends nothing while the
+    /// connection stays open, as a follow over a half-open connection does.
+    async fn fake_log_api(pod: String, uids: &'static [&'static str]) -> kube::Config {
+        use axum::http::Uri;
+        use futures::StreamExt as _;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let gets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = axum::Router::new().fallback(move |uri: Uri| {
+            let gets = gets.clone();
+            let pod = pod.clone();
+            async move {
+                if uri.path().ends_with("/log") {
+                    let first = futures::stream::once(async {
+                        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"hello\n"))
+                    });
+                    return axum::response::Response::new(axum::body::Body::from_stream(
+                        first.chain(futures::stream::pending()),
+                    ));
+                }
+                let n = gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let uid = uids[n.min(uids.len() - 1)];
+                let body = serde_json::json!({
+                    "apiVersion": "v1", "kind": "Pod",
+                    "metadata": {
+                        "name": pod, "namespace": "ci-steps", "uid": uid,
+                        "labels": { VALUE_LEDGER_LABEL: "1" },
+                    },
+                    "spec": {
+                        "nodeName": "node-1",
+                        "containers": [{ "name": STEP_CONTAINER, "image": "busybox" }],
+                    },
+                });
+                axum::response::Response::new(axum::body::Body::from(body.to_string()))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        kube::Config::new(format!("http://{addr}").parse().unwrap())
+    }
+
+    /// RT-M3: the log is read from the Pod whose label was checked. A Pod
+    /// deleted and made again between the label check and the log request
+    /// (another uid on the GET after the open) is not read this time.
+    /// Kills: the uid comparison after the open removed.
+    #[tokio::test]
+    async fn a_pod_replaced_after_the_label_check_is_not_read() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        let config = fake_log_api(pod_name(&step), &["u1", "u2"]).await;
+        let exec = K8sExecutor::with_client("ci-steps", kube::Client::try_from(config).unwrap());
+        match exec.log_stream(&step, LogFrom::Start).await {
+            Err(ExecError::Other(m)) => assert!(m.contains("was replaced"), "{m}"),
+            Err(other) => panic!("{other:?}"),
+            Ok(_) => panic!("the replaced Pod's log was opened"),
+        }
+    }
+
     /// The log source state of a step container, a restartable sidecar and
     /// a Pod being deleted. Kills: a sidecar crash read as the end of its
     /// stream; `Ended` without the finish time.

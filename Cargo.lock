@@ -2791,6 +2791,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "cel",
  "futures",
  "k8s-openapi",
  "kube",
