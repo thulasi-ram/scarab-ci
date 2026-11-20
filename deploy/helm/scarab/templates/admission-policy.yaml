@@ -26,10 +26,15 @@
       envFrom secretRef naming a Secret other than the Pod's own per-Pod
       Secrets (`<pod>-secrets`, `-token`, `-registry`, `-oidc`, `-workspace`;
       crates/scarab-executor-k8s) or one the operator placement config
-      (scarab.placement baseline and profiles) names;
+      (scarab.placement baseline and profiles) or
+      scarab.admissionPolicy.allowSecrets names;
     - a serviceAccountName other than `default` (a step Pod sets none) or one
-      the placement config names;
+      the placement config or scarab.admissionPolicy.allowServiceAccounts
+      names;
     - a hostPath volume, hostNetwork, hostPID or hostIPC.
+  The chart refuses to render a placement config that asks for a host field,
+  and a shared namespace where `default` is the server's ServiceAccount
+  (scarab.validateAdmissionPolicy).
   Privileged containers and added capabilities are left to Pod Security:
   Scarab allows them by a governed grant per step, which this policy cannot
   see.
@@ -38,6 +43,7 @@
   with "scarab-step-pods.": the executor fails the step with the reason when
   a create is refused by this policy, instead of retrying the launch.
 */ -}}
+{{- include "scarab.validateAdmissionPolicy" . -}}
 {{- $allowed := include "scarab.admissionPolicyAllowed" . | fromJson -}}
 {{- $name := printf "scarab-step-pods.%s.%s" .Release.Namespace (include "scarab.fullname" .) -}}
 {{- $own := "(n in variables.ownSecrets || n in variables.placementSecrets)" -}}

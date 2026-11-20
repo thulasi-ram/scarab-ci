@@ -27,7 +27,13 @@
 #      selects the step namespace in both modes (`<release namespace>-steps`
 #      and scarab.namespace = the release namespace), it matches the server's
 #      ServiceAccount, and its allowed ServiceAccounts and Secrets carry what
-#      the placement profiles name.
+#      the placement profiles name and scarab.admissionPolicy.allow* lists.
+#      `enabled: auto` (default) is off when scarab.createNamespace is false
+#      (a namespace-only installer cannot create cluster-scoped objects) and
+#      on when set to true. The render fails when the placement config asks
+#      for a host field, when step Pods share the release namespace with a
+#      server whose ServiceAccount the policy allows, and on an `enabled`
+#      that is not auto, true or false.
 #
 # Run by `just check all`. Usage: scripts/chart_render_check.sh [chart-dir]
 # (needs helm, yq v4).
@@ -187,5 +193,42 @@ got=$(vap_field ValidatingAdmissionPolicy '.spec.variables[] | select(.name == "
 got=$(vap_field ValidatingAdmissionPolicy '.spec.variables[] | select(.name == "placementSecrets") | .expression' "$out")
 [ "$got" = '"[\"ca-bundle\",\"login-token\",\"gpu-license\"]"' ] \
   || fail "the placement Secrets are $got, want ca-bundle, login-token and gpu-license"
+
+check_vap "scarab.createNamespace=false" "" "${vap_api[@]}" --set scarab.createNamespace=false
+check_vap "scarab.createNamespace=false, admissionPolicy.enabled=true" "$vap_want" "${vap_api[@]}" \
+  --set scarab.createNamespace=false --set scarab.admissionPolicy.enabled=true
+
+out=$(helm template t "$chart" "${base[@]}" "${vap_api[@]}" \
+  --set-json 'scarab.admissionPolicy.allowSecrets=["ext-ca"]' \
+  --set-json 'scarab.admissionPolicy.allowServiceAccounts=["ext-runner"]')
+got=$(vap_field ValidatingAdmissionPolicy '.spec.variables[] | select(.name == "serviceAccounts") | .expression' "$out")
+[ "$got" = '"[\"default\",\"ext-runner\"]"' ] || fail "allowServiceAccounts: the allowed ServiceAccounts are $got"
+got=$(vap_field ValidatingAdmissionPolicy '.spec.variables[] | select(.name == "placementSecrets") | .expression' "$out")
+[ "$got" = '"[\"ext-ca\"]"' ] || fail "allowSecrets: the allowed Secrets are $got"
+
+refuses() { # <case> <want in the error> <helm args...>
+  local case=$1 want=$2; shift 2
+  local err
+  if err=$(helm template t "$chart" "${base[@]}" "${vap_api[@]}" "$@" 2>&1); then
+    fail "$case: rendered; want a failure naming '$want'"
+  fi
+  grep -qF -- "$want" <<<"$err" || fail "$case: failed with: $err"
+}
+host_placement='scarab.placement={"baseline":{"spec":{"volumes":[{"name":"cache","hostPath":{"path":"/c"}}]}},"profiles":[{"name":"net","k8s":{"spec":{"hostNetwork":true,"hostPID":true}}},{"name":"ipc","k8s":{"spec":{"hostIPC":true}}}]}'
+refuses "a placement host field" \
+  'the baseline (hostPath volume "cache"); profile "net" (hostNetwork, hostPID); profile "ipc" (hostIPC)' \
+  --set-json "$host_placement"
+refuses "a placement host field" "scarab.admissionPolicy.enabled=false" --set-json "$host_placement"
+check_vap "a placement host field, admissionPolicy.enabled=false" "" "${vap_api[@]}" \
+  --set-json "$host_placement" --set scarab.admissionPolicy.enabled=false
+refuses "a shared namespace, the server on default" \
+  "where the server's ServiceAccount is \"default\"" --set scarab.namespace=ci --set serviceAccount.create=false
+refuses "a shared namespace, the server's ServiceAccount allowed" \
+  "where the server's ServiceAccount is \"t-scarab\"" --set scarab.namespace=ci \
+  --set-json 'scarab.admissionPolicy.allowServiceAccounts=["t-scarab"]'
+check_vap "a shared namespace, serviceAccount.name=builder" "$vap_want" "${vap_api[@]}" \
+  --set scarab.namespace=ci --set serviceAccount.create=false --set serviceAccount.name=builder
+check_vap "the step namespace, the server on default" "$vap_want" "${vap_api[@]}" --set serviceAccount.create=false
+refuses "admissionPolicy.enabled=maybe" "it takes auto, true or false" --set scarab.admissionPolicy.enabled=maybe
 
 echo "chart_render_check: SCARAB_UI_URL, the provider secrets, the step namespace, the placement config and the step Pod admission policy render as expected"

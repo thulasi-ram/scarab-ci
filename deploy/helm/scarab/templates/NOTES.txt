@@ -7,14 +7,7 @@ scarab-server is deployed as release "{{ .Release.Name }}" in namespace "{{ .Rel
 {{- if eq .Values.scarab.executor "k8s" }}
 {{- if include "scarab.admissionPolicyRenders" . }}
   Admission: scarab-step-pods.{{ .Release.Namespace }}.{{ include "scarab.fullname" . }} ({{ join ", " .Values.scarab.admissionPolicy.validationActions }})
-{{- if include "scarab.placementUsesHost" . }}
-
-  ⚠  scarab.placement sets a hostPath volume, hostNetwork, hostPID or
-     hostIPC, which the step Pod admission policy refuses: those step Pods
-     will fail. Remove them from the placement config, or set
-     scarab.admissionPolicy.enabled=false.
-{{- end }}
-{{- else if .Values.scarab.admissionPolicy.enabled }}
+{{- else if include "scarab.admissionPolicyWanted" . }}
 
   ⚠  The step Pod admission policy is NOT installed: this cluster does not
      serve admissionregistration.k8s.io/v1 ValidatingAdmissionPolicy
@@ -22,6 +15,15 @@ scarab-server is deployed as release "{{ .Release.Name }}" in namespace "{{ .Rel
      the server's Secrets and ServiceAccount. Set
      scarab.admissionPolicy.force=true if the API is there but Helm cannot
      see it (helm template without a cluster).
+{{- else if eq (toString .Values.scarab.admissionPolicy.enabled) "auto" }}
+
+  ⚠  The step Pod admission policy is NOT installed: scarab.createNamespace
+     is false, the setting for an installer with rights in the release
+     namespace only, and the policy is cluster-scoped. Only Scarab's own Pod
+     builder keeps step Pods off the server's Secrets and ServiceAccount. To
+     install it, set scarab.admissionPolicy.enabled=true and run the install
+     with rights to create ValidatingAdmissionPolicy and
+     ValidatingAdmissionPolicyBinding.
 {{- end }}
 {{- end }}
 {{- if not .Values.secrets.existingSecret }}

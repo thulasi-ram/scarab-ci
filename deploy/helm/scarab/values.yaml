@@ -222,14 +222,30 @@ scarab:
   # Privileged containers and capabilities are left to Pod Security: Scarab
   # allows them per step by grant, which the policy cannot see.
   #
+  # The policy and its binding are cluster-scoped: the installer needs rights
+  # to create ValidatingAdmissionPolicy and ValidatingAdmissionPolicyBinding
+  # (admissionregistration.k8s.io).
+  #
   # Rendered only when the cluster serves admissionregistration.k8s.io/v1
   # ValidatingAdmissionPolicy (Kubernetes 1.30+); on an older cluster the
   # chart renders none and NOTES.txt says so. `force: true` renders it
   # anyway, for `helm template` without a cluster (or pass
   # `--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy`).
+  #
+  # The render fails when the placement config sets a hostPath volume,
+  # hostNetwork, hostPID or hostIPC (every step Pod placed with it would be
+  # refused), and when step Pods share the release namespace with a server
+  # whose ServiceAccount is `default` or one the policy allows.
   admissionPolicy:
-    enabled: true
+    # auto: on, unless scarab.createNamespace is false (the setting for an
+    # installer with rights in the release namespace only). true: on. false: off.
+    enabled: auto
     force: false
+    # Secrets and ServiceAccounts a step Pod may name besides its own per-Pod
+    # Secrets, `default` and what `placement` names: the ones the chart
+    # cannot see, such as a placement file mounted through extraVolumes.
+    allowSecrets: []
+    allowServiceAccounts: []
     # [Deny] refuses the Pod and fails the step. [Audit] only records what
     # would be refused in the API server's audit log: use it for a trial, then
     # switch to [Deny]. [Warn] returns a warning to the server.
