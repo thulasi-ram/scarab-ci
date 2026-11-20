@@ -26,7 +26,7 @@
 //! code recorded, and a second `launch` of the same fence re-attaches to the
 //! existing Pod rather than creating a new one.
 
-use scarab_engine::ports::{ExecHandle, ExecState, FailureClass, LogFrom, LogRedactions};
+use scarab_engine::ports::{ExecHandle, ExecState, FailureClass, LogFrom};
 use scarab_engine::{
     Attempt, AttemptId, AttemptOutcome, Executor, RunId, StepId, StepRun, StepSpec, StepStatus,
     Timestamp,
@@ -3649,116 +3649,60 @@ async fn a_needs_step_with_a_uid_pinned_service_can_write_its_workspace() {
     }
 }
 
-/// LIVE (J-1, round 2 judge S7): a control plane that tails a step it did not
-/// launch reads the step's secret values back from the step's own Secrets,
-/// so it redacts them as the launching replica does. A second executor (a
-/// fresh client, nothing in memory from the launch) returns the step's
-/// secret values, the registry dockerconfigjson, the forge token and the
-/// OIDC token; a Pod with no secrets
-/// returns none; once the Attempt ends and its Secrets are deleted it
-/// answers `Gone`, never "none".
+/// LIVE (85b29e0): a step Pod carries the value-ledger label and mounts its
+/// credentials from the `-v-` Secrets; a second executor (nothing in memory
+/// from the launch) opens its log and reads its source state without
+/// reading any Secret; the Attempt-end delete removes the Secrets by name.
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
-async fn log_redactions_reads_the_values_back_from_another_executor() {
+async fn a_labelled_step_pod_is_read_by_another_executor() {
     let ns = enter_tier();
+    let client = kube_client().await;
+    let launcher = K8sExecutor::with_client(ns.clone(), client.clone());
+    let peer = K8sExecutor::with_client(ns.clone(), kube_client().await);
 
-    let launcher = K8sExecutor::with_client(ns.clone(), kube_client().await);
-    let peer = K8sExecutor::with_client(ns, kube_client().await);
-
-    let step = step_run_of(&unique_run("run-redact"), "redact");
-    let mut spec = busybox_spec("sleep 30", true);
+    let step = step_run_of(&unique_run("run-ledger"), "ledger");
+    let mut spec = busybox_spec("echo hello; sleep 5", true);
     spec.secrets = vec!["DB_PASSWORD".into()];
     spec.resolved_secrets =
-        scarab_engine::ResolvedSecrets(vec![("DB_PASSWORD".into(), "sekret-db-redact".into())]);
-    spec.registry_auth = Some(scarab_engine::RegistryAuthConfig {
-        owner: "acme".into(),
-        name: "web".into(),
-        library: Some("ab".repeat(32)),
-        credential_eligible: true,
-        derived_auth: Some(scarab_engine::RegistryCredential {
-            registry: "ghcr.io".into(),
-            username: "x-access-token".into(),
-            token: "sekret-registry-token".into(),
-        }),
-        ..Default::default()
-    });
-    spec.forge_token = Some(scarab_engine::ForgeTokenConfig {
-        access: scarab_pipeline::ForgeToken::Read,
-        owner: "acme".into(),
-        name: "web".into(),
-        read_only: false,
-        trusted_library: None,
-        credential: Some(scarab_engine::ForgeCredential {
-            username: "x-access-token".into(),
-            token: "sekret-forge-redact".into(),
-            minted: false,
-        }),
-    });
-    spec.oidc_token = Some("sekret-oidc-redact".into());
+        scarab_engine::ResolvedSecrets(vec![("DB_PASSWORD".into(), "sekret-db-ledger".into())]);
     let h = launcher.launch(&step, &spec).await.expect("launch");
+    let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+        kube::Api::namespaced(client.clone(), &ns);
+    let pod = pods.get(&h.0).await.expect("the Pod");
+    assert!(scarab_executor_k8s::has_value_ledger_label(&pod));
 
-    let values = match peer.log_redactions(&step).await.expect("log_redactions") {
-        LogRedactions::Values(values) => values,
-        LogRedactions::Gone => panic!("the Secrets exist"),
-    };
-    for value in [
-        &b"sekret-db-redact"[..],
-        b"sekret-forge-redact",
-        b"sekret-oidc-redact",
-    ] {
-        assert!(
-            values.iter().any(|v| v == value),
-            "{}: {values:?}",
-            String::from_utf8_lossy(value)
-        );
-    }
-    // The forge username is not a credential.
-    assert!(values.iter().all(|v| v != b"x-access-token"));
-    // The launching replica registers the token and `base64(user:token)`;
-    // the server extracts both from the dockerconfigjson returned here.
-    use base64::Engine as _;
-    let auth =
-        base64::engine::general_purpose::STANDARD.encode("x-access-token:sekret-registry-token");
-    assert!(
-        values.iter().any(|v| {
-            serde_json::from_slice::<serde_json::Value>(v)
-                .is_ok_and(|j| j["auths"]["ghcr.io"]["auth"] == auth.as_str())
-        }),
-        "the registry dockerconfigjson: {:?}",
-        values
-            .iter()
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .collect::<Vec<_>>()
-    );
-
-    // The Attempt ends: its Secrets are deleted. The Pod still references
-    // them, so the answer is `Gone`, not "no values".
-    launcher
-        .take_forge_credential(&h)
-        .await
-        .expect("attempt-end hook");
-    let mut after = peer.log_redactions(&step).await.expect("log_redactions");
-    for _ in 0..10 {
-        if after == LogRedactions::Gone {
+    let mut chunks = None;
+    for _ in 0..60 {
+        if let Ok(Some(c)) = peer.log_stream(&step, LogFrom::Start).await {
+            chunks = Some(c);
             break;
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        after = peer.log_redactions(&step).await.expect("log_redactions");
     }
-    assert_eq!(after, LogRedactions::Gone);
-    launcher.cancel(&h).await.expect("cleanup");
-
-    // A Pod with no secrets: none.
-    let plain = step_run_of(&unique_run("run-redact-none"), "plain");
-    let hp = launcher
-        .launch(&plain, &busybox_spec("true", true))
+    let mut chunks = chunks.expect("the log opens");
+    let first = chunks.next_chunk().await.expect("read").expect("bytes");
+    assert!(String::from_utf8_lossy(&first).contains("hello"));
+    let state = peer
+        .log_source_state(&scarab_engine::LogSourceRef::Step(step.clone()))
         .await
-        .expect("launch");
-    assert_eq!(
-        peer.log_redactions(&plain).await.expect("log_redactions"),
-        LogRedactions::Values(Vec::new())
+        .expect("state");
+    assert!(
+        !matches!(state, scarab_engine::LogSourceState::Gone),
+        "{state:?}"
     );
-    launcher.cancel(&hp).await.expect("cleanup");
+
+    launcher
+        .delete_unit_secrets(&h)
+        .await
+        .expect("attempt-end hook");
+    let secrets: kube::Api<k8s_openapi::api::core::v1::Secret> = kube::Api::namespaced(client, &ns);
+    assert!(secrets
+        .get_opt(&format!("{}-v-secrets", h.0))
+        .await
+        .expect("get")
+        .is_none());
+    launcher.cancel(&h).await.expect("cleanup");
 }
 
 /// LIVE (RT-R2-1): an overlay that keeps to the author's fields and makes a

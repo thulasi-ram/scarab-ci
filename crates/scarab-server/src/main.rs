@@ -472,7 +472,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // pre-ADR-0061 snapshots and drain-less dev.
         None => cold_cas,
     };
-    let logs = Arc::new(LogService::new(store.clone(), db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
     // Secrets store (envelope-encrypted, ADR-0014): built up-front — before the
@@ -520,6 +519,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Arc::new(s)
     };
+    // The log pipeline seals each unit's value ledger under the same master
+    // keys, so every replica opens what any replica sealed (git-bug 2d78464).
+    let logs = Arc::new(
+        LogService::new(store.clone(), db.clone())
+            .with_sealer(pg_secrets.clone() as Arc<dyn scarab_secrets::Sealer>),
+    );
     let secrets: Arc<dyn scarab_secrets::SecretProvider> = pg_secrets.clone();
 
     // Retention sweeper (ADR-0050): leader-gated, prunes terminal runs' log
@@ -869,10 +874,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         };
         if let Some(executor) = executor {
-            // Inject env-scoped secrets into deploy-run pods at launch
-            // (ADR-0037).
-            let mut secret_exec =
-                SecretInjectingExecutor::new(executor, db.clone(), secrets.clone(), logs.clone())
+            // The executor stack: Forge(SecretInjecting(Ledger(backend))).
+            // The ledger layer records each launch's mounted values before
+            // the backend writes them (git-bug 2d78464).
+            let oidc = oidc_issuer.clone().zip(config.oidc.clone());
+            let executor: Arc<dyn Executor> = scarab_server::build_executor_stack(
+                executor,
+                logs.clone(),
+                clock.clone(),
+                |ledger| {
+                    // Inject env-scoped secrets into deploy-run pods at launch
+                    // (ADR-0037).
+                    let mut secret_exec = SecretInjectingExecutor::new(
+                        ledger,
+                        db.clone(),
+                        secrets.clone(),
+                        logs.clone(),
+                    )
                     // ADR-0071 §2: re-admit a deploy step at the point its
                     // Environment's credentials would be used.
                     .with_environment_governance(pg.clone())
@@ -883,33 +901,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_policies(pg.clone())
                     // ADR-0080 §3: a recorded approver set compares as ids.
                     .with_identities(pg.clone());
-            // Per-attempt OIDC federation tokens (ADR-0015), tmpfs-delivered.
-            if let (Some(issuer), Some(oidc_cfg)) = (oidc_issuer.clone(), &config.oidc) {
-                secret_exec = secret_exec.with_oidc(
-                    issuer,
-                    oidc_cfg.issuer_url.clone(),
-                    oidc_cfg.audience.clone(),
-                );
-                tracing::info!("per-run OIDC token injection enabled (ADR-0015)");
-            }
-            let executor: Arc<dyn Executor> = Arc::new(secret_exec);
-            // Mint a Step's forge credential at each launch and revoke it
-            // when its Attempt ends (ADR-0076 §9) — in memory only,
-            // delivered as files on tmpfs.
-            let executor: Arc<dyn Executor> = Arc::new(
-                scarab_server::forge_token::ForgeCredentialExecutor::new(executor, forge.clone())
+                    // Per-attempt OIDC federation tokens (ADR-0015),
+                    // tmpfs-delivered.
+                    if let Some((issuer, oidc_cfg)) = oidc {
+                        secret_exec = secret_exec.with_oidc(
+                            issuer,
+                            oidc_cfg.issuer_url.clone(),
+                            oidc_cfg.audience.clone(),
+                        );
+                        tracing::info!("per-run OIDC token injection enabled (ADR-0015)");
+                    }
+                    secret_exec
+                },
+                // Mint a Step's forge credential at each launch and revoke it
+                // when its Attempt ends (ADR-0076 §9), from the unit's ledger.
+                |with_secrets| {
+                    scarab_server::forge_token::ForgeCredentialExecutor::new(
+                        with_secrets,
+                        forge.clone(),
+                    )
                     // A `registry_auth` Step's credential (ADR-0018): scoped
                     // REGISTRY_AUTH secret first, forge-derived credential as
-                    // fallback, each value registered with the log redactor.
+                    // fallback.
                     .with_secrets(secrets.clone())
-                    .with_logs(logs.clone())
                     // A yanked library Step is refused before its forge
                     // credential or registry auth is asked for (ADR-0076 §6).
                     .with_libraries(db.clone(), pg.clone())
                     // So is a deploy Step whose Environment no longer admits
                     // its Project (ADR-0071 §2).
                     .with_environment_governance(db.clone(), pg.clone())
-                    .with_identities(pg.clone()),
+                    .with_identities(pg.clone())
+                },
             );
             // Local host processes finish instantly, so re-poll them quickly; k8s
             // Pods take time, so the default window avoids thundering re-claims.

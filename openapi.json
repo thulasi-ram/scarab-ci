@@ -8066,14 +8066,26 @@
               "type": "integer",
               "format": "int64"
             }
+          },
+          {
+            "name": "markers",
+            "in": "query",
+            "description": "`none`: the stored output bytes exactly, with no `[scarab] …` marker lines; default: marker rows are written as `[scarab] <text>` lines",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "the service's log as text/plain, sent as an attachment",
+            "description": "the service's log as text/plain, sent as an attachment; the X-Scarab-Log-Markers header counts the log's marker rows",
             "content": {
               "text/plain": {}
             }
+          },
+          "400": {
+            "description": "`markers` is not `none` or `lines`"
           },
           "404": {
             "description": "no such run, or no such service (at that Take)"
@@ -8474,17 +8486,26 @@
               "type": "integer",
               "minimum": 0
             }
+          },
+          {
+            "name": "markers",
+            "in": "query",
+            "description": "`none`: the stored output bytes exactly, with no `[scarab] …` marker lines; default: marker rows are written as `[scarab] <text>` lines",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "the try's log as text/plain, sent as an attachment",
+            "description": "the try's log as text/plain, sent as an attachment; the X-Scarab-Log-Markers header counts the log's marker rows",
             "content": {
               "text/plain": {}
             }
           },
           "400": {
-            "description": "no attempt given"
+            "description": "no attempt given, or `markers` is not `none` or `lines`"
           },
           "404": {
             "description": "no such run, step or attempt"

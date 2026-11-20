@@ -36,7 +36,7 @@ use scarab_engine::ports::{ExecHandle, ExecState, Executor, LogChunks};
 use scarab_engine::{Db, ExecError, StepRun, StepSpec};
 use scarab_secrets::{SecretProvider, SecretScope};
 
-use crate::{resolve_step_secrets, LogFence, LogService};
+use crate::{resolve_step_secrets, LogService};
 
 /// Wraps an [`Executor`], resolving a step's declared secrets at launch
 /// time — and, when the OIDC issuer is configured, minting the
@@ -780,16 +780,10 @@ impl Executor for SecretInjectingExecutor {
         let oidc_token = self
             .mint_oidc_token(step, ctx.as_ref(), admission, now_ms)
             .await?;
-        // The step's log stream: the values this launch mounts redact it,
-        // and no other stream.
-        let fence = LogFence::of_step(step);
+        // The token is mounted into the step container. The value ledger
+        // records it from the final spec before the backend writes it.
         let mut base = None;
         if let Some(token) = oidc_token {
-            // Mounted into the step container: a step that prints it shows
-            // `***`. Each launch mints a new one and registers it here.
-            if let Some(fence) = &fence {
-                self.logs.register_secret(fence, token.as_bytes());
-            }
             base = Some(StepSpec {
                 oidc_token: Some(token),
                 ..spec.clone()
@@ -831,16 +825,9 @@ impl Executor for SecretInjectingExecutor {
         // Resolve (with inheritance), register each value with the redactor, and
         // honor the fork-PR lockout — all inside `resolve_step_secrets`.
         let keys: Vec<String> = spec.secrets.iter().map(|s| s.name.clone()).collect();
-        let resolved = resolve_step_secrets(
-            self.secrets.as_ref(),
-            &self.logs,
-            fence.as_ref(),
-            &scope,
-            &keys,
-            ctx.locked_out,
-        )
-        .await
-        .map_err(|e| ExecError::Other(e.to_string()))?;
+        let resolved = resolve_step_secrets(self.secrets.as_ref(), &scope, &keys, ctx.locked_out)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?;
 
         // The values ride the launch copy only. The executor mounts each one
         // as a file and never writes a value into the Pod spec (ADR-0014).
@@ -871,7 +858,7 @@ impl Executor for SecretInjectingExecutor {
             } => ExecState::Failed {
                 exit_code,
                 class,
-                cause: Some(self.logs.redact_text(&cause)),
+                cause: Some(self.logs.redact_text_for_handle(&handle.0, &cause).await),
             },
             other => other,
         })
@@ -907,23 +894,27 @@ impl Executor for SecretInjectingExecutor {
         // Forward and scrub, for the same reason as `poll` above: an infra
         // condition quotes the backend verbatim and is appended to the run's
         // event log, which has no redactor of its own.
-        Ok(self
-            .inner
-            .infra_condition(handle)
-            .await?
-            .map(|c| scarab_engine::InfraCondition {
-                message: c.message.as_deref().map(|m| self.logs.redact_text(m)),
-                ..c
-            }))
+        let Some(c) = self.inner.infra_condition(handle).await? else {
+            return Ok(None);
+        };
+        let message = match c.message.as_deref() {
+            Some(m) => Some(self.logs.redact_text_for_handle(&handle.0, m).await),
+            None => None,
+        };
+        Ok(Some(scarab_engine::InfraCondition { message, ..c }))
     }
 
-    async fn take_forge_credential(
+    async fn delete_unit_secrets(&self, handle: &ExecHandle) -> Result<(), ExecError> {
+        // Forward: a no-op would leave every credential of the wrapped
+        // executor stored.
+        self.inner.delete_unit_secrets(handle).await
+    }
+
+    async fn log_source_state(
         &self,
-        handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
-        // Forward: the default would leave every token of the wrapped
-        // executor unrevoked.
-        self.inner.take_forge_credential(handle).await
+        src: &scarab_engine::LogSourceRef,
+    ) -> Result<scarab_engine::LogSourceState, ExecError> {
+        self.inner.log_source_state(src).await
     }
 
     async fn cancel(&self, handle: &ExecHandle) -> Result<(), ExecError> {
@@ -1006,15 +997,6 @@ impl Executor for SecretInjectingExecutor {
         // Forward the log tail unchanged (ADR-0013); redaction happens downstream
         // in the pipeline, not here.
         self.inner.log_stream(step, from).await
-    }
-
-    async fn log_redactions(
-        &self,
-        step: &StepRun,
-    ) -> Result<scarab_engine::LogRedactions, ExecError> {
-        // Forward: the trait default answers none, which would make every
-        // replica that did not launch a step store its secrets in clear.
-        self.inner.log_redactions(step).await
     }
 
     async fn sidecar_log_stream(

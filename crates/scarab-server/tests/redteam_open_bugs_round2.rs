@@ -146,11 +146,15 @@ impl Executor for HookExec {
         self.inner.infra_condition(handle).await
     }
 
-    async fn take_forge_credential(
+    async fn delete_unit_secrets(&self, handle: &ExecHandle) -> Result<(), ExecError> {
+        self.inner.delete_unit_secrets(handle).await
+    }
+
+    async fn log_source_state(
         &self,
-        handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
-        self.inner.take_forge_credential(handle).await
+        src: &scarab_engine::LogSourceRef,
+    ) -> Result<scarab_engine::LogSourceState, ExecError> {
+        self.inner.log_source_state(src).await
     }
 }
 

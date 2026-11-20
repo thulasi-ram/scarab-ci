@@ -12372,6 +12372,8 @@ export interface operations {
             query?: {
                 /** @description restrict to one Take generation (default = current) */
                 take?: number;
+                /** @description `none`: the stored output bytes exactly, with no `[scarab] …` marker lines; default: marker rows are written as `[scarab] <text>` lines */
+                markers?: string;
             };
             header?: never;
             path: {
@@ -12384,7 +12386,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description the service's log as text/plain, sent as an attachment */
+            /** @description the service's log as text/plain, sent as an attachment; the X-Scarab-Log-Markers header counts the log's marker rows */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -12392,6 +12394,13 @@ export interface operations {
                 content: {
                     "text/plain": unknown;
                 };
+            };
+            /** @description `markers` is not `none` or `lines` */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description no such run, or no such service (at that Take) */
             404: {
@@ -12638,6 +12647,8 @@ export interface operations {
                 attempt: string;
                 /** @description a sidecar service by its index in the step's services (default = the step's main container) */
                 sidecar?: number;
+                /** @description `none`: the stored output bytes exactly, with no `[scarab] …` marker lines; default: marker rows are written as `[scarab] <text>` lines */
+                markers?: string;
             };
             header?: never;
             path: {
@@ -12650,7 +12661,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description the try's log as text/plain, sent as an attachment */
+            /** @description the try's log as text/plain, sent as an attachment; the X-Scarab-Log-Markers header counts the log's marker rows */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -12659,7 +12670,7 @@ export interface operations {
                     "text/plain": unknown;
                 };
             };
-            /** @description no attempt given */
+            /** @description no attempt given, or `markers` is not `none` or `lines` */
             400: {
                 headers: {
                     [name: string]: unknown;

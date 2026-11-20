@@ -93,6 +93,7 @@ pub mod forge_token;
 pub mod infra_observer;
 pub mod libraries;
 pub mod library_fetch;
+pub mod log_ledger;
 pub mod log_stream;
 pub mod log_tail;
 pub mod logs;
@@ -132,8 +133,9 @@ pub mod step_up;
 pub mod workspaced;
 
 pub use infra_observer::{live_fences, InfraObserver};
+pub use log_ledger::{build_executor_stack, RedactionLedgerExecutor};
 pub use log_tail::{pump_log_stream, LogTailer};
-pub use logs::{LogFence, LogService};
+pub use logs::LogService;
 pub use secret_executor::SecretInjectingExecutor;
 
 /// The cold-tier Workspace-Snapshot retention default, in days — mirrors
@@ -3116,7 +3118,26 @@ struct RawLogsQuery {
     attempt: String,
     #[serde(default)]
     sidecar: Option<usize>,
+    /// `none`: the stored output bytes only, no marker lines.
+    #[serde(default)]
+    markers: Option<String>,
 }
+
+/// Whether a raw download writes marker lines: yes, unless `?markers=none`.
+/// Any other value is a 400.
+fn raw_markers(q: Option<&str>) -> Result<bool, ApiError> {
+    match q {
+        None | Some("lines") => Ok(true),
+        Some("none") => Ok(false),
+        Some(other) => Err(ApiError::BadRequest(format!(
+            "markers must be `none` or `lines`, not {other:?}"
+        ))),
+    }
+}
+
+/// The header a raw download carries: how many marker rows the stored log
+/// has, whether or not their lines are in the body.
+pub const LOG_MARKERS_HEADER: &str = "x-scarab-log-markers";
 
 /// `s` cut to 64 characters, each one not an ASCII letter, digit, `-` or `_`
 /// replaced by `_`: safe inside a quoted `Content-Disposition` filename.
@@ -3154,9 +3175,12 @@ fn raw_service_log_filename(run: &RunId, service: &str, take: i64) -> String {
     )
 }
 
-/// One stored log stream as a plain-text attachment, streamed in chunk order
-/// from the object store with the next chunks fetched ahead
-/// ([`LogService::read_chunks`]). Shared by the step and the service raw
+/// One stored log stream as a plain-text attachment, streamed in row order
+/// from the object store with the next bodies fetched ahead
+/// ([`LogService::read_chunks`]). A marker row is written as
+/// `\n[scarab] <text>\n` unless `markers` is false (`?markers=none`: the
+/// stored output bytes exactly); the count of marker rows is in the
+/// [`LOG_MARKERS_HEADER`] either way. Shared by the step and the service raw
 /// routes.
 async fn raw_log_response(
     st: &AppState,
@@ -3164,10 +3188,27 @@ async fn raw_log_response(
     read_step: &StepId,
     attempt: &scarab_engine::AttemptId,
     filename: &str,
+    markers: bool,
 ) -> Result<Response, ApiError> {
     let index = st.logs.chunks(run, read_step, attempt).await?;
-    let mut bodies = st.logs.read_chunks(index);
-    // The first chunk is read before the response starts, so a missing body
+    let marker_count = index.iter().filter(|r| !r.is_output()).count();
+    let index: Vec<_> = index
+        .into_iter()
+        .filter(|r| markers || r.is_output())
+        .collect();
+    let lines: Vec<Option<Vec<u8>>> = index
+        .iter()
+        .map(|r| (!r.is_output()).then(|| crate::logs::marker_line(r)))
+        .collect();
+    let mut bodies = st
+        .logs
+        .read_chunks(index)
+        .zip(stream::iter(lines))
+        .map(|(body, line)| match line {
+            Some(line) => Ok(line),
+            None => body,
+        });
+    // The first row is read before the response starts, so a missing body
     // is a 500 rather than a short download; a later one aborts the body.
     let first = bodies.next().await.transpose()?;
     let rest = bodies.map(|item| {
@@ -3176,6 +3217,7 @@ async fn raw_log_response(
     });
     let body = stream::iter(first.map(|b| Ok::<_, std::io::Error>(Bytes::from(b)))).chain(rest);
     Response::builder()
+        .header(LOG_MARKERS_HEADER, marker_count.to_string())
         .header(
             axum::http::header::CONTENT_TYPE,
             "text/plain; charset=utf-8",
@@ -3202,11 +3244,12 @@ async fn raw_log_response(
         ("id" = String, Path, description = "run id"),
         ("step" = String, Path, description = "a step key (preferred) or the authored step id, percent-encoded"),
         ("attempt" = String, Query, description = "the attempt id (required)"),
-        ("sidecar" = Option<usize>, Query, description = "a sidecar service by its index in the step's services (default = the step's main container)")
+        ("sidecar" = Option<usize>, Query, description = "a sidecar service by its index in the step's services (default = the step's main container)"),
+        ("markers" = Option<String>, Query, description = "`none`: the stored output bytes exactly, with no `[scarab] …` marker lines; default: marker rows are written as `[scarab] <text>` lines")
     ),
     responses(
-        (status = 200, description = "the try's log as text/plain, sent as an attachment", content_type = "text/plain"),
-        (status = 400, description = "no attempt given"),
+        (status = 200, description = "the try's log as text/plain, sent as an attachment; the X-Scarab-Log-Markers header counts the log's marker rows", content_type = "text/plain"),
+        (status = 400, description = "no attempt given, or `markers` is not `none` or `lines`"),
         (status = 404, description = "no such run, step or attempt")
     )
 )]
@@ -3240,7 +3283,8 @@ async fn get_step_logs_raw(
         None => step.clone(),
     };
     let filename = raw_log_filename(&run, try_no, q.sidecar);
-    raw_log_response(&st, &run, &read_step, &attempt, &filename).await
+    let markers = raw_markers(q.markers.as_deref())?;
+    raw_log_response(&st, &run, &read_step, &attempt, &filename, markers).await
 }
 
 /// The shared services of a run's **current Take**, name-ordered —
@@ -3343,6 +3387,9 @@ async fn get_service_logs(
 struct ServiceRawLogsQuery {
     #[serde(default)]
     take: Option<i64>,
+    /// `none`: the stored output bytes only, no marker lines.
+    #[serde(default)]
+    markers: Option<String>,
 }
 
 /// The shared service instance a log route reads: a requested Take, else the
@@ -3378,10 +3425,12 @@ fn service_take(
     params(
         ("id" = String, Path, description = "run id"),
         ("service" = String, Path, description = "declared service name"),
-        ("take" = Option<i64>, Query, description = "restrict to one Take generation (default = current)")
+        ("take" = Option<i64>, Query, description = "restrict to one Take generation (default = current)"),
+        ("markers" = Option<String>, Query, description = "`none`: the stored output bytes exactly, with no `[scarab] …` marker lines; default: marker rows are written as `[scarab] <text>` lines")
     ),
     responses(
-        (status = 200, description = "the service's log as text/plain, sent as an attachment", content_type = "text/plain"),
+        (status = 200, description = "the service's log as text/plain, sent as an attachment; the X-Scarab-Log-Markers header counts the log's marker rows", content_type = "text/plain"),
+        (status = 400, description = "`markers` is not `none` or `lines`"),
         (status = 404, description = "no such run, or no such service (at that Take)")
     )
 )]
@@ -3399,7 +3448,8 @@ async fn get_service_logs_raw(
     let take = service_take(&services, &service, q.take)?;
     let (step, attempt) = crate::logs::service_stream_key(&service, take);
     let filename = raw_service_log_filename(&run, &service, take);
-    raw_log_response(&st, &run, &step, &attempt, &filename).await
+    let markers = raw_markers(q.markers.as_deref())?;
+    raw_log_response(&st, &run, &step, &attempt, &filename, markers).await
 }
 
 /// Map a rerun/retry outcome to the API's error space (the success half rides
@@ -14654,15 +14704,13 @@ pub async fn connection_credential(
 }
 
 /// Resolve a step's scoped secrets and prepare them for injection (ADR-0014,
-/// 0013): fetch each `key` at `scope` from `provider`, **register its value with
-/// the log redactor** for the step's log stream `fence` so it can never appear
-/// in its stored or streamed log, and return the values as `(key, value)`
-/// pairs, the value bytes as stored. The executor writes each one as a file
-/// under `/scarab/secrets/`.
+/// 0013): fetch each `key` at `scope` from `provider` and return the values
+/// as `(key, value)` pairs, the value bytes as stored. The executor writes
+/// each one as a file under `/scarab/secrets/`. The value ledger records
+/// them from the launch spec before the executor writes them, so the log
+/// pipeline redacts them (git-bug 2d78464).
 pub async fn resolve_step_secrets(
     provider: &dyn scarab_secrets::SecretProvider,
-    logs: &LogService,
-    fence: Option<&LogFence>,
     scope: &scarab_secrets::SecretScope,
     keys: &[String],
     locked_out: bool,
@@ -14677,9 +14725,6 @@ pub async fn resolve_step_secrets(
         // `resolve` (not `get`) so an env-scoped run inherits repo/org secrets
         // (ADR-0037); the exact scope is tried first, so exact hits are unchanged.
         let secret = provider.resolve(scope, key).await?;
-        if let Some(fence) = fence {
-            logs.register_secret(fence, &secret.value);
-        }
         env.push((key.clone(), secret.value));
     }
     Ok(env)

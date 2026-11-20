@@ -30,8 +30,9 @@ pub use logstore::{
     SealedGeneration, LEDGER_HARD_CAP_MS, LEDGER_SETTLED_KEEP_MS,
 };
 pub use ports::{
-    Clock, Db, Executor, LeaderTerm, LogChunks, LogFrom, LogRedactions, RunSettlement,
-    SnapshotRetention, StepLaunch, WorkspaceSnapshots, LEADER_TX_BOUND_MS, SCHEDULER_LEASE,
+    Clock, Db, Executor, LeaderTerm, LogChunks, LogFrom, LogSourceRef, LogSourceState,
+    RunSettlement, SnapshotRetention, StepLaunch, WorkspaceSnapshots, LEADER_TX_BOUND_MS,
+    SCHEDULER_LEASE,
 };
 pub use scheduler::{
     cancel_run_request, environment_approval_met, fail_run_creation, gate_approvers,

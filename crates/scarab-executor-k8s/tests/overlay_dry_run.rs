@@ -1,12 +1,6 @@
-//! `K8sExecutor::log_redactions` and the overlay dry run against a fake API
-//! server. Hermetic: no cluster.
-//!
-//! `log_redactions` reads back the secret values of a step's Pod so a
-//! control plane that did not launch the step redacts its log. A read that
-//! fails must never count as "the step has no secret values": the log tail
-//! would then store them in clear.
+//! The overlay dry run of `K8sExecutor::launch` against a fake API server.
+//! Hermetic: no cluster.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, RawQuery, State};
@@ -15,31 +9,18 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
-use scarab_engine::ports::LogRedactions;
 use scarab_engine::{
     Attempt, AttemptId, AttemptOutcome, ExecError, Executor, RunId, StepId, StepRun, StepSpec,
     StepStatus, Timestamp,
 };
-use scarab_executor_k8s::{pod_name, K8sExecutor};
+use scarab_executor_k8s::K8sExecutor;
 
 const NS: &str = "scarab-test";
-
-/// How the fake API server answers a GET of one Secret.
-#[derive(Clone)]
-enum SecretAnswer {
-    Value(&'static [u8]),
-    NotFound,
-    Forbidden,
-}
 
 #[derive(Default)]
 struct Fake {
     /// The Pod a GET returns; `None` answers 404.
     pod: Option<Value>,
-    /// Secret answers by name; a name not here answers 404.
-    secrets: HashMap<String, SecretAnswer>,
-    /// Secret names read, in order.
-    secret_gets: Mutex<Vec<String>>,
     /// Every dry-run create fails, as behind a webhook that rejects dry runs.
     dry_run_fails: bool,
     /// Pod creates: `(dry run, body)`.
@@ -106,38 +87,6 @@ async fn fake_api(fake: Fake) -> (String, Arc<Fake>) {
                 },
             ),
         )
-        .route(
-            "/api/v1/namespaces/{ns}/secrets/{name}",
-            get(
-                |State(fake): State<Arc<Fake>>, Path((_ns, name)): Path<(String, String)>| async move {
-                    fake.secret_gets.lock().unwrap().push(name.clone());
-                    match fake.secrets.get(&name) {
-                        Some(SecretAnswer::Value(v)) => {
-                            use base64::Engine as _;
-                            let b64 = base64::engine::general_purpose::STANDARD.encode(v);
-                            (
-                                StatusCode::OK,
-                                Json(json!({
-                                    "kind": "Secret", "apiVersion": "v1",
-                                    "metadata": { "name": name, "namespace": NS },
-                                    "data": { "TOKEN": b64 },
-                                })),
-                            )
-                        }
-                        Some(SecretAnswer::Forbidden) => status(
-                            StatusCode::FORBIDDEN,
-                            "Forbidden",
-                            format!("secrets \"{name}\" is forbidden: cannot get secrets"),
-                        ),
-                        Some(SecretAnswer::NotFound) | None => status(
-                            StatusCode::NOT_FOUND,
-                            "NotFound",
-                            format!("secrets \"{name}\" not found"),
-                        ),
-                    }
-                },
-            ),
-        )
         .with_state(fake.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -168,101 +117,6 @@ fn step() -> StepRun {
         needs: vec![],
         gate_kind: None,
     }
-}
-
-/// The step's Pod as the API returns it: it mounts `<pod>-secrets`, or no
-/// Secret at all.
-fn pod(with_secrets: bool) -> Value {
-    let name = pod_name(&step());
-    let volumes = if with_secrets {
-        json!([{ "name": "scarab-secrets", "projected": { "sources": [
-            { "secret": { "name": format!("{name}-secrets") } }
-        ] } }])
-    } else {
-        json!([])
-    };
-    json!({
-        "apiVersion": "v1", "kind": "Pod",
-        "metadata": { "name": name, "namespace": NS, "uid": "pod-uid-1" },
-        "spec": {
-            "containers": [{ "name": "step", "image": "busybox" }],
-            "volumes": volumes,
-        },
-    })
-}
-
-fn secrets(answer: SecretAnswer) -> HashMap<String, SecretAnswer> {
-    HashMap::from([(format!("{}-secrets", pod_name(&step())), answer)])
-}
-
-/// The Pod's Secret exists: its values are read back.
-#[tokio::test]
-async fn the_values_of_a_referenced_secret_are_read_back() {
-    let (url, _) = fake_api(Fake {
-        pod: Some(pod(true)),
-        secrets: secrets(SecretAnswer::Value(b"sekret-db")),
-        ..Fake::default()
-    })
-    .await;
-    let answer = executor(&url).log_redactions(&step()).await.unwrap();
-    assert_eq!(answer, LogRedactions::Values(vec![b"sekret-db".to_vec()]));
-}
-
-/// RT-R3 mutation 3: a Secret the API refuses to read (RBAC) is an error.
-/// Read as "no values", the tail would store the step's secrets in clear.
-#[tokio::test]
-async fn a_secret_the_api_refuses_to_read_is_an_error() {
-    let (url, _) = fake_api(Fake {
-        pod: Some(pod(true)),
-        secrets: secrets(SecretAnswer::Forbidden),
-        ..Fake::default()
-    })
-    .await;
-    let err = executor(&url)
-        .log_redactions(&step())
-        .await
-        .expect_err("a refused read is not \"no values\"");
-    assert!(err.to_string().contains("forbidden"), "{err}");
-}
-
-/// R3-1 / RT-R3-1: the Pod references a Secret that is gone (deleted when
-/// the attempt settled). The answer is `Gone`, not "no values".
-#[tokio::test]
-async fn a_referenced_secret_that_is_gone_answers_gone() {
-    let (url, _) = fake_api(Fake {
-        pod: Some(pod(true)),
-        secrets: secrets(SecretAnswer::NotFound),
-        ..Fake::default()
-    })
-    .await;
-    let answer = executor(&url).log_redactions(&step()).await.unwrap();
-    assert_eq!(answer, LogRedactions::Gone);
-}
-
-/// A Pod that references no credential Secret has no values, and no Secret
-/// is read.
-#[tokio::test]
-async fn a_pod_with_no_credential_secret_has_no_values() {
-    let (url, fake) = fake_api(Fake {
-        pod: Some(pod(false)),
-        ..Fake::default()
-    })
-    .await;
-    let answer = executor(&url).log_redactions(&step()).await.unwrap();
-    assert_eq!(answer, LogRedactions::Values(Vec::new()));
-    assert!(fake.secret_gets.lock().unwrap().is_empty());
-}
-
-/// No Pod: nothing says which Secrets it would mount. An error, not "no
-/// values" (a launch writes the Pod before its Secrets).
-#[tokio::test]
-async fn a_missing_pod_is_an_error() {
-    let (url, _) = fake_api(Fake::default()).await;
-    let err = executor(&url)
-        .log_redactions(&step())
-        .await
-        .expect_err("no Pod");
-    assert!(err.to_string().contains("NotFound"), "{err}");
 }
 
 fn overlay_spec() -> StepSpec {

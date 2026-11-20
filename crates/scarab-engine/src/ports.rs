@@ -1604,25 +1604,41 @@ pub trait LogChunks: Send {
 }
 
 /// Where a log read starts: [`Executor::log_stream`] and its sidecar and
-/// service forms.
+/// service forms. A read always starts at the container log's first byte:
+/// the log store compares it with what it stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFrom {
     /// The container log's first byte.
     Start,
-    /// Output printed after the read opens; nothing printed before it.
-    Now,
 }
 
-/// The secret values a unit was launched with, as
-/// [`Executor::log_redactions`] reads them back.
+/// The log source a [`Executor::log_source_state`] question is about.
+#[derive(Debug, Clone)]
+pub enum LogSourceRef {
+    /// A step's main container.
+    Step(StepRun),
+    /// A sidecar container (`service-<i>`) of a step's unit.
+    Sidecar { step: StepRun, container: String },
+    /// A shared service instance's container, by launch handle.
+    Service(ExecHandle),
+}
+
+/// What the backend says about a log source's container now. A log read
+/// that ended cleanly asks it, to tell the container's end from a dropped
+/// connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LogRedactions {
-    /// Every value the unit holds. Empty: the unit references no credential
-    /// Secret.
-    Values(Vec<Vec<u8>>),
-    /// The unit references a credential Secret that does not exist: it was
-    /// deleted when the attempt settled, or the launch has not written it
-    /// yet. Its values cannot be read.
+pub enum LogSourceState {
+    /// The container runs. `container_id` names this run of it.
+    Running { container_id: Option<String> },
+    /// The container ended and will start again (a restartable sidecar or
+    /// shared service).
+    Restarting,
+    /// The container ended for good, at `finished_at` (backend clock).
+    Ended {
+        finished_at: Timestamp,
+        container_id: Option<String>,
+    },
+    /// The unit is gone.
     Gone,
 }
 
@@ -1844,24 +1860,29 @@ pub trait Executor: Send + Sync {
         handle: &ExecHandle,
     ) -> Result<Option<crate::InfraCondition>, ExecError>;
 
-    /// Remove the forge credential `handle`'s unit holds from the backend,
-    /// and return it (ADR-0076 §9). Called once the Attempt has ended, so
-    /// the control plane that sees the end can revoke a minted token,
-    /// whichever replica minted it, and a long-lived token does not stay
-    /// stored for as long as the unit is kept. On k8s that is the per-Pod
-    /// token Secret. `Ok(None)`: the unit holds none, or it was taken
-    /// already. A backend that never mounts one answers `Ok(None)`. A
-    /// backend also removes the unit's other stored secret values here: on
-    /// k8s, the per-Pod Secret that holds the Step's own secrets.
+    /// Delete the per-unit Secrets `handle`'s unit was given (the forge
+    /// credential, the step's own secrets, the registry auth, the OIDC
+    /// token), by name, without reading them. Called once the Attempt has
+    /// ended; the forge tokens to revoke come from the unit's value ledger,
+    /// never from the backend. Missing Secrets are not an error. A backend
+    /// that stores none answers `Ok(())`.
     ///
     /// **Deliberately REQUIRED — no default**, for the reason spelled out on
     /// [`workspace_provisioning`](Self::workspace_provisioning): a decorator
-    /// that inherited a `None` default would leave every token of the
-    /// executor it wraps unrevoked, and nothing would fail.
-    async fn take_forge_credential(
-        &self,
-        handle: &ExecHandle,
-    ) -> Result<Option<crate::MountedForgeCredential>, ExecError>;
+    /// that inherited a no-op default would leave every credential of the
+    /// executor it wraps stored for as long as its unit is kept.
+    async fn delete_unit_secrets(&self, handle: &ExecHandle) -> Result<(), ExecError>;
+
+    /// The state of a log source's container now (see [`LogSourceState`]).
+    /// A log tail asks it when a read ends cleanly, and when a read of an
+    /// ended unit goes quiet.
+    ///
+    /// **Deliberately REQUIRED — no default**: a decorator that answered a
+    /// default would tell every tail the container ended (or never did), and
+    /// the log store would close or re-read streams on a wrong answer.
+    /// Decorators forward it; a backend without a log source answers
+    /// [`LogSourceState::Gone`].
+    async fn log_source_state(&self, src: &LogSourceRef) -> Result<LogSourceState, ExecError>;
 
     /// Open a best-effort **live tail** of the unit's stdout/stderr for `step`,
     /// keyed by its fence (ADR-0013). The control plane drains the returned
@@ -1872,34 +1893,16 @@ pub trait Executor: Send + Sync {
     /// because the source is derived from the fence — the same derivation `launch`
     /// uses — so the caller needs no handle bookkeeping to start a tail.
     ///
-    /// `from` says where the read starts: [`LogFrom::Now`] skips what the
-    /// unit printed before the read opened.
+    /// A unit that may not be read (see
+    /// [`ExecError::NotLedgerComplete`](crate::ExecError::NotLedgerComplete))
+    /// answers that error; the check is made on the same object whose log is
+    /// then read.
     async fn log_stream(
         &self,
         _step: &StepRun,
         _from: LogFrom,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         Ok(None)
-    }
-
-    /// The secret values `step`'s fenced unit was launched with, read back
-    /// from the unit, so that whichever control plane tails its log
-    /// ([`log_stream`](Self::log_stream), [`sidecar_log_stream`](Self::sidecar_log_stream))
-    /// can redact them: the log redactor is process memory, filled at launch,
-    /// and a replica that did not launch the unit (a tail-lease takeover, a
-    /// server roll while it runs) would otherwise store them in clear.
-    ///
-    /// Each value is returned as the unit holds it: the step's own secret
-    /// values, and the registry dockerconfigjson whole (the caller extracts
-    /// the credentials in it). [`LogRedactions::Values`] with no values when
-    /// the unit references no credential Secret; [`LogRedactions::Gone`]
-    /// when it references one that does not exist (deleted when the attempt
-    /// settled, or not written yet). An `Err` (the unit or a Secret could
-    /// not be read) is never "none": the tail reads nothing until the values
-    /// load. The default answers no values: a backend without a log source,
-    /// or whose log tail runs only where the unit was launched.
-    async fn log_redactions(&self, _step: &StepRun) -> Result<LogRedactions, ExecError> {
-        Ok(LogRedactions::Values(Vec::new()))
     }
 
     /// Open a best-effort **live tail** of one of `step`'s co-located sidecar

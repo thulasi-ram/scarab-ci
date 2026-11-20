@@ -3227,7 +3227,7 @@ struct FakeExecState {
     /// Scripted outcomes a test wants `poll` to return, in order.
     scripted: Vec<ExecState>,
     /// The forge credential each launched unit holds (ADR-0076 §9), as the
-    /// k8s per-Pod token Secret holds it, until `take_forge_credential`.
+    /// k8s per-Pod token Secret holds it, until `delete_unit_secrets`.
     forge_credentials: HashMap<String, scarab_engine::MountedForgeCredential>,
     /// Handles the test has declared "dead" (backend lost them).
     dead: Vec<ExecHandle>,
@@ -3316,12 +3316,11 @@ pub struct FakeExecutor {
     /// A one-shot hook the next `poll` awaits — see
     /// [`during_next_poll`](Self::during_next_poll).
     poll_hook: Mutex<Option<LaunchHook>>,
-    /// What `log_redactions` answers for every step — see
-    /// [`set_log_redactions`](Self::set_log_redactions).
-    log_redactions: Mutex<Result<scarab_engine::LogRedactions, String>>,
     /// Polls in flight right now, and the most ever in flight at once, for
     /// one handle (git-bug 068cc0b: two replicas driving one unit).
     polls: Mutex<PollCount>,
+    /// What `log_source_state` answers ([`Self::set_log_source_state`]).
+    log_source_state: Mutex<scarab_engine::LogSourceState>,
 }
 
 #[derive(Default)]
@@ -3343,20 +3342,14 @@ impl FakeExecutor {
             launch_hook: Mutex::new(None),
             poll_hook: Mutex::new(None),
             polls: Mutex::new(PollCount::default()),
-            log_redactions: Mutex::new(Ok(scarab_engine::LogRedactions::Values(Vec::new()))),
+            log_source_state: Mutex::new(scarab_engine::LogSourceState::Gone),
         }
     }
 
-    /// The secret values `log_redactions` answers for every step, as the k8s
-    /// executor reads them back from a unit's Secrets.
-    pub fn set_log_redactions(&self, values: Vec<Vec<u8>>) {
-        *self.log_redactions.lock().unwrap() = Ok(scarab_engine::LogRedactions::Values(values));
-    }
-
-    /// What `log_redactions` answers for every step: an answer, or an error
-    /// with this message.
-    pub fn set_log_redactions_answer(&self, answer: Result<scarab_engine::LogRedactions, String>) {
-        *self.log_redactions.lock().unwrap() = answer;
+    /// What `log_source_state` answers from now on (default `Gone`: this
+    /// backend has no log source).
+    pub fn set_log_source_state(&self, state: scarab_engine::LogSourceState) {
+        *self.log_source_state.lock().unwrap() = state;
     }
 
     /// Run `hook` to completion INSIDE the next `poll`, before it reports
@@ -3563,7 +3556,7 @@ impl FakeExecutor {
     /// The spec `handle` was most recently launched with (after launch-time
     /// interpolation, ADR-0041), or `None` if it was never launched.
     /// Whether `handle`'s unit still holds a forge credential: launched with
-    /// one, and not yet taken by `take_forge_credential`.
+    /// one, and not yet deleted by `delete_unit_secrets`.
     pub fn holds_forge_credential(&self, handle: &ExecHandle) -> bool {
         self.inner
             .lock()
@@ -3824,27 +3817,20 @@ impl Executor for FakeExecutor {
         Ok(None)
     }
 
-    async fn log_redactions(
-        &self,
-        _step: &StepRun,
-    ) -> Result<scarab_engine::LogRedactions, ExecError> {
-        self.log_redactions
-            .lock()
-            .unwrap()
-            .clone()
-            .map_err(ExecError::Other)
-    }
-
-    async fn take_forge_credential(
-        &self,
-        handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
-        Ok(self
-            .inner
+    async fn delete_unit_secrets(&self, handle: &ExecHandle) -> Result<(), ExecError> {
+        self.inner
             .lock()
             .unwrap()
             .forge_credentials
-            .remove(&handle.0))
+            .remove(&handle.0);
+        Ok(())
+    }
+
+    async fn log_source_state(
+        &self,
+        _src: &scarab_engine::LogSourceRef,
+    ) -> Result<scarab_engine::LogSourceState, ExecError> {
+        Ok(self.log_source_state.lock().unwrap().clone())
     }
 
     async fn infra_condition(
@@ -4102,6 +4088,10 @@ pub struct FakeForge {
     mints: Mutex<bool>,
     /// The tokens [`revoke_credential`](ForgePort::revoke_credential) ended.
     revoked: Mutex<Vec<String>>,
+    /// When set, every revocation fails (and is still recorded as tried).
+    revoke_fails: Mutex<bool>,
+    /// Every revocation tried, failed or not.
+    revoke_tries: Mutex<Vec<String>>,
     /// How many checkout credentials [`mint_checkout_credential`](ForgePort::mint_checkout_credential)
     /// has handed out — lets a test assert a refused launch minted nothing.
     checkout_mints: Mutex<u32>,
@@ -4224,6 +4214,16 @@ impl FakeForge {
     /// The tokens revoked so far, in order.
     pub fn revoked(&self) -> Vec<String> {
         self.revoked.lock().unwrap().clone()
+    }
+
+    /// Make every later revocation fail (`true`) or succeed again.
+    pub fn fail_revocations(&self, fail: bool) {
+        *self.revoke_fails.lock().unwrap() = fail;
+    }
+
+    /// Every revocation tried so far, failed or not, in order.
+    pub fn revoke_tries(&self) -> Vec<String> {
+        self.revoke_tries.lock().unwrap().clone()
     }
 
     /// How many checkout or registry credentials were asked for.
@@ -4931,6 +4931,10 @@ impl ForgePort for FakeForge {
     }
 
     async fn revoke_credential(&self, _repo: &RepoRef, token: &str) -> Result<(), ForgeError> {
+        self.revoke_tries.lock().unwrap().push(token.to_string());
+        if *self.revoke_fails.lock().unwrap() {
+            return Err(ForgeError::Api("revocation refused (test)".into()));
+        }
         if *self.mints.lock().unwrap() {
             self.revoked.lock().unwrap().push(token.to_string());
         }
