@@ -1364,6 +1364,150 @@ contract_test!(
     units_are_purged_by_age_only_when_not_running
 );
 
+/// I7 (settled_at on every settle path): `settle_log_units` reads the
+/// settled state, so every way an attempt or a service ends sets it: an
+/// outcome (succeeded, superseded, cancelled), a classified failure, a
+/// closed gate-style attempt, a terminal run, a service torn down or
+/// failed. A running step and a live service stay unsettled. Kills: a
+/// settle path that misses it.
+async fn every_settle_path_sets_settled_at(db: &dyn Db) {
+    let run = RunId("lr".into());
+    let step = StepId("build".into());
+    seed_run_and_step(db, &run, &step).await;
+    let attempts = ["ok", "sup", "can", "fail", "closed", "live"];
+    for a in attempts {
+        db.record_attempt(&run, &step, &attempt(a, 0))
+            .await
+            .unwrap();
+        db.write_log_unit(&stream_id("build", a), None, 0, None, Timestamp(0))
+            .await
+            .unwrap();
+    }
+    let a = |id: &str| AttemptId(id.into());
+    db.set_attempt_outcome(&run, &step, &a("ok"), AttemptOutcome::Succeeded)
+        .await
+        .unwrap();
+    db.set_attempt_outcome(&run, &step, &a("sup"), AttemptOutcome::Superseded)
+        .await
+        .unwrap();
+    db.set_attempt_outcome(&run, &step, &a("can"), AttemptOutcome::Cancelled)
+        .await
+        .unwrap();
+    db.set_attempt_failure(&run, &step, &a("fail"), FailureKind::Step, Some("x"))
+        .await
+        .unwrap();
+    db.close_running_attempt(&run, &step, &a("closed"), AttemptOutcome::Cancelled, None)
+        .await
+        .unwrap();
+    for (name, status) in [
+        ("down", scarab_engine::ServiceStatus::TornDown),
+        ("broke", scarab_engine::ServiceStatus::Failed),
+        ("up", scarab_engine::ServiceStatus::Running),
+    ] {
+        db.create_run_service(None, &run, 1, name, Timestamp(0))
+            .await
+            .unwrap();
+        db.set_run_service(None, &run, 1, name, status, Some(name))
+            .await
+            .unwrap();
+        db.write_log_unit(
+            &stream_id(&format!("service:{name}"), "t1"),
+            None,
+            0,
+            None,
+            Timestamp(0),
+        )
+        .await
+        .unwrap();
+    }
+    db.settle_log_units(Timestamp(7)).await.unwrap();
+    let settled = |u: LogStreamId| async move {
+        db.log_unit_ledger(&u)
+            .await
+            .unwrap()
+            .unwrap()
+            .unit
+            .settled_at
+    };
+    for a in ["ok", "sup", "can", "fail", "closed"] {
+        assert_eq!(settled(stream_id("build", a)).await, Some(7), "attempt {a}");
+    }
+    for s in ["down", "broke"] {
+        assert_eq!(
+            settled(stream_id(&format!("service:{s}"), "t1")).await,
+            Some(7),
+            "{s}"
+        );
+    }
+    assert_eq!(settled(stream_id("build", "live")).await, None);
+    assert_eq!(settled(stream_id("service:up", "t1")).await, None);
+    // The run ends: every unit of it is settled.
+    db.record_transition(&run, RunStatus::Pending, RunStatus::Running)
+        .await
+        .unwrap();
+    db.record_transition(&run, RunStatus::Running, RunStatus::Cancelled)
+        .await
+        .unwrap();
+    db.settle_log_units(Timestamp(9)).await.unwrap();
+    assert_eq!(settled(stream_id("build", "live")).await, Some(9));
+    assert_eq!(settled(stream_id("service:up", "t1")).await, Some(9));
+}
+
+contract_test!(log_settle_paths, every_settle_path_sets_settled_at);
+
+/// 2.5: an attempt that ended with no ledger row (an earlier version
+/// launched it, or it never launched) is a pending final read with
+/// `has_ledger` false; `started` says whether it ran, and a terminal stream
+/// drops it. Kills: no pending query for units with no row.
+async fn an_ended_attempt_with_no_ledger_is_pending(db: &dyn Db) {
+    let run = RunId("lr".into());
+    let step = StepId("build".into());
+    seed_run_and_step(db, &run, &step).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    for a in ["ran", "never"] {
+        db.record_attempt(&run, &step, &attempt(a, now))
+            .await
+            .unwrap();
+        db.set_attempt_outcome(&run, &step, &AttemptId(a.into()), AttemptOutcome::Cancelled)
+            .await
+            .unwrap();
+    }
+    db.mark_attempt_execution_started(&run, &step, &AttemptId("ran".into()), Timestamp(now))
+        .await
+        .unwrap();
+    let pending = db.pending_final_reads(100).await.unwrap();
+    let find = |a: &str| {
+        pending
+            .iter()
+            .find(|p| p.unit == stream_id("build", a))
+            .cloned()
+            .unwrap_or_else(|| panic!("{a} is pending: {pending:?}"))
+    };
+    assert!(!find("ran").has_ledger && find("ran").started);
+    assert!(!find("never").started);
+    let w = writer(db, "tail2:lr:build:never", "a", 60_000).await;
+    db.set_log_stream_state(
+        &stream_id("build", "never"),
+        &w,
+        LogStreamState::Closed,
+        Timestamp(1),
+    )
+    .await
+    .unwrap();
+    let pending = db.pending_final_reads(100).await.unwrap();
+    assert!(!pending
+        .iter()
+        .any(|p| p.unit == stream_id("build", "never")));
+}
+
+contract_test!(
+    log_pending_no_ledger,
+    an_ended_attempt_with_no_ledger_is_pending
+);
+
 /// 3.3: retention tombstones every stream of the run and purges its units
 /// in one transaction; a late append is refused. Kills: a tombstone missing
 /// (a late writer recreates the stream).

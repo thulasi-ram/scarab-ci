@@ -1955,10 +1955,11 @@ fn forge_token_secret_name(pod_name: &str) -> String {
 
 /// The label this version stamps on every step and shared-service Pod it
 /// creates. Only a server that writes the unit's value ledger before any of
-/// its Secrets sets it, and a labelled Pod mounts only the per-Pod Secrets
-/// named with the `-v-` suffix, which only such a server writes: the log of
-/// a labelled Pod is redacted with a complete value set. A Pod without it
-/// is not read.
+/// its Secrets sets it, and Scarab's per-Pod Secrets of a labelled Pod carry
+/// the `-v-` names, which only such a server writes (an operator's placement
+/// profile may mount Secrets of its own; their values are the operator's):
+/// the log of a labelled Pod is redacted with a complete value set. A Pod
+/// without it is not read.
 pub const VALUE_LEDGER_LABEL: &str = "scarab.io/value-ledger";
 
 /// Whether `pod` carries [`VALUE_LEDGER_LABEL`] `"1"`.

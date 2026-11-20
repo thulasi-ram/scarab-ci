@@ -1593,3 +1593,89 @@ async fn a_cause_of_a_unit_without_a_ledger_is_replaced() {
         scarab_server::logs::CAUSE_NOT_STORED
     );
 }
+
+#[path = "common/mod.rs"]
+mod common;
+
+/// I1 (Q1 = A): a ledger generation in Postgres holds no value in clear,
+/// opens only under its own unit and generation, and a load with a
+/// generation missing or not openable here is an error, never "fewer
+/// values". Kills: a seal without AAD; a load that skips a generation.
+#[tokio::test]
+async fn ledger_rows_hold_no_plaintext_and_open_only_under_their_unit() {
+    let Some(tdb) = common::fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = Arc::new(scarab_db_postgres::PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    let db = pg.clone() as Arc<dyn Db>;
+    let seal = sealer();
+    let logs =
+        LogService::new(Arc::new(InMemoryObjectStore::new()), db.clone()).with_sealer(seal.clone());
+    let value = |v: &[u8]| scarab_engine::MountedValue {
+        kind: scarab_engine::MountedValueKind::Secret,
+        value: v.to_vec(),
+        repo: None,
+        minted: None,
+    };
+    logs.record_launch_values(
+        &stream(),
+        None,
+        vec![value(b"plain-secret-1")],
+        Timestamp(1),
+    )
+    .await
+    .unwrap();
+    logs.record_launch_values(
+        &stream(),
+        None,
+        vec![value(b"plain-secret-2")],
+        Timestamp(2),
+    )
+    .await
+    .unwrap();
+    let rows = db.log_unit_ledger(&stream()).await.unwrap().unwrap();
+    assert_eq!(rows.generations.len(), 2);
+    for g in &rows.generations {
+        let hay = &g.sealed;
+        assert!(
+            !hay.windows(14).any(|w| w.starts_with(b"plain-secret")),
+            "generation {} holds a value in clear",
+            g.gen
+        );
+        // Under another unit's or generation's AAD it does not open.
+        let other = LogStreamId::new(&run(), &StepId("other".into()), &AttemptId(ATTEMPT.into()));
+        assert!(seal
+            .open(hay, &scarab_server::logs::ledger_aad(&other, g.gen))
+            .is_err());
+        assert!(seal
+            .open(hay, &scarab_server::logs::ledger_aad(&stream(), g.gen + 1))
+            .is_err());
+    }
+    // Both generations load.
+    let fresh =
+        LogService::new(Arc::new(InMemoryObjectStore::new()), db.clone()).with_sealer(seal.clone());
+    assert_eq!(
+        fresh.load_values(&stream()).await.unwrap().values().len(),
+        2
+    );
+    // A replica with other keys: a local error, not fewer values.
+    let other_keys =
+        LogService::new(Arc::new(InMemoryObjectStore::new()), db.clone()).with_sealer(sealer());
+    assert!(matches!(
+        other_keys.load_values(&stream()).await,
+        Err(scarab_server::logs::LedgerError::Local(_))
+    ));
+    // A generation gone (an accident): a local error.
+    sqlx::query("DELETE FROM log_unit_values WHERE gen = 1")
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
+    let after = LogService::new(Arc::new(InMemoryObjectStore::new()), db).with_sealer(seal);
+    assert!(matches!(
+        after.load_values(&stream()).await,
+        Err(scarab_server::logs::LedgerError::Local(_))
+    ));
+    tdb.cleanup().await;
+}
