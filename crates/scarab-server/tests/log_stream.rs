@@ -1064,8 +1064,15 @@ async fn app_with_markers() -> (axum::Router, Arc<InMemoryDb>) {
         db.clone(),
     ));
     let stream = scarab_engine::LogStreamId::new(&run, &step, &attempt);
-    let lease = db.lease("w", "w", 60_000).await.unwrap();
-    let writer = lease.held_by("w", "w").unwrap();
+    // The stream's tail lease, expired at once: its term still fences the
+    // appends below (nobody took it over), and a reader does not take it
+    // for a log still being stored.
+    let resource = scarab_engine::LogLease::Tail.resource(&stream);
+    let lease = db.lease(&resource, "w", 1).await.unwrap();
+    let writer = scarab_engine::LogWriter::holding(
+        scarab_engine::LogLease::Tail,
+        &lease.held_by(&resource, "w").unwrap(),
+    );
     logs.append(&run, &step, &attempt, b"one\r").await.unwrap();
     logs.append_marker(
         &stream,

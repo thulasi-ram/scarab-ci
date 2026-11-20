@@ -978,22 +978,25 @@ pub trait Db: Send + Sync {
     /// The run's append-only event log, in append order (the SSE tail source).
     async fn events(&self, run: &RunId) -> Result<Vec<EventKind>, DbError>;
 
-    /// Append one row to `stream`'s index, fenced on the stream's tail lease
-    /// `writer` (I3). In one transaction: the lease `(owner, term)` is held
-    /// `FOR SHARE`; the `log_streams` row is created if missing (from the
-    /// rows already stored) and locked; a stream that is not `open` refuses
+    /// Append one row to `stream`'s index, fenced on `writer` (I3): the
+    /// lease of `writer.lease`'s kind **for this stream**, whose resource the
+    /// store derives from the stream id ([`crate::LogLease::resource`]), held
+    /// by `(owner, term)`. In one transaction: that lease row is held `FOR
+    /// SHARE`; the `log_streams` row is locked, or created from the rows
+    /// already stored when missing, unless the run's log was pruned (then
+    /// [`LogAppendError::Closed`]); a stream that is not `open` refuses
     /// ([`LogAppendError::Closed`]); an `Output` row refuses a unit with no
     /// `log_units` row, a purged one, or a `values_gen` that is not the
     /// unit's current generation; the row takes the next `seq` and
     /// `byte_offset` (a conflict is an error, never dropped); the stream's
     /// `next_seq`, `byte_len`, `part_start_seq` (after a `source_restarted`
-    /// row) and `state` (`row.then`) are updated. `unit` is the unit the
+    /// row) and `state` (`row.then`) are updated. The unit is the one the
     /// stream belongs to ([`LogStreamId::unit`](crate::LogStreamId::unit)).
     async fn append_log_row(
         &self,
         stream: &crate::LogStreamId,
         row: &crate::NewLogRow,
-        writer: &LeaderTerm,
+        writer: &crate::LogWriter,
         now: Timestamp,
     ) -> Result<LogChunkMeta, crate::LogAppendError>;
 
@@ -1004,7 +1007,7 @@ pub trait Db: Send + Sync {
     async fn set_log_stream_state(
         &self,
         stream: &crate::LogStreamId,
-        writer: &LeaderTerm,
+        writer: &crate::LogWriter,
         state: crate::LogStreamState,
         now: Timestamp,
     ) -> Result<(), crate::LogAppendError>;
@@ -1015,7 +1018,7 @@ pub trait Db: Send + Sync {
     async fn start_log_final_budget(
         &self,
         stream: &crate::LogStreamId,
-        writer: &LeaderTerm,
+        writer: &crate::LogWriter,
         now: Timestamp,
     ) -> Result<i64, crate::LogAppendError>;
 
@@ -1068,7 +1071,8 @@ pub trait Db: Send + Sync {
         unit: &crate::LogStreamId,
     ) -> Result<Option<crate::LogLedgerRows>, DbError>;
 
-    /// The unit whose `log_units.handle` is `handle`.
+    /// The unit whose `log_units.handle` is `handle`; of several (a Pod
+    /// name hash collision), the newest row.
     async fn log_unit_by_handle(&self, handle: &str)
         -> Result<Option<crate::LogStreamId>, DbError>;
 

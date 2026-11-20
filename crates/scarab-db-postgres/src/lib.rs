@@ -157,48 +157,74 @@ impl PostgresDb {
         Ok(tx)
     }
 
-    /// A transaction fenced on a stream's tail lease, holding its
-    /// `log_streams` row (created when missing) `FOR UPDATE`, refused when
-    /// the stream is not `open`.
+    /// A transaction fenced on `writer`'s lease for `stream` (the resource
+    /// derived from the stream id), holding its `log_streams` row `FOR
+    /// UPDATE`: read first, and created from the stored rows only when
+    /// missing, unless the run's log was pruned. Refused when the stream is
+    /// not `open`.
     async fn begin_stream_fenced(
         &self,
         stream: &scarab_engine::LogStreamId,
-        writer: &LeaderTerm,
+        writer: &scarab_engine::LogWriter,
         now: Timestamp,
     ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, scarab_engine::LogAppendError> {
         use scarab_engine::LogAppendError;
-        let mut tx = match self.begin_fenced(writer).await {
+        let mut tx = match self.begin_fenced(&writer.fence(stream)).await {
             Ok(tx) => tx,
             Err(DbError::NotLeader) => return Err(LogAppendError::NotWriter),
             Err(e) => return Err(e.into()),
         };
-        sqlx::query(
-            "INSERT INTO log_streams (run_id, step_id, attempt_id, next_seq, byte_len, updated_at)
-             SELECT $1, $2, $3, COALESCE(max(c.seq) + 1, 0),
-                    COALESCE(max(c.byte_offset + c.len), 0), $4
-             FROM log_chunks c
-             WHERE c.run_id = $1 AND c.step_id = $2 AND c.attempt_id = $3
-             ON CONFLICT (run_id, step_id, attempt_id) DO NOTHING",
-        )
-        .bind(&stream.run.0)
-        .bind(&stream.step.0)
-        .bind(&stream.attempt.0)
-        .bind(now.0)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        let state: String = sqlx::query(
-            "SELECT state FROM log_streams
-             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3 FOR UPDATE",
-        )
-        .bind(&stream.run.0)
-        .bind(&stream.step.0)
-        .bind(&stream.attempt.0)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(db_err)?
-        .get("state");
-        if state != "open" {
+        let lock = "SELECT state FROM log_streams
+                    WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3 FOR UPDATE";
+        let mut state: Option<String> = sqlx::query(lock)
+            .bind(&stream.run.0)
+            .bind(&stream.step.0)
+            .bind(&stream.attempt.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .map(|r| r.get("state"));
+        if state.is_none() {
+            let pruned: bool = sqlx::query(
+                "SELECT EXISTS (SELECT 1 FROM log_prune_pending WHERE run_id = $1)
+                     OR EXISTS (SELECT 1 FROM log_streams WHERE run_id = $1 AND pruned) AS pruned",
+            )
+            .bind(&stream.run.0)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .get("pruned");
+            if pruned {
+                let _ = tx.rollback().await;
+                return Err(LogAppendError::Closed);
+            }
+            sqlx::query(
+                "INSERT INTO log_streams (run_id, step_id, attempt_id, next_seq, byte_len, updated_at)
+                 SELECT $1, $2, $3, COALESCE(max(c.seq) + 1, 0),
+                        COALESCE(max(c.byte_offset + c.len), 0), $4
+                 FROM log_chunks c
+                 WHERE c.run_id = $1 AND c.step_id = $2 AND c.attempt_id = $3
+                 ON CONFLICT (run_id, step_id, attempt_id) DO NOTHING",
+            )
+            .bind(&stream.run.0)
+            .bind(&stream.step.0)
+            .bind(&stream.attempt.0)
+            .bind(now.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            state = Some(
+                sqlx::query(lock)
+                    .bind(&stream.run.0)
+                    .bind(&stream.step.0)
+                    .bind(&stream.attempt.0)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(db_err)?
+                    .get("state"),
+            );
+        }
+        if state.as_deref() != Some("open") {
             let _ = tx.rollback().await;
             return Err(LogAppendError::Closed);
         }
@@ -2152,23 +2178,21 @@ impl Db for PostgresDb {
         &self,
         stream: &scarab_engine::LogStreamId,
         row: &scarab_engine::NewLogRow,
-        writer: &LeaderTerm,
+        writer: &scarab_engine::LogWriter,
         now: Timestamp,
     ) -> Result<LogChunkMeta, scarab_engine::LogAppendError> {
         use scarab_engine::LogAppendError;
-        let unit = stream.unit();
         let mut tx = self.begin_bounded().await?;
         let r = sqlx::query(
             "SELECT outcome, out_seq, out_offset, out_gen FROM scarab_append_log_row(
-               $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+               $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(&stream.run.0)
         .bind(&stream.step.0)
         .bind(&stream.attempt.0)
-        .bind(&unit.step.0)
-        .bind(writer.resource())
-        .bind(writer.owner())
-        .bind(writer.term())
+        .bind(writer.lease.as_str())
+        .bind(&writer.owner)
+        .bind(writer.term)
         .bind(row.kind.as_str())
         .bind(row.reason.map(|r| r.as_str()))
         .bind(row.body.as_ref().map(|b| b.object_key.clone()))
@@ -2216,7 +2240,7 @@ impl Db for PostgresDb {
     async fn set_log_stream_state(
         &self,
         stream: &scarab_engine::LogStreamId,
-        writer: &LeaderTerm,
+        writer: &scarab_engine::LogWriter,
         state: scarab_engine::LogStreamState,
         now: Timestamp,
     ) -> Result<(), scarab_engine::LogAppendError> {
@@ -2240,7 +2264,7 @@ impl Db for PostgresDb {
     async fn start_log_final_budget(
         &self,
         stream: &scarab_engine::LogStreamId,
-        writer: &LeaderTerm,
+        writer: &scarab_engine::LogWriter,
         now: Timestamp,
     ) -> Result<i64, scarab_engine::LogAppendError> {
         let mut tx = self.begin_stream_fenced(stream, writer, now).await?;
@@ -2310,8 +2334,8 @@ impl Db for PostgresDb {
     ) -> Result<i64, DbError> {
         let mut tx = self.pool().begin().await.map_err(db_err)?;
         sqlx::query(
-            "INSERT INTO log_units (run_id, step_id, attempt_id, handle)
-             VALUES ($1, $2, $3, $4)
+            "INSERT INTO log_units (run_id, step_id, attempt_id, handle, created_at)
+             VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (run_id, step_id, attempt_id)
              DO UPDATE SET handle = COALESCE(EXCLUDED.handle, log_units.handle)",
         )
@@ -2319,6 +2343,7 @@ impl Db for PostgresDb {
         .bind(&unit.step.0)
         .bind(&unit.attempt.0)
         .bind(handle)
+        .bind(now.0)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -2379,7 +2404,8 @@ impl Db for PostgresDb {
         // One statement, one snapshot: the row and its generations agree.
         let rows = sqlx::query(
             "SELECT u.gen, u.handle, u.started_at, u.settled_at, u.revoke_attempted_at,
-                    u.purged, v.gen AS value_gen, v.sealed, v.created_at
+                    u.purged, u.created_at AS unit_created_at,
+                    v.gen AS value_gen, v.sealed, v.created_at
              FROM log_units u
              LEFT JOIN log_unit_values v
                ON v.run_id = u.run_id AND v.step_id = u.step_id AND v.attempt_id = u.attempt_id
@@ -2418,7 +2444,7 @@ impl Db for PostgresDb {
     ) -> Result<Option<scarab_engine::LogStreamId>, DbError> {
         let r = sqlx::query(
             "SELECT run_id, step_id, attempt_id FROM log_units WHERE handle = $1
-             ORDER BY run_id, step_id, attempt_id LIMIT 1",
+             ORDER BY created_at DESC, run_id DESC, step_id DESC, attempt_id DESC LIMIT 1",
         )
         .bind(handle)
         .fetch_optional(self.pool())
@@ -6164,5 +6190,9 @@ fn log_unit_row(r: &sqlx::postgres::PgRow) -> scarab_engine::LogUnitRow {
         settled_at: r.get("settled_at"),
         revoke_attempted_at: r.get("revoke_attempted_at"),
         purged: r.get("purged"),
+        created_at: r
+            .try_get::<i64, _>("unit_created_at")
+            .or_else(|_| r.try_get::<i64, _>("created_at"))
+            .unwrap_or(0),
     }
 }

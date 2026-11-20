@@ -30,9 +30,9 @@ use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::scheduler::MAX_DELIVERY_ATTEMPTS;
 use scarab_engine::{
-    Attempt, AttemptId, AttemptOutcome, Db, DbError, FailureKind, LeaderTerm, LogAppendError,
-    LogBody, LogRowKind, LogStreamId, LogStreamState, NewLogRow, NotStoredReason, OutboxId,
-    OutboxMessage, RunId, RunStatus, StepId, StepStatus, Timestamp,
+    Attempt, AttemptId, AttemptOutcome, Db, DbError, FailureKind, LogAppendError, LogBody,
+    LogLease, LogRowKind, LogStreamId, LogStreamState, LogWriter, NewLogRow, NotStoredReason,
+    OutboxId, OutboxMessage, RunId, RunStatus, StepId, StepStatus, Timestamp,
 };
 use scarab_testkit::InMemoryDb;
 
@@ -978,13 +978,16 @@ fn stream_id(step: &str, attempt: &str) -> LogStreamId {
     )
 }
 
-/// The tail lease of `resource` for `owner`, as a writer.
-async fn writer(db: &dyn Db, resource: &str, owner: &str, ttl_ms: i64) -> LeaderTerm {
-    db.lease(resource, owner, ttl_ms)
+/// `stream`'s tail lease for `owner`, as a writer.
+async fn writer(db: &dyn Db, stream: &LogStreamId, owner: &str, ttl_ms: i64) -> LogWriter {
+    let resource = LogLease::Tail.resource(stream);
+    let held = db
+        .lease(&resource, owner, ttl_ms)
         .await
         .unwrap()
-        .held_by(resource, owner)
-        .unwrap_or_else(|| panic!("{owner} does not hold {resource}"))
+        .held_by(&resource, owner)
+        .unwrap_or_else(|| panic!("{owner} does not hold {resource}"));
+    LogWriter::holding(LogLease::Tail, &held)
 }
 
 fn body(key: &str, len: u64) -> LogBody {
@@ -1011,7 +1014,7 @@ async fn seed_log_run(db: &dyn Db) {
 /// generation passing).
 async fn an_append_with_no_unit_row_is_refused(db: &dyn Db) {
     let s = stream_id("build", "a1");
-    let w = writer(db, "tail2:lr:build:a1", "a", 60_000).await;
+    let w = writer(db, &s, "a", 60_000).await;
     let out = NewLogRow::output(body("k0", 3), 0);
     assert!(matches!(
         db.append_log_row(&s, &out, &w, Timestamp(1)).await,
@@ -1088,12 +1091,12 @@ async fn a_stale_writer_cannot_append_after_a_takeover(db: &dyn Db) {
     db.write_log_unit(&s, None, 0, None, Timestamp(0))
         .await
         .unwrap();
-    let a = writer(db, "tail2:lr:build:a1", "a", 50).await;
+    let a = writer(db, &s, "a", 50).await;
     db.append_log_row(&s, &NewLogRow::output(body("ka", 1), 0), &a, Timestamp(1))
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-    let b = writer(db, "tail2:lr:build:a1", "b", 60_000).await;
+    let b = writer(db, &s, "b", 60_000).await;
     assert!(matches!(
         db.append_log_row(&s, &NewLogRow::output(body("ka2", 1), 0), &a, Timestamp(2))
             .await,
@@ -1125,7 +1128,7 @@ async fn concurrent_appenders_produce_dense_rows(db: &dyn Db) {
     db.write_log_unit(&s, None, 0, None, Timestamp(0))
         .await
         .unwrap();
-    let w = writer(db, "tail2:lr:build:a1", "a", 60_000).await;
+    let w = writer(db, &s, "a", 60_000).await;
     let append = |i: u64| {
         let (s, w) = (s.clone(), w.clone());
         async move {
@@ -1174,7 +1177,7 @@ async fn markers_are_rows_and_terminal_streams_take_none(db: &dyn Db) {
     db.write_log_unit(&s, None, 0, None, Timestamp(0))
         .await
         .unwrap();
-    let w = writer(db, "tail2:lr:build:a1", "a", 60_000).await;
+    let w = writer(db, &s, "a", 60_000).await;
     db.append_log_row(&s, &NewLogRow::output(body("k0", 5), 0), &w, Timestamp(1))
         .await
         .unwrap();
@@ -1223,6 +1226,7 @@ async fn markers_are_rows_and_terminal_streams_take_none(db: &dyn Db) {
     );
     // The final-read budget starts once and is durable.
     let n = stream_id("build::service-0", "a1");
+    let w = writer(db, &n, "a", 60_000).await;
     assert_eq!(
         db.start_log_final_budget(&n, &w, Timestamp(10))
             .await
@@ -1263,8 +1267,8 @@ async fn the_purge_waits_for_every_stream_of_the_unit(db: &dyn Db) {
     db.write_log_unit(&unit, None, 0, None, Timestamp(0))
         .await
         .unwrap();
-    let w = writer(db, "tail2:lr:build:a1", "a", 60_000).await;
     for s in [&unit, &sidecar, &other] {
+        let w = writer(db, s, "a", 60_000).await;
         db.append_log_row(
             s,
             &NewLogRow::marker(LogRowKind::SourceRestarted, None),
@@ -1274,6 +1278,7 @@ async fn the_purge_waits_for_every_stream_of_the_unit(db: &dyn Db) {
         .await
         .unwrap();
     }
+    let w = writer(db, &unit, "a", 60_000).await;
     db.set_log_stream_state(&unit, &w, LogStreamState::Complete, Timestamp(2))
         .await
         .unwrap();
@@ -1281,6 +1286,7 @@ async fn the_purge_waits_for_every_stream_of_the_unit(db: &dyn Db) {
         db.log_unit_has_open_stream(&unit).await.unwrap(),
         "the sidecar is open"
     );
+    let w = writer(db, &sidecar, "a", 60_000).await;
     db.set_log_stream_state(&sidecar, &w, LogStreamState::Closed, Timestamp(2))
         .await
         .unwrap();
@@ -1488,7 +1494,7 @@ async fn an_ended_attempt_with_no_ledger_is_pending(db: &dyn Db) {
     };
     assert!(!find("ran").has_ledger && find("ran").started);
     assert!(!find("never").started);
-    let w = writer(db, "tail2:lr:build:never", "a", 60_000).await;
+    let w = writer(db, &stream_id("build", "never"), "a", 60_000).await;
     db.set_log_stream_state(
         &stream_id("build", "never"),
         &w,
@@ -1517,7 +1523,7 @@ async fn retention_tombstones_streams_and_refuses_late_appends(db: &dyn Db) {
     db.write_log_unit(&s, None, 0, Some(b"sealed"), Timestamp(0))
         .await
         .unwrap();
-    let w = writer(db, "tail2:lr:build:a1", "a", 60_000).await;
+    let w = writer(db, &s, "a", 60_000).await;
     db.append_log_row(&s, &NewLogRow::output(body("k", 3), 1), &w, Timestamp(1))
         .await
         .unwrap();
@@ -1567,7 +1573,8 @@ contract_test!(
 async fn log_chunk_index_reads_are_bounded_by_seq(db: &dyn Db) {
     let a1 = stream_id("build", "a1");
     let a2 = stream_id("build", "a2");
-    let w = writer(db, "tail2:lr:build:a1", "a", 60_000).await;
+    let w = writer(db, &a1, "a", 60_000).await;
+    let w2 = writer(db, &a2, "a", 60_000).await;
     for s in [&a1, &a2] {
         db.write_log_unit(s, None, 0, None, Timestamp(0))
             .await
@@ -1583,7 +1590,7 @@ async fn log_chunk_index_reads_are_bounded_by_seq(db: &dyn Db) {
         .await
         .unwrap();
     }
-    db.append_log_row(&a2, &NewLogRow::output(body("x", 10), 0), &w, Timestamp(1))
+    db.append_log_row(&a2, &NewLogRow::output(body("x", 10), 0), &w2, Timestamp(1))
         .await
         .unwrap();
     let seqs = |rows: Vec<scarab_engine::LogChunkMeta>| -> Vec<u64> {
@@ -1637,6 +1644,336 @@ async fn an_insert_without_a_term_is_refused() {
     .await
     .expect_err("an insert without writer_term is refused");
     assert!(err.to_string().contains("log_chunks_fenced"), "{err}");
+    tdb.cleanup().await;
+}
+
+/// RT-m7: the store fences an append on the writer's lease **for the
+/// stream it appends to**: a writer that holds another stream's tail lease
+/// (a sidecar's, a peer step's) is refused. Kills: a fence that takes the
+/// lease the caller names.
+async fn an_append_under_another_streams_lease_is_refused(db: &dyn Db) {
+    let a = stream_id("build", "a1");
+    let b = stream_id("test", "a1");
+    let side = stream_id("build::service-0", "a1");
+    db.write_log_unit(&a, None, 0, None, Timestamp(0))
+        .await
+        .unwrap();
+    // `x` holds B's tail lease and the sidecar's, never A's.
+    let on_b = writer(db, &b, "x", 60_000).await;
+    let on_side = writer(db, &side, "x", 60_000).await;
+    for w in [&on_b, &on_side] {
+        assert!(matches!(
+            db.append_log_row(&a, &NewLogRow::output(body("k", 1), 0), w, Timestamp(1))
+                .await,
+            Err(LogAppendError::NotWriter)
+        ));
+        assert!(matches!(
+            db.append_log_row(
+                &a,
+                &NewLogRow::marker(LogRowKind::Incomplete, None),
+                w,
+                Timestamp(1)
+            )
+            .await,
+            Err(LogAppendError::NotWriter)
+        ));
+        assert!(matches!(
+            db.set_log_stream_state(&a, w, LogStreamState::Closed, Timestamp(1))
+                .await,
+            Err(LogAppendError::NotWriter)
+        ));
+    }
+    // The sidecar's own lease writes the sidecar's stream, not the step's.
+    db.append_log_row(
+        &side,
+        &NewLogRow::output(body("ks", 2), 0),
+        &on_side,
+        Timestamp(1),
+    )
+    .await
+    .unwrap();
+    assert!(db.log_chunks(&a.run, &a.step, &a.attempt).await.unwrap().is_empty());
+    assert!(db.log_stream_row(&a).await.unwrap().is_none());
+}
+
+contract_test!(
+    log_append_lease_is_the_streams,
+    an_append_under_another_streams_lease_is_refused
+);
+
+/// REV-m13: once a run's log is pruned, a marker (or a state change) for a
+/// stream of that run that has no row yet is refused, not stored as a new
+/// open stream. Kills: a stream row created for a pruned run.
+async fn a_marker_for_a_new_stream_of_a_pruned_run_is_refused(db: &dyn Db) {
+    let s = stream_id("build", "a1");
+    let late = stream_id("deploy", "a1");
+    db.write_log_unit(&s, None, 0, None, Timestamp(0))
+        .await
+        .unwrap();
+    let w = writer(db, &s, "a", 60_000).await;
+    db.append_log_row(&s, &NewLogRow::output(body("k", 3), 0), &w, Timestamp(1))
+        .await
+        .unwrap();
+    db.prune_log_run(&s.run, Timestamp(100)).await.unwrap();
+    let wl = writer(db, &late, "a", 60_000).await;
+    let refused = |r: Result<_, LogAppendError>| matches!(r, Err(LogAppendError::Closed));
+    assert!(refused(
+        db.append_log_row(
+            &late,
+            &NewLogRow::marker(LogRowKind::NotStored, Some(NotStoredReason::NoLedger))
+                .then(LogStreamState::Closed),
+            &wl,
+            Timestamp(101),
+        )
+        .await
+        .map(|_| ())
+    ));
+    assert!(refused(
+        db.set_log_stream_state(&late, &wl, LogStreamState::Closed, Timestamp(101))
+            .await
+    ));
+    assert!(refused(
+        db.start_log_final_budget(&late, &wl, Timestamp(101))
+            .await
+            .map(|_| ())
+    ));
+    // Still refused after the second prefix delete forgot the run.
+    db.forget_log_run_redelete(&s.run).await.unwrap();
+    assert!(refused(
+        db.append_log_row(
+            &late,
+            &NewLogRow::marker(LogRowKind::Incomplete, None),
+            &wl,
+            Timestamp(102),
+        )
+        .await
+        .map(|_| ())
+    ));
+    assert!(db.log_stream_row(&late).await.unwrap().is_none());
+    assert!(db
+        .log_chunks(&late.run, &late.step, &late.attempt)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+contract_test!(
+    log_pruned_run_takes_no_new_stream,
+    a_marker_for_a_new_stream_of_a_pruned_run_is_refused
+);
+
+/// RT-m2: two units with one handle (Pod names end in a 32-bit hash): the
+/// handle names the newer one, whatever their ids sort as. Kills: the
+/// oldest (or the lowest id) chosen.
+async fn two_units_with_one_handle_resolve_to_the_newer(db: &dyn Db) {
+    let (alpha, zeta, beta) = (
+        stream_id("alpha", "a1"),
+        stream_id("zeta", "a1"),
+        stream_id("beta", "a1"),
+    );
+    db.write_log_unit(&alpha, Some("pod-h"), 0, None, Timestamp(1))
+        .await
+        .unwrap();
+    db.write_log_unit(&zeta, Some("pod-h"), 0, None, Timestamp(2))
+        .await
+        .unwrap();
+    assert_eq!(db.log_unit_by_handle("pod-h").await.unwrap(), Some(zeta));
+    db.write_log_unit(&beta, Some("pod-h"), 0, None, Timestamp(3))
+        .await
+        .unwrap();
+    assert_eq!(db.log_unit_by_handle("pod-h").await.unwrap(), Some(beta));
+}
+
+contract_test!(
+    log_unit_handle_newest,
+    two_units_with_one_handle_resolve_to_the_newer
+);
+
+/// REV-M3: migration 0099 adds no CHECK on `log_chunks` that Postgres
+/// validates by scanning the table under the ALTER's lock. Kills: a column
+/// CHECK (validated when added) or a check added without `NOT VALID`.
+#[tokio::test]
+async fn migration_0099_adds_no_validated_check_to_log_chunks() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    let checks: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT conname::text, convalidated FROM pg_constraint
+         WHERE conrelid = 'log_chunks'::regclass AND contype = 'c' ORDER BY conname",
+    )
+    .fetch_all(&tdb.pool)
+    .await
+    .unwrap();
+    let names: Vec<&str> = checks.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "log_chunks_body",
+            "log_chunks_fenced",
+            "log_chunks_kind",
+            "log_chunks_reason"
+        ]
+    );
+    for (name, validated) in &checks {
+        assert!(!validated, "{name} was validated when it was added");
+    }
+    tdb.cleanup().await;
+}
+
+/// REV-M3 (the stream row is read first): a stream with rows stored by
+/// 0.6.x and no `log_streams` row continues after them: the first append
+/// takes `max(seq) + 1` at the end of their bytes. Guards the change that
+/// reads the old rows only when the stream row is missing.
+#[tokio::test]
+async fn a_stream_with_rows_from_before_0_7_continues_at_their_end() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    let s = stream_id("build", "a1");
+    // Rows as 0.6.x stored them (the term only satisfies the new check).
+    for (seq, offset, len) in [(0i64, 0i64, 5i64), (1, 5, 7), (2, 12, 3)] {
+        sqlx::query(
+            "INSERT INTO log_chunks
+               (run_id, step_id, attempt_id, seq, byte_offset, len, object_key, at, writer_term)
+             VALUES ('lr', 'build', 'a1', $1, $2, $3, 'logs/lr/build/a1/old.gz', 0, 0)",
+        )
+        .bind(seq)
+        .bind(offset)
+        .bind(len)
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
+    }
+    db.write_log_unit(&s, None, 0, None, Timestamp(0))
+        .await
+        .unwrap();
+    let w = writer(&db, &s, "a", 60_000).await;
+    let row = db
+        .append_log_row(&s, &NewLogRow::output(body("k", 4), 0), &w, Timestamp(1))
+        .await
+        .unwrap();
+    assert_eq!((row.seq, row.byte_offset), (3, 15));
+    let m = db
+        .append_log_row(
+            &s,
+            &NewLogRow::marker(LogRowKind::SourceRestarted, None),
+            &w,
+            Timestamp(2),
+        )
+        .await
+        .unwrap();
+    assert_eq!((m.seq, m.byte_offset), (4, 19));
+    let st = db.log_stream_row(&s).await.unwrap().unwrap();
+    assert_eq!((st.next_seq, st.byte_len, st.part_start_seq), (5, 19, 5));
+    tdb.cleanup().await;
+}
+
+/// REV-M4: the revert file takes a database that ran 0099 and 0100 back to
+/// the 0.6 schema (the `log_chunks` columns of 0.6, migrations up to 98),
+/// keeps the output rows, deletes the markers, and the migrator can upgrade
+/// it again. Kills: a revert that leaves a table, a column, a constraint or
+/// a migration row behind.
+#[tokio::test]
+async fn the_0099_revert_leaves_a_schema_the_migrator_can_upgrade_again() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    let s = stream_id("build", "a1");
+    db.write_log_unit(&s, None, 0, Some(b"sealed"), Timestamp(0))
+        .await
+        .unwrap();
+    let w = writer(&db, &s, "a", 60_000).await;
+    db.append_log_row(&s, &NewLogRow::output(body("logs/out", 4), 1), &w, Timestamp(1))
+        .await
+        .unwrap();
+    db.append_log_row(
+        &s,
+        &NewLogRow::marker(LogRowKind::Incomplete, None).then(LogStreamState::Closed),
+        &w,
+        Timestamp(2),
+    )
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(include_str!("../rollback/0099_revert.sql"))
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
+
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name::text FROM information_schema.columns
+         WHERE table_name = 'log_chunks' ORDER BY ordinal_position",
+    )
+    .fetch_all(&tdb.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        columns,
+        ["run_id", "step_id", "attempt_id", "seq", "byte_offset", "len", "object_key", "at"]
+    );
+    let not_null: String = sqlx::query_scalar(
+        "SELECT is_nullable::text FROM information_schema.columns
+         WHERE table_name = 'log_chunks' AND column_name = 'object_key'",
+    )
+    .fetch_one(&tdb.pool)
+    .await
+    .unwrap();
+    assert_eq!(not_null, "NO");
+    let max: i64 = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations")
+        .fetch_one(&tdb.pool)
+        .await
+        .unwrap();
+    assert_eq!(max, 98);
+    let left: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name::text FROM information_schema.tables
+         WHERE table_name IN ('log_streams', 'log_units', 'log_unit_values', 'log_legacy_units',
+                              'log_store_epoch', 'log_prune_pending')",
+    )
+    .fetch_all(&tdb.pool)
+    .await
+    .unwrap();
+    assert!(left.is_empty(), "{left:?}");
+    let checks: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint WHERE conrelid = 'log_chunks'::regclass AND contype = 'c'",
+    )
+    .fetch_one(&tdb.pool)
+    .await
+    .unwrap();
+    assert_eq!(checks, 0);
+    let functions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_proc WHERE proname = 'scarab_append_log_row'",
+    )
+    .fetch_one(&tdb.pool)
+    .await
+    .unwrap();
+    assert_eq!(functions, 0);
+    let index: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_indexes WHERE indexname = 'attempts_started_at_idx'",
+    )
+    .fetch_one(&tdb.pool)
+    .await
+    .unwrap();
+    assert_eq!(index, 0);
+    let keys: Vec<String> = sqlx::query_scalar("SELECT object_key FROM log_chunks")
+        .fetch_all(&tdb.pool)
+        .await
+        .unwrap();
+    assert_eq!(keys, ["logs/out"], "the output row stays, the marker goes");
+
+    // Upgrading again runs 0099 and 0100 again.
+    db.migrate().await.unwrap();
+    let rows = db.log_chunks(&s.run, &s.step, &s.attempt).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind, LogRowKind::Output);
     tdb.cleanup().await;
 }
 

@@ -43,6 +43,83 @@ impl LogStreamId {
     }
 }
 
+/// The resource of a stream's tail lease (ADR-0051). A replica holds it
+/// while it reads the stream's source; every row it appends is fenced on
+/// its term. The `tail2:` prefix is new in 0.7, so a 0.7 tail never waits on
+/// a 0.6.x holder of the old `tail:` lease during a rollout. The store
+/// derives the same string from the stream id
+/// (`scarab_append_log_row` in migration 0099): keep the two in step.
+pub fn tail_lease_resource(run: &RunId, step: &StepId, attempt: &AttemptId) -> String {
+    match step.0.rsplit_once("::service-") {
+        Some((owner, index)) => format!("tail2:{}:{owner}:sidecar-{index}:{}", run.0, attempt.0),
+        None => format!("tail2:{}:{}:{}", run.0, step.0, attempt.0),
+    }
+}
+
+/// Which lease a writer of a stream holds. The store derives the lease's
+/// resource from the stream it appends to ([`LogLease::resource`]), so a
+/// writer holding one stream's lease cannot append to another stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LogLease {
+    /// The stream's tail lease ([`tail_lease_resource`]): a replica that
+    /// reads the stream's source.
+    Tail,
+    /// The lease of a writer that feeds the store directly (tests and
+    /// tools): `append:<run>:<step>:<attempt>`. A reader of the log never
+    /// takes it to mean the log is still being stored.
+    Append,
+}
+
+impl LogLease {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogLease::Tail => "tail",
+            LogLease::Append => "append",
+        }
+    }
+
+    /// The lease resource of `stream` for this kind.
+    pub fn resource(self, stream: &LogStreamId) -> String {
+        match self {
+            LogLease::Tail => tail_lease_resource(&stream.run, &stream.step, &stream.attempt),
+            LogLease::Append => format!(
+                "append:{}:{}:{}",
+                stream.run.0, stream.step.0, stream.attempt.0
+            ),
+        }
+    }
+}
+
+/// A writer of a stream: the kind of lease it holds and its `(owner,
+/// term)`. An append is fenced on the lease of that kind for the stream it
+/// appends to, whatever lease the writer took.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogWriter {
+    pub lease: LogLease,
+    pub owner: String,
+    pub term: i64,
+}
+
+impl LogWriter {
+    pub fn new(lease: LogLease, owner: impl Into<String>, term: i64) -> Self {
+        Self {
+            lease,
+            owner: owner.into(),
+            term,
+        }
+    }
+
+    /// The writer that holds `held`, a lease of kind `lease`.
+    pub fn holding(lease: LogLease, held: &crate::LeaderTerm) -> Self {
+        Self::new(lease, held.owner(), held.term())
+    }
+
+    /// The lease row an append to `stream` is fenced on.
+    pub fn fence(&self, stream: &LogStreamId) -> crate::LeaderTerm {
+        crate::LeaderTerm::new(self.lease.resource(stream), self.owner.clone(), self.term)
+    }
+}
+
 /// What an index row is. Only `Output` rows have a body; the others are
 /// markers the server writes, never derived from a body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -265,6 +342,9 @@ pub struct LogUnitRow {
     pub settled_at: Option<i64>,
     pub revoke_attempted_at: Option<i64>,
     pub purged: bool,
+    /// When the row was created: of two units with one handle (a Pod name
+    /// hash collision), the newer is the one a handle names.
+    pub created_at: i64,
 }
 
 /// One sealed generation of a unit's ledger.
@@ -494,6 +574,27 @@ mod tests {
             &AttemptId("t1".into()),
         );
         assert_eq!(svc.unit(), svc);
+    }
+
+    #[test]
+    fn a_writer_is_fenced_on_the_lease_of_the_stream_it_appends_to() {
+        let main = LogStreamId::new(
+            &RunId("r".into()),
+            &StepId("build".into()),
+            &AttemptId("a1".into()),
+        );
+        let side = LogStreamId::new(
+            &RunId("r".into()),
+            &StepId("build::service-1".into()),
+            &AttemptId("a1".into()),
+        );
+        let w = LogWriter::new(LogLease::Tail, "o", 3);
+        assert_eq!(w.fence(&main).resource(), "tail2:r:build:a1");
+        assert_eq!(w.fence(&side).resource(), "tail2:r:build:sidecar-1:a1");
+        assert_eq!(
+            LogLease::Append.resource(&main),
+            "append:r:build:a1".to_string()
+        );
     }
 
     #[test]

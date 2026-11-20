@@ -24,8 +24,9 @@ pub mod scheduler;
 pub mod schedules;
 
 pub use logstore::{
-    marker_text, registry_secret_values, LogAppendError, LogBody, LogLedgerRows, LogRowKind,
-    LogStreamId, LogStreamRow, LogStreamState, LogUnitRow, MountedRepo, MountedValue,
+    marker_text, registry_secret_values, tail_lease_resource, LogAppendError, LogBody,
+    LogLease, LogLedgerRows, LogRowKind, LogStreamId, LogStreamRow, LogStreamState, LogUnitRow,
+    LogWriter, MountedRepo, MountedValue,
     MountedValueKind, NewLogRow, NotStoredReason, PendingFinalRead, PurgeCandidate,
     SealedGeneration, LEDGER_HARD_CAP_MS, LEDGER_SETTLED_KEEP_MS,
 };

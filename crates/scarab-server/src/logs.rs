@@ -7,7 +7,8 @@
 //! pure crate.
 //!
 //! **Writes** are fenced (git-bug 511a769): every row is appended through
-//! [`Db::append_log_row`] under the stream's tail lease term, and an output
+//! [`Db::append_log_row`] under the writer's lease for that stream (the
+//! store derives its resource from the stream id), and an output
 //! row commits only while the ledger generation its bytes were redacted
 //! with is the unit's current one. A body's object key is its content
 //! address, so no PUT rewrites a committed body.
@@ -31,9 +32,9 @@ use flate2::Compression;
 use futures::stream::{self, BoxStream, StreamExt};
 
 use scarab_engine::{
-    AttemptId, Db, DbError, LeaderTerm, LogAppendError, LogBody, LogChunkMeta, LogRowKind,
-    LogStreamId, LogStreamState, MountedValue, NewLogRow, NotStoredReason, RunId, StepId,
-    Timestamp,
+    AttemptId, Db, DbError, LogAppendError, LogBody, LogChunkMeta, LogLease, LogRowKind,
+    LogStreamId, LogStreamState, LogWriter, MountedValue, NewLogRow, NotStoredReason, RunId,
+    StepId, Timestamp,
 };
 use scarab_secrets::Sealer;
 use scarab_storage::ObjectStore;
@@ -193,16 +194,7 @@ pub fn sidecar_stream_key(step: &StepId, index: usize) -> StepId {
     StepId(format!("{}::service-{index}", step.0))
 }
 
-/// The resource of a stream's tail lease (ADR-0051). A replica holds it
-/// while it reads the stream's source; every row it appends is fenced on
-/// its term. The `tail2:` prefix is new in 0.7, so a 0.7 tail never waits on
-/// a 0.6.x holder of the old `tail:` lease during a rollout.
-pub fn tail_lease_resource(run: &RunId, step: &StepId, attempt: &AttemptId) -> String {
-    match step.0.rsplit_once("::service-") {
-        Some((owner, index)) => format!("tail2:{}:{owner}:sidecar-{index}:{}", run.0, attempt.0),
-        None => format!("tail2:{}:{}:{}", run.0, step.0, attempt.0),
-    }
-}
+pub use scarab_engine::tail_lease_resource;
 
 /// The tail lease a 0.6.x server took for the same stream; a reader of a
 /// stream with rows from 0.6.x checks it too.
@@ -430,7 +422,7 @@ impl LogService {
         stream: &LogStreamId,
         bytes: &[u8],
         values_gen: i64,
-        writer: &LeaderTerm,
+        writer: &LogWriter,
         then: Option<LogStreamState>,
         now: Timestamp,
     ) -> Result<LogChunkMeta, LogAppendError> {
@@ -460,7 +452,7 @@ impl LogService {
         stream: &LogStreamId,
         kind: LogRowKind,
         reason: Option<NotStoredReason>,
-        writer: &LeaderTerm,
+        writer: &LogWriter,
         then: Option<LogStreamState>,
         now: Timestamp,
     ) -> Result<LogChunkMeta, LogAppendError> {
@@ -493,11 +485,14 @@ impl LogService {
         };
         // Its own lease, not the tail lease: a reader of the log takes a
         // live tail lease to mean the log is still being stored.
-        let resource = format!("append:{}:{}:{}", run.0, step.0, attempt.0);
+        let resource = LogLease::Append.resource(&stream);
         let lease = self.db.lease(&resource, &self.owner, 45_000).await?;
-        let writer = lease
-            .held_by(&resource, &self.owner)
-            .ok_or(LogError::Db(DbError::NotLeader))?;
+        let writer = LogWriter::holding(
+            LogLease::Append,
+            &lease
+                .held_by(&resource, &self.owner)
+                .ok_or(LogError::Db(DbError::NotLeader))?,
+        );
         let mut redactor = StreamRedactor::new(values.clone(), false);
         let mut out = redactor.push(chunk);
         out.extend(redactor.finish_confirmed());

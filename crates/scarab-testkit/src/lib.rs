@@ -93,7 +93,30 @@ fn log_key(s: &scarab_engine::LogStreamId) -> (RunId, StepId, AttemptId) {
 }
 
 /// The stream's `log_streams` row, created from its stored rows when
-/// missing (as the Postgres append function does).
+/// missing (as the Postgres append function does). `None`: it is missing
+/// and the run's log was pruned, so no stream row is made.
+fn mem_open_stream_row(
+    st: &mut InMemoryState,
+    key: &(RunId, StepId, AttemptId),
+    now: Timestamp,
+) -> Option<scarab_engine::LogStreamRow> {
+    if let Some(s) = st.log_streams.get(key) {
+        return Some(s.clone());
+    }
+    let run = &key.0;
+    if st.log_prune_pending.contains_key(run)
+        || st
+            .log_streams
+            .iter()
+            .any(|((r, _, _), s)| r == run && s.pruned)
+    {
+        return None;
+    }
+    Some(mem_stream_row(st, key, now))
+}
+
+/// The stream's `log_streams` row, created from its stored rows when
+/// missing.
 fn mem_stream_row(
     st: &mut InMemoryState,
     key: &(RunId, StepId, AttemptId),
@@ -1986,16 +2009,18 @@ impl Db for InMemoryDb {
         &self,
         stream: &scarab_engine::LogStreamId,
         row: &scarab_engine::NewLogRow,
-        writer: &LeaderTerm,
+        writer: &scarab_engine::LogWriter,
         now: Timestamp,
     ) -> Result<LogChunkMeta, scarab_engine::LogAppendError> {
         use scarab_engine::LogAppendError;
         let mut st = self.state.lock().unwrap();
-        if holds_leader_term(&st, writer).is_err() {
+        if holds_leader_term(&st, &writer.fence(stream)).is_err() {
             return Err(LogAppendError::NotWriter);
         }
         let key = log_key(stream);
-        let s = mem_stream_row(&mut st, &key, now);
+        let Some(s) = mem_open_stream_row(&mut st, &key, now) else {
+            return Err(LogAppendError::Closed);
+        };
         if s.state != scarab_engine::LogStreamState::Open {
             return Err(LogAppendError::Closed);
         }
@@ -2042,17 +2067,19 @@ impl Db for InMemoryDb {
     async fn set_log_stream_state(
         &self,
         stream: &scarab_engine::LogStreamId,
-        writer: &LeaderTerm,
+        writer: &scarab_engine::LogWriter,
         state: scarab_engine::LogStreamState,
         now: Timestamp,
     ) -> Result<(), scarab_engine::LogAppendError> {
         use scarab_engine::LogAppendError;
         let mut st = self.state.lock().unwrap();
-        if holds_leader_term(&st, writer).is_err() {
+        if holds_leader_term(&st, &writer.fence(stream)).is_err() {
             return Err(LogAppendError::NotWriter);
         }
         let key = log_key(stream);
-        let s = mem_stream_row(&mut st, &key, now);
+        let Some(s) = mem_open_stream_row(&mut st, &key, now) else {
+            return Err(LogAppendError::Closed);
+        };
         if s.state != scarab_engine::LogStreamState::Open {
             return Err(LogAppendError::Closed);
         }
@@ -2063,16 +2090,18 @@ impl Db for InMemoryDb {
     async fn start_log_final_budget(
         &self,
         stream: &scarab_engine::LogStreamId,
-        writer: &LeaderTerm,
+        writer: &scarab_engine::LogWriter,
         now: Timestamp,
     ) -> Result<i64, scarab_engine::LogAppendError> {
         use scarab_engine::LogAppendError;
         let mut st = self.state.lock().unwrap();
-        if holds_leader_term(&st, writer).is_err() {
+        if holds_leader_term(&st, &writer.fence(stream)).is_err() {
             return Err(LogAppendError::NotWriter);
         }
         let key = log_key(stream);
-        let s = mem_stream_row(&mut st, &key, now);
+        let Some(s) = mem_open_stream_row(&mut st, &key, now) else {
+            return Err(LogAppendError::Closed);
+        };
         if s.state != scarab_engine::LogStreamState::Open {
             return Err(LogAppendError::Closed);
         }
@@ -2136,6 +2165,7 @@ impl Db for InMemoryDb {
                 settled_at: None,
                 revoke_attempted_at: None,
                 purged: false,
+                created_at: now.0,
             });
         if let Some(h) = handle {
             u.handle = Some(h.to_string());
@@ -2182,16 +2212,21 @@ impl Db for InMemoryDb {
         handle: &str,
     ) -> Result<Option<scarab_engine::LogStreamId>, DbError> {
         let st = self.state.lock().unwrap();
-        let mut found: Vec<&(RunId, StepId, AttemptId)> = st
+        // The newest row, as Postgres orders it.
+        let found = st
             .log_units
             .iter()
             .filter(|(_, u)| u.handle.as_deref() == Some(handle))
-            .map(|(k, _)| k)
-            .collect();
-        found.sort_by(|a, b| (&a.0 .0, &a.1 .0, &a.2 .0).cmp(&(&b.0 .0, &b.1 .0, &b.2 .0)));
-        Ok(found
-            .first()
-            .map(|(r, s, a)| scarab_engine::LogStreamId::new(r, s, a)))
+            .max_by(|(ka, a), (kb, b)| {
+                (a.created_at, &ka.0 .0, &ka.1 .0, &ka.2 .0).cmp(&(
+                    b.created_at,
+                    &kb.0 .0,
+                    &kb.1 .0,
+                    &kb.2 .0,
+                ))
+            })
+            .map(|(k, _)| k);
+        Ok(found.map(|(r, s, a)| scarab_engine::LogStreamId::new(r, s, a)))
     }
 
     async fn mark_log_unit_started(
@@ -4092,6 +4127,10 @@ pub struct FakeForge {
     revoke_fails: Mutex<bool>,
     /// Every revocation tried, failed or not.
     revoke_tries: Mutex<Vec<String>>,
+    /// Tokens whose revocation fails (and is still recorded as tried).
+    revoke_fail_tokens: Mutex<std::collections::HashSet<String>>,
+    /// When set, a revocation never returns: a forge that does not answer.
+    revoke_hangs: Mutex<bool>,
     /// How many checkout credentials [`mint_checkout_credential`](ForgePort::mint_checkout_credential)
     /// has handed out — lets a test assert a refused launch minted nothing.
     checkout_mints: Mutex<u32>,
@@ -4224,6 +4263,16 @@ impl FakeForge {
     /// Every revocation tried so far, failed or not, in order.
     pub fn revoke_tries(&self) -> Vec<String> {
         self.revoke_tries.lock().unwrap().clone()
+    }
+
+    /// Make every later revocation of `token` fail.
+    pub fn fail_revocation_of(&self, token: impl Into<String>) {
+        self.revoke_fail_tokens.lock().unwrap().insert(token.into());
+    }
+
+    /// Make every later revocation never return (`true`), or answer again.
+    pub fn hang_revocations(&self, hang: bool) {
+        *self.revoke_hangs.lock().unwrap() = hang;
     }
 
     /// How many checkout or registry credentials were asked for.
@@ -4932,7 +4981,13 @@ impl ForgePort for FakeForge {
 
     async fn revoke_credential(&self, _repo: &RepoRef, token: &str) -> Result<(), ForgeError> {
         self.revoke_tries.lock().unwrap().push(token.to_string());
-        if *self.revoke_fails.lock().unwrap() {
+        let hangs = *self.revoke_hangs.lock().unwrap();
+        if hangs {
+            std::future::pending::<()>().await;
+        }
+        if *self.revoke_fails.lock().unwrap()
+            || self.revoke_fail_tokens.lock().unwrap().contains(token)
+        {
             return Err(ForgeError::Api("revocation refused (test)".into()));
         }
         if *self.mints.lock().unwrap() {
@@ -5936,9 +5991,14 @@ pub async fn seed_log_row(
     len: u64,
 ) -> LogChunkMeta {
     let stream = scarab_engine::LogStreamId::new(run, step, attempt);
-    let resource = format!("seed:{}:{}:{}", run.0, step.0, attempt.0);
+    // Its own lease kind, never the tail lease a reader takes to mean the
+    // log is still being stored.
+    let resource = scarab_engine::LogLease::Append.resource(&stream);
     let lease = db.lease(&resource, "seed", 60_000).await.expect("lease");
-    let writer = lease.held_by(&resource, "seed").expect("seed holds it");
+    let writer = scarab_engine::LogWriter::holding(
+        scarab_engine::LogLease::Append,
+        &lease.held_by(&resource, "seed").expect("seed holds it"),
+    );
     let gen = db
         .write_log_unit(&stream.unit(), None, 0, None, Timestamp(0))
         .await

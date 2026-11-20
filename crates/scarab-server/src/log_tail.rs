@@ -33,9 +33,9 @@ use std::time::{Duration, Instant};
 
 use futures::FutureExt;
 use scarab_engine::{
-    Attempt, AttemptId, AttemptOutcome, Db, ExecError, Executor, LeaderTerm, LogAppendError,
-    LogChunkMeta, LogChunks, LogFrom, LogRowKind, LogSourceRef, LogSourceState, LogStreamId,
-    LogStreamState, NotStoredReason, RunId, StepId, StepRun, StepStatus, Timestamp,
+    Attempt, AttemptId, AttemptOutcome, Db, ExecError, Executor, LogAppendError, LogChunkMeta,
+    LogChunks, LogFrom, LogLease, LogRowKind, LogSourceRef, LogSourceState, LogStreamId,
+    LogStreamState, LogWriter, NotStoredReason, RunId, StepId, StepRun, StepStatus, Timestamp,
 };
 
 pub use crate::logs::tail_lease_resource;
@@ -565,10 +565,14 @@ enum Outcome {
     Stop,
 }
 
-/// Claim `resource` for this process. `Err`: another replica holds it.
-async fn claim(ctx: &Ctx, resource: &str) -> Result<LeaderTerm, ()> {
+/// Claim `resource`, a stream's tail lease, for this process. `Err`:
+/// another replica holds it.
+async fn claim(ctx: &Ctx, resource: &str) -> Result<LogWriter, ()> {
     match ctx.db.lease(resource, &ctx.owner, TAIL_LEASE_TTL_MS).await {
-        Ok(l) => l.held_by(resource, &ctx.owner).ok_or(()),
+        Ok(l) => l
+            .held_by(resource, &ctx.owner)
+            .map(|held| LogWriter::holding(LogLease::Tail, &held))
+            .ok_or(()),
         Err(_) => Err(()),
     }
 }
@@ -650,7 +654,7 @@ async fn read_stream(
     source: &TailSource,
     final_read: bool,
     signal: &EndSignal,
-    writer: &LeaderTerm,
+    writer: &LogWriter,
     lost: &AtomicBool,
 ) -> Outcome {
     let unit = fence.unit();
@@ -789,7 +793,7 @@ fn report(ctx: &Ctx, fence: &LogStreamId, failure: Failure) -> Outcome {
 async fn refused(
     ctx: &Ctx,
     fence: &LogStreamId,
-    writer: &LeaderTerm,
+    writer: &LogWriter,
     e: LogAppendError,
 ) -> Outcome {
     match e {
@@ -811,7 +815,7 @@ async fn refused(
 async fn close_not_stored(
     ctx: &Ctx,
     fence: &LogStreamId,
-    writer: &LeaderTerm,
+    writer: &LogWriter,
     reason: NotStoredReason,
 ) -> Outcome {
     tracing::warn!(
@@ -855,7 +859,7 @@ async fn gone_unconfirmed(
     ctx: &Ctx,
     fence: &LogStreamId,
     unit: &LogStreamId,
-    writer: &LeaderTerm,
+    writer: &LogWriter,
     has_rows: bool,
 ) -> Outcome {
     close_incomplete(ctx, fence, writer, unit_started(ctx, unit, has_rows).await).await
@@ -864,7 +868,7 @@ async fn gone_unconfirmed(
 async fn close_incomplete(
     ctx: &Ctx,
     fence: &LogStreamId,
-    writer: &LeaderTerm,
+    writer: &LogWriter,
     started: bool,
 ) -> Outcome {
     let now = Timestamp(now_ms());
@@ -901,7 +905,7 @@ async fn check_budget(
     ctx: &Ctx,
     fence: &LogStreamId,
     unit: &LogStreamId,
-    writer: &LeaderTerm,
+    writer: &LogWriter,
 ) -> Option<Outcome> {
     let now = now_ms();
     let since = ctx
@@ -952,7 +956,7 @@ struct Read<'a> {
     ctx: &'a Ctx,
     fence: &'a LogStreamId,
     source: &'a TailSource,
-    writer: &'a LeaderTerm,
+    writer: &'a LogWriter,
     lost: &'a AtomicBool,
     signal: &'a EndSignal,
     final_read: bool,
@@ -1283,9 +1287,12 @@ pub async fn pump_log_stream(
         .lease(&resource, owner, TAIL_LEASE_TTL_MS)
         .await
         .map_err(LogError::Db)?;
-    let writer = lease
-        .held_by(&resource, owner)
-        .ok_or(LogError::Db(scarab_engine::DbError::NotLeader))?;
+    let writer = LogWriter::holding(
+        LogLease::Tail,
+        &lease
+            .held_by(&resource, owner)
+            .ok_or(LogError::Db(scarab_engine::DbError::NotLeader))?,
+    );
     let mut redactor = crate::logs::StreamRedactor::new(values.clone(), false);
     let mut appended = 0u64;
     let mut out = Vec::new();
