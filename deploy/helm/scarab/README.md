@@ -295,9 +295,10 @@ namespace modes: `<release namespace>-steps`, and `scarab.namespace` set to the 
 It refuses a Pod that:
 
 - names a Secret in a Secret volume, a projected volume, an env `secretKeyRef` or an `envFrom`
-  `secretRef`, other than the Pod's own per-Pod Secrets (`<pod>-secrets`, `<pod>-token`,
-  `<pod>-registry`, `<pod>-oidc`, `<pod>-workspace`), the Secrets your `scarab.placement`
-  baseline and profiles name, and `scarab.admissionPolicy.allowSecrets`;
+  `secretRef`, other than the Pod's own per-Pod Secrets (`<pod>-v-secrets`, `<pod>-v-token`,
+  `<pod>-v-registry`, `<pod>-v-oidc`, `<pod>-workspace`, and the names a server before 0.7
+  wrote: `<pod>-secrets`, `<pod>-token`, `<pod>-registry`, `<pod>-oidc`), the Secrets your
+  `scarab.placement` baseline and profiles name, and `scarab.admissionPolicy.allowSecrets`;
 - runs as a ServiceAccount other than `default`, the ServiceAccounts your placement baseline and
   profiles name, and `scarab.admissionPolicy.allowServiceAccounts`;
 - has a `hostPath` volume, `hostNetwork`, `hostPID` or `hostIPC`.

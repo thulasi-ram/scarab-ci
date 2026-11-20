@@ -181,7 +181,7 @@ got=$(vap_field ValidatingAdmissionPolicy '.spec.failurePolicy' "$out")
 got=$(vap_field ValidatingAdmissionPolicy '.spec.variables[] | select(.name == "serviceAccounts") | .expression' "$out")
 [ "$got" = '"[\"default\"]"' ] || fail "with no placement the allowed ServiceAccounts are $got, want [\"default\"]"
 got=$(vap_field ValidatingAdmissionPolicy '.spec.variables[] | select(.name == "ownSecrets") | .expression' "$out")
-[ "$got" = "\"['secrets', 'token', 'registry', 'oidc', 'workspace'].map(s, object.metadata.name + '-' + s)\"" ] \
+[ "$got" = "\"['v-secrets', 'v-token', 'v-registry', 'v-oidc', 'workspace', 'secrets', 'token', 'registry', 'oidc'].map(s, object.metadata.name + '-' + s)\"" ] \
   || fail "the per-Pod Secrets are $got"
 
 out=$(helm template t "$chart" "${base[@]}" "${vap_api[@]}" \
