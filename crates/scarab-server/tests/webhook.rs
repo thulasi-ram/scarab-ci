@@ -1340,6 +1340,139 @@ async fn a_broken_pipeline_fails_the_check_of_every_pipeline_in_the_delivery_onc
     }
 }
 
+/// A Pipeline kept to `main` by its trigger's `when:`.
+const MAIN_ONLY_YAML: &str = r#"
+name: release
+on:
+  push:
+    when: "event.branch == 'main'"
+steps:
+  - { id: ship, image: busybox, command: ["true"] }
+"#;
+
+/// A signed GitHub push of `abc123` to `git_ref` with delivery id `delivery`.
+fn push_request_to(delivery: &str, git_ref: &str) -> Request<Body> {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "ref": git_ref,
+        "after": "abc123",
+        "repository": { "name": "app", "owner": { "login": "acme" } }
+    }))
+    .unwrap();
+    let sig = scarab_forge_github::sign_hex(SECRET, &body);
+    Request::builder()
+        .method("POST")
+        .uri("/webhooks/github")
+        .header("content-type", "application/json")
+        .header("x-github-event", "push")
+        .header("x-github-delivery", delivery)
+        .header("x-hub-signature-256", &sig)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// The contexts of the `failure` statuses on the pushed commit, sorted.
+async fn failed_contexts(forge: &FakeForge, db: &InMemoryDb) -> Vec<String> {
+    let mut contexts: Vec<String> = statuses_on_push(forge, db)
+        .await
+        .into_iter()
+        .filter(|s| s.state == scarab_forge::StatusState::Failure)
+        .map(|s| s.context)
+        .collect();
+    contexts.sort();
+    contexts
+}
+
+/// A broken file, a Pipeline for every push and one kept to `main`.
+fn broken_ci_and_release() -> Arc<FakeForge> {
+    Arc::new(
+        FakeForge::new()
+            .with_file(".scarab/broken.yaml", BROKEN_YAML)
+            .with_file(".scarab/ci.yaml", CI_YAML)
+            .with_file(".scarab/release.yaml", MAIN_ONLY_YAML),
+    )
+}
+
+/// REV-m9: a broken file stops the delivery, and only the Pipelines the
+/// event would have started fail their checks. A push to a feature branch
+/// fails the broken file's check and the CI Pipeline's; the Pipeline kept
+/// to `main` by its `when:` would not have run, and gets no red check
+/// because another file is broken.
+#[tokio::test]
+async fn a_broken_file_fails_only_the_pipelines_this_event_would_have_started() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = broken_ci_and_release();
+    let app = multi_forge_app_arc(db.clone(), forge.clone());
+
+    let resp = app
+        .oneshot(push_request_to("gh-feature-1", "refs/heads/feature"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(db.active_runs().await.unwrap().is_empty(), "no Run at all");
+    assert_eq!(
+        failed_contexts(&forge, &db).await,
+        ["scarab/checks", "scarab/ci"]
+    );
+    assert!(
+        forge
+            .statuses_on("abc123")
+            .iter()
+            .all(|s| s.context != "scarab/release"),
+        "the main-only Pipeline posts nothing"
+    );
+}
+
+/// The same files pushed to `main`: every Pipeline would have run, so every
+/// check fails.
+#[tokio::test]
+async fn a_broken_file_on_main_fails_every_matching_pipeline() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = broken_ci_and_release();
+    let app = multi_forge_app_arc(db.clone(), forge.clone());
+
+    let resp = app
+        .oneshot(push_request_to("gh-main-1", "refs/heads/main"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        failed_contexts(&forge, &db).await,
+        ["scarab/checks", "scarab/ci", "scarab/release"]
+    );
+    let release = forge
+        .statuses_on("abc123")
+        .into_iter()
+        .find(|s| s.context == "scarab/release")
+        .expect("the release check");
+    assert_eq!(
+        release.description.as_deref(),
+        Some("not run: .scarab/broken.yaml failed to compile")
+    );
+}
+
+/// A Pipeline whose trigger `when:` cannot be decided may have run, so in a
+/// delivery a broken file stopped its check fails too (fail closed).
+#[tokio::test]
+async fn an_undecidable_when_in_a_broken_delivery_still_fails_its_check() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = Arc::new(
+        FakeForge::new()
+            .with_file(".scarab/a.yaml", UNDECIDABLE_WHEN_YAML)
+            .with_file(".scarab/broken.yaml", BROKEN_YAML),
+    );
+    let app = multi_forge_app_arc(db.clone(), forge.clone());
+
+    let resp = app.oneshot(push_request("gh-undecided-1")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        failed_contexts(&forge, &db).await,
+        ["scarab/a", "scarab/checks"]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // pull_request actions: only code-changing ones start Runs
 // ---------------------------------------------------------------------------

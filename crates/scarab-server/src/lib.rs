@@ -5013,7 +5013,8 @@ fn origin_pr_base(event: &scarab_forge::Event) -> Option<String> {
 /// order. Every file is compiled before any Run is created: a file that
 /// fails to compile fails the whole trigger and nothing runs (a broken
 /// pipeline is a submit-time error, ADR-0009), and the check of every
-/// pipeline the event names fails on the commit. A pipeline whose `when:` cannot be decided, or that admission
+/// pipeline the event would have started fails on the commit. A pipeline
+/// whose `when:` cannot be decided, or that admission
 /// **refuses** (a disallowed ref, an unknown Environment, an ineligible
 /// Project — ADR-0037, ADR-0071), is skipped on its own and never aborts the
 /// delivery: the other pipelines still run.
@@ -5362,7 +5363,20 @@ pub(crate) async fn trigger_runs_from_files(
     }
     if let Some((first_broken, _, first_text)) = broken.first() {
         let error = TriggerError::Pipeline(first_text.clone());
-        refuse_uncompiled_delivery(db, clock, event, kind.as_str(), &compiled, &broken).await;
+        let delivery = DeliveryTrigger {
+            forge,
+            event,
+            kind: kind.as_str(),
+        };
+        refuse_uncompiled_delivery(
+            db,
+            clock,
+            &delivery,
+            &compiled,
+            &broken,
+            (&mut ctx, &mut paths),
+        )
+        .await;
         tracing::warn!(
             org = %repo.owner,
             project = %repo.name,
@@ -5372,51 +5386,21 @@ pub(crate) async fn trigger_runs_from_files(
         return Err(error);
     }
 
+    let delivery = DeliveryTrigger {
+        forge,
+        event,
+        kind: kind.as_str(),
+    };
     for (path, ir) in compiled {
-        // The trigger is matched first, with a pull request's paths not yet
-        // asked for (unknown), so a Pipeline whose trigger does not match
-        // (another kind, a false branch test) costs no files request. Only a
-        // match that may have rested on the unknown paths asks, once per
-        // delivery, and is decided again with the answer.
-        //
         // A `when:` that cannot be decided refuses this Pipeline only: it is
         // recorded and its check fails, and the files after it are still
         // evaluated (git-bug 2a680c8).
-        let trigger_matches =
-            |ctx: &serde_json::Value| scarab_pipeline::matches_trigger(&ir, kind.as_str(), ctx);
-        match trigger_matches(&ctx) {
-            Ok(true) => {}
-            Ok(false) => continue,
-            Err(e) => {
-                let message = format!(
-                    "the `when:` of its `{}` trigger could not be decided: {e}",
-                    kind.as_str()
-                );
+        match delivery.decide(&ir, &mut ctx, &mut paths).await {
+            TriggerDecision::Matches => {}
+            TriggerDecision::NoMatch => continue,
+            TriggerDecision::Undecided(message) => {
                 refuse_undecided_when(db, clock, event, path, &ir, message, &mut outcome).await;
                 continue;
-            }
-        }
-        if let (
-            scarab_forge::ChangedPaths::Unknown(scarab_forge::PathsUnknown::NotFetched),
-            scarab_forge::Event::PullRequest { number, .. },
-        ) = (&paths, event)
-        {
-            if scarab_pipeline::reads_changed_paths(&ir, kind.as_str()) {
-                paths = pull_request_paths(forge, repo, *number).await;
-                paths.apply_to(&mut ctx);
-                match trigger_matches(&ctx) {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(e) => {
-                        let message = format!(
-                            "the `when:` of its `{}` trigger could not be decided: {e}",
-                            kind.as_str()
-                        );
-                        refuse_undecided_when(db, clock, event, path, &ir, message, &mut outcome)
-                            .await;
-                        continue;
-                    }
-                }
             }
         }
         // A chain of follow-ups stops at a pipeline already in it (a loop)
@@ -6218,21 +6202,96 @@ fn first_diagnostic(text: &str) -> String {
     first.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// How a compiled Pipeline's trigger answers one delivery.
+#[derive(Debug, PartialEq)]
+enum TriggerDecision {
+    /// The trigger matches: the delivery starts a Run of the Pipeline,
+    /// unless a later rule (a Step's `when:`, admission) refuses it.
+    Matches,
+    /// The trigger does not match: the delivery starts nothing for it.
+    NoMatch,
+    /// The trigger's `when:` could not be decided; the text says why.
+    Undecided(String),
+}
+
+/// The delivery whose Pipelines' triggers are decided: the event, its
+/// trigger kind, and the forge a pull request's changed paths are asked of.
+struct DeliveryTrigger<'a> {
+    forge: &'a dyn scarab_forge::ForgePort,
+    event: &'a scarab_forge::Event,
+    kind: &'a str,
+}
+
+impl DeliveryTrigger<'_> {
+    /// Decide `ir`'s trigger for this delivery: the one rule for a delivery
+    /// that starts Runs and for one a file that does not compile stopped
+    /// ([`refuse_uncompiled_delivery`]), so the two cannot answer
+    /// differently.
+    ///
+    /// The trigger is matched first with a pull request's paths not yet
+    /// asked for (unknown), so a Pipeline whose trigger does not match
+    /// (another kind, a false branch test) costs no files request. Only a
+    /// match that may have rested on the unknown paths asks, once per
+    /// delivery (`ctx` and `paths` keep the answer for the next Pipeline),
+    /// and is decided again with the answer.
+    async fn decide(
+        &self,
+        ir: &scarab_pipeline::PipelineIr,
+        ctx: &mut serde_json::Value,
+        paths: &mut scarab_forge::ChangedPaths,
+    ) -> TriggerDecision {
+        let kind = self.kind;
+        let decide = |ctx: &serde_json::Value| match scarab_pipeline::matches_trigger(ir, kind, ctx)
+        {
+            Ok(true) => TriggerDecision::Matches,
+            Ok(false) => TriggerDecision::NoMatch,
+            Err(e) => TriggerDecision::Undecided(format!(
+                "the `when:` of its `{kind}` trigger could not be decided: {e}"
+            )),
+        };
+        let first = decide(ctx);
+        if first != TriggerDecision::Matches {
+            return first;
+        }
+        if let (
+            scarab_forge::ChangedPaths::Unknown(scarab_forge::PathsUnknown::NotFetched),
+            scarab_forge::Event::PullRequest { repo, number, .. },
+        ) = (&*paths, self.event)
+        {
+            if scarab_pipeline::reads_changed_paths(ir, kind) {
+                *paths = pull_request_paths(self.forge, repo, *number).await;
+                paths.apply_to(ctx);
+                return decide(ctx);
+            }
+        }
+        first
+    }
+}
+
 /// A delivery in which a Pipeline file does not compile starts no Run
 /// (ADR-0009), and no required check may wait on the commit for one: each
 /// file that does not compile is recorded as a refused Run and fails its
-/// check with its first diagnostic, and every other Pipeline whose `on:`
-/// names `kind` fails its check as not run, naming the file that broke the
-/// delivery (git-bug e5089fd). A Pipeline whose `on:` does not name `kind`
-/// posts nothing.
+/// check with its first diagnostic, and every other Pipeline this delivery
+/// would have started fails its check as not run, naming the file that
+/// broke the delivery (git-bug e5089fd).
+///
+/// "Would have started" is its trigger decided as a delivery that starts
+/// Runs decides it ([`DeliveryTrigger::decide`], with the same one pull
+/// request paths request): a match fails the check; a trigger that does not
+/// match posts nothing, so a Pipeline kept to `main` by its `when:` gets no
+/// red check on a feature branch because another file is broken; a `when:`
+/// that cannot be decided fails the check, as the Pipeline may have run. A
+/// file that does not compile cannot be decided: it fails its check when
+/// its `on:` names the event or cannot be read ([`may_trigger_on`]).
 async fn refuse_uncompiled_delivery(
     db: &dyn Db,
     clock: &dyn Clock,
-    event: &scarab_forge::Event,
-    kind: &str,
+    delivery: &DeliveryTrigger<'_>,
     compiled: &[(&String, scarab_pipeline::PipelineIr)],
     broken: &[(&String, &str, String)],
+    (ctx, paths): (&mut serde_json::Value, &mut scarab_forge::ChangedPaths),
 ) {
+    let (event, kind) = (delivery.event, delivery.kind);
     let Some(repo) = event.repo() else {
         return;
     };
@@ -6259,7 +6318,9 @@ async fn refuse_uncompiled_delivery(
     }
     let not_run = format!("not run: {first_broken} failed to compile");
     for (path, ir) in compiled {
-        if ir.triggers.0.contains_key(kind) {
+        // A `when:` that cannot be decided fails closed: the Pipeline may
+        // have run.
+        if delivery.decide(ir, ctx, paths).await != TriggerDecision::NoMatch {
             enqueue_refusal_status(
                 db,
                 clock,
