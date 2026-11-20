@@ -4960,9 +4960,10 @@ fn origin_pr_base(event: &scarab_forge::Event) -> Option<String> {
 /// (empty when there is no config, or no pipeline's trigger matches).
 ///
 /// Pipelines are evaluated independently and in a deterministic (path-sorted)
-/// order; a file that fails to compile fails the whole trigger (a broken
-/// pipeline is a submit-time error, ADR-0009), and its check fails on the
-/// commit. A pipeline whose `when:` cannot be decided, or that admission
+/// order. Every file is compiled before any Run is created: a file that
+/// fails to compile fails the whole trigger and nothing runs (a broken
+/// pipeline is a submit-time error, ADR-0009), and the check of every
+/// pipeline the event names fails on the commit. A pipeline whose `when:` cannot be decided, or that admission
 /// **refuses** (a disallowed ref, an unknown Environment, an ineligible
 /// Project — ADR-0037, ADR-0071), is skipped on its own and never aborts the
 /// delivery: the other pipelines still run.
@@ -5282,11 +5283,15 @@ pub(crate) async fn trigger_runs_from_files(
     let installed = installed_libraries(ports.libraries, ports.plugins, &repo.owner)
         .await
         .map_err(TriggerError::Db)?;
+    // Every Pipeline file is compiled before any Run is created. A file that
+    // does not compile fails the whole delivery and nothing runs (ADR-0009).
+    let mut compiled: Vec<(&String, scarab_pipeline::PipelineIr)> = Vec::new();
+    let mut broken: Vec<(&String, &str, String)> = Vec::new();
     for (path, yaml) in files {
         let yaml = yaml.as_str();
         // A library (`kind: library`, ADR-0076 §2) runs only where it is
         // invoked, wherever it sits under `.scarab/`.
-        if scarab_pipeline::is_library(&yaml) {
+        if scarab_pipeline::is_library(yaml) {
             continue;
         }
         // A follow-up already started by an earlier delivery of the same
@@ -5296,31 +5301,28 @@ pub(crate) async fn trigger_runs_from_files(
         {
             continue;
         }
-
         // Pre-fetch transitive `invoke:` libraries at this ref and compile
         // (ADR-0038) — the shared read-at-ref → compile primitive also used by
         // the manual/api dispatch path.
-        let compiled = prefetch_libs_and_compile(forge, repo, &git_ref, &yaml, &installed).await;
-        // A file that does not compile creates no Run, so no Run posts its
-        // check: the refusal posts it, `failure` with the first diagnostic,
-        // or a required check waits on the commit for good (git-bug
-        // e5089fd).
-        if let Err(TriggerError::Pipeline(text)) = &compiled {
-            if may_trigger_on(&yaml, kind.as_str()) {
-                enqueue_refusal_status(
-                    db,
-                    clock,
-                    event,
-                    path,
-                    &declared_pipeline_name(&yaml, path),
-                    &first_diagnostic(text),
-                    &repo_page_path(&repo.owner, &repo.name),
-                )
-                .await;
-            }
+        match prefetch_libs_and_compile(forge, repo, &git_ref, yaml, &installed).await {
+            Ok(ir) => compiled.push((path, ir)),
+            Err(TriggerError::Pipeline(text)) => broken.push((path, yaml, text)),
+            Err(e) => return Err(e),
         }
-        let ir = record_compile_failure(db, clock, event, path, compiled).await?;
+    }
+    if let Some((first_broken, _, first_text)) = broken.first() {
+        let error = TriggerError::Pipeline(first_text.clone());
+        refuse_uncompiled_delivery(db, clock, event, kind.as_str(), &compiled, &broken).await;
+        tracing::warn!(
+            org = %repo.owner,
+            project = %repo.name,
+            pipeline = %first_broken,
+            "no pipeline run: a pipeline file does not compile"
+        );
+        return Err(error);
+    }
 
+    for (path, ir) in compiled {
         // The trigger is matched first, with a pull request's paths not yet
         // asked for (unknown), so a Pipeline whose trigger does not match
         // (another kind, a false branch test) costs no files request. Only a
@@ -6164,6 +6166,62 @@ fn first_diagnostic(text: &str) -> String {
         .next()
         .map_or_else(|| text.to_string(), |e| e.message);
     first.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A delivery in which a Pipeline file does not compile starts no Run
+/// (ADR-0009), and no required check may wait on the commit for one: each
+/// file that does not compile is recorded as a refused Run and fails its
+/// check with its first diagnostic, and every other Pipeline whose `on:`
+/// names `kind` fails its check as not run, naming the file that broke the
+/// delivery (git-bug e5089fd). A Pipeline whose `on:` does not name `kind`
+/// posts nothing.
+async fn refuse_uncompiled_delivery(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    event: &scarab_forge::Event,
+    kind: &str,
+    compiled: &[(&String, scarab_pipeline::PipelineIr)],
+    broken: &[(&String, &str, String)],
+) {
+    let Some(repo) = event.repo() else {
+        return;
+    };
+    let Some((first_broken, _, _)) = broken.first() else {
+        return;
+    };
+    let target_path = repo_page_path(&repo.owner, &repo.name);
+    for (path, yaml, text) in broken {
+        if may_trigger_on(yaml, kind) {
+            enqueue_refusal_status(
+                db,
+                clock,
+                event,
+                path,
+                &declared_pipeline_name(yaml, path),
+                &first_diagnostic(text),
+                &target_path,
+            )
+            .await;
+        }
+        let message = format!("pipeline: {text}");
+        let errors = compile_errors(&message);
+        record_refusal(db, clock, event, path, "compile", message, &errors).await;
+    }
+    let not_run = format!("not run: {first_broken} failed to compile");
+    for (path, ir) in compiled {
+        if ir.triggers.0.contains_key(kind) {
+            enqueue_refusal_status(
+                db,
+                clock,
+                event,
+                path,
+                &run_pipeline_name(ir, path),
+                &not_run,
+                &target_path,
+            )
+            .await;
+        }
+    }
 }
 
 /// Refuse a Pipeline whose `when:` (its trigger's or a Step's) could not be

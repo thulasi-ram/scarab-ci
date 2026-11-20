@@ -1289,3 +1289,53 @@ async fn an_undecidable_when_refuses_its_pipeline_and_the_next_file_still_runs()
         "{failed:?}"
     );
 }
+
+/// A delivery with a Pipeline file that does not compile starts no Run, not
+/// even for the files before it (ADR-0009), and no check waits on the
+/// commit: the broken `checks` fails with its diagnostic, and the CI
+/// Pipeline beside it fails as not run, naming the broken file. A second
+/// delivery of the same push posts nothing new.
+#[tokio::test]
+async fn a_broken_pipeline_fails_the_check_of_every_pipeline_in_the_delivery_once() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = Arc::new(
+        FakeForge::new()
+            .with_file(".scarab/a.yaml", CI_YAML)
+            .with_file(".scarab/b.yaml", BROKEN_YAML),
+    );
+    let app = multi_forge_app_arc(db.clone(), forge.clone());
+
+    for delivery in ["gh-two-1", "gh-two-2"] {
+        let resp = app.clone().oneshot(push_request(delivery)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(db.active_runs().await.unwrap().is_empty(), "no Run at all");
+
+        let statuses = statuses_on_push(&forge, &db).await;
+        assert_eq!(statuses.len(), 2, "one each, posted once: {statuses:?}");
+        assert!(statuses
+            .iter()
+            .all(|s| s.state == scarab_forge::StatusState::Failure
+                && s.target_url == "https://scarab.example/acme/app"));
+        let broken = statuses
+            .iter()
+            .find(|s| s.context == "scarab/checks")
+            .expect("the broken Pipeline's check");
+        assert!(
+            broken
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("needs unknown step `ghost`"),
+            "{broken:?}"
+        );
+        let other = statuses
+            .iter()
+            .find(|s| s.context == "scarab/a")
+            .expect("the other Pipeline's check");
+        assert_eq!(
+            other.description.as_deref(),
+            Some("not run: .scarab/b.yaml failed to compile")
+        );
+    }
+}

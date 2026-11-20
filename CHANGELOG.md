@@ -24,7 +24,9 @@ release.yml uses that version's section as the GitHub Release text. See
   Pipeline file that did not compile created no Run and posted no commit status, so a required
   check waited for good. It now posts `failure` under the Pipeline's usual check name, on GitHub
   and Forgejo, with the first compile error as the description and a link to the repository page,
-  where the refused Run is listed. A Pipeline refused by a Policy, a sandbox or library rule, a
+  where the refused Run is listed. A broken file still stops every Pipeline in the delivery, and
+  now before any of them starts a Run: each other Pipeline whose `on:` names the event posts
+  `failure` with "not run: <file> failed to compile". A Pipeline refused by a Policy, a sandbox or library rule, a
   missing approval gate, or a loop of follow-up Runs posts the same way; an Environment refusal
   already did. A branch-scoped Environment skipping another branch still posts nothing. The same
   delivery sent twice posts once.
