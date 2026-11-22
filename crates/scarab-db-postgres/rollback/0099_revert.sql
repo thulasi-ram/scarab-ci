@@ -1,6 +1,7 @@
 -- Revert migrations 0099 (log streams and the value ledger), 0100 (the
--- `attempts.started_at` index) and 0101 (validating 0099's checks), so a
--- 0.6.x server starts on this database again. Not a migration: the
+-- `attempts.started_at` index), 0101 (validating 0099's checks) and 0102
+-- (the `values_too_large` reason), so a 0.6.x server starts on this
+-- database again. Not a migration: the
 -- migrator never runs this file. It also reverts a database that ran 0099
 -- and 0100 but not 0101.
 --
@@ -14,7 +15,7 @@
 --
 -- What it deletes: the marker rows of logs stored by 0.7 (`kind` other than
 -- `output`) and every value ledger. Output rows stay, and 0.6.x reads them
--- as before. Upgrading again runs 0099, 0100 and 0101 again.
+-- as before. Upgrading again runs 0099 to 0102 again.
 
 BEGIN;
 
@@ -44,6 +45,6 @@ ALTER TABLE log_chunks
 
 DROP INDEX IF EXISTS attempts_started_at_idx;
 
-DELETE FROM _sqlx_migrations WHERE version IN (99, 100, 101);
+DELETE FROM _sqlx_migrations WHERE version IN (99, 100, 101, 102);
 
 COMMIT;

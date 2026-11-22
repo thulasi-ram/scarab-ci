@@ -960,6 +960,180 @@ async fn a_first_part_starting_inside_a_value_stores_stars_and_rereads_equal() {
     assert!(w.markers(&stream()).await.is_empty());
 }
 
+/// The lengths of the stored output rows of `s`.
+async fn output_lens(w: &World, s: &LogStreamId) -> Vec<u64> {
+    w.rows(s)
+        .await
+        .into_iter()
+        .filter(|r| r.is_output())
+        .map(|r| r.len)
+        .collect()
+}
+
+/// ADR-0082 §3: a read that breaks after emitting the `***` of a span
+/// that may still grow (`abc` read, `abcdefgh` could follow) stores a row
+/// that ends inside the starred run and no byte of the span; the re-read,
+/// cut in other chunks, emits the same `***` at the same place, matches
+/// the stored digests and appends the rest. Kills: a span's bytes emitted
+/// before its end is known; a re-read that differs from the stored part
+/// by its cut.
+#[tokio::test]
+async fn a_read_broken_with_a_span_open_stores_no_byte_of_it_and_rereads_equal() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[b"abc", b"abcdefgh"]).await;
+    let live = LiveLog::new(b"x abcdefgh y\n", true);
+    live.script(ReadScript {
+        chunk: 7,
+        fail_after: Some(1),
+        ..Default::default()
+    });
+    live.script(ReadScript {
+        chunk: 3,
+        ..Default::default()
+    });
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.ensure(&running());
+    until("the first read's row", || async {
+        w.stored(&logs, &stream()).await.starts_with(b"x ***")
+    })
+    .await;
+    live.stop();
+    drive_until(&tailer, &running(), "complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    assert_eq!(w.stored(&logs, &stream()).await, b"x *** y\n");
+    assert_eq!(
+        output_lens(&w, &stream()).await,
+        [5, 3],
+        "the first row ends inside the starred run"
+    );
+    assert!(w.markers(&stream()).await.is_empty());
+}
+
+/// ADR-0082 §3: a read that breaks while the start of the part can still
+/// be inside a value (the leading interval is pending) stores nothing; the
+/// re-read in other chunks stores `***` for the value's tail, with no
+/// `source_restarted` row. Kills: bytes emitted while the lead is pending.
+#[tokio::test]
+async fn a_read_broken_while_the_lead_is_pending_stores_nothing_and_rereads_equal() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[b"0123456789abcdefghij"]).await;
+    let live = LiveLog::new(b"456789abcdefghij rest\n", true);
+    live.script(ReadScript {
+        chunk: 4,
+        fail_after: Some(2),
+        ..Default::default()
+    });
+    live.script(ReadScript {
+        chunk: 5,
+        ..Default::default()
+    });
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.ensure(&running());
+    until("the second read", || async { live.opens() >= 2 }).await;
+    live.stop();
+    drive_until(&tailer, &running(), "complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    assert_eq!(w.stored(&logs, &stream()).await, b"*** rest\n");
+    assert_eq!(
+        output_lens(&w, &stream()).await,
+        [9],
+        "the broken read stored no row"
+    );
+    assert!(w.markers(&stream()).await.is_empty());
+}
+
+/// ADR-0082 §3: two values that overlap (`user:hunter2pw` and
+/// `hunter2pw-and-more-secret`) are one `***`; a re-read one byte per
+/// chunk matches the stored digests. Kills: the 0.7.0 scan, which stored
+/// `-and-more-secret` (32c3c10).
+#[tokio::test]
+async fn overlapping_values_store_one_run_and_reread_one_byte_per_chunk_equal() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[b"user:hunter2pw", b"hunter2pw-and-more-secret"])
+        .await;
+    let live = LiveLog::new(b"dsn=user:hunter2pw-and-more-secret\nnext\n", true);
+    live.script(ReadScript {
+        chunk: 64,
+        fail_after: Some(1),
+        ..Default::default()
+    });
+    live.script(ReadScript {
+        chunk: 1,
+        ..Default::default()
+    });
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.ensure(&running());
+    until("the first read's row", || async {
+        !w.rows(&stream()).await.is_empty()
+    })
+    .await;
+    live.stop();
+    drive_until(&tailer, &running(), "complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    assert_eq!(w.stored(&logs, &stream()).await, b"dsn=***\nnext\n");
+    assert!(w.markers(&stream()).await.is_empty());
+}
+
+/// ADR-0082 §3, the whole-part interval: a first part that is lines 2-3
+/// of a multi-line value (the kubelet rotated the file between its lines)
+/// and ends there at a confirmed end stores `***`. Kills: no whole-part
+/// interval (both lines stored).
+#[tokio::test]
+async fn a_first_part_inside_a_multi_line_value_stores_stars() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(
+        &logs,
+        &[b"-----BEGIN KEY-----\nMIIEvQIBADANBgkq\nhkiG9w0BAQEFAASC\nBKcwggSjAgEAAoIB\n-----END KEY-----\n"],
+    )
+    .await;
+    let live = LiveLog::new(b"MIIEvQIBADANBgkq\nhkiG9w0BAQEFAASC\n", false);
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.ensure(&running());
+    until("complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    assert_eq!(w.stored(&logs, &stream()).await, b"***");
+}
+
+/// ADR-0082 §3: a unit whose values add up to more than 256 KiB gets one
+/// `not_stored` (`values_too_large`) marker and no source byte is read;
+/// its failure causes are replaced. Kills: a cap that redacts part of a
+/// value; reading the source before the size check.
+#[tokio::test]
+async fn values_over_the_cap_store_one_marker_and_no_bytes() {
+    let w = World::new().await;
+    let logs = w.logs();
+    let big = vec![b'q'; scarab_server::logs::MAX_VALUE_BYTES + 1];
+    w.ledger(&logs, &[&big]).await;
+    let live = LiveLog::new(b"qqqq and more\n", true);
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    drive_until(&tailer, &running(), "closed", || async {
+        w.state(&stream()).await == Some(LogStreamState::Closed)
+    })
+    .await;
+    let rows = w.rows(&stream()).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].kind, LogRowKind::NotStored);
+    assert_eq!(rows[0].reason, Some(NotStoredReason::ValuesTooLarge));
+    assert_eq!(live.opens(), 0, "no source byte read");
+    assert_eq!(
+        logs.redact_text_for_handle("pod-build", "pull failed: qqqq")
+            .await,
+        scarab_server::logs::CAUSE_NOT_STORED
+    );
+}
+
 // ---------------------------------------------------------------------------
 // I2: how a read ends
 // ---------------------------------------------------------------------------

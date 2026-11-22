@@ -170,6 +170,9 @@ pub enum NotStoredReason {
     NoLedger,
     /// The unit's value ledger was removed before the log could be read.
     LedgerPurged,
+    /// The unit's secret values add up to more than the server redacts a
+    /// log with (256 KiB, ADR-0082).
+    ValuesTooLarge,
 }
 
 impl NotStoredReason {
@@ -177,6 +180,7 @@ impl NotStoredReason {
         match self {
             NotStoredReason::NoLedger => "no_ledger",
             NotStoredReason::LedgerPurged => "ledger_purged",
+            NotStoredReason::ValuesTooLarge => "values_too_large",
         }
     }
 
@@ -184,6 +188,7 @@ impl NotStoredReason {
         Some(match s {
             "no_ledger" => NotStoredReason::NoLedger,
             "ledger_purged" => NotStoredReason::LedgerPurged,
+            "values_too_large" => NotStoredReason::ValuesTooLarge,
             _ => return None,
         })
     }
@@ -201,6 +206,10 @@ pub fn marker_text(kind: LogRowKind, reason: Option<NotStoredReason>) -> &'stati
         (LogRowKind::NotStored, Some(NotStoredReason::LedgerPurged)) => {
             "the rest of this log was not stored: its secret values were removed before it \
              could be read"
+        }
+        (LogRowKind::NotStored, Some(NotStoredReason::ValuesTooLarge)) => {
+            "the rest of this log was not stored: this step's secret values add up to more \
+             than 256 KiB, more than a log is checked against"
         }
         (LogRowKind::NotStored, _) => {
             "the rest of this log was not stored: this step was started by an earlier Scarab \

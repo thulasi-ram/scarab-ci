@@ -114,6 +114,7 @@ pub mod plugins;
 /// decision logs and the policy test API.
 pub mod policies;
 mod policy_checkpoints;
+mod redact;
 mod refused_runs;
 pub mod retention;
 mod routes;

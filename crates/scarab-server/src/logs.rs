@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use flate2::read::GzDecoder;
@@ -39,6 +39,8 @@ use scarab_engine::{
 use scarab_secrets::Sealer;
 use scarab_storage::ObjectStore;
 
+use crate::redact::{Core, Sam, Trie};
+
 /// Errors from the log pipeline's reads.
 #[derive(Debug, thiserror::Error)]
 pub enum LogError {
@@ -48,6 +50,8 @@ pub enum LogError {
     Store(#[from] scarab_storage::StorageError),
     #[error("gzip error: {0}")]
     Gzip(String),
+    #[error(transparent)]
+    ValuesTooLarge(#[from] ValuesTooLarge),
 }
 
 /// Why a unit's values could not be loaded.
@@ -75,12 +79,36 @@ pub const CAUSE_NOT_STORED: &str =
 /// The secret values of one unit, as its ledger holds them at generation
 /// `gen`: the union of every generation `1..=gen`. Built only from a loaded
 /// ledger (there is no empty default).
-#[derive(Debug)]
 pub struct ValueSet {
     gen: i64,
     entries: Vec<MountedValue>,
     values: Vec<Vec<u8>>,
     generations: Vec<LedgerGeneration>,
+    /// The bytes of `values`, added up.
+    value_bytes: usize,
+    /// The redaction automata, built on first use and shared with a later
+    /// load of the same generation ([`ValueSet::keep_automata_of`]).
+    automata: Arc<Automata>,
+}
+
+impl std::fmt::Debug for ValueSet {
+    // No value bytes: a value set is printed in traces.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValueSet")
+            .field("gen", &self.gen)
+            .field("values", &self.values.len())
+            .field("value_bytes", &self.value_bytes)
+            .field("trie_built", &self.automata.trie.get().is_some())
+            .field("sam_built", &self.automata.sam.get().is_some())
+            .finish()
+    }
+}
+
+/// The automata of a value set, each built at most once.
+#[derive(Default)]
+struct Automata {
+    trie: OnceLock<Arc<Trie>>,
+    sam: OnceLock<Arc<Sam>>,
 }
 
 /// One generation of a unit's ledger as loaded: the values one launch
@@ -138,12 +166,112 @@ impl ValueSet {
                 values.push(e.value.clone());
             }
         }
+        let value_bytes = values.iter().map(Vec::len).sum();
         Self {
             gen,
             entries,
             values,
             generations,
+            value_bytes,
+            automata: Arc::default(),
         }
+    }
+
+    /// Share `other`'s automata (built or not) when it is the same
+    /// generation with the same values: a reload after the cache's TTL
+    /// does not build them again.
+    fn keep_automata_of(&mut self, other: &ValueSet) {
+        if other.gen == self.gen && other.values == self.values {
+            self.automata = other.automata.clone();
+        }
+    }
+
+    /// The bytes of every value, added up.
+    pub fn value_bytes(&self) -> usize {
+        self.value_bytes
+    }
+
+    fn check_size(&self) -> Result<(), ValuesTooLarge> {
+        if self.value_bytes > MAX_VALUE_BYTES {
+            return Err(ValuesTooLarge {
+                bytes: self.value_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    /// The trie of the values, built here if it is not built.
+    fn trie(&self) -> Result<Arc<Trie>, ValuesTooLarge> {
+        self.check_size()?;
+        Ok(self
+            .automata
+            .trie
+            .get_or_init(|| Arc::new(Trie::build(&self.values)))
+            .clone())
+    }
+
+    /// The suffix automaton of the values, built here if it is not built.
+    fn sam(&self) -> Result<Arc<Sam>, ValuesTooLarge> {
+        self.check_size()?;
+        Ok(self
+            .automata
+            .sam
+            .get_or_init(|| Arc::new(Sam::build(&self.values)))
+            .clone())
+    }
+
+    /// Build what a [`StreamRedactor`] needs (the trie and the suffix
+    /// automaton), on a blocking thread when the values are over 16 KiB.
+    /// A set over [`MAX_VALUE_BYTES`] builds nothing.
+    pub async fn prepare_stream(self: &Arc<Self>) -> Result<(), ValuesTooLarge> {
+        self.prepare(true).await
+    }
+
+    /// Build what [`redact_text`] needs (the trie only).
+    pub async fn prepare_text(self: &Arc<Self>) -> Result<(), ValuesTooLarge> {
+        self.prepare(false).await
+    }
+
+    async fn prepare(self: &Arc<Self>, sam: bool) -> Result<(), ValuesTooLarge> {
+        self.check_size()?;
+        let built =
+            self.automata.trie.get().is_some() && (!sam || self.automata.sam.get().is_some());
+        if built {
+            return Ok(());
+        }
+        if self.value_bytes > BUILD_INLINE_BYTES {
+            let set = self.clone();
+            // A panic or a cancelled task leaves the cells empty; the
+            // caller's own `trie()` / `sam()` then builds (or panics) there.
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = set.trie();
+                if sam {
+                    let _ = set.sam();
+                }
+            })
+            .await;
+            return Ok(());
+        }
+        self.trie()?;
+        if sam {
+            self.sam()?;
+        }
+        Ok(())
+    }
+
+    /// Which automata are built: (trie, suffix automaton).
+    #[cfg(test)]
+    fn built(&self) -> (bool, bool) {
+        (
+            self.automata.trie.get().is_some(),
+            self.automata.sam.get().is_some(),
+        )
+    }
+
+    /// Whether `other` shares this set's automata.
+    #[cfg(test)]
+    fn shares_automata_with(&self, other: &ValueSet) -> bool {
+        Arc::ptr_eq(&self.automata, &other.automata)
     }
 
     /// Each generation, oldest first.
@@ -320,10 +448,15 @@ impl LogService {
     /// The unit's value set: from the cache, else loaded from its ledger.
     pub async fn load_values(&self, unit: &LogStreamId) -> Result<Arc<ValueSet>, LedgerError> {
         {
+            let key = unit_key(unit);
             let mut cache = self.cache.lock().unwrap();
-            cache.retain(|_, c| c.at.elapsed() < VALUES_TTL);
-            if let Some(c) = cache.get(&unit_key(unit)) {
-                return Ok(c.set.clone());
+            // An expired entry of this unit stays until the reload, which
+            // keeps its automata when the generation has not moved.
+            cache.retain(|k, c| *k == key || c.at.elapsed() < VALUES_TTL);
+            if let Some(c) = cache.get(&key) {
+                if c.at.elapsed() < VALUES_TTL {
+                    return Ok(c.set.clone());
+                }
             }
         }
         self.reload_values(unit).await
@@ -370,14 +503,20 @@ impl LogService {
                 entries,
             });
         }
-        let set = Arc::new(ValueSet::from_generations(gen, generations));
-        self.cache.lock().unwrap().insert(
+        let mut set = ValueSet::from_generations(gen, generations);
+        let mut cache = self.cache.lock().unwrap();
+        if let Some(c) = cache.get(&unit_key(unit)) {
+            set.keep_automata_of(&c.set);
+        }
+        let set = Arc::new(set);
+        cache.insert(
             unit_key(unit),
             Cached {
                 set: set.clone(),
                 at: Instant::now(),
             },
         );
+        drop(cache);
         Ok(set)
     }
 
@@ -445,7 +584,10 @@ impl LogService {
             _ => return CAUSE_NOT_STORED.to_string(),
         };
         match self.reload_values(&unit).await {
-            Ok(set) => redact_text(&set, text),
+            Ok(set) => match set.prepare_text().await {
+                Ok(()) => redact_text(&set, text),
+                Err(_) => CAUSE_NOT_STORED.to_string(),
+            },
             Err(_) => CAUSE_NOT_STORED.to_string(),
         }
     }
@@ -488,9 +630,14 @@ impl LogService {
         self.cache.lock().unwrap().remove(&unit_key(unit));
     }
 
-    /// A redactor for one read of a part of `values`' unit, with the
-    /// suffix rule on at the part's first byte.
-    pub fn redactor(&self, values: Arc<ValueSet>) -> StreamRedactor {
+    /// A redactor for one read of a part of `values`' unit, its automata
+    /// built off the async workers when large. A set over
+    /// [`MAX_VALUE_BYTES`] gets none: its log is not stored.
+    pub async fn stream_redactor(
+        &self,
+        values: Arc<ValueSet>,
+    ) -> Result<StreamRedactor, ValuesTooLarge> {
+        values.prepare_stream().await?;
         StreamRedactor::new(values)
     }
 
@@ -577,7 +724,7 @@ impl LogService {
                 .held_by(&resource, &self.owner)
                 .ok_or(LogError::Db(DbError::NotLeader))?,
         );
-        let mut redactor = StreamRedactor::new(values.clone());
+        let mut redactor = self.stream_redactor(values.clone()).await?;
         let mut out = redactor.push(chunk);
         out.extend(redactor.finish_confirmed());
         let appended = self
@@ -739,68 +886,89 @@ fn gunzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// What a redacted secret value is replaced with.
-const REDACTED: &[u8] = b"***";
-
-/// The shortest leading proper suffix of a value that is redacted at the
-/// start of a part (residual R-1: a shorter one is stored).
+/// The shortest start of a part that is redacted because it ends a value,
+/// and the shortest part redacted because it lies inside one (residual
+/// R-1: a shorter one is stored).
 pub const MIN_SUFFIX: usize = 8;
 
-/// Redact a whole `text` with `values`. The text is known whole, so its
-/// end is not a cut: a trailing start of a value is kept as it is.
+/// The most value bytes (every value of a unit, added up) a log is
+/// redacted with. A unit over it has its log not stored
+/// ([`NotStoredReason::ValuesTooLarge`]) and its failure causes replaced
+/// with [`CAUSE_NOT_STORED`]: a value is never redacted in part.
+///
+/// Why 256 KiB: the automata keep at most 52 bytes per value byte (21 for
+/// the trie, at most 31 for the suffix automaton at 2 states and 3
+/// transitions per byte; 44 measured on random bytes), so at most 13 MiB
+/// per unit being read, and about 36 MiB while the suffix automaton is
+/// built (its lookup map). A PEM key is about 3 KiB, a kubeconfig under
+/// 10 KiB, the Mozilla CA bundle about 220 KiB.
+pub const MAX_VALUE_BYTES: usize = 256 * 1024;
+
+/// A value set over this many bytes is built on a blocking thread, not on
+/// an async worker.
+const BUILD_INLINE_BYTES: usize = 16 * 1024;
+
+/// A unit's values are over [`MAX_VALUE_BYTES`]: nothing is redacted with
+/// them and nothing they cover is stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the unit's secret values are {bytes} bytes in all, over the {MAX_VALUE_BYTES} bytes a log is redacted with")]
+pub struct ValuesTooLarge {
+    pub bytes: usize,
+}
+
+/// Redact a whole `text` with `values`: every occurrence of a value, with
+/// overlapping ones as one `***`. The text is known whole, so its start and
+/// end are not cuts. A set over [`MAX_VALUE_BYTES`] gives
+/// [`CAUSE_NOT_STORED`]. Builds only the trie.
 pub fn redact_text(values: &Arc<ValueSet>, text: &str) -> String {
-    let out = redact_scan(text.as_bytes(), values.values(), Scan::Whole).0;
+    let Ok(trie) = values.trie() else {
+        return CAUSE_NOT_STORED.to_string();
+    };
+    let mut core = Core::text(trie);
+    let mut out = core.push(text.as_bytes());
+    out.extend(core.finish(false));
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Where a [`redact_scan`] stops.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Scan {
-    /// More bytes may follow: hold a trailing start of a value.
-    Open,
-    /// A confirmed end of a source: a trailing proper prefix of a value is
-    /// `***` (the prefix rule).
-    ConfirmedEnd,
-    /// A whole text: nothing follows and nothing was cut.
-    Whole,
-}
-
-/// Redacts one read of a log source as a stream of chunks, so a secret value
-/// split across two chunks is still replaced, with the values of one ledger
-/// generation (a new generation needs a new redactor).
+/// Redacts one read of a part of a log source as a stream of chunks, with
+/// the values of one ledger generation (a new generation needs a new
+/// redactor). ADR-0082 §3: it stores the union of every match.
 ///
-/// Bytes are scanned left to right; at each position the longest value that
-/// matches is replaced by `***`, otherwise one byte is copied.
-/// [`push`](Self::push) holds back the longest suffix of what it has seen
-/// that is a proper prefix of a value (at most the longest value less one
-/// byte) until the next push shows whether it is a secret. A chunk that does
-/// not end in the start of a value is emitted whole, so a live tail is not
-/// delayed.
+/// What it stores for the bytes `S` it reads: every occurrence of every
+/// value; the longest start of `S` of at least [`MIN_SUFFIX`] bytes that
+/// ends a value (a read can start inside a value when the kubelet rotated
+/// the log file); at a confirmed end, all of `S` when it is
+/// [`MIN_SUFFIX`] bytes or longer and lies inside a value with more of the
+/// value after it, and the shortest end of `S` that begins a value. Marked
+/// ranges that share a byte are one `***`; ranges that only touch are two.
 ///
-/// Edges (I1): [`finish_confirmed`](Self::finish_confirmed), at a confirmed
-/// end of the source, writes a held proper prefix of a value as `***`. At
-/// the first byte of a part (the first part of a stream, or one after a
-/// `source_restarted` row) it writes the longest leading proper suffix of a
-/// value of at least [`MIN_SUFFIX`] bytes as `***`: a read can start inside
-/// a value when the kubelet rotated the log file. Until the bytes held at
-/// the start show whether a longer value matches there, nothing is emitted,
-/// so what is stored does not depend on how the source is chunked. A read
-/// that fails drops the redactor and its held bytes: they may be the start
-/// of a secret, and the next read sees them again.
+/// [`push`](Self::push) emits what no later byte can change, so what it
+/// has emitted is a prefix of the output of every continuation of the
+/// source: how the source is cut changes when bytes are emitted, never
+/// which. After each push it holds at most the longest value less one
+/// byte. A read that fails drops the redactor and its held bytes: they may
+/// be part of a secret, and the next read sees them again.
 pub struct StreamRedactor {
     values: Arc<ValueSet>,
-    held: Vec<u8>,
-    /// The suffix rule still applies to the first byte.
-    suffix_pending: bool,
+    core: Core,
 }
 
 impl StreamRedactor {
-    pub fn new(values: Arc<ValueSet>) -> Self {
-        Self {
-            values,
-            held: Vec::new(),
-            suffix_pending: true,
-        }
+    /// A redactor for one read. Builds the value set's automata here if
+    /// they are not built ([`ValueSet::prepare_stream`] builds them off
+    /// the async workers).
+    pub fn new(values: Arc<ValueSet>) -> Result<Self, ValuesTooLarge> {
+        Self::with_min_suffix(values, MIN_SUFFIX)
+    }
+
+    /// [`new`](Self::new) with another minimum than [`MIN_SUFFIX`], for
+    /// tests that search small inputs.
+    pub(crate) fn with_min_suffix(
+        values: Arc<ValueSet>,
+        min_suffix: usize,
+    ) -> Result<Self, ValuesTooLarge> {
+        let core = Core::stream(values.trie()?, values.sam()?, min_suffix);
+        Ok(Self { values, core })
     }
 
     /// The generation of the values this redactor uses.
@@ -815,133 +983,20 @@ impl StreamRedactor {
 
     /// Redact the next chunk of the source; returns what can be emitted now.
     pub fn push(&mut self, src: &[u8]) -> Vec<u8> {
-        let mut buf = std::mem::take(&mut self.held);
-        buf.extend_from_slice(src);
-        let mut out = Vec::new();
-        if self.suffix_pending {
-            match leading_suffix(&buf, self.values.values(), false) {
-                SuffixAt::Undecided => {
-                    self.held = buf;
-                    return out;
-                }
-                SuffixAt::None => {}
-                SuffixAt::Len(n) => {
-                    out.extend_from_slice(REDACTED);
-                    buf.drain(..n);
-                }
-            }
-            self.suffix_pending = false;
-        }
-        let (scanned, held_from) = redact_scan(&buf, self.values.values(), Scan::Open);
-        out.extend(scanned);
-        buf.drain(..held_from);
-        self.held = buf;
-        out
+        self.core.push(src)
     }
 
-    /// The source's end is confirmed: emit the held bytes, a held proper
-    /// prefix of a value as `***`.
-    pub fn finish_confirmed(mut self) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut buf = std::mem::take(&mut self.held);
-        if self.suffix_pending {
-            if let SuffixAt::Len(n) = leading_suffix(&buf, self.values.values(), true) {
-                out.extend_from_slice(REDACTED);
-                buf.drain(..n);
-            }
-        }
-        out.extend(redact_scan(&buf, self.values.values(), Scan::ConfirmedEnd).0);
-        out
+    /// The source's end is confirmed: emit the held bytes, with the
+    /// whole-part and trailing ranges as `***`.
+    pub fn finish_confirmed(self) -> Vec<u8> {
+        self.core.finish(true)
     }
-}
 
-/// What the suffix rule finds at the start of a part.
-enum SuffixAt {
-    /// More bytes could still make a longer suffix or a whole value match.
-    Undecided,
-    None,
-    /// The first `n` bytes are a proper suffix of a value (`n >=
-    /// MIN_SUFFIX`), and no whole value at the start is longer.
-    Len(usize),
-}
-
-/// The suffix rule at the start of `buf`. Before a confirmed end (`at_end`
-/// false) it decides only once no suffix and no whole value longer than
-/// `buf` can still match there, so every chunking of a source decides as
-/// the whole source in one chunk does (2599a7b: deciding on a suffix while
-/// a longer whole value could still match stored that value's tail).
-fn leading_suffix(buf: &[u8], values: &[Vec<u8>], at_end: bool) -> SuffixAt {
-    if !at_end
-        && values
-            .iter()
-            .any(|v| v.len() > buf.len() && v.starts_with(buf))
-    {
-        return SuffixAt::Undecided;
+    /// The bytes held now.
+    #[cfg(test)]
+    fn held_len(&self) -> usize {
+        self.core.held_len()
     }
-    let mut best: Option<usize> = None;
-    for v in values {
-        for n in MIN_SUFFIX..v.len() {
-            let suffix = &v[v.len() - n..];
-            if buf.starts_with(suffix) {
-                best = Some(best.map_or(n, |b| b.max(n)));
-            } else if !at_end && suffix.len() > buf.len() && suffix.starts_with(buf) {
-                return SuffixAt::Undecided;
-            }
-        }
-    }
-    let Some(n) = best else {
-        return SuffixAt::None;
-    };
-    // A whole value at the start that is longer wins, as the longest
-    // match does everywhere.
-    if values.iter().any(|v| v.len() > n && buf.starts_with(v)) {
-        return SuffixAt::None;
-    }
-    SuffixAt::Len(n)
-}
-
-/// One left-to-right pass over `buf`. Returns the output and the index where
-/// the held suffix starts (`buf.len()` when nothing is held; always that
-/// unless the scan is [`Scan::Open`]).
-fn redact_scan(buf: &[u8], values: &[Vec<u8>], scan: Scan) -> (Vec<u8>, usize) {
-    let mut out = Vec::with_capacity(buf.len());
-    let longest = values.iter().map(Vec::len).max().unwrap_or(0);
-    let mut i = 0;
-    while i < buf.len() {
-        let rest = &buf[i..];
-        // The rest of the buffer may be the start of a value whose end has
-        // not been read yet: hold it, even when a shorter value matches here,
-        // so the longest match wins as it would on the whole stream. At a
-        // confirmed end it is redacted instead.
-        if scan != Scan::Whole
-            && rest.len() < longest
-            && values
-                .iter()
-                .any(|v| v.len() > rest.len() && v.starts_with(rest))
-        {
-            if scan == Scan::ConfirmedEnd {
-                out.extend_from_slice(REDACTED);
-                return (out, buf.len());
-            }
-            return (out, i);
-        }
-        match values
-            .iter()
-            .filter(|v| !v.is_empty() && rest.starts_with(v))
-            .map(Vec::len)
-            .max()
-        {
-            Some(n) => {
-                out.extend_from_slice(REDACTED);
-                i += n;
-            }
-            None => {
-                out.push(buf[i]);
-                i += 1;
-            }
-        }
-    }
-    (out, buf.len())
 }
 
 #[cfg(test)]
@@ -950,6 +1005,7 @@ mod tests {
     use proptest::prelude::*;
     use proptest::sample::Index;
     use scarab_engine::{MountedValueKind, StepId};
+    use std::collections::HashMap;
 
     fn set(values: &[&[u8]]) -> Arc<ValueSet> {
         Arc::new(ValueSet::new(
@@ -969,7 +1025,7 @@ mod tests {
     /// Feed `chunks` through one redactor and return everything it emitted
     /// up to a confirmed end.
     fn run(values: &[&[u8]], chunks: &[&[u8]]) -> Vec<u8> {
-        let mut r = StreamRedactor::new(set(values));
+        let mut r = StreamRedactor::new(set(values)).unwrap();
         let mut out = Vec::new();
         for c in chunks {
             out.extend(r.push(c));
@@ -996,7 +1052,7 @@ mod tests {
     /// line would show only when the step ends).
     #[test]
     fn only_the_start_of_a_secret_is_held() {
-        let mut r = StreamRedactor::new(set(&[b"token-value"]));
+        let mut r = StreamRedactor::new(set(&[b"token-value"])).unwrap();
         assert_eq!(r.push(b"line one\n"), b"line one\n".to_vec());
         assert_eq!(r.push(b"abc tok"), b"abc ".to_vec());
         assert_eq!(r.push(b"io\n"), b"tokio\n".to_vec());
@@ -1100,7 +1156,7 @@ mod tests {
     /// at a confirmed end with the bytes held: V1's tail is `***`.
     #[test]
     fn a_held_start_at_a_confirmed_end_is_starred() {
-        let mut r = StreamRedactor::new(set(&[b"abcdefghijkl", b"efghijklMNOPQRST"]));
+        let mut r = StreamRedactor::new(set(&[b"abcdefghijkl", b"efghijklMNOPQRST"])).unwrap();
         assert_eq!(
             r.push(b"efghijkl"),
             Vec::<u8>::new(),
@@ -1216,13 +1272,13 @@ mod tests {
 
     /// What the redactor must store for a [`separated_source`]: every run
     /// of value bytes is `***`, filler is copied.
-    fn reference(src: &[u8]) -> Vec<u8> {
+    fn separated_reference(src: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         let mut in_value = false;
         for &b in src {
             if VALUE_BYTES.contains(&b) {
                 if !in_value {
-                    out.extend_from_slice(REDACTED);
+                    out.extend_from_slice(b"***");
                 }
                 in_value = true;
             } else {
@@ -1246,7 +1302,7 @@ mod tests {
         /// redactor that stores a value consistently in clear.
         #[test]
         fn any_chunking_stores_the_reference_output((values, src, cuts) in separated_source()) {
-            prop_assert_eq!(redacted(&values, &chunked(&src, &cuts)), reference(&src));
+            prop_assert_eq!(redacted(&values, &chunked(&src, &cuts)), separated_reference(&src));
         }
 
         /// Any cut of any source of value and filler bytes (short tails,
@@ -1266,6 +1322,621 @@ mod tests {
                 redacted(&values, &[&src])
             );
         }
+    }
+
+    // -- ADR-0082 §3: the union of matches ----------------------------------
+    //
+    // `reference` is a brute force of §3's definition: no automaton. Every
+    // window against every value, every leading length, every whole-part
+    // and trailing start; intervals that share a byte merge, touching ones
+    // do not.
+
+    fn set_of(values: &[Vec<u8>]) -> Arc<ValueSet> {
+        let v: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+        set(&v)
+    }
+
+    /// The marked intervals of `src`. `lead`: a stream (the leading and,
+    /// at a confirmed end, the whole-part interval); `confirmed`: a
+    /// confirmed end (the trailing interval).
+    fn intervals(
+        values: &[Vec<u8>],
+        src: &[u8],
+        lead: bool,
+        confirmed: bool,
+        min: usize,
+    ) -> Vec<(usize, usize)> {
+        let vals: Vec<&[u8]> = values
+            .iter()
+            .map(Vec::as_slice)
+            .filter(|v| !v.is_empty())
+            .collect();
+        let mut iv = Vec::new();
+        for v in &vals {
+            for i in 0..(src.len() + 1).saturating_sub(v.len()) {
+                if &src[i..i + v.len()] == *v {
+                    iv.push((i, i + v.len()));
+                }
+            }
+        }
+        if lead {
+            let n = vals
+                .iter()
+                .flat_map(|v| {
+                    (min..=v.len().min(src.len())).filter(move |&m| src[..m] == v[v.len() - m..])
+                })
+                .max();
+            if let Some(n) = n {
+                iv.push((0, n));
+            }
+            let inside = vals.iter().any(|v| {
+                v.len() > src.len() && (0..v.len() - src.len()).any(|i| &v[i..i + src.len()] == src)
+            });
+            if confirmed && src.len() >= min && inside {
+                iv.push((0, src.len()));
+            }
+        }
+        if confirmed {
+            let p = (0..src.len()).find(|&p| {
+                vals.iter()
+                    .any(|v| v.len() > src.len() - p && v.starts_with(&src[p..]))
+            });
+            if let Some(p) = p {
+                iv.push((p, src.len()));
+            }
+        }
+        iv
+    }
+
+    fn render(src: &[u8], mut iv: Vec<(usize, usize)>) -> Vec<u8> {
+        iv.sort_unstable();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for (s, e) in iv {
+            match spans.last_mut() {
+                Some(last) if s < last.1 => last.1 = last.1.max(e),
+                _ => spans.push((s, e)),
+            }
+        }
+        let mut out = Vec::new();
+        let mut i = 0;
+        for (s, e) in spans {
+            out.extend_from_slice(&src[i..s]);
+            out.extend_from_slice(b"***");
+            i = e;
+        }
+        out.extend_from_slice(&src[i..]);
+        out
+    }
+
+    /// What a stream redactor with minimum `min` stores for `src` up to a
+    /// confirmed end.
+    fn reference(values: &[Vec<u8>], src: &[u8], min: usize) -> Vec<u8> {
+        render(src, intervals(values, src, true, true, min))
+    }
+
+    /// What one read records: the output and, after each push, the bytes
+    /// read, everything emitted so far and the bytes held.
+    struct Recorded {
+        out: Vec<u8>,
+        pushes: Vec<(usize, Vec<u8>, usize)>,
+    }
+
+    fn record(values: &Arc<ValueSet>, chunks: &[&[u8]], min: usize) -> Recorded {
+        let mut r = StreamRedactor::with_min_suffix(values.clone(), min).unwrap();
+        let mut out = Vec::new();
+        let mut read = 0;
+        let mut pushes = Vec::new();
+        for c in chunks {
+            out.extend(r.push(c));
+            read += c.len();
+            pushes.push((read, out.clone(), r.held_len()));
+        }
+        out.extend(r.finish_confirmed());
+        Recorded { out, pushes }
+    }
+
+    /// Every check of one source against the reference: the output of one
+    /// byte per push and of `chunks` equals it; after every push of
+    /// either, what was emitted is a prefix of the reference of the whole
+    /// source and of the bytes read so far with a confirmed end, it is
+    /// what one byte per push had emitted after the same bytes, and at
+    /// most the longest value less one byte is held.
+    fn check_source(
+        values: &[Vec<u8>],
+        set: &Arc<ValueSet>,
+        src: &[u8],
+        chunks: &[&[u8]],
+        min: usize,
+    ) -> Result<(), String> {
+        let want = reference(values, src, min);
+        let longest = values.iter().map(Vec::len).max().unwrap_or(0);
+        let one: Vec<&[u8]> = src.chunks(1).collect();
+        let base = record(set, &one, min);
+        let by_read: HashMap<usize, Vec<u8>> = base
+            .pushes
+            .iter()
+            .map(|(k, e, _)| (*k, e.clone()))
+            .collect();
+        for rec in [&base, &record(set, chunks, min)] {
+            if rec.out != want {
+                return Err(format!(
+                    "stored {:?}, reference {:?}",
+                    String::from_utf8_lossy(&rec.out),
+                    String::from_utf8_lossy(&want)
+                ));
+            }
+            for (k, emitted, held) in &rec.pushes {
+                if !want.starts_with(emitted)
+                    || !reference(values, &src[..*k], min).starts_with(emitted)
+                {
+                    return Err(format!("after {k} bytes emitted {emitted:?}"));
+                }
+                if *k > 0 && by_read.get(k).is_some_and(|b| b != emitted) {
+                    return Err(format!(
+                        "after {k} bytes the emitted bytes depend on the cut"
+                    ));
+                }
+                if *held > longest.saturating_sub(1) {
+                    return Err(format!("{held} bytes held after {k}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A small xorshift generator: the property tests draw a seed and
+    /// build value sets and sources of chosen shapes from it.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n.max(1) as u64) as usize
+        }
+        fn range(&mut self, lo: usize, hi: usize) -> usize {
+            lo + self.below(hi - lo + 1)
+        }
+        fn word(&mut self, alphabet: &[u8], lo: usize, hi: usize) -> Vec<u8> {
+            let n = self.range(lo, hi);
+            (0..n)
+                .map(|_| alphabet[self.below(alphabet.len())])
+                .collect()
+        }
+    }
+
+    /// `a` then `b`, sharing the longest end of `a` that begins `b`.
+    fn glue(a: &[u8], b: &[u8]) -> Vec<u8> {
+        let k = (0..=a.len().min(b.len()))
+            .rev()
+            .find(|&k| a.ends_with(&b[..k]))
+            .unwrap_or(0);
+        [a, &b[k..]].concat()
+    }
+
+    /// A value set of one of seven shapes (free values, a prefix chain, a
+    /// suffix chain, repeats of a word, infixes of one value, lengths
+    /// `min - 1`, `min`, `min + 1` and 1, rotations) over a one- to
+    /// three-letter alphabet, some with `*` or `\n`.
+    fn gen_values(rng: &mut Rng, min: usize) -> (Vec<Vec<u8>>, &'static [u8]) {
+        const ALPHABETS: [&[u8]; 6] = [b"a", b"ab", b"a*", b"a\n", b"abc", b"ab*\n"];
+        let a = ALPHABETS[rng.below(ALPHABETS.len())];
+        let hi = if min < 8 { 6 } else { 20 };
+        let values = match rng.below(7) {
+            0 => (0..rng.range(1, 4)).map(|_| rng.word(a, 1, hi)).collect(),
+            1 => {
+                let v = rng.word(a, min + 1, hi + 4);
+                (0..rng.range(1, 4))
+                    .map(|_| v[..rng.range(1, v.len())].to_vec())
+                    .collect()
+            }
+            2 => {
+                let v = rng.word(a, min + 1, hi + 4);
+                (0..rng.range(1, 4))
+                    .map(|_| v[rng.below(v.len())..].to_vec())
+                    .collect()
+            }
+            3 => {
+                let u = rng.word(a, 1, 3);
+                vec![
+                    u.repeat(rng.range(1, 8)),
+                    u.repeat(rng.range(1, 8)),
+                    rng.word(a, 1, hi),
+                ]
+            }
+            4 => {
+                let v = rng.word(a, min + 2, hi + 6);
+                let mut out = vec![v.clone()];
+                for _ in 0..rng.range(1, 3) {
+                    let i = rng.below(v.len());
+                    let j = rng.range(i + 1, v.len());
+                    out.push(v[i..j].to_vec());
+                }
+                out
+            }
+            5 => vec![
+                rng.word(a, min, min),
+                rng.word(
+                    a,
+                    min.saturating_sub(1).max(1),
+                    min.saturating_sub(1).max(1),
+                ),
+                rng.word(a, min + 1, min + 1),
+                rng.word(a, 1, 1),
+            ],
+            _ => {
+                let v = rng.word(a, min + 1, hi);
+                let j = rng.range(1, v.len() - 1);
+                let rot = [&v[j..], &v[..j]].concat();
+                let tail = [&v[j..], &rng.word(a, 1, hi)[..]].concat();
+                vec![v, rot, tail]
+            }
+        };
+        (values, a)
+    }
+
+    /// A source of random bytes, or values glued with their overlap
+    /// shared, that may start inside a value (a tail or an infix) and end
+    /// inside one, with filler `x` between.
+    fn gen_source(rng: &mut Rng, values: &[Vec<u8>], alphabet: &[u8]) -> Vec<u8> {
+        if rng.below(4) == 0 {
+            let mut a = alphabet.to_vec();
+            a.push(b'x');
+            return rng.word(&a, 0, 40);
+        }
+        let mut src = Vec::new();
+        if rng.below(10) < 6 {
+            let v = &values[rng.below(values.len())];
+            let i = rng.below(v.len());
+            src = if rng.below(10) < 6 {
+                v[i..].to_vec()
+            } else {
+                v[i..rng.range(i + 1, v.len())].to_vec()
+            };
+        }
+        for _ in 0..rng.range(0, 4) {
+            if rng.below(10) < 3 {
+                src.push(b'x');
+            }
+            let mut v = values[rng.below(values.len())].clone();
+            if rng.below(10) < 3 {
+                v = v[rng.below(v.len())..].to_vec();
+            }
+            if rng.below(10) < 3 {
+                v.truncate(rng.range(1, v.len()));
+            }
+            src = if rng.below(10) < 7 {
+                glue(&src, &v)
+            } else {
+                [src, v].concat()
+            };
+        }
+        src
+    }
+
+    /// Cuts of `src` at random points, with empty chunks.
+    fn gen_chunks<'a>(rng: &mut Rng, src: &'a [u8]) -> Vec<&'a [u8]> {
+        let mut cuts: Vec<usize> = (0..rng.below(11))
+            .map(|_| rng.below(src.len() + 1))
+            .collect();
+        cuts.sort_unstable();
+        chunked(src, &cuts)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 512,
+            ..ProptestConfig::default()
+        })]
+
+        /// ADR-0082 §3: for value sets built to overlap and sources glued
+        /// from them, with the minimum at 8 and lowered to 1, 2 or 3, the
+        /// redactor stores the brute-force reference however the source is
+        /// cut; after every push its output is a prefix of the reference of
+        /// every continuation, the same for every cut, and it holds at most
+        /// the longest value less one byte. Kills: deciding one match and
+        /// skipping past it (2599a7b, 32c3c10); a span closed while a value
+        /// starting before `h` could extend it; touching spans merged; the
+        /// whole-part interval missing.
+        #[test]
+        fn the_redactor_stores_the_union_of_matches(seed in any::<u64>(), m in 0usize..4) {
+            let min = [1, 2, 3, 8][m];
+            let mut rng = Rng(seed | 1);
+            let (values, alphabet) = gen_values(&mut rng, min);
+            let src = gen_source(&mut rng, &values, alphabet);
+            let chunks = gen_chunks(&mut rng, &src);
+            let set = set_of(&values);
+            if let Err(e) = check_source(&values, &set, &src, &chunks, min) {
+                prop_assert!(false, "values {:?} source {:?} chunks {:?}: {}", values, src, chunks, e);
+            }
+            // A whole text: occurrences only.
+            let text = String::from_utf8(src.clone()).expect("ASCII alphabets");
+            prop_assert_eq!(
+                redact_text(&set, &text).into_bytes(),
+                render(&src, intervals(&values, &src, false, false, min))
+            );
+        }
+    }
+
+    /// Every set of one or two values of 1 to 4 bytes over `ab` against
+    /// every source of up to 8 bytes over `ab`, with the minimum lowered to
+    /// 2: one byte per push, the whole source in one push and a cut in the
+    /// middle, every check of [`check_source`]. 465 sets by 511 sources;
+    /// the references are computed once per set. Kills what the property
+    /// test can miss by sampling.
+    #[test]
+    fn every_small_value_set_and_source_stores_the_reference() {
+        const MIN: usize = 2;
+        let words: Vec<Vec<u8>> = (1..=4usize)
+            .flat_map(|n| {
+                (0..1usize << n).map(move |bits| {
+                    (0..n)
+                        .map(|i| {
+                            if bits >> (n - 1 - i) & 1 == 1 {
+                                b'b'
+                            } else {
+                                b'a'
+                            }
+                        })
+                        .collect()
+                })
+            })
+            .collect();
+        let sources: Vec<Vec<u8>> = (0..=8usize)
+            .flat_map(|n| {
+                (0..1usize << n).map(move |bits| {
+                    (0..n)
+                        .map(|i| {
+                            if bits >> (n - 1 - i) & 1 == 1 {
+                                b'b'
+                            } else {
+                                b'a'
+                            }
+                        })
+                        .collect()
+                })
+            })
+            .collect();
+        // The index of a source in `sources`: by length, then by bits.
+        let index = |s: &[u8]| -> usize {
+            let bits = s
+                .iter()
+                .fold(0usize, |acc, &b| acc << 1 | usize::from(b == b'b'));
+            (1 << s.len()) - 1 + bits
+        };
+        let mut sets: Vec<Vec<Vec<u8>>> = words.iter().map(|w| vec![w.clone()]).collect();
+        for i in 0..words.len() {
+            for j in i + 1..words.len() {
+                sets.push(vec![words[i].clone(), words[j].clone()]);
+            }
+        }
+        assert_eq!(sets.len(), 465);
+        let mut runs = 0usize;
+        for values in &sets {
+            let set = set_of(values);
+            let longest = values.iter().map(Vec::len).max().unwrap();
+            let refs: Vec<Vec<u8>> = sources.iter().map(|s| reference(values, s, MIN)).collect();
+            for src in &sources {
+                let want = &refs[index(src)];
+                let one: Vec<&[u8]> = src.chunks(1).collect();
+                let base = record(&set, &one, MIN);
+                assert_eq!(&base.out, want, "{values:?} on {src:?}");
+                for (k, emitted, held) in &base.pushes {
+                    assert!(want.starts_with(emitted), "{values:?} on {src:?} at {k}");
+                    assert!(
+                        refs[index(&src[..*k])].starts_with(emitted),
+                        "{values:?} on {src:?}: confirmed end at {k}"
+                    );
+                    assert!(*held < longest, "{values:?} on {src:?}: {held} held at {k}");
+                }
+                assert_eq!(
+                    &record(&set, &[src], MIN).out,
+                    want,
+                    "{values:?} on {src:?}"
+                );
+                let (a, b) = src.split_at(src.len() / 2);
+                let cut = record(&set, &[a, b], MIN);
+                assert_eq!(&cut.out, want, "{values:?} on {a:?}|{b:?}");
+                if !a.is_empty() {
+                    assert_eq!(
+                        cut.pushes[0].1,
+                        base.pushes[a.len() - 1].1,
+                        "{values:?} on {a:?}|{b:?}"
+                    );
+                }
+                runs += 3;
+            }
+        }
+        assert_eq!(runs, 465 * 511 * 3);
+    }
+
+    /// The breaks the 0.7.0 code and §1 stored a value's bytes for (ADR-0082
+    /// §3 table, 2599a7b, 32c3c10) store one `***`, in one chunk, one byte
+    /// per chunk and at every two-chunk cut.
+    #[test]
+    fn the_breaks_of_one_match_at_a_time_store_one_run_of_stars() {
+        type Case<'a> = (&'a [&'a [u8]], &'a [u8], &'a [u8]);
+        let cases: [Case; 4] = [
+            (
+                &[b"abcdefghijkl", b"efghijklMNOPQRST"],
+                b"efghijklMNOP",
+                b"***",
+            ),
+            (
+                &[b"abcdefghijkl", b"ijklXYZW1234"],
+                b"efghijklXYZW1234 rest\n",
+                b"*** rest\n",
+            ),
+            (
+                &[b"user:hunter2pw", b"hunter2pw-and-more-secret"],
+                b"dsn=user:hunter2pw-and-more-secret\n",
+                b"dsn=***\n",
+            ),
+            (
+                &[b"abcdefghijkl", b"efghijklMNOPQRST"],
+                b"cdefghijklMNOPQRST",
+                b"***",
+            ),
+        ];
+        for (values, src, want) in cases {
+            let owned: Vec<Vec<u8>> = values.iter().map(|v| v.to_vec()).collect();
+            assert_eq!(reference(&owned, src, MIN_SUFFIX), want, "reference");
+            assert_eq!(run(values, &[src]), want, "{src:?}");
+            let bytes: Vec<&[u8]> = src.chunks(1).collect();
+            assert_eq!(run(values, &bytes), want, "{src:?} one byte per chunk");
+            for cut in 1..src.len() {
+                let (a, b) = src.split_at(cut);
+                assert_eq!(run(values, &[a, b]), want, "{src:?} cut at {cut}");
+            }
+        }
+        // The overlap leak in the middle of a log, before 0.7.0 too.
+        assert_eq!(
+            redact_text(
+                &set(&[b"user:hunter2pw", b"hunter2pw-and-more-secret"]),
+                "dsn=user:hunter2pw-and-more-secret"
+            ),
+            "dsn=***"
+        );
+    }
+
+    /// The whole-part interval: a part that lies wholly inside a value (a
+    /// rotation between two lines of a multi-line value, and the process
+    /// ended) is `***` from 8 bytes; 7 bytes are stored (R-1). Kills: no
+    /// whole-part interval; it applied below the minimum.
+    #[test]
+    fn a_part_wholly_inside_a_value_is_starred_from_8_bytes() {
+        let value: &[u8] = b"0123456789abcdefghij";
+        assert_eq!(run(&[value], &[b"456789abcdef"]), b"***");
+        assert_eq!(run(&[value], &[b"4567", b"89ab", b"cdef"]), b"***");
+        assert_eq!(run(&[value], &[b"3456789"]), b"3456789");
+        let pem: &[u8] =
+            b"-----BEGIN KEY-----\nMIIEvQIBADANBgkq\nhkiG9w0BAQEFAASC\nBKcwggSjAgEAAoIB\n-----END KEY-----\n";
+        assert_eq!(
+            run(&[pem], &[b"MIIEvQIBADANBgkq\n", b"hkiG9w0BAQEFAASC\n"]),
+            b"***"
+        );
+        // Residual, as in 0.7.0: value bytes that neither end the value nor
+        // end the part (more output follows them) are no interval.
+        assert_eq!(
+            run(&[value], &[b"456789abcdef rest\n"]),
+            b"456789abcdef rest\n"
+        );
+    }
+
+    /// Spans that only touch stay two `***` (0.7.0 stored them so, and
+    /// merging would change the digests of ordinary logs), also when the
+    /// first is open, a leading interval, or the second a trailing one.
+    #[test]
+    fn touching_spans_stay_separate() {
+        assert_eq!(run(&[b"abc", b"def"], &[b"abcdef\n"]), b"******\n");
+        assert_eq!(run(&[b"tok"], &[b"toktok\n"]), b"******\n");
+        assert_eq!(run(&[b"ab", b"abX", b"cd"], &[b"ab", b"cd"]), b"******");
+        assert_eq!(
+            run(&[b"XXXXabcdefgh", b"tok"], &[b"abcdefghtok!"]),
+            b"******!"
+        );
+        assert_eq!(run(&[b"tok", b"abZ"], &[b"tokab"]), b"******");
+        // A leading interval that absorbs two spans and is extended by a
+        // third is one run.
+        assert_eq!(
+            run(
+                &[b"XXabcdefghij", b"bc", b"ef", b"ijKL"],
+                &[b"abcdefghijKL."]
+            ),
+            b"***."
+        );
+    }
+
+    /// Intervals that share a byte are one `***`: overlapping occurrences
+    /// of one value, a chain of values, and a value that repeats a word
+    /// (`abab` printed twice is one run; 0.7.0 stored `******`).
+    #[test]
+    fn overlapping_values_store_one_run() {
+        assert_eq!(run(&[b"aa"], &[b"aaa\n"]), b"***\n");
+        assert_eq!(run(&[b"abc", b"bcde", b"de"], &[b"abcde\n"]), b"***\n");
+        assert_eq!(run(&[b"abab"], &[b"x abababab\n"]), b"x ***\n");
+        assert_eq!(run(&[b"aaaa"], &[b"x aaaaaaaaa\n"]), b"x ***\n");
+        assert_eq!(
+            run(&[b"abc", b"abcdef", b"cde"], &[b"x abcde", b"y"]),
+            b"x ***y"
+        );
+    }
+
+    /// A set over [`MAX_VALUE_BYTES`] redacts nothing and builds nothing:
+    /// no stream redactor, and a text is replaced with
+    /// [`CAUSE_NOT_STORED`]. A set at the cap is allowed. Kills: a cap
+    /// that redacts the first bytes of a value and stores the rest.
+    #[test]
+    fn a_set_over_the_cap_redacts_nothing_and_builds_nothing() {
+        let big = vec![b'q'; MAX_VALUE_BYTES - 3];
+        let over = set(&[&big, b"tok1"]);
+        assert_eq!(over.value_bytes(), MAX_VALUE_BYTES + 1);
+        assert_eq!(
+            StreamRedactor::new(over.clone()).err(),
+            Some(ValuesTooLarge {
+                bytes: MAX_VALUE_BYTES + 1
+            })
+        );
+        assert_eq!(redact_text(&over, "a tok1 b"), CAUSE_NOT_STORED);
+        assert_eq!(over.built(), (false, false));
+        let at = set(&[&big, b"tok"]);
+        assert_eq!(at.value_bytes(), MAX_VALUE_BYTES);
+        assert!(at.check_size().is_ok());
+    }
+
+    /// The automata are built only where a redactor needs them: a launch
+    /// builds none, a failure cause builds the trie only, a stream
+    /// redactor both; a reload of the same generation keeps them. Kills:
+    /// building in `from_generations`; the suffix automaton built for
+    /// `redact_text`; a rebuild on every TTL reload.
+    #[tokio::test]
+    async fn automata_are_built_lazily_and_kept_across_reloads() {
+        use scarab_engine::{AttemptId, RunId, RunStatus};
+        let db = Arc::new(scarab_testkit::InMemoryDb::new());
+        let run_id = RunId("r1".into());
+        db.seed_run(&run_id, RunStatus::Running);
+        let store = Arc::new(scarab_testkit::InMemoryObjectStore::default());
+        let logs = LogService::new(store, db.clone() as Arc<dyn Db>);
+        let unit = LogStreamId::new(&run_id, &StepId("build".into()), &AttemptId("a1".into()));
+        let launched = logs
+            .record_launch_values(
+                &unit,
+                Some("pod-build"),
+                vec![MountedValue {
+                    kind: MountedValueKind::Secret,
+                    value: b"s3cr3t-value".to_vec(),
+                    repo: None,
+                    minted: None,
+                }],
+                Timestamp(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(launched.built(), (false, false), "a launch builds nothing");
+        assert_eq!(
+            logs.redact_text_for_handle("pod-build", "pull failed: s3cr3t-value")
+                .await,
+            "pull failed: ***"
+        );
+        let cached = logs.load_values(&unit).await.unwrap();
+        assert_eq!(
+            cached.built(),
+            (true, false),
+            "a cause builds the trie only"
+        );
+        let mut r = logs.stream_redactor(cached.clone()).await.unwrap();
+        assert_eq!(cached.built(), (true, true));
+        assert_eq!(r.push(b"x s3cr3t-value y"), b"x *** y");
+        let reloaded = logs.reload_values(&unit).await.unwrap();
+        assert!(!Arc::ptr_eq(&reloaded, &cached));
+        assert!(
+            reloaded.shares_automata_with(&cached),
+            "same generation, same automata"
+        );
     }
 
     /// A value starting with `***` is redacted like any other value.

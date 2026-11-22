@@ -11,7 +11,8 @@
 //! 1. claims the stream's tail lease; every row it appends is fenced on that
 //!    term ([`scarab_engine::Db::append_log_row`]);
 //! 2. loads the unit's value ledger, all of it or nothing. A unit with no
-//!    ledger, a purged one, or a source that answers
+//!    ledger, a purged one, one whose values are over
+//!    [`crate::logs::MAX_VALUE_BYTES`], or a source that answers
 //!    [`ExecError::NotLedgerComplete`] gets one `not_stored` marker and the
 //!    stream is closed: no source byte is read;
 //! 3. reads the source from its first byte, redacts it as one stream, and
@@ -779,6 +780,14 @@ async fn read_stream(
             }
             Err(LedgerError::Local(e)) => return report(ctx, fence, Failure::Local(e)),
         };
+        // Values over the cap are never used in part: the rest of the log
+        // is not stored, and no source byte is read. Otherwise the
+        // automata are built here, off the async workers when large.
+        if let Some(v) = &values {
+            if v.prepare_stream().await.is_err() {
+                return close_not_stored(ctx, fence, writer, NotStoredReason::ValuesTooLarge).await;
+            }
+        }
         let before = ctx
             .executor
             .log_source_state(&source.source_ref())
@@ -920,7 +929,8 @@ async fn refused(ctx: &Ctx, fence: &LogStreamId, writer: &LogWriter, e: LogAppen
     }
 }
 
-/// The unit is not ledger-complete: one `not_stored` marker, `closed`, no
+/// The rest of the log is not stored (the unit is not ledger-complete, or
+/// its values are over the cap): one `not_stored` marker, `closed`, no
 /// source byte read.
 async fn close_not_stored(
     ctx: &Ctx,
@@ -931,7 +941,7 @@ async fn close_not_stored(
     tracing::warn!(
         run = %fence.run.0, step = %fence.step.0, attempt = %fence.attempt.0,
         reason = reason.as_str(),
-        "log tail: the unit is not ledger-complete; the rest of its log is not stored"
+        "log tail: the rest of the unit's log is not stored"
     );
     match ctx
         .logs
@@ -1104,7 +1114,11 @@ impl Read<'_> {
         part: Vec<LogChunkMeta>,
     ) -> PumpEnd {
         let gen = values.gen();
-        let mut redactor = Some(crate::logs::StreamRedactor::new(values));
+        let mut redactor = match crate::logs::StreamRedactor::new(values) {
+            Ok(r) => Some(r),
+            // `read_stream` closed a set over the cap before the read.
+            Err(e) => return PumpEnd::Broken(Failure::Local(e.to_string())),
+        };
         let mut verify = Verifier::new(part);
         let mut batch = Batch::default();
         let mut last_byte = tokio::time::Instant::now();
@@ -1260,8 +1274,13 @@ impl Read<'_> {
         }
     }
 
-    /// The source ended inside the last stored row: whether what it read of
-    /// that row matches the row's body (one GET).
+    /// The source ended inside the last stored row: whether the bytes this
+    /// read emitted for that row, at its confirmed end, are a prefix of the
+    /// row's body (one GET). The stored row came from a longer source, so
+    /// they can differ where this read's end starred a value's start that
+    /// the longer source showed was no value (stored `tokio`, this read
+    /// `***`): then it is a `Mismatch`, a marker and a second copy, never a
+    /// stored value byte.
     async fn ends_inside_matches(&self, verify: &Verifier) -> bool {
         let Some((meta, partial)) = verify.inside() else {
             return true;
@@ -1418,7 +1437,10 @@ pub async fn pump_log_stream(
             .held_by(&resource, owner)
             .ok_or(LogError::Db(scarab_engine::DbError::NotLeader))?,
     );
-    let mut redactor = crate::logs::StreamRedactor::new(values.clone());
+    let mut redactor = logs
+        .stream_redactor(values.clone())
+        .await
+        .map_err(LogError::from)?;
     let mut appended = 0u64;
     let mut out = Vec::new();
     while let Some(chunk) = chunks.next_chunk().await? {
