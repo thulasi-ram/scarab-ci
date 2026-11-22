@@ -117,25 +117,50 @@ on:
 
 Where the list comes from:
 
-- **push**: the `added`, `modified` and `removed` files of every commit in the webhook payload. A
-  renamed file is listed under both names.
-- **pull_request**: the forge's pull request files API, asked once per delivery and only when a
-  Pipeline whose `pull_request` trigger matches reads `event.changed_paths`. A repository that
-  does not use it makes no extra API calls. The list is the pull request's files when Scarab
-  handles the webhook, which can differ from the event's head commit if the pull request moved
-  since.
+- **push**: the forge's compare API, from the branch's head before the push to its head after
+  it, asked once per delivery and only when a Pipeline whose `push` trigger matches reads
+  `event.changed_paths`. The list is every file that differs between the two commits, including
+  a file changed only in a merge's conflict resolution. A renamed file is listed under both
+  names.
+- **pull_request**: the forge's pull request files API, asked the same way. The list is the pull
+  request's files when Scarab handles the webhook, which can differ from the event's head commit
+  if the pull request moved since.
 - Every other trigger (`tag`, `release`, `comment`, `cron`, `manual`, `api`, `upstream`) has no
   list.
 
-Sometimes the list is **unknown**: the trigger has none, the push created the branch or deleted
-it, the push was forced (detected on GitHub only), the payload lists only some of the pushed
-commits (GitHub lists at most 2048, Forgejo only the first few and the total), 3,000 or more files
-changed, or the forge's files API returned an error or did not answer within 5 seconds. Unknown is not the same as an empty list. While the list is unknown, a
-`when:` that needs it counts as true, so the Run starts, and the Run's activity log says why:
+A repository whose Pipelines do not read `event.changed_paths` makes no extra API calls. Each
+request may take at most 5 seconds; past that the list is unknown.
+
+Sometimes the list is **unknown**. Unknown is not the same as an empty list. While the list is
+unknown, a `when:` that needs it counts as true, so the Run starts, and the Run's activity log
+says why:
 
 ```text
-changed paths unknown: new branch; the path filter in `when:` was not applied (on.push)
+changed paths unknown: forced push; the path filter in `when:` was not applied (on.push)
 ```
+
+The reasons:
+
+| Reason in the activity log | When |
+|---|---|
+| this trigger does not say which files changed | a trigger with no list |
+| new branch | the push created the branch, so there is no earlier commit to compare with |
+| the push deleted the branch | the push deleted the branch |
+| forced push | the earlier head is not an ancestor of the new one, on GitHub and on Forgejo |
+| the branch's earlier head is not on the new head's first-parent line | Forgejo only: a merge whose first parent is not the branch, such as a `git pull` merge pushed back. Forgejo lists each commit's files against its first parent only, so the list could miss a change |
+| 300 or more files changed | a GitHub push: its compare API lists at most 300 files |
+| 3000 or more files changed | a pull request, or a Forgejo push |
+| more than 1000 commits were pushed, so the changed files were not asked for | a Forgejo push of more than 1,000 commits |
+| the forge's changed files answer was over 16 MiB | the answer was too large to read |
+| the forge's answer did not list every pushed commit or file | the forge sent an answer that is not whole |
+| the forge answered 404 | the forge no longer has the earlier head (removed after a forced push), or Scarab can no longer read the repository |
+| the push payload's commit ids are not commit ids | the webhook's `before` or `after` is not a full commit id |
+| the forge did not answer the changed files request | an API error, or a rate limit that outlasted the retries |
+| the forge did not list the changed files within 5 seconds | the forge was slow |
+
+The push list needs Forgejo 16.0.1 or later, the version Scarab is tested against. An older
+Forgejo, or a Gitea whose compare answer has no per-commit files, gives an unknown list on every
+push, so its path-filtered Pipelines always run.
 
 To a `when:`, the field is always there and only its value is unknown, so
 `has(event.changed_paths)` is true either way and cannot test for an unknown list.
@@ -145,9 +170,11 @@ event.changed_paths.exists(…)` is false on another branch whether or not the l
 `when:` that does not read `event.changed_paths` is unaffected. The same rule applies to a step's
 `when:`: a step that needs an unknown list runs.
 
-Forced-push detection is GitHub only: Forgejo's push payload does not say whether a push was
-forced. For a forced push to Forgejo, the list holds the files of the commits the push added, not
-the files of commits it dropped.
+A `changed_paths` filter is not a deploy guard: it decides when a Pipeline may skip work. An
+unknown list runs the Pipeline, and a list is unknown during a forge outage, when the forge is
+slow or rate-limits Scarab, and on every GitHub push of 300 or more files. A Pipeline that runs
+`terraform apply` when `infra/` changed also runs on each of those. Guard a deploy with an
+[Environment](#environments--gates)'s protection and approvals.
 
 The list is not stored with the Run, and a template cannot read it: `${{ event.changed_paths }}`
 is a compile error, because anyone who can push chooses the paths.
