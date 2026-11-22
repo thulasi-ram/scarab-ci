@@ -891,13 +891,13 @@ which it does not know, and stops. To go back:
    `kubectl -n scarab scale deploy/scarab --replicas=0`.
 3. Back up the database.
 4. Run the revert below once. It is `crates/scarab-db-postgres/rollback/0099_revert.sql` in the
-   repository, and it reverts migration 0100 too:
+   repository, and it reverts migrations 0100 and 0101 too:
    `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0099_revert.sql`.
 5. Install the 0.6 chart and image:
    `helm upgrade scarab oci://ghcr.io/thulasi-ram/charts/scarab --version 0.6.1 -n scarab -f values.yaml`.
 
 The revert deletes the notes of logs stored by 0.7 and every value ledger. Output rows stay, and
-0.6 reads them as before. Upgrading to 0.7 again runs 0099 and 0100 again.
+0.6 reads them as before. Upgrading again runs 0099, 0100 and 0101 again.
 
 ```sql
 BEGIN;
@@ -928,10 +928,22 @@ ALTER TABLE log_chunks
 
 DROP INDEX IF EXISTS attempts_started_at_idx;
 
-DELETE FROM _sqlx_migrations WHERE version IN (99, 100);
+DELETE FROM _sqlx_migrations WHERE version IN (99, 100, 101);
 
 COMMIT;
 ```
+
+### Migration 0101
+
+The first release after 0.7.0 runs migration 0101 when the server starts. It validates three of
+the checks 0099 added to `log_chunks` (`log_chunks_kind`, `log_chunks_reason` and
+`log_chunks_body`). Validating takes a lock that blocks no read or write, and scans `log_chunks`
+once per check, so on a large table the server takes longer to start. `log_chunks_fenced` stays
+`NOT VALID`.
+
+A 0.7.0 server does not start on a database that ran 0101. To go back to it, scale the server to
+zero, run `DELETE FROM _sqlx_migrations WHERE version = 101;` and install 0.7.0. The checks stay
+validated, and 0.7.0 writes no row that breaks them.
 
 ## The chart on a local kind cluster
 

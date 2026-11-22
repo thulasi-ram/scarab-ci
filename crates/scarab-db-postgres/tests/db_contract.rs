@@ -2304,14 +2304,23 @@ async fn a_legacy_shared_service_is_pending_once_torn_down_and_forgotten_after()
 /// REV-M3: migration 0099 adds no CHECK on `log_chunks` that Postgres
 /// validates by scanning the table under the ALTER's lock. Kills: a column
 /// CHECK (validated when added) or a check added without `NOT VALID`.
+/// Migrations up to 0099 only: 0101 validates three of them later, under a
+/// lock that blocks no write (tests/migration_0101.rs).
 #[tokio::test]
 async fn migration_0099_adds_no_validated_check_to_log_chunks() {
     let Some(tdb) = fresh_db().await else {
         eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
         return;
     };
-    let db = PostgresDb::with_pool(tdb.pool.clone());
-    db.migrate().await.unwrap();
+    for m in scarab_db_postgres::MIGRATOR
+        .iter()
+        .filter(|m| m.version <= 99)
+    {
+        sqlx::raw_sql(&m.sql)
+            .execute(&tdb.pool)
+            .await
+            .unwrap_or_else(|e| panic!("apply migration {}: {e}", m.version));
+    }
     let checks: Vec<(String, bool)> = sqlx::query_as(
         "SELECT conname::text, convalidated FROM pg_constraint
          WHERE conrelid = 'log_chunks'::regclass AND contype = 'c' ORDER BY conname",
