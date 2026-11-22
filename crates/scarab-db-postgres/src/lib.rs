@@ -59,10 +59,16 @@ pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 /// an invalid index of that name behind; the migration's `IF NOT EXISTS`
 /// passes over it when it runs again, and the planner never uses it, so
 /// [`PostgresDb::migrate`] drops and builds each invalid one again.
-const CONCURRENT_INDEXES: &[(&str, &str)] = &[(
-    "attempts_started_at_idx",
-    "CREATE INDEX CONCURRENTLY attempts_started_at_idx ON attempts (started_at)",
-)];
+const CONCURRENT_INDEXES: &[(&str, &str)] = &[
+    (
+        "attempts_started_at_idx",
+        "CREATE INDEX CONCURRENTLY attempts_started_at_idx ON attempts (started_at)",
+    ),
+    (
+        "webhook_deliveries_at_idx",
+        "CREATE INDEX CONCURRENTLY webhook_deliveries_at_idx ON webhook_deliveries (at)",
+    ),
+];
 
 /// The session advisory lock (`hashtextextended(key, 0)`) [`PostgresDb::migrate`]
 /// holds: two replicas starting at once neither run the migrations nor

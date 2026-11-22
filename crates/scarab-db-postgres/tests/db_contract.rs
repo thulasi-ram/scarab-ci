@@ -2431,6 +2431,11 @@ async fn the_0099_revert_leaves_a_schema_the_migrator_can_upgrade_again() {
     .await
     .unwrap();
 
+    // Back to 0.7.1 first (ADR-0083's migrations), then to 0.6.
+    sqlx::raw_sql(include_str!("../rollback/0104_revert.sql"))
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
     sqlx::raw_sql(include_str!("../rollback/0099_revert.sql"))
         .execute(&tdb.pool)
         .await
