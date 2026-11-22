@@ -105,10 +105,12 @@ release.yml uses that version's section as the GitHub Release text. See
 - **Overlapping values are redacted in full only once every replica runs this version.** During a
   rolling upgrade, a 0.7.0 replica that takes over a log's tail can store its own copy with the
   0.7.0 redactor after a `source_restarted` note.
-- **Every GitHub and Forgejo answer is read up to 16 MiB.** Only the compare answer had a cap; a
-  forge that sent a longer answer to any other call, an error answer included, had it read whole
-  into the server's memory. A longer answer now fails the call with `the forge's answer was over
-  16777216 bytes and was not read`, and none of it is parsed (git-bug bfa8dfd).
+- **Every GitHub and Forgejo answer, and every answer from the login provider, is read up to
+  16 MiB.** Only the compare answer had a cap; a forge that sent a longer answer to any other call,
+  an error answer included, had it read whole into the server's memory, and so did the OAuth or
+  OIDC provider's token, userinfo, discovery and key set answers at login. A longer forge answer
+  now fails the call with `the forge's answer was over 16777216 bytes and was not read`, a longer
+  provider answer fails the login, and none of either is parsed (git-bug bfa8dfd).
 
 ### Features
 
