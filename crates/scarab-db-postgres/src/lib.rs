@@ -54,6 +54,21 @@ pub use step_up::{step_up_request_lock_key, BindingRow};
 /// `MIGRATOR.iter()` to apply schema versions one at a time.
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
+/// The indexes a `-- no-transaction` migration builds `CONCURRENTLY`, with
+/// the statement that builds each. A build that fails or is killed leaves
+/// an invalid index of that name behind; the migration's `IF NOT EXISTS`
+/// passes over it when it runs again, and the planner never uses it, so
+/// [`PostgresDb::migrate`] drops and builds each invalid one again.
+const CONCURRENT_INDEXES: &[(&str, &str)] = &[(
+    "attempts_started_at_idx",
+    "CREATE INDEX CONCURRENTLY attempts_started_at_idx ON attempts (started_at)",
+)];
+
+/// The session advisory lock (`hashtextextended(key, 0)`) [`PostgresDb::migrate`]
+/// holds: two replicas starting at once neither run the migrations nor
+/// rebuild an index together, and none drops an index another is building.
+const MIGRATE_LOCK: &str = "scarab:migrate";
+
 /// A Postgres-backed [`Db`]. Always connected: Postgres is mandatory for
 /// every serving role (ADR-0048) — the unconnected/API-only construction was
 /// deleted, not guarded.
@@ -249,12 +264,34 @@ impl PostgresDb {
         Ok(Self::with_pool(pool))
     }
 
-    /// Apply all pending migrations (the production expand-contract path).
+    /// Apply all pending migrations (the production expand-contract path),
+    /// then build again any index of [`CONCURRENT_INDEXES`] an earlier
+    /// build left invalid. On one connection, under [`MIGRATE_LOCK`].
     pub async fn migrate(&self) -> Result<(), DbError> {
-        MIGRATOR
-            .run(self.pool())
+        let mut conn = self.pool().acquire().await.map_err(db_err)?;
+        sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+            .bind(MIGRATE_LOCK)
+            .execute(&mut *conn)
             .await
-            .map_err(|e| DbError::Other(e.to_string()))
+            .map_err(db_err)?;
+        let result = async {
+            MIGRATOR
+                .run(&mut *conn)
+                .await
+                .map_err(|e| DbError::Other(e.to_string()))?;
+            rebuild_invalid_indexes(&mut conn).await
+        }
+        .await;
+        let unlocked = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+            .bind(MIGRATE_LOCK)
+            .execute(&mut *conn)
+            .await;
+        if result.is_err() || unlocked.is_err() {
+            // It may still hold a lock (the migrator's own is not let go
+            // when a migration fails): closed, not handed back to the pool.
+            conn.close_on_drop();
+        }
+        result
     }
 
     fn pool(&self) -> &PgPool {
@@ -5091,6 +5128,37 @@ async fn close_attempt_on(
     .map_err(db_err)?
     .rows_affected();
     Ok(closed == 1)
+}
+
+/// Drop and build again each index of [`CONCURRENT_INDEXES`] that is
+/// invalid (a `CONCURRENTLY` build failed or was killed). Each statement
+/// alone, outside a transaction, as `CONCURRENTLY` requires.
+async fn rebuild_invalid_indexes(conn: &mut sqlx::PgConnection) -> Result<(), DbError> {
+    for (name, create) in CONCURRENT_INDEXES {
+        let invalid: Option<bool> = sqlx::query_scalar(
+            "SELECT NOT i.indisvalid FROM pg_index i WHERE i.indexrelid = to_regclass($1)",
+        )
+        .bind(name)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        if invalid != Some(true) {
+            continue;
+        }
+        tracing::warn!(
+            index = name,
+            "an earlier build of this index failed and left it invalid: building it again"
+        );
+        sqlx::raw_sql(&format!("DROP INDEX CONCURRENTLY IF EXISTS {name}"))
+            .execute(&mut *conn)
+            .await
+            .map_err(db_err)?;
+        sqlx::raw_sql(create)
+            .execute(&mut *conn)
+            .await
+            .map_err(db_err)?;
+    }
+    Ok(())
 }
 
 fn db_err(e: sqlx::Error) -> DbError {
