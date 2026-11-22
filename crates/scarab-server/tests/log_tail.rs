@@ -2377,3 +2377,76 @@ async fn ledger_rows_under_an_old_key_keep_the_rotation_metric_above_zero() {
     w.db.purge_log_unit(&u1).await.unwrap();
     assert_eq!(count().await.unwrap(), 0);
 }
+
+/// RT-M3: a stream one replica completed is read by a peer with its own
+/// lease (the first one's lease ended), whose source is gone: the peer
+/// stores nothing, no `incomplete` either, and the stream stays complete.
+/// Kills: a read that closes a stream without checking that it is
+/// terminal; a store that takes a marker on a terminal stream.
+#[tokio::test]
+async fn a_complete_stream_gets_no_marker_from_a_peer() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    let live = LiveLog::new(b"done\n", false);
+    let a = w.tailer(live.clone(), &logs, "a");
+    a.ensure(&running());
+    until("complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    let rows = w.rows(&stream()).await;
+    let resource = scarab_engine::LogLease::Tail.resource(&stream());
+    // A's read is over; let its lease go so the peer can claim it.
+    until("a gave up its lease", || async {
+        a.tracked_streams() > 0 && w.db.release_lease(&resource, "a").await.is_ok()
+    })
+    .await;
+    w.end_attempt().await;
+    live.set_state(Some(LogSourceState::Gone));
+    let peer_logs = w.logs();
+    let b = w.tailer(Arc::new(GoneSource(live.clone())), &peer_logs, "b");
+    // The peer reads the stream (its read claims the lease, then holds it
+    // for its done margin); the probe runs once the peer's read is over.
+    until("the peer read the stream", || async {
+        b.ensure(&running());
+        b.end_pass(true);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let probe = w.db.lease(&resource, "probe", 1).await.unwrap();
+        probe.owner == "b"
+    })
+    .await;
+    for _ in 0..20 {
+        b.end_pass(true);
+        b.pending_pass().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(w.rows(&stream()).await, rows, "the peer appended a row");
+    assert_eq!(w.state(&stream()).await, Some(LogStreamState::Complete));
+}
+
+/// RT-M3: a final read of an ended unit (no live read ran here) whose
+/// first open never returns a byte or an end is aborted by the idle rule
+/// once the state says `Ended`, and re-opened; the second read completes
+/// the stream. Virtual time. Kills: a final read with no idle rule.
+#[tokio::test(start_paused = true)]
+async fn a_hung_final_read_is_reopened() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    w.end_attempt().await;
+    let live = LiveLog::new(b"all\n", false);
+    live.script(ReadScript {
+        hang: true,
+        ..Default::default()
+    });
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    // Settle the unit and run the pending-final-read query.
+    tailer.sweep().await;
+    until("complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    assert_eq!(live.opens(), 2, "the hung read was re-opened once");
+    assert_eq!(w.stored(&logs, &stream()).await, b"all\n");
+}
