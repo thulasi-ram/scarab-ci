@@ -18,6 +18,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-22
+
 ### Breaking changes
 
 - **A GitHub push of 300 or more changed files has an unknown `event.changed_paths`, so its
@@ -2314,7 +2316,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.5.0...v0.6.0
