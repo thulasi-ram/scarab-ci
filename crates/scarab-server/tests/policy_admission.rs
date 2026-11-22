@@ -814,6 +814,7 @@ async fn postgres_a_duplicate_run_id_leaves_no_second_decision() {
         ir_version: 2,
         event_schema_version: 1,
         created_at: 1,
+        delivery: None,
     };
     let err = pg
         .record_run_create_decision(&rt_record(&run.0, "dec-2"), &row)

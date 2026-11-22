@@ -141,7 +141,11 @@ async fn follow(
         Some(paths) if paths.is_empty() => return Ok(0),
         Some(paths) => read_files(forge, repo, sha, &paths).await?,
         // Not recorded (a dispatched or cron Run): read `.scarab/`.
-        None => read_event_pipelines(forge, &event).await?.files,
+        None => {
+            read_event_pipelines(forge, &event, &crate::config_ref(&event))
+                .await?
+                .files
+        }
     };
     // Only the files that follow this pipeline are compiled.
     let files: Vec<(String, String)> = files
@@ -155,7 +159,8 @@ async fn follow(
     }
     // `files` is not the whole of `.scarab/`, so the follow-ups record
     // nothing of their own: each one's ending reads `.scarab/` itself.
-    let outcome = trigger_runs_from_files(forge, db, clock, ports, &event, &files, false).await?;
+    let outcome =
+        trigger_runs_from_files(forge, db, clock, ports, &event, &files, false, None).await?;
     Ok(outcome.runs.len())
 }
 

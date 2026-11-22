@@ -703,35 +703,3 @@ async fn the_account_login_is_kept_and_follows_a_rename() {
         Some("acme-labs")
     );
 }
-
-/// The replay guard: a recorded delivery id is a replay until it is
-/// forgotten (a delivery that created nothing because the forge could not
-/// be read), and then the redelivery is fresh again. Forgetting one forge's
-/// id leaves the same id of the other forge, and an unknown id, alone.
-#[tokio::test]
-async fn a_forgotten_delivery_id_is_fresh_again() {
-    let Some(tdb) = fresh_db().await else {
-        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
-        return;
-    };
-    let db = PostgresDb::with_pool(tdb.pool.clone());
-    db.migrate().await.unwrap();
-
-    assert!(db.record_delivery(ForgeKind::GitHub, "d-1").await.unwrap());
-    assert!(db.record_delivery(ForgeKind::Forgejo, "d-1").await.unwrap());
-    assert!(!db.record_delivery(ForgeKind::GitHub, "d-1").await.unwrap());
-
-    db.forget_delivery(ForgeKind::GitHub, "d-1").await.unwrap();
-    db.forget_delivery(ForgeKind::GitHub, "never-seen")
-        .await
-        .unwrap();
-
-    assert!(
-        db.record_delivery(ForgeKind::GitHub, "d-1").await.unwrap(),
-        "the forgotten id is fresh"
-    );
-    assert!(
-        !db.record_delivery(ForgeKind::Forgejo, "d-1").await.unwrap(),
-        "the other forge's id is kept"
-    );
-}

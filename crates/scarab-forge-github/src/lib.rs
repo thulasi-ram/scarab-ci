@@ -263,12 +263,17 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            // A comment on a pull request carries `issue.pull_request`.
+            let pull_request = p
+                .pointer("/issue/pull_request")
+                .is_some_and(|v| !v.is_null());
             Ok(Event::Comment {
                 actor,
                 actor_id,
                 repo,
                 issue,
                 body,
+                pull_request,
             })
         }
         other => Err(ForgeError::UnsupportedEvent(other.to_string())),

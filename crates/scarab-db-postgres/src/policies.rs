@@ -389,6 +389,18 @@ impl PolicyStore for PostgresDb {
         run: &RunCreationRow,
     ) -> Result<(String, bool), PolicyStoreError> {
         let mut tx = self.pool().begin().await.map_err(store_err)?;
+        // The webhook delivery outcome first (ADR-0083 §2): a key another
+        // try recorded leaves nothing of this write, the decision included.
+        if let Some(d) = &run.delivery {
+            let claim = crate::delivery::RunClaim::of_policy_row(d, run.created_at);
+            if !crate::delivery::claim_delivery_run(&mut tx, &claim, &run.run_id)
+                .await
+                .map_err(store_err)?
+            {
+                tx.rollback().await.map_err(store_err)?;
+                return Err(PolicyStoreError::DeliveryClaimed);
+            }
+        }
         insert_decision(&mut *tx, record).await?;
         crate::insert_creating_run(
             &mut *tx,

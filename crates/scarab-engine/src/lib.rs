@@ -17,12 +17,18 @@
 //!
 //! Everything below is a compiling skeleton — method bodies are stubs.
 
+pub mod delivery;
 pub mod logstore;
 pub mod ports;
 pub mod render;
 pub mod scheduler;
 pub mod schedules;
 
+pub use delivery::{
+    DeliveryOutcome, DeliveryOutcomeKind, DeliveryPipeline, DeliveryRefusal, DeliveryRunClaim,
+    HeadQuery, HeadScope, OutcomeWrite, RunCreationState, REASON_COMPILE, REASON_NOT_HEAD,
+    UNFINISHED_CREATION_BOUND_MS,
+};
 pub use logstore::ledger_revoke_backoff_ms;
 pub use logstore::{
     marker_text, registry_secret_values, tail_lease_resource, LogAppendError, LogBody, LogLease,

@@ -253,12 +253,24 @@ pub enum RerunError {
     /// Mapped to 409.
     #[error("this Run's creation failed; start a new Run")]
     CreationUnfinished,
+    /// Rerun, retry or a gate action refused: a redelivery of the webhook
+    /// delivery that began this Run replaced it with the named Run, because
+    /// its creation never finished (ADR-0083 §4). Mapped to 409.
+    #[error("this Run's creation did not finish and Run {} replaced it", .0 .0)]
+    Replaced(RunId),
 }
 
 /// Refuse to act on `run` while its creation is unfinished
 /// ([`RerunError::CreationUnfinished`]). Called first by every entry point that
 /// re-arms a step or resolves a gate.
 async fn ensure_creation_finished(db: &dyn Db, run: &RunId) -> Result<(), RerunError> {
+    if let Some(replacement) = db
+        .run_creation_state(run)
+        .await?
+        .and_then(|s| s.replaced_by)
+    {
+        return Err(RerunError::Replaced(replacement));
+    }
     if db.run_creation_unfinished(run).await? {
         return Err(RerunError::CreationUnfinished);
     }
@@ -2446,7 +2458,7 @@ impl<'a> Scheduler<'a> {
                 default_step_timeout_ms: 3_600_000,
                 service_ready_timeout_ms: 300_000,
                 tick_failure_deadline_ms: 300_000,
-                unfinished_creation_bound_ms: 600_000,
+                unfinished_creation_bound_ms: crate::UNFINISHED_CREATION_BOUND_MS,
             },
         }
     }

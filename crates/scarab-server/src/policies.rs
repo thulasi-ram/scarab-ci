@@ -450,7 +450,9 @@ fn store_api_error(e: PolicyStoreError) -> ApiError {
         ),
         e @ PolicyStoreError::NameTaken(_) => ApiError::Conflict(e.to_string()),
         PolicyStoreError::Invalid(m) => ApiError::BadRequest(m),
-        e @ PolicyStoreError::Store(_) => ApiError::Db(DbError::Other(e.to_string())),
+        e @ (PolicyStoreError::Store(_) | PolicyStoreError::DeliveryClaimed) => {
+            ApiError::Db(DbError::Other(e.to_string()))
+        }
     }
 }
 
@@ -1391,6 +1393,7 @@ fn test_event(
             repo,
             issue: 0,
             body: String::new(),
+            pull_request: false,
         },
         TriggerKind::Upstream => Event::Upstream {
             repo,

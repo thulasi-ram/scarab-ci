@@ -64,6 +64,11 @@ impl FakeClock {
     pub fn advance(&self, delta_millis: i64) {
         self.millis.fetch_add(delta_millis, Ordering::SeqCst);
     }
+
+    /// The current virtual time, unix ms, without awaiting.
+    pub fn millis(&self) -> i64 {
+        self.millis.load(Ordering::SeqCst)
+    }
 }
 
 impl Default for FakeClock {
@@ -304,6 +309,23 @@ fn fake_run_summary(st: &InMemoryState, run: &RunId, status: RunStatus) -> RunSu
     }
 }
 
+/// One webhook delivery row (mirrors `webhook_deliveries`, ADR-0083 §7).
+struct DeliveryRow {
+    at: i64,
+    unfinished: bool,
+    pins: Option<scarab_forge::DeliveryPins>,
+    try_until: Option<i64>,
+}
+
+/// A delivery outcome's key in the in-memory state.
+fn outcome_key(k: &scarab_engine::DeliveryPipeline) -> (String, String, String) {
+    (
+        k.connection_id.clone(),
+        k.delivery_id.clone(),
+        k.pipeline.clone(),
+    )
+}
+
 #[derive(Default)]
 struct InMemoryState {
     /// The append-only event log.
@@ -406,8 +428,22 @@ struct InMemoryState {
     /// Orgs recorded by `record_org` (the Postgres `orgs` table), beside the
     /// ones the registry names.
     orgs: std::collections::BTreeSet<String>,
-    /// Webhook delivery-id replay guard: (forge kind token, delivery id).
-    webhook_deliveries: std::collections::HashSet<(String, String)>,
+    /// Webhook delivery rows (ADR-0046, ADR-0083): (forge kind token,
+    /// delivery id) → the row.
+    webhook_deliveries: HashMap<(String, String), DeliveryRow>,
+    /// Webhook delivery outcomes (ADR-0083; mirrors
+    /// `webhook_delivery_pipelines`): (connection id, delivery id, file) →
+    /// (forge kind token, outcome).
+    #[allow(clippy::type_complexity)]
+    delivery_outcomes: std::collections::BTreeMap<
+        (String, String, String),
+        (String, scarab_engine::DeliveryOutcome),
+    >,
+    /// Per-run replacement (mirrors `runs.replaced_by`).
+    run_replaced_by: HashMap<RunId, RunId>,
+    /// Test-only one-shot failure of the next
+    /// [`record_delivery_refusal`](Db::record_delivery_refusal).
+    delivery_refusal_failure: bool,
     /// Lease table: resource → (owner, expiry instant, term).
     leases: HashMap<String, (String, std::time::Instant, i64)>,
     /// Artifact versions (ADR-0052, immutable per attempt by ADR-0056),
@@ -453,6 +489,10 @@ struct InMemoryState {
 /// fake for driving the pure engine.
 pub struct InMemoryDb {
     state: Mutex<InMemoryState>,
+    /// The clock the delivery rows' `at` and leases read (the Postgres store
+    /// reads the database's): wall time until a test sets one
+    /// ([`use_clock`](Self::use_clock)).
+    clock: Mutex<Option<Arc<FakeClock>>>,
     /// A one-shot hook the next call of the named method awaits before it
     /// does anything — see [`interleave_before_next`](Self::interleave_before_next).
     /// Kept outside `state` so the hook can call back into this store.
@@ -475,7 +515,67 @@ impl InMemoryDb {
                 ..InMemoryState::default()
             }),
             interleave: Mutex::new(None),
+            clock: Mutex::new(None),
         }
+    }
+
+    /// Read the delivery rows' clock from `clock` (test seam, ADR-0083): a
+    /// test that drives the server's [`FakeClock`] gives the store the same
+    /// one, so a Run's `created_at` and a delivery's `at` compare as they do
+    /// on one database.
+    pub fn use_clock(&self, clock: Arc<FakeClock>) {
+        *self.clock.lock().unwrap() = Some(clock);
+    }
+
+    /// Now, unix ms, on the store's clock.
+    fn store_now(&self) -> i64 {
+        match self.clock.lock().unwrap().as_ref() {
+            Some(c) => c.millis(),
+            None => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        }
+    }
+
+    /// Let the lease of the try processing a delivery lapse (test seam,
+    /// ADR-0083 §7): the next try of it takes the lease.
+    pub fn expire_delivery_try(&self, forge: scarab_forge::ForgeKind, delivery_id: &str) {
+        if let Some(row) = self
+            .state
+            .lock()
+            .unwrap()
+            .webhook_deliveries
+            .get_mut(&(forge.as_str().to_string(), delivery_id.to_string()))
+        {
+            row.try_until = Some(i64::MIN);
+        }
+    }
+
+    /// The delivery row of `delivery_id`, as `(unfinished, try held, pins)`,
+    /// or `None` when there is none.
+    pub fn delivery_row(
+        &self,
+        forge: scarab_forge::ForgeKind,
+        delivery_id: &str,
+    ) -> Option<(bool, bool, Option<scarab_forge::DeliveryPins>)> {
+        self.state
+            .lock()
+            .unwrap()
+            .webhook_deliveries
+            .get(&(forge.as_str().to_string(), delivery_id.to_string()))
+            .map(|r| (r.unfinished, r.try_until.is_some(), r.pins.clone()))
+    }
+
+    /// Fail the next [`record_delivery_refusal`](Db::record_delivery_refusal)
+    /// with a store error, nothing written (test seam).
+    pub fn fail_next_delivery_refusal(&self) {
+        self.state.lock().unwrap().delivery_refusal_failure = true;
+    }
+
+    /// The run that replaced `run`, if any (`runs.replaced_by`).
+    pub fn replaced_by(&self, run: &RunId) -> Option<RunId> {
+        self.state.lock().unwrap().run_replaced_by.get(run).cloned()
     }
 
     /// Record `unit` as running when the ledger was added (what migration
@@ -498,7 +598,9 @@ impl InMemoryDb {
     /// another — that commits between two of a caller's separate writes.
     /// Constructs the interleaving instead of scheduling it. Supported
     /// methods: `set_run_params`, `set_run_concurrency`,
-    /// `commit_step_transition`, `append_event`, `record_delivery`.
+    /// `commit_step_transition`, `append_event`, `begin_delivery_try`,
+    /// `delivery_outcomes`, `begin_run_creation` (also the first row of a
+    /// delivery's Run), `finish_run_creation`, `record_delivery_refusal`.
     pub fn interleave_before_next(&self, method: &'static str, hook: DbHook) {
         *self.interleave.lock().unwrap() = Some((method, hook));
     }
@@ -953,6 +1055,7 @@ impl Db for InMemoryDb {
         _event_schema_version: u32,
         at: Timestamp,
     ) -> Result<(), DbError> {
+        self.interleave_point("begin_run_creation").await;
         // One lock: the run is never visible without its `creating` mark.
         let mut st = self.state.lock().unwrap();
         st.runs.insert(run.clone(), RunStatus::Pending);
@@ -961,9 +1064,234 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
-    async fn finish_run_creation(&self, run: &RunId) -> Result<(), DbError> {
-        self.state.lock().unwrap().creating.remove(run);
-        Ok(())
+    async fn finish_run_creation(&self, run: &RunId) -> Result<bool, DbError> {
+        self.interleave_point("finish_run_creation").await;
+        let mut st = self.state.lock().unwrap();
+        let open = st.creating.contains(run)
+            && st.runs.get(run) == Some(&RunStatus::Pending)
+            && !st.run_replaced_by.contains_key(run);
+        if open {
+            st.creating.remove(run);
+        }
+        Ok(open)
+    }
+
+    async fn begin_delivery_run_creation(
+        &self,
+        run: &RunId,
+        _ir_version: u32,
+        _event_schema_version: u32,
+        claim: &scarab_engine::DeliveryRunClaim,
+    ) -> Result<scarab_engine::OutcomeWrite, DbError> {
+        self.interleave_point("begin_run_creation").await;
+        // One lock: the outcome, the first row and the replacement mark.
+        let mut st = self.state.lock().unwrap();
+        let k = outcome_key(&claim.key);
+        let current = st.delivery_outcomes.get(&k).map(|(_, o)| o.clone());
+        let free = match (&claim.replaces, &current) {
+            (None, None) => true,
+            (Some(old), Some(o)) => {
+                o.outcome == scarab_engine::DeliveryOutcomeKind::Run && o.run_id.as_ref() == Some(old)
+            }
+            _ => false,
+        };
+        if !free {
+            return Ok(scarab_engine::OutcomeWrite::Claimed(current));
+        }
+        let at = current.as_ref().map_or(claim.at, |o| o.at);
+        st.delivery_outcomes.insert(
+            k,
+            (
+                claim.key.forge.clone(),
+                scarab_engine::DeliveryOutcome {
+                    pipeline: claim.key.pipeline.clone(),
+                    outcome: scarab_engine::DeliveryOutcomeKind::Run,
+                    reason_kind: None,
+                    run_id: Some(run.clone()),
+                    refused_run_id: None,
+                    at,
+                },
+            ),
+        );
+        if let Some(old) = &claim.replaces {
+            st.run_replaced_by.insert(old.clone(), run.clone());
+        }
+        st.runs.insert(run.clone(), RunStatus::Pending);
+        st.run_created.insert(run.clone(), claim.at);
+        st.creating.insert(run.clone());
+        Ok(scarab_engine::OutcomeWrite::Written)
+    }
+
+    async fn run_creation_state(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<scarab_engine::RunCreationState>, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(st.runs.get(run).map(|status| scarab_engine::RunCreationState {
+            status: *status,
+            creating: st.creating.contains(run),
+            created_at: st.run_created.get(run).copied().unwrap_or(Timestamp(0)),
+            replaced_by: st.run_replaced_by.get(run).cloned(),
+        }))
+    }
+
+    async fn record_delivery_refusal(
+        &self,
+        key: &scarab_engine::DeliveryPipeline,
+        refusal: &scarab_engine::DeliveryRefusal,
+    ) -> Result<scarab_engine::OutcomeWrite, DbError> {
+        self.interleave_point("record_delivery_refusal").await;
+        // One lock: the outcome, the refused row and the status.
+        let mut st = self.state.lock().unwrap();
+        if std::mem::take(&mut st.delivery_refusal_failure) {
+            return Err(DbError::Other("injected delivery refusal failure".into()));
+        }
+        let k = outcome_key(key);
+        let current = st.delivery_outcomes.get(&k).map(|(_, o)| o.clone());
+        let free = match (&refusal.replaces, &current) {
+            (None, None) => true,
+            (Some(old), Some(o)) => {
+                o.outcome == scarab_engine::DeliveryOutcomeKind::Run && o.run_id.as_ref() == Some(old)
+            }
+            _ => false,
+        };
+        if !free {
+            return Ok(scarab_engine::OutcomeWrite::Claimed(current));
+        }
+        let refused_run_id = refusal.refused.as_ref().map(|r| {
+            let mut r = r.clone();
+            r.id = st.refused_runs.len() as i64 + 1;
+            let id = r.id;
+            st.refused_runs.push(r);
+            id
+        });
+        if let Some(status) = &refusal.status {
+            enqueue_outbox_locked(&mut st, status);
+        }
+        let at = current.as_ref().map_or(refusal.at, |o| o.at);
+        st.delivery_outcomes.insert(
+            k,
+            (
+                key.forge.clone(),
+                scarab_engine::DeliveryOutcome {
+                    pipeline: key.pipeline.clone(),
+                    outcome: refusal.outcome,
+                    reason_kind: Some(refusal.reason_kind.clone()),
+                    run_id: None,
+                    refused_run_id,
+                    at,
+                },
+            ),
+        );
+        Ok(scarab_engine::OutcomeWrite::Written)
+    }
+
+    async fn record_delivery_outcome(
+        &self,
+        key: &scarab_engine::DeliveryPipeline,
+        outcome: scarab_engine::DeliveryOutcomeKind,
+        at: Timestamp,
+    ) -> Result<scarab_engine::OutcomeWrite, DbError> {
+        let mut st = self.state.lock().unwrap();
+        let k = outcome_key(key);
+        if let Some((_, o)) = st.delivery_outcomes.get(&k) {
+            return Ok(scarab_engine::OutcomeWrite::Claimed(Some(o.clone())));
+        }
+        st.delivery_outcomes.insert(
+            k,
+            (
+                key.forge.clone(),
+                scarab_engine::DeliveryOutcome {
+                    pipeline: key.pipeline.clone(),
+                    outcome,
+                    reason_kind: None,
+                    run_id: None,
+                    refused_run_id: None,
+                    at,
+                },
+            ),
+        );
+        Ok(scarab_engine::OutcomeWrite::Written)
+    }
+
+    async fn delivery_outcomes(
+        &self,
+        connection_id: &str,
+        delivery_id: &str,
+    ) -> Result<Vec<scarab_engine::DeliveryOutcome>, DbError> {
+        self.interleave_point("delivery_outcomes").await;
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .delivery_outcomes
+            .iter()
+            .filter(|((c, d, _), _)| c == connection_id && d == delivery_id)
+            .map(|(_, (_, o))| o.clone())
+            .collect())
+    }
+
+    async fn head_moved(&self, q: &scarab_engine::HeadQuery) -> Result<bool, DbError> {
+        let st = self.state.lock().unwrap();
+        let newest = st
+            .runs
+            .keys()
+            .filter(|r| {
+                st.run_tenant.get(*r) == Some(&(q.org.clone(), q.project.clone()))
+                    && st.run_created.get(*r).is_some_and(|at| at.0 > q.after.0)
+                    && q.pipeline_name
+                        .as_ref()
+                        .is_none_or(|p| st.run_pipeline.get(*r) == Some(p))
+                    && st.run_origin.get(*r).is_some_and(|o| match &q.scope {
+                        scarab_engine::HeadScope::Ref(r) => o.2.as_deref() == Some(r.as_str()),
+                        scarab_engine::HeadScope::PullRequest(n) => o.4 == Some(*n),
+                    })
+            })
+            .max_by(|a, b| {
+                (st.run_created.get(*a), &a.0).cmp(&(st.run_created.get(*b), &b.0))
+            });
+        if let Some(run) = newest {
+            let sha = st.run_origin.get(run).and_then(|o| o.3.as_deref());
+            if sha != Some(q.head_sha.as_str()) {
+                return Ok(true);
+            }
+        }
+        let scope = q.scope.key(&q.org, &q.project);
+        Ok(st.delivery_outcomes.iter().any(|((_, d, path), (forge, _))| {
+            q.pipeline_path.as_ref().is_none_or(|p| p == path)
+                && st
+                    .webhook_deliveries
+                    .get(&(forge.clone(), d.clone()))
+                    .is_some_and(|row| {
+                        row.at > q.after.0
+                            && row.pins.as_ref().is_some_and(|p| {
+                                p.head_scope.as_deref() == Some(scope.as_str())
+                                    && p.head_sha
+                                        .as_deref()
+                                        .is_some_and(|s| s != q.head_sha.as_str())
+                            })
+                    })
+        }))
+    }
+
+    async fn prune_webhook_deliveries(
+        &self,
+        before: Timestamp,
+        limit: u32,
+    ) -> Result<u64, DbError> {
+        let mut st = self.state.lock().unwrap();
+        let mut gone: Vec<((String, String), i64)> = st
+            .webhook_deliveries
+            .iter()
+            .filter(|(_, row)| row.at < before.0)
+            .map(|(k, row)| (k.clone(), row.at))
+            .collect();
+        gone.sort_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
+        gone.truncate(limit as usize);
+        for ((forge, id), _) in &gone {
+            st.webhook_deliveries.remove(&(forge.clone(), id.clone()));
+            st.delivery_outcomes
+                .retain(|(_, d, _), (f, _)| !(d == id && f == forge));
+        }
+        Ok(gone.len() as u64)
     }
 
     async fn run_creation_unfinished(&self, run: &RunId) -> Result<bool, DbError> {
@@ -4951,31 +5279,83 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
             }))
     }
 
-    async fn record_delivery(
+    async fn begin_delivery_try(
         &self,
         forge: scarab_forge::ForgeKind,
         delivery_id: &str,
-    ) -> Result<bool, scarab_forge::RegistryError> {
-        self.interleave_point("record_delivery").await;
+        lease_ms: i64,
+    ) -> Result<scarab_forge::DeliveryTry, scarab_forge::RegistryError> {
+        self.interleave_point("begin_delivery_try").await;
+        let now = self.store_now();
+        let mut st = self.state.lock().unwrap();
+        let key = (forge.as_str().to_string(), delivery_id.to_string());
+        let Some(row) = st.webhook_deliveries.get_mut(&key) else {
+            st.webhook_deliveries.insert(
+                key,
+                DeliveryRow {
+                    at: now,
+                    unfinished: true,
+                    pins: None,
+                    try_until: Some(now.saturating_add(lease_ms)),
+                },
+            );
+            return Ok(scarab_forge::DeliveryTry::First { at: now });
+        };
+        if !row.unfinished {
+            return Ok(scarab_forge::DeliveryTry::Finished);
+        }
+        if row.try_until.is_some_and(|until| until >= now) {
+            return Ok(scarab_forge::DeliveryTry::Held);
+        }
+        row.try_until = Some(now.saturating_add(lease_ms));
+        Ok(scarab_forge::DeliveryTry::Again {
+            at: row.at,
+            pins: row.pins.clone(),
+        })
+    }
+
+    async fn pin_delivery(
+        &self,
+        forge: scarab_forge::ForgeKind,
+        delivery_id: &str,
+        pins: &scarab_forge::DeliveryPins,
+    ) -> Result<scarab_forge::DeliveryPins, scarab_forge::RegistryError> {
+        let mut st = self.state.lock().unwrap();
+        let key = (forge.as_str().to_string(), delivery_id.to_string());
+        Ok(match st.webhook_deliveries.get_mut(&key) {
+            Some(row) => row.pins.get_or_insert_with(|| pins.clone()).clone(),
+            None => pins.clone(),
+        })
+    }
+
+    async fn end_delivery_try(
+        &self,
+        forge: scarab_forge::ForgeKind,
+        delivery_id: &str,
+        finished: bool,
+    ) -> Result<(), scarab_forge::RegistryError> {
+        let mut st = self.state.lock().unwrap();
+        let key = (forge.as_str().to_string(), delivery_id.to_string());
+        if let Some(row) = st.webhook_deliveries.get_mut(&key) {
+            row.try_until = None;
+            row.unfinished = row.unfinished && !finished;
+        }
+        Ok(())
+    }
+
+    async fn last_delivery_at(
+        &self,
+        forge: scarab_forge::ForgeKind,
+    ) -> Result<Option<i64>, scarab_forge::RegistryError> {
         Ok(self
             .state
             .lock()
             .unwrap()
             .webhook_deliveries
-            .insert((forge.as_str().to_string(), delivery_id.to_string())))
-    }
-
-    async fn forget_delivery(
-        &self,
-        forge: scarab_forge::ForgeKind,
-        delivery_id: &str,
-    ) -> Result<(), scarab_forge::RegistryError> {
-        self.state
-            .lock()
-            .unwrap()
-            .webhook_deliveries
-            .remove(&(forge.as_str().to_string(), delivery_id.to_string()));
-        Ok(())
+            .iter()
+            .filter(|((f, _), _)| f == forge.as_str())
+            .map(|(_, row)| row.at)
+            .max())
     }
 
     /// The single-owner marker (ADR-0060 part D), mirroring the Postgres

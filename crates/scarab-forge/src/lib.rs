@@ -659,6 +659,11 @@ pub enum Event {
         repo: RepoRef,
         issue: u64,
         body: String,
+        /// The issue is a pull request (GitHub `issue.pull_request`, Forgejo
+        /// `is_pull`): a later try of the delivery applies the head rule
+        /// against it (ADR-0083 §5).
+        #[serde(default)]
+        pull_request: bool,
     },
     /// A scheduled fire of an `on: cron:` Pipeline (git-bug 5d5fc8a). The
     /// server builds it at fire time from what it just read from the forge:
@@ -1634,6 +1639,37 @@ pub fn is_reserved_org(org: &str) -> bool {
     org.starts_with('_')
 }
 
+/// What the store found when a try of a webhook delivery began
+/// ([`ForgeConnectionStore::begin_delivery_try`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryTry {
+    /// This try inserted the delivery row; it holds the lease. `at` is when
+    /// the delivery arrived (unix ms, the store's clock).
+    First { at: i64 },
+    /// A later try of an unfinished delivery; it took the lease. `pins` is
+    /// what an earlier try pinned, if any.
+    Again {
+        at: i64,
+        pins: Option<DeliveryPins>,
+    },
+    /// The delivery is finished: a replay.
+    Finished,
+    /// Another try holds the lease.
+    Held,
+}
+
+/// What a delivery is pinned to on its first try (ADR-0083 §1, §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryPins {
+    /// The commit every try reads `.scarab/` at.
+    pub config_sha: String,
+    /// The ref or pull request the delivery is about (`HeadScope::key`), for
+    /// the head rule; `None` for a delivery the rule does not apply to.
+    pub head_scope: Option<String>,
+    /// The scope's commit when the delivery arrived.
+    pub head_sha: Option<String>,
+}
+
 /// Durable store for [`ForgeConnection`]s and the [`RepoRef`]s they own —
 /// the repo/Project **registry** (ADR-0046). Persistence is an adapter
 /// (Postgres); this port keeps the pure crate I/O-free. In v1 a `RepoRef`
@@ -1748,24 +1784,42 @@ pub trait ForgeConnectionStore: Send + Sync {
     /// an unregistered repo (its webhooks are dropped).
     async fn resolve(&self, repo: &RepoRef) -> Result<Option<ResolvedRepo>, RegistryError>;
 
-    /// Record a webhook delivery id for `forge` — the replay guard (ADR-0046).
-    /// Returns `true` if this is the FIRST time the id is seen; `false` for a
-    /// replay (the caller acknowledges without re-processing). Idempotent.
-    async fn record_delivery(
+    /// Begin a try of webhook delivery `delivery_id` of `forge` (ADR-0046,
+    /// ADR-0083 §7), with the store's clock:
+    ///
+    /// * no row: insert it unfinished, leased for `lease_ms`, and answer
+    ///   [`DeliveryTry::First`];
+    /// * a finished row: [`DeliveryTry::Finished`] (a replay, acknowledged
+    ///   without processing);
+    /// * an unfinished row whose lease is free or expired: take the lease
+    ///   and answer [`DeliveryTry::Again`] with what the first try pinned;
+    /// * an unfinished row another try holds: [`DeliveryTry::Held`].
+    async fn begin_delivery_try(
         &self,
         forge: ForgeKind,
         delivery_id: &str,
-    ) -> Result<bool, RegistryError>;
+        lease_ms: i64,
+    ) -> Result<DeliveryTry, RegistryError>;
 
-    /// Remove a delivery id [`record_delivery`](Self::record_delivery)
-    /// recorded, so a redelivery of it is processed. Called only for a
-    /// delivery that created no Run because the forge could not be read: its
-    /// redelivery cannot duplicate a Run. Removing an id that is not there
-    /// is not an error.
-    async fn forget_delivery(
+    /// Store what a delivery is pinned to (ADR-0083 §1, §5) unless a try
+    /// stored it first, and answer what is stored. Every try reads
+    /// `.scarab/` at the answered `config_sha`.
+    async fn pin_delivery(
         &self,
         forge: ForgeKind,
         delivery_id: &str,
+        pins: &DeliveryPins,
+    ) -> Result<DeliveryPins, RegistryError>;
+
+    /// End a try begun with [`begin_delivery_try`](Self::begin_delivery_try):
+    /// clear its lease, and mark the delivery finished when `finished` (every
+    /// Pipeline decided). An unfinished delivery is processed again by its
+    /// next redelivery.
+    async fn end_delivery_try(
+        &self,
+        forge: ForgeKind,
+        delivery_id: &str,
+        finished: bool,
     ) -> Result<(), RegistryError>;
 
     /// Unix-ms of the most recent delivery recorded for `forge`, if any — a
@@ -2140,6 +2194,7 @@ mod tests {
                     repo: repo(),
                     issue: 1,
                     body: "/deploy".into(),
+                    pull_request: false,
                 },
                 TriggerKind::Comment,
             ),
@@ -2418,7 +2473,8 @@ mod tests {
                 actor_id: String::new(),
                 repo: repo(),
                 issue: 1,
-                body: "/deploy".into()
+                body: "/deploy".into(),
+                pull_request: false,
             }
             .protection_ref(),
             None,
