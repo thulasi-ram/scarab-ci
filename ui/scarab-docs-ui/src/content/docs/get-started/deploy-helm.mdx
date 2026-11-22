@@ -233,15 +233,16 @@ twice starts its Runs once. The forge's delivery log shows the answer:
 | Answer | What happened | What to do |
 |---|---|---|
 | 202 | Runs were created; the body lists their ids. `"incomplete": true` means a Pipeline file could not be read from the forge, so that Pipeline started nothing | Start the missing Pipeline by hand: a redelivery is answered as a duplicate, so it would not create the Runs again |
-| 200 | Nothing started: `{"ignored": "<reason>"}` (for example `no matching pipeline` or `duplicate delivery`), or `refused` lists the Pipelines that were refused | Nothing |
-| 400 | The body is not an event Scarab reads, or the delivery has no id header (with forge connections configured) | A hand-made request needs the forge's delivery id header |
+| 200 | Nothing started: `{"ignored": "<reason>"}` (for example `no matching pipeline` or `duplicate delivery`), or `refused` lists the Pipelines that were refused. With `refused`, `"incomplete": true` means another Pipeline file could not be read | Nothing, or start the missing Pipeline by hand |
+| 400 | A Pipeline file does not compile (the text says why; its check is posted as failed), the body is not an event Scarab reads, or the delivery has no id header (with forge connections configured) | Fix the Pipeline and push again; a hand-made request needs the forge's delivery id header |
 | 401 | The signature does not match the webhook secret | Check the secret on both sides |
-| 502 | A Pipeline file could not be read from the forge (three tries, 0.5 and 2 seconds apart), and no Run was created. The id is not kept | Redeliver it from the forge's webhook page |
-| 503 | 64 deliveries were already running and none ended within 10 seconds. Nothing was recorded | Redeliver it |
+| 502 | A Pipeline file could not be read from the forge (three tries, 0.5 and 2 seconds apart), and nothing was created or refused. The id is not kept | Redeliver it from the forge's webhook page |
+| 503 | 64 deliveries were already running and none ended within 10 seconds, or this delivery is still running on the server from an earlier try. Nothing was recorded | Redeliver it later |
 
 A delivery's work runs in a task of its own. When the forge stops waiting (GitHub after 10
 seconds, Forgejo after its `DELIVER_TIMEOUT`), the delivery still creates its Runs; only the
-answer is lost. When the server shuts down, it waits up to 20 seconds for running deliveries to
+answer is lost. A redelivery sent while that work is still running on the same server is
+answered 503; one that reaches another server replica is answered as a duplicate. When the server shuts down, it waits up to 20 seconds for running deliveries to
 finish, then logs how many it left. The chart sets no `terminationGracePeriodSeconds`, so a Pod
 has Kubernetes' default 30 seconds to stop.
 

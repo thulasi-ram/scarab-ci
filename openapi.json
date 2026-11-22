@@ -9469,7 +9469,7 @@
             "description": "the forge could not be read and nothing was created; redeliver"
           },
           "503": {
-            "description": "too many deliveries running; nothing was recorded, redeliver"
+            "description": "too many deliveries running, or this delivery is still running; redeliver later"
           }
         },
         "security": []
@@ -9496,7 +9496,7 @@
             "description": "the forge could not be read and nothing was created; redeliver"
           },
           "503": {
-            "description": "too many deliveries running; nothing was recorded, redeliver"
+            "description": "too many deliveries running, or this delivery is still running; redeliver later"
           }
         },
         "security": []

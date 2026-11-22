@@ -2152,3 +2152,101 @@ async fn a_delivery_that_started_runs_with_an_unreadable_file_is_incomplete() {
     assert_eq!(json_of(again).await["ignored"], "duplicate delivery");
     assert_eq!(db.active_runs().await.unwrap().len(), 1);
 }
+
+/// The forge answers the read of `.scarab/` with an error that is not
+/// retried (here its rate limit). Nothing was recorded, so the id is
+/// forgotten and the answer is 502; the redelivery creates the Run.
+#[tokio::test]
+async fn a_delivery_whose_pipeline_listing_failed_is_answered_502_and_repaired() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML));
+    let app = multi_forge_app_arc(db.clone(), forge.clone());
+
+    forge.set_rate_limited(true);
+    let first = app
+        .clone()
+        .oneshot(push_request("delivery-1"))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+    assert!(db.active_runs().await.unwrap().is_empty());
+
+    forge.set_rate_limited(false);
+    let redelivery = app.oneshot(push_request("delivery-1")).await.unwrap();
+    assert_eq!(redelivery.status(), StatusCode::ACCEPTED);
+    assert_eq!(db.active_runs().await.unwrap().len(), 1);
+}
+
+/// Round-2 review #2: the forge redelivers while the first try is still
+/// running (in its forge reads). "duplicate delivery" would end the
+/// delivery if the first try then fails and forgets its id; the redelivery
+/// is answered 503 instead, so the forge tries again later.
+#[tokio::test]
+async fn a_redelivery_of_a_running_delivery_is_answered_503() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML));
+    let app = multi_forge_app_arc(db.clone(), forge);
+    let (entered, release) = hold_next_record_delivery(&db);
+
+    let first = tokio::spawn(app.clone().oneshot(push_request("delivery-1")));
+    entered.await.unwrap();
+    let redelivery = app
+        .clone()
+        .oneshot(push_request("delivery-1"))
+        .await
+        .unwrap();
+    assert_eq!(redelivery.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let text = axum::body::to_bytes(redelivery.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&text).contains("still running"),
+        "{text:?}"
+    );
+
+    release.send(()).unwrap();
+    assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::ACCEPTED);
+    let after = app.oneshot(push_request("delivery-1")).await.unwrap();
+    assert_eq!(json_of(after).await["ignored"], "duplicate delivery");
+    assert_eq!(db.active_runs().await.unwrap().len(), 1);
+}
+
+/// Round-2 review #3: one Pipeline file cannot be read and another does
+/// not compile. The compile failure is recorded (a refused Run, a failure
+/// status), so the id is kept: a redelivery is a duplicate and records it
+/// no second time. The 400 says a file could not be read.
+#[tokio::test(start_paused = true)]
+async fn a_recorded_compile_failure_keeps_the_id_when_another_file_was_unreadable() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = Arc::new(
+        FakeForge::new()
+            .with_file(".scarab/checks.yaml", BROKEN_YAML)
+            .with_file(".scarab/lint.yaml", CI_YAML),
+    );
+    forge.set_read_error_for(".scarab/lint.yaml", Some("502 bad gateway"));
+    let app = multi_forge_app_arc(db.clone(), forge.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(push_request("delivery-1"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let text = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&text).contains("could not be read"),
+        "{text:?}"
+    );
+    assert_compile_failure_status(&statuses_on_push(&forge, &db).await);
+
+    forge.set_read_error_for(".scarab/lint.yaml", None);
+    let again = app.oneshot(push_request("delivery-1")).await.unwrap();
+    assert_eq!(json_of(again).await["ignored"], "duplicate delivery");
+    assert!(db.active_runs().await.unwrap().is_empty());
+    assert_compile_failure_status(&statuses_on_push(&forge, &db).await);
+}

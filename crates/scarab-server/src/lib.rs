@@ -382,13 +382,15 @@ pub const WEBHOOK_DELIVERY_SLOTS: u32 = 64;
 /// nothing recorded: GitHub's delivery timeout.
 pub const WEBHOOK_DELIVERY_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The permits webhook deliveries take ([`WEBHOOK_DELIVERY_SLOTS`]) and how
-/// long one waits for a permit.
+/// The permits webhook deliveries take ([`WEBHOOK_DELIVERY_SLOTS`]), how
+/// long one waits for a permit, and the delivery ids whose task is running
+/// on this server ([`RunningDelivery`]).
 #[derive(Clone)]
 struct DeliverySlots {
     permits: Arc<tokio::sync::Semaphore>,
     count: u32,
     wait: std::time::Duration,
+    running: Arc<std::sync::Mutex<std::collections::HashSet<(&'static str, String)>>>,
 }
 
 impl DeliverySlots {
@@ -397,8 +399,59 @@ impl DeliverySlots {
             permits: Arc::new(tokio::sync::Semaphore::new(count as usize)),
             count,
             wait,
+            running: Arc::default(),
         }
     }
+}
+
+/// A delivery id whose task is running on this server, from before its id
+/// is recorded until the task ends. A redelivery of a running id is
+/// answered 503 instead of "duplicate delivery": the first try may still
+/// fail to read the forge, forget the id and answer 502 to a forge that
+/// stopped waiting, and a 200 to the redelivery would then end the
+/// delivery with no Run. The set is per server: a redelivery that reaches
+/// another replica finds the id recorded and is answered as a duplicate.
+struct RunningDelivery {
+    running: Arc<std::sync::Mutex<std::collections::HashSet<(&'static str, String)>>>,
+    key: Option<(&'static str, String)>,
+}
+
+impl RunningDelivery {
+    /// Mark `delivery_id` of `forge` running, or `None` when it already
+    /// is. An empty id (no registry wired) is never deduplicated.
+    fn claim(st: &AppState, forge: scarab_forge::ForgeKind, delivery_id: &str) -> Option<Self> {
+        let running = st.delivery_slots.running.clone();
+        if delivery_id.is_empty() {
+            return Some(Self { running, key: None });
+        }
+        let key = (forge.as_str(), delivery_id.to_string());
+        if !running.lock().unwrap().insert(key.clone()) {
+            return None;
+        }
+        Some(Self {
+            running,
+            key: Some(key),
+        })
+    }
+}
+
+impl Drop for RunningDelivery {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.running.lock().unwrap().remove(&key);
+        }
+    }
+}
+
+/// [`RunningDelivery::claim`], answering 503 when the id is running.
+fn claim_delivery(
+    st: &AppState,
+    forge: scarab_forge::ForgeKind,
+    delivery_id: &str,
+) -> Result<RunningDelivery, ApiError> {
+    RunningDelivery::claim(st, forge, delivery_id).ok_or_else(|| {
+        ApiError::Unavailable("this delivery is still running; redeliver later".into())
+    })
 }
 
 /// Wait, at most `wait`, for every webhook delivery task to end, and return
@@ -8631,9 +8684,10 @@ fn duplicate_delivery() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-/// A delivery that created no Run because the forge could not be read: its
-/// id is removed from the replay guard, so the forge's redelivery is
-/// processed and cannot duplicate a Run, and the answer is 502.
+/// A delivery that recorded nothing (no Run, no refusal) because the forge
+/// could not be read: its id is removed from the replay guard, so the
+/// forge's redelivery is processed and cannot duplicate a Run or a refusal,
+/// and the answer is 502.
 async fn refuse_unread_delivery(
     st: &AppState,
     forge: scarab_forge::ForgeKind,
@@ -8681,11 +8735,12 @@ async fn delivery_is_fresh(
 /// (ADR-0010). Without a forge wired we can only acknowledge the delivery.
 ///
 /// A Pipeline file the forge could not read (after
-/// [`read_event_pipelines`]'s retries) and no Run created: the delivery id
-/// `delivery_id` of `kind` is forgotten and the answer is 502, so the
+/// [`read_event_pipelines`]'s retries) and nothing recorded: the delivery
+/// id `delivery_id` of `kind` is forgotten and the answer is 502, so the
 /// forge's redelivery is processed ([`refuse_unread_delivery`]). Some Runs
-/// created: 202 with `"incomplete": true`; a redelivery would duplicate
-/// those Runs, so the id stays recorded.
+/// created or Pipelines refused: the usual answer with `"incomplete": true`
+/// (a 400 says so in its text); a redelivery would record them again, so
+/// the id stays recorded.
 async fn ingest_event(
     st: &AppState,
     event: scarab_forge::Event,
@@ -8769,15 +8824,17 @@ async fn ingest_event(
     )
     .await;
     if !complete {
-        let created_nothing = match &triggered {
-            Ok(outcome) => outcome.runs.is_empty(),
-            // A file that does not compile stops the delivery before any
-            // Run is created.
-            Err(TriggerError::Pipeline(_)) => true,
-            // Anything else may have stopped after a Run was created.
-            Err(_) => false,
-        };
-        if created_nothing {
+        // The id is forgotten only when the delivery recorded nothing: no
+        // Run, and no refusal (a refused-Run row, a failure status, a
+        // Policy decision), which a redelivery would record again. A file
+        // that does not compile records refusals for the delivery, so it
+        // keeps the id like a refusal does; anything else may have stopped
+        // after a Run was created.
+        let recorded_nothing = matches!(
+            &triggered,
+            Ok(outcome) if outcome.runs.is_empty() && outcome.refused.is_empty()
+        );
+        if recorded_nothing {
             return refuse_unread_delivery(
                 st,
                 kind,
@@ -8815,15 +8872,21 @@ async fn ingest_event(
             }
             Ok((StatusCode::ACCEPTED, Json(body)))
         }
-        Ok(outcome) if !outcome.refused.is_empty() => Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({
+        Ok(outcome) if !outcome.refused.is_empty() => {
+            let mut body = serde_json::json!({
                 "refused": outcome.refused,
                 "trigger": event.trigger_kind(),
-            })),
-        )),
+            });
+            if !complete {
+                body["incomplete"] = serde_json::json!(true);
+            }
+            Ok((StatusCode::OK, Json(body)))
+        }
         Ok(_) => no_match(),
         Err(TriggerError::Db(e)) => Err(ApiError::Db(e)),
+        Err(e @ TriggerError::Pipeline(_)) if !complete => Err(ApiError::BadRequest(format!(
+            "{e}; another Pipeline file could not be read from the forge"
+        ))),
         Err(e) => Err(ApiError::BadRequest(e.to_string())),
     }
 }
@@ -9047,7 +9110,7 @@ fn delivery_assign_refusal(
 /// durably create the triggered Runs. Unverified deliveries are rejected;
 /// administrative events (e.g. `ping`) and events of a repo that is not
 /// enabled are acknowledged and ignored.
-#[utoipa::path(post, path = "/webhooks/github", summary = "GitHub webhook ingest (HMAC-verified)", responses((status = 202, description = "delivery accepted"), (status = 400, description = "malformed delivery, or no delivery id"), (status = 401, description = "bad signature"), (status = 502, description = "the forge could not be read and nothing was created; redeliver"), (status = 503, description = "too many deliveries running; nothing was recorded, redeliver")))]
+#[utoipa::path(post, path = "/webhooks/github", summary = "GitHub webhook ingest (HMAC-verified)", responses((status = 202, description = "delivery accepted"), (status = 400, description = "malformed delivery, or no delivery id"), (status = 401, description = "bad signature"), (status = 502, description = "the forge could not be read and nothing was created; redeliver"), (status = 503, description = "too many deliveries running, or this delivery is still running; redeliver later")))]
 async fn github_webhook(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -9079,6 +9142,7 @@ async fn github_webhook(
     finish_delivery(slot, async move {
         let kind = scarab_forge::ForgeKind::GitHub;
         // Replay guard — only verified deliveries are recorded (ADR-0046).
+        let _running = claim_delivery(&st, kind, &delivery.id)?;
         if !delivery_is_fresh(&st, kind, &delivery.id).await? {
             return Ok(duplicate_delivery());
         }
@@ -9150,7 +9214,7 @@ async fn finish_delivery(
 /// bound to the Forgejo adapter's verification (plain-hex
 /// `X-Forgejo/Gitea-Signature`) and its own secret — no payload sniffing on a
 /// shared endpoint. Same replay guard, same canonical vocabulary downstream.
-#[utoipa::path(post, path = "/webhooks/forgejo", summary = "Forgejo webhook ingest (HMAC-verified)", responses((status = 202, description = "delivery accepted"), (status = 400, description = "malformed delivery, or no delivery id"), (status = 401, description = "bad signature"), (status = 502, description = "the forge could not be read and nothing was created; redeliver"), (status = 503, description = "too many deliveries running; nothing was recorded, redeliver")))]
+#[utoipa::path(post, path = "/webhooks/forgejo", summary = "Forgejo webhook ingest (HMAC-verified)", responses((status = 202, description = "delivery accepted"), (status = 400, description = "malformed delivery, or no delivery id"), (status = 401, description = "bad signature"), (status = 502, description = "the forge could not be read and nothing was created; redeliver"), (status = 503, description = "too many deliveries running, or this delivery is still running; redeliver later")))]
 async fn forgejo_webhook(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -9196,6 +9260,7 @@ async fn forgejo_webhook(
     let slot = delivery_slot(&st).await?;
     finish_delivery(slot, async move {
         let kind = scarab_forge::ForgeKind::Forgejo;
+        let _running = claim_delivery(&st, kind, &delivery.id)?;
         if !delivery_is_fresh(&st, kind, &delivery.id).await? {
             return Ok(duplicate_delivery());
         }

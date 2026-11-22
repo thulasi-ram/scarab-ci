@@ -13380,7 +13380,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description too many deliveries running; nothing was recorded, redeliver */
+            /** @description too many deliveries running, or this delivery is still running; redeliver later */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -13426,7 +13426,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description too many deliveries running; nothing was recorded, redeliver */
+            /** @description too many deliveries running, or this delivery is still running; redeliver later */
             503: {
                 headers: {
                     [name: string]: unknown;
