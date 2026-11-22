@@ -1,9 +1,13 @@
-//! A Step's own secrets leave the Pod spec (ADR-0014, git-bug bcf2c11).
+//! A Step's own secrets leave the Pod spec (ADR-0014, git-bug bcf2c11), and
+//! only a Pod made by a server that keeps a value ledger gets them (git-bug
+//! 2d78464, 85b29e0).
 //!
 //! `K8sExecutor::launch` against a fake API server: the Pod it POSTs holds
 //! no secret value (a file mount and, for `env: true`, a `secretKeyRef`),
-//! and the values go to the per-Pod `<pod>-secrets` Secret, owner-referenced
-//! to the Pod. Hermetic: no cluster.
+//! carries the `scarab.io/value-ledger` label, and the values go to the
+//! per-Pod `<pod>-v-secrets` Secret, owner-referenced to the Pod. A Pod
+//! without the label (an earlier version made it) gets no Secret, and its
+//! log is not read. No code path reads a Secret. Hermetic: no cluster.
 
 use std::sync::{Arc, Mutex};
 
@@ -27,6 +31,12 @@ struct Seen {
     replaced: Vec<(String, Value)>,
     /// Secrets DELETEd, by name.
     deleted: Vec<String>,
+    /// Secrets read (GET), by name: none may be.
+    secret_gets: Vec<String>,
+    /// Pods DELETEd, by name.
+    pods_deleted: Vec<String>,
+    /// Pod log reads, by name.
+    log_reads: Vec<String>,
 }
 
 /// What the fake API server holds before the launch.
@@ -69,6 +79,24 @@ async fn fake_api(cluster: Cluster) -> (String, Arc<Fake>) {
                         None => not_found("pods", &name),
                     }
                 },
+            )
+            .delete(
+                |State(fake): State<Arc<Fake>>, Path((_ns, name)): Path<(String, String)>| async move {
+                    fake.seen.lock().unwrap().pods_deleted.push(name.clone());
+                    match &fake.cluster.pod {
+                        Some(pod) => (StatusCode::OK, Json(pod.clone())),
+                        None => not_found("pods", &name),
+                    }
+                },
+            ),
+        )
+        .route(
+            "/api/v1/namespaces/{ns}/pods/{name}/log",
+            get(
+                |State(fake): State<Arc<Fake>>, Path((_ns, name)): Path<(String, String)>| async move {
+                    fake.seen.lock().unwrap().log_reads.push(name);
+                    "a line\n"
+                },
             ),
         )
         .route(
@@ -103,9 +131,12 @@ async fn fake_api(cluster: Cluster) -> (String, Arc<Fake>) {
         )
         .route(
             "/api/v1/namespaces/{ns}/secrets/{name}",
-            get(|Path((_ns, name)): Path<(String, String)>| async move {
-                not_found("secrets", &name)
-            })
+            get(
+                |State(fake): State<Arc<Fake>>, Path((_ns, name)): Path<(String, String)>| async move {
+                    fake.seen.lock().unwrap().secret_gets.push(name.clone());
+                    not_found("secrets", &name)
+                },
+            )
             .put(
                 |State(fake): State<Arc<Fake>>,
                  Path((_ns, name)): Path<(String, String)>,
@@ -242,7 +273,7 @@ async fn launch_puts_secret_values_in_a_per_pod_secret_and_none_in_the_pod() {
         .unwrap();
     assert_eq!(
         argo["valueFrom"]["secretKeyRef"],
-        json!({ "name": format!("{pod_name}-secrets"), "key": "ARGOCD_AUTH_TOKEN" })
+        json!({ "name": format!("{pod_name}-v-secrets"), "key": "ARGOCD_AUTH_TOKEN" })
     );
     assert!(container["volumeMounts"]
         .as_array()
@@ -253,13 +284,17 @@ async fn launch_puts_secret_values_in_a_per_pod_secret_and_none_in_the_pod() {
     let secret = seen
         .secrets
         .iter()
-        .find(|s| s["metadata"]["name"] == format!("{pod_name}-secrets").as_str())
+        .find(|s| s["metadata"]["name"] == format!("{pod_name}-v-secrets").as_str())
         .unwrap_or_else(|| panic!("the per-Pod Secret was created: {:#?}", seen.secrets));
     assert_secret_data(secret);
     let owner = &secret["metadata"]["ownerReferences"][0];
     assert_eq!(
         (owner["kind"].as_str(), owner["uid"].as_str()),
         (Some("Pod"), Some("pod-uid-1"))
+    );
+    assert_eq!(
+        seen.pods[0]["metadata"]["labels"]["scarab.io/value-ledger"],
+        json!("1")
     );
 }
 
@@ -274,13 +309,159 @@ async fn the_per_pod_secret_is_deleted_when_the_attempt_ends() {
 
     // The Attempt-end hook: the forge credential decorator calls it on every
     // terminal poll and on cancel.
-    let held = exec.take_forge_credential(&handle).await.expect("take");
+    exec.delete_unit_secrets(&handle).await.expect("delete");
 
-    assert!(held.is_none(), "the Step has no forge credential");
-    assert_eq!(
-        fake.seen.lock().unwrap().deleted,
-        vec![format!("{}-secrets", handle.0)]
+    let deleted = fake.seen.lock().unwrap().deleted.clone();
+    for suffix in ["-v-secrets", "-v-token", "-secrets", "-token"] {
+        assert!(
+            deleted.contains(&format!("{}{suffix}", handle.0)),
+            "{suffix}: {deleted:?}"
+        );
+    }
+}
+
+/// A Pod as the API returns it: with or without the value-ledger label, and
+/// with its step container running or never started.
+fn existing_pod(labelled: bool, started: bool) -> Value {
+    let pod_name = scarab_executor_k8s::pod_name(&step());
+    let labels = if labelled {
+        json!({ "scarab.io/value-ledger": "1" })
+    } else {
+        json!({})
+    };
+    let statuses = if started {
+        json!([{ "name": "step", "ready": true, "restartCount": 0, "image": "i",
+                 "imageID": "", "state": { "running": {} } }])
+    } else {
+        json!([{ "name": "step", "ready": false, "restartCount": 0, "image": "i",
+                 "imageID": "", "state": { "waiting": { "reason": "ContainerCreating" } } }])
+    };
+    json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": { "name": pod_name, "namespace": NS, "uid": "pod-uid-live",
+                      "labels": labels },
+        "spec": { "nodeName": "node-1", "containers": [{ "name": "step", "image": "i" }] },
+        "status": { "phase": "Running", "containerStatuses": statuses },
+    })
+}
+
+/// I1a (2d78464): a re-drive adopting a running Pod an earlier version made
+/// writes no Secret: nothing this server mints reaches a Pod whose log it
+/// does not store. Kills: a replace on an unlabelled Pod.
+#[tokio::test]
+async fn adopting_an_unlabelled_pod_writes_no_secret() {
+    let (url, fake) = fake_api(Cluster {
+        pod: Some(existing_pod(false, true)),
+        secrets_exist: true,
+    })
+    .await;
+    let handle = executor(&url)
+        .launch(&step(), &spec())
+        .await
+        .expect("adopted");
+    assert_eq!(handle.0, scarab_executor_k8s::pod_name(&step()));
+    let seen = fake.seen.lock().unwrap();
+    assert!(seen.secrets.is_empty(), "{:#?}", seen.secrets);
+    assert!(seen.replaced.is_empty(), "{:#?}", seen.replaced);
+    assert!(seen.pods.is_empty() && seen.pods_deleted.is_empty());
+}
+
+/// Red team R4-1: an unlabelled Pod none of whose containers started (an
+/// earlier leader stopped between the Pod create and its Secret writes, so
+/// it waits on Secrets that never come) is deleted, and the launch fails to
+/// be retried with a labelled Pod; no Secret is written for it. Kills:
+/// adopting it as is (it sits in FailedMount until the provisioning
+/// deadline).
+#[tokio::test]
+async fn an_unlabelled_pod_that_never_started_is_replaced() {
+    let (url, fake) = fake_api(Cluster {
+        pod: Some(existing_pod(false, false)),
+        secrets_exist: false,
+    })
+    .await;
+    let err = executor(&url)
+        .launch(&step(), &spec())
+        .await
+        .expect_err("the launch is retried");
+    assert!(
+        matches!(err, scarab_engine::ExecError::Launch(_)),
+        "{err:?}"
     );
+    let seen = fake.seen.lock().unwrap();
+    assert_eq!(
+        seen.pods_deleted,
+        vec![scarab_executor_k8s::pod_name(&step())]
+    );
+    assert!(seen.secrets.is_empty() && seen.replaced.is_empty());
+}
+
+/// I1 (85b29e0 iv): the log of a Pod without the label is not read: the
+/// open answers `NotLedgerComplete` from the Pod it checked. A labelled
+/// Pod's log opens. Kills: the label check removed.
+#[tokio::test]
+async fn the_log_of_an_unlabelled_pod_is_not_read() {
+    let (url, fake) = fake_api(Cluster {
+        pod: Some(existing_pod(false, true)),
+        secrets_exist: false,
+    })
+    .await;
+    let err = executor(&url)
+        .log_stream(&step(), scarab_engine::LogFrom::Start)
+        .await
+        .err()
+        .expect("not read");
+    assert!(
+        matches!(err, scarab_engine::ExecError::NotLedgerComplete(_)),
+        "{err:?}"
+    );
+    assert!(fake.seen.lock().unwrap().log_reads.is_empty());
+
+    let (url, fake) = fake_api(Cluster {
+        pod: Some(existing_pod(true, true)),
+        secrets_exist: false,
+    })
+    .await;
+    let mut chunks = executor(&url)
+        .log_stream(&step(), scarab_engine::LogFrom::Start)
+        .await
+        .expect("opens")
+        .expect("a log source");
+    assert_eq!(
+        chunks.next_chunk().await.unwrap(),
+        Some(b"a line\n".to_vec())
+    );
+    assert_eq!(fake.seen.lock().unwrap().log_reads.len(), 1);
+}
+
+/// Q3 = B: no code path reads a Secret's value: not a launch, a re-drive,
+/// a log open, a source-state question, nor the Attempt-end delete. The
+/// fake records every Secret GET. Kills: a read-back left in place.
+#[tokio::test]
+async fn no_code_path_reads_a_secret_value() {
+    for cluster in [
+        Cluster::default(),
+        Cluster {
+            pod: Some(existing_pod(true, true)),
+            secrets_exist: true,
+        },
+        Cluster {
+            pod: Some(existing_pod(false, true)),
+            secrets_exist: true,
+        },
+    ] {
+        let (url, fake) = fake_api(cluster).await;
+        let exec = executor(&url);
+        let handle = exec.launch(&step(), &spec()).await.expect("launch");
+        let _ = exec
+            .log_stream(&step(), scarab_engine::LogFrom::Start)
+            .await;
+        let _ = exec
+            .log_source_state(&scarab_engine::LogSourceRef::Step(step()))
+            .await;
+        exec.delete_unit_secrets(&handle).await.unwrap();
+        let gets = fake.seen.lock().unwrap().secret_gets.clone();
+        assert!(gets.is_empty(), "Secrets read: {gets:?}");
+    }
 }
 
 /// A re-drive after a crash between creating the Pod and its Secret, or after
@@ -292,7 +473,8 @@ async fn a_redrive_replaces_the_per_pod_secret_owned_by_the_live_pod() {
     let (url, fake) = fake_api(Cluster {
         pod: Some(json!({
             "apiVersion": "v1", "kind": "Pod",
-            "metadata": { "name": pod_name, "namespace": NS, "uid": "pod-uid-live" },
+            "metadata": { "name": pod_name, "namespace": NS, "uid": "pod-uid-live",
+                          "labels": { "scarab.io/value-ledger": "1" } },
         })),
         secrets_exist: true,
     })
@@ -304,7 +486,7 @@ async fn a_redrive_replaces_the_per_pod_secret_owned_by_the_live_pod() {
     let seen = fake.seen.lock().unwrap();
     assert_eq!(handle.0, pod_name);
     assert!(seen.pods.is_empty(), "no second Pod: {:#?}", seen.pods);
-    let name = format!("{pod_name}-secrets");
+    let name = format!("{pod_name}-v-secrets");
     let (_, secret) = seen
         .replaced
         .iter()

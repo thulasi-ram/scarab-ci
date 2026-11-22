@@ -56,9 +56,10 @@ pub async fn sweep_retention(
         .map_err(|e| e.to_string())?;
     let mut pruned = 0u32;
     for run in runs {
-        prune_run_logs(db, store, &run).await?;
+        prune_run_logs(db, store, &run, now).await?;
         pruned += 1;
     }
+    redelete_pruned_logs(db, store, now).await?;
 
     // The artifact class (ADR-0052): same lifecycle key, its own TTL.
     let cutoff = Timestamp(now.0 - cfg.artifact_ttl_ms);
@@ -232,28 +233,63 @@ pub type StepUpStores = (
     Arc<dyn scarab_identity::StepUpStore>,
 );
 
-/// Delete one run's log blobs, then its index. Body deletion is best-effort
-/// per key (a missing blob is already gone); the index drop only happens
-/// after the pass over the bodies, so a partial failure re-sweeps.
+/// Prune one run's logs: in one transaction the store tombstones every
+/// stream of the run (a late append is refused), purges its units' value
+/// ledgers and deletes its index; then the bodies are deleted by prefix
+/// `logs/{run}/`. A writer refused after its PUT can leave a body behind
+/// that delete, so the prefix is deleted once more on a later pass
+/// ([`redelete_pruned_logs`]).
 async fn prune_run_logs(
     db: &Arc<dyn Db>,
     store: &Arc<dyn ObjectStore>,
     run: &RunId,
+    now: Timestamp,
 ) -> Result<(), String> {
-    let keys = db
-        .log_object_keys_of_run(run)
+    db.prune_log_run(run, now)
         .await
         .map_err(|e| e.to_string())?;
-    for key in &keys {
-        if let Err(e) = store.delete(key).await {
-            tracing::warn!(run = %run.0, key = %key, error = %e, "retention: blob delete failed (will re-sweep)");
-            return Err(format!("delete {key}: {e}"));
+    let blobs = delete_log_prefix(store, run).await?;
+    tracing::info!(run = %run.0, blobs, "retention: pruned run logs (metadata retained)");
+    Ok(())
+}
+
+/// Delete every object under `logs/{run}/`; returns how many.
+async fn delete_log_prefix(store: &Arc<dyn ObjectStore>, run: &RunId) -> Result<usize, String> {
+    let prefix = format!("logs/{}/", run.0);
+    let objects = store
+        .list_objects(&prefix)
+        .await
+        .map_err(|e| format!("list {prefix}: {e}"))?;
+    for o in &objects {
+        if let Err(e) = store.delete(&o.key).await {
+            tracing::warn!(run = %run.0, key = %o.key, error = %e, "retention: blob delete failed (will re-sweep)");
+            return Err(format!("delete {}: {e}", o.key));
         }
     }
-    db.delete_log_index_of_run(run)
+    Ok(objects.len())
+}
+
+/// How long after a run's log index is pruned its bodies are deleted by
+/// prefix a second time.
+const REDELETE_AFTER_MS: i64 = 10 * 60 * 1000;
+
+/// The second delete by prefix of runs pruned more than
+/// [`REDELETE_AFTER_MS`] ago.
+async fn redelete_pruned_logs(
+    db: &Arc<dyn Db>,
+    store: &Arc<dyn ObjectStore>,
+    now: Timestamp,
+) -> Result<(), String> {
+    let runs = db
+        .log_runs_to_redelete(Timestamp(now.0 - REDELETE_AFTER_MS), SWEEP_BATCH)
         .await
         .map_err(|e| e.to_string())?;
-    tracing::info!(run = %run.0, blobs = keys.len(), "retention: pruned run logs (metadata retained)");
+    for run in runs {
+        delete_log_prefix(store, &run).await?;
+        db.forget_log_run_redelete(&run)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 

@@ -2766,6 +2766,7 @@ dependencies = [
  "scarab-chaos",
  "scarab-db-postgres",
  "scarab-forge",
+ "scarab-project",
  "serde",
  "serde_json",
  "tokio",
@@ -2776,6 +2777,7 @@ name = "scarab-engine"
 version = "0.6.1"
 dependencies = [
  "async-trait",
+ "base64",
  "scarab-pipeline",
  "serde",
  "serde_json",
@@ -2790,6 +2792,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "cel",
  "futures",
  "k8s-openapi",
  "kube",

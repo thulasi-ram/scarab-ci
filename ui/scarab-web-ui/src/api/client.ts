@@ -4,7 +4,7 @@ import createClient from "openapi-fetch";
 import { createSignal } from "solid-js";
 import type { paths, components } from "./schema";
 import type { ParamSpec } from "../params";
-import type { LogStreamHandlers, LogStreamQuery } from "../log-stream";
+import { parseLogMarker, type LogStreamHandlers, type LogStreamQuery } from "../log-stream";
 import { isDeleteBlockers } from "../org-environments";
 import { askStepUp, errorMessage, shareCeremony, withStepUp } from "../step-up";
 
@@ -1494,9 +1494,11 @@ function logQuery(q: URLSearchParams, opts: LogStreamQuery): URLSearchParams {
 
 /** Open one log stream (a step's, a sidecar's or a service's). Each `data`
  * event is raw output, passed on as it came with its id (the resume cursor);
- * a `truncated` event says how much of the log the replay skipped, and a
- * `storing` event whether the log is still being stored after its try ended,
- * and an `error` event that reading the stored log failed. The server
+ * a `truncated` event says how much of the log the replay skipped, a
+ * `marker` event is the server's note about the stored log (with an id, like
+ * a `data` event), a `storing` event says whether the log is still being
+ * stored after its try ended, and an `error` event that reading the stored
+ * log failed. The server
  * ends the stream when nothing more will be written, which reads as an error
  * here; the stream is then closed so the browser's EventSource does not open
  * it again by itself. Returns a cleanup fn. */
@@ -1520,6 +1522,11 @@ function openLogStream(url: string, opts: LogStreamHandlers): () => void {
     } catch {
       // A malformed notice hides nothing on screen; skip it.
     }
+  });
+  es.addEventListener("marker", (e) => {
+    const m = parseLogMarker((e as MessageEvent).data);
+    // A malformed note has nothing to show; skip it.
+    if (m) opts.onMarker?.(m, (e as MessageEvent).lastEventId || null);
   });
   es.addEventListener("storing", (e) => {
     try {

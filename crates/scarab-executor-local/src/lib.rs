@@ -199,13 +199,18 @@ impl Executor for LocalExecutor {
         Ok(None)
     }
 
-    async fn take_forge_credential(
+    async fn delete_unit_secrets(&self, _handle: &ExecHandle) -> Result<(), ExecError> {
+        // The local executor stores no per-unit Secret: secrets are files
+        // under a temporary directory removed with the step process.
+        Ok(())
+    }
+
+    async fn log_source_state(
         &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
-        // The local executor refuses a Step with `forge_token`: it never
-        // mounts one.
-        Ok(None)
+        _src: &scarab_engine::LogSourceRef,
+    ) -> Result<scarab_engine::LogSourceState, ExecError> {
+        // No log source: the child inherits the server's stdio.
+        Ok(scarab_engine::LogSourceState::Gone)
     }
 
     async fn workspace_provisioning(

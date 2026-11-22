@@ -1,991 +1,328 @@
-//! Log-source wiring (ADR-0013): the executor's live tail feeds the log pipeline.
-//! Hermetic — a mock `LogChunks` source stands in for the k8s Pod-log stream, and
-//! the pipeline runs over the in-memory object store + index. No cluster.
+//! Log storage and redaction (git-bug 2d78464, 511a769, 93b7733, 772c34f,
+//! 85b29e0): the read state machine of [`LogTailer`], the value ledger the
+//! executor stack writes before a unit is created, fenced appends, markers
+//! as rows, and failure-cause redaction by handle.
+//!
+//! Hermetic: an in-memory store and object store, a fake executor shaped
+//! like a followed Kubernetes log ([`LiveLog`]: every open reads the
+//! container's log from its first byte, scripted source states, restarts,
+//! `NotLedgerComplete` on open, a read that never returns), and the real
+//! executor stack from [`build_executor_stack`]. Each test names the
+//! mutation it kills.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use scarab_engine::ports::{ExecHandle, ExecState, Executor, LogChunks, LogFrom, LogRedactions};
+use scarab_engine::ports::{ExecHandle, ExecState, Executor, LogChunks, LogFrom};
 use scarab_engine::{
-    Attempt, AttemptId, AttemptOutcome, ExecError, RunId, StepId, StepRun, StepSpec, StepStatus,
-    Timestamp,
+    Attempt, AttemptId, AttemptOutcome, Db, DeployContext, ExecError, ForgeTokenConfig, LogRowKind,
+    LogSourceRef, LogSourceState, LogStreamId, LogStreamState, NotStoredReason, RunId, StepId,
+    StepRun, StepSpec, StepStatus, Timestamp,
 };
-use scarab_server::{pump_log_stream, LogFence, LogService, LogTailer};
-use scarab_testkit::{InMemoryDb, InMemoryObjectStore};
+use scarab_forge::ForgePort;
+use scarab_server::log_tail::TailTiming;
+use scarab_server::{build_executor_stack, LogService, LogTailer, SecretInjectingExecutor};
+use scarab_storage::ObjectStore;
+use scarab_testkit::{FakeForge, FakeSecrets, InMemoryDb, InMemoryObjectStore};
 
-fn logs() -> Arc<LogService> {
-    Arc::new(LogService::new(
-        Arc::new(InMemoryObjectStore::new()),
-        Arc::new(InMemoryDb::new()),
-    ))
+const RUN: &str = "r1";
+const STEP: &str = "build";
+const ATTEMPT: &str = "a1";
+
+fn run() -> RunId {
+    RunId(RUN.into())
 }
 
-fn stream() -> (RunId, StepId, AttemptId) {
-    (
-        RunId("r".into()),
-        StepId("build".into()),
-        AttemptId("a1".into()),
+fn stream() -> LogStreamId {
+    LogStreamId::new(&run(), &StepId(STEP.into()), &AttemptId(ATTEMPT.into()))
+}
+
+fn sidecar_stream() -> LogStreamId {
+    LogStreamId::new(
+        &run(),
+        &StepId(format!("{STEP}::service-0")),
+        &AttemptId(ATTEMPT.into()),
     )
 }
 
-/// The fence of [`stream`]: the stream whose values redact it.
-fn fence() -> LogFence {
-    let (run, step, attempt) = stream();
-    LogFence::new(&run, &step, &attempt)
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
-/// A mock log source: hands out queued chunks, then end-of-stream.
-struct MockChunks(VecDeque<Vec<u8>>);
-
-#[async_trait]
-impl LogChunks for MockChunks {
-    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ExecError> {
-        Ok(self.0.pop_front())
-    }
-}
-
-/// The pump drains every chunk into the pipeline, in order — `read_all`
-/// reconstructs the exact byte stream the source produced.
-#[tokio::test]
-async fn pump_drains_all_chunks_in_order() {
-    let logs = logs();
-    let (run, step, attempt) = stream();
-    let source = Box::new(MockChunks(VecDeque::from(vec![
-        b"hello ".to_vec(),
-        b"scarab ".to_vec(),
-        b"logs\n".to_vec(),
-    ])));
-
-    let n = pump_log_stream(source, &logs, &run, &step, &attempt)
-        .await
-        .expect("pump");
-
-    assert_eq!(n, b"hello scarab logs\n".len() as u64);
-    let all = logs.read_all(&run, &step, &attempt).await.unwrap();
-    assert_eq!(all, b"hello scarab logs\n");
-}
-
-/// Secrets registered with the pipeline are redacted from tailed log bytes before
-/// they are stored (ADR-0013, 0032) — the source is scrubbed on the way in.
-#[tokio::test]
-async fn pump_redacts_registered_secrets() {
-    let logs = logs();
-    let (run, step, attempt) = stream();
-    logs.register_secret(&fence(), b"s3cr3t");
-
-    let source = Box::new(MockChunks(VecDeque::from(vec![
-        b"token=s3cr3t done\n".to_vec()
-    ])));
-    pump_log_stream(source, &logs, &run, &step, &attempt)
-        .await
-        .expect("pump");
-
-    let all = logs.read_all(&run, &step, &attempt).await.unwrap();
-    assert_eq!(all, b"token=*** done\n");
-}
-
-/// An empty chunk from the source is not persisted as a spurious index row.
-#[tokio::test]
-async fn pump_skips_empty_chunks() {
-    let logs = logs();
-    let (run, step, attempt) = stream();
-    let source = Box::new(MockChunks(VecDeque::from(vec![
-        b"a".to_vec(),
-        Vec::new(),
-        b"b".to_vec(),
-    ])));
-
-    pump_log_stream(source, &logs, &run, &step, &attempt)
-        .await
-        .unwrap();
-
-    assert_eq!(logs.read_all(&run, &step, &attempt).await.unwrap(), b"ab");
-}
-
-// --- LogTailer: dedup + drive-through-executor ------------------------------
-
-fn running_step() -> StepRun {
+fn step_run(outcome: AttemptOutcome) -> StepRun {
     StepRun {
         key: None,
-        run: RunId("r".into()),
-        step: StepId("build".into()),
-        status: StepStatus::Running,
+        run: run(),
+        step: StepId(STEP.into()),
+        status: if outcome == AttemptOutcome::Running {
+            StepStatus::Running
+        } else {
+            StepStatus::Succeeded
+        },
         attempts: vec![Attempt {
-            id: AttemptId("a1".into()),
+            id: AttemptId(ATTEMPT.into()),
             started_at: Timestamp(0),
             failure: None,
             failure_detail: None,
-            outcome: AttemptOutcome::Running,
+            outcome,
         }],
         needs: vec![],
         gate_kind: None,
     }
 }
 
-/// A fake executor whose `log_stream` parks on a gate before returning, so a
-/// spawned tail is held open deterministically (fence stays claimed) — and counts
-/// how many times it is opened, to prove the tailer dedups per fence.
-struct GatedExec {
-    calls: AtomicUsize,
-    open: tokio::sync::Notify,
-    chunks: Mutex<Vec<Vec<u8>>>,
+fn running() -> StepRun {
+    step_run(AttemptOutcome::Running)
 }
 
-impl GatedExec {
-    fn new(chunks: Vec<Vec<u8>>) -> Arc<Self> {
-        Arc::new(Self {
-            calls: AtomicUsize::new(0),
-            open: tokio::sync::Notify::new(),
-            chunks: Mutex::new(chunks),
-        })
-    }
-    fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
-    }
-}
-
-#[async_trait]
-impl Executor for GatedExec {
-    async fn results_delivery_failure(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<String>, ExecError> {
-        Ok(None)
-    }
-
-    async fn gate_refusal(
-        &self,
-        _gate: &scarab_engine::StepRun,
-    ) -> Result<Option<String>, scarab_engine::ExecError> {
-        Ok(None)
-    }
-
-    async fn infra_condition(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
-        Ok(None)
-    }
-
-    async fn take_forge_credential(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
-        Ok(None)
-    }
-
-    async fn workspace_provisioning(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
-        // No fan-in sensor here; the method is REQUIRED (not defaulted) so
-        // this "none" is a visible decision, not a decorator-shaped evidence
-        // drop (56220d7).
-        Ok(None)
-    }
-
-    async fn launch(&self, step: &StepRun, _spec: &StepSpec) -> Result<ExecHandle, ExecError> {
-        Ok(ExecHandle(step.step.0.clone()))
-    }
-    async fn poll(&self, _h: &ExecHandle) -> Result<ExecState, ExecError> {
-        Ok(ExecState::Running)
-    }
-    async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
-        Ok(())
-    }
-    fn unit_handle(
-        &self,
-        _step: &scarab_engine::StepRun,
-    ) -> Option<scarab_engine::ports::ExecHandle> {
-        None // nothing is created behind this stub's launches
-    }
-
-    async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
-        Ok(true) // nothing runs behind this stub's handles
-    }
-    // ADR-0064 s2: required (never defaulted) so the compiler makes every impl —
-    // wrappers included — decide; this stub snapshots nothing, so no stamp.
-    async fn log_stream(
-        &self,
-        _step: &StepRun,
-        _from: LogFrom,
-    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        // Count the open *before* parking, so the fence is provably held while a
-        // concurrent `ensure` runs.
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.open.notified().await;
-        let chunks = std::mem::take(&mut *self.chunks.lock().unwrap());
-        Ok(Some(Box::new(MockChunks(VecDeque::from(chunks)))))
+fn spec() -> StepSpec {
+    StepSpec {
+        image: "busybox".into(),
+        command: vec![],
+        env: vec![],
+        secrets: vec![],
+        run_as_root: false,
+        run_as_user: None,
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: None,
+        workspace_inputs: vec![],
+        workspace_outputs: vec![],
+        cache: None,
+        forge_token: None,
+        sandbox: None,
+        registry_auth: None,
+        build: None,
+        artifacts: vec![],
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
+        resolved_secrets: Default::default(),
+        services: Vec::new(),
+        uses: Vec::new(),
+        matrix_values: Default::default(),
+        scope: None,
     }
 }
 
-/// Wait (bounded) for `cond` to hold, yielding to the runtime between checks.
-async fn wait_for(mut cond: impl FnMut() -> bool) {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while !cond() {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .expect("condition did not hold in time");
+fn forge_spec() -> StepSpec {
+    let mut s = spec();
+    s.forge_token = Some(ForgeTokenConfig {
+        access: scarab_pipeline::ForgeToken::Read,
+        owner: "acme".into(),
+        name: "web".into(),
+        read_only: false,
+        trusted_library: None,
+        credential: None,
+    });
+    s
 }
 
-/// The tailer starts exactly one tail per fence: a second `ensure` for a step
-/// already being tailed is a no-op (so the driver can call it every tick).
-#[tokio::test]
-async fn tailer_dedups_per_fence() {
-    let exec = GatedExec::new(vec![b"line\n".to_vec()]);
-    let logs = logs();
-    let tailer = LogTailer::new(exec.clone(), logs.clone());
-    let step = running_step();
-
-    // First ensure spawns a tail; it parks in log_stream with the fence claimed.
-    tailer.ensure(&step);
-    wait_for(|| exec.calls() == 1).await;
-
-    // Second ensure, fence still claimed → deduped (no new log_stream open).
-    tailer.ensure(&step);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(
-        exec.calls(),
-        1,
-        "a fence already being tailed is not re-opened"
-    );
-
-    // Release the parked tail; it drains its chunk into the pipeline.
-    exec.open.notify_waiters();
-    let (run, s, a) = stream();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if logs.read_all(&run, &s, &a).await.unwrap_or_default() == b"line\n" {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .expect("tail drained its chunk into the pipeline");
-    assert_eq!(exec.calls(), 1);
-}
-
-/// git-bug 1dee2f3: a tail that ends having read nothing is not a complete
-/// log. Kubernetes answers a log request for a Pod with no node yet with an
-/// empty stream; the next `ensure` after the backoff opens the tail again and
-/// the step's later output reaches the pipeline.
-#[tokio::test]
-async fn a_tail_that_read_nothing_is_retried() {
-    // One empty chunk: the pump skips it, so the tail reads 0 bytes.
-    let exec = GatedExec::new(vec![Vec::new()]);
-    let logs = logs();
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    let step = running_step();
-
-    // First tail: the stream ends with no output.
-    tailer.ensure(&step);
-    wait_for(|| exec.calls() == 1).await;
-    exec.open.notify_one();
-    // The first tail has taken its (empty) chunks.
-    wait_for(|| exec.chunks.lock().unwrap().is_empty()).await;
-
-    // The Pod now prints. After the backoff the next ensure re-opens it.
-    *exec.chunks.lock().unwrap() = vec![b"late\n".to_vec()];
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while exec.calls() < 2 {
-            tailer.ensure(&step);
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("an empty tail is opened again");
-    exec.open.notify_one();
-
-    let (run, s, a) = stream();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if logs.read_all(&run, &s, &a).await.unwrap_or_default() == b"late\n" {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .expect("the later output reached the pipeline");
-}
-
-// --- Ended units (git-bug 1dee2f3) ------------------------------------------
-
-/// A fake executor whose `log_stream` answers each open from a script: an
-/// error, or a stream of chunks. Once the script is spent it answers an empty
-/// stream. Counts opens.
-struct ScriptedExec {
-    calls: AtomicUsize,
-    script: Mutex<VecDeque<Result<Vec<Vec<u8>>, String>>>,
-}
-
-impl ScriptedExec {
-    fn new(script: Vec<Result<Vec<Vec<u8>>, String>>) -> Arc<Self> {
-        Arc::new(Self {
-            calls: AtomicUsize::new(0),
-            script: Mutex::new(script.into()),
-        })
-    }
-    fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
+/// Short timings: the state machine's waits in tens of milliseconds.
+fn timing() -> TailTiming {
+    TailTiming {
+        retry_backoff: Duration::from_millis(10),
+        final_backoff: Duration::from_millis(10),
+        final_backoff_max: Duration::from_millis(40),
+        end_wait: Duration::from_millis(300),
+        end_poll: Duration::from_millis(10),
+        end_skew_ms: 2_000,
+        idle: Duration::from_millis(200),
+        final_budget_ms: 30 * 60 * 1000,
     }
 }
 
-#[async_trait]
-impl Executor for ScriptedExec {
-    async fn results_delivery_failure(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<String>, ExecError> {
-        Ok(None)
-    }
-    async fn gate_refusal(&self, _gate: &StepRun) -> Result<Option<String>, ExecError> {
-        Ok(None)
-    }
-    async fn infra_condition(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
-        Ok(None)
-    }
-    async fn take_forge_credential(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
-        Ok(None)
-    }
-    async fn workspace_provisioning(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
-        Ok(None)
-    }
-    async fn launch(&self, step: &StepRun, _spec: &StepSpec) -> Result<ExecHandle, ExecError> {
-        Ok(ExecHandle(step.step.0.clone()))
-    }
-    async fn poll(&self, _h: &ExecHandle) -> Result<ExecState, ExecError> {
-        Ok(ExecState::Running)
-    }
-    async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
-        Ok(())
-    }
-    fn unit_handle(&self, _step: &StepRun) -> Option<ExecHandle> {
-        None
-    }
-    async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
-        Ok(true)
-    }
-    async fn log_stream(
-        &self,
-        _step: &StepRun,
-        _from: LogFrom,
-    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        match self.script.lock().unwrap().pop_front() {
-            Some(Ok(chunks)) => Ok(Some(Box::new(MockChunks(chunks.into())))),
-            Some(Err(e)) => Err(ExecError::Other(e)),
-            None => Ok(Some(Box::new(MockChunks(VecDeque::new())))),
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// LiveLog: a followed Kubernetes log
+// ---------------------------------------------------------------------------
 
-const INITIALIZING: &str =
-    "container \"step\" in pod \"scarab-build-a1\" is waiting to start: PodInitializing";
-
-/// Wait long enough for spawned tails and a 10 ms backoff to play out.
-async fn settle() {
-    tokio::time::sleep(Duration::from_millis(60)).await;
-}
-
-/// git-bug 1dee2f3: a short step whose first tail found its Pod not ready,
-/// and which ran and finished inside the retry backoff, is never `Running`
-/// again on a later tick. The pass that no longer ensures it reads its log
-/// once more, so its output is stored.
-#[tokio::test]
-async fn a_step_that_ended_during_the_backoff_is_read_once_more() {
-    let exec = ScriptedExec::new(vec![
-        Err(INITIALIZING.into()),
-        Ok(vec![b"short step\n".to_vec()]),
-    ]);
-    let logs = logs();
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-
-    // The pass that sees the step Running: its tail finds the Pod not ready.
-    tailer.ensure(&running_step());
-    tailer.end_pass(true);
-    wait_for(|| exec.calls() == 1).await;
-    settle().await;
-
-    // The step has ended: the next pass ensures nothing.
-    tailer.end_pass(true);
-    let (run, s, a) = stream();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while logs.read_all(&run, &s, &a).await.unwrap_or_default() != b"short step\n" {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .expect("the ended step's output reached the pipeline");
-
-    // The fence is closed: later passes do not read it again.
-    for _ in 0..3 {
-        tailer.end_pass(true);
-        settle().await;
-    }
-    assert_eq!(exec.calls(), 2);
-    assert_eq!(logs.read_all(&run, &s, &a).await.unwrap(), b"short step\n");
-}
-
-/// A step that prints nothing is re-read only while it is `Running`; once it
-/// ends, one more read closes the fence and nothing reopens it.
-#[tokio::test]
-async fn a_silent_step_stops_being_read_once_it_ends() {
-    let exec = ScriptedExec::new(vec![]);
-    let logs = logs();
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-
-    tailer.ensure(&running_step());
-    tailer.end_pass(true);
-    wait_for(|| exec.calls() == 1).await;
-    settle().await;
-
-    // Ended: one more read, then nothing.
-    tailer.end_pass(true);
-    wait_for(|| exec.calls() == 2).await;
-    for _ in 0..5 {
-        tailer.end_pass(true);
-        settle().await;
-    }
-    assert_eq!(exec.calls(), 2, "a closed fence is never read again");
-}
-
-/// A replica that stored the fence's output first (it held the tail lease)
-/// is not repeated: the read of the ended step skips the stored part and
-/// adds nothing.
-#[tokio::test]
-async fn an_ended_step_with_stored_output_is_not_stored_twice() {
-    let exec = ScriptedExec::new(vec![Err(INITIALIZING.into()), Ok(vec![b"once\n".to_vec()])]);
-    let logs = logs();
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-
-    tailer.ensure(&running_step());
-    tailer.end_pass(true);
-    wait_for(|| exec.calls() == 1).await;
-    settle().await;
-
-    // A peer replica tailed the step and stored its output.
-    let (run, s, a) = stream();
-    logs.append(&run, &s, &a, b"once\n").await.unwrap();
-
-    tailer.end_pass(true);
-    wait_for(|| exec.calls() == 2).await;
-    for _ in 0..3 {
-        tailer.end_pass(true);
-        settle().await;
-    }
-    assert_eq!(exec.calls(), 2, "the fence is closed after one read");
-    assert_eq!(logs.read_all(&run, &s, &a).await.unwrap(), b"once\n");
-}
-
-/// The read of an ended unit is bounded: a Pod that is gone fails every read,
-/// and the fence is given up after a few tries.
-#[tokio::test]
-async fn reading_an_ended_step_gives_up_after_a_few_tries() {
-    let gone =
-        || Err::<Vec<Vec<u8>>, _>("pods \"scarab-build-a1\" not found: NotFound".to_string());
-    let exec = ScriptedExec::new((0..10).map(|_| gone()).collect());
-    let logs = logs();
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-
-    tailer.ensure(&running_step());
-    tailer.end_pass(true);
-    wait_for(|| exec.calls() == 1).await;
-    settle().await;
-
-    for _ in 0..10 {
-        tailer.end_pass(true);
-        settle().await;
-    }
-    assert_eq!(
-        exec.calls(),
-        4,
-        "one live tail, then three reads of the ended step"
-    );
-}
-
-/// A pass that did not ensure every unit (a store error) does not treat the
-/// units it missed as ended.
-#[tokio::test]
-async fn an_incomplete_pass_reads_nothing() {
-    let exec = ScriptedExec::new(vec![Err(INITIALIZING.into())]);
-    let logs = logs();
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-
-    tailer.ensure(&running_step());
-    tailer.end_pass(true);
-    wait_for(|| exec.calls() == 1).await;
-    settle().await;
-
-    tailer.end_pass(false);
-    settle().await;
-    assert_eq!(exec.calls(), 1);
-}
-
-/// The live tail's backoff does not delay the read of an ended unit: with a
-/// backoff of an hour, the pass that no longer ensures the step stores its
-/// output at once, before a live viewer's stream ends.
-#[tokio::test]
-async fn the_read_of_an_ended_step_does_not_wait_out_the_backoff() {
-    let exec = ScriptedExec::new(vec![
-        Err(INITIALIZING.into()),
-        Ok(vec![b"short step\n".to_vec()]),
-    ]);
-    let logs = logs();
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_secs(3600));
-
-    // The live tail finds the Pod not ready and backs off for an hour.
-    tailer.ensure(&running_step());
-    tailer.end_pass(true);
-    wait_for(|| exec.calls() == 1).await;
-    settle().await;
-
-    // The step has ended: one pass reads it.
-    tailer.end_pass(true);
-    let (run, s, a) = stream();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while logs.read_all(&run, &s, &a).await.unwrap_or_default() != b"short step\n" {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .expect("the ended step's output was stored without waiting out the backoff");
-    assert_eq!(exec.calls(), 2);
-}
-
-// --- A tail that broke part way (git-bug de2bd9b) ------------------------------
-
-/// How one open of [`ContainerLog`] reads the log.
-#[derive(Clone, Copy)]
-struct Read {
-    /// Bytes per chunk.
+/// How one open of the source behaves.
+#[derive(Clone, Copy, Default)]
+struct ReadScript {
+    /// Bytes per chunk (0 = 4).
     chunk: usize,
-    /// Fail with an error after this many chunks; `None` reads to the end.
+    /// Fail with a connection error after this many chunks.
     fail_after: Option<usize>,
+    /// End cleanly after this many chunks, while the container runs (a
+    /// kubelet restart, a dropped apiserver-kubelet connection).
+    clean_after: Option<usize>,
+    /// Never return a chunk and never end.
+    hang: bool,
+    /// At the `clean_after` end, the status says the container finished
+    /// this many ms from now (a glitch: the read ended long before it).
+    glitch_finished_in_ms: Option<i64>,
 }
 
-/// A fake executor shaped like the Kubernetes log API: every open reads the
-/// container's whole log from its first byte (there is no byte offset), in
-/// chunks of the size the open's [`Read`] gives, and the open can break part
-/// way with an error. Opens past the script read to the end in 4-byte chunks.
-struct ContainerLog {
-    log: Mutex<Vec<u8>>,
-    reads: Mutex<VecDeque<Read>>,
+/// The container a [`LiveLog`] models.
+struct Container {
+    log: Vec<u8>,
+    running: bool,
+    /// A scripted state that overrides the container's.
+    state: Option<LogSourceState>,
+    /// What `log_source_state` answers while the container runs.
+    id: u32,
+    finished_at: i64,
+}
+
+struct LiveLog {
+    container: Arc<Mutex<Container>>,
+    scripts: Mutex<VecDeque<ReadScript>>,
     opens: AtomicUsize,
+    /// The source answers `NotLedgerComplete` (a Pod without the label).
+    unlabelled: AtomicBool,
+    /// Sidecar sources answer `Restarting` when their container ended.
+    restartable: AtomicBool,
+    /// What the ledger held for this unit when the backend launched it.
+    ledger_at_launch: Mutex<Option<Vec<Vec<u8>>>>,
+    launch_fails: AtomicBool,
+    logs_for_launch_check: Mutex<Option<Arc<LogService>>>,
+    launched: Mutex<Vec<StepSpec>>,
+    poll_state: Mutex<ExecState>,
+    polls: AtomicUsize,
 }
 
-impl ContainerLog {
-    fn new(log: &[u8], reads: Vec<Read>) -> Arc<Self> {
+impl LiveLog {
+    fn new(log: &[u8], running: bool) -> Arc<Self> {
         Arc::new(Self {
-            log: Mutex::new(log.to_vec()),
-            reads: Mutex::new(reads.into()),
+            container: Arc::new(Mutex::new(Container {
+                log: log.to_vec(),
+                running,
+                id: 1,
+                finished_at: if running { 0 } else { now_ms() },
+                state: None,
+            })),
+            scripts: Mutex::new(VecDeque::new()),
             opens: AtomicUsize::new(0),
+            unlabelled: AtomicBool::new(false),
+            restartable: AtomicBool::new(false),
+            ledger_at_launch: Mutex::new(None),
+            launch_fails: AtomicBool::new(false),
+            logs_for_launch_check: Mutex::new(None),
+            launched: Mutex::new(Vec::new()),
+            poll_state: Mutex::new(ExecState::Running),
+            polls: AtomicUsize::new(0),
         })
+    }
+    fn script(&self, s: ReadScript) {
+        self.scripts.lock().unwrap().push_back(s);
     }
     fn opens(&self) -> usize {
         self.opens.load(Ordering::SeqCst)
     }
-}
-
-/// Chunks of a log, then end-of-stream, or an error after `fail_after` chunks.
-struct BreakingChunks {
-    chunks: VecDeque<Vec<u8>>,
-    fail_after: Option<usize>,
-    served: usize,
-}
-
-#[async_trait]
-impl LogChunks for BreakingChunks {
-    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ExecError> {
-        if self.fail_after == Some(self.served) {
-            return Err(ExecError::Other(
-                "error reading the log stream: connection reset by peer".into(),
+    fn print(&self, more: &[u8]) {
+        self.container.lock().unwrap().log.extend_from_slice(more);
+    }
+    /// The container exits now.
+    fn stop(&self) {
+        let mut c = self.container.lock().unwrap();
+        c.running = false;
+        c.finished_at = now_ms();
+    }
+    /// The container restarts with a new, empty log.
+    fn restart(&self) {
+        let mut c = self.container.lock().unwrap();
+        c.log.clear();
+        c.id += 1;
+        c.running = true;
+    }
+    fn set_state(&self, s: Option<LogSourceState>) {
+        self.container.lock().unwrap().state = s;
+    }
+    /// The kubelet rotated the log file: the log is replaced, same
+    /// container.
+    fn rotate(&self, log: &[u8]) {
+        self.container.lock().unwrap().log = log.to_vec();
+    }
+    fn current_state(&self) -> LogSourceState {
+        let c = self.container.lock().unwrap();
+        if let Some(s) = c.state.clone() {
+            return s;
+        }
+        if c.running {
+            LogSourceState::Running {
+                container_id: Some(format!("c{}", c.id)),
+            }
+        } else {
+            LogSourceState::Ended {
+                finished_at: Timestamp(c.finished_at),
+                container_id: Some(format!("c{}", c.id)),
+            }
+        }
+    }
+    fn open(&self) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        if self.unlabelled.load(Ordering::SeqCst) {
+            return Err(ExecError::NotLedgerComplete(
+                "pod \"p\" has no label".into(),
             ));
         }
-        self.served += 1;
-        Ok(self.chunks.pop_front())
-    }
-}
-
-#[async_trait]
-impl Executor for ContainerLog {
-    async fn results_delivery_failure(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<String>, ExecError> {
-        Ok(None)
-    }
-    async fn gate_refusal(&self, _gate: &StepRun) -> Result<Option<String>, ExecError> {
-        Ok(None)
-    }
-    async fn infra_condition(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
-        Ok(None)
-    }
-    async fn take_forge_credential(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
-        Ok(None)
-    }
-    async fn workspace_provisioning(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
-        Ok(None)
-    }
-    async fn launch(&self, step: &StepRun, _spec: &StepSpec) -> Result<ExecHandle, ExecError> {
-        Ok(ExecHandle(step.step.0.clone()))
-    }
-    async fn poll(&self, _h: &ExecHandle) -> Result<ExecState, ExecError> {
-        Ok(ExecState::Running)
-    }
-    async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
-        Ok(())
-    }
-    fn unit_handle(&self, _step: &StepRun) -> Option<ExecHandle> {
-        None
-    }
-    async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
-        Ok(true)
-    }
-    async fn log_stream(
-        &self,
-        _step: &StepRun,
-        _from: LogFrom,
-    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         self.opens.fetch_add(1, Ordering::SeqCst);
-        let read = self.reads.lock().unwrap().pop_front().unwrap_or(Read {
-            chunk: 4,
-            fail_after: None,
-        });
-        let chunks = self
-            .log
-            .lock()
-            .unwrap()
-            .chunks(read.chunk)
-            .map(<[u8]>::to_vec)
-            .collect();
-        Ok(Some(Box::new(BreakingChunks {
-            chunks,
-            fail_after: read.fail_after,
+        let script = self.scripts.lock().unwrap().pop_front().unwrap_or_default();
+        let id = self.container.lock().unwrap().id;
+        Ok(Some(Box::new(Follow {
+            container: self.container.clone(),
+            id,
+            pos: 0,
+            script,
             served: 0,
         })))
     }
 }
 
-/// Wait (bounded) until the stream's stored log is `want`.
-async fn wait_stored(logs: &LogService, want: &[u8]) {
-    let (run, s, a) = stream();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while logs.read_all(&run, &s, &a).await.unwrap_or_default() != want {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "stored log never became {:?}",
-            String::from_utf8_lossy(want)
-        )
-    });
-}
-
-/// git-bug de2bd9b: the live tail stores the first lines, then the stream
-/// breaks. The step prints the rest and ends inside the retry backoff, so no
-/// live retry runs. The read of the ended step stores the rest, once.
-#[tokio::test]
-async fn output_after_a_broken_tail_is_stored_when_the_step_ends_in_the_backoff() {
-    let full = b"line one\nline two\nline three\n";
-    let exec = ContainerLog::new(
-        full,
-        vec![
-            // The live tail stores "line one\nl" and breaks.
-            Read {
-                chunk: 5,
-                fail_after: Some(2),
-            },
-            // The ended step's read comes in other chunk sizes, so the
-            // stored part ends inside a chunk.
-            Read {
-                chunk: 7,
-                fail_after: None,
-            },
-        ],
-    );
-    let logs = logs();
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_secs(3600));
-
-    tailer.ensure(&running_step());
-    tailer.end_pass(true);
-    wait_stored(&logs, b"line one\nl").await;
-    settle().await;
-
-    // The step has ended: the next pass ensures nothing.
-    tailer.end_pass(true);
-    wait_stored(&logs, full).await;
-    for _ in 0..3 {
-        tailer.end_pass(true);
-        settle().await;
-    }
-    assert_eq!(exec.opens(), 2, "one live tail, one read of the ended step");
-    let (run, s, a) = stream();
-    assert_eq!(logs.read_all(&run, &s, &a).await.unwrap(), full);
-}
-
-/// git-bug de2bd9b: a running step's tail breaks part way and is opened
-/// again after the backoff. The new read starts at the log's first byte; the
-/// stored part is skipped and the lines printed since are appended: no line
-/// twice, none missing.
-#[tokio::test]
-async fn a_running_step_resumes_after_a_broken_tail_without_a_duplicate_or_a_gap() {
-    let exec = ContainerLog::new(
-        b"one\ntwo\nthree\n",
-        vec![
-            Read {
-                chunk: 4,
-                fail_after: Some(2),
-            },
-            Read {
-                chunk: 3,
-                fail_after: None,
-            },
-        ],
-    );
-    let logs = logs();
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    let step = running_step();
-
-    tailer.ensure(&step);
-    wait_stored(&logs, b"one\ntwo\n").await;
-    // The step prints more before the tail is opened again.
-    exec.log.lock().unwrap().extend_from_slice(b"four\n");
-
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while exec.opens() < 2 {
-            tailer.ensure(&step);
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the broken tail is opened again");
-    wait_stored(&logs, b"one\ntwo\nthree\nfour\n").await;
-
-    // The second read reached the end of the stream: the fence is drained.
-    for _ in 0..3 {
-        tailer.ensure(&step);
-        settle().await;
-    }
-    assert_eq!(exec.opens(), 2);
-    let (run, s, a) = stream();
-    assert_eq!(
-        logs.read_all(&run, &s, &a).await.unwrap(),
-        b"one\ntwo\nthree\nfour\n"
-    );
-}
-
-/// git-bug de2bd9b: the stored part is skipped by its length as read from the
-/// container, not as stored. A secret in it is stored as `***`, shorter than
-/// the secret; resuming at the stored length would append part of the
-/// secret's line again.
-#[tokio::test]
-async fn redaction_in_the_stored_part_does_not_move_the_resume_point() {
-    let line = b"token=s3cr3t-value\n";
-    let exec = ContainerLog::new(
-        b"token=s3cr3t-value\nnext line\n",
-        vec![
-            // The first chunk is the whole secret's line; then the tail breaks.
-            Read {
-                chunk: line.len(),
-                fail_after: Some(1),
-            },
-            Read {
-                chunk: 7,
-                fail_after: None,
-            },
-        ],
-    );
-    let logs = logs();
-    logs.register_secret(&fence(), b"s3cr3t-value");
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_secs(3600));
-
-    tailer.ensure(&running_step());
-    tailer.end_pass(true);
-    wait_stored(&logs, b"token=***\n").await;
-    settle().await;
-
-    tailer.end_pass(true);
-    wait_stored(&logs, b"token=***\nnext line\n").await;
-    for _ in 0..3 {
-        tailer.end_pass(true);
-        settle().await;
-    }
-    let (run, s, a) = stream();
-    assert_eq!(
-        logs.read_all(&run, &s, &a).await.unwrap(),
-        b"token=***\nnext line\n"
-    );
-}
-
-/// Collects formatted log lines, for a test that checks a warning.
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Captured {
-    /// Route WARN lines of this (single-threaded) test runtime here.
-    fn install(&self) -> tracing::subscriber::DefaultGuard {
-        let writer = self.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        tracing::subscriber::set_default(subscriber)
-    }
-    fn text(&self) -> String {
-        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-    }
-}
-
-/// The chunk stored before a source is stored again from its first byte.
-const MARKER: &[u8] = b"\nscarab: the log source restarted; earlier lines may repeat\n";
-
-fn cat(parts: &[&[u8]]) -> Vec<u8> {
-    parts.concat()
-}
-
-fn markers(log: &[u8]) -> usize {
-    log.windows(MARKER.len()).filter(|w| *w == MARKER).count()
-}
-
-/// A fake executor shaped like a followed Kubernetes log: every open reads the
-/// container's log as it is now from its first byte and, while `running`,
-/// waits for more instead of ending. The test replaces the log to model a
-/// rotated log file or a restarted container. An open can break after a
-/// number of chunks; opens past the script read in 4-byte chunks.
-/// `sidecar_log_stream` reads the same log. `log_redactions` answers what
-/// the test set.
-struct LiveLog {
-    log: Arc<Mutex<Vec<u8>>>,
-    running: Arc<std::sync::atomic::AtomicBool>,
-    reads: Mutex<VecDeque<Read>>,
-    opens: AtomicUsize,
-    redactions: Mutex<Result<LogRedactions, String>>,
-}
-
-impl LiveLog {
-    fn new(log: &[u8], running: bool, reads: Vec<Read>) -> Arc<Self> {
-        Arc::new(Self {
-            log: Arc::new(Mutex::new(log.to_vec())),
-            running: Arc::new(std::sync::atomic::AtomicBool::new(running)),
-            reads: Mutex::new(reads.into()),
-            opens: AtomicUsize::new(0),
-            redactions: Mutex::new(Ok(LogRedactions::Values(Vec::new()))),
-        })
-    }
-    fn opens(&self) -> usize {
-        self.opens.load(Ordering::SeqCst)
-    }
-    fn set(&self, log: &[u8]) {
-        *self.log.lock().unwrap() = log.to_vec();
-    }
-    fn print(&self, more: &[u8]) {
-        self.log.lock().unwrap().extend_from_slice(more);
-    }
-    fn stop(&self) {
-        self.running.store(false, Ordering::SeqCst);
-    }
-    /// What `log_redactions` answers from now on.
-    fn answer(&self, answer: Result<LogRedactions, &str>) {
-        *self.redactions.lock().unwrap() = answer.map_err(str::to_string);
-    }
-    fn open(&self, from: LogFrom) -> Box<dyn LogChunks> {
-        self.opens.fetch_add(1, Ordering::SeqCst);
-        // A read from now on starts after what is printed already.
-        let pos = match from {
-            LogFrom::Start => 0,
-            LogFrom::Now => self.log.lock().unwrap().len(),
-        };
-        let read = self.reads.lock().unwrap().pop_front().unwrap_or(Read {
-            chunk: 4,
-            fail_after: None,
-        });
-        Box::new(FollowChunks {
-            log: self.log.clone(),
-            running: self.running.clone(),
-            pos,
-            read,
-            served: 0,
-        })
-    }
-}
-
-struct FollowChunks {
-    log: Arc<Mutex<Vec<u8>>>,
-    running: Arc<std::sync::atomic::AtomicBool>,
+struct Follow {
+    container: Arc<Mutex<Container>>,
+    /// The container this read follows: a restart ends it.
+    id: u32,
     pos: usize,
-    read: Read,
+    script: ReadScript,
     served: usize,
 }
 
 #[async_trait]
-impl LogChunks for FollowChunks {
+impl LogChunks for Follow {
     async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ExecError> {
+        if self.script.hang {
+            std::future::pending::<()>().await;
+        }
         loop {
-            if self.read.fail_after == Some(self.served) {
-                return Err(ExecError::Other(
-                    "error reading the log stream: connection reset by peer".into(),
-                ));
+            if self.script.fail_after == Some(self.served) {
+                return Err(ExecError::Other("connection reset by peer".into()));
+            }
+            if self.script.clean_after == Some(self.served) {
+                if let Some(ms) = self.script.glitch_finished_in_ms {
+                    self.container.lock().unwrap().state = Some(LogSourceState::Ended {
+                        finished_at: Timestamp(now_ms() + ms),
+                        container_id: Some("c1".into()),
+                    });
+                }
+                return Ok(None);
             }
             {
-                let log = self.log.lock().unwrap();
-                if self.pos < log.len() {
-                    let end = (self.pos + self.read.chunk).min(log.len());
-                    let chunk = log[self.pos..end].to_vec();
+                let c = self.container.lock().unwrap();
+                if c.id != self.id {
+                    return Ok(None);
+                }
+                if self.pos < c.log.len() {
+                    let n = if self.script.chunk == 0 {
+                        4
+                    } else {
+                        self.script.chunk
+                    };
+                    let end = (self.pos + n).min(c.log.len());
+                    let chunk = c.log[self.pos..end].to_vec();
                     self.pos = end;
                     self.served += 1;
                     return Ok(Some(chunk));
                 }
-            }
-            if !self.running.load(Ordering::SeqCst) {
-                return Ok(None);
+                if !c.running {
+                    return Ok(None);
+                }
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -994,1348 +331,2399 @@ impl LogChunks for FollowChunks {
 
 #[async_trait]
 impl Executor for LiveLog {
-    async fn results_delivery_failure(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<String>, ExecError> {
-        Ok(None)
-    }
-    async fn gate_refusal(&self, _gate: &StepRun) -> Result<Option<String>, ExecError> {
-        Ok(None)
-    }
-    async fn infra_condition(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
-        Ok(None)
-    }
-    async fn take_forge_credential(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
-        Ok(None)
-    }
-    async fn workspace_provisioning(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
-        Ok(None)
-    }
-    async fn launch(&self, step: &StepRun, _spec: &StepSpec) -> Result<ExecHandle, ExecError> {
-        Ok(ExecHandle(step.step.0.clone()))
+    async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+        if let Some(logs) = self.logs_for_launch_check.lock().unwrap().clone() {
+            let unit = LogStreamId::new(&step.run, &step.step, &step.attempts[0].id);
+            // What the ledger holds when the backend is called.
+            let held = futures::executor::block_on(logs.reload_values(&unit))
+                .map(|v| v.values().to_vec())
+                .unwrap_or_default();
+            *self.ledger_at_launch.lock().unwrap() = Some(held);
+        }
+        self.launched.lock().unwrap().push(spec.clone());
+        if self.launch_fails.load(Ordering::SeqCst) {
+            return Err(ExecError::Launch("the API server is unavailable".into()));
+        }
+        Ok(ExecHandle(format!("pod-{}", step.step.0)))
     }
     async fn poll(&self, _h: &ExecHandle) -> Result<ExecState, ExecError> {
-        Ok(ExecState::Running)
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.poll_state.lock().unwrap().clone())
     }
     async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
         Ok(())
     }
-    fn unit_handle(&self, _step: &StepRun) -> Option<ExecHandle> {
-        None
+    fn unit_handle(&self, step: &StepRun) -> Option<ExecHandle> {
+        Some(ExecHandle(format!("pod-{}", step.step.0)))
     }
     async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
         Ok(true)
     }
+    async fn results_delivery_failure(&self, _h: &ExecHandle) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+    async fn workspace_provisioning(
+        &self,
+        _h: &ExecHandle,
+    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
+        Ok(None)
+    }
+    async fn gate_refusal(&self, _g: &StepRun) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+    async fn infra_condition(
+        &self,
+        _h: &ExecHandle,
+    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
+        Ok(None)
+    }
+    async fn delete_unit_secrets(&self, _h: &ExecHandle) -> Result<(), ExecError> {
+        Ok(())
+    }
+    async fn log_source_state(&self, src: &LogSourceRef) -> Result<LogSourceState, ExecError> {
+        let s = self.current_state();
+        if self.restartable.load(Ordering::SeqCst) && matches!(src, LogSourceRef::Sidecar { .. }) {
+            if let LogSourceState::Ended { .. } = s {
+                return Ok(LogSourceState::Restarting);
+            }
+        }
+        Ok(s)
+    }
     async fn log_stream(
         &self,
         _step: &StepRun,
-        from: LogFrom,
+        _from: LogFrom,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        Ok(Some(self.open(from)))
+        self.open()
     }
     async fn sidecar_log_stream(
         &self,
         _step: &StepRun,
         _container: &str,
-        from: LogFrom,
+        _from: LogFrom,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        Ok(Some(self.open(from)))
-    }
-    async fn log_redactions(&self, _step: &StepRun) -> Result<LogRedactions, ExecError> {
-        self.redactions
-            .lock()
-            .unwrap()
-            .clone()
-            .map_err(ExecError::Other)
+        self.open()
     }
 }
 
-/// Wait (bounded) until the stream `{r, build-or-sidecar, a1}` stores `want`.
-async fn wait_stored_in(logs: &LogService, step: &StepId, want: &[u8]) {
-    let (run, _, a) = stream();
-    let mut got = Vec::new();
-    let waited = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            got = logs.read_all(&run, step, &a).await.unwrap_or_default();
-            if got == want {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+/// An object store that counts GETs and records every PUT's bytes per key.
+#[derive(Default)]
+struct CountingStore {
+    inner: InMemoryObjectStore,
+    gets: AtomicUsize,
+    puts: Mutex<HashMap<String, Vec<Vec<u8>>>>,
+}
+
+#[async_trait]
+impl ObjectStore for CountingStore {
+    async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), scarab_storage::StorageError> {
+        self.puts
+            .lock()
+            .unwrap()
+            .entry(key.to_string())
+            .or_default()
+            .push(body.clone());
+        self.inner.put(key, body).await
+    }
+    async fn get(&self, key: &str) -> Result<Vec<u8>, scarab_storage::StorageError> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        self.inner.get(key).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), scarab_storage::StorageError> {
+        self.inner.delete(key).await
+    }
+    async fn list_objects(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<scarab_storage::StoredObject>, scarab_storage::StorageError> {
+        self.inner.list_objects(prefix).await
+    }
+}
+
+/// One replica: its log service (with `sealer`) over the shared store.
+fn replica(
+    db: &Arc<InMemoryDb>,
+    store: Arc<dyn ObjectStore>,
+    sealer: &Arc<dyn scarab_secrets::Sealer>,
+) -> Arc<LogService> {
+    Arc::new(LogService::new(store, db.clone() as Arc<dyn Db>).with_sealer(sealer.clone()))
+}
+
+fn sealer() -> Arc<dyn scarab_secrets::Sealer> {
+    Arc::new(scarab_secrets_postgres::KeySealer::ephemeral())
+}
+
+struct World {
+    db: Arc<InMemoryDb>,
+    store: Arc<CountingStore>,
+    sealer: Arc<dyn scarab_secrets::Sealer>,
+    forge: Arc<FakeForge>,
+}
+
+impl World {
+    async fn new() -> Self {
+        let db = Arc::new(InMemoryDb::new());
+        db.seed_run(&run(), scarab_engine::RunStatus::Running);
+        db.create_step_run(&run(), &StepId(STEP.into()), None, &[], Timestamp(0))
+            .await
+            .unwrap();
+        db.record_attempt(&run(), &StepId(STEP.into()), &running().attempts[0].clone())
+            .await
+            .unwrap();
+        db.set_run_deploy_context(
+            &run(),
+            &DeployContext {
+                org: "acme".into(),
+                project: "web".into(),
+                environment: "prod".into(),
+                git_ref: "refs/heads/main".into(),
+                locked_out: false,
+            },
+        )
+        .await
+        .unwrap();
+        Self {
+            db,
+            store: Arc::new(CountingStore::default()),
+            sealer: sealer(),
+            forge: Arc::new(FakeForge::new().with_minted_tokens()),
         }
+    }
+
+    fn logs(&self) -> Arc<LogService> {
+        replica(&self.db, self.store.clone(), &self.sealer)
+    }
+
+    /// The production executor stack over `backend`, on replica `logs`.
+    fn stack(&self, backend: Arc<LiveLog>, logs: &Arc<LogService>) -> Arc<dyn Executor> {
+        let db = self.db.clone() as Arc<dyn Db>;
+        let forge = self.forge.clone() as Arc<dyn ForgePort>;
+        let secret_logs = logs.clone();
+        build_executor_stack(
+            backend,
+            logs.clone(),
+            Arc::new(scarab_testkit::FakeClock::new(now_ms())),
+            move |ledger| {
+                SecretInjectingExecutor::new(ledger, db, Arc::new(FakeSecrets::new()), secret_logs)
+            },
+            move |with_secrets, ledger_logs| {
+                scarab_server::forge_token::ForgeCredentialExecutor::new(
+                    with_secrets,
+                    forge,
+                    ledger_logs,
+                )
+            },
+        )
+    }
+
+    /// Give the unit a ledger holding `values` (as a launch would).
+    async fn ledger(&self, logs: &LogService, values: &[&[u8]]) {
+        logs.record_launch_values(
+            &stream(),
+            Some("pod-build"),
+            values
+                .iter()
+                .map(|v| scarab_engine::MountedValue {
+                    kind: scarab_engine::MountedValueKind::Secret,
+                    value: v.to_vec(),
+                    repo: None,
+                    minted: None,
+                })
+                .collect(),
+            Timestamp(now_ms()),
+        )
+        .await
+        .unwrap();
+    }
+
+    fn tailer(&self, exec: Arc<dyn Executor>, logs: &Arc<LogService>, owner: &str) -> LogTailer {
+        LogTailer::new(exec, logs.clone())
+            .with_lease(self.db.clone() as Arc<dyn Db>, owner)
+            .with_timing(timing())
+    }
+
+    async fn rows(&self, s: &LogStreamId) -> Vec<scarab_engine::LogChunkMeta> {
+        self.db
+            .log_chunks(&s.run, &s.step, &s.attempt)
+            .await
+            .unwrap()
+    }
+
+    async fn state(&self, s: &LogStreamId) -> Option<LogStreamState> {
+        self.db.log_stream_row(s).await.unwrap().map(|r| r.state)
+    }
+
+    /// The stored output bytes of `s`.
+    async fn stored(&self, logs: &LogService, s: &LogStreamId) -> Vec<u8> {
+        logs.read_output(&s.run, &s.step, &s.attempt).await.unwrap()
+    }
+
+    async fn markers(&self, s: &LogStreamId) -> Vec<LogRowKind> {
+        self.rows(s)
+            .await
+            .into_iter()
+            .filter(|r| !r.is_output())
+            .map(|r| r.kind)
+            .collect()
+    }
+
+    /// End the attempt in the store.
+    async fn end_attempt(&self) {
+        self.db
+            .set_attempt_outcome(
+                &run(),
+                &StepId(STEP.into()),
+                &AttemptId(ATTEMPT.into()),
+                AttemptOutcome::Succeeded,
+            )
+            .await
+            .unwrap();
+    }
+}
+
+/// Wait (bounded, real time) for `cond`.
+async fn until<F, Fut>(what: &str, mut cond: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..1500 {
+        if cond().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// Drive `tailer` like the driver: ensure while `running`, then end passes.
+async fn drive_until<F, Fut>(tailer: &LogTailer, step: &StepRun, what: &str, mut cond: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..1500 {
+        if step.attempts[0].outcome == AttemptOutcome::Running {
+            tailer.ensure(step);
+        }
+        tailer.end_pass(true);
+        if cond().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+// ---------------------------------------------------------------------------
+// I1: the ledger and redaction
+// ---------------------------------------------------------------------------
+
+/// I1/I7: the stack records every value the launch mounts (the forge token
+/// the outer layer minted) in the unit's ledger before the backend is
+/// called. Kills: the ledger written after `inner.launch`; a value kind
+/// missing from `mounted_secret_values`; the ledger layer not innermost.
+#[tokio::test]
+async fn the_ledger_is_written_before_the_unit_is_created() {
+    let w = World::new().await;
+    let logs = w.logs();
+    let live = LiveLog::new(b"", true);
+    *live.logs_for_launch_check.lock().unwrap() = Some(logs.clone());
+    let stack = w.stack(live.clone(), &logs);
+    stack.launch(&running(), &forge_spec()).await.unwrap();
+    let token = live.launched.lock().unwrap()[0]
+        .forge_token
+        .as_ref()
+        .unwrap()
+        .credential
+        .as_ref()
+        .unwrap()
+        .token
+        .clone();
+    let held = live.ledger_at_launch.lock().unwrap().clone().unwrap();
+    assert!(
+        held.contains(&token.into_bytes()),
+        "the forge token was not in the ledger when the backend launched"
+    );
+}
+
+/// I1 (2d78464): a re-drive on another replica mints a new token and
+/// records a new generation; a tail on this replica holding the old set
+/// has its next append refused, reloads, and stores the new token as
+/// `***`. Kills: `values_gen` ignored; no reload on `ValuesChanged`.
+#[tokio::test]
+async fn a_redrive_on_a_peer_is_redacted_before_the_step_can_print_it() {
+    let w = World::new().await;
+    let (a, b) = (w.logs(), w.logs());
+    let live = LiveLog::new(b"", true);
+    w.stack(live.clone(), &a)
+        .launch(&running(), &forge_spec())
+        .await
+        .unwrap();
+    let tailer = w.tailer(live.clone(), &a, "replica-a");
+    tailer.ensure(&running());
+    live.print(b"first line\n");
+    until("the first line", || async {
+        w.stored(&a, &stream()).await == b"first line\n"
+    })
+    .await;
+    // Replica B re-drives: a new token is minted and recorded.
+    w.stack(live.clone(), &b)
+        .launch(&running(), &forge_spec())
+        .await
+        .unwrap();
+    let t2 = live.launched.lock().unwrap()[1]
+        .forge_token
+        .as_ref()
+        .unwrap()
+        .credential
+        .as_ref()
+        .unwrap()
+        .token
+        .clone();
+    live.print(format!("token {t2}\n").as_bytes());
+    live.stop();
+    until("the stream completes", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    let stored = String::from_utf8(w.stored(&a, &stream()).await).unwrap();
+    assert!(!stored.contains(&t2), "{stored}");
+    assert!(stored.contains("token ***"), "{stored}");
+}
+
+/// I1: a server that starts after a re-drive loads every generation: the
+/// token the re-drive replaced is redacted too. Kills: loading only the
+/// newest generation.
+#[tokio::test]
+async fn a_restarted_server_redacts_the_token_a_redrive_replaced() {
+    let w = World::new().await;
+    let a = w.logs();
+    let live = LiveLog::new(b"", true);
+    let stack = w.stack(live.clone(), &a);
+    stack.launch(&running(), &forge_spec()).await.unwrap();
+    stack.launch(&running(), &forge_spec()).await.unwrap();
+    let tokens: Vec<String> = live
+        .launched
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            s.forge_token
+                .as_ref()
+                .unwrap()
+                .credential
+                .as_ref()
+                .unwrap()
+                .token
+                .clone()
+        })
+        .collect();
+    assert_ne!(tokens[0], tokens[1]);
+    // A fresh process: nothing in memory, the same keys.
+    let fresh = w.logs();
+    let tailer = w.tailer(live.clone(), &fresh, "fresh");
+    live.print(format!("{} {}\n", tokens[0], tokens[1]).as_bytes());
+    live.stop();
+    drive_until(&tailer, &running(), "complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    assert_eq!(w.stored(&fresh, &stream()).await, b"*** ***\n");
+}
+
+/// I1: a re-launch that fails after its ledger write keeps every value
+/// (the running unit may hold either token). Kills: forgetting values on a
+/// launch error.
+#[tokio::test]
+async fn a_failed_relaunch_keeps_the_values_of_the_running_unit() {
+    let w = World::new().await;
+    let logs = w.logs();
+    let live = LiveLog::new(b"", true);
+    let stack = w.stack(live.clone(), &logs);
+    stack.launch(&running(), &forge_spec()).await.unwrap();
+    live.launch_fails.store(true, Ordering::SeqCst);
+    stack.launch(&running(), &forge_spec()).await.unwrap_err();
+    let tokens: Vec<String> = live
+        .launched
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            s.forge_token
+                .as_ref()
+                .unwrap()
+                .credential
+                .as_ref()
+                .unwrap()
+                .token
+                .clone()
+        })
+        .collect();
+    let values = logs.reload_values(&stream()).await.unwrap();
+    for t in &tokens {
+        assert!(values.values().contains(&t.clone().into_bytes()), "{t}");
+    }
+}
+
+/// I1 (93b7733, Q3 = B): a unit launched by an earlier version (no ledger
+/// row, a Pod without the label) gets one `not_stored` marker and no
+/// source byte, however often it is ensured. Kills: any read of a unit
+/// with no ledger; the marker repeated.
+#[tokio::test]
+async fn a_unit_without_a_ledger_stores_one_marker_and_no_bytes() {
+    let w = World::new().await;
+    let logs = w.logs();
+    let live = LiveLog::new(b"token-from-0.6\n", true);
+    live.unlabelled.store(true, Ordering::SeqCst);
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    drive_until(&tailer, &running(), "closed", || async {
+        w.state(&stream()).await == Some(LogStreamState::Closed)
+    })
+    .await;
+    for _ in 0..5 {
+        tailer.ensure(&running());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let rows = w.rows(&stream()).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].kind, LogRowKind::NotStored);
+    assert_eq!(rows[0].reason, Some(NotStoredReason::NoLedger));
+    assert_eq!(live.opens(), 0, "no source byte read");
+}
+
+/// I1: an ended unit an earlier version launched, which no tail of this
+/// version saw run, is closed by the pending-final-read query with one
+/// `not_stored` marker (it started) and no source read. Kills: no pending
+/// query for units with no ledger.
+#[tokio::test]
+async fn an_ended_unit_without_a_ledger_is_closed_by_the_pending_query() {
+    let w = World::new().await;
+    let logs = w.logs();
+    // Running when the ledger was added (migration 0099 records it).
+    w.db.seed_log_legacy_unit(&stream());
+    w.db.mark_attempt_execution_started(
+        &run(),
+        &StepId(STEP.into()),
+        &AttemptId(ATTEMPT.into()),
+        Timestamp(5),
+    )
+    .await
+    .unwrap();
+    w.end_attempt().await;
+    let live = LiveLog::new(b"secret-from-0.6\n", false);
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.sweep().await;
+    until("closed", || async {
+        w.state(&stream()).await == Some(LogStreamState::Closed)
+    })
+    .await;
+    assert_eq!(w.markers(&stream()).await, [LogRowKind::NotStored]);
+    assert_eq!(live.opens(), 0);
+}
+
+/// I1 (85b29e0 iv): a unit with a ledger whose Pod lacks the label (an
+/// earlier version made the Pod) is not read. Kills: the label check
+/// removed.
+#[tokio::test]
+async fn a_pod_without_the_ledger_label_stores_no_bytes() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[b"s3cr3t-value"]).await;
+    let live = LiveLog::new(b"s3cr3t-value\n", true);
+    live.unlabelled.store(true, Ordering::SeqCst);
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    drive_until(&tailer, &running(), "closed", || async {
+        w.state(&stream()).await == Some(LogStreamState::Closed)
+    })
+    .await;
+    assert_eq!(w.markers(&stream()).await, [LogRowKind::NotStored]);
+    assert!(w.stored(&logs, &stream()).await.is_empty());
+}
+
+/// I1 (772c34f): a value that starts with `***` is redacted after a broken
+/// read and a retry; nothing classifies a difference by `***`. Kills: a
+/// `***`-based classification (the 0.6.x "from now on" path).
+#[tokio::test]
+async fn a_value_starting_with_stars_is_redacted_after_a_retry() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[b"***starry-secret"]).await;
+    let live = LiveLog::new(b"a ***starry-secret b\n", true);
+    live.script(ReadScript {
+        fail_after: Some(3),
+        ..Default::default()
+    });
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.ensure(&running());
+    until("the first part", || async {
+        !w.rows(&stream()).await.is_empty()
+    })
+    .await;
+    live.print(b"c ***starry-secret d\n");
+    live.stop();
+    drive_until(&tailer, &running(), "complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    assert_eq!(w.stored(&logs, &stream()).await, b"a *** b\nc *** d\n");
+    assert!(w.markers(&stream()).await.is_empty());
+}
+
+/// I1 prefix rule, at the tail: a log whose confirmed end is inside the
+/// start of a value stores `***`. Kills: no prefix rule at a confirmed end.
+#[tokio::test]
+async fn a_confirmed_end_inside_a_value_prefix_stores_stars() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[b"token-value"]).await;
+    let live = LiveLog::new(b"ends in token-va", false);
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.ensure(&running());
+    until("complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    assert_eq!(w.stored(&logs, &stream()).await, b"ends in ***");
+}
+
+/// I1 suffix rule, at the tail: after a rotation the source starts inside
+/// a value; its tail of at least 8 bytes is `***` in the part after the
+/// `source_restarted` row. Kills: no suffix rule after a restart.
+#[tokio::test]
+async fn a_part_after_a_restart_starting_inside_a_value_stores_stars() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[b"ghs_0123456789abcdef"]).await;
+    let live = LiveLog::new(b"first\n", true);
+    live.script(ReadScript {
+        chunk: 64,
+        fail_after: Some(1),
+        ..Default::default()
+    });
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.ensure(&running());
+    until("first", || async {
+        w.stored(&logs, &stream()).await == b"first\n"
+    })
+    .await;
+    // The read breaks; the kubelet rotates the file meanwhile: the new
+    // one starts mid-value.
+    live.rotate(b"6789abcdef rest\n");
+    live.stop();
+    drive_until(&tailer, &running(), "complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    assert_eq!(w.markers(&stream()).await, [LogRowKind::SourceRestarted]);
+    assert_eq!(w.stored(&logs, &stream()).await, b"first\n*** rest\n");
+}
+
+// ---------------------------------------------------------------------------
+// I2: how a read ends
+// ---------------------------------------------------------------------------
+
+/// I2 (93b7733): a clean end while the container still runs (a dropped
+/// apiserver-kubelet connection) is not a complete log: held bytes are
+/// dropped, the stream stays open and the next read stores the rest.
+/// Kills: `complete` on a clean end without asking the state.
+#[tokio::test]
+async fn a_clean_end_while_running_stores_no_held_bytes_and_rereads() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[b"token-value"]).await;
+    let live = LiveLog::new(b"line 1\nhalf tok", true);
+    live.script(ReadScript {
+        chunk: 64,
+        clean_after: Some(1),
+        ..Default::default()
+    });
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.ensure(&running());
+    until("line 1", || async {
+        w.stored(&logs, &stream()).await == b"line 1\nhalf "
+    })
+    .await;
+    assert_eq!(w.state(&stream()).await, Some(LogStreamState::Open));
+    live.print(b"en-value done\n");
+    live.stop();
+    drive_until(&tailer, &running(), "complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    assert_eq!(w.stored(&logs, &stream()).await, b"line 1\nhalf *** done\n");
+}
+
+/// I2: the common race at a real exit — the read ends before the status
+/// says `terminated`. The read keeps its position and polls; one source
+/// open. Kills: a re-read on every unconfirmed clean end.
+#[tokio::test]
+async fn a_clean_end_before_the_status_turns_terminated_completes_without_a_reread() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    let live = LiveLog::new(b"all of it\n", true);
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.ensure(&running());
+    until("stored", || async { !w.rows(&stream()).await.is_empty() }).await;
+    // The container exits; the status still says running for a moment.
+    live.set_state(Some(LogSourceState::Running {
+        container_id: Some("c1".into()),
+    }));
+    live.stop();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    live.set_state(None);
+    until("complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    assert_eq!(live.opens(), 1);
+    assert_eq!(w.stored(&logs, &stream()).await, b"all of it\n");
+}
+
+/// I2: a clean end long before the container's reported finish is a
+/// glitch: re-read; the re-read is opened after `Ended`, so its end is
+/// confirmed without the clock. Kills: skipping the `finished_at` check.
+#[tokio::test]
+async fn a_glitch_end_followed_by_exit_is_reread() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    let live = LiveLog::new(b"one\n", true);
+    live.script(ReadScript {
+        clean_after: Some(1),
+        glitch_finished_in_ms: Some(60_000),
+        ..Default::default()
+    });
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.ensure(&running());
+    until("a second open", || {
+        tailer.ensure(&running());
+        async { live.opens() >= 2 }
+    })
+    .await;
+    live.print(b"two\n");
+    live.stop();
+    live.set_state(None);
+    drive_until(&tailer, &running(), "complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    assert_eq!(w.stored(&logs, &stream()).await, b"one\ntwo\n");
+    assert!(w.markers(&stream()).await.is_empty());
+}
+
+/// I2: a read opened after the container ended completes on its clean end
+/// whatever the clocks say. Kills: the clock check on such a read.
+#[tokio::test]
+async fn a_read_opened_after_ended_completes_without_a_clock() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    let live = LiveLog::new(b"done\n", false);
+    live.set_state(Some(LogSourceState::Ended {
+        finished_at: Timestamp(now_ms() + 3_600_000),
+        container_id: Some("c1".into()),
+    }));
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.ensure(&running());
+    until("complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    assert_eq!(live.opens(), 1);
+}
+
+/// I2: a sidecar that crashes and restarts keeps its new output: its
+/// stream is not completed by the container's end; the next read stores a
+/// `source_restarted` row and the new container's log. Kills: `complete`
+/// on a restartable container's end.
+#[tokio::test]
+async fn a_sidecar_that_restarts_keeps_its_new_output() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    let live = LiveLog::new(b"db up\n", true);
+    live.restartable.store(true, Ordering::SeqCst);
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.ensure_sidecar(&running(), 0);
+    until("first", || async {
+        w.stored(&logs, &sidecar_stream()).await == b"db up\n"
+    })
+    .await;
+    live.stop();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    live.restart();
+    live.print(b"db up again\n");
+    until("the new container's log", || {
+        tailer.ensure_sidecar(&running(), 0);
+        async { w.stored(&logs, &sidecar_stream()).await == b"db up\ndb up again\n" }
+    })
+    .await;
+    assert_eq!(w.state(&sidecar_stream()).await, Some(LogStreamState::Open));
+    assert_eq!(
+        w.markers(&sidecar_stream()).await,
+        [LogRowKind::SourceRestarted]
+    );
+}
+
+/// I2: the held bytes of a restarting sidecar's ended container are
+/// emitted with the prefix rule, not dropped. Kills: held bytes dropped on
+/// `Restarting`.
+#[tokio::test]
+async fn a_restarting_sidecar_emits_the_held_bytes_of_the_ended_container() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[b"token-value"]).await;
+    let live = LiveLog::new(b"bye t", true);
+    live.restartable.store(true, Ordering::SeqCst);
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.ensure_sidecar(&running(), 0);
+    until("the open", || async { live.opens() >= 1 }).await;
+    live.stop();
+    until("the held bytes", || async {
+        w.stored(&logs, &sidecar_stream()).await == b"bye ***"
+    })
+    .await;
+}
+
+/// I2/I9: a live read that hangs (no byte, no end) of a unit that ended is
+/// aborted once the state says `Ended`, and the final read re-opens and
+/// completes. Kills: no abort after the unit ends.
+#[tokio::test]
+async fn a_hung_read_of_an_ended_unit_is_aborted_and_read_again() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    let live = LiveLog::new(b"all\n", true);
+    live.script(ReadScript {
+        hang: true,
+        ..Default::default()
+    });
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.ensure(&running());
+    until("the hung open", || async { live.opens() == 1 }).await;
+    live.stop();
+    // The unit leaves Running: the driver stops ensuring it.
+    drive_until(
+        &tailer,
+        &step_run(AttemptOutcome::Succeeded),
+        "complete",
+        || async { w.state(&stream()).await == Some(LogStreamState::Complete) },
+    )
+    .await;
+    assert_eq!(w.stored(&logs, &stream()).await, b"all\n");
+    assert_eq!(live.opens(), 2);
+}
+
+/// I2 (85b29e0): a unit that settled while no server ran is read by the
+/// pending-final-read query. Kills: no pending query.
+#[tokio::test]
+async fn a_unit_settled_while_no_server_ran_is_read() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[b"s3cr3t"]).await;
+    w.end_attempt().await;
+    let live = LiveLog::new(b"printed s3cr3t\n", false);
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.sweep().await;
+    until("complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    assert_eq!(w.stored(&logs, &stream()).await, b"printed ***\n");
+}
+
+// ---------------------------------------------------------------------------
+// I3, I4, I5: one writer, markers out of band, bounded cost
+// ---------------------------------------------------------------------------
+
+/// I3 (B-1): two reads in one lease term (a broken read and its retry)
+/// never PUT different bytes to one key, and every row's body hashes to
+/// its digest. Kills: a counter-based object key.
+#[tokio::test]
+async fn two_reads_in_one_term_never_rewrite_a_body() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    let live = LiveLog::new(b"aaaa\nbbbb\n", true);
+    live.script(ReadScript {
+        fail_after: Some(2),
+        ..Default::default()
+    });
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.ensure(&running());
+    until("first rows", || async {
+        !w.rows(&stream()).await.is_empty()
+    })
+    .await;
+    live.print(b"cccc\n");
+    live.stop();
+    drive_until(&tailer, &running(), "complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    for (key, bodies) in w.store.puts.lock().unwrap().iter() {
+        assert!(bodies.windows(2).all(|b| b[0] == b[1]), "{key} rewritten");
+    }
+    for row in w.rows(&stream()).await.iter().filter(|r| r.is_output()) {
+        let body = logs.read_chunk(row).await.unwrap();
+        assert_eq!(
+            Some(scarab_server::logs::sha256(&body)),
+            row.digest,
+            "row {} body",
+            row.seq
+        );
+    }
+    assert_eq!(w.stored(&logs, &stream()).await, b"aaaa\nbbbb\ncccc\n");
+}
+
+/// I4 (772c34f): a step that prints the marker texts, old and new, changes
+/// nothing about how its log is stored: a broken read and a retry add no
+/// `source_restarted` row. Kills: marker recognition from bodies.
+#[tokio::test]
+async fn printed_marker_texts_change_nothing() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    let printed: &[u8] = b"\nscarab: the log source restarted; earlier lines may repeat\n\
+        [scarab] the log source restarted; lines before this point may be missing or repeat\n";
+    let live = LiveLog::new(printed, true);
+    live.script(ReadScript {
+        chunk: 64,
+        fail_after: Some(1),
+        ..Default::default()
+    });
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.ensure(&running());
+    until("first rows", || async {
+        !w.rows(&stream()).await.is_empty()
+    })
+    .await;
+    live.stop();
+    drive_until(&tailer, &running(), "complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    assert!(w.markers(&stream()).await.is_empty());
+    assert_eq!(w.stored(&logs, &stream()).await, printed);
+}
+
+/// I5: a retry verifies the stored part by digests: at most one body GET
+/// (the row the source ends inside). Kills: verify by fetching bodies.
+#[tokio::test]
+async fn a_retry_reads_no_stored_bodies() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    let big: Vec<u8> = (0..40_000u32)
+        .flat_map(|i| format!("line {i}\n").into_bytes())
+        .collect();
+    let live = LiveLog::new(&big, true);
+    live.script(ReadScript {
+        chunk: 8 * 1024,
+        fail_after: Some(60),
+        ..Default::default()
+    });
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.ensure(&running());
+    until("two rows", || async { w.rows(&stream()).await.len() >= 2 }).await;
+    let gets_before = w.store.gets.load(Ordering::SeqCst);
+    live.stop();
+    drive_until(&tailer, &running(), "complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
     })
     .await;
     assert!(
-        waited.is_ok(),
-        "stored log never became {:?}; it is {:?}",
-        String::from_utf8_lossy(want),
-        String::from_utf8_lossy(&got)
+        w.store.gets.load(Ordering::SeqCst) - gets_before <= 1,
+        "the retry fetched stored bodies"
     );
+    assert_eq!(w.stored(&logs, &stream()).await, big);
 }
 
-/// Call `ensure` (bounded) until `cond` holds.
-async fn ensure_until(tailer: &LogTailer, step: &StepRun, mut cond: impl FnMut() -> bool) {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while !cond() {
-            tailer.ensure(step);
-            tokio::time::sleep(Duration::from_millis(5)).await;
+/// I5: a value set evicted from the process cache loads again from the
+/// ledger with every value. Kills: an eviction that loses values.
+#[tokio::test]
+async fn an_evicted_cache_entry_reloads_from_the_ledger() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[b"kept-value"]).await;
+    logs.forget_values(&stream());
+    let set = logs.load_values(&stream()).await.unwrap();
+    assert_eq!(set.values(), &[b"kept-value".to_vec()]);
+}
+
+// ---------------------------------------------------------------------------
+// I6: terminal is final, and global
+// ---------------------------------------------------------------------------
+
+/// I6: a stream completed by one replica takes no marker from a peer that
+/// reads it later, and three replicas store one copy. Kills: the state
+/// check removed.
+#[tokio::test]
+async fn three_replicas_store_one_copy() {
+    let w = World::new().await;
+    let reps: Vec<_> = (0..3).map(|_| w.logs()).collect();
+    w.ledger(&reps[0], &[]).await;
+    let live = LiveLog::new(b"once\n", false);
+    let tailers: Vec<_> = reps
+        .iter()
+        .enumerate()
+        .map(|(i, l)| w.tailer(live.clone(), l, &format!("r{i}")))
+        .collect();
+    for _ in 0..50 {
+        for t in &tailers {
+            t.ensure(&running());
+            t.end_pass(true);
         }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    until("complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
     })
-    .await
-    .expect("the condition did not hold in time");
+    .await;
+    assert_eq!(w.stored(&reps[0], &stream()).await, b"once\n");
+    assert!(w.markers(&stream()).await.is_empty());
 }
 
-/// git-bug de2bd9b (round 2): after the kubelet rotates the container's log
-/// file, a new read serves the new file only, which does not begin with the
-/// part already stored. Skipping the stored part's length of it would drop
-/// output never stored. The read compares instead: on a difference it stores
-/// a marker and then all of the new file.
+/// I6: a replica that cannot open the ledger's seal (it lacks the key)
+/// never writes a terminal marker; a replica with the key stores the log.
+/// Kills: a terminal marker from a local error.
 #[tokio::test]
-async fn a_rotated_log_is_stored_again_after_a_marker() {
-    let a = b"aaaa\nbbbb\n";
-    let b = b"cccc\ndddd\neeee\n";
-    let exec = LiveLog::new(
-        a,
-        false,
-        vec![Read {
-            chunk: 5,
-            fail_after: Some(2),
-        }],
-    );
-    let logs = logs();
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    let step = running_step();
-
-    tailer.ensure(&step);
-    wait_stored(&logs, a).await;
-    // Rotated: the API now serves another file.
-    exec.set(b);
-    ensure_until(&tailer, &step, || exec.opens() >= 3).await;
-    wait_stored(&logs, &cat(&[a, MARKER, b])).await;
-
-    // The new file was read to its end: the fence is drained.
-    for _ in 0..3 {
-        tailer.ensure(&step);
-        settle().await;
+async fn a_replica_that_cannot_open_the_seal_never_closes_a_stream() {
+    let w = World::new().await;
+    let a = w.logs();
+    w.ledger(&a, &[b"s3cr3t"]).await;
+    // B has other keys.
+    let b = replica(&w.db, w.store.clone(), &sealer());
+    let live = LiveLog::new(b"x s3cr3t\n", false);
+    let tb = w.tailer(live.clone(), &b, "b");
+    for _ in 0..40 {
+        tb.ensure(&running());
+        tb.end_pass(true);
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    assert_eq!(
-        exec.opens(),
-        3,
-        "one broken read, one that differed, one reopen"
-    );
-    let (run, s, at) = stream();
-    assert_eq!(
-        logs.read_all(&run, &s, &at).await.unwrap(),
-        cat(&[a, MARKER, b])
-    );
-}
-
-/// The same for a running step: the retry is a follow read, and the read
-/// after the marker becomes the live tail. Output printed after it is stored
-/// while the stream is still open, after one marker.
-#[tokio::test]
-async fn a_rotated_log_of_a_running_step_is_followed_after_one_marker() {
-    let a = b"aaaa\nbbbb\n";
-    let exec = LiveLog::new(
-        a,
-        true,
-        vec![Read {
-            chunk: 5,
-            fail_after: Some(2),
-        }],
-    );
-    let logs = logs();
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    let step = running_step();
-
-    tailer.ensure(&step);
-    wait_stored(&logs, a).await;
-    exec.set(b"BBBB");
-    ensure_until(&tailer, &step, || exec.opens() >= 3).await;
-    wait_stored(&logs, &cat(&[a, MARKER, b"BBBB"])).await;
-
-    exec.print(b"\nmore\n");
-    wait_stored(&logs, &cat(&[a, MARKER, b"BBBB\nmore\n"])).await;
-    for _ in 0..3 {
-        tailer.ensure(&step);
-        settle().await;
-    }
-    assert_eq!(exec.opens(), 3, "the read after the marker is still open");
-
-    exec.stop();
-    settle().await;
-    let (run, s, at) = stream();
-    let stored = logs.read_all(&run, &s, &at).await.unwrap();
-    assert_eq!(stored, cat(&[a, MARKER, b"BBBB\nmore\n"]));
-    assert_eq!(markers(&stored), 1);
-}
-
-/// A sidecar container restarts (`restartPolicy: Always`) after its tail
-/// broke: the new instance's log does not begin with the stored part, and is
-/// stored after a marker.
-#[tokio::test]
-async fn a_restarted_sidecar_is_stored_again_after_a_marker() {
-    let a = b"ready\naccepting\n";
-    let b = b"ready\nrestarted\n";
-    let exec = LiveLog::new(
-        a,
-        false,
-        vec![Read {
-            chunk: 6,
-            fail_after: Some(2),
-        }],
-    );
-    let logs = logs();
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    let step = running_step();
-    let sidecar = scarab_server::logs::sidecar_stream_key(&step.step, 0);
-
-    tailer.ensure_sidecar(&step, 0);
-    wait_stored_in(&logs, &sidecar, b"ready\naccept").await;
-    exec.set(b);
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while exec.opens() < 3 {
-            tailer.ensure_sidecar(&step, 0);
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+    assert!(w.rows(&stream()).await.is_empty(), "B wrote a row");
+    assert_ne!(w.state(&stream()).await, Some(LogStreamState::Closed));
+    let ta = w.tailer(live.clone(), &a, "a");
+    tokio::time::sleep(Duration::from_millis(50)).await; // B's short lease lapses
+    drive_until(&ta, &running(), "complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
     })
-    .await
-    .expect("the sidecar's tail is opened again");
-    wait_stored_in(&logs, &sidecar, &cat(&[b"ready\naccept", MARKER, b])).await;
+    .await;
+    assert_eq!(w.stored(&a, &stream()).await, b"x ***\n");
 }
 
-/// After a fallback the marker bounds what is compared: a later read of the
-/// same source compares with the part after the marker and appends only its
-/// new bytes. One marker, however many retries.
+/// I6: a unit that never started (cancelled while Pending: its Pod is
+/// gone) gets no marker; its stream is closed. Kills: `incomplete` without
+/// `started_at`.
 #[tokio::test]
-async fn a_retry_after_a_fallback_appends_only_new_output() {
-    let a = b"aaaa\nbbbb\n";
-    let b = b"cccc\ndddd\neeee\n";
-    let exec = LiveLog::new(
-        a,
-        true,
-        vec![
-            Read {
-                chunk: 5,
-                fail_after: Some(2),
-            },
-            // The read that differs.
-            Read {
-                chunk: 5,
-                fail_after: None,
-            },
-            // The read after the marker stores all of `b`, then breaks.
-            Read {
-                chunk: 5,
-                fail_after: Some(3),
-            },
-        ],
+async fn a_unit_that_never_started_gets_no_marker() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    w.end_attempt().await;
+    let live = LiveLog::new(b"", false);
+    live.set_state(Some(LogSourceState::Gone));
+    // The source cannot be opened: the Pod is gone.
+    let tailer = w.tailer(
+        Arc::new(GoneSource(live.clone())) as Arc<dyn Executor>,
+        &logs,
+        "a",
     );
-    let logs = logs();
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    let step = running_step();
-
-    tailer.ensure(&step);
-    wait_stored(&logs, a).await;
-    exec.set(b);
-    let (run, s, at) = stream();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while logs.read_all(&run, &s, &at).await.unwrap() != cat(&[a, MARKER, b]) {
-            tailer.ensure(&step);
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+    tailer.sweep().await;
+    until("closed", || async {
+        w.state(&stream()).await == Some(LogStreamState::Closed)
     })
-    .await
-    .expect("the new file is stored after a marker");
-
-    exec.print(b"ffff\n");
-    ensure_until(&tailer, &step, || exec.opens() >= 4).await;
-    wait_stored(&logs, &cat(&[a, MARKER, b, b"ffff\n"])).await;
-    exec.stop();
-    for _ in 0..3 {
-        tailer.ensure(&step);
-        settle().await;
-    }
-    let stored = logs.read_all(&run, &s, &at).await.unwrap();
-    assert_eq!(stored, cat(&[a, MARKER, b, b"ffff\n"]));
-    assert_eq!(markers(&stored), 1, "exactly one marker");
+    .await;
+    assert!(w.rows(&stream()).await.is_empty());
 }
 
-/// A secret split across two chunks of one read is redacted: the read is
-/// redacted as one stream, not chunk by chunk.
-#[tokio::test]
-async fn pump_redacts_a_secret_split_across_chunks() {
-    let logs = logs();
-    let (run, step, attempt) = stream();
-    logs.register_secret(&fence(), b"token-value");
-    let source = Box::new(MockChunks(VecDeque::from(vec![
-        b"tok".to_vec(),
-        b"en-value\n".to_vec(),
-    ])));
-    pump_log_stream(source, &logs, &run, &step, &attempt)
-        .await
-        .expect("pump");
-    assert_eq!(
-        logs.read_all(&run, &step, &attempt).await.unwrap(),
-        b"***\n"
-    );
-}
-
-/// The tail stores what it reads in chunks of up to `TAIL_CHUNK_BYTES`, not
-/// one chunk per read: a source read in small pieces, with a secret split
-/// across pieces many times, is stored as the same redacted bytes in a few
-/// chunks.
-#[tokio::test]
-async fn small_reads_are_stored_in_few_chunks_with_the_same_bytes() {
-    use scarab_server::log_tail::TAIL_CHUNK_BYTES;
-    let logs = logs();
-    let (run, step, attempt) = stream();
-    logs.register_secret(&fence(), b"token-value");
-    let mut source = Vec::new();
-    let mut want = Vec::new();
-    for i in 0..4000 {
-        let line = format!("line {i:05} token-value {}\n", "x".repeat(i % 50));
-        source.extend_from_slice(line.as_bytes());
-        want.extend_from_slice(line.replace("token-value", "***").as_bytes());
-    }
-    // Pieces of 7 bytes: most secrets are cut across two of them.
-    let pieces: VecDeque<Vec<u8>> = source.chunks(7).map(<[u8]>::to_vec).collect();
-    let n = pump_log_stream(Box::new(MockChunks(pieces)), &logs, &run, &step, &attempt)
-        .await
-        .expect("pump");
-
-    assert_eq!(n, want.len() as u64);
-    assert_eq!(logs.read_all(&run, &step, &attempt).await.unwrap(), want);
-    let chunks = logs.chunks(&run, &step, &attempt).await.unwrap();
-    assert_eq!(
-        chunks.len(),
-        want.len().div_ceil(TAIL_CHUNK_BYTES),
-        "{} bytes in {} chunks",
-        want.len(),
-        chunks.len()
-    );
-    assert!(chunks.iter().all(|c| c.len < (TAIL_CHUNK_BYTES + 7) as u64));
-}
-
-/// A step that prints a line and then nothing more has the line stored
-/// while its read stays open: what a read gathered is stored after
-/// `TAIL_FLUSH_INTERVAL`, not only at `TAIL_CHUNK_BYTES` or the end.
-#[tokio::test]
-async fn a_quiet_step_has_its_output_stored_while_the_read_is_open() {
-    let exec = LiveLog::new(b"one\n", true, vec![]);
-    let logs = logs();
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    tailer.ensure(&running_step());
-    wait_stored(&logs, b"one\n").await;
-    exec.print(b"two\n");
-    wait_stored(&logs, b"one\ntwo\n").await;
-    assert_eq!(exec.opens(), 1, "one read, still open");
-    let (run, s, at) = stream();
-    assert_eq!(logs.chunks(&run, &s, &at).await.unwrap().len(), 2);
-    exec.stop();
-}
-
-/// A read that breaks stores what it gathered before the break, and the
-/// next read appends only what follows (git-bug de2bd9b), with a secret
-/// that the break cut still redacted whole.
-#[tokio::test]
-async fn a_broken_read_stores_what_it_gathered() {
-    let logs = logs();
-    logs.register_secret(&fence(), b"token-value");
-    let exec = LiveLog::new(
-        b"one\ntwo tok",
-        true,
-        vec![Read {
-            chunk: 4,
-            fail_after: Some(3),
-        }],
-    );
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    let step = running_step();
-    tailer.ensure(&step);
-    // The break comes before the read's flush interval: "one\ntwo " is
-    // stored at the break, "tok" is held back as the start of the secret.
-    wait_stored(&logs, b"one\ntwo ").await;
-    exec.print(b"en-value three\n");
-    ensure_until(&tailer, &step, || exec.opens() >= 2).await;
-    wait_stored(&logs, b"one\ntwo *** three\n").await;
-    exec.stop();
-}
-
-/// A read breaks just after the start of a secret: the start is held back,
-/// not stored, and the next read redacts the whole value. No fragment of it
-/// is ever stored, and no marker.
-#[tokio::test]
-async fn a_secret_across_the_resume_point_is_redacted() {
-    let exec = LiveLog::new(
-        b"abc tok",
-        false,
-        vec![Read {
-            chunk: 7,
-            fail_after: Some(1),
-        }],
-    );
-    let logs = logs();
-    logs.register_secret(&fence(), b"token-value");
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    let step = running_step();
-
-    tailer.ensure(&step);
-    wait_stored(&logs, b"abc ").await;
-    settle().await;
-    let (run, s, at) = stream();
-    assert!(
-        !logs
-            .read_all(&run, &s, &at)
-            .await
-            .unwrap()
-            .ends_with(b"tok"),
-        "the start of the secret is not stored"
-    );
-
-    exec.set(b"abc token-value\n");
-    ensure_until(&tailer, &step, || exec.opens() >= 2).await;
-    wait_stored(&logs, b"abc ***\n").await;
-    settle().await;
-    assert_eq!(logs.read_all(&run, &s, &at).await.unwrap(), b"abc ***\n");
-}
-
-/// REV-R2-2: chunks stored before this release hold `***` for a secret of
-/// any length, with no record of the length as read. A read compares the
-/// redacted source with them, so it resumes at the end of the secret, not
-/// part way into it.
-#[tokio::test]
-async fn chunks_stored_before_the_upgrade_resume_with_no_fragment_of_a_secret() {
-    let secret = b"0123456789abcdefghijklmnopqrstuvwxyzABCD";
-    assert_eq!(secret.len(), 40);
-    let logs = logs();
-    logs.register_secret(&fence(), secret);
-    let (run, s, at) = stream();
-    // Written as an older server stored it: the redacted line only.
-    logs.append(&run, &s, &at, b"key=***\n").await.unwrap();
-
-    let exec = LiveLog::new(&cat(&[b"key=", secret, b"\nnext\n"]), false, vec![]);
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    tailer.ensure(&running_step());
-    wait_stored(&logs, b"key=***\nnext\n").await;
-    settle().await;
-    let stored = logs.read_all(&run, &s, &at).await.unwrap();
-    assert_eq!(stored, b"key=***\nnext\n");
-    assert!(!stored.windows(4).any(|w| secret.windows(4).any(|x| x == w)));
-}
-
-/// A re-read shorter than the stored part that matches it so far (the
-/// container ended, nothing new) appends nothing, and no marker.
-#[tokio::test]
-async fn a_shorter_log_that_matches_appends_nothing() {
-    let exec = LiveLog::new(
-        b"aaaa\nbbbb\ncccc\n",
-        false,
-        vec![Read {
-            chunk: 5,
-            fail_after: Some(2),
-        }],
-    );
-    let logs = logs();
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    let step = running_step();
-
-    tailer.ensure(&step);
-    wait_stored(&logs, b"aaaa\nbbbb\n").await;
-    exec.set(b"aaaa\n");
-    ensure_until(&tailer, &step, || exec.opens() >= 2).await;
-    for _ in 0..3 {
-        tailer.ensure(&step);
-        settle().await;
-    }
-    assert_eq!(exec.opens(), 2, "the fence is drained");
-    let (run, s, at) = stream();
-    assert_eq!(logs.read_all(&run, &s, &at).await.unwrap(), b"aaaa\nbbbb\n");
-}
-
-/// A re-read shorter than the stored part that differs from it (the kubelet
-/// rotated the file and serves a short new one) is stored after a marker,
-/// with a warning that says why.
-#[tokio::test]
-async fn a_shorter_log_that_differs_is_stored_after_a_marker_and_warns() {
-    let captured = Captured::default();
-    let _guard = captured.install();
-
-    let exec = LiveLog::new(
-        b"aaaa\nbbbb\ncccc\n",
-        false,
-        vec![Read {
-            chunk: 5,
-            fail_after: Some(2),
-        }],
-    );
-    let logs = logs();
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    let step = running_step();
-
-    tailer.ensure(&step);
-    wait_stored(&logs, b"aaaa\nbbbb\n").await;
-    exec.set(b"dd\n");
-    ensure_until(&tailer, &step, || exec.opens() >= 3).await;
-    wait_stored(&logs, &cat(&[b"aaaa\nbbbb\n", MARKER, b"dd\n"])).await;
-
-    let out = captured.text();
-    assert!(
-        out.contains("WARN") && out.contains("does not begin with the part already stored"),
-        "a warning says the log differed: {out}"
-    );
-}
-
-// --- A replica that did not launch the step (J-1) -----------------------------
-
-/// The redactor is process memory, filled at launch. A replica that tails a
-/// step it did not launch reads the step's secret values from the executor
-/// before it reads the log, so it redacts them: the stored part verifies and
-/// the new output is redacted.
-#[tokio::test]
-async fn a_replica_that_did_not_launch_the_step_redacts_its_secrets() {
-    let db = Arc::new(InMemoryDb::new());
-    let store = Arc::new(InMemoryObjectStore::new());
-    let (run, s, at) = stream();
-    // The replica that launched the step stored the first line.
-    let launcher = LogService::new(store.clone(), db.clone());
-    launcher.register_secret(&fence(), b"s3cr3t-value");
-    launcher
-        .append(&run, &s, &at, b"token=s3cr3t-value\n")
-        .await
-        .unwrap();
-
-    // Another replica takes the tail over.
-    let logs = Arc::new(LogService::new(store, db));
-    let exec = LiveLog::new(b"token=s3cr3t-value\nagain s3cr3t-value\n", false, vec![]);
-    exec.answer(Ok(LogRedactions::Values(vec![b"s3cr3t-value".to_vec()])));
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    tailer.ensure(&running_step());
-    wait_stored(&logs, b"token=***\nagain ***\n").await;
-    settle().await;
-    assert_eq!(
-        logs.read_all(&run, &s, &at).await.unwrap(),
-        b"token=***\nagain ***\n"
-    );
-}
-
-/// When the executor cannot say what the step's secret values are, nothing
-/// is read: the tail backs off and tries again.
-#[tokio::test]
-async fn a_tail_that_cannot_read_the_secret_values_reads_nothing() {
-    let exec = LiveLog::new(b"token=s3cr3t-value\n", false, vec![]);
-    exec.answer(Err("secrets \"scarab-build-a1-secrets\" is forbidden"));
-    let logs = logs();
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    for _ in 0..5 {
-        tailer.ensure(&running_step());
-        settle().await;
-    }
-    assert_eq!(exec.opens(), 0, "the log is never opened");
-    let (run, s, at) = stream();
-    assert!(logs.read_all(&run, &s, &at).await.unwrap().is_empty());
-}
-
-/// The markers a tail stores in place of output it cannot check; the texts
-/// the run-logs docs page quotes.
-const FROM_NOW: &[u8] =
-    b"\nscarab: earlier output could not be checked; showing output from now on\n";
-const WITHHELD: &[u8] = b"\nscarab: the rest of this log was withheld: it could not be checked against the part already stored\n";
-const VALUES_UNREAD: &[u8] =
-    b"\nscarab: the rest of this log was not stored: its secret values could not be read\n";
-
-fn holds(log: &[u8], value: &[u8]) -> bool {
-    log.windows(value.len()).any(|w| w == value)
-}
-
-/// R3-2: a running unit whose log differs from the stored part where that
-/// part holds a `***` (the replica that stored it held a value this one does
-/// not) is not stored again from its first byte, which would store the value
-/// in clear, and its tail is not closed with no word: a marker, then its
-/// output from now on. Before this, the fence was closed and `later` was
-/// never stored.
-#[tokio::test]
-async fn a_running_unit_that_cannot_be_checked_is_stored_from_now_on_after_a_marker() {
-    let db = Arc::new(InMemoryDb::new());
-    let store = Arc::new(InMemoryObjectStore::new());
-    let (run, s, at) = stream();
-    let launcher = LogService::new(store.clone(), db.clone());
-    launcher.register_secret(&fence(), b"s3cr3t-value");
-    launcher
-        .append(&run, &s, &at, b"token=s3cr3t-value\n")
-        .await
-        .unwrap();
-
-    // The peer's executor reads no value back (the unit's value changed).
-    let logs = Arc::new(LogService::new(store, db));
-    let exec = LiveLog::new(b"token=s3cr3t-value\n", true, vec![]);
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    tailer.ensure(&running_step());
-    wait_stored(&logs, &cat(&[b"token=***\n", FROM_NOW])).await;
-
-    exec.print(b"later\n");
-    wait_stored(&logs, &cat(&[b"token=***\n", FROM_NOW, b"later\n"])).await;
-    exec.stop();
-    for _ in 0..3 {
-        tailer.ensure(&running_step());
-        settle().await;
-    }
-    let stored = logs.read_all(&run, &s, &at).await.unwrap();
-    assert_eq!(stored, cat(&[b"token=***\n", FROM_NOW, b"later\n"]));
-    assert!(!holds(&stored, b"s3cr3t-value"));
-    assert_eq!(markers(&stored), 0, "not stored again from the first byte");
-}
-
-/// RC-1: once a stream is stored "from now on", a read that breaks is
-/// retried from now on too, after the marker again for the gap. It is never
-/// compared from the source's first byte with the part after the marker:
-/// that differs plainly, and would store the whole log again with this
-/// replica's values, which the first check found incomplete, so the value
-/// behind the stored `***` would be stored in clear.
-#[tokio::test]
-async fn a_broken_read_of_a_stream_stored_from_now_on_resumes_from_now_on() {
-    let captured = Captured::default();
-    let _guard = captured.install();
-
-    let db = Arc::new(InMemoryDb::new());
-    let store = Arc::new(InMemoryObjectStore::new());
-    let (run, s, at) = stream();
-    let launcher = LogService::new(store.clone(), db.clone());
-    launcher.register_secret(&fence(), b"s3cr3t-value");
-    launcher
-        .append(&run, &s, &at, b"token=s3cr3t-value\n")
-        .await
-        .unwrap();
-
-    // The peer's executor reads no value back. Its first read (from the
-    // first byte) stops at the `***`; its read from now on breaks after one
-    // chunk.
-    let logs = Arc::new(LogService::new(store, db));
-    let exec = LiveLog::new(
-        b"token=s3cr3t-value\n",
-        true,
-        vec![
-            Read {
-                chunk: 4,
-                fail_after: None,
-            },
-            Read {
-                chunk: 64,
-                fail_after: Some(1),
-            },
-        ],
-    );
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    let step = running_step();
-    tailer.ensure(&step);
-    wait_stored(&logs, &cat(&[b"token=***\n", FROM_NOW])).await;
-    wait_for(|| exec.opens() >= 2).await;
-    exec.print(b"later\n");
-    wait_stored(&logs, &cat(&[b"token=***\n", FROM_NOW, b"later\n"])).await;
-
-    // The read broke after `later`; the retry reads the stream again.
-    ensure_until(&tailer, &step, || exec.opens() >= 3).await;
-    exec.print(b"more\n");
-    let want = cat(&[b"token=***\n", FROM_NOW, b"later\n", FROM_NOW, b"more\n"]);
-    wait_stored(&logs, &want).await;
-    exec.stop();
-    for _ in 0..3 {
-        tailer.ensure(&step);
-        settle().await;
-    }
-    let stored = logs.read_all(&run, &s, &at).await.unwrap();
-    assert_eq!(stored, want);
-    assert!(!holds(&stored, b"s3cr3t-value"));
-    assert_eq!(markers(&stored), 0, "not stored again from the first byte");
-    // The retry did not compare with the stored part at all: only the first
-    // read found the difference at the `***`.
-    let out = captured.text();
-    assert_eq!(
-        out.matches("storing its output from now on after a marker")
-            .count(),
-        1,
-        "one difference found, by the first read: {out}"
-    );
-}
-
-/// The same for an ended unit (its last read): a marker says the rest was
-/// withheld. Before this, nothing was stored and nothing said so.
-#[tokio::test]
-async fn an_ended_unit_that_cannot_be_checked_gets_a_marker() {
-    let db = Arc::new(InMemoryDb::new());
-    let store = Arc::new(InMemoryObjectStore::new());
-    let (run, s, at) = stream();
-    let launcher = LogService::new(store.clone(), db.clone());
-    launcher.register_secret(&fence(), b"s3cr3t-value");
-    launcher
-        .append(&run, &s, &at, b"token=s3cr3t-value\n")
-        .await
-        .unwrap();
-
-    let logs = Arc::new(LogService::new(store, db));
-    // The live read breaks before its first chunk.
-    let exec = LiveLog::new(
-        b"token=s3cr3t-value\nmore\n",
-        false,
-        vec![Read {
-            chunk: 4,
-            fail_after: Some(0),
-        }],
-    );
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    tailer.ensure(&running_step());
-    settle().await;
-    tailer.end_pass(true);
-    // The step is no longer ensured: the read of the ended unit.
-    tailer.end_pass(true);
-    wait_stored(&logs, &cat(&[b"token=***\n", WITHHELD])).await;
-    for _ in 0..3 {
-        tailer.end_pass(true);
-        settle().await;
-    }
-    let stored = logs.read_all(&run, &s, &at).await.unwrap();
-    assert_eq!(stored, cat(&[b"token=***\n", WITHHELD]));
-}
-
-/// The tail lease of `stream()`.
-const TAIL_RESOURCE: &str = "tail:r:build:a1";
-
-/// R3-1 / RT-R3-1: a replica that a dead replica's lease kept from the
-/// step, and that never read the step's values (the Secrets were deleted
-/// when the attempt settled), reads the ended step once the lease expires.
-/// It stores a marker in place of the output, never the output. Before
-/// this, it read no values ("none"), matched the stored part and appended
-/// `TOKEN=s3cr3t-value` in clear.
-#[tokio::test]
-async fn a_peer_that_never_read_the_values_stores_a_marker_not_the_output() {
-    use scarab_engine::Db as _;
-    let db = Arc::new(InMemoryDb::new());
-    let store = Arc::new(InMemoryObjectStore::new());
-    let (run, s, at) = stream();
-    // The replica that launched the step stored a line, then died holding
-    // the tail lease.
-    let launcher = LogService::new(store.clone(), db.clone());
-    launcher.append(&run, &s, &at, b"line one\n").await.unwrap();
-    db.lease(TAIL_RESOURCE, "dead", 45_000).await.unwrap();
-
-    let logs = Arc::new(LogService::new(store, db.clone()));
-    let exec = LiveLog::new(b"line one\n", true, vec![]);
-    exec.answer(Ok(LogRedactions::Gone));
-    let tailer = LogTailer::new(exec.clone(), logs.clone())
-        .with_retry_backoff(Duration::from_millis(10))
-        .with_lease(db.clone(), "b");
-    for _ in 0..3 {
-        tailer.ensure(&running_step());
-        settle().await;
-        tailer.end_pass(true);
-    }
-    assert_eq!(exec.opens(), 0, "nothing is read without the values");
-
-    // The step prints its secret and ends; the dead replica's lease expires.
-    exec.print(b"TOKEN=s3cr3t-value\n");
-    exec.stop();
-    db.release_lease(TAIL_RESOURCE, "dead").await.unwrap();
-    let want = cat(&[b"line one\n", VALUES_UNREAD]);
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while logs.read_all(&run, &s, &at).await.unwrap() != want {
-            tailer.end_pass(true);
-            tokio::time::sleep(Duration::from_millis(15)).await;
-        }
-    })
-    .await
-    .expect("the marker is stored");
-    for _ in 0..3 {
-        tailer.end_pass(true);
-        settle().await;
-    }
-    let stored = logs.read_all(&run, &s, &at).await.unwrap();
-    assert_eq!(stored, want);
-    assert!(!holds(&stored, b"s3cr3t-value"));
-}
-
-/// R3-1: the values load before the lease claim. A replica the lease turns
-/// away while the step runs still reads them, so after the attempt settles
-/// (its Secrets deleted) and the lease expires, it redacts the step's last
-/// output. Before this, it read them only after winning the lease, when
-/// they were gone, and stored `TOKEN=s3cr3t-value` in clear.
-#[tokio::test]
-async fn a_peer_turned_away_by_the_lease_reads_the_values_while_the_step_runs() {
-    use scarab_engine::Db as _;
-    let db = Arc::new(InMemoryDb::new());
-    let store = Arc::new(InMemoryObjectStore::new());
-    let (run, s, at) = stream();
-    let launcher = LogService::new(store.clone(), db.clone());
-    launcher.append(&run, &s, &at, b"line one\n").await.unwrap();
-    db.lease(TAIL_RESOURCE, "dead", 45_000).await.unwrap();
-
-    let logs = Arc::new(LogService::new(store, db.clone()));
-    let exec = LiveLog::new(b"line one\n", true, vec![]);
-    exec.answer(Ok(LogRedactions::Values(vec![b"s3cr3t-value".to_vec()])));
-    let tailer = LogTailer::new(exec.clone(), logs.clone())
-        .with_retry_backoff(Duration::from_millis(10))
-        .with_lease(db.clone(), "b");
-    for _ in 0..3 {
-        tailer.ensure(&running_step());
-        settle().await;
-        tailer.end_pass(true);
-    }
-    assert_eq!(exec.opens(), 0, "the lease keeps it from the log");
-
-    // Settled: the Secrets are deleted.
-    exec.answer(Ok(LogRedactions::Gone));
-    exec.print(b"TOKEN=s3cr3t-value\n");
-    exec.stop();
-    db.release_lease(TAIL_RESOURCE, "dead").await.unwrap();
-    let want = b"line one\nTOKEN=***\n".to_vec();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while logs.read_all(&run, &s, &at).await.unwrap() != want {
-            tailer.end_pass(true);
-            tokio::time::sleep(Duration::from_millis(15)).await;
-        }
-    })
-    .await
-    .expect("the end of the log is stored, redacted");
-}
-
-/// An error reading the values is never "no values" (RT-R3 mutation 3, on
-/// the server's side): an ended unit whose values cannot be read gets a
-/// marker after its last try, not its output.
-#[tokio::test]
-async fn an_ended_unit_whose_values_cannot_be_read_gets_a_marker_not_its_output() {
-    let exec = LiveLog::new(b"TOKEN=s3cr3t-value\n", false, vec![]);
-    exec.answer(Err("secrets \"scarab-build-a1-secrets\" is forbidden"));
-    let logs = logs();
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    tailer.ensure(&running_step());
-    settle().await;
-    tailer.end_pass(true);
-    let (run, s, at) = stream();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while logs.read_all(&run, &s, &at).await.unwrap() != VALUES_UNREAD {
-            tailer.end_pass(true);
-            tokio::time::sleep(Duration::from_millis(15)).await;
-        }
-    })
-    .await
-    .expect("the marker is stored");
-    for _ in 0..3 {
-        tailer.end_pass(true);
-        settle().await;
-    }
-    assert_eq!(logs.read_all(&run, &s, &at).await.unwrap(), VALUES_UNREAD);
-}
-
-/// RT-R3 mutation 1: a sidecar is in the step's Pod; its tail reads the
-/// step's values like the step's tail, and redacts them.
-#[tokio::test]
-async fn a_sidecar_tail_redacts_the_step_values() {
-    let exec = LiveLog::new(b"pw=s3cr3t-value\n", false, vec![]);
-    exec.answer(Ok(LogRedactions::Values(vec![b"s3cr3t-value".to_vec()])));
-    let logs = logs();
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    let step = running_step();
-    let sidecar = scarab_server::logs::sidecar_stream_key(&step.step, 0);
-    tailer.ensure_sidecar(&step, 0);
-    wait_stored_in(&logs, &sidecar, b"pw=***\n").await;
-}
-
-/// RT-R3-2 / RT-R3-5: values are kept per stream. Another Run's secret
-/// (`postgres`) is not redacted from this step's log, so a peer that reads
-/// only this step's values verifies the stored part and stores what
-/// follows, with no marker. Before this, the server stored `starting ***`
-/// and a peer's re-read closed the tail.
-#[tokio::test]
-async fn another_streams_value_neither_redacts_this_log_nor_trips_the_guard() {
-    let db = Arc::new(InMemoryDb::new());
-    let store = Arc::new(InMemoryObjectStore::new());
-    let (run, s, at) = stream();
-    let first = Arc::new(LogService::new(store.clone(), db.clone()));
-    first.register_secret(
-        &LogFence::new(
-            &RunId("other".into()),
-            &StepId("migrate".into()),
-            &AttemptId("a1".into()),
-        ),
-        b"postgres",
-    );
-    let exec = LiveLog::new(
-        b"starting postgres\n",
-        true,
-        vec![Read {
-            chunk: 18,
-            fail_after: Some(1),
-        }],
-    );
-    let tailer =
-        LogTailer::new(exec.clone(), first.clone()).with_retry_backoff(Duration::from_secs(3600));
-    tailer.ensure(&running_step());
-    wait_stored(&first, b"starting postgres\n").await;
-    settle().await;
-
-    // A peer takes the tail over.
-    let peer = Arc::new(LogService::new(store, db));
-    exec.print(b"ready\n");
-    let tailer =
-        LogTailer::new(exec.clone(), peer.clone()).with_retry_backoff(Duration::from_millis(10));
-    tailer.ensure(&running_step());
-    wait_stored(&peer, b"starting postgres\nready\n").await;
-    exec.stop();
-    settle().await;
-    let stored = peer.read_all(&run, &s, &at).await.unwrap();
-    assert_eq!(stored, b"starting postgres\nready\n");
-}
-
-// --- Through the converged driver ---------------------------------------------
-
-/// A fake executor driven by the test: `poll` reports Running until `end` is
-/// called, then Succeeded. `log_stream` answers "not ready" while the unit
-/// runs and its output once it has ended.
-struct DrivenExec {
-    ended: std::sync::atomic::AtomicBool,
-    log_opens: AtomicUsize,
-    output: Mutex<Vec<Vec<u8>>>,
-}
-
-impl DrivenExec {
-    fn end(&self) {
-        self.ended.store(true, Ordering::SeqCst);
-    }
-    fn ended(&self) -> bool {
-        self.ended.load(Ordering::SeqCst)
-    }
-}
+/// A [`LiveLog`] whose source cannot be opened (`NotFound`).
+struct GoneSource(Arc<LiveLog>);
 
 #[async_trait]
-impl Executor for DrivenExec {
-    async fn results_delivery_failure(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<String>, ExecError> {
-        Ok(None)
+impl Executor for GoneSource {
+    async fn launch(&self, s: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+        self.0.launch(s, spec).await
     }
-    async fn gate_refusal(&self, _gate: &StepRun) -> Result<Option<String>, ExecError> {
-        Ok(None)
+    async fn poll(&self, h: &ExecHandle) -> Result<ExecState, ExecError> {
+        self.0.poll(h).await
     }
-    async fn infra_condition(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
-        Ok(None)
+    async fn cancel(&self, h: &ExecHandle) -> Result<(), ExecError> {
+        self.0.cancel(h).await
     }
-    async fn take_forge_credential(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
-        Ok(None)
+    fn unit_handle(&self, s: &StepRun) -> Option<ExecHandle> {
+        self.0.unit_handle(s)
+    }
+    async fn torn_down(&self, h: &ExecHandle) -> Result<bool, ExecError> {
+        self.0.torn_down(h).await
+    }
+    async fn results_delivery_failure(&self, h: &ExecHandle) -> Result<Option<String>, ExecError> {
+        self.0.results_delivery_failure(h).await
     }
     async fn workspace_provisioning(
         &self,
-        _handle: &ExecHandle,
+        h: &ExecHandle,
     ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
-        Ok(None)
+        self.0.workspace_provisioning(h).await
     }
-    async fn launch(&self, step: &StepRun, _spec: &StepSpec) -> Result<ExecHandle, ExecError> {
-        Ok(ExecHandle(step.step.0.clone()))
-    }
-    async fn poll(&self, _h: &ExecHandle) -> Result<ExecState, ExecError> {
-        Ok(if self.ended() {
-            ExecState::Succeeded
-        } else {
-            ExecState::Running
-        })
-    }
-    async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
-        Ok(())
-    }
-    fn unit_handle(&self, _step: &StepRun) -> Option<ExecHandle> {
-        None
-    }
-    async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
-        Ok(true)
-    }
-    async fn log_stream(
-        &self,
-        _step: &StepRun,
-        _from: LogFrom,
-    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        self.log_opens.fetch_add(1, Ordering::SeqCst);
-        if !self.ended() {
-            return Err(ExecError::Other(INITIALIZING.into()));
-        }
-        let chunks = std::mem::take(&mut *self.output.lock().unwrap());
-        Ok(Some(Box::new(MockChunks(chunks.into()))))
-    }
-}
-
-/// git-bug 1dee2f3 through `tick_once`: a step whose live tail never got its
-/// log (the Pod was not ready) is Running on one cycle and ended on a later
-/// one; the cycle that no longer sees it Running reads its log, so the
-/// output is stored.
-#[tokio::test]
-async fn the_driver_reads_the_log_of_a_step_that_ended() {
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use scarab_engine::{Clock, Db};
-    use scarab_server::{converged, router, AppState};
-    use scarab_testkit::FakeClock;
-    use tower::ServiceExt;
-
-    let db = Arc::new(InMemoryDb::new());
-    let clock = Arc::new(FakeClock::new(1_000));
-    let logs = Arc::new(LogService::new(
-        Arc::new(InMemoryObjectStore::new()),
-        db.clone(),
-    ));
-    let app = router(AppState::new(db.clone(), clock.clone(), logs.clone()));
-    let body = serde_json::json!({
-        "pipeline": {
-            "ir_version": 1,
-            "steps": [{ "id": "build", "image": "busybox:latest", "command": ["echo", "hi"] }]
-        }
-    })
-    .to_string();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/runs")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let run = RunId(v["id"].as_str().unwrap().to_string());
-
-    let exec = Arc::new(DrivenExec {
-        ended: Default::default(),
-        log_opens: AtomicUsize::new(0),
-        output: Mutex::new(vec![b"short step\n".to_vec()]),
-    });
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    let db_dyn: Arc<dyn Db> = db.clone();
-    let clock_dyn: Arc<dyn Clock> = clock.clone();
-    let exec_dyn: Arc<dyn Executor> = exec.clone();
-    let supervision = scarab_engine::Supervision::new();
-    let health = scarab_engine::TickHealth::new();
-    macro_rules! tick {
-        () => {
-            converged::tick_once(
-                &db_dyn,
-                &clock_dyn,
-                &exec_dyn,
-                None,
-                None,
-                Some(&tailer),
-                None,
-                "log-tail-test",
-                0,
-                3_600_000,
-                None,
-                "http://scarab.test",
-                &supervision,
-                &health,
-            )
-            .await
-            .unwrap()
-        };
-    }
-
-    // Cycles while the step runs: its tail is opened and finds no log.
-    for _ in 0..30 {
-        tick!();
-        settle().await;
-        if exec.log_opens.load(Ordering::SeqCst) > 0 {
-            break;
-        }
-    }
-    assert!(
-        exec.log_opens.load(Ordering::SeqCst) > 0,
-        "the running step was tailed"
-    );
-
-    // The step ends; the next cycles see it leave Running.
-    exec.end();
-    let mut stored = Vec::new();
-    for _ in 0..30 {
-        tick!();
-        settle().await;
-        let step = StepId("build".into());
-        let attempt = db
-            .steps_of_run(&run)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|s| s.step == step)
-            .and_then(|s| s.attempts.last().map(|a| a.id.clone()));
-        if let Some(a) = attempt {
-            stored = logs.read_all(&run, &step, &a).await.unwrap();
-        }
-        if !stored.is_empty() {
-            break;
-        }
-    }
-    assert_eq!(stored, b"short step\n");
-}
-
-/// A driver-level executor whose step prints its secret, ends its log while
-/// the step is still `Running` in the store, and then fails with a cause that
-/// quotes the secret. `log_redactions` reads the value back, as the
-/// Kubernetes executor reads a step Pod's Secrets.
-struct FailsAfterItsLog {
-    ended: std::sync::atomic::AtomicBool,
-    log_opens: AtomicUsize,
-    output: Mutex<Vec<Vec<u8>>>,
-}
-
-const STEP_SECRET: &[u8] = b"s3cr3t-value";
-
-#[async_trait]
-impl Executor for FailsAfterItsLog {
-    async fn results_delivery_failure(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<String>, ExecError> {
-        Ok(None)
-    }
-    async fn gate_refusal(&self, _gate: &StepRun) -> Result<Option<String>, ExecError> {
-        Ok(None)
+    async fn gate_refusal(&self, g: &StepRun) -> Result<Option<String>, ExecError> {
+        self.0.gate_refusal(g).await
     }
     async fn infra_condition(
         &self,
-        _handle: &ExecHandle,
+        h: &ExecHandle,
     ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
-        Ok(None)
+        self.0.infra_condition(h).await
     }
-    async fn take_forge_credential(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
-        Ok(None)
+    async fn delete_unit_secrets(&self, h: &ExecHandle) -> Result<(), ExecError> {
+        self.0.delete_unit_secrets(h).await
     }
-    async fn workspace_provisioning(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
-        Ok(None)
-    }
-    async fn launch(&self, step: &StepRun, _spec: &StepSpec) -> Result<ExecHandle, ExecError> {
-        Ok(ExecHandle(step.step.0.clone()))
-    }
-    async fn poll(&self, _h: &ExecHandle) -> Result<ExecState, ExecError> {
-        Ok(if self.ended.load(Ordering::SeqCst) {
-            ExecState::Failed {
-                exit_code: Some(1),
-                class: scarab_engine::ports::FailureClass::Step,
-                cause: Some("upload refused for token s3cr3t-value".into()),
-            }
-        } else {
-            ExecState::Running
-        })
-    }
-    async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
-        Ok(())
-    }
-    fn unit_handle(&self, _step: &StepRun) -> Option<ExecHandle> {
-        None
-    }
-    async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
-        Ok(true)
+    async fn log_source_state(&self, s: &LogSourceRef) -> Result<LogSourceState, ExecError> {
+        self.0.log_source_state(s).await
     }
     async fn log_stream(
         &self,
-        _step: &StepRun,
-        _from: LogFrom,
+        _s: &StepRun,
+        _f: LogFrom,
     ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        self.log_opens.fetch_add(1, Ordering::SeqCst);
-        let chunks = std::mem::take(&mut *self.output.lock().unwrap());
-        Ok(Some(Box::new(MockChunks(chunks.into()))))
-    }
-    async fn log_redactions(&self, _step: &StepRun) -> Result<LogRedactions, ExecError> {
-        Ok(LogRedactions::Values(vec![STEP_SECRET.to_vec()]))
+        Err(ExecError::Other("pods \"p\" not found: NotFound".into()))
     }
 }
 
-/// RC-5 and RC-T2 through `tick_once`. The follow read of an exited
-/// container ends before the scheduler's poll sees the step fail, so the
-/// tail closes the stream while the step is still `Running`. The failure
-/// cause the later poll records is redacted with the step's own values:
-/// they are kept until the driver pass after the step ended. Before this,
-/// closing the tail dropped them, and the cause was stored in clear. That
-/// pass then drops them, so values do not pile up for the life of the
-/// process.
+/// I6: a cancel before any poll saw the unit run still records its start
+/// (the decorator polls once first), so its Gone end gets `incomplete`.
+/// Kills: a cancel without the poll.
 #[tokio::test]
-async fn a_failure_cause_after_the_tail_closed_is_redacted_and_the_values_then_dropped() {
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use scarab_engine::{Clock, Db};
-    use scarab_secrets::SecretProvider;
-    use scarab_server::{converged, router, AppState, SecretInjectingExecutor};
-    use scarab_testkit::{FakeClock, FakeSecrets};
-    use tower::ServiceExt;
+async fn a_cancel_before_the_first_poll_still_records_the_start() {
+    let w = World::new().await;
+    let logs = w.logs();
+    let live = LiveLog::new(b"", true);
+    let stack = w.stack(live.clone(), &logs);
+    let h = stack.launch(&running(), &spec()).await.unwrap();
+    stack.cancel(&h).await.unwrap();
+    assert!(live.polls.load(Ordering::SeqCst) >= 1);
+    let ledger = w.db.log_unit_ledger(&stream()).await.unwrap().unwrap();
+    assert!(ledger.unit.started_at.is_some());
+}
 
-    let db = Arc::new(InMemoryDb::new());
-    let clock = Arc::new(FakeClock::new(1_000));
-    let logs = Arc::new(LogService::new(
-        Arc::new(InMemoryObjectStore::new()),
-        db.clone(),
-    ));
-    let app = router(AppState::new(db.clone(), clock.clone(), logs.clone()));
-    let body = serde_json::json!({
-        "pipeline": {
-            "ir_version": 1,
-            "steps": [{ "id": "build", "image": "busybox:latest", "command": ["echo", "hi"] }]
-        }
-    })
-    .to_string();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/runs")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap(),
-        )
+// ---------------------------------------------------------------------------
+// I7, I8: purge and revocation
+// ---------------------------------------------------------------------------
+
+/// I8 (2d78464): every minted token in the ledger is revoked, whichever
+/// replica minted it, once. A mints T1; B re-drives with T2 and revokes T1
+/// at once; C sees the attempt end and attempts T2 only (T1's generation
+/// is marked revoked). A failed revocation is retried by the sweep, after
+/// its backoff, before the ledger is purged. Kills: memory-only
+/// revocation; purge before the revocation attempt; a revoked generation
+/// revoked again.
+#[tokio::test]
+async fn every_minted_token_in_the_ledger_is_revoked_whichever_replica_minted_it() {
+    let w = World::new().await;
+    let (a, b, c) = (w.logs(), w.logs(), w.logs());
+    let live = LiveLog::new(b"", true);
+    w.stack(live.clone(), &a)
+        .launch(&running(), &forge_spec())
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+    w.stack(live.clone(), &b)
+        .launch(&running(), &forge_spec())
         .await
         .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let run = RunId(v["id"].as_str().unwrap().to_string());
+    let tokens: Vec<String> = live
+        .launched
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            s.forge_token
+                .as_ref()
+                .unwrap()
+                .credential
+                .as_ref()
+                .unwrap()
+                .token
+                .clone()
+        })
+        .collect();
+    assert_eq!(w.forge.revoked(), vec![tokens[0].clone()], "B revoked T1");
+    // C sees the end, with revocations failing.
+    w.forge.fail_revocations(true);
+    *live.poll_state.lock().unwrap() = ExecState::Succeeded;
+    let stack_c = w.stack(live.clone(), &c);
+    stack_c.poll(&ExecHandle("pod-build".into())).await.unwrap();
+    assert_eq!(
+        w.forge.revoke_tries(),
+        vec![tokens[0].clone(), tokens[1].clone()],
+        "T1 is not attempted again"
+    );
+    let ledger = w.db.log_unit_ledger(&stream()).await.unwrap().unwrap();
+    assert!(ledger.unit.revoke_attempted_at.is_none());
+    // The unit is due a purge (settled over an hour ago): the sweep tries
+    // again first, and keeps the ledger while it fails.
+    w.end_attempt().await;
+    w.db.settle_log_units(Timestamp(0)).await.unwrap();
+    let now = Timestamp(2 * 3_600_000);
+    let pass = scarab_server::log_tail::sweep_ledgers(&c, w.forge.as_ref(), now).await;
+    assert_eq!(pass.failed, 1);
+    assert!(
+        !w.db
+            .log_unit_ledger(&stream())
+            .await
+            .unwrap()
+            .unwrap()
+            .unit
+            .purged
+    );
+    w.forge.fail_revocations(false);
+    // Inside its backoff: not tried again.
+    let tries = w.forge.revoke_tries().len();
+    scarab_server::log_tail::sweep_ledgers(&c, w.forge.as_ref(), Timestamp(now.0 + 1_000)).await;
+    assert_eq!(w.forge.revoke_tries().len(), tries);
+    // After it: tried again, revoked, purged.
+    let later = Timestamp(now.0 + scarab_engine::LEDGER_REVOKE_BACKOFF_MS);
+    scarab_server::log_tail::sweep_ledgers(&c, w.forge.as_ref(), later).await;
+    assert_eq!(
+        w.forge.revoked(),
+        vec![tokens[0].clone(), tokens[1].clone()]
+    );
+    assert!(
+        w.db.log_unit_ledger(&stream())
+            .await
+            .unwrap()
+            .unwrap()
+            .unit
+            .purged
+    );
+}
 
-    let inner = Arc::new(FailsAfterItsLog {
-        ended: Default::default(),
-        log_opens: AtomicUsize::new(0),
-        output: Mutex::new(vec![b"token=s3cr3t-value\n".to_vec()]),
-    });
-    let db_dyn: Arc<dyn Db> = db.clone();
-    // The decorator that redacts the failure cause, as `main.rs` wires it.
-    let exec: Arc<dyn Executor> = Arc::new(SecretInjectingExecutor::new(
-        inner.clone(),
-        db_dyn.clone(),
-        Arc::new(FakeSecrets::new()) as Arc<dyn SecretProvider>,
-        logs.clone(),
-    ));
-    let tailer =
-        LogTailer::new(exec.clone(), logs.clone()).with_retry_backoff(Duration::from_millis(10));
-    let clock_dyn: Arc<dyn Clock> = clock.clone();
-    let supervision = scarab_engine::Supervision::new();
-    let health = scarab_engine::TickHealth::new();
-    macro_rules! tick {
-        () => {
-            converged::tick_once(
-                &db_dyn,
-                &clock_dyn,
-                &exec,
-                None,
-                None,
-                Some(&tailer),
-                None,
-                "log-tail-test",
-                0,
-                3_600_000,
-                None,
-                "http://scarab.test",
-                &supervision,
-                &health,
+/// I8: a launch that fails revokes nothing at once (its token may be
+/// mounted); the attempt's end does. Kills: a revoke on `Err`.
+#[tokio::test]
+async fn a_failed_launch_revokes_nothing_now() {
+    let w = World::new().await;
+    let logs = w.logs();
+    let live = LiveLog::new(b"", true);
+    let stack = w.stack(live.clone(), &logs);
+    stack.launch(&running(), &forge_spec()).await.unwrap();
+    live.launch_fails.store(true, Ordering::SeqCst);
+    stack.launch(&running(), &forge_spec()).await.unwrap_err();
+    assert!(
+        w.forge.revoke_tries().is_empty(),
+        "{:?}",
+        w.forge.revoke_tries()
+    );
+}
+
+/// The forge tokens the backend was handed, in launch order.
+fn mounted_tokens(live: &LiveLog) -> Vec<String> {
+    live.launched
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s.forge_token.as_ref()?.credential.as_ref())
+        .map(|c| c.token.clone())
+        .collect()
+}
+
+/// N-1: replica B sees the Attempt end and revokes T1; replica A, which
+/// no longer drives the Run, was still inside a launch of the same Attempt
+/// and now records T2 and launches. T2 is revoked by a later end and by
+/// the ledger sweep exactly once, and T1 is not revoked again. Kills: a
+/// unit mark that a later generation leaves set (every later path skips
+/// the unit, the purge deletes T2's generation, and T2 lives to its TTL).
+#[tokio::test]
+async fn a_token_recorded_after_the_attempt_end_was_seen_is_revoked_once() {
+    let w = World::new().await;
+    let (a, b) = (w.logs(), w.logs());
+    let live = LiveLog::new(b"", true);
+    let (stack_a, stack_b) = (w.stack(live.clone(), &a), w.stack(live.clone(), &b));
+    stack_a.launch(&running(), &forge_spec()).await.unwrap();
+    *live.poll_state.lock().unwrap() = ExecState::Succeeded;
+    let h = ExecHandle("pod-build".into());
+    stack_b.poll(&h).await.unwrap();
+    w.end_attempt().await;
+    let t1 = mounted_tokens(&live)[0].clone();
+    assert_eq!(w.forge.revoked(), vec![t1.clone()]);
+    // A's late launch.
+    stack_a.launch(&running(), &forge_spec()).await.unwrap();
+    let t2 = mounted_tokens(&live)[1].clone();
+    assert_eq!(w.forge.revoked(), vec![t1.clone()], "T2 is mounted");
+    // B sees the end again.
+    stack_b.poll(&h).await.unwrap();
+    assert_eq!(w.forge.revoked(), vec![t1.clone(), t2.clone()]);
+    stack_b.poll(&h).await.unwrap();
+    // The sweep purges the ledger and revokes nothing again.
+    w.db.settle_log_units(Timestamp(0)).await.unwrap();
+    let pass =
+        scarab_server::log_tail::sweep_ledgers(&b, w.forge.as_ref(), Timestamp(2 * 3_600_000))
+            .await;
+    assert_eq!(pass.purged, 1);
+    assert_eq!(w.forge.revoked(), vec![t1, t2]);
+}
+
+/// N-1, the sweep alone: no later end is seen; the sweep finds the unit
+/// unmarked and revokes T2 before it purges the ledger. Kills: a sweep
+/// that trusts a mark set before T2's generation was written.
+#[tokio::test]
+async fn the_sweep_revokes_a_token_recorded_after_the_unit_was_marked() {
+    let w = World::new().await;
+    let (a, b) = (w.logs(), w.logs());
+    let live = LiveLog::new(b"", true);
+    let (stack_a, stack_b) = (w.stack(live.clone(), &a), w.stack(live.clone(), &b));
+    stack_a.launch(&running(), &forge_spec()).await.unwrap();
+    *live.poll_state.lock().unwrap() = ExecState::Succeeded;
+    stack_b.poll(&ExecHandle("pod-build".into())).await.unwrap();
+    w.end_attempt().await;
+    stack_a.launch(&running(), &forge_spec()).await.unwrap();
+    w.db.settle_log_units(Timestamp(0)).await.unwrap();
+    scarab_server::log_tail::sweep_ledgers(&b, w.forge.as_ref(), Timestamp(2 * 3_600_000)).await;
+    assert_eq!(w.forge.revoked(), mounted_tokens(&live));
+    assert!(
+        w.db.log_unit_ledger(&stream())
+            .await
+            .unwrap()
+            .unwrap()
+            .unit
+            .purged
+    );
+}
+
+/// A forge that, while the ledger sweep revokes the unit's first token,
+/// lets a late launch on another replica write the unit's next generation
+/// (token `late`): after the sweep decided to purge and before it does.
+struct LateLaunchDuringRevoke {
+    forge: Arc<FakeForge>,
+    late: Mutex<Option<Arc<LogService>>>,
+}
+
+#[async_trait]
+impl ForgePort for LateLaunchDuringRevoke {
+    async fn latest_commit(
+        &self,
+        r: &scarab_forge::RepoRef,
+        x: &str,
+    ) -> Result<scarab_forge::Commit, scarab_forge::ForgeError> {
+        self.forge.latest_commit(r, x).await
+    }
+    async fn read_file_at_ref(
+        &self,
+        r: &scarab_forge::RepoRef,
+        x: &str,
+        p: &str,
+    ) -> Result<Vec<u8>, scarab_forge::ForgeError> {
+        self.forge.read_file_at_ref(r, x, p).await
+    }
+    async fn list_dir_at_ref(
+        &self,
+        r: &scarab_forge::RepoRef,
+        x: &str,
+        d: &str,
+    ) -> Result<Vec<String>, scarab_forge::ForgeError> {
+        self.forge.list_dir_at_ref(r, x, d).await
+    }
+    async fn list_refs(
+        &self,
+        r: &scarab_forge::RepoRef,
+        q: Option<&str>,
+    ) -> Result<Vec<scarab_forge::ForgeRef>, scarab_forge::ForgeError> {
+        self.forge.list_refs(r, q).await
+    }
+    async fn register_webhook(
+        &self,
+        r: &scarab_forge::RepoRef,
+        u: &str,
+    ) -> Result<(), scarab_forge::ForgeError> {
+        self.forge.register_webhook(r, u).await
+    }
+    async fn normalize_event(
+        &self,
+        raw: scarab_forge::WebhookDelivery,
+    ) -> Result<scarab_forge::Event, scarab_forge::ForgeError> {
+        self.forge.normalize_event(raw).await
+    }
+    async fn set_status(
+        &self,
+        r: &scarab_forge::RepoRef,
+        c: &scarab_forge::Commit,
+        s: scarab_forge::Status,
+    ) -> Result<(), scarab_forge::ForgeError> {
+        self.forge.set_status(r, c, s).await
+    }
+    async fn create_deployment(
+        &self,
+        r: &scarab_forge::RepoRef,
+        e: &str,
+    ) -> Result<(), scarab_forge::ForgeError> {
+        self.forge.create_deployment(r, e).await
+    }
+    async fn post_comment(
+        &self,
+        r: &scarab_forge::RepoRef,
+        i: u64,
+        b: &str,
+    ) -> Result<(), scarab_forge::ForgeError> {
+        self.forge.post_comment(r, i, b).await
+    }
+    async fn get_permissions(
+        &self,
+        r: &scarab_forge::RepoRef,
+        u: &str,
+    ) -> Result<scarab_forge::Permissions, scarab_forge::ForgeError> {
+        self.forge.get_permissions(r, u).await
+    }
+    async fn mint_checkout_credential(
+        &self,
+        r: &scarab_forge::RepoRef,
+        read_only: bool,
+    ) -> Result<scarab_forge::CheckoutCredential, scarab_forge::ForgeError> {
+        self.forge.mint_checkout_credential(r, read_only).await
+    }
+    async fn revoke_credential(
+        &self,
+        r: &scarab_forge::RepoRef,
+        token: &str,
+    ) -> Result<(), scarab_forge::ForgeError> {
+        let late = self.late.lock().unwrap().take();
+        if let Some(logs) = late {
+            let late_token = scarab_engine::MountedValue {
+                kind: scarab_engine::MountedValueKind::ForgeToken,
+                value: b"late".to_vec(),
+                repo: Some(scarab_engine::MountedRepo {
+                    owner: "acme".into(),
+                    name: "web".into(),
+                }),
+                minted: Some(true),
+            };
+            logs.record_launch_values(
+                &stream(),
+                Some("pod-build"),
+                vec![late_token],
+                Timestamp(now_ms()),
             )
             .await
-            .unwrap()
-        };
+            .unwrap();
+        }
+        self.forge.revoke_credential(r, token).await
     }
-    let step = StepId("build".into());
-    let first_attempt = || async {
-        db.steps_of_run(&run)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|s| s.step == step)
-            .and_then(|s| s.attempts.first().cloned())
+}
+
+/// N-1, the purge: the sweep decides on generation 1 (T1 not revoked yet),
+/// and while it revokes T1 a late launch writes generation 2. The purge is
+/// refused (the unit is not at the generation it was decided on), so
+/// generation 2 survives, and the next pass revokes its token and purges.
+/// Kills: a purge that deletes a generation written after its decision.
+#[tokio::test]
+async fn a_generation_written_while_the_sweep_revokes_survives_the_purge() {
+    let w = World::new().await;
+    let (a, b) = (w.logs(), w.logs());
+    let live = LiveLog::new(b"", true);
+    w.stack(live.clone(), &a)
+        .launch(&running(), &forge_spec())
+        .await
+        .unwrap();
+    let t1 = mounted_tokens(&live)[0].clone();
+    w.end_attempt().await;
+    w.db.settle_log_units(Timestamp(0)).await.unwrap();
+    let forge = LateLaunchDuringRevoke {
+        forge: w.forge.clone(),
+        late: Mutex::new(Some(w.logs())),
     };
+    let now = Timestamp(2 * 3_600_000);
+    let pass = scarab_server::log_tail::sweep_ledgers(&b, &forge, now).await;
+    assert_eq!(pass.purged, 0);
+    assert_eq!(w.forge.revoked(), vec![t1.clone()]);
+    let ledger = w.db.log_unit_ledger(&stream()).await.unwrap().unwrap();
+    assert!(!ledger.unit.purged);
+    assert_eq!(ledger.generations.len(), 2, "generation 2 survives");
+    let pass = scarab_server::log_tail::sweep_ledgers(&b, &forge, now).await;
+    assert_eq!(pass.purged, 1);
+    assert_eq!(w.forge.revoked(), vec![t1, "late".to_string()]);
+}
 
-    // Cycles while the step runs: its tail reads the whole log and closes.
-    let mut stored = Vec::new();
-    for _ in 0..30 {
-        tick!();
-        settle().await;
-        if let Some(a) = first_attempt().await {
-            stored = logs.read_all(&run, &step, &a.id).await.unwrap();
-        }
-        if !stored.is_empty() {
+/// A layer under the forge layer refuses the launch before the ledger
+/// layer records the token (here the secrets layer: a secret the scope
+/// does not have). No ledger holds the token and no Pod mounts it, so it
+/// is revoked at once. Kills: a refusal that returns and leaves the minted
+/// token live to its TTL.
+#[tokio::test]
+async fn a_token_minted_for_a_launch_refused_before_the_ledger_is_revoked() {
+    let w = World::new().await;
+    let logs = w.logs();
+    let live = LiveLog::new(b"", true);
+    let stack = w.stack(live.clone(), &logs);
+    let mut spec = forge_spec();
+    spec.secrets = vec![scarab_pipeline::SecretRef::file("MISSING")];
+    stack.launch(&running(), &spec).await.unwrap_err();
+    assert!(
+        live.launched.lock().unwrap().is_empty(),
+        "the backend was not called"
+    );
+    assert_eq!(w.forge.revoked(), vec!["fake-token-acme-web-1".to_string()]);
+}
+
+/// The ledger sweep lets its lease go when it stops (a graceful shutdown),
+/// so another replica sweeps on its next turn instead of after the lease's
+/// six-minute TTL. Kills: a sweeper aborted while it holds the lease.
+#[tokio::test]
+async fn the_ledger_sweeper_lets_its_lease_go_when_it_stops() {
+    let w = World::new().await;
+    let lease = [scarab_server::log_tail::LEDGER_SWEEP_LEASE.to_string()];
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let handle = scarab_server::log_tail::spawn_ledger_sweeper(
+        w.logs(),
+        w.forge.clone(),
+        "replica-a".into(),
+        async {
+            let _ = stopped.await;
+        },
+    );
+    until("the sweeper's lease", || async {
+        !w.db.live_leases(&lease).await.unwrap().is_empty()
+    })
+    .await;
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("the sweeper stops")
+        .unwrap();
+    assert!(w.db.live_leases(&lease).await.unwrap().is_empty());
+    let next = w.db.lease(&lease[0], "replica-b", 60_000).await.unwrap();
+    assert_eq!(next.owner, "replica-b");
+}
+
+// ---------------------------------------------------------------------------
+// I9: liveness
+// ---------------------------------------------------------------------------
+
+/// I9: a stream of an ended unit whose source cannot be read is closed
+/// once the durable budget is spent, with `incomplete` (it started).
+/// Kills: a budget that is not durable.
+#[tokio::test]
+async fn a_stream_of_an_ended_unit_is_terminal_within_the_budget() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    w.db.mark_log_unit_started(&stream(), Timestamp(1))
+        .await
+        .unwrap();
+    w.end_attempt().await;
+    let live = LiveLog::new(b"", false);
+    // Running forever: the source is not Gone, and the open fails.
+    live.set_state(Some(LogSourceState::Running { container_id: None }));
+    let mut t = timing();
+    t.final_budget_ms = 50;
+    let tailer = LogTailer::new(Arc::new(GoneSource(live.clone())), logs.clone())
+        .with_lease(w.db.clone() as Arc<dyn Db>, "a")
+        .with_timing(t);
+    for _ in 0..200 {
+        tailer.sweep().await;
+        if w.state(&stream()).await == Some(LogStreamState::Closed) {
             break;
         }
+        // `sweep` runs at most every 30 s: read through the pending pass.
+        tailer.pending_pass().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(stored, b"token=***\n");
-    // One more cycle with the step still Running and its tail closed.
-    tick!();
-    settle().await;
-    assert_eq!(inner.log_opens.load(Ordering::SeqCst), 1, "the tail closed");
+    assert_eq!(w.state(&stream()).await, Some(LogStreamState::Closed));
+    assert_eq!(w.markers(&stream()).await, [LogRowKind::Incomplete]);
+}
 
-    // The step fails; the next cycle records its cause.
-    inner.ended.store(true, Ordering::SeqCst);
-    let mut attempt = None;
-    for _ in 0..30 {
-        tick!();
-        settle().await;
-        attempt = first_attempt().await.filter(|a| a.failure_detail.is_some());
-        if attempt.is_some() {
-            break;
-        }
+/// I9: a final read in a cancelled unit's grace period whose container is
+/// silent and still running is not re-opened: one open. Kills: re-open on
+/// `Running`.
+#[tokio::test]
+async fn a_silent_container_in_grace_is_not_reread() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    let live = LiveLog::new(b"", true);
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.ensure(&running());
+    until("the open", || async { live.opens() == 1 }).await;
+    for _ in 0..10 {
+        tailer.end_pass(true);
+        tokio::time::sleep(Duration::from_millis(60)).await;
     }
-    let attempt = attempt.expect("the attempt failed with a cause");
-    let detail = attempt.failure_detail.unwrap();
-    assert!(
-        !detail.contains("s3cr3t-value"),
-        "the failure cause was stored with the step's secret: {detail}"
-    );
-    assert!(detail.contains("upload refused for token ***"), "{detail}");
+    assert_eq!(live.opens(), 1, "a running silent container is not re-read");
+    live.stop();
+    until("complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+}
 
-    // RC-T2: the pass after the step ended dropped its values.
-    tick!();
-    settle().await;
-    let fence = LogFence::new(&run, &step, &attempt.id);
-    assert!(
-        !logs.values_loaded(&fence),
-        "the ended step's values are dropped"
-    );
+// ---------------------------------------------------------------------------
+// I10: failure causes
+// ---------------------------------------------------------------------------
+
+/// I10 (RC-5): a failure cause is redacted on a process that neither
+/// launched nor tailed the unit: it loads the ledger by handle. Kills: a
+/// cache-only redaction.
+#[tokio::test]
+async fn a_failure_cause_is_redacted_on_a_process_that_neither_launched_nor_tailed() {
+    let w = World::new().await;
+    let launcher = w.logs();
+    w.ledger(&launcher, &[b"s3cr3t-value"]).await;
+    let other = w.logs();
     assert_eq!(
-        logs.redact_text("token s3cr3t-value"),
-        "token s3cr3t-value",
-        "no stream holds the ended step's value"
+        other
+            .redact_text_for_handle("pod-build", "pull failed: s3cr3t-value rejected")
+            .await,
+        "pull failed: *** rejected"
     );
+}
+
+/// I10: a cause about a unit with no ledger is replaced by a fixed text.
+/// Kills: the 0.6.x union fallback left in.
+#[tokio::test]
+async fn a_cause_of_a_unit_without_a_ledger_is_replaced() {
+    let w = World::new().await;
+    let logs = w.logs();
+    assert_eq!(
+        logs.redact_text_for_handle("pod-unknown", "token abc")
+            .await,
+        scarab_server::logs::CAUSE_NOT_STORED
+    );
+}
+
+#[path = "common/mod.rs"]
+mod common;
+
+/// I1 (Q1 = A): a ledger generation in Postgres holds no value in clear,
+/// opens only under its own unit and generation, and a load with a
+/// generation missing or not openable here is an error, never "fewer
+/// values". Kills: a seal without AAD; a load that skips a generation.
+#[tokio::test]
+async fn ledger_rows_hold_no_plaintext_and_open_only_under_their_unit() {
+    let Some(tdb) = common::fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = Arc::new(scarab_db_postgres::PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    let db = pg.clone() as Arc<dyn Db>;
+    let seal = sealer();
+    let logs =
+        LogService::new(Arc::new(InMemoryObjectStore::new()), db.clone()).with_sealer(seal.clone());
+    let value = |v: &[u8]| scarab_engine::MountedValue {
+        kind: scarab_engine::MountedValueKind::Secret,
+        value: v.to_vec(),
+        repo: None,
+        minted: None,
+    };
+    logs.record_launch_values(
+        &stream(),
+        None,
+        vec![value(b"plain-secret-1")],
+        Timestamp(1),
+    )
+    .await
+    .unwrap();
+    logs.record_launch_values(
+        &stream(),
+        None,
+        vec![value(b"plain-secret-2")],
+        Timestamp(2),
+    )
+    .await
+    .unwrap();
+    let rows = db.log_unit_ledger(&stream()).await.unwrap().unwrap();
+    assert_eq!(rows.generations.len(), 2);
+    for g in &rows.generations {
+        let hay = &g.sealed;
+        assert!(
+            !hay.windows(14).any(|w| w.starts_with(b"plain-secret")),
+            "generation {} holds a value in clear",
+            g.gen
+        );
+        // Under another unit's or generation's AAD it does not open.
+        let other = LogStreamId::new(&run(), &StepId("other".into()), &AttemptId(ATTEMPT.into()));
+        assert!(seal
+            .open(hay, &scarab_server::logs::ledger_aad(&other, g.gen))
+            .is_err());
+        assert!(seal
+            .open(hay, &scarab_server::logs::ledger_aad(&stream(), g.gen + 1))
+            .is_err());
+    }
+    // Both generations load.
+    let fresh =
+        LogService::new(Arc::new(InMemoryObjectStore::new()), db.clone()).with_sealer(seal.clone());
+    assert_eq!(
+        fresh.load_values(&stream()).await.unwrap().values().len(),
+        2
+    );
+    // A replica with other keys: a local error, not fewer values.
+    let other_keys =
+        LogService::new(Arc::new(InMemoryObjectStore::new()), db.clone()).with_sealer(sealer());
+    assert!(matches!(
+        other_keys.load_values(&stream()).await,
+        Err(scarab_server::logs::LedgerError::Local(_))
+    ));
+    // A generation gone (an accident): a local error.
+    sqlx::query("DELETE FROM log_unit_values WHERE gen = 1")
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
+    let after = LogService::new(Arc::new(InMemoryObjectStore::new()), db).with_sealer(seal);
+    assert!(matches!(
+        after.load_values(&stream()).await,
+        Err(scarab_server::logs::LedgerError::Local(_))
+    ));
+    tdb.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// Review findings (b2): purge, pending reads, read ends, failure causes
+// ---------------------------------------------------------------------------
+
+/// A step with one sidecar: the main container from `main`, the sidecar
+/// container `service-0` from `side`. Until `main_ready` is set, opening the
+/// main log fails as a Pod still initializing does.
+struct TwoSources {
+    main: Arc<LiveLog>,
+    side: Arc<LiveLog>,
+    main_ready: AtomicBool,
+}
+
+impl TwoSources {
+    fn new(main: Arc<LiveLog>, side: Arc<LiveLog>, main_ready: bool) -> Arc<Self> {
+        Arc::new(Self {
+            main,
+            side,
+            main_ready: AtomicBool::new(main_ready),
+        })
+    }
+}
+
+#[async_trait]
+impl Executor for TwoSources {
+    async fn launch(&self, s: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+        self.main.launch(s, spec).await
+    }
+    async fn poll(&self, h: &ExecHandle) -> Result<ExecState, ExecError> {
+        self.main.poll(h).await
+    }
+    async fn cancel(&self, h: &ExecHandle) -> Result<(), ExecError> {
+        self.main.cancel(h).await
+    }
+    fn unit_handle(&self, s: &StepRun) -> Option<ExecHandle> {
+        self.main.unit_handle(s)
+    }
+    async fn torn_down(&self, h: &ExecHandle) -> Result<bool, ExecError> {
+        self.main.torn_down(h).await
+    }
+    async fn results_delivery_failure(&self, h: &ExecHandle) -> Result<Option<String>, ExecError> {
+        self.main.results_delivery_failure(h).await
+    }
+    async fn workspace_provisioning(
+        &self,
+        h: &ExecHandle,
+    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
+        self.main.workspace_provisioning(h).await
+    }
+    async fn gate_refusal(&self, g: &StepRun) -> Result<Option<String>, ExecError> {
+        self.main.gate_refusal(g).await
+    }
+    async fn infra_condition(
+        &self,
+        h: &ExecHandle,
+    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
+        self.main.infra_condition(h).await
+    }
+    async fn delete_unit_secrets(&self, h: &ExecHandle) -> Result<(), ExecError> {
+        self.main.delete_unit_secrets(h).await
+    }
+    async fn log_source_state(&self, s: &LogSourceRef) -> Result<LogSourceState, ExecError> {
+        match s {
+            LogSourceRef::Sidecar { .. } => self.side.log_source_state(s).await,
+            _ => self.main.log_source_state(s).await,
+        }
+    }
+    async fn log_stream(
+        &self,
+        _s: &StepRun,
+        _f: LogFrom,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        if !self.main_ready.load(Ordering::SeqCst) {
+            return Err(ExecError::Other(
+                "container \"step\" in pod \"p\" is waiting to start: PodInitializing".into(),
+            ));
+        }
+        self.main.open()
+    }
+    async fn sidecar_log_stream(
+        &self,
+        _s: &StepRun,
+        _c: &str,
+        _f: LogFrom,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        self.side.open()
+    }
+}
+
+fn spec_with_sidecar() -> StepSpec {
+    let mut s = spec();
+    s.services = vec![scarab_pipeline::ServiceSpec {
+        image: "postgres:16".into(),
+        ..Default::default()
+    }];
+    s
+}
+
+fn tokens_launched(live: &LiveLog) -> Vec<String> {
+    live.launched
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            s.forge_token
+                .as_ref()
+                .unwrap()
+                .credential
+                .as_ref()
+                .unwrap()
+                .token
+                .clone()
+        })
+        .collect()
+}
+
+/// RT-M2: a failure cause is redacted with the ledger as it is now, not a
+/// cached set one generation old. B loads generation 1; A re-drives and
+/// records generation 2 with a new token; B redacts a cause that quotes
+/// it. Kills: redaction from the process cache.
+#[tokio::test]
+async fn a_failure_cause_quoting_a_token_minted_after_this_replica_cached_is_redacted() {
+    let w = World::new().await;
+    let (a, b) = (w.logs(), w.logs());
+    let live = LiveLog::new(b"", true);
+    w.stack(live.clone(), &a)
+        .launch(&running(), &forge_spec())
+        .await
+        .unwrap();
+    assert_eq!(b.load_values(&stream()).await.unwrap().gen(), 1);
+    w.stack(live.clone(), &a)
+        .launch(&running(), &forge_spec())
+        .await
+        .unwrap();
+    let t2 = tokens_launched(&live)[1].clone();
+    let cause = format!("clone failed: https://x-access-token:{t2}@github.com/acme/web.git");
+    let redacted = b.redact_text_for_handle("pod-build", &cause).await;
+    assert!(!redacted.contains(&t2), "{redacted}");
+}
+
+/// RT-M1: a short step with a sidecar. The sidecar's log completes while
+/// the main container's log has stored nothing yet (its Pod was still
+/// initializing at the first open); the unit is settled and revoked. The
+/// ledger must not be purged until the main stream is terminal too, so the
+/// main log is stored, not replaced by a `not_stored` marker. Kills: a
+/// purge that counts only stream rows that exist.
+#[tokio::test]
+async fn a_short_step_with_a_sidecar_keeps_its_log() {
+    let w = World::new().await;
+    let logs = w.logs();
+    let main = LiveLog::new(b"built\n", true);
+    let side = LiveLog::new(b"db up\n", true);
+    let exec = TwoSources::new(main.clone(), side.clone(), false);
+    let stack = build_executor_stack(
+        exec.clone(),
+        logs.clone(),
+        Arc::new(scarab_testkit::FakeClock::new(now_ms())),
+        {
+            let (db, l) = (w.db.clone() as Arc<dyn Db>, logs.clone());
+            move |ledger| SecretInjectingExecutor::new(ledger, db, Arc::new(FakeSecrets::new()), l)
+        },
+        {
+            let forge = w.forge.clone() as Arc<dyn ForgePort>;
+            move |with_secrets, ledger_logs| {
+                scarab_server::forge_token::ForgeCredentialExecutor::new(
+                    with_secrets,
+                    forge,
+                    ledger_logs,
+                )
+            }
+        },
+    );
+    stack
+        .launch(&running(), &spec_with_sidecar())
+        .await
+        .unwrap();
+    let tailer = w.tailer(exec.clone(), &logs, "a");
+    tailer.ensure(&running());
+    tailer.ensure_sidecar(&running(), 0);
+    until("the sidecar's line", || async {
+        w.stored(&logs, &sidecar_stream()).await == b"db up\n"
+    })
+    .await;
+    assert!(w.db.log_stream_row(&stream()).await.unwrap().is_none());
+    // The step exits: the attempt-end poll attempts the revocation, the
+    // attempt ends and the unit settles.
+    main.stop();
+    *main.poll_state.lock().unwrap() = ExecState::Succeeded;
+    stack.poll(&ExecHandle("pod-build".into())).await.unwrap();
+    w.end_attempt().await;
+    w.db.settle_log_units(Timestamp(now_ms())).await.unwrap();
+    // The sidecar's container ends: its stream completes first.
+    side.stop();
+    until("the sidecar completes", || async {
+        w.state(&sidecar_stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    // Now the main log can be read.
+    exec.main_ready.store(true, Ordering::SeqCst);
+    drive_until(
+        &tailer,
+        &step_run(AttemptOutcome::Succeeded),
+        "the main stream is terminal",
+        || async {
+            w.state(&stream())
+                .await
+                .is_some_and(|s| s != LogStreamState::Open)
+        },
+    )
+    .await;
+    assert!(
+        w.markers(&stream()).await.is_empty(),
+        "{:?}",
+        w.rows(&stream()).await
+    );
+    assert_eq!(w.state(&stream()).await, Some(LogStreamState::Complete));
+    assert_eq!(w.stored(&logs, &stream()).await, b"built\n");
+}
+
+/// RT-m3 / REV-m2: a sidecar stream left open when every replica that read
+/// it went away, with the main stream already complete, is read by the
+/// pending-final-read query of a new process. Kills: a pending query that
+/// looks at the main stream only.
+#[tokio::test]
+async fn a_sidecar_stream_left_open_across_a_restart_is_read() {
+    let w = World::new().await;
+    let logs = w.logs();
+    let main = LiveLog::new(b"built\n", false);
+    let side = LiveLog::new(b"db up\n", true);
+    side.script(ReadScript {
+        chunk: 64,
+        fail_after: Some(1),
+        ..Default::default()
+    });
+    let exec = TwoSources::new(main.clone(), side.clone(), true);
+    let stack = build_executor_stack(
+        exec.clone(),
+        logs.clone(),
+        Arc::new(scarab_testkit::FakeClock::new(now_ms())),
+        {
+            let (db, l) = (w.db.clone() as Arc<dyn Db>, logs.clone());
+            move |ledger| SecretInjectingExecutor::new(ledger, db, Arc::new(FakeSecrets::new()), l)
+        },
+        {
+            let forge = w.forge.clone() as Arc<dyn ForgePort>;
+            move |with_secrets, ledger_logs| {
+                scarab_server::forge_token::ForgeCredentialExecutor::new(
+                    with_secrets,
+                    forge,
+                    ledger_logs,
+                )
+            }
+        },
+    );
+    stack
+        .launch(&running(), &spec_with_sidecar())
+        .await
+        .unwrap();
+    // The old process: the main log completes, the sidecar's read breaks
+    // after its first line; then the process is gone.
+    let old = w.tailer(exec.clone(), &logs, "old");
+    old.ensure(&running());
+    old.ensure_sidecar(&running(), 0);
+    until("the old process's reads", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+            && w.stored(&logs, &sidecar_stream()).await == b"db up\n"
+    })
+    .await;
+    side.print(b"db down\n");
+    side.stop();
+    w.end_attempt().await;
+    w.db.settle_log_units(Timestamp(now_ms())).await.unwrap();
+    // A new process reads what the pending query names.
+    let fresh = w.tailer(exec.clone(), &logs, "fresh");
+    until("the sidecar stream completes", || async {
+        fresh.pending_pass().await;
+        w.state(&sidecar_stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    assert_eq!(
+        w.stored(&logs, &sidecar_stream()).await,
+        b"db up\ndb down\n"
+    );
+}
+
+/// REV-m1: a unit cancelled while Pending (it never started) whose first
+/// final read failed (the Pod was terminating) and then found the Pod gone
+/// gets no marker: the stream row the budget created has no rows. Kills:
+/// "has rows" read as "has a stream row".
+#[tokio::test]
+async fn a_step_cancelled_while_pending_gets_no_marker_after_a_failed_final_read() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    w.end_attempt().await;
+    w.db.settle_log_units(Timestamp(now_ms())).await.unwrap();
+    let live = LiveLog::new(b"", false);
+    live.set_state(Some(LogSourceState::Running { container_id: None }));
+    let tailer = w.tailer(Arc::new(GoneSource(live.clone())), &logs, "a");
+    until("the final-read budget started", || async {
+        tailer.pending_pass().await;
+        w.db.log_stream_row(&stream())
+            .await
+            .unwrap()
+            .is_some_and(|r| r.final_since.is_some())
+    })
+    .await;
+    live.set_state(Some(LogSourceState::Gone));
+    until("closed", || async {
+        tailer.pending_pass().await;
+        w.state(&stream()).await == Some(LogStreamState::Closed)
+    })
+    .await;
+    assert!(
+        w.rows(&stream()).await.is_empty(),
+        "{:?}",
+        w.rows(&stream()).await
+    );
+}
+
+/// REV-m6 (path row 20): a unit an earlier version launched (no ledger
+/// row) that started, whose Pod is gone when its final read runs, gets
+/// `not_stored` (`no_ledger`), not `incomplete` and not nothing. Kills: the
+/// gone branch taken before the no-ledger close.
+#[tokio::test]
+async fn a_0_6_unit_whose_pod_is_gone_gets_not_stored_not_incomplete() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.db.mark_attempt_execution_started(
+        &run(),
+        &StepId(STEP.into()),
+        &AttemptId(ATTEMPT.into()),
+        Timestamp(5),
+    )
+    .await
+    .unwrap();
+    let live = LiveLog::new(b"", false);
+    live.set_state(Some(LogSourceState::Gone));
+    let tailer = w.tailer(Arc::new(GoneSource(live.clone())), &logs, "a");
+    tailer.ensure(&running());
+    w.end_attempt().await;
+    drive_until(
+        &tailer,
+        &step_run(AttemptOutcome::Succeeded),
+        "closed",
+        || async { w.state(&stream()).await == Some(LogStreamState::Closed) },
+    )
+    .await;
+    let rows = w.rows(&stream()).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].kind, LogRowKind::NotStored);
+    assert_eq!(rows[0].reason, Some(NotStoredReason::NoLedger));
+}
+
+/// REV-m4: a sidecar in a crash loop (its container ended and waits to
+/// start again) is not opened again on every driver tick: the read backs
+/// off. Kills: `Again` (no wait) on a container waiting to restart.
+#[tokio::test]
+async fn a_crash_looping_sidecar_is_not_reopened_every_tick() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    let live = LiveLog::new(b"crashed\n", false);
+    live.restartable.store(true, Ordering::SeqCst);
+    let mut t = timing();
+    t.retry_backoff = Duration::from_millis(50);
+    t.final_backoff = Duration::from_millis(50);
+    t.final_backoff_max = Duration::from_millis(400);
+    let tailer = LogTailer::new(live.clone(), logs.clone())
+        .with_lease(w.db.clone() as Arc<dyn Db>, "a")
+        .with_timing(t);
+    for _ in 0..20 {
+        tailer.ensure_sidecar(&running(), 0);
+        tailer.end_pass(true);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(live.opens() <= 5, "{} opens in 20 ticks", live.opens());
+    assert_eq!(
+        w.stored(&logs, &sidecar_stream()).await,
+        b"crashed\n",
+        "the ended container's log is stored once"
+    );
+}
+
+/// RT-m8: a gate attempt (no container, no ledger) that ended gets no log
+/// marker from the pending-final-read query.
+#[tokio::test]
+async fn a_gate_attempt_gets_no_log_marker() {
+    let w = World::new().await;
+    let logs = w.logs();
+    let gate = StepId("approve".into());
+    w.db.create_step_run(&run(), &gate, None, &[], Timestamp(0))
+        .await
+        .unwrap();
+    w.db.record_attempt(
+        &run(),
+        &gate,
+        &Attempt {
+            id: AttemptId(ATTEMPT.into()),
+            started_at: Timestamp(now_ms()),
+            failure: None,
+            failure_detail: None,
+            outcome: AttemptOutcome::Running,
+        },
+    )
+    .await
+    .unwrap();
+    w.db.set_attempt_outcome(
+        &run(),
+        &gate,
+        &AttemptId(ATTEMPT.into()),
+        AttemptOutcome::Succeeded,
+    )
+    .await
+    .unwrap();
+    let live = LiveLog::new(b"", false);
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    let gate_stream = LogStreamId::new(&run(), &gate, &AttemptId(ATTEMPT.into()));
+    for _ in 0..20 {
+        tailer.pending_pass().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(w.rows(&gate_stream).await.is_empty());
+    assert_eq!(live.opens(), 0);
+}
+
+/// REV-M1: a forge that never answers a revocation does not hold the
+/// scheduler's tick: the ledger sweep is not part of it. Kills: the sweep
+/// awaited inside `tick_cycle`.
+#[tokio::test]
+async fn a_forge_that_hangs_on_revoke_does_not_hold_the_tick() {
+    let w = World::new().await;
+    let logs = w.logs();
+    let live = LiveLog::new(b"", false);
+    w.stack(live.clone(), &logs)
+        .launch(&running(), &forge_spec())
+        .await
+        .unwrap();
+    // The attempt ended over an hour ago: its ledger is due a purge, and
+    // its minted token was never revoked.
+    w.end_attempt().await;
+    w.db.settle_log_units(Timestamp(0)).await.unwrap();
+    w.forge.hang_revocations(true);
+    // Built as the driver builds it: the tailer has no forge.
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    let db = w.db.clone() as Arc<dyn Db>;
+    let clock: Arc<dyn scarab_engine::Clock> = Arc::new(scarab_testkit::FakeClock::new(now_ms()));
+    let exec: Arc<dyn Executor> = live.clone();
+    let (supervision, health) = (
+        scarab_engine::Supervision::new(),
+        scarab_engine::TickHealth::new(),
+    );
+    let tick = scarab_server::converged::tick_once(
+        &db,
+        &clock,
+        &exec,
+        None,
+        None,
+        Some(&tailer),
+        None,
+        "owner",
+        30_000,
+        3_600_000,
+        None,
+        "http://scarab.test",
+        &supervision,
+        &health,
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(5), tick)
+        .await
+        .expect("the tick returned while the forge hangs");
+}
+
+/// A forge token `token` of acme/web, minted, as a launch records it.
+fn minted(token: &str) -> scarab_engine::MountedValue {
+    scarab_engine::MountedValue {
+        kind: scarab_engine::MountedValueKind::ForgeToken,
+        value: token.as_bytes().to_vec(),
+        repo: Some(scarab_engine::MountedRepo {
+            owner: "acme".into(),
+            name: "web".into(),
+        }),
+        minted: Some(true),
+    }
+}
+
+/// REV-M1: 101 units whose revocations fail sit ahead of one that can be
+/// revoked. One pass reaches it and purges it; each failing unit is tried
+/// once and not again before its backoff. Kills: a pass limited to one
+/// page of an unordered query; failing units retried every pass.
+#[tokio::test]
+async fn a_failed_revoke_backs_off_and_does_not_starve_later_units() {
+    let w = World::new().await;
+    let logs = w.logs();
+    let t0 = 10 * 3_600_000;
+    let unit = |step: &str| {
+        LogStreamId::new(
+            &RunId("r2".into()),
+            &StepId(step.into()),
+            &AttemptId("a1".into()),
+        )
+    };
+    for i in 0..101 {
+        let token = format!("bad-{i}");
+        w.forge.fail_revocation_of(token.clone());
+        logs.record_launch_values(
+            &unit(&format!("s{i:03}")),
+            None,
+            vec![minted(&token)],
+            Timestamp(t0),
+        )
+        .await
+        .unwrap();
+    }
+    logs.record_launch_values(&unit("zzz"), None, vec![minted("good")], Timestamp(t0))
+        .await
+        .unwrap();
+    w.db.settle_log_units(Timestamp(t0)).await.unwrap();
+    let now = Timestamp(t0 + 2 * 3_600_000);
+    let pass = scarab_server::log_tail::sweep_ledgers(&logs, w.forge.as_ref(), now).await;
+    assert_eq!(pass.purged, 1, "{pass:?}");
+    assert_eq!(pass.failed, 101, "{pass:?}");
+    assert_eq!(w.forge.revoked(), vec!["good".to_string()]);
+    assert!(
+        w.db.log_unit_ledger(&unit("zzz"))
+            .await
+            .unwrap()
+            .unwrap()
+            .unit
+            .purged
+    );
+    assert_eq!(w.forge.revoke_tries().len(), 102, "each unit tried once");
+    // Inside their backoff: no unit is tried again.
+    let pass =
+        scarab_server::log_tail::sweep_ledgers(&logs, w.forge.as_ref(), Timestamp(now.0 + 1_000))
+            .await;
+    assert_eq!(pass, Default::default());
+    assert_eq!(w.forge.revoke_tries().len(), 102);
+}
+
+/// REV-M1: a revocation the forge never answers is cut off at the
+/// per-unit timeout; the pass ends and the unit backs off. Kills: a revoke
+/// awaited without a bound.
+#[tokio::test(start_paused = true)]
+async fn a_revocation_that_never_answers_is_cut_off_and_backs_off() {
+    let w = World::new().await;
+    let logs = w.logs();
+    let u = LogStreamId::new(
+        &RunId("r2".into()),
+        &StepId("s".into()),
+        &AttemptId("a1".into()),
+    );
+    logs.record_launch_values(&u, None, vec![minted("t")], Timestamp(0))
+        .await
+        .unwrap();
+    w.db.settle_log_units(Timestamp(0)).await.unwrap();
+    w.forge.hang_revocations(true);
+    let now = Timestamp(2 * 3_600_000);
+    let started = tokio::time::Instant::now();
+    let pass = scarab_server::log_tail::sweep_ledgers(&logs, w.forge.as_ref(), now).await;
+    assert_eq!(pass.failed, 1);
+    let took = started.elapsed();
+    let limit = scarab_server::log_tail::LEDGER_REVOKE_TIMEOUT;
+    assert!(
+        took >= limit && took < limit + Duration::from_secs(1),
+        "{took:?}"
+    );
+    let row = w.db.log_unit_ledger(&u).await.unwrap().unwrap().unit;
+    assert!(!row.purged);
+    assert_eq!(
+        row.revoke_retry_at,
+        Some(now.0 + scarab_engine::LEDGER_REVOKE_BACKOFF_MS)
+    );
+}
+
+/// REV-m7: the tailer's per-stream state falls back to nothing once the
+/// units it read have ended and been read to their end, and the ledger
+/// layer forgets a handle once its unit ends (a unit an earlier version
+/// launched, with no unit row, is remembered while it runs so it is asked
+/// for once). Kills: sets that only grow.
+#[tokio::test]
+async fn the_tailer_forgets_streams_of_runs_that_ended() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    let live = LiveLog::new(b"hi\n", true);
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    drive_until(&tailer, &running(), "the first line", || async {
+        w.stored(&logs, &stream()).await == b"hi\n"
+    })
+    .await;
+    assert!(tailer.tracked_streams() > 0);
+    live.stop();
+    w.end_attempt().await;
+    drive_until(
+        &tailer,
+        &step_run(AttemptOutcome::Succeeded),
+        "complete",
+        || async { w.state(&stream()).await == Some(LogStreamState::Complete) },
+    )
+    .await;
+    until("the tailer's state is empty", || async {
+        tailer.end_pass(true);
+        tailer.tracked_streams() == 0
+    })
+    .await;
+
+    let ledger = scarab_server::RedactionLedgerExecutor::new(
+        live.clone(),
+        logs.clone(),
+        Arc::new(scarab_testkit::FakeClock::new(now_ms())),
+    );
+    let h = ledger.launch(&running(), &spec()).await.unwrap();
+    let old = ExecHandle("pod-from-0-6".into());
+    *live.poll_state.lock().unwrap() = ExecState::Running;
+    ledger.poll(&h).await.unwrap();
+    ledger.poll(&old).await.unwrap();
+    ledger.poll(&old).await.unwrap();
+    assert_eq!(ledger.remembered_handles(), 2);
+    *live.poll_state.lock().unwrap() = ExecState::Succeeded;
+    ledger.poll(&h).await.unwrap();
+    ledger.cancel(&old).await.unwrap();
+    assert_eq!(ledger.remembered_handles(), 0);
+}
+
+/// REV-m12: a ledger generation sealed under a key that is no longer the
+/// active one counts toward the rotation metric (it cannot be rewrapped),
+/// one under the active key does not, and a purged unit's do not. Kills:
+/// a boot sweep that counts `secrets` rows only.
+#[tokio::test]
+async fn ledger_rows_under_an_old_key_keep_the_rotation_metric_above_zero() {
+    use scarab_secrets_postgres::{KeySealer, MasterKeySet};
+    let w = World::new().await;
+    let (old, new) = ([1u8; 32], [2u8; 32]);
+    let before = KeySealer::new(MasterKeySet::single(old));
+    let after = KeySealer::new(MasterKeySet::new(vec![new, old]).unwrap());
+    let logs_before = replica(
+        &w.db,
+        w.store.clone(),
+        &(Arc::new(before) as Arc<dyn scarab_secrets::Sealer>),
+    );
+    let logs_after = replica(
+        &w.db,
+        w.store.clone(),
+        &(Arc::new(after.clone()) as Arc<dyn scarab_secrets::Sealer>),
+    );
+    let secret = |v: &[u8]| scarab_engine::MountedValue {
+        kind: scarab_engine::MountedValueKind::Secret,
+        value: v.to_vec(),
+        repo: None,
+        minted: None,
+    };
+    let (u1, u2) = (
+        LogStreamId::new(&run(), &StepId("one".into()), &AttemptId("a1".into())),
+        LogStreamId::new(&run(), &StepId("two".into()), &AttemptId("a1".into())),
+    );
+    logs_before
+        .record_launch_values(&u1, None, vec![secret(b"s1")], Timestamp(0))
+        .await
+        .unwrap();
+    logs_after
+        .record_launch_values(&u2, None, vec![secret(b"s2")], Timestamp(0))
+        .await
+        .unwrap();
+    // Every replica opens both: the old key is still in the set.
+    assert!(logs_after.reload_values(&u1).await.is_ok());
+    let count = || scarab_server::logs::ledger_rows_under_nonactive_key(w.db.as_ref(), &after);
+    assert_eq!(
+        count().await.unwrap(),
+        1,
+        "the generation under the old key"
+    );
+    assert!(w.db.purge_log_unit(&u1, 1).await.unwrap());
+    assert_eq!(count().await.unwrap(), 0);
+}
+
+/// RT-M3: a stream one replica completed is read by a peer with its own
+/// lease (the first one's lease ended), whose source is gone: the peer
+/// stores nothing, no `incomplete` either, and the stream stays complete.
+/// Kills: a read that closes a stream without checking that it is
+/// terminal; a store that takes a marker on a terminal stream.
+#[tokio::test]
+async fn a_complete_stream_gets_no_marker_from_a_peer() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    let live = LiveLog::new(b"done\n", false);
+    let a = w.tailer(live.clone(), &logs, "a");
+    a.ensure(&running());
+    until("complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    let rows = w.rows(&stream()).await;
+    let resource = scarab_engine::LogLease::Tail.resource(&stream());
+    // A's read is over; let its lease go so the peer can claim it.
+    until("a gave up its lease", || async {
+        a.tracked_streams() > 0 && w.db.release_lease(&resource, "a").await.is_ok()
+    })
+    .await;
+    w.end_attempt().await;
+    live.set_state(Some(LogSourceState::Gone));
+    let peer_logs = w.logs();
+    let b = w.tailer(Arc::new(GoneSource(live.clone())), &peer_logs, "b");
+    // The peer reads the stream (its read claims the lease, then holds it
+    // for its done margin); the probe runs once the peer's read is over.
+    until("the peer read the stream", || async {
+        b.ensure(&running());
+        b.end_pass(true);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let probe = w.db.lease(&resource, "probe", 1).await.unwrap();
+        probe.owner == "b"
+    })
+    .await;
+    for _ in 0..20 {
+        b.end_pass(true);
+        b.pending_pass().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(w.rows(&stream()).await, rows, "the peer appended a row");
+    assert_eq!(w.state(&stream()).await, Some(LogStreamState::Complete));
+}
+
+/// RT-M3: a final read of an ended unit (no live read ran here) whose
+/// first open never returns a byte or an end is aborted by the idle rule
+/// once the state says `Ended`, and re-opened; the second read completes
+/// the stream. Virtual time. Kills: a final read with no idle rule.
+#[tokio::test(start_paused = true)]
+async fn a_hung_final_read_is_reopened() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    w.end_attempt().await;
+    let live = LiveLog::new(b"all\n", false);
+    live.script(ReadScript {
+        hang: true,
+        ..Default::default()
+    });
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    // Settle the unit and run the pending-final-read query.
+    tailer.sweep().await;
+    until("complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    assert_eq!(live.opens(), 2, "the hung read was re-opened once");
+    assert_eq!(w.stored(&logs, &stream()).await, b"all\n");
 }

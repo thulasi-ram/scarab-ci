@@ -35,6 +35,53 @@ fn step_run(id: &str) -> StepRun {
     }
 }
 
+/// The production stack `Forge(SecretInjecting(Ledger(inner)))` over
+/// `inner`, with its value ledger in `logs`: revocation reads the tokens
+/// from the ledger.
+fn stack(
+    inner: Arc<FakeExecutor>,
+    forge: Arc<FakeForge>,
+    logs: &Arc<LogService>,
+) -> Arc<dyn Executor> {
+    stack_with(inner, forge, logs, |f| f)
+}
+
+/// [`stack`], with `configure` applied to the forge layer.
+fn stack_with(
+    inner: Arc<dyn Executor>,
+    forge: Arc<dyn scarab_forge::ForgePort>,
+    logs: &Arc<LogService>,
+    configure: impl FnOnce(ForgeCredentialExecutor) -> ForgeCredentialExecutor,
+) -> Arc<dyn Executor> {
+    let db = logs.db().clone();
+    let secret_logs = logs.clone();
+    scarab_server::build_executor_stack(
+        inner,
+        logs.clone(),
+        Arc::new(scarab_testkit::FakeClock::new(1_000)),
+        move |ledger| {
+            scarab_server::SecretInjectingExecutor::new(
+                ledger,
+                db,
+                Arc::new(scarab_testkit::FakeSecrets::new()),
+                secret_logs,
+            )
+        },
+        move |with_secrets, ledger_logs| {
+            configure(ForgeCredentialExecutor::new(
+                with_secrets,
+                forge,
+                ledger_logs,
+            ))
+        },
+    )
+}
+
+fn ledger_logs() -> Arc<LogService> {
+    let db: Arc<dyn Db> = Arc::new(InMemoryDb::new());
+    Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), db))
+}
+
 fn token_spec(access: ForgeToken) -> StepSpec {
     StepSpec {
         image: "ghcr.io/thulasi-ram/scarab-clone@sha256:abc".into(),
@@ -97,7 +144,7 @@ fn clone_urls_are_credential_free_per_forge() {
 async fn each_launch_mints_a_credential_that_is_never_stored() {
     let inner = Arc::new(FakeExecutor::new());
     let forge = Arc::new(FakeForge::new().with_minted_tokens());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
+    let exec = stack(inner.clone(), forge.clone(), &ledger_logs());
     let spec = token_spec(ForgeToken::Read);
     let handle = exec.launch(&step_run("checkout/git"), &spec).await.unwrap();
     let launched = inner.launched_spec(&handle).unwrap().forge_token.unwrap();
@@ -124,11 +171,10 @@ async fn each_launch_mints_a_credential_that_is_never_stored() {
 /// it stores `***`. A re-drive mints a new token, which is redacted too.
 #[tokio::test]
 async fn a_printed_forge_token_is_stored_redacted() {
-    let db: Arc<dyn Db> = Arc::new(InMemoryDb::new());
-    let logs = Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), db));
+    let logs = ledger_logs();
     let inner = Arc::new(FakeExecutor::new());
     let forge = Arc::new(FakeForge::new().with_minted_tokens());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge).with_logs(logs.clone());
+    let exec = stack(inner.clone(), forge, &logs);
     let spec = token_spec(ForgeToken::Read);
     let (run, step, attempt) = (
         RunId("r1".into()),
@@ -175,7 +221,7 @@ async fn a_minted_token_is_revoked_when_the_attempt_ends() {
     ] {
         let inner = Arc::new(FakeExecutor::new());
         let forge = Arc::new(FakeForge::new().with_minted_tokens());
-        let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
+        let exec = stack(inner.clone(), forge.clone(), &ledger_logs());
         let handle = exec
             .launch(&step_run("push"), &token_spec(ForgeToken::Write))
             .await
@@ -209,12 +255,208 @@ async fn a_minted_token_is_revoked_when_the_attempt_ends() {
 async fn a_cancelled_attempt_revokes_its_tokens_including_a_re_drives() {
     let inner = Arc::new(FakeExecutor::new());
     let forge = Arc::new(FakeForge::new().with_minted_tokens());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
+    let exec = stack(inner.clone(), forge.clone(), &ledger_logs());
     let spec = token_spec(ForgeToken::Read);
     let handle = exec.launch(&step_run("checkout/git"), &spec).await.unwrap();
+    let first = inner
+        .launched_spec(&handle)
+        .unwrap()
+        .forge_token
+        .unwrap()
+        .credential
+        .unwrap()
+        .token;
     exec.launch(&step_run("checkout/git"), &spec).await.unwrap();
+    let second = inner
+        .launched_spec(&handle)
+        .unwrap()
+        .forge_token
+        .unwrap()
+        .credential
+        .unwrap()
+        .token;
+    // The re-drive ends the token it replaced at once.
+    assert_eq!(forge.revoked(), vec![first.clone()]);
     exec.cancel(&handle).await.unwrap();
-    assert_eq!(forge.revoked().len(), 2, "both launches' tokens end");
+    let revoked = forge.revoked();
+    assert!(
+        revoked.contains(&first) && revoked.contains(&second),
+        "both launches' tokens end: {revoked:?}"
+    );
+}
+
+/// J-1: a forge layer built over a backend with no ledger layer under it
+/// (no value ledger records the token it mints) revokes the token it
+/// minted and fails the launch: the unit's log could not be redacted for
+/// it. Kills: a launch that succeeds without its token in the ledger; a
+/// fail without the revoke.
+#[tokio::test]
+async fn a_forge_executor_over_a_backend_with_no_ledger_layer_revokes_what_it_minted_and_fails_the_launch(
+) {
+    let logs = ledger_logs();
+    let inner = Arc::new(FakeExecutor::new());
+    let forge = Arc::new(FakeForge::new().with_minted_tokens());
+    // SecretInjecting directly over the backend: no RedactionLedgerExecutor.
+    let secret: Arc<dyn Executor> = Arc::new(scarab_server::SecretInjectingExecutor::new(
+        inner.clone(),
+        logs.db().clone(),
+        Arc::new(scarab_testkit::FakeSecrets::new()),
+        logs.clone(),
+    ));
+    let exec = ForgeCredentialExecutor::new(secret, forge.clone(), logs);
+    let err = exec
+        .launch(&step_run("checkout/git"), &token_spec(ForgeToken::Read))
+        .await
+        .expect_err("a launch whose token is in no ledger fails");
+    assert!(err.to_string().contains("ledger"), "{err}");
+    assert_eq!(forge.credential_calls(), 1);
+    assert_eq!(forge.revoked().len(), 1, "the minted token was revoked");
+    let handle = scarab_engine::ports::ExecHandle("fake://r1/checkout/git/a1".into());
+    let mounted = inner
+        .launched_spec(&handle)
+        .and_then(|s| s.forge_token)
+        .and_then(|f| f.credential)
+        .map(|c| c.token);
+    assert_eq!(mounted.as_ref(), forge.revoked().first());
+}
+
+/// A backend whose first launch returns only once `release` is notified: a
+/// launcher deposed while its backend call is in flight.
+struct LateFirstLaunch {
+    inner: Arc<FakeExecutor>,
+    calls: std::sync::atomic::AtomicUsize,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl Executor for LateFirstLaunch {
+    async fn launch(
+        &self,
+        step: &StepRun,
+        spec: &StepSpec,
+    ) -> Result<scarab_engine::ports::ExecHandle, scarab_engine::ExecError> {
+        let first = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+        let handle = self.inner.launch(step, spec).await;
+        if first {
+            self.release.notified().await;
+        }
+        handle
+    }
+    async fn poll(
+        &self,
+        h: &scarab_engine::ports::ExecHandle,
+    ) -> Result<ExecState, scarab_engine::ExecError> {
+        self.inner.poll(h).await
+    }
+    async fn cancel(
+        &self,
+        h: &scarab_engine::ports::ExecHandle,
+    ) -> Result<(), scarab_engine::ExecError> {
+        self.inner.cancel(h).await
+    }
+    fn unit_handle(&self, s: &StepRun) -> Option<scarab_engine::ports::ExecHandle> {
+        self.inner.unit_handle(s)
+    }
+    async fn torn_down(
+        &self,
+        h: &scarab_engine::ports::ExecHandle,
+    ) -> Result<bool, scarab_engine::ExecError> {
+        self.inner.torn_down(h).await
+    }
+    async fn results_delivery_failure(
+        &self,
+        h: &scarab_engine::ports::ExecHandle,
+    ) -> Result<Option<String>, scarab_engine::ExecError> {
+        self.inner.results_delivery_failure(h).await
+    }
+    async fn workspace_provisioning(
+        &self,
+        h: &scarab_engine::ports::ExecHandle,
+    ) -> Result<Option<scarab_engine::ProvisioningReport>, scarab_engine::ExecError> {
+        self.inner.workspace_provisioning(h).await
+    }
+    async fn gate_refusal(&self, g: &StepRun) -> Result<Option<String>, scarab_engine::ExecError> {
+        self.inner.gate_refusal(g).await
+    }
+    async fn infra_condition(
+        &self,
+        h: &scarab_engine::ports::ExecHandle,
+    ) -> Result<Option<scarab_engine::InfraCondition>, scarab_engine::ExecError> {
+        self.inner.infra_condition(h).await
+    }
+    async fn delete_unit_secrets(
+        &self,
+        h: &scarab_engine::ports::ExecHandle,
+    ) -> Result<(), scarab_engine::ExecError> {
+        self.inner.delete_unit_secrets(h).await
+    }
+    async fn log_source_state(
+        &self,
+        s: &scarab_engine::LogSourceRef,
+    ) -> Result<scarab_engine::LogSourceState, scarab_engine::ExecError> {
+        self.inner.log_source_state(s).await
+    }
+}
+
+/// RT-m6: a launch whose backend call returns after a re-drive of the same
+/// Attempt minted and mounted a newer token revokes only the generations
+/// older than its own: the newer launch's token stays live. Kills: a launch
+/// that revokes every token in the ledger but its own.
+#[tokio::test]
+async fn a_launch_that_returns_late_does_not_revoke_a_newer_launchs_token() {
+    let logs = ledger_logs();
+    let fake = Arc::new(FakeExecutor::new());
+    let backend = Arc::new(LateFirstLaunch {
+        inner: fake.clone(),
+        calls: Default::default(),
+        release: tokio::sync::Notify::new(),
+    });
+    let forge = Arc::new(FakeForge::new().with_minted_tokens());
+    let exec = stack_with(backend.clone(), forge.clone(), &logs, |f| f);
+    let spec = token_spec(ForgeToken::Read);
+    let late = tokio::spawn({
+        let (exec, spec) = (exec.clone(), spec.clone());
+        async move { exec.launch(&step_run("tag"), &spec).await }
+    });
+    // The first launch's token is in the ledger and its backend call hangs.
+    let unit = scarab_engine::LogStreamId::new(
+        &RunId("r1".into()),
+        &StepId("tag".into()),
+        &AttemptId("a1".into()),
+    );
+    for _ in 0..200 {
+        if backend.calls.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let first = logs
+        .reload_values(&unit)
+        .await
+        .unwrap()
+        .minted_forge_tokens()[0]
+        .value
+        .clone();
+    // The re-drive mints T2, mounts it, and ends T1.
+    let handle = exec.launch(&step_run("tag"), &spec).await.unwrap();
+    let second = fake
+        .launched_spec(&handle)
+        .unwrap()
+        .forge_token
+        .unwrap()
+        .credential
+        .unwrap()
+        .token;
+    assert_eq!(forge.revoked(), vec![String::from_utf8(first).unwrap()]);
+    // The deposed launch returns now.
+    backend.release.notify_one();
+    late.await.unwrap().unwrap();
+    assert!(
+        !forge.revoked().contains(&second),
+        "the late launch revoked the newer launch's token: {:?}",
+        forge.revoked()
+    );
+    assert_eq!(forge.revoked().len(), 1);
 }
 
 /// A library from a source `acme` trusts, stored in `acme`; its hash.
@@ -255,8 +497,9 @@ async fn a_long_lived_token_is_handed_over_and_never_revoked() {
     let libs = Arc::new(InMemoryLibraries::new());
     let mut spec = token_spec(ForgeToken::Read);
     spec.forge_token.as_mut().unwrap().trusted_library = Some(trusted_library(&libs).await);
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone())
-        .with_libraries(Arc::new(InMemoryDb::new()), libs.clone());
+    let exec = stack_with(inner.clone(), forge.clone(), &ledger_logs(), |f| {
+        f.with_libraries(Arc::new(InMemoryDb::new()), libs.clone())
+    });
     let handle = exec.launch(&step_run("checkout/git"), &spec).await.unwrap();
     assert!(inner
         .launched_spec(&handle)
@@ -292,8 +535,13 @@ async fn a_launch_for_a_run_with_an_http_clone_url_mints_nothing() {
         .unwrap();
     let inner = Arc::new(FakeExecutor::new());
     let forge = Arc::new(FakeForge::new().with_minted_tokens());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone())
-        .with_libraries(db.clone(), Arc::new(InMemoryLibraries::new()));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let exec = stack_with(inner.clone(), forge.clone(), &logs, |f| {
+        f.with_libraries(db.clone(), Arc::new(InMemoryLibraries::new()))
+    });
     let err = exec
         .launch(&step_run("checkout/git"), &token_spec(ForgeToken::Read))
         .await
@@ -319,8 +567,9 @@ async fn a_launch_after_the_trust_is_removed_mints_nothing() {
     )
     .await
     .unwrap();
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone())
-        .with_libraries(Arc::new(InMemoryDb::new()), libs.clone());
+    let exec = stack_with(inner.clone(), forge.clone(), &ledger_logs(), |f| {
+        f.with_libraries(Arc::new(InMemoryDb::new()), libs.clone())
+    });
     let err = exec
         .launch(&step_run("checkout/git"), &spec)
         .await
@@ -330,7 +579,7 @@ async fn a_launch_after_the_trust_is_removed_mints_nothing() {
     // A Run stored as fork-locked stays `read` even where its stored
     // access says `write`.
     let minting = Arc::new(FakeForge::new().with_minted_tokens());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), minting.clone());
+    let exec = stack(inner.clone(), minting.clone(), &ledger_logs());
     let mut write = token_spec(ForgeToken::Write);
     write.forge_token.as_mut().unwrap().read_only = true;
     let handle = exec.launch(&step_run("push"), &write).await.unwrap();
@@ -368,8 +617,9 @@ async fn a_clone_library_launch_gets_the_long_lived_token_only_once_its_source_i
     .unwrap();
     let mut spec = token_spec(ForgeToken::Read);
     spec.forge_token.as_mut().unwrap().trusted_library = Some(content_hash(CLONE_LIBRARY));
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone())
-        .with_libraries(Arc::new(InMemoryDb::new()), libs.clone());
+    let exec = stack_with(inner.clone(), forge.clone(), &ledger_logs(), |f| {
+        f.with_libraries(Arc::new(InMemoryDb::new()), libs.clone())
+    });
     let err = exec
         .launch(&step_run("checkout/git"), &spec)
         .await
@@ -399,7 +649,7 @@ async fn a_clone_library_launch_gets_the_long_lived_token_only_once_its_source_i
 #[tokio::test]
 async fn a_write_token_the_forge_cannot_mint_fails_the_launch() {
     let inner = Arc::new(FakeExecutor::new());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), Arc::new(FakeForge::new()));
+    let exec = stack(inner.clone(), Arc::new(FakeForge::new()), &ledger_logs());
     let err = exec
         .launch(&step_run("push"), &token_spec(ForgeToken::Write))
         .await
@@ -410,7 +660,7 @@ async fn a_write_token_the_forge_cannot_mint_fails_the_launch() {
 #[tokio::test]
 async fn steps_without_forge_token_pass_through_untouched() {
     let inner = Arc::new(FakeExecutor::new());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), Arc::new(FakeForge::new()));
+    let exec = stack(inner.clone(), Arc::new(FakeForge::new()), &ledger_logs());
     let mut spec = token_spec(ForgeToken::Read);
     spec.forge_token = None;
     spec.image = "busybox".into();
@@ -479,15 +729,31 @@ async fn a_refused_readmission_mints_no_credential() {
             Arc::new(InMemoryObjectStore::new()),
             db.clone(),
         ));
-        let secret_exec = SecretInjectingExecutor::new(
+        let secret_logs = logs.clone();
+        let exec = scarab_server::build_executor_stack(
             inner.clone(),
-            db.clone() as Arc<dyn Db>,
-            Arc::new(FakeSecrets::new()),
             logs,
-        )
-        .with_environment_governance(governance.clone());
-        let exec = ForgeCredentialExecutor::new(Arc::new(secret_exec), forge.clone())
-            .with_environment_governance(db.clone(), governance);
+            Arc::new(scarab_testkit::FakeClock::new(1_000)),
+            {
+                let (db, governance) = (db.clone(), governance.clone());
+                move |ledger| {
+                    SecretInjectingExecutor::new(
+                        ledger,
+                        db as Arc<dyn Db>,
+                        Arc::new(FakeSecrets::new()),
+                        secret_logs,
+                    )
+                    .with_environment_governance(governance)
+                }
+            },
+            {
+                let (db, forge) = (db.clone(), forge.clone());
+                move |with_secrets, ledger_logs| {
+                    ForgeCredentialExecutor::new(with_secrets, forge, ledger_logs)
+                        .with_environment_governance(db, governance)
+                }
+            },
+        );
 
         let launched = exec.launch(&step_run("checkout/git"), &spec).await;
         assert!(

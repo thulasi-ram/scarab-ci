@@ -1,29 +1,45 @@
 //! Log pipeline (ADR-0013): step stdout/stderr → chunked, **compressed**
-//! object-store blobs + a per-step byte-offset **index in Postgres** (never the
-//! bodies) → live SSE tail + full replay.
+//! object-store blobs + a per-stream byte-offset **index in Postgres** (never
+//! the bodies) → live SSE tail + full replay.
 //!
-//! [`LogService`] orchestrates the two ports — `ObjectStore` (blobs) and `Db`
-//! (offset index) — and an in-process broadcast for live tailing. It is infra
-//! composition (both ports at once), so it lives in the server, not a pure
-//! crate. The Pod-stdout *source* (the executor's k8s log tail) feeds
-//! [`LogService::append`]; that wiring lands with the converged/dev-harness
-//! slices.
+//! [`LogService`] composes the two ports — `ObjectStore` (blobs) and `Db`
+//! (index, stream state, value ledger) — so it lives in the server, not a
+//! pure crate.
+//!
+//! **Writes** are fenced (git-bug 511a769): every row is appended through
+//! [`Db::append_log_row`] under the writer's lease for that stream (the
+//! store derives its resource from the stream id), and an output
+//! row commits only while the ledger generation its bytes were redacted
+//! with is the unit's current one. A body's object key is its content
+//! address, so no PUT rewrites a committed body.
+//!
+//! **Redaction** (git-bug 2d78464): a unit's secret values are sealed in its
+//! **value ledger** in Postgres before any of them is written where the unit
+//! can read them ([`LogService::record_launch_values`]). Every replica reads
+//! the ledger, all of it or nothing ([`LogService::load_values`]); a unit
+//! with no ledger, or a purged one, is not ledger-complete and its source is
+//! never read. The process keeps a cache of loaded ledgers, evicted after
+//! [`VALUES_TTL`]: the ledger is the source.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use futures::stream::{self, BoxStream, StreamExt};
-use tokio::sync::broadcast;
 
-use scarab_engine::{AttemptId, Db, LogChunkMeta, RunId, StepId};
+use scarab_engine::{
+    AttemptId, Db, DbError, LogAppendError, LogBody, LogChunkMeta, LogLease, LogRowKind,
+    LogStreamId, LogStreamState, LogWriter, MountedValue, NewLogRow, NotStoredReason, RunId,
+    StepId, Timestamp,
+};
+use scarab_secrets::Sealer;
 use scarab_storage::ObjectStore;
 
-/// Errors from the log pipeline.
+/// Errors from the log pipeline's reads.
 #[derive(Debug, thiserror::Error)]
 pub enum LogError {
     #[error("db error: {0}")]
@@ -34,55 +50,172 @@ pub enum LogError {
     Gzip(String),
 }
 
-/// Identifies one log stream: a single attempt of a step.
-type StreamKey = (String, String, String);
-
-fn stream_key(run: &RunId, step: &StepId, attempt: &AttemptId) -> StreamKey {
-    (run.0.clone(), step.0.clone(), attempt.0.clone())
+/// Why a unit's values could not be loaded.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum LedgerError {
+    /// The unit is not ledger-complete, for a reason every replica finds:
+    /// it has no `log_units` row, or its ledger was purged. Its log is not
+    /// stored.
+    #[error("the unit is not ledger-complete ({})", .0.as_str())]
+    NotLedgerComplete(NotStoredReason),
+    /// This replica could not load it (a seal it cannot open, a missing
+    /// generation, a database error). Never a reason to close a stream.
+    #[error("the unit's values could not be loaded here: {0}")]
+    Local(String),
 }
 
-/// One log stream, as the secret values that redact it are kept: a single
-/// attempt of a step, or a sidecar or shared-service stream
-/// ([`sidecar_stream_key`], [`service_stream_key`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LogFence {
-    pub run: RunId,
-    pub step: StepId,
-    pub attempt: AttemptId,
+/// How long a loaded value set is kept in the process cache.
+pub const VALUES_TTL: Duration = Duration::from_secs(600);
+
+/// The text a failure cause is replaced with when the unit it is about has
+/// no ledger this replica can load.
+pub const CAUSE_NOT_STORED: &str =
+    "the cause was not stored: it may quote secret values that could not be checked";
+
+/// The secret values of one unit, as its ledger holds them at generation
+/// `gen`: the union of every generation `1..=gen`. Built only from a loaded
+/// ledger (there is no empty default).
+#[derive(Debug)]
+pub struct ValueSet {
+    gen: i64,
+    entries: Vec<MountedValue>,
+    values: Vec<Vec<u8>>,
+    generations: Vec<LedgerGeneration>,
 }
 
-impl LogFence {
-    pub fn new(run: &RunId, step: &StepId, attempt: &AttemptId) -> Self {
+/// One generation of a unit's ledger as loaded: the values one launch
+/// mounted, and when its minted forge tokens were revoked (so they are not
+/// revoked again).
+#[derive(Debug, Clone)]
+pub struct LedgerGeneration {
+    pub gen: i64,
+    pub revoked_at: Option<i64>,
+    pub entries: Vec<MountedValue>,
+}
+
+impl LedgerGeneration {
+    /// The minted forge tokens in this generation, once each.
+    pub fn minted_forge_tokens(&self) -> Vec<&MountedValue> {
+        minted_once(&self.entries)
+    }
+}
+
+fn minted_once(entries: &[MountedValue]) -> Vec<&MountedValue> {
+    let mut out: Vec<&MountedValue> = Vec::new();
+    for e in entries {
+        if e.kind == scarab_engine::MountedValueKind::ForgeToken
+            && e.minted == Some(true)
+            && !out.iter().any(|o| o.value == e.value)
+        {
+            out.push(e);
+        }
+    }
+    out
+}
+
+impl ValueSet {
+    /// A set of one generation `gen` holding `entries`.
+    #[cfg(test)]
+    fn new(gen: i64, entries: Vec<MountedValue>) -> Self {
+        Self::from_generations(
+            gen,
+            vec![LedgerGeneration {
+                gen,
+                revoked_at: None,
+                entries,
+            }],
+        )
+    }
+
+    fn from_generations(gen: i64, generations: Vec<LedgerGeneration>) -> Self {
+        let entries: Vec<MountedValue> = generations
+            .iter()
+            .flat_map(|g| g.entries.iter().cloned())
+            .collect();
+        let mut values: Vec<Vec<u8>> = Vec::new();
+        for e in &entries {
+            if !e.value.is_empty() && !values.contains(&e.value) {
+                values.push(e.value.clone());
+            }
+        }
         Self {
-            run: run.clone(),
-            step: step.clone(),
-            attempt: attempt.clone(),
+            gen,
+            entries,
+            values,
+            generations,
         }
     }
 
-    /// The fence of `step`'s current attempt; `None` before it has one.
-    pub fn of_step(step: &scarab_engine::StepRun) -> Option<Self> {
-        step.current_attempt()
-            .map(|a| Self::new(&step.run, &step.step, &a.id))
+    /// Each generation, oldest first.
+    pub fn generations(&self) -> &[LedgerGeneration] {
+        &self.generations
     }
 
-    fn key(&self) -> StreamKey {
-        stream_key(&self.run, &self.step, &self.attempt)
+    /// The oldest generation that holds `value`, if any.
+    pub fn generation_holding(&self, value: &[u8]) -> Option<i64> {
+        self.generations
+            .iter()
+            .find(|g| g.entries.iter().any(|e| e.value == value))
+            .map(|g| g.gen)
+    }
+
+    /// The ledger generation this set is.
+    pub fn gen(&self) -> i64 {
+        self.gen
+    }
+
+    /// Every value to redact.
+    pub fn values(&self) -> &[Vec<u8>] {
+        &self.values
+    }
+
+    /// Every entry, with its kind (forge tokens carry their repository and
+    /// whether they were minted).
+    pub fn entries(&self) -> &[MountedValue] {
+        &self.entries
+    }
+
+    /// The minted forge tokens in the ledger, once each: what is revoked.
+    pub fn minted_forge_tokens(&self) -> Vec<&MountedValue> {
+        minted_once(&self.entries)
     }
 }
 
-/// The secret values of one log stream.
-#[derive(Default)]
-struct FenceValues {
-    values: Mutex<Vec<Vec<u8>>>,
-    /// Every value the stream's unit holds is registered: read back from the
-    /// unit (`Executor::log_redactions`), or registered by the launch on this
-    /// process.
-    loaded: AtomicBool,
+/// A unit's key in the process cache.
+type StreamKey = (String, String, String);
+
+fn unit_key(unit: &LogStreamId) -> StreamKey {
+    (
+        unit.run.0.clone(),
+        unit.step.0.clone(),
+        unit.attempt.0.clone(),
+    )
 }
 
-fn object_key(run: &RunId, step: &StepId, attempt: &AttemptId, seq: u64) -> String {
-    format!("logs/{}/{}/{}/{seq:08}.gz", run.0, step.0, attempt.0)
+/// The AEAD associated data of generation `gen` of `unit`'s ledger: a seal
+/// opens only under its own unit and generation.
+pub fn ledger_aad(unit: &LogStreamId, gen: i64) -> Vec<u8> {
+    format!(
+        "scarab-log-values/v1:{}:{}:{}:{gen}",
+        unit.run.0, unit.step.0, unit.attempt.0
+    )
+    .into_bytes()
+}
+
+/// A body's object key: its content address, so a PUT to a key always
+/// carries the same bytes and a committed body is never rewritten.
+fn object_key(stream: &LogStreamId, sha256: &[u8]) -> String {
+    let hex: String = sha256.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "logs/{}/{}/{}/{hex}.gz",
+        stream.run.0, stream.step.0, stream.attempt.0
+    )
+}
+
+/// SHA-256 of `data`.
+pub fn sha256(data: &[u8]) -> Vec<u8> {
+    use sha2::Digest;
+    sha2::Sha256::digest(data).to_vec()
 }
 
 /// Map a **shared-service** instance `{run, take, name}` (ADR-0058) onto the log
@@ -114,170 +247,308 @@ pub fn sidecar_stream_key(step: &StepId, index: usize) -> StepId {
     StepId(format!("{}::service-{index}", step.0))
 }
 
+pub use scarab_engine::tail_lease_resource;
+
+/// The tail lease a 0.6.x server took for the same stream; a reader of a
+/// stream with rows from 0.6.x checks it too.
+pub fn legacy_tail_lease_resource(run: &RunId, step: &StepId, attempt: &AttemptId) -> String {
+    match step.0.rsplit_once("::service-") {
+        Some((owner, index)) => format!("tail:{}:{owner}:sidecar-{index}:{}", run.0, attempt.0),
+        None => format!("tail:{}:{}:{}", run.0, step.0, attempt.0),
+    }
+}
+
+/// How many stored value-ledger generations are sealed under a master key
+/// other than `keys`' active one (git-bug 2d78464). They cannot be
+/// rewrapped (the AAD binds unit and generation) and live at most a day;
+/// key rotation adds them to the rows under a non-active key, so an old
+/// key is not removed while a ledger still needs it.
+pub async fn ledger_rows_under_nonactive_key(
+    db: &dyn Db,
+    keys: &scarab_secrets_postgres::KeySealer,
+) -> Result<u64, DbError> {
+    db.count_log_values_not_sealed_with(&keys.active_seal_prefix())
+        .await
+}
+
+/// A loaded value set and when it was loaded.
+struct Cached {
+    set: Arc<ValueSet>,
+    at: Instant,
+}
+
 /// Persists and streams step logs.
 pub struct LogService {
     store: Arc<dyn ObjectStore>,
     db: Arc<dyn Db>,
-    /// Live broadcast channels, one per in-flight stream.
-    live: Mutex<HashMap<StreamKey, broadcast::Sender<Vec<u8>>>>,
-    /// Secret values to scrub from a stream's chunks before they are stored
-    /// or streamed (ADR-0013, 0032), per stream: a value redacts only the
-    /// stream it was registered for. Registered when secrets are injected
-    /// into a step, and by a log tail from the unit it reads; removed once
-    /// the tail has closed the stream and the unit has ended
-    /// ([`forget_secrets`](Self::forget_secrets)).
-    /// There is no server-wide value: every value Scarab registers belongs
-    /// to one launch. A [`StreamRedactor`] holds its stream's entry and reads
-    /// it at each push.
-    secrets: Mutex<HashMap<StreamKey, Arc<FenceValues>>>,
+    /// Seals and opens ledger generations: the deployment's master keys.
+    sealer: Arc<dyn Sealer>,
+    /// Loaded value sets by unit, evicted after [`VALUES_TTL`].
+    cache: Mutex<HashMap<StreamKey, Cached>>,
+    /// The lease owner of [`append`](Self::append), the test writer.
+    owner: String,
 }
 
 impl LogService {
+    /// A log service whose ledger seals under a fresh random key: what it
+    /// seals opens only in this process. A server sets the deployment's
+    /// sealer ([`with_sealer`](Self::with_sealer)).
     pub fn new(store: Arc<dyn ObjectStore>, db: Arc<dyn Db>) -> Self {
         Self {
             store,
             db,
-            live: Mutex::new(HashMap::new()),
-            secrets: Mutex::new(HashMap::new()),
+            sealer: Arc::new(scarab_secrets_postgres::KeySealer::ephemeral()),
+            cache: Mutex::new(HashMap::new()),
+            owner: format!("logsvc-{}", uuid::Uuid::new_v4()),
         }
     }
 
-    /// The values entry of `fence`, created when missing.
-    fn fence_values(&self, fence: &LogFence) -> Arc<FenceValues> {
-        self.secrets
-            .lock()
-            .unwrap()
-            .entry(fence.key())
-            .or_default()
-            .clone()
+    /// Seal and open ledger generations with `sealer` (the master keys):
+    /// every replica must use the same keys, or a replica that cannot open
+    /// a seal never reads that unit's log (a local error, never a close).
+    pub fn with_sealer(mut self, sealer: Arc<dyn Sealer>) -> Self {
+        self.sealer = sealer;
+        self
     }
 
-    /// Register a secret value of `fence`'s unit so it is redacted from the
-    /// stream's later chunks, and from no other stream. Empty values are
-    /// ignored. Idempotent.
-    pub fn register_secret(&self, fence: &LogFence, value: &[u8]) {
-        if value.is_empty() {
-            return;
-        }
-        let entry = self.fence_values(fence);
-        let mut values = entry.values.lock().unwrap();
-        if !values.iter().any(|v| v == value) {
-            values.push(value.to_vec());
-        }
+    pub fn db(&self) -> &Arc<dyn Db> {
+        &self.db
     }
 
-    /// Every value of `fence`'s unit is registered now (see
-    /// [`values_loaded`](Self::values_loaded)).
-    pub fn mark_values_loaded(&self, fence: &LogFence) {
-        self.fence_values(fence)
-            .loaded
-            .store(true, Ordering::SeqCst);
-    }
+    // -- value ledger ------------------------------------------------------
 
-    /// Whether every value of `fence`'s unit is registered: read back from
-    /// the unit, or registered by its launch on this process. A log tail
-    /// stores nothing from a stream whose values are not loaded.
-    pub fn values_loaded(&self, fence: &LogFence) -> bool {
-        self.secrets
-            .lock()
-            .unwrap()
-            .get(&fence.key())
-            .is_some_and(|e| e.loaded.load(Ordering::SeqCst))
-    }
-
-    /// Drop `fence`'s values: its log tail has closed the stream and its
-    /// unit has ended, so its failure cause is recorded. A redactor already
-    /// made for it keeps them.
-    pub fn forget_secrets(&self, fence: &LogFence) {
-        self.secrets.lock().unwrap().remove(&fence.key());
-    }
-
-    /// Every value registered for `fence`.
-    #[cfg(test)]
-    pub(crate) fn registered_secrets(&self, fence: &LogFence) -> Vec<Vec<u8>> {
-        self.secrets
-            .lock()
-            .unwrap()
-            .get(&fence.key())
-            .map(|e| e.values.lock().unwrap().clone())
-            .unwrap_or_default()
-    }
-
-    /// Replace every registered secret value in a **text diagnostic** with
-    /// `***` — the same scrub [`append`](Self::append) applies to log bytes,
-    /// for the strings that never travel as log bytes.
-    ///
-    /// A failure cause or an infra condition quotes whatever the backend said,
-    /// and a backend quotes registry URLs and auth-failure bodies. Those land
-    /// in Postgres (`attempts.failure_detail`, the event log) and are served on
-    /// the API, neither of which passes through the log pipeline — so without
-    /// this they would be the one uncensored channel out of a step.
-    ///
-    /// The caller knows the unit's handle, not its stream, so this uses the
-    /// values of every stream registered now. A stream's values live until
-    /// its tail has closed it and the driver pass after the unit ended, so
-    /// the terminal poll of a unit still has them, and the set is bounded by
-    /// the units that have not ended yet.
-    ///
-    /// Lossy by design on invalid UTF-8: a diagnostic is for reading.
-    pub fn redact_text(&self, text: &str) -> String {
-        let entries: Vec<Arc<FenceValues>> =
-            self.secrets.lock().unwrap().values().cloned().collect();
-        let mut values: Vec<Vec<u8>> = Vec::new();
-        for entry in entries {
-            for v in entry.values.lock().unwrap().iter() {
-                if !values.contains(v) {
-                    values.push(v.clone());
-                }
+    /// The unit's value set: from the cache, else loaded from its ledger.
+    pub async fn load_values(&self, unit: &LogStreamId) -> Result<Arc<ValueSet>, LedgerError> {
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.retain(|_, c| c.at.elapsed() < VALUES_TTL);
+            if let Some(c) = cache.get(&unit_key(unit)) {
+                return Ok(c.set.clone());
             }
         }
-        let all = FenceValues {
-            values: Mutex::new(values),
-            loaded: AtomicBool::new(true),
-        };
-        let out = redact_with(Arc::new(all), text.as_bytes());
-        String::from_utf8_lossy(&out).into_owned()
+        self.reload_values(unit).await
     }
 
-    /// A redactor for one read of `fence`'s log source, which can split a
-    /// secret value across two chunks. It redacts the values registered for
-    /// `fence` only. See [`StreamRedactor`].
-    pub fn redactor(&self, fence: &LogFence) -> StreamRedactor {
-        // A stream with no entry gets an empty one that is not kept: a
-        // value registered later goes to the kept entry, which this
-        // redactor does not see. A tail registers before it reads.
-        let values = self
-            .secrets
-            .lock()
-            .unwrap()
-            .get(&fence.key())
-            .cloned()
-            .unwrap_or_default();
-        StreamRedactor {
-            secrets: values,
-            held: Vec::new(),
+    /// Load the unit's value set from its ledger, all of it or nothing:
+    /// every generation `1..=gen` present and opened here. A unit with no
+    /// row, or a purged one, is not ledger-complete (every replica finds
+    /// the same); anything else that fails is local to this replica.
+    pub async fn reload_values(&self, unit: &LogStreamId) -> Result<Arc<ValueSet>, LedgerError> {
+        let rows = self
+            .db
+            .log_unit_ledger(unit)
+            .await
+            .map_err(|e| LedgerError::Local(e.to_string()))?;
+        let Some(rows) = rows else {
+            return Err(LedgerError::NotLedgerComplete(NotStoredReason::NoLedger));
+        };
+        if rows.unit.purged {
+            self.cache.lock().unwrap().remove(&unit_key(unit));
+            return Err(LedgerError::NotLedgerComplete(
+                NotStoredReason::LedgerPurged,
+            ));
+        }
+        let gen = rows.unit.gen;
+        let gens: Vec<i64> = rows.generations.iter().map(|g| g.gen).collect();
+        if gens != (1..=gen).collect::<Vec<_>>() {
+            return Err(LedgerError::Local(format!(
+                "the ledger of {}/{}/{} is at generation {gen} and holds {gens:?}",
+                unit.run.0, unit.step.0, unit.attempt.0
+            )));
+        }
+        let mut generations = Vec::new();
+        for g in &rows.generations {
+            let plain = self
+                .sealer
+                .open(&g.sealed, &ledger_aad(unit, g.gen))
+                .map_err(|e| LedgerError::Local(format!("opening generation {}: {e}", g.gen)))?;
+            let entries: Vec<MountedValue> = serde_json::from_slice(&plain)
+                .map_err(|e| LedgerError::Local(format!("generation {}: {e}", g.gen)))?;
+            generations.push(LedgerGeneration {
+                gen: g.gen,
+                revoked_at: g.revoked_at,
+                entries,
+            });
+        }
+        let set = Arc::new(ValueSet::from_generations(gen, generations));
+        self.cache.lock().unwrap().insert(
+            unit_key(unit),
+            Cached {
+                set: set.clone(),
+                at: Instant::now(),
+            },
+        );
+        Ok(set)
+    }
+
+    /// Record the values a launch of `unit` mounts, before any of them is
+    /// written where the unit can read them (I7): upsert the unit's row
+    /// (with `handle`), and when `values` adds anything to the ledger's
+    /// union, seal `values` as the next generation. Returns the set the
+    /// unit has after it. A purged unit or a ledger this replica cannot
+    /// load fails the launch.
+    pub async fn record_launch_values(
+        &self,
+        unit: &LogStreamId,
+        handle: Option<&str>,
+        values: Vec<MountedValue>,
+        now: Timestamp,
+    ) -> Result<Arc<ValueSet>, LedgerError> {
+        for _ in 0..4 {
+            let current = match self.reload_values(unit).await {
+                Ok(set) => Some(set),
+                Err(LedgerError::NotLedgerComplete(NotStoredReason::NoLedger)) => None,
+                Err(e) => return Err(e),
+            };
+            let gen = current.as_ref().map_or(0, |c| c.gen);
+            let adds = values.iter().any(|v| {
+                !current
+                    .as_ref()
+                    .is_some_and(|c| c.values.contains(&v.value))
+            });
+            let sealed = if adds {
+                let json =
+                    serde_json::to_vec(&values).map_err(|e| LedgerError::Local(e.to_string()))?;
+                Some(
+                    self.sealer
+                        .seal(&json, &ledger_aad(unit, gen + 1))
+                        .map_err(|e| LedgerError::Local(format!("sealing: {e}")))?,
+                )
+            } else {
+                None
+            };
+            match self
+                .db
+                .write_log_unit(unit, handle, gen, sealed.as_deref(), now)
+                .await
+            {
+                Ok(_) => return self.reload_values(unit).await,
+                // Another launch wrote a generation since the load: again.
+                Err(DbError::Conflict) => continue,
+                Err(e) => return Err(LedgerError::Local(e.to_string())),
+            }
+        }
+        Err(LedgerError::Local(
+            "the ledger kept changing under this launch".into(),
+        ))
+    }
+
+    /// Redact a failure cause or infra message about the unit behind
+    /// `handle` with that unit's ledger (I10), read at its current
+    /// generation, never from the cache: a peer may have recorded a token
+    /// since this replica loaded the unit. A unit with no ledger this
+    /// replica can load gets [`CAUSE_NOT_STORED`] in place of the text.
+    /// Lossy on invalid UTF-8: a diagnostic is for reading.
+    pub async fn redact_text_for_handle(&self, handle: &str, text: &str) -> String {
+        let unit = match self.db.log_unit_by_handle(handle).await {
+            Ok(Some(unit)) => unit,
+            _ => return CAUSE_NOT_STORED.to_string(),
+        };
+        match self.reload_values(&unit).await {
+            Ok(set) => redact_text(&set, text),
+            Err(_) => CAUSE_NOT_STORED.to_string(),
         }
     }
 
-    fn sender(&self, key: &StreamKey) -> broadcast::Sender<Vec<u8>> {
-        let mut live = self.live.lock().unwrap();
-        live.entry(key.clone())
-            .or_insert_with(|| broadcast::channel(1024).0)
-            .clone()
+    /// Purge `unit`'s ledger if every one of its `stream_count` streams is
+    /// terminal (a stream that has stored nothing yet is not), it has
+    /// settled, and every minted token in it was revoked (or it holds none:
+    /// `values`, when it is the ledger's current generation). The purge
+    /// happens only at the generation read here, so one a late launch
+    /// writes meanwhile is kept and revoked later. Best-effort: the purge
+    /// sweep covers what this misses.
+    pub async fn purge_if_done(&self, unit: &LogStreamId, values: Option<&ValueSet>) {
+        let Ok(Some(rows)) = self.db.log_unit_ledger(unit).await else {
+            return;
+        };
+        let revoked = rows.unit.revoke_attempted_at.is_some()
+            || values
+                .is_some_and(|v| v.gen() == rows.unit.gen && v.minted_forge_tokens().is_empty());
+        if rows.unit.purged || rows.unit.settled_at.is_none() || !revoked {
+            return;
+        }
+        if !matches!(self.db.log_unit_streams_all_terminal(unit).await, Ok(true)) {
+            return;
+        }
+        match self.db.purge_log_unit(unit, rows.unit.gen).await {
+            Ok(true) => {
+                self.cache.lock().unwrap().remove(&unit_key(unit));
+            }
+            Ok(false) => {
+                tracing::debug!("log ledger: a generation was written since the purge was decided; the sweep revokes and purges it");
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "log ledger: purge after the last stream closed failed; the sweep retries");
+            }
+        }
     }
 
-    /// Subscribe to live chunks for a stream (uncompressed bodies).
-    pub fn subscribe(
+    /// Drop `unit` from the process cache.
+    pub fn forget_values(&self, unit: &LogStreamId) {
+        self.cache.lock().unwrap().remove(&unit_key(unit));
+    }
+
+    /// A redactor for one read of `values`' unit. `after_restart`: the part
+    /// it stores starts after a `source_restarted` row (the suffix rule).
+    pub fn redactor(&self, values: Arc<ValueSet>, after_restart: bool) -> StreamRedactor {
+        StreamRedactor::new(values, after_restart)
+    }
+
+    // -- fenced writes -----------------------------------------------------
+
+    /// Store `bytes` (already redacted with generation `values_gen`) as one
+    /// output row of `stream`, fenced on `writer`: compress → object store
+    /// under its content address, then the index row. `then` sets the
+    /// stream's state in the same transaction.
+    pub async fn append_output(
         &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-    ) -> broadcast::Receiver<Vec<u8>> {
-        self.sender(&stream_key(run, step, attempt)).subscribe()
+        stream: &LogStreamId,
+        bytes: &[u8],
+        values_gen: i64,
+        writer: &LogWriter,
+        then: Option<LogStreamState>,
+        now: Timestamp,
+    ) -> Result<LogChunkMeta, LogAppendError> {
+        let digest = sha256(bytes);
+        let key = object_key(stream, &digest);
+        let compressed =
+            gzip(bytes).map_err(|e| LogAppendError::Db(DbError::Other(format!("gzip: {e}"))))?;
+        self.store
+            .put(&key, compressed)
+            .await
+            .map_err(|e| LogAppendError::Db(DbError::Other(format!("object store: {e}"))))?;
+        let mut row = NewLogRow::output(
+            LogBody {
+                object_key: key,
+                len: bytes.len() as u64,
+                sha256: digest,
+            },
+            values_gen,
+        );
+        row.then = then;
+        self.db.append_log_row(stream, &row, writer, now).await
     }
 
-    /// Append one log chunk: compress → object store, index offsets → Postgres,
-    /// broadcast the (uncompressed) body to any live tailer.
+    /// Append a marker row to `stream`, fenced on `writer`.
+    pub async fn append_marker(
+        &self,
+        stream: &LogStreamId,
+        kind: LogRowKind,
+        reason: Option<NotStoredReason>,
+        writer: &LogWriter,
+        then: Option<LogStreamState>,
+        now: Timestamp,
+    ) -> Result<LogChunkMeta, LogAppendError> {
+        let mut row = NewLogRow::marker(kind, reason);
+        row.then = then;
+        self.db.append_log_row(stream, &row, writer, now).await
+    }
+
+    /// Append one chunk the way a tail does, for tests and tools that feed
+    /// the pipeline directly: under the stream's append lease (not its tail
+    /// lease), taken for the one write and let go after it, after
+    /// giving the stream's unit a ledger (with no values) if it has none,
+    /// redacted with the unit's current values. Not a production path.
     pub async fn append(
         &self,
         run: &RunId,
@@ -285,65 +556,61 @@ impl LogService {
         attempt: &AttemptId,
         chunk: &[u8],
     ) -> Result<LogChunkMeta, LogError> {
-        // Scrub secrets before the bytes touch the store OR the live stream, so
-        // a value never reaches stored or streamed logs (ADR-0013, 0032).
-        let mut redactor = self.redactor(&LogFence::new(run, step, attempt));
-        let mut redacted = redactor.push(chunk);
-        redacted.extend(redactor.finish());
-        let chunk = redacted;
-        self.append_redacted(run, step, attempt, &chunk).await
+        let stream = LogStreamId::new(run, step, attempt);
+        let unit = stream.unit();
+        let other = |e: String| LogError::Db(DbError::Other(e));
+        let values = match self.load_values(&unit).await {
+            Ok(v) => v,
+            Err(LedgerError::NotLedgerComplete(NotStoredReason::NoLedger)) => self
+                .record_launch_values(&unit, None, Vec::new(), Timestamp(0))
+                .await
+                .map_err(|e| other(e.to_string()))?,
+            Err(e) => return Err(other(e.to_string())),
+        };
+        // Its own lease, not the tail lease: a reader of the log takes a
+        // live tail lease to mean the log is still being stored.
+        let resource = LogLease::Append.resource(&stream);
+        let lease = self.db.lease(&resource, &self.owner, 45_000).await?;
+        let writer = LogWriter::holding(
+            LogLease::Append,
+            &lease
+                .held_by(&resource, &self.owner)
+                .ok_or(LogError::Db(DbError::NotLeader))?,
+        );
+        let mut redactor = StreamRedactor::new(values.clone(), false);
+        let mut out = redactor.push(chunk);
+        out.extend(redactor.finish_confirmed());
+        let appended = self
+            .append_output(&stream, &out, values.gen, &writer, None, Timestamp(0))
+            .await
+            .map_err(|e| other(e.to_string()));
+        // A one-shot writer: let the lease go (owner and term stay, so a
+        // concurrent call of this service still appends), so another
+        // writer of the stream (a test's `seed_log_row`) can take it.
+        let _ = self.db.release_lease(&resource, &self.owner).await;
+        appended
     }
 
-    /// [`append`](Self::append) for bytes a [`StreamRedactor`] already
-    /// redacted: stored and streamed exactly as given. A log tail redacts
-    /// its source as one stream, so a secret split across two chunks is
-    /// still replaced.
-    pub(crate) async fn append_redacted(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-        chunk: &[u8],
-    ) -> Result<LogChunkMeta, LogError> {
-        // Next seq / cumulative uncompressed offset from the newest index row
-        // (seqs are dense from 0, so it carries the whole stream's length).
-        let (seq, byte_offset) = match self.db.last_log_chunk(run, step, attempt).await? {
-            Some(last) => (last.seq + 1, last.byte_offset + last.len),
-            None => (0, 0),
-        };
+    // -- reads -------------------------------------------------------------
 
-        let key = object_key(run, step, attempt, seq);
-        let compressed = gzip(chunk).map_err(|e| LogError::Gzip(e.to_string()))?;
-        self.store.put(&key, compressed).await?;
-
-        let meta = LogChunkMeta {
-            seq,
-            byte_offset,
-            len: chunk.len() as u64,
-            object_key: key,
-        };
-        self.db.append_log_chunk(run, step, attempt, &meta).await?;
-
-        // Best-effort live fan-out (ignored if there are no subscribers).
-        let _ = self
-            .sender(&stream_key(run, step, attempt))
-            .send(chunk.to_vec());
-
-        Ok(meta)
-    }
-
-    /// Whether any chunk of the stream is stored, by any replica.
+    /// Whether any output row of the stream is stored, by any replica.
     pub async fn has_output(
         &self,
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
     ) -> Result<bool, LogError> {
-        Ok(self.db.last_log_chunk(run, step, attempt).await?.is_some())
+        Ok(self
+            .db
+            .log_chunks(run, step, attempt)
+            .await?
+            .iter()
+            .any(|c| c.is_output()))
     }
 
-    /// A stream's chunk index, in `seq` order (durable, replica-agnostic:
-    /// ADR-0051). Metadata only; the bodies stay in the object store.
+    /// A stream's index, output and marker rows, in `seq` order (durable,
+    /// replica-agnostic: ADR-0051). Metadata only; the bodies stay in the
+    /// object store.
     pub async fn chunks(
         &self,
         run: &RunId,
@@ -368,17 +635,19 @@ impl LogService {
             .await?)
     }
 
-    /// Fetch and decompress one indexed chunk.
+    /// Fetch and decompress one output row's body. A marker has none.
     pub async fn read_chunk(&self, meta: &LogChunkMeta) -> Result<Vec<u8>, LogError> {
-        let blob = self.store.get(&meta.object_key).await?;
+        let Some(key) = &meta.object_key else {
+            return Ok(Vec::new());
+        };
+        let blob = self.store.get(key).await?;
         gunzip(&blob).map_err(|e| LogError::Gzip(e.to_string()))
     }
 
-    /// Fetch and decompress `chunks` in the order given, with up to
-    /// [`PREFETCH_CHUNKS`] fetches in flight. One fetch per chunk in a row
-    /// spends a store round trip on each: a log tailed in small chunks
-    /// downloaded at a few KB/s. At most [`PREFETCH_CHUNKS`] bodies are held
-    /// ahead of the reader.
+    /// Fetch and decompress the bodies of `chunks`, in the order given, with
+    /// up to [`PREFETCH_CHUNKS`] fetches in flight. A marker row yields an
+    /// empty body. At most [`PREFETCH_CHUNKS`] bodies are held ahead of the
+    /// reader.
     pub fn read_chunks(
         &self,
         chunks: Vec<LogChunkMeta>,
@@ -388,7 +657,10 @@ impl LogService {
             .map(move |c| {
                 let store = store.clone();
                 async move {
-                    let blob = store.get(&c.object_key).await?;
+                    let Some(key) = &c.object_key else {
+                        return Ok(Vec::new());
+                    };
+                    let blob = store.get(key).await?;
                     gunzip(&blob).map_err(|e| LogError::Gzip(e.to_string()))
                 }
             })
@@ -396,22 +668,58 @@ impl LogService {
             .boxed()
     }
 
-    /// A stream's whole log in one buffer. For tests and small reads; the
-    /// HTTP routes stream it ([`chunks`](Self::chunks) +
-    /// [`read_chunks`](Self::read_chunks)).
+    /// A stream's whole log in one buffer, a marker row written as the raw
+    /// download writes it (`\n[scarab] <text>\n`). For tests and small
+    /// reads; the HTTP routes stream it.
     pub async fn read_all(
         &self,
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
     ) -> Result<Vec<u8>, LogError> {
+        let rows = self.chunks(run, step, attempt).await?;
         let mut out = Vec::new();
-        let mut bodies = self.read_chunks(self.chunks(run, step, attempt).await?);
+        let mut bodies = self.read_chunks(rows.clone());
+        for row in rows {
+            let body = bodies.next().await.unwrap_or(Ok(Vec::new()))?;
+            if row.is_output() {
+                out.extend(body);
+            } else {
+                out.extend(marker_line(&row));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The stored output bytes only, as `?markers=none` returns them.
+    pub async fn read_output(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Vec<u8>, LogError> {
+        let rows: Vec<_> = self
+            .chunks(run, step, attempt)
+            .await?
+            .into_iter()
+            .filter(|r| r.is_output())
+            .collect();
+        let mut out = Vec::new();
+        let mut bodies = self.read_chunks(rows);
         while let Some(body) = bodies.next().await {
             out.extend(body?);
         }
         Ok(out)
     }
+}
+
+/// A marker row as a raw download writes it: `\n[scarab] <text>\n`.
+pub fn marker_line(row: &LogChunkMeta) -> Vec<u8> {
+    format!(
+        "\n[scarab] {}\n",
+        scarab_engine::marker_text(row.kind, row.reason)
+    )
+    .into_bytes()
 }
 
 /// Chunk bodies a reader of a stored log fetches ahead of what it has used
@@ -434,62 +742,154 @@ fn gunzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
 /// What a redacted secret value is replaced with.
 const REDACTED: &[u8] = b"***";
 
-/// Redacts one log source read as a stream of chunks, so a secret value
-/// split across two chunks is still replaced.
+/// The shortest leading proper suffix of a value that is redacted at the
+/// start of a part that follows a `source_restarted` row (residual R-1: a
+/// shorter one is stored).
+pub const MIN_SUFFIX: usize = 8;
+
+/// Redact a whole `text` with `values`. The text is known whole, so its
+/// end is not a cut: a trailing start of a value is kept as it is.
+pub fn redact_text(values: &Arc<ValueSet>, text: &str) -> String {
+    let out = redact_scan(text.as_bytes(), values.values(), Scan::Whole).0;
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Where a [`redact_scan`] stops.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scan {
+    /// More bytes may follow: hold a trailing start of a value.
+    Open,
+    /// A confirmed end of a source: a trailing proper prefix of a value is
+    /// `***` (the prefix rule).
+    ConfirmedEnd,
+    /// A whole text: nothing follows and nothing was cut.
+    Whole,
+}
+
+/// Redacts one read of a log source as a stream of chunks, so a secret value
+/// split across two chunks is still replaced, with the values of one ledger
+/// generation (a new generation needs a new redactor).
 ///
-/// Bytes are scanned left to right; at each position the longest registered
-/// value that matches is replaced by `***`, otherwise one byte is copied.
+/// Bytes are scanned left to right; at each position the longest value that
+/// matches is replaced by `***`, otherwise one byte is copied.
 /// [`push`](Self::push) holds back the longest suffix of what it has seen
-/// that is a proper prefix of a registered value (at most the longest value
-/// less one byte) until the next push shows whether it is a secret. A chunk
-/// that does not end in the start of a value is emitted whole, so a live
-/// tail is not delayed. The registered values are read at each push.
+/// that is a proper prefix of a value (at most the longest value less one
+/// byte) until the next push shows whether it is a secret. A chunk that does
+/// not end in the start of a value is emitted whole, so a live tail is not
+/// delayed.
 ///
-/// [`finish`](Self::finish) emits the held bytes, at the clean end of the
-/// source only. A read that fails drops the redactor and its held bytes:
-/// they may be the start of a secret, and the next read sees them again.
+/// Edges (I1): [`finish_confirmed`](Self::finish_confirmed), at a confirmed
+/// end of the source, writes a held proper prefix of a value as `***`. A
+/// redactor made `after_restart` (its part starts after a `source_restarted`
+/// row) writes the longest leading proper suffix of a value of at least
+/// [`MIN_SUFFIX`] bytes at its first byte as `***`. A read that fails drops
+/// the redactor and its held bytes: they may be the start of a secret, and
+/// the next read sees them again.
 pub struct StreamRedactor {
-    secrets: Arc<FenceValues>,
+    values: Arc<ValueSet>,
     held: Vec<u8>,
+    /// The suffix rule still applies to the first byte.
+    suffix_pending: bool,
 }
 
 impl StreamRedactor {
+    pub fn new(values: Arc<ValueSet>, after_restart: bool) -> Self {
+        Self {
+            values,
+            held: Vec::new(),
+            suffix_pending: after_restart,
+        }
+    }
+
+    /// The generation of the values this redactor uses.
+    pub fn gen(&self) -> i64 {
+        self.values.gen
+    }
+
+    /// The values this redactor uses.
+    pub fn values(&self) -> &Arc<ValueSet> {
+        &self.values
+    }
+
     /// Redact the next chunk of the source; returns what can be emitted now.
     pub fn push(&mut self, src: &[u8]) -> Vec<u8> {
         let mut buf = std::mem::take(&mut self.held);
         buf.extend_from_slice(src);
-        // A snapshot of the stream's values, so the scan does not hold the
-        // lock a launch registering a value waits on.
-        let values = self.secrets.values.lock().unwrap().clone();
-        let (out, held_from) = redact_scan(&buf, &values, false);
+        let mut out = Vec::new();
+        if self.suffix_pending {
+            match leading_suffix(&buf, self.values.values(), false) {
+                SuffixAt::Undecided => {
+                    self.held = buf;
+                    return out;
+                }
+                SuffixAt::None => {}
+                SuffixAt::Len(n) => {
+                    out.extend_from_slice(REDACTED);
+                    buf.drain(..n);
+                }
+            }
+            self.suffix_pending = false;
+        }
+        let (scanned, held_from) = redact_scan(&buf, self.values.values(), Scan::Open);
+        out.extend(scanned);
         buf.drain(..held_from);
         self.held = buf;
         out
     }
 
-    /// The source ended cleanly: redact and emit the held bytes.
-    pub fn finish(self) -> Vec<u8> {
-        let values = self.secrets.values.lock().unwrap().clone();
-        redact_scan(&self.held, &values, true).0
+    /// The source's end is confirmed: emit the held bytes, a held proper
+    /// prefix of a value as `***`.
+    pub fn finish_confirmed(mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = std::mem::take(&mut self.held);
+        if self.suffix_pending {
+            if let SuffixAt::Len(n) = leading_suffix(&buf, self.values.values(), true) {
+                out.extend_from_slice(REDACTED);
+                buf.drain(..n);
+            }
+        }
+        out.extend(redact_scan(&buf, self.values.values(), Scan::ConfirmedEnd).0);
+        out
     }
 }
 
-/// Redact all of `data` with `values`: one [`StreamRedactor`] given all of
-/// it at once.
-fn redact_with(values: Arc<FenceValues>, data: &[u8]) -> Vec<u8> {
-    let mut redactor = StreamRedactor {
-        secrets: values,
-        held: Vec::new(),
-    };
-    let mut out = redactor.push(data);
-    out.extend(redactor.finish());
-    out
+/// What the suffix rule finds at the start of a part.
+enum SuffixAt {
+    /// More bytes could still make a longer suffix match.
+    Undecided,
+    None,
+    /// The first `n` bytes are a proper suffix of a value (`n >=
+    /// MIN_SUFFIX`), and no whole value at the start is longer.
+    Len(usize),
 }
 
-/// One left-to-right pass of [`StreamRedactor`] over `buf`. Returns the
-/// output and the index where the held suffix starts (`buf.len()` when
-/// nothing is held; always that when `at_end`).
-fn redact_scan(buf: &[u8], values: &[Vec<u8>], at_end: bool) -> (Vec<u8>, usize) {
+fn leading_suffix(buf: &[u8], values: &[Vec<u8>], at_end: bool) -> SuffixAt {
+    let mut best: Option<usize> = None;
+    for v in values {
+        for n in MIN_SUFFIX..v.len() {
+            let suffix = &v[v.len() - n..];
+            if buf.starts_with(suffix) {
+                best = Some(best.map_or(n, |b| b.max(n)));
+            } else if !at_end && suffix.len() > buf.len() && suffix.starts_with(buf) {
+                return SuffixAt::Undecided;
+            }
+        }
+    }
+    let Some(n) = best else {
+        return SuffixAt::None;
+    };
+    // A whole value at the start that is longer wins, as the longest
+    // match does everywhere.
+    if values.iter().any(|v| v.len() > n && buf.starts_with(v)) {
+        return SuffixAt::None;
+    }
+    SuffixAt::Len(n)
+}
+
+/// One left-to-right pass over `buf`. Returns the output and the index where
+/// the held suffix starts (`buf.len()` when nothing is held; always that
+/// unless the scan is [`Scan::Open`]).
+fn redact_scan(buf: &[u8], values: &[Vec<u8>], scan: Scan) -> (Vec<u8>, usize) {
     let mut out = Vec::with_capacity(buf.len());
     let longest = values.iter().map(Vec::len).max().unwrap_or(0);
     let mut i = 0;
@@ -497,18 +897,23 @@ fn redact_scan(buf: &[u8], values: &[Vec<u8>], at_end: bool) -> (Vec<u8>, usize)
         let rest = &buf[i..];
         // The rest of the buffer may be the start of a value whose end has
         // not been read yet: hold it, even when a shorter value matches here,
-        // so the longest match wins as it would on the whole stream.
-        if !at_end
+        // so the longest match wins as it would on the whole stream. At a
+        // confirmed end it is redacted instead.
+        if scan != Scan::Whole
             && rest.len() < longest
             && values
                 .iter()
                 .any(|v| v.len() > rest.len() && v.starts_with(rest))
         {
+            if scan == Scan::ConfirmedEnd {
+                out.extend_from_slice(REDACTED);
+                return (out, buf.len());
+            }
             return (out, i);
         }
         match values
             .iter()
-            .filter(|v| rest.starts_with(v))
+            .filter(|v| !v.is_empty() && rest.starts_with(v))
             .map(Vec::len)
             .max()
         {
@@ -527,101 +932,37 @@ fn redact_scan(buf: &[u8], values: &[Vec<u8>], at_end: bool) -> (Vec<u8>, usize)
 
 #[cfg(test)]
 mod tests {
-    use super::{sidecar_stream_key, FenceValues, LogFence, LogService, StreamRedactor};
-    use scarab_engine::{AttemptId, Db, RunId, StepId};
-    use scarab_testkit::{InMemoryDb, InMemoryObjectStore};
-    use std::sync::{Arc, Mutex};
+    use super::*;
+    use scarab_engine::{MountedValueKind, StepId};
 
-    fn redactor(values: &[&[u8]]) -> StreamRedactor {
-        StreamRedactor {
-            secrets: Arc::new(FenceValues {
-                values: Mutex::new(values.iter().map(|v| v.to_vec()).collect()),
-                ..Default::default()
-            }),
-            held: Vec::new(),
-        }
+    fn set(values: &[&[u8]]) -> Arc<ValueSet> {
+        Arc::new(ValueSet::new(
+            1,
+            values
+                .iter()
+                .map(|v| MountedValue {
+                    kind: MountedValueKind::Secret,
+                    value: v.to_vec(),
+                    repo: None,
+                    minted: None,
+                })
+                .collect(),
+        ))
     }
 
-    fn service() -> LogService {
-        LogService::new(
-            Arc::new(InMemoryObjectStore::new()),
-            Arc::new(InMemoryDb::new()) as Arc<dyn Db>,
-        )
-    }
-
-    fn fence(run: &str, attempt: &str) -> LogFence {
-        LogFence::new(
-            &RunId(run.into()),
-            &StepId("build".into()),
-            &AttemptId(attempt.into()),
-        )
-    }
-
-    /// RT-R3-2 / R3-3: values are kept per stream. Registering the tokens of
-    /// many other launches does not grow the set a stream's redactor scans
-    /// (the cost per byte), and drops when each of them closes.
-    #[test]
-    fn values_of_other_streams_do_not_reach_a_stream() {
-        let logs = service();
-        let mine = fence("r1", "a1");
-        logs.register_secret(&mine, b"my-token");
-        for i in 0..1000 {
-            let other = fence(&format!("other-{i}"), "a1");
-            logs.register_secret(&other, format!("token-{i}").as_bytes());
-        }
-        assert_eq!(logs.registered_secrets(&mine), vec![b"my-token".to_vec()]);
-        let r = logs.redactor(&mine);
-        assert_eq!(r.secrets.values.lock().unwrap().len(), 1);
-
-        // Another stream's value is not redacted here.
-        let mut r = logs.redactor(&mine);
-        let mut out = r.push(b"token-7 my-token\n");
-        out.extend(r.finish());
-        assert_eq!(out, b"token-7 ***\n".to_vec());
-
-        // A closed stream's values are gone.
-        for i in 0..1000 {
-            logs.forget_secrets(&fence(&format!("other-{i}"), "a1"));
-        }
-        assert_eq!(logs.secrets.lock().unwrap().len(), 1);
-        logs.forget_secrets(&mine);
-        assert!(logs.registered_secrets(&mine).is_empty());
-        assert!(!logs.values_loaded(&mine));
-    }
-
-    /// A stream's values are loaded only once marked, and the mark is per
-    /// stream.
-    #[test]
-    fn values_loaded_is_per_stream() {
-        let logs = service();
-        let a = fence("r1", "a1");
-        let b = fence("r1", "a2");
-        logs.register_secret(&a, b"x");
-        assert!(!logs.values_loaded(&a));
-        logs.mark_values_loaded(&a);
-        assert!(logs.values_loaded(&a));
-        assert!(!logs.values_loaded(&b));
-    }
-
-    /// A diagnostic is redacted with the values of every open stream.
-    #[test]
-    fn redact_text_uses_every_open_stream() {
-        let logs = service();
-        logs.register_secret(&fence("r1", "a1"), b"one-secret");
-        logs.register_secret(&fence("r2", "a1"), b"two-secret");
-        assert_eq!(logs.redact_text("a one-secret b two-secret"), "a *** b ***");
-        logs.forget_secrets(&fence("r1", "a1"));
-        assert_eq!(logs.redact_text("one-secret"), "one-secret");
-    }
-
-    /// Feed `chunks` through one redactor and return everything it emitted.
+    /// Feed `chunks` through one redactor and return everything it emitted
+    /// up to a confirmed end.
     fn run(values: &[&[u8]], chunks: &[&[u8]]) -> Vec<u8> {
-        let mut r = redactor(values);
+        run_part(values, chunks, false)
+    }
+
+    fn run_part(values: &[&[u8]], chunks: &[&[u8]], after_restart: bool) -> Vec<u8> {
+        let mut r = StreamRedactor::new(set(values), after_restart);
         let mut out = Vec::new();
         for c in chunks {
             out.extend(r.push(c));
         }
-        out.extend(r.finish());
+        out.extend(r.finish_confirmed());
         out
     }
 
@@ -632,7 +973,6 @@ mod tests {
             run(&[b"token-value"], &[b"tok", b"en-value\n"]),
             b"***\n".to_vec()
         );
-        // Split one byte at a time.
         let src = b"a token-value b";
         let chunks: Vec<&[u8]> = src.chunks(1).collect();
         assert_eq!(run(&[b"token-value"], &chunks), b"a *** b".to_vec());
@@ -642,12 +982,11 @@ mod tests {
     /// anything else is emitted at once.
     #[test]
     fn only_the_start_of_a_secret_is_held() {
-        let mut r = redactor(&[b"token-value"]);
+        let mut r = StreamRedactor::new(set(&[b"token-value"]), false);
         assert_eq!(r.push(b"line one\n"), b"line one\n".to_vec());
         assert_eq!(r.push(b"abc tok"), b"abc ".to_vec());
-        // Not the secret after all: the held bytes are emitted.
         assert_eq!(r.push(b"io\n"), b"tokio\n".to_vec());
-        assert_eq!(r.finish(), Vec::<u8>::new());
+        assert_eq!(r.finish_confirmed(), Vec::<u8>::new());
     }
 
     /// The longest value wins, also when a shorter one ends inside the held
@@ -664,30 +1003,100 @@ mod tests {
         );
     }
 
-    /// At the end of the source the held bytes are emitted, redacted.
+    /// I1 prefix rule (772c34f): at a confirmed end, a held proper prefix
+    /// of a value is `***`, never its bytes. Kills: no prefix rule (the old
+    /// `finish` emitted the held bytes).
     #[test]
-    fn finish_emits_the_held_bytes() {
-        let mut r = redactor(&[b"token-value"]);
-        assert_eq!(r.push(b"ends in tok"), b"ends in ".to_vec());
-        assert_eq!(r.finish(), b"tok".to_vec());
+    fn a_confirmed_end_inside_a_value_prefix_stores_stars() {
+        assert_eq!(
+            run(&[b"token-value"], &[b"ends in token-va"]),
+            b"ends in ***".to_vec()
+        );
+    }
+
+    /// I1 suffix rule (R-1): a part that starts after a `source_restarted`
+    /// row, inside a value, stores the value's tail of at least 8 bytes as
+    /// `***`. Kills: no suffix rule after a restart.
+    #[test]
+    fn a_part_after_a_restart_starting_inside_a_value_stores_stars() {
+        let value: &[u8] = b"ghs_0123456789abcdef";
+        // The part starts with the last 13 bytes of the value, split.
+        assert_eq!(
+            run_part(&[value], &[b"456", b"789abcdef rest\n"], true),
+            b"*** rest\n".to_vec()
+        );
+    }
+
+    /// The suffix rule applies only after a restart, and only from 8 bytes.
+    /// Kills: the rule at seq 0; the rule below 8 bytes.
+    #[test]
+    fn a_log_whose_first_byte_ends_a_value_is_stored_unchanged() {
+        let value: &[u8] = b"ghs_0123456789abcdef";
+        assert_eq!(
+            run_part(&[value], &[b"9abcdef rest\n"], false),
+            b"9abcdef rest\n".to_vec()
+        );
+        assert_eq!(
+            run_part(&[value], &[b"f\n"], true),
+            b"f\n".to_vec(),
+            "the last byte of a value alone is stored"
+        );
+    }
+
+    /// R-1: a suffix shorter than 8 bytes at a part start is stored.
+    #[test]
+    fn a_short_suffix_is_not_starred() {
+        let value: &[u8] = b"ghs_0123456789abcdef";
+        assert_eq!(
+            run_part(&[value], &[b"bcdef rest\n"], true),
+            b"bcdef rest\n".to_vec()
+        );
+    }
+
+    /// A value starting with `***` is redacted like any other value.
+    #[test]
+    fn a_value_starting_with_stars_is_redacted() {
+        assert_eq!(
+            run(&[b"***secret"], &[b"a ***secret b\n"]),
+            b"a *** b\n".to_vec()
+        );
     }
 
     #[test]
     fn sidecar_stream_key_namespaces_by_step_and_index() {
-        // Nests under the step id and is distinct per index; the `::` guards it
-        // from colliding with a real (colon-free) step id, so a sidecar's stream
-        // never overwrites the step's own or a sibling sidecar's.
         assert_eq!(
             sidecar_stream_key(&StepId("test".into()), 0).0,
             "test::service-0"
-        );
-        assert_eq!(
-            sidecar_stream_key(&StepId("test".into()), 1).0,
-            "test::service-1"
         );
         assert_ne!(
             sidecar_stream_key(&StepId("build".into()), 0).0,
             sidecar_stream_key(&StepId("build".into()), 1).0,
         );
+    }
+
+    /// The minted forge tokens of a ledger, once each.
+    #[test]
+    fn minted_tokens_are_listed_once() {
+        let token = |v: &str, minted| MountedValue {
+            kind: MountedValueKind::ForgeToken,
+            value: v.as_bytes().to_vec(),
+            repo: None,
+            minted: Some(minted),
+        };
+        let s = ValueSet::new(
+            2,
+            vec![
+                token("t1", true),
+                token("t2", true),
+                token("t1", true),
+                token("ll", false),
+            ],
+        );
+        let minted: Vec<_> = s
+            .minted_forge_tokens()
+            .iter()
+            .map(|m| m.value.clone())
+            .collect();
+        assert_eq!(minted, vec![b"t1".to_vec(), b"t2".to_vec()]);
     }
 }

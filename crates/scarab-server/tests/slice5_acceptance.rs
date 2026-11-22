@@ -62,21 +62,29 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
         StepId("deploy".into()),
         scarab_engine::AttemptId("a1".into()),
     );
-    let fence = scarab_server::LogFence::new(&run, &step, &attempt);
-    let env = resolve_step_secrets(
-        &secrets,
-        &logs,
-        Some(&fence),
-        &scope(),
-        &["DEPLOY_TOKEN".to_string()],
-        false,
-    )
-    .await
-    .unwrap();
+    let env = resolve_step_secrets(&secrets, &scope(), &["DEPLOY_TOKEN".to_string()], false)
+        .await
+        .unwrap();
     assert_eq!(
         env,
         vec![("DEPLOY_TOKEN".to_string(), b"prod-token-xyz".to_vec())]
     );
+    // The launch records the resolved values in the unit's ledger.
+    logs.record_launch_values(
+        &scarab_engine::LogStreamId::new(&run, &step, &attempt),
+        None,
+        env.iter()
+            .map(|(_, v)| scarab_engine::MountedValue {
+                kind: scarab_engine::MountedValueKind::Secret,
+                value: v.clone(),
+                repo: None,
+                minted: None,
+            })
+            .collect(),
+        scarab_engine::Timestamp(0),
+    )
+    .await
+    .unwrap();
     logs.append(
         &run,
         &step,

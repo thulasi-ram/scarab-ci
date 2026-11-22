@@ -1,6 +1,7 @@
-// The log body's rows for a log that has no lines to show yet: still loading,
-// or could not be read. Shared by the step pane (main container and sidecars)
-// and the service pane.
+// The log body's rows that are not output lines: a log that has no lines to
+// show yet (still loading, or could not be read) and the server's notes about
+// a log. Shared by the step pane (main container and sidecars) and the service
+// pane.
 import { For } from "solid-js";
 
 // Varied widths read as text.
@@ -54,6 +55,22 @@ export function LogError(props: { reason: string; onRetry: () => void; rest?: bo
         <button type="button" class="linklike" onClick={() => props.onRetry()}>
           Retry
         </button>
+      </span>
+    </div>
+  );
+}
+
+/** A note from the server about the stored log (the log source restarted, the
+ * rest of the log was not stored, its end could not be read), in a row of its
+ * own between the output lines. It has no line number, and it reads
+ * `[scarab] <text>` like the line the raw download writes for it, so a copy
+ * of the log does not pass it off as step output. */
+export function LogMarkerRow(props: { text: string }) {
+  return (
+    <div class="lgrow lgmark" role="note">
+      <span class="lgln" />
+      <span class="lgtx">
+        <span class="lgmark-tag">[scarab]</span> {props.text}
       </span>
     </div>
   );

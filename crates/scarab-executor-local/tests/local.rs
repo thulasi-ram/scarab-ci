@@ -465,7 +465,7 @@ async fn no_gate_refusal_and_no_forge_credential_to_take() {
     let exec = LocalExecutor::new();
     assert_eq!(exec.gate_refusal(&step("r1", "gate")).await.unwrap(), None);
     let handle = scarab_engine::ports::ExecHandle("local://r1/ok/0".into());
-    assert!(exec.take_forge_credential(&handle).await.unwrap().is_none());
+    exec.delete_unit_secrets(&handle).await.unwrap();
 }
 
 /// ADR-0014 (git-bug bcf2c11): each secret is a file in `$SCARAB_SECRETS`,

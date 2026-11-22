@@ -153,7 +153,63 @@ fn spec_from(forge_token: serde_json::Value) -> StepSpec {
     .expect("spec decodes")
 }
 
-async fn drive(db: &dyn Db, inner: &FakeExecutor, exec: &ForgeCredentialExecutor, run: &RunId) {
+/// The production executor stack over `inner`,
+/// `Forge(SecretInjecting(Ledger(inner)))`, with its value ledger in `logs`
+/// (revocation reads the tokens from it); `configure` sets up the forge
+/// layer.
+fn stack_on(
+    logs: &Arc<LogService>,
+    inner: Arc<FakeExecutor>,
+    forge: Arc<dyn ForgePort>,
+    configure: impl FnOnce(ForgeCredentialExecutor) -> ForgeCredentialExecutor,
+) -> Arc<dyn Executor> {
+    let (secret_db, secret_logs) = (logs.db().clone(), logs.clone());
+    scarab_server::build_executor_stack(
+        inner,
+        logs.clone(),
+        Arc::new(FakeClock::new(1_000)),
+        move |ledger| {
+            scarab_server::SecretInjectingExecutor::new(
+                ledger,
+                secret_db,
+                Arc::new(scarab_testkit::FakeSecrets::new()),
+                secret_logs,
+            )
+        },
+        move |with_secrets, ledger_logs| {
+            configure(ForgeCredentialExecutor::new(
+                with_secrets,
+                forge,
+                ledger_logs,
+            ))
+        },
+    )
+}
+
+/// A log service over `db`, sealing with `sealer`: replicas that share
+/// the database and the keys.
+fn replica_logs(db: &Arc<InMemoryDb>, sealer: &Arc<dyn scarab_secrets::Sealer>) -> Arc<LogService> {
+    Arc::new(
+        LogService::new(Arc::new(InMemoryObjectStore::new()), db.clone())
+            .with_sealer(sealer.clone()),
+    )
+}
+
+/// [`stack_on`] with a log service on `db` of its own.
+fn stack(
+    db: &Arc<InMemoryDb>,
+    inner: Arc<FakeExecutor>,
+    forge: Arc<dyn ForgePort>,
+    configure: impl FnOnce(ForgeCredentialExecutor) -> ForgeCredentialExecutor,
+) -> Arc<dyn Executor> {
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    stack_on(&logs, inner, forge, configure)
+}
+
+async fn drive(db: &dyn Db, inner: &FakeExecutor, exec: &dyn Executor, run: &RunId) {
     let clock = FakeClock::new(1_000);
     let sched = Scheduler::new(db, &clock as &dyn Clock, exec, "sched");
     for _ in 0..8 {
@@ -176,9 +232,16 @@ async fn rt2_an_old_shape_stored_spec_fails_closed_on_a_long_lived_connection() 
     assert!(!f.read_only && f.trusted_library.is_none());
     let inner = Arc::new(FakeExecutor::new());
     let forge = Arc::new(FakeForge::new());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone()).with_libraries(
-        Arc::new(InMemoryDb::new()),
-        Arc::new(InMemoryLibraries::new()),
+    let exec = stack(
+        &Arc::new(InMemoryDb::new()),
+        inner.clone(),
+        forge.clone(),
+        |f| {
+            f.with_libraries(
+                Arc::new(InMemoryDb::new()),
+                Arc::new(InMemoryLibraries::new()),
+            )
+        },
     );
     let got = exec.launch(&step_run("r1", "checkout/git"), &spec).await;
     assert!(got.is_err(), "launched: {got:?}");
@@ -199,8 +262,12 @@ async fn rt2_a_hash_trusted_in_another_org_is_refused_at_launch() {
     }));
     let inner = Arc::new(FakeExecutor::new());
     let forge = Arc::new(FakeForge::new());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone())
-        .with_libraries(Arc::new(InMemoryDb::new()), libs.clone());
+    let exec = stack(
+        &Arc::new(InMemoryDb::new()),
+        inner.clone(),
+        forge.clone(),
+        |f| f.with_libraries(Arc::new(InMemoryDb::new()), libs.clone()),
+    );
     let got = exec.launch(&step_run("r1", "checkout/git"), &spec).await;
     assert!(got.is_err(), "launched with org `other`'s trust: {got:?}");
     assert_eq!(forge.credential_calls(), 0);
@@ -243,9 +310,10 @@ async fn rt2_a_yanked_clone_version_mints_nothing_on_rerun() {
     .await
     .unwrap();
     let inner = Arc::new(FakeExecutor::new());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone())
-        .with_libraries(db.clone(), libs.clone());
-    drive(db.as_ref(), &inner, &exec, &run).await;
+    let exec = stack(&db, inner.clone(), forge.clone(), |f| {
+        f.with_libraries(db.clone(), libs.clone())
+    });
+    drive(db.as_ref(), &inner, &*exec, &run).await;
     assert_eq!(
         forge.credential_calls(),
         0,
@@ -316,9 +384,11 @@ impl ForgePort for SwappedBetweenCalls {
 async fn rt2_a_connection_swapped_between_the_check_and_the_mint_hands_over_nothing() {
     let spec = spec_from(serde_json::json!({ "access": "read", "owner": "acme", "name": "web" }));
     let inner = Arc::new(FakeExecutor::new());
-    let exec = ForgeCredentialExecutor::new(
+    let exec = stack(
+        &Arc::new(InMemoryDb::new()),
         inner.clone(),
         Arc::new(SwappedBetweenCalls(FakeForge::new())),
+        |f| f,
     );
     let launched = exec.launch(&step_run("r1", "tag"), &spec).await;
     let cred = launched
@@ -430,8 +500,8 @@ async fn rt2_a_non_boolean_result_for_a_boolean_input_mints_nothing() {
         "prep",
         std::collections::BTreeMap::from([("sub".to_string(), serde_json::json!("true; id"))]),
     );
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
-    drive(db.as_ref(), &inner, &exec, &run).await;
+    let exec = stack(&db, inner.clone(), forge.clone(), |f| f);
+    drive(db.as_ref(), &inner, &*exec, &run).await;
     let h = ExecHandle(format!("fake://{}/checkout/git/a1", run.0));
     assert!(
         inner.launched_spec(&h).is_none(),
@@ -452,7 +522,12 @@ async fn rt2_concurrent_launches_of_one_attempt_leave_no_live_token() {
     let spec = spec_from(serde_json::json!({ "access": "read", "owner": "acme", "name": "web" }));
     let inner = Arc::new(FakeExecutor::new());
     let forge = Arc::new(FakeForge::new().with_minted_tokens());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
+    let exec = stack(
+        &Arc::new(InMemoryDb::new()),
+        inner.clone(),
+        forge.clone(),
+        |f| f,
+    );
     let sr = step_run("r1", "tag");
     let (a, b) = tokio::join!(exec.launch(&sr, &spec), exec.launch(&sr, &spec));
     let h = a.unwrap();
@@ -477,8 +552,22 @@ async fn rt2_a_token_minted_on_one_replica_is_revoked_when_another_sees_the_end(
     let spec = spec_from(serde_json::json!({ "access": "read", "owner": "acme", "name": "web" }));
     let inner = Arc::new(FakeExecutor::new());
     let forge = Arc::new(FakeForge::new().with_minted_tokens());
-    let replica_a = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
-    let replica_b = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
+    // One database and one set of keys; a log service each.
+    let db = Arc::new(InMemoryDb::new());
+    let sealer: Arc<dyn scarab_secrets::Sealer> =
+        Arc::new(scarab_secrets_postgres::KeySealer::ephemeral());
+    let replica_a = stack_on(
+        &replica_logs(&db, &sealer),
+        inner.clone(),
+        forge.clone(),
+        |f| f,
+    );
+    let replica_b = stack_on(
+        &replica_logs(&db, &sealer),
+        inner.clone(),
+        forge.clone(),
+        |f| f,
+    );
     let h = replica_a
         .launch(&step_run("r1", "tag"), &spec)
         .await

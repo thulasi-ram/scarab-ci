@@ -87,6 +87,98 @@ impl Clock for FakeClock {
     }
 }
 
+/// A log stream's (or unit's) key in the in-memory state.
+fn log_key(s: &scarab_engine::LogStreamId) -> (RunId, StepId, AttemptId) {
+    (s.run.clone(), s.step.clone(), s.attempt.clone())
+}
+
+/// The stream's `log_streams` row, created from its stored rows when
+/// missing (as the Postgres append function does). `None`: it is missing
+/// and the run's log was pruned, so no stream row is made.
+fn mem_open_stream_row(
+    st: &mut InMemoryState,
+    key: &(RunId, StepId, AttemptId),
+    now: Timestamp,
+) -> Option<scarab_engine::LogStreamRow> {
+    if let Some(s) = st.log_streams.get(key) {
+        return Some(s.clone());
+    }
+    let run = &key.0;
+    if st.log_prune_pending.contains_key(run)
+        || st
+            .log_streams
+            .iter()
+            .any(|((r, _, _), s)| r == run && s.pruned)
+    {
+        return None;
+    }
+    Some(mem_stream_row(st, key, now))
+}
+
+/// The stream's `log_streams` row, created from its stored rows when
+/// missing.
+fn mem_stream_row(
+    st: &mut InMemoryState,
+    key: &(RunId, StepId, AttemptId),
+    _now: Timestamp,
+) -> scarab_engine::LogStreamRow {
+    if let Some(s) = st.log_streams.get(key) {
+        return s.clone();
+    }
+    let rows = st.logs.get(key).map(Vec::as_slice).unwrap_or_default();
+    let row = scarab_engine::LogStreamRow {
+        next_seq: rows.iter().map(|c| c.seq + 1).max().unwrap_or(0),
+        byte_len: rows
+            .iter()
+            .map(|c| c.byte_offset + c.len)
+            .max()
+            .unwrap_or(0),
+        part_start_seq: 0,
+        state: scarab_engine::LogStreamState::Open,
+        pruned: false,
+        final_since: None,
+    };
+    st.log_streams.insert(key.clone(), row.clone());
+    row
+}
+
+/// How many streams of the unit `k` (its main stream and its sidecar
+/// streams) have a row that is terminal, and how many one that is open.
+fn mem_unit_streams(st: &InMemoryState, k: &(RunId, StepId, AttemptId)) -> (usize, usize) {
+    let sidecar = format!("{}::service-", k.1 .0);
+    let mut out = (0, 0);
+    for ((r, s, a), row) in &st.log_streams {
+        if r == &k.0 && a == &k.2 && (s == &k.1 || s.0.starts_with(&sidecar)) {
+            if row.state == scarab_engine::LogStreamState::Open {
+                out.1 += 1;
+            } else {
+                out.0 += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Whether a unit is still running in the store: its run is not terminal,
+/// and its step attempt has no outcome, or its shared service is live.
+fn mem_unit_running(st: &InMemoryState, k: &(RunId, StepId, AttemptId)) -> bool {
+    if st.runs.get(&k.0).is_some_and(|s| s.is_terminal()) {
+        return false;
+    }
+    if let Some(name) = k.1 .0.strip_prefix("service:") {
+        let take = k.2 .0.strip_prefix('t').and_then(|t| t.parse::<i64>().ok());
+        return take.is_some_and(|take| {
+            st.run_services
+                .get(&(k.0.clone(), take, name.to_string()))
+                .is_some_and(|(status, _, _)| !status.is_terminal())
+        });
+    }
+    st.steps
+        .get(&(k.0.clone(), k.1.clone()))
+        .and_then(|rec| rec.attempts.iter().find(|a| a.id == k.2))
+        .is_some_and(|a| a.outcome == scarab_engine::AttemptOutcome::Running)
+}
+
 /// The in-memory leader fence (git-bug aaf4e3e): `leader` still holds its
 /// lease term, or [`DbError::NotLeader`]. Called with the state lock held, so
 /// the check and the write after it are one step, as the postgres fenced
@@ -235,6 +327,18 @@ struct InMemoryState {
     outbox: Vec<OutboxEntry>,
     /// Per-(run, step, attempt) log-chunk index (offsets only, no bodies).
     logs: HashMap<(RunId, StepId, AttemptId), Vec<LogChunkMeta>>,
+    /// Per-stream `log_streams` rows.
+    log_streams: HashMap<(RunId, StepId, AttemptId), scarab_engine::LogStreamRow>,
+    /// Per-unit `log_units` rows and their sealed generations.
+    log_units: HashMap<(RunId, StepId, AttemptId), scarab_engine::LogUnitRow>,
+    log_unit_values: HashMap<(RunId, StepId, AttemptId), Vec<scarab_engine::SealedGeneration>>,
+    /// Runs whose log index was pruned, by when.
+    log_prune_pending: HashMap<RunId, Timestamp>,
+    /// Units an earlier version launched (`log_legacy_units`).
+    log_legacy_units: std::collections::HashSet<(RunId, StepId, AttemptId)>,
+    /// When the log store's ledger was added (`log_store_epoch`): when this
+    /// store was made.
+    log_store_epoch: i64,
     /// Per-(run, step, attempt) launch handle — the durable "launch happened"
     /// marker (ADR-0047).
     attempt_handles: HashMap<(RunId, StepId, AttemptId), String>,
@@ -361,10 +465,32 @@ pub type DbHook =
 
 impl InMemoryDb {
     pub fn new() -> Self {
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
         Self {
-            state: Mutex::new(InMemoryState::default()),
+            state: Mutex::new(InMemoryState {
+                log_store_epoch: epoch,
+                ..InMemoryState::default()
+            }),
             interleave: Mutex::new(None),
         }
+    }
+
+    /// Record `unit` as running when the ledger was added (what migration
+    /// 0099 writes to `log_legacy_units`): an earlier version launched it.
+    pub fn seed_log_legacy_unit(&self, unit: &scarab_engine::LogStreamId) {
+        self.state
+            .lock()
+            .unwrap()
+            .log_legacy_units
+            .insert(log_key(unit));
+    }
+
+    /// The log store's epoch (`log_store_epoch.at`), ms.
+    pub fn log_store_epoch(&self) -> i64 {
+        self.state.lock().unwrap().log_store_epoch
     }
 
     /// Run `hook` to completion at the start of the next call of `method`
@@ -1923,24 +2049,121 @@ impl Db for InMemoryDb {
             .collect())
     }
 
-    async fn append_log_chunk(
+    async fn append_log_row(
         &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-        meta: &LogChunkMeta,
-    ) -> Result<(), DbError> {
+        stream: &scarab_engine::LogStreamId,
+        row: &scarab_engine::NewLogRow,
+        writer: &scarab_engine::LogWriter,
+        now: Timestamp,
+    ) -> Result<LogChunkMeta, scarab_engine::LogAppendError> {
+        use scarab_engine::LogAppendError;
         let mut st = self.state.lock().unwrap();
-        let chunks = st
-            .logs
-            .entry((run.clone(), step.clone(), attempt.clone()))
-            .or_default();
-        // Idempotent on seq.
-        if !chunks.iter().any(|c| c.seq == meta.seq) {
-            chunks.push(meta.clone());
-            chunks.sort_by_key(|c| c.seq);
+        if holds_leader_term(&st, &writer.fence(stream)).is_err() {
+            return Err(LogAppendError::NotWriter);
         }
+        let key = log_key(stream);
+        let Some(s) = mem_open_stream_row(&mut st, &key, now) else {
+            return Err(LogAppendError::Closed);
+        };
+        if s.state != scarab_engine::LogStreamState::Open {
+            return Err(LogAppendError::Closed);
+        }
+        if row.kind == scarab_engine::LogRowKind::Output {
+            let unit = stream.unit();
+            match st.log_units.get(&log_key(&unit)) {
+                None => return Err(LogAppendError::NoLedger),
+                Some(u) if u.purged => return Err(LogAppendError::LedgerPurged),
+                Some(u) if row.values_gen != Some(u.gen) => {
+                    return Err(LogAppendError::ValuesChanged { gen: u.gen })
+                }
+                Some(_) => {}
+            }
+        }
+        let meta = LogChunkMeta {
+            seq: s.next_seq,
+            byte_offset: s.byte_len,
+            len: row.body.as_ref().map_or(0, |b| b.len),
+            object_key: row.body.as_ref().map(|b| b.object_key.clone()),
+            kind: row.kind,
+            reason: row.reason,
+            digest: row.body.as_ref().map(|b| b.sha256.clone()),
+        };
+        let chunks = st.logs.entry(key.clone()).or_default();
+        if chunks.iter().any(|c| c.seq == meta.seq) {
+            return Err(LogAppendError::Db(DbError::Other(format!(
+                "log row {} exists",
+                meta.seq
+            ))));
+        }
+        chunks.push(meta.clone());
+        let s = st.log_streams.get_mut(&key).expect("created above");
+        s.next_seq += 1;
+        s.byte_len += meta.len;
+        if row.kind == scarab_engine::LogRowKind::SourceRestarted {
+            s.part_start_seq = s.next_seq;
+        }
+        if let Some(then) = row.then {
+            s.state = then;
+        }
+        Ok(meta)
+    }
+
+    async fn set_log_stream_state(
+        &self,
+        stream: &scarab_engine::LogStreamId,
+        writer: &scarab_engine::LogWriter,
+        state: scarab_engine::LogStreamState,
+        now: Timestamp,
+    ) -> Result<(), scarab_engine::LogAppendError> {
+        use scarab_engine::LogAppendError;
+        let mut st = self.state.lock().unwrap();
+        if holds_leader_term(&st, &writer.fence(stream)).is_err() {
+            return Err(LogAppendError::NotWriter);
+        }
+        let key = log_key(stream);
+        let Some(s) = mem_open_stream_row(&mut st, &key, now) else {
+            return Err(LogAppendError::Closed);
+        };
+        if s.state != scarab_engine::LogStreamState::Open {
+            return Err(LogAppendError::Closed);
+        }
+        st.log_streams.get_mut(&key).expect("created above").state = state;
         Ok(())
+    }
+
+    async fn start_log_final_budget(
+        &self,
+        stream: &scarab_engine::LogStreamId,
+        writer: &scarab_engine::LogWriter,
+        now: Timestamp,
+    ) -> Result<i64, scarab_engine::LogAppendError> {
+        use scarab_engine::LogAppendError;
+        let mut st = self.state.lock().unwrap();
+        if holds_leader_term(&st, &writer.fence(stream)).is_err() {
+            return Err(LogAppendError::NotWriter);
+        }
+        let key = log_key(stream);
+        let Some(s) = mem_open_stream_row(&mut st, &key, now) else {
+            return Err(LogAppendError::Closed);
+        };
+        if s.state != scarab_engine::LogStreamState::Open {
+            return Err(LogAppendError::Closed);
+        }
+        let s = st.log_streams.get_mut(&key).expect("created above");
+        Ok(*s.final_since.get_or_insert(now.0))
+    }
+
+    async fn log_stream_row(
+        &self,
+        stream: &scarab_engine::LogStreamId,
+    ) -> Result<Option<scarab_engine::LogStreamRow>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .log_streams
+            .get(&log_key(stream))
+            .cloned())
     }
 
     async fn log_chunks_from(
@@ -1966,19 +2189,403 @@ impl Db for InMemoryDb {
             .unwrap_or_default())
     }
 
-    async fn last_log_chunk(
+    async fn write_log_unit(
         &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-    ) -> Result<Option<LogChunkMeta>, DbError> {
-        Ok(self
-            .state
+        unit: &scarab_engine::LogStreamId,
+        handle: Option<&str>,
+        expected_gen: i64,
+        sealed: Option<&[u8]>,
+        now: Timestamp,
+    ) -> Result<i64, DbError> {
+        let mut st = self.state.lock().unwrap();
+        let key = log_key(unit);
+        let u = st
+            .log_units
+            .entry(key.clone())
+            .or_insert_with(|| scarab_engine::LogUnitRow {
+                gen: 0,
+                handle: None,
+                started_at: None,
+                settled_at: None,
+                revoke_attempted_at: None,
+                purged: false,
+                created_at: now.0,
+                stream_count: 1,
+                revoke_failures: 0,
+                revoke_retry_at: None,
+            });
+        if let Some(h) = handle {
+            u.handle = Some(h.to_string());
+        }
+        if u.purged {
+            return Err(DbError::Conflict);
+        }
+        let Some(sealed) = sealed else {
+            return Ok(u.gen);
+        };
+        if u.gen != expected_gen {
+            return Err(DbError::Conflict);
+        }
+        u.gen += 1;
+        // A new generation holds tokens no revocation has seen.
+        u.revoke_attempted_at = None;
+        let gen = u.gen;
+        st.log_unit_values
+            .entry(key)
+            .or_default()
+            .push(scarab_engine::SealedGeneration {
+                gen,
+                sealed: sealed.to_vec(),
+                created_at: now.0,
+                revoked_at: None,
+            });
+        Ok(gen)
+    }
+
+    async fn log_unit_ledger(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+    ) -> Result<Option<scarab_engine::LogLedgerRows>, DbError> {
+        let st = self.state.lock().unwrap();
+        let key = log_key(unit);
+        Ok(st
+            .log_units
+            .get(&key)
+            .map(|u| scarab_engine::LogLedgerRows {
+                unit: u.clone(),
+                generations: st.log_unit_values.get(&key).cloned().unwrap_or_default(),
+            }))
+    }
+
+    async fn log_unit_by_handle(
+        &self,
+        handle: &str,
+    ) -> Result<Option<scarab_engine::LogStreamId>, DbError> {
+        let st = self.state.lock().unwrap();
+        // The newest row, as Postgres orders it.
+        let found = st
+            .log_units
+            .iter()
+            .filter(|(_, u)| u.handle.as_deref() == Some(handle))
+            .max_by(|(ka, a), (kb, b)| {
+                (a.created_at, &ka.0 .0, &ka.1 .0, &ka.2 .0).cmp(&(
+                    b.created_at,
+                    &kb.0 .0,
+                    &kb.1 .0,
+                    &kb.2 .0,
+                ))
+            })
+            .map(|(k, _)| k);
+        Ok(found.map(|(r, s, a)| scarab_engine::LogStreamId::new(r, s, a)))
+    }
+
+    async fn mark_log_unit_started(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+        at: Timestamp,
+    ) -> Result<(), DbError> {
+        if let Some(u) = self.state.lock().unwrap().log_units.get_mut(&log_key(unit)) {
+            u.started_at.get_or_insert(at.0);
+        }
+        Ok(())
+    }
+
+    async fn count_log_values_not_sealed_with(&self, seal_prefix: &[u8]) -> Result<u64, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .log_unit_values
+            .values()
+            .flatten()
+            .filter(|g| !g.sealed.starts_with(seal_prefix))
+            .count() as u64)
+    }
+
+    async fn mark_log_generation_revoked(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+        gen: i64,
+        at: Timestamp,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(g) = st
+            .log_unit_values
+            .get_mut(&log_key(unit))
+            .and_then(|gens| gens.iter_mut().find(|g| g.gen == gen))
+        {
+            g.revoked_at.get_or_insert(at.0);
+        }
+        Ok(())
+    }
+
+    async fn record_log_unit_revoke_failure(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+        now: Timestamp,
+    ) -> Result<(), DbError> {
+        if let Some(u) = self.state.lock().unwrap().log_units.get_mut(&log_key(unit)) {
+            u.revoke_failures += 1;
+            u.revoke_retry_at =
+                Some(now.0 + scarab_engine::ledger_revoke_backoff_ms(u.revoke_failures));
+        }
+        Ok(())
+    }
+
+    async fn mark_log_unit_revoked(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+        at: Timestamp,
+    ) -> Result<(), DbError> {
+        // Only while every generation is marked revoked (as Postgres).
+        let mut st = self.state.lock().unwrap();
+        let key = log_key(unit);
+        let revoked = st.log_unit_values.get(&key).map_or(0, |gens| {
+            gens.iter().filter(|g| g.revoked_at.is_some()).count()
+        });
+        if let Some(u) = st.log_units.get_mut(&key) {
+            if u.gen == revoked as i64 {
+                u.revoke_attempted_at.get_or_insert(at.0);
+            }
+        }
+        Ok(())
+    }
+
+    async fn settle_log_units(&self, now: Timestamp) -> Result<u64, DbError> {
+        let mut st = self.state.lock().unwrap();
+        let settled: Vec<(RunId, StepId, AttemptId)> = st
+            .log_units
+            .iter()
+            .filter(|(k, u)| u.settled_at.is_none() && !mem_unit_running(&st, k))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in &settled {
+            st.log_units.get_mut(k).expect("listed above").settled_at = Some(now.0);
+        }
+        Ok(settled.len() as u64)
+    }
+
+    async fn purge_log_unit(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+        through_gen: i64,
+    ) -> Result<bool, DbError> {
+        let mut st = self.state.lock().unwrap();
+        let key = log_key(unit);
+        // Only at the generation the caller decided on (as Postgres).
+        match st.log_units.get_mut(&key) {
+            Some(u) if !u.purged && u.gen == through_gen => u.purged = true,
+            _ => return Ok(false),
+        }
+        st.log_unit_values.remove(&key);
+        Ok(true)
+    }
+
+    async fn set_log_unit_stream_count(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+        count: i32,
+    ) -> Result<(), DbError> {
+        if let Some(u) = self.state.lock().unwrap().log_units.get_mut(&log_key(unit)) {
+            u.stream_count = count;
+        }
+        Ok(())
+    }
+
+    async fn log_unit_streams_all_terminal(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+    ) -> Result<bool, DbError> {
+        let st = self.state.lock().unwrap();
+        let Some(u) = st.log_units.get(&log_key(unit)) else {
+            return Ok(false);
+        };
+        let (terminal, open) = mem_unit_streams(&st, &log_key(unit));
+        Ok(terminal >= u.stream_count as usize && open == 0)
+    }
+
+    async fn log_units_to_purge(
+        &self,
+        now: Timestamp,
+        hard_cap_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<scarab_engine::PurgeCandidate>, DbError> {
+        let st = self.state.lock().unwrap();
+        let keep = scarab_engine::LEDGER_SETTLED_KEEP_MS;
+        let mut out = Vec::new();
+        for (k, u) in &st.log_units {
+            if u.purged {
+                continue;
+            }
+            let running = mem_unit_running(&st, k);
+            let oldest = st
+                .log_unit_values
+                .get(k)
+                .and_then(|g| g.iter().map(|g| g.created_at).min());
+            let past_cap = !running && oldest.is_some_and(|o| o < now.0 - hard_cap_ms);
+            let run_ended = st
+                .runs
+                .get(&k.0)
+                .filter(|s| s.is_terminal())
+                .map(|_| st.run_created.get(&k.0).copied().unwrap_or(Timestamp(0)).0);
+            let due = u.settled_at.is_some_and(|s| s < now.0 - keep)
+                || run_ended.is_some_and(|e| e < now.0 - keep)
+                || past_cap;
+            let backing_off = u.revoke_retry_at.is_some_and(|at| at > now.0);
+            if due && (!backing_off || past_cap) {
+                out.push(scarab_engine::PurgeCandidate {
+                    unit: scarab_engine::LogStreamId::new(&k.0, &k.1, &k.2),
+                    row: u.clone(),
+                    past_cap,
+                });
+            }
+        }
+        // Oldest first, as Postgres orders them.
+        out.sort_by(|a, b| {
+            (
+                a.row.settled_at.unwrap_or(0),
+                &a.unit.run.0,
+                &a.unit.step.0,
+                &a.unit.attempt.0,
+            )
+                .cmp(&(
+                    b.row.settled_at.unwrap_or(0),
+                    &b.unit.run.0,
+                    &b.unit.step.0,
+                    &b.unit.attempt.0,
+                ))
+        });
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+
+    async fn pending_final_reads(
+        &self,
+        now: Timestamp,
+        cursor: &scarab_engine::PendingReadCursor,
+        limit: u32,
+    ) -> Result<scarab_engine::PendingReads, DbError> {
+        type Key = (RunId, StepId, AttemptId);
+        let st = self.state.lock().unwrap();
+        let after = |k: &Key, c: &Option<scarab_engine::LogStreamId>| {
+            c.as_ref()
+                .is_none_or(|c| (&k.0 .0, &k.1 .0, &k.2 .0) > (&c.run.0, &c.step.0, &c.attempt.0))
+        };
+        let id = |k: &Key| scarab_engine::LogStreamId::new(&k.0, &k.1, &k.2);
+        let open = |k: &Key| {
+            st.log_streams
+                .get(k)
+                .is_none_or(|s| s.state == scarab_engine::LogStreamState::Open)
+        };
+        let has_chunks = |k: &Key| st.logs.get(k).is_some_and(|c| !c.is_empty());
+        let mut out = scarab_engine::PendingReads::default();
+
+        let mut ledger: Vec<(&Key, &scarab_engine::LogUnitRow)> = st
+            .log_units
+            .iter()
+            .filter(|(k, u)| {
+                u.settled_at.is_some()
+                    && !u.purged
+                    && after(k, &cursor.ledger)
+                    && mem_unit_streams(&st, k).0 < u.stream_count as usize
+                    && !st.log_prune_pending.contains_key(&k.0)
+            })
+            .collect();
+        ledger.sort_by(|a, b| {
+            (&a.0 .0 .0, &a.0 .1 .0, &a.0 .2 .0).cmp(&(&b.0 .0 .0, &b.0 .1 .0, &b.0 .2 .0))
+        });
+        ledger.truncate(limit as usize);
+        out.next.ledger = (ledger.len() as u32 >= limit)
+            .then(|| ledger.last().map(|(k, _)| id(k)))
+            .flatten();
+        for (k, u) in ledger {
+            out.reads.push(scarab_engine::PendingFinalRead {
+                unit: id(k),
+                handle: u
+                    .handle
+                    .clone()
+                    .or_else(|| st.attempt_handles.get(k).cloned()),
+                has_ledger: true,
+                started: u.started_at.is_some(),
+                stream_count: u.stream_count,
+            });
+        }
+
+        let mut legacy: Vec<&Key> = st
+            .log_legacy_units
+            .iter()
+            .filter(|k| {
+                after(k, &cursor.legacy)
+                    && !st.log_units.contains_key(*k)
+                    && !st.log_prune_pending.contains_key(&k.0)
+                    && !mem_unit_running(&st, k)
+            })
+            .collect();
+        legacy.sort_by(|a, b| (&a.0 .0, &a.1 .0, &a.2 .0).cmp(&(&b.0 .0, &b.1 .0, &b.2 .0)));
+        legacy.truncate(limit as usize);
+        out.next.legacy = (legacy.len() as u32 >= limit)
+            .then(|| legacy.last().map(|k| id(k)))
+            .flatten();
+        for k in legacy {
+            out.reads.push(scarab_engine::PendingFinalRead {
+                unit: id(k),
+                handle: st.attempt_handles.get(k).cloned(),
+                has_ledger: false,
+                started: st.attempt_execution_started.contains_key(k) || has_chunks(k),
+                stream_count: 1,
+            });
+        }
+
+        let floor = (st.log_store_epoch - scarab_engine::PENDING_EPOCH_SKEW_MS)
+            .max(now.0 - scarab_engine::PENDING_RECENT_WINDOW_MS);
+        let mut recent: Vec<(i64, Key)> = Vec::new();
+        for ((run, step), rec) in &st.steps {
+            for a in &rec.attempts {
+                let k = (run.clone(), step.clone(), a.id.clone());
+                let at = a.started_at.0;
+                let past = cursor.recent.as_ref().is_none_or(|(c_at, c)| {
+                    (at, &run.0, &step.0, &a.id.0) > (*c_at, &c.run.0, &c.step.0, &c.attempt.0)
+                });
+                if at >= floor
+                    && past
+                    && a.outcome != scarab_engine::AttemptOutcome::Running
+                    && open(&k)
+                    && !st.log_units.contains_key(&k)
+                    && !st.log_legacy_units.contains(&k)
+                    && !st.log_prune_pending.contains_key(run)
+                {
+                    recent.push((at, k));
+                }
+            }
+        }
+        recent.sort_by(|a, b| {
+            (a.0, &a.1 .0 .0, &a.1 .1 .0, &a.1 .2 .0)
+                .cmp(&(b.0, &b.1 .0 .0, &b.1 .1 .0, &b.1 .2 .0))
+        });
+        recent.truncate(limit as usize);
+        out.next.recent = (recent.len() as u32 >= limit)
+            .then(|| recent.last().map(|(at, k)| (*at, id(k))))
+            .flatten();
+        for (_, k) in &recent {
+            out.reads.push(scarab_engine::PendingFinalRead {
+                unit: id(k),
+                handle: st.attempt_handles.get(k).cloned(),
+                has_ledger: false,
+                started: st.attempt_execution_started.contains_key(k) || has_chunks(k),
+                stream_count: 1,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn forget_log_legacy_unit(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+    ) -> Result<(), DbError> {
+        self.state
             .lock()
             .unwrap()
-            .logs
-            .get(&(run.clone(), step.clone(), attempt.clone()))
-            .and_then(|chunks| chunks.last().cloned()))
+            .log_legacy_units
+            .remove(&log_key(unit));
+        Ok(())
     }
 
     async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError> {
@@ -2634,22 +3241,49 @@ impl Db for InMemoryDb {
             .collect())
     }
 
-    async fn log_object_keys_of_run(&self, run: &RunId) -> Result<Vec<String>, DbError> {
-        let st = self.state.lock().unwrap();
-        Ok(st
+    async fn prune_log_run(&self, run: &RunId, now: Timestamp) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        let keys: Vec<(RunId, StepId, AttemptId)> = st
             .logs
-            .iter()
-            .filter(|((r, _, _), _)| r == run)
-            .flat_map(|(_, metas)| metas.iter().map(|m| m.object_key.clone()))
-            .collect())
+            .keys()
+            .filter(|(r, _, _)| r == run)
+            .cloned()
+            .collect();
+        for k in keys {
+            mem_stream_row(&mut st, &k, now);
+        }
+        for ((r, _, _), s) in st.log_streams.iter_mut() {
+            if r == run {
+                s.state = scarab_engine::LogStreamState::Closed;
+                s.pruned = true;
+            }
+        }
+        st.log_unit_values.retain(|(r, _, _), _| r != run);
+        st.log_units.retain(|(r, _, _), _| r != run);
+        st.log_legacy_units.retain(|(r, _, _)| r != run);
+        st.logs.retain(|(r, _, _), _| r != run);
+        st.log_prune_pending.insert(run.clone(), now);
+        Ok(())
     }
 
-    async fn delete_log_index_of_run(&self, run: &RunId) -> Result<(), DbError> {
-        self.state
-            .lock()
-            .unwrap()
-            .logs
-            .retain(|(r, _, _), _| r != run);
+    async fn log_runs_to_redelete(
+        &self,
+        before: Timestamp,
+        limit: u32,
+    ) -> Result<Vec<RunId>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<RunId> = st
+            .log_prune_pending
+            .iter()
+            .filter(|(_, at)| at.0 < before.0)
+            .map(|(r, _)| r.clone())
+            .collect();
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+
+    async fn forget_log_run_redelete(&self, run: &RunId) -> Result<(), DbError> {
+        self.state.lock().unwrap().log_prune_pending.remove(run);
         Ok(())
     }
 
@@ -2834,7 +3468,7 @@ struct FakeExecState {
     /// Scripted outcomes a test wants `poll` to return, in order.
     scripted: Vec<ExecState>,
     /// The forge credential each launched unit holds (ADR-0076 §9), as the
-    /// k8s per-Pod token Secret holds it, until `take_forge_credential`.
+    /// k8s per-Pod token Secret holds it, until `delete_unit_secrets`.
     forge_credentials: HashMap<String, scarab_engine::MountedForgeCredential>,
     /// Handles the test has declared "dead" (backend lost them).
     dead: Vec<ExecHandle>,
@@ -2923,12 +3557,11 @@ pub struct FakeExecutor {
     /// A one-shot hook the next `poll` awaits — see
     /// [`during_next_poll`](Self::during_next_poll).
     poll_hook: Mutex<Option<LaunchHook>>,
-    /// What `log_redactions` answers for every step — see
-    /// [`set_log_redactions`](Self::set_log_redactions).
-    log_redactions: Mutex<Result<scarab_engine::LogRedactions, String>>,
     /// Polls in flight right now, and the most ever in flight at once, for
     /// one handle (git-bug 068cc0b: two replicas driving one unit).
     polls: Mutex<PollCount>,
+    /// What `log_source_state` answers ([`Self::set_log_source_state`]).
+    log_source_state: Mutex<scarab_engine::LogSourceState>,
 }
 
 #[derive(Default)]
@@ -2950,20 +3583,14 @@ impl FakeExecutor {
             launch_hook: Mutex::new(None),
             poll_hook: Mutex::new(None),
             polls: Mutex::new(PollCount::default()),
-            log_redactions: Mutex::new(Ok(scarab_engine::LogRedactions::Values(Vec::new()))),
+            log_source_state: Mutex::new(scarab_engine::LogSourceState::Gone),
         }
     }
 
-    /// The secret values `log_redactions` answers for every step, as the k8s
-    /// executor reads them back from a unit's Secrets.
-    pub fn set_log_redactions(&self, values: Vec<Vec<u8>>) {
-        *self.log_redactions.lock().unwrap() = Ok(scarab_engine::LogRedactions::Values(values));
-    }
-
-    /// What `log_redactions` answers for every step: an answer, or an error
-    /// with this message.
-    pub fn set_log_redactions_answer(&self, answer: Result<scarab_engine::LogRedactions, String>) {
-        *self.log_redactions.lock().unwrap() = answer;
+    /// What `log_source_state` answers from now on (default `Gone`: this
+    /// backend has no log source).
+    pub fn set_log_source_state(&self, state: scarab_engine::LogSourceState) {
+        *self.log_source_state.lock().unwrap() = state;
     }
 
     /// Run `hook` to completion INSIDE the next `poll`, before it reports
@@ -3170,7 +3797,7 @@ impl FakeExecutor {
     /// The spec `handle` was most recently launched with (after launch-time
     /// interpolation, ADR-0041), or `None` if it was never launched.
     /// Whether `handle`'s unit still holds a forge credential: launched with
-    /// one, and not yet taken by `take_forge_credential`.
+    /// one, and not yet deleted by `delete_unit_secrets`.
     pub fn holds_forge_credential(&self, handle: &ExecHandle) -> bool {
         self.inner
             .lock()
@@ -3431,27 +4058,20 @@ impl Executor for FakeExecutor {
         Ok(None)
     }
 
-    async fn log_redactions(
-        &self,
-        _step: &StepRun,
-    ) -> Result<scarab_engine::LogRedactions, ExecError> {
-        self.log_redactions
-            .lock()
-            .unwrap()
-            .clone()
-            .map_err(ExecError::Other)
-    }
-
-    async fn take_forge_credential(
-        &self,
-        handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
-        Ok(self
-            .inner
+    async fn delete_unit_secrets(&self, handle: &ExecHandle) -> Result<(), ExecError> {
+        self.inner
             .lock()
             .unwrap()
             .forge_credentials
-            .remove(&handle.0))
+            .remove(&handle.0);
+        Ok(())
+    }
+
+    async fn log_source_state(
+        &self,
+        _src: &scarab_engine::LogSourceRef,
+    ) -> Result<scarab_engine::LogSourceState, ExecError> {
+        Ok(self.log_source_state.lock().unwrap().clone())
     }
 
     async fn infra_condition(
@@ -3709,6 +4329,14 @@ pub struct FakeForge {
     mints: Mutex<bool>,
     /// The tokens [`revoke_credential`](ForgePort::revoke_credential) ended.
     revoked: Mutex<Vec<String>>,
+    /// When set, every revocation fails (and is still recorded as tried).
+    revoke_fails: Mutex<bool>,
+    /// Every revocation tried, failed or not.
+    revoke_tries: Mutex<Vec<String>>,
+    /// Tokens whose revocation fails (and is still recorded as tried).
+    revoke_fail_tokens: Mutex<std::collections::HashSet<String>>,
+    /// When set, a revocation never returns: a forge that does not answer.
+    revoke_hangs: Mutex<bool>,
     /// How many checkout credentials [`mint_checkout_credential`](ForgePort::mint_checkout_credential)
     /// has handed out — lets a test assert a refused launch minted nothing.
     checkout_mints: Mutex<u32>,
@@ -3831,6 +4459,26 @@ impl FakeForge {
     /// The tokens revoked so far, in order.
     pub fn revoked(&self) -> Vec<String> {
         self.revoked.lock().unwrap().clone()
+    }
+
+    /// Make every later revocation fail (`true`) or succeed again.
+    pub fn fail_revocations(&self, fail: bool) {
+        *self.revoke_fails.lock().unwrap() = fail;
+    }
+
+    /// Every revocation tried so far, failed or not, in order.
+    pub fn revoke_tries(&self) -> Vec<String> {
+        self.revoke_tries.lock().unwrap().clone()
+    }
+
+    /// Make every later revocation of `token` fail.
+    pub fn fail_revocation_of(&self, token: impl Into<String>) {
+        self.revoke_fail_tokens.lock().unwrap().insert(token.into());
+    }
+
+    /// Make every later revocation never return (`true`), or answer again.
+    pub fn hang_revocations(&self, hang: bool) {
+        *self.revoke_hangs.lock().unwrap() = hang;
     }
 
     /// How many checkout or registry credentials were asked for.
@@ -4538,6 +5186,16 @@ impl ForgePort for FakeForge {
     }
 
     async fn revoke_credential(&self, _repo: &RepoRef, token: &str) -> Result<(), ForgeError> {
+        self.revoke_tries.lock().unwrap().push(token.to_string());
+        let hangs = *self.revoke_hangs.lock().unwrap();
+        if hangs {
+            std::future::pending::<()>().await;
+        }
+        if *self.revoke_fails.lock().unwrap()
+            || self.revoke_fail_tokens.lock().unwrap().contains(token)
+        {
+            return Err(ForgeError::Api("revocation refused (test)".into()));
+        }
         if *self.mints.lock().unwrap() {
             self.revoked.lock().unwrap().push(token.to_string());
         }
@@ -5525,4 +6183,49 @@ mod tests {
             "int type preserved"
         );
     }
+}
+
+/// Append one output row to a stream's index as a fenced tail writer does,
+/// under a tail lease this helper takes, after giving the stream's unit a
+/// ledger with no values. For tests that seed a stored log without a tail.
+pub async fn seed_log_row(
+    db: &dyn Db,
+    run: &RunId,
+    step: &StepId,
+    attempt: &AttemptId,
+    object_key: &str,
+    len: u64,
+) -> LogChunkMeta {
+    let stream = scarab_engine::LogStreamId::new(run, step, attempt);
+    // Its own lease kind, never the tail lease a reader takes to mean the
+    // log is still being stored.
+    let resource = scarab_engine::LogLease::Append.resource(&stream);
+    let lease = db.lease(&resource, "seed", 60_000).await.expect("lease");
+    let writer = scarab_engine::LogWriter::holding(
+        scarab_engine::LogLease::Append,
+        &lease.held_by(&resource, "seed").expect("seed holds it"),
+    );
+    let gen = db
+        .write_log_unit(&stream.unit(), None, 0, None, Timestamp(0))
+        .await
+        .expect("unit row");
+    let meta = db
+        .append_log_row(
+            &stream,
+            &scarab_engine::NewLogRow::output(
+                scarab_engine::LogBody {
+                    object_key: object_key.to_string(),
+                    len,
+                    sha256: Vec::new(),
+                },
+                gen,
+            ),
+            &writer,
+            Timestamp(0),
+        )
+        .await
+        .expect("append");
+    // Let it go, so the next writer of the stream can take it.
+    db.release_lease(&resource, "seed").await.expect("release");
+    meta
 }

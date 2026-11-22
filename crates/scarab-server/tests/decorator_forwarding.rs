@@ -110,9 +110,9 @@ async fn the_production_decorator_stack_forwards_identity() {
         inner.clone(),
         db,
         secrets,
-        logs,
+        logs.clone(),
     ));
-    let stack = ForgeCredentialExecutor::new(secret_layer, Arc::new(FakeForge::new()));
+    let stack = ForgeCredentialExecutor::new(secret_layer, Arc::new(FakeForge::new()), logs);
 
     let handle = scarab_engine::ports::ExecHandle("fake://r1/s1/a1".into());
     assert_eq!(
@@ -124,5 +124,53 @@ async fn the_production_decorator_stack_forwards_identity() {
     assert_eq!(
         stack.output(&handle).await.unwrap().as_deref(),
         Some("root-hash")
+    );
+}
+
+/// Every layer of the production stack forwards `log_source_state` (2.4 of
+/// the log design): a layer that answered on its own would tell every tail
+/// the container ended, or never did, and the log store would close or
+/// re-read streams on a wrong answer. Kills: a decorator answering its own.
+#[tokio::test]
+async fn the_production_stack_forwards_log_source_state() {
+    use scarab_engine::{LogSourceRef, LogSourceState, StepId, StepRun, StepStatus, Timestamp};
+    let inner = Arc::new(FakeExecutor::new());
+    let want = LogSourceState::Ended {
+        finished_at: Timestamp(42),
+        container_id: Some("c7".into()),
+    };
+    inner.set_log_source_state(want.clone());
+    let db = Arc::new(InMemoryDb::new());
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let secret_logs = logs.clone();
+    let stack = scarab_server::build_executor_stack(
+        inner,
+        logs,
+        Arc::new(scarab_testkit::FakeClock::new(0)),
+        move |ledger| {
+            SecretInjectingExecutor::new(ledger, db, Arc::new(FakeSecrets::new()), secret_logs)
+        },
+        |with_secrets, ledger_logs| {
+            ForgeCredentialExecutor::new(with_secrets, Arc::new(FakeForge::new()), ledger_logs)
+        },
+    );
+    let step = StepRun {
+        key: None,
+        run: RunId("r1".into()),
+        step: StepId("s".into()),
+        status: StepStatus::Running,
+        attempts: vec![],
+        needs: vec![],
+        gate_kind: None,
+    };
+    assert_eq!(
+        stack
+            .log_source_state(&LogSourceRef::Step(step))
+            .await
+            .unwrap(),
+        want
     );
 }

@@ -9,6 +9,7 @@ import { createEffect, createMemo, createSignal, onCleanup, Index, Match, Show, 
 import { probeLogStream, serviceLogsRawUrl, serviceLogStreamUrl, streamServiceLogs } from "../api/client";
 import type { DagService } from "./Dag";
 import {
+  addMarker,
   appendLog,
   DEFAULT_TAIL_BYTES,
   emptyLogBuffer,
@@ -20,7 +21,7 @@ import {
   type LogFollower,
 } from "../log-stream";
 import { logBodyState } from "../logs";
-import { LogError, LogLoading } from "./LogStates";
+import { LogError, LogLoading, LogMarkerRow } from "./LogStates";
 
 // Cap rendered log lines so a chatty service can't blow up the DOM (windowing).
 const MAX_LINES = 1500;
@@ -71,6 +72,7 @@ export default function ServicePane(props: { runId: string; service: DagService 
       outcome: () => untrack(() => (LIVE_STATUSES.has(props.service.status) ? "running" : "ended")),
       onChunk: (t) => setBuffer((prev) => appendLog(prev, t)),
       onTruncated: (t) => setBuffer((prev) => truncateLog(prev, t)),
+      onMarker: (m) => setBuffer((prev) => addMarker(prev, m)),
       onEnd: () => setEnded(true),
       onReopen: () => setEnded(false),
       onReset: () => setBuffer(emptyLogBuffer()),
@@ -89,6 +91,7 @@ export default function ServicePane(props: { runId: string; service: DagService 
   const logState = () =>
     logBodyState({
       text: buffer().text,
+      markers: buffer().markers.length,
       ended: ended(),
       outcome: NOT_DONE_STATUSES.has(props.service.status) ? "running" : "ended",
       loaded: loaded(),
@@ -171,10 +174,17 @@ export default function ServicePane(props: { runId: string; service: DagService 
             }
           >
             {(r) => (
-              <div class="lgrow">
-                <span class="lgln">{r().n}</span>
-                <span class="lgtx">{r().line}</span>
-              </div>
+              <Show
+                when={r().marker}
+                fallback={
+                  <div class="lgrow">
+                    <span class="lgln">{r().n}</span>
+                    <span class="lgtx">{r().line}</span>
+                  </div>
+                }
+              >
+                {(m) => <LogMarkerRow text={m().text} />}
+              </Show>
             )}
           </Index>
         </div>

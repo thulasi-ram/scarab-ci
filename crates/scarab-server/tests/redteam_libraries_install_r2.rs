@@ -147,34 +147,38 @@ async fn create_run(db: &InMemoryDb, libs: &dyn LibraryStore, ci: &str, repo: &s
     out.runs[0].clone()
 }
 
-fn secret_executor(
-    db: &Arc<InMemoryDb>,
-    libs: Arc<dyn LibraryStore>,
-    inner: Arc<FakeExecutor>,
-) -> SecretInjectingExecutor {
-    let logs = Arc::new(LogService::new(
-        Arc::new(InMemoryObjectStore::new()),
-        db.clone(),
-    ));
-    SecretInjectingExecutor::new(
-        inner,
-        db.clone() as Arc<dyn Db>,
-        Arc::new(FakeSecrets::new()),
-        logs,
-    )
-    .with_libraries(libs)
-}
-
-/// The production order (main.rs): CloneEnriching(SecretInjecting(backend)).
+/// The production order (main.rs): Forge(SecretInjecting(Ledger(backend))).
 fn production_executor(
     db: &Arc<InMemoryDb>,
     libs: Arc<dyn LibraryStore>,
     inner: Arc<FakeExecutor>,
     forge: Arc<FakeForge>,
-) -> ForgeCredentialExecutor {
-    let secret: Arc<dyn Executor> = Arc::new(secret_executor(db, libs.clone(), inner));
-    ForgeCredentialExecutor::new(secret, forge as Arc<dyn ForgePort>)
-        .with_libraries(db.clone() as Arc<dyn Db>, libs)
+) -> Arc<dyn Executor> {
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let (secret_db, secret_libs, secret_logs) =
+        (db.clone() as Arc<dyn Db>, libs.clone(), logs.clone());
+    let forge_db = db.clone() as Arc<dyn Db>;
+    scarab_server::build_executor_stack(
+        inner,
+        logs,
+        Arc::new(FakeClock::new(1_000)),
+        move |ledger| {
+            SecretInjectingExecutor::new(
+                ledger,
+                secret_db,
+                Arc::new(FakeSecrets::new()),
+                secret_logs,
+            )
+            .with_libraries(secret_libs)
+        },
+        move |with_secrets, ledger_logs| {
+            ForgeCredentialExecutor::new(with_secrets, forge as Arc<dyn ForgePort>, ledger_logs)
+                .with_libraries(forge_db, libs)
+        },
+    )
 }
 
 async fn tick_prod(
@@ -186,7 +190,7 @@ async fn tick_prod(
     let inner = Arc::new(FakeExecutor::new());
     inner.script_outcome(ExecState::Succeeded);
     let exec = production_executor(db, libs, inner, Arc::new(FakeForge::new()));
-    let sched = Scheduler::new(db.as_ref(), clock as &dyn Clock, &exec, "sched");
+    let sched = Scheduler::new(db.as_ref(), clock as &dyn Clock, &*exec, "sched");
     for _ in 0..6 {
         sched.tick(run).await.unwrap();
     }
@@ -362,7 +366,7 @@ async fn gate_refusal_a_store_error_holds_the_gate_and_blocks_no_other_run() {
     inner.script_outcome(ExecState::Succeeded);
     let down: Arc<dyn LibraryStore> = Arc::new(YankedDown(libs.clone()));
     let exec = production_executor(&db, down, inner, Arc::new(FakeForge::new()));
-    let sched = Scheduler::new(db.as_ref(), &clock as &dyn Clock, &exec, "sched");
+    let sched = Scheduler::new(db.as_ref(), &clock as &dyn Clock, &*exec, "sched");
     let mut isolated_a = 0;
     for _ in 0..8 {
         let isolated = sched.tick_all().await.expect("the tick itself broke");
@@ -1175,7 +1179,7 @@ async fn credentials_asked(
     inner.script_outcome(ExecState::Succeeded);
     let exec = production_executor(db, libs, inner, forge.clone());
     let clock = FakeClock::new(1_000);
-    let sched = Scheduler::new(db.as_ref(), &clock as &dyn Clock, &exec, "sched");
+    let sched = Scheduler::new(db.as_ref(), &clock as &dyn Clock, &*exec, "sched");
     for _ in 0..6 {
         sched.tick(run).await.unwrap();
     }

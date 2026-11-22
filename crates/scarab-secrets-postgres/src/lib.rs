@@ -728,6 +728,50 @@ fn seal_aad(aad: &[u8]) -> Vec<u8> {
 /// Both seals bind `"scarab-sealer/v1\0" || aad`.
 impl Sealer for PostgresSecrets {
     fn seal(&self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, SecretError> {
+        KeySealer::new(self.keys.clone()).seal(plaintext, aad)
+    }
+
+    fn open(&self, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, SecretError> {
+        KeySealer::new(self.keys.clone()).open(sealed, aad)
+    }
+
+    fn derive_key(&self, label: &str) -> [u8; 32] {
+        KeySealer::new(self.keys.clone()).derive_key(label)
+    }
+}
+
+/// The [`Sealer`] of [`PostgresSecrets`] over a master key set alone, with
+/// no database: the same envelope and AAD, so either opens what the other
+/// sealed under the same keys. The log pipeline seals its value ledger
+/// with it.
+#[derive(Clone)]
+pub struct KeySealer {
+    keys: MasterKeySet,
+}
+
+impl KeySealer {
+    pub fn new(keys: MasterKeySet) -> Self {
+        Self { keys }
+    }
+
+    /// The bytes every seal under the active key starts with: the version
+    /// byte and the active key's fingerprint. A stored seal that does not
+    /// start with them is under another key (or is not this adapter's).
+    pub fn active_seal_prefix(&self) -> Vec<u8> {
+        let mut out = vec![SEAL_VERSION];
+        out.extend_from_slice(self.keys.active_fingerprint().as_bytes());
+        out
+    }
+
+    /// A sealer under one fresh random key: what it seals opens only in
+    /// this process.
+    pub fn ephemeral() -> Self {
+        Self::new(MasterKeySet::single(random_bytes()))
+    }
+}
+
+impl Sealer for KeySealer {
+    fn seal(&self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, SecretError> {
         let (active_fp, active_key) = self.keys.active();
         let aad = seal_aad(aad);
         let data_key: [u8; 32] = random_bytes();

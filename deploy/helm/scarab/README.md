@@ -61,6 +61,36 @@ role, because the server and the workspace StatefulSet both reach the bucket:
 `eks.amazonaws.com/role-arn: arn:aws:iam::<acct>:role/scarab`. Step Pods run
 under neither ServiceAccount, so they do not inherit the role.
 
+## Master keys and value ledgers
+
+Every replica must use the same master keys. `SCARAB_MASTER_KEYS` is a
+comma-separated list of base64 32-byte keys: the first encrypts, the rest only
+decrypt (`SCARAB_MASTER_KEY` sets one key). Scarab encrypts stored secrets with
+them, and each step's value ledger: the secret values a launch hands the step,
+which the server redacts the step's log with. A replica that cannot decrypt a
+step's ledger stores none of that step's log and leaves it to a replica that
+can.
+
+To rotate a key, add the new key after the active one on every replica and roll
+them out, then move it to the front on every replica and roll them out again.
+At boot each replica rewraps the stored secrets under the active key. A ledger
+generation cannot be rewrapped (its encryption is bound to its step and
+generation), so it stays under the key it was sealed with until the ledger is
+deleted. Remove the old key only when `scarab_secrets_rows_under_nonactive_key`
+reads 0 on every replica. The metric counts the stored secrets and the ledger
+generations still under a key that is not the active one, as of the replica's
+boot, so restart the replicas to read it again. It reaches 0 at most 24.5 hours
+after the key stopped being active, the longest a ledger lives. Removing the key
+earlier stops the logs of running steps from being stored, and a re-drive of
+such a step fails.
+
+One replica revokes forge tokens and deletes ledgers: the one that holds the
+lease `ledger-sweep`, every 30 seconds, in a task of its own beside the
+scheduler. It waits at most 20 seconds for one step's revocations; a failed
+revocation is tried again after 1 minute, doubling to an hour, and a ledger is
+deleted anyway 24.5 hours after its first generation once its step is not
+running.
+
 ## Login (`scarab.oauth`, ADR-0049)
 
 Scarab authenticates operators against a **forge-agnostic OAuth/OIDC provider**:
@@ -295,12 +325,17 @@ namespace modes: `<release namespace>-steps`, and `scarab.namespace` set to the 
 It refuses a Pod that:
 
 - names a Secret in a Secret volume, a projected volume, an env `secretKeyRef` or an `envFrom`
-  `secretRef`, other than the Pod's own per-Pod Secrets (`<pod>-secrets`, `<pod>-token`,
-  `<pod>-registry`, `<pod>-oidc`, `<pod>-workspace`), the Secrets your `scarab.placement`
-  baseline and profiles name, and `scarab.admissionPolicy.allowSecrets`;
+  `secretRef`, other than the Pod's own per-Pod Secrets (`<pod>-v-secrets`, `<pod>-v-token`,
+  `<pod>-v-registry`, `<pod>-v-oidc`, `<pod>-workspace`, and the names a server before 0.7
+  wrote: `<pod>-secrets`, `<pod>-token`, `<pod>-registry`, `<pod>-oidc`), the Secrets your
+  `scarab.placement` baseline and profiles name, and `scarab.admissionPolicy.allowSecrets`;
 - runs as a ServiceAccount other than `default`, the ServiceAccounts your placement baseline and
   profiles name, and `scarab.admissionPolicy.allowServiceAccounts`;
 - has a `hostPath` volume, `hostNetwork`, `hostPID` or `hostIPC`.
+
+The old names are allowed so that Pods a 0.6 server made still pass during an upgrade. Upgrade the
+chart with the server image: under a 0.6 chart's policy, which lists only the old names, every step
+Pod a 0.7 server makes with one of the `-v-` Secrets is refused, and its step fails.
 
 The policy cannot tell which profile a Pod was placed with, so a Secret or ServiceAccount any
 profile names is allowed on every step Pod. It does not check `privileged` or added capabilities:
@@ -527,6 +562,46 @@ the old count until the release is upgraded.
 The StatefulSet's `serviceName` is unchanged, so upgrading needs no migration.
 
 > **Unverified in this chart version:** per-availability-zone placement.
+
+### Upgrading to 0.7.0
+
+Read the Breaking changes of 0.7.0 in `CHANGELOG.md` first. 0.7 changes how
+logs are stored and how the secret values they are redacted with are kept.
+
+1. Let running Runs finish
+   (`kubectl -n <step namespace> get pods -l scarab.io/run` lists none). A step
+   or shared service that runs across the upgrade stores no log after it: its
+   log gets the note "the rest of this log was not stored: this step was
+   started by an earlier Scarab version, so its secret values are not known".
+2. Keep `strategy.type: Recreate`, the default. Once migration 0099 has run,
+   the database refuses log chunks from a 0.6 server, and a 0.6 server does not
+   start. With `RollingUpdate`, the 0.6 servers still running store no log, and
+   a step one of them launches gets the same note and no log.
+3. Upgrade the chart with the image. A 0.7 server mounts its per-Pod Secrets
+   under the `<pod>-v-…` names, and only the 0.7 admission policy allows them
+   ([The step Pod admission policy](#the-step-pod-admission-policy-scarabadmissionpolicy)).
+
+Migration 0099 adds the log stream and value ledger tables; its checks on
+`log_chunks` are `NOT VALID`, so it scans no stored chunk. Migration 0100
+builds `attempts_started_at_idx` with `CREATE INDEX CONCURRENTLY`, outside a
+transaction. A build that fails leaves an invalid index: drop it
+(`DROP INDEX CONCURRENTLY attempts_started_at_idx;`) and start the server
+again. Forge tokens minted by 0.6 are not revoked after the upgrade (0.7
+revokes only tokens in a value ledger); a GitHub App token expires an hour
+after it was minted. Never drop the `log_chunks_fenced` check on `log_chunks`:
+during a rolling update it stops a 0.6 server that is still running from
+storing output it cannot redact.
+
+To roll back: a 0.6 server does not start on a database that ran 0099 (its
+migrator finds version 99, which it does not know). Let Runs finish and stop
+new ones, scale the server to zero
+(`kubectl -n scarab scale deploy/scarab --replicas=0`), back up the database,
+run
+[`rollback/0099_revert.sql`](../../../crates/scarab-db-postgres/rollback/0099_revert.sql)
+once (`psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0099_revert.sql`; it reverts
+0100 too), then install the 0.6.1 chart. The revert deletes the notes of logs
+stored by 0.7 and every value ledger; output rows stay, and 0.6 reads them as
+before. Upgrading again runs 0099 and 0100 again.
 
 ### Upgrading from 0.4.4 or earlier: step Pods move
 

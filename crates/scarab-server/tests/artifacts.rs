@@ -35,6 +35,28 @@ async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
         .to_vec()
 }
 
+/// The executor stack `main.rs` builds around `backend`, in the same
+/// order: `Forge(SecretInjecting(Ledger(backend)))`, the value ledger in
+/// `logs`.
+fn production_stack(
+    backend: Arc<FakeExecutor>,
+    db: Arc<dyn Db>,
+    logs: &Arc<LogService>,
+) -> Arc<dyn Executor> {
+    let secret_logs = logs.clone();
+    scarab_server::build_executor_stack(
+        backend,
+        logs.clone(),
+        Arc::new(FakeClock::new(1_000)),
+        move |ledger| {
+            SecretInjectingExecutor::new(ledger, db, Arc::new(FakeSecrets::new()), secret_logs)
+        },
+        |with_secrets, ledger_logs| {
+            ForgeCredentialExecutor::new(with_secrets, Arc::new(FakeForge::new()), ledger_logs)
+        },
+    )
+}
+
 #[tokio::test]
 async fn artifacts_are_listed_and_downloadable() {
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
@@ -306,16 +328,7 @@ async fn published_artifacts_are_indexed_through_the_decorated_executor_stack() 
     // The backend that harvests artifacts (the k8s executor's role here).
     let backend = Arc::new(FakeExecutor::new());
     // The decorator chain `main.rs` builds around it, in the same order.
-    let secret_exec: Arc<dyn Executor> = Arc::new(SecretInjectingExecutor::new(
-        backend.clone(),
-        db.clone() as Arc<dyn Db>,
-        Arc::new(FakeSecrets::new()),
-        logs.clone(),
-    ));
-    let exec: Arc<dyn Executor> = Arc::new(ForgeCredentialExecutor::new(
-        secret_exec,
-        Arc::new(FakeForge::new()),
-    ));
+    let exec = production_stack(backend.clone(), db.clone() as Arc<dyn Db>, &logs);
 
     let app = router(
         AppState::new(db.clone(), clock.clone(), logs.clone()).with_artifact_store(store.clone()),
@@ -439,16 +452,7 @@ async fn a_failing_steps_artifacts_are_indexed_and_downloadable() {
     let logs = Arc::new(LogService::new(store.clone(), db.clone()));
 
     let backend = Arc::new(FakeExecutor::new());
-    let secret_exec: Arc<dyn Executor> = Arc::new(SecretInjectingExecutor::new(
-        backend.clone(),
-        db.clone() as Arc<dyn Db>,
-        Arc::new(FakeSecrets::new()),
-        logs.clone(),
-    ));
-    let exec: Arc<dyn Executor> = Arc::new(ForgeCredentialExecutor::new(
-        secret_exec,
-        Arc::new(FakeForge::new()),
-    ));
+    let exec = production_stack(backend.clone(), db.clone() as Arc<dyn Db>, &logs);
 
     let app = router(
         AppState::new(db.clone(), clock.clone(), logs.clone()).with_artifact_store(store.clone()),
@@ -645,16 +649,7 @@ async fn published_artifacts_are_durably_indexed_in_postgres() {
     );
 
     // The production decorator chain, over real Postgres.
-    let secret_exec: Arc<dyn Executor> = Arc::new(SecretInjectingExecutor::new(
-        backend.clone(),
-        pg.clone() as Arc<dyn Db>,
-        Arc::new(FakeSecrets::new()),
-        logs.clone(),
-    ));
-    let exec: Arc<dyn Executor> = Arc::new(ForgeCredentialExecutor::new(
-        secret_exec,
-        Arc::new(FakeForge::new()),
-    ));
+    let exec = production_stack(backend.clone(), pg.clone() as Arc<dyn Db>, &logs);
 
     for _ in 0..4 {
         backend.script_outcome(ExecState::Succeeded);

@@ -472,7 +472,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // pre-ADR-0061 snapshots and drain-less dev.
         None => cold_cas,
     };
-    let logs = Arc::new(LogService::new(store.clone(), db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
     // Secrets store (envelope-encrypted, ADR-0014): built up-front — before the
@@ -492,6 +491,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     // Kept concrete as well: the same KEK envelope seals pending step-up
     // requests and derives the step-up digest key (ADR-0073 §5).
+    // The value ledger seals under the same keys; its rows count toward the
+    // rotation metric below.
+    let ledger_keys = scarab_secrets_postgres::KeySealer::new(master_keys.clone());
+    let mut secrets_under_old_keys = 0;
     let pg_secrets: Arc<scarab_secrets_postgres::PostgresSecrets> = {
         let s =
             scarab_secrets_postgres::PostgresSecrets::connect(&database_url, master_keys).await?;
@@ -512,7 +515,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     sum.unreadable,
                     sum.remaining,
                 );
-                scarab_server::metrics::set_secrets_rows_under_nonactive_key(sum.remaining);
+                secrets_under_old_keys = sum.remaining;
             }
             Err(e) => tracing::warn!(
                 "secrets rewrap sweep failed (boot continues; reads rewrap lazily): {e}"
@@ -520,6 +523,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Arc::new(s)
     };
+    // The log pipeline seals each unit's value ledger under the same master
+    // keys, so every replica opens what any replica sealed (git-bug 2d78464).
+    let logs = Arc::new(
+        LogService::new(store.clone(), db.clone())
+            .with_sealer(pg_secrets.clone() as Arc<dyn scarab_secrets::Sealer>),
+    );
+    // Ledger generations under an old key cannot be rewrapped; they live at
+    // most a day. Remove an old key only once this metric reads 0 on every
+    // replica.
+    match scarab_server::logs::ledger_rows_under_nonactive_key(db.as_ref(), &ledger_keys).await {
+        Ok(n) => {
+            if n > 0 {
+                tracing::info!(
+                    "{n} log value-ledger generations are still sealed under a non-active \
+                     master key; they are purged within a day of their step's end"
+                );
+            }
+            secrets_under_old_keys += n;
+        }
+        Err(e) => tracing::warn!("counting log value ledgers under non-active keys failed: {e}"),
+    }
+    scarab_server::metrics::set_secrets_rows_under_nonactive_key(secrets_under_old_keys);
     let secrets: Arc<dyn scarab_secrets::SecretProvider> = pg_secrets.clone();
 
     // Retention sweeper (ADR-0050): leader-gated, prunes terminal runs' log
@@ -793,6 +818,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // state, reported loudly); the local backend needs nothing but a working
     // host (dev/CLI, ADR-0036).
     let mut driver_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut ledger_sweep_handle: Option<tokio::task::JoinHandle<()>> = None;
     // The driver's health, shared with `/livez` (git-bug afa9f07).
     let mut driver_health: Option<Arc<converged::DriverHealth>> = None;
     if config.role.runs_driver() {
@@ -869,10 +895,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         };
         if let Some(executor) = executor {
-            // Inject env-scoped secrets into deploy-run pods at launch
-            // (ADR-0037).
-            let mut secret_exec =
-                SecretInjectingExecutor::new(executor, db.clone(), secrets.clone(), logs.clone())
+            // The executor stack: Forge(SecretInjecting(Ledger(backend))).
+            // The ledger layer records each launch's mounted values before
+            // the backend writes them (git-bug 2d78464).
+            let oidc = oidc_issuer.clone().zip(config.oidc.clone());
+            let executor: Arc<dyn Executor> = scarab_server::build_executor_stack(
+                executor,
+                logs.clone(),
+                clock.clone(),
+                |ledger| {
+                    // Inject env-scoped secrets into deploy-run pods at launch
+                    // (ADR-0037).
+                    let mut secret_exec = SecretInjectingExecutor::new(
+                        ledger,
+                        db.clone(),
+                        secrets.clone(),
+                        logs.clone(),
+                    )
                     // ADR-0071 §2: re-admit a deploy step at the point its
                     // Environment's credentials would be used.
                     .with_environment_governance(pg.clone())
@@ -883,33 +922,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_policies(pg.clone())
                     // ADR-0080 §3: a recorded approver set compares as ids.
                     .with_identities(pg.clone());
-            // Per-attempt OIDC federation tokens (ADR-0015), tmpfs-delivered.
-            if let (Some(issuer), Some(oidc_cfg)) = (oidc_issuer.clone(), &config.oidc) {
-                secret_exec = secret_exec.with_oidc(
-                    issuer,
-                    oidc_cfg.issuer_url.clone(),
-                    oidc_cfg.audience.clone(),
-                );
-                tracing::info!("per-run OIDC token injection enabled (ADR-0015)");
-            }
-            let executor: Arc<dyn Executor> = Arc::new(secret_exec);
-            // Mint a Step's forge credential at each launch and revoke it
-            // when its Attempt ends (ADR-0076 §9) — in memory only,
-            // delivered as files on tmpfs.
-            let executor: Arc<dyn Executor> = Arc::new(
-                scarab_server::forge_token::ForgeCredentialExecutor::new(executor, forge.clone())
+                    // Per-attempt OIDC federation tokens (ADR-0015),
+                    // tmpfs-delivered.
+                    if let Some((issuer, oidc_cfg)) = oidc {
+                        secret_exec = secret_exec.with_oidc(
+                            issuer,
+                            oidc_cfg.issuer_url.clone(),
+                            oidc_cfg.audience.clone(),
+                        );
+                        tracing::info!("per-run OIDC token injection enabled (ADR-0015)");
+                    }
+                    secret_exec
+                },
+                // Mint a Step's forge credential at each launch and revoke it
+                // when its Attempt ends (ADR-0076 §9), from the unit's ledger.
+                |with_secrets, ledger_logs| {
+                    scarab_server::forge_token::ForgeCredentialExecutor::new(
+                        with_secrets,
+                        forge.clone(),
+                        ledger_logs,
+                    )
                     // A `registry_auth` Step's credential (ADR-0018): scoped
                     // REGISTRY_AUTH secret first, forge-derived credential as
-                    // fallback, each value registered with the log redactor.
+                    // fallback.
                     .with_secrets(secrets.clone())
-                    .with_logs(logs.clone())
                     // A yanked library Step is refused before its forge
                     // credential or registry auth is asked for (ADR-0076 §6).
                     .with_libraries(db.clone(), pg.clone())
                     // So is a deploy Step whose Environment no longer admits
                     // its Project (ADR-0071 §2).
                     .with_environment_governance(db.clone(), pg.clone())
-                    .with_identities(pg.clone()),
+                    .with_identities(pg.clone())
+                },
             );
             // Local host processes finish instantly, so re-poll them quickly; k8s
             // Pods take time, so the default window avoids thundering re-claims.
@@ -951,6 +995,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 health,
             ));
             tracing::info!("converged driver started");
+            // Revoke the forge tokens in due value ledgers and purge them
+            // (git-bug 2d78464): a task of its own under its own lease, so
+            // a forge that does not answer never holds the driver's cycle.
+            ledger_sweep_handle = Some(scarab_server::log_tail::spawn_ledger_sweeper(
+                logs.clone(),
+                forge.clone(),
+                replica_id.clone(),
+                shutdown_signal(),
+            ));
         }
     }
 
@@ -1450,6 +1503,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("shutdown: stopping the converged driver");
         handle.abort();
         let _ = handle.await;
+    }
+    if let Some(handle) = ledger_sweep_handle {
+        // It got the same signal and lets its lease go, so another replica
+        // sweeps without waiting out the TTL.
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
     tracing::info!("shutdown complete");
     // The scheduler driver stopped (git-bug afa9f07): the drain above ran,

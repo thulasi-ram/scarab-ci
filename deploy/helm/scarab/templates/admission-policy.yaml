@@ -24,8 +24,10 @@
   Refused:
     - a Secret volume, a projected Secret source, an env secretKeyRef or an
       envFrom secretRef naming a Secret other than the Pod's own per-Pod
-      Secrets (`<pod>-secrets`, `-token`, `-registry`, `-oidc`, `-workspace`;
-      crates/scarab-executor-k8s) or one the operator placement config
+      Secrets (`<pod>-v-secrets`, `-v-token`, `-v-registry`, `-v-oidc`,
+      `-workspace`, and the names a server before 0.7 wrote: `<pod>-secrets`,
+      `-token`, `-registry`, `-oidc`; crates/scarab-executor-k8s) or one the
+      operator placement config
       (scarab.placement baseline and profiles) or
       scarab.admissionPolicy.allowSecrets names;
     - a serviceAccountName other than `default` (a step Pod sets none) or one
@@ -68,7 +70,7 @@ spec:
   variables:
     - name: ownSecrets
       expression: >-
-        ['secrets', 'token', 'registry', 'oidc', 'workspace'].map(s, object.metadata.name + '-' + s)
+        ['v-secrets', 'v-token', 'v-registry', 'v-oidc', 'workspace', 'secrets', 'token', 'registry', 'oidc'].map(s, object.metadata.name + '-' + s)
     - name: placementSecrets
       expression: {{ $allowed.secrets | toJson | quote }}
     - name: serviceAccounts

@@ -5,7 +5,8 @@
 // tag at the commit it points to when fetched, and the review page shows
 // that commit. Upgrade opens the same dialog with the installed source
 // filled in, and the branch or tag it was fetched at when there was one:
-// fetch again, or change the ref and fetch.
+// fetch again, or change the ref and fetch. A ref where the file is the
+// same moves the installed library to that commit.
 //
 // The Name field starts as `<owner>::<repo>::<file name>`, the name the
 // server gives when none is sent, and follows the File field until someone
@@ -81,7 +82,7 @@ export default function InstallLibraryDialog(props: {
       title={props.upgrade ? `Upgrade lib:${form().name}` : "Install library"}
       purpose={
         props.upgrade
-          ? "Give the branch, tag or commit to upgrade to. The next page shows the diff from the installed version."
+          ? "Give the branch, tag or commit to upgrade to. The next page shows the diff from the installed version, or, when the file is the same there, moves the library to that commit."
           : "Give the file to install. The next page shows it, and nothing is installed until you confirm there."
       }
       onClose={props.onClose}

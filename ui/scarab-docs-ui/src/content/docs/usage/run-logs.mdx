@@ -18,8 +18,11 @@ Open a Run and pick a step. The Logs tab shows the try in view and follows it wh
   numbers count from the first line loaded, not from the start of the log.
 - **Load full log** reads the log again, up to 8 MiB. It shows only when the whole log is 8 MiB or
   less.
-- **Download** saves the whole log of the try as a text file, with the bytes the step wrote. It is
-  in the log toolbar for every try.
+- **Download** saves the whole log of the try as a text file, with the bytes the step wrote and a
+  `[scarab] …` line for each note the server stored with the log (see
+  [Notes in a log](#notes-in-a-log)). It is in the log toolbar for every try.
+- A note the server stored with the log (the log source restarted, part of the log was not
+  stored, the end could not be read) shows as a row of its own, set apart from the step's output.
 - The pane keeps at most 8 MiB. Past that, it drops lines from the top as new output arrives. The
   notice counts those too, and the lines that stay keep their numbers. A log with no line breaks
   has no line to drop: once its last line is over 16 MiB, the pane cuts its start down to 8 MiB, at
@@ -52,7 +55,8 @@ scarab logs <run-id>
 ```
 
 This prints the log of every try of every step of the Run, in step order, and follows the Run until
-it finishes. It prints the whole log, with no 2 MiB cut. It exits 1 when a stored part of the log
+it finishes. It prints the whole log, with no 2 MiB cut. It prints each note the server stored with
+the log on stderr, as `[scarab] <text>`, so stdout holds the step output only. It exits 1 when a stored part of the log
 cannot be read. When the reader of its output goes away, as with `scarab logs <run-id> | head`, it
 stops and exits 0. It reads `SCARAB_SERVER` and `SCARAB_TOKEN` (see [API tokens](/scarab-ci/usage/api-tokens/)).
 
@@ -64,9 +68,9 @@ percent-encoded (see [Step keys](/scarab-ci/get-started/deploy-helm/#step-keys))
 | Call | What it returns |
 |------|-----------------|
 | `GET /v1/runs/{id}/steps/{step}/logs` | one step's log as Server-Sent Events. `?attempt=` picks one try, `?tail=<bytes>` asks for the end of the log only (at most 64 MiB), `?from=<event id>` resumes |
-| `GET /v1/runs/{id}/steps/{step}/logs/raw?attempt=<id>` | one try's whole log as `text/plain`, sent as an attachment. `?sidecar=<index>` reads a sidecar's log for the same try. `attempt` is required |
+| `GET /v1/runs/{id}/steps/{step}/logs/raw?attempt=<id>` | one try's whole log as `text/plain`, sent as an attachment, each note written as a line `[scarab] <text>`. `?markers=none` returns the stored output bytes only. `?sidecar=<index>` reads a sidecar's log for the same try. `attempt` is required |
 | `GET /v1/runs/{id}/services/{service}/logs` | one shared service's log, with the same `?tail=` and `?from=` |
-| `GET /v1/runs/{id}/services/{service}/logs/raw?take=<n>` | one shared service's whole log in Take `n` as `text/plain`, sent as an attachment named `scarab-<run>-<service>-take<n>.log` (a character outside `A-Z`, `a-z`, `0-9`, `_` and `-` becomes `_`). Without `?take=`, the current Take |
+| `GET /v1/runs/{id}/services/{service}/logs/raw?take=<n>` | one shared service's whole log in Take `n` as `text/plain`, sent as an attachment named `scarab-<run>-<service>-take<n>.log` (a character outside `A-Z`, `a-z`, `0-9`, `_` and `-` becomes `_`). Without `?take=`, the current Take. `?markers=none` as above |
 | `GET /v1/runs/{id}/logs` | every step's log, as `scarab logs` reads it. Event ids, no `?tail=` |
 
 Each `data` event carries about 256 KiB of one try's log (at most 256 KiB plus two stored chunks)
@@ -95,59 +99,171 @@ chunk more. It first sends `event: truncated` with `{"skipped_bytes":N,"total_by
 `M` is the stored length when the stream opened. `event: error` means a
 stored part of the log could not be read, and the stream ends after it.
 
-The stream sends each `\r\n` as `\n`. The raw download returns the stored bytes unchanged.
+Each note the server stored with the log is sent as `event: marker`, with an id like a `data`
+event's (the position after it) and data `{"kind":"…","reason":"…","text":"…"}` (`reason` only on
+`not_stored`). A `data` event never spans a note. Clients built before Scarab 0.7 ignore the event.
+
+The stream sends each `\r\n` as `\n`. The raw download returns the stored bytes unchanged, with
+a line `\n[scarab] <text>\n` where each note is; `?markers=none` leaves the notes out. Either way,
+the `X-Scarab-Log-Markers` header says how many notes the log has. A plain text file cannot prove
+that a line is a note: a step can print `[scarab] …` itself. The stream's `marker` events and the
+header can.
 
 ## How the server stores a log
 
 A server replica reads each step's container log while the step runs and stores it in chunks of
 about 256 KiB at most: it stores what it has read once that reaches 256 KiB, 250 ms after the
-first byte of it, and when the read ends. The raw download and the stream fetch up to 16 chunks ahead.
-Before it stores anything, it replaces each of the step's secret values, its registry credential,
-its forge token and its OIDC token with `***`. It redacts the log as one stream, so a value split
-between two chunks of output is still replaced. A step's values redact only that step's log (and
-its sidecars' logs), never another step's.
+first byte of it, and when the read ends. The raw download and the stream fetch up to 16 chunks
+ahead. One replica at a time reads a log: it holds the log's lease, and the database refuses a
+chunk from a replica whose lease another replica took over.
 
-A replica that did not launch the step (after a server roll, for example) reads the step's
-secret values from the step Pod's Secrets before it reads any of the log. When it cannot read
-them while the step runs, it reads no log and tries again later. When the step has ended and the
-replica never read them (the Secrets are deleted when the step's try ends), it stores this line in
-place of the rest of the log, never the output itself:
+### Secret values
 
-```text
-scarab: the rest of this log was not stored: its secret values could not be read
-```
+Before it stores anything, the server replaces each value the step can read with `***`: the
+step's secrets, its registry credential, its forge token and its OIDC token. It redacts the log as
+one stream, so a value split between two chunks of output is still replaced. A step's values
+redact only that step's log (and its sidecars' logs), never another step's.
 
-When a read breaks part way, or the step stops before its log was read in full, the server reads
-the container's log again from the start and compares it with the part already stored:
+The values come from the step's value ledger. Each time Scarab launches a step, before it creates
+the Pod or any Secret, it stores the values that launch hands the step as a new generation of the
+ledger, encrypted with the server's master key, in Postgres. Every replica reads the ledger, so
+the replica that reads a log does not have to be the one that launched the step, and a step
+launched again with a new token is redacted with both tokens. A replica loads every generation or
+none: one that cannot decrypt the ledger (it has a different master key) reads none of that log
+and leaves it to a replica that can. Scarab never reads a value back from a Kubernetes Secret.
 
-- When the log begins with exactly the stored part, the server stores only what follows it.
-- When it does not, because the kubelet rotated the log file, the container restarted, or the
-  step's secret values changed, the server stores this line and then the whole log it read:
+A failure cause or infra message about a step (what the Run page shows when a step fails) is
+redacted with the same values. The server reads the ledger from Postgres each time it stores a
+cause, so a token another replica added after this one last loaded the ledger is redacted too. A
+cause about a step with no ledger is replaced by "the cause was not stored: it may quote secret
+values that could not be checked".
 
-  ```text
-  scarab: the log source restarted; earlier lines may repeat
-  ```
-
-  No output is dropped, and lines stored before the marker may show again after it.
-
-The log can also differ from the stored part where the stored part holds `***`: the replica that
-stored it held a value this one does not (the step was relaunched with a new token), or the step
-printed `***` itself. Storing the log again from the start could store a value in clear, so the
-replica does not. For a step that is still running it stores this line, then the output the step
-prints from then on; what the step printed between the stored part and the line is not stored:
+A Pod that a Scarab server keeps a ledger for carries the label `scarab.io/value-ledger: "1"`, and
+Scarab's per-Pod Secrets for it are named `<pod>-v-secrets`, `<pod>-v-registry`, `<pod>-v-token`
+and `<pod>-v-oidc`. An earlier version writes other names, which such a Pod does not mount. The server reads the log of a labelled Pod only. A Pod without the label was
+started by an earlier Scarab version, and its log gets one note in place of the rest:
 
 ```text
-scarab: earlier output could not be checked; showing output from now on
+[scarab] the rest of this log was not stored: this step was started by an earlier Scarab version, so its secret values are not known
 ```
 
-For a step that has ended it stores this line in place of the rest of the log:
+Someone who can create Pods in the step namespace can create a labelled Pod themselves. Scarab
+does not defend against that: that person can already read the step's Secrets.
 
-```text
-scarab: the rest of this log was withheld: it could not be checked against the part already stored
-```
+### Forge tokens and when a ledger is deleted
 
-Each of these lines comes with a warning in the server log.
+Each ledger generation that holds a minted forge token records when that token was revoked, so
+each token is revoked once:
 
-Output the kubelet rotated away before the server read it is gone; the marker line does not
-recover it. Each of these reads also reads the stored part back from object storage to compare
-it, so a retry on a long log costs one read per stored chunk.
+- A launch that replaces an earlier one (a re-drive) revokes the tokens of older generations,
+  never the one it mounted, so a launch that returns late does not revoke a newer launch's token.
+- When the try ends, the server that sees the end revokes the tokens not revoked yet.
+- A launch whose minted token is in no generation of the ledger revokes that token and fails, so a
+  token is never left live with nothing to revoke it.
+
+The ledger is deleted:
+
+- once every log of the try (the step's and each sidecar's) is stored to its end or closed with a
+  note, and its tokens are revoked;
+- otherwise an hour after the try ends or its Run ends, once its tokens are revoked;
+- at the latest 24.5 hours after its first generation (the longest step timeout, the 30-minute
+  provisioning deadline and an hour), once the try is not running, even while a revocation still
+  fails. Those tokens then expire on their own: a GitHub App token lasts an hour.
+
+One replica retries failed revocations and deletes ledgers: the one that holds the lease
+`ledger-sweep`. It runs every 30 seconds in a task of its own, so a forge that does not answer
+delays no scheduling. It waits at most 20 seconds for one try's revocations, and a revocation that
+fails or times out is tried again after 1 minute, then 2, 4 and so on up to an hour. A log whose
+end was not read when its ledger was deleted gets the `ledger_purged` note.
+
+### Edges of a value
+
+Two edges of a log can cut a value:
+
+- When the server has confirmed that the container ended and the log ends in the first bytes of a
+  value, it stores `***` for them.
+- After a `source_restarted` note (below), when the new part starts inside a value, the server
+  stores `***` for the value's last bytes if there are 8 or more of them. Fewer than 8 bytes of a
+  value's end can be stored there. This needs a line over 16 KiB with the value across the
+  kubelet's split point and a log rotation between the two halves.
+
+### When a read ends
+
+A followed read can end while the container still runs (a kubelet restart, a dropped connection
+between the API server and the kubelet). So when a read ends, the server asks Kubernetes about the
+container for up to 10 seconds. The log is complete only once the container has ended at about the
+time the read ended. Otherwise the server keeps what it stored, drops the bytes it held back, and
+reads again.
+
+A followed read that gets no byte for 5 minutes fails and is opened again. A node or a load
+balancer can drop a connection without telling either end, and the Kubernetes client Scarab uses
+(kube 4.0) has no TCP keepalive setting, so without this read timeout the live log would stop until
+the step ended. A step that prints nothing for 5 minutes is read again from the start each time;
+when the log begins with the stored part, nothing new is stored and no note is added.
+
+A sidecar or shared service whose container ended and waits to restart (for example in
+`CrashLoopBackOff`) is read again after 3 seconds, then 6, 12 and so on up to 60 seconds. A new
+container that already runs is read at once.
+
+A read that breaks part way, or a later read, reads the container's log again from the start and
+compares it with the part already stored, by a SHA-256 digest of each stored chunk:
+
+- When the log begins with the stored part, the server stores only what follows it.
+- When it does not, because the kubelet rotated the log file, a sidecar or service container
+  restarted, or the step was launched again with a new secret value, the server stores a note and
+  then the whole log it read. Lines stored before the note may show again after it.
+
+### Notes in a log
+
+A note is a row of the log's index, written by the server; a step cannot write one by printing
+text. These are the notes:
+
+| Note (`kind`) | Text |
+|---|---|
+| `source_restarted` | the log source restarted; lines before this point may be missing or repeat |
+| `not_stored` (`no_ledger`) | the rest of this log was not stored: this step was started by an earlier Scarab version, so its secret values are not known |
+| `not_stored` (`ledger_purged`) | the rest of this log was not stored: its secret values were removed before it could be read |
+| `incomplete` | the end of this log could not be read |
+
+`not_stored` covers the rest of the log, and the server stores none of the step's output after it:
+
+- `no_ledger`: the step has no value ledger, or its Pod has no `scarab.io/value-ledger` label. An
+  earlier Scarab version started it, for example a step that ran across the upgrade to 0.7. A step
+  of an earlier version whose Pod is gone when the server reads its end gets this note if it
+  started, and no note if it never started.
+- `ledger_purged`: the step's ledger was deleted before its log was read to the end (see
+  [above](#forge-tokens-and-when-a-ledger-is-deleted)).
+
+`incomplete` is written when the step's Pod is gone before the end of its log was read, or when
+the server could not read the end of the log within 30 minutes after the step ended. A step
+cancelled before it started gets no note. Output the kubelet rotated away before the server read
+it is gone; a note does not recover it. When that happens before the server's first read of the
+log, the log starts at the oldest byte the kubelet kept, with no note: the kubelet's log API does
+not say that an earlier file was deleted.
+
+Logs stored by Scarab 0.6 and earlier keep their notes as they were stored, as output lines that
+start with `scarab:`.
+
+## Upgrading from Scarab 0.6
+
+Read [Upgrading to Scarab 0.7](/scarab-ci/get-started/deploy-helm/#upgrading-to-scarab-07) first.
+For logs, the upgrade means:
+
+- Let running Runs finish before you upgrade. A step or shared service that runs across the
+  upgrade was started without a value ledger, so the new server stores none of its output after
+  the upgrade: its log gets the `no_ledger` note after the part the old server stored, and a
+  failure cause about it reads "the cause was not stored".
+- Once migration 0099 has run, the database refuses log chunks from a 0.6 server. With the chart's
+  default `strategy.type: Recreate` no 0.6 server runs by then. With `RollingUpdate`, the 0.6
+  servers still running store no log, and a step one of them launches gets the `no_ledger` note and
+  nothing else.
+- Never drop the `log_chunks_fenced` check on `log_chunks`. It is what stops a 0.6 server that is
+  still running during a rolling update from storing output it cannot redact.
+- Forge tokens minted by 0.6 are in no ledger, so 0.7 does not revoke them; they expire on their
+  own.
+- A 0.6 server does not start on the migrated database. To go back, see
+  [Rolling back to Scarab 0.6](/scarab-ci/get-started/deploy-helm/#rolling-back-to-scarab-06): the
+  revert deletes the notes of logs stored by 0.7 and every value ledger, and the output stays
+  readable.
+- Every replica must use the same master keys (see
+  [Master keys and value ledgers](/scarab-ci/get-started/deploy-helm/#master-keys-and-value-ledgers)).

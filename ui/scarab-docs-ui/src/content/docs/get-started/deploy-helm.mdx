@@ -376,12 +376,17 @@ namespace modes: `<release namespace>-steps`, and `scarab.namespace` set to the 
 It refuses a Pod that:
 
 - names a Secret in a Secret volume, a projected volume, an env `secretKeyRef` or an `envFrom`
-  `secretRef`, other than the Pod's own per-Pod Secrets (`<pod>-secrets`, `<pod>-token`,
-  `<pod>-registry`, `<pod>-oidc`, `<pod>-workspace`), the Secrets your `scarab.placement`
-  baseline and profiles name, and `scarab.admissionPolicy.allowSecrets`;
+  `secretRef`, other than the Pod's own per-Pod Secrets (`<pod>-v-secrets`, `<pod>-v-token`,
+  `<pod>-v-registry`, `<pod>-v-oidc`, `<pod>-workspace`, and the names a server before 0.7
+  wrote: `<pod>-secrets`, `<pod>-token`, `<pod>-registry`, `<pod>-oidc`), the Secrets your
+  `scarab.placement` baseline and profiles name, and `scarab.admissionPolicy.allowSecrets`;
 - runs as a ServiceAccount other than `default`, the ServiceAccounts your placement baseline and
   profiles name, and `scarab.admissionPolicy.allowServiceAccounts`;
 - has a `hostPath` volume, `hostNetwork`, `hostPID` or `hostIPC`.
+
+The old names are allowed so that Pods a 0.6 server made still pass during an upgrade. Upgrade the
+chart with the server image: under a 0.6 chart's policy, which lists only the old names, every step
+Pod a 0.7 server makes with one of the `-v-` Secrets is refused, and its step fails.
 
 The policy cannot tell which profile a Pod was placed with, so a Secret or ServiceAccount any
 profile names is allowed on every step Pod. It does not check `privileged` or added capabilities:
@@ -474,11 +479,42 @@ on your install, such as a slow Kubernetes API or a large batch of forge statuse
 than a minute: the warning names the part that was stopped.
 
 Calls to the Kubernetes API wait at most 30 seconds for a response before they fail, and calls to
-a forge (GitHub, Forgejo) at most 30 seconds in all; log tails and `exec` sessions have no limit.
+a forge (GitHub, Forgejo) at most 30 seconds in all. A followed log read fails after 5 minutes
+with no byte and is opened again ([Run logs](/scarab-ci/usage/run-logs/#when-a-read-ends));
+`exec` sessions have no limit.
 
 A `values.yaml` that sets the whole `livenessProbe.httpGet` keeps its own path; point it at
 `/livez` to get this check. When it is `/healthz`, `helm install` and `helm upgrade` print a
 warning.
+
+### Master keys and value ledgers
+
+Every replica must use the same master keys. `SCARAB_MASTER_KEYS` is a comma-separated list of
+base64 32-byte keys: the first encrypts, the rest only decrypt (`SCARAB_MASTER_KEY` sets one key).
+Scarab encrypts stored secrets with them, and each step's value ledger: the secret values a launch
+hands the step, which the server redacts the step's log with
+([Run logs](/scarab-ci/usage/run-logs/#secret-values)). A replica that cannot decrypt a step's
+ledger stores none of that step's log and leaves it to a replica that can.
+
+To rotate a key:
+
+1. Add the new key after the active one on every replica, and roll them out.
+2. Move the new key to the front on every replica, and roll them out. At boot each replica
+   rewraps the stored secrets under the active key. A ledger generation cannot be rewrapped (its
+   encryption is bound to its step and generation), so it stays under the key it was sealed with
+   until the ledger is deleted.
+3. Remove the old key only when `scarab_secrets_rows_under_nonactive_key` reads 0 on every
+   replica. The metric counts the stored secrets and the ledger generations still under a key
+   that is not the active one, as of the replica's boot, so restart the replicas to read it again.
+   It reaches 0 at most 24.5 hours after the key stopped being active, the longest a ledger lives.
+   Removing the key earlier stops the logs of running steps from being stored, and a re-drive of
+   such a step fails.
+
+One replica revokes forge tokens and deletes ledgers: the one that holds the lease
+`ledger-sweep`, every 30 seconds, in a task of its own beside the scheduler. It waits at most 20
+seconds for one step's revocations; a failed revocation is tried again after 1 minute, doubling to
+an hour, and a ledger is deleted anyway 24.5 hours after its first generation once its step is not
+running. A forge that does not answer delays no scheduling.
 
 ### Plugins
 
@@ -762,6 +798,90 @@ In a cluster, run it in the server Pod, which has the database URL:
 ```sh
 kubectl exec -n scarab deploy/scarab -c scarab-server -- \
   scarab-server admin grant --org acme --subject github:alice --role member
+```
+
+## Upgrading to Scarab 0.7
+
+0.7 changes how the server stores logs and keeps the secret values it redacts them with
+([Run logs](/scarab-ci/usage/run-logs/#how-the-server-stores-a-log)). Read the Breaking changes of
+0.7.0 in `CHANGELOG.md` too. Then:
+
+1. **Let running Runs finish.** A step or shared service that runs across the upgrade stores no
+   log after it: its log gets the note "the rest of this log was not stored: this step was started
+   by an earlier Scarab version, so its secret values are not known". When no step runs,
+   `kubectl -n <step namespace> get pods -l scarab.io/run` lists no Pod.
+2. **Keep `strategy.type: Recreate`**, the chart's default. Once migration 0099 has run, the
+   database refuses log chunks from a 0.6 server, and a 0.6 server does not start. With
+   `RollingUpdate`, the 0.6 servers still running store no log, and a step one of them launches
+   gets the same note and no log.
+3. **Upgrade the chart and the image together** (`helm upgrade --version 0.7.0`). A 0.7 server
+   mounts its per-Pod Secrets under the `<pod>-v-…` names, and only the 0.7 chart's admission
+   policy allows them ([above](#the-step-pod-admission-policy)).
+
+The server runs two migrations before it listens. 0099 adds the log stream and value ledger
+tables; its checks on `log_chunks` are `NOT VALID`, so it scans no stored chunk. 0100 builds the
+index `attempts_started_at_idx` with `CREATE INDEX CONCURRENTLY`, outside a transaction, so writes
+to `attempts` go on while it builds. A build that fails or is stopped leaves an invalid index
+behind, and the next server to start drops it and builds it again before it listens.
+
+After the upgrade:
+
+- Forge tokens minted by 0.6 for steps that ran across the upgrade are not revoked: 0.7 revokes
+  only tokens it finds in a value ledger. A GitHub App token expires an hour after it was minted.
+- Never drop the `log_chunks_fenced` check on `log_chunks`. During a rolling update it is what
+  stops a 0.6 server that is still running from storing output it cannot redact.
+- Every replica must use the same master keys ([above](#master-keys-and-value-ledgers)).
+
+### Rolling back to Scarab 0.6
+
+A 0.6 server does not start on a database that ran migration 0099: its migrator finds version 99,
+which it does not know, and stops. To go back:
+
+1. Let Runs finish and stop new ones.
+2. Scale the server to zero, so no 0.7 server runs while the revert runs or after it:
+   `kubectl -n scarab scale deploy/scarab --replicas=0`.
+3. Back up the database.
+4. Run the revert below once. It is `crates/scarab-db-postgres/rollback/0099_revert.sql` in the
+   repository, and it reverts migration 0100 too:
+   `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0099_revert.sql`.
+5. Install the 0.6 chart and image:
+   `helm upgrade scarab oci://ghcr.io/thulasi-ram/charts/scarab --version 0.6.1 -n scarab -f values.yaml`.
+
+The revert deletes the notes of logs stored by 0.7 and every value ledger. Output rows stay, and
+0.6 reads them as before. Upgrading to 0.7 again runs 0099 and 0100 again.
+
+```sql
+BEGIN;
+
+DELETE FROM log_chunks WHERE kind <> 'output';
+
+DROP FUNCTION IF EXISTS scarab_append_log_row(
+  TEXT, TEXT, TEXT, TEXT, TEXT, BIGINT, TEXT, TEXT, TEXT, BIGINT, BYTEA, BIGINT, TEXT, BIGINT);
+
+DROP TABLE IF EXISTS log_unit_values;
+DROP TABLE IF EXISTS log_units;
+DROP TABLE IF EXISTS log_streams;
+DROP TABLE IF EXISTS log_legacy_units;
+DROP TABLE IF EXISTS log_store_epoch;
+DROP TABLE IF EXISTS log_prune_pending;
+
+ALTER TABLE log_chunks
+  DROP CONSTRAINT IF EXISTS log_chunks_kind,
+  DROP CONSTRAINT IF EXISTS log_chunks_reason,
+  DROP CONSTRAINT IF EXISTS log_chunks_body,
+  DROP CONSTRAINT IF EXISTS log_chunks_fenced,
+  DROP COLUMN IF EXISTS kind,
+  DROP COLUMN IF EXISTS reason,
+  DROP COLUMN IF EXISTS writer_term,
+  DROP COLUMN IF EXISTS values_gen,
+  DROP COLUMN IF EXISTS digest,
+  ALTER COLUMN object_key SET NOT NULL;
+
+DROP INDEX IF EXISTS attempts_started_at_idx;
+
+DELETE FROM _sqlx_migrations WHERE version IN (99, 100);
+
+COMMIT;
 ```
 
 ## The chart on a local kind cluster

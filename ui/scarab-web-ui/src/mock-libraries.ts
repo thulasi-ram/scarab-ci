@@ -15,6 +15,12 @@
 //   /orgs/acme/settings/libraries/review?source=…&ref=…&stored=elsewhere
 //                                                content stored before from
 //                                                another fetch, under `main`
+//   /orgs/acme/settings/libraries/review?source=…&ref=…&same=moved
+//                                                deploy-helm's installed file,
+//                                                the same at a new commit
+//   /orgs/acme/settings/libraries/review?source=…&same=installed
+//                                                deploy-helm at the ref and
+//                                                commit installed
 //   /acme/edge-gateway/runs/<PLUGIN>?gate=pass | exp | kill
 //   /acme/orders-api/run                         the compile errors (pick release)
 //   /acme/orders-api?status=refused              refused rows
@@ -55,6 +61,8 @@ const KANIKO_YANK = {
   yanked_at: ago(2 * 3_600_000),
 };
 const HELM_NEW_SRC = "github.com/acme/scarab-libs//deploy-helm.yaml@d41f07b29c3e8a6f5b1d0c9e7a2f4b8c6d3e1a90";
+/** deploy-helm's installed file, the same at a later commit. */
+const HELM_MOVED_SRC = "github.com/acme/scarab-libs//deploy-helm.yaml@1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b";
 const YANK_REASON =
   "scarab-clone 0.4.0 writes the forge token to the log when a fetch fails; upgrade to b4d0f2a8c6e3 (v0.4.1)";
 
@@ -90,11 +98,9 @@ const fullLibraries: S["OrgLibrariesDto"] = {
       id: "e4a61b8c39",
       name: "acme::scarab-libs::git-tag",
       content_hash: h("6a0d3e9f2b17"),
-      source: "github.com/acme/scarab-libs//git-tag.yaml@51c3b8e0f2a4d6c8e0b2a4c6e8f0a2b4c6d8e0f2",
-      // Fetched again under `main` after it moved; the file did not change,
-      // so the source keeps the first fetch's commit.
+      // Moved to `main` after the branch moved; the file did not change.
+      source: "github.com/acme/scarab-libs//git-tag.yaml@7d3e9a1c5b8f2e4a6c0d9b3f5e7a1c2d4b6f8e0a",
       requested_ref: "main",
-      resolved_commit: "7d3e9a1c5b8f2e4a6c0d9b3f5e7a1c2d4b6f8e0a",
       installed_at: ago(3 * day),
     }),
     installation({
@@ -241,19 +247,43 @@ function lineDiff(a: string, b: string): string {
 const carriedGrants = (): S["TrustGrantDto"][] =>
   page().get("grants") === "carry" ? ["build_sandbox", "forge_credentials", "registry_credential"] : [];
 
+/** deploy-helm as installed. */
+const HELM_CURRENT = { content_hash: HELM, source: HELM_SRC, requested_ref: "v1.1.0", resolved_commit: commitOf(HELM_SRC) };
+
 /** Every fetch answers an upgrade of deploy-helm, at the ref it asked for
- *  (none when the source named a commit). */
-const fetchedUpgrade = (ref: string | null): S["FetchedLibraryDto"] => ({
-  name: "acme::scarab-libs::deploy-helm",
-  content_hash: HELM_NEW,
-  source: HELM_NEW_SRC,
-  requested_ref: ref,
-  resolved_commit: commitOf(HELM_NEW_SRC),
-  content: NEW,
-  current: { content_hash: HELM, source: HELM_SRC, requested_ref: "v1.1.0", resolved_commit: commitOf(HELM_SRC) },
-  diff: lineDiff(OLD, NEW),
-  carried_grants: carriedGrants(),
-});
+ *  (none when the source named a commit). With `?same=moved` it answers the
+ *  installed file at a new commit, and with `?same=installed` the installed
+ *  file at the installed ref and commit. */
+const fetchedUpgrade = (ref: string | null): S["FetchedLibraryDto"] => {
+  const same = page().get("same");
+  if (same === "moved" || same === "installed") {
+    const source = same === "moved" ? HELM_MOVED_SRC : HELM_SRC;
+    return {
+      name: "acme::scarab-libs::deploy-helm",
+      content_hash: HELM,
+      source,
+      requested_ref: same === "moved" ? ref : HELM_CURRENT.requested_ref,
+      resolved_commit: commitOf(source),
+      content: OLD,
+      current: HELM_CURRENT,
+      diff: lineDiff(OLD, OLD),
+      content_unchanged: true,
+      carried_grants: carriedGrants(),
+    };
+  }
+  return {
+    name: "acme::scarab-libs::deploy-helm",
+    content_hash: HELM_NEW,
+    source: HELM_NEW_SRC,
+    requested_ref: ref,
+    resolved_commit: commitOf(HELM_NEW_SRC),
+    content: NEW,
+    current: HELM_CURRENT,
+    diff: lineDiff(OLD, NEW),
+    content_unchanged: false,
+    carried_grants: carriedGrants(),
+  };
+};
 
 // ── Runs ──────────────────────────────────────────────────────────────────
 const lib = (name: string, hash: string, source: string, yanked = false): S["OriginLinkDto"] => ({ kind: "library", name, content_hash: hash, source, yanked });
@@ -480,7 +510,13 @@ export function libraryRoute(
   }
   if (/^\/v1\/orgs\/[^/]+\/library-installations$/.test(p) && method === "POST") {
     // Install echoes the reviewed version as installed now. Nothing is kept.
-    const req = JSON.parse(body || "{}") as { name?: string; content_hash?: string; carry_grants?: string[] };
+    const req = JSON.parse(body || "{}") as {
+      name?: string;
+      content_hash?: string;
+      carry_grants?: string[];
+      requested_ref?: string | null;
+      resolved_commit?: string;
+    };
     // As the server: the install names exactly the carried grants.
     const carried = carriedGrants();
     const acked = [...new Set(req.carry_grants ?? [])].sort();
@@ -492,14 +528,22 @@ export function libraryRoute(
     }
     const name = req.name ?? "acme::scarab-libs::deploy-helm";
     const was = fullLibraries.installations.find((l) => l.name === name);
+    const src = req.content_hash === HELM_NEW ? HELM_NEW_SRC : (was?.source ?? HELM_NEW_SRC);
+    // As the server: the install records the reviewed ref and commit, and
+    // its source is the file pinned to that commit.
+    const commit = req.resolved_commit ?? commitOf(src);
     return json(
       installation({
         id: was?.id ?? "0a6f2d9e41",
         name,
         content_hash: req.content_hash ?? HELM_NEW,
-        source: req.content_hash === HELM_NEW ? HELM_NEW_SRC : (was?.source ?? HELM_NEW_SRC),
-        requested_ref: req.content_hash === HELM_NEW ? "v1.2.0" : (was?.requested_ref ?? null),
-        resolved_commit: commitOf(req.content_hash === HELM_NEW ? HELM_NEW_SRC : (was?.source ?? HELM_NEW_SRC)),
+        source: `${src.slice(0, src.lastIndexOf("@"))}@${commit}`,
+        requested_ref: req.resolved_commit
+          ? (req.requested_ref ?? null)
+          : req.content_hash === HELM_NEW
+            ? "v1.2.0"
+            : (was?.requested_ref ?? null),
+        resolved_commit: commit,
         installed_at: now,
       }),
     );

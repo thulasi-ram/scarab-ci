@@ -52,6 +52,7 @@ import { heldBeforeStart } from "../events";
 import { failureBox, notLatestNote, statusWord, stepName, tryStatusWords } from "../run-page";
 import { levelOf, logBodyState } from "../logs";
 import {
+  addMarker,
   appendLog,
   DEFAULT_TAIL_BYTES,
   emptyLogBuffer,
@@ -75,7 +76,7 @@ import Icon from "./Icon";
 import AttemptsDropdown, { type FilmstripTry } from "./AttemptsDropdown";
 import TryTabs from "./TryTabs";
 import Pill from "./Pill";
-import { LogError, LogLoading, LogSkeleton } from "./LogStates";
+import { LogError, LogLoading, LogMarkerRow, LogSkeleton } from "./LogStates";
 
 export type PaneTab = "logs" | "results" | "outputs" | "workspace" | "source" | "gate";
 
@@ -513,6 +514,7 @@ export default function StepPane(props: {
           ),
         onChunk: (t) => updateBuffer(key, (b) => appendLog(b, t)),
         onTruncated: (t) => updateBuffer(key, (b) => truncateLog(b, t)),
+        onMarker: (m) => updateBuffer(key, (b) => addMarker(b, m)),
         onStoring: (on, waitOver) => setStoringKey(key, waitOver ? "wait_over" : on ? "storing" : null),
         onEnd: () => setEndedKey(key, true),
         onReopen: () => {
@@ -541,6 +543,7 @@ export default function StepPane(props: {
     const key = logKey(s, a.id, container());
     return logBodyState({
       text: buffers()[key]?.text,
+      markers: buffers()[key]?.markers.length,
       ended: !!ended()[key],
       outcome: a.outcome,
       loaded: !!loadedLogs()[key],
@@ -555,7 +558,7 @@ export default function StepPane(props: {
   };
   const logRows = () => {
     const b = logBuffer();
-    return b ? tailRows(b, MAX_LINES).map((r) => ({ ...r, lvl: levelOf(r.line) })) : [];
+    return b ? tailRows(b, MAX_LINES).map((r) => ({ ...r, lvl: r.marker ? "" : levelOf(r.line) })) : [];
   };
   // "Showing the last 2.0 MiB of 14.3 MiB. Line numbers start here." when
   // part of the log is not shown; "so far" while more may be stored, and
@@ -972,10 +975,17 @@ export default function StepPane(props: {
                       }
                     >
                       {(r) => (
-                        <div class={`lgrow ${r().lvl}`}>
-                          <span class="lgln">{r().n}</span>
-                          <span class="lgtx">{r().line}</span>
-                        </div>
+                        <Show
+                          when={r().marker}
+                          fallback={
+                            <div class={`lgrow ${r().lvl}`}>
+                              <span class="lgln">{r().n}</span>
+                              <span class="lgtx">{r().line}</span>
+                            </div>
+                          }
+                        >
+                          {(m) => <LogMarkerRow text={m().text} />}
+                        </Show>
                       )}
                     </Index>
                   </div>

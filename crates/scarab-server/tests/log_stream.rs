@@ -785,6 +785,84 @@ async fn a_held_back_chunk_waits_two_polls_after_whole_chunks_were_sent() {
     );
 }
 
+/// REV-m11: a running attempt's newest chunk ends inside a character and
+/// is held back; a marker is stored after it. The held bytes go out before
+/// the marker, with the cut character as U+FFFD, never dropped. Kills: the
+/// hold cleared when a marker comes next without sending what it held.
+#[tokio::test(start_paused = true)]
+async fn held_bytes_before_a_marker_are_sent_with_a_replacement_character() {
+    let (db, logs) = live_store(
+        Some(RunStatus::Running),
+        &[(
+            "a1",
+            AttemptOutcome::Running,
+            vec![b"hello\n".to_vec(), vec![b'x', 0xE2, 0x82]],
+        )],
+    )
+    .await;
+    let mut s = open_live(&db, &logs, Start::Full).await;
+    assert_eq!(
+        opening(&mut s).await,
+        [Item::Data {
+            id: "a1:1".into(),
+            text: "hello\n".into(),
+        }]
+    );
+    assert_eq!(
+        s.next(true).await.unwrap(),
+        Some(Item::Keepalive),
+        "held on the first poll"
+    );
+    // The tail stores a marker: the rest of the character never comes.
+    let stream = scarab_engine::LogStreamId::new(
+        &RunId("r1".into()),
+        &StepId("build".into()),
+        &AttemptId("a1".into()),
+    );
+    let resource = scarab_engine::LogLease::Tail.resource(&stream);
+    let lease = db.lease(&resource, "w", 1).await.unwrap();
+    let writer = scarab_engine::LogWriter::holding(
+        scarab_engine::LogLease::Tail,
+        &lease.held_by(&resource, "w").unwrap(),
+    );
+    logs.append_marker(
+        &stream,
+        scarab_engine::LogRowKind::SourceRestarted,
+        None,
+        &writer,
+        None,
+        Timestamp(1),
+    )
+    .await
+    .unwrap();
+    let mut items = Vec::new();
+    while items.len() < 2 {
+        match s.next(true).await.unwrap() {
+            Some(Item::Keepalive) => {}
+            Some(item) => items.push(item),
+            None => panic!("the stream ended"),
+        }
+    }
+    assert_eq!(
+        items[0],
+        Item::Data {
+            id: "a1:2".into(),
+            text: "x\u{FFFD}".into(),
+        }
+    );
+    assert!(
+        matches!(
+            &items[1],
+            Item::Marker {
+                kind: scarab_engine::LogRowKind::SourceRestarted,
+                ..
+            }
+        ),
+        "{:?}",
+        items[1]
+    );
+}
+
 /// A finished attempt is not held back while the Run goes on: its last chunk,
 /// cut inside a character, is sent on the first pass.
 #[tokio::test(start_paused = true)]
@@ -910,7 +988,7 @@ async fn a_stream_does_not_end_while_the_log_is_still_being_stored() {
     let step = StepId("build".into());
     let attempt = AttemptId("a1".into());
     let resource = scarab_server::log_tail::tail_lease_resource(&run, &step, &attempt);
-    assert_eq!(resource, "tail:r1:build:a1");
+    assert_eq!(resource, "tail2:r1:build:a1");
     db.lease(&resource, "replica-a", 45_000).await.unwrap();
 
     // The route opens a settled run's stream as a replay (`live` false).
@@ -1033,4 +1111,167 @@ async fn a_running_attempt_with_a_live_tail_lease_is_not_storing() {
     for _ in 0..3 {
         assert_eq!(s.next(true).await.unwrap(), Some(Item::Keepalive));
     }
+}
+
+/// A settled run whose `build`/`a1` log is `one\r`, a `source_restarted`
+/// marker, `\nmore\n`, then an `incomplete` marker closing it.
+async fn app_with_markers() -> (axum::Router, Arc<InMemoryDb>) {
+    let db = Arc::new(InMemoryDb::new());
+    let run = RunId("r1".into());
+    let step = StepId("build".into());
+    let attempt = AttemptId("a1".into());
+    db.seed_run(&run, RunStatus::Succeeded);
+    db.create_step_run(&run, &step, None, &[], Timestamp(0))
+        .await
+        .unwrap();
+    db.record_attempt(
+        &run,
+        &step,
+        &Attempt {
+            id: attempt.clone(),
+            started_at: Timestamp(10),
+            failure: None,
+            failure_detail: None,
+            outcome: AttemptOutcome::Succeeded,
+        },
+    )
+    .await
+    .unwrap();
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let stream = scarab_engine::LogStreamId::new(&run, &step, &attempt);
+    // The stream's tail lease, expired at once: its term still fences the
+    // appends below (nobody took it over), and a reader does not take it
+    // for a log still being stored.
+    let resource = scarab_engine::LogLease::Tail.resource(&stream);
+    let lease = db.lease(&resource, "w", 1).await.unwrap();
+    let writer = scarab_engine::LogWriter::holding(
+        scarab_engine::LogLease::Tail,
+        &lease.held_by(&resource, "w").unwrap(),
+    );
+    logs.append(&run, &step, &attempt, b"one\r").await.unwrap();
+    logs.append_marker(
+        &stream,
+        scarab_engine::LogRowKind::SourceRestarted,
+        None,
+        &writer,
+        None,
+        Timestamp(1),
+    )
+    .await
+    .unwrap();
+    logs.append(&run, &step, &attempt, b"\nmore\n")
+        .await
+        .unwrap();
+    logs.append_marker(
+        &stream,
+        scarab_engine::LogRowKind::Incomplete,
+        None,
+        &writer,
+        Some(scarab_engine::LogStreamState::Closed),
+        Timestamp(2),
+    )
+    .await
+    .unwrap();
+    (
+        router(AppState::new(
+            db.clone(),
+            Arc::new(FakeClock::new(1_000)),
+            logs,
+        )),
+        db,
+    )
+}
+
+/// 3.2/3.4: a marker row is its own `event: marker` with the next cursor
+/// id; a resume from the marker's id sends only what follows; the `\n`
+/// after a marker is not taken as the end of the `\r\n` before it. The raw
+/// download writes `[scarab] <text>` lines and counts the markers. Kills: a
+/// NULL `object_key` panic; markers sent as output; the `\r\n` join across
+/// a marker.
+#[tokio::test]
+async fn resume_after_a_marker_and_raw_download_with_markers() {
+    let (app, _db) = app_with_markers().await;
+    let (status, body) = get(&app, "/v1/runs/r1/steps/build/logs", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let evs = events(&body);
+    let kinds: Vec<_> = evs
+        .iter()
+        .map(|e| e.event.clone().unwrap_or_default())
+        .collect();
+    assert_eq!(kinds, ["", "marker", "", "marker"], "{evs:?}");
+    let marker: serde_json::Value = serde_json::from_str(&evs[1].data).unwrap();
+    assert_eq!(marker["kind"], "source_restarted");
+    assert!(marker["text"].as_str().unwrap().contains("restarted"));
+    assert_eq!(evs[1].id.as_deref(), Some("a1:2"));
+    // `\r` then, after the marker, a `\n` that starts a line of its own.
+    assert_eq!(evs[2].data, "\nmore\n");
+    // Resume from the marker's id: the rest only.
+    let (_, rest) = get(&app, "/v1/runs/r1/steps/build/logs?from=a1:2", None).await;
+    let rest = events(&rest);
+    assert_eq!(rest.len(), 2, "{rest:?}");
+    assert_eq!(rest[1].event.as_deref(), Some("marker"));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/runs/r1/steps/build/logs/raw?attempt=a1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers()
+            .get("x-scarab-log-markers")
+            .map(|v| v.to_str().unwrap()),
+        Some("2")
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(bytes.to_vec()).unwrap(),
+        "one\r\n[scarab] the log source restarted; lines before this point may be missing or \
+         repeat\n\nmore\n\n[scarab] the end of this log could not be read\n"
+    );
+}
+
+/// Q2 = C: `?markers=none` returns the stored output bytes exactly, and
+/// still counts the markers in the header; another value is a 400. Kills:
+/// marker lines in `?markers=none`.
+#[tokio::test]
+async fn raw_download_without_markers_is_byte_exact() {
+    let (app, _db) = app_with_markers().await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/runs/r1/steps/build/logs/raw?attempt=a1&markers=none")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("x-scarab-log-markers")
+            .map(|v| v.to_str().unwrap()),
+        Some("2")
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"one\r\nmore\n");
+    let (status, _) = get(
+        &app,
+        "/v1/runs/r1/steps/build/logs/raw?attempt=a1&markers=all",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }

@@ -914,7 +914,27 @@ const testLogLines = [
 // `data` event carrying an id `<attempt>:<next chunk>` to resume after, the
 // end of the log from the chunk that holds the `?tail=`-th byte from the end
 // with a `truncated` event first, and the whole log at
-// `…/logs/raw` (a step try's or a shared service's).
+// `…/logs/raw` (a step try's or a shared service's). A part of a log can be
+// the server's note about it instead of output: a `marker` event with an id
+// like a chunk's, and a `[scarab] <text>` line in the raw log.
+
+/** One stored part of a mock log: raw output, or the server's note. */
+type MockLogPart = string | { marker: { kind: string; reason?: string; text: string } };
+
+/** The rich run's `test` step: its log source restarted part way through, so
+ * a note sits between the two parts of its log. */
+function restartedTestLog(): MockLogPart[] {
+  return [
+    testLogLines.slice(0, 7).join("\n") + "\n",
+    {
+      marker: {
+        kind: "source_restarted",
+        text: "the log source restarted; lines before this point may be missing or repeat",
+      },
+    },
+    testLogLines.slice(7).join("\n") + "\n",
+  ];
+}
 
 /** The matrix cell whose `tofu plan` printed a large log (about 5.5 MiB): the
  * pane shows its last 2 MiB and offers Load full log and Download. */
@@ -974,9 +994,9 @@ function bigServiceLog(): string[] {
   return out;
 }
 
-/** The stored chunks of the log a step or service stream reads, or null when
+/** The stored parts of the log a step or service stream reads, or null when
  * it has none (a Pod that never started printed nothing). */
-function mockLogChunks(url: string): string[] | null {
+function mockLogChunks(url: string): MockLogPart[] | null {
   let u: URL;
   try {
     u = new URL(url, window.location.origin);
@@ -988,6 +1008,9 @@ function mockLogChunks(url: string): string[] | null {
   if (step) {
     if (unscheduledTry(url)) return null;
     if (step[1] === MATRIX_RUN_ID && mockStepId(step[2]!) === BIG_LOG_STEP) return bigLog();
+    if (step[1] === RICH_RUN_ID && mockStepId(step[2]!) === "test" && !u.searchParams.has("sidecar")) {
+      return restartedTestLog();
+    }
     return [testLogLines.join("\n") + "\n"];
   }
   const service = path.match(/^\/v1\/runs\/([^/]+)\/services\/([^/]+)\/logs$/);
@@ -1000,7 +1023,7 @@ function mockLogChunks(url: string): string[] | null {
 
 /** The events a log stream sends for `url`: where `?from=` or `?tail=` says
  * to start, a `truncated` event when the tail skipped chunks, then one `data`
- * event per chunk. */
+ * event per chunk, or a `marker` event for a note. */
 function mockLogEvents(url: string): { type: string; data: string; id?: string }[] {
   const chunks = mockLogChunks(url);
   if (!chunks) return [];
@@ -1013,7 +1036,7 @@ function mockLogEvents(url: string): { type: string; data: string; id?: string }
   if (from) {
     start = Number(from.split(":")[1] ?? 0) || 0;
   } else if (tail) {
-    const sizes = chunks.map((c) => new TextEncoder().encode(c).length);
+    const sizes = chunks.map((c) => (typeof c === "string" ? new TextEncoder().encode(c).length : 0));
     const total = sizes.reduce((a, b) => a + b, 0);
     // Start at the chunk that holds the `tail`-th byte from the end.
     let rest = total;
@@ -1023,7 +1046,11 @@ function mockLogEvents(url: string): { type: string; data: string; id?: string }
     }
   }
   for (let i = start; i < chunks.length; i++) {
-    out.push({ type: "message", data: chunks[i]!, id: `${attempt}:${i + 1}` });
+    const c = chunks[i]!;
+    const id = `${attempt}:${i + 1}`;
+    out.push(
+      typeof c === "string" ? { type: "message", data: c, id } : { type: "marker", data: JSON.stringify(c.marker), id },
+    );
   }
   return out;
 }
@@ -2293,7 +2320,8 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   // A try's or a shared service's whole log as a file.
   if (/^\/v1\/runs\/[^/]+\/(steps|services)\/[^/]+\/logs\/raw$/.test(p)) {
     const chunks = mockLogChunks(p + search);
-    return new Response((chunks ?? []).join(""), {
+    const raw = (chunks ?? []).map((c) => (typeof c === "string" ? c : `[scarab] ${c.marker.text}\n`)).join("");
+    return new Response(raw, {
       status: 200,
       headers: {
         "content-type": "text/plain; charset=utf-8",

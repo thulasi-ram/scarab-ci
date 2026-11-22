@@ -80,6 +80,12 @@ reuse, deploys, and the operational settings.
 `tag`, `release`, `comment`, `cron`, `manual`, `api`, and `upstream`. An empty `on:` means the
 pipeline has no automatic triggers: it runs only when launched explicitly.
 
+A `pull_request` trigger fires when a pull request is opened or reopened, when new commits reach
+it, and when it is edited to target another base branch. Closing or merging it, a label, an
+assignee, a review request, marking it ready for review, or an edit of its title or description
+starts no Run and posts no status; the webhook answers 200 with `{"ignored": "<reason>"}`. This
+holds on GitHub and Forgejo.
+
 ```yaml
 on:
   push: {}
@@ -254,6 +260,36 @@ the same `name:` share one status. A branch protection rule requires `scarab/<pi
 pipeline it waits for. A deploy pipeline whose Environment does not exist or does not admit the
 Project starts no Run, and its status is a `failure` that says why (see
 [Environments](/scarab-ci/usage/environments/#who-may-run-in-it)).
+
+A Pipeline that a push or pull request does not start because it was refused also posts a
+`failure` under its usual status name, with the reason as the description and a link to the
+repository page, where the refused Run is listed. That covers a Policy deny, a sandbox or library
+rule (a yanked library, for example), an `event` field or `forge_token` rule, a missing approval
+gate, a `when:` that could not be decided (only that Pipeline is refused; the other files still
+start their Runs), and a follow-up refused for a loop or a chain 8 Pipelines long. A branch-scoped
+Environment that does not deploy from the pushed branch posts nothing.
+
+Each refused event posts again, also on a commit where a later Run of the Pipeline has posted its
+own status since, so the check shows the latest refusal. The same delivery sent twice posts once.
+
+#### When a Pipeline file does not compile
+
+A push or pull request in which any Pipeline file does not compile starts no Run, from any file:
+Scarab compiles every file before it creates a Run. So that no required check waits for a Run that
+will not come:
+
+- each file that does not compile is listed with the repository's refused runs and posts `failure`
+  with its first compile error, when its `on:` names the event or cannot be read. A broken file
+  that only runs on `manual` posts nothing on a push;
+- each other Pipeline whose trigger matches the event, its `when:` included, posts `failure` with
+  "not run: <file> failed to compile", naming the first file that did not compile;
+- a Pipeline whose trigger `when:` cannot be decided posts the same `failure`, since it may have
+  run;
+- a Pipeline whose trigger does not match posts nothing. A Pipeline kept to `main` by its `when:`
+  gets no red check on a feature branch because another file is broken.
+
+The status name of a broken file is its `name:`, read without compiling the file, or its file
+name.
 
 ## Interface: `interface.inputs` (and `outputs`)
 
@@ -666,7 +702,10 @@ Scarab mints the credential each time the step's attempt launches, a rerun or re
 mounts it as two files: `/scarab/secrets/forge-token` and `/scarab/secrets/forge-username`. It is
 never an environment variable. When the attempt ends, the Kubernetes Secret that holds it is
 deleted, even if the Pod is kept, and a token GitHub minted is revoked, by whichever Scarab server
-sees the end.
+sees the end. Each minted token is revoked once, from the step's value ledger. A failed revocation
+is tried again until the ledger is deleted, at the latest 24.5 hours after the attempt first
+launched; a token still live then expires on its own (see
+[Run logs](/scarab-ci/usage/run-logs/#forge-tokens-and-when-a-ledger-is-deleted)).
 
 Whether a step may have one is decided when the Run is created; a Run that asks for more is
 refused with the reason. Each launch checks again, from the connection and the org's trust as
@@ -734,6 +773,11 @@ CEL predicates (evaluated against each combination's own coordinate) drops combi
 
 Each instance gets a deterministic id like `test[arch=amd64,os=linux]`, and a downstream
 `needs: [test]` fans in over every surviving instance.
+
+A step id may not contain `::service-`, whether it is written that way or built from a matrix
+value: Scarab names a step's sidecar logs `<step>::service-<i>`, and a step `t[v=1]::service-0]`
+would read as a sidecar of `t[v=1]`. The compiler refuses it with one error that names the matrix
+value.
 
 A matrix can have at most 65,536 combinations before `exclude`, and 256 `exclude` predicates. All
 the matrices of one pipeline, counting a library's matrix each time the library is inlined, can

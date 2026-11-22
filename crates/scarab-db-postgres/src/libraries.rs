@@ -25,8 +25,8 @@ use sqlx::Row;
 
 use scarab_pipeline::InstalledLibrary;
 use scarab_policy::library::{
-    pinned_commit, trust_key, LibraryInstallation, LibraryStore, LibraryStoreError, LibraryVersion,
-    LibraryYank, NewInstallation, Replaces, TrustGrant, TrustedSource,
+    pinned_at, pinned_commit, trust_key, LibraryInstallation, LibraryStore, LibraryStoreError,
+    LibraryVersion, LibraryYank, NewInstallation, Replaces, TrustGrant, TrustedSource,
 };
 
 use crate::PostgresDb;
@@ -75,7 +75,7 @@ fn version_from_row(r: &PgRow) -> LibraryVersion {
 /// copied at install, and read only while `ref_for_hash` names its
 /// content: an install or upgrade by a binary from before migration 0097
 /// writes none of them, and reads as no ref and the commit in its version's
-/// source.
+/// source. Its source is the version's file pinned to its own commit.
 const INSTALLATION_SELECT: &str = "SELECT i.id, i.org, i.name, i.content_hash, \
      v.source, i.installed_by, i.installed_at, i.step_up_ref, \
      CASE WHEN i.ref_for_hash = i.content_hash THEN i.requested_ref END AS requested_ref, \
@@ -84,7 +84,8 @@ const INSTALLATION_SELECT: &str = "SELECT i.id, i.org, i.name, i.content_hash, \
      JOIN library_versions v ON v.org = i.org AND v.content_hash = i.content_hash";
 
 fn installation_from_row(r: &PgRow) -> LibraryInstallation {
-    let source: String = r.get("source");
+    let version_source: String = r.get("source");
+    let resolved_commit = commit_or_source(r.get("resolved_commit"), &version_source);
     LibraryInstallation {
         id: r.get("id"),
         org: r.get("org"),
@@ -94,8 +95,8 @@ fn installation_from_row(r: &PgRow) -> LibraryInstallation {
         installed_at: r.get("installed_at"),
         step_up_ref: r.get("step_up_ref"),
         requested_ref: r.get("requested_ref"),
-        resolved_commit: commit_or_source(r.get("resolved_commit"), &source),
-        source,
+        source: pinned_at(&version_source, &resolved_commit),
+        resolved_commit,
     }
 }
 
@@ -239,8 +240,12 @@ impl LibraryStore for PostgresDb {
         &self,
         org: &str,
     ) -> Result<BTreeMap<String, InstalledLibrary>, LibraryStoreError> {
+        // The source is the installation's: the version's file pinned to
+        // the commit the installation names.
         let rows = sqlx::query(
-            "SELECT i.name, v.content, v.source \
+            "SELECT i.name, v.content, v.source, \
+               CASE WHEN i.ref_for_hash = i.content_hash THEN i.resolved_commit END \
+                 AS resolved_commit \
              FROM library_installations i \
              JOIN library_versions v ON v.org = i.org AND v.content_hash = i.content_hash \
              WHERE i.org = $1",
@@ -252,11 +257,13 @@ impl LibraryStore for PostgresDb {
         Ok(rows
             .iter()
             .map(|r| {
+                let source: String = r.get("source");
+                let commit = commit_or_source(r.get("resolved_commit"), &source);
                 (
                     r.get::<String, _>("name"),
                     InstalledLibrary {
                         content: r.get("content"),
-                        source: r.get("source"),
+                        source: pinned_at(&source, &commit),
                     },
                 )
             })

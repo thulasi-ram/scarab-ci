@@ -768,11 +768,15 @@ impl Executor for RecordingExec {
         Ok(None)
     }
 
-    async fn take_forge_credential(
+    async fn delete_unit_secrets(&self, _handle: &ExecHandle) -> Result<(), ExecError> {
+        Ok(())
+    }
+
+    async fn log_source_state(
         &self,
-        _handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
-        Ok(None)
+        _src: &scarab_engine::LogSourceRef,
+    ) -> Result<scarab_engine::LogSourceState, ExecError> {
+        Ok(scarab_engine::LogSourceState::Gone)
     }
     async fn workspace_provisioning(
         &self,

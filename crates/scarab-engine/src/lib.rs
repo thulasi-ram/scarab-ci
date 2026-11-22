@@ -17,14 +17,25 @@
 //!
 //! Everything below is a compiling skeleton — method bodies are stubs.
 
+pub mod logstore;
 pub mod ports;
 pub mod render;
 pub mod scheduler;
 pub mod schedules;
 
+pub use logstore::ledger_revoke_backoff_ms;
+pub use logstore::{
+    marker_text, registry_secret_values, tail_lease_resource, LogAppendError, LogBody, LogLease,
+    LogLedgerRows, LogRowKind, LogStreamId, LogStreamRow, LogStreamState, LogUnitRow, LogWriter,
+    MountedRepo, MountedValue, MountedValueKind, NewLogRow, NotStoredReason, PendingFinalRead,
+    PendingReadCursor, PendingReads, PurgeCandidate, SealedGeneration, LEDGER_HARD_CAP_MS,
+    LEDGER_REVOKE_BACKOFF_MAX_MS, LEDGER_REVOKE_BACKOFF_MS, LEDGER_SETTLED_KEEP_MS,
+    PENDING_EPOCH_SKEW_MS, PENDING_RECENT_WINDOW_MS,
+};
 pub use ports::{
-    Clock, Db, Executor, LeaderTerm, LogChunks, LogFrom, LogRedactions, RunSettlement,
-    SnapshotRetention, StepLaunch, WorkspaceSnapshots, LEADER_TX_BOUND_MS, SCHEDULER_LEASE,
+    Clock, Db, Executor, LeaderTerm, LogChunks, LogFrom, LogSourceRef, LogSourceState,
+    RunSettlement, SnapshotRetention, StepLaunch, WorkspaceSnapshots, LEADER_TX_BOUND_MS,
+    SCHEDULER_LEASE,
 };
 pub use scheduler::{
     cancel_run_request, environment_approval_met, fail_run_creation, gate_approvers,
@@ -1323,14 +1334,32 @@ pub struct OutboxMessage {
 /// just this offset metadata so the store never bloats with log text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogChunkMeta {
-    /// 0-based position of this chunk within the step's log stream.
+    /// 0-based position of this row within the step's log stream.
     pub seq: u64,
-    /// Cumulative *uncompressed* byte offset where this chunk begins.
+    /// Cumulative *uncompressed* byte offset where this row begins. Marker
+    /// rows take no bytes.
     pub byte_offset: u64,
-    /// Uncompressed length of this chunk in bytes.
+    /// Uncompressed length of this row's body in bytes; 0 for a marker.
     pub len: u64,
-    /// Object-store key holding the compressed chunk body.
-    pub object_key: String,
+    /// Object-store key holding the compressed body; `None` for a marker.
+    pub object_key: Option<String>,
+    /// Output, or a marker the server wrote.
+    #[serde(default)]
+    pub kind: LogRowKind,
+    /// Why a `not_stored` marker's log was not stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<NotStoredReason>,
+    /// SHA-256 of the stored body. `None` for a marker and for rows stored
+    /// before 0.7.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<Vec<u8>>,
+}
+
+impl LogChunkMeta {
+    /// An output row (it has a body).
+    pub fn is_output(&self) -> bool {
+        self.kind == LogRowKind::Output
+    }
 }
 
 /// A deploy run's durable target: the repo it deploys, the environment it
@@ -1694,6 +1723,11 @@ pub enum ExecError {
     Unavailable,
     #[error("exec error: {0}")]
     Other(String),
+    /// The unit's log may not be read: it was not made by a server that
+    /// keeps a value ledger (on Kubernetes, its Pod lacks the
+    /// `scarab.io/value-ledger` label), so its secret values are not known.
+    #[error("the unit was not started with a value ledger: {0}")]
+    NotLedgerComplete(String),
 }
 
 /// A transition the state machine refused because it is not legal from the

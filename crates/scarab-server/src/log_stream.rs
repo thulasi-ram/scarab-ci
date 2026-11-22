@@ -46,7 +46,14 @@
 //!   stored from one with no output; `{"storing":true,"wait_over":true}`
 //!   says the stream ends after [`STORE_WAIT`] with the log still being
 //!   stored. The running attempt never counts: its tail holds its lease for
-//!   as long as it runs.
+//!   as long as it runs. A source whose stream is `complete` or `closed` is
+//!   not being stored, whatever its lease says.
+//! - **Markers.** A marker row (`source_restarted`, `not_stored`,
+//!   `incomplete`) is sent as its own `event: marker`, `id:
+//!   <attempt_id>:<seq + 1>`, data `{"kind", "reason"?, "text"}`. A batch
+//!   ends before a marker: what it holds goes out first, a cut character
+//!   replaced, and a `\n` after the marker is never taken as the end of a
+//!   `\r\n` before it. Offsets (`?tail=`) count output bytes only.
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -59,8 +66,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use scarab_engine::{AttemptId, AttemptOutcome, Db, LogChunkMeta, RunId, StepId};
 use tokio::time::Instant;
 
-use crate::log_tail::tail_lease_resource;
-use crate::logs::{LogError, LogService};
+use crate::logs::{legacy_tail_lease_resource, tail_lease_resource, LogError, LogService};
 use crate::ApiError;
 
 /// The most bytes one `data` event carries (a single bigger chunk goes alone).
@@ -142,6 +148,12 @@ pub enum Item {
         id: String,
         text: String,
     },
+    /// A marker row: the server's note about the log, never step output.
+    Marker {
+        id: String,
+        kind: scarab_engine::LogRowKind,
+        reason: Option<scarab_engine::NotStoredReason>,
+    },
     /// Whether a source of the stream that is not running is still being
     /// stored; sent when it changes, starting from `false`.
     Storing(bool),
@@ -174,6 +186,22 @@ impl Item {
                     Event::default().id(id)
                 };
                 ev.data(text)
+            }
+            Item::Marker { id, kind, reason } => {
+                let mut data = serde_json::json!({
+                    "kind": kind.as_str(),
+                    "text": scarab_engine::marker_text(kind, reason),
+                });
+                if let Some(r) = reason {
+                    data["reason"] = serde_json::json!(r.as_str());
+                }
+                let ev = Event::default().event("marker");
+                let ev = if id.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+                    ev
+                } else {
+                    ev.id(id)
+                };
+                ev.data(data.to_string())
             }
             Item::Storing(storing) => Event::default()
                 .event("storing")
@@ -414,21 +442,41 @@ impl LogStream {
     /// running and still being stored, and say whether any is; queue a
     /// `storing` event when that changed. A failed check marks none.
     async fn check_storing(&mut self) -> bool {
-        let resources: Vec<String> = self
+        // The 0.7 tail lease, and the one a 0.6.x server took for a stream
+        // it was storing during an upgrade.
+        let resources: Vec<[String; 2]> = self
             .sources
             .iter()
-            .map(|src| tail_lease_resource(&self.run, &src.step, &src.attempt))
+            .map(|src| {
+                [
+                    tail_lease_resource(&self.run, &src.step, &src.attempt),
+                    legacy_tail_lease_resource(&self.run, &src.step, &src.attempt),
+                ]
+            })
             .collect();
-        let live = if resources.is_empty() {
+        let flat: Vec<String> = resources.iter().flatten().cloned().collect();
+        let live = if flat.is_empty() {
             Vec::new()
         } else {
-            self.db.live_leases(&resources).await.unwrap_or_default()
+            self.db.live_leases(&flat).await.unwrap_or_default()
         };
         // Only a source that cannot grow otherwise counts: the running
-        // attempt's tail always holds its lease while it reads.
+        // attempt's tail always holds its lease while it reads. A stream
+        // that is terminal is not being stored.
         let mut any = false;
-        for (src, resource) in self.sources.iter_mut().zip(&resources) {
-            src.storing = !src.may_grow && live.contains(resource);
+        for (src, rs) in self.sources.iter_mut().zip(&resources) {
+            let leased = !src.may_grow && rs.iter().any(|r| live.contains(r));
+            src.storing = leased
+                && !matches!(
+                    self.db
+                        .log_stream_row(&scarab_engine::LogStreamId::new(
+                            &self.run,
+                            &src.step,
+                            &src.attempt
+                        ))
+                        .await,
+                    Ok(Some(row)) if row.state.is_terminal()
+                );
             any |= src.storing;
         }
         if any != self.storing_sent {
@@ -509,7 +557,33 @@ impl LogStream {
             self.index_reads += 1;
         }
         let index = self.index.as_deref().unwrap_or_default();
-        let todo: Vec<&LogChunkMeta> = index.iter().filter(|c| c.seq >= from).collect();
+        let mut todo: Vec<&LogChunkMeta> = index.iter().filter(|c| c.seq >= from).collect();
+        // A marker goes out as its own event, and ends the batch before it.
+        if let Some(first) = todo.first() {
+            if !first.is_output() {
+                let m = (*first).clone();
+                self.quiet_since.remove(&k);
+                self.held.remove(&k);
+                // A `\n` after a marker starts a line of its own.
+                self.ends_cr.insert(k.clone(), false);
+                if self.strip_lead.as_ref() == Some(&k) {
+                    self.strip_lead = None;
+                }
+                self.progress.insert(k, m.seq + 1);
+                return Ok(Some(Item::Marker {
+                    id: Cursor::format(&attempt, m.seq + 1),
+                    kind: m.kind,
+                    reason: m.reason,
+                }));
+            }
+        }
+        let before_marker = match todo.iter().position(|c| !c.is_output()) {
+            Some(i) => {
+                todo.truncate(i);
+                true
+            }
+            None => false,
+        };
         if todo.is_empty() {
             if may_grow {
                 self.quiet_since.remove(&k);
@@ -521,8 +595,14 @@ impl LogStream {
         self.quiet_since.remove(&k);
         // A stream resumed from a cursor does not know how the chunk before
         // `from` ended; it reads that chunk if the batch starts with `\n`.
+        // A marker before it means no `\r` to join (a marker breaks the line).
         let before = (from > 0 && !self.ends_cr.contains_key(&k))
-            .then(|| index.iter().find(|c| c.seq + 1 == from).cloned())
+            .then(|| {
+                index
+                    .iter()
+                    .find(|c| c.seq + 1 == from && c.is_output())
+                    .cloned()
+            })
             .flatten();
         let end = todo.last().map_or(from, |c| c.seq + 1);
         let strip = self.strip_lead.as_ref() == Some(&k);
@@ -590,7 +670,7 @@ impl LogStream {
                 buf.truncate(len);
                 next = n;
             }
-        } else if self.live && !self.last_pass && may_grow {
+        } else if self.live && !self.last_pass && may_grow && !before_marker {
             // The newest chunk of a running attempt ends inside a character:
             // send up to the last whole boundary and wait for the rest, for
             // at most HOLD_PASSES passes.

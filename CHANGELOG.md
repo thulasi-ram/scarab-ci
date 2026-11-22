@@ -18,6 +18,212 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **Let running Runs finish before you upgrade.** Scarab now stores a step's log only when it
+  launched the step with a value ledger (see Security). A step or shared service that runs across
+  the upgrade stores nothing after it: its log ends with the note "the rest of this log was not
+  stored: this step was started by an earlier Scarab version, so its secret values are not known",
+  after the part stored before the upgrade, and a failure cause about it reads "the cause was not
+  stored: it may quote secret values that could not be checked". `kubectl -n <step namespace> get
+  pods -l scarab.io/run` lists no Pod when no step runs. See
+  [Upgrading to Scarab 0.7](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#upgrading-to-scarab-07).
+- **Keep the server Deployment's `strategy.type: Recreate` for this upgrade.** With
+  `RollingUpdate`, a step that a 0.6 server launches while the new servers start gets the same
+  note and no log: its Pod has no `scarab.io/value-ledger` label, and once migration 0099 has run
+  the database refuses log chunks from a 0.6 server. `Recreate`, the chart's default, stops every
+  old server before a new one starts.
+- **A 0.6 server does not start on a database that ran migration 0099, so a rollback needs the
+  revert file.** The 0.6 migrator finds version 99, which it does not know, and stops. To go back:
+  let Runs finish and stop new ones, scale the server to zero (`kubectl -n scarab scale
+  deploy/scarab --replicas=0`), back up the database, run
+  `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f crates/scarab-db-postgres/rollback/0099_revert.sql`
+  (it reverts 0100 too), then install the 0.6.1 chart. The revert deletes the notes of logs stored
+  by 0.7 and every value ledger; output rows stay, and 0.6 reads them as before. Upgrading again
+  runs 0099 and 0100 again. Never drop the `log_chunks_fenced` check on `log_chunks`: during a
+  rolling update it is what stops a 0.6 server that is still running from storing output it cannot
+  redact. See
+  [Rolling back to Scarab 0.6](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#rolling-back-to-scarab-06).
+- **Migration 0100 builds an index with `CREATE INDEX CONCURRENTLY`.** It adds
+  `attempts_started_at_idx` outside a transaction, so writes to `attempts` go on while it builds. A
+  build that fails or is stopped leaves an invalid index behind, and the next server to start drops
+  it and builds it again (see Bug Fixes). Migration 0099's checks on `log_chunks` are `NOT VALID`,
+  so it scans no stored chunk.
+- **Upgrade the chart with the server image: step Pods mount their credentials from Secrets with
+  new names.** A step Pod made by 0.7 carries the label `scarab.io/value-ledger: "1"` and mounts
+  `<pod>-v-secrets`, `<pod>-v-registry`, `<pod>-v-token` and `<pod>-v-oidc`. The 0.7 chart's
+  admission policy allows these and the names 0.6 wrote. Under the 0.6 chart's policy, every step
+  Pod that mounts one of the new Secrets is refused and its step fails. A policy or tool of your own
+  that matched the old names (`<pod>-secrets`, `<pod>-token`, …) needs the new ones. A re-drive
+  that finds a Pod without the label writes no Secret to it; one whose containers never started is
+  deleted and created again. See
+  [The step Pod admission policy](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#the-step-pod-admission-policy).
+- **Forge tokens minted by 0.6 are not revoked after the upgrade.** 0.7 revokes only tokens it finds
+  in a value ledger, and a step 0.6 launched has none. A GitHub App token minted for a step that ran
+  across the upgrade expires an hour after it was minted.
+- **Every replica must use the same master keys, and an old key stays until the rotation metric
+  reads 0.** Each step's value ledger is encrypted with the master keys; a replica that cannot
+  decrypt it stores none of that step's log. `scarab_secrets_rows_under_nonactive_key` now also
+  counts ledger generations under a key that is not the active one; it is set at boot, so restart
+  the replicas to read it again. Ledger generations cannot be rewrapped: remove an old key only
+  when the metric reads 0 on every replica, at most 24.5 hours after the key stopped being active
+  (the longest a ledger lives). Removing it earlier stops the logs of running steps from being stored, and a
+  re-drive of such a step fails. See
+  [Master keys and value ledgers](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#master-keys-and-value-ledgers).
+- **A Pipeline file that does not compile now fails the checks of the Pipelines the event would
+  have started.** A broken file still stops every Pipeline in the delivery, and now before any of
+  them starts a Run: every file is compiled first. Each file that does not compile is listed as a
+  refused Run and posts `failure` under its usual check name with its first compile error, when its
+  `on:` names the event or cannot be read. Each other Pipeline whose trigger matches the event,
+  `when:` included, posts `failure` with "not run: <file> failed to compile"; one whose `when:`
+  cannot be decided posts it too, since it may have run; one whose trigger does not match posts
+  nothing, so a Pipeline kept to `main` gets no red check on a feature branch. Before, the broken
+  file posted no status, so a required check waited for good, and Pipelines sorted before it had
+  already started Runs. See
+  [When a Pipeline file does not compile](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#when-a-pipeline-file-does-not-compile).
+- **A refused Pipeline now fails its check on the commit.** A Pipeline that a push or pull request
+  does not start because a Policy denied it, a sandbox or library rule refused it, an `event` field
+  or `forge_token` rule refused it, an approval gate is missing, its `when:` could not be decided,
+  or a loop of follow-up Runs or a chain 8 Pipelines long stopped it, posts `failure` under its usual check
+  name, on GitHub and Forgejo, with the reason as the description and a link to the repository
+  page, where the refused Run is listed. An Environment refusal already did. A branch-scoped
+  Environment skipping another branch still posts nothing. Each refused event posts again, also on
+  a commit where a later Run of the Pipeline has posted its own status since; the same delivery
+  sent twice posts once. See
+  [Commit statuses](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#commit-statuses).
+- **Closing, merging or labelling a pull request no longer starts its `pull_request` Pipelines.**
+  Scarab started Runs for every pull request webhook, so closing or merging a pull request, or
+  labelling it, ran the Pipeline again, and a build Pipeline with `push: true` pushed its images
+  again. A pull request now starts Runs only when it is opened or reopened, gets new commits, or is
+  edited to target another base branch. Other deliveries (closed, merged, labelled, assigned, a
+  review request, ready for review, a title or description edit) start no Run and post no status,
+  and the webhook answers 200 with `{"ignored": "<reason>"}`. GitHub and Forgejo. See
+  [Triggers](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#triggers-on).
+- **A step id may not contain `::service-`.** Scarab names a step's sidecar logs
+  `<step>::service-<i>`, so a matrix value such as `1]::service-0` gave a step whose log was read
+  as another step's sidecar and redacted with that step's values. The compiler refuses a step id,
+  written or built from matrix values, that contains it, with one error naming the matrix value.
+  See [Fan-out](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#fan-out-matrix).
+- **A raw log download writes the server's notes as `[scarab] <text>` lines.** Add
+  `?markers=none` to get the stored output bytes only. The `X-Scarab-Log-Markers` header counts the
+  notes either way. See [Run logs](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/#through-the-api).
+
+### Security
+
+- **A step's log is redacted with every secret value any launch of it was given, on every
+  replica.** Each launch stores the values it hands the step (secrets, registry credential, forge
+  token, OIDC token) as a new generation of the step's value ledger, encrypted with the master key,
+  in Postgres, before it creates the Pod or any Secret; the replica that reads the log loads every
+  generation or none. A re-drive that minted a new forge token on another replica no longer leaves
+  the old one unredacted, and a failed re-launch no longer drops the values of the running step.
+  The ledger is deleted once every log of the try is stored and its tokens are revoked, or an hour
+  after the try or its Run ends once its tokens are revoked. See
+  [Secret values](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/#secret-values).
+- **Scarab no longer reads secret values back from Kubernetes Secrets.** Neither the log tail nor
+  forge token revocation reads them; the Secrets are deleted by name when a try ends.
+- **Every forge token minted for a step is revoked once, whichever replica minted it.** Each
+  ledger generation records when its token was revoked. A re-drive revokes the tokens of older
+  generations only, so a launch that returns late no longer revokes a newer launch's token, and
+  the end of the try revokes the rest. A launch whose minted token is in no ledger generation
+  revokes it and fails, so a token is never left live with nothing to revoke it. One replica, the
+  holder of the lease `ledger-sweep`, retries failed revocations and deletes ledgers every 30
+  seconds, in a task of its own beside the scheduler: each step's revocations are cut off at 20
+  seconds, a failed one is tried again after 1 minute, doubling to 1 hour, and a ledger past its
+  cap (24.5 hours after its first generation, once the try is not running) is deleted anyway; its
+  tokens then expire on their own. Tokens minted by 0.6 are not revoked (see Breaking changes).
+  See [Forge tokens and when a ledger is deleted](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/#forge-tokens-and-when-a-ledger-is-deleted).
+- **A failure cause or infra message is redacted with the values of the step it is about**, read
+  from the step's ledger each time a cause is stored, so a value another replica recorded after
+  this replica last loaded the ledger is redacted too. A cause about a step with no ledger is
+  replaced by "the cause was not stored: it may quote secret values that could not be checked".
+
+### Features
+
+- **The server's notes in a log are their own rows.** A restarted log source, a part not stored
+  and an end that could not be read are stored as index rows, not text in the log, so a step that
+  prints the same text changes nothing. The Run page shows each as a row set apart from the
+  output, the log stream sends `event: marker`, and `scarab logs` prints them on stderr. See
+  [Notes in a log](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/#notes-in-a-log).
+
+### Bug Fixes
+
+- **A `when:` that cannot be decided refuses its own Pipeline only.** A trigger or Step `when:`
+  that failed to evaluate (for example, one reading an event field that is not there) stopped the
+  whole delivery, so the Pipeline files after it in `.scarab/` were not evaluated. That Pipeline is
+  now listed as a refused Run with the error and fails its check, and the other files still start
+  their Runs.
+- **Two replicas no longer write one log at once.** Every log chunk is stored under the lease of
+  the log it belongs to, and the database refuses a chunk from a replica whose lease was taken over
+  or that holds another log's lease, so chunks are no longer dropped, reordered or pointed at
+  another replica's body. Chunk bodies are stored under their content hash, so a second read never
+  overwrites a stored body.
+- **A log is complete only when its container ended.** A read that ended while the container still
+  ran (a kubelet restart, a dropped connection) was taken as the end of the log, so output after it
+  was lost. The server now asks Kubernetes and reads again. A crashed sidecar or shared service
+  keeps the output of its next run; while its container waits to restart, it is read again after
+  3 seconds, doubling to 60.
+- **A live log no longer stops on a dead connection.** A followed log read had no read timeout,
+  and the Kubernetes client has no TCP keepalive setting, so a connection a node or load balancer
+  dropped without a reset froze the log until the step ended. A follow that gets no byte for 5
+  minutes now fails, is opened again and is compared with the stored part.
+- **The rest of a log is no longer lost or withheld after a broken read.** The "from now on" and
+  "withheld" fallbacks are gone: the server compares a new read with the stored part by digests,
+  stores the source again after a note when it differs, and no longer fetches every stored chunk
+  on each retry.
+- **A value cut at the end of a log, or at the start of a part after a restart, is stored as
+  `***`.**
+- **A step that ended while no server ran, or whose read hung, still gets its log stored or
+  closed**, within 30 minutes of the step ending. A step cancelled before it started gets no note.
+- **A library can move to a new commit when its file did not change.** A tag or branch that
+  moved to a commit with the same library file produced no diff, and the review page showed
+  "This version is installed already" with Upgrade turned off, so the installation stayed at the
+  old ref and commit. The review page now says the file is the same at the new commit, and
+  **Move to this commit** moves the installation there, with the same passkey confirmation and
+  trust boxes as an upgrade; the security log names both commits. The fetch answer has
+  `content_unchanged`, an installation's `source` names the commit it is at, and an install at
+  the ref and commit already installed is refused with 409. Runs inline the same content, and
+  Runs created before the move do not change. See
+  [Upgrade](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#upgrade).
+- **A request no longer fails with "tried to clone a span that already closed".** The server's
+  request-id middleware held its tracing span entered across an await, so a request that finished
+  on another worker thread left its closed span on the first thread, and a later request there
+  could panic. It now enters the span for each poll of the request. Seen as a failed status poll
+  in the Argo CD plugin's end-to-end test.
+- **A forge token recorded after the end of a try was seen is revoked.** A launch on a replica
+  that no longer drives the Run can record a new token in the step's value ledger after another
+  replica saw the try end and revoked the tokens then in it. The ledger is no longer taken as
+  revoked: the next end of the try or the ledger sweep revokes the new token, once.
+- **A value ledger is deleted only at the generation its deletion was decided on.** A generation
+  that a late launch writes between the decision and the delete is kept, and the ledger sweep
+  revokes its token and deletes the ledger on its next pass.
+- **A forge token minted for a launch that is refused before its value ledger is written is
+  revoked at once**, for example for a step whose secret is not in its scope. The token was in no
+  ledger, so nothing revoked it and it lived until it expired.
+- **A server that shuts down cleanly releases the `ledger-sweep` lease.** Before, the next
+  replica waited up to the lease's 6 minutes before it swept.
+- **The server builds `attempts_started_at_idx` again when an earlier build left it invalid.**
+  Migration 0100 builds the index with `CREATE INDEX CONCURRENTLY`. A build that failed or was
+  stopped left an invalid index, which the migration's `IF NOT EXISTS` passed over, so the query
+  for logs still to be read scanned `attempts`. At start, after the migrations, the server now
+  drops an invalid index of that name and builds it again, under a lock, so two replicas that
+  start at once do not build it together.
+
+### Tests
+
+- **The kind tier checks logs and the admission policy on a real cluster.** `just test e2e` (run on
+  pull requests labelled `ci:full`) now has a step that prints numbered lines and an Environment
+  secret across a server SIGKILL, a kubelet restart and a containerd restart: every line is stored
+  in order within each part, a gap or repeat sits only after a `source_restarted` note, and the
+  secret appears in neither the raw download nor the stream. The admission policy case admits a
+  Pod with the four `-v-` names and refuses another Pod's, and 40 short step Pods confirm a clean
+  end on a real kubelet. A host test evaluates the chart's admission policy expression against the
+  Secret names the executor writes.
+
+### Misc
+
+- **Migration 0099 changed before the release.** A local kind stack whose database ran an
+  unreleased build of it needs `just stack down` and `just stack up`.
+
 ## [0.6.1] - 2026-11-20
 
 ### Bug Fixes

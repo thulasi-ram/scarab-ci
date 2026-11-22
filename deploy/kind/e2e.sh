@@ -19,7 +19,9 @@
 #      filter or the filter is part of its name, `plugin-argocd`. It is a
 #      child process with its own EXIT trap, which stops the fake Argo CD and
 #      its port-forward however the pass ends.
-#   7. crash_resume, alone and last: it kills the server every case talks to
+#   7. crash_resume, alone and last, one test at a time in name order: it
+#      kills the server every case talks to, and restarts the kubelet and
+#      containerd on the node
 #
 # All passes run; the exit code is non-zero when any failed. Zero
 # auto-retries: a red run is a real bug, not flake to mask. The release stays
@@ -205,5 +207,5 @@ case plugin-argocd in
       || { rc=$?; echo "==> pass FAILED: plugin-argocd"; } ;;
   *) echo "==> pass: plugin-argocd skipped (the filter '$filter' is not part of its name)" ;;
 esac
-pass crash_resume -p scarab-e2e --test crash_resume
+pass crash_resume -p scarab-e2e --test crash_resume --test-threads 1
 exit "$rc"
