@@ -181,10 +181,15 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
         };
         let mut trigger =
             wait_trigger(stack, &views, &scenario.runs, &target_run, kind, &holds).await;
-        // kill-tailer: the tail must be appending, not about to start.
-        if let (Kind::KillTailer, Some(t)) = (kind, trigger.take()) {
-            let lines = scenario.logs.as_ref().map_or(0, |l| l.lines);
-            trigger = crate::logs::wait_output_rows(&stack.pg, &views, t, &holds, lines).await?;
+        // kill-tailer: the tail must be appending, not about to start. Test the
+        // kind first: `take()` in a tuple pattern would empty every other
+        // kind's trigger, and its scenario would fire no fault.
+        if matches!(kind, Kind::KillTailer) {
+            if let Some(t) = trigger.take() {
+                let lines = scenario.logs.as_ref().map_or(0, |l| l.lines);
+                trigger =
+                    crate::logs::wait_output_rows(&stack.pg, &views, t, &holds, lines).await?;
+            }
         }
         match trigger {
             None => {
