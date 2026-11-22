@@ -6434,9 +6434,12 @@ impl DeliveryTrigger<'_> {
     /// delivery (`ctx` and `paths` keep the answer for the next Pipeline,
     /// for its run-scope Step `when:`s and for the Run's note), and is
     /// decided again with the answer. Until the forge is asked,
-    /// `event.changed_paths_known` is not decided either (absent from `ctx`),
-    /// so `event.changed_paths_known && …` asks too rather than deciding
-    /// `false` before the answer; [`ChangedPaths::apply_to`] then sets it.
+    /// `event.changed_paths_known` is not decided either (absent from `ctx`):
+    /// the first match is decided only when the `when:` gives the same answer
+    /// with an unknown list (flag `false`) and with a known one (flag `true`),
+    /// so `event.changed_paths_known && …` or `… == true` asks rather than
+    /// deciding `false` before the answer; [`ChangedPaths::apply_to`] then
+    /// sets it.
     ///
     /// [`ChangedPaths::apply_to`]: scarab_forge::ChangedPaths::apply_to
     async fn decide(

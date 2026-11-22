@@ -6790,10 +6790,17 @@ fn with_event_fields(
 /// write `event.changed_paths_known && …` to not run on an unknown list.
 /// It is `true` with a list and `false` without one. A context that has
 /// neither field is one whose paths have not been asked of the forge yet
-/// (ADR-0081): there the flag is not decided either, and is bound to `0`
-/// like the list; when the answer needed it, the `when:` counts as true,
-/// and the server asks the forge and decides again. A context with a list
-/// but no flag (one written by hand) reads the flag as `true`.
+/// (ADR-0081). The answer will be one of two worlds: an unknown list with
+/// the flag `false`, or a known list with the flag `true`. The `when:` is
+/// evaluated in the first, and in the second with the list as `0`, `[]` and
+/// `[""]`. It decides only when every one of those gives the same answer
+/// (`event.branch == 'release' && …` on `main` is `false` in each); any
+/// other mix counts as true, and the server asks the forge and decides
+/// again. No single value for the flag would do: `==`, `!=` and `in` give
+/// an answer for any value, so `event.changed_paths_known == true` would
+/// decide `false` before the forge was asked. When every probe fails, the
+/// error is reported as above. A context with a list but no flag (one
+/// written by hand) reads the flag as `true`.
 fn eval_when(expr: &str, ctx: &serde_json::Value) -> Result<WhenOutcome, PipelineError> {
     use serde_json::json;
     if !event::when_reads_changed_paths(expr) {
@@ -6811,32 +6818,55 @@ fn eval_when(expr: &str, ctx: &serde_json::Value) -> Result<WhenOutcome, Pipelin
             cel::eval_bool(expr, &ctx).map(WhenOutcome::Decided)
         };
     }
-    // Not asked yet: the flag is as undecided as the list.
-    let flags: &[Option<bool>] = if flag_set {
-        &[None]
-    } else {
-        &[Some(true), Some(false)]
-    };
-    let bind = |paths: serde_json::Value, flag: Option<serde_json::Value>| {
+    let bind = |paths: serde_json::Value, flag: Option<bool>| {
         let mut fields = vec![(event::CHANGED_PATHS, paths)];
-        fields.extend(flag.map(|f| (event::CHANGED_PATHS_KNOWN, f)));
+        fields.extend(flag.map(|f| (event::CHANGED_PATHS_KNOWN, json!(f))));
         with_event_fields(ctx, &fields)
     };
-    let undecided = (!flag_set).then(|| json!(0));
-    match cel::eval_bool(expr, &bind(json!(0), undecided)) {
-        Ok(b) => Ok(WhenOutcome::Decided(b)),
-        Err(e) => {
-            let some_list_decides = [json!([]), json!([""])].iter().any(|list| {
-                flags.iter().any(|flag| {
-                    cel::eval_bool(expr, &bind(list.clone(), flag.map(|f| json!(f)))).is_ok()
-                })
-            });
-            if some_list_decides {
+    let lists = [json!([]), json!([""])];
+    if flag_set {
+        // Asked, and unknown (or a trigger with no list): the flag is as
+        // written and only the list is bound.
+        return match cel::eval_bool(expr, &bind(json!(0), None)) {
+            Ok(b) => Ok(WhenOutcome::Decided(b)),
+            Err(e) => {
+                if lists
+                    .iter()
+                    .any(|list| cel::eval_bool(expr, &bind(list.clone(), None)).is_ok())
+                {
+                    Ok(WhenOutcome::PathsUnknown)
+                } else {
+                    Err(e)
+                }
+            }
+        };
+    }
+    // Not asked yet: the forge's answer is one of two worlds. Either the list
+    // is unknown and the flag `false` (W0, exactly what the pass after the
+    // answer evaluates), or the list is known and the flag `true` (W1, the
+    // list probed as `0`, `[]` and `[""]`). The expression decides only when
+    // every probe gives the same answer; otherwise it counts as true and the
+    // server asks the forge.
+    let w0 = cel::eval_bool(expr, &bind(json!(0), Some(false)));
+    let w1: Vec<_> = std::iter::once(json!(0))
+        .chain(lists.iter().cloned())
+        .map(|list| cel::eval_bool(expr, &bind(list, Some(true))))
+        .collect();
+    match w0 {
+        Ok(b) if w1.iter().all(|r| matches!(r, Ok(x) if *x == b)) => Ok(WhenOutcome::Decided(b)),
+        Err(e) if w1.iter().all(Result::is_err) => {
+            // Every probe failed: an error that no list removes is reported,
+            // as for a known flag.
+            if lists
+                .iter()
+                .any(|list| cel::eval_bool(expr, &bind(list.clone(), Some(false))).is_ok())
+            {
                 Ok(WhenOutcome::PathsUnknown)
             } else {
                 Err(e)
             }
         }
+        _ => Ok(WhenOutcome::PathsUnknown),
     }
 }
 
@@ -13222,29 +13252,71 @@ steps:
     }
 
     // Attack on the order the server decides in: before the forge is asked
-    // (neither field in the context), a guard that read the flag as `false`
+    // (neither field in the context), a guard that read the flag as `false`,
+    // or as any one value (`==`, `!=` and `in` answer for every value),
     // would decide "no match", the server would never ask, and the trigger
-    // would skip on every push whose list is in fact known. Safe outcome: the
-    // flag is as undecided as the list, so the trigger counts as matched and
-    // the server asks and decides again.
+    // would skip on every push whose list is in fact known. Safe outcome: a
+    // `when:` whose answer differs between an unknown list (flag `false`)
+    // and a known one (flag `true`) counts as matched, and the server asks
+    // and decides again; one that is `false` in both still asks nothing.
     #[test]
     fn changed_paths_known_is_not_decided_before_the_forge_is_asked() {
-        let ir = compile(
-            r#"
-on:
-  push:
-    when: 'event.changed_paths_known && event.changed_paths.exists(p, p.startsWith("docker/"))'
-steps:
-  - { id: deploy, image: busybox }
-"#,
-        );
+        let on_push = |when: &str| {
+            compile(&format!(
+                "on:\n  push:\n    when: '{when}'\nsteps:\n  - {{ id: deploy, image: busybox }}\n"
+            ))
+        };
         let not_asked = json!({ "event": { "kind": "push", "branch": "main" } });
-        assert!(matches!(matches_trigger(&ir, "push", &not_asked), Ok(true)));
-        let flag_only = compile("on:\n  push:\n    when: event.changed_paths_known\nsteps:\n  - { id: d, image: busybox }\n");
-        assert!(reads_changed_paths(&flag_only, "push"));
-        assert!(matches!(
-            matches_trigger(&flag_only, "push", &not_asked),
-            Ok(true)
-        ));
+        for when in [
+            r#"event.changed_paths_known && event.changed_paths.exists(p, p.startsWith("docker/"))"#,
+            r#"event.changed_paths_known == true && event.changed_paths.exists(p, p.startsWith("docker/"))"#,
+            r#"true == event.changed_paths_known"#,
+            r#"event.changed_paths_known == false"#,
+            r#"event.changed_paths_known != true"#,
+            r#"event.changed_paths_known in [true]"#,
+            r#"event.changed_paths_known && event.changed_paths == []"#,
+            r#"event.changed_paths == []"#,
+            r#"event.changed_paths_known"#,
+        ] {
+            let ir = on_push(when);
+            assert!(reads_changed_paths(&ir, "push"), "{when}");
+            let got = matches_trigger(&ir, "push", &not_asked);
+            assert!(matches!(got, Ok(true)), "{when}: {got:?}");
+        }
+        // False whatever the forge answers: decided, no request.
+        let other_branch =
+            on_push(r#"event.branch == "release" && event.changed_paths_known == true"#);
+        let got = matches_trigger(&other_branch, "push", &not_asked);
+        assert!(matches!(got, Ok(false)), "{got:?}");
+
+        // After the answer, the same `when:`s decide as written.
+        let unknown = push_ctx("main", None);
+        let docker = push_ctx("main", Some(&["docker/x"]));
+        for (when, on_unknown, on_docker) in [
+            (
+                r#"event.changed_paths_known == true && event.changed_paths.exists(p, p.startsWith("docker/"))"#,
+                false,
+                true,
+            ),
+            (r#"event.changed_paths_known == false"#, true, false),
+        ] {
+            let ir = on_push(when);
+            assert_eq!(
+                matches_trigger(&ir, "push", &unknown).unwrap(),
+                on_unknown,
+                "{when}"
+            );
+            assert_eq!(
+                matches_trigger(&ir, "push", &docker).unwrap(),
+                on_docker,
+                "{when}"
+            );
+            assert!(
+                changed_paths_unapplied(&ir, "push", &unknown)
+                    .unwrap()
+                    .is_empty(),
+                "{when}"
+            );
+        }
     }
 }
