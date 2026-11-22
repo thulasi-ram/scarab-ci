@@ -1002,6 +1002,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 logs.clone(),
                 forge.clone(),
                 replica_id.clone(),
+                shutdown_signal(),
             ));
         }
     }
@@ -1504,8 +1505,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = handle.await;
     }
     if let Some(handle) = ledger_sweep_handle {
-        handle.abort();
-        let _ = handle.await;
+        // It got the same signal and lets its lease go, so another replica
+        // sweeps without waiting out the TTL.
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
     tracing::info!("shutdown complete");
     // The scheduler driver stopped (git-bug afa9f07): the drain above ran,

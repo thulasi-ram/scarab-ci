@@ -1568,29 +1568,45 @@ async fn sweep_unit(
 /// Run the ledger sweep every [`LEDGER_SWEEP_EVERY`] while this process
 /// (`owner`) holds [`LEDGER_SWEEP_LEASE`]: one replica sweeps. Its own task,
 /// off the scheduler's tick, so a forge that does not answer delays
-/// nothing else.
+/// nothing else. When `stop` resolves, a pass under way is abandoned and
+/// the lease let go, so another replica sweeps on its next turn rather
+/// than after the lease's TTL (each revocation is idempotent).
 pub fn spawn_ledger_sweeper(
     logs: Arc<LogService>,
     forge: Arc<dyn scarab_forge::ForgePort>,
     owner: String,
+    stop: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        tokio::pin!(stop);
         loop {
-            let held = matches!(
-                logs.db().lease(LEDGER_SWEEP_LEASE, &owner, LEDGER_SWEEP_LEASE_TTL_MS).await,
-                Ok(l) if l.owner == owner
-            );
-            if held {
-                let pass = sweep_ledgers(&logs, forge.as_ref(), Timestamp(now_ms())).await;
-                if pass.failed > 0 {
-                    tracing::info!(
-                        purged = pass.purged,
-                        failed = pass.failed,
-                        "log ledger sweep: some revocations failed; each is retried after its backoff"
-                    );
+            let pass = async {
+                let held = matches!(
+                    logs.db().lease(LEDGER_SWEEP_LEASE, &owner, LEDGER_SWEEP_LEASE_TTL_MS).await,
+                    Ok(l) if l.owner == owner
+                );
+                if held {
+                    let pass = sweep_ledgers(&logs, forge.as_ref(), Timestamp(now_ms())).await;
+                    if pass.failed > 0 {
+                        tracing::info!(
+                            purged = pass.purged,
+                            failed = pass.failed,
+                            "log ledger sweep: some revocations failed; each is retried after its backoff"
+                        );
+                    }
                 }
+            };
+            tokio::select! {
+                _ = &mut stop => break,
+                () = pass => {}
             }
-            tokio::time::sleep(LEDGER_SWEEP_EVERY).await;
+            tokio::select! {
+                _ = &mut stop => break,
+                () = tokio::time::sleep(LEDGER_SWEEP_EVERY) => {}
+            }
+        }
+        if let Err(e) = logs.db().release_lease(LEDGER_SWEEP_LEASE, &owner).await {
+            tracing::warn!(error = %e, "log ledger sweep: could not let the lease go; another replica sweeps after its TTL");
         }
     })
 }

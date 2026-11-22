@@ -1616,6 +1616,36 @@ async fn a_token_minted_for_a_launch_refused_before_the_ledger_is_revoked() {
     assert_eq!(w.forge.revoked(), vec!["fake-token-acme-web-1".to_string()]);
 }
 
+/// The ledger sweep lets its lease go when it stops (a graceful shutdown),
+/// so another replica sweeps on its next turn instead of after the lease's
+/// six-minute TTL. Kills: a sweeper aborted while it holds the lease.
+#[tokio::test]
+async fn the_ledger_sweeper_lets_its_lease_go_when_it_stops() {
+    let w = World::new().await;
+    let lease = [scarab_server::log_tail::LEDGER_SWEEP_LEASE.to_string()];
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let handle = scarab_server::log_tail::spawn_ledger_sweeper(
+        w.logs(),
+        w.forge.clone(),
+        "replica-a".into(),
+        async {
+            let _ = stopped.await;
+        },
+    );
+    until("the sweeper's lease", || async {
+        !w.db.live_leases(&lease).await.unwrap().is_empty()
+    })
+    .await;
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("the sweeper stops")
+        .unwrap();
+    assert!(w.db.live_leases(&lease).await.unwrap().is_empty());
+    let next = w.db.lease(&lease[0], "replica-b", 60_000).await.unwrap();
+    assert_eq!(next.owner, "replica-b");
+}
+
 // ---------------------------------------------------------------------------
 // I9: liveness
 // ---------------------------------------------------------------------------
