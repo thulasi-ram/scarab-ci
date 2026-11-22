@@ -152,13 +152,14 @@ impl Kind {
     /// The seeded delay range after the trigger, in ms. Measured 2026-11-01
     /// at 2+2 on colima (2 vCPU) with 64 x 2 MiB per producer: the drain
     /// window (step exit to root annotation) was 63 s, the feed 8 s. The
-    /// leader stop needs only Runs in flight, and the producer's step runs
-    /// for several seconds.
+    /// leader stop needs only Runs in flight; it must land while the
+    /// producer's step runs, which took about 2.5 s on kind (2026-11-22), so
+    /// a delay past that fired after the step and was INCONCLUSIVE.
     fn delay_range_ms(self) -> std::ops::RangeInclusive<u64> {
         match self {
             Kind::MidDrain | Kind::KillServer => 2_000..=10_000,
             Kind::MidFeed => 0..=2_000,
-            Kind::StopLeader => 0..=3_000,
+            Kind::StopLeader => 0..=1_500,
             // Early in the step's print time, so the takeover (the tail
             // lease's 45 s TTL) happens while it still prints.
             Kind::KillTailer => 0..=3_000,
