@@ -282,7 +282,7 @@ will not come:
   with its first compile error, when its `on:` names the event or cannot be read. A broken file
   that only runs on `manual` posts nothing on a push;
 - each other Pipeline whose trigger matches the event, its `when:` included, posts `failure` with
-  "not run: <file> failed to compile", naming the first file that did not compile;
+  `not run: <file> failed to compile`, naming the first file that did not compile;
 - a Pipeline whose trigger `when:` cannot be decided posts the same `failure`, since it may have
   run;
 - a Pipeline whose trigger does not match posts nothing. A Pipeline kept to `main` by its `when:`
