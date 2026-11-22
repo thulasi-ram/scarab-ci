@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1795329820,"nonce":"JRx1pC2jzCZ6NoR6wLqPxHycZJc=","message":"Built in f9772ad7 (feat(triggers): event.changed_paths for when:), on main since before v0.7.0. Gaps tracked separately: 63dbeee (Forgejo forced push), 0354b5a (merge-commit resolutions). Closing.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1795329820,"nonce":"sodntZ61xZhor2dvqtZY04XMdYY=","status":2}]}
