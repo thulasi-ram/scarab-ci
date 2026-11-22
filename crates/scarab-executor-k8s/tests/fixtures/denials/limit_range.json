@@ -1,0 +1,13 @@
+{
+  "kind": "Status",
+  "apiVersion": "v1",
+  "metadata": {},
+  "status": "Failure",
+  "message": "pods \"record-denials\" is forbidden: maximum cpu usage per Container is 1, but limit is 2",
+  "reason": "Forbidden",
+  "details": {
+    "name": "record-denials",
+    "kind": "pods"
+  },
+  "code": 403
+}

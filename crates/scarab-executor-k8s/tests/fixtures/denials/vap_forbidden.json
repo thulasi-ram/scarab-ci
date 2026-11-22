@@ -1,0 +1,18 @@
+{
+  "kind": "Status",
+  "apiVersion": "v1",
+  "metadata": {},
+  "status": "Failure",
+  "message": "pods \"record-denials\" is forbidden: ValidatingAdmissionPolicy 'scarab-record-denials' with binding 'scarab-record-denials' denied request: the Pod has the label scarab.io/record-denials",
+  "reason": "Forbidden",
+  "details": {
+    "name": "record-denials",
+    "kind": "pods",
+    "causes": [
+      {
+        "message": "ValidatingAdmissionPolicy 'scarab-record-denials' with binding 'scarab-record-denials' denied request: the Pod has the label scarab.io/record-denials"
+      }
+    ]
+  },
+  "code": 403
+}

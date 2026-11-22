@@ -100,6 +100,19 @@ chaos what="all" seed="1":
 record-compare:
     bash deploy/kind/record-compare.sh
 
+# Re-record the denials Kubernetes' built-in admission gives a Pod create, which
+# the k8s_overlay classifier tests of crates/scarab-executor-k8s read (git-bug
+# 1d983fd): a ValidatingAdmissionPolicy (with and without `reason: Forbidden`),
+# a ResourceQuota, a LimitRange and Pod Security `restricted`, each applied
+# alone in the throwaway namespace `scarab-record-denials`, with the create and
+# the dry-run create answers written to
+# crates/scarab-executor-k8s/tests/fixtures/denials. Needs the kind stack
+# (`just stack up`); deletes the namespace and the policy at the end and changes
+# nothing else. Review the diff and commit it. See deploy/kind/record-denials.sh.
+[doc('Record the built-in admission denial fixtures from the kind cluster')]
+record-denials:
+    bash deploy/kind/record-denials.sh
+
 # Coverage run (mirrors the CI `test-and-coverage` job): the suite under
 # cargo-llvm-cov against the compose Postgres AND MinIO, per-crate summary, and
 # REGENERATES docs/audits/coverage-baseline.toml — review + commit the baseline

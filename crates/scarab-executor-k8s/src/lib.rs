@@ -8733,6 +8733,53 @@ mod tests {
         assert!(overlay_refusal(403, rbac, Some(&denied(403, rbac)), Some(false)).is_none());
     }
 
+    /// A `Status` body from `tests/fixtures/denials` (see its README).
+    fn recorded_denial(file: &str) -> kube::core::Status {
+        let path = format!(
+            "{}/tests/fixtures/denials/{file}.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let body = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        serde_json::from_str(&body).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    // git-bug 1d983fd: the denials Kubernetes' built-in admission answers a
+    // Pod create and a dry-run create with, as `just test record-denials`
+    // records them. Each is classified with the Pod without the overlay
+    // passing: a ValidatingAdmissionPolicy (403 or 422), a LimitRange and
+    // Pod Security fail the step with the dry run's message; a ResourceQuota
+    // stays a launch error the scheduler retries. None is the chart's step
+    // Pod policy.
+    #[test]
+    fn recorded_builtin_denials_are_classified() {
+        for (case, code, the_overlays) in [
+            ("vap_forbidden", 403, true),
+            ("vap_invalid", 422, true),
+            ("limit_range", 403, true),
+            ("pod_security", 403, true),
+            ("resource_quota", 403, false),
+        ] {
+            let create = recorded_denial(case);
+            let dry_run = recorded_denial(&format!("{case}.dry_run"));
+            assert_eq!((create.code, dry_run.code), (code, code), "{case}");
+            let got = overlay_refusal(
+                create.code,
+                &create.message,
+                Some(&denied(dry_run.code, &dry_run.message)),
+                Some(true),
+            );
+            match (the_overlays, got) {
+                (true, Some(ExecError::Refused(m))) => {
+                    assert!(m.contains(&dry_run.message), "{case}: {m}")
+                }
+                (false, None) => {}
+                (_, got) => panic!("{case}: {got:?}"),
+            }
+            let e = kube::Error::Api(create.boxed());
+            assert!(admission_policy_refusal(&e).is_none(), "{case}");
+        }
+    }
+
     // m8: the API server's message reaches the Run's author; both failures
     // copy at most 1,024 bytes of it, cut on a char boundary and marked
     // with `…` where it was cut.
