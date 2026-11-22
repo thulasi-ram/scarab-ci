@@ -52,6 +52,10 @@ required-if-run  ci/test-and-coverage   # workspace nextest under llvm-cov, real
 required-if-run  ci/openapi-drift       # committed spec + generated client + tsc
 required-if-run  ci/ui-tests            # UI no-DOM vitest suites
 
+# Path-filtered (`docs_site` in .github/path-filters.yml): a PR that touches
+# nothing the docs site reads skips it.
+required-if-run  ci/docs-build          # `just docs build`: the docs site builds
+
 # Every live suite (`just test e2e`: the scarab-e2e crate, Forgejo, the tunnel
 # cases, the executor and plugin cluster suites, the Argo CD plugin,
 # crash_resume). Runs on a PR

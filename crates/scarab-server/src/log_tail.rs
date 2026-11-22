@@ -11,7 +11,8 @@
 //! 1. claims the stream's tail lease; every row it appends is fenced on that
 //!    term ([`scarab_engine::Db::append_log_row`]);
 //! 2. loads the unit's value ledger, all of it or nothing. A unit with no
-//!    ledger, a purged one, or a source that answers
+//!    ledger, a purged one, one whose values are over
+//!    [`crate::logs::MAX_VALUE_BYTES`], or a source that answers
 //!    [`ExecError::NotLedgerComplete`] gets one `not_stored` marker and the
 //!    stream is closed: no source byte is read;
 //! 3. reads the source from its first byte, redacts it as one stream, and
@@ -39,7 +40,7 @@ use scarab_engine::{
 };
 
 pub use crate::logs::tail_lease_resource;
-use crate::logs::{LedgerError, LogError, LogService, ValueSet};
+use crate::logs::{LedgerError, LogError, LogService, PrepareError, StreamRedactor};
 
 /// Errors from [`pump_log_stream`].
 #[derive(Debug, thiserror::Error)]
@@ -779,6 +780,26 @@ async fn read_stream(
             }
             Err(LedgerError::Local(e)) => return report(ctx, fence, Failure::Local(e)),
         };
+        // The redactor before the source: values over the cap are never
+        // used in part (the rest of the log is not stored and no source
+        // byte is read), and a read waits here for room in the process's
+        // automata budget, never reading without them.
+        let redactor = match &values {
+            Some(v) => match wait_for_redactor(&ctx.logs, v.clone(), lost).await {
+                RedactorWait::Ready(Ok(r)) => Some(r),
+                RedactorWait::Ready(Err(PrepareError::TooLarge(_))) => {
+                    return close_not_stored(ctx, fence, writer, NotStoredReason::ValuesTooLarge)
+                        .await;
+                }
+                RedactorWait::Ready(Err(PrepareError::Build(e))) => {
+                    return report(ctx, fence, Failure::Local(e));
+                }
+                // Another replica holds the stream now: no source byte is
+                // read, and no write is tried.
+                RedactorWait::LeaseLost => return Outcome::Stop,
+            },
+            None => None,
+        };
         let before = ctx
             .executor
             .log_source_state(&source.source_ref())
@@ -811,7 +832,7 @@ async fn read_stream(
                 break;
             }
         };
-        let Some(values) = values else {
+        let Some(redactor) = redactor else {
             // A source that opened (a labelled unit) with no ledger row:
             // not read.
             failure = Some(Failure::Local(
@@ -842,7 +863,7 @@ async fn read_stream(
             final_read,
             before,
         };
-        match read.pump(chunks, values, part, part_start > 0).await {
+        match read.pump(chunks, redactor, part).await {
             PumpEnd::Complete => {
                 ctx.logs.purge_if_done(&unit, None).await;
                 return Outcome::Terminal;
@@ -920,7 +941,8 @@ async fn refused(ctx: &Ctx, fence: &LogStreamId, writer: &LogWriter, e: LogAppen
     }
 }
 
-/// The unit is not ledger-complete: one `not_stored` marker, `closed`, no
+/// The rest of the log is not stored (the unit is not ledger-complete, or
+/// its values are over the cap): one `not_stored` marker, `closed`, no
 /// source byte read.
 async fn close_not_stored(
     ctx: &Ctx,
@@ -931,7 +953,7 @@ async fn close_not_stored(
     tracing::warn!(
         run = %fence.run.0, step = %fence.step.0, attempt = %fence.attempt.0,
         reason = reason.as_str(),
-        "log tail: the unit is not ledger-complete; the rest of its log is not stored"
+        "log tail: the rest of the unit's log is not stored"
     );
     match ctx
         .logs
@@ -1052,6 +1074,46 @@ async fn check_budget(
     Some(close_incomplete(ctx, fence, writer, started).await)
 }
 
+/// How often a read waiting for room in the automata budget checks its
+/// tail lease.
+const LEASE_CHECK: Duration = Duration::from_millis(200);
+
+/// What waiting for a read's redactor ended with.
+enum RedactorWait {
+    Ready(Result<StreamRedactor, PrepareError>),
+    /// The tail lease was lost while the read waited (or as it got room):
+    /// the read does not start.
+    LeaseLost,
+}
+
+/// A redactor for `values`, waiting for room in the process's automata
+/// budget, unless the tail lease is lost first. Dropping the wait gives
+/// back nothing it did not take: a budget wait is cancelled cleanly.
+async fn wait_for_redactor(
+    logs: &LogService,
+    values: Arc<crate::logs::ValueSet>,
+    lost: &AtomicBool,
+) -> RedactorWait {
+    let ready = logs.stream_redactor(values);
+    tokio::pin!(ready);
+    loop {
+        if lost.load(Ordering::SeqCst) {
+            return RedactorWait::LeaseLost;
+        }
+        tokio::select! {
+            r = &mut ready => {
+                // Checked again: the lease can be lost while the build ran.
+                return if lost.load(Ordering::SeqCst) {
+                    RedactorWait::LeaseLost
+                } else {
+                    RedactorWait::Ready(r)
+                };
+            }
+            () = tokio::time::sleep(LEASE_CHECK) => {}
+        }
+    }
+}
+
 /// How one read of a source ended.
 enum PumpEnd {
     /// The end was confirmed and the stream is `complete`.
@@ -1100,12 +1162,11 @@ impl Read<'_> {
     async fn pump(
         &self,
         mut chunks: Box<dyn LogChunks>,
-        values: Arc<ValueSet>,
+        redactor: StreamRedactor,
         part: Vec<LogChunkMeta>,
-        after_restart: bool,
     ) -> PumpEnd {
-        let gen = values.gen();
-        let mut redactor = Some(crate::logs::StreamRedactor::new(values, after_restart));
+        let gen = redactor.gen();
+        let mut redactor = Some(redactor);
         let mut verify = Verifier::new(part);
         let mut batch = Batch::default();
         let mut last_byte = tokio::time::Instant::now();
@@ -1261,8 +1322,13 @@ impl Read<'_> {
         }
     }
 
-    /// The source ended inside the last stored row: whether what it read of
-    /// that row matches the row's body (one GET).
+    /// The source ended inside the last stored row: whether the bytes this
+    /// read emitted for that row, at its confirmed end, are a prefix of the
+    /// row's body (one GET). The stored row came from a longer source, so
+    /// they can differ where this read's end starred a value's start that
+    /// the longer source showed was no value (stored `tokio`, this read
+    /// `***`): then it is a `Mismatch`, a marker and a second copy, never a
+    /// stored value byte.
     async fn ends_inside_matches(&self, verify: &Verifier) -> bool {
         let Some((meta, partial)) = verify.inside() else {
             return true;
@@ -1419,7 +1485,10 @@ pub async fn pump_log_stream(
             .held_by(&resource, owner)
             .ok_or(LogError::Db(scarab_engine::DbError::NotLeader))?,
     );
-    let mut redactor = crate::logs::StreamRedactor::new(values.clone(), false);
+    let mut redactor = logs
+        .stream_redactor(values.clone())
+        .await
+        .map_err(LogError::from)?;
     let mut appended = 0u64;
     let mut out = Vec::new();
     while let Some(chunk) = chunks.next_chunk().await? {
@@ -1699,8 +1768,46 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        classify_tail_error, is_pod_not_ready, TailErrorClass, NOT_READY_GRACE, STUCK_WARN_INTERVAL,
+        classify_tail_error, is_pod_not_ready, wait_for_redactor, RedactorWait, TailErrorClass,
+        NOT_READY_GRACE, STUCK_WARN_INTERVAL,
     };
+
+    /// A read waiting for room in the automata budget stops when its tail
+    /// lease is lost, takes no budget, and does not start; one that is
+    /// told the lease is lost as it gets room gives the room back. The
+    /// clock is paused: the lease checks advance it, no test time passes.
+    /// Kills: a waiter that holds on after another replica took the
+    /// stream; a read started after the lease was lost.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_waiting_for_the_budget_stops_when_its_lease_is_lost() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (logs, units) = crate::logs::tests::service_with(
+            1024,
+            &[("a", b"s3cr3t-value"), ("b", b"other-secret")],
+        )
+        .await;
+        let a = logs.load_values(&units[0]).await.unwrap();
+        let b = logs.load_values(&units[1]).await.unwrap();
+        let first = logs.stream_redactor(a).await.unwrap();
+        let lost = AtomicBool::new(false);
+        let mut waiting = Box::pin(wait_for_redactor(&logs, b.clone(), &lost));
+        assert!(
+            futures::poll!(&mut waiting).is_pending(),
+            "the budget is full"
+        );
+        lost.store(true, Ordering::SeqCst);
+        assert!(matches!(waiting.await, RedactorWait::LeaseLost));
+        // The abandoned wait took nothing: the room `first` frees goes to
+        // the next reader at once.
+        drop(first);
+        let next = logs.stream_redactor(b.clone()).await.unwrap();
+        drop(next);
+        // Room is there, but the lease is already lost: no redactor.
+        assert!(matches!(
+            wait_for_redactor(&logs, b, &lost).await,
+            RedactorWait::LeaseLost
+        ));
+    }
 
     const INITIALIZING: &str = "executor error: exec error: ApiError: container \"step\" in pod \
                                 \"scarab-check-a1-7893ca80\" is waiting to start: PodInitializing: \

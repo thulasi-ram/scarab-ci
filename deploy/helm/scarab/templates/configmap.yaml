@@ -90,6 +90,9 @@ data:
   {{- if ne (toString .Values.scarab.driverStalledAfterSecs) "" }}
   SCARAB_DRIVER_STALLED_AFTER_SECS: {{ .Values.scarab.driverStalledAfterSecs | quote }}
   {{- end }}
+  {{- if ne (toString .Values.scarab.logAutomataBudgetMib) "" }}
+  SCARAB_LOG_AUTOMATA_BUDGET_MIB: {{ .Values.scarab.logAutomataBudgetMib | quote }}
+  {{- end }}
   {{- with .Values.scarab.projectRunCap }}
   SCARAB_PROJECT_RUN_CAP: {{ . | quote }}
   {{- end }}

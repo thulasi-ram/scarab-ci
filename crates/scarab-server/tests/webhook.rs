@@ -47,15 +47,26 @@ fn push_body() -> Vec<u8> {
 }
 
 fn webhook_request(event: &str, body: &[u8], signature: &str) -> Request<Body> {
-    Request::builder()
+    webhook_request_with_id(event, "delivery-1", body, signature)
+}
+
+/// A GitHub delivery with delivery id `delivery` (none when empty).
+fn webhook_request_with_id(
+    event: &str,
+    delivery: &str,
+    body: &[u8],
+    signature: &str,
+) -> Request<Body> {
+    let mut request = Request::builder()
         .method("POST")
         .uri("/webhooks/github")
         .header("content-type", "application/json")
         .header("x-github-event", event)
-        .header("x-github-delivery", "delivery-1")
-        .header("x-hub-signature-256", signature)
-        .body(Body::from(body.to_vec()))
-        .unwrap()
+        .header("x-hub-signature-256", signature);
+    if !delivery.is_empty() {
+        request = request.header("x-github-delivery", delivery);
+    }
+    request.body(Body::from(body.to_vec())).unwrap()
 }
 
 #[tokio::test]
@@ -1130,17 +1141,20 @@ steps:
 
 /// [`multi_forge_app`] over a forge the test keeps, to drain its statuses.
 fn multi_forge_app_arc(db: Arc<InMemoryDb>, forge: Arc<FakeForge>) -> axum::Router {
+    router(multi_forge_state(db, forge))
+}
+
+/// The state [`multi_forge_app_arc`] serves, for a test that also needs it.
+fn multi_forge_state(db: Arc<InMemoryDb>, forge: Arc<FakeForge>) -> AppState {
     let clock = Arc::new(FakeClock::new(1_000));
     let store = Arc::new(InMemoryObjectStore::new());
     let logs = Arc::new(LogService::new(store, db.clone()));
     let forge: Arc<dyn ForgePort> = forge;
-    router(
-        AppState::new(db.clone(), clock, logs)
-            .with_github_webhook_secret(SECRET.to_vec())
-            .with_forgejo_webhook_secret(b"forgejo-secret".to_vec())
-            .with_forge_connections(db)
-            .with_forge(forge),
-    )
+    AppState::new(db.clone(), clock, logs)
+        .with_github_webhook_secret(SECRET.to_vec())
+        .with_forgejo_webhook_secret(b"forgejo-secret".to_vec())
+        .with_forge_connections(db)
+        .with_forge(forge)
 }
 
 /// Post every queued commit status the way the server's tick does, and
@@ -1757,4 +1771,550 @@ async fn forgejo_pull_request_actions_start_runs_only_for_new_code() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     assert_eq!(db.active_runs().await.unwrap().len(), 1);
+}
+
+/// Runs only when something under `infra/` changed.
+const INFRA_ONLY_YAML: &str = r#"
+on:
+  push:
+    when: 'event.changed_paths.exists(p, p.startsWith("infra/"))'
+steps:
+  - { id: plan, image: busybox, command: ["true"] }
+"#;
+
+/// The `note` lines in a Run's event log.
+async fn run_notes(db: &InMemoryDb, run: &RunId) -> Vec<String> {
+    db.events(run)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.kind {
+            scarab_engine::EventPayload::Raw(v) => v["note"].as_str().map(str::to_string),
+            _ => None,
+        })
+        .collect()
+}
+
+/// git-bug 0354b5a (ADR-0081): GitHub's push payload does not list a file
+/// changed only in a merge's conflict resolution (`infra/main.tf` here). The
+/// compare answer for the payload's own `before` and `after` does, so the
+/// Pipeline filtered on `infra/` starts. Built from the payload's commit
+/// lists, the paths would be known and miss `infra/`, and no Run would start.
+#[tokio::test]
+async fn a_push_whose_merge_resolution_touches_the_filter_starts_the_run() {
+    let body = include_bytes!("../../scarab-forge-github/tests/fixtures/push_merge.json");
+    let payload: serde_json::Value = serde_json::from_slice(body).unwrap();
+    let id = |k: &str| payload[k].as_str().unwrap().to_string();
+    let forge = Arc::new(FakeForge::new().with_file(".scarab/infra.yaml", INFRA_ONLY_YAML));
+    forge.set_push_paths(
+        &id("before"),
+        &id("after"),
+        scarab_forge::ChangedPaths::from_paths(
+            ["conf/app.yaml", "infra/main.tf", "side/feature.txt"].map(String::from),
+        ),
+    );
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let app = multi_forge_app_arc(db.clone(), forge.clone());
+
+    let sig = scarab_forge_github::sign_hex(SECRET, body);
+    let resp = app
+        .oneshot(webhook_request("push", body, &sig))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let runs = db.active_runs().await.unwrap();
+    assert_eq!(runs.len(), 1);
+    assert!(
+        run_notes(&db, &runs[0]).await.is_empty(),
+        "the filter was applied"
+    );
+    assert_eq!(forge.push_paths_calls(), 1);
+}
+
+/// git-bug 63dbeee (ADR-0081): Forgejo's push payload does not say a push
+/// was forced, and its commits are only the new ones. The compare answer
+/// says the old head is not an ancestor: the paths are unknown, the
+/// Pipeline filtered on `infra/` starts, and its log says it was a forced
+/// push. Built from the payload, the paths would be known, miss `infra/`,
+/// and no Run would start.
+#[tokio::test]
+async fn a_forced_forgejo_push_starts_the_run_with_the_forced_note() {
+    let before = "6113728f27ae82c7b1a177c8d03f9e96e0adf246";
+    let after = "0d1a26e67d8f5eaf1f6ba5c57fc3c7d91ac0fd1c";
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::Forgejo).await;
+    let forge = FakeForge::new().with_file(".scarab/infra.yaml", INFRA_ONLY_YAML);
+    forge.set_push_paths(
+        before,
+        after,
+        scarab_forge::ChangedPaths::Unknown(scarab_forge::PathsUnknown::Forced),
+    );
+    let app = multi_forge_app_with(db.clone(), forge);
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "ref": "refs/heads/main",
+        "before": before,
+        "after": after,
+        "total_commits": 1,
+        "commits": [{ "id": after, "added": ["README.md"], "removed": [], "modified": [] }],
+        "repository": { "name": "app", "owner": { "username": "acme" } }
+    }))
+    .unwrap();
+    let sig = scarab_forge_forgejo::sign_hex(b"forgejo-secret", &body);
+    let resp = app
+        .oneshot(forgejo_request("push", "fj-forced", &body, &sig))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let runs = db.active_runs().await.unwrap();
+    assert_eq!(runs.len(), 1);
+    let notes = run_notes(&db, &runs[0]).await;
+    assert_eq!(notes.len(), 1);
+    assert!(
+        notes[0].contains(&scarab_forge::PathsUnknown::Forced.reason()),
+        "{notes:?}"
+    );
+}
+
+/// ADR-0081 §7, git-bug 23e3a09: a forge that stops waiting for the answer
+/// closes the connection, and the HTTP server drops the handler. The
+/// delivery id is already recorded, so a redelivery is answered "duplicate
+/// delivery" and could not repair it. Dropping the router's response future
+/// while the compare is pending is what the server does on a disconnect;
+/// the Run must still be created.
+#[tokio::test]
+async fn a_delivery_whose_client_went_away_still_creates_its_runs() {
+    let body = include_bytes!("../../scarab-forge-github/tests/fixtures/push_merge.json");
+    let payload: serde_json::Value = serde_json::from_slice(body).unwrap();
+    let id = |k: &str| payload[k].as_str().unwrap().to_string();
+    let forge = Arc::new(FakeForge::new().with_file(".scarab/infra.yaml", INFRA_ONLY_YAML));
+    forge.set_push_paths(
+        &id("before"),
+        &id("after"),
+        scarab_forge::ChangedPaths::from_paths(["infra/main.tf".to_string()]),
+    );
+    let gate = forge.hold_push_paths();
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let app = multi_forge_app_arc(db.clone(), forge.clone());
+
+    let sig = scarab_forge_github::sign_hex(SECRET, body);
+    let mut answer = Box::pin(app.oneshot(webhook_request("push", body, &sig)));
+    tokio::select! {
+        _ = &mut answer => panic!("the delivery was answered before the compare"),
+        _ = gate.entered() => {}
+    }
+    drop(answer);
+    gate.release();
+
+    let created = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if !db.active_runs().await.unwrap().is_empty() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(created.is_ok(), "the Run was lost with the dropped handler");
+    assert_eq!(db.active_runs().await.unwrap().len(), 1);
+}
+
+/// Hold the next `record_delivery` call of `db`: the first channel fires
+/// when the call got there, and the call goes on when the second is sent.
+fn hold_next_record_delivery(
+    db: &InMemoryDb,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    db.interleave_before_next(
+        "record_delivery",
+        Box::new(move || {
+            Box::pin(async move {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+            })
+        }),
+    );
+    (entered_rx, release_tx)
+}
+
+/// The red team's case (RT-12): the forge closes the connection while the
+/// delivery id is being recorded. Recorded in the handler, before the
+/// task was spawned, the id could commit with nothing spawned, and the
+/// redelivery was a duplicate. Recorded inside the task, the work goes on
+/// and creates the Run.
+#[tokio::test]
+async fn a_delivery_dropped_while_its_id_is_recorded_still_creates_its_runs() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML));
+    let state = multi_forge_state(db.clone(), forge);
+    let app = router(state.clone());
+    let (entered, release) = hold_next_record_delivery(&db);
+
+    let mut answer = Box::pin(app.clone().oneshot(push_request("delivery-1")));
+    tokio::select! {
+        _ = &mut answer => panic!("the delivery was answered before its id was recorded"),
+        _ = entered => {}
+    }
+    drop(answer);
+    release.send(()).unwrap();
+
+    let running =
+        scarab_server::drain_webhook_deliveries(&state, std::time::Duration::from_secs(10)).await;
+    assert_eq!(running, 0);
+    assert_eq!(db.active_runs().await.unwrap().len(), 1, "the Run was lost");
+    let again = app.oneshot(push_request("delivery-1")).await.unwrap();
+    assert_eq!(json_of(again).await["ignored"], "duplicate delivery");
+}
+
+/// RT-13: a delivery whose forge stopped waiting runs in a task no
+/// connection waits for. The shutdown drain waits for it, so a rollout does
+/// not kill it after its id was recorded.
+#[tokio::test]
+async fn the_shutdown_drain_waits_for_a_delivery_whose_client_went_away() {
+    let body = include_bytes!("../../scarab-forge-github/tests/fixtures/push_merge.json");
+    let payload: serde_json::Value = serde_json::from_slice(body).unwrap();
+    let id = |k: &str| payload[k].as_str().unwrap().to_string();
+    let forge = Arc::new(FakeForge::new().with_file(".scarab/infra.yaml", INFRA_ONLY_YAML));
+    forge.set_push_paths(
+        &id("before"),
+        &id("after"),
+        scarab_forge::ChangedPaths::from_paths(["infra/main.tf".to_string()]),
+    );
+    let gate = forge.hold_push_paths();
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let state = multi_forge_state(db.clone(), forge);
+    let app = router(state.clone());
+
+    let sig = scarab_forge_github::sign_hex(SECRET, body);
+    let mut answer = Box::pin(app.oneshot(webhook_request("push", body, &sig)));
+    tokio::select! {
+        _ = &mut answer => panic!("the delivery was answered before the compare"),
+        _ = gate.entered() => {}
+    }
+    drop(answer);
+
+    let drain = tokio::spawn(async move {
+        scarab_server::drain_webhook_deliveries(&state, std::time::Duration::from_secs(20)).await
+    });
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !drain.is_finished(),
+        "the drain ended while a delivery was running"
+    );
+    gate.release();
+    assert_eq!(drain.await.unwrap(), 0);
+    assert_eq!(db.active_runs().await.unwrap().len(), 1);
+}
+
+/// RT-13 / m7: deliveries run in tasks of their own, so their number is
+/// bounded. A delivery that finds every slot taken is answered 503 before
+/// its id is recorded, so the forge's redelivery is processed.
+#[tokio::test]
+async fn a_delivery_that_finds_every_slot_taken_is_answered_503_and_records_nothing() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML));
+    let app = router(
+        multi_forge_state(db.clone(), forge)
+            .with_webhook_delivery_slots(1, std::time::Duration::ZERO),
+    );
+    let (entered, release) = hold_next_record_delivery(&db);
+
+    let first = tokio::spawn(app.clone().oneshot(push_request("delivery-1")));
+    entered.await.unwrap();
+    let second = app
+        .clone()
+        .oneshot(push_request("delivery-2"))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    release.send(()).unwrap();
+    assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::ACCEPTED);
+    let redelivery = app.oneshot(push_request("delivery-2")).await.unwrap();
+    assert_eq!(
+        redelivery.status(),
+        StatusCode::ACCEPTED,
+        "the refused delivery's id was recorded"
+    );
+}
+
+/// m7: with a registry wired, a verified delivery without a delivery id
+/// could never be deduplicated; it is refused, on both endpoints.
+#[tokio::test]
+async fn a_delivery_without_an_id_is_refused() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let app = multi_forge_app(db.clone());
+
+    let body = push_body();
+    let sig = scarab_forge_github::sign_hex(SECRET, &body);
+    let github = app
+        .clone()
+        .oneshot(webhook_request_with_id("push", "", &body, &sig))
+        .await
+        .unwrap();
+    assert_eq!(github.status(), StatusCode::BAD_REQUEST);
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "ref": "refs/heads/main",
+        "after": "abc123",
+        "repository": { "name": "app", "owner": { "username": "acme" } }
+    }))
+    .unwrap();
+    let sig = scarab_forge_forgejo::sign_hex(b"forgejo-secret", &body);
+    let forgejo = app
+        .oneshot(forgejo_request("push", "", &body, &sig))
+        .await
+        .unwrap();
+    assert_eq!(forgejo.status(), StatusCode::BAD_REQUEST);
+    assert!(db.active_runs().await.unwrap().is_empty());
+}
+
+/// RT-11: the forge fails to read the Pipeline file on every try of the
+/// first delivery. Nothing was created, so the id is forgotten and the
+/// answer is 502; the redelivery of the same id creates the Run. Before,
+/// the first try answered "no matching pipeline" and the redelivery was a
+/// duplicate. Time is paused: the retries' pauses pass at once.
+#[tokio::test(start_paused = true)]
+async fn a_delivery_whose_pipeline_could_not_be_read_is_repaired_by_its_redelivery() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML));
+    let app = multi_forge_app_arc(db.clone(), forge.clone());
+
+    forge.set_read_error(Some("502 bad gateway"));
+    let first = app
+        .clone()
+        .oneshot(push_request("delivery-1"))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+    assert!(db.active_runs().await.unwrap().is_empty());
+
+    forge.set_read_error(None);
+    let redelivery = app.oneshot(push_request("delivery-1")).await.unwrap();
+    assert_eq!(redelivery.status(), StatusCode::ACCEPTED);
+    assert_eq!(db.active_runs().await.unwrap().len(), 1);
+}
+
+/// A read of the Pipeline file that fails once is tried again, and the
+/// delivery creates its Run.
+#[tokio::test(start_paused = true)]
+async fn a_pipeline_read_that_fails_once_is_tried_again() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML));
+    let app = multi_forge_app_arc(db.clone(), forge.clone());
+
+    forge.fail_next_reads(1);
+    let resp = app.oneshot(push_request("delivery-1")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_eq!(db.active_runs().await.unwrap().len(), 1);
+}
+
+/// One Pipeline file could not be read and another started a Run. A
+/// redelivery would start that Run again, so the id stays recorded and the
+/// answer says the delivery is incomplete.
+#[tokio::test(start_paused = true)]
+async fn a_delivery_that_started_runs_with_an_unreadable_file_is_incomplete() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = Arc::new(
+        FakeForge::new()
+            .with_file(".scarab/ci.yaml", CI_YAML)
+            .with_file(".scarab/lint.yaml", CI_YAML),
+    );
+    forge.set_read_error_for(".scarab/lint.yaml", Some("502 bad gateway"));
+    let app = multi_forge_app_arc(db.clone(), forge.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(push_request("delivery-1"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = json_of(resp).await;
+    assert_eq!(body["incomplete"], true, "{body}");
+    assert_eq!(body["run_ids"].as_array().unwrap().len(), 1, "{body}");
+
+    let again = app.oneshot(push_request("delivery-1")).await.unwrap();
+    assert_eq!(json_of(again).await["ignored"], "duplicate delivery");
+    assert_eq!(db.active_runs().await.unwrap().len(), 1);
+}
+
+/// The forge answers the read of `.scarab/` with an error that is not
+/// retried (here its rate limit). Nothing was recorded, so the id is
+/// forgotten and the answer is 502; the redelivery creates the Run.
+#[tokio::test]
+async fn a_delivery_whose_pipeline_listing_failed_is_answered_502_and_repaired() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML));
+    let app = multi_forge_app_arc(db.clone(), forge.clone());
+
+    forge.set_rate_limited(true);
+    let first = app
+        .clone()
+        .oneshot(push_request("delivery-1"))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+    assert!(db.active_runs().await.unwrap().is_empty());
+
+    forge.set_rate_limited(false);
+    let redelivery = app.oneshot(push_request("delivery-1")).await.unwrap();
+    assert_eq!(redelivery.status(), StatusCode::ACCEPTED);
+    assert_eq!(db.active_runs().await.unwrap().len(), 1);
+}
+
+/// Round-2 review #2: the forge redelivers while the first try is still
+/// running (in its forge reads). "duplicate delivery" would end the
+/// delivery if the first try then fails and forgets its id; the redelivery
+/// is answered 503 instead, so the forge tries again later.
+#[tokio::test]
+async fn a_redelivery_of_a_running_delivery_is_answered_503() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML));
+    let app = multi_forge_app_arc(db.clone(), forge);
+    let (entered, release) = hold_next_record_delivery(&db);
+
+    let first = tokio::spawn(app.clone().oneshot(push_request("delivery-1")));
+    entered.await.unwrap();
+    let redelivery = app
+        .clone()
+        .oneshot(push_request("delivery-1"))
+        .await
+        .unwrap();
+    assert_eq!(redelivery.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let text = axum::body::to_bytes(redelivery.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&text).contains("still running"),
+        "{text:?}"
+    );
+
+    release.send(()).unwrap();
+    assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::ACCEPTED);
+    let after = app.oneshot(push_request("delivery-1")).await.unwrap();
+    assert_eq!(json_of(after).await["ignored"], "duplicate delivery");
+    assert_eq!(db.active_runs().await.unwrap().len(), 1);
+}
+
+/// Round-2 review #3: one Pipeline file cannot be read and another does
+/// not compile. The compile failure is recorded (a refused Run, a failure
+/// status), so the id is kept: a redelivery is a duplicate and records it
+/// no second time. The 400 says a file could not be read.
+#[tokio::test(start_paused = true)]
+async fn a_recorded_compile_failure_keeps_the_id_when_another_file_was_unreadable() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = Arc::new(
+        FakeForge::new()
+            .with_file(".scarab/checks.yaml", BROKEN_YAML)
+            .with_file(".scarab/lint.yaml", CI_YAML),
+    );
+    forge.set_read_error_for(".scarab/lint.yaml", Some("502 bad gateway"));
+    let app = multi_forge_app_arc(db.clone(), forge.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(push_request("delivery-1"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let text = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&text).contains("could not be read"),
+        "{text:?}"
+    );
+    assert_compile_failure_status(&statuses_on_push(&forge, &db).await);
+
+    forge.set_read_error_for(".scarab/lint.yaml", None);
+    let again = app.oneshot(push_request("delivery-1")).await.unwrap();
+    assert_eq!(json_of(again).await["ignored"], "duplicate delivery");
+    assert!(db.active_runs().await.unwrap().is_empty());
+    assert_compile_failure_status(&statuses_on_push(&forge, &db).await);
+}
+
+/// A Pipeline that invokes a library in its repository.
+const INVOKES_LIB_YAML: &str = r#"
+on:
+  push: {}
+steps:
+  - { id: c, invoke: file:.scarab/lib/l.yaml }
+"#;
+
+const LIB_YAML: &str = r#"
+kind: library
+steps:
+  - { id: inner, image: busybox, command: ["true"] }
+"#;
+
+/// Round-2 red team W2: the forge fails (three tries) to read an `invoke:`
+/// library. That says nothing about the file, so the Pipeline is not
+/// refused as "no library found": nothing was recorded, the id is
+/// forgotten and the answer is 502; the redelivery creates the Run.
+#[tokio::test(start_paused = true)]
+async fn a_delivery_whose_library_could_not_be_read_is_repaired_by_its_redelivery() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = Arc::new(
+        FakeForge::new()
+            .with_file(".scarab/ci.yaml", INVOKES_LIB_YAML)
+            .with_file(".scarab/lib/l.yaml", LIB_YAML),
+    );
+    forge.set_read_error_for(".scarab/lib/l.yaml", Some("502 bad gateway"));
+    let app = multi_forge_app_arc(db.clone(), forge.clone());
+
+    let first = app
+        .clone()
+        .oneshot(push_request("delivery-1"))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+    assert!(db.active_runs().await.unwrap().is_empty());
+    assert!(
+        statuses_on_push(&forge, &db).await.is_empty(),
+        "no failure status for an outage"
+    );
+
+    forge.set_read_error_for(".scarab/lib/l.yaml", None);
+    let redelivery = app.oneshot(push_request("delivery-1")).await.unwrap();
+    assert_eq!(redelivery.status(), StatusCode::ACCEPTED);
+    assert_eq!(db.active_runs().await.unwrap().len(), 1);
+}
+
+/// A library that is not in the repository is the author's mistake, not an
+/// outage: 400, and the id is kept.
+#[tokio::test]
+async fn a_delivery_whose_library_is_missing_is_refused() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", INVOKES_LIB_YAML));
+    let app = multi_forge_app_arc(db.clone(), forge);
+
+    let first = app
+        .clone()
+        .oneshot(push_request("delivery-1"))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::BAD_REQUEST);
+    let again = app.oneshot(push_request("delivery-1")).await.unwrap();
+    assert_eq!(json_of(again).await["ignored"], "duplicate delivery");
+    assert!(db.active_runs().await.unwrap().is_empty());
 }

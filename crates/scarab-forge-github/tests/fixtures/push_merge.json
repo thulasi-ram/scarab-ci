@@ -1,0 +1,110 @@
+{
+  "ref": "refs/heads/main",
+  "before": "7cea710f62cb9d71c3f545e815375058d590b7f1",
+  "after": "568f433822aff1dddd7d15836cdc87bb2ac0266e",
+  "created": false,
+  "deleted": false,
+  "forced": false,
+  "base_ref": null,
+  "compare": "https://github.com/acme/app/compare/7cea710f62cb...568f433822af",
+  "commits": [
+    {
+      "id": "9b80ed92f7bee0abce8d7eba2925dcc0f353090b",
+      "tree_id": "5396e1c7a5983d4ed8e4eba5b1f1eff716ac5e4c",
+      "distinct": true,
+      "message": "line: rename docs, drop scratch",
+      "timestamp": "2026-11-22T10:00:00+00:00",
+      "url": "https://github.com/acme/app/commit/9b80ed92f7bee0abce8d7eba2925dcc0f353090b",
+      "author": {
+        "name": "Octo Cat",
+        "email": "octocat@example.com",
+        "username": "octocat"
+      },
+      "committer": {
+        "name": "Octo Cat",
+        "email": "octocat@example.com",
+        "username": "octocat"
+      },
+      "added": [
+        "docs/new.md"
+      ],
+      "removed": [
+        "docs/old.md",
+        "tmp/scratch.txt"
+      ],
+      "modified": [
+        "conf/app.yaml"
+      ]
+    },
+    {
+      "id": "9a82ad1f36de11e99301f1bf9dd3af3c117197f8",
+      "tree_id": "f82b90efe944cd1e9005dfb650ad9f40d0388321",
+      "distinct": true,
+      "message": "side: add feature",
+      "timestamp": "2026-11-22T10:00:00+00:00",
+      "url": "https://github.com/acme/app/commit/9a82ad1f36de11e99301f1bf9dd3af3c117197f8",
+      "author": {
+        "name": "Octo Cat",
+        "email": "octocat@example.com",
+        "username": "octocat"
+      },
+      "committer": {
+        "name": "Octo Cat",
+        "email": "octocat@example.com",
+        "username": "octocat"
+      },
+      "added": [
+        "side/feature.txt"
+      ],
+      "removed": [],
+      "modified": [
+        "conf/app.yaml"
+      ]
+    },
+    {
+      "id": "568f433822aff1dddd7d15836cdc87bb2ac0266e",
+      "tree_id": "6341d947725cf7425a60f0c53b1230945df9de47",
+      "distinct": true,
+      "message": "Merge branch 'side'",
+      "timestamp": "2026-11-22T10:00:00+00:00",
+      "url": "https://github.com/acme/app/commit/568f433822aff1dddd7d15836cdc87bb2ac0266e",
+      "author": {
+        "name": "Octo Cat",
+        "email": "octocat@example.com",
+        "username": "octocat"
+      },
+      "committer": {
+        "name": "Octo Cat",
+        "email": "octocat@example.com",
+        "username": "octocat"
+      },
+      "added": [],
+      "removed": [],
+      "modified": []
+    }
+  ],
+  "head_commit": {
+    "id": "568f433822aff1dddd7d15836cdc87bb2ac0266e",
+    "message": "Merge branch 'side'",
+    "added": [],
+    "removed": [],
+    "modified": []
+  },
+  "repository": {
+    "id": 1296269,
+    "name": "app",
+    "full_name": "acme/app",
+    "owner": {
+      "login": "acme",
+      "id": 9919
+    }
+  },
+  "pusher": {
+    "name": "octocat",
+    "email": "octocat@example.com"
+  },
+  "sender": {
+    "login": "octocat",
+    "id": 583231
+  }
+}

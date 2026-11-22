@@ -11,6 +11,11 @@
 #   probe_pod_host     the host name or address a Pod reaches the host at, for
 #                      a test that is itself a server (a fake forge, a results
 #                      listener); sets pod_host.
+#   read_step_ns       the namespace the release launches step Pods into, as
+#                      the running server is configured (its ConfigMap's
+#                      SCARAB_NAMESPACE, the chart's `<release ns>-steps` by
+#                      default); sets step_ns. Never guessed: a harness that
+#                      looks for step Pods in the wrong namespace finds none.
 # shellcheck shell=bash
 
 fwd_pids=""
@@ -31,6 +36,11 @@ forward() { # $1 Service name, $2 its port
   done
   cat "$log" >&2
   die "the port-forward to svc/$1:$2 did not open 127.0.0.1:$fwd_port"
+}
+
+read_step_ns() {
+  step_ns="$(kc get configmap "$release" -n "$ns" -o jsonpath='{.data.SCARAB_NAMESPACE}')"
+  [ -n "$step_ns" ] || die "configmap $release in $ns has no SCARAB_NAMESPACE: the step namespace is unknown"
 }
 
 stop_forwards() {

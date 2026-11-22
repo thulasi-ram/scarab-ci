@@ -63,9 +63,23 @@ pub fn kubeconfig() -> PathBuf {
     }
 }
 
-/// The k8s namespace the release and its step Pods live in.
+/// The k8s namespace the release (the server, the Depot) lives in.
 pub fn namespace() -> String {
     std::env::var("SCARAB_E2E_NAMESPACE").unwrap_or_else(|_| "scarab".into())
+}
+
+/// The k8s namespace the release launches step Pods into, with their per-Pod
+/// Secrets: `just test e2e` reads it from the server's ConfigMap (the
+/// chart's default is `<release namespace>-steps`). No default: a case that
+/// looked for step Pods in the release namespace would find none and could
+/// pass on nothing.
+pub fn step_namespace() -> String {
+    std::env::var("SCARAB_E2E_STEP_NAMESPACE")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            panic!("SCARAB_E2E_STEP_NAMESPACE unset: `just test e2e` reads it from the release")
+        })
 }
 
 /// The kind node's docker container (`scarab-dev-control-plane`): the
@@ -305,11 +319,16 @@ pub async fn logs(client: &reqwest::Client, base: &str, id: &str) -> String {
 /// Names of the step Pods for `run_id` in the stack's kind cluster, via the
 /// isolated kubeconfig (never the ambient context).
 pub fn pods_of_run(run_id: &str) -> Vec<String> {
+    pods_of_run_in(&step_namespace(), run_id)
+}
+
+/// Names of the Pods labelled with `run_id` in namespace `ns`.
+pub fn pods_of_run_in(ns: &str, run_id: &str) -> Vec<String> {
     kubectl(&[
         "get",
         "pods",
         "-n",
-        &namespace(),
+        ns,
         "-l",
         &format!("scarab.io/run={run_id}"),
         "--no-headers",

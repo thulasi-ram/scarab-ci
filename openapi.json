@@ -7,7 +7,7 @@
       "name": "AGPL-3.0-only",
       "identifier": "AGPL-3.0-only"
     },
-    "version": "0.7.0"
+    "version": "0.7.1"
   },
   "paths": {
     "/.well-known/jwks.json": {
@@ -9459,8 +9459,17 @@
           "202": {
             "description": "delivery accepted"
           },
+          "400": {
+            "description": "malformed delivery, or no delivery id"
+          },
           "401": {
             "description": "bad signature"
+          },
+          "502": {
+            "description": "the forge could not be read and nothing was created; redeliver"
+          },
+          "503": {
+            "description": "too many deliveries running, or this delivery is still running; redeliver later"
           }
         },
         "security": []
@@ -9477,8 +9486,17 @@
           "202": {
             "description": "delivery accepted"
           },
+          "400": {
+            "description": "malformed delivery, or no delivery id"
+          },
           "401": {
             "description": "bad signature"
+          },
+          "502": {
+            "description": "the forge could not be read and nothing was created; redeliver"
+          },
+          "503": {
+            "description": "too many deliveries running, or this delivery is still running; redeliver later"
           }
         },
         "security": []

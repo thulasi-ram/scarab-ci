@@ -18,6 +18,175 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-22
+
+### Breaking changes
+
+- **A GitHub push of 300 or more changed files has an unknown `event.changed_paths`, so its
+  path-filtered Pipelines run.** A push's list now comes from the forge's compare API (see
+  Enhancement), and GitHub's lists at most 300 files. Before, a push of up to 2,999 files had a
+  list, read from the webhook payload. The activity log says `300 or more files changed`.
+- **A push's file list on Forgejo needs Forgejo 16.0.1 or later.** An older Forgejo, or a Gitea
+  whose compare answer has no per-commit files, gives an unknown list on every push, so its
+  path-filtered Pipelines always run. Pull requests are not affected.
+- **A `changed_paths` filter is not a deploy guard.** An unknown list counts as true and the
+  Pipeline runs, and a list is unknown during a forge outage, when the forge is slow or
+  rate-limits Scarab, and on every GitHub push of 300 or more files. A Pipeline that runs a deploy
+  when `infra/` changed also runs then; guard a deploy with an Environment's protection and
+  approvals. The reasons a list is unknown changed: "the push payload lists no commits" and "the
+  push payload lists only some of its commits" are gone; new ones say the forge answered 404, the
+  branch's earlier head is not on the new head's first-parent line (Forgejo), more than 1,000
+  commits were pushed (Forgejo), the answer was over 16 MiB, the answer did not list every pushed
+  commit or file, or the payload's commit ids are not commit ids. A tool that matches the reason
+  text in the activity log needs the new ones. See
+  [Changed files](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#changed-files-eventchanged_paths).
+- **Migration 0101 validates three of 0099's checks on `log_chunks` when the server starts.**
+  `log_chunks_kind`, `log_chunks_reason` and `log_chunks_body` are checked against every stored
+  row, under a lock that blocks no read or write, so on a large table the start takes longer.
+  The migration waits at most 5 seconds for that lock: while a manual `VACUUM` or `ANALYZE`, an
+  anti-wraparound autovacuum or a `CREATE INDEX CONCURRENTLY` runs on `log_chunks`, the server
+  stops with `canceling statement due to lock timeout` and Kubernetes restarts it until the other
+  session ends. Migration 0102, right after it, adds the `values_too_large` reason to
+  `log_chunks_reason` (see Security): it drops the check and adds it again `NOT VALID`, scanning no
+  row, under a lock that every other lock on `log_chunks` blocks: an open transaction that read the
+  table (a `pg_dump`, a long `SELECT`) makes it stop with the lock timeout, and while it waits, up
+  to 5 seconds, log reads and writes on `log_chunks` wait behind it. Migration 0103 then validates it again in its own transaction, under the same lock and
+  5-second wait as 0101, so the start scans `log_chunks` once more. A 0.7.0 server does not start
+  on a database that ran 0101, 0102 or 0103: to go back, scale the server to zero, run
+  `DELETE FROM _sqlx_migrations WHERE version IN (101, 102, 103);` and install 0.7.0. To go back
+  to 0.6, `rollback/0099_revert.sql` now reverts 0101 to 0103 too, and a second run of it changes
+  nothing (it failed with `column "kind" does not exist`). See
+  [Migration 0101](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#migration-0101)
+  and [Migrations 0102 and 0103](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#migrations-0102-and-0103).
+- **A webhook delivery without a delivery id is refused with 400** when forge connections are
+  configured, since it could not be deduplicated. GitHub and Forgejo send the header on every
+  delivery; a hand-made request or script that posts to `/webhooks/github` or `/webhooks/forgejo`
+  must send `X-GitHub-Delivery` or `X-Forgejo-Delivery`.
+
+### Security
+
+- **The refusal for an unknown placement profile no longer lists the operator's profiles.** It
+  named every profile in the registry, so a repository author could list them by naming one that
+  does not exist. It now names the step and the profile only. See
+  [Placement & resources](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#placement--resources).
+- **Overlapping secret values are redacted as one `***`, and no byte of either is stored.** The
+  redactor replaced the longest value at a position and went on after it, so a value that started
+  inside it and ended after it kept its end in clear: with the values `user:hunter2pw` and
+  `hunter2pw-and-more-secret`, `dsn=user:hunter2pw-and-more-secret` was stored as
+  `dsn=***-and-more-secret` (git-bug 32c3c10, present before 0.7.0). The redactor now finds every
+  match first and stores each run of bytes they cover as one `***`; values that only touch stay
+  two. A value that repeats a word, printed twice in a row, is now one `***` (`abab` twice, was
+  `******`). See [Edges of a value](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/#edges-of-a-value).
+- **A log part that starts inside a value no longer stores the value's end, however the log was
+  read in chunks.** In 0.7.0, a part after a `source_restarted` note that began with 8 bytes ending
+  one value and starting another stored the second value's last bytes when the read was cut after
+  those 8 bytes (git-bug 2599a7b). That case now stores `***`.
+- **The start of every log is checked against the ends of values.** 0.7.0 starred a value's last
+  8 or more bytes only at the start of a part after a `source_restarted` note; now the first part
+  of every log gets the same rule. Output that begins with 8 or more bytes that end a secret value
+  shows `***` there, and the first bytes of a log can appear a moment later.
+- **A log part that lies wholly inside a value is `***`.** A part that starts after a value's first
+  byte and whose container ended before the value's last byte (the kubelet rotated the file between
+  two lines of a PEM key, and the process ended) stored those lines. It now stores `***` when the
+  part is 8 bytes or longer.
+- **A step whose secret values add up to more than 256 KiB has its log not stored.** It gets one
+  `not_stored` note with the reason `values_too_large`, the server reads none of its log, and a
+  failure cause about it is replaced by "the cause was not stored". The redactor keeps up to 52
+  bytes of lookup tables per value byte, so the cap holds them at 13 MiB per step being read. A
+  server keeps at most 128 MiB of these tables by default (`SCARAB_LOG_AUTOMATA_BUDGET_MIB`, chart value
+  `scarab.logAutomataBudgetMib`), frees a step's tables when its last log read ends, and builds
+  them for 2 steps at a time; a read that does not fit waits for another to end. A value is never
+  redacted in part.
+- **A failure cause that ends in the first bytes of a secret value has them replaced by `***`.**
+  The executor keeps 1,024 bytes of an API server message (an admission denial) and could cut it
+  inside a value; the part before the cut was no occurrence and was stored. A cut message now ends
+  with `…`, and the bytes before it count as the end of the cause.
+- **Rows already stored are not rewritten.** A value's end that 0.7.0 stored stays stored. A
+  re-read of a part stored by 0.7.0 that held an overlap stores one `source_restarted` note and a
+  second, redacted copy.
+- **Overlapping values are redacted in full only once every replica runs this version.** During a
+  rolling upgrade, a 0.7.0 replica that takes over a log's tail can store its own copy with the
+  0.7.0 redactor after a `source_restarted` note.
+- **Every GitHub and Forgejo answer, and every answer from the login provider, is read up to
+  16 MiB.** Only the compare answer had a cap; a forge that sent a longer answer to any other call,
+  an error answer included, had it read whole into the server's memory, and so did the OAuth or
+  OIDC provider's token, userinfo, discovery and key set answers at login. A longer forge answer
+  now fails the call with `the forge's answer was over 16777216 bytes and was not read`, a longer
+  provider answer fails the login, and none of either is parsed (git-bug bfa8dfd).
+
+### Features
+
+- **A `when:` can read `event.changed_paths_known`** to tell an unknown changed files list from a
+  known one. It is `true` when Scarab has the complete list, an empty one included, and `false`
+  when the list is unknown and on every trigger with no list (`tag`, `release`, `comment`,
+  `cron`, `manual`, `api`, `upstream`). An unknown list still counts as true, so `when:
+  event.changed_paths_known && event.changed_paths.exists(p, p.startsWith("infra/"))` is how a
+  trigger skips on an unknown list. A template cannot read it. See
+  [Changed files](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#changed-files-eventchanged_paths).
+
+### Enhancement
+
+- **A push's changed files come from the forge's compare API**, from the branch's head before the
+  push to its head after it, asked once per delivery and only when a Pipeline whose `push` trigger
+  matches reads `event.changed_paths`. The list now includes a file changed only in a merge's
+  conflict resolution, on GitHub and Forgejo, and a forced push to Forgejo gives an unknown list
+  (`forced push`) instead of only the files of the commits it added, so its path-filtered
+  Pipelines run. A forge answer is read up to 16 MiB. See
+  [Changed files](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#changed-files-eventchanged_paths).
+
+### Bug Fixes
+
+- **A Pod Security or LimitRange denial caused by a step's `k8s_overlay` fails the step.** It was
+  a launch error that the scheduler retried until the Run dead-lettered. When Kubernetes refuses a
+  step Pod with a 400, 403 or 422, Scarab now dry-runs the same Pod and, when that is refused
+  again, the Pod without the overlay: up to two more requests to the API server. The step fails
+  as a configuration error only when the same Pod is refused twice and the Pod without the overlay
+  passes. A refusal gone by the dry run, an RBAC denial and a ResourceQuota denial (matched by
+  Kubernetes' own `is forbidden: exceeded quota: ` text, so a policy message that only contains
+  the words still fails the step) stay launch errors. A webhook that refuses for a reason of the
+  moment on both requests fails the step; rerun it. The API server's message in the failure is
+  cut to 1,024 bytes, also for a refusal by the chart's admission policy. See
+  [Placement & resources](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#placement--resources).
+- **A webhook delivery whose forge stopped waiting still creates its Runs.** The work runs in a
+  task of its own, and the delivery id is recorded inside it, so a delivery dropped before the
+  task started records nothing and its redelivery is processed. At most 64 deliveries run at once;
+  one that gets no turn within 10 seconds is answered 503 with nothing recorded. On shutdown the
+  server waits up to 20 seconds for running deliveries. See
+  [Webhook deliveries](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#webhook-deliveries).
+- **A delivery whose Pipeline files could not be read from the forge can be redelivered.** A
+  failed read is tried three times. When it still fails and no Run was created, the delivery id
+  is forgotten and the answer is 502, so a redelivery creates the Runs; before, the answer was
+  200 `no matching pipeline` and a redelivery was a duplicate. When some Runs were created, the
+  answer is 202 with `"incomplete": true`.
+
+### Tests
+
+- **`just test chaos kill-tailer`** (rank 2) SIGKILLs the server replica that owns a step's log
+  tail lease while the step prints, and checks that each log's lines are stored whole and in
+  order or the log ends in a note, and that the step's secret is in no stored object and not in
+  the log API.
+- **`just test e2e` checks that a rerun step that writes the same bytes skips the step after
+  it.**
+- **`just test record-compare`** records the Forgejo compare answers the adapter's tests read,
+  from the kind stack's Forgejo.
+
+### Documentation
+
+- **Set `kernel.yama.ptrace_scope` to 1 or more on the nodes that run step Pods.** A new section
+  says what it stops and what it does not, its cost, how to read a node's value, and how to set
+  it on Amazon Linux 2023 nodes with Karpenter. Scarab does not check it. See
+  [Hardening the nodes that run step Pods](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#hardening-the-nodes-that-run-step-pods).
+- **The 0.7 docs site builds again.** The 0.7.0 publish stopped at a `<file>` in the Pipeline
+  syntax page.
+
+### Misc
+
+- **CI builds the docs site on pull requests that change it**, so an MDX error fails the pull
+  request instead of the release.
+- **The kind stack runs step Pods in the chart's default namespace, `scarab-steps`**, not the
+  release namespace. The e2e and chaos harnesses read the step namespace from the server's
+  ConfigMap.
+
 ## [0.7.0] - 2026-11-22
 
 ### Breaking changes
@@ -2147,7 +2316,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.5.0...v0.6.0

@@ -75,6 +75,10 @@ fn unreadable(field: &str) -> Option<&'static str> {
         "body" => "free text that anyone who can comment writes",
         "schedule" => "it comes from the Pipeline itself",
         "changed_paths" => "file paths that anyone who can push names; a `when:` may read it",
+        "changed_paths_known" => {
+            "it is decided while the trigger is matched and the Run does not store it; a `when:` \
+             may read it"
+        }
         "message" | "title" | "base" | "reason" => {
             "it is provenance shown on the Run page, not trigger data (ADR-0057)"
         }
@@ -87,14 +91,25 @@ fn unreadable(field: &str) -> Option<&'static str> {
 /// anyone who can push writes.
 pub const CHANGED_PATHS: &str = "changed_paths";
 
-/// Whether the `when:` expression `expr` reads `event.changed_paths`: a read
-/// of that member, or of `event` whole or by a computed key, which may reach
-/// it. An expression that does not parse reads nothing here.
+/// The `event` field a `when:` reads to learn whether [`CHANGED_PATHS`] is
+/// known (ADR-0081): `true` for a known list, `false` for an unknown one and
+/// for every trigger kind that has no changed paths. A `when:` that must not
+/// run on an unknown list writes `event.changed_paths_known && …`.
+pub const CHANGED_PATHS_KNOWN: &str = "changed_paths_known";
+
+/// Whether the `when:` expression `expr` reads `event.changed_paths` or
+/// `event.changed_paths_known`: a read of either member, or of `event` whole
+/// or by a computed key, which may reach them. Either needs the forge's
+/// answer for a push or pull request. An expression that does not parse
+/// reads nothing here.
 pub fn when_reads_changed_paths(expr: &str) -> bool {
     cel::reads(expr).is_ok_and(|reads| {
-        reads
-            .iter()
-            .any(|r| r.var == "event" && r.first.as_deref().is_none_or(|f| f == CHANGED_PATHS))
+        reads.iter().any(|r| {
+            r.var == "event"
+                && r.first
+                    .as_deref()
+                    .is_none_or(|f| f == CHANGED_PATHS || f == CHANGED_PATHS_KNOWN)
+        })
     })
 }
 

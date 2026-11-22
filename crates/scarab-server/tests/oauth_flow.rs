@@ -773,6 +773,28 @@ async fn api_login_works_without_a_verifier_and_forwards_one_when_given() {
     );
 }
 
+// A provider (or something answering for it) sends a userinfo body over the
+// 16 MiB cap, to make the server hold it in memory. Safe outcome: the read
+// stops at the cap, the login fails, and nothing of the body comes back.
+#[tokio::test]
+async fn a_userinfo_answer_over_the_cap_fails_the_login_unread() {
+    let p = provider(None).await;
+    let pad = "z".repeat(scarab_forge::FORGE_BODY_MAX_BYTES);
+    *p.user.lock().unwrap() = serde_json::json!({ "id": 1001, "login": "alice", "pad": pad });
+    let app = app_for(&p, vec!["alice".into()], false);
+
+    let resp = api_login(&app, "good-code").await;
+    assert_ne!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&bytes).contains("zzzzzzzz"),
+        "the answer carries part of the provider's body"
+    );
+    assert_eq!(*p.userinfo_hits.lock().unwrap(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // id_token verification (ADR-0049 amendment)
 // ---------------------------------------------------------------------------

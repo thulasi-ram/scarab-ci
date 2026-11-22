@@ -1,0 +1,15 @@
+{
+  "recorded_from": "Forgejo 16.0.1+gitea-1.22.0, deploy/kind/record-compare.sh, 2026-11-22",
+  "ff_merge": {
+    "before": "b6cc449d3106d99f039176b31154fc9be02f700a",
+    "after": "4ed8ec692c0285e527bea3236b5739a4ae2e7537"
+  },
+  "forced": {
+    "before": "7872c147545aaf830293ef13ef32343d3a4afeb5",
+    "after": "c85bda7d9bd85b1941709f16282b74258c6ad3ad"
+  },
+  "pull_merge": {
+    "before": "453bcf838ab9d909926d225e36d69ce431ce7da9",
+    "after": "b1af9f370300e77971f1ba0f47846986dc42f561"
+  }
+}

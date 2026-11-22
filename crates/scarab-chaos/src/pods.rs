@@ -1,6 +1,8 @@
-//! The Pod watcher (ADR-0077 §2): a kube watch on the release namespace that
-//! writes one JSONL line per change to a step Pod or a Depot Pod, and keeps
-//! the latest view of each for the nemesis.
+//! The Pod watcher (ADR-0077 §2): kube watches that write one JSONL line per
+//! change to a step Pod or a Depot Pod, and keep the latest view of each for
+//! the nemesis. Step Pods run in the step namespace (the chart's
+//! `<release namespace>-steps`), Depot Pods in the release namespace, so the
+//! nemesis runs one watcher on each ([`step_pod`], [`depot_pod`]).
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -156,8 +158,15 @@ pub fn read_records(path: &std::path::Path) -> Result<Vec<PodRecord>, String> {
 /// The latest view of every recorded Pod, by UID.
 pub type Views = Arc<Mutex<HashMap<String, PodView>>>;
 
-fn interesting(v: &PodView) -> bool {
-    v.run.is_some() || v.is_depot()
+/// A step Pod: it carries a Run label. The step namespace's watcher keeps
+/// these.
+pub fn step_pod(v: &PodView) -> bool {
+    v.run.is_some()
+}
+
+/// A Depot Pod. The release namespace's watcher keeps these.
+pub fn depot_pod(v: &PodView) -> bool {
+    v.is_depot()
 }
 
 /// How long a list may take, and how long a watch may go without an event
@@ -168,15 +177,18 @@ fn interesting(v: &PodView) -> bool {
 const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const WATCH_IDLE: std::time::Duration = std::time::Duration::from_secs(270);
 
-/// Watch `ns` until `stop` flips, appending a line to `out` whenever a step
-/// or Depot Pod changes. A watch that ends, errors or goes quiet past
-/// `WATCH_IDLE` is re-listed and resumed; a re-list records every Pod again
-/// as `added`.
+/// Watch the namespace of `pods` until `stop` flips, appending a line to
+/// `out` whenever a Pod `keep` selects changes. A watch that ends, errors or
+/// goes quiet past `WATCH_IDLE` is re-listed and resumed; a re-list records
+/// every kept Pod again as `added`. Two watchers may share `out` and `views`
+/// when their `keep`s select disjoint Pods: each line is one append, and a
+/// re-list replaces only the views its own `keep` selects.
 pub async fn watch(
     pods: Api<Pod>,
     out: std::path::PathBuf,
     views: Views,
     mut stop: tokio::sync::watch::Receiver<bool>,
+    keep: fn(&PodView) -> bool,
 ) -> Result<(), String> {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -189,8 +201,8 @@ pub async fn watch(
             event: event.to_string(),
             pod: view.clone(),
         };
-        let line = serde_json::to_string(&rec).map_err(|e| e.to_string())?;
-        writeln!(file, "{line}").map_err(|e| e.to_string())
+        let line = serde_json::to_string(&rec).map_err(|e| e.to_string())? + "\n";
+        file.write_all(line.as_bytes()).map_err(|e| e.to_string())
     };
     loop {
         if *stop.borrow() {
@@ -214,7 +226,7 @@ pub async fn watch(
             let mut seen = HashMap::new();
             for p in &list.items {
                 let v = PodView::from_json(&serde_json::to_value(p).map_err(|e| e.to_string())?);
-                if interesting(&v) {
+                if keep(&v) {
                     seen.insert(v.uid.clone(), v);
                 }
             }
@@ -225,11 +237,12 @@ pub async fn watch(
                 }
             }
             for (uid, v) in map.iter() {
-                if !seen.contains_key(uid) {
+                if keep(v) && !seen.contains_key(uid) {
                     write("deleted", v)?;
                 }
             }
-            *map = seen;
+            map.retain(|_, v| !keep(v));
+            map.extend(seen);
         }
         let stream = match tokio::time::timeout(
             LIST_TIMEOUT,
@@ -275,7 +288,7 @@ pub async fn watch(
                 }
             };
             let v = PodView::from_json(&serde_json::to_value(&pod).map_err(|e| e.to_string())?);
-            if !interesting(&v) {
+            if !keep(&v) {
                 continue;
             }
             let mut map = views.lock().expect("views lock");

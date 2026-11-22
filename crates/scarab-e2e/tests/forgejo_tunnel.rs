@@ -26,11 +26,12 @@ use std::time::Duration;
 use support::forgejo::*;
 use support::*;
 
-/// The forge-token Secrets left in the stack's namespace (`<pod>-token`).
+/// The forge-token Secrets left in the step namespace (`<pod>-token`): the
+/// executor writes them beside the step Pod they belong to.
 fn forge_token_secrets() -> Vec<String> {
     let out = std::process::Command::new("kubectl")
         .env("KUBECONFIG", kubeconfig())
-        .args(["get", "secrets", "-n", &namespace(), "-o", "name"])
+        .args(["get", "secrets", "-n", &step_namespace(), "-o", "name"])
         .output()
         .expect("kubectl runs");
     assert!(

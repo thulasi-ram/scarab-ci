@@ -1516,3 +1516,59 @@ async fn dispatch_refuses_a_resolved_commit_that_is_not_a_hex_sha() {
         );
     }
 }
+
+/// A step guarded by `event.changed_paths_known` (ADR-0081 §6) in a
+/// Pipeline that is also dispatchable.
+const KNOWN_GUARD_YAML: &str = r#"
+on:
+  manual: {}
+  push: {}
+steps:
+  - id: image
+    image: busybox
+    command: ["true"]
+    when: 'event.changed_paths_known && event.changed_paths.exists(p, p.startsWith("docker/"))'
+  - { id: test, image: busybox, command: ["true"] }
+"#;
+
+// A dispatch has no changed files, so the guard reads `false`: the guarded
+// step is skipped, the dispatch is not refused over a missing field, and no
+// note says a path filter was not applied.
+#[tokio::test]
+async fn dispatch_reads_changed_paths_known_as_false() {
+    let forge = scarab_testkit::FakeForge::new().with_file(".scarab/ci.yaml", KNOWN_GUARD_YAML);
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+
+    let run = dispatch_run(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        "alice".into(),
+        repo(),
+        "refs/heads/main".into(),
+        "ci".into(),
+        std::collections::BTreeMap::new(),
+        DispatchKind::Manual,
+        None,
+    )
+    .await
+    .expect("dispatch");
+
+    let steps = db.steps_of_run(&run).await.unwrap();
+    let status = |id: &str| steps.iter().find(|s| s.step.0 == id).unwrap().status;
+    assert_eq!(status("image"), scarab_engine::StepStatus::Skipped);
+    assert_ne!(status("test"), scarab_engine::StepStatus::Skipped);
+    let notes: Vec<String> = db
+        .events(&run)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.kind {
+            EventPayload::Raw(v) => v["note"].as_str().map(str::to_string),
+            _ => None,
+        })
+        .collect();
+    assert!(notes.is_empty(), "{notes:?}");
+}

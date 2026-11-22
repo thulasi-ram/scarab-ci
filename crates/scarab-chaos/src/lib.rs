@@ -6,6 +6,7 @@
 pub mod cache;
 pub mod check;
 pub mod env;
+pub mod logs;
 pub mod nemesis;
 pub mod node;
 pub mod pods;

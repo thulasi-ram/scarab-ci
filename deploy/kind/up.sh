@@ -278,6 +278,17 @@ chmod 600 "$kubeconfig"
 verify_kubeconfig
 kc get nodes >/dev/null
 
+# The node shares the docker host's kernel (the VM on macOS, the host itself on
+# Linux), whose default of 128 inotify instances runs out once the e2e and
+# chaos tiers have many Pods: kubelet's log follower then fails with "failed to
+# create fsnotify watcher: too many open files" and a log read ends early.
+# kind's known-issues page recommends 512. The limit is not namespaced, so this
+# sets the kernel's value: the VM's, which resets when the VM restarts, or on
+# Linux the host's own, which stays until the host reboots. Set it on every
+# run; a node that refuses keeps its value.
+docker exec "$cluster-control-plane" sysctl -q -w fs.inotify.max_user_instances=512 \
+  || echo "warning: could not raise fs.inotify.max_user_instances on the kind node" >&2
+
 # The mode-switch guard, before anything is applied or deleted: a refused
 # switch must leave the running mode as it was (its toxiproxy, its Forgejo
 # tunnel and ROOT_URL, its release). A step Pod of the current mode would

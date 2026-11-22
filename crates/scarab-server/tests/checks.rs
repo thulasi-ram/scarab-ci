@@ -29,6 +29,7 @@ fn push() -> Event {
         r#ref: "refs/heads/main".into(),
         after: "sha123".into(),
         message: "build the thing".into(),
+        before: String::new(),
         changed_paths: Default::default(),
     }
 }

@@ -114,6 +114,7 @@ pub mod plugins;
 /// decision logs and the policy test API.
 pub mod policies;
 mod policy_checkpoints;
+mod redact;
 mod refused_runs;
 pub mod retention;
 mod routes;
@@ -368,6 +369,102 @@ pub struct AppState {
     /// against its profile registry ([`PlacementConfig::profile_refusals`](scarab_executor_k8s::PlacementConfig::profile_refusals)).
     /// `None` (another executor, or a hand-built state): not checked.
     pub placement: Option<Arc<scarab_executor_k8s::PlacementConfig>>,
+    /// The turns webhook deliveries take ([`DeliverySlots`]); the shutdown
+    /// path waits for them with [`drain_webhook_deliveries`].
+    delivery_slots: DeliverySlots,
+}
+
+/// How many webhook deliveries run at once (git-bug 23e3a09): each one holds
+/// a permit from the moment before its id is recorded until its task ends.
+pub const WEBHOOK_DELIVERY_SLOTS: u32 = 64;
+
+/// How long a delivery waits for a permit before it is answered 503 with
+/// nothing recorded: GitHub's delivery timeout.
+pub const WEBHOOK_DELIVERY_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The permits webhook deliveries take ([`WEBHOOK_DELIVERY_SLOTS`]), how
+/// long one waits for a permit, and the delivery ids whose task is running
+/// on this server ([`RunningDelivery`]).
+#[derive(Clone)]
+struct DeliverySlots {
+    permits: Arc<tokio::sync::Semaphore>,
+    count: u32,
+    wait: std::time::Duration,
+    running: Arc<std::sync::Mutex<std::collections::HashSet<(&'static str, String)>>>,
+}
+
+impl DeliverySlots {
+    fn new(count: u32, wait: std::time::Duration) -> Self {
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(count as usize)),
+            count,
+            wait,
+            running: Arc::default(),
+        }
+    }
+}
+
+/// A delivery id whose task is running on this server, from before its id
+/// is recorded until the task ends. A redelivery of a running id is
+/// answered 503 instead of "duplicate delivery": the first try may still
+/// fail to read the forge, forget the id and answer 502 to a forge that
+/// stopped waiting, and a 200 to the redelivery would then end the
+/// delivery with no Run. The set is per server: a redelivery that reaches
+/// another replica finds the id recorded and is answered as a duplicate.
+struct RunningDelivery {
+    running: Arc<std::sync::Mutex<std::collections::HashSet<(&'static str, String)>>>,
+    key: Option<(&'static str, String)>,
+}
+
+impl RunningDelivery {
+    /// Mark `delivery_id` of `forge` running, or `None` when it already
+    /// is. An empty id (no registry wired) is never deduplicated.
+    fn claim(st: &AppState, forge: scarab_forge::ForgeKind, delivery_id: &str) -> Option<Self> {
+        let running = st.delivery_slots.running.clone();
+        if delivery_id.is_empty() {
+            return Some(Self { running, key: None });
+        }
+        let key = (forge.as_str(), delivery_id.to_string());
+        if !running.lock().unwrap().insert(key.clone()) {
+            return None;
+        }
+        Some(Self {
+            running,
+            key: Some(key),
+        })
+    }
+}
+
+impl Drop for RunningDelivery {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.running.lock().unwrap().remove(&key);
+        }
+    }
+}
+
+/// [`RunningDelivery::claim`], answering 503 when the id is running.
+fn claim_delivery(
+    st: &AppState,
+    forge: scarab_forge::ForgeKind,
+    delivery_id: &str,
+) -> Result<RunningDelivery, ApiError> {
+    RunningDelivery::claim(st, forge, delivery_id).ok_or_else(|| {
+        ApiError::Unavailable("this delivery is still running; redeliver later".into())
+    })
+}
+
+/// Wait, at most `wait`, for every webhook delivery task to end, and return
+/// how many were still running when the wait ended. The shutdown path calls
+/// it after the HTTP server stopped: a delivery whose forge stopped waiting
+/// runs in a task nothing else waits for, and its id is already recorded.
+pub async fn drain_webhook_deliveries(st: &AppState, wait: std::time::Duration) -> usize {
+    let slots = &st.delivery_slots;
+    let all = slots.permits.acquire_many(slots.count);
+    match tokio::time::timeout(wait, all).await {
+        Ok(_) => 0,
+        Err(_) => (slots.count as usize).saturating_sub(slots.permits.available_permits()),
+    }
 }
 
 impl AppState {
@@ -421,7 +518,16 @@ impl AppState {
             step_up: step_up::StepUpPolicy::Off,
             author_overlay: scarab_executor_k8s::AuthorOverlayConfig::default(),
             placement: None,
+            delivery_slots: DeliverySlots::new(WEBHOOK_DELIVERY_SLOTS, WEBHOOK_DELIVERY_SLOT_WAIT),
         }
+    }
+
+    /// Run at most `count` webhook deliveries at once, and answer 503 to a
+    /// delivery that waited `wait` for a turn. [`AppState::new`] sets
+    /// [`WEBHOOK_DELIVERY_SLOTS`] and [`WEBHOOK_DELIVERY_SLOT_WAIT`].
+    pub fn with_webhook_delivery_slots(mut self, count: u32, wait: std::time::Duration) -> Self {
+        self.delivery_slots = DeliverySlots::new(count, wait);
+        self
     }
 
     /// The placement config the k8s executor applies ([`AppState::placement`]):
@@ -1858,6 +1964,13 @@ pub enum ApiError {
     /// plausible blank pane (ADR-0063 part 5: absence is authoritative only when
     /// the index records no chunks).
     LogRead(crate::logs::LogError),
+    /// The server failed in a way that is neither the database nor the log
+    /// store (500), e.g. a webhook delivery's task stopped. The text says what.
+    Internal(String),
+    /// A forge this request depends on could not be read (502): a webhook
+    /// delivery whose Pipeline files could not be read and that created
+    /// nothing. The text says what to do.
+    BadGateway(String),
 }
 
 impl From<DbError> for ApiError {
@@ -1921,6 +2034,8 @@ impl IntoResponse for ApiError {
                 format!("log storage read failed: {e}"),
             )
                 .into_response(),
+            ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
+            ApiError::BadGateway(m) => (StatusCode::BAD_GATEWAY, m).into_response(),
             ApiError::StepUpRequired(refusal) => refusal.into_response(),
             ApiError::FreshLoginRequired { login_url } => (
                 StatusCode::FORBIDDEN,
@@ -2262,9 +2377,47 @@ fn run_pipeline_name(ir: &scarab_pipeline::PipelineIr, path: &str) -> String {
     ir.name.clone().unwrap_or_else(|| bare_pipeline_name(path))
 }
 
+/// The paths a push from `before` to `after` changed, from the forge's
+/// compare API (ADR-0081), waiting at most
+/// [`CHANGED_FILES_TIMEOUT_SECS`](scarab_forge::CHANGED_FILES_TIMEOUT_SECS)
+/// for the whole call, the adapter's rate-limit waits included. A failed,
+/// slow or incomplete answer is "unknown", never a refused trigger and never
+/// the payload's own commit lists: the `when:` that wanted the paths counts
+/// as true, and the Run says why.
+async fn push_paths(
+    forge: &dyn scarab_forge::ForgePort,
+    repo: &scarab_forge::RepoRef,
+    before: &str,
+    after: &str,
+) -> scarab_forge::ChangedPaths {
+    use scarab_forge::{ChangedPaths, PathsUnknown};
+    let wait = std::time::Duration::from_secs(scarab_forge::CHANGED_FILES_TIMEOUT_SECS);
+    let Ok(answer) =
+        tokio::time::timeout(wait, forge.push_changed_paths(repo, before, after)).await
+    else {
+        tracing::warn!(
+            org = %repo.owner,
+            project = %repo.name,
+            after,
+            "comparing a push's commits timed out; its changed paths are unknown"
+        );
+        return ChangedPaths::Unknown(PathsUnknown::TimedOut);
+    };
+    if let ChangedPaths::Unknown(why) = &answer {
+        tracing::info!(
+            org = %repo.owner,
+            project = %repo.name,
+            after,
+            reason = %why.reason(),
+            "a push's changed paths are unknown"
+        );
+    }
+    answer
+}
+
 /// The paths pull request `number` changes, from the forge's files API
 /// (git-bug 418f55e), waiting at most
-/// [`PULL_REQUEST_FILES_TIMEOUT_SECS`](scarab_forge::PULL_REQUEST_FILES_TIMEOUT_SECS).
+/// [`CHANGED_FILES_TIMEOUT_SECS`](scarab_forge::CHANGED_FILES_TIMEOUT_SECS).
 /// A failed or slow request is "unknown", never a refused trigger: the `when:` that wanted the paths counts as true, and the Run
 /// says why.
 async fn pull_request_paths(
@@ -2273,7 +2426,7 @@ async fn pull_request_paths(
     number: u64,
 ) -> scarab_forge::ChangedPaths {
     use scarab_forge::{ChangedPaths, PathsUnknown};
-    let wait = std::time::Duration::from_secs(scarab_forge::PULL_REQUEST_FILES_TIMEOUT_SECS);
+    let wait = std::time::Duration::from_secs(scarab_forge::CHANGED_FILES_TIMEOUT_SECS);
     let Ok(answer) = tokio::time::timeout(wait, forge.pull_request_files(repo, number)).await
     else {
         tracing::warn!(
@@ -2286,7 +2439,9 @@ async fn pull_request_paths(
     };
     match answer {
         Ok(Some(files)) => ChangedPaths::from_paths(files),
-        Ok(None) => ChangedPaths::Unknown(PathsUnknown::TooMany),
+        Ok(None) => ChangedPaths::Unknown(PathsUnknown::TooMany {
+            limit: scarab_forge::CHANGED_PATHS_MAX,
+        }),
         Err(e) => {
             tracing::warn!(
                 org = %repo.owner,
@@ -5258,9 +5413,39 @@ struct EventPipelines {
     complete: bool,
 }
 
+/// The pauses before the second and third try of a forge read of the
+/// Pipeline files that failed with [`Api`](scarab_forge::ForgeError::Api)
+/// (a timeout, a `5xx`).
+const PIPELINE_READ_RETRY_PAUSES: [std::time::Duration; 2] = [
+    std::time::Duration::from_millis(500),
+    std::time::Duration::from_secs(2),
+];
+
+/// `read` tried up to three times while it fails with
+/// [`Api`](scarab_forge::ForgeError::Api), pausing
+/// [`PIPELINE_READ_RETRY_PAUSES`] between tries. Any other answer is final.
+async fn forge_read_retried<T, F, Fut>(mut read: F) -> Result<T, scarab_forge::ForgeError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, scarab_forge::ForgeError>>,
+{
+    for pause in PIPELINE_READ_RETRY_PAUSES {
+        match read().await {
+            Err(scarab_forge::ForgeError::Api(e)) => {
+                tracing::debug!(error = %e, "forge read of the Pipeline files failed; retrying");
+                tokio::time::sleep(pause).await;
+            }
+            answer => return answer,
+        }
+    }
+    read().await
+}
+
 /// The event's `.scarab/` Pipeline files and their YAML, read at the event's
 /// commit. An absent directory yields nothing (not an error); a file that
-/// vanished between list and read is left out.
+/// vanished between list and read is left out. A read that fails with
+/// [`Api`](scarab_forge::ForgeError::Api) is tried three times
+/// ([`forge_read_retried`]) before the list is marked incomplete.
 async fn read_event_pipelines(
     forge: &dyn scarab_forge::ForgePort,
     event: &scarab_forge::Event,
@@ -5273,21 +5458,24 @@ async fn read_event_pipelines(
         return Ok(read);
     };
     let git_ref = config_ref(event);
-    let entries = match forge.list_dir_at_ref(repo, &git_ref, CONFIG_DIR).await {
-        Ok(e) => e,
-        Err(scarab_forge::ForgeError::Api(_)) => {
-            read.complete = false;
-            return Ok(read);
-        }
-        Err(e) => return Err(TriggerError::Forge(e)),
-    };
+    let git_ref = git_ref.as_str();
+    let entries =
+        match forge_read_retried(|| forge.list_dir_at_ref(repo, git_ref, CONFIG_DIR)).await {
+            Ok(e) => e,
+            Err(scarab_forge::ForgeError::Api(_)) => {
+                read.complete = false;
+                return Ok(read);
+            }
+            Err(e) => return Err(TriggerError::Forge(e)),
+        };
     let mut paths: Vec<String> = entries
         .into_iter()
         .filter(|p| is_pipeline_file(p))
         .collect();
     paths.sort();
     for path in paths {
-        let bytes = match forge.read_file_at_ref(repo, &git_ref, &path).await {
+        let file = path.as_str();
+        let bytes = match forge_read_retried(|| forge.read_file_at_ref(repo, git_ref, file)).await {
             Ok(b) => b,
             // A listed file that vanished between list and read → skip it.
             Err(scarab_forge::ForgeError::NotFound(_)) => continue,
@@ -5310,6 +5498,9 @@ async fn read_event_pipelines(
 /// whole of `.scarab/` at that commit: each Run started then records which
 /// of them follow it (`on: upstream:`), so its `run_finished` needs no forge
 /// read when nothing does.
+///
+/// A [`TriggerError::Forge`] comes only from reading an `invoke:` library,
+/// before any Run or refusal is recorded.
 pub(crate) async fn trigger_runs_from_files(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
@@ -5323,9 +5514,10 @@ pub(crate) async fn trigger_runs_from_files(
         return Ok(TriggerOutcome::default());
     };
     let git_ref = config_ref(event);
-    // `event.changed_paths` (git-bug 418f55e): a push carries its own; a
+    // `event.changed_paths` (git-bug 418f55e): a push's (ADR-0081) and a
     // pull request's are asked of the forge once, and only when a Pipeline
-    // reads them.
+    // reads them; a push payload may already have decided them (a new
+    // branch, a forced push, ...).
     let mut ctx = event.when_context();
     let mut paths = event.changed_paths();
     let kind = event.trigger_kind();
@@ -5358,6 +5550,9 @@ pub(crate) async fn trigger_runs_from_files(
         match prefetch_libs_and_compile(forge, repo, &git_ref, yaml, &installed).await {
             Ok(ir) => compiled.push((path, ir)),
             Err(TriggerError::Pipeline(text)) => broken.push((path, yaml, text)),
+            // Before anything is recorded for the delivery. This is the only
+            // `TriggerError::Forge` this function returns, and the webhook
+            // ingest relies on that to forget the delivery (`ingest_event`).
             Err(e) => return Err(e),
         }
     }
@@ -5619,15 +5814,17 @@ async fn prefetch_libs_and_compile(
         if !seen.insert(lib_path.clone()) {
             continue;
         }
-        match forge.read_file_at_ref(repo, read_ref, &lib_path).await {
+        let file = lib_path.as_str();
+        match forge_read_retried(|| forge.read_file_at_ref(repo, read_ref, file)).await {
             Ok(bytes) => {
                 let src = String::from_utf8(bytes).map_err(|_| TriggerError::NotUtf8)?;
                 worklist.extend(scarab_pipeline::invoke_refs(&src));
                 libs.insert(lib_path, src);
             }
-            Err(scarab_forge::ForgeError::Api(_) | scarab_forge::ForgeError::NotFound(_)) => {
-                continue
-            }
+            // Not there: compile reports "no library found at ...".
+            Err(scarab_forge::ForgeError::NotFound(_)) => continue,
+            // A forge that failed three times says nothing about the file:
+            // compiling without it would refuse the Pipeline for an outage.
             Err(e) => return Err(TriggerError::Forge(e)),
         }
     }
@@ -6215,7 +6412,8 @@ enum TriggerDecision {
 }
 
 /// The delivery whose Pipelines' triggers are decided: the event, its
-/// trigger kind, and the forge a pull request's changed paths are asked of.
+/// trigger kind, and the forge a push's or pull request's changed paths are
+/// asked of.
 struct DeliveryTrigger<'a> {
     forge: &'a dyn scarab_forge::ForgePort,
     event: &'a scarab_forge::Event,
@@ -6228,12 +6426,22 @@ impl DeliveryTrigger<'_> {
     /// ([`refuse_uncompiled_delivery`]), so the two cannot answer
     /// differently.
     ///
-    /// The trigger is matched first with a pull request's paths not yet
-    /// asked for (unknown), so a Pipeline whose trigger does not match
-    /// (another kind, a false branch test) costs no files request. Only a
-    /// match that may have rested on the unknown paths asks, once per
-    /// delivery (`ctx` and `paths` keep the answer for the next Pipeline),
-    /// and is decided again with the answer.
+    /// The trigger is matched first with a push's or pull request's paths
+    /// not yet asked for (unknown), so a Pipeline whose trigger does not
+    /// match (another kind, a false branch test) costs no request. Only a
+    /// match that may have rested on the unknown paths asks (a push the
+    /// compare API, ADR-0081; a pull request the files API), once per
+    /// delivery (`ctx` and `paths` keep the answer for the next Pipeline,
+    /// for its run-scope Step `when:`s and for the Run's note), and is
+    /// decided again with the answer. Until the forge is asked,
+    /// `event.changed_paths_known` is not decided either (absent from `ctx`):
+    /// the first match is decided only when the `when:` gives the same answer
+    /// with an unknown list (flag `false`) and with a known one (flag `true`),
+    /// so `event.changed_paths_known && …` or `… == true` asks rather than
+    /// deciding `false` before the answer; [`ChangedPaths::apply_to`] then
+    /// sets it.
+    ///
+    /// [`ChangedPaths::apply_to`]: scarab_forge::ChangedPaths::apply_to
     async fn decide(
         &self,
         ir: &scarab_pipeline::PipelineIr,
@@ -6253,18 +6461,27 @@ impl DeliveryTrigger<'_> {
         if first != TriggerDecision::Matches {
             return first;
         }
-        if let (
-            scarab_forge::ChangedPaths::Unknown(scarab_forge::PathsUnknown::NotFetched),
-            scarab_forge::Event::PullRequest { repo, number, .. },
-        ) = (&*paths, self.event)
-        {
-            if scarab_pipeline::reads_changed_paths(ir, kind) {
-                *paths = pull_request_paths(self.forge, repo, *number).await;
-                paths.apply_to(ctx);
-                return decide(ctx);
-            }
+        let not_fetched = matches!(
+            paths,
+            scarab_forge::ChangedPaths::Unknown(scarab_forge::PathsUnknown::NotFetched)
+        );
+        if !not_fetched || !scarab_pipeline::reads_changed_paths(ir, kind) {
+            return first;
         }
-        first
+        *paths = match self.event {
+            scarab_forge::Event::PullRequest { repo, number, .. } => {
+                pull_request_paths(self.forge, repo, *number).await
+            }
+            scarab_forge::Event::Push {
+                repo,
+                before,
+                after,
+                ..
+            } => push_paths(self.forge, repo, before, after).await,
+            _ => return first,
+        };
+        paths.apply_to(ctx);
+        decide(ctx)
     }
 }
 
@@ -7373,7 +7590,10 @@ pub async fn dispatch_run(
     // from `context()`, so it never reaches trigger-matching / interpolation.
     let event = kind.into_event(actor, repo, sym, sha, reason);
     let ir = record_compile_failure(db, clock, &event, &path, compiled).await?;
-    let ctx = event.context();
+    // The `when:` context: a dispatch has no changed paths, so
+    // `event.changed_paths_known` reads `false` here as on a push whose list
+    // is unknown.
+    let ctx = event.when_context();
 
     // Opt-in (ADR-0043 §4): the pipeline is dispatchable only if it declares a
     // matching `on: manual` / `on: api` (a `when:` on that trigger is honoured
@@ -8449,10 +8669,72 @@ async fn run_forge_coords(
     Ok(None)
 }
 
+/// A verified delivery must carry its id when a registry is wired: without
+/// one it could not be deduplicated. GitHub sends `X-GitHub-Delivery` and
+/// Forgejo `X-Forgejo-Delivery` / `X-Gitea-Delivery` on every delivery, so
+/// only a hand-made request lacks it. With no registry (dev) nothing is
+/// deduplicated and no id is needed.
+fn require_delivery_id(st: &AppState, delivery_id: &str) -> Result<(), ApiError> {
+    if st.connections.is_some() && delivery_id.is_empty() {
+        return Err(ApiError::BadRequest("missing delivery id".into()));
+    }
+    Ok(())
+}
+
+/// A turn for one delivery ([`DeliverySlots`]), taken before its id is
+/// recorded. Waits at most [`WEBHOOK_DELIVERY_SLOT_WAIT`], then answers 503
+/// with nothing recorded, so the forge's redelivery is processed. A sender
+/// that goes away while this waits has recorded nothing either.
+async fn delivery_slot(st: &AppState) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
+    let slots = &st.delivery_slots;
+    match tokio::time::timeout(slots.wait, slots.permits.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) | Err(_) => Err(ApiError::Unavailable(
+            "too many webhook deliveries are running; redeliver later".into(),
+        )),
+    }
+}
+
+/// The answer to a delivery whose id was already recorded.
+fn duplicate_delivery() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ignored": "duplicate delivery" })),
+    )
+}
+
+/// A delivery that recorded nothing (no Run, no refusal) because the forge
+/// could not be read: its id is removed from the replay guard, so the
+/// forge's redelivery is processed and cannot duplicate a Run or a refusal,
+/// and the answer is 502.
+async fn refuse_unread_delivery(
+    st: &AppState,
+    forge: scarab_forge::ForgeKind,
+    delivery_id: &str,
+    why: &str,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    if let (Some(connections), false) = (st.connections.as_ref(), delivery_id.is_empty()) {
+        connections
+            .forget_delivery(forge, delivery_id)
+            .await
+            .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
+    }
+    tracing::warn!(
+        forge = forge.as_str(),
+        delivery = %delivery_id,
+        reason = %why,
+        "webhook delivery created nothing: the forge could not be read"
+    );
+    Err(ApiError::BadGateway(
+        "the forge could not be read; redeliver".into(),
+    ))
+}
+
 /// Replay guard (ADR-0046): record the delivery id against the registry;
 /// `Ok(false)` means this exact delivery was already processed (a replay —
 /// even a correctly-signed one) and must be acknowledged without re-processing.
-/// With no registry wired (dev) or an empty id, dedup is skipped.
+/// With no registry wired (dev), dedup is skipped. With one wired, an empty
+/// id was refused before this ([`require_delivery_id`]).
 async fn delivery_is_fresh(
     st: &AppState,
     forge: scarab_forge::ForgeKind,
@@ -8470,9 +8752,19 @@ async fn delivery_is_fresh(
 /// The shared tail of every webhook ingest: read in-repo `.scarab` config at
 /// the event ref, compile, and start Runs if a pipeline's `on:` matches
 /// (ADR-0010). Without a forge wired we can only acknowledge the delivery.
+///
+/// A Pipeline file the forge could not read (after
+/// [`read_event_pipelines`]'s retries) and nothing recorded: the delivery
+/// id `delivery_id` of `kind` is forgotten and the answer is 502, so the
+/// forge's redelivery is processed ([`refuse_unread_delivery`]). Some Runs
+/// created or Pipelines refused: the usual answer with `"incomplete": true`
+/// (a 400 says so in its text); a redelivery would record them again, so
+/// the id stays recorded.
 async fn ingest_event(
     st: &AppState,
     event: scarab_forge::Event,
+    kind: scarab_forge::ForgeKind,
+    delivery_id: &str,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let Some(forge) = st.forge.as_ref() else {
         return Ok((
@@ -8508,38 +8800,76 @@ async fn ingest_event(
             Some(_) => {}
         }
     }
-    let triggered = async {
-        if matches!(event, scarab_forge::Event::Cron { .. }) {
-            return Ok(TriggerOutcome::default());
+    let no_match = || {
+        Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({ "ignored": "no matching pipeline" })),
+        ))
+    };
+    if matches!(event, scarab_forge::Event::Cron { .. }) {
+        return no_match();
+    }
+    let read = match read_event_pipelines(forge.as_ref(), &event).await {
+        Ok(read) => read,
+        Err(TriggerError::Forge(e)) => {
+            return refuse_unread_delivery(st, kind, delivery_id, &e.to_string()).await
         }
-        let read = read_event_pipelines(forge.as_ref(), &event).await?;
-        let complete = read.complete;
-        let files = read.files;
-        // A push to the live default branch rewrites the cron schedule index
-        // (git-bug 5d5fc8a) from the files this delivery read anyway, when
-        // every read succeeded.
-        if let (Some(store), true) = (st.schedules.as_ref(), read.complete) {
-            schedules::index_push(
-                forge.as_ref(),
-                store.as_ref(),
-                st.clock.as_ref(),
-                &event,
-                &files,
+        Err(TriggerError::Db(e)) => return Err(ApiError::Db(e)),
+        Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+    };
+    let complete = read.complete;
+    let files = read.files;
+    // A push to the live default branch rewrites the cron schedule index
+    // (git-bug 5d5fc8a) from the files this delivery read anyway, when
+    // every read succeeded.
+    if let (Some(store), true) = (st.schedules.as_ref(), complete) {
+        schedules::index_push(
+            forge.as_ref(),
+            store.as_ref(),
+            st.clock.as_ref(),
+            &event,
+            &files,
+        )
+        .await;
+    }
+    let triggered = trigger_runs_from_files(
+        forge.as_ref(),
+        st.db.as_ref(),
+        st.clock.as_ref(),
+        st.admission_ports(),
+        &event,
+        &files,
+        complete,
+    )
+    .await;
+    // A library the forge could not read: returned before any Run or
+    // refusal was recorded ([`trigger_runs_from_files`] returns a forge error
+    // from its library reads only), so the delivery is forgotten as for an
+    // unreadable Pipeline file.
+    if let Err(TriggerError::Forge(e)) = &triggered {
+        return refuse_unread_delivery(st, kind, delivery_id, &e.to_string()).await;
+    }
+    if !complete {
+        // The id is forgotten only when the delivery recorded nothing: no
+        // Run, and no refusal (a refused-Run row, a failure status, a
+        // Policy decision), which a redelivery would record again. A file
+        // that does not compile records refusals for the delivery, so it
+        // keeps the id like a refusal does; anything else may have stopped
+        // after a Run was created.
+        let recorded_nothing = matches!(
+            &triggered,
+            Ok(outcome) if outcome.runs.is_empty() && outcome.refused.is_empty()
+        );
+        if recorded_nothing {
+            return refuse_unread_delivery(
+                st,
+                kind,
+                delivery_id,
+                "a Pipeline file could not be read",
             )
             .await;
         }
-        trigger_runs_from_files(
-            forge.as_ref(),
-            st.db.as_ref(),
-            st.clock.as_ref(),
-            st.admission_ports(),
-            &event,
-            &files,
-            complete,
-        )
-        .await
     }
-    .await;
     match triggered {
         // ADR-0071 §2: every deploy pipeline the Environment refused is named
         // in the body as `refused: [{pipeline, environment, reason}]` — beside
@@ -8555,20 +8885,34 @@ async fn ingest_event(
             if !outcome.refused.is_empty() {
                 body["refused"] = serde_json::json!(outcome.refused);
             }
+            // A Pipeline file could not be read: it started nothing, and a
+            // redelivery would duplicate the Runs above, so the id stays
+            // recorded and the answer says so.
+            if !complete {
+                body["incomplete"] = serde_json::json!(true);
+                tracing::warn!(
+                    forge = kind.as_str(),
+                    delivery = %delivery_id,
+                    "webhook delivery created Runs, but a Pipeline file could not be read"
+                );
+            }
             Ok((StatusCode::ACCEPTED, Json(body)))
         }
-        Ok(outcome) if !outcome.refused.is_empty() => Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({
+        Ok(outcome) if !outcome.refused.is_empty() => {
+            let mut body = serde_json::json!({
                 "refused": outcome.refused,
                 "trigger": event.trigger_kind(),
-            })),
-        )),
-        Ok(_) => Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({ "ignored": "no matching pipeline" })),
-        )),
+            });
+            if !complete {
+                body["incomplete"] = serde_json::json!(true);
+            }
+            Ok((StatusCode::OK, Json(body)))
+        }
+        Ok(_) => no_match(),
         Err(TriggerError::Db(e)) => Err(ApiError::Db(e)),
+        Err(e @ TriggerError::Pipeline(_)) if !complete => Err(ApiError::BadRequest(format!(
+            "{e}; another Pipeline file could not be read from the forge"
+        ))),
         Err(e) => Err(ApiError::BadRequest(e.to_string())),
     }
 }
@@ -8792,7 +9136,7 @@ fn delivery_assign_refusal(
 /// durably create the triggered Runs. Unverified deliveries are rejected;
 /// administrative events (e.g. `ping`) and events of a repo that is not
 /// enabled are acknowledged and ignored.
-#[utoipa::path(post, path = "/webhooks/github", summary = "GitHub webhook ingest (HMAC-verified)", responses((status = 202, description = "delivery accepted"), (status = 401, description = "bad signature")))]
+#[utoipa::path(post, path = "/webhooks/github", summary = "GitHub webhook ingest (HMAC-verified)", responses((status = 202, description = "delivery accepted"), (status = 400, description = "malformed delivery, or no delivery id"), (status = 401, description = "bad signature"), (status = 502, description = "the forge could not be read and nothing was created; redeliver"), (status = 503, description = "too many deliveries running, or this delivery is still running; redeliver later")))]
 async fn github_webhook(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -8819,45 +9163,84 @@ async fn github_webhook(
         payload,
     };
 
-    // Replay guard — only verified deliveries are recorded (ADR-0046).
-    if !delivery_is_fresh(&st, scarab_forge::ForgeKind::GitHub, &delivery.id).await? {
-        return Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({ "ignored": "duplicate delivery" })),
-        ));
-    }
+    require_delivery_id(&st, &delivery.id)?;
+    let slot = delivery_slot(&st).await?;
+    finish_delivery(slot, async move {
+        let kind = scarab_forge::ForgeKind::GitHub;
+        // Replay guard — only verified deliveries are recorded (ADR-0046).
+        let _running = claim_delivery(&st, kind, &delivery.id)?;
+        if !delivery_is_fresh(&st, kind, &delivery.id).await? {
+            return Ok(duplicate_delivery());
+        }
+        // Installation lifecycle → the connection's registration (ADR-0046).
+        if let Some(sync) = scarab_forge_github::installation_sync(&delivery) {
+            if let Some(connections) = st.connections.as_ref() {
+                return register_installation(&st, connections.as_ref(), &sync).await;
+            }
+            return Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({ "ignored": "no registry configured" })),
+            ));
+        }
 
-    // Installation lifecycle → the connection's registration (ADR-0046).
-    if let Some(sync) = scarab_forge_github::installation_sync(&delivery) {
-        if let Some(connections) = st.connections.as_ref() {
-            return register_installation(&st, connections.as_ref(), &sync).await;
-        }
-        return Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({ "ignored": "no registry configured" })),
-        ));
-    }
+        let event = match scarab_forge_github::normalize(&delivery) {
+            Ok(e) => e,
+            // Acknowledge-and-ignore events we don't act on (ping, unsupported).
+            Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => {
+                return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true }))));
+            }
+            // A supported event that starts nothing (a closed pull request, ...).
+            Err(scarab_forge::ForgeError::Ignored(why)) => {
+                return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": why }))));
+            }
+            Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+        };
+        ingest_event(&st, event, kind, &delivery.id).await
+    })
+    .await
+}
 
-    let event = match scarab_forge_github::normalize(&delivery) {
-        Ok(e) => e,
-        // Acknowledge-and-ignore events we don't act on (ping, unsupported).
-        Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => {
-            return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true }))));
-        }
-        // A supported event that starts nothing (a closed pull request, ...).
-        Err(scarab_forge::ForgeError::Ignored(why)) => {
-            return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": why }))));
-        }
-        Err(e) => return Err(ApiError::BadRequest(e.to_string())),
-    };
-    ingest_event(&st, event).await
+/// Do a verified delivery's work in its own task and wait for it (ADR-0081
+/// §7, git-bug 23e3a09). The work records the delivery id first
+/// ([`delivery_is_fresh`]); once it is recorded a redelivery is answered
+/// "duplicate delivery" and cannot repair this one. A forge that stops
+/// waiting (GitHub after 10 seconds, Forgejo after its `DELIVER_TIMEOUT`)
+/// closes the connection, and the HTTP server then drops the handler; in a
+/// task of its own the work goes on, records the id, reads the Pipeline
+/// files, asks for the changed files and creates the Runs, and only the wait
+/// is dropped. Nothing is recorded before the task is spawned, so a handler
+/// dropped earlier leaves nothing for a redelivery to trip on.
+///
+/// Two bounds keep the tasks in check. The task holds `slot`, one of
+/// [`WEBHOOK_DELIVERY_SLOTS`] permits, until it ends: at most that many
+/// deliveries run at once, and a delivery that cannot get a permit in
+/// [`WEBHOOK_DELIVERY_SLOT_WAIT`] is answered 503 with nothing recorded
+/// ([`delivery_slot`]). On shutdown, [`drain_webhook_deliveries`] waits a
+/// bounded time for every permit, so the running deliveries finish.
+async fn finish_delivery(
+    slot: tokio::sync::OwnedSemaphorePermit,
+    work: impl std::future::Future<Output = Result<(StatusCode, Json<serde_json::Value>), ApiError>>
+        + Send
+        + 'static,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let task = tokio::spawn(async move {
+        let answer = work.await;
+        drop(slot);
+        answer
+    });
+    match task.await {
+        Ok(answer) => answer,
+        Err(e) => Err(ApiError::Internal(format!(
+            "the delivery's task stopped: {e}"
+        ))),
+    }
 }
 
 /// Inbound Forgejo webhook ingest (ADR-0046): the second per-forge endpoint,
 /// bound to the Forgejo adapter's verification (plain-hex
 /// `X-Forgejo/Gitea-Signature`) and its own secret — no payload sniffing on a
 /// shared endpoint. Same replay guard, same canonical vocabulary downstream.
-#[utoipa::path(post, path = "/webhooks/forgejo", summary = "Forgejo webhook ingest (HMAC-verified)", responses((status = 202, description = "delivery accepted"), (status = 401, description = "bad signature")))]
+#[utoipa::path(post, path = "/webhooks/forgejo", summary = "Forgejo webhook ingest (HMAC-verified)", responses((status = 202, description = "delivery accepted"), (status = 400, description = "malformed delivery, or no delivery id"), (status = 401, description = "bad signature"), (status = 502, description = "the forge could not be read and nothing was created; redeliver"), (status = 503, description = "too many deliveries running, or this delivery is still running; redeliver later")))]
 async fn forgejo_webhook(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -8899,24 +9282,27 @@ async fn forgejo_webhook(
         payload,
     };
 
-    if !delivery_is_fresh(&st, scarab_forge::ForgeKind::Forgejo, &delivery.id).await? {
-        return Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({ "ignored": "duplicate delivery" })),
-        ));
-    }
-
-    let event = match scarab_forge_forgejo::normalize(&delivery) {
-        Ok(e) => e,
-        Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => {
-            return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true }))));
+    require_delivery_id(&st, &delivery.id)?;
+    let slot = delivery_slot(&st).await?;
+    finish_delivery(slot, async move {
+        let kind = scarab_forge::ForgeKind::Forgejo;
+        let _running = claim_delivery(&st, kind, &delivery.id)?;
+        if !delivery_is_fresh(&st, kind, &delivery.id).await? {
+            return Ok(duplicate_delivery());
         }
-        Err(scarab_forge::ForgeError::Ignored(why)) => {
-            return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": why }))));
-        }
-        Err(e) => return Err(ApiError::BadRequest(e.to_string())),
-    };
-    ingest_event(&st, event).await
+        let event = match scarab_forge_forgejo::normalize(&delivery) {
+            Ok(e) => e,
+            Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => {
+                return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true }))));
+            }
+            Err(scarab_forge::ForgeError::Ignored(why)) => {
+                return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": why }))));
+            }
+            Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+        };
+        ingest_event(&st, event, kind, &delivery.id).await
+    })
+    .await
 }
 
 fn header_str(headers: &HeaderMap, name: &str) -> String {

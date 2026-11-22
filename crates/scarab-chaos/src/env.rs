@@ -228,6 +228,7 @@ impl Api {
         pipeline: &str,
         r#ref: &str,
         params: &serde_json::Value,
+        reason: &str,
     ) -> Result<String, String> {
         let created = self
             .json(
@@ -236,7 +237,7 @@ impl Api {
                     .post(format!("{}/v1/repos/{org}/{repo}/dispatch", self.base))
                     .json(&serde_json::json!({
                         "ref": r#ref, "pipeline": pipeline, "kind": "api", "params": params,
-                        "reason": "scarab-chaos Cache probe",
+                        "reason": reason,
                     })),
             )
             .await?;
@@ -244,6 +245,99 @@ impl Api {
             .as_str()
             .map(str::to_string)
             .ok_or_else(|| format!("dispatch: no id in {created}"))
+    }
+
+    /// Create or replace the org Environment `env` (no approvers, so it adds
+    /// no approval gate) and admit every Project of the org to it.
+    pub async fn put_open_environment(
+        &self,
+        org: &str,
+        env: &str,
+        description: &str,
+    ) -> Result<(), String> {
+        self.json(
+            "PUT environment",
+            self.http
+                .put(format!("{}/v1/orgs/{org}/environments/{env}", self.base))
+                .json(&serde_json::json!({ "description": description })),
+        )
+        .await?;
+        self.json(
+            "PUT environment eligibility",
+            self.http
+                .put(format!(
+                    "{}/v1/orgs/{org}/environments/{env}/eligibility",
+                    self.base
+                ))
+                .json(&serde_json::json!({ "all_projects": true, "projects": [] })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Store secret `name` for Project `repo` in Environment `env`. The value
+    /// is never logged.
+    pub async fn put_environment_secret(
+        &self,
+        org: &str,
+        repo: &str,
+        env: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<(), String> {
+        self.json(
+            "POST /v1/secrets",
+            self.http
+                .post(format!("{}/v1/secrets", self.base))
+                .json(&serde_json::json!({
+                    "org": org, "repo": repo, "environment": env, "name": name, "value": value,
+                })),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// The id of the connection whose base URL is `base_url`, when exactly
+    /// one is.
+    pub async fn connection_to(&self, base_url: &str) -> Result<Option<String>, String> {
+        let want = base_url.trim_end_matches('/');
+        let list = self
+            .json(
+                "GET /v1/connections",
+                self.http.get(format!("{}/v1/connections", self.base)),
+            )
+            .await?;
+        let ids: Vec<String> = list
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|c| c["base_url"].as_str().map(|u| u.trim_end_matches('/')) == Some(want))
+            .filter_map(|c| c["id"].as_str().map(str::to_string))
+            .collect();
+        Ok(match ids.as_slice() {
+            [one] => Some(one.clone()),
+            _ => None,
+        })
+    }
+
+    /// The body of `GET /v1/runs/{id}/logs` (an SSE replay of every stored
+    /// log of a terminal Run), as text.
+    pub async fn logs_text(&self, id: &str) -> Result<String, String> {
+        let resp = self
+            .http
+            .get(format!("{}/v1/runs/{id}/logs", self.base))
+            .send()
+            .await
+            .map_err(|e| format!("GET logs of run {id}: {e}"))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| format!("GET logs of run {id}: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("GET logs of run {id}: {status}: {text}"));
+        }
+        Ok(text)
     }
 
     /// `status` of `GET /v1/runs/{id}`.

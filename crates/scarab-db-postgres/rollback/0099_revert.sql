@@ -1,22 +1,35 @@
--- Revert migrations 0099 (log streams and the value ledger) and 0100 (the
--- `attempts.started_at` index), so a 0.6.x server starts on this database
--- again. Not a migration: the migrator never runs this file.
+-- Revert migrations 0099 (log streams and the value ledger), 0100 (the
+-- `attempts.started_at` index), 0101 (validating 0099's checks), 0102
+-- (the `values_too_large` reason) and 0103 (validating the reason check
+-- again), so a 0.6.x server starts on this database again. Not a migration: the
+-- migrator never runs this file. It also reverts a database that ran 0099
+-- and 0100 but not 0101.
 --
 -- Before running it:
 --   1. let Runs finish and stop new ones;
---   2. scale every Scarab server to zero (no 0.7 server may run against the
---      database while this runs, or after it);
+--   2. scale every Scarab server to zero (no server of 0.7 or later may run
+--      against the database while this runs, or after it);
 --   3. back up the database.
--- Then run it once, e.g. `psql "$DATABASE_URL" -f 0099_revert.sql`, and
+-- Then run it, e.g. `psql "$DATABASE_URL" -f 0099_revert.sql`, and
 -- start 0.6.x.
 --
 -- What it deletes: the marker rows of logs stored by 0.7 (`kind` other than
 -- `output`) and every value ledger. Output rows stay, and 0.6.x reads them
--- as before. Upgrading to 0.7 again runs 0099 and 0100 again.
+-- as before. Upgrading again runs 0099 to 0103 again.
 
 BEGIN;
 
-DELETE FROM log_chunks WHERE kind <> 'output';
+-- A second run changes nothing: the delete below runs only while the
+-- `kind` column exists, and every other statement is safe to repeat.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = 'log_chunks' AND column_name = 'kind') THEN
+    DELETE FROM log_chunks WHERE kind <> 'output';
+  END IF;
+END
+$$;
 
 DROP FUNCTION IF EXISTS scarab_append_log_row(
   TEXT, TEXT, TEXT, TEXT, TEXT, BIGINT, TEXT, TEXT, TEXT, BIGINT, BYTEA, BIGINT, TEXT, BIGINT);
@@ -42,6 +55,6 @@ ALTER TABLE log_chunks
 
 DROP INDEX IF EXISTS attempts_started_at_idx;
 
-DELETE FROM _sqlx_migrations WHERE version IN (99, 100);
+DELETE FROM _sqlx_migrations WHERE version IN (99, 100, 101, 102, 103);
 
 COMMIT;

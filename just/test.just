@@ -71,20 +71,48 @@ e2e filter="":
 # servers, 2 Depot replicas), run three chained Runs under one fault per
 # scenario, and check the invariants (crates/scarab-chaos). Rank 1 deletes a
 # Depot Pod with grace 0 mid-drain and mid-feed; rank 2 runs two server
-# replicas with no fault, then SIGKILLs the replica driving a drain; rank 4
+# replicas with no fault, then SIGKILLs the replica driving a drain, then
+# (`kill-tailer`) the replica storing a printing step's log, and checks the
+# log is whole or marked and its secret stored nowhere; rank 4
 # SIGSTOPs the scheduler leader past its lease; `pause-node` freezes the kind
 # node mid-drain for longer than the lease but shorter than the Pod's grace.
-# `all` runs those six, in that order (about an hour); `rank1`, `rank2` and
+# `all` runs those seven, in that order (about an hour); `rank1`, `rank2` and
 # `rank4` run one rank. Switches back to the mode that was active before (dev or dogfood; else dev)
 # and runs `just stack demo` there. Scenario files land in deploy/kind/.chaos
 # (or $SCARAB_CHAOS_DIR). Exit 1 means a verdict failed, 3 that a scenario was
 # inconclusive (its fault did not land in its window). See deploy/kind/chaos.sh.
 # Usage: `just test chaos` | `just test chaos rank2` | `just test chaos mid-feed 7` |
+# `just test chaos kill-tailer` |
 # `just test chaos pause-node` (about 8-10 minutes) |
 # `just test chaos replay <scenario.json>`.
 [doc('Fault tier (ADR-0077 ranks 1, 2, 4): one fault per scenario, then the invariant checker')]
 chaos what="all" seed="1":
     bash deploy/kind/chaos.sh "{{what}}" "{{seed}}"
+
+# Re-record the Forgejo compare answers the changed-paths tests of
+# crates/scarab-forge-forgejo read (ADR-0081): builds a fast-forward merge, a
+# forced push and a `git pull` merge pushed back in the repo
+# `<admin>/record-compare` of the in-cluster Forgejo, and writes each compare
+# answer and the ids to crates/scarab-forge-forgejo/tests/fixtures. Needs the
+# kind stack (`just stack up`); deletes the repo on exit and changes nothing
+# else in the cluster. Review the diff and commit it. See
+# deploy/kind/record-compare.sh.
+[doc('Record the Forgejo compare fixtures from the kind stack (ADR-0081)')]
+record-compare:
+    bash deploy/kind/record-compare.sh
+
+# Re-record the denials Kubernetes' built-in admission gives a Pod create, which
+# the k8s_overlay classifier tests of crates/scarab-executor-k8s read (git-bug
+# 1d983fd): a ValidatingAdmissionPolicy (with and without `reason: Forbidden`),
+# a ResourceQuota, a LimitRange and Pod Security `restricted`, each applied
+# alone in the throwaway namespace `scarab-record-denials`, with the create and
+# the dry-run create answers written to
+# crates/scarab-executor-k8s/tests/fixtures/denials. Needs the kind stack
+# (`just stack up`); deletes the namespace and the policy at the end and changes
+# nothing else. Review the diff and commit it. See deploy/kind/record-denials.sh.
+[doc('Record the built-in admission denial fixtures from the kind cluster')]
+record-denials:
+    bash deploy/kind/record-denials.sh
 
 # Coverage run (mirrors the CI `test-and-coverage` job): the suite under
 # cargo-llvm-cov against the compose Postgres AND MinIO, per-crate summary, and

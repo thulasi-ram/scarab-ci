@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use scarab_engine::ports::{ExecHandle, ExecState, LeaderTerm, Lease};
@@ -498,7 +498,7 @@ impl InMemoryDb {
     /// another — that commits between two of a caller's separate writes.
     /// Constructs the interleaving instead of scheduling it. Supported
     /// methods: `set_run_params`, `set_run_concurrency`,
-    /// `commit_step_transition`, `append_event`.
+    /// `commit_step_transition`, `append_event`, `record_delivery`.
     pub fn interleave_before_next(&self, method: &'static str, hook: DbHook) {
         *self.interleave.lock().unwrap() = Some((method, hook));
     }
@@ -4353,6 +4353,13 @@ pub struct FakeForge {
     /// When set, `read_file_at_ref` fails with this [`Api`](ForgeError::Api)
     /// error (a timeout or a `5xx`, not "no such file").
     read_error: Mutex<Option<String>>,
+    /// Per path: `read_file_at_ref` of that path fails with this
+    /// [`Api`](ForgeError::Api) error ([`FakeForge::set_read_error_for`]).
+    read_errors_for: Mutex<HashMap<String, String>>,
+    /// How many of the next `read_file_at_ref` calls fail with an
+    /// [`Api`](ForgeError::Api) error before reads work again
+    /// ([`FakeForge::fail_next_reads`]).
+    failing_reads: Mutex<usize>,
     /// What [`pull_request_files`](ForgePort::pull_request_files) answers,
     /// per pull request number. A number with no entry answers
     /// `Unsupported`; `Err` answers that [`Api`](ForgeError::Api) error.
@@ -4362,6 +4369,41 @@ pub struct FakeForge {
     pr_files_calls: Mutex<usize>,
     /// How long `pull_request_files` takes to answer: a slow forge.
     pr_files_delay: Mutex<Option<std::time::Duration>>,
+    /// What [`push_changed_paths`](ForgePort::push_changed_paths) answers,
+    /// per `(before, after)` pair (ADR-0081). A pair with no entry answers
+    /// [`ForgeError`](scarab_forge::PathsUnknown::ForgeError), so a Run that
+    /// started on a scripted answer proves the right two ids reached the
+    /// port.
+    push_paths: Mutex<HashMap<(String, String), scarab_forge::ChangedPaths>>,
+    /// How many `push_changed_paths` calls were made.
+    push_paths_calls: Mutex<usize>,
+    /// How long `push_changed_paths` takes to answer: a slow forge.
+    push_paths_delay: Mutex<Option<std::time::Duration>>,
+    /// When set, `push_changed_paths` signals `entered` and waits for
+    /// `release` before it answers ([`FakeForge::hold_push_paths`]).
+    push_paths_gate: Mutex<Option<Arc<ForgeGate>>>,
+}
+
+/// A point a [`FakeForge`] call stops at until the test lets it go: the call
+/// signals [`entered`](ForgeGate::entered) and waits for
+/// [`release`](ForgeGate::release). Both are `Notify` permits, so neither
+/// side can miss the other whatever order they run in.
+#[derive(Default)]
+pub struct ForgeGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl ForgeGate {
+    /// Wait until the call reached the gate.
+    pub async fn entered(&self) {
+        self.entered.notified().await;
+    }
+
+    /// Let the call that reached the gate answer.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 impl FakeForge {
@@ -4391,6 +4433,32 @@ impl FakeForge {
     /// How many `pull_request_files` calls were made.
     pub fn pr_files_calls(&self) -> usize {
         *self.pr_files_calls.lock().unwrap()
+    }
+
+    /// Script what the compare of a push from `before` to `after` answers.
+    pub fn set_push_paths(&self, before: &str, after: &str, answer: scarab_forge::ChangedPaths) {
+        self.push_paths
+            .lock()
+            .unwrap()
+            .insert((before.to_string(), after.to_string()), answer);
+    }
+
+    /// Make `push_changed_paths` take `delay` before it answers.
+    pub fn set_push_paths_delay(&self, delay: std::time::Duration) {
+        *self.push_paths_delay.lock().unwrap() = Some(delay);
+    }
+
+    /// Make the next `push_changed_paths` calls stop at a gate the test
+    /// opens: the returned [`ForgeGate`].
+    pub fn hold_push_paths(&self) -> Arc<ForgeGate> {
+        let gate = Arc::new(ForgeGate::default());
+        *self.push_paths_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    /// How many `push_changed_paths` calls were made.
+    pub fn push_paths_calls(&self) -> usize {
+        *self.push_paths_calls.lock().unwrap()
     }
 
     pub fn new() -> Self {
@@ -4431,6 +4499,22 @@ impl FakeForge {
     /// Make `read_file_at_ref` fail as a forge outage would, or stop.
     pub fn set_read_error(&self, error: Option<&str>) {
         *self.read_error.lock().unwrap() = error.map(str::to_string);
+    }
+
+    /// Make `read_file_at_ref` of `path` alone fail as a forge outage
+    /// would, or stop.
+    pub fn set_read_error_for(&self, path: &str, error: Option<&str>) {
+        let mut errors = self.read_errors_for.lock().unwrap();
+        match error {
+            Some(e) => errors.insert(path.to_string(), e.to_string()),
+            None => errors.remove(path),
+        };
+    }
+
+    /// Make the next `count` `read_file_at_ref` calls fail as a forge outage
+    /// would; the reads after them work.
+    pub fn fail_next_reads(&self, count: usize) {
+        *self.failing_reads.lock().unwrap() = count;
     }
 
     /// How many `list_dir_at_ref` and `read_file_at_ref` calls were made.
@@ -4872,12 +4956,26 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
         forge: scarab_forge::ForgeKind,
         delivery_id: &str,
     ) -> Result<bool, scarab_forge::RegistryError> {
+        self.interleave_point("record_delivery").await;
         Ok(self
             .state
             .lock()
             .unwrap()
             .webhook_deliveries
             .insert((forge.as_str().to_string(), delivery_id.to_string())))
+    }
+
+    async fn forget_delivery(
+        &self,
+        forge: scarab_forge::ForgeKind,
+        delivery_id: &str,
+    ) -> Result<(), scarab_forge::RegistryError> {
+        self.state
+            .lock()
+            .unwrap()
+            .webhook_deliveries
+            .remove(&(forge.as_str().to_string(), delivery_id.to_string()));
+        Ok(())
     }
 
     /// The single-owner marker (ADR-0060 part D), mirroring the Postgres
@@ -4953,6 +5051,32 @@ pub fn fake_commit_sha(r#ref: &str) -> String {
 
 #[async_trait]
 impl ForgePort for FakeForge {
+    async fn push_changed_paths(
+        &self,
+        _repo: &RepoRef,
+        before: &str,
+        after: &str,
+    ) -> scarab_forge::ChangedPaths {
+        *self.push_paths_calls.lock().unwrap() += 1;
+        let gate = self.push_paths_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        let delay = *self.push_paths_delay.lock().unwrap();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        self.push_paths
+            .lock()
+            .unwrap()
+            .get(&(before.to_string(), after.to_string()))
+            .cloned()
+            .unwrap_or(scarab_forge::ChangedPaths::Unknown(
+                scarab_forge::PathsUnknown::ForgeError,
+            ))
+    }
+
     async fn pull_request_files(
         &self,
         _repo: &RepoRef,
@@ -5002,6 +5126,16 @@ impl ForgePort for FakeForge {
         *self.file_reads.lock().unwrap() += 1;
         if let Some(e) = self.read_error.lock().unwrap().clone() {
             return Err(ForgeError::Api(e));
+        }
+        if let Some(e) = self.read_errors_for.lock().unwrap().get(path).cloned() {
+            return Err(ForgeError::Api(e));
+        }
+        {
+            let mut failing = self.failing_reads.lock().unwrap();
+            if *failing > 0 {
+                *failing -= 1;
+                return Err(ForgeError::Api("fake forge: read failed".into()));
+            }
         }
         self.files
             .lock()

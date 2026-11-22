@@ -16,13 +16,15 @@
 //!
 //! Kinds: mid-drain, mid-feed (rank 1: a Depot Pod deleted with grace 0),
 //! two-replicas (rank 2 with no fault), kill-server (rank 2: SIGKILL of the
-//! producer's claim holder), stop-leader (rank 4: SIGSTOP of the scheduler
+//! producer's claim holder), kill-tailer (rank 2: SIGKILL of the holder of
+//! a printing step's tail lease; see `logs`), stop-leader (rank 4: SIGSTOP of the scheduler
 //! leader past the lease TTL, then SIGCONT), pause-node (`docker pause` of
 //! the whole kind node mid-drain, past the lease TTL and short of the Pod's
 //! grace period, then `docker unpause`). See `scenario::Kind`.
 //!
 //! Connections come from the environment `deploy/kind/chaos.sh` sets:
 //! SCARAB_CHAOS_API, SCARAB_CHAOS_KUBECONFIG, SCARAB_CHAOS_NAMESPACE,
+//! SCARAB_CHAOS_STEP_NAMESPACE (where step Pods run; required),
 //! SCARAB_CHAOS_DATABASE_URL, SCARAB_CHAOS_S3_ENDPOINT, SCARAB_CHAOS_S3_BUCKET,
 //! SCARAB_CHAOS_S3_ACCESS_KEY, SCARAB_CHAOS_S3_SECRET_KEY, and for the
 //! server signals and the pause SCARAB_CHAOS_NODE (the kind node container),
@@ -134,6 +136,9 @@ async fn connect() -> Result<Conn, String> {
             api: env::Api::new(&var("SCARAB_CHAOS_API")?)?,
             kube,
             namespace: std::env::var("SCARAB_CHAOS_NAMESPACE").unwrap_or_else(|_| "scarab".into()),
+            // No default: a checker that lists step Pods and Secrets in a
+            // namespace they are not in finds nothing and passes I8.
+            step_namespace: var("SCARAB_CHAOS_STEP_NAMESPACE")?,
             release: std::env::var("SCARAB_CHAOS_RELEASE").unwrap_or_else(|_| "scarab".into()),
             pg,
         },
@@ -148,10 +153,11 @@ async fn check_dir(conn: &Conn, file: &Path) -> Result<check::Outcome, String> {
     let dir = file.parent().unwrap_or(Path::new("."));
     let records = pods::read_records(&dir.join("pods.jsonl"))?;
     let src = check::Sources {
+        api: &conn.stack.api,
         pg: &conn.stack.pg,
         bucket: &conn.bucket,
         kube: conn.stack.kube.clone(),
-        namespace: &conn.stack.namespace,
+        step_namespace: &conn.stack.step_namespace,
     };
     let mut facts = check::gather(&src, &s, records).await?;
     facts.release_log = std::fs::read_to_string(dir.join(nemesis::RELEASE_LOG)).ok();
@@ -205,6 +211,12 @@ async fn check_dir(conn: &Conn, file: &Path) -> Result<check::Outcome, String> {
                 if let Some(e) = &p.error {
                     line += &format!(" ({e})");
                 }
+            }
+            if let Some(tl) = &f.tail {
+                line += &format!(
+                    "; tail lease {} owner {:?} term {:?} with {:?} output rows stored",
+                    tl.resource, tl.owner, tl.term, tl.output_rows_at_fire
+                );
             }
             if let Some(r) = f.resumed_at_ms {
                 line += &format!("; resumed after {} ms", r - f.fired_at_ms);

@@ -1,0 +1,13 @@
+{
+  "kind": "Status",
+  "apiVersion": "v1",
+  "metadata": {},
+  "status": "Failure",
+  "message": "pods \"record-denials\" is forbidden: exceeded quota: record-denials, requested: limits.cpu=2, used: limits.cpu=0, limited: limits.cpu=1",
+  "reason": "Forbidden",
+  "details": {
+    "name": "record-denials",
+    "kind": "pods"
+  },
+  "code": 403
+}

@@ -1,0 +1,13 @@
+{
+  "kind": "Status",
+  "apiVersion": "v1",
+  "metadata": {},
+  "status": "Failure",
+  "message": "pods \"record-denials\" is forbidden: violates PodSecurity \"restricted:latest\": allowPrivilegeEscalation != false (container \"step\" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (container \"step\" must set securityContext.capabilities.drop=[\"ALL\"]), runAsNonRoot != true (pod or container \"step\" must set securityContext.runAsNonRoot=true), seccompProfile (pod or container \"step\" must set securityContext.seccompProfile.type to \"RuntimeDefault\" or \"Localhost\")",
+  "reason": "Forbidden",
+  "details": {
+    "name": "record-denials",
+    "kind": "pods"
+  },
+  "code": 403
+}

@@ -148,6 +148,10 @@ export SCARAB_E2E_DATABASE_URL="postgres://scarab:scarab@127.0.0.1:$pg_port/scar
 export SCARAB_E2E_CLI_BIN="$target/debug/scarab"
 export SCARAB_E2E_KUBECONFIG="$kubeconfig"
 export SCARAB_E2E_NAMESPACE="$ns"
+# Where the release launches step Pods (and their per-Pod Secrets): read from
+# the server's ConfigMap, not assumed.
+read_step_ns
+export SCARAB_E2E_STEP_NAMESPACE="$step_ns"
 export SCARAB_E2E_KIND_NODE="$node"
 export SCARAB_E2E_POD_HOST="$pod_host"
 # The same host as an IPv4 address, as the Pod resolved it ("" if it did not):
@@ -167,10 +171,10 @@ export SCARAB_TEST_SIDECAR_IMAGE=scarab-results-sidecar:dev
 export SCARAB_TEST_REGISTRY="registry.$tns.svc.cluster.local:5000"
 export SCARAB_TEST_HOST_IP="$pod_host"
 # The step Pod admission policy case (git-bug 07f0de3) creates Pods as the
-# server's ServiceAccount in the release's step namespace: deploy/kind/values.yaml
-# sets scarab.namespace to the release namespace, and the chart names the
-# ServiceAccount after the release.
-export SCARAB_TEST_STEP_NAMESPACE="$ns"
+# server's ServiceAccount in the release's step namespace (the chart's
+# `<release namespace>-steps`), and the chart names the ServiceAccount after
+# the release.
+export SCARAB_TEST_STEP_NAMESPACE="$step_ns"
 export SCARAB_TEST_SERVER_USER="system:serviceaccount:$ns:$release"
 # The Depot's cold store: the e2e mode's bucket, through the port-forward.
 export SCARAB_S3_BUCKET=scarab-e2e

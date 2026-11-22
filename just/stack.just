@@ -81,7 +81,6 @@ up mode="dev" ref="":
         echo "==> deploying published images @ $ref (ghcr, pullPolicy Always)"
         IMAGE_REPOSITORY="$owner/scarab-server" \
         IMAGE_PULL_POLICY=Always \
-        SCARAB_CLONE_IMAGE="$owner/scarab-clone:$ref" \
         SCARAB_SIDECAR_IMAGE="$owner/scarab-results-sidecar:$ref" \
         SCARAB_WSFETCH_IMAGE="$owner/scarab-wsfetch:$ref" \
           bash deploy/demo-oracle/deploy.sh "$ref"

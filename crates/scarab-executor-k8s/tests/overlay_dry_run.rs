@@ -23,6 +23,9 @@ struct Fake {
     pod: Option<Value>,
     /// Every dry-run create fails, as behind a webhook that rejects dry runs.
     dry_run_fails: bool,
+    /// The overlaid Pod is refused by the real create only: a dry run of it
+    /// passes, as when a webhook's denial is gone by the second request.
+    refused_once: bool,
     /// Pod creates: `(dry run, body)`.
     creates: Mutex<Vec<(bool, Value)>>,
 }
@@ -65,6 +68,9 @@ async fn fake_api(fake: Fake) -> (String, Arc<Fake>) {
                     let dry_run = query.is_some_and(|q| q.contains("dryRun=All"));
                     fake.creates.lock().unwrap().push((dry_run, pod.clone()));
                     let overlaid = pod["spec"]["nodeSelector"]["pool"].is_string();
+                    if dry_run && overlaid && fake.refused_once {
+                        return (StatusCode::CREATED, Json(pod));
+                    }
                     if dry_run && !overlaid {
                         // Valid without the overlay, unless the test says
                         // the dry run itself fails.
@@ -152,10 +158,9 @@ fn overlay_spec() -> StepSpec {
     }
 }
 
-/// RT-R3 mutation 5: the API refuses the Pod and the Pod without the
-/// overlay passes a dry run, so the overlay is the cause: `Refused`. The
-/// dry run is of the Pod without the overlay (the fake refuses one that
-/// carries it), and stores nothing.
+/// RT-R3 mutation 5: the API refuses the Pod, a dry run of the same Pod
+/// is refused again, and the Pod without the overlay passes a dry run, so
+/// the overlay is the cause: `Refused`. Both dry runs store nothing.
 #[tokio::test]
 async fn an_overlay_the_api_refuses_fails_the_step() {
     let (url, fake) = fake_api(Fake::default()).await;
@@ -168,9 +173,10 @@ async fn an_overlay_the_api_refuses_fails_the_step() {
         "{err:?}"
     );
     let creates = fake.creates.lock().unwrap();
-    assert_eq!(creates.len(), 2, "one create, one dry run");
-    assert!(!creates[0].0 && creates[1].0);
-    assert!(!creates[1].1["spec"]["nodeSelector"]["pool"].is_string());
+    assert_eq!(creates.len(), 3, "one create, two dry runs");
+    assert!(!creates[0].0 && creates[1].0 && creates[2].0);
+    assert!(creates[1].1["spec"]["nodeSelector"]["pool"].is_string());
+    assert!(!creates[2].1["spec"]["nodeSelector"]["pool"].is_string());
 }
 
 /// RT-R3 mutation 5: when the dry run itself fails (a webhook that rejects
@@ -188,5 +194,25 @@ async fn a_failing_dry_run_does_not_blame_the_overlay() {
         .await
         .expect_err("the create fails");
     assert!(matches!(err, ExecError::Launch(_)), "{err:?}");
-    assert_eq!(fake.creates.lock().unwrap().len(), 2, "the dry run ran");
+    assert_eq!(fake.creates.lock().unwrap().len(), 3, "both dry runs ran");
+}
+
+/// M1: the real create is refused and a dry run of the same Pod passes, so
+/// the refusal was of the moment, not the overlay's: the launch error the
+/// scheduler retries, and the Pod without the overlay is not asked about.
+#[tokio::test]
+async fn a_refusal_the_dry_run_does_not_repeat_stays_a_launch_error() {
+    let (url, fake) = fake_api(Fake {
+        refused_once: true,
+        ..Fake::default()
+    })
+    .await;
+    let err = executor(&url)
+        .launch(&step(), &overlay_spec())
+        .await
+        .expect_err("the create fails");
+    assert!(matches!(err, ExecError::Launch(_)), "{err:?}");
+    let creates = fake.creates.lock().unwrap();
+    assert_eq!(creates.len(), 2, "one create, one dry run of the same Pod");
+    assert!(creates[1].0 && creates[1].1["spec"]["nodeSelector"]["pool"].is_string());
 }

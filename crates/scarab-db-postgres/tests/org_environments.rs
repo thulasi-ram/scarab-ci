@@ -379,22 +379,7 @@ async fn a_write_that_loses_a_serialization_race_is_a_conflict() {
         }
     });
     // Wait until the store's write is blocked on tx1's row lock.
-    let mut blocked = false;
-    for _ in 0..200 {
-        let n: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity
-             WHERE wait_event_type = 'Lock' AND query LIKE '%INSERT INTO org_environments%'",
-        )
-        .fetch_one(&tdb.pool)
-        .await
-        .unwrap();
-        if n > 0 {
-            blocked = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    assert!(blocked, "the store's write never blocked on tx1's row lock");
+    common::wait_until_blocked(&tdb.pool, "%INSERT INTO org_environments%").await;
     tx1.commit().await.unwrap();
 
     let lost = write.await.unwrap();
@@ -471,26 +456,7 @@ async fn an_overlay_insert_waits_for_an_eligibility_withdrawal_and_is_refused() 
         }
     });
     // Wait until the insert's eligibility check is blocked on tx1's row lock.
-    let mut blocked = false;
-    for _ in 0..200 {
-        let n: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity
-             WHERE datname = current_database() AND wait_event_type = 'Lock'
-               AND query LIKE '%FOR SHARE%'",
-        )
-        .fetch_one(&tdb.pool)
-        .await
-        .unwrap();
-        if n > 0 {
-            blocked = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    assert!(
-        blocked,
-        "the overlay insert never waited for tx1's row lock"
-    );
+    common::wait_until_blocked(&tdb.pool, "%FOR SHARE%").await;
     tx1.commit().await.unwrap();
 
     let refused = insert.await.unwrap();

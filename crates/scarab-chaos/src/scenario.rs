@@ -61,8 +61,8 @@ pub fn pause_secs(grace_secs: Option<i64>) -> u64 {
 pub const DRAIN_ESCALATION_SECS: u64 = 300;
 
 /// The scenarios. Rank 1 (ADR-0077 §3): one Depot Pod deleted with grace 0,
-/// at two moments. Rank 2: two server replicas with no fault, and one server
-/// SIGKILLed mid-drain. Rank 4: the scheduler leader SIGSTOPped past the
+/// at two moments. Rank 2: two server replicas with no fault, one server
+/// SIGKILLed mid-drain, and one SIGKILLed while it stores a step's log. Rank 4: the scheduler leader SIGSTOPped past the
 /// lease TTL, then resumed. The server signals are sent from the kind
 /// node's PID namespace (`crate::node`): in its container the server is PID
 /// 1 with no init and ignores them. `pause-node` is not one of ADR-0077's
@@ -85,6 +85,13 @@ pub enum Kind {
     /// claim (and so polls its Pod and drives its drain) while the drain is
     /// in flight. The kubelet restarts the container in the same Pod.
     KillServer,
+    /// Rank 2, log storage (git-bug dbb1d7c): SIGKILL the server replica
+    /// that holds the producer's tail lease (`tail2:<run>:<step>:<attempt>`,
+    /// so it reads the step's log and appends it) while the step prints
+    /// numbered lines and a secret value. The peer, or the restarted
+    /// container, takes the lease over and goes on storing the log. See
+    /// `crate::logs`.
+    KillTailer,
     /// Rank 4: SIGSTOP the scheduler leader while a producer runs, keep it
     /// stopped until a peer takes the lease over (past the 30 s TTL), then
     /// SIGCONT it.
@@ -105,6 +112,7 @@ impl Kind {
             Kind::MidFeed => "mid-feed",
             Kind::TwoReplicas => "two-replicas",
             Kind::KillServer => "kill-server",
+            Kind::KillTailer => "kill-tailer",
             Kind::StopLeader => "stop-leader",
             Kind::PauseNode => "pause-node",
         }
@@ -124,7 +132,7 @@ impl Kind {
         match self {
             Kind::MidDrain | Kind::KillServer | Kind::PauseNode => Some(Kind::MidDrain),
             Kind::MidFeed => Some(Kind::MidFeed),
-            Kind::TwoReplicas | Kind::StopLeader => None,
+            Kind::TwoReplicas | Kind::StopLeader | Kind::KillTailer => None,
         }
     }
 
@@ -137,20 +145,24 @@ impl Kind {
     pub fn targets_servers(self) -> bool {
         matches!(
             self,
-            Kind::KillServer | Kind::StopLeader | Kind::TwoReplicas
+            Kind::KillServer | Kind::KillTailer | Kind::StopLeader | Kind::TwoReplicas
         )
     }
 
     /// The seeded delay range after the trigger, in ms. Measured 2026-11-01
     /// at 2+2 on colima (2 vCPU) with 64 x 2 MiB per producer: the drain
     /// window (step exit to root annotation) was 63 s, the feed 8 s. The
-    /// leader stop needs only Runs in flight, and the producer's step runs
-    /// for several seconds.
+    /// leader stop needs only Runs in flight; it must land while the
+    /// producer's step runs, which took about 2.5 s on kind (2026-11-22), so
+    /// a delay past that fired after the step and was INCONCLUSIVE.
     fn delay_range_ms(self) -> std::ops::RangeInclusive<u64> {
         match self {
             Kind::MidDrain | Kind::KillServer => 2_000..=10_000,
             Kind::MidFeed => 0..=2_000,
-            Kind::StopLeader => 0..=3_000,
+            Kind::StopLeader => 0..=1_500,
+            // Early in the step's print time, so the takeover (the tail
+            // lease's 45 s TTL) happens while it still prints.
+            Kind::KillTailer => 0..=3_000,
             // Early in the drain window: the pause must start before the
             // drain records its root.
             Kind::PauseNode => 0..=2_000,
@@ -409,6 +421,28 @@ pub struct Fault {
     /// `pause-node`: the pause as done. Its end is `resumed_at_ms`.
     #[serde(default)]
     pub pause: Option<NodePause>,
+    /// `kill-tailer`: the tail lease of the target stream when it fired, and
+    /// whether its owner kept writing after.
+    #[serde(default)]
+    pub tail: Option<TailObservation>,
+}
+
+/// `kill-tailer`: the target stream's tail lease as read just before the
+/// kill, and the owner's writes after it (as [`ClaimObservation`]'s).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TailObservation {
+    /// `tail2:<run>:<step>:<attempt>`.
+    pub resource: String,
+    /// `leases.owner` of that row just before the signal.
+    pub owner: Option<String>,
+    pub term: Option<i64>,
+    /// `output` rows of the target stream already stored when it fired.
+    pub output_rows_at_fire: Option<i64>,
+    /// The latest lease expiry or claim the owner had written, 5 s and 20 s
+    /// after the kill. Equal: the owner stopped writing, so it was the
+    /// process killed.
+    pub owner_written_until_5s: Option<i64>,
+    pub owner_written_until_20s: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -436,6 +470,10 @@ pub struct Scenario {
     /// file runs no probe.
     #[serde(default)]
     pub cache: Option<crate::cache::CacheProbe>,
+    /// `kill-tailer`'s log workload: the step's line count and the planted
+    /// secret (`crate::logs`). `None` for every other scenario.
+    #[serde(default)]
+    pub logs: Option<crate::logs::LogProbe>,
 }
 
 impl Scenario {
@@ -460,6 +498,8 @@ impl Scenario {
     ) -> Self {
         let quiesce_bound_secs = quiesce_bound_secs(&workload);
         let cache = Some(crate::cache::CacheProbe::new(&workload.image));
+        let logs =
+            (kind == Kind::KillTailer).then(|| crate::logs::LogProbe::new(seed, &workload.image));
         Self {
             format: FORMAT,
             kind,
@@ -476,6 +516,7 @@ impl Scenario {
             quiesced_at_ms: None,
             notes: Vec::new(),
             cache,
+            logs,
         }
     }
 
@@ -493,6 +534,8 @@ impl Scenario {
         // The recorded pipeline, not this build's: the replay writes what the
         // original wrote.
         s.cache = self.cache.as_ref().map(crate::cache::CacheProbe::replay);
+        // The recorded log pipeline and secret, nothing observed.
+        s.logs = self.logs.as_ref().map(crate::logs::LogProbe::replay);
         s
     }
 
@@ -733,6 +776,29 @@ mod tests {
         let err = Scenario::read(&file).unwrap_err();
         assert!(err.contains("above the 240 s maximum"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `kill-tailer` parses from the recipe's argument, carries its log
+    /// workload (other scenarios do not), and a replay prints the same
+    /// lines with the same secret.
+    #[test]
+    fn kill_tailer_carries_its_log_workload_into_a_replay() {
+        use clap::ValueEnum as _;
+        assert_eq!(Kind::from_str("kill-tailer", false), Ok(Kind::KillTailer));
+        assert!(Kind::KillTailer.targets_servers() && Kind::KillTailer.window().is_none());
+        assert_eq!(Kind::KillTailer.target_step(), crate::logs::LOG_STEP);
+        let s = Scenario::new(Kind::KillTailer, 5, Workload::default(), 2, 2);
+        let logs = s.logs.clone().expect("kill-tailer has a log workload");
+        assert_eq!(logs.secret, crate::logs::secret_for_seed(5));
+        assert!(
+            Scenario::new(Kind::KillServer, 5, Workload::default(), 2, 2)
+                .logs
+                .is_none()
+        );
+        let mut ran = s.clone();
+        ran.logs.as_mut().unwrap().project = Some("o/p".into());
+        let r = ran.replay("old.json");
+        assert_eq!(r.logs, Some(logs));
     }
 
     #[test]

@@ -300,7 +300,9 @@ pub async fn dispatch_cron(
     };
     for schedule in due {
         let event = event_for(schedule);
-        let ctx = event.context();
+        // The `when:` context, `event.changed_paths_known` (`false`: a cron
+        // fire has no changed paths) included.
+        let ctx = event.when_context();
         if !scarab_pipeline::matches_trigger(&ir, "cron", &ctx)
             .map_err(|e| TriggerError::Pipeline(e.to_string()))?
         {

@@ -55,7 +55,7 @@ for _ in $(seq 1 90); do
       echo "==> the fetcher's own line (ADR-0061 s3-feed stepping stone):"
       curl -sf "$base/v1/runs/$id/logs" | grep -i "mode=eager" || \
         echo "    (not in the step log stream — the init container's log is separate; \
-try: kubectl logs -n scarab <pod> -c scarab-workspace-init)"
+try: kubectl logs -n scarab-steps <pod> -c scarab-workspace-init)"
       exit 0
       ;;
     failed | dead_lettered | cancelled)

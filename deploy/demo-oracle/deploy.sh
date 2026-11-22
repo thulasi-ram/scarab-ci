@@ -24,10 +24,12 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
-# Image SOURCE (repository + clone/sidecar/wsfetch refs) is a per-invocation
+# Image SOURCE (repository + sidecar/wsfetch refs) is a per-invocation
 # choice, so a caller (`just stack up demo-oracle`) may override it even though .env is
 # otherwise file-wins for durable config + secrets. Capture caller-provided
-# image refs now; re-apply after the .env load.
+# image refs now; re-apply after the .env load. There is no clone image to
+# pass: checkouts run the image the installed clone library names
+# (libs/clone.yaml), and the server ignores SCARAB_CLONE_IMAGE.
 _img_repo="${IMAGE_REPOSITORY:-}"
 _img_sidecar="${SCARAB_SIDECAR_IMAGE:-}"
 _img_wsfetch="${SCARAB_WSFETCH_IMAGE:-}"

@@ -174,6 +174,33 @@ async fn happy_path_cli_dispatch_to_succeeded_with_logs() {
     let run = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert!(!run.is_empty(), "`scarab run` printed no run id");
 
+    // --- its step Pod runs in the step namespace, not the release's ---------
+    // (git-bug 19c3d42.) Read while the Run runs: a step Pod stays after its
+    // step ends, but this does not depend on that.
+    let (step_ns, release_ns) = (step_namespace(), namespace());
+    assert_ne!(
+        step_ns, release_ns,
+        "the kind release must launch step Pods outside its own namespace, as the chart's \
+         default does"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let step_pods = loop {
+        let found = pods_of_run_in(&step_ns, &run);
+        if !found.is_empty() {
+            break found;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "run {run}: no Pod labelled with it in the step namespace {step_ns} within 60 s"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+    assert_eq!(
+        pods_of_run_in(&release_ns, &run),
+        Vec::<String>::new(),
+        "run {run}: a Pod of it in the release namespace {release_ns} (its step Pods: {step_pods:?})"
+    );
+
     // --- the run executes on the cluster to `succeeded` ----------------------
     let rs = wait_for_terminal(&http, &base, &run, Duration::from_secs(180)).await;
     assert_eq!(

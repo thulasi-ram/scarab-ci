@@ -224,6 +224,28 @@ When every repository has moved, remove the old connection. Removing a connectio
 holds a repository of another org is refused (409, naming it): that org re-syncs or adds it on
 its own connection first.
 
+### Webhook deliveries
+
+The forge posts each event to `/webhooks/github` or `/webhooks/forgejo`. Scarab records the
+delivery's id (`X-GitHub-Delivery`, `X-Forgejo-Delivery` or `X-Gitea-Delivery`) so a delivery sent
+twice starts its Runs once. The forge's delivery log shows the answer:
+
+| Answer | What happened | What to do |
+|---|---|---|
+| 202 | Runs were created; the body lists their ids. `"incomplete": true` means a Pipeline file could not be read from the forge, so that Pipeline started nothing | Start the missing Pipeline by hand: a redelivery is answered as a duplicate, so it would not create the Runs again |
+| 200 | Nothing started: `{"ignored": "<reason>"}` (for example `no matching pipeline` or `duplicate delivery`), or `refused` lists the Pipelines that were refused. With `refused`, `"incomplete": true` means another Pipeline file could not be read | Nothing, or start the missing Pipeline by hand |
+| 400 | A Pipeline file does not compile (the text says why; its check is posted as failed), the body is not an event Scarab reads, or the delivery has no id header (with forge connections configured) | Fix the Pipeline and push again; a hand-made request needs the forge's delivery id header |
+| 401 | The signature does not match the webhook secret | Check the secret on both sides |
+| 502 | A Pipeline file could not be read from the forge (three tries, 0.5 and 2 seconds apart), and nothing was created or refused. The id is not kept | Redeliver it from the forge's webhook page |
+| 503 | 64 deliveries were already running and none ended within 10 seconds, or this delivery is still running on the server from an earlier try. Nothing was recorded | Redeliver it later |
+
+A delivery's work runs in a task of its own. When the forge stops waiting (GitHub after 10
+seconds, Forgejo after its `DELIVER_TIMEOUT`), the delivery still creates its Runs; only the
+answer is lost. A redelivery sent while that work is still running on the same server is
+answered 503; one that reaches another server replica is answered as a duplicate. When the server shuts down, it waits up to 20 seconds for running deliveries to
+finish, then logs how many it left. The chart sets no `terminationGracePeriodSeconds`, so a Pod
+has Kubernetes' default 30 seconds to stop.
+
 ## Settings
 
 The web UI has two settings pages, each with its own sidebar, and each section has its own
@@ -451,6 +473,55 @@ With the policy on, the render fails when:
 | `scarab.admissionPolicy.allowSecrets` | `[]` | Secrets a step Pod may name besides its own and the placement config's |
 | `scarab.admissionPolicy.allowServiceAccounts` | `[]` | ServiceAccounts a step Pod may run as besides `default` and the placement config's |
 
+### Hardening the nodes that run step Pods
+
+We recommend `kernel.yama.ptrace_scope` set to 1 or more on the nodes that run step Pods. Scarab
+does not check it, and runs at any value.
+
+At 1, a process can attach to (`ptrace`, `/proc/<pid>/mem`) only its own descendants unless it
+holds `CAP_SYS_PTRACE`. It is hardening, not a boundary Scarab relies on: Yama checks attach-mode
+access only, not reads of `/proc/<pid>/root` or `/proc/<pid>/environ`. What keeps a Dockerfile
+`RUN` in the build library away from buildkitd and buildctl is the kernel's capability rule, which
+holds at any `ptrace_scope` (measured on 2026-11-12 in Docker with the executor's settings).
+Amazon Linux 2023, the EKS default, ships with 0; Ubuntu ships with 1.
+
+The cost at 1: `strace -p`, `gdb -p` and `py-spy --pid` against a process that is not a child need
+`CAP_SYS_PTRACE`. `strace <command>` and `gdb ./<program>` still work.
+
+The setting is the node's, not the Pod's, so any Pod on a node shows it:
+
+```bash
+kubectl -n <step namespace> exec <pod> -- cat /proc/sys/kernel/yama/ptrace_scope
+```
+
+On Amazon Linux 2023 nodes, add a sysctl drop-in through the node's user data. With Karpenter, in
+the `EC2NodeClass` of the pool that runs step Pods (a launch template's user data takes the same
+part):
+
+```yaml
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: steps
+spec:
+  amiSelectorTerms:
+    - alias: al2023@latest
+  userData: |
+    MIME-Version: 1.0
+    Content-Type: multipart/mixed; boundary="BOUNDARY"
+
+    --BOUNDARY
+    Content-Type: text/x-shellscript; charset="us-ascii"
+
+    #!/bin/bash
+    echo 'kernel.yama.ptrace_scope = 1' > /etc/sysctl.d/90-ptrace-scope.conf
+    sysctl --system
+    --BOUNDARY--
+  # role, subnetSelectorTerms, securityGroupSelectorTerms as for your other pools
+```
+
+New nodes pick it up; replace the existing nodes of the pool to apply it there.
+
 ### Health checks
 
 The server answers three health endpoints. The chart's probes use `/livez` and `/readyz`.
@@ -495,6 +566,15 @@ Scarab encrypts stored secrets with them, and each step's value ledger: the secr
 hands the step, which the server redacts the step's log with
 ([Run logs](/scarab-ci/usage/run-logs/#secret-values)). A replica that cannot decrypt a step's
 ledger stores none of that step's log and leaves it to a replica that can.
+
+To redact a log, the server builds lookup tables from the step's values, up to 52 bytes per value
+byte (at most 13 MiB for a step at the 256 KiB cap), and frees them when the step's last log read
+ends. `scarab.logAutomataBudgetMib` (`SCARAB_LOG_AUTOMATA_BUDGET_MIB`, default 128, from 16 to
+65536) is the most MiB of these tables a replica keeps at once; a log read that does not fit waits
+until another ends, and a read that loses its tail lease while it waits stops. It builds them for
+2 steps at a time, about 36 MiB each at the cap. Count the budget and 72 MiB in the server Pod's
+memory limit: the default 128 fits the chart's default limit of 512Mi, and a larger budget needs a
+larger `resources.limits.memory`.
 
 To rotate a key:
 
@@ -841,19 +921,29 @@ which it does not know, and stops. To go back:
 2. Scale the server to zero, so no 0.7 server runs while the revert runs or after it:
    `kubectl -n scarab scale deploy/scarab --replicas=0`.
 3. Back up the database.
-4. Run the revert below once. It is `crates/scarab-db-postgres/rollback/0099_revert.sql` in the
-   repository, and it reverts migration 0100 too:
+4. Run the revert below (a second run changes nothing). It is `crates/scarab-db-postgres/rollback/0099_revert.sql` in the
+   repository, and it reverts migrations 0100 to 0103 too:
    `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0099_revert.sql`.
 5. Install the 0.6 chart and image:
    `helm upgrade scarab oci://ghcr.io/thulasi-ram/charts/scarab --version 0.6.1 -n scarab -f values.yaml`.
 
 The revert deletes the notes of logs stored by 0.7 and every value ledger. Output rows stay, and
-0.6 reads them as before. Upgrading to 0.7 again runs 0099 and 0100 again.
+0.6 reads them as before. Upgrading again runs 0099 to 0103 again.
 
 ```sql
 BEGIN;
 
-DELETE FROM log_chunks WHERE kind <> 'output';
+-- A second run changes nothing: the delete below runs only while the
+-- `kind` column exists, and every other statement is safe to repeat.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = 'log_chunks' AND column_name = 'kind') THEN
+    DELETE FROM log_chunks WHERE kind <> 'output';
+  END IF;
+END
+$$;
 
 DROP FUNCTION IF EXISTS scarab_append_log_row(
   TEXT, TEXT, TEXT, TEXT, TEXT, BIGINT, TEXT, TEXT, TEXT, BIGINT, BYTEA, BIGINT, TEXT, BIGINT);
@@ -879,10 +969,53 @@ ALTER TABLE log_chunks
 
 DROP INDEX IF EXISTS attempts_started_at_idx;
 
-DELETE FROM _sqlx_migrations WHERE version IN (99, 100);
+DELETE FROM _sqlx_migrations WHERE version IN (99, 100, 101, 102, 103);
 
 COMMIT;
 ```
+
+### Migration 0101
+
+The first release after 0.7.0 runs migration 0101 when the server starts. It validates three of
+the checks 0099 added to `log_chunks` (`log_chunks_kind`, `log_chunks_reason` and
+`log_chunks_body`). Validating takes a lock that blocks no read or write, and scans `log_chunks`
+once per check, so on a large table the server takes longer to start. `log_chunks_fenced` stays
+`NOT VALID`.
+
+The migration waits at most 5 seconds for that lock. Another session that holds a lock of the same
+kind on `log_chunks` makes it wait: a manual `VACUUM` or `ANALYZE`, an autovacuum that runs to
+prevent transaction ID wraparound, or a `CREATE INDEX CONCURRENTLY`. After 5 seconds the server
+stops with `canceling statement due to lock timeout`, Kubernetes restarts it, and it runs the
+migration again. The server starts once the other session ends; until then the Pod restarts
+with Kubernetes' back-off, up to 5 minutes between tries. A plain autovacuum does not cause this:
+it gives way to the migration after about a second. To see what holds the table:
+
+```sql
+SELECT pid, query, now() - query_start AS running
+FROM pg_stat_activity
+WHERE pid IN (SELECT pid FROM pg_locks WHERE relation = 'log_chunks'::regclass);
+```
+
+### Migrations 0102 and 0103
+
+The same release runs migrations 0102 and 0103 right after 0101. It adds a third reason to the
+`log_chunks_reason` check, `values_too_large`: a step whose secret values add up to more than
+256 KiB gets a `not_stored` note in place of its log (see
+[Run logs](/scarab-ci/usage/run-logs/#edges-of-a-value)). It drops the check and adds it again
+`NOT VALID`, so it scans no row under its lock, which blocks reads and writes. Migration 0103
+then validates that check again, in its own transaction, under the same lock as 0101 (it blocks
+no read or write); it scans `log_chunks` once more, so on a large table the start takes longer.
+Each waits at most 5 seconds for its lock, and a timeout restarts the server as for 0101. 0103
+waits for the same sessions as 0101. 0102's lock waits for every other session that holds a lock
+on `log_chunks`: any open transaction that read the table (a `pg_dump`, a long `SELECT`) makes it
+stop with the lock timeout, and while it waits, up to 5 seconds, the log reads and writes of the
+replicas still running wait behind it.
+
+A 0.7.0 server does not start on a database that ran 0101, 0102 or 0103. To go back to it, scale
+the server to zero, run `DELETE FROM _sqlx_migrations WHERE version IN (101, 102, 103);` and
+install 0.7.0.
+The checks stay, and 0.7.0 writes no row that breaks them. A 0.7.0 server shows a
+`values_too_large` note with the text of the `no_ledger` note.
 
 ## The chart on a local kind cluster
 

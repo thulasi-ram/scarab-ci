@@ -86,3 +86,37 @@ fn swap_db(url: &str, dbname: &str) -> String {
     }
     out
 }
+
+/// How many backends of the pool's OWN database are waiting on a lock while
+/// running a query that matches `like` (a SQL `LIKE` pattern).
+///
+/// `pg_stat_activity` is cluster-wide, and nextest runs sibling tests as
+/// separate processes on one Postgres, each in a database of its own. Without
+/// the `datname` filter another test's blocked query counts, and a wait built
+/// on it returns before this test's query blocks (git-bug 789ed54).
+#[allow(dead_code)]
+pub async fn blocked_count(pool: &PgPool, like: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity
+         WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE $1",
+    )
+    .bind(like)
+    .fetch_one(pool)
+    .await
+    .expect("read pg_stat_activity")
+}
+
+/// Wait until a backend of the pool's own database is blocked on a lock
+/// running a query that matches `like` ([`blocked_count`]). Polls every 25 ms
+/// and panics, naming the pattern, after 5 s. Row locks do not show in
+/// `pg_locks`, so a query waiting on a lock is the condition a test can see.
+#[allow(dead_code)]
+pub async fn wait_until_blocked(pool: &PgPool, like: &str) {
+    for _ in 0..200 {
+        if blocked_count(pool, like).await > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("no query like {like:?} blocked on a lock in this database within 5 s");
+}

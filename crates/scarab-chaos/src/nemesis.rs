@@ -22,7 +22,11 @@ use crate::time::now_ms;
 pub struct Stack {
     pub api: Api,
     pub kube: kube::Client,
+    /// The release namespace: the servers, the Depot, Postgres, MinIO.
     pub namespace: String,
+    /// The namespace the executor launches step Pods into (the server's
+    /// `SCARAB_NAMESPACE`; the chart's default is `<release namespace>-steps`).
+    pub step_namespace: String,
     /// The release name: Depot Pods are `<release>-workspace-<n>`.
     pub release: String,
     pub pg: sqlx::PgPool,
@@ -40,20 +44,33 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let file = dir.join("scenario.json");
     let pods_api: KubeApi<Pod> = KubeApi::namespaced(stack.kube.clone(), &stack.namespace);
+    let step_pods: KubeApi<Pod> = KubeApi::namespaced(stack.kube.clone(), &stack.step_namespace);
 
     if scenario.kind == Kind::PauseNode {
         // Before anything can pause the node: Ctrl-C or SIGTERM unpauses it.
         crate::node::unpause_on_signal()?;
     }
 
+    // One watcher on the step namespace (step Pods), one on the release
+    // namespace (Depot Pods), into one `pods.jsonl` and one map of views.
     let views: Views = Default::default();
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let watcher = tokio::spawn(pods::watch(
-        pods_api.clone(),
-        dir.join("pods.jsonl"),
-        views.clone(),
-        stop_rx,
-    ));
+    let watchers = [
+        tokio::spawn(pods::watch(
+            step_pods.clone(),
+            dir.join("pods.jsonl"),
+            views.clone(),
+            stop_rx.clone(),
+            pods::step_pod,
+        )),
+        tokio::spawn(pods::watch(
+            pods_api.clone(),
+            dir.join("pods.jsonl"),
+            views.clone(),
+            stop_rx,
+            pods::depot_pod,
+        )),
+    ];
 
     // The stack must be at the scenario's topology before anything runs: a
     // replay of a 2+2 file on a 1-server release is not the same scenario.
@@ -75,6 +92,14 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
         depots,
         scenario.plan
     ));
+
+    // kill-tailer's pipeline goes into the Forgejo repo before the Cache
+    // probe's seed, which commits to the same repo.
+    if let Some(lp) = scenario.logs.as_ref() {
+        let fj = crate::cache::Forgejo::from_env()
+            .map_err(|e| format!("kill-tailer needs the in-cluster Forgejo: {e}"))?;
+        crate::logs::write_pipeline(&fj, lp).await?;
+    }
 
     // The Cache probe's seed Run (`crate::cache`), before the workload and
     // waited for, so the probe Run below has a Cache to restore. A probe that
@@ -99,10 +124,33 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
         scenario.write(&file)?;
     }
 
+    // kill-tailer's Runs are dispatched in a Project, in an Environment that
+    // holds the planted secret; the others are inline Runs.
+    let log_project = match scenario.logs.as_mut() {
+        Some(lp) => {
+            let fj = crate::cache::Forgejo::from_env()
+                .map_err(|e| format!("kill-tailer needs the in-cluster Forgejo: {e}"))?;
+            let cache_project = scenario.cache.as_ref().and_then(|c| c.project.clone());
+            let project =
+                crate::logs::prepare(&stack.api, &fj, lp, cache_project.as_deref()).await?;
+            log(&format!(
+                "kill-tailer: Project {}/{} in Environment {} with secret {}",
+                project.0,
+                project.1,
+                crate::logs::ENVIRONMENT,
+                crate::logs::SECRET_NAME
+            ));
+            Some(project)
+        }
+        None => None,
+    };
     scenario.started_at_ms = now_ms();
     let body = scenario.workload.pipeline();
     for _ in 0..scenario.workload.runs {
-        let id = stack.api.create_run(&body).await?;
+        let id = match &log_project {
+            Some((org, project)) => crate::logs::dispatch(&stack.api, org, project).await?,
+            None => stack.api.create_run(&body).await?,
+        };
         log(&format!("created run {id}"));
         scenario.runs.push(id);
     }
@@ -128,10 +176,22 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
         let holds = move |p: &PodView| match kind {
             Kind::MidDrain | Kind::KillServer | Kind::PauseNode => pods::drain_in_flight(p),
             Kind::MidFeed => pods::feed_in_flight(p),
-            Kind::StopLeader => pods::step_running(p),
+            Kind::StopLeader | Kind::KillTailer => pods::step_running(p),
             Kind::TwoReplicas => false,
         };
-        match wait_trigger(stack, &views, &scenario.runs, &target_run, kind, &holds).await {
+        let mut trigger =
+            wait_trigger(stack, &views, &scenario.runs, &target_run, kind, &holds).await;
+        // kill-tailer: the tail must be appending, not about to start. Test the
+        // kind first: `take()` in a tuple pattern would empty every other
+        // kind's trigger, and its scenario would fire no fault.
+        if matches!(kind, Kind::KillTailer) {
+            if let Some(t) = trigger.take() {
+                let lines = scenario.logs.as_ref().map_or(0, |l| l.lines);
+                trigger =
+                    crate::logs::wait_output_rows(&stack.pg, &views, t, &holds, lines).await?;
+            }
+        }
+        match trigger {
             None => {
                 scenario.notes.push(format!(
                     "trigger never held on run {target_run}; no fault fired"
@@ -150,6 +210,17 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
                     }
                     Kind::KillServer => {
                         crate::servers::kill_server(
+                            stack,
+                            &Node::from_env(),
+                            &views,
+                            &t,
+                            &scenario.plan,
+                            &holds,
+                        )
+                        .await?
+                    }
+                    Kind::KillTailer => {
+                        crate::servers::kill_tailer(
                             stack,
                             &Node::from_env(),
                             &views,
@@ -203,12 +274,37 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+    // kill-tailer: every stream of the Runs has left `open` (its final read
+    // happens after its unit settles), under the same bound.
+    if scenario.logs.is_some() {
+        loop {
+            match crate::logs::open_streams(&stack.pg, &scenario.runs).await {
+                Ok(0) => break,
+                Ok(n) if now_ms() > deadline_ms => {
+                    scenario.notes.push(format!(
+                        "{n} log stream(s) still open when the quiesce bound ran out"
+                    ));
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    scenario
+                        .notes
+                        .push(format!("could not read the log streams: {e}"));
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
     tokio::time::sleep(SETTLE).await;
     let _ = stop_tx.send(true);
-    watcher
-        .await
-        .map_err(|e| format!("watcher task: {e}"))?
-        .map_err(|e| format!("watcher: {e}"))?;
+    for watcher in watchers {
+        watcher
+            .await
+            .map_err(|e| format!("watcher task: {e}"))?
+            .map_err(|e| format!("watcher: {e}"))?;
+    }
 
     // The release's own log lines about the scenario's step Pods and the
     // fault's target: what the drains, feeds and the fault did, for whoever
@@ -231,6 +327,7 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
         needles.push(f.pod.clone());
         needles.extend(f.claim.as_ref().and_then(|c| c.owner.clone()));
         needles.extend(f.lease.as_ref().map(|l| l.owner_before.clone()));
+        needles.extend(f.tail.as_ref().and_then(|l| l.owner.clone()));
     }
     needles.sort();
     needles.dedup();
@@ -248,7 +345,7 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
                 container: Some(pods::INIT_CONTAINER.into()),
                 ..Default::default()
             };
-            let text = match pods_api.logs(&t.pod, &lp).await {
+            let text = match step_pods.logs(&t.pod, &lp).await {
                 Ok(t) => t,
                 Err(e) => format!("could not read the fetcher's log: {e}\n"),
             };
@@ -258,7 +355,7 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
 
     // The Cache probe: each cached Step's fetcher log, while the Pods exist.
     if let Some(probe) = scenario.cache.as_mut() {
-        crate::cache::observe(&stack.api, &pods_api, &stack.pg, probe).await;
+        crate::cache::observe(&stack.api, &step_pods, &stack.pg, probe).await;
         let text: String = probe
             .restores
             .iter()
@@ -314,7 +411,11 @@ pub fn window(kind: Kind, records: &[pods::PodRecord], uid: &str) -> (Option<i64
             let end = of_pod.iter().filter_map(|r| c(r)?.finished_at_ms).min();
             (start, end)
         }
-        Kind::TwoReplicas | Kind::KillServer | Kind::StopLeader | Kind::PauseNode => (None, None),
+        Kind::TwoReplicas
+        | Kind::KillServer
+        | Kind::KillTailer
+        | Kind::StopLeader
+        | Kind::PauseNode => (None, None),
     }
 }
 
@@ -342,7 +443,7 @@ async fn wait_trigger(
                         "step exited 0, egress running, no workspace-root annotation".into()
                     }
                     Kind::MidFeed => "scarab-workspace-init running".into(),
-                    Kind::StopLeader => "step container running".into(),
+                    Kind::StopLeader | Kind::KillTailer => "step container running".into(),
                     Kind::TwoReplicas => String::new(),
                 },
                 observed_at_ms: now_ms(),

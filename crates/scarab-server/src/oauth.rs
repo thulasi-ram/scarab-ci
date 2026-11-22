@@ -53,11 +53,42 @@ pub(crate) fn percent_encode(v: &str) -> String {
     out
 }
 
+/// The largest answer body read from an OAuth or OIDC provider: the cap the
+/// forge adapters read under
+/// ([`FORGE_BODY_MAX_BYTES`](scarab_forge::FORGE_BODY_MAX_BYTES)).
+const PROVIDER_BODY_MAX_BYTES: usize = scarab_forge::FORGE_BODY_MAX_BYTES;
+
+/// The body of `resp`, read chunk by chunk and stopped once it passes
+/// [`PROVIDER_BODY_MAX_BYTES`]: the part read is dropped, never parsed, and
+/// the error names the status and the cap and carries none of the body.
+async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, String> {
+    let status = resp.status();
+    let mut body = scarab_forge::CappedBody::new(PROVIDER_BODY_MAX_BYTES);
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        if !body.push(&chunk) {
+            return Err(format!(
+                "{status}: the answer was over {PROVIDER_BODY_MAX_BYTES} bytes and was not read"
+            ));
+        }
+    }
+    Ok(body.into_bytes())
+}
+
+/// A provider's JSON answer, read under [`PROVIDER_BODY_MAX_BYTES`].
+async fn read_json(resp: reqwest::Response) -> Result<serde_json::Value, String> {
+    let body = read_capped(resp).await?;
+    serde_json::from_slice(&body).map_err(|e| e.to_string())
+}
+
 /// Why a provider endpoint said no, safe to log: the RFC 6749 §5.2 `error` /
 /// `error_description` pair when the body is one, else the first 200 chars of
-/// it. Never the request — that carries the client secret and the code.
+/// it. Never the request — that carries the client secret and the code. A
+/// body over [`PROVIDER_BODY_MAX_BYTES`] is not read; the reason then says so.
 async fn oauth_error(resp: reqwest::Response) -> String {
-    let body = resp.text().await.unwrap_or_default();
+    let body = match read_capped(resp).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(why) => return why,
+    };
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
         if let Some(error) = v.get("error").and_then(|e| e.as_str()) {
             return match v.get("error_description").and_then(|d| d.as_str()) {
@@ -453,8 +484,7 @@ impl OAuthAuthenticator {
             tracing::warn!(provider = %self.cfg.provider_id, %status, error = %why, "OAuth token endpoint refused the code exchange");
             return Err(IdentityError::AuthFailed);
         }
-        let token: serde_json::Value = token_resp
-            .json()
+        let token = read_json(token_resp)
             .await
             .map_err(|e| IdentityError::Issuance(format!("token body: {e}")))?;
 
@@ -495,8 +525,7 @@ impl OAuthAuthenticator {
             tracing::warn!(provider = %self.cfg.provider_id, %status, error = %why, "OAuth userinfo endpoint refused the access token");
             return Err(IdentityError::AuthFailed);
         }
-        let user: serde_json::Value = user_resp
-            .json()
+        let user = read_json(user_resp)
             .await
             .map_err(|e| IdentityError::Issuance(format!("userinfo body: {e}")))?;
         Ok((user, false))
@@ -813,7 +842,7 @@ impl OAuthAuthenticator {
                 resp.status()
             )));
         }
-        resp.json()
+        read_json(resp)
             .await
             .map_err(|e| IdentityError::Issuance(format!("{url}: {e}")))
     }

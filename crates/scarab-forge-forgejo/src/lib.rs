@@ -20,8 +20,8 @@
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use scarab_forge::{
-    filter_refs, CheckoutCredential, Collaborator, Commit, Event, ForgeError, ForgePort, ForgeRef,
-    Permissions, RefKind, RepoRef, Status, WebhookDelivery,
+    filter_refs, ChangedPaths, CheckoutCredential, Collaborator, Commit, Event, ForgeError,
+    ForgePort, ForgeRef, PathsUnknown, Permissions, RefKind, RepoRef, Status, WebhookDelivery,
 };
 use serde_json::Value;
 use sha2::Sha256;
@@ -83,14 +83,25 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                 if !scarab_forge::is_commit_sha(&after) {
                     return Err(ForgeError::Malformed("after is not a commit SHA".into()));
                 }
+                // Forgejo sends `total_commits`; over the limit no compare is
+                // asked for (ADR-0081 §3).
+                let changed_paths = scarab_forge::push_payload_paths(
+                    p,
+                    Some(scarab_forge::PUSH_COMPARE_COMMITS_MAX),
+                );
                 Ok(Event::Push {
                     actor,
                     actor_id,
                     repo,
                     r#ref,
+                    before: p
+                        .get("before")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
                     after,
                     message,
-                    changed_paths: scarab_forge::push_changed_paths(p, None),
+                    changed_paths,
                 })
             }
         }
@@ -504,11 +515,7 @@ impl ForgejoForge {
             .get("etag")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| ForgeError::Api(e.to_string()))?
-            .to_vec();
+        let body = read_body(resp).await?;
         match (status.is_success(), new_etag) {
             (true, Some(tag)) => self.etags.store(url, &tag, &body),
             _ => self.etags.forget(url),
@@ -529,17 +536,195 @@ impl ForgejoForge {
     }
 }
 
-/// Fail non-2xx with the body in the error; parse JSON otherwise.
+/// The fields of a Forgejo compare answer [`compare_changed_paths`] reads;
+/// the rest of the answer is skipped while parsing, never kept. A field
+/// that is absent or `null` is `None`; one of another type fails the parse.
+#[derive(serde::Deserialize)]
+struct CompareAnswer {
+    commits: Option<Vec<CompareCommit>>,
+    total_commits: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct CompareCommit {
+    sha: Option<String>,
+    files: Option<Vec<CompareFile>>,
+    parents: Option<Vec<CompareParent>>,
+}
+
+#[derive(serde::Deserialize)]
+struct CompareParent {
+    sha: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct CompareFile {
+    filename: Option<String>,
+}
+
+/// The changed paths in a Forgejo compare answer,
+/// `GET /repos/{o}/{r}/compare/{before}...{after}` (ADR-0081 §2), for a push
+/// from `before` to `after`. Pure, so every rule is tested on fixtures
+/// without a network. It parses the whole body: call it off the async
+/// runtime (the adapter runs it in `spawn_blocking`).
+///
+/// Forgejo has no tree diff of two commits. Its answer lists every commit in
+/// merge-base..`after`, each with its own `files` (its diff against its first
+/// parent, from `git log --name-status -m --first-parent --no-renames`) and
+/// `parents`, and `total_commits`. In order:
+///
+/// 1. **Complete?** `commits` or `total_commits` absent or `null`,
+///    `total_commits` not the number of listed commits, `after` not listed,
+///    or a listed commit whose `files` or `parents` is absent or `null`:
+///    [`Incomplete`](PathsUnknown::Incomplete).
+/// 2. **Fast-forward?** Only when some listed commit has `before` among its
+///    parents, in any position: then `before` is an ancestor of `after` and
+///    the list holds every commit between them. Otherwise
+///    [`Forced`](PathsUnknown::Forced).
+/// 3. **First-parent line.** From `after`, follow each commit's first parent
+///    through the listed commits. Reaching `before`, the list is the union of
+///    the files of the commits on that line: every path that differs between
+///    `before` and `after`, merge resolutions included (and possibly a path
+///    that changed and changed back). Leaving the listed commits first:
+///    [`MergedHead`](PathsUnknown::MergedHead), because a merge whose
+///    first-parent line misses `before` can drop a change of `before`'s that
+///    no listed commit shows. A merge on that line (two parents or more)
+///    that lists no files is [`Incomplete`](PathsUnknown::Incomplete): a
+///    forge that does not list a merge's diff against its first parent
+///    answers that way for every clean merge, and a known empty list is the
+///    one answer that skips a Pipeline.
+///
+/// An answer that is not the expected JSON (a field of another type, a
+/// commit with no `sha`, a `sha` listed twice, a file with an empty name) is
+/// [`ForgeError`](PathsUnknown::ForgeError); 3,000 paths or more is
+/// [`TooMany`](PathsUnknown::TooMany).
+pub fn compare_changed_paths(before: &str, after: &str, body: &[u8]) -> ChangedPaths {
+    use std::collections::HashMap;
+    let unknown = ChangedPaths::Unknown;
+    let Ok(answer) = serde_json::from_slice::<CompareAnswer>(body) else {
+        return unknown(PathsUnknown::ForgeError);
+    };
+    let Some(commits) = &answer.commits else {
+        return unknown(PathsUnknown::Incomplete);
+    };
+    if answer.total_commits != Some(commits.len() as u64) {
+        return unknown(PathsUnknown::Incomplete);
+    }
+    // sha -> (parent shas, files)
+    let mut listed: HashMap<&str, (Vec<&str>, &Vec<CompareFile>)> = HashMap::new();
+    for commit in commits {
+        let Some(sha) = commit.sha.as_deref() else {
+            return unknown(PathsUnknown::ForgeError);
+        };
+        let Some(files) = &commit.files else {
+            return unknown(PathsUnknown::Incomplete);
+        };
+        // A root commit lists `parents: []`; no key at all is an answer
+        // that does not say, read as incomplete rather than as a root.
+        let Some(parents) = &commit.parents else {
+            return unknown(PathsUnknown::Incomplete);
+        };
+        let Some(parents) = parents
+            .iter()
+            .map(|p| p.sha.as_deref())
+            .collect::<Option<Vec<&str>>>()
+        else {
+            return unknown(PathsUnknown::ForgeError);
+        };
+        // A commit listed twice: which entry is the commit is not known.
+        if listed.insert(sha, (parents, files)).is_some() {
+            return unknown(PathsUnknown::ForgeError);
+        }
+    }
+    if !listed.contains_key(after) {
+        return unknown(PathsUnknown::Incomplete);
+    }
+    if !listed
+        .values()
+        .any(|(parents, _)| parents.contains(&before))
+    {
+        return unknown(PathsUnknown::Forced);
+    }
+    let mut paths = Vec::new();
+    let mut at = after;
+    // Each step visits a listed commit, and the step after the last listed
+    // one finds its parent unlisted (MergedHead): more steps than that is a
+    // cycle.
+    for _ in 0..=listed.len() {
+        let Some((parents, files)) = listed.get(at) else {
+            return unknown(PathsUnknown::MergedHead);
+        };
+        if parents.len() >= 2 && files.is_empty() {
+            return unknown(PathsUnknown::Incomplete);
+        }
+        for file in files.iter() {
+            // An empty name is no path: dropped later, a merge listing only
+            // it would pass the check above and leave a known empty list.
+            let Some(name) = file.filename.as_ref().filter(|n| !n.is_empty()) else {
+                return unknown(PathsUnknown::ForgeError);
+            };
+            paths.push(name.clone());
+        }
+        match parents.first() {
+            Some(&parent) if parent == before => return ChangedPaths::from_paths(paths),
+            Some(&parent) => at = parent,
+            None => return unknown(PathsUnknown::MergedHead),
+        }
+    }
+    unknown(PathsUnknown::ForgeError)
+}
+
+/// The body of `resp`, read as a stream through a
+/// [`CappedBody`](scarab_forge::CappedBody) and stopped once it passes `cap`
+/// bytes: `Ok(None)` then, and the part read is dropped, never parsed.
+async fn read_capped(
+    mut resp: reqwest::Response,
+    cap: usize,
+) -> Result<Option<Vec<u8>>, ForgeError> {
+    let mut body = scarab_forge::CappedBody::new(cap);
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| ForgeError::Api(e.to_string()))?
+    {
+        if !body.push(&chunk) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(body.into_bytes()))
+}
+
+/// The whole body of `resp` up to
+/// [`FORGE_BODY_MAX_BYTES`](scarab_forge::FORGE_BODY_MAX_BYTES); a longer one
+/// is [`body_too_large`](scarab_forge::body_too_large) (git-bug bfa8dfd).
+async fn read_body(resp: reqwest::Response) -> Result<Vec<u8>, ForgeError> {
+    let status = resp.status();
+    read_capped(resp, scarab_forge::FORGE_BODY_MAX_BYTES)
+        .await?
+        .ok_or_else(|| scarab_forge::body_too_large(status, scarab_forge::FORGE_BODY_MAX_BYTES))
+}
+
+/// The body of a failed answer as text for an error message, read under the
+/// same cap; empty when it cannot be read or is over the cap.
+async fn error_text(resp: reqwest::Response) -> String {
+    match read_capped(resp, scarab_forge::FORGE_BODY_MAX_BYTES).await {
+        Ok(Some(body)) => String::from_utf8_lossy(&body).into_owned(),
+        _ => String::new(),
+    }
+}
+
+/// Fail non-2xx with the body in the error; parse JSON otherwise. The body
+/// is read under the cap ([`read_body`]).
 async fn ok_json(resp: reqwest::Response) -> Result<Value, ForgeError> {
     let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| ForgeError::Api(e.to_string()))?;
+    let body = read_body(resp).await?;
     if !status.is_success() {
-        return Err(ForgeError::Api(format!("{status}: {text}")));
+        return Err(ForgeError::Api(format!(
+            "{status}: {}",
+            String::from_utf8_lossy(&body)
+        )));
     }
-    serde_json::from_str(&text).map_err(|e| ForgeError::Api(format!("bad JSON: {e}")))
+    serde_json::from_slice(&body).map_err(|e| ForgeError::Api(format!("bad JSON: {e}")))
 }
 
 /// A Forgejo user object → `(numeric id, login)`. Older instances spell the
@@ -759,7 +944,7 @@ impl ForgePort for ForgejoForge {
             let status = resp.status();
             // Gone already (a concurrent delete) is what was wanted.
             if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
-                let text = resp.text().await.unwrap_or_default();
+                let text = error_text(resp).await;
                 return Err(ForgeError::Api(format!("{status}: {text}")));
             }
         }
@@ -797,6 +982,45 @@ impl ForgePort for ForgejoForge {
 
     async fn normalize_event(&self, raw: WebhookDelivery) -> Result<Event, ForgeError> {
         normalize(&raw)
+    }
+
+    /// `GET /repos/{o}/{r}/compare/{before}...{after}?verification=false`,
+    /// one request (signature checks are the expensive part of the answer
+    /// and are not needed). The body is read up to
+    /// [`COMPARE_BODY_MAX_BYTES`](scarab_forge::COMPARE_BODY_MAX_BYTES), then
+    /// [`compare_changed_paths`] decides. A 404 is
+    /// [`NotFound`](PathsUnknown::NotFound): after a forced push Forgejo may
+    /// no longer have `before`. Any other failure is
+    /// [`ForgeError`](PathsUnknown::ForgeError).
+    async fn push_changed_paths(&self, repo: &RepoRef, before: &str, after: &str) -> ChangedPaths {
+        if let Some(answer) = scarab_forge::push_ids_answer(before, after) {
+            return answer;
+        }
+        let unknown = ChangedPaths::Unknown;
+        let url = self.url(&format!(
+            "/repos/{}/{}/compare/{before}...{after}?verification=false",
+            repo.owner, repo.name
+        ));
+        let Ok(resp) = self.send(|| self.client.get(&url)).await else {
+            return unknown(PathsUnknown::ForgeError);
+        };
+        match resp.status() {
+            s if s.is_success() => {}
+            reqwest::StatusCode::NOT_FOUND => return unknown(PathsUnknown::NotFound),
+            _ => return unknown(PathsUnknown::ForgeError),
+        }
+        match read_capped(resp, scarab_forge::COMPARE_BODY_MAX_BYTES).await {
+            // Parsing up to 16 MiB is CPU work the caller's timeout cannot
+            // cut: off the async workers.
+            Ok(Some(body)) => {
+                let (before, after) = (before.to_string(), after.to_string());
+                tokio::task::spawn_blocking(move || compare_changed_paths(&before, &after, &body))
+                    .await
+                    .unwrap_or(unknown(PathsUnknown::ForgeError))
+            }
+            Ok(None) => unknown(PathsUnknown::TooLarge),
+            Err(_) => unknown(PathsUnknown::ForgeError),
+        }
     }
 
     /// `GET /repos/{o}/{r}/pulls/{index}/files`, walked to an empty page
@@ -1064,13 +1288,14 @@ mod tests {
                     name: "app".into()
                 },
                 r#ref: "refs/heads/main".into(),
+                before: String::new(),
                 after: "abc123".into(),
                 // Forgejo carries head_commit.message like GitHub — the Headline
                 // extractor takes its first line (ADR-0057).
                 message: "chore: bump deps\n\ndetails".into(),
-                // No commit list in this payload.
+                // No `before`, and `after` is not a full commit id.
                 changed_paths: scarab_forge::ChangedPaths::Unknown(
-                    scarab_forge::PathsUnknown::NoCommits
+                    scarab_forge::PathsUnknown::BadPayload
                 ),
             }
         );
