@@ -28,6 +28,10 @@
 > (§8); a resend under a new delivery id is an accepted risk (§10); the key carries the forge
 > connection id (§1, orchestrator's call).
 
+> **2026-11-22, orchestrator correction.** A comment on a pull request follows §5's head
+> rule; a comment not on a pull request has no head and runs, like tags and releases. The
+> item that left comments out of §5 is removed from Not solved.
+
 ## Context
 
 A verified webhook delivery runs in its own task (`finish_delivery`, `scarab-server/src/lib.rs`)
@@ -327,17 +331,25 @@ creates nothing.
 
 - **Which try.** The first try is the one whose insert created the delivery row (§7); it
   behaves as today. Every other try applies this rule.
-- **Which events.** Push and pull request. Tag and release deliveries always run. Comment
-  deliveries always run, at the commit their first try pinned (§1).
+- **Which events.** Push, pull request, and a comment on a pull request. Tag and release
+  deliveries always run. A comment that is not on a pull request has no head and always runs,
+  at the commit its first try pinned (§1). Whether a comment is on a pull request is read
+  from its payload (GitHub `issue.pull_request`, Forgejo `is_pull`).
 - **How "head" is decided.** From Scarab's own Runs, with no forge call: the newest Run of
   the same Project and Pipeline name in the same scope (a push: the same `origin_ref`; a pull
   request: the same `origin_pr_number`) whose `created_at` is later than the delivery row's
   `at`. If such a Run exists and its `origin_sha` is not the delivery's commit, the head has
   moved. The lower bound on `created_at` is needed: without it the newest Run before this
   delivery, at the previous commit, would make every redelivery look stale.
+- **A comment on a pull request.** A comment carries no head commit, and the Pipeline it runs
+  is not a pull request Pipeline, so the pull request's own Runs stand for its head: the
+  newest Run of the same Project with the comment's `origin_pr_number` (any Pipeline) created
+  after the delivery row's `at`, compared with the newest one created before it. The head has
+  moved when the later Run is at another commit, or when there is a later Run and no earlier
+  one to compare it with.
 - **What is recorded.** `not_run` with `reason_kind = not_head`, a `failure` commit status
   on the delivery's commit reading "no longer the head of `<ref>`" (or "of pull request
-  #`<n>`"), and the Pipeline counts as decided. A replacement under §4 applies the same check.
+  #`<n>`"; a comment has no commit to post on), and the Pipeline counts as decided. A replacement under §4 applies the same check.
 
 "Head" here means "no newer Run of this Pipeline". A newer push whose own trigger did not
 match this Pipeline leaves the older commit the head for it, and the redelivery creates the
@@ -535,9 +547,6 @@ Owner decision (2026-11-22): nothing is built for this. A new delivery id is a n
 - **An admission error that repeats** (a concurrency group that cannot be rendered) stops
   every try at the same Pipeline, and the files sorted after it stay undecided. Recording it
   as a refusal is a change to admission, not to delivery handling.
-- **Comment deliveries** read `.scarab/` at one commit for every try (§1) and are not subject
-  to §5: a late redelivery of a comment command runs at the commit its first try pinned.
-  Whether the Run's checkout uses that commit is unchanged by this ADR.
 - **A resend under a new id** (§10), Forgejo Replay included.
 - **Follow-up refusals** (a chain loop or cap) are recorded again when a `run_finished` is
   delivered twice; their status is not, through the derived id. Pre-existing, not on the
@@ -581,9 +590,10 @@ Owner decision (2026-11-22): nothing is built for this. A new delivery id is a n
 
 ## Owner decisions (2026-11-22)
 
-1. **A late redelivery** creates nothing for a push or pull request whose head has moved,
-   decided from Scarab's Runs; tags and releases always run; the first try behaves as today
-   (§5).
+1. **A late redelivery** creates nothing for a push, pull request, or comment on a pull
+   request whose head has moved, decided from Scarab's Runs; tags, releases and other
+   comments always run; the first try behaves as today (§5). The comment rule is the
+   orchestrator's correction of 2026-11-22.
 2. **Answers:** a partial delivery is 502 with what ran and what did not; a delivery another
    try is processing is 409 on any replica; the overload answer stays 503 (§7).
 3. **Retention:** 30 days by default, a setting with a chart value, never under 7 days (§8).
@@ -609,8 +619,10 @@ the forge is the existing `FakeForge`.
   redelivery reads at the stored commit and creates nothing new.
 - **A late redelivery** (owner decision 1): push P1 with `c.yaml` unreadable; push P2 creates
   a `c.yaml` Run; the redelivery of P1 records `not_run` (`not_head`), posts its `failure` on
-  P1's commit and leaves P2's Run running. The same for a pull request whose head moved. A
-  redelivery of P1 with no newer `c.yaml` Run creates it. A tag redelivery creates it.
+  P1's commit and leaves P2's Run running. The same for a pull request whose head moved, and
+  for a comment on a pull request whose pull request got a Run at a new commit. A
+  redelivery of P1 with no newer `c.yaml` Run creates it. A tag redelivery creates it, and so
+  does a comment that is not on a pull request.
 - **Server stopped between rows** (window 2): a store hook stops the try after
   `begin_run_creation` of `b.yaml`; the redelivery within the bound answers 409 and creates
   nothing; with the clock past the bound it ends the old Run `Failed`, creates a new one, the
