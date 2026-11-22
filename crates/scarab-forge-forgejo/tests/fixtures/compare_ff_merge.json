@@ -2,27 +2,27 @@
   "total_commits": 3,
   "commits": [
     {
-      "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/commits/5b307cff920d2d06dabc8c785bbd13f98d18ac9d",
-      "sha": "5b307cff920d2d06dabc8c785bbd13f98d18ac9d",
-      "created": "2026-11-22T10:03:00Z",
-      "html_url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/scarab-admin/record-compare/commit/5b307cff920d2d06dabc8c785bbd13f98d18ac9d",
+      "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/commits/4ed8ec692c0285e527bea3236b5739a4ae2e7537",
+      "sha": "4ed8ec692c0285e527bea3236b5739a4ae2e7537",
+      "created": "2026-11-22T13:07:44+05:30",
+      "html_url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/scarab-admin/record-compare/commit/4ed8ec692c0285e527bea3236b5739a4ae2e7537",
       "commit": {
-        "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/commits/5b307cff920d2d06dabc8c785bbd13f98d18ac9d",
+        "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/commits/4ed8ec692c0285e527bea3236b5739a4ae2e7537",
         "author": {
           "name": "scarab-record",
           "email": "record@verify.invalid",
-          "date": "2026-11-22T10:03:00Z"
+          "date": "2026-11-22T13:07:44+05:30"
         },
         "committer": {
           "name": "scarab-record",
           "email": "record@verify.invalid",
-          "date": "2026-11-22T10:03:00Z"
+          "date": "2026-11-22T13:07:44+05:30"
         },
         "message": "merge: side into ff\n",
         "tree": {
-          "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/trees/d2a67c1e4708d28cc99b93645ba12bc407fc1137",
-          "sha": "d2a67c1e4708d28cc99b93645ba12bc407fc1137",
-          "created": "2026-11-22T10:03:00Z"
+          "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/trees/4ed8ec692c0285e527bea3236b5739a4ae2e7537",
+          "sha": "4ed8ec692c0285e527bea3236b5739a4ae2e7537",
+          "created": "2026-11-22T13:07:44+05:30"
         },
         "verification": null
       },
@@ -30,14 +30,14 @@
       "committer": null,
       "parents": [
         {
-          "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/commits/b551578a268daddd37ceea44bc9192ff2d86ee88",
-          "sha": "b551578a268daddd37ceea44bc9192ff2d86ee88",
-          "created": "2026-11-22T10:03:00Z"
+          "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/commits/79fbd7b8c6386a5651bb212a7e0d7d27ad30deaf",
+          "sha": "79fbd7b8c6386a5651bb212a7e0d7d27ad30deaf",
+          "created": "0001-01-01T00:00:00Z"
         },
         {
-          "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/commits/66f047da38092bf38d8ad9f57d1fa347d944ac17",
-          "sha": "66f047da38092bf38d8ad9f57d1fa347d944ac17",
-          "created": "2026-11-22T10:03:00Z"
+          "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/commits/15d62d75c3a5d11f8e5a778a29c1a6527c0358b0",
+          "sha": "15d62d75c3a5d11f8e5a778a29c1a6527c0358b0",
+          "created": "0001-01-01T00:00:00Z"
         }
       ],
       "files": [
@@ -55,83 +55,33 @@
         }
       ],
       "stats": {
-        "total": 6,
-        "additions": 3,
-        "deletions": 3
+        "total": 0,
+        "additions": 0,
+        "deletions": 0
       }
     },
     {
-      "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/commits/66f047da38092bf38d8ad9f57d1fa347d944ac17",
-      "sha": "66f047da38092bf38d8ad9f57d1fa347d944ac17",
-      "created": "2026-11-22T10:02:00Z",
-      "html_url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/scarab-admin/record-compare/commit/66f047da38092bf38d8ad9f57d1fa347d944ac17",
+      "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/commits/79fbd7b8c6386a5651bb212a7e0d7d27ad30deaf",
+      "sha": "79fbd7b8c6386a5651bb212a7e0d7d27ad30deaf",
+      "created": "2026-11-22T13:07:44+05:30",
+      "html_url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/scarab-admin/record-compare/commit/79fbd7b8c6386a5651bb212a7e0d7d27ad30deaf",
       "commit": {
-        "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/commits/66f047da38092bf38d8ad9f57d1fa347d944ac17",
+        "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/commits/79fbd7b8c6386a5651bb212a7e0d7d27ad30deaf",
         "author": {
           "name": "scarab-record",
           "email": "record@verify.invalid",
-          "date": "2026-11-22T10:02:00Z"
+          "date": "2026-11-22T13:07:44+05:30"
         },
         "committer": {
           "name": "scarab-record",
           "email": "record@verify.invalid",
-          "date": "2026-11-22T10:02:00Z"
-        },
-        "message": "side: add feature\n",
-        "tree": {
-          "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/trees/dacb2975656703dc7cfaa579cf6656a0987381f7",
-          "sha": "dacb2975656703dc7cfaa579cf6656a0987381f7",
-          "created": "2026-11-22T10:02:00Z"
-        },
-        "verification": null
-      },
-      "author": null,
-      "committer": null,
-      "parents": [
-        {
-          "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/commits/ae4f281df5a5d0ff3cad6371f76d5c29b6d953ec",
-          "sha": "ae4f281df5a5d0ff3cad6371f76d5c29b6d953ec",
-          "created": "2026-11-22T10:02:00Z"
-        }
-      ],
-      "files": [
-        {
-          "filename": "conf/app.yaml",
-          "status": "modified"
-        },
-        {
-          "filename": "side/feature.txt",
-          "status": "added"
-        }
-      ],
-      "stats": {
-        "total": 4,
-        "additions": 2,
-        "deletions": 2
-      }
-    },
-    {
-      "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/commits/b551578a268daddd37ceea44bc9192ff2d86ee88",
-      "sha": "b551578a268daddd37ceea44bc9192ff2d86ee88",
-      "created": "2026-11-22T10:01:00Z",
-      "html_url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/scarab-admin/record-compare/commit/b551578a268daddd37ceea44bc9192ff2d86ee88",
-      "commit": {
-        "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/commits/b551578a268daddd37ceea44bc9192ff2d86ee88",
-        "author": {
-          "name": "scarab-record",
-          "email": "record@verify.invalid",
-          "date": "2026-11-22T10:01:00Z"
-        },
-        "committer": {
-          "name": "scarab-record",
-          "email": "record@verify.invalid",
-          "date": "2026-11-22T10:01:00Z"
+          "date": "2026-11-22T13:07:44+05:30"
         },
         "message": "line: rename docs, drop scratch\n",
         "tree": {
-          "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/trees/91f505c49342435725514666b60f82191c686fe1",
-          "sha": "91f505c49342435725514666b60f82191c686fe1",
-          "created": "2026-11-22T10:01:00Z"
+          "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/trees/79fbd7b8c6386a5651bb212a7e0d7d27ad30deaf",
+          "sha": "79fbd7b8c6386a5651bb212a7e0d7d27ad30deaf",
+          "created": "2026-11-22T13:07:44+05:30"
         },
         "verification": null
       },
@@ -139,16 +89,12 @@
       "committer": null,
       "parents": [
         {
-          "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/commits/ae4f281df5a5d0ff3cad6371f76d5c29b6d953ec",
-          "sha": "ae4f281df5a5d0ff3cad6371f76d5c29b6d953ec",
-          "created": "2026-11-22T10:01:00Z"
+          "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/commits/b6cc449d3106d99f039176b31154fc9be02f700a",
+          "sha": "b6cc449d3106d99f039176b31154fc9be02f700a",
+          "created": "0001-01-01T00:00:00Z"
         }
       ],
       "files": [
-        {
-          "filename": "conf/app.yaml",
-          "status": "modified"
-        },
         {
           "filename": "docs/new.md",
           "status": "added"
@@ -160,13 +106,105 @@
         {
           "filename": "tmp/scratch.txt",
           "status": "removed"
+        },
+        {
+          "filename": "conf/app.yaml",
+          "status": "modified"
         }
       ],
       "stats": {
-        "total": 8,
-        "additions": 4,
-        "deletions": 4
+        "total": 3,
+        "additions": 1,
+        "deletions": 2
       }
+    },
+    {
+      "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/commits/15d62d75c3a5d11f8e5a778a29c1a6527c0358b0",
+      "sha": "15d62d75c3a5d11f8e5a778a29c1a6527c0358b0",
+      "created": "2026-11-22T13:07:43+05:30",
+      "html_url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/scarab-admin/record-compare/commit/15d62d75c3a5d11f8e5a778a29c1a6527c0358b0",
+      "commit": {
+        "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/commits/15d62d75c3a5d11f8e5a778a29c1a6527c0358b0",
+        "author": {
+          "name": "scarab-record",
+          "email": "record@verify.invalid",
+          "date": "2026-11-22T13:07:43+05:30"
+        },
+        "committer": {
+          "name": "scarab-record",
+          "email": "record@verify.invalid",
+          "date": "2026-11-22T13:07:43+05:30"
+        },
+        "message": "side: add feature\n",
+        "tree": {
+          "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/trees/15d62d75c3a5d11f8e5a778a29c1a6527c0358b0",
+          "sha": "15d62d75c3a5d11f8e5a778a29c1a6527c0358b0",
+          "created": "2026-11-22T13:07:43+05:30"
+        },
+        "verification": null
+      },
+      "author": null,
+      "committer": null,
+      "parents": [
+        {
+          "url": "http://scarab-forgejo.scarab.svc.cluster.local:3000/api/v1/repos/scarab-admin/record-compare/git/commits/b6cc449d3106d99f039176b31154fc9be02f700a",
+          "sha": "b6cc449d3106d99f039176b31154fc9be02f700a",
+          "created": "0001-01-01T00:00:00Z"
+        }
+      ],
+      "files": [
+        {
+          "filename": "side/feature.txt",
+          "status": "added"
+        },
+        {
+          "filename": "conf/app.yaml",
+          "status": "modified"
+        }
+      ],
+      "stats": {
+        "total": 3,
+        "additions": 2,
+        "deletions": 1
+      }
+    }
+  ],
+  "files": [
+    {
+      "filename": "conf/app.yaml",
+      "status": "modified"
+    },
+    {
+      "filename": "conf/resolution.yaml",
+      "status": "added"
+    },
+    {
+      "filename": "side/feature.txt",
+      "status": "added"
+    },
+    {
+      "filename": "docs/new.md",
+      "status": "added"
+    },
+    {
+      "filename": "docs/old.md",
+      "status": "removed"
+    },
+    {
+      "filename": "tmp/scratch.txt",
+      "status": "removed"
+    },
+    {
+      "filename": "conf/app.yaml",
+      "status": "modified"
+    },
+    {
+      "filename": "side/feature.txt",
+      "status": "added"
+    },
+    {
+      "filename": "conf/app.yaml",
+      "status": "modified"
     }
   ]
 }

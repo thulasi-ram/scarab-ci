@@ -622,8 +622,10 @@ pub fn compare_changed_paths(before: &str, after: &str, body: &[u8]) -> ChangedP
     }
     let mut paths = Vec::new();
     let mut at = after;
-    // Each step visits a listed commit; more steps than commits is a cycle.
-    for _ in 0..listed.len() {
+    // Each step visits a listed commit, and the step after the last listed
+    // one finds its parent unlisted (MergedHead): more steps than that is a
+    // cycle.
+    for _ in 0..=listed.len() {
         let Some((parents, files)) = listed.get(at) else {
             return unknown(PathsUnknown::MergedHead);
         };
