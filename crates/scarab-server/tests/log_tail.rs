@@ -1595,6 +1595,158 @@ async fn the_sweep_revokes_a_token_recorded_after_the_unit_was_marked() {
     );
 }
 
+/// A forge that, while the ledger sweep revokes the unit's first token,
+/// lets a late launch on another replica write the unit's next generation
+/// (token `late`): after the sweep decided to purge and before it does.
+struct LateLaunchDuringRevoke {
+    forge: Arc<FakeForge>,
+    late: Mutex<Option<Arc<LogService>>>,
+}
+
+#[async_trait]
+impl ForgePort for LateLaunchDuringRevoke {
+    async fn latest_commit(
+        &self,
+        r: &scarab_forge::RepoRef,
+        x: &str,
+    ) -> Result<scarab_forge::Commit, scarab_forge::ForgeError> {
+        self.forge.latest_commit(r, x).await
+    }
+    async fn read_file_at_ref(
+        &self,
+        r: &scarab_forge::RepoRef,
+        x: &str,
+        p: &str,
+    ) -> Result<Vec<u8>, scarab_forge::ForgeError> {
+        self.forge.read_file_at_ref(r, x, p).await
+    }
+    async fn list_dir_at_ref(
+        &self,
+        r: &scarab_forge::RepoRef,
+        x: &str,
+        d: &str,
+    ) -> Result<Vec<String>, scarab_forge::ForgeError> {
+        self.forge.list_dir_at_ref(r, x, d).await
+    }
+    async fn list_refs(
+        &self,
+        r: &scarab_forge::RepoRef,
+        q: Option<&str>,
+    ) -> Result<Vec<scarab_forge::ForgeRef>, scarab_forge::ForgeError> {
+        self.forge.list_refs(r, q).await
+    }
+    async fn register_webhook(
+        &self,
+        r: &scarab_forge::RepoRef,
+        u: &str,
+    ) -> Result<(), scarab_forge::ForgeError> {
+        self.forge.register_webhook(r, u).await
+    }
+    async fn normalize_event(
+        &self,
+        raw: scarab_forge::WebhookDelivery,
+    ) -> Result<scarab_forge::Event, scarab_forge::ForgeError> {
+        self.forge.normalize_event(raw).await
+    }
+    async fn set_status(
+        &self,
+        r: &scarab_forge::RepoRef,
+        c: &scarab_forge::Commit,
+        s: scarab_forge::Status,
+    ) -> Result<(), scarab_forge::ForgeError> {
+        self.forge.set_status(r, c, s).await
+    }
+    async fn create_deployment(
+        &self,
+        r: &scarab_forge::RepoRef,
+        e: &str,
+    ) -> Result<(), scarab_forge::ForgeError> {
+        self.forge.create_deployment(r, e).await
+    }
+    async fn post_comment(
+        &self,
+        r: &scarab_forge::RepoRef,
+        i: u64,
+        b: &str,
+    ) -> Result<(), scarab_forge::ForgeError> {
+        self.forge.post_comment(r, i, b).await
+    }
+    async fn get_permissions(
+        &self,
+        r: &scarab_forge::RepoRef,
+        u: &str,
+    ) -> Result<scarab_forge::Permissions, scarab_forge::ForgeError> {
+        self.forge.get_permissions(r, u).await
+    }
+    async fn mint_checkout_credential(
+        &self,
+        r: &scarab_forge::RepoRef,
+        read_only: bool,
+    ) -> Result<scarab_forge::CheckoutCredential, scarab_forge::ForgeError> {
+        self.forge.mint_checkout_credential(r, read_only).await
+    }
+    async fn revoke_credential(
+        &self,
+        r: &scarab_forge::RepoRef,
+        token: &str,
+    ) -> Result<(), scarab_forge::ForgeError> {
+        let late = self.late.lock().unwrap().take();
+        if let Some(logs) = late {
+            let late_token = scarab_engine::MountedValue {
+                kind: scarab_engine::MountedValueKind::ForgeToken,
+                value: b"late".to_vec(),
+                repo: Some(scarab_engine::MountedRepo {
+                    owner: "acme".into(),
+                    name: "web".into(),
+                }),
+                minted: Some(true),
+            };
+            logs.record_launch_values(
+                &stream(),
+                Some("pod-build"),
+                vec![late_token],
+                Timestamp(now_ms()),
+            )
+            .await
+            .unwrap();
+        }
+        self.forge.revoke_credential(r, token).await
+    }
+}
+
+/// N-1, the purge: the sweep decides on generation 1 (T1 not revoked yet),
+/// and while it revokes T1 a late launch writes generation 2. The purge is
+/// refused (the unit is not at the generation it was decided on), so
+/// generation 2 survives, and the next pass revokes its token and purges.
+/// Kills: a purge that deletes a generation written after its decision.
+#[tokio::test]
+async fn a_generation_written_while_the_sweep_revokes_survives_the_purge() {
+    let w = World::new().await;
+    let (a, b) = (w.logs(), w.logs());
+    let live = LiveLog::new(b"", true);
+    w.stack(live.clone(), &a)
+        .launch(&running(), &forge_spec())
+        .await
+        .unwrap();
+    let t1 = mounted_tokens(&live)[0].clone();
+    w.end_attempt().await;
+    w.db.settle_log_units(Timestamp(0)).await.unwrap();
+    let forge = LateLaunchDuringRevoke {
+        forge: w.forge.clone(),
+        late: Mutex::new(Some(w.logs())),
+    };
+    let now = Timestamp(2 * 3_600_000);
+    let pass = scarab_server::log_tail::sweep_ledgers(&b, &forge, now).await;
+    assert_eq!(pass.purged, 0);
+    assert_eq!(w.forge.revoked(), vec![t1.clone()]);
+    let ledger = w.db.log_unit_ledger(&stream()).await.unwrap().unwrap();
+    assert!(!ledger.unit.purged);
+    assert_eq!(ledger.generations.len(), 2, "generation 2 survives");
+    let pass = scarab_server::log_tail::sweep_ledgers(&b, &forge, now).await;
+    assert_eq!(pass.purged, 1);
+    assert_eq!(w.forge.revoked(), vec![t1, "late".to_string()]);
+}
+
 /// A layer under the forge layer refuses the launch before the ledger
 /// layer records the token (here the secrets layer: a secret the scope
 /// does not have). No ledger holds the token and no Pod mounts it, so it
@@ -2499,7 +2651,7 @@ async fn ledger_rows_under_an_old_key_keep_the_rotation_metric_above_zero() {
         1,
         "the generation under the old key"
     );
-    w.db.purge_log_unit(&u1).await.unwrap();
+    assert!(w.db.purge_log_unit(&u1, 1).await.unwrap());
     assert_eq!(count().await.unwrap(), 0);
 }
 

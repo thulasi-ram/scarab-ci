@@ -1067,7 +1067,7 @@ async fn an_append_with_no_unit_row_is_refused(db: &dyn Db) {
         .await
         .unwrap();
     // Purged: refused, and the ledger holds no generation.
-    db.purge_log_unit(&s).await.unwrap();
+    assert!(db.purge_log_unit(&s, 1).await.unwrap());
     assert!(matches!(
         db.append_log_row(&s, &NewLogRow::output(body("k2", 1), 1), &w, Timestamp(3))
             .await,
@@ -2118,6 +2118,39 @@ contract_test!(
     a_late_generation_unmarks_the_unit_until_it_is_revoked
 );
 
+/// N-1, the purge: a purge decided at generation 1 keeps generation 2,
+/// written between the decision and the delete, and purges only at the
+/// generation it was decided on. Kills: a purge that deletes whatever
+/// generations were written since its decision.
+async fn a_purge_keeps_a_generation_written_after_it_was_decided(db: &dyn Db) {
+    let u = stream_id("build", "a1");
+    db.write_log_unit(&u, Some("pod-p"), 0, Some(b"one"), Timestamp(1))
+        .await
+        .unwrap();
+    // Decided at generation 1; a late launch writes generation 2 first.
+    db.write_log_unit(&u, None, 1, Some(b"two"), Timestamp(2))
+        .await
+        .unwrap();
+    assert!(!db.purge_log_unit(&u, 1).await.unwrap());
+    let ledger = db.log_unit_ledger(&u).await.unwrap().unwrap();
+    assert!(!ledger.unit.purged);
+    let gens: Vec<i64> = ledger.generations.iter().map(|g| g.gen).collect();
+    assert_eq!(gens, [1, 2]);
+    assert!(db.purge_log_unit(&u, 2).await.unwrap());
+    let ledger = db.log_unit_ledger(&u).await.unwrap().unwrap();
+    assert!(ledger.unit.purged && ledger.generations.is_empty());
+    assert!(!db.purge_log_unit(&u, 2).await.unwrap(), "purged already");
+    assert!(!db
+        .purge_log_unit(&stream_id("nope", "a1"), 0)
+        .await
+        .unwrap());
+}
+
+contract_test!(
+    log_purge_keeps_a_late_generation,
+    a_purge_keeps_a_generation_written_after_it_was_decided
+);
+
 /// REV-m12: ledger generations whose seal does not start with the active
 /// key's prefix are counted; a purged unit's are gone. Kills: a prefix
 /// compared on the wrong bytes; purged values counted.
@@ -2149,7 +2182,7 @@ async fn ledger_values_under_another_key_are_counted(db: &dyn Db) {
         db.count_log_values_not_sealed_with(prefix).await.unwrap(),
         2
     );
-    db.purge_log_unit(&b).await.unwrap();
+    assert!(db.purge_log_unit(&b, 1).await.unwrap());
     assert_eq!(
         db.count_log_values_not_sealed_with(prefix).await.unwrap(),
         1

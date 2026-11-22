@@ -2623,14 +2623,37 @@ impl Db for PostgresDb {
         Ok(r.rows_affected())
     }
 
-    async fn purge_log_unit(&self, unit: &scarab_engine::LogStreamId) -> Result<(), DbError> {
+    async fn purge_log_unit(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+        through_gen: i64,
+    ) -> Result<bool, DbError> {
         let mut tx = self.pool().begin().await.map_err(db_err)?;
-        sqlx::query(
-            "DELETE FROM log_unit_values WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        // The row lock orders this against `write_log_unit`, which takes it
+        // too: a generation it commits first moves `gen`, and one it tries
+        // after finds the unit purged.
+        let gen: Option<i64> = sqlx::query_scalar(
+            "SELECT gen FROM log_units
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3 AND NOT purged
+             FOR UPDATE",
         )
         .bind(&unit.run.0)
         .bind(&unit.step.0)
         .bind(&unit.attempt.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if gen != Some(through_gen) {
+            return Ok(false);
+        }
+        sqlx::query(
+            "DELETE FROM log_unit_values
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3 AND gen <= $4",
+        )
+        .bind(&unit.run.0)
+        .bind(&unit.step.0)
+        .bind(&unit.attempt.0)
+        .bind(through_gen)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -2645,7 +2668,7 @@ impl Db for PostgresDb {
         .await
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
-        Ok(())
+        Ok(true)
     }
 
     async fn set_log_unit_stream_count(

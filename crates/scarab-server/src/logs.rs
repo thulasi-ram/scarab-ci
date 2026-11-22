@@ -452,24 +452,34 @@ impl LogService {
 
     /// Purge `unit`'s ledger if every one of its `stream_count` streams is
     /// terminal (a stream that has stored nothing yet is not), it has
-    /// settled, and every minted token in it was revoked (or it holds none).
-    /// Best-effort: the purge sweep covers what this misses.
+    /// settled, and every minted token in it was revoked (or it holds none:
+    /// `values`, when it is the ledger's current generation). The purge
+    /// happens only at the generation read here, so one a late launch
+    /// writes meanwhile is kept and revoked later. Best-effort: the purge
+    /// sweep covers what this misses.
     pub async fn purge_if_done(&self, unit: &LogStreamId, values: Option<&ValueSet>) {
         let Ok(Some(rows)) = self.db.log_unit_ledger(unit).await else {
             return;
         };
         let revoked = rows.unit.revoke_attempted_at.is_some()
-            || values.is_some_and(|v| v.minted_forge_tokens().is_empty());
+            || values
+                .is_some_and(|v| v.gen() == rows.unit.gen && v.minted_forge_tokens().is_empty());
         if rows.unit.purged || rows.unit.settled_at.is_none() || !revoked {
             return;
         }
         if !matches!(self.db.log_unit_streams_all_terminal(unit).await, Ok(true)) {
             return;
         }
-        if let Err(e) = self.db.purge_log_unit(unit).await {
-            tracing::debug!(error = %e, "log ledger: purge after the last stream closed failed; the sweep retries");
-        } else {
-            self.cache.lock().unwrap().remove(&unit_key(unit));
+        match self.db.purge_log_unit(unit, rows.unit.gen).await {
+            Ok(true) => {
+                self.cache.lock().unwrap().remove(&unit_key(unit));
+            }
+            Ok(false) => {
+                tracing::debug!("log ledger: a generation was written since the purge was decided; the sweep revokes and purges it");
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "log ledger: purge after the last stream closed failed; the sweep retries");
+            }
         }
     }
 

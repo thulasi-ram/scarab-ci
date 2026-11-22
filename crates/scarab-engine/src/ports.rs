@@ -1127,9 +1127,18 @@ pub trait Db: Send + Sync {
     /// rather than being called by each path. Returns how many it set.
     async fn settle_log_units(&self, now: Timestamp) -> Result<u64, DbError>;
 
-    /// Purge a unit's ledger in one transaction: delete its generations and
-    /// set `purged`. A purged unit reads as "not ledger-complete".
-    async fn purge_log_unit(&self, unit: &crate::LogStreamId) -> Result<(), DbError>;
+    /// Purge a unit's ledger in one transaction, only if its generation is
+    /// still `through_gen`, the one the caller decided on: delete its
+    /// generations and set `purged`. Returns whether it purged. A
+    /// generation written since the decision holds tokens the decision did
+    /// not see, so the unit stays for a later pass; a unit with no row, or
+    /// purged already, is not purged again. A purged unit reads as "not
+    /// ledger-complete".
+    async fn purge_log_unit(
+        &self,
+        unit: &crate::LogStreamId,
+        through_gen: i64,
+    ) -> Result<bool, DbError>;
 
     /// Record how many streams `unit` has (its main stream and one per
     /// sidecar service), before its launch writes anything the unit can

@@ -1557,11 +1557,16 @@ async fn sweep_unit(
             );
         }
     }
-    if let Err(e) = logs.db().purge_log_unit(&c.unit).await {
-        tracing::debug!(error = %e, "log ledger: purge failed; retried");
-    } else {
-        out.purged += 1;
-        logs.forget_values(&c.unit);
+    // At the generation the candidate was read at: one written since (a
+    // late launch) holds a token this pass may not have revoked, and waits
+    // for the next pass.
+    match logs.db().purge_log_unit(&c.unit, c.row.gen).await {
+        Ok(true) => {
+            out.purged += 1;
+            logs.forget_values(&c.unit);
+        }
+        Ok(false) => {}
+        Err(e) => tracing::debug!(error = %e, "log ledger: purge failed; retried"),
     }
 }
 

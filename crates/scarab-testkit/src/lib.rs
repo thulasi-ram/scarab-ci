@@ -2363,14 +2363,20 @@ impl Db for InMemoryDb {
         Ok(settled.len() as u64)
     }
 
-    async fn purge_log_unit(&self, unit: &scarab_engine::LogStreamId) -> Result<(), DbError> {
+    async fn purge_log_unit(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+        through_gen: i64,
+    ) -> Result<bool, DbError> {
         let mut st = self.state.lock().unwrap();
         let key = log_key(unit);
-        st.log_unit_values.remove(&key);
-        if let Some(u) = st.log_units.get_mut(&key) {
-            u.purged = true;
+        // Only at the generation the caller decided on (as Postgres).
+        match st.log_units.get_mut(&key) {
+            Some(u) if !u.purged && u.gen == through_gen => u.purged = true,
+            _ => return Ok(false),
         }
-        Ok(())
+        st.log_unit_values.remove(&key);
+        Ok(true)
     }
 
     async fn set_log_unit_stream_count(
