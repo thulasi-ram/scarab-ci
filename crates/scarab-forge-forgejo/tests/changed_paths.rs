@@ -233,6 +233,31 @@ fn a_merge_on_the_first_parent_line_with_no_files_is_incomplete() {
     assert_eq!(parse(&empty, OLD, NEW), ChangedPaths::Known(vec![]));
 }
 
+/// Round-2 red team m-b: a merge on the walked line whose only file has an
+/// empty name passes the empty-`files` check above; dropping the name
+/// would leave a known empty list, the answer that skips a Pipeline. An
+/// empty name is read like a missing one.
+#[test]
+fn a_file_with_an_empty_name_is_a_forge_error() {
+    let merge = answer(vec![
+        listed(NEW, &[OLD, SIDE], &[""]),
+        listed(
+            SIDE,
+            &["4444444444444444444444444444444444444444"],
+            &["infra/main.tf"],
+        ),
+    ]);
+    assert_eq!(
+        parse(&merge, OLD, NEW),
+        ChangedPaths::Unknown(PathsUnknown::ForgeError)
+    );
+    let one_parent = answer(vec![listed(NEW, &[OLD], &[""])]);
+    assert_eq!(
+        parse(&one_parent, OLD, NEW),
+        ChangedPaths::Unknown(PathsUnknown::ForgeError)
+    );
+}
+
 #[test]
 fn a_push_starts_not_fetched_and_carries_before() {
     let event = push(include_str!("fixtures/push.json"));

@@ -599,7 +599,7 @@ struct CompareFile {
 ///    one answer that skips a Pipeline.
 ///
 /// An answer that is not the expected JSON (a field of another type, a
-/// commit with no `sha`, a `sha` listed twice) is
+/// commit with no `sha`, a `sha` listed twice, a file with an empty name) is
 /// [`ForgeError`](PathsUnknown::ForgeError); 3,000 paths or more is
 /// [`TooMany`](PathsUnknown::TooMany).
 pub fn compare_changed_paths(before: &str, after: &str, body: &[u8]) -> ChangedPaths {
@@ -662,7 +662,9 @@ pub fn compare_changed_paths(before: &str, after: &str, body: &[u8]) -> ChangedP
             return unknown(PathsUnknown::Incomplete);
         }
         for file in files.iter() {
-            let Some(name) = &file.filename else {
+            // An empty name is no path: dropped later, a merge listing only
+            // it would pass the check above and leave a known empty list.
+            let Some(name) = file.filename.as_ref().filter(|n| !n.is_empty()) else {
                 return unknown(PathsUnknown::ForgeError);
             };
             paths.push(name.clone());

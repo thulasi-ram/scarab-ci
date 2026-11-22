@@ -86,7 +86,7 @@ struct CompareFile {
 /// - [`GITHUB_COMPARE_FILES_MAX`] entries:
 ///   [`TooMany`](PathsUnknown::TooMany) with that limit.
 /// - Anything else (another `status`, no `ahead_by`, a file with no
-///   `filename`, a body that is not the expected JSON, a field of another
+///   `filename` or an empty one, a body that is not the expected JSON, a field of another
 ///   type): [`ForgeError`](PathsUnknown::ForgeError).
 pub fn compare_changed_paths(body: &[u8]) -> ChangedPaths {
     let unknown = ChangedPaths::Unknown;
@@ -116,7 +116,9 @@ pub fn compare_changed_paths(body: &[u8]) -> ChangedPaths {
     }
     let mut paths = Vec::with_capacity(files.len());
     for file in files {
-        let Some(filename) = file.filename else {
+        // An empty name is no path; dropped later, it could leave a known
+        // empty list, the answer that skips a Pipeline.
+        let Some(filename) = file.filename.filter(|f| !f.is_empty()) else {
             return unknown(PathsUnknown::ForgeError);
         };
         paths.push(filename);

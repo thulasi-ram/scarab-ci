@@ -5498,6 +5498,9 @@ async fn read_event_pipelines(
 /// whole of `.scarab/` at that commit: each Run started then records which
 /// of them follow it (`on: upstream:`), so its `run_finished` needs no forge
 /// read when nothing does.
+///
+/// A [`TriggerError::Forge`] comes only from reading an `invoke:` library,
+/// before any Run or refusal is recorded.
 pub(crate) async fn trigger_runs_from_files(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
@@ -5547,6 +5550,9 @@ pub(crate) async fn trigger_runs_from_files(
         match prefetch_libs_and_compile(forge, repo, &git_ref, yaml, &installed).await {
             Ok(ir) => compiled.push((path, ir)),
             Err(TriggerError::Pipeline(text)) => broken.push((path, yaml, text)),
+            // Before anything is recorded for the delivery. This is the only
+            // `TriggerError::Forge` this function returns, and the webhook
+            // ingest relies on that to forget the delivery (`ingest_event`).
             Err(e) => return Err(e),
         }
     }
@@ -5808,15 +5814,17 @@ async fn prefetch_libs_and_compile(
         if !seen.insert(lib_path.clone()) {
             continue;
         }
-        match forge.read_file_at_ref(repo, read_ref, &lib_path).await {
+        let file = lib_path.as_str();
+        match forge_read_retried(|| forge.read_file_at_ref(repo, read_ref, file)).await {
             Ok(bytes) => {
                 let src = String::from_utf8(bytes).map_err(|_| TriggerError::NotUtf8)?;
                 worklist.extend(scarab_pipeline::invoke_refs(&src));
                 libs.insert(lib_path, src);
             }
-            Err(scarab_forge::ForgeError::Api(_) | scarab_forge::ForgeError::NotFound(_)) => {
-                continue
-            }
+            // Not there: compile reports "no library found at ...".
+            Err(scarab_forge::ForgeError::NotFound(_)) => continue,
+            // A forge that failed three times says nothing about the file:
+            // compiling without it would refuse the Pipeline for an outage.
             Err(e) => return Err(TriggerError::Forge(e)),
         }
     }
@@ -8823,6 +8831,13 @@ async fn ingest_event(
         complete,
     )
     .await;
+    // A library the forge could not read: returned before any Run or
+    // refusal was recorded ([`trigger_runs_from_files`] returns a forge error
+    // from its library reads only), so the delivery is forgotten as for an
+    // unreadable Pipeline file.
+    if let Err(TriggerError::Forge(e)) = &triggered {
+        return refuse_unread_delivery(st, kind, delivery_id, &e.to_string()).await;
+    }
     if !complete {
         // The id is forgotten only when the delivery recorded nothing: no
         // Run, and no refusal (a refused-Run row, a failure status, a

@@ -2250,3 +2250,71 @@ async fn a_recorded_compile_failure_keeps_the_id_when_another_file_was_unreadabl
     assert!(db.active_runs().await.unwrap().is_empty());
     assert_compile_failure_status(&statuses_on_push(&forge, &db).await);
 }
+
+/// A Pipeline that invokes a library in its repository.
+const INVOKES_LIB_YAML: &str = r#"
+on:
+  push: {}
+steps:
+  - { id: c, invoke: file:.scarab/lib/l.yaml }
+"#;
+
+const LIB_YAML: &str = r#"
+kind: library
+steps:
+  - { id: inner, image: busybox, command: ["true"] }
+"#;
+
+/// Round-2 red team W2: the forge fails (three tries) to read an `invoke:`
+/// library. That says nothing about the file, so the Pipeline is not
+/// refused as "no library found": nothing was recorded, the id is
+/// forgotten and the answer is 502; the redelivery creates the Run.
+#[tokio::test(start_paused = true)]
+async fn a_delivery_whose_library_could_not_be_read_is_repaired_by_its_redelivery() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = Arc::new(
+        FakeForge::new()
+            .with_file(".scarab/ci.yaml", INVOKES_LIB_YAML)
+            .with_file(".scarab/lib/l.yaml", LIB_YAML),
+    );
+    forge.set_read_error_for(".scarab/lib/l.yaml", Some("502 bad gateway"));
+    let app = multi_forge_app_arc(db.clone(), forge.clone());
+
+    let first = app
+        .clone()
+        .oneshot(push_request("delivery-1"))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+    assert!(db.active_runs().await.unwrap().is_empty());
+    assert!(
+        statuses_on_push(&forge, &db).await.is_empty(),
+        "no failure status for an outage"
+    );
+
+    forge.set_read_error_for(".scarab/lib/l.yaml", None);
+    let redelivery = app.oneshot(push_request("delivery-1")).await.unwrap();
+    assert_eq!(redelivery.status(), StatusCode::ACCEPTED);
+    assert_eq!(db.active_runs().await.unwrap().len(), 1);
+}
+
+/// A library that is not in the repository is the author's mistake, not an
+/// outage: 400, and the id is kept.
+#[tokio::test]
+async fn a_delivery_whose_library_is_missing_is_refused() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let forge = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", INVOKES_LIB_YAML));
+    let app = multi_forge_app_arc(db.clone(), forge);
+
+    let first = app
+        .clone()
+        .oneshot(push_request("delivery-1"))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::BAD_REQUEST);
+    let again = app.oneshot(push_request("delivery-1")).await.unwrap();
+    assert_eq!(json_of(again).await["ignored"], "duplicate delivery");
+    assert!(db.active_runs().await.unwrap().is_empty());
+}

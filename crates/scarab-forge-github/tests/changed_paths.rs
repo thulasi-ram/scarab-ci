@@ -106,6 +106,20 @@ fn ahead_with_no_files_or_empty_files_is_incomplete() {
     }
 }
 
+/// Round-2 red team m-b: `ahead` whose only file has an empty name passes
+/// the empty-`files` check; dropping the name would leave a known empty
+/// list, the answer that skips a Pipeline. An empty name is read like a
+/// missing one.
+#[test]
+fn a_file_with_an_empty_name_is_a_forge_error() {
+    let mut answer = compare();
+    answer["files"] = serde_json::json!([{ "filename": "", "status": "modified" }]);
+    assert_eq!(
+        parse(&answer),
+        ChangedPaths::Unknown(PathsUnknown::ForgeError)
+    );
+}
+
 #[test]
 fn the_300th_file_makes_the_list_unknown() {
     let files = |n: usize| {
