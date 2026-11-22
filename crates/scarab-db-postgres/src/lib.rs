@@ -2691,9 +2691,10 @@ impl Db for PostgresDb {
         limit: u32,
     ) -> Result<scarab_engine::PendingReads, DbError> {
         let key = |c: &Option<scarab_engine::LogStreamId>| {
-            c.as_ref().map_or((String::new(), String::new(), String::new()), |k| {
-                (k.run.0.clone(), k.step.0.clone(), k.attempt.0.clone())
-            })
+            c.as_ref()
+                .map_or((String::new(), String::new(), String::new()), |k| {
+                    (k.run.0.clone(), k.step.0.clone(), k.attempt.0.clone())
+                })
         };
         let read = |r: &sqlx::postgres::PgRow, has_ledger: bool| scarab_engine::PendingFinalRead {
             unit: log_unit_id(r),

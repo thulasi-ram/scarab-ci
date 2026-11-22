@@ -2463,7 +2463,9 @@ impl Db for InMemoryDb {
                     && !st.log_prune_pending.contains_key(&k.0)
             })
             .collect();
-        ledger.sort_by(|a, b| (&a.0 .0 .0, &a.0 .1 .0, &a.0 .2 .0).cmp(&(&b.0 .0 .0, &b.0 .1 .0, &b.0 .2 .0)));
+        ledger.sort_by(|a, b| {
+            (&a.0 .0 .0, &a.0 .1 .0, &a.0 .2 .0).cmp(&(&b.0 .0 .0, &b.0 .1 .0, &b.0 .2 .0))
+        });
         ledger.truncate(limit as usize);
         out.next.ledger = (ledger.len() as u32 >= limit)
             .then(|| ledger.last().map(|(k, _)| id(k)))
@@ -2529,7 +2531,8 @@ impl Db for InMemoryDb {
             }
         }
         recent.sort_by(|a, b| {
-            (a.0, &a.1 .0 .0, &a.1 .1 .0, &a.1 .2 .0).cmp(&(b.0, &b.1 .0 .0, &b.1 .1 .0, &b.1 .2 .0))
+            (a.0, &a.1 .0 .0, &a.1 .1 .0, &a.1 .2 .0)
+                .cmp(&(b.0, &b.1 .0 .0, &b.1 .1 .0, &b.1 .2 .0))
         });
         recent.truncate(limit as usize);
         out.next.recent = (recent.len() as u32 >= limit)
@@ -6180,19 +6183,23 @@ pub async fn seed_log_row(
         .write_log_unit(&stream.unit(), None, 0, None, Timestamp(0))
         .await
         .expect("unit row");
-    db.append_log_row(
-        &stream,
-        &scarab_engine::NewLogRow::output(
-            scarab_engine::LogBody {
-                object_key: object_key.to_string(),
-                len,
-                sha256: Vec::new(),
-            },
-            gen,
-        ),
-        &writer,
-        Timestamp(0),
-    )
-    .await
-    .expect("append")
+    let meta = db
+        .append_log_row(
+            &stream,
+            &scarab_engine::NewLogRow::output(
+                scarab_engine::LogBody {
+                    object_key: object_key.to_string(),
+                    len,
+                    sha256: Vec::new(),
+                },
+                gen,
+            ),
+            &writer,
+            Timestamp(0),
+        )
+        .await
+        .expect("append");
+    // Let it go, so the next writer of the stream can take it.
+    db.release_lease(&resource, "seed").await.expect("release");
+    meta
 }

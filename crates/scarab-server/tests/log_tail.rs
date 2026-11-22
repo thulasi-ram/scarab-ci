@@ -1885,7 +1885,11 @@ async fn a_short_step_with_a_sidecar_keeps_its_log() {
         },
     )
     .await;
-    assert!(w.markers(&stream()).await.is_empty(), "{:?}", w.rows(&stream()).await);
+    assert!(
+        w.markers(&stream()).await.is_empty(),
+        "{:?}",
+        w.rows(&stream()).await
+    );
     assert_eq!(w.state(&stream()).await, Some(LogStreamState::Complete));
     assert_eq!(w.stored(&logs, &stream()).await, b"built\n");
 }
@@ -1977,7 +1981,11 @@ async fn a_step_cancelled_while_pending_gets_no_marker_after_a_failed_final_read
         w.state(&stream()).await == Some(LogStreamState::Closed)
     })
     .await;
-    assert!(w.rows(&stream()).await.is_empty(), "{:?}", w.rows(&stream()).await);
+    assert!(
+        w.rows(&stream()).await.is_empty(),
+        "{:?}",
+        w.rows(&stream()).await
+    );
 }
 
 /// REV-m6 (path row 20): a unit an earlier version launched (no ledger

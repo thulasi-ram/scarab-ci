@@ -497,9 +497,15 @@ impl LogService {
         let mut redactor = StreamRedactor::new(values.clone(), false);
         let mut out = redactor.push(chunk);
         out.extend(redactor.finish_confirmed());
-        self.append_output(&stream, &out, values.gen, &writer, None, Timestamp(0))
+        let appended = self
+            .append_output(&stream, &out, values.gen, &writer, None, Timestamp(0))
             .await
-            .map_err(|e| other(e.to_string()))
+            .map_err(|e| other(e.to_string()));
+        // A one-shot writer: let the lease go (owner and term stay, so a
+        // concurrent call of this service still appends), so another
+        // writer of the stream (a test's `seed_log_row`) can take it.
+        let _ = self.db.release_lease(&resource, &self.owner).await;
+        appended
     }
 
     // -- reads -------------------------------------------------------------

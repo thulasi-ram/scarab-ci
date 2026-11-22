@@ -1383,7 +1383,9 @@ async fn the_pending_read_query_does_not_return_attempts_from_before_the_epoch(d
     seed_run_and_step(db, &run, &step).await;
     let now = now_ms();
     for (a, at) in [("old", now - 600_000), ("new", now)] {
-        db.record_attempt(&run, &step, &attempt(a, at)).await.unwrap();
+        db.record_attempt(&run, &step, &attempt(a, at))
+            .await
+            .unwrap();
         db.set_attempt_outcome(&run, &step, &AttemptId(a.into()), AttemptOutcome::Succeeded)
             .await
             .unwrap();
@@ -1414,7 +1416,9 @@ async fn sixty_four_units_that_fail_locally_do_not_hide_the_sixty_fifth(db: &dyn
     seed_run_and_step(db, &run, &step).await;
     for i in 0..65 {
         let a = format!("a{i:03}");
-        db.record_attempt(&run, &step, &attempt(&a, 0)).await.unwrap();
+        db.record_attempt(&run, &step, &attempt(&a, 0))
+            .await
+            .unwrap();
         db.set_attempt_outcome(&run, &step, &AttemptId(a.clone()), AttemptOutcome::Failed)
             .await
             .unwrap();
@@ -1849,7 +1853,11 @@ async fn an_append_under_another_streams_lease_is_refused(db: &dyn Db) {
     )
     .await
     .unwrap();
-    assert!(db.log_chunks(&a.run, &a.step, &a.attempt).await.unwrap().is_empty());
+    assert!(db
+        .log_chunks(&a.run, &a.step, &a.attempt)
+        .await
+        .unwrap()
+        .is_empty());
     assert!(db.log_stream_row(&a).await.unwrap().is_none());
 }
 
@@ -1966,7 +1974,9 @@ async fn an_attempt_claimed_just_before_the_epoch_by_clock_skew_is_closed() {
     let step = StepId("build".into());
     seed_run_and_step(&db, &run, &step).await;
     for (a, at) in [("skewed", epoch - 60_000), ("before", epoch - 600_000)] {
-        db.record_attempt(&run, &step, &attempt(a, at)).await.unwrap();
+        db.record_attempt(&run, &step, &attempt(a, at))
+            .await
+            .unwrap();
         db.set_attempt_outcome(&run, &step, &AttemptId(a.into()), AttemptOutcome::Succeeded)
             .await
             .unwrap();
@@ -1981,7 +1991,9 @@ async fn an_attempt_claimed_just_before_the_epoch_by_clock_skew_is_closed() {
         .find(|p| p.unit == stream_id("build", "skewed"))
         .unwrap_or_else(|| panic!("the skewed attempt is pending: {pending:?}"));
     assert!(!skewed.has_ledger);
-    assert!(!pending.iter().any(|p| p.unit == stream_id("build", "before")));
+    assert!(!pending
+        .iter()
+        .any(|p| p.unit == stream_id("build", "before")));
     tdb.cleanup().await;
 }
 
@@ -2023,7 +2035,10 @@ async fn a_legacy_shared_service_is_pending_once_torn_down_and_forgotten_after()
             .unwrap()
             .reads
     }
-    assert!(!pending(&db).await.iter().any(|p| p.unit == unit), "still running");
+    assert!(
+        !pending(&db).await.iter().any(|p| p.unit == unit),
+        "still running"
+    );
     db.set_run_service(
         None,
         &run,
@@ -2149,9 +2164,14 @@ async fn the_0099_revert_leaves_a_schema_the_migrator_can_upgrade_again() {
         .await
         .unwrap();
     let w = writer(&db, &s, "a", 60_000).await;
-    db.append_log_row(&s, &NewLogRow::output(body("logs/out", 4), 1), &w, Timestamp(1))
-        .await
-        .unwrap();
+    db.append_log_row(
+        &s,
+        &NewLogRow::output(body("logs/out", 4), 1),
+        &w,
+        Timestamp(1),
+    )
+    .await
+    .unwrap();
     db.append_log_row(
         &s,
         &NewLogRow::marker(LogRowKind::Incomplete, None).then(LogStreamState::Closed),
@@ -2175,7 +2195,16 @@ async fn the_0099_revert_leaves_a_schema_the_migrator_can_upgrade_again() {
     .unwrap();
     assert_eq!(
         columns,
-        ["run_id", "step_id", "attempt_id", "seq", "byte_offset", "len", "object_key", "at"]
+        [
+            "run_id",
+            "step_id",
+            "attempt_id",
+            "seq",
+            "byte_offset",
+            "len",
+            "object_key",
+            "at"
+        ]
     );
     let not_null: String = sqlx::query_scalar(
         "SELECT is_nullable::text FROM information_schema.columns
@@ -2206,12 +2235,11 @@ async fn the_0099_revert_leaves_a_schema_the_migrator_can_upgrade_again() {
     .await
     .unwrap();
     assert_eq!(checks, 0);
-    let functions: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_proc WHERE proname = 'scarab_append_log_row'",
-    )
-    .fetch_one(&tdb.pool)
-    .await
-    .unwrap();
+    let functions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pg_proc WHERE proname = 'scarab_append_log_row'")
+            .fetch_one(&tdb.pool)
+            .await
+            .unwrap();
     assert_eq!(functions, 0);
     let index: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pg_indexes WHERE indexname = 'attempts_started_at_idx'",

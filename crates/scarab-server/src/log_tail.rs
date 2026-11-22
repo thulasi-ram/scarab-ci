@@ -849,12 +849,7 @@ fn report(ctx: &Ctx, fence: &LogStreamId, failure: Failure) -> Outcome {
 
 /// A refused append: the stream is terminal (`Closed`), the lease moved
 /// (`NotWriter`), or the unit's ledger is gone (a marker closes it).
-async fn refused(
-    ctx: &Ctx,
-    fence: &LogStreamId,
-    writer: &LogWriter,
-    e: LogAppendError,
-) -> Outcome {
+async fn refused(ctx: &Ctx, fence: &LogStreamId, writer: &LogWriter, e: LogAppendError) -> Outcome {
     match e {
         LogAppendError::Closed => Outcome::Terminal,
         LogAppendError::NotWriter => Outcome::Stop,
