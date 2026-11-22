@@ -851,16 +851,12 @@ impl K8sExecutor {
             return false;
         };
         let pod = with_unschedulable_grace(pod, self.unschedulable_grace_secs);
-        let dry_run = PostParams {
-            dry_run: true,
-            ..Default::default()
-        };
-        match pods.create(&dry_run, &pod).await {
-            Ok(_) => true,
-            Err(e) => {
+        match dry_run_create(pods, &pod).await {
+            DryRun::Passes => true,
+            answer => {
                 tracing::info!(
                     %step,
-                    error = %e,
+                    ?answer,
                     "the step Pod without its k8s_overlay fails a dry-run create too"
                 );
                 false
@@ -3184,14 +3180,17 @@ impl Executor for K8sExecutor {
             // An overlay that keeps to the author's fields can still make a
             // Pod the API server refuses (a label value it does not accept, a
             // memory request above the limit, a field Pod Security or a
-            // LimitRange denies with a 403). Ask it whether the Pod passes
-            // without the overlay; if it does, the overlay is the cause and
-            // the step fails with the API's reason instead of a launch error
-            // the scheduler retries until the Run dead-letters. An invalid
-            // operator baseline or profile fails the dry run too and stays a
-            // launch error. A Pod the chart's step Pod admission policy
-            // refuses (git-bug 07f0de3) fails the step the same way: the
-            // refusal is permanent, so a retry would only dead-letter the Run.
+            // LimitRange denies with a 403). Ask it twice with dry runs: the
+            // same Pod is denied again (the denial was not of the moment) and
+            // the Pod without the overlay passes (the overlay is the cause).
+            // Then the step fails with the API's reason instead of a launch
+            // error the scheduler retries until the Run dead-letters. A
+            // denial gone by the dry run (a ServiceAccount not there yet, a
+            // webhook that answers per call) and an invalid operator
+            // baseline or profile (its dry run fails too) stay launch errors.
+            // A Pod the chart's step Pod admission policy refuses (git-bug
+            // 07f0de3) fails the step the same way: the refusal is permanent,
+            // so a retry would only dead-letter the Run.
             Err(e) => {
                 if let Some(refused) = admission_policy_refusal(&e) {
                     return Err(refused);
@@ -3200,10 +3199,16 @@ impl Executor for K8sExecutor {
                     (kube::Error::Api(ae), Some(unplaced))
                         if overlay_may_be_refused(ae.code, &ae.message) =>
                     {
-                        let passes = self
-                            .passes_without_overlay(&pods, unplaced, &step.step.0, spec)
-                            .await;
-                        overlay_refusal(ae.code, &ae.message, Some(passes))
+                        let again = dry_run_create(&pods, &pod).await;
+                        // Only a Pod denied again is worth the second request.
+                        let passes_without = match again {
+                            DryRun::Denied { .. } => Some(
+                                self.passes_without_overlay(&pods, unplaced, &step.step.0, spec)
+                                    .await,
+                            ),
+                            _ => None,
+                        };
+                        overlay_refusal(ae.code, &ae.message, Some(&again), passes_without)
                     }
                     _ => None,
                 };
@@ -5707,21 +5712,75 @@ fn merge_layer(
         .map_err(|e| format!("{source} leaves a Pod that does not decode: {e}"))
 }
 
+/// What the ResourceQuota admission plugin writes into its denial, as the
+/// API server prefixes it: `pods "x" is forbidden: exceeded quota: <name>,
+/// requested: ...`. A message that only holds the words "exceeded quota"
+/// (a policy's or a webhook's own text) is not this shape.
+const RESOURCE_QUOTA_DENIAL: &str = "is forbidden: exceeded quota: ";
+
 /// Whether a `pods.create` answered with `code` and `message` may be the
-/// step's `k8s_overlay`'s fault, so the launch asks whether the Pod passes a
-/// dry run without it. A 400 or 422 is an object the API server will not
-/// accept. A 403 is an admission denial (Pod Security, a LimitRange, an
-/// admission policy or webhook) or an RBAC denial; the dry run tells them
-/// apart, because an RBAC denial fails the dry run too (git-bug 54b98bf).
-/// A ResourceQuota denial (`exceeded quota`) is not: the Pod without the
-/// overlay asks for less and passes, yet the same Pod is admitted once other
-/// Pods finish, so it stays a launch error the scheduler retries.
+/// step's `k8s_overlay`'s fault, so the launch asks the API server again
+/// with dry runs. A 400 or 422 is an object the API server will not accept.
+/// A 403 is an admission denial (Pod Security, a LimitRange, an admission
+/// policy or webhook) or an RBAC denial; the dry runs tell them apart,
+/// because an RBAC denial fails the dry run without the overlay too
+/// (git-bug 54b98bf). A ResourceQuota denial is not: the plugin evaluates
+/// dry runs too, so the same Pod is denied again and the Pod without the
+/// overlay (asking for less) passes, yet the same Pod is admitted once
+/// other Pods finish. It stays a launch error the scheduler retries.
 fn overlay_may_be_refused(code: u16, message: &str) -> bool {
     match code {
         400 | 422 => true,
-        403 => !message.contains("exceeded quota"),
+        403 => !message.contains(RESOURCE_QUOTA_DENIAL),
         _ => false,
     }
+}
+
+/// What a dry-run create of a Pod answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DryRun {
+    /// The API server would admit the Pod.
+    Passes,
+    /// The API server refused it with a `Status` of `code` and `message`.
+    Denied { code: u16, message: String },
+    /// Anything else: a transport error, an answer that is not a `Status`.
+    Failed,
+}
+
+/// A dry-run create (`?dryRun=All`) of `pod`: the API server runs
+/// validation and admission (webhooks, policies, quota) and stores nothing.
+async fn dry_run_create(pods: &Api<Pod>, pod: &Pod) -> DryRun {
+    let dry_run = PostParams {
+        dry_run: true,
+        ..Default::default()
+    };
+    match pods.create(&dry_run, pod).await {
+        Ok(_) => DryRun::Passes,
+        Err(kube::Error::Api(ae)) => DryRun::Denied {
+            code: ae.code,
+            message: ae.message,
+        },
+        Err(e) => {
+            tracing::info!(error = %e, "a dry-run create of a step Pod failed");
+            DryRun::Failed
+        }
+    }
+}
+
+/// The most bytes of an API server message a step failure carries. The
+/// message reaches the Run's author; a webhook's text can be long.
+const ADMISSION_MESSAGE_MAX_BYTES: usize = 1024;
+
+/// `message` cut to [`ADMISSION_MESSAGE_MAX_BYTES`] on a char boundary.
+fn capped_admission_message(message: &str) -> &str {
+    if message.len() <= ADMISSION_MESSAGE_MAX_BYTES {
+        return message;
+    }
+    let mut end = ADMISSION_MESSAGE_MAX_BYTES;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    &message[..end]
 }
 
 /// The name every step Pod admission policy the chart renders starts with
@@ -5745,7 +5804,7 @@ fn admission_policy_refusal(e: &kube::Error) -> Option<ExecError> {
         {
             Some(ExecError::Refused(format!(
                 "the cluster's step Pod admission policy refused the step Pod: {}",
-                ae.message
+                capped_admission_message(&ae.message)
             )))
         }
         _ => None,
@@ -5754,19 +5813,30 @@ fn admission_policy_refusal(e: &kube::Error) -> Option<ExecError> {
 
 /// The step's failure when `pods.create` answered `code` with `message`
 /// for a step with a `k8s_overlay`, or `None` to keep the launch error.
-/// `passes_without_overlay` is whether the same Pod without the overlay
-/// passed a dry-run create (`None`: not asked). Only a Pod that passes
-/// without the overlay puts the fault on it.
+/// `with_overlay` is what a dry-run create of the same Pod answered after
+/// that, and `passes_without_overlay` whether the Pod without the overlay
+/// passed a dry-run create (`None`: not asked). The fault is the overlay's
+/// only when the same Pod is denied again in a way that may be the
+/// overlay's (a denial gone by the dry run was of the moment) and the Pod
+/// without the overlay passes. The failure carries the dry run's message.
 fn overlay_refusal(
     code: u16,
     message: &str,
+    with_overlay: Option<&DryRun>,
     passes_without_overlay: Option<bool>,
 ) -> Option<ExecError> {
-    (overlay_may_be_refused(code, message) && passes_without_overlay == Some(true)).then(|| {
-        ExecError::Refused(format!(
-            "the step's k8s_overlay makes a Pod Kubernetes refuses: {message}"
-        ))
-    })
+    if !overlay_may_be_refused(code, message) || passes_without_overlay != Some(true) {
+        return None;
+    }
+    match with_overlay {
+        Some(DryRun::Denied { code, message }) if overlay_may_be_refused(*code, message) => {
+            Some(ExecError::Refused(format!(
+                "the step's k8s_overlay makes a Pod Kubernetes refuses: {}",
+                capped_admission_message(message)
+            )))
+        }
+        _ => None,
+    }
 }
 
 /// Whether a `registry_auth_only` profile (one that carries a registry
@@ -8594,17 +8664,103 @@ mod tests {
             (403, POD_SECURITY_DENIAL),
             (403, LIMIT_RANGE_DENIAL),
         ] {
-            match overlay_refusal(code, message, Some(true)) {
+            let again = denied(code, message);
+            match overlay_refusal(code, message, Some(&again), Some(true)) {
                 Some(ExecError::Refused(m)) => {
                     assert!(m.contains("k8s_overlay") && m.contains(message), "{m}")
                 }
                 other => panic!("{code} {message}: {other:?}"),
             }
-            assert!(overlay_refusal(code, message, Some(false)).is_none());
-            assert!(overlay_refusal(code, message, None).is_none());
+            assert!(overlay_refusal(code, message, Some(&again), Some(false)).is_none());
+            assert!(overlay_refusal(code, message, Some(&again), None).is_none());
+            assert!(overlay_refusal(code, message, None, Some(true)).is_none());
         }
-        assert!(overlay_refusal(403, QUOTA_DENIAL, Some(true)).is_none());
-        assert!(overlay_refusal(500, "etcd", Some(true)).is_none());
+        let quota = denied(403, QUOTA_DENIAL);
+        assert!(overlay_refusal(403, QUOTA_DENIAL, Some(&quota), Some(true)).is_none());
+        assert!(overlay_refusal(500, "etcd", Some(&denied(500, "etcd")), Some(true)).is_none());
+    }
+
+    fn denied(code: u16, message: &str) -> DryRun {
+        DryRun::Denied {
+            code,
+            message: message.into(),
+        }
+    }
+
+    // M1 / RT-14: a 403 for a step with a `k8s_overlay` is the overlay's
+    // fault only when the same Pod is denied again by a dry run and the
+    // Pod without the overlay passes. A denial gone by the dry run (a
+    // ServiceAccount created a moment later, a webhook that answers per
+    // call) stays a launch error; a policy's text that holds the words
+    // "exceeded quota" is not the ResourceQuota plugin's shape and fails the
+    // step; the plugin's own shape is denied twice (it evaluates dry runs)
+    // and stays a launch error; RBAC fails both dry runs.
+    #[test]
+    fn a_403_is_the_overlays_only_when_a_dry_run_denies_it_again() {
+        let budget = "admission webhook \"budget.example.com\" denied the request: team GPU \
+            budget in use, retry when a Pod finishes";
+        let no_sa = "pods \"x\" is forbidden: error looking up service account \
+            ci-steps/deployer: serviceaccount \"deployer\" not found";
+        for transient in [budget, no_sa] {
+            assert!(
+                overlay_refusal(403, transient, Some(&DryRun::Passes), Some(true)).is_none(),
+                "{transient}"
+            );
+            assert!(overlay_refusal(403, transient, Some(&DryRun::Failed), Some(true)).is_none());
+        }
+        let kyverno = "admission webhook \"validate.kyverno.svc-fail\" denied the request: \
+            policy Pod/ci-steps/x: gpu-limit: this team exceeded quota of 1 GPU per Pod";
+        let vap = "pods \"x\" is forbidden: ValidatingAdmissionPolicy 'max-gpu' with binding \
+            'b' denied request: step exceeded quota for nvidia.com/gpu (max 1)";
+        for policy in [kyverno, vap] {
+            match overlay_refusal(403, policy, Some(&denied(403, policy)), Some(true)) {
+                Some(ExecError::Refused(m)) => assert!(m.contains(policy), "{m}"),
+                other => panic!("{policy}: {other:?}"),
+            }
+        }
+        // Denied again, but by the quota this time: a launch error.
+        assert!(
+            overlay_refusal(403, kyverno, Some(&denied(403, QUOTA_DENIAL)), Some(true)).is_none()
+        );
+        let rbac = "pods is forbidden: User \"system:serviceaccount:scarab:scarab\" cannot \
+            create resource \"pods\" in API group \"\" in the namespace \"ci-steps\"";
+        assert!(overlay_refusal(403, rbac, Some(&denied(403, rbac)), Some(false)).is_none());
+    }
+
+    // m8: the API server's message reaches the Run's author; both failures
+    // copy at most 1,024 bytes of it, cut on a char boundary.
+    #[test]
+    fn the_copied_admission_message_is_capped_at_1024_bytes() {
+        // 1,023 ASCII bytes, then a 3-byte char across the 1,024th byte.
+        let long = format!("{}€{}", "a".repeat(1023), "b".repeat(4000));
+        let copied = |m: String, prefix: &str| m.strip_prefix(prefix).unwrap().to_string();
+        let Some(ExecError::Refused(m)) =
+            overlay_refusal(422, &long, Some(&denied(422, &long)), Some(true))
+        else {
+            panic!("refused");
+        };
+        let m = copied(m, "the step's k8s_overlay makes a Pod Kubernetes refuses: ");
+        assert_eq!(m, "a".repeat(1023));
+        let policy = format!(
+            "pods \"x\" is forbidden: ValidatingAdmissionPolicy 'scarab-step-pods.ci' {}",
+            "é".repeat(2000)
+        );
+        let e = kube::Error::Api(
+            kube::core::Status::failure(&policy, "Forbidden")
+                .with_code(403)
+                .boxed(),
+        );
+        let Some(ExecError::Refused(m)) = admission_policy_refusal(&e) else {
+            panic!("refused");
+        };
+        let m = copied(
+            m,
+            "the cluster's step Pod admission policy refused the step Pod: ",
+        );
+        assert!(m.len() <= 1024 && m.len() > 1020, "{}", m.len());
+        assert!(policy.starts_with(&m));
+        // A short message is copied whole.
+        assert_eq!(capped_admission_message("short"), "short");
     }
 
     /// `launch` against a fake API server that has no Pod and answers the
@@ -8658,24 +8814,41 @@ mod tests {
         ]
     }
 
-    /// `launch` of a step with a `k8s_overlay` against a fake API server
-    /// that has no Pod, answers the real Pod create with `real`, and answers
-    /// a dry-run create (`?dryRun=All`) with `dry_run`: a `Status` for
-    /// `Some`, the Pod back with a 201 for `None`.
-    async fn launch_overlaid_refused_with(
+    /// The fake API server's answers to the Pod creates of an overlaid
+    /// step: `None` admits the Pod (a 201 with the Pod back), `Some` is a
+    /// `Status` with that code and message.
+    #[derive(Clone, Copy)]
+    struct OverlaidAnswers {
+        /// The real create.
         real: (u16, &'static str),
-        dry_run: Option<(u16, &'static str)>,
-    ) -> ExecError {
+        /// A dry-run create of the Pod with the overlay.
+        with_overlay: Option<(u16, &'static str)>,
+        /// A dry-run create of the Pod without the overlay.
+        without_overlay: Option<(u16, &'static str)>,
+    }
+
+    /// `launch` of a step with a `k8s_overlay` (`nodeSelector: {gpu:
+    /// a100}`) against a fake API server that has no Pod and answers each
+    /// Pod create as `answers` says, telling a dry run (`?dryRun=All`) from
+    /// the real create and the overlaid Pod from the one without the
+    /// overlay by its body. Returns the error and every create it got:
+    /// `(dry run, overlaid)`.
+    async fn launch_overlaid_refused_with(
+        answers: OverlaidAnswers,
+    ) -> (ExecError, Vec<(bool, bool)>) {
         use axum::http::{Method, StatusCode, Uri};
         use axum::response::IntoResponse;
+        use std::sync::{Arc, Mutex};
         let _ = rustls::crypto::ring::default_provider().install_default();
         // As the API server answers: the `reason` goes with the code (kube's
         // `get_opt` reads a missing Pod from `reason: NotFound`).
         let status = |code: u16, message: &str| {
             let reason = match code {
+                400 => "BadRequest",
                 403 => "Forbidden",
                 404 => "NotFound",
-                _ => "Invalid",
+                422 => "Invalid",
+                _ => "InternalError",
             };
             (
                 StatusCode::from_u16(code).unwrap(),
@@ -8687,19 +8860,33 @@ mod tests {
             )
                 .into_response()
         };
+        let creates = Arc::new(Mutex::new(Vec::new()));
+        let seen = creates.clone();
         let app = axum::Router::new().fallback(
-            move |method: Method, uri: Uri, body: axum::body::Bytes| async move {
-                let is_dry_run = uri.query().is_some_and(|q| q.contains("dryRun="));
-                match (method, is_dry_run, dry_run) {
-                    (Method::POST, true, None) => (
-                        StatusCode::CREATED,
-                        [("content-type", "application/json")],
-                        body,
-                    )
-                        .into_response(),
-                    (Method::POST, true, Some((code, message))) => status(code, message),
-                    (Method::POST, false, _) => status(real.0, real.1),
-                    _ => status(404, "pods \"scarab-x\" not found"),
+            move |method: Method, uri: Uri, body: axum::body::Bytes| {
+                let seen = seen.clone();
+                async move {
+                    if method != Method::POST {
+                        return status(404, "pods \"scarab-x\" not found");
+                    }
+                    let is_dry_run = uri.query().is_some_and(|q| q.contains("dryRun=All"));
+                    let pod: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let overlaid = pod["spec"]["nodeSelector"]["gpu"] == "a100";
+                    seen.lock().unwrap().push((is_dry_run, overlaid));
+                    let answer = match (is_dry_run, overlaid) {
+                        (false, _) => Some(answers.real),
+                        (true, true) => answers.with_overlay,
+                        (true, false) => answers.without_overlay,
+                    };
+                    match answer {
+                        Some((code, message)) => status(code, message),
+                        None => (
+                            StatusCode::CREATED,
+                            [("content-type", "application/json")],
+                            body,
+                        )
+                            .into_response(),
+                    }
                 }
             },
         );
@@ -8712,27 +8899,103 @@ mod tests {
         let step = step_with_attempt("run-1", "build", "a1");
         let mut spec = busybox();
         spec.k8s_overlay = Some(serde_json::json!({"spec": {"nodeSelector": {"gpu": "a100"}}}));
-        exec.launch(&step, &spec).await.expect_err("launch")
+        let err = exec.launch(&step, &spec).await.expect_err("launch");
+        let creates = creates.lock().unwrap().clone();
+        (err, creates)
     }
 
     // git-bug 54b98bf: a 403 from Pod Security for a step Pod whose
     // overlay is the cause failed with a launch error the scheduler retried
-    // until the Run dead-lettered. When the Pod passes a dry run without its
-    // overlay, the step fails with the API's reason. An RBAC denial fails the
-    // dry run too, and a quota denial passes on a retry; both stay launch
+    // until the Run dead-lettered. When the same Pod is denied again by a
+    // dry run and passes one without its overlay, the step fails with the
+    // API's reason. An RBAC denial fails the dry run without the overlay
+    // too, and a ResourceQuota denial is not asked about; both stay launch
     // errors.
     #[tokio::test]
     async fn a_403_for_a_pod_that_passes_a_dry_run_without_its_overlay_fails_the_step() {
-        match launch_overlaid_refused_with((403, POD_SECURITY_DENIAL), None).await {
+        let (err, creates) = launch_overlaid_refused_with(OverlaidAnswers {
+            real: (403, POD_SECURITY_DENIAL),
+            with_overlay: Some((403, POD_SECURITY_DENIAL)),
+            without_overlay: None,
+        })
+        .await;
+        match err {
             ExecError::Refused(m) => assert!(m.contains(POD_SECURITY_DENIAL), "{m}"),
             other => panic!("Pod Security: {other:?}"),
         }
+        assert_eq!(creates, [(false, true), (true, true), (true, false)]);
         let rbac = "pods is forbidden: User \"system:serviceaccount:scarab:scarab\" cannot \
             create resource \"pods\" in API group \"\" in the namespace \"ci-steps\"";
-        let err = launch_overlaid_refused_with((403, POD_SECURITY_DENIAL), Some((403, rbac))).await;
+        let (err, _) = launch_overlaid_refused_with(OverlaidAnswers {
+            real: (403, rbac),
+            with_overlay: Some((403, rbac)),
+            without_overlay: Some((403, rbac)),
+        })
+        .await;
         assert!(matches!(err, ExecError::Launch(_)), "RBAC: {err:?}");
-        let err = launch_overlaid_refused_with((403, QUOTA_DENIAL), None).await;
+    }
+
+    // M1 / RT-14: the real create is denied by a webhook or a missing
+    // ServiceAccount, and the dry run of the same Pod a moment later
+    // passes: the denial was of the moment, so it stays a launch error the
+    // scheduler retries (0.7.0's behaviour), and the Pod without the
+    // overlay is not asked about.
+    #[tokio::test]
+    async fn a_403_gone_by_the_dry_run_stays_a_launch_error() {
+        for transient in [
+            "admission webhook \"budget.example.com\" denied the request: team GPU budget in \
+             use, retry when a Pod finishes",
+            "pods \"scarab-build-a1-0\" is forbidden: error looking up service account \
+             ci-steps/deployer: serviceaccount \"deployer\" not found",
+        ] {
+            let (err, creates) = launch_overlaid_refused_with(OverlaidAnswers {
+                real: (403, transient),
+                with_overlay: None,
+                without_overlay: None,
+            })
+            .await;
+            assert!(matches!(err, ExecError::Launch(_)), "{transient}: {err:?}");
+            assert_eq!(creates, [(false, true), (true, true)], "{transient}");
+        }
+    }
+
+    // M1 / RT-14: a policy that denies the overlaid Pod on every request
+    // fails the step even when its text holds the words "exceeded quota";
+    // only the ResourceQuota plugin's shape (`is forbidden: exceeded quota:
+    // <name>`), which it gives the dry run too, stays a launch error.
+    #[tokio::test]
+    async fn only_the_resource_quota_shape_of_exceeded_quota_is_retried() {
+        let policy = "admission webhook \"validate.kyverno.svc-fail\" denied the request: \
+            policy Pod/ci-steps/x: gpu-limit: this team exceeded quota of 1 GPU per Pod";
+        let (err, _) = launch_overlaid_refused_with(OverlaidAnswers {
+            real: (403, policy),
+            with_overlay: Some((403, policy)),
+            without_overlay: None,
+        })
+        .await;
+        match err {
+            ExecError::Refused(m) => assert!(m.contains("gpu-limit"), "{m}"),
+            other => panic!("policy: {other:?}"),
+        }
+        let (err, creates) = launch_overlaid_refused_with(OverlaidAnswers {
+            real: (403, QUOTA_DENIAL),
+            with_overlay: Some((403, QUOTA_DENIAL)),
+            without_overlay: None,
+        })
+        .await;
         assert!(matches!(err, ExecError::Launch(_)), "quota: {err:?}");
+        assert_eq!(creates, [(false, true)], "a quota denial asks nothing more");
+        // A transient denial whose dry run meets the quota: a launch error.
+        let (err, _) = launch_overlaid_refused_with(OverlaidAnswers {
+            real: (403, policy),
+            with_overlay: Some((403, QUOTA_DENIAL)),
+            without_overlay: None,
+        })
+        .await;
+        assert!(
+            matches!(err, ExecError::Launch(_)),
+            "quota on the dry run: {err:?}"
+        );
     }
 
     // git-bug 07f0de3: the chart's step Pod admission policy denies the
