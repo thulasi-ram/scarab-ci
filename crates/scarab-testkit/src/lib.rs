@@ -2227,6 +2227,8 @@ impl Db for InMemoryDb {
             return Err(DbError::Conflict);
         }
         u.gen += 1;
+        // A new generation holds tokens no revocation has seen.
+        u.revoke_attempted_at = None;
         let gen = u.gen;
         st.log_unit_values
             .entry(key)
@@ -2333,8 +2335,16 @@ impl Db for InMemoryDb {
         unit: &scarab_engine::LogStreamId,
         at: Timestamp,
     ) -> Result<(), DbError> {
-        if let Some(u) = self.state.lock().unwrap().log_units.get_mut(&log_key(unit)) {
-            u.revoke_attempted_at.get_or_insert(at.0);
+        // Only while every generation is marked revoked (as Postgres).
+        let mut st = self.state.lock().unwrap();
+        let key = log_key(unit);
+        let revoked = st.log_unit_values.get(&key).map_or(0, |gens| {
+            gens.iter().filter(|g| g.revoked_at.is_some()).count()
+        });
+        if let Some(u) = st.log_units.get_mut(&key) {
+            if u.gen == revoked as i64 {
+                u.revoke_attempted_at.get_or_insert(at.0);
+            }
         }
         Ok(())
     }

@@ -2382,8 +2382,11 @@ impl Db for PostgresDb {
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+        // A new generation holds tokens no revocation has seen: the unit is
+        // not revoked until they are (a launch that lost the race with the
+        // Attempt's end, on a replica that no longer drives the Run).
         sqlx::query(
-            "UPDATE log_units SET gen = $4
+            "UPDATE log_units SET gen = $4, revoke_attempted_at = NULL
              WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
         )
         .bind(&unit.run.0)
@@ -2539,9 +2542,17 @@ impl Db for PostgresDb {
         unit: &scarab_engine::LogStreamId,
         at: Timestamp,
     ) -> Result<(), DbError> {
+        // Only while every generation is marked revoked, compared with the
+        // row's own `gen`: a generation inserted since the caller read the
+        // ledger keeps the unit unmarked, also when its insert commits while
+        // this statement waits for the row (the re-check reads the row's new
+        // `gen`, and the count is from this statement's snapshot).
         sqlx::query(
-            "UPDATE log_units SET revoke_attempted_at = COALESCE(revoke_attempted_at, $4)
-             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+            "UPDATE log_units u SET revoke_attempted_at = COALESCE(u.revoke_attempted_at, $4)
+             WHERE u.run_id = $1 AND u.step_id = $2 AND u.attempt_id = $3
+               AND u.gen = (SELECT count(*) FROM log_unit_values v
+                            WHERE v.run_id = u.run_id AND v.step_id = u.step_id
+                              AND v.attempt_id = u.attempt_id AND v.revoked_at IS NOT NULL)",
         )
         .bind(&unit.run.0)
         .bind(&unit.step.0)

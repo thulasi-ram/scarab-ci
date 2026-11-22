@@ -2068,6 +2068,56 @@ contract_test!(
     a_revoked_generation_is_not_revoked_again
 );
 
+/// N-1: a generation written after the unit was marked revoked (a launch on
+/// a replica that no longer drives the Run, after another saw the Attempt
+/// end) clears the mark, so the paths that skip a marked unit revoke its
+/// token. A mark is refused while a generation is not marked revoked,
+/// whoever read the ledger before it was written. A write that adds no
+/// generation keeps the mark. Kills: a write that keeps the unit's mark; a
+/// mark that ignores an unmarked generation.
+async fn a_late_generation_unmarks_the_unit_until_it_is_revoked(db: &dyn Db) {
+    async fn marked(db: &dyn Db, u: &LogStreamId) -> Option<i64> {
+        db.log_unit_ledger(u)
+            .await
+            .unwrap()
+            .unwrap()
+            .unit
+            .revoke_attempted_at
+    }
+    let u = stream_id("build", "a1");
+    db.write_log_unit(&u, Some("pod-n1"), 0, Some(b"one"), Timestamp(1))
+        .await
+        .unwrap();
+    db.mark_log_generation_revoked(&u, 1, Timestamp(2))
+        .await
+        .unwrap();
+    db.mark_log_unit_revoked(&u, Timestamp(2)).await.unwrap();
+    assert_eq!(marked(db, &u).await, Some(2));
+    // The late launch's generation.
+    db.write_log_unit(&u, None, 1, Some(b"two"), Timestamp(3))
+        .await
+        .unwrap();
+    assert_eq!(marked(db, &u).await, None, "generation 2 is not revoked");
+    // A caller that revoked generation 1 only marks the unit: refused.
+    db.mark_log_unit_revoked(&u, Timestamp(4)).await.unwrap();
+    assert_eq!(marked(db, &u).await, None);
+    db.mark_log_generation_revoked(&u, 2, Timestamp(5))
+        .await
+        .unwrap();
+    db.mark_log_unit_revoked(&u, Timestamp(5)).await.unwrap();
+    assert_eq!(marked(db, &u).await, Some(5));
+    // A launch that adds no value writes no generation.
+    db.write_log_unit(&u, Some("pod-n1"), 2, None, Timestamp(6))
+        .await
+        .unwrap();
+    assert_eq!(marked(db, &u).await, Some(5));
+}
+
+contract_test!(
+    log_late_generation_unmarks_the_unit,
+    a_late_generation_unmarks_the_unit_until_it_is_revoked
+);
+
 /// REV-m12: ledger generations whose seal does not start with the active
 /// key's prefix are counted; a purged unit's are gone. Kills: a prefix
 /// compared on the wrong bytes; purged values counted.

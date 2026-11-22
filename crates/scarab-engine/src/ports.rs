@@ -1051,8 +1051,9 @@ pub trait Db: Send + Sync {
 
     /// Write a unit's ledger at launch (I7): in one transaction, upsert its
     /// `log_units` row (setting `handle` when given) and, with `sealed`,
-    /// insert generation `expected_gen + 1` sealed under that number.
-    /// [`DbError::Conflict`] when the unit's generation is no longer
+    /// insert generation `expected_gen + 1` sealed under that number and
+    /// clear the unit's `revoke_attempted_at` (the new generation's tokens
+    /// are not revoked yet). [`DbError::Conflict`] when the unit's generation is no longer
     /// `expected_gen` (another launch wrote one; the caller reloads), or
     /// when the unit is purged. Returns the unit's generation after it.
     async fn write_log_unit(
@@ -1108,7 +1109,11 @@ pub trait Db: Send + Sync {
         now: Timestamp,
     ) -> Result<(), DbError>;
 
-    /// Record that every revocation of the unit's minted tokens succeeded.
+    /// Record that every revocation of the unit's minted tokens succeeded:
+    /// set `revoke_attempted_at` (first write wins) only while every
+    /// generation of its ledger is marked revoked, read in the same
+    /// statement, so a generation written since the caller read the ledger
+    /// leaves the unit unmarked.
     async fn mark_log_unit_revoked(
         &self,
         unit: &crate::LogStreamId,

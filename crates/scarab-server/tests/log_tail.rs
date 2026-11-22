@@ -1521,6 +1521,80 @@ async fn a_failed_launch_revokes_nothing_now() {
     );
 }
 
+/// The forge tokens the backend was handed, in launch order.
+fn mounted_tokens(live: &LiveLog) -> Vec<String> {
+    live.launched
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s.forge_token.as_ref()?.credential.as_ref())
+        .map(|c| c.token.clone())
+        .collect()
+}
+
+/// N-1: replica B sees the Attempt end and revokes T1; replica A, which
+/// no longer drives the Run, was still inside a launch of the same Attempt
+/// and now records T2 and launches. T2 is revoked by a later end and by
+/// the ledger sweep exactly once, and T1 is not revoked again. Kills: a
+/// unit mark that a later generation leaves set (every later path skips
+/// the unit, the purge deletes T2's generation, and T2 lives to its TTL).
+#[tokio::test]
+async fn a_token_recorded_after_the_attempt_end_was_seen_is_revoked_once() {
+    let w = World::new().await;
+    let (a, b) = (w.logs(), w.logs());
+    let live = LiveLog::new(b"", true);
+    let (stack_a, stack_b) = (w.stack(live.clone(), &a), w.stack(live.clone(), &b));
+    stack_a.launch(&running(), &forge_spec()).await.unwrap();
+    *live.poll_state.lock().unwrap() = ExecState::Succeeded;
+    let h = ExecHandle("pod-build".into());
+    stack_b.poll(&h).await.unwrap();
+    w.end_attempt().await;
+    let t1 = mounted_tokens(&live)[0].clone();
+    assert_eq!(w.forge.revoked(), vec![t1.clone()]);
+    // A's late launch.
+    stack_a.launch(&running(), &forge_spec()).await.unwrap();
+    let t2 = mounted_tokens(&live)[1].clone();
+    assert_eq!(w.forge.revoked(), vec![t1.clone()], "T2 is mounted");
+    // B sees the end again.
+    stack_b.poll(&h).await.unwrap();
+    assert_eq!(w.forge.revoked(), vec![t1.clone(), t2.clone()]);
+    stack_b.poll(&h).await.unwrap();
+    // The sweep purges the ledger and revokes nothing again.
+    w.db.settle_log_units(Timestamp(0)).await.unwrap();
+    let pass =
+        scarab_server::log_tail::sweep_ledgers(&b, w.forge.as_ref(), Timestamp(2 * 3_600_000))
+            .await;
+    assert_eq!(pass.purged, 1);
+    assert_eq!(w.forge.revoked(), vec![t1, t2]);
+}
+
+/// N-1, the sweep alone: no later end is seen; the sweep finds the unit
+/// unmarked and revokes T2 before it purges the ledger. Kills: a sweep
+/// that trusts a mark set before T2's generation was written.
+#[tokio::test]
+async fn the_sweep_revokes_a_token_recorded_after_the_unit_was_marked() {
+    let w = World::new().await;
+    let (a, b) = (w.logs(), w.logs());
+    let live = LiveLog::new(b"", true);
+    let (stack_a, stack_b) = (w.stack(live.clone(), &a), w.stack(live.clone(), &b));
+    stack_a.launch(&running(), &forge_spec()).await.unwrap();
+    *live.poll_state.lock().unwrap() = ExecState::Succeeded;
+    stack_b.poll(&ExecHandle("pod-build".into())).await.unwrap();
+    w.end_attempt().await;
+    stack_a.launch(&running(), &forge_spec()).await.unwrap();
+    w.db.settle_log_units(Timestamp(0)).await.unwrap();
+    scarab_server::log_tail::sweep_ledgers(&b, w.forge.as_ref(), Timestamp(2 * 3_600_000)).await;
+    assert_eq!(w.forge.revoked(), mounted_tokens(&live));
+    assert!(
+        w.db.log_unit_ledger(&stream())
+            .await
+            .unwrap()
+            .unwrap()
+            .unit
+            .purged
+    );
+}
+
 // ---------------------------------------------------------------------------
 // I9: liveness
 // ---------------------------------------------------------------------------
