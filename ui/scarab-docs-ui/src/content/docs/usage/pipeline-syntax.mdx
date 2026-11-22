@@ -1253,8 +1253,9 @@ with `resources`:
 ```
 
 With the k8s executor, Scarab checks each name against the operator's profile registry when the
-Run is created. A name the registry does not hold refuses the Run, and the error names the step,
-the profile and the profiles the registry holds. `scarab validate --server` and the policy test
+Run is created. A name the registry does not hold refuses the Run, and the error names the step
+and the profile. It does not list the profiles the registry holds; ask the operator for those.
+`scarab validate --server` and the policy test
 report the same refusal. If the operator removes a profile after a Run was created, that Run's
 step fails to launch and is retried as a launch error.
 
@@ -1279,12 +1280,19 @@ checks the same list again before it creates the Pod; an overlay refused there (
 operator changed the lists, for example) fails the step as a configuration error with the reason.
 
 An overlay that keeps to these fields can still make a Pod Kubernetes refuses, such as a
-`nodeSelector` value that is not a valid label value, or a memory request above the limit. When
-Kubernetes refuses the Pod as invalid, Scarab asks it whether the same Pod without the overlay is
-valid (a dry run, which creates nothing). If it is, the step fails as a configuration error with
-Kubernetes' message. If the Pod is invalid without the overlay too, the operator's baseline or a
-profile is at fault, and the launch is retried as a launch error. A refusal for quota or
-permissions is always a launch error.
+`nodeSelector` value that is not a valid label value, a memory request above the limit, or a field
+that Pod Security or a LimitRange in the step namespace denies. When Kubernetes refuses the Pod as
+invalid or forbidden, Scarab asks it whether the same Pod without the overlay passes (a dry run,
+which creates nothing). If it does, the step fails as a configuration error with Kubernetes'
+message. If the Pod fails without the overlay too, the operator's baseline, a profile or the
+server's permissions are at fault, and the launch is retried as a launch error. A ResourceQuota
+refusal (`exceeded quota`) is always a launch error, because it can pass once other Pods finish.
+
+The dry run goes through the same admission webhooks as a real create. A webhook that does not
+declare `sideEffects: None` or `NoneOnDryRun` refuses every dry run, so on a cluster with such a
+webhook on Pods the check never passes: a refusal the overlay caused stays a launch error, and the
+launch is retried until it dead-letters. To get the configuration error instead, make every
+validating and mutating webhook that matches Pods in the step namespace support dry run.
 
 | Field | Why it is allowed |
 |-------|-------------------|

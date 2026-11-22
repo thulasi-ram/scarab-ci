@@ -255,22 +255,14 @@ impl PlacementConfig {
             .collect()
     }
 
-    /// The refusal for a profile name the registry does not hold, naming
-    /// the profiles it does hold.
+    /// The refusal for a profile name the registry does not hold. It names
+    /// the step and the name the author wrote, and no other profile: the
+    /// repo author reads it, and naming a bogus profile must not list the
+    /// operator's profiles (git-bug 387f0a3).
     fn unknown_profile(&self, step: &str, name: &str) -> String {
-        let held = if self.profiles.is_empty() {
-            "it holds none".to_string()
-        } else {
-            let names: Vec<String> = self
-                .profiles
-                .iter()
-                .map(|p| format!("`{}`", p.name))
-                .collect();
-            format!("it holds {}", names.join(", "))
-        };
         format!(
             "step `{step}` names placement profile `{name}`, which is not in the operator's \
-             placement config ({held})"
+             placement config"
         )
     }
 
@@ -3191,7 +3183,8 @@ impl Executor for K8sExecutor {
             }
             // An overlay that keeps to the author's fields can still make a
             // Pod the API server refuses (a label value it does not accept, a
-            // memory request above the limit). Ask it whether the Pod passes
+            // memory request above the limit, a field Pod Security or a
+            // LimitRange denies with a 403). Ask it whether the Pod passes
             // without the overlay; if it does, the overlay is the cause and
             // the step fails with the API's reason instead of a launch error
             // the scheduler retries until the Run dead-letters. An invalid
@@ -3204,7 +3197,9 @@ impl Executor for K8sExecutor {
                     return Err(refused);
                 }
                 let refusal = match (&e, unplaced) {
-                    (kube::Error::Api(ae), Some(unplaced)) if overlay_may_be_refused(ae.code) => {
+                    (kube::Error::Api(ae), Some(unplaced))
+                        if overlay_may_be_refused(ae.code, &ae.message) =>
+                    {
                         let passes = self
                             .passes_without_overlay(&pods, unplaced, &step.step.0, spec)
                             .await;
@@ -5712,12 +5707,21 @@ fn merge_layer(
         .map_err(|e| format!("{source} leaves a Pod that does not decode: {e}"))
 }
 
-/// Whether a `pods.create` answered with `code` may be the step's
-/// `k8s_overlay`'s fault: 400 or 422, an object the API server will not
-/// accept. A 403 (a quota, an RBAC or admission denial) can pass on a retry
-/// and is left a launch error.
-fn overlay_may_be_refused(code: u16) -> bool {
-    matches!(code, 400 | 422)
+/// Whether a `pods.create` answered with `code` and `message` may be the
+/// step's `k8s_overlay`'s fault, so the launch asks whether the Pod passes a
+/// dry run without it. A 400 or 422 is an object the API server will not
+/// accept. A 403 is an admission denial (Pod Security, a LimitRange, an
+/// admission policy or webhook) or an RBAC denial; the dry run tells them
+/// apart, because an RBAC denial fails the dry run too (git-bug 54b98bf).
+/// A ResourceQuota denial (`exceeded quota`) is not: the Pod without the
+/// overlay asks for less and passes, yet the same Pod is admitted once other
+/// Pods finish, so it stays a launch error the scheduler retries.
+fn overlay_may_be_refused(code: u16, message: &str) -> bool {
+    match code {
+        400 | 422 => true,
+        403 => !message.contains("exceeded quota"),
+        _ => false,
+    }
 }
 
 /// The name every step Pod admission policy the chart renders starts with
@@ -5758,7 +5762,7 @@ fn overlay_refusal(
     message: &str,
     passes_without_overlay: Option<bool>,
 ) -> Option<ExecError> {
-    (overlay_may_be_refused(code) && passes_without_overlay == Some(true)).then(|| {
+    (overlay_may_be_refused(code, message) && passes_without_overlay == Some(true)).then(|| {
         ExecError::Refused(format!(
             "the step's k8s_overlay makes a Pod Kubernetes refuses: {message}"
         ))
@@ -8504,22 +8508,26 @@ mod tests {
     fn unknown_placement_profile_is_fail_closed() {
         let mut spec = busybox();
         spec.placement_profiles = vec!["ghost".into()];
-        let err = apply_placement(pod_for(&spec), "s", &spec, &PlacementConfig::default())
+        // A registry that holds a profile, so a refusal that listed it would show.
+        let err = apply_placement(pod_for(&spec), "s", &spec, &with_push_profile())
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("placement profile `ghost`") && err.contains("it holds none"),
+            err.contains("placement profile `ghost`")
+                && err.contains("not in the operator's placement config")
+                && !err.contains("ecr-push"),
             "got: {err}"
         );
     }
 
     // RT-R2-2: the profile names a Step gives come from the Pipeline file,
     // so Run creation checks them against the registry the executor reads.
-    // An unknown name is refused naming the names the registry holds; a
-    // `registry_auth_only` profile on a Step without `registry_auth` with the
-    // text the launch uses.
+    // An unknown name is refused naming the step and the name, and no other
+    // profile (git-bug 387f0a3: a repo author must not be able to list the
+    // operator's profiles by naming a bogus one); a `registry_auth_only`
+    // profile on a Step without `registry_auth` with the text the launch uses.
     #[test]
-    fn profile_refusals_name_the_step_the_profile_and_the_registry() {
+    fn profile_refusals_name_the_step_and_the_profile_and_no_other_profile() {
         let mut placement = with_push_profile();
         placement
             .profiles
@@ -8529,7 +8537,8 @@ mod tests {
         assert!(
             refused[0].contains("step `build`")
                 && refused[0].contains("`bgi`")
-                && refused[0].contains("`big`"),
+                && !refused[0].contains("`big`")
+                && !refused[0].contains("ecr-push"),
             "{refused:?}"
         );
         let refused = placement.profile_refusals("steal", &["ecr-push".into()], false);
@@ -8556,29 +8565,46 @@ mod tests {
         assert!(matches!(err.into_exec_error(), ExecError::Refused(m) if m.contains("`ecr-push`")),);
     }
 
-    // RT-R2-1: an overlay that keeps to the author's fields can make a Pod
-    // the API server refuses. Only a 400 or 422 for a Pod that passes a dry
-    // run without the overlay fails the step with the API's reason; a dry
-    // run that fails too (an invalid operator baseline), a step with no
-    // overlay (not asked) and a 403 (a quota or RBAC denial a retry can pass)
-    // stay launch errors.
+    // The API server's text for a Pod Security denial (the pod-security
+    // admission plugin's `violates PodSecurity %q: %s`, prefixed with the
+    // Forbidden status's `pods "<name>" is forbidden: `).
+    const POD_SECURITY_DENIAL: &str = "pods \"x\" is forbidden: violates PodSecurity \
+        \"restricted:latest\": allowPrivilegeEscalation != false (container \"step\" must set \
+        securityContext.allowPrivilegeEscalation=false)";
+    // The LimitRanger admission plugin's text for a limit above the range's max.
+    const LIMIT_RANGE_DENIAL: &str =
+        "pods \"x\" is forbidden: maximum cpu usage per Container is 1, but limit is 2";
+    // The ResourceQuota admission plugin's text.
+    const QUOTA_DENIAL: &str = "pods \"x\" is forbidden: exceeded quota: steps, requested: pods=1";
+
+    // RT-R2-1, git-bug 54b98bf: an overlay that keeps to the author's fields
+    // can make a Pod the API server refuses. A 400 or 422, or a 403 from Pod
+    // Security or a LimitRange, for a Pod that passes a dry run without the
+    // overlay fails the step with the API's reason. A dry run that fails too
+    // (an invalid operator baseline, an RBAC denial), a step with no overlay
+    // (not asked), a quota denial (a retry passes once other Pods finish) and
+    // a 500 stay launch errors.
     #[test]
     fn a_pod_kubernetes_refuses_fails_the_step_only_when_the_overlay_is_the_cause() {
-        let message =
+        let invalid =
             "Pod \"x\" is invalid: spec.nodeSelector: Invalid value: \"not a label value!\"";
-        for code in [400, 422] {
+        for (code, message) in [
+            (400, invalid),
+            (422, invalid),
+            (403, POD_SECURITY_DENIAL),
+            (403, LIMIT_RANGE_DENIAL),
+        ] {
             match overlay_refusal(code, message, Some(true)) {
                 Some(ExecError::Refused(m)) => {
                     assert!(m.contains("k8s_overlay") && m.contains(message), "{m}")
                 }
-                other => panic!("{code}: {other:?}"),
+                other => panic!("{code} {message}: {other:?}"),
             }
             assert!(overlay_refusal(code, message, Some(false)).is_none());
             assert!(overlay_refusal(code, message, None).is_none());
         }
-        assert!(overlay_refusal(403, "exceeded quota", Some(true)).is_none());
+        assert!(overlay_refusal(403, QUOTA_DENIAL, Some(true)).is_none());
         assert!(overlay_refusal(500, "etcd", Some(true)).is_none());
-        assert!(!overlay_may_be_refused(403));
     }
 
     /// `launch` against a fake API server that has no Pod and answers the
@@ -8630,6 +8656,76 @@ mod tests {
                 .err()
                 .expect("debug"),
         ]
+    }
+
+    /// `launch` of a step with a `k8s_overlay` against a fake API server
+    /// that has no Pod, answers the real Pod create with `real`, and answers
+    /// a dry-run create (`?dryRun=All`) with `dry_run`: a `Status` for
+    /// `Some`, the Pod back with a 201 for `None`.
+    async fn launch_overlaid_refused_with(
+        real: (u16, &'static str),
+        dry_run: Option<(u16, &'static str)>,
+    ) -> ExecError {
+        use axum::http::{Method, StatusCode, Uri};
+        use axum::response::IntoResponse;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let status = |code: u16, message: &str| {
+            (
+                StatusCode::from_u16(code).unwrap(),
+                axum::Json(serde_json::json!({
+                    "kind": "Status", "apiVersion": "v1", "metadata": {},
+                    "status": "Failure", "message": message, "reason": "Forbidden",
+                    "code": code,
+                })),
+            )
+                .into_response()
+        };
+        let app = axum::Router::new().fallback(
+            move |method: Method, uri: Uri, body: axum::body::Bytes| async move {
+                let is_dry_run = uri.query().is_some_and(|q| q.contains("dryRun="));
+                match (method, is_dry_run, dry_run) {
+                    (Method::POST, true, None) => (
+                        StatusCode::CREATED,
+                        [("content-type", "application/json")],
+                        body,
+                    )
+                        .into_response(),
+                    (Method::POST, true, Some((code, message))) => status(code, message),
+                    (Method::POST, false, _) => status(real.0, real.1),
+                    _ => status(404, "pods \"scarab-x\" not found"),
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = kube::Config::new(format!("http://{addr}").parse().unwrap());
+        let client = kube::Client::try_from(config).unwrap();
+        let exec = K8sExecutor::with_client("ci-steps", client);
+        let step = step_with_attempt("run-1", "build", "a1");
+        let mut spec = busybox();
+        spec.k8s_overlay = Some(serde_json::json!({"spec": {"nodeSelector": {"gpu": "a100"}}}));
+        exec.launch(&step, &spec).await.expect_err("launch")
+    }
+
+    // git-bug 54b98bf: a 403 from Pod Security for a step Pod whose
+    // overlay is the cause failed with a launch error the scheduler retried
+    // until the Run dead-lettered. When the Pod passes a dry run without its
+    // overlay, the step fails with the API's reason. An RBAC denial fails the
+    // dry run too, and a quota denial passes on a retry; both stay launch
+    // errors.
+    #[tokio::test]
+    async fn a_403_for_a_pod_that_passes_a_dry_run_without_its_overlay_fails_the_step() {
+        match launch_overlaid_refused_with((403, POD_SECURITY_DENIAL), None).await {
+            ExecError::Refused(m) => assert!(m.contains(POD_SECURITY_DENIAL), "{m}"),
+            other => panic!("Pod Security: {other:?}"),
+        }
+        let rbac = "pods is forbidden: User \"system:serviceaccount:scarab:scarab\" cannot \
+            create resource \"pods\" in API group \"\" in the namespace \"ci-steps\"";
+        let err = launch_overlaid_refused_with((403, POD_SECURITY_DENIAL), Some((403, rbac))).await;
+        assert!(matches!(err, ExecError::Launch(_)), "RBAC: {err:?}");
+        let err = launch_overlaid_refused_with((403, QUOTA_DENIAL), None).await;
+        assert!(matches!(err, ExecError::Launch(_)), "quota: {err:?}");
     }
 
     // git-bug 07f0de3: the chart's step Pod admission policy denies the
