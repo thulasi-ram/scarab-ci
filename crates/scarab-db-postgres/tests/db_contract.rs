@@ -2522,70 +2522,123 @@ async fn the_0099_revert_leaves_a_schema_the_migrator_can_upgrade_again() {
     tdb.cleanup().await;
 }
 
-/// `attempts_started_at_idx` (0100) as Postgres holds it: `(valid, unique)`,
-/// or `None` with no index of that name.
-async fn started_at_index(pool: &sqlx::PgPool) -> Option<(bool, bool)> {
+/// An index a `CONCURRENTLY` migration builds, as Postgres holds it:
+/// `(valid, unique)`, or `None` with no index of that name.
+async fn index_state(pool: &sqlx::PgPool, name: &str) -> Option<(bool, bool)> {
     sqlx::query_as(
         "SELECT i.indisvalid, i.indisunique FROM pg_index i
-         WHERE i.indexrelid = to_regclass('attempts_started_at_idx')",
+         WHERE i.indexrelid = to_regclass($1)",
     )
+    .bind(name)
     .fetch_optional(pool)
     .await
     .unwrap()
 }
 
-/// Leave `attempts_started_at_idx` invalid the way a failed `CONCURRENTLY`
-/// build does: a unique build over two attempts with one start fails.
-async fn break_started_at_index(pool: &sqlx::PgPool) {
-    sqlx::raw_sql("DROP INDEX IF EXISTS attempts_started_at_idx")
+/// Leave index `name` on `table (column)` invalid the way a failed
+/// `CONCURRENTLY` build does: a unique build over two rows with one value
+/// fails.
+async fn break_index(pool: &sqlx::PgPool, name: &str, table: &str, column: &str) {
+    sqlx::raw_sql(&format!("DROP INDEX IF EXISTS {name}"))
         .execute(pool)
         .await
         .unwrap();
-    sqlx::raw_sql(
-        "CREATE UNIQUE INDEX CONCURRENTLY attempts_started_at_idx ON attempts (started_at)",
-    )
+    sqlx::raw_sql(&format!(
+        "CREATE UNIQUE INDEX CONCURRENTLY {name} ON {table} ({column})"
+    ))
     .execute(pool)
     .await
     .unwrap_err();
-    assert_eq!(started_at_index(pool).await, Some((false, true)));
+    assert_eq!(index_state(pool, name).await, Some((false, true)));
 }
 
-/// 0100 builds its index `CONCURRENTLY`. A build that fails or is killed
+/// A migration's `CONCURRENTLY` index: a build that fails or is killed
 /// leaves an invalid index of its name, which `IF NOT EXISTS` passes over;
-/// `migrate` builds it again, when 0100 runs again (the failed run was not
-/// recorded) and when 0100 is recorded already. Kills: an invalid index
-/// left in place, which the planner never uses.
-#[tokio::test]
-async fn migrate_builds_again_an_index_a_failed_concurrent_build_left_invalid() {
+/// `migrate` builds it again, when the migration runs again (the failed run
+/// was not recorded) and when it is recorded already. `seed` writes two rows
+/// with one value of the column. Kills: an invalid index left in place,
+/// which the planner never uses; an index left out of `CONCURRENT_INDEXES`.
+async fn rebuilds_an_invalid_concurrent_index(
+    name: &str,
+    table: &str,
+    column: &str,
+    version: i64,
+    seed: impl for<'a> Fn(
+        &'a PostgresDb,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>,
+) {
     let Some(tdb) = fresh_db().await else {
         eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
         return;
     };
     let db = PostgresDb::with_pool(tdb.pool.clone());
     db.migrate().await.unwrap();
-    assert_eq!(started_at_index(&tdb.pool).await, Some((true, false)));
-    let (run, step) = (RunId("r-idx".into()), StepId("build".into()));
-    seed_run_and_step(&db, &run, &step).await;
-    for a in ["a1", "a2"] {
-        db.record_attempt(&run, &step, &attempt(a, 7))
-            .await
-            .unwrap();
-    }
+    assert_eq!(index_state(&tdb.pool, name).await, Some((true, false)));
+    seed(&db).await;
 
-    // The build failed, so 0100 was not recorded: it runs again.
-    break_started_at_index(&tdb.pool).await;
-    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 100")
+    // The build failed, so the migration was not recorded: it runs again.
+    break_index(&tdb.pool, name, table, column).await;
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
+        .bind(version)
         .execute(&tdb.pool)
         .await
         .unwrap();
     db.migrate().await.unwrap();
-    assert_eq!(started_at_index(&tdb.pool).await, Some((true, false)));
+    assert_eq!(index_state(&tdb.pool, name).await, Some((true, false)));
 
-    // 0100 recorded with the index invalid.
-    break_started_at_index(&tdb.pool).await;
+    // The migration recorded with the index invalid.
+    break_index(&tdb.pool, name, table, column).await;
     db.migrate().await.unwrap();
-    assert_eq!(started_at_index(&tdb.pool).await, Some((true, false)));
+    assert_eq!(index_state(&tdb.pool, name).await, Some((true, false)));
     tdb.cleanup().await;
+}
+
+/// 0100's `attempts_started_at_idx`.
+#[tokio::test]
+async fn migrate_builds_again_an_index_a_failed_concurrent_build_left_invalid() {
+    rebuilds_an_invalid_concurrent_index(
+        "attempts_started_at_idx",
+        "attempts",
+        "started_at",
+        100,
+        |db| {
+            Box::pin(async move {
+                let (run, step) = (RunId("r-idx".into()), StepId("build".into()));
+                seed_run_and_step(db, &run, &step).await;
+                for a in ["a1", "a2"] {
+                    db.record_attempt(&run, &step, &attempt(a, 7))
+                        .await
+                        .unwrap();
+                }
+            })
+        },
+    )
+    .await;
+}
+
+/// M3: 0105's `webhook_deliveries_at_idx` (ADR-0083 §9).
+#[tokio::test]
+async fn migrate_builds_webhook_deliveries_at_idx_again_when_it_is_invalid() {
+    rebuilds_an_invalid_concurrent_index(
+        "webhook_deliveries_at_idx",
+        "webhook_deliveries",
+        "at",
+        105,
+        |db| {
+            Box::pin(async move {
+                for id in ["d1", "d2"] {
+                    sqlx::query(
+                        "INSERT INTO webhook_deliveries (forge, id, at) VALUES ('github', $1, 7)",
+                    )
+                    .bind(id)
+                    .execute(db.pool_for_tests())
+                    .await
+                    .unwrap();
+                }
+            })
+        },
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
