@@ -1121,7 +1121,31 @@ impl Executor for ForgeCredentialExecutor {
                     minted: c.minted,
                 });
             }
-            let launched = self.inner.launch(step, &enriched).await?;
+            let launched = match self.inner.launch(step, &enriched).await {
+                Ok(launched) => launched,
+                Err(e) => {
+                    // A minted token the unit's ledger does not hold was
+                    // refused before the ledger layer recorded it (by the
+                    // secrets layer, say): nothing mounted it, and no
+                    // Attempt end or sweep would find it, so it ends now (as
+                    // does one in a ledger this replica cannot read: the
+                    // launch failed). A token the ledger holds may be
+                    // mounted; the Attempt's end and the ledger sweep end it.
+                    if let Some(c) = credential.as_ref().filter(|c| c.minted) {
+                        let held = match crate::log_ledger::step_unit(step) {
+                            Some(unit) => self
+                                .ledger_generation_holding(&unit, &c.token)
+                                .await
+                                .is_some(),
+                            None => false,
+                        };
+                        if !held {
+                            revoke_one(self.forge.as_ref(), &repo, &c.token).await;
+                        }
+                    }
+                    return Err(e);
+                }
+            };
             let (Some(c), Some(unit)) = (&credential, crate::log_ledger::step_unit(step)) else {
                 return Ok(launched);
             };

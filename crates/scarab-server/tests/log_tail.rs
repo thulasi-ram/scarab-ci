@@ -1595,6 +1595,27 @@ async fn the_sweep_revokes_a_token_recorded_after_the_unit_was_marked() {
     );
 }
 
+/// A layer under the forge layer refuses the launch before the ledger
+/// layer records the token (here the secrets layer: a secret the scope
+/// does not have). No ledger holds the token and no Pod mounts it, so it
+/// is revoked at once. Kills: a refusal that returns and leaves the minted
+/// token live to its TTL.
+#[tokio::test]
+async fn a_token_minted_for_a_launch_refused_before_the_ledger_is_revoked() {
+    let w = World::new().await;
+    let logs = w.logs();
+    let live = LiveLog::new(b"", true);
+    let stack = w.stack(live.clone(), &logs);
+    let mut spec = forge_spec();
+    spec.secrets = vec![scarab_pipeline::SecretRef::file("MISSING")];
+    stack.launch(&running(), &spec).await.unwrap_err();
+    assert!(
+        live.launched.lock().unwrap().is_empty(),
+        "the backend was not called"
+    );
+    assert_eq!(w.forge.revoked(), vec!["fake-token-acme-web-1".to_string()]);
+}
+
 // ---------------------------------------------------------------------------
 // I9: liveness
 // ---------------------------------------------------------------------------
