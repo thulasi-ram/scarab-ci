@@ -1308,18 +1308,36 @@ operator changed the lists, for example) fails the step as a configuration error
 
 An overlay that keeps to these fields can still make a Pod Kubernetes refuses, such as a
 `nodeSelector` value that is not a valid label value, a memory request above the limit, or a field
-that Pod Security or a LimitRange in the step namespace denies. When Kubernetes refuses the Pod as
-invalid or forbidden, Scarab asks it whether the same Pod without the overlay passes (a dry run,
-which creates nothing). If it does, the step fails as a configuration error with Kubernetes'
-message. If the Pod fails without the overlay too, the operator's baseline, a profile or the
-server's permissions are at fault, and the launch is retried as a launch error. A ResourceQuota
-refusal (`exceeded quota`) is always a launch error, because it can pass once other Pods finish.
+that Pod Security, a LimitRange, an admission policy or a webhook in the step namespace denies.
+When Kubernetes refuses the Pod as invalid (400, 422) or forbidden (403), Scarab asks it twice
+more with dry runs, which create nothing: once for the same Pod, and, if that is refused again,
+once for the Pod without the overlay. The step fails as a configuration error only when the same
+Pod is refused again and the Pod without the overlay passes. Otherwise the launch is retried as a
+launch error:
 
-The dry run goes through the same admission webhooks as a real create. A webhook that does not
+- the same Pod passes its dry run: the first refusal was of the moment, such as a ServiceAccount
+  created a moment later or a webhook that answers each request on its own;
+- the Pod fails without the overlay too: the operator's baseline, a profile or the server's
+  permissions (RBAC) are at fault;
+- the refusal is a ResourceQuota denial, which Kubernetes writes as
+  `pods "<name>" is forbidden: exceeded quota: <quota>, ...`: it can pass once other Pods finish.
+  A policy or webhook message that only contains the words "exceeded quota" is not this shape,
+  and is checked like any other refusal.
+
+The step's failure carries Kubernetes' message, cut to its first 1,024 bytes. The Run's author
+reads it, so an admission policy's or webhook's denial message should hold nothing the author may
+not read. The message of a refusal by the chart's step Pod admission policy is cut the same way.
+
+One case is blamed on the overlay wrongly: a webhook that refuses for a reason of the moment (a
+budget that frees up once a Pod finishes, for example) on both the create and the dry run, and
+admits the Pod without the overlay, fails the step. Rerun the step once the reason has passed.
+
+The dry runs go through the same admission webhooks as a real create. A webhook that does not
 declare `sideEffects: None` or `NoneOnDryRun` refuses every dry run, so on a cluster with such a
-webhook on Pods the check never passes: a refusal the overlay caused stays a launch error, and the
-launch is retried until it dead-letters. To get the configuration error instead, make every
-validating and mutating webhook that matches Pods in the step namespace support dry run.
+webhook on Pods the Pod without the overlay never passes: a refusal the overlay caused stays a
+launch error, and the launch is retried until it dead-letters. To get the configuration error
+instead, make every validating and mutating webhook that matches Pods in the step namespace
+support dry run.
 
 | Field | Why it is allowed |
 |-------|-------------------|

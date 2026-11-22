@@ -603,6 +603,16 @@ once (`psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0099_revert.sql`; it reverts
 stored by 0.7 and every value ledger; output rows stay, and 0.6 reads them as
 before. Upgrading again runs 0099, 0100 and 0101 again.
 
+Migration 0101 (the first release after 0.7.0) validates three of 0099's
+checks on `log_chunks` when the server starts. It waits at most 5 seconds for
+its lock on the table. A manual `VACUUM` or `ANALYZE`, an anti-wraparound
+autovacuum or a `CREATE INDEX CONCURRENTLY` on `log_chunks` holds that lock
+longer, so the server stops with `canceling statement due to lock timeout`,
+Kubernetes restarts it, and it tries again; it starts once the other session
+ends. A plain autovacuum gives way after about a second. To go back to 0.7.0
+from 0101, scale the server to zero, run
+`DELETE FROM _sqlx_migrations WHERE version = 101;` and install 0.7.0.
+
 ### Upgrading from 0.4.4 or earlier: step Pods move
 
 Up to 0.4.4 an empty `scarab.namespace` meant the release namespace. Now, with
