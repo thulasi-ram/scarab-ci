@@ -4389,6 +4389,20 @@ impl ForgeConnectionStore for PostgresDb {
         Ok(result.rows_affected() == 1)
     }
 
+    async fn forget_delivery(
+        &self,
+        forge: ForgeKind,
+        delivery_id: &str,
+    ) -> Result<(), RegistryError> {
+        sqlx::query("DELETE FROM webhook_deliveries WHERE forge = $1 AND id = $2")
+            .bind(forge.as_str())
+            .bind(delivery_id)
+            .execute(self.pool())
+            .await
+            .map_err(reg_err)?;
+        Ok(())
+    }
+
     async fn last_delivery_at(&self, forge: ForgeKind) -> Result<Option<i64>, RegistryError> {
         let row = sqlx::query("SELECT max(at) AS at FROM webhook_deliveries WHERE forge = $1")
             .bind(forge.as_str())

@@ -498,7 +498,7 @@ impl InMemoryDb {
     /// another — that commits between two of a caller's separate writes.
     /// Constructs the interleaving instead of scheduling it. Supported
     /// methods: `set_run_params`, `set_run_concurrency`,
-    /// `commit_step_transition`, `append_event`.
+    /// `commit_step_transition`, `append_event`, `record_delivery`.
     pub fn interleave_before_next(&self, method: &'static str, hook: DbHook) {
         *self.interleave.lock().unwrap() = Some((method, hook));
     }
@@ -4353,6 +4353,13 @@ pub struct FakeForge {
     /// When set, `read_file_at_ref` fails with this [`Api`](ForgeError::Api)
     /// error (a timeout or a `5xx`, not "no such file").
     read_error: Mutex<Option<String>>,
+    /// Per path: `read_file_at_ref` of that path fails with this
+    /// [`Api`](ForgeError::Api) error ([`FakeForge::set_read_error_for`]).
+    read_errors_for: Mutex<HashMap<String, String>>,
+    /// How many of the next `read_file_at_ref` calls fail with an
+    /// [`Api`](ForgeError::Api) error before reads work again
+    /// ([`FakeForge::fail_next_reads`]).
+    failing_reads: Mutex<usize>,
     /// What [`pull_request_files`](ForgePort::pull_request_files) answers,
     /// per pull request number. A number with no entry answers
     /// `Unsupported`; `Err` answers that [`Api`](ForgeError::Api) error.
@@ -4492,6 +4499,22 @@ impl FakeForge {
     /// Make `read_file_at_ref` fail as a forge outage would, or stop.
     pub fn set_read_error(&self, error: Option<&str>) {
         *self.read_error.lock().unwrap() = error.map(str::to_string);
+    }
+
+    /// Make `read_file_at_ref` of `path` alone fail as a forge outage
+    /// would, or stop.
+    pub fn set_read_error_for(&self, path: &str, error: Option<&str>) {
+        let mut errors = self.read_errors_for.lock().unwrap();
+        match error {
+            Some(e) => errors.insert(path.to_string(), e.to_string()),
+            None => errors.remove(path),
+        };
+    }
+
+    /// Make the next `count` `read_file_at_ref` calls fail as a forge outage
+    /// would; the reads after them work.
+    pub fn fail_next_reads(&self, count: usize) {
+        *self.failing_reads.lock().unwrap() = count;
     }
 
     /// How many `list_dir_at_ref` and `read_file_at_ref` calls were made.
@@ -4933,12 +4956,26 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
         forge: scarab_forge::ForgeKind,
         delivery_id: &str,
     ) -> Result<bool, scarab_forge::RegistryError> {
+        self.interleave_point("record_delivery").await;
         Ok(self
             .state
             .lock()
             .unwrap()
             .webhook_deliveries
             .insert((forge.as_str().to_string(), delivery_id.to_string())))
+    }
+
+    async fn forget_delivery(
+        &self,
+        forge: scarab_forge::ForgeKind,
+        delivery_id: &str,
+    ) -> Result<(), scarab_forge::RegistryError> {
+        self.state
+            .lock()
+            .unwrap()
+            .webhook_deliveries
+            .remove(&(forge.as_str().to_string(), delivery_id.to_string()));
+        Ok(())
     }
 
     /// The single-owner marker (ADR-0060 part D), mirroring the Postgres
@@ -5089,6 +5126,16 @@ impl ForgePort for FakeForge {
         *self.file_reads.lock().unwrap() += 1;
         if let Some(e) = self.read_error.lock().unwrap().clone() {
             return Err(ForgeError::Api(e));
+        }
+        if let Some(e) = self.read_errors_for.lock().unwrap().get(path).cloned() {
+            return Err(ForgeError::Api(e));
+        }
+        {
+            let mut failing = self.failing_reads.lock().unwrap();
+            if *failing > 0 {
+                *failing -= 1;
+                return Err(ForgeError::Api("fake forge: read failed".into()));
+            }
         }
         self.files
             .lock()

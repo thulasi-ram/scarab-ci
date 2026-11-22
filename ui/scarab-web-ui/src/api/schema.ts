@@ -13359,8 +13359,29 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description malformed delivery, or no delivery id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description bad signature */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the forge could not be read and nothing was created; redeliver */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description too many deliveries running; nothing was recorded, redeliver */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -13384,8 +13405,29 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description malformed delivery, or no delivery id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description bad signature */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the forge could not be read and nothing was created; redeliver */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description too many deliveries running; nothing was recorded, redeliver */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -1472,6 +1472,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scarab_server::followups::spawn(state.clone(), replica_id.clone());
         tracing::info!("upstream: follow-up loop started");
     }
+    let deliveries_state = state.clone();
     let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
@@ -1482,6 +1483,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let served = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await;
+    // A webhook delivery whose forge stopped waiting runs in a task no
+    // connection waits for, with its id already recorded: wait for those
+    // (git-bug 23e3a09). 20 s leaves room in the Pod's 30 s grace period
+    // (the chart sets no `terminationGracePeriodSeconds`).
+    let running =
+        scarab_server::drain_webhook_deliveries(&deliveries_state, Duration::from_secs(20)).await;
+    if running > 0 {
+        tracing::warn!(
+            running,
+            "shutdown: webhook deliveries still running after 20 s; they are lost"
+        );
+    } else {
+        tracing::info!("shutdown: no webhook delivery running");
+    }
     // Whatever serve returned: stop the flusher between flushes, then write
     // what is left.
     let _ = token_uses_stop.send(());

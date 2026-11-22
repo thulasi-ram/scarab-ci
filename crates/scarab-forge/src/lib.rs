@@ -1678,6 +1678,17 @@ pub trait ForgeConnectionStore: Send + Sync {
         delivery_id: &str,
     ) -> Result<bool, RegistryError>;
 
+    /// Remove a delivery id [`record_delivery`](Self::record_delivery)
+    /// recorded, so a redelivery of it is processed. Called only for a
+    /// delivery that created no Run because the forge could not be read: its
+    /// redelivery cannot duplicate a Run. Removing an id that is not there
+    /// is not an error.
+    async fn forget_delivery(
+        &self,
+        forge: ForgeKind,
+        delivery_id: &str,
+    ) -> Result<(), RegistryError>;
+
     /// Unix-ms of the most recent delivery recorded for `forge`, if any — a
     /// liveness signal for the Settings connection health readout (ADR-0060).
     ///
