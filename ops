@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1795364827,"nonce":"YxP0+Iqx03DsYzqhy6PtbWoDlRY=","message":"Fixed in 0.7.1 (PR #207, merge 8f4ae197). Gates at the release head: just check all, just test (3332/3332), CI required checks, just test e2e, chaos (all seven scenarios PASS).","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1795364827,"nonce":"Vfyu6ZPsRu4XmI/AEInViuiJtcc=","status":2}]}
