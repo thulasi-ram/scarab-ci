@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1795328086,"nonce":"BLclK/Qr4yWEwQ4HW/9ADj8hOBk=","message":"Fixed in PR #205 (merge 79b1643b on main), 2026-11-22; ships in 0.7.0.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1795328086,"nonce":"BOl3UI984E66XSaERGce7ULE/4s=","status":2}]}
