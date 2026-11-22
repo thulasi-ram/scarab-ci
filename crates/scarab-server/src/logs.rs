@@ -364,7 +364,9 @@ impl LogService {
     }
 
     /// Redact a failure cause or infra message about the unit behind
-    /// `handle` with that unit's ledger (I10). A unit with no ledger this
+    /// `handle` with that unit's ledger (I10), read at its current
+    /// generation, never from the cache: a peer may have recorded a token
+    /// since this replica loaded the unit. A unit with no ledger this
     /// replica can load gets [`CAUSE_NOT_STORED`] in place of the text.
     /// Lossy on invalid UTF-8: a diagnostic is for reading.
     pub async fn redact_text_for_handle(&self, handle: &str, text: &str) -> String {
@@ -372,7 +374,7 @@ impl LogService {
             Ok(Some(unit)) => unit,
             _ => return CAUSE_NOT_STORED.to_string(),
         };
-        match self.load_values(&unit).await {
+        match self.reload_values(&unit).await {
             Ok(set) => redact_text(&set, text),
             Err(_) => CAUSE_NOT_STORED.to_string(),
         }
