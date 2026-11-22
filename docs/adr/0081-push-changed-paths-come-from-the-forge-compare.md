@@ -218,6 +218,20 @@ Later work, not decided here: expose whether the list is known to `when:` (for e
 `event.changed_paths_known`, or the field left out so `has(event.changed_paths)` is false),
 so an author can write a deploy trigger that skips on unknown.
 
+**2026-11-22, the flag is built.** The owner confirmed that an unknown list keeps counting
+as true. A `when:` can now read `event.changed_paths_known`: `true` when the complete list
+is known (an empty list included), `false` when it is unknown for any reason and on every
+trigger that has no list (`tag`, `release`, `comment`, `cron`, `manual`, `api`,
+`upstream`). `event.changed_paths_known && event.changed_paths.exists(p,
+p.startsWith('infra/'))` is false on an unknown list, so that trigger skips, with no Run and
+no note, like any other `when:` that is false. A `when:` that reads only the flag asks the
+forge as one that reads the list does; until the forge answers, the flag is not decided, so
+the first match cannot skip on a list nobody asked for. The flag is not in the stored Run
+context and a template cannot read it, like the list. `has(event.changed_paths)` stays true
+either way, so the flag is the one test for an unknown list. Manual and API dispatch and
+cron fires (§5) now match their `when:` against the same context a webhook uses, so the flag
+reads `false` there instead of being missing.
+
 ### 7. Time inside the webhook delivery
 
 The compare runs inside the webhook request (§Context), after the config reads, library

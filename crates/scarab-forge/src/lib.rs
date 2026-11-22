@@ -348,19 +348,48 @@ impl ChangedPaths {
         ChangedPaths::Known(set.into_iter().collect())
     }
 
-    /// Put the list into a `{ "event": { … } }` context as
-    /// `event.changed_paths` when it is known; leave the context as it is
-    /// when it is not, so the field is absent.
+    /// Put the list into a `{ "event": { … } }` context, with
+    /// `event.changed_paths_known` saying whether it is known:
+    ///
+    /// - known: `event.changed_paths` is the list and
+    ///   `event.changed_paths_known` is `true`;
+    /// - unknown for a reason: `event.changed_paths` is absent and
+    ///   `event.changed_paths_known` is `false`;
+    /// - [`NotFetched`](PathsUnknown::NotFetched): both are absent, as the
+    ///   forge has not been asked yet. A `when:` evaluated then treats both
+    ///   as not yet decided, and the server asks the forge before the answer
+    ///   counts.
     pub fn apply_to(&self, ctx: &mut serde_json::Value) {
-        if let (ChangedPaths::Known(paths), Some(event)) = (
-            self,
-            ctx.get_mut("event")
-                .and_then(serde_json::Value::as_object_mut),
-        ) {
-            event.insert("changed_paths".into(), serde_json::json!(paths));
+        let Some(event) = ctx
+            .get_mut("event")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            return;
+        };
+        match self {
+            ChangedPaths::Known(paths) => {
+                event.insert(CHANGED_PATHS_FIELD.into(), serde_json::json!(paths));
+                event.insert(CHANGED_PATHS_KNOWN_FIELD.into(), serde_json::json!(true));
+            }
+            ChangedPaths::Unknown(PathsUnknown::NotFetched) => {
+                event.remove(CHANGED_PATHS_FIELD);
+                event.remove(CHANGED_PATHS_KNOWN_FIELD);
+            }
+            ChangedPaths::Unknown(_) => {
+                event.remove(CHANGED_PATHS_FIELD);
+                event.insert(CHANGED_PATHS_KNOWN_FIELD.into(), serde_json::json!(false));
+            }
         }
     }
 }
+
+/// The `event` field a `when:` reads the changed paths from.
+const CHANGED_PATHS_FIELD: &str = "changed_paths";
+
+/// The `event` field a `when:` reads to learn whether the changed paths are
+/// known: `true` for a known list (empty included), `false` for an unknown
+/// one, for every trigger kind that has no changed paths too.
+const CHANGED_PATHS_KNOWN_FIELD: &str = "changed_paths_known";
 
 /// Why a trigger's changed paths are unknown (git-bug 418f55e, ADR-0081).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -965,7 +994,8 @@ impl Event {
     }
 
     /// The context a `when:` evaluates against: [`context`](Self::context)
-    /// plus `event.changed_paths` when they are known. Kept out of
+    /// plus `event.changed_paths` when they are known and
+    /// `event.changed_paths_known` ([`ChangedPaths::apply_to`]). Kept out of
     /// `context()`, which the Run stores, so a Run never stores the list.
     pub fn when_context(&self) -> serde_json::Value {
         let mut ctx = self.context();

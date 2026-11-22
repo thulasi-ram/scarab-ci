@@ -110,6 +110,16 @@ release.yml uses that version's section as the GitHub Release text. See
   into the server's memory. A longer answer now fails the call with `the forge's answer was over
   16777216 bytes and was not read`, and none of it is parsed (git-bug bfa8dfd).
 
+### Features
+
+- **A `when:` can read `event.changed_paths_known`** to tell an unknown changed files list from a
+  known one. It is `true` when Scarab has the complete list, an empty one included, and `false`
+  when the list is unknown and on every trigger with no list (`tag`, `release`, `comment`,
+  `cron`, `manual`, `api`, `upstream`). An unknown list still counts as true, so `when:
+  event.changed_paths_known && event.changed_paths.exists(p, p.startsWith("infra/"))` is how a
+  trigger skips on an unknown list. A template cannot read it. See
+  [Changed files](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#changed-files-eventchanged_paths).
+
 ### Enhancement
 
 - **A push's changed files come from the forge's compare API**, from the branch's head before the

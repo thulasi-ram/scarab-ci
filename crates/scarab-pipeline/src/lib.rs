@@ -6739,7 +6739,8 @@ enum WhenOutcome {
     /// The expression decided, as written.
     Decided(bool),
     /// The expression needed `event.changed_paths` while it was unknown
-    /// (absent from the context), so it counts as true (git-bug 418f55e).
+    /// (absent from the context), or `event.changed_paths_known` before the
+    /// forge was asked, so it counts as true (git-bug 418f55e).
     PathsUnknown,
 }
 
@@ -6749,18 +6750,23 @@ impl WhenOutcome {
     }
 }
 
-/// Whether `ctx` carries `event.changed_paths`, i.e. they are known.
-fn changed_paths_known(ctx: &serde_json::Value) -> bool {
+/// Whether `ctx` carries `event.changed_paths`, i.e. the list is known.
+fn has_changed_paths(ctx: &serde_json::Value) -> bool {
     ctx.get("event")
         .and_then(|e| e.get(event::CHANGED_PATHS))
         .is_some()
 }
 
-/// `ctx` with `event.changed_paths` set to `value`.
-fn with_changed_paths(ctx: &serde_json::Value, value: serde_json::Value) -> serde_json::Value {
+/// `ctx` with each `(field, value)` set on `event`.
+fn with_event_fields(
+    ctx: &serde_json::Value,
+    fields: &[(&str, serde_json::Value)],
+) -> serde_json::Value {
     let mut out = ctx.clone();
     if let Some(ev) = out.get_mut("event").and_then(|v| v.as_object_mut()) {
-        ev.insert(event::CHANGED_PATHS.into(), value);
+        for (field, value) in fields {
+            ev.insert((*field).into(), value.clone());
+        }
     }
     out
 }
@@ -6779,16 +6785,52 @@ fn with_changed_paths(ctx: &serde_json::Value, value: serde_json::Value) -> serd
 /// never skipped for want of it. An error that no list removes (the
 /// expression fails with `[]` and with `[""]` in its place) is reported as
 /// before.
+///
+/// `event.changed_paths_known` says which case holds, so an author can
+/// write `event.changed_paths_known && …` to not run on an unknown list.
+/// It is `true` with a list and `false` without one. A context that has
+/// neither field is one whose paths have not been asked of the forge yet
+/// (ADR-0081): there the flag is not decided either, and is bound to `0`
+/// like the list; when the answer needed it, the `when:` counts as true,
+/// and the server asks the forge and decides again. A context with a list
+/// but no flag (one written by hand) reads the flag as `true`.
 fn eval_when(expr: &str, ctx: &serde_json::Value) -> Result<WhenOutcome, PipelineError> {
-    if changed_paths_known(ctx) || !event::when_reads_changed_paths(expr) {
+    use serde_json::json;
+    if !event::when_reads_changed_paths(expr) {
         return cel::eval_bool(expr, ctx).map(WhenOutcome::Decided);
     }
-    match cel::eval_bool(expr, &with_changed_paths(ctx, serde_json::json!(0))) {
+    let flag_set = ctx
+        .get("event")
+        .and_then(|e| e.get(event::CHANGED_PATHS_KNOWN))
+        .is_some();
+    if has_changed_paths(ctx) {
+        return if flag_set {
+            cel::eval_bool(expr, ctx).map(WhenOutcome::Decided)
+        } else {
+            let ctx = with_event_fields(ctx, &[(event::CHANGED_PATHS_KNOWN, json!(true))]);
+            cel::eval_bool(expr, &ctx).map(WhenOutcome::Decided)
+        };
+    }
+    // Not asked yet: the flag is as undecided as the list.
+    let flags: &[Option<bool>] = if flag_set {
+        &[None]
+    } else {
+        &[Some(true), Some(false)]
+    };
+    let bind = |paths: serde_json::Value, flag: Option<serde_json::Value>| {
+        let mut fields = vec![(event::CHANGED_PATHS, paths)];
+        fields.extend(flag.map(|f| (event::CHANGED_PATHS_KNOWN, f)));
+        with_event_fields(ctx, &fields)
+    };
+    let undecided = (!flag_set).then(|| json!(0));
+    match cel::eval_bool(expr, &bind(json!(0), undecided)) {
         Ok(b) => Ok(WhenOutcome::Decided(b)),
         Err(e) => {
-            let some_list_decides = [serde_json::json!([]), serde_json::json!([""])]
-                .into_iter()
-                .any(|list| cel::eval_bool(expr, &with_changed_paths(ctx, list)).is_ok());
+            let some_list_decides = [json!([]), json!([""])].iter().any(|list| {
+                flags.iter().any(|flag| {
+                    cel::eval_bool(expr, &bind(list.clone(), flag.map(|f| json!(f)))).is_ok()
+                })
+            });
             if some_list_decides {
                 Ok(WhenOutcome::PathsUnknown)
             } else {
@@ -6841,7 +6883,7 @@ pub fn changed_paths_unapplied(
     ctx: &serde_json::Value,
 ) -> Result<Vec<String>, PipelineError> {
     let mut out = Vec::new();
-    if changed_paths_known(ctx) || !reads_changed_paths(ir, kind) {
+    if has_changed_paths(ctx) || !reads_changed_paths(ir, kind) {
         return Ok(out);
     }
     if let Some(expr) = ir.triggers.0.get(kind).and_then(|f| f.when.as_deref()) {

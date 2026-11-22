@@ -6433,7 +6433,12 @@ impl DeliveryTrigger<'_> {
     /// compare API, ADR-0081; a pull request the files API), once per
     /// delivery (`ctx` and `paths` keep the answer for the next Pipeline,
     /// for its run-scope Step `when:`s and for the Run's note), and is
-    /// decided again with the answer.
+    /// decided again with the answer. Until the forge is asked,
+    /// `event.changed_paths_known` is not decided either (absent from `ctx`),
+    /// so `event.changed_paths_known && …` asks too rather than deciding
+    /// `false` before the answer; [`ChangedPaths::apply_to`] then sets it.
+    ///
+    /// [`ChangedPaths::apply_to`]: scarab_forge::ChangedPaths::apply_to
     async fn decide(
         &self,
         ir: &scarab_pipeline::PipelineIr,
@@ -7582,7 +7587,10 @@ pub async fn dispatch_run(
     // from `context()`, so it never reaches trigger-matching / interpolation.
     let event = kind.into_event(actor, repo, sym, sha, reason);
     let ir = record_compile_failure(db, clock, &event, &path, compiled).await?;
-    let ctx = event.context();
+    // The `when:` context: a dispatch has no changed paths, so
+    // `event.changed_paths_known` reads `false` here as on a push whose list
+    // is unknown.
+    let ctx = event.when_context();
 
     // Opt-in (ADR-0043 §4): the pipeline is dispatchable only if it declares a
     // matching `on: manual` / `on: api` (a `when:` on that trigger is honoured
