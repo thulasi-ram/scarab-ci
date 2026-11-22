@@ -2362,7 +2362,9 @@ fn github(event: &str, delivery: &str, body: serde_json::Value) -> Request<Body>
     webhook_request_with_id(event, delivery, &body, &sig)
 }
 
-/// A push of `sha` to `git_ref`.
+/// A push of `sha` to `git_ref`. Commit ids are lowercase hex here: both
+/// adapters answer a push or pull request whose commit id is not one with
+/// 400 (`is_commit_sha`).
 fn push_of(delivery: &str, git_ref: &str, sha: &str) -> Request<Body> {
     github(
         "push",
@@ -2527,13 +2529,13 @@ steps:
     t.forge.set_pr_files(7, &["lib/widget.rs"]);
     t.forge
         .set_read_error_for(".scarab/c.yaml", Some("502 bad gateway"));
-    let (status, body) = send(&app, pull_request_of("d1", 7, "h1")).await;
+    let (status, body) = send(&app, pull_request_of("d1", 7, "bbb111")).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert!(t.db.active_runs().await.unwrap().is_empty());
 
     t.forge.set_pr_files_unknown(7, Some("timeout"));
     t.forge.set_read_error_for(".scarab/c.yaml", None);
-    let (status, body) = send(&app, pull_request_of("d1", 7, "h1")).await;
+    let (status, body) = send(&app, pull_request_of("d1", 7, "bbb111")).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     let runs = t.db.active_runs().await.unwrap();
     assert_eq!(runs.len(), 1, "only c runs: {body}");
@@ -2611,9 +2613,9 @@ async fn a_comment_redelivery_reads_at_the_commit_its_first_try_resolved() {
     let other = on_push("other");
     let t = Redelivery::new(&[]).await;
     let app = t.replica();
-    t.forge.set_commit("HEAD", "sha1");
+    t.forge.set_commit("HEAD", "aaa111");
     t.forge.put_tree_at(
-        "sha1",
+        "aaa111",
         &[
             (".scarab/deploy.yaml", DEPLOY_COMMENT_YAML),
             (".scarab/other.yaml", &other),
@@ -2625,9 +2627,9 @@ async fn a_comment_redelivery_reads_at_the_commit_its_first_try_resolved() {
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert_eq!(body["run_ids"].as_array().unwrap().len(), 1, "{body}");
 
-    t.forge.set_commit("HEAD", "sha2");
+    t.forge.set_commit("HEAD", "aaa222");
     t.forge.put_tree_at(
-        "sha2",
+        "aaa222",
         &[
             (".scarab/release.yaml", DEPLOY_COMMENT_YAML),
             (".scarab/other.yaml", &other),
@@ -2657,13 +2659,13 @@ async fn a_late_push_redelivery_does_not_cancel_the_newer_push() {
         .set_read_error_for(".scarab/c.yaml", Some("502 bad gateway"));
     t.forge
         .set_read_error_for(".scarab/deploy.yaml", Some("502 bad gateway"));
-    let (status, body) = send(&app, push_of("p1", "refs/heads/main", "sha1")).await;
+    let (status, body) = send(&app, push_of("p1", "refs/heads/main", "aaa111")).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
 
     t.later();
     t.forge.set_read_error_for(".scarab/c.yaml", None);
     t.forge.set_read_error_for(".scarab/deploy.yaml", None);
-    let (status, body) = send(&app, push_of("p2", "refs/heads/main", "sha2")).await;
+    let (status, body) = send(&app, push_of("p2", "refs/heads/main", "aaa222")).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     let newer = [
         t.run_of("p2", ".scarab/c.yaml").await,
@@ -2671,7 +2673,7 @@ async fn a_late_push_redelivery_does_not_cancel_the_newer_push() {
     ];
 
     t.later();
-    let (status, body) = send(&app, push_of("p1", "refs/heads/main", "sha1")).await;
+    let (status, body) = send(&app, push_of("p1", "refs/heads/main", "aaa111")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["run_ids"].as_array().map_or(0, Vec::len), 0, "{body}");
     for o in t.outcomes("p1").await {
@@ -2687,7 +2689,7 @@ async fn a_late_push_redelivery_does_not_cancel_the_newer_push() {
         assert!(live(&t.db, run).await, "P2's Run {run:?} was cancelled");
     }
     let mut on_sha1: Vec<(String, String)> = t
-        .statuses_on("sha1")
+        .statuses_on("aaa111")
         .await
         .into_iter()
         .map(|s| (s.context, s.description.unwrap_or_default()))
@@ -2702,7 +2704,7 @@ async fn a_late_push_redelivery_does_not_cancel_the_newer_push() {
             .all(|(_, d)| d.contains("no longer the head of")),
         "{on_sha1:?}"
     );
-    let (_, body) = send(&app, push_of("p1", "refs/heads/main", "sha1")).await;
+    let (_, body) = send(&app, push_of("p1", "refs/heads/main", "aaa111")).await;
     assert_eq!(body["ignored"], "duplicate delivery");
 }
 
@@ -2715,22 +2717,22 @@ async fn a_push_redelivery_still_the_head_creates_its_run() {
     let c = on_push("gamma");
     let t = Redelivery::new(&[(".scarab/c.yaml", &c)]).await;
     let app = t.replica();
-    let (status, _) = send(&app, push_of("p0", "refs/heads/main", "sha0")).await;
+    let (status, _) = send(&app, push_of("p0", "refs/heads/main", "aaa000")).await;
     assert_eq!(status, StatusCode::ACCEPTED);
 
     t.later();
     t.forge
         .set_read_error_for(".scarab/c.yaml", Some("502 bad gateway"));
-    let (status, _) = send(&app, push_of("p1", "refs/heads/main", "sha1")).await;
+    let (status, _) = send(&app, push_of("p1", "refs/heads/main", "aaa111")).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     t.forge.set_read_error_for(".scarab/c.yaml", None);
 
     t.later();
-    let (status, _) = send(&app, push_of("o1", "refs/heads/other", "sha9")).await;
+    let (status, _) = send(&app, push_of("o1", "refs/heads/other", "aaa999")).await;
     assert_eq!(status, StatusCode::ACCEPTED);
 
     t.later();
-    let (status, body) = send(&app, push_of("p1", "refs/heads/main", "sha1")).await;
+    let (status, body) = send(&app, push_of("p1", "refs/heads/main", "aaa111")).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     assert_eq!(body["run_ids"].as_array().unwrap().len(), 1, "{body}");
 }
@@ -2746,22 +2748,22 @@ async fn a_late_pull_request_redelivery_is_not_the_head() {
     let app = t.replica();
     t.forge
         .set_read_error_for(".scarab/c.yaml", Some("502 bad gateway"));
-    let (status, _) = send(&app, pull_request_of("pr1", 7, "h1")).await;
+    let (status, _) = send(&app, pull_request_of("pr1", 7, "bbb111")).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     t.forge.set_read_error_for(".scarab/c.yaml", None);
 
     t.later();
-    let (status, _) = send(&app, pull_request_of("pr2", 7, "h2")).await;
+    let (status, _) = send(&app, pull_request_of("pr2", 7, "bbb222")).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     let newer = t.run_of("pr2", ".scarab/c.yaml").await;
 
     t.later();
-    let (status, body) = send(&app, pull_request_of("pr1", 7, "h1")).await;
+    let (status, body) = send(&app, pull_request_of("pr1", 7, "bbb111")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let o = &t.outcomes("pr1").await[0];
     assert_eq!(o.reason_kind.as_deref(), Some("not_head"), "{o:?}");
     assert!(live(&t.db, &newer).await);
-    let on_h1 = t.statuses_on("h1").await;
+    let on_h1 = t.statuses_on("bbb111").await;
     assert_eq!(on_h1.len(), 1, "{on_h1:?}");
     assert!(on_h1[0]
         .description
@@ -2784,7 +2786,7 @@ async fn a_late_pr_comment_redelivery_is_not_the_head() {
     ])
     .await;
     let app = t.replica();
-    t.forge.set_commit("refs/pull/7/head", "h1");
+    t.forge.set_commit("refs/pull/7/head", "bbb111");
     t.forge
         .set_read_error_for(".scarab/deploy.yaml", Some("502 bad gateway"));
     let (status, _) = send(&app, comment_of("c1", 7, "/deploy", true)).await;
@@ -2792,8 +2794,8 @@ async fn a_late_pr_comment_redelivery_is_not_the_head() {
     t.forge.set_read_error_for(".scarab/deploy.yaml", None);
 
     t.later();
-    t.forge.set_commit("refs/pull/7/head", "h2");
-    let (status, _) = send(&app, pull_request_of("pr2", 7, "h2")).await;
+    t.forge.set_commit("refs/pull/7/head", "bbb222");
+    let (status, _) = send(&app, pull_request_of("pr2", 7, "bbb222")).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     let pr_run = t.run_of("pr2", ".scarab/pr.yaml").await;
 
@@ -2836,9 +2838,9 @@ async fn a_comment_not_on_a_pull_request_runs_on_redelivery() {
     t.forge.set_read_error_for(".scarab/deploy.yaml", None);
 
     t.later();
-    let (status, _) = send(&app, push_of("p1", "refs/heads/main", "sha2")).await;
+    let (status, _) = send(&app, push_of("p1", "refs/heads/main", "aaa222")).await;
     assert_eq!(status, StatusCode::ACCEPTED);
-    let (status, _) = send(&app, pull_request_of("pr9", 9, "h9")).await;
+    let (status, _) = send(&app, pull_request_of("pr9", 9, "bbb999")).await;
     assert_eq!(status, StatusCode::ACCEPTED);
 
     t.later();
@@ -2864,18 +2866,18 @@ steps:
     let app = t.replica();
     t.forge
         .set_read_error_for(".scarab/c.yaml", Some("502 bad gateway"));
-    let (status, _) = send(&app, push_of("t1", "refs/tags/v1", "sha1")).await;
+    let (status, _) = send(&app, push_of("t1", "refs/tags/v1", "aaa111")).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     t.forge.set_read_error_for(".scarab/c.yaml", None);
 
     t.later();
-    let (status, _) = send(&app, push_of("p1", "refs/heads/main", "sha2")).await;
+    let (status, _) = send(&app, push_of("p1", "refs/heads/main", "aaa222")).await;
     assert_eq!(status, StatusCode::ACCEPTED);
-    let (status, _) = send(&app, push_of("t2", "refs/tags/v2", "sha3")).await;
+    let (status, _) = send(&app, push_of("t2", "refs/tags/v2", "aaa333")).await;
     assert_eq!(status, StatusCode::ACCEPTED);
 
     t.later();
-    let (status, body) = send(&app, push_of("t1", "refs/tags/v1", "sha1")).await;
+    let (status, body) = send(&app, push_of("t1", "refs/tags/v1", "aaa111")).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     t.run_of("t1", ".scarab/c.yaml").await;
 }
