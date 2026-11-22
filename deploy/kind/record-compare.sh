@@ -4,7 +4,10 @@
 #
 # Against the in-cluster Forgejo of the kind stack (deploy/kind/forgejo.yaml),
 # seeded by deploy/kind/forgejo.sh (`just stack up` runs it). The script:
-#   - deletes and recreates the repo `<admin>/record-compare`;
+#   - deletes and recreates the repo `<admin>/record-compare`, and deletes it
+#     again when the script exits, done or not: the Forgejo tier counts the
+#     repos the admin can list (SCARAB_TEST_FORGEJO_REPO_TOTAL), and a repo
+#     left behind makes that count one too many;
 #   - builds three pushes with git in a temporary directory and pushes every
 #     branch:
 #       ff_merge    a fast-forward from B to M = merge(c1, s1): c1 renames
@@ -47,11 +50,20 @@ repo=record-compare
 out="$repo_root/crates/scarab-forge-forgejo/tests/fixtures"
 
 work="$(mktemp -d "$state/record-compare.XXXXXX")"
-trap 'stop_forwards; rm -rf "$work"' EXIT
+base=""
+api() { curl -sf -H "authorization: token $token" -H "content-type: application/json" "$@"; }
+cleanup() {
+  if [ -n "$base" ]; then
+    api -o /dev/null -X DELETE "$base/api/v1/repos/$owner/$repo" \
+      || echo "warning: could not delete $owner/$repo; delete it before \`just test e2e\`" >&2
+  fi
+  stop_forwards
+  rm -rf "$work"
+}
+trap cleanup EXIT
 
 forward scarab-forgejo 3000
 base="http://127.0.0.1:$fwd_port"
-api() { curl -sf -H "authorization: token $token" -H "content-type: application/json" "$@"; }
 
 version="$(api "$base/api/v1/version" | python3 -I -c 'import json,sys;print(json.load(sys.stdin)["version"])')"
 echo "==> Forgejo $version at $base"
@@ -141,4 +153,4 @@ with open(path, "w") as f:
     f.write("\n")
 PY
 echo "    wrote $out/compare_ids.json"
-echo "==> done: review \`git diff $out\` and commit the recording"
+echo "==> done: review \`git diff $out\` and commit the recording ($owner/$repo is deleted on exit)"

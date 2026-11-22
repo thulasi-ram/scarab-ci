@@ -94,8 +94,9 @@ chaos what="all" seed="1":
 # forced push and a `git pull` merge pushed back in the repo
 # `<admin>/record-compare` of the in-cluster Forgejo, and writes each compare
 # answer and the ids to crates/scarab-forge-forgejo/tests/fixtures. Needs the
-# kind stack (`just stack up`); changes nothing else in the cluster. Review the
-# diff and commit it. See deploy/kind/record-compare.sh.
+# kind stack (`just stack up`); deletes the repo on exit and changes nothing
+# else in the cluster. Review the diff and commit it. See
+# deploy/kind/record-compare.sh.
 [doc('Record the Forgejo compare fixtures from the kind stack (ADR-0081)')]
 record-compare:
     bash deploy/kind/record-compare.sh
