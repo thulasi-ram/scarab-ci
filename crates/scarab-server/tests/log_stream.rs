@@ -785,6 +785,84 @@ async fn a_held_back_chunk_waits_two_polls_after_whole_chunks_were_sent() {
     );
 }
 
+/// REV-m11: a running attempt's newest chunk ends inside a character and
+/// is held back; a marker is stored after it. The held bytes go out before
+/// the marker, with the cut character as U+FFFD, never dropped. Kills: the
+/// hold cleared when a marker comes next without sending what it held.
+#[tokio::test(start_paused = true)]
+async fn held_bytes_before_a_marker_are_sent_with_a_replacement_character() {
+    let (db, logs) = live_store(
+        Some(RunStatus::Running),
+        &[(
+            "a1",
+            AttemptOutcome::Running,
+            vec![b"hello\n".to_vec(), vec![b'x', 0xE2, 0x82]],
+        )],
+    )
+    .await;
+    let mut s = open_live(&db, &logs, Start::Full).await;
+    assert_eq!(
+        opening(&mut s).await,
+        [Item::Data {
+            id: "a1:1".into(),
+            text: "hello\n".into(),
+        }]
+    );
+    assert_eq!(
+        s.next(true).await.unwrap(),
+        Some(Item::Keepalive),
+        "held on the first poll"
+    );
+    // The tail stores a marker: the rest of the character never comes.
+    let stream = scarab_engine::LogStreamId::new(
+        &RunId("r1".into()),
+        &StepId("build".into()),
+        &AttemptId("a1".into()),
+    );
+    let resource = scarab_engine::LogLease::Tail.resource(&stream);
+    let lease = db.lease(&resource, "w", 1).await.unwrap();
+    let writer = scarab_engine::LogWriter::holding(
+        scarab_engine::LogLease::Tail,
+        &lease.held_by(&resource, "w").unwrap(),
+    );
+    logs.append_marker(
+        &stream,
+        scarab_engine::LogRowKind::SourceRestarted,
+        None,
+        &writer,
+        None,
+        Timestamp(1),
+    )
+    .await
+    .unwrap();
+    let mut items = Vec::new();
+    while items.len() < 2 {
+        match s.next(true).await.unwrap() {
+            Some(Item::Keepalive) => {}
+            Some(item) => items.push(item),
+            None => panic!("the stream ended"),
+        }
+    }
+    assert_eq!(
+        items[0],
+        Item::Data {
+            id: "a1:2".into(),
+            text: "x\u{FFFD}".into(),
+        }
+    );
+    assert!(
+        matches!(
+            &items[1],
+            Item::Marker {
+                kind: scarab_engine::LogRowKind::SourceRestarted,
+                ..
+            }
+        ),
+        "{:?}",
+        items[1]
+    );
+}
+
 /// A finished attempt is not held back while the Run goes on: its last chunk,
 /// cut inside a character, is sent on the first pass.
 #[tokio::test(start_paused = true)]
