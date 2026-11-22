@@ -102,6 +102,11 @@ data:
          ConfigMap. Peak memory scales with it — see values.yaml. */}}
   SCARAB_CAS_CONCURRENCY: {{ . | quote }}
   {{- end }}
+  {{- with .Values.retention.webhookDeliveryDays }}
+  {{- /* ADR-0083 §8: how long webhook deliveries and their outcomes are
+         kept. The server refuses to start under 7 days. */}}
+  SCARAB_RETENTION_WEBHOOK_DELIVERY_DAYS: {{ . | quote }}
+  {{- end }}
   {{- if .Values.secrets.githubAppPemSecret.name }}
   {{- /* File-mounted App PEM (enh 245a99c): the path is not sensitive — only
          the mounted Secret is — so it belongs in the ConfigMap. */}}

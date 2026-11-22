@@ -153,6 +153,7 @@ async fn sweeps_only_terminal_runs_past_ttl_and_keeps_metadata() {
         RetentionConfig {
             log_ttl_ms: 30 * DAY_MS,
             artifact_ttl_ms: 20 * DAY_MS,
+            webhook_delivery_ttl_ms: 30 * DAY_MS,
         },
     )
     .await
@@ -236,6 +237,7 @@ async fn sweeps_only_terminal_runs_past_ttl_and_keeps_metadata() {
         RetentionConfig {
             log_ttl_ms: 30 * DAY_MS,
             artifact_ttl_ms: 20 * DAY_MS,
+            webhook_delivery_ttl_ms: 30 * DAY_MS,
         },
     )
     .await
@@ -251,6 +253,7 @@ async fn sweeps_only_terminal_runs_past_ttl_and_keeps_metadata() {
         RetentionConfig {
             log_ttl_ms: 30 * DAY_MS,
             artifact_ttl_ms: 20 * DAY_MS,
+            webhook_delivery_ttl_ms: 30 * DAY_MS,
         },
     )
     .await
