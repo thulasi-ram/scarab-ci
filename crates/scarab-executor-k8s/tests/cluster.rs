@@ -4012,7 +4012,10 @@ async fn a_clean_end_is_confirmed_on_a_real_kubelet() {
             let exec = exec.clone();
             let step = step_run_of(&run, &format!("end-{n}"));
             reads.spawn(async move {
-                let spec = busybox_spec(&format!("echo start-{n}; sleep 2; echo done-{n}"), false);
+                // busybox runs as root: under the non-root baseline the
+                // kubelet refuses to start it (CreateContainerConfigError)
+                // and the log never opens.
+                let spec = busybox_spec(&format!("echo start-{n}; sleep 2; echo done-{n}"), true);
                 let h = exec.launch(&step, &spec).await.expect("launch");
                 let mut opened = None;
                 for _ in 0..120 {
