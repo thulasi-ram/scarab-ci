@@ -1297,7 +1297,7 @@ async fn run_creation_and_the_policy_test_refuse_a_placement_profile_the_registr
     for (yaml, says) in [
         (
             "on: { push: {} }\nsteps:\n  - { id: b, image: busybox, placement_profiles: [bgi] }\n",
-            vec!["step `b`", "`bgi`", "`big`"],
+            vec!["step `b`", "`bgi`"],
         ),
         (
             "on: { push: {} }\nsteps:\n  - { id: b, image: busybox, placement_profiles: [ecr-push] }\n",
@@ -1320,6 +1320,10 @@ async fn run_creation_and_the_policy_test_refuse_a_placement_profile_the_registr
         for want in &says {
             assert!(err.contains(want), "{want}: {err}");
         }
+        assert!(
+            !err.contains("`big`"),
+            "the refusal lists no other profile: {err}"
+        );
 
         let trigger = json!({ "kind": "push", "ref": "refs/heads/main", "sha": SHA });
         let (st, b) = h

@@ -599,9 +599,9 @@ new ones, scale the server to zero
 run
 [`rollback/0099_revert.sql`](../../../crates/scarab-db-postgres/rollback/0099_revert.sql)
 once (`psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0099_revert.sql`; it reverts
-0100 too), then install the 0.6.1 chart. The revert deletes the notes of logs
+0100 and 0101 too), then install the 0.6.1 chart. The revert deletes the notes of logs
 stored by 0.7 and every value ledger; output rows stay, and 0.6 reads them as
-before. Upgrading again runs 0099 and 0100 again.
+before. Upgrading again runs 0099, 0100 and 0101 again.
 
 ### Upgrading from 0.4.4 or earlier: step Pods move
 
