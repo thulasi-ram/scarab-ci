@@ -599,9 +599,9 @@ new ones, scale the server to zero
 run
 [`rollback/0099_revert.sql`](../../../crates/scarab-db-postgres/rollback/0099_revert.sql)
 once (`psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0099_revert.sql`; it reverts
-0100 and 0101 too), then install the 0.6.1 chart. The revert deletes the notes of logs
+0100 to 0103 too), then install the 0.6.1 chart. The revert deletes the notes of logs
 stored by 0.7 and every value ledger; output rows stay, and 0.6 reads them as
-before. Upgrading again runs 0099, 0100 and 0101 again.
+before. Upgrading again runs 0099 to 0103 again.
 
 Migration 0101 (the first release after 0.7.0) validates three of 0099's
 checks on `log_chunks` when the server starts. It waits at most 5 seconds for
@@ -609,9 +609,14 @@ its lock on the table. A manual `VACUUM` or `ANALYZE`, an anti-wraparound
 autovacuum or a `CREATE INDEX CONCURRENTLY` on `log_chunks` holds that lock
 longer, so the server stops with `canceling statement due to lock timeout`,
 Kubernetes restarts it, and it tries again; it starts once the other session
-ends. A plain autovacuum gives way after about a second. To go back to 0.7.0
-from 0101, scale the server to zero, run
-`DELETE FROM _sqlx_migrations WHERE version = 101;` and install 0.7.0.
+ends. A plain autovacuum gives way after about a second. Right after it,
+migration 0102 adds the `values_too_large` reason to `log_chunks_reason`
+(dropped and added again `NOT VALID`, so it scans no row), and migration 0103
+validates that check again in its own transaction, under the same lock and
+5-second wait as 0101, with one more scan of `log_chunks`. To go back to 0.7.0,
+scale the server to zero, run
+`DELETE FROM _sqlx_migrations WHERE version IN (101, 102, 103);` and install
+0.7.0.
 
 ### Upgrading from 0.4.4 or earlier: step Pods move
 

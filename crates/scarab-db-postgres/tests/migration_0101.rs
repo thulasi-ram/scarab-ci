@@ -67,9 +67,9 @@ async fn rows_from_0_6_pass_validation_and_fenced_stays_not_valid() {
             ("log_chunks_body".to_string(), true),
             ("log_chunks_fenced".to_string(), false),
             ("log_chunks_kind".to_string(), true),
-            // 0102 adds it again NOT VALID, with the `values_too_large`
-            // reason (ADR-0082 §3); 0101 validated every row just before.
-            ("log_chunks_reason".to_string(), false),
+            // 0102 adds it again NOT VALID with the `values_too_large`
+            // reason (ADR-0082 §3); 0103 validates it again.
+            ("log_chunks_reason".to_string(), true),
         ]
     );
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM log_chunks WHERE run_id = 'r06'")

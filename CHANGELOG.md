@@ -45,12 +45,14 @@ release.yml uses that version's section as the GitHub Release text. See
   anti-wraparound autovacuum or a `CREATE INDEX CONCURRENTLY` runs on `log_chunks`, the server
   stops with `canceling statement due to lock timeout` and Kubernetes restarts it until the other
   session ends. Migration 0102, right after it, adds the `values_too_large` reason to
-  `log_chunks_reason` (see Security) and leaves that check `NOT VALID`; it scans no row. A 0.7.0
-  server does not start on a database that ran 0101 or 0102: to go back, scale the server to zero,
-  run `DELETE FROM _sqlx_migrations WHERE version IN (101, 102);` and install 0.7.0. To go back to
-  0.6, `rollback/0099_revert.sql` now reverts 0101 and 0102 too. See
+  `log_chunks_reason` (see Security): it drops the check and adds it again `NOT VALID`, scanning no
+  row. Migration 0103 then validates it again in its own transaction, under the same lock and
+  5-second wait as 0101, so the start scans `log_chunks` once more. A 0.7.0 server does not start
+  on a database that ran 0101, 0102 or 0103: to go back, scale the server to zero, run
+  `DELETE FROM _sqlx_migrations WHERE version IN (101, 102, 103);` and install 0.7.0. To go back
+  to 0.6, `rollback/0099_revert.sql` now reverts 0101 to 0103 too. See
   [Migration 0101](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#migration-0101)
-  and [Migration 0102](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#migration-0102).
+  and [Migrations 0102 and 0103](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#migrations-0102-and-0103).
 - **A webhook delivery without a delivery id is refused with 400** when forge connections are
   configured, since it could not be deduplicated. GitHub and Forgejo send the header on every
   delivery; a hand-made request or script that posts to `/webhooks/github` or `/webhooks/forgejo`

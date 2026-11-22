@@ -31,8 +31,8 @@
 > reference stored a part that lies wholly inside a value, and that the automata had no memory
 > bound or build site. §3 now adds the whole-part interval, decides how and where the automata are
 > built, caps a unit's values at 256 KiB (over it the log is not stored), and names the
-> assumption that one read is contiguous. The cap adds a `not_stored` reason and migration 0102,
-> so §2's "No schema change" holds for §2 only. The Context's "a line over 16 KiB" is not the
+> assumption that one read is contiguous. The cap adds a `not_stored` reason and migrations 0102
+> and 0103, so §2's "No schema change" holds for §2 only. The Context's "a line over 16 KiB" is not the
 > common way a part starts inside a value: a rotation between two lines of a multi-line value (a
 > PEM key, a kubeconfig) is. The status stays Proposed.
 
@@ -319,10 +319,12 @@ redacted in part (*Capping the length of a value that is redacted* is rejected b
 - `LogService::append` and `pump_log_stream` (tests and tools) return an error.
 
 The reason is a new value of the `log_chunks_reason` check, so migration 0102 drops the check and
-adds it again `NOT VALID` (0101 has just validated every stored row; a later release can
-validate it). A rollback to 0.7.0 deletes versions 101 and 102 from `_sqlx_migrations`; a 0.7.0
-replica reads `values_too_large` as a `not_stored` marker with no reason it knows and shows the
-`no_ledger` text. `rollback/0099_revert.sql` deletes version 102 too.
+adds it again `NOT VALID` (no scan under its ACCESS EXCLUSIVE lock), and migration 0103 validates
+it again in its own transaction (sqlx runs one per migration), under SHARE UPDATE EXCLUSIVE, so
+0101's validation (64bc5c6) holds at head. A rollback to 0.7.0 deletes versions 101 to 103 from
+`_sqlx_migrations`; a 0.7.0 replica reads `values_too_large` as a `not_stored` marker with no
+reason it knows and shows the `no_ledger` text. `rollback/0099_revert.sql` deletes versions 102
+and 103 too.
 
 **What the Verifier needs** (`log_tail.rs`, `Verifier::check`). A re-read compares what its
 redactor emits with the stored rows' digests, as a prefix: the stored part must be a prefix
