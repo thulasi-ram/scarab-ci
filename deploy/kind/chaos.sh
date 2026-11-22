@@ -9,6 +9,12 @@
 #                 replicas claimed some of the launches
 #   kill-server   rank 2: SIGKILL the server replica holding the producer's
 #                 launch claim while its drain is in flight
+#   kill-tailer   rank 2, log storage: SIGKILL the server replica holding a
+#                 step's tail lease while the step prints numbered lines and
+#                 a secret; the log must stay whole or end in a marker, and
+#                 the secret must be in no stored object (LG1-LG3). Its Runs
+#                 are dispatched from the Forgejo repo the Cache probe uses,
+#                 in Environment chaos-logs; about 6 minutes.
 #   stop-leader   rank 4: SIGSTOP the scheduler leader until a peer takes the
 #                 lease over (past the 30 s TTL), then SIGCONT it
 #   pause-node    `docker pause` the whole kind node while a producer's drain
@@ -16,8 +22,9 @@
 #                 of the Pod's grace period (min(grace - 120 s, 240 s): 240 s
 #                 for a workspace Pod), then `docker unpause` it; every Run
 #                 must still succeed. Not an ADR-0077 rank; about 8-10 minutes.
-# Groups: rank1 (mid-drain mid-feed), rank2 (two-replicas kill-server),
-# rank4 (stop-leader), all (the five ranked scenarios, then pause-node). The server signals go from the kind node's PID
+# Groups: rank1 (mid-drain mid-feed), rank2 (two-replicas kill-server
+# kill-tailer), rank4 (stop-leader), all (the six ranked scenarios, then
+# pause-node). The server signals go from the kind node's PID
 # namespace (`docker exec <node> kill`), because the server is PID 1 in its
 # container; see crates/scarab-chaos/src/node.rs.
 #
@@ -69,16 +76,16 @@ cd "$root"
 . "$here/test-env.sh"
 
 case "$what" in
-  mid-drain|mid-feed|two-replicas|kill-server|stop-leader|pause-node) kinds=("$what") ;;
+  mid-drain|mid-feed|two-replicas|kill-server|kill-tailer|stop-leader|pause-node) kinds=("$what") ;;
   rank1) kinds=(mid-drain mid-feed) ;;
-  rank2) kinds=(two-replicas kill-server) ;;
+  rank2) kinds=(two-replicas kill-server kill-tailer) ;;
   rank4) kinds=(stop-leader) ;;
-  all) kinds=(mid-drain mid-feed two-replicas kill-server stop-leader pause-node) ;;
+  all) kinds=(mid-drain mid-feed two-replicas kill-server kill-tailer stop-leader pause-node) ;;
   replay)
     [ -f "$arg" ] || die "just test chaos replay <scenario.json>: '$arg' does not exist"
     replay_file="$(cd "$(dirname "$arg")" && pwd)/$(basename "$arg")"
     ;;
-  *) die "unknown scenario '$what' (expected mid-drain, mid-feed, two-replicas, kill-server, stop-leader, pause-node, rank1, rank2, rank4, all or replay <file>)" ;;
+  *) die "unknown scenario '$what' (expected mid-drain, mid-feed, two-replicas, kill-server, kill-tailer, stop-leader, pause-node, rank1, rank2, rank4, all or replay <file>)" ;;
 esac
 if [ "$what" != replay ]; then
   case "$arg" in ''|*[!0-9]*) die "seed must be a non-negative integer, got '$arg'" ;; esac
@@ -241,7 +248,8 @@ export SCARAB_CHAOS_S3_ACCESS_KEY=scarab
 export SCARAB_CHAOS_S3_SECRET_KEY=scarabsecret
 export SCARAB_CHAOS_NODE="$node"
 # The Cache probe's Forgejo (up.sh seeded it and wrote forgejo.env, with a
-# token minted for this run). Without it the probe is skipped with a note.
+# token minted for this run). Without it the probe is skipped with a note,
+# and kill-tailer, whose Runs are dispatched from it, cannot run (exit 2).
 forgejo_env="$here/.state/forgejo.env"
 if [ -f "$forgejo_env" ]; then
   forward_kept scarab-forgejo 3000

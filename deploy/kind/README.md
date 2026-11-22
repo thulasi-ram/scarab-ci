@@ -327,6 +327,14 @@ at two server replicas and two Depot replicas:
   workspace drain is in flight, then while a fetcher pulls a Step's inputs;
 - rank 2, `two-replicas` and `kill-server`: no fault, then the server replica
   that holds a launch claim SIGKILLed while its drain is in flight;
+- rank 2 for log storage, `kill-tailer` (git-bug dbb1d7c): the server replica
+  that holds a step's tail lease (it reads the step's log and stores it)
+  SIGKILLed while the step prints 150 numbered lines, one a second, every
+  tenth with a secret of Environment `chaos-logs`. The peer, or the restarted
+  container, takes the lease over. Its Runs are dispatched from the Forgejo
+  repo `scarab-admin/chaos-cache` (a secret needs an Environment, and an
+  Environment a Project); the harness creates the Environment and stores a
+  secret drawn from the seed there. It checks LG1 to LG3 below;
 - rank 4, `stop-leader`: the scheduler leader SIGSTOPped past its 30 s lease
   until a peer takes over, then SIGCONTed;
 - `pause-node` (not an ADR-0077 rank): the whole kind node `docker pause`d
@@ -341,7 +349,7 @@ container. The `scarab-chaos` binary (`crates/scarab-chaos`) fires the fault and
 then checks the invariants.
 
 ```sh
-just test chaos             # all six scenarios, seed 1
+just test chaos             # all seven scenarios, seed 1
 just test chaos rank2       # one rank
 just test chaos mid-feed 7  # one scenario, another seed
 just test chaos pause-node  # about 8-10 minutes
@@ -429,6 +437,9 @@ does not take the API's or a Step's word for success:
 | W1 | the workload's outcome (not an ADR-0077 §2 invariant): every scenario Run ends `succeeded`, and every green Attempt has an output snapshot |
 | N1 | `pause-node` only: no Attempt finished with a lost-node cause ("workspace snapshot lost", "egress sidecar died"); any other failed Attempt is a warning |
 | D1 | `two-replicas` only (git-bug 068cc0b): no two different server replicas drained the same scenario Pod over overlapping time. Each drain's interval comes from the replica's `ws-timing` line with `leg: drain` in `release-log.txt` (end = its timestamp, start = end − `total_ms`); a re-drive by another replica after the first drain ended passes. A drain that failed logs no `ws-timing` line. "drain helper exited 12 with no record posted" means a record POST failed (the Depot's `drain_state_incomplete` 422 at two Depot replicas, for one) and is printed as info |
+| LG1 | `kill-tailer` only: the counting step's log, in its current part (the rows after its newest `source_restarted` marker), is every line once, whole and in order, or the stream ends in an `incomplete` or `not_stored` marker |
+| LG2 | `kill-tailer` only: every stream's rows have `seq` 0..n with no gap, each row starts where the one before it ends, and each body has the row's length and digest |
+| LG3 | `kill-tailer` only: the secret is in no object under `logs/<run>/` in the bucket, objects no row points at included, and not in `GET /v1/runs/{id}/logs`; a whole log has the placeholder `***` on each secret line |
 | C1 | the Cache probe (git-bug 12e2f6b): when the probe's seed Run succeeded and no fault hit the Cache's home Depot replica, every restore of the probe Run is a hit from that home. Otherwise it is printed `not exercised` with the reason, and it has no minimum |
 
 W1 is separate from the ADR's I-numbers because I3 and I4 as written there
@@ -451,6 +462,15 @@ workload produces: T1 and I3 one per Run, I1a, I1c and I4 one per Attempt
 (two per Run). An invariant that looked at nothing prints `not exercised`, not
 `ok`. I1b compares a Step's consecutive Attempts, and a Depot fault causes no
 retry, so rank 1 never exercises it; it is printed as such and not counted.
+
+`kill-tailer` is INCONCLUSIVE when the kill hit a replica other than the
+tail lease's owner (the owner kept renewing its leases after the kill), when
+the target stream's output rows carry one writer term (nothing was stored
+after the kill by a new writer), when no counting log was stored whole (all
+markers), when no stored line carries the placeholder (the secret was never
+printed, so LG3 could not have found it), or when LG1 or LG3 looked at fewer
+logs or Runs than the workload has. It runs in no CI workflow: run it on a
+machine with the kind stack and keep its `scenario.json` and `verdict.json`.
 
 N1 exists because the executor's lost-node verdict is an Infra failure that
 the engine retries: the Run can still end `succeeded` on a second Attempt and

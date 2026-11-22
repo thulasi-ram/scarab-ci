@@ -51,6 +51,8 @@ pub const PIPELINE: &str = "chaos-cache";
 pub const CACHED_STEP: &str = "cached";
 /// The cached directory, workspace-relative.
 pub const CACHE_DIR: &str = "deps";
+/// The dispatch reason of the probe's Runs.
+const DISPATCH_REASON: &str = "scarab-chaos Cache probe";
 /// How long the harness waits for the seed Run before it submits the
 /// workload anyway.
 pub const SEED_TIMEOUT: Duration = Duration::from_secs(300);
@@ -433,6 +435,17 @@ fn http() -> Result<reqwest::Client, String> {
 /// depend on whether chaos ran), and write the pipeline on `main` unless it
 /// already holds this text.
 async fn write_pipeline(fj: &Forgejo, yaml: &str) -> Result<(), String> {
+    write_repo_pipeline(fj, PIPELINE, yaml, "scarab-chaos: the Cache probe").await
+}
+
+/// [`write_pipeline`] for `.scarab/<pipeline>.yaml` in the same repo
+/// ([`REPO`]): `kill-tailer` writes its pipeline beside the probe's.
+pub(crate) async fn write_repo_pipeline(
+    fj: &Forgejo,
+    pipeline: &str,
+    yaml: &str,
+    message: &str,
+) -> Result<(), String> {
     let http = http()?;
     let auth = format!("token {}", fj.token);
     let repo_url = format!("{}/api/v1/repos/{}/{REPO}", fj.url, fj.owner);
@@ -462,7 +475,7 @@ async fn write_pipeline(fj: &Forgejo, yaml: &str) -> Result<(), String> {
     } else if !got.status().is_success() {
         return Err(format!("forgejo GET repo: {}", got.status()));
     }
-    let path = format!(".scarab/{PIPELINE}.yaml");
+    let path = format!(".scarab/{pipeline}.yaml");
     let file_url = format!("{repo_url}/contents/{path}");
     let current: Option<(String, Vec<u8>)> = {
         let resp = http
@@ -491,10 +504,10 @@ async fn write_pipeline(fj: &Forgejo, yaml: &str) -> Result<(), String> {
     let req = match current {
         Some((_, have)) if have == yaml.as_bytes() => return Ok(()),
         Some((sha, _)) => http.put(&file_url).json(&serde_json::json!({
-            "content": content, "sha": sha, "message": "scarab-chaos: the Cache probe", "branch": "main"
+            "content": content, "sha": sha, "message": message, "branch": "main"
         })),
         None => http.post(&file_url).json(&serde_json::json!({
-            "content": content, "message": "scarab-chaos: the Cache probe", "branch": "main"
+            "content": content, "message": message, "branch": "main"
         })),
     };
     let resp = req
@@ -541,7 +554,7 @@ pub async fn seed(api: &Api, fj: &Forgejo, p: &mut CacheProbe, salt: String) -> 
     p.salt = Some(salt.clone());
     let params = serde_json::json!({ "salt": salt });
     let run = api
-        .dispatch(&org, &project, PIPELINE, "main", &params)
+        .dispatch(&org, &project, PIPELINE, "main", &params, DISPATCH_REASON)
         .await?;
     p.seed_run = Some(run.clone());
     p.seed_status = wait_terminal(api, &run, SEED_TIMEOUT).await;
@@ -562,7 +575,7 @@ pub async fn dispatch_probe(api: &Api, p: &mut CacheProbe) -> Result<(), String>
     let (org, project) = project.split_once('/').ok_or("bad project")?;
     let params = serde_json::json!({ "salt": salt });
     p.probe_run = Some(
-        api.dispatch(org, project, PIPELINE, "main", &params)
+        api.dispatch(org, project, PIPELINE, "main", &params, DISPATCH_REASON)
             .await?,
     );
     Ok(())

@@ -16,7 +16,8 @@
 //!
 //! Kinds: mid-drain, mid-feed (rank 1: a Depot Pod deleted with grace 0),
 //! two-replicas (rank 2 with no fault), kill-server (rank 2: SIGKILL of the
-//! producer's claim holder), stop-leader (rank 4: SIGSTOP of the scheduler
+//! producer's claim holder), kill-tailer (rank 2: SIGKILL of the holder of
+//! a printing step's tail lease; see `logs`), stop-leader (rank 4: SIGSTOP of the scheduler
 //! leader past the lease TTL, then SIGCONT), pause-node (`docker pause` of
 //! the whole kind node mid-drain, past the lease TTL and short of the Pod's
 //! grace period, then `docker unpause`). See `scenario::Kind`.
@@ -152,6 +153,7 @@ async fn check_dir(conn: &Conn, file: &Path) -> Result<check::Outcome, String> {
     let dir = file.parent().unwrap_or(Path::new("."));
     let records = pods::read_records(&dir.join("pods.jsonl"))?;
     let src = check::Sources {
+        api: &conn.stack.api,
         pg: &conn.stack.pg,
         bucket: &conn.bucket,
         kube: conn.stack.kube.clone(),
@@ -209,6 +211,12 @@ async fn check_dir(conn: &Conn, file: &Path) -> Result<check::Outcome, String> {
                 if let Some(e) = &p.error {
                     line += &format!(" ({e})");
                 }
+            }
+            if let Some(tl) = &f.tail {
+                line += &format!(
+                    "; tail lease {} owner {:?} term {:?} with {:?} output rows stored",
+                    tl.resource, tl.owner, tl.term, tl.output_rows_at_fire
+                );
             }
             if let Some(r) = f.resumed_at_ms {
                 line += &format!("; resumed after {} ms", r - f.fired_at_ms);

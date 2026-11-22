@@ -25,6 +25,7 @@
 //! | W1   | the workload's own outcome: every scenario Run that ended, ended `succeeded`, and every green Attempt has an output snapshot |
 //! | N1   | `pause-node` (a freeze shorter than the Pod's grace): no Attempt of a scenario Run finished with a lost-node verdict ("workspace snapshot lost", "egress sidecar died"); the node was paused, not lost. Any other failed Attempt is a warning |
 //! | D1   | `two-replicas` (git-bug 068cc0b): no two different server replicas ran a drain of the same scenario Pod over overlapping time. Each drain's interval comes from the replica's `ws-timing` line with `leg: drain` (end = the line's timestamp, start = end − `total_ms`). A re-drive by another replica after the first drain ended is allowed |
+//! | LG1-3 | `kill-tailer` (git-bug dbb1d7c): a step's log stays whole or marked, its rows contiguous, and its secret in no stored object nor the API's log; see `crate::logs` |
 //! | C1   | the Cache probe (`crate::cache::c1`, git-bug 12e2f6b): when the seed Run succeeded and no fault hit the Cache's home replica, every restore of the probe Run is a hit from that home. Otherwise not exercised, with the reason as an info finding; it has no minimum |
 //!
 //! W1 is not one of ADR-0077 §2's invariants. As written there, I3 accepts a
@@ -248,6 +249,9 @@ pub struct Facts {
     /// The Cache probe as recorded (scenario.json). C1 reads it; `None`
     /// skips C1.
     pub cache: Option<crate::cache::CacheProbe>,
+    /// `kill-tailer`: the stored logs of the scenario's Runs
+    /// (`crate::logs`). LG1 to LG3 read it; `None` skips them.
+    pub logs: Option<crate::logs::LogFacts>,
 }
 
 /// The causes the executor gives when it judges a node lost while the step's
@@ -530,6 +534,13 @@ pub fn exercised(kind: Kind, faults: &[Fault]) -> Vec<String> {
         }
         let role = x.victim_role.as_deref().unwrap_or("unknown");
         match kind {
+            Kind::KillTailer if role != "tail-owner" => why.push(format!(
+                "{} {}: the victim was the {role}, not the replica holding the target stream's tail \
+                 lease (chosen by {})",
+                x.action,
+                x.pod,
+                x.target_basis.as_deref().unwrap_or("?")
+            )),
             Kind::KillServer if role != "claim-holder" => why.push(format!(
                 "{} {}: the victim was the {role}, not the replica holding the producer's launch claim \
                  (chosen by {})",
@@ -1226,9 +1237,22 @@ pub fn evaluate(f: &Facts) -> Verdict {
         }
     }
 
+    // LG1-LG3: kill-tailer's stored logs.
+    let mut logs_why = Vec::new();
+    if let Some(l) = &f.logs {
+        let (found, counts, why) = crate::logs::evaluate(f, l);
+        findings.extend(found);
+        checked.extend(counts);
+        logs_why = why;
+    }
+
     let inconclusive = match f.kind {
         Some(kind) => {
             let mut why = exercised(kind, &f.faults);
+            if kind == Kind::KillTailer && f.logs.is_none() {
+                why.push("kill-tailer: no stored log was read (LG1-LG3 checked nothing)".into());
+            }
+            why.extend(logs_why);
             why.extend(minimums(f.expected_runs, &checked));
             if kind == Kind::PauseNode {
                 let attempts = f.expected_runs * crate::scenario::Workload::STEPS;
@@ -1284,6 +1308,8 @@ pub fn evaluate(f: &Facts) -> Verdict {
 // --- gather --------------------------------------------------------------------------
 
 pub struct Sources<'a> {
+    /// `kill-tailer` reads each Run's log through it (LG3).
+    pub api: &'a crate::env::Api,
     pub pg: &'a sqlx::PgPool,
     pub bucket: &'a object_store::aws::AmazonS3,
     pub kube: kube::Client,
@@ -1317,6 +1343,9 @@ pub async fn gather(
         cache: scenario.cache.clone(),
         ..Default::default()
     };
+    if let Some(p) = &scenario.logs {
+        f.logs = Some(crate::logs::gather(src.pg, src.bucket, src.api, runs, p).await?);
+    }
 
     for (id, status, creating) in sqlx::query_as::<_, (String, String, bool)>(
         "SELECT id, status, creating FROM runs WHERE id = ANY($1)",

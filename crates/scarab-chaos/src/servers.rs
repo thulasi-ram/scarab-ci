@@ -32,7 +32,8 @@ use crate::nemesis::{fence_pack_rows, log, Stack};
 use crate::node::{ContGuard, Node};
 use crate::pods::{PodView, Views};
 use crate::scenario::{
-    ClaimObservation, Fault, LeaseObservation, NodeSignal, Plan, Trigger, LEASE_TTL_SECS,
+    ClaimObservation, Fault, LeaseObservation, NodeSignal, Plan, TailObservation, Trigger,
+    LEASE_TTL_SECS,
 };
 use crate::time::now_ms;
 
@@ -374,6 +375,128 @@ pub async fn kill_server(
         target_basis: Some(basis),
         victim_role: Some(role.into()),
         claim: Some(obs),
+        ..Default::default()
+    })
+}
+
+/// Who the `kill-tailer` kill hit, from the tail lease owner's writes after
+/// it ([`claim_role`]'s rule): `tail-owner`, `peer` or `unknown`.
+pub fn tail_role(obs: &TailObservation) -> &'static str {
+    match claim_role(&ClaimObservation {
+        owner: obs.owner.clone(),
+        owner_written_until_5s: obs.owner_written_until_5s,
+        owner_written_until_20s: obs.owner_written_until_20s,
+        ..Default::default()
+    }) {
+        "claim-holder" => "tail-owner",
+        other => other,
+    }
+}
+
+/// Rank 2, log storage (`kill-tailer`): SIGKILL the replica that holds the
+/// target stream's tail lease while the step prints. `holds` is the trigger
+/// condition (the step container running), checked again at the kill. The
+/// lease is read again just before the signal; that owner is the one the
+/// kill is judged against ([`tail_role`]).
+pub async fn kill_tailer(
+    stack: &Stack,
+    node: &Node,
+    views: &Views,
+    t: &Trigger,
+    plan: &Plan,
+    holds: &impl Fn(&PodView) -> bool,
+) -> Result<Fault, String> {
+    let pods: KubeApi<Pod> = KubeApi::namespaced(stack.kube.clone(), &stack.namespace);
+    let servers = server_pods(&pods, &stack.release).await?;
+    if servers.len() < 2 {
+        return Err(format!(
+            "kill-tailer needs 2 server replicas, found {}",
+            servers.len()
+        ));
+    }
+    let attempt = t
+        .attempt
+        .as_deref()
+        .ok_or("the target Pod has no attempt label")?;
+    let resource = crate::logs::tail_resource(&t.run, &t.step, attempt);
+    let lease = crate::logs::tail_lease(&stack.pg, &resource).await?;
+    let mapped = match &lease {
+        Some((owner, _)) => owner_pod(&pods, owner, &servers).await,
+        None => None,
+    };
+    let (victim, basis) = match mapped {
+        Some((p, basis)) => (p, basis.to_string()),
+        None => (
+            servers[plan.victim_ordinal as usize % servers.len()].clone(),
+            match &lease {
+                Some((owner, _)) => format!("seed (tail lease owner {owner} not mapped to a Pod)"),
+                None => format!("seed (no tail lease row {resource})"),
+            },
+        ),
+    };
+    let container_id = victim.container_id.clone().ok_or_else(|| {
+        format!(
+            "server Pod {} has no {SERVER_CONTAINER} container id",
+            victim.name
+        )
+    })?;
+    let pid = node.container_pid(&container_id).await?;
+    let rows = crate::logs::output_rows(&stack.pg, &t.run, &t.step, attempt)
+        .await
+        .ok();
+    let lease = crate::logs::tail_lease(&stack.pg, &resource).await?;
+    let held = views
+        .lock()
+        .expect("views lock")
+        .get(&t.pod_uid)
+        .is_some_and(holds);
+
+    let fired_at_ms = now_ms();
+    node.signal(pid, "KILL").await?;
+    log(&format!(
+        "SIGKILL from node {} to PID {pid}, container {container_id} of {} ({basis}); tail lease {resource} \
+         {lease:?}; {rows:?} output rows stored; condition held: {held}",
+        node.name, victim.name
+    ));
+
+    let mut obs = TailObservation {
+        resource,
+        owner: lease.as_ref().map(|l| l.0.clone()),
+        term: lease.as_ref().and_then(|l| l.1),
+        output_rows_at_fire: rows,
+        ..Default::default()
+    };
+    if let Some(owner) = obs.owner.clone() {
+        sleep_until_ms(fired_at_ms + 5_000).await;
+        obs.owner_written_until_5s = owner_written_until(&stack.pg, &owner).await?;
+        sleep_until_ms(fired_at_ms + 20_000).await;
+        obs.owner_written_until_20s = owner_written_until(&stack.pg, &owner).await?;
+    }
+    let role = tail_role(&obs);
+    let (delivered, evidence) = wait_restarted(&pods, &stack.release, &victim).await;
+    log(&format!(
+        "kill-tailer: victim was the {role}; delivered: {delivered} ({evidence})"
+    ));
+
+    Ok(Fault {
+        action: "kill-tailer".into(),
+        pod: victim.name.clone(),
+        pod_uid: Some(victim.uid.clone()),
+        grace_seconds: 0,
+        trigger: Some(t.clone()),
+        condition_held_at_fire: held,
+        fired_at_ms,
+        signal: Some(NodeSignal {
+            signal: "KILL".into(),
+            node: node.name.clone(),
+            container_id,
+            pid,
+            delivered,
+            evidence,
+        }),
+        target_basis: Some(basis),
+        victim_role: Some(role.into()),
+        tail: Some(obs),
         ..Default::default()
     })
 }

@@ -93,6 +93,14 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
         scenario.plan
     ));
 
+    // kill-tailer's pipeline goes into the Forgejo repo before the Cache
+    // probe's seed, which commits to the same repo.
+    if let Some(lp) = scenario.logs.as_ref() {
+        let fj = crate::cache::Forgejo::from_env()
+            .map_err(|e| format!("kill-tailer needs the in-cluster Forgejo: {e}"))?;
+        crate::logs::write_pipeline(&fj, lp).await?;
+    }
+
     // The Cache probe's seed Run (`crate::cache`), before the workload and
     // waited for, so the probe Run below has a Cache to restore. A probe that
     // cannot run is a note, never a harness failure: C1 is then reported as
@@ -116,10 +124,33 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
         scenario.write(&file)?;
     }
 
+    // kill-tailer's Runs are dispatched in a Project, in an Environment that
+    // holds the planted secret; the others are inline Runs.
+    let log_project = match scenario.logs.as_mut() {
+        Some(lp) => {
+            let fj = crate::cache::Forgejo::from_env()
+                .map_err(|e| format!("kill-tailer needs the in-cluster Forgejo: {e}"))?;
+            let cache_project = scenario.cache.as_ref().and_then(|c| c.project.clone());
+            let project =
+                crate::logs::prepare(&stack.api, &fj, lp, cache_project.as_deref()).await?;
+            log(&format!(
+                "kill-tailer: Project {}/{} in Environment {} with secret {}",
+                project.0,
+                project.1,
+                crate::logs::ENVIRONMENT,
+                crate::logs::SECRET_NAME
+            ));
+            Some(project)
+        }
+        None => None,
+    };
     scenario.started_at_ms = now_ms();
     let body = scenario.workload.pipeline();
     for _ in 0..scenario.workload.runs {
-        let id = stack.api.create_run(&body).await?;
+        let id = match &log_project {
+            Some((org, project)) => crate::logs::dispatch(&stack.api, org, project).await?,
+            None => stack.api.create_run(&body).await?,
+        };
         log(&format!("created run {id}"));
         scenario.runs.push(id);
     }
@@ -145,10 +176,17 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
         let holds = move |p: &PodView| match kind {
             Kind::MidDrain | Kind::KillServer | Kind::PauseNode => pods::drain_in_flight(p),
             Kind::MidFeed => pods::feed_in_flight(p),
-            Kind::StopLeader => pods::step_running(p),
+            Kind::StopLeader | Kind::KillTailer => pods::step_running(p),
             Kind::TwoReplicas => false,
         };
-        match wait_trigger(stack, &views, &scenario.runs, &target_run, kind, &holds).await {
+        let mut trigger =
+            wait_trigger(stack, &views, &scenario.runs, &target_run, kind, &holds).await;
+        // kill-tailer: the tail must be appending, not about to start.
+        if let (Kind::KillTailer, Some(t)) = (kind, trigger.take()) {
+            let lines = scenario.logs.as_ref().map_or(0, |l| l.lines);
+            trigger = crate::logs::wait_output_rows(&stack.pg, &views, t, &holds, lines).await?;
+        }
+        match trigger {
             None => {
                 scenario.notes.push(format!(
                     "trigger never held on run {target_run}; no fault fired"
@@ -167,6 +205,17 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
                     }
                     Kind::KillServer => {
                         crate::servers::kill_server(
+                            stack,
+                            &Node::from_env(),
+                            &views,
+                            &t,
+                            &scenario.plan,
+                            &holds,
+                        )
+                        .await?
+                    }
+                    Kind::KillTailer => {
+                        crate::servers::kill_tailer(
                             stack,
                             &Node::from_env(),
                             &views,
@@ -220,6 +269,29 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+    // kill-tailer: every stream of the Runs has left `open` (its final read
+    // happens after its unit settles), under the same bound.
+    if scenario.logs.is_some() {
+        loop {
+            match crate::logs::open_streams(&stack.pg, &scenario.runs).await {
+                Ok(0) => break,
+                Ok(n) if now_ms() > deadline_ms => {
+                    scenario.notes.push(format!(
+                        "{n} log stream(s) still open when the quiesce bound ran out"
+                    ));
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    scenario
+                        .notes
+                        .push(format!("could not read the log streams: {e}"));
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
     tokio::time::sleep(SETTLE).await;
     let _ = stop_tx.send(true);
     for watcher in watchers {
@@ -250,6 +322,7 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
         needles.push(f.pod.clone());
         needles.extend(f.claim.as_ref().and_then(|c| c.owner.clone()));
         needles.extend(f.lease.as_ref().map(|l| l.owner_before.clone()));
+        needles.extend(f.tail.as_ref().and_then(|l| l.owner.clone()));
     }
     needles.sort();
     needles.dedup();
@@ -333,7 +406,11 @@ pub fn window(kind: Kind, records: &[pods::PodRecord], uid: &str) -> (Option<i64
             let end = of_pod.iter().filter_map(|r| c(r)?.finished_at_ms).min();
             (start, end)
         }
-        Kind::TwoReplicas | Kind::KillServer | Kind::StopLeader | Kind::PauseNode => (None, None),
+        Kind::TwoReplicas
+        | Kind::KillServer
+        | Kind::KillTailer
+        | Kind::StopLeader
+        | Kind::PauseNode => (None, None),
     }
 }
 
@@ -361,7 +438,7 @@ async fn wait_trigger(
                         "step exited 0, egress running, no workspace-root annotation".into()
                     }
                     Kind::MidFeed => "scarab-workspace-init running".into(),
-                    Kind::StopLeader => "step container running".into(),
+                    Kind::StopLeader | Kind::KillTailer => "step container running".into(),
                     Kind::TwoReplicas => String::new(),
                 },
                 observed_at_ms: now_ms(),
