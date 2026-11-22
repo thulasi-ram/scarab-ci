@@ -52,7 +52,8 @@ release.yml uses that version's section as the GitHub Release text. See
   5-second wait as 0101, so the start scans `log_chunks` once more. A 0.7.0 server does not start
   on a database that ran 0101, 0102 or 0103: to go back, scale the server to zero, run
   `DELETE FROM _sqlx_migrations WHERE version IN (101, 102, 103);` and install 0.7.0. To go back
-  to 0.6, `rollback/0099_revert.sql` now reverts 0101 to 0103 too. See
+  to 0.6, `rollback/0099_revert.sql` now reverts 0101 to 0103 too, and a second run of it changes
+  nothing (it failed with `column "kind" does not exist`). See
   [Migration 0101](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#migration-0101)
   and [Migrations 0102 and 0103](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#migrations-0102-and-0103).
 - **A webhook delivery without a delivery id is refused with 400** when forge connections are
@@ -90,9 +91,14 @@ release.yml uses that version's section as the GitHub Release text. See
   `not_stored` note with the reason `values_too_large`, the server reads none of its log, and a
   failure cause about it is replaced by "the cause was not stored". The redactor keeps up to 52
   bytes of lookup tables per value byte, so the cap holds them at 13 MiB per step being read. A
-  server keeps at most 512 MiB of these tables, frees a step's tables when its last log read ends,
-  and builds them for 2 steps at a time; a read that does not fit waits for another to end. A
-  value is never redacted in part.
+  server keeps at most 512 MiB of these tables (`SCARAB_LOG_AUTOMATA_BUDGET_MIB`, chart value
+  `scarab.logAutomataBudgetMib`), frees a step's tables when its last log read ends, and builds
+  them for 2 steps at a time; a read that does not fit waits for another to end. A value is never
+  redacted in part.
+- **A failure cause that ends in the first bytes of a secret value has them replaced by `***`.**
+  The executor keeps 1,024 bytes of an API server message (an admission denial) and could cut it
+  inside a value; the part before the cut was no occurrence and was stored. A cut message now ends
+  with `…`, and the bytes before it count as the end of the cause.
 - **Rows already stored are not rewritten.** A value's end that 0.7.0 stored stays stored. A
   re-read of a part stored by 0.7.0 that held an overlap stores one `source_restarted` note and a
   second, redacted copy.

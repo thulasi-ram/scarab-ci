@@ -137,7 +137,10 @@ redacted with the same values. The server reads the ledger from Postgres each ti
 cause, so a token another replica added after this one last loaded the ledger is redacted too. A
 cause about a step with no ledger, or with values over 256 KiB in all (see
 [Edges of a value](#edges-of-a-value)), is replaced by "the cause was not stored: it may quote
-secret values that could not be checked".
+secret values that could not be checked". A cause that ends in the first bytes of a value has
+them replaced by `***`, as a log's confirmed end does. The server keeps at most 1,024 bytes of an
+API server message in a cause and ends a cut message with `…`; the bytes before the `…` count as
+the end.
 
 A Pod that a Scarab server keeps a ledger for carries the label `scarab.io/value-ledger: "1"`, and
 Scarab's per-Pod Secrets for it are named `<pod>-v-secrets`, `<pod>-v-registry`, `<pod>-v-token`

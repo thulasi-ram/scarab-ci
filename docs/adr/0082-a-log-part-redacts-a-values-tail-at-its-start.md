@@ -144,10 +144,11 @@ marked intervals are:
   wholly inside a value (lines 2-3 of a PEM key, the process ended). A value that began before
   the part either ends inside it (the leading interval) or runs past its end (this interval); a
   value that begins inside the part and is cut is the trailing interval. A shorter part is
-  stored (R-1). `redact_text` has none;
+  stored (R-1). `redact_text` (a failure cause) has none;
 - at a confirmed end only, the trailing interval `[p, |S|)`, where `p` is the smallest `p`
   such that `S[p..]` is a non-empty proper prefix of some value (any length, as the 0.7.0
-  prefix rule). `redact_text` has none.
+  prefix rule). `redact_text` (a failure cause) has it too: the end of a cause is its known end,
+  and a cause the executor cut at 1,024 bytes ends with `…`, before which the end is taken.
 
 Value bytes that start a part, stop before the value's end, and have more output after them are
 no interval and are stored, as in 0.7.0: the part does not end inside the value, and its start
@@ -227,7 +228,8 @@ nothing has been emitted, so it merges from the front.
 `n > 0`. Then the trailing interval `[k - pend[node], k)` is added if `pend[node] > 0`, and step
 7 runs with `h = k`, so an open span closes and every held byte is emitted or starred. Nothing is
 emitted while `lead` is pending, so the whole-part interval does not affect the prefix property. **`redact_text`** runs the
-same steps with no leading and no trailing interval and `h = k` at the end.
+same steps with no leading interval, the trailing interval at the end (before a final `…`), and
+`h = k` at the end.
 
 **Why it stores the reference.** An interval found later is an occurrence that ends after
 `k`, the trailing interval, or the leading interval (only while `lead` is pending, when
@@ -283,8 +285,9 @@ its per-node fields against brute force. No new crate; `Cargo.lock` does not cha
   (about 100 ms at the cap).
 - *A process budget and build slots.* Before it builds, a set reserves the most its automata can
   keep (`21n + 64` bytes for the trie and `31n + 64` for the suffix automaton, `n` value bytes)
-  from a budget of 512 MiB per process (`AUTOMATA_BUDGET_BYTES`; `LogService::with_automata_budget`
-  sets another), waiting while it is full; a stream reserves both in one wait, so two readers
+  from a budget of 512 MiB per process (`SCARAB_LOG_AUTOMATA_BUDGET_MIB`, chart value
+  `scarab.logAutomataBudgetMib`, 16 to 65536), waiting while it is full; a read that loses its tail
+  lease while it waits stops (checked every 200 ms and again when it gets room) and reads nothing; a stream reserves both in one wait, so two readers
   never each hold half of what they need. Then it takes one of 2 build slots
   (`CONCURRENT_BUILDS`), which bounds the build's temporary memory (about 36 MiB each at the cap)
   to 2 builds. A read waits for room and is never read without its automata. At the cap a unit
