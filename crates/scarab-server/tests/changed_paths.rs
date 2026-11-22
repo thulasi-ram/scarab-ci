@@ -476,3 +476,105 @@ async fn a_files_request_that_does_not_answer_in_time_starts_the_run_with_a_note
         "{notes:?}"
     );
 }
+
+/// Runs only when the list is known and `docker/ci-tools/` changed
+/// (`event.changed_paths_known`, ADR-0081 §6): an unknown list skips it.
+const GUARDED: &str = r#"
+on:
+  push:
+    when: 'event.changed_paths_known && event.changed_paths.exists(p, p.startsWith("docker/ci-tools/"))'
+steps:
+  - { id: image, image: busybox, command: ["true"] }
+"#;
+
+/// The bare Pipeline names of `runs`, sorted.
+async fn pipelines(db: &InMemoryDb, runs: &[RunId]) -> Vec<String> {
+    let mut out = Vec::new();
+    for run in runs {
+        out.push(db.run_pipeline(run).await.unwrap().unwrap_or_default());
+    }
+    out.sort();
+    out
+}
+
+#[tokio::test]
+async fn a_guarded_when_skips_on_an_unknown_list_and_a_plain_filter_still_runs() {
+    let forge = || {
+        FakeForge::new()
+            .with_file(".scarab/guarded.yaml", GUARDED)
+            .with_file(".scarab/ci-tools.yaml", CI_TOOLS)
+    };
+
+    // The forge answers that the list is unknown: the guard skips, the plain
+    // filter counts as true and says why.
+    let unknown = forge();
+    unknown.set_push_paths(BEFORE, AFTER, ChangedPaths::Unknown(PathsUnknown::Forced));
+    let db = Arc::new(InMemoryDb::new());
+    let runs = trigger(&unknown, &db, &push("main", BEFORE, AFTER)).await;
+    assert_eq!(pipelines(&db, &runs).await, vec!["ci-tools".to_string()]);
+    let notes_a = notes(&db, &runs[0]).await;
+    assert_eq!(notes_a.len(), 1, "{notes_a:?}");
+    assert!(notes_a[0].contains("(on.push)"), "{notes_a:?}");
+    assert_eq!(unknown.push_paths_calls(), 1);
+
+    // The forge answers a known list that touches the directory: the flag
+    // turned true when the answer was applied, so both run.
+    let listed = forge();
+    listed.set_push_paths(BEFORE, AFTER, known(&["docker/ci-tools/Dockerfile"]));
+    let db = Arc::new(InMemoryDb::new());
+    let runs = trigger(&listed, &db, &push("main", BEFORE, AFTER)).await;
+    assert_eq!(
+        pipelines(&db, &runs).await,
+        vec!["ci-tools".to_string(), "guarded".to_string()]
+    );
+    for run in &runs {
+        assert!(notes(&db, run).await.is_empty());
+    }
+    assert_eq!(listed.push_paths_calls(), 1);
+
+    // The payload already decided the list is unknown: no request, and the
+    // flag reads false.
+    let decided = forge();
+    let db = Arc::new(InMemoryDb::new());
+    let new_branch = decided_push("main", ChangedPaths::Unknown(PathsUnknown::NewBranch));
+    let runs = trigger(&decided, &db, &new_branch).await;
+    assert_eq!(pipelines(&db, &runs).await, vec!["ci-tools".to_string()]);
+    assert_eq!(decided.push_paths_calls(), 0);
+}
+
+/// Reads only `event.changed_paths_known`, never the list.
+const FLAG_ONLY: &str = r#"
+on:
+  push:
+    when: event.changed_paths_known
+  pull_request:
+    when: event.changed_paths_known
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+"#;
+
+#[tokio::test]
+async fn a_when_that_reads_only_the_flag_asks_the_forge() {
+    let forge = FakeForge::new().with_file(".scarab/ci.yaml", FLAG_ONLY);
+    forge.set_push_paths(BEFORE, AFTER, known(&["a"]));
+    let db = Arc::new(InMemoryDb::new());
+    assert_eq!(
+        trigger(&forge, &db, &push("main", BEFORE, AFTER))
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(forge.push_paths_calls(), 1);
+
+    forge.set_pr_files(1, &["a"]);
+    assert_eq!(trigger(&forge, &db, &pr(1)).await.len(), 1);
+    assert_eq!(forge.pr_files_calls(), 1);
+
+    // An unknown files answer: the flag is false and the trigger is decided,
+    // not an error.
+    let forge = FakeForge::new().with_file(".scarab/ci.yaml", FLAG_ONLY);
+    forge.set_pr_files_unknown(1, None);
+    let db = Arc::new(InMemoryDb::new());
+    assert!(trigger(&forge, &db, &pr(1)).await.is_empty());
+    assert_eq!(forge.pr_files_calls(), 1);
+}

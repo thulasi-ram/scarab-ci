@@ -11544,6 +11544,8 @@ mod tests {
             ("event.body", "may not read"),
             // Free text from a push (git-bug 418f55e): a `when:` only.
             ("event.changed_paths", "may not read"),
+            // Decided while the trigger is matched, not stored with the Run.
+            ("event.changed_paths_known", "may not read"),
             ("event", "whole"),
             ("event.repo", "whole"),
         ] {
@@ -12989,8 +12991,12 @@ steps:
   - { id: build, image: busybox }
 "#;
 
+    /// A push's `when:` context as the server builds it once the paths are
+    /// decided: `Some` is a known list, `None` an unknown one, and
+    /// `event.changed_paths_known` says which.
     fn push_ctx(branch: &str, paths: Option<&[&str]>) -> serde_json::Value {
         let mut ctx = json!({ "event": { "kind": "push", "branch": branch } });
+        ctx["event"]["changed_paths_known"] = json!(paths.is_some());
         if let Some(p) = paths {
             ctx["event"]["changed_paths"] = json!(p);
         }
@@ -13171,5 +13177,74 @@ steps:
             );
             assert!(matches_trigger(&ir, "push", &push_ctx("main", None)).unwrap());
         }
+    }
+
+    /// `event.changed_paths_known` (ADR-0081 §6): an author writes
+    /// `event.changed_paths_known && …` so a trigger skips on an unknown list.
+    /// It decides on either side of `&&`, an empty list is known, and a
+    /// `when:` the flag decided was applied, so no place is reported.
+    #[test]
+    fn changed_paths_known_decides_a_when_on_either_side_and_negated() {
+        let guarded = [
+            r#"event.changed_paths_known && event.changed_paths.exists(p, p.startsWith("docker/"))"#,
+            r#"event.changed_paths.exists(p, p.startsWith("docker/")) && event.changed_paths_known"#,
+        ];
+        let contexts: [(&str, Option<&[&str]>); 4] = [
+            ("unknown", None),
+            ("docker", Some(&["docker/x"])),
+            ("readme", Some(&["README.md"])),
+            ("empty", Some(&[])),
+        ];
+        let cases = guarded
+            .iter()
+            .map(|w| (*w, [false, true, false, false]))
+            .chain([("!event.changed_paths_known", [true, false, false, false])]);
+        for (when, want) in cases {
+            let ir = compile(&format!(
+                "on:\n  push:\n    when: '{when}'\nsteps:\n  - {{ id: deploy, image: busybox }}\n"
+            ));
+            assert!(reads_changed_paths(&ir, "push"), "{when}");
+            for ((name, paths), want) in contexts.iter().zip(want) {
+                let ctx = push_ctx("main", *paths);
+                assert_eq!(
+                    matches_trigger(&ir, "push", &ctx).unwrap(),
+                    want,
+                    "{when} on {name}"
+                );
+                assert!(
+                    changed_paths_unapplied(&ir, "push", &ctx)
+                        .unwrap()
+                        .is_empty(),
+                    "{when} on {name}: the flag decided, nothing was counted as true"
+                );
+            }
+        }
+    }
+
+    // Attack on the order the server decides in: before the forge is asked
+    // (neither field in the context), a guard that read the flag as `false`
+    // would decide "no match", the server would never ask, and the trigger
+    // would skip on every push whose list is in fact known. Safe outcome: the
+    // flag is as undecided as the list, so the trigger counts as matched and
+    // the server asks and decides again.
+    #[test]
+    fn changed_paths_known_is_not_decided_before_the_forge_is_asked() {
+        let ir = compile(
+            r#"
+on:
+  push:
+    when: 'event.changed_paths_known && event.changed_paths.exists(p, p.startsWith("docker/"))'
+steps:
+  - { id: deploy, image: busybox }
+"#,
+        );
+        let not_asked = json!({ "event": { "kind": "push", "branch": "main" } });
+        assert!(matches!(matches_trigger(&ir, "push", &not_asked), Ok(true)));
+        let flag_only = compile("on:\n  push:\n    when: event.changed_paths_known\nsteps:\n  - { id: d, image: busybox }\n");
+        assert!(reads_changed_paths(&flag_only, "push"));
+        assert!(matches!(
+            matches_trigger(&flag_only, "push", &not_asked),
+            Ok(true)
+        ));
     }
 }

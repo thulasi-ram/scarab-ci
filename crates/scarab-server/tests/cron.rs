@@ -420,3 +420,22 @@ async fn the_schedule_whose_when_matches_makes_the_run() {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].trigger_title.as_deref(), Some("0 * * * *"));
 }
+
+// A cron fire has no changed files, so a step guarded by
+// `event.changed_paths_known` (ADR-0081 §6) is skipped, and the fire still
+// makes its Run instead of failing on a missing field.
+#[tokio::test]
+async fn a_cron_fire_reads_changed_paths_known_as_false() {
+    let h = H::new(
+        "on: { cron: { schedule: \"0 * * * *\" } }\nsteps:\n  - id: image\n    image: busybox\n    command: [\"true\"]\n    when: 'event.changed_paths_known && event.changed_paths.exists(p, p.startsWith(\"docker/\"))'\n  - { id: test, image: busybox, command: [\"true\"] }\n",
+    );
+    h.push("main", SHA1).await;
+    h.tick_at(T0 + 30 * MIN + 2_000).await;
+    h.tick_at(T0 + 30 * MIN + 7_000).await;
+    let runs = h.runs().await;
+    assert_eq!(runs.len(), 1, "the fire made its Run");
+    let steps = h.db.steps_of_run(&runs[0].run).await.unwrap();
+    let status = |id: &str| steps.iter().find(|s| s.step.0 == id).unwrap().status;
+    assert_eq!(status("image"), scarab_engine::StepStatus::Skipped);
+    assert_ne!(status("test"), scarab_engine::StepStatus::Skipped);
+}
