@@ -262,9 +262,58 @@ pub const CHANGED_PATHS_MAX: usize = 3000;
 /// [`TooManyCommits`](PathsUnknown::TooManyCommits) and no request is made.
 pub const PUSH_COMPARE_COMMITS_MAX: u64 = 1000;
 
+/// The largest answer body an adapter reads from a forge (git-bug bfa8dfd):
+/// every JSON answer, every file read, every error body. A longer body is
+/// never kept whole and never parsed; the read is
+/// [`body_too_large`]. The largest answer a forge sends Scarab is a compare
+/// answer, so the cap is the one that answer always had.
+pub const FORGE_BODY_MAX_BYTES: usize = 16 * 1024 * 1024;
+
 /// The largest compare answer an adapter reads (ADR-0081 §3). A longer body
 /// is [`TooLarge`](PathsUnknown::TooLarge) and is never parsed.
-pub const COMPARE_BODY_MAX_BYTES: usize = 16 * 1024 * 1024;
+pub const COMPARE_BODY_MAX_BYTES: usize = FORGE_BODY_MAX_BYTES;
+
+/// A forge answer body gathered chunk by chunk under a byte cap. The adapters
+/// read every body through one, so none of them holds more than the cap of a
+/// forge's answer in memory (git-bug bfa8dfd).
+#[derive(Debug)]
+pub struct CappedBody {
+    bytes: Vec<u8>,
+    cap: usize,
+}
+
+impl CappedBody {
+    pub fn new(cap: usize) -> Self {
+        CappedBody {
+            bytes: Vec::new(),
+            cap,
+        }
+    }
+
+    /// Add the next chunk. `false` when the body would pass the cap: the
+    /// reader stops there and drops the body, and the chunk is not kept. A
+    /// body of exactly the cap is accepted.
+    #[must_use]
+    pub fn push(&mut self, chunk: &[u8]) -> bool {
+        if self.bytes.len() + chunk.len() > self.cap {
+            return false;
+        }
+        self.bytes.extend_from_slice(chunk);
+        true
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+/// The error for a forge answer over `cap` bytes, with the answer's `status`.
+/// It names the cap and carries none of the body.
+pub fn body_too_large(status: impl std::fmt::Display, cap: usize) -> ForgeError {
+    ForgeError::Api(format!(
+        "{status}: the forge's answer was over {cap} bytes and was not read"
+    ))
+}
 
 /// The repository paths a trigger changed, as a `when:` reads them through
 /// `event.changed_paths` (git-bug 418f55e), or the reason they are unknown.

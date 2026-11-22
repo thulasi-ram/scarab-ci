@@ -515,11 +515,7 @@ impl ForgejoForge {
             .get("etag")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| ForgeError::Api(e.to_string()))?
-            .to_vec();
+        let body = read_body(resp).await?;
         match (status.is_success(), new_etag) {
             (true, Some(tag)) => self.etags.store(url, &tag, &body),
             _ => self.etags.forget(url),
@@ -678,37 +674,57 @@ pub fn compare_changed_paths(before: &str, after: &str, body: &[u8]) -> ChangedP
     unknown(PathsUnknown::ForgeError)
 }
 
-/// The body of `resp`, read as a stream and stopped once it passes `cap`
+/// The body of `resp`, read as a stream through a
+/// [`CappedBody`](scarab_forge::CappedBody) and stopped once it passes `cap`
 /// bytes: `Ok(None)` then, and the part read is dropped, never parsed.
 async fn read_capped(
     mut resp: reqwest::Response,
     cap: usize,
 ) -> Result<Option<Vec<u8>>, ForgeError> {
-    let mut body = Vec::new();
+    let mut body = scarab_forge::CappedBody::new(cap);
     while let Some(chunk) = resp
         .chunk()
         .await
         .map_err(|e| ForgeError::Api(e.to_string()))?
     {
-        if body.len() + chunk.len() > cap {
+        if !body.push(&chunk) {
             return Ok(None);
         }
-        body.extend_from_slice(&chunk);
     }
-    Ok(Some(body))
+    Ok(Some(body.into_bytes()))
 }
 
-/// Fail non-2xx with the body in the error; parse JSON otherwise.
+/// The whole body of `resp` up to
+/// [`FORGE_BODY_MAX_BYTES`](scarab_forge::FORGE_BODY_MAX_BYTES); a longer one
+/// is [`body_too_large`](scarab_forge::body_too_large) (git-bug bfa8dfd).
+async fn read_body(resp: reqwest::Response) -> Result<Vec<u8>, ForgeError> {
+    let status = resp.status();
+    read_capped(resp, scarab_forge::FORGE_BODY_MAX_BYTES)
+        .await?
+        .ok_or_else(|| scarab_forge::body_too_large(status, scarab_forge::FORGE_BODY_MAX_BYTES))
+}
+
+/// The body of a failed answer as text for an error message, read under the
+/// same cap; empty when it cannot be read or is over the cap.
+async fn error_text(resp: reqwest::Response) -> String {
+    match read_capped(resp, scarab_forge::FORGE_BODY_MAX_BYTES).await {
+        Ok(Some(body)) => String::from_utf8_lossy(&body).into_owned(),
+        _ => String::new(),
+    }
+}
+
+/// Fail non-2xx with the body in the error; parse JSON otherwise. The body
+/// is read under the cap ([`read_body`]).
 async fn ok_json(resp: reqwest::Response) -> Result<Value, ForgeError> {
     let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| ForgeError::Api(e.to_string()))?;
+    let body = read_body(resp).await?;
     if !status.is_success() {
-        return Err(ForgeError::Api(format!("{status}: {text}")));
+        return Err(ForgeError::Api(format!(
+            "{status}: {}",
+            String::from_utf8_lossy(&body)
+        )));
     }
-    serde_json::from_str(&text).map_err(|e| ForgeError::Api(format!("bad JSON: {e}")))
+    serde_json::from_slice(&body).map_err(|e| ForgeError::Api(format!("bad JSON: {e}")))
 }
 
 /// A Forgejo user object → `(numeric id, login)`. Older instances spell the
@@ -928,7 +944,7 @@ impl ForgePort for ForgejoForge {
             let status = resp.status();
             // Gone already (a concurrent delete) is what was wanted.
             if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
-                let text = resp.text().await.unwrap_or_default();
+                let text = error_text(resp).await;
                 return Err(ForgeError::Api(format!("{status}: {text}")));
             }
         }
