@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Pre-commit: `cargo check --tests` on each crate the commit touches, so a
+# commit that does not compile is refused at the commit, not at the gate.
+# Installed by `just check hooks` (sets core.hooksPath to .githooks).
+# Skip once with `git commit --no-verify` or SCARAB_SKIP_PRECOMMIT=1.
+set -euo pipefail
+[[ "${SCARAB_SKIP_PRECOMMIT:-}" == 1 ]] && exit 0
+
+# Crates with a staged .rs, Cargo.toml or build input; a staged root
+# Cargo.toml / Cargo.lock / rust-toolchain.toml checks the workspace.
+staged="$(git diff --cached --name-only --diff-filter=ACMRD)"
+[[ -z "$staged" ]] && exit 0
+if grep -qxE 'Cargo\.toml|Cargo\.lock|rust-toolchain\.toml' <<<"$staged"; then
+  echo "pre-commit: cargo check --workspace --tests" >&2
+  exec cargo check --quiet --workspace --tests
+fi
+pkgs=()
+while IFS= read -r dir; do
+  manifest="crates/$dir/Cargo.toml"
+  [[ -f "$manifest" ]] || continue
+  name="$(sed -n 's/^name *= *"\(.*\)"/\1/p' "$manifest" | head -1)"
+  [[ -n "$name" ]] && pkgs+=(-p "$name")
+done < <(grep -E '^crates/[^/]+/(.*\.rs|Cargo\.toml|build\.rs|.*\.sql)$' <<<"$staged" | cut -d/ -f2 | sort -u)
+[[ ${#pkgs[@]} -eq 0 ]] && exit 0
+echo "pre-commit: cargo check --tests ${pkgs[*]}" >&2
+exec cargo check --quiet --tests "${pkgs[@]}"

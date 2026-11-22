@@ -23,7 +23,7 @@ Justfile header).
 | Task | Recipe | What it is |
 |------|--------|-----------|
 | Compile / test the workspace | `just check`, `just test`, `just test rust <filter>` | `cargo check`; the workspace suite (nextest against the compose Postgres + MinIO in `deploy/test-services/`, so PG and S3 tests run for real) then the UI no-DOM vitest suite; one test or a group by nextest filter |
-| CI gates | `just check all`, `just pr <n>` | `cargo check` + the `openapi-drift` and chart-immutable gates; whether PR `<n>`'s required checks are green (`.github/required-checks.txt`) |
+| CI gates | `just check all`, `just pr <n>`, `just check hooks` | `cargo check` + the `openapi-drift` and chart-immutable gates; whether PR `<n>`'s required checks are green (`.github/required-checks.txt`); install the pre-commit hook that runs `cargo check --tests` on the crates a commit touches |
 | UI | `just ui [mock]`, `just test ui` | Vite against the kind stack (host address from `deploy/kind/.env`) or against a built-in fixture; vitest + the Playwright specs |
 | **Full local stack** (kind) | `just stack up` → `just stack demo [chain]` → `just stack down [keep]` | one kind cluster `scarab-dev`: Postgres + MinIO + Forgejo + the real chart in it; server and Depot run a host-built binary (cargo-zigbuild on macOS) mounted into a thin runtime image; `just stack reload` rolls a rebuild, `just stack logs` follows the server. See `deploy/kind/README.md` |
 | **Data Depot** (ADR-0061, ADR-0063) | `just stack logs depot`, `just stack status` | StatefulSet `scarab-workspace` in the release, with its own log and its own `/readyz` |

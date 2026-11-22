@@ -8,6 +8,15 @@ set working-directory := '..'
 default:
     cargo check --workspace
 
+# Install the repository's git hooks (.githooks): pre-commit runs
+# `cargo check --tests` on each crate a commit touches. Applies to every
+# worktree of this clone. Skip one commit with --no-verify or
+# SCARAB_SKIP_PRECOMMIT=1; undo with `git config --unset core.hooksPath`.
+[doc('Install the git hooks: pre-commit cargo-checks the crates a commit touches')]
+hooks:
+    git config core.hooksPath .githooks
+    @echo "core.hooksPath = .githooks (pre-commit: cargo check --tests on touched crates)"
+
 # What CI checks besides the test suites: `cargo check`, then the contract gate
 # (the CI `openapi-drift` job: rustfmt, then spec and client drift), the chart guard (a step of the CI `chart`
 # job) and the chart render check, in that order; the first failure stops it.
