@@ -48,9 +48,28 @@ pub fn sign_hex(secret: &[u8], body: &[u8]) -> String {
 /// [`TooMany`](scarab_forge::PathsUnknown::TooMany).
 pub const GITHUB_COMPARE_FILES_MAX: usize = 300;
 
+/// The fields of a GitHub compare answer [`compare_changed_paths`] reads;
+/// the rest (the commit list included) is skipped while parsing, never
+/// kept. A field that is absent or `null` is `None`; one of another type
+/// fails the parse.
+#[derive(serde::Deserialize)]
+struct CompareAnswer {
+    status: Option<String>,
+    ahead_by: Option<u64>,
+    files: Option<Vec<CompareFile>>,
+}
+
+#[derive(serde::Deserialize)]
+struct CompareFile {
+    filename: Option<String>,
+    previous_filename: Option<String>,
+}
+
 /// The changed paths in a GitHub compare answer,
 /// `GET /repos/{o}/{r}/compare/{before}...{after}` (ADR-0081 §2). Pure, so
-/// every rule is tested on fixtures without a network.
+/// every rule is tested on fixtures without a network. It parses the whole
+/// body: call it off the async runtime (the adapter runs it in
+/// `spawn_blocking`).
 ///
 /// A known list comes only from `status: ahead` with `ahead_by` above 0 and a
 /// non-empty `files` array of fewer than [`GITHUB_COMPARE_FILES_MAX`]
@@ -66,27 +85,26 @@ pub const GITHUB_COMPARE_FILES_MAX: usize = 300;
 ///   the one answer that skips a Pipeline.
 /// - [`GITHUB_COMPARE_FILES_MAX`] entries:
 ///   [`TooMany`](PathsUnknown::TooMany) with that limit.
-/// - Anything else (another `status`, no `ahead_by`, a body that is not the
-///   expected JSON): [`ForgeError`](PathsUnknown::ForgeError).
+/// - Anything else (another `status`, no `ahead_by`, a file with no
+///   `filename`, a body that is not the expected JSON, a field of another
+///   type): [`ForgeError`](PathsUnknown::ForgeError).
 pub fn compare_changed_paths(body: &[u8]) -> ChangedPaths {
     let unknown = ChangedPaths::Unknown;
-    let Ok(answer) = serde_json::from_slice::<Value>(body) else {
+    let Ok(answer) = serde_json::from_slice::<CompareAnswer>(body) else {
         return unknown(PathsUnknown::ForgeError);
     };
-    match answer.get("status").and_then(Value::as_str) {
+    match answer.status.as_deref() {
         Some("identical") => return ChangedPaths::Known(Vec::new()),
         Some("behind" | "diverged") => return unknown(PathsUnknown::Forced),
         Some("ahead") => {}
         _ => return unknown(PathsUnknown::ForgeError),
     }
-    match answer.get("ahead_by").and_then(Value::as_u64) {
+    match answer.ahead_by {
         Some(n) if n > 0 => {}
         _ => return unknown(PathsUnknown::ForgeError),
     }
-    let files = match answer.get("files") {
-        None | Some(Value::Null) => return unknown(PathsUnknown::Incomplete),
-        Some(Value::Array(files)) => files,
-        Some(_) => return unknown(PathsUnknown::ForgeError),
+    let Some(files) = answer.files else {
+        return unknown(PathsUnknown::Incomplete);
     };
     if files.is_empty() {
         return unknown(PathsUnknown::Incomplete);
@@ -98,10 +116,11 @@ pub fn compare_changed_paths(body: &[u8]) -> ChangedPaths {
     }
     let mut paths = Vec::with_capacity(files.len());
     for file in files {
-        if file.get("filename").and_then(Value::as_str).is_none() {
+        let Some(filename) = file.filename else {
             return unknown(PathsUnknown::ForgeError);
-        }
-        paths.extend(pr_file_paths(file));
+        };
+        paths.push(filename);
+        paths.extend(file.previous_filename);
     }
     ChangedPaths::from_paths(paths)
 }
@@ -1354,7 +1373,11 @@ impl ForgePort for GithubForge {
             _ => return unknown(PathsUnknown::ForgeError),
         }
         match read_capped(resp, scarab_forge::COMPARE_BODY_MAX_BYTES).await {
-            Ok(Some(body)) => compare_changed_paths(&body),
+            // Parsing up to 16 MiB is CPU work the caller's timeout cannot
+            // cut: off the async workers.
+            Ok(Some(body)) => tokio::task::spawn_blocking(move || compare_changed_paths(&body))
+                .await
+                .unwrap_or(unknown(PathsUnknown::ForgeError)),
             Ok(None) => unknown(PathsUnknown::TooLarge),
             Err(_) => unknown(PathsUnknown::ForgeError),
         }

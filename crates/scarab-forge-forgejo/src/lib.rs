@@ -540,19 +540,47 @@ impl ForgejoForge {
     }
 }
 
+/// The fields of a Forgejo compare answer [`compare_changed_paths`] reads;
+/// the rest of the answer is skipped while parsing, never kept. A field
+/// that is absent or `null` is `None`; one of another type fails the parse.
+#[derive(serde::Deserialize)]
+struct CompareAnswer {
+    commits: Option<Vec<CompareCommit>>,
+    total_commits: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct CompareCommit {
+    sha: Option<String>,
+    files: Option<Vec<CompareFile>>,
+    parents: Option<Vec<CompareParent>>,
+}
+
+#[derive(serde::Deserialize)]
+struct CompareParent {
+    sha: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct CompareFile {
+    filename: Option<String>,
+}
+
 /// The changed paths in a Forgejo compare answer,
 /// `GET /repos/{o}/{r}/compare/{before}...{after}` (ADR-0081 §2), for a push
 /// from `before` to `after`. Pure, so every rule is tested on fixtures
-/// without a network.
+/// without a network. It parses the whole body: call it off the async
+/// runtime (the adapter runs it in `spawn_blocking`).
 ///
 /// Forgejo has no tree diff of two commits. Its answer lists every commit in
 /// merge-base..`after`, each with its own `files` (its diff against its first
 /// parent, from `git log --name-status -m --first-parent --no-renames`) and
 /// `parents`, and `total_commits`. In order:
 ///
-/// 1. **Complete?** `total_commits` missing or not the number of listed
-///    commits, `after` not listed, or a listed commit with no `files` or no
-///    `parents` key: [`Incomplete`](PathsUnknown::Incomplete).
+/// 1. **Complete?** `commits` or `total_commits` absent or `null`,
+///    `total_commits` not the number of listed commits, `after` not listed,
+///    or a listed commit whose `files` or `parents` is absent or `null`:
+///    [`Incomplete`](PathsUnknown::Incomplete).
 /// 2. **Fast-forward?** Only when some listed commit has `before` among its
 ///    parents, in any position: then `before` is an ancestor of `after` and
 ///    the list holds every commit between them. Otherwise
@@ -564,52 +592,53 @@ impl ForgejoForge {
 ///    that changed and changed back). Leaving the listed commits first:
 ///    [`MergedHead`](PathsUnknown::MergedHead), because a merge whose
 ///    first-parent line misses `before` can drop a change of `before`'s that
-///    no listed commit shows.
+///    no listed commit shows. A merge on that line (two parents or more)
+///    that lists no files is [`Incomplete`](PathsUnknown::Incomplete): a
+///    forge that does not list a merge's diff against its first parent
+///    answers that way for every clean merge, and a known empty list is the
+///    one answer that skips a Pipeline.
 ///
-/// An answer that is not the expected JSON is
+/// An answer that is not the expected JSON (a field of another type, a
+/// commit with no `sha`, a `sha` listed twice) is
 /// [`ForgeError`](PathsUnknown::ForgeError); 3,000 paths or more is
 /// [`TooMany`](PathsUnknown::TooMany).
 pub fn compare_changed_paths(before: &str, after: &str, body: &[u8]) -> ChangedPaths {
     use std::collections::HashMap;
     let unknown = ChangedPaths::Unknown;
-    let Ok(answer) = serde_json::from_slice::<Value>(body) else {
+    let Ok(answer) = serde_json::from_slice::<CompareAnswer>(body) else {
         return unknown(PathsUnknown::ForgeError);
     };
-    let Some(commits) = answer.get("commits").and_then(Value::as_array) else {
+    let Some(commits) = &answer.commits else {
         return unknown(PathsUnknown::Incomplete);
     };
-    let total = answer.get("total_commits").and_then(Value::as_u64);
-    if total != Some(commits.len() as u64) {
+    if answer.total_commits != Some(commits.len() as u64) {
         return unknown(PathsUnknown::Incomplete);
     }
     // sha -> (parent shas, files)
-    let mut listed: HashMap<&str, (Vec<&str>, &Vec<Value>)> = HashMap::new();
+    let mut listed: HashMap<&str, (Vec<&str>, &Vec<CompareFile>)> = HashMap::new();
     for commit in commits {
-        let Some(sha) = commit.get("sha").and_then(Value::as_str) else {
+        let Some(sha) = commit.sha.as_deref() else {
             return unknown(PathsUnknown::ForgeError);
         };
-        let files = match commit.get("files") {
-            None | Some(Value::Null) => return unknown(PathsUnknown::Incomplete),
-            Some(Value::Array(files)) => files,
-            Some(_) => return unknown(PathsUnknown::ForgeError),
+        let Some(files) = &commit.files else {
+            return unknown(PathsUnknown::Incomplete);
         };
         // A root commit lists `parents: []`; no key at all is an answer
         // that does not say, read as incomplete rather than as a root.
-        let parents = match commit.get("parents") {
-            None | Some(Value::Null) => return unknown(PathsUnknown::Incomplete),
-            Some(Value::Array(parents)) => {
-                let shas: Option<Vec<&str>> = parents
-                    .iter()
-                    .map(|p| p.get("sha").and_then(Value::as_str))
-                    .collect();
-                let Some(shas) = shas else {
-                    return unknown(PathsUnknown::ForgeError);
-                };
-                shas
-            }
-            Some(_) => return unknown(PathsUnknown::ForgeError),
+        let Some(parents) = &commit.parents else {
+            return unknown(PathsUnknown::Incomplete);
         };
-        listed.insert(sha, (parents, files));
+        let Some(parents) = parents
+            .iter()
+            .map(|p| p.sha.as_deref())
+            .collect::<Option<Vec<&str>>>()
+        else {
+            return unknown(PathsUnknown::ForgeError);
+        };
+        // A commit listed twice: which entry is the commit is not known.
+        if listed.insert(sha, (parents, files)).is_some() {
+            return unknown(PathsUnknown::ForgeError);
+        }
     }
     if !listed.contains_key(after) {
         return unknown(PathsUnknown::Incomplete);
@@ -629,11 +658,14 @@ pub fn compare_changed_paths(before: &str, after: &str, body: &[u8]) -> ChangedP
         let Some((parents, files)) = listed.get(at) else {
             return unknown(PathsUnknown::MergedHead);
         };
+        if parents.len() >= 2 && files.is_empty() {
+            return unknown(PathsUnknown::Incomplete);
+        }
         for file in files.iter() {
-            let Some(name) = file.get("filename").and_then(Value::as_str) else {
+            let Some(name) = &file.filename else {
                 return unknown(PathsUnknown::ForgeError);
             };
-            paths.push(name.to_string());
+            paths.push(name.clone());
         }
         match parents.first() {
             Some(&parent) if parent == before => return ChangedPaths::from_paths(paths),
@@ -960,7 +992,14 @@ impl ForgePort for ForgejoForge {
             _ => return unknown(PathsUnknown::ForgeError),
         }
         match read_capped(resp, scarab_forge::COMPARE_BODY_MAX_BYTES).await {
-            Ok(Some(body)) => compare_changed_paths(before, after, &body),
+            // Parsing up to 16 MiB is CPU work the caller's timeout cannot
+            // cut: off the async workers.
+            Ok(Some(body)) => {
+                let (before, after) = (before.to_string(), after.to_string());
+                tokio::task::spawn_blocking(move || compare_changed_paths(&before, &after, &body))
+                    .await
+                    .unwrap_or(unknown(PathsUnknown::ForgeError))
+            }
             Ok(None) => unknown(PathsUnknown::TooLarge),
             Err(_) => unknown(PathsUnknown::ForgeError),
         }

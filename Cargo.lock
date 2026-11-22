@@ -2846,6 +2846,7 @@ dependencies = [
  "hmac",
  "reqwest",
  "scarab-forge",
+ "serde",
  "serde_json",
  "sha2",
  "tokio",

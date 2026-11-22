@@ -175,6 +175,64 @@ fn a_commit_count_that_differs_or_is_missing_is_incomplete() {
     }
 }
 
+const OLD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const NEW: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const SIDE: &str = "1111111111111111111111111111111111111111";
+
+/// A listed commit with its parents and its files.
+fn listed(sha: &str, parents: &[&str], files: &[&str]) -> Value {
+    serde_json::json!({
+        "sha": sha,
+        "parents": parents.iter().map(|p| serde_json::json!({ "sha": p })).collect::<Vec<_>>(),
+        "files": files
+            .iter()
+            .map(|f| serde_json::json!({ "filename": f, "status": "modified" }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn answer(commits: Vec<Value>) -> Value {
+    serde_json::json!({ "total_commits": commits.len(), "commits": commits })
+}
+
+/// RT-7: `after` listed twice, first with a file, then with none. A map
+/// keyed by sha kept the second entry and answered a known empty list,
+/// the one answer that skips a Pipeline.
+#[test]
+fn a_commit_listed_twice_is_a_forge_error() {
+    let twice = answer(vec![
+        listed(NEW, &[OLD], &["infra/main.tf"]),
+        listed(NEW, &[OLD], &[]),
+    ]);
+    assert_eq!(
+        parse(&twice, OLD, NEW),
+        ChangedPaths::Unknown(PathsUnknown::ForgeError)
+    );
+}
+
+/// RT-8: a clean merge of `before` (first parent) and a feature commit,
+/// as a forge that does not list a merge's diff against its first parent
+/// answers it: the merge lists no files. A known empty list would skip
+/// the Pipeline although `infra/main.tf` changed.
+#[test]
+fn a_merge_on_the_first_parent_line_with_no_files_is_incomplete() {
+    let merge = answer(vec![
+        listed(NEW, &[OLD, SIDE], &[]),
+        listed(
+            SIDE,
+            &["4444444444444444444444444444444444444444"],
+            &["infra/main.tf"],
+        ),
+    ]);
+    assert_eq!(
+        parse(&merge, OLD, NEW),
+        ChangedPaths::Unknown(PathsUnknown::Incomplete)
+    );
+    // A commit with one parent and no files changed nothing: known.
+    let empty = answer(vec![listed(NEW, &[OLD], &[])]);
+    assert_eq!(parse(&empty, OLD, NEW), ChangedPaths::Known(vec![]));
+}
+
 #[test]
 fn a_push_starts_not_fetched_and_carries_before() {
     let event = push(include_str!("fixtures/push.json"));
