@@ -3758,9 +3758,10 @@ async fn an_overlay_kubernetes_refuses_fails_the_step() {
 ///   admission runs, nothing is stored);
 /// - a Pod that mounts the server's Secret (the chart names it, like the
 ///   ServiceAccount, after the release) or another Pod's `-v-` Secret,
-///   reads it through envFrom or secretKeyRef, runs as the server's
-///   ServiceAccount, or asks for hostPath or hostNetwork is refused, naming
-///   the policy;
+///   reads it through envFrom or secretKeyRef, runs as a ServiceAccount
+///   other than the step one (the server's, when the step namespace is the
+///   release namespace; else one the test makes in the step namespace), or
+///   asks for hostPath or hostNetwork is refused, naming the policy;
 /// - the same refused Pod created by the test's own (admin) user is
 ///   admitted: the policy holds only the server's creates;
 /// - the executor's launch of a step the policy refuses (a placement
@@ -3776,10 +3777,11 @@ async fn the_step_pod_admission_policy_holds_server_created_pods_to_their_own_se
     let ns = tier_var("SCARAB_TEST_STEP_NAMESPACE");
     let server = tier_var("SCARAB_TEST_SERVER_USER");
     // system:serviceaccount:<release namespace>:<name>
-    let server_sa = server
-        .rsplit(':')
+    let mut user = server.rsplitn(3, ':');
+    let server_sa = user.next().expect("a ServiceAccount user").to_string();
+    let release_ns = user
         .next()
-        .expect("a ServiceAccount user")
+        .expect("a ServiceAccount user names its namespace")
         .to_string();
     let server_secret = server_sa.clone();
 
@@ -3849,6 +3851,30 @@ async fn the_step_pod_admission_policy_holds_server_created_pods_to_their_own_se
     // Another Pod's `-v-` Secret is not one of them.
     let other_v_secret = format!("{}-other-v-secrets", unique_run("scarab-vap"));
 
+    // A Pod names a ServiceAccount of its own namespace, and Kubernetes'
+    // ServiceAccount admission refuses one that does not exist there before
+    // the policy runs. When the step namespace is the release namespace the
+    // server's own ServiceAccount is the one to refuse. In a separate step
+    // namespace (the chart's default, `<release namespace>-steps`) the
+    // server's is not there to name, so the case names one the test makes in
+    // the step namespace, which the policy does not allow either.
+    let sa_api: Api<k8s_openapi::api::core::v1::ServiceAccount> =
+        Api::namespaced(kube_client().await, &ns);
+    let (refused_sa, made_sa) = if release_ns == ns {
+        (server_sa.clone(), None)
+    } else {
+        let made = unique_run("scarab-vap-sa");
+        sa_api
+            .create(
+                &PostParams::default(),
+                &serde_json::from_value(serde_json::json!({"metadata": {"name": made}}))
+                    .expect("a ServiceAccount"),
+            )
+            .await
+            .expect("create a ServiceAccount in the step namespace");
+        (made.clone(), Some(made))
+    };
+
     let refused = [
         (
             "a Secret volume",
@@ -3873,8 +3899,8 @@ async fn the_step_pod_admission_policy_holds_server_created_pods_to_their_own_se
                 "env": [{"name": "X", "valueFrom": {"secretKeyRef": {"name": server_secret, "key": "SCARAB_MASTER_KEY"}}}]}]}),
         ),
         (
-            "the server's ServiceAccount",
-            serde_json::json!({"serviceAccountName": server_sa}),
+            "a ServiceAccount other than the step one",
+            serde_json::json!({"serviceAccountName": refused_sa}),
         ),
         (
             "a hostPath volume",
@@ -3901,6 +3927,9 @@ async fn the_step_pod_admission_policy_holds_server_created_pods_to_their_own_se
             .create(&dry_run, &p)
             .await
             .unwrap_or_else(|e| panic!("{what}: the admin's create was refused: {e}"));
+    }
+    if let Some(made) = made_sa {
+        let _ = sa_api.delete(&made, &DeleteParams::default()).await;
     }
 
     // The executor, as the server: a step Pod it builds, mounting its
