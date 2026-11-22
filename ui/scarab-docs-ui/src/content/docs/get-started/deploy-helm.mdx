@@ -821,8 +821,8 @@ kubectl exec -n scarab deploy/scarab -c scarab-server -- \
 The server runs two migrations before it listens. 0099 adds the log stream and value ledger
 tables; its checks on `log_chunks` are `NOT VALID`, so it scans no stored chunk. 0100 builds the
 index `attempts_started_at_idx` with `CREATE INDEX CONCURRENTLY`, outside a transaction, so writes
-to `attempts` go on while it builds. A build that fails leaves an invalid index behind: drop it
-with `DROP INDEX CONCURRENTLY attempts_started_at_idx;` and start the server again.
+to `attempts` go on while it builds. A build that fails or is stopped leaves an invalid index
+behind, and the next server to start drops it and builds it again before it listens.
 
 After the upgrade:
 

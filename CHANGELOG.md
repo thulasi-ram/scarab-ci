@@ -46,9 +46,9 @@ release.yml uses that version's section as the GitHub Release text. See
   [Rolling back to Scarab 0.6](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#rolling-back-to-scarab-06).
 - **Migration 0100 builds an index with `CREATE INDEX CONCURRENTLY`.** It adds
   `attempts_started_at_idx` outside a transaction, so writes to `attempts` go on while it builds. A
-  build that fails leaves an invalid index behind: drop it
-  (`DROP INDEX CONCURRENTLY attempts_started_at_idx`) and start the server again. Migration 0099's
-  checks on `log_chunks` are `NOT VALID`, so it scans no stored chunk.
+  build that fails or is stopped leaves an invalid index behind, and the next server to start drops
+  it and builds it again (see Bug Fixes). Migration 0099's checks on `log_chunks` are `NOT VALID`,
+  so it scans no stored chunk.
 - **Upgrade the chart with the server image: step Pods mount their credentials from Secrets with
   new names.** A step Pod made by 0.7 carries the label `scarab.io/value-ledger: "1"` and mounts
   `<pod>-v-secrets`, `<pod>-v-registry`, `<pod>-v-token` and `<pod>-v-oidc`. The 0.7 chart's
@@ -189,6 +189,24 @@ release.yml uses that version's section as the GitHub Release text. See
   on another worker thread left its closed span on the first thread, and a later request there
   could panic. It now enters the span for each poll of the request. Seen as a failed status poll
   in the Argo CD plugin's end-to-end test.
+- **A forge token recorded after the end of a try was seen is revoked.** A launch on a replica
+  that no longer drives the Run can record a new token in the step's value ledger after another
+  replica saw the try end and revoked the tokens then in it. The ledger is no longer taken as
+  revoked: the next end of the try or the ledger sweep revokes the new token, once.
+- **A value ledger is deleted only at the generation its deletion was decided on.** A generation
+  that a late launch writes between the decision and the delete is kept, and the ledger sweep
+  revokes its token and deletes the ledger on its next pass.
+- **A forge token minted for a launch that is refused before its value ledger is written is
+  revoked at once**, for example for a step whose secret is not in its scope. The token was in no
+  ledger, so nothing revoked it and it lived until it expired.
+- **A server that shuts down cleanly releases the `ledger-sweep` lease.** Before, the next
+  replica waited up to the lease's 6 minutes before it swept.
+- **The server builds `attempts_started_at_idx` again when an earlier build left it invalid.**
+  Migration 0100 builds the index with `CREATE INDEX CONCURRENTLY`. A build that failed or was
+  stopped left an invalid index, which the migration's `IF NOT EXISTS` passed over, so the query
+  for logs still to be read scanned `attempts`. At start, after the migrations, the server now
+  drops an invalid index of that name and builds it again, under a lock, so two replicas that
+  start at once do not build it together.
 
 ### Tests
 

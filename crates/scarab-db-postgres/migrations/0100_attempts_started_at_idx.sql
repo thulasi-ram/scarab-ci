@@ -5,7 +5,8 @@
 -- `started_at`. Without an index that was a scan of the whole `attempts`
 -- table. Built CONCURRENTLY, so writes to `attempts` go on while it builds;
 -- that cannot run in a transaction, hence the directive on the first line
--- and one statement in this file. A build that fails leaves an invalid
--- index behind: drop it (`DROP INDEX CONCURRENTLY attempts_started_at_idx`)
--- and start the server again.
+-- and one statement in this file. A build that fails or is stopped leaves an
+-- invalid index behind, which `IF NOT EXISTS` passes over when this file
+-- runs again; the server drops it and builds it again at start, after the
+-- migrations (`CONCURRENT_INDEXES` in src/lib.rs).
 CREATE INDEX CONCURRENTLY IF NOT EXISTS attempts_started_at_idx ON attempts (started_at);
