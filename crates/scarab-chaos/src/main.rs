@@ -23,6 +23,7 @@
 //!
 //! Connections come from the environment `deploy/kind/chaos.sh` sets:
 //! SCARAB_CHAOS_API, SCARAB_CHAOS_KUBECONFIG, SCARAB_CHAOS_NAMESPACE,
+//! SCARAB_CHAOS_STEP_NAMESPACE (where step Pods run; required),
 //! SCARAB_CHAOS_DATABASE_URL, SCARAB_CHAOS_S3_ENDPOINT, SCARAB_CHAOS_S3_BUCKET,
 //! SCARAB_CHAOS_S3_ACCESS_KEY, SCARAB_CHAOS_S3_SECRET_KEY, and for the
 //! server signals and the pause SCARAB_CHAOS_NODE (the kind node container),
@@ -134,6 +135,9 @@ async fn connect() -> Result<Conn, String> {
             api: env::Api::new(&var("SCARAB_CHAOS_API")?)?,
             kube,
             namespace: std::env::var("SCARAB_CHAOS_NAMESPACE").unwrap_or_else(|_| "scarab".into()),
+            // No default: a checker that lists step Pods and Secrets in a
+            // namespace they are not in finds nothing and passes I8.
+            step_namespace: var("SCARAB_CHAOS_STEP_NAMESPACE")?,
             release: std::env::var("SCARAB_CHAOS_RELEASE").unwrap_or_else(|_| "scarab".into()),
             pg,
         },
@@ -151,7 +155,7 @@ async fn check_dir(conn: &Conn, file: &Path) -> Result<check::Outcome, String> {
         pg: &conn.stack.pg,
         bucket: &conn.bucket,
         kube: conn.stack.kube.clone(),
-        namespace: &conn.stack.namespace,
+        step_namespace: &conn.stack.step_namespace,
     };
     let mut facts = check::gather(&src, &s, records).await?;
     facts.release_log = std::fs::read_to_string(dir.join(nemesis::RELEASE_LOG)).ok();

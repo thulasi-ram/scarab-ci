@@ -22,7 +22,11 @@ use crate::time::now_ms;
 pub struct Stack {
     pub api: Api,
     pub kube: kube::Client,
+    /// The release namespace: the servers, the Depot, Postgres, MinIO.
     pub namespace: String,
+    /// The namespace the executor launches step Pods into (the server's
+    /// `SCARAB_NAMESPACE`; the chart's default is `<release namespace>-steps`).
+    pub step_namespace: String,
     /// The release name: Depot Pods are `<release>-workspace-<n>`.
     pub release: String,
     pub pg: sqlx::PgPool,
@@ -40,20 +44,33 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let file = dir.join("scenario.json");
     let pods_api: KubeApi<Pod> = KubeApi::namespaced(stack.kube.clone(), &stack.namespace);
+    let step_pods: KubeApi<Pod> = KubeApi::namespaced(stack.kube.clone(), &stack.step_namespace);
 
     if scenario.kind == Kind::PauseNode {
         // Before anything can pause the node: Ctrl-C or SIGTERM unpauses it.
         crate::node::unpause_on_signal()?;
     }
 
+    // One watcher on the step namespace (step Pods), one on the release
+    // namespace (Depot Pods), into one `pods.jsonl` and one map of views.
     let views: Views = Default::default();
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let watcher = tokio::spawn(pods::watch(
-        pods_api.clone(),
-        dir.join("pods.jsonl"),
-        views.clone(),
-        stop_rx,
-    ));
+    let watchers = [
+        tokio::spawn(pods::watch(
+            step_pods.clone(),
+            dir.join("pods.jsonl"),
+            views.clone(),
+            stop_rx.clone(),
+            pods::step_pod,
+        )),
+        tokio::spawn(pods::watch(
+            pods_api.clone(),
+            dir.join("pods.jsonl"),
+            views.clone(),
+            stop_rx,
+            pods::depot_pod,
+        )),
+    ];
 
     // The stack must be at the scenario's topology before anything runs: a
     // replay of a 2+2 file on a 1-server release is not the same scenario.
@@ -205,10 +222,12 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
     }
     tokio::time::sleep(SETTLE).await;
     let _ = stop_tx.send(true);
-    watcher
-        .await
-        .map_err(|e| format!("watcher task: {e}"))?
-        .map_err(|e| format!("watcher: {e}"))?;
+    for watcher in watchers {
+        watcher
+            .await
+            .map_err(|e| format!("watcher task: {e}"))?
+            .map_err(|e| format!("watcher: {e}"))?;
+    }
 
     // The release's own log lines about the scenario's step Pods and the
     // fault's target: what the drains, feeds and the fault did, for whoever
@@ -248,7 +267,7 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
                 container: Some(pods::INIT_CONTAINER.into()),
                 ..Default::default()
             };
-            let text = match pods_api.logs(&t.pod, &lp).await {
+            let text = match step_pods.logs(&t.pod, &lp).await {
                 Ok(t) => t,
                 Err(e) => format!("could not read the fetcher's log: {e}\n"),
             };
@@ -258,7 +277,7 @@ pub async fn run(stack: &Stack, mut scenario: Scenario, dir: &Path) -> Result<Sc
 
     // The Cache probe: each cached Step's fetcher log, while the Pods exist.
     if let Some(probe) = scenario.cache.as_mut() {
-        crate::cache::observe(&stack.api, &pods_api, &stack.pg, probe).await;
+        crate::cache::observe(&stack.api, &step_pods, &stack.pg, probe).await;
         let text: String = probe
             .restores
             .iter()

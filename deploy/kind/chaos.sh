@@ -187,7 +187,10 @@ cleanup() {
   # the chaos mode and would block the switch back. The checker has already
   # recorded them (I8). A deleted Pod still counts in up.sh's guard while it
   # terminates, so wait (bounded) until none is left.
-  ( kc delete pods -n "$ns" -l scarab.io/run --field-selector=status.phase!=Succeeded,status.phase!=Failed \
+  # They run in the step namespace, read after the switch; read here when the
+  # recipe stopped before that (in a subshell: read_step_ns dies on failure).
+  [ -n "${step_ns:-}" ] || step_ns="$( (read_step_ns && printf '%s' "$step_ns") 2>/dev/null || true)"
+  ( kc delete pods -n "${step_ns:-$ns}" -l scarab.io/run --field-selector=status.phase!=Succeeded,status.phase!=Failed \
       --ignore-not-found --wait=false >/dev/null 2>&1 ) || true
   local left=""
   for _ in $(seq 1 60); do
@@ -226,6 +229,10 @@ forward_kept scarab-minio 9000; s3_port="$fwd_port"
 export SCARAB_CHAOS_API="$base"
 export SCARAB_CHAOS_KUBECONFIG="$kubeconfig"
 export SCARAB_CHAOS_NAMESPACE="$ns"
+# Step Pods, their per-Pod Secrets and Services: the namespace the server
+# launches them into, read from its ConfigMap.
+read_step_ns
+export SCARAB_CHAOS_STEP_NAMESPACE="$step_ns"
 export SCARAB_CHAOS_RELEASE="$release"
 export SCARAB_CHAOS_DATABASE_URL="postgres://scarab:scarab@127.0.0.1:$pg_port/scarab_chaos"
 export SCARAB_CHAOS_S3_ENDPOINT="http://127.0.0.1:$s3_port"

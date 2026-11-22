@@ -1287,7 +1287,9 @@ pub struct Sources<'a> {
     pub pg: &'a sqlx::PgPool,
     pub bucket: &'a object_store::aws::AmazonS3,
     pub kube: kube::Client,
-    pub namespace: &'a str,
+    /// Where step Pods, their per-Pod Secrets, Services and NetworkPolicies
+    /// live: the executor's namespace, not the release's.
+    pub step_namespace: &'a str,
 }
 
 fn db_err(e: sqlx::Error) -> String {
@@ -1467,7 +1469,7 @@ pub async fn gather(
     }
 
     // I8: what still exists for the scenario's Runs.
-    let pods_api: KubeApi<Pod> = KubeApi::namespaced(src.kube.clone(), src.namespace);
+    let pods_api: KubeApi<Pod> = KubeApi::namespaced(src.kube.clone(), src.step_namespace);
     let all_pods = pods_api
         .list(&ListParams::default())
         .await
@@ -1502,7 +1504,7 @@ pub async fn gather(
         }
     }
     let lp = ListParams::default().labels("scarab.io/run");
-    let svcs: KubeApi<Service> = KubeApi::namespaced(src.kube.clone(), src.namespace);
+    let svcs: KubeApi<Service> = KubeApi::namespaced(src.kube.clone(), src.step_namespace);
     for s in svcs
         .list(&lp)
         .await
@@ -1524,7 +1526,7 @@ pub async fn gather(
             });
         }
     }
-    let nps: KubeApi<NetworkPolicy> = KubeApi::namespaced(src.kube.clone(), src.namespace);
+    let nps: KubeApi<NetworkPolicy> = KubeApi::namespaced(src.kube.clone(), src.step_namespace);
     for n in nps
         .list(&lp)
         .await
@@ -1548,7 +1550,7 @@ pub async fn gather(
     }
     // Per-Pod workspace Secrets (`<pod>-workspace`, owned by the Pod): one
     // whose Pod is gone has outlived it.
-    let secrets: KubeApi<Secret> = KubeApi::namespaced(src.kube.clone(), src.namespace);
+    let secrets: KubeApi<Secret> = KubeApi::namespaced(src.kube.clone(), src.step_namespace);
     for s in secrets
         .list(&ListParams::default())
         .await

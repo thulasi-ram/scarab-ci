@@ -305,7 +305,14 @@ run on the host. `test-env.sh` gives them what the host cannot reach directly:
   capture listener, the results listener of the executor suite). A listener on
   the host is asked for from a busybox Pod; the first of
   `host.docker.internal`, the kind network's gateway and `host.lima.internal`
-  that answers wins. On macOS the gateway is the VM's, not the host's.
+  that answers wins. On macOS the gateway is the VM's, not the host's;
+- the namespace step Pods run in. The release keeps the chart's default,
+  `scarab-steps` (`<release namespace>-steps`), and `read_step_ns` reads it
+  from the server's ConfigMap (`SCARAB_NAMESPACE`) for the e2e and chaos
+  harnesses (`SCARAB_E2E_STEP_NAMESPACE`, `SCARAB_CHAOS_STEP_NAMESPACE`).
+  `happy_path` checks that its step Pod is there and not in `scarab`. kind's
+  network plugin does not enforce NetworkPolicy, so the step namespace's
+  policies are not tested here.
 
 `crash_resume` kills the server with SIGKILL from the kind node's PID
 namespace (`crictl inspect` gives the container's PID on the node), so the
@@ -353,7 +360,8 @@ What it does, in order:
 2. Submits three chained Runs at once. Each producer writes 64 files of 2 MiB
    of random bytes and their SHA-256 list into `/workspace`; each consumer
    inherits the workspace and checks every file against the list.
-3. Watches the namespace's Pods (a kube watch, one JSONL line per change)
+3. Watches the step Pods in the step namespace and the Depot Pods in the
+   release namespace (kube watches, one JSONL line per change)
    until the planned Run's Pod shows the trigger, waits the planned delay, and
    deletes the planned Depot replica with `gracePeriodSeconds: 0`:
    - mid-drain: the producer's `step` container exited 0, its egress helper
@@ -429,7 +437,7 @@ is built so that every Run succeeds: a Run that ends failed or dead-lettered
 (git-bug e140121, a Depot outage that dead-letters Runs) fails W1 with its
 Run id and status.
 
-Completed step Pods stay in the namespace on main, so I8 counts a Pod in
+Completed step Pods stay in the step namespace on main, so I8 counts a Pod in
 phase Succeeded or Failed as torn down. An uncommitted pack row of a fence
 with no drain record (an abandoned drain) is reported as a warning: the pack
 reclaimer removes it later (git-bug ad79c90). ADR-0077's I2, I5, I6, I7, I9

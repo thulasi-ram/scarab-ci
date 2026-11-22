@@ -333,6 +333,28 @@ fn i4_over_nothing_is_inconclusive() {
     );
 }
 
+/// The step namespace was wrong (git-bug 19c3d42: step Pods moved to
+/// `<release namespace>-steps` while the checker listed the release
+/// namespace): the watcher recorded no step Pod and I8 listed no Pod and no
+/// Secret. I8 has no minimum, so finding nothing is its pass; the verdict
+/// must still not be PASS, and today I1a's minimum is what stops it.
+#[test]
+fn i8_over_no_pods_and_no_secrets_is_inconclusive() {
+    let mut f = clean();
+    f.pod_records.clear();
+    f.live.clear();
+    f.live_pod_names.clear();
+    let v = evaluate(&f);
+    assert_eq!(v.outcome, Outcome::Inconclusive, "{:?}", v.findings);
+    assert!(
+        v.inconclusive
+            .iter()
+            .any(|w| w.starts_with("I1a looked at 0, below its minimum of 2")),
+        "{:?}",
+        v.inconclusive
+    );
+}
+
 // --- I1b / I1c over the journal ---------------------------------------------------
 
 /// Red team: a1 ran but the watcher never saw its step container; a2 started
