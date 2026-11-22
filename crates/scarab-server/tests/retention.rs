@@ -1888,3 +1888,83 @@ async fn a_durable_index_probe_error_does_not_suppress_the_detector() {
 
     tdb.cleanup().await;
 }
+
+/// R1 (ADR-0083 §8, red team A12): a delivery past the period goes with
+/// every outcome it recorded, whatever an outcome's own `at` (one written
+/// yesterday by a redelivery); a delivery inside the period stays with its
+/// outcome; `last_delivery_at` still answers. Kills: the two tables pruned
+/// by their own `at` (a same-id try finds half the outcomes and creates the
+/// rest again); a sweep pass that never prunes deliveries.
+#[tokio::test]
+async fn a_delivery_past_the_period_is_pruned_with_every_outcome() {
+    use scarab_forge::{ForgeConnectionStore, ForgeKind};
+    use scarab_server::retention::sweep_webhook_deliveries;
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pool = tdb.pool.clone();
+    let db = PostgresDb::with_pool(pool.clone());
+    db.migrate().await.unwrap();
+    let now = 40 * DAY_MS;
+    for (id, at) in [("d1", now - 31 * DAY_MS), ("d2", now - 29 * DAY_MS)] {
+        sqlx::query("INSERT INTO webhook_deliveries (forge, id, at) VALUES ('github', $1, $2)")
+            .bind(id)
+            .bind(at)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    for (delivery, pipeline, at) in [
+        ("d1", ".scarab/a.yaml", now - 31 * DAY_MS),
+        ("d1", ".scarab/b.yaml", now - DAY_MS),
+        ("d2", ".scarab/a.yaml", now - 29 * DAY_MS),
+    ] {
+        db.record_delivery_outcome(
+            &scarab_engine::DeliveryPipeline {
+                connection_id: "acme-conn".into(),
+                delivery_id: delivery.into(),
+                pipeline: pipeline.into(),
+                forge: "github".into(),
+            },
+            scarab_engine::DeliveryOutcomeKind::NoMatch,
+            Timestamp(at),
+        )
+        .await
+        .unwrap();
+    }
+
+    let db: Arc<dyn Db> = Arc::new(db);
+    let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(now));
+    let pruned = sweep_webhook_deliveries(&db, &clock, "sweeper-1", 30 * DAY_MS)
+        .await
+        .unwrap();
+    assert_eq!(pruned, 1);
+    assert!(db
+        .delivery_outcomes("acme-conn", "d1")
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        db.delivery_outcomes("acme-conn", "d2").await.unwrap().len(),
+        1
+    );
+    let kept: Vec<String> = sqlx::query_scalar("SELECT id FROM webhook_deliveries")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, ["d2"]);
+    let registry = PostgresDb::with_pool(pool.clone());
+    assert_eq!(
+        registry.last_delivery_at(ForgeKind::GitHub).await.unwrap(),
+        Some(now - 29 * DAY_MS)
+    );
+    // A replica that does not hold the sweeper's lease prunes nothing.
+    assert_eq!(
+        sweep_webhook_deliveries(&db, &clock, "sweeper-2", 0)
+            .await
+            .unwrap(),
+        0
+    );
+    tdb.cleanup().await;
+}
