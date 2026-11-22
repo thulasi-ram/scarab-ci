@@ -285,14 +285,14 @@ its per-node fields against brute force. No new crate; `Cargo.lock` does not cha
   (about 100 ms at the cap).
 - *A process budget and build slots.* Before it builds, a set reserves the most its automata can
   keep (`21n + 64` bytes for the trie and `31n + 64` for the suffix automaton, `n` value bytes)
-  from a budget of 512 MiB per process (`SCARAB_LOG_AUTOMATA_BUDGET_MIB`, chart value
+  from a budget of 128 MiB per process by default (`SCARAB_LOG_AUTOMATA_BUDGET_MIB`, chart value
   `scarab.logAutomataBudgetMib`, 16 to 65536), waiting while it is full; a read that loses its tail
   lease while it waits stops (checked every 200 ms and again when it gets room) and reads nothing; a stream reserves both in one wait, so two readers
   never each hold half of what they need. Then it takes one of 2 build slots
   (`CONCURRENT_BUILDS`), which bounds the build's temporary memory (about 36 MiB each at the cap)
   to 2 builds. A read waits for room and is never read without its automata. At the cap a unit
-  reserves 13 MiB, so 39 units at the cap are read at once and the 40th waits for one to end.
-  The process keeps at most 512 MiB of automata and 2 × 36 MiB while building.
+  reserves 13 MiB, so at the default budget 9 units at the cap are read at once and the 10th waits for one to end.
+  The process keeps at most the budget of automata and 2 × 36 MiB while building.
 - *Off the async workers.* A build of over 16 KiB of values runs on a `spawn_blocking` thread,
   under 16 KiB inline. A build that does not finish (a panic, the runtime shutting down) is an
   error: the read fails and is retried, and nothing is built on an async worker in its place.

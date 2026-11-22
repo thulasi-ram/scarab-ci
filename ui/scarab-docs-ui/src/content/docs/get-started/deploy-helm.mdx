@@ -569,11 +569,12 @@ ledger stores none of that step's log and leaves it to a replica that can.
 
 To redact a log, the server builds lookup tables from the step's values, up to 52 bytes per value
 byte (at most 13 MiB for a step at the 256 KiB cap), and frees them when the step's last log read
-ends. `scarab.logAutomataBudgetMib` (`SCARAB_LOG_AUTOMATA_BUDGET_MIB`, default 512, from 16 to
+ends. `scarab.logAutomataBudgetMib` (`SCARAB_LOG_AUTOMATA_BUDGET_MIB`, default 128, from 16 to
 65536) is the most MiB of these tables a replica keeps at once; a log read that does not fit waits
 until another ends, and a read that loses its tail lease while it waits stops. It builds them for
 2 steps at a time, about 36 MiB each at the cap. Count the budget and 72 MiB in the server Pod's
-memory limit.
+memory limit: the default 128 fits the chart's default limit of 512Mi, and a larger budget needs a
+larger `resources.limits.memory`.
 
 To rotate a key:
 

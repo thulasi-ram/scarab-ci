@@ -121,8 +121,9 @@ pub(crate) struct Built<T> {
     _budget: OwnedSemaphorePermit,
 }
 
-/// The default process budget for built automata: 512 MiB.
-pub const AUTOMATA_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+/// The default process budget for built automata: 128 MiB, a quarter of the
+/// chart's default server memory limit (512Mi).
+pub const AUTOMATA_BUDGET_BYTES: usize = 128 * 1024 * 1024;
 
 /// How many value sets the process builds automata for at once.
 pub const CONCURRENT_BUILDS: usize = 2;

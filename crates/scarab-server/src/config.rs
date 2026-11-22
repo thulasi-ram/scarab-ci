@@ -49,7 +49,7 @@
 //! | `SCARAB_STEP_TIMEOUT_SECS` | env | global default step deadline (ADR-0047); default 3600 (1h), per-step overridable via `timeout:` |
 //! | `SCARAB_DRIVER_STALL_CUTOFF_SECS` | env | seconds a scheduler driver cycle may go without progress before it is cut off and the next starts (git-bug afa9f07); default 60, from 30 to 3600 |
 //! | `SCARAB_DRIVER_STALLED_AFTER_SECS` | env | seconds the scheduler driver may go without progress before `/livez` fails, so Kubernetes restarts the Pod; default 90 (or the cutoff plus 30 when that is more), at least the cutoff plus 30, at most 3600 |
-//! | `SCARAB_LOG_AUTOMATA_BUDGET_MIB` | env | MiB of log redaction tables (ADR-0082 §3) the server keeps built at once; a log read that does not fit waits for another to end. Default 512, from 16 to 65536 |
+//! | `SCARAB_LOG_AUTOMATA_BUDGET_MIB` | env | MiB of log redaction tables (ADR-0082 §3) the server keeps built at once; a log read that does not fit waits for another to end. Default 128, from 16 to 65536 |
 //! | `SCARAB_PROJECT_RUN_CAP` | env | how many of one project's Runs may be `Running` at once; the rest wait `Pending` (ADR-0011). Unset or `0` = no cap (default). A Run waiting on a gate is not counted |
 //! | `SCARAB_PUBLIC_URL` | env | Scarab's public base URL — the run deep-link every forge status carries (ADR-0046); default `http://localhost:8080` (dev) |
 //! | `SCARAB_UI_URL` | env | the URL people open the web UI at, when it is not `SCARAB_PUBLIC_URL` (a staging stack whose public hostname serves only `/webhooks/`). Three things are built from it: the OAuth callback (`{ui_url}/v1/auth/callback`), the passkey (WebAuthn) origin, and the step-up confirmation link. Webhook URLs and forge status links stay on `SCARAB_PUBLIC_URL`. Default `SCARAB_PUBLIC_URL`. An `http(s)` URL with no query or fragment; with step-up enforced it must be `https` or loopback `http`. Browsers refuse passkeys on an IP literal, so a local one is `http://localhost:<port>` |
@@ -2636,13 +2636,13 @@ mod tests {
         assert!(err.to_string().contains("at least 30 more"), "{err}");
     }
 
-    /// `SCARAB_LOG_AUTOMATA_BUDGET_MIB`: default 512, a set value, and the
+    /// `SCARAB_LOG_AUTOMATA_BUDGET_MIB`: default 128, a set value, and the
     /// bounds. Kills: the setting ignored; no lower bound.
     #[test]
     fn the_log_automata_budget_is_a_setting() {
         let url = Some("postgres://localhost/scarab");
         let c = Config::resolve_from(&cli(url), dev_env(&[])).unwrap();
-        assert_eq!(c.log_automata_budget_mib, 512);
+        assert_eq!(c.log_automata_budget_mib, 128);
         let c = Config::resolve_from(
             &cli(url),
             dev_env(&[("SCARAB_LOG_AUTOMATA_BUDGET_MIB", "2048")]),

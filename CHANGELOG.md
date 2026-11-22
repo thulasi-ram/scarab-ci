@@ -91,7 +91,7 @@ release.yml uses that version's section as the GitHub Release text. See
   `not_stored` note with the reason `values_too_large`, the server reads none of its log, and a
   failure cause about it is replaced by "the cause was not stored". The redactor keeps up to 52
   bytes of lookup tables per value byte, so the cap holds them at 13 MiB per step being read. A
-  server keeps at most 512 MiB of these tables (`SCARAB_LOG_AUTOMATA_BUDGET_MIB`, chart value
+  server keeps at most 128 MiB of these tables by default (`SCARAB_LOG_AUTOMATA_BUDGET_MIB`, chart value
   `scarab.logAutomataBudgetMib`), frees a step's tables when its last log read ends, and builds
   them for 2 steps at a time; a read that does not fit waits for another to end. A value is never
   redacted in part.
