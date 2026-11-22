@@ -179,9 +179,10 @@ on:
 
 A trigger that skips this way starts no Run, so no activity log line says why. Reading
 `event.changed_paths_known` asks the forge for the list the same way reading
-`event.changed_paths` does. In a step's `when:`, remember that a manual dispatch or a cron fire
-has no list: `event.changed_paths_known && …` skips that step on every dispatch, so write
-`event.kind != "push" || (event.changed_paths_known && …)` to keep it.
+`event.changed_paths` does. Only a push and a pull request have a list, so in a step's `when:`
+in a Pipeline that a manual dispatch, a cron fire or another trigger also starts,
+`event.changed_paths_known && …` skips that step on every one of those Runs. To run the step on
+them, write `!(event.kind in ["push", "pull_request"]) || (event.changed_paths_known && …)`.
 
 The rest of the expression still decides when it can: `event.branch == 'main' &&
 event.changed_paths.exists(…)` is false on another branch whether or not the list is known. A

@@ -3908,29 +3908,36 @@ async fn the_step_pod_admission_policy_holds_server_created_pods_to_their_own_se
         ),
         ("hostNetwork", serde_json::json!({"hostNetwork": true})),
     ];
+    // Each case's failure is kept, not raised, so the ServiceAccount made
+    // above is deleted before the test fails.
+    let mut failures = Vec::new();
     for (what, spec) in refused {
         let p = pod(spec);
         match server_pods.create(&dry_run, &p).await {
             Err(kube::Error::Api(ae)) => {
-                assert_eq!(ae.code, 403, "{what}: {}", ae.message);
-                assert!(
-                    ae.message
-                        .contains("ValidatingAdmissionPolicy 'scarab-step-pods.")
-                        && ae.message.contains("Scarab step Pod policy:"),
-                    "{what}: {}",
-                    ae.message
-                );
+                let by_policy = ae
+                    .message
+                    .contains("ValidatingAdmissionPolicy 'scarab-step-pods.")
+                    && ae.message.contains("Scarab step Pod policy:");
+                if ae.code != 403 || !by_policy {
+                    failures.push(format!(
+                        "{what}: refused with {} but not by the step Pod policy: {}",
+                        ae.code, ae.message
+                    ));
+                }
             }
-            other => panic!("{what}: the server's create was not refused: {other:?}"),
+            other => failures.push(format!(
+                "{what}: the server's create was not refused: {other:?}"
+            )),
         }
-        admin_pods
-            .create(&dry_run, &p)
-            .await
-            .unwrap_or_else(|e| panic!("{what}: the admin's create was refused: {e}"));
+        if let Err(e) = admin_pods.create(&dry_run, &p).await {
+            failures.push(format!("{what}: the admin's create was refused: {e}"));
+        }
     }
     if let Some(made) = made_sa {
         let _ = sa_api.delete(&made, &DeleteParams::default()).await;
     }
+    assert!(failures.is_empty(), "{failures:#?}");
 
     // The executor, as the server: a step Pod it builds, mounting its
     // `-v-` Secrets, is admitted...
