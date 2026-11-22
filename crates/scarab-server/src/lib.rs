@@ -5341,6 +5341,9 @@ pub struct TriggerOutcome {
     /// The Pipeline files left undecided for a redelivery: not read, or
     /// their decision not recorded.
     pub undecided: Vec<String>,
+    /// The Pipeline files this try decided without a Run or a listed
+    /// refusal: no match, every Step excluded, a ref not allowed, not run.
+    pub not_run: Vec<String>,
     /// A Pipeline whose Run another try is still creating (ADR-0083 §4).
     pub busy: bool,
     /// On the webhook path, the compile error that stopped the delivery
@@ -5637,7 +5640,10 @@ impl TriggerOutcome {
     /// this try recorded it.
     fn settle(&mut self, path: &str, recorded: Recorded, refused: Option<RefusedPipeline>) {
         match recorded {
-            Recorded::Written => self.refused.extend(refused),
+            Recorded::Written => match refused {
+                Some(refused) => self.refused.push(refused),
+                None => self.not_run.push(path.to_string()),
+            },
             Recorded::Claimed(Some(o)) => self.note_earlier(&o),
             Recorded::Claimed(None) => self.earlier.push(EarlierOutcome {
                 pipeline: path.to_string(),
@@ -9814,16 +9820,14 @@ fn delivery_answer(
         return (Ok((StatusCode::OK, Json(body))), true);
     }
     // Every Pipeline decided by earlier tries (ADR-0083 §7).
-    if !outcome.earlier.is_empty() {
+    if outcome.not_run.is_empty() && !outcome.earlier.is_empty() {
         return (Ok(duplicate_delivery()), true);
     }
-    (
-        Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({ "ignored": "no matching pipeline" })),
-        )),
-        true,
-    )
+    let mut body = serde_json::json!({ "ignored": "no matching pipeline" });
+    if !outcome.earlier.is_empty() {
+        body["earlier"] = serde_json::json!(outcome.earlier);
+    }
+    (Ok((StatusCode::OK, Json(body))), true)
 }
 
 /// The API base every GitHub App installation connection talks to.

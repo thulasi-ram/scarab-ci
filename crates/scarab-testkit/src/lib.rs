@@ -4606,6 +4606,8 @@ use scarab_forge::{
 #[derive(Default)]
 pub struct FakeForge {
     files: Mutex<HashMap<String, Vec<u8>>>,
+    /// Trees served at one ref instead of `files` ([`put_tree_at`](Self::put_tree_at)).
+    trees_at: Mutex<HashMap<String, HashMap<String, Vec<u8>>>>,
     /// Each posted status and the commit sha it was posted on.
     statuses: Mutex<Vec<(String, Status)>>,
     comments: Mutex<Vec<(u64, String)>>,
@@ -4807,6 +4809,24 @@ impl FakeForge {
     }
 
     /// Point `git_ref` at `sha` after construction (a push moved it).
+    /// Serve `files` as the whole tree at `git_ref` (a commit sha):
+    /// `list_dir_at_ref` and `read_file_at_ref` at that ref read it instead of
+    /// the files every other ref reads.
+    pub fn put_tree_at(&self, git_ref: impl Into<String>, files: &[(&str, &str)]) {
+        self.trees_at.lock().unwrap().insert(
+            git_ref.into(),
+            files
+                .iter()
+                .map(|(p, c)| (p.to_string(), c.as_bytes().to_vec()))
+                .collect(),
+        );
+    }
+
+    /// Make [`set_status`](ForgePort::set_status) fail (`true`) or work again.
+    pub fn set_failing_status(&self, failing: bool) {
+        *self.fail_status.lock().unwrap() = failing;
+    }
+
     pub fn set_commit(&self, git_ref: impl Into<String>, sha: impl Into<String>) {
         self.commits
             .lock()
@@ -5499,7 +5519,7 @@ impl ForgePort for FakeForge {
     async fn read_file_at_ref(
         &self,
         _repo: &RepoRef,
-        _ref: &str,
+        git_ref: &str,
         path: &str,
     ) -> Result<Vec<u8>, ForgeError> {
         self.check_rate_limit()?;
@@ -5517,6 +5537,12 @@ impl ForgePort for FakeForge {
                 return Err(ForgeError::Api("fake forge: read failed".into()));
             }
         }
+        if let Some(tree) = self.trees_at.lock().unwrap().get(git_ref) {
+            return tree
+                .get(path)
+                .cloned()
+                .ok_or_else(|| ForgeError::NotFound(path.to_string()));
+        }
         self.files
             .lock()
             .unwrap()
@@ -5528,16 +5554,16 @@ impl ForgePort for FakeForge {
     async fn list_dir_at_ref(
         &self,
         _repo: &RepoRef,
-        _ref: &str,
+        git_ref: &str,
         dir: &str,
     ) -> Result<Vec<String>, ForgeError> {
         self.check_rate_limit()?;
         *self.file_reads.lock().unwrap() += 1;
         let prefix = format!("{}/", dir.trim_end_matches('/'));
-        let mut out: Vec<String> = self
-            .files
-            .lock()
-            .unwrap()
+        let trees = self.trees_at.lock().unwrap();
+        let files = self.files.lock().unwrap();
+        let tree = trees.get(git_ref).unwrap_or(&files);
+        let mut out: Vec<String> = tree
             .keys()
             // Direct children of `dir` only (no deeper nesting).
             .filter(|k| {
