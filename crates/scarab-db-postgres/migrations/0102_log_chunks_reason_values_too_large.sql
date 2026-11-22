@@ -6,12 +6,12 @@
 -- NOT VALID, so the ADD scans no row under the ALTER's ACCESS EXCLUSIVE
 -- lock; Postgres checks every row written after it. The rows already
 -- stored hold only `no_ledger`, `ledger_purged` or NULL, and 0101 has just
--- validated them. A later release can VALIDATE the check under a lock that
--- blocks no write, as 0101 did.
+-- validated them. Migration 0103 validates the check again, in its own
+-- transaction, under a lock that blocks no read or write.
 --
 -- Rollback: a server built before this migration does not start on a
 -- database that ran it (the migrator finds version 102, which it does not
--- know, and stops). To go back to 0.7.x, delete rows 101 and 102 from
+-- know, and stops). To go back to 0.7.x, delete rows 101, 102 and 103 from
 -- `_sqlx_migrations`. The wider check is harmless to 0.7.x; it shows a
 -- `values_too_large` marker with the text of a `not_stored` marker that has
 -- no reason it knows. `rollback/0099_revert.sql` reverts this migration too.

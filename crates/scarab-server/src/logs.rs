@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use flate2::read::GzDecoder;
@@ -38,6 +38,7 @@ use scarab_engine::{
 };
 use scarab_secrets::Sealer;
 use scarab_storage::ObjectStore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::redact::{Core, Sam, Trie};
 
@@ -51,7 +52,7 @@ pub enum LogError {
     #[error("gzip error: {0}")]
     Gzip(String),
     #[error(transparent)]
-    ValuesTooLarge(#[from] ValuesTooLarge),
+    Redactor(#[from] PrepareError),
 }
 
 /// Why a unit's values could not be loaded.
@@ -86,9 +87,11 @@ pub struct ValueSet {
     generations: Vec<LedgerGeneration>,
     /// The bytes of `values`, added up.
     value_bytes: usize,
-    /// The redaction automata, built on first use and shared with a later
-    /// load of the same generation ([`ValueSet::keep_automata_of`]).
-    automata: Arc<Automata>,
+    /// The redaction automata while a reader holds them, shared with a
+    /// later load of the same generation ([`ValueSet::keep_automata_of`]).
+    cells: Arc<Cells>,
+    /// The process's limits on building and keeping automata.
+    limits: Arc<AutomataLimits>,
 }
 
 impl std::fmt::Debug for ValueSet {
@@ -98,17 +101,77 @@ impl std::fmt::Debug for ValueSet {
             .field("gen", &self.gen)
             .field("values", &self.values.len())
             .field("value_bytes", &self.value_bytes)
-            .field("trie_built", &self.automata.trie.get().is_some())
-            .field("sam_built", &self.automata.sam.get().is_some())
             .finish()
     }
 }
 
-/// The automata of a value set, each built at most once.
+/// The automata of a value set, held weakly: they live while a reader (a
+/// [`StreamRedactor`], a failure cause being redacted) holds them, and are
+/// freed with their share of the budget when the last one ends. The
+/// value cache keeps the values, not the automata.
 #[derive(Default)]
-struct Automata {
-    trie: OnceLock<Arc<Trie>>,
-    sam: OnceLock<Arc<Sam>>,
+struct Cells {
+    trie: tokio::sync::Mutex<Weak<Built<Trie>>>,
+    sam: tokio::sync::Mutex<Weak<Built<Sam>>>,
+}
+
+/// A built automaton and its share of the process budget, freed together.
+pub(crate) struct Built<T> {
+    value: Arc<T>,
+    _budget: OwnedSemaphorePermit,
+}
+
+/// The default process budget for built automata: 512 MiB.
+pub const AUTOMATA_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+
+/// How many value sets the process builds automata for at once.
+pub const CONCURRENT_BUILDS: usize = 2;
+
+/// The process's limits on the redaction automata. A build first reserves
+/// the most its automata can take (52 bytes per value byte) from the
+/// budget, waiting while the budget is full, then takes one of
+/// [`CONCURRENT_BUILDS`] build slots, which bounds the memory a build uses
+/// only while it runs. Nothing is ever redacted without its automata.
+pub(crate) struct AutomataLimits {
+    /// KiB of built automata.
+    budget: Arc<Semaphore>,
+    budget_kib: usize,
+    builds: Semaphore,
+}
+
+impl AutomataLimits {
+    fn new(budget_bytes: usize) -> Self {
+        let budget_kib = budget_bytes.div_ceil(1024).max(1);
+        Self {
+            budget: Arc::new(Semaphore::new(budget_kib)),
+            budget_kib,
+            builds: Semaphore::new(CONCURRENT_BUILDS),
+        }
+    }
+
+    /// Reserve `bytes` of the budget, waiting for room. A reservation over
+    /// the whole budget takes the whole budget.
+    async fn reserve(&self, bytes: usize) -> Result<OwnedSemaphorePermit, PrepareError> {
+        let kib = bytes.div_ceil(1024).clamp(1, self.budget_kib);
+        self.budget
+            .clone()
+            .acquire_many_owned(kib as u32)
+            .await
+            .map_err(|e| PrepareError::Build(e.to_string()))
+    }
+}
+
+/// The most bytes a built trie of `n` value bytes keeps: at most `n + 1`
+/// nodes of 21 bytes (an offset, an edge byte and target, the failure
+/// link, `best` and `pend`).
+fn trie_bound(n: usize) -> usize {
+    21 * n + 64
+}
+
+/// The most bytes a built suffix automaton of `n` value bytes keeps: at
+/// most `2n` states of 8 bytes and `3n` transitions of 5.
+fn sam_bound(n: usize) -> usize {
+    31 * n + 64
 }
 
 /// One generation of a unit's ledger as loaded: the values one launch
@@ -152,10 +215,15 @@ impl ValueSet {
                 revoked_at: None,
                 entries,
             }],
+            Arc::new(AutomataLimits::new(AUTOMATA_BUDGET_BYTES)),
         )
     }
 
-    fn from_generations(gen: i64, generations: Vec<LedgerGeneration>) -> Self {
+    fn from_generations(
+        gen: i64,
+        generations: Vec<LedgerGeneration>,
+        limits: Arc<AutomataLimits>,
+    ) -> Self {
         let entries: Vec<MountedValue> = generations
             .iter()
             .flat_map(|g| g.entries.iter().cloned())
@@ -173,16 +241,16 @@ impl ValueSet {
             values,
             generations,
             value_bytes,
-            automata: Arc::default(),
+            cells: Arc::default(),
+            limits,
         }
     }
 
-    /// Share `other`'s automata (built or not) when it is the same
-    /// generation with the same values: a reload after the cache's TTL
-    /// does not build them again.
+    /// Share `other`'s automata (while a reader holds them) when it is the
+    /// same generation with the same values.
     fn keep_automata_of(&mut self, other: &ValueSet) {
         if other.gen == self.gen && other.values == self.values {
-            self.automata = other.automata.clone();
+            self.cells = other.cells.clone();
         }
     }
 
@@ -200,78 +268,121 @@ impl ValueSet {
         Ok(())
     }
 
-    /// The trie of the values, built here if it is not built.
-    fn trie(&self) -> Result<Arc<Trie>, ValuesTooLarge> {
-        self.check_size()?;
-        Ok(self
-            .automata
-            .trie
-            .get_or_init(|| Arc::new(Trie::build(&self.values)))
-            .clone())
-    }
-
-    /// The suffix automaton of the values, built here if it is not built.
-    fn sam(&self) -> Result<Arc<Sam>, ValuesTooLarge> {
-        self.check_size()?;
-        Ok(self
-            .automata
-            .sam
-            .get_or_init(|| Arc::new(Sam::build(&self.values)))
-            .clone())
-    }
-
-    /// Build what a [`StreamRedactor`] needs (the trie and the suffix
-    /// automaton), on a blocking thread when the values are over 16 KiB.
-    /// A set over [`MAX_VALUE_BYTES`] builds nothing.
-    pub async fn prepare_stream(self: &Arc<Self>) -> Result<(), ValuesTooLarge> {
-        self.prepare(true).await
-    }
-
-    /// Build what [`redact_text`] needs (the trie only).
-    pub async fn prepare_text(self: &Arc<Self>) -> Result<(), ValuesTooLarge> {
-        self.prepare(false).await
-    }
-
-    async fn prepare(self: &Arc<Self>, sam: bool) -> Result<(), ValuesTooLarge> {
-        self.check_size()?;
-        let built =
-            self.automata.trie.get().is_some() && (!sam || self.automata.sam.get().is_some());
-        if built {
-            return Ok(());
+    /// Build the automata `want` asks for (trie, suffix automaton) in one
+    /// of the process's build slots: on a blocking thread when the values
+    /// are over 16 KiB, else here. A build that did not finish (a panic,
+    /// the runtime shutting down) is an error: nothing is built inline on
+    /// an async worker in its place.
+    async fn build(
+        self: &Arc<Self>,
+        want: (bool, bool),
+    ) -> Result<(Option<Trie>, Option<Sam>), PrepareError> {
+        let _slot = self
+            .limits
+            .builds
+            .acquire()
+            .await
+            .map_err(|e| PrepareError::Build(e.to_string()))?;
+        let build = move |values: &[Vec<u8>]| {
+            (
+                want.0.then(|| Trie::build(values)),
+                want.1.then(|| Sam::build(values)),
+            )
+        };
+        if self.value_bytes <= BUILD_INLINE_BYTES {
+            return Ok(build(&self.values));
         }
-        if self.value_bytes > BUILD_INLINE_BYTES {
-            let set = self.clone();
-            // A panic or a cancelled task leaves the cells empty; the
-            // caller's own `trie()` / `sam()` then builds (or panics) there.
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = set.trie();
-                if sam {
-                    let _ = set.sam();
-                }
-            })
-            .await;
-            return Ok(());
-        }
-        self.trie()?;
-        if sam {
-            self.sam()?;
-        }
-        Ok(())
+        let set = self.clone();
+        tokio::task::spawn_blocking(move || build(&set.values))
+            .await
+            .map_err(|e| PrepareError::Build(format!("the automata build did not finish: {e}")))
     }
 
-    /// Which automata are built: (trie, suffix automaton).
+    /// The trie, built (within the budget) if no reader holds it. What
+    /// [`redact_text_with`] needs.
+    pub(crate) async fn text_automaton(self: &Arc<Self>) -> Result<Arc<Built<Trie>>, PrepareError> {
+        self.check_size()?;
+        let mut cell = self.cells.trie.lock().await;
+        if let Some(t) = cell.upgrade() {
+            return Ok(t);
+        }
+        let budget = self.limits.reserve(trie_bound(self.value_bytes)).await?;
+        let (trie, _) = self.build((true, false)).await?;
+        let built = Arc::new(Built {
+            value: Arc::new(trie.expect("asked for")),
+            _budget: budget,
+        });
+        *cell = Arc::downgrade(&built);
+        Ok(built)
+    }
+
+    /// The trie and the suffix automaton, built (within the budget) if no
+    /// reader holds them. Both are reserved in one wait, so two readers
+    /// never each hold half of what they need while the budget is full.
+    async fn stream_automata(
+        self: &Arc<Self>,
+    ) -> Result<(Arc<Built<Trie>>, Arc<Built<Sam>>), PrepareError> {
+        self.check_size()?;
+        // Always the trie's lock first, as in `text_automaton`.
+        let mut tcell = self.cells.trie.lock().await;
+        let mut scell = self.cells.sam.lock().await;
+        let (t, s) = (tcell.upgrade(), scell.upgrade());
+        if let (Some(t), Some(s)) = (&t, &s) {
+            return Ok((t.clone(), s.clone()));
+        }
+        let n = self.value_bytes;
+        let need_t = if t.is_none() { trie_bound(n) } else { 0 };
+        let need_s = if s.is_none() { sam_bound(n) } else { 0 };
+        let budget = self.limits.reserve(need_t + need_s).await?;
+        let (trie, sam) = self.build((t.is_none(), s.is_none())).await?;
+        // Each built automaton keeps its own share of the reservation, so
+        // either can be freed first.
+        let mut budget = Some(budget);
+        let t = match t {
+            Some(t) => t,
+            None => {
+                let own = if s.is_none() {
+                    let b = budget.as_mut().expect("not taken yet");
+                    let share = need_t.div_ceil(1024).min(b.num_permits());
+                    b.split(share).expect("the share is within the reservation")
+                } else {
+                    budget.take().expect("not taken yet")
+                };
+                let built = Arc::new(Built {
+                    value: Arc::new(trie.expect("asked for")),
+                    _budget: own,
+                });
+                *tcell = Arc::downgrade(&built);
+                built
+            }
+        };
+        let s = match s {
+            Some(s) => s,
+            None => {
+                let built = Arc::new(Built {
+                    value: Arc::new(sam.expect("asked for")),
+                    _budget: budget.take().expect("the rest of the reservation"),
+                });
+                *scell = Arc::downgrade(&built);
+                built
+            }
+        };
+        Ok((t, s))
+    }
+
+    /// Which automata a reader holds now: (trie, suffix automaton).
     #[cfg(test)]
     fn built(&self) -> (bool, bool) {
-        (
-            self.automata.trie.get().is_some(),
-            self.automata.sam.get().is_some(),
-        )
+        fn alive<T>(c: &tokio::sync::Mutex<Weak<T>>) -> bool {
+            c.try_lock().map(|w| w.strong_count() > 0).unwrap_or(true)
+        }
+        (alive(&self.cells.trie), alive(&self.cells.sam))
     }
 
     /// Whether `other` shares this set's automata.
     #[cfg(test)]
     fn shares_automata_with(&self, other: &ValueSet) -> bool {
-        Arc::ptr_eq(&self.automata, &other.automata)
+        Arc::ptr_eq(&self.cells, &other.cells)
     }
 
     /// Each generation, oldest first.
@@ -415,6 +526,9 @@ pub struct LogService {
     cache: Mutex<HashMap<StreamKey, Cached>>,
     /// The lease owner of [`append`](Self::append), the test writer.
     owner: String,
+    /// The process's budget and build slots for redaction automata: one
+    /// `LogService` per server process.
+    limits: Arc<AutomataLimits>,
 }
 
 impl LogService {
@@ -428,7 +542,16 @@ impl LogService {
             sealer: Arc::new(scarab_secrets_postgres::KeySealer::ephemeral()),
             cache: Mutex::new(HashMap::new()),
             owner: format!("logsvc-{}", uuid::Uuid::new_v4()),
+            limits: Arc::new(AutomataLimits::new(AUTOMATA_BUDGET_BYTES)),
         }
+    }
+
+    /// Keep at most `bytes` of built redaction automata in this process
+    /// (default [`AUTOMATA_BUDGET_BYTES`]). A read whose automata do not
+    /// fit waits until a reader ends; it is never read without them.
+    pub fn with_automata_budget(mut self, bytes: usize) -> Self {
+        self.limits = Arc::new(AutomataLimits::new(bytes));
+        self
     }
 
     /// Seal and open ledger generations with `sealer` (the master keys):
@@ -503,7 +626,7 @@ impl LogService {
                 entries,
             });
         }
-        let mut set = ValueSet::from_generations(gen, generations);
+        let mut set = ValueSet::from_generations(gen, generations, self.limits.clone());
         let mut cache = self.cache.lock().unwrap();
         if let Some(c) = cache.get(&unit_key(unit)) {
             set.keep_automata_of(&c.set);
@@ -584,8 +707,8 @@ impl LogService {
             _ => return CAUSE_NOT_STORED.to_string(),
         };
         match self.reload_values(&unit).await {
-            Ok(set) => match set.prepare_text().await {
-                Ok(()) => redact_text(&set, text),
+            Ok(set) => match set.text_automaton().await {
+                Ok(trie) => redact_text_with(&trie, text),
                 Err(_) => CAUSE_NOT_STORED.to_string(),
             },
             Err(_) => CAUSE_NOT_STORED.to_string(),
@@ -630,15 +753,16 @@ impl LogService {
         self.cache.lock().unwrap().remove(&unit_key(unit));
     }
 
-    /// A redactor for one read of a part of `values`' unit, its automata
-    /// built off the async workers when large. A set over
-    /// [`MAX_VALUE_BYTES`] gets none: its log is not stored.
+    /// A redactor for one read of a part of `values`' unit. Its automata
+    /// are built within the process budget, waiting for room, off the
+    /// async workers when large. A set over [`MAX_VALUE_BYTES`] gets none
+    /// (its log is not stored); a build that fails is an error (the read
+    /// fails and is retried).
     pub async fn stream_redactor(
         &self,
         values: Arc<ValueSet>,
-    ) -> Result<StreamRedactor, ValuesTooLarge> {
-        values.prepare_stream().await?;
-        StreamRedactor::new(values)
+    ) -> Result<StreamRedactor, PrepareError> {
+        StreamRedactor::prepared(values, MIN_SUFFIX).await
     }
 
     // -- fenced writes -----------------------------------------------------
@@ -916,18 +1040,37 @@ pub struct ValuesTooLarge {
     pub bytes: usize,
 }
 
-/// Redact a whole `text` with `values`: every occurrence of a value, with
+/// Why a value set has no automata for a reader.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PrepareError {
+    /// Over [`MAX_VALUE_BYTES`], for every replica: the log is not stored.
+    #[error(transparent)]
+    TooLarge(#[from] ValuesTooLarge),
+    /// The build did not finish here (a panic, the runtime shutting down):
+    /// local to this replica, the read is retried.
+    #[error("{0}")]
+    Build(String),
+}
+
+/// Redact a whole `text` with the trie of a value set
+/// ([`ValueSet::text_automaton`]): every occurrence of a value, with
 /// overlapping ones as one `***`. The text is known whole, so its start and
-/// end are not cuts. A set over [`MAX_VALUE_BYTES`] gives
-/// [`CAUSE_NOT_STORED`]. Builds only the trie.
-pub fn redact_text(values: &Arc<ValueSet>, text: &str) -> String {
-    let Ok(trie) = values.trie() else {
-        return CAUSE_NOT_STORED.to_string();
-    };
-    let mut core = Core::text(trie);
+/// end are not cuts.
+pub(crate) fn redact_text_with(trie: &Built<Trie>, text: &str) -> String {
+    let mut core = Core::text(trie.value.clone());
     let mut out = core.push(text.as_bytes());
     out.extend(core.finish(false));
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// [`redact_text_with`], building the trie on this thread; a set over
+/// [`MAX_VALUE_BYTES`] gives [`CAUSE_NOT_STORED`]. Small value sets only.
+#[cfg(test)]
+fn redact_text(values: &Arc<ValueSet>, text: &str) -> String {
+    match futures::executor::block_on(values.text_automaton()) {
+        Ok(trie) => redact_text_with(&trie, text),
+        Err(_) => CAUSE_NOT_STORED.to_string(),
+    }
 }
 
 /// Redacts one read of a part of a log source as a stream of chunks, with
@@ -951,24 +1094,36 @@ pub fn redact_text(values: &Arc<ValueSet>, text: &str) -> String {
 pub struct StreamRedactor {
     values: Arc<ValueSet>,
     core: Core,
+    /// Holds the automata (and their share of the budget) while the read
+    /// lasts; the last redactor of a set to end frees them.
+    _automata: (Arc<Built<Trie>>, Arc<Built<Sam>>),
 }
 
 impl StreamRedactor {
-    /// A redactor for one read. Builds the value set's automata here if
-    /// they are not built ([`ValueSet::prepare_stream`] builds them off
-    /// the async workers).
-    pub fn new(values: Arc<ValueSet>) -> Result<Self, ValuesTooLarge> {
+    /// A redactor whose automata are built within the process budget
+    /// ([`LogService::stream_redactor`]).
+    async fn prepared(values: Arc<ValueSet>, min_suffix: usize) -> Result<Self, PrepareError> {
+        let (trie, sam) = values.stream_automata().await?;
+        let core = Core::stream(trie.value.clone(), sam.value.clone(), min_suffix);
+        Ok(Self {
+            values,
+            core,
+            _automata: (trie, sam),
+        })
+    }
+
+    /// A redactor for one read, its automata built on this thread. Small
+    /// value sets only.
+    #[cfg(test)]
+    fn new(values: Arc<ValueSet>) -> Result<Self, PrepareError> {
         Self::with_min_suffix(values, MIN_SUFFIX)
     }
 
     /// [`new`](Self::new) with another minimum than [`MIN_SUFFIX`], for
     /// tests that search small inputs.
-    pub(crate) fn with_min_suffix(
-        values: Arc<ValueSet>,
-        min_suffix: usize,
-    ) -> Result<Self, ValuesTooLarge> {
-        let core = Core::stream(values.trie()?, values.sam()?, min_suffix);
-        Ok(Self { values, core })
+    #[cfg(test)]
+    fn with_min_suffix(values: Arc<ValueSet>, min_suffix: usize) -> Result<Self, PrepareError> {
+        futures::executor::block_on(Self::prepared(values, min_suffix))
     }
 
     /// The generation of the values this redactor uses.
@@ -1451,6 +1606,9 @@ mod tests {
         let want = reference(values, src, min);
         let longest = values.iter().map(Vec::len).max().unwrap_or(0);
         let one: Vec<&[u8]> = src.chunks(1).collect();
+        // Holds the automata, so each run reuses them (they are freed with
+        // their last reader).
+        let _keep = StreamRedactor::with_min_suffix(set.clone(), min).unwrap();
         let base = record(set, &one, min);
         let by_read: HashMap<usize, Vec<u8>> = base
             .pushes
@@ -1718,6 +1876,7 @@ mod tests {
         let mut runs = 0usize;
         for values in &sets {
             let set = set_of(values);
+            let _keep = StreamRedactor::with_min_suffix(set.clone(), MIN).unwrap();
             let longest = values.iter().map(Vec::len).max().unwrap();
             let refs: Vec<Vec<u8>> = sources.iter().map(|s| reference(values, s, MIN)).collect();
             for src in &sources {
@@ -1877,9 +2036,9 @@ mod tests {
         assert_eq!(over.value_bytes(), MAX_VALUE_BYTES + 1);
         assert_eq!(
             StreamRedactor::new(over.clone()).err(),
-            Some(ValuesTooLarge {
+            Some(PrepareError::TooLarge(ValuesTooLarge {
                 bytes: MAX_VALUE_BYTES + 1
-            })
+            }))
         );
         assert_eq!(redact_text(&over, "a tok1 b"), CAUSE_NOT_STORED);
         assert_eq!(over.built(), (false, false));
@@ -1888,27 +2047,27 @@ mod tests {
         assert!(at.check_size().is_ok());
     }
 
-    /// The automata are built only where a redactor needs them: a launch
-    /// builds none, a failure cause builds the trie only, a stream
-    /// redactor both; a reload of the same generation keeps them. Kills:
-    /// building in `from_generations`; the suffix automaton built for
-    /// `redact_text`; a rebuild on every TTL reload.
-    #[tokio::test]
-    async fn automata_are_built_lazily_and_kept_across_reloads() {
+    /// A log service over in-memory stores and the ledgers of `units`
+    /// (one value each), with an automata budget of `budget` bytes.
+    async fn service_with(
+        budget: usize,
+        units: &[(&str, &[u8])],
+    ) -> (LogService, Vec<LogStreamId>) {
         use scarab_engine::{AttemptId, RunId, RunStatus};
         let db = Arc::new(scarab_testkit::InMemoryDb::new());
         let run_id = RunId("r1".into());
         db.seed_run(&run_id, RunStatus::Running);
         let store = Arc::new(scarab_testkit::InMemoryObjectStore::default());
-        let logs = LogService::new(store, db.clone() as Arc<dyn Db>);
-        let unit = LogStreamId::new(&run_id, &StepId("build".into()), &AttemptId("a1".into()));
-        let launched = logs
-            .record_launch_values(
+        let logs = LogService::new(store, db.clone() as Arc<dyn Db>).with_automata_budget(budget);
+        let mut ids = Vec::new();
+        for (step, value) in units {
+            let unit = LogStreamId::new(&run_id, &StepId((*step).into()), &AttemptId("a1".into()));
+            logs.record_launch_values(
                 &unit,
-                Some("pod-build"),
+                Some(&format!("pod-{step}")),
                 vec![MountedValue {
                     kind: MountedValueKind::Secret,
-                    value: b"s3cr3t-value".to_vec(),
+                    value: value.to_vec(),
                     repo: None,
                     minted: None,
                 }],
@@ -1916,27 +2075,101 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(launched.built(), (false, false), "a launch builds nothing");
+            ids.push(unit);
+        }
+        (logs, ids)
+    }
+
+    /// The automata live only while a reader holds them: a launch builds
+    /// none, a failure cause builds the trie only and frees it, a stream
+    /// redactor holds both (shared with a reload of the same generation)
+    /// and the last one to end frees them and their budget, while the
+    /// cache keeps the values. Kills: building in `from_generations`; the
+    /// suffix automaton built for a text; the cache keeping automata alive
+    /// for its TTL; a budget share not given back.
+    #[tokio::test]
+    async fn automata_live_while_a_reader_holds_them() {
+        let (logs, units) =
+            service_with(AUTOMATA_BUDGET_BYTES, &[("build", b"s3cr3t-value")]).await;
+        let unit = &units[0];
+        let full = logs.limits.budget.available_permits();
+        let cached = logs.load_values(unit).await.unwrap();
+        assert_eq!(cached.built(), (false, false), "a launch builds nothing");
         assert_eq!(
             logs.redact_text_for_handle("pod-build", "pull failed: s3cr3t-value")
                 .await,
             "pull failed: ***"
         );
-        let cached = logs.load_values(&unit).await.unwrap();
-        assert_eq!(
-            cached.built(),
-            (true, false),
-            "a cause builds the trie only"
-        );
+        assert_eq!(cached.built(), (false, false), "a cause frees its trie");
+        let trie = cached.text_automaton().await.unwrap();
+        assert_eq!(cached.built(), (true, false), "a text builds the trie only");
+        drop(trie);
         let mut r = logs.stream_redactor(cached.clone()).await.unwrap();
         assert_eq!(cached.built(), (true, true));
+        assert!(logs.limits.budget.available_permits() < full);
         assert_eq!(r.push(b"x s3cr3t-value y"), b"x *** y");
-        let reloaded = logs.reload_values(&unit).await.unwrap();
+        let reloaded = logs.reload_values(unit).await.unwrap();
         assert!(!Arc::ptr_eq(&reloaded, &cached));
         assert!(
             reloaded.shares_automata_with(&cached),
             "same generation, same automata"
         );
+        let second = logs.stream_redactor(reloaded.clone()).await.unwrap();
+        drop(r);
+        assert_eq!(reloaded.built(), (true, true), "a reader still holds them");
+        drop(second);
+        assert_eq!(
+            reloaded.built(),
+            (false, false),
+            "the last reader freed them"
+        );
+        assert_eq!(logs.limits.budget.available_permits(), full);
+        assert!(
+            Arc::ptr_eq(&logs.load_values(unit).await.unwrap(), &reloaded),
+            "the cache keeps the values"
+        );
+    }
+
+    /// A build waits for room in the process budget and goes ahead when a
+    /// reader ends; it never reads without its automata. The budget here
+    /// fits one unit's automata. Kills: no budget; a budget that lets a
+    /// build through unredacted or without a reservation.
+    #[tokio::test]
+    async fn a_build_waits_for_room_in_the_budget() {
+        let (logs, units) =
+            service_with(1024, &[("a", b"s3cr3t-value"), ("b", b"other-secret")]).await;
+        let a = logs.load_values(&units[0]).await.unwrap();
+        let b = logs.load_values(&units[1]).await.unwrap();
+        let first = logs.stream_redactor(a).await.unwrap();
+        assert_eq!(logs.limits.budget.available_permits(), 0);
+        let mut waiting = Box::pin(logs.stream_redactor(b.clone()));
+        assert!(
+            futures::poll!(&mut waiting).is_pending(),
+            "the budget is full"
+        );
+        assert_eq!(b.built(), (false, false));
+        drop(first);
+        let mut second = waiting.await.unwrap();
+        assert_eq!(second.push(b"x other-secret y"), b"x *** y");
+    }
+
+    /// At most [`CONCURRENT_BUILDS`] builds run at once: a build waits for
+    /// a slot. Kills: unbounded concurrent builds.
+    #[tokio::test]
+    async fn a_build_waits_for_a_build_slot() {
+        let (logs, units) = service_with(AUTOMATA_BUDGET_BYTES, &[("a", b"s3cr3t-value")]).await;
+        let a = logs.load_values(&units[0]).await.unwrap();
+        let slots = logs
+            .limits
+            .builds
+            .acquire_many(CONCURRENT_BUILDS as u32)
+            .await
+            .unwrap();
+        let mut waiting = Box::pin(logs.stream_redactor(a.clone()));
+        assert!(futures::poll!(&mut waiting).is_pending(), "no build slot");
+        drop(slots);
+        let mut r = waiting.await.unwrap();
+        assert_eq!(r.push(b"s3cr3t-value\n"), b"***\n");
     }
 
     /// A value starting with `***` is redacted like any other value.

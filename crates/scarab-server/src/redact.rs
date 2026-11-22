@@ -12,17 +12,17 @@
 //!
 //! [`Trie`] (Aho–Corasick) finds the occurrences and where a value could
 //! still start; [`Sam`] (a suffix automaton of the values) decides the
-//! leading interval. Both are flat arrays (no node owns a heap block), are
-//! built without recursion, and are built once per value set, lazily
-//! (`logs::ValueSet`).
+//! leading interval. Both are flat arrays (no node owns a heap block) and
+//! are built without recursion; `logs::ValueSet` builds them within the
+//! process budget and keeps them while a reader holds them.
 //!
 //! The model this was ported from matched a brute-force reference; the
 //! tests in `logs.rs` compare this code with the same reference.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
-use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::Arc;
+use std::hash::{BuildHasher, Hasher};
+use std::sync::{Arc, OnceLock};
 
 /// What a redacted span is replaced with.
 pub(crate) const REDACTED: &[u8] = b"***";
@@ -102,6 +102,9 @@ impl Trie {
             }
         }
         drop(edges);
+        // Grown by pushes: up to twice its length until shrunk (4 bytes per
+        // node of the 21 the size bound allows for).
+        best.shrink_to_fit();
         let mut trie = Trie {
             start,
             edge_byte,
@@ -218,18 +221,36 @@ pub(crate) struct Sam {
 
 const SUFFIX_BIT: u32 = 1 << 31;
 
-/// A hasher for `(state, byte)` keys: the splitmix64 finaliser.
-#[derive(Default)]
+/// The hash key of this process: a value's author cannot choose bytes
+/// whose `(state, byte)` keys collide in the build's map.
+fn process_seed() -> u64 {
+    static SEED: OnceLock<u64> = OnceLock::new();
+    *SEED.get_or_init(|| std::collections::hash_map::RandomState::new().hash_one(0u64))
+}
+
+/// Builds [`KeyHasher`]s keyed with [`process_seed`].
+#[derive(Clone, Copy)]
+struct KeyBuild(u64);
+
+impl BuildHasher for KeyBuild {
+    type Hasher = KeyHasher;
+    fn build_hasher(&self) -> KeyHasher {
+        KeyHasher(self.0)
+    }
+}
+
+/// A hasher for `(state, byte)` keys: the key xor the process seed, then
+/// the splitmix64 finaliser.
 struct KeyHasher(u64);
 
 impl Hasher for KeyHasher {
     fn write(&mut self, bytes: &[u8]) {
         for &b in bytes {
-            self.write_u64(self.0 ^ u64::from(b));
+            self.write_u64(u64::from(b));
         }
     }
     fn write_u64(&mut self, n: u64) {
-        let mut z = n.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = (n ^ self.0).wrapping_add(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         self.0 = z ^ (z >> 31);
@@ -249,7 +270,7 @@ struct SamBuilder {
     e_byte: Vec<u8>,
     e_to: Vec<u32>,
     e_next: Vec<u32>,
-    map: HashMap<u64, u32, BuildHasherDefault<KeyHasher>>,
+    map: HashMap<u64, u32, KeyBuild>,
 }
 
 fn key(p: u32, c: u8) -> u64 {
@@ -350,7 +371,7 @@ impl Sam {
             e_byte: Vec::with_capacity(total),
             e_to: Vec::with_capacity(total),
             e_next: Vec::with_capacity(total),
-            map: HashMap::with_capacity_and_hasher(total, Default::default()),
+            map: HashMap::with_capacity_and_hasher(total, KeyBuild(process_seed())),
         };
         b.new_state(0, NONE);
         for v in values.iter().filter(|v| !v.is_empty()) {
@@ -403,7 +424,10 @@ impl Sam {
         }
         drop(order);
         // Freeze into sorted flat arrays; the map is not needed for it.
-        drop(std::mem::take(&mut b.map));
+        drop(std::mem::replace(
+            &mut b.map,
+            HashMap::with_hasher(KeyBuild(0)),
+        ));
         let edges = b.e_to.len();
         let mut start = Vec::with_capacity(states + 1);
         let mut edge_byte = Vec::with_capacity(edges);
@@ -808,6 +832,7 @@ mod tests {
                 let suffix = values.iter().any(|v| v.ends_with(s));
                 let room = values
                     .iter()
+                    .filter(|v| v.len() >= s.len())
                     .flat_map(|v| {
                         (0..=v.len().saturating_sub(s.len()))
                             .filter(move |&i| &v[i..i + s.len()] == s.as_slice())

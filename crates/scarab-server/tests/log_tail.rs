@@ -1032,8 +1032,11 @@ async fn a_read_broken_while_the_lead_is_pending_stores_nothing_and_rereads_equa
         ..Default::default()
     });
     let tailer = w.tailer(live.clone(), &logs, "a");
-    tailer.ensure(&running());
-    until("the second read", || async { live.opens() >= 2 }).await;
+    // A broken read is retried when the driver ensures the stream again.
+    drive_until(&tailer, &running(), "the second read", || async {
+        live.opens() >= 2
+    })
+    .await;
     live.stop();
     drive_until(&tailer, &running(), "complete", || async {
         w.state(&stream()).await == Some(LogStreamState::Complete)

@@ -40,7 +40,7 @@ use scarab_engine::{
 };
 
 pub use crate::logs::tail_lease_resource;
-use crate::logs::{LedgerError, LogError, LogService, ValueSet};
+use crate::logs::{LedgerError, LogError, LogService, PrepareError, StreamRedactor};
 
 /// Errors from [`pump_log_stream`].
 #[derive(Debug, thiserror::Error)]
@@ -780,14 +780,21 @@ async fn read_stream(
             }
             Err(LedgerError::Local(e)) => return report(ctx, fence, Failure::Local(e)),
         };
-        // Values over the cap are never used in part: the rest of the log
-        // is not stored, and no source byte is read. Otherwise the
-        // automata are built here, off the async workers when large.
-        if let Some(v) = &values {
-            if v.prepare_stream().await.is_err() {
-                return close_not_stored(ctx, fence, writer, NotStoredReason::ValuesTooLarge).await;
-            }
-        }
+        // The redactor before the source: values over the cap are never
+        // used in part (the rest of the log is not stored and no source
+        // byte is read), and a read waits here for room in the process's
+        // automata budget, never reading without them.
+        let redactor = match &values {
+            Some(v) => match ctx.logs.stream_redactor(v.clone()).await {
+                Ok(r) => Some(r),
+                Err(PrepareError::TooLarge(_)) => {
+                    return close_not_stored(ctx, fence, writer, NotStoredReason::ValuesTooLarge)
+                        .await;
+                }
+                Err(PrepareError::Build(e)) => return report(ctx, fence, Failure::Local(e)),
+            },
+            None => None,
+        };
         let before = ctx
             .executor
             .log_source_state(&source.source_ref())
@@ -820,7 +827,7 @@ async fn read_stream(
                 break;
             }
         };
-        let Some(values) = values else {
+        let Some(redactor) = redactor else {
             // A source that opened (a labelled unit) with no ledger row:
             // not read.
             failure = Some(Failure::Local(
@@ -851,7 +858,7 @@ async fn read_stream(
             final_read,
             before,
         };
-        match read.pump(chunks, values, part).await {
+        match read.pump(chunks, redactor, part).await {
             PumpEnd::Complete => {
                 ctx.logs.purge_if_done(&unit, None).await;
                 return Outcome::Terminal;
@@ -1110,15 +1117,11 @@ impl Read<'_> {
     async fn pump(
         &self,
         mut chunks: Box<dyn LogChunks>,
-        values: Arc<ValueSet>,
+        redactor: StreamRedactor,
         part: Vec<LogChunkMeta>,
     ) -> PumpEnd {
-        let gen = values.gen();
-        let mut redactor = match crate::logs::StreamRedactor::new(values) {
-            Ok(r) => Some(r),
-            // `read_stream` closed a set over the cap before the read.
-            Err(e) => return PumpEnd::Broken(Failure::Local(e.to_string())),
-        };
+        let gen = redactor.gen();
+        let mut redactor = Some(redactor);
         let mut verify = Verifier::new(part);
         let mut batch = Batch::default();
         let mut last_byte = tokio::time::Instant::now();
