@@ -208,7 +208,10 @@ rest, until the server reads enough to tell whether a value starts there.
 
 A step's values can add up to at most 256 KiB (every value the step can read, each counted once).
 The server keeps up to 52 bytes of lookup tables per value byte while it reads a log, so the cap
-holds that at 13 MiB per step. A PEM key is about 3 KiB and a kubeconfig is under 10 KiB. A step
+holds that at 13 MiB per step. It keeps at most 512 MiB of these tables in all and builds them
+for 2 steps at a time; a log read that does not fit waits until another read ends, so with many
+steps near the cap at once, some logs show later. A PEM key is about 3 KiB and a kubeconfig is
+under 10 KiB. A step
 over the cap gets one note in place of its log, and the server reads none of it:
 
 ```text

@@ -986,7 +986,11 @@ The same release runs migrations 0102 and 0103 right after 0101. It adds a third
 `NOT VALID`, so it scans no row under its lock, which blocks reads and writes. Migration 0103
 then validates that check again, in its own transaction, under the same lock as 0101 (it blocks
 no read or write); it scans `log_chunks` once more, so on a large table the start takes longer.
-Each waits at most 5 seconds for its lock, with the same causes and the same restarts as 0101.
+Each waits at most 5 seconds for its lock, and a timeout restarts the server as for 0101. 0103
+waits for the same sessions as 0101. 0102's lock waits for every other session that holds a lock
+on `log_chunks`: any open transaction that read the table (a `pg_dump`, a long `SELECT`) makes it
+stop with the lock timeout, and while it waits, up to 5 seconds, the log reads and writes of the
+replicas still running wait behind it.
 
 A 0.7.0 server does not start on a database that ran 0101, 0102 or 0103. To go back to it, scale
 the server to zero, run `DELETE FROM _sqlx_migrations WHERE version IN (101, 102, 103);` and

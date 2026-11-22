@@ -46,7 +46,9 @@ release.yml uses that version's section as the GitHub Release text. See
   stops with `canceling statement due to lock timeout` and Kubernetes restarts it until the other
   session ends. Migration 0102, right after it, adds the `values_too_large` reason to
   `log_chunks_reason` (see Security): it drops the check and adds it again `NOT VALID`, scanning no
-  row. Migration 0103 then validates it again in its own transaction, under the same lock and
+  row, under a lock that every other lock on `log_chunks` blocks: an open transaction that read the
+  table (a `pg_dump`, a long `SELECT`) makes it stop with the lock timeout, and while it waits, up
+  to 5 seconds, log reads and writes on `log_chunks` wait behind it. Migration 0103 then validates it again in its own transaction, under the same lock and
   5-second wait as 0101, so the start scans `log_chunks` once more. A 0.7.0 server does not start
   on a database that ran 0101, 0102 or 0103: to go back, scale the server to zero, run
   `DELETE FROM _sqlx_migrations WHERE version IN (101, 102, 103);` and install 0.7.0. To go back
@@ -88,6 +90,8 @@ release.yml uses that version's section as the GitHub Release text. See
   `not_stored` note with the reason `values_too_large`, the server reads none of its log, and a
   failure cause about it is replaced by "the cause was not stored". The redactor keeps up to 52
   bytes of lookup tables per value byte, so the cap holds them at 13 MiB per step being read. A
+  server keeps at most 512 MiB of these tables, frees a step's tables when its last log read ends,
+  and builds them for 2 steps at a time; a read that does not fit waits for another to end. A
   value is never redacted in part.
 - **Rows already stored are not rewritten.** A value's end that 0.7.0 stored stays stored. A
   re-read of a part stored by 0.7.0 that held an overlap stores one `source_restarted` note and a

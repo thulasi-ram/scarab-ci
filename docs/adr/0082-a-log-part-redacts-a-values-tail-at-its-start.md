@@ -272,15 +272,29 @@ its per-node fields against brute force. No new crate; `Cargo.lock` does not cha
 
 **Building the automata.**
 
-- *Lazily, where a redactor needs them.* `ValueSet` holds the trie and the suffix automaton in two
-  `OnceLock`s. Loading a ledger builds neither, so a launch (`record_launch_values`) builds
-  nothing. `redact_text` (a failure cause) builds the trie only. A stream redactor builds both.
-- *Off the async workers.* `ValueSet::prepare_stream` and `prepare_text` build on a
-  `spawn_blocking` thread when the values are over 16 KiB, and inline below that. The tail
-  prepares the set before it opens the source.
-- *Once per generation.* A reload of the same generation with the same values (the cache's
-  600-second TTL, `redact_text_for_handle`'s reload) shares the built automata of the cached set.
-  A new generation builds again.
+- *Lazily, where a redactor needs them.* Loading a ledger builds nothing, so a launch
+  (`record_launch_values`) builds nothing. A failure cause (`ValueSet::text_automaton`) builds the
+  trie only. A stream redactor builds both. The tail builds them before it opens the source.
+- *Only while a reader holds them.* `ValueSet` holds each automaton through a `Weak`: a stream
+  redactor or a cause being redacted holds it, and the last one to end frees it with its share of
+  the budget. The value cache (600-second TTL) keeps the values, not the automata. A reload of
+  the same generation with the same values shares the automata its readers hold; a new
+  generation builds again. A read that breaks and is retried with no other reader builds again
+  (about 100 ms at the cap).
+- *A process budget and build slots.* Before it builds, a set reserves the most its automata can
+  keep (`21n + 64` bytes for the trie and `31n + 64` for the suffix automaton, `n` value bytes)
+  from a budget of 512 MiB per process (`AUTOMATA_BUDGET_BYTES`; `LogService::with_automata_budget`
+  sets another), waiting while it is full; a stream reserves both in one wait, so two readers
+  never each hold half of what they need. Then it takes one of 2 build slots
+  (`CONCURRENT_BUILDS`), which bounds the build's temporary memory (about 36 MiB each at the cap)
+  to 2 builds. A read waits for room and is never read without its automata. At the cap a unit
+  reserves 13 MiB, so 39 units at the cap are read at once and the 40th waits for one to end.
+  The process keeps at most 512 MiB of automata and 2 × 36 MiB while building.
+- *Off the async workers.* A build of over 16 KiB of values runs on a `spawn_blocking` thread,
+  under 16 KiB inline. A build that does not finish (a panic, the runtime shutting down) is an
+  error: the read fails and is retried, and nothing is built on an async worker in its place.
+- *A keyed hash.* The suffix automaton build's map from `(state, byte)` to edge hashes the key
+  xor a random per-process seed, so a value's author cannot pick bytes whose keys collide.
 - *Flat arrays, no recursion.* Each automaton is a few `Vec`s: an offset per node or state, one
   array of edge bytes and one of targets, and the per-node fields. No node owns a heap block. The
   trie is built from the sorted values (each node's children come in byte order, so a counting
@@ -296,7 +310,7 @@ its per-node fields against brute force. No new crate; `Cargo.lock` does not cha
   interval reaches, and one from the front absorbs every span that starts before the growing end;
   an interval extends the open span only when `s < open`, and a span closes at `c <= h`.
 - *Size.* Kept: the trie takes 21 bytes per node (offset, edge byte and target, failure link,
-  `best`, `pend`), the suffix automaton 8 bytes per state (offset, `room` with `suffix` in its top
+  `best`, `pend`; every array allocated at its length), the suffix automaton 8 bytes per state (offset, `room` with `suffix` in its top
   bit) and 5 per transition. At most 52 bytes per value byte (2 states and 3 transitions per
   byte); measured with the model on 64 KiB of random bytes, base64, hex and PEM lines, 1.17 to
   1.35 states and 2.17 to 2.34 transitions per byte, about 44 bytes per value byte. While the
@@ -305,7 +319,8 @@ its per-node fields against brute force. No new crate; `Cargo.lock` does not cha
 
 **A cap on a unit's values: 256 KiB, fail closed.** `MAX_VALUE_BYTES` is 256 KiB of value bytes
 per unit (every distinct value, added up). At 52 bytes per value byte that keeps the automata of
-one unit under 13 MiB, and the build under about 36 MiB while it runs. A PEM key is about 3 KiB,
+one unit under 13 MiB, and the build under about 36 MiB while it runs; the process budget above
+bounds the sum over units. A PEM key is about 3 KiB,
 a kubeconfig under 10 KiB, the Mozilla CA bundle about 220 KiB. A unit over the cap is never
 redacted in part (*Capping the length of a value that is redacted* is rejected below):
 
@@ -431,8 +446,9 @@ below, and the tail half stays):
   cap gets one `values_too_large` marker and its source is not opened.
 - Build: per value byte at most 2 states, 3 transitions and 52 kept bytes, for random bytes, a
   repeated byte, `abb…bc` and many short tokens, at 256 KiB (which also shows the build uses no
-  recursion); a launch builds no automaton, a failure cause builds the trie only, and a reload of
-  the same generation shares the built automata.
+  recursion); a launch builds no automaton, a failure cause builds the trie only, a reload of
+  the same generation shares the automata its readers hold, and the last reader frees them and
+  their budget; a build waits for room in the budget and for a build slot (polled, no sleeps).
 
 ## Consequences
 

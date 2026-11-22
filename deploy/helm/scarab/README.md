@@ -611,7 +611,10 @@ longer, so the server stops with `canceling statement due to lock timeout`,
 Kubernetes restarts it, and it tries again; it starts once the other session
 ends. A plain autovacuum gives way after about a second. Right after it,
 migration 0102 adds the `values_too_large` reason to `log_chunks_reason`
-(dropped and added again `NOT VALID`, so it scans no row), and migration 0103
+(dropped and added again `NOT VALID`, so it scans no row). Its lock waits for
+every other session on `log_chunks`: an open transaction that read the table
+(a `pg_dump`, a long `SELECT`) makes it stop with the lock timeout, and while
+it waits, up to 5 seconds, log reads and writes wait behind it. Migration 0103
 validates that check again in its own transaction, under the same lock and
 5-second wait as 0101, with one more scan of `log_chunks`. To go back to 0.7.0,
 scale the server to zero, run
