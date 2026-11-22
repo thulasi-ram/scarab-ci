@@ -18,6 +18,112 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **A GitHub push of 300 or more changed files has an unknown `event.changed_paths`, so its
+  path-filtered Pipelines run.** A push's list now comes from the forge's compare API (see
+  Enhancement), and GitHub's lists at most 300 files. Before, a push of up to 2,999 files had a
+  list, read from the webhook payload. The activity log says `300 or more files changed`.
+- **A push's file list on Forgejo needs Forgejo 16.0.1 or later.** An older Forgejo, or a Gitea
+  whose compare answer has no per-commit files, gives an unknown list on every push, so its
+  path-filtered Pipelines always run. Pull requests are not affected.
+- **A `changed_paths` filter is not a deploy guard.** An unknown list counts as true and the
+  Pipeline runs, and a list is unknown during a forge outage, when the forge is slow or
+  rate-limits Scarab, and on every GitHub push of 300 or more files. A Pipeline that runs a deploy
+  when `infra/` changed also runs then; guard a deploy with an Environment's protection and
+  approvals. The reasons a list is unknown changed: "the push payload lists no commits" and "the
+  push payload lists only some of its commits" are gone; new ones say the forge answered 404, the
+  branch's earlier head is not on the new head's first-parent line (Forgejo), more than 1,000
+  commits were pushed (Forgejo), the answer was over 16 MiB, the answer did not list every pushed
+  commit or file, or the payload's commit ids are not commit ids. A tool that matches the reason
+  text in the activity log needs the new ones. See
+  [Changed files](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#changed-files-eventchanged_paths).
+- **Migration 0101 validates three of 0099's checks on `log_chunks` when the server starts.**
+  `log_chunks_kind`, `log_chunks_reason` and `log_chunks_body` are checked against every stored
+  row, under a lock that blocks no read or write, so on a large table the start takes longer.
+  The migration waits at most 5 seconds for that lock: while a manual `VACUUM` or `ANALYZE`, an
+  anti-wraparound autovacuum or a `CREATE INDEX CONCURRENTLY` runs on `log_chunks`, the server
+  stops with `canceling statement due to lock timeout` and Kubernetes restarts it until the other
+  session ends. A 0.7.0 server does not start on a database that ran 0101: to go back, scale the
+  server to zero, run `DELETE FROM _sqlx_migrations WHERE version = 101;` and install 0.7.0. To go
+  back to 0.6, `rollback/0099_revert.sql` now reverts 0101 too. See
+  [Migration 0101](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#migration-0101).
+- **A webhook delivery without a delivery id is refused with 400** when forge connections are
+  configured, since it could not be deduplicated. GitHub and Forgejo send the header on every
+  delivery; a hand-made request or script that posts to `/webhooks/github` or `/webhooks/forgejo`
+  must send `X-GitHub-Delivery` or `X-Forgejo-Delivery`.
+
+### Security
+
+- **The refusal for an unknown placement profile no longer lists the operator's profiles.** It
+  named every profile in the registry, so a repository author could list them by naming one that
+  does not exist. It now names the step and the profile only. See
+  [Placement & resources](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#placement--resources).
+<!-- redactor entry: added by the redactor build -->
+
+### Enhancement
+
+- **A push's changed files come from the forge's compare API**, from the branch's head before the
+  push to its head after it, asked once per delivery and only when a Pipeline whose `push` trigger
+  matches reads `event.changed_paths`. The list now includes a file changed only in a merge's
+  conflict resolution, on GitHub and Forgejo, and a forced push to Forgejo gives an unknown list
+  (`forced push`) instead of only the files of the commits it added, so its path-filtered
+  Pipelines run. A forge answer is read up to 16 MiB. See
+  [Changed files](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#changed-files-eventchanged_paths).
+
+### Bug Fixes
+
+- **A Pod Security or LimitRange denial caused by a step's `k8s_overlay` fails the step.** It was
+  a launch error that the scheduler retried until the Run dead-lettered. When Kubernetes refuses a
+  step Pod with a 400, 403 or 422, Scarab now dry-runs the same Pod and, when that is refused
+  again, the Pod without the overlay: up to two more requests to the API server. The step fails
+  as a configuration error only when the same Pod is refused twice and the Pod without the overlay
+  passes. A refusal gone by the dry run, an RBAC denial and a ResourceQuota denial (matched by
+  Kubernetes' own `is forbidden: exceeded quota: ` text, so a policy message that only contains
+  the words still fails the step) stay launch errors. A webhook that refuses for a reason of the
+  moment on both requests fails the step; rerun it. The API server's message in the failure is
+  cut to 1,024 bytes, also for a refusal by the chart's admission policy. See
+  [Placement & resources](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#placement--resources).
+- **A webhook delivery whose forge stopped waiting still creates its Runs.** The work runs in a
+  task of its own, and the delivery id is recorded inside it, so a delivery dropped before the
+  task started records nothing and its redelivery is processed. At most 64 deliveries run at once;
+  one that gets no turn within 10 seconds is answered 503 with nothing recorded. On shutdown the
+  server waits up to 20 seconds for running deliveries. See
+  [Webhook deliveries](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#webhook-deliveries).
+- **A delivery whose Pipeline files could not be read from the forge can be redelivered.** A
+  failed read is tried three times. When it still fails and no Run was created, the delivery id
+  is forgotten and the answer is 502, so a redelivery creates the Runs; before, the answer was
+  200 `no matching pipeline` and a redelivery was a duplicate. When some Runs were created, the
+  answer is 202 with `"incomplete": true`.
+
+### Tests
+
+- **`just test chaos kill-tailer`** (rank 2) SIGKILLs the server replica that owns a step's log
+  tail lease while the step prints, and checks that each log's lines are stored whole and in
+  order or the log ends in a note, and that the step's secret is in no stored object and not in
+  the log API.
+- **`just test e2e` checks that a rerun step that writes the same bytes skips the step after
+  it.**
+- **`just test record-compare`** records the Forgejo compare answers the adapter's tests read,
+  from the kind stack's Forgejo.
+
+### Documentation
+
+- **Set `kernel.yama.ptrace_scope` to 1 or more on the nodes that run step Pods.** A new section
+  says what it stops and what it does not, its cost, how to read a node's value, and how to set
+  it on Amazon Linux 2023 nodes with Karpenter. Scarab does not check it. See
+  [Hardening the nodes that run step Pods](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#hardening-the-nodes-that-run-step-pods).
+- **The 0.7 docs site builds again.** The 0.7.0 publish stopped at a `<file>` in the Pipeline
+  syntax page.
+
+### Misc
+
+- **CI builds the docs site on pull requests that change it**, so an MDX error fails the pull
+  request instead of the release.
+- **The kind stack runs step Pods in the chart's default namespace, `scarab-steps`**, not the
+  release namespace. The e2e and chaos harnesses read the step namespace from the server's
+  ConfigMap.
+
 ## [0.7.0] - 2026-11-22
 
 ### Breaking changes
