@@ -135,8 +135,8 @@ async fn tick_cycle(
         // short step that finished during a retry backoff keeps its output
         // (git-bug 1dee2f3).
         tailer.end_pass(steps.is_ok() && services.is_ok());
-        // Every 30 s: settle units that left Running, read once more the
-        // units no tail here saw end, revoke and purge due ledgers.
+        // Every 30 s: settle units that left Running and read once more the
+        // units no tail here saw end. Database work and spawned reads only.
         tailer.sweep().await;
     }
     // Infra observation (ADR-0068): narrate why an in-flight step has no logs
@@ -274,13 +274,10 @@ pub fn spawn_driver(
 ) -> tokio::task::JoinHandle<()> {
     // Claim-to-tail lease (ADR-0051): with 2+ replicas, only the fence's
     // lease holder tails a step — deduping ingestion and spreading log I/O.
-    let tailer = logs.map(|logs| {
-        let tailer = LogTailer::new(executor.clone(), logs).with_lease(db.clone(), owner.clone());
-        match &forge {
-            Some(forge) => tailer.with_forge(forge.clone()),
-            None => tailer,
-        }
-    });
+    // Revoking and purging value ledgers is not part of the cycle: it makes
+    // forge calls, and runs as a task of its own (`spawn_ledger_sweeper`).
+    let tailer = logs
+        .map(|logs| LogTailer::new(executor.clone(), logs).with_lease(db.clone(), owner.clone()));
     // Infra observation (ADR-0068) is unconditional: unlike the log tail it needs
     // no object store, and the failures it exists to explain are exactly the ones
     // that produce no logs to store.

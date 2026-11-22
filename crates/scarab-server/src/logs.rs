@@ -80,10 +80,58 @@ pub struct ValueSet {
     gen: i64,
     entries: Vec<MountedValue>,
     values: Vec<Vec<u8>>,
+    generations: Vec<LedgerGeneration>,
+}
+
+/// One generation of a unit's ledger as loaded: the values one launch
+/// mounted, and when its minted forge tokens were revoked (so they are not
+/// revoked again).
+#[derive(Debug, Clone)]
+pub struct LedgerGeneration {
+    pub gen: i64,
+    pub revoked_at: Option<i64>,
+    pub entries: Vec<MountedValue>,
+}
+
+impl LedgerGeneration {
+    /// The minted forge tokens in this generation, once each.
+    pub fn minted_forge_tokens(&self) -> Vec<&MountedValue> {
+        minted_once(&self.entries)
+    }
+}
+
+fn minted_once(entries: &[MountedValue]) -> Vec<&MountedValue> {
+    let mut out: Vec<&MountedValue> = Vec::new();
+    for e in entries {
+        if e.kind == scarab_engine::MountedValueKind::ForgeToken
+            && e.minted == Some(true)
+            && !out.iter().any(|o| o.value == e.value)
+        {
+            out.push(e);
+        }
+    }
+    out
 }
 
 impl ValueSet {
+    /// A set of one generation `gen` holding `entries`.
+    #[cfg(test)]
     fn new(gen: i64, entries: Vec<MountedValue>) -> Self {
+        Self::from_generations(
+            gen,
+            vec![LedgerGeneration {
+                gen,
+                revoked_at: None,
+                entries,
+            }],
+        )
+    }
+
+    fn from_generations(gen: i64, generations: Vec<LedgerGeneration>) -> Self {
+        let entries: Vec<MountedValue> = generations
+            .iter()
+            .flat_map(|g| g.entries.iter().cloned())
+            .collect();
         let mut values: Vec<Vec<u8>> = Vec::new();
         for e in &entries {
             if !e.value.is_empty() && !values.contains(&e.value) {
@@ -94,7 +142,21 @@ impl ValueSet {
             gen,
             entries,
             values,
+            generations,
         }
+    }
+
+    /// Each generation, oldest first.
+    pub fn generations(&self) -> &[LedgerGeneration] {
+        &self.generations
+    }
+
+    /// The oldest generation that holds `value`, if any.
+    pub fn generation_holding(&self, value: &[u8]) -> Option<i64> {
+        self.generations
+            .iter()
+            .find(|g| g.entries.iter().any(|e| e.value == value))
+            .map(|g| g.gen)
     }
 
     /// The ledger generation this set is.
@@ -115,16 +177,7 @@ impl ValueSet {
 
     /// The minted forge tokens in the ledger, once each: what is revoked.
     pub fn minted_forge_tokens(&self) -> Vec<&MountedValue> {
-        let mut out: Vec<&MountedValue> = Vec::new();
-        for e in &self.entries {
-            if e.kind == scarab_engine::MountedValueKind::ForgeToken
-                && e.minted == Some(true)
-                && !out.iter().any(|o| o.value == e.value)
-            {
-                out.push(e);
-            }
-        }
-        out
+        minted_once(&self.entries)
     }
 }
 
@@ -290,17 +343,21 @@ impl LogService {
                 unit.run.0, unit.step.0, unit.attempt.0
             )));
         }
-        let mut entries = Vec::new();
+        let mut generations = Vec::new();
         for g in &rows.generations {
             let plain = self
                 .sealer
                 .open(&g.sealed, &ledger_aad(unit, g.gen))
                 .map_err(|e| LedgerError::Local(format!("opening generation {}: {e}", g.gen)))?;
-            let mut values: Vec<MountedValue> = serde_json::from_slice(&plain)
+            let entries: Vec<MountedValue> = serde_json::from_slice(&plain)
                 .map_err(|e| LedgerError::Local(format!("generation {}: {e}", g.gen)))?;
-            entries.append(&mut values);
+            generations.push(LedgerGeneration {
+                gen: g.gen,
+                revoked_at: g.revoked_at,
+                entries,
+            });
         }
-        let set = Arc::new(ValueSet::new(gen, entries));
+        let set = Arc::new(ValueSet::from_generations(gen, generations));
         self.cache.lock().unwrap().insert(
             unit_key(unit),
             Cached {

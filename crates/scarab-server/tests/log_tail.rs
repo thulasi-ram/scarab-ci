@@ -510,8 +510,12 @@ impl World {
             move |ledger| {
                 SecretInjectingExecutor::new(ledger, db, Arc::new(FakeSecrets::new()), secret_logs)
             },
-            move |with_secrets| {
-                scarab_server::forge_token::ForgeCredentialExecutor::new(with_secrets, forge)
+            move |with_secrets, ledger_logs| {
+                scarab_server::forge_token::ForgeCredentialExecutor::new(
+                    with_secrets,
+                    forge,
+                    ledger_logs,
+                )
             },
         )
     }
@@ -1413,10 +1417,12 @@ async fn a_cancel_before_the_first_poll_still_records_the_start() {
 // ---------------------------------------------------------------------------
 
 /// I8 (2d78464): every minted token in the ledger is revoked, whichever
-/// replica minted it. A mints T1; B re-drives with T2 and revokes T1 at
-/// once; C sees the attempt end and attempts T2 (and T1 again). A failed
-/// revocation is retried by the sweep before the ledger is purged. Kills:
-/// memory-only revocation; purge before the revocation attempt.
+/// replica minted it, once. A mints T1; B re-drives with T2 and revokes T1
+/// at once; C sees the attempt end and attempts T2 only (T1's generation
+/// is marked revoked). A failed revocation is retried by the sweep, after
+/// its backoff, before the ledger is purged. Kills: memory-only
+/// revocation; purge before the revocation attempt; a revoked generation
+/// revoked again.
 #[tokio::test]
 async fn every_minted_token_in_the_ledger_is_revoked_whichever_replica_minted_it() {
     let w = World::new().await;
@@ -1452,7 +1458,11 @@ async fn every_minted_token_in_the_ledger_is_revoked_whichever_replica_minted_it
     *live.poll_state.lock().unwrap() = ExecState::Succeeded;
     let stack_c = w.stack(live.clone(), &c);
     stack_c.poll(&ExecHandle("pod-build".into())).await.unwrap();
-    assert!(w.forge.revoke_tries().contains(&tokens[1]));
+    assert_eq!(
+        w.forge.revoke_tries(),
+        vec![tokens[0].clone(), tokens[1].clone()],
+        "T1 is not attempted again"
+    );
     let ledger = w.db.log_unit_ledger(&stream()).await.unwrap().unwrap();
     assert!(ledger.unit.revoke_attempted_at.is_none());
     // The unit is due a purge (settled over an hour ago): the sweep tries
@@ -1460,7 +1470,8 @@ async fn every_minted_token_in_the_ledger_is_revoked_whichever_replica_minted_it
     w.end_attempt().await;
     w.db.settle_log_units(Timestamp(0)).await.unwrap();
     let now = Timestamp(2 * 3_600_000);
-    scarab_server::log_tail::sweep_ledgers(&c, Some(w.forge.as_ref()), now).await;
+    let pass = scarab_server::log_tail::sweep_ledgers(&c, w.forge.as_ref(), now).await;
+    assert_eq!(pass.failed, 1);
     assert!(
         !w.db
             .log_unit_ledger(&stream())
@@ -1471,8 +1482,17 @@ async fn every_minted_token_in_the_ledger_is_revoked_whichever_replica_minted_it
             .purged
     );
     w.forge.fail_revocations(false);
-    scarab_server::log_tail::sweep_ledgers(&c, Some(w.forge.as_ref()), now).await;
-    assert!(w.forge.revoked().contains(&tokens[1]));
+    // Inside its backoff: not tried again.
+    let tries = w.forge.revoke_tries().len();
+    scarab_server::log_tail::sweep_ledgers(&c, w.forge.as_ref(), Timestamp(now.0 + 1_000)).await;
+    assert_eq!(w.forge.revoke_tries().len(), tries);
+    // After it: tried again, revoked, purged.
+    let later = Timestamp(now.0 + scarab_engine::LEDGER_REVOKE_BACKOFF_MS);
+    scarab_server::log_tail::sweep_ledgers(&c, w.forge.as_ref(), later).await;
+    assert_eq!(
+        w.forge.revoked(),
+        vec![tokens[0].clone(), tokens[1].clone()]
+    );
     assert!(
         w.db.log_unit_ledger(&stream())
             .await
@@ -1845,12 +1865,19 @@ async fn a_short_step_with_a_sidecar_keeps_its_log() {
         },
         {
             let forge = w.forge.clone() as Arc<dyn ForgePort>;
-            move |with_secrets| {
-                scarab_server::forge_token::ForgeCredentialExecutor::new(with_secrets, forge)
+            move |with_secrets, ledger_logs| {
+                scarab_server::forge_token::ForgeCredentialExecutor::new(
+                    with_secrets,
+                    forge,
+                    ledger_logs,
+                )
             }
         },
     );
-    stack.launch(&running(), &spec_with_sidecar()).await.unwrap();
+    stack
+        .launch(&running(), &spec_with_sidecar())
+        .await
+        .unwrap();
     let tailer = w.tailer(exec.clone(), &logs, "a");
     tailer.ensure(&running());
     tailer.ensure_sidecar(&running(), 0);
@@ -1920,12 +1947,19 @@ async fn a_sidecar_stream_left_open_across_a_restart_is_read() {
         },
         {
             let forge = w.forge.clone() as Arc<dyn ForgePort>;
-            move |with_secrets| {
-                scarab_server::forge_token::ForgeCredentialExecutor::new(with_secrets, forge)
+            move |with_secrets, ledger_logs| {
+                scarab_server::forge_token::ForgeCredentialExecutor::new(
+                    with_secrets,
+                    forge,
+                    ledger_logs,
+                )
             }
         },
     );
-    stack.launch(&running(), &spec_with_sidecar()).await.unwrap();
+    stack
+        .launch(&running(), &spec_with_sidecar())
+        .await
+        .unwrap();
     // The old process: the main log completes, the sidecar's read breaks
     // after its first line; then the process is gone.
     let old = w.tailer(exec.clone(), &logs, "old");
@@ -2111,9 +2145,8 @@ async fn a_forge_that_hangs_on_revoke_does_not_hold_the_tick() {
     w.end_attempt().await;
     w.db.settle_log_units(Timestamp(0)).await.unwrap();
     w.forge.hang_revocations(true);
-    let tailer = w
-        .tailer(live.clone(), &logs, "a")
-        .with_forge(w.forge.clone() as Arc<dyn ForgePort>);
+    // Built as the driver builds it: the tailer has no forge.
+    let tailer = w.tailer(live.clone(), &logs, "a");
     let db = w.db.clone() as Arc<dyn Db>;
     let clock: Arc<dyn scarab_engine::Clock> = Arc::new(scarab_testkit::FakeClock::new(now_ms()));
     let exec: Arc<dyn Executor> = live.clone();

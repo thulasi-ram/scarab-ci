@@ -384,7 +384,11 @@ async fn executor(
     .await
     .unwrap();
     let forge = Arc::new(FakeForge::new().with_registry_credential(ghcr()));
-    ForgeCredentialExecutor::new(inner, forge)
+    let logs = Arc::new(scarab_server::LogService::new(
+        Arc::new(scarab_testkit::InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    ForgeCredentialExecutor::new(inner, forge, logs)
         .with_secrets(Arc::new(secrets))
         .with_libraries(db.clone(), libs)
         .with_environment_governance(db, Arc::new(InMemoryEnvironmentGovernance::new()))

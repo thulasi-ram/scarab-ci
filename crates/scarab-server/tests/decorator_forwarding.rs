@@ -110,9 +110,9 @@ async fn the_production_decorator_stack_forwards_identity() {
         inner.clone(),
         db,
         secrets,
-        logs,
+        logs.clone(),
     ));
-    let stack = ForgeCredentialExecutor::new(secret_layer, Arc::new(FakeForge::new()));
+    let stack = ForgeCredentialExecutor::new(secret_layer, Arc::new(FakeForge::new()), logs);
 
     let handle = scarab_engine::ports::ExecHandle("fake://r1/s1/a1".into());
     assert_eq!(
@@ -153,7 +153,9 @@ async fn the_production_stack_forwards_log_source_state() {
         move |ledger| {
             SecretInjectingExecutor::new(ledger, db, Arc::new(FakeSecrets::new()), secret_logs)
         },
-        |with_secrets| ForgeCredentialExecutor::new(with_secrets, Arc::new(FakeForge::new())),
+        |with_secrets, ledger_logs| {
+            ForgeCredentialExecutor::new(with_secrets, Arc::new(FakeForge::new()), ledger_logs)
+        },
     );
     let step = StepRun {
         key: None,

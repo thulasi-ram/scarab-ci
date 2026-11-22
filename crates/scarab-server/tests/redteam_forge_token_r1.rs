@@ -163,7 +163,43 @@ async fn stored_token(db: &InMemoryDb, run: &RunId, step: &str) -> Option<ForgeT
 }
 
 /// Drive `run` to the end with `exec` over `forge`, every launch succeeding.
-async fn drive(db: &InMemoryDb, inner: &FakeExecutor, exec: &ForgeCredentialExecutor, run: &RunId) {
+/// The production executor stack over `inner`,
+/// `Forge(SecretInjecting(Ledger(inner)))`, its value ledger in a store of
+/// its own (revocation reads the tokens from it).
+fn stack(
+    inner: Arc<FakeExecutor>,
+    forge: Arc<dyn scarab_forge::ForgePort>,
+) -> Arc<dyn scarab_engine::Executor> {
+    let ledger_db: Arc<dyn Db> = Arc::new(InMemoryDb::new());
+    let logs = Arc::new(scarab_server::LogService::new(
+        Arc::new(scarab_testkit::InMemoryObjectStore::new()),
+        ledger_db.clone(),
+    ));
+    let secret_logs = logs.clone();
+    scarab_server::build_executor_stack(
+        inner,
+        logs,
+        Arc::new(FakeClock::new(1_000)),
+        move |ledger| {
+            scarab_server::SecretInjectingExecutor::new(
+                ledger,
+                ledger_db,
+                Arc::new(scarab_testkit::FakeSecrets::new()),
+                secret_logs,
+            )
+        },
+        move |with_secrets, ledger_logs| {
+            ForgeCredentialExecutor::new(with_secrets, forge, ledger_logs)
+        },
+    )
+}
+
+async fn drive(
+    db: &InMemoryDb,
+    inner: &FakeExecutor,
+    exec: &dyn scarab_engine::Executor,
+    run: &RunId,
+) {
     let clock = FakeClock::new(1_000);
     let sched = Scheduler::new(db, &clock as &dyn Clock, exec, "sched");
     for _ in 0..8 {
@@ -205,8 +241,8 @@ async fn rt_rerun_after_the_connection_turns_long_lived_must_not_hand_repo_code_
 
     // First Attempt under the App: fine, a short-lived repository token.
     let inner = Arc::new(FakeExecutor::new());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), Arc::new(app));
-    drive(&db, &inner, &exec, &run).await;
+    let exec = stack(inner.clone(), Arc::new(app));
+    drive(&db, &inner, &*exec, &run).await;
     assert_eq!(
         db.run_status(&run).await.unwrap(),
         Some(RunStatus::Succeeded)
@@ -215,12 +251,12 @@ async fn rt_rerun_after_the_connection_turns_long_lived_must_not_hand_repo_code_
     // The connection is now long-lived (Forgejo / GitHub PAT).
     let pat = Arc::new(long_lived(&[(".scarab/ci.yaml", OWN_STEP_YAML)]));
     let inner2 = Arc::new(FakeExecutor::new());
-    let exec2 = ForgeCredentialExecutor::new(inner2.clone(), pat.clone());
+    let exec2 = stack(inner2.clone(), pat.clone());
     let clock = FakeClock::new(2_000);
     scarab_engine::rerun_step(&db, &clock, &run, &StepId("tag".into()), Some("amy".into()))
         .await
         .unwrap();
-    drive(&db, &inner2, &exec2, &run).await;
+    drive(&db, &inner2, &*exec2, &run).await;
     let attempts = db
         .attempts_of_step(&run, &StepId("tag".into()))
         .await
@@ -387,8 +423,8 @@ steps:
     if out.runs.len() == 1 {
         let run = out.runs[0].clone();
         let inner = Arc::new(FakeExecutor::new());
-        let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
-        drive(&db, &inner, &exec, &run).await;
+        let exec = stack(inner.clone(), forge.clone());
+        drive(&db, &inner, &*exec, &run).await;
         let launched = inner.launched_spec(&handle(&run, "g/git", "a1"));
         let (image, cred) = launched
             .map(|s| (s.image.clone(), s.forge_token.and_then(|f| f.credential)))
@@ -490,8 +526,8 @@ async fn rt_a_repo_result_failing_validate_fails_the_token_step_before_any_mint(
         "prep",
         std::collections::BTreeMap::from([("depth".to_string(), serde_json::json!("1;id"))]),
     );
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
-    drive(&db, &inner, &exec, &run).await;
+    let exec = stack(inner.clone(), forge.clone());
+    drive(&db, &inner, &*exec, &run).await;
     let git = StepId("checkout/git".into());
     let status = db
         .steps_of_run(&run)
@@ -662,8 +698,8 @@ async fn rt_a_fork_pull_request_never_mints_a_write_token() {
     assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
     let run = out.runs[0].clone();
     let inner = Arc::new(FakeExecutor::new());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
-    drive(&db, &inner, &exec, &run).await;
+    let exec = stack(inner.clone(), forge.clone());
+    drive(&db, &inner, &*exec, &run).await;
     let launched = inner
         .launched_spec(&handle(&run, "tag", "a1"))
         .expect("tag launched");
@@ -766,8 +802,8 @@ async fn rt_a_skipped_gate_does_not_release_a_write_step() {
     );
     for run in &out.runs {
         let inner = Arc::new(FakeExecutor::new());
-        let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
-        drive(&db, &inner, &exec, run).await;
+        let exec = stack(inner.clone(), forge.clone());
+        drive(&db, &inner, &*exec, run).await;
         assert!(
             inner.launched_spec(&handle(run, "tag", "a1")).is_none(),
             "the write Step launched without its gate being approved"
@@ -789,7 +825,7 @@ async fn rt_a_re_drive_revokes_the_token_it_replaces() {
     let out = trigger(&db, &forge, AdmissionPorts::default(), &push()).await;
     let run = out.runs[0].clone();
     let inner = Arc::new(FakeExecutor::new());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
+    let exec = stack(inner.clone(), forge.clone());
     let step = db
         .steps_of_run(&run)
         .await
@@ -806,7 +842,6 @@ async fn rt_a_re_drive_revokes_the_token_it_replaces() {
         outcome: scarab_engine::AttemptOutcome::Running,
     });
     let spec = db.step_spec(&run, &step.step).await.unwrap().unwrap();
-    use scarab_engine::Executor;
     exec.launch(&step, &spec).await.unwrap();
     exec.launch(&step, &spec).await.unwrap(); // the re-drive
     assert_eq!(
@@ -851,8 +886,8 @@ async fn rt_a_stored_clone_spec_fails_clearly_and_mints_nothing() {
     .unwrap();
     let forge = Arc::new(FakeForge::new().with_minted_tokens());
     let inner = Arc::new(FakeExecutor::new());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
-    drive(&db, &inner, &exec, &run).await;
+    let exec = stack(inner.clone(), forge.clone());
+    drive(&db, &inner, &*exec, &run).await;
     assert!(inner
         .launched_spec(&handle(&run, "checkout", "a1"))
         .is_none());

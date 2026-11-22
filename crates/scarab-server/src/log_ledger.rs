@@ -28,19 +28,21 @@ use crate::secret_executor::SecretInjectingExecutor;
 
 /// Build the executor stack: `Forge(SecretInjecting(Ledger(backend)))`.
 /// `secrets` and `forge` configure the two outer layers over the layer
-/// they are given. The ledger layer is innermost, so every value an outer
-/// layer adds to the spec is recorded before the backend writes it.
+/// they are given; `forge` is handed the same log service the ledger layer
+/// writes to, for [`ForgeCredentialExecutor::new`]. The ledger layer is
+/// innermost, so every value an outer layer adds to the spec is recorded
+/// before the backend writes it.
 pub fn build_executor_stack(
     backend: Arc<dyn Executor>,
     logs: Arc<LogService>,
     clock: Arc<dyn Clock>,
     secrets: impl FnOnce(Arc<dyn Executor>) -> SecretInjectingExecutor,
-    forge: impl FnOnce(Arc<dyn Executor>) -> ForgeCredentialExecutor,
+    forge: impl FnOnce(Arc<dyn Executor>, Arc<LogService>) -> ForgeCredentialExecutor,
 ) -> Arc<dyn Executor> {
     let ledger: Arc<dyn Executor> =
         Arc::new(RedactionLedgerExecutor::new(backend, logs.clone(), clock));
     let with_secrets: Arc<dyn Executor> = Arc::new(secrets(ledger));
-    Arc::new(forge(with_secrets).with_logs(logs))
+    Arc::new(forge(with_secrets, logs))
 }
 
 /// The unit a launch of `step` creates: its current attempt.

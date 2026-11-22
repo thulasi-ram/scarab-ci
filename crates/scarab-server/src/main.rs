@@ -798,6 +798,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // state, reported loudly); the local backend needs nothing but a working
     // host (dev/CLI, ADR-0036).
     let mut driver_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut ledger_sweep_handle: Option<tokio::task::JoinHandle<()>> = None;
     // The driver's health, shared with `/livez` (git-bug afa9f07).
     let mut driver_health: Option<Arc<converged::DriverHealth>> = None;
     if config.role.runs_driver() {
@@ -915,10 +916,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 // Mint a Step's forge credential at each launch and revoke it
                 // when its Attempt ends (ADR-0076 §9), from the unit's ledger.
-                |with_secrets| {
+                |with_secrets, ledger_logs| {
                     scarab_server::forge_token::ForgeCredentialExecutor::new(
                         with_secrets,
                         forge.clone(),
+                        ledger_logs,
                     )
                     // A `registry_auth` Step's credential (ADR-0018): scoped
                     // REGISTRY_AUTH secret first, forge-derived credential as
@@ -973,6 +975,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 health,
             ));
             tracing::info!("converged driver started");
+            // Revoke the forge tokens in due value ledgers and purge them
+            // (git-bug 2d78464): a task of its own under its own lease, so
+            // a forge that does not answer never holds the driver's cycle.
+            ledger_sweep_handle = Some(scarab_server::log_tail::spawn_ledger_sweeper(
+                logs.clone(),
+                forge.clone(),
+                replica_id.clone(),
+            ));
         }
     }
 
@@ -1470,6 +1480,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(handle) = driver_handle {
         tracing::info!("shutdown: stopping the converged driver");
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(handle) = ledger_sweep_handle {
         handle.abort();
         let _ = handle.await;
     }

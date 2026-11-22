@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use scarab_engine::ports::{ExecHandle, ExecState};
-use scarab_engine::{Clock, Db, RunId, RunStatus, Scheduler, StepId};
+use scarab_engine::{Clock, Db, Executor, RunId, RunStatus, Scheduler, StepId};
 use scarab_forge::{Event, RepoRef};
 use scarab_pipeline::ForgeToken;
 use scarab_policy::library::{
@@ -33,6 +33,43 @@ use scarab_testkit::{
     FakeClock, FakeExecutor, FakeForge, InMemoryDb, InMemoryEnvironmentGovernance,
     InMemoryLibraries,
 };
+
+/// The production executor stack over `inner`,
+/// `Forge(SecretInjecting(Ledger(inner)))`, with its value ledger on `db`
+/// (revocation reads the tokens from it); `configure` sets up the forge
+/// layer.
+fn stack(
+    db: &Arc<InMemoryDb>,
+    inner: Arc<FakeExecutor>,
+    forge: Arc<FakeForge>,
+    configure: impl FnOnce(ForgeCredentialExecutor) -> ForgeCredentialExecutor,
+) -> Arc<dyn Executor> {
+    let logs = Arc::new(scarab_server::LogService::new(
+        Arc::new(scarab_testkit::InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let (secret_db, secret_logs) = (db.clone() as Arc<dyn Db>, logs.clone());
+    scarab_server::build_executor_stack(
+        inner,
+        logs,
+        Arc::new(FakeClock::new(1_000)),
+        move |ledger| {
+            scarab_server::SecretInjectingExecutor::new(
+                ledger,
+                secret_db,
+                Arc::new(scarab_testkit::FakeSecrets::new()),
+                secret_logs,
+            )
+        },
+        move |with_secrets, ledger_logs| {
+            configure(ForgeCredentialExecutor::new(
+                with_secrets,
+                forge,
+                ledger_logs,
+            ))
+        },
+    )
+}
 
 const SHA: &str = "1234567890abcdef1234567890abcdef12345678";
 const CLONE: &str = include_str!("../../../libs/clone.yaml");
@@ -272,10 +309,11 @@ async fn the_trusted_clone_step_gets_the_credential_and_no_env_carries_it() {
     let inner = Arc::new(FakeExecutor::new());
     // Each launch on a long-lived connection checks the org still trusts
     // the Step's library, so the launch reads the library store too.
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone())
-        .with_libraries(db.clone(), libs.clone());
+    let exec = stack(&db, inner.clone(), forge.clone(), |f| {
+        f.with_libraries(db.clone(), libs.clone())
+    });
     let clock = FakeClock::new(1_000);
-    let sched = Scheduler::new(db.as_ref(), &clock as &dyn Clock, &exec, "sched");
+    let sched = Scheduler::new(db.as_ref(), &clock as &dyn Clock, &*exec, "sched");
     inner.script_outcome(ExecState::Succeeded); // prep
     for _ in 0..6 {
         sched.tick(&run).await.unwrap();
@@ -704,10 +742,11 @@ async fn write_with_no_approval_is_refused_at_launch_and_an_excluded_one_is_admi
         .unwrap();
 
     let inner = Arc::new(FakeExecutor::new());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone())
-        .with_environment_governance(db.clone() as Arc<dyn Db>, gov.clone());
+    let exec = stack(&db, inner.clone(), forge.clone(), |f| {
+        f.with_environment_governance(db.clone() as Arc<dyn Db>, gov.clone())
+    });
     let clock = FakeClock::new(1_000);
-    let sched = Scheduler::new(db.as_ref(), &clock as &dyn Clock, &exec, "sched");
+    let sched = Scheduler::new(db.as_ref(), &clock as &dyn Clock, &*exec, "sched");
     for _ in 0..4 {
         sched.tick(&run).await.unwrap();
     }
@@ -755,9 +794,9 @@ async fn a_rerun_mints_again() {
     .await;
     let run = out.runs[0].clone();
     let inner = Arc::new(FakeExecutor::new());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
+    let exec = stack(&db, inner.clone(), forge.clone(), |f| f);
     let clock = FakeClock::new(1_000);
-    let sched = Scheduler::new(db.as_ref(), &clock as &dyn Clock, &exec, "sched");
+    let sched = Scheduler::new(db.as_ref(), &clock as &dyn Clock, &*exec, "sched");
     inner.script_outcome(ExecState::Succeeded);
     for _ in 0..4 {
         sched.tick(&run).await.unwrap();

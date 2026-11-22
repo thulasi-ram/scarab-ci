@@ -436,12 +436,21 @@ pub struct ForgeCredentialExecutor {
     identities: Option<Arc<dyn scarab_identity::IdentityStore>>,
     /// The log pipeline: its value ledger holds every forge token a unit
     /// was given, by whichever replica minted it; the tokens revoked come
-    /// from there (git-bug 2d78464).
-    logs: Option<Arc<crate::LogService>>,
+    /// from there (git-bug 2d78464). A launch whose token the ledger does
+    /// not hold fails (see `launch`).
+    logs: Arc<crate::LogService>,
 }
 
 impl ForgeCredentialExecutor {
-    pub fn new(inner: Arc<dyn Executor>, forge: Arc<dyn ForgePort>) -> Self {
+    /// The forge layer over `inner`, revoking from the value ledgers in
+    /// `logs`. [`crate::log_ledger::build_executor_stack`] builds it over
+    /// the ledger layer; over a backend without one, every launch that
+    /// mounts a token fails, and a minted token is revoked at once.
+    pub fn new(
+        inner: Arc<dyn Executor>,
+        forge: Arc<dyn ForgePort>,
+        logs: Arc<crate::LogService>,
+    ) -> Self {
         Self {
             inner,
             forge,
@@ -450,15 +459,8 @@ impl ForgeCredentialExecutor {
             governance: None,
             clock: Arc::new(crate::SystemClock),
             identities: None,
-            logs: None,
+            logs,
         }
-    }
-
-    /// Revoke forge tokens from the units' value ledgers in `logs`.
-    /// [`crate::log_ledger::build_executor_stack`] sets it.
-    pub fn with_logs(mut self, logs: Arc<crate::LogService>) -> Self {
-        self.logs = Some(logs);
-        self
     }
 
     /// Compare recorded approver sets as Principal ids (ADR-0080 §3).
@@ -545,52 +547,52 @@ impl ForgeCredentialExecutor {
         }
     }
 
-    /// Attempt a revoke of every minted forge token in the ledger of the
-    /// unit behind `handle`, except `keep`, and return whether every call
-    /// succeeded (none to make counts). The ledger holds every token a
-    /// labelled unit was given, whichever replica minted it. A token not
-    /// revoked here is retried by the purge sweep; it expires on its own.
-    async fn revoke_from_ledger(
-        &self,
-        unit: &scarab_engine::LogStreamId,
-        keep: Option<&str>,
-    ) -> bool {
-        let Some(logs) = &self.logs else {
-            return true;
-        };
-        let values = match logs.reload_values(unit).await {
-            Ok(v) => v,
-            // No ledger: nothing this version minted for it.
-            Err(crate::logs::LedgerError::NotLedgerComplete(_)) => return true,
-            Err(e) => {
-                tracing::warn!(error = %e, "reading a unit's ledger to revoke its forge tokens failed; retried later");
-                return false;
-            }
-        };
-        revoke_tokens(self.forge.as_ref(), &values, keep).await
-    }
-
-    /// The Attempt behind `handle` ended: revoke every minted token in its
-    /// ledger, record that when every call succeeded, and delete the unit's
-    /// Secrets by name (never reading them).
+    /// The Attempt behind `handle` ended: revoke the minted tokens of every
+    /// generation of its ledger not revoked yet, record the unit revoked
+    /// when none is left, and delete the unit's Secrets by name (never
+    /// reading them).
     async fn revoke(&self, handle: &ExecHandle) {
-        if let Some(logs) = &self.logs {
-            if let Ok(Some(unit)) = logs.db().log_unit_by_handle(&handle.0).await {
-                // Revoked already, by this replica or another (a later poll).
-                let done = matches!(
-                    logs.db().log_unit_ledger(&unit).await,
-                    Ok(Some(l)) if l.unit.revoke_attempted_at.is_some()
-                );
-                if !done && self.revoke_from_ledger(&unit, None).await {
-                    let now = self.clock.now().await;
-                    if let Err(e) = logs.db().mark_log_unit_revoked(&unit, now).await {
-                        tracing::debug!(error = %e, "recording a unit's revocation failed; the sweep retries");
-                    }
+        let db = self.logs.db();
+        if let Ok(Some(unit)) = db.log_unit_by_handle(&handle.0).await {
+            // Revoked already, by this replica or another (a later poll).
+            let done = matches!(
+                db.log_unit_ledger(&unit).await,
+                Ok(Some(l)) if l.unit.revoke_attempted_at.is_some()
+            );
+            let now = self.clock.now().await;
+            if !done
+                && revoke_ledger_generations(
+                    &self.logs,
+                    self.forge.as_ref(),
+                    &unit,
+                    RevokeScope::All,
+                    now,
+                )
+                .await
+            {
+                if let Err(e) = db.mark_log_unit_revoked(&unit, now).await {
+                    tracing::debug!(error = %e, "recording a unit's revocation failed; the sweep retries");
                 }
             }
         }
         if let Err(e) = self.inner.delete_unit_secrets(handle).await {
             tracing::warn!(unit = %handle.0, error = %e, "deleting a unit's Secrets failed; they are removed with its Pod");
+        }
+    }
+
+    /// The generation of `unit`'s ledger, read now, that holds `token`;
+    /// `None` when the ledger cannot be read or does not hold it.
+    async fn ledger_generation_holding(
+        &self,
+        unit: &scarab_engine::LogStreamId,
+        token: &str,
+    ) -> Option<i64> {
+        match self.logs.reload_values(unit).await {
+            Ok(values) => values.generation_holding(token.as_bytes()),
+            Err(e) => {
+                tracing::warn!(error = %e, "reading the unit's value ledger after launch failed");
+                None
+            }
         }
     }
 
@@ -820,37 +822,116 @@ impl ForgeCredentialExecutor {
     }
 }
 
-/// Attempt a revoke of every minted forge token in `values` except `keep`;
-/// whether every call succeeded. A failure is logged with the repository,
-/// never the token.
-pub async fn revoke_tokens(
-    forge: &dyn ForgePort,
-    values: &crate::logs::ValueSet,
-    keep: Option<&str>,
-) -> bool {
-    let mut all = true;
-    for t in values.minted_forge_tokens() {
-        let token = String::from_utf8_lossy(&t.value).into_owned();
-        if keep == Some(token.as_str()) {
-            continue;
-        }
-        let repo = t.repo.as_ref().map_or(
-            RepoRef {
-                owner: String::new(),
-                name: String::new(),
-            },
-            |r| RepoRef {
-                owner: r.owner.clone(),
-                name: r.name.clone(),
-            },
-        );
-        if let Err(e) = forge.revoke_credential(&repo, &token).await {
-            all = false;
+/// Which generations of a unit's ledger a revocation covers. A generation
+/// holds the values one launch mounted, its minted token among them.
+#[derive(Debug, Clone, Copy)]
+pub enum RevokeScope<'a> {
+    /// Every generation: the Attempt ended.
+    All,
+    /// The generations older than `gen`, which holds `keep`, the token a
+    /// launch mounted: the launches it replaced. A launch that returns
+    /// late never ends a newer launch's token.
+    OlderThan { gen: i64, keep: &'a str },
+}
+
+/// The repository a ledger entry names (empty when it names none).
+fn entry_repo(t: &scarab_engine::MountedValue) -> RepoRef {
+    t.repo.as_ref().map_or(
+        RepoRef {
+            owner: String::new(),
+            name: String::new(),
+        },
+        |r| RepoRef {
+            owner: r.owner.clone(),
+            name: r.name.clone(),
+        },
+    )
+}
+
+/// Revoke `token` of `repo`; whether the forge said it ended. A failure is
+/// logged with the repository, never the token.
+async fn revoke_one(forge: &dyn ForgePort, repo: &RepoRef, token: &str) -> bool {
+    match forge.revoke_credential(repo, token).await {
+        Ok(()) => true,
+        Err(e) => {
             tracing::warn!(
                 repo = %format!("{}/{}", repo.owner, repo.name),
                 error = %e,
                 "revoking a forge token failed; retried until the ledger is purged"
             );
+            false
+        }
+    }
+}
+
+/// Revoke the minted forge tokens of the generations of `unit`'s ledger in
+/// `scope` that are not marked revoked, each token once, and mark each
+/// generation whose tokens all ended (or that holds none), so it is never
+/// revoked again. Whether no generation in `scope` is left unmarked. A
+/// unit with no ledger, or a purged one, has nothing this version minted
+/// left to revoke. A token not revoked here is retried by the ledger
+/// sweep; it expires on its own.
+pub async fn revoke_ledger_generations(
+    logs: &crate::LogService,
+    forge: &dyn ForgePort,
+    unit: &scarab_engine::LogStreamId,
+    scope: RevokeScope<'_>,
+    now: scarab_engine::Timestamp,
+) -> bool {
+    let values = match logs.reload_values(unit).await {
+        Ok(v) => v,
+        Err(crate::logs::LedgerError::NotLedgerComplete(_)) => return true,
+        Err(e) => {
+            tracing::warn!(error = %e, "reading a unit's ledger to revoke its forge tokens failed; retried later");
+            return false;
+        }
+    };
+    // A token of a generation already marked ended: never again.
+    let mut ended: BTreeSet<Vec<u8>> = values
+        .generations()
+        .iter()
+        .filter(|g| g.revoked_at.is_some())
+        .flat_map(|g| g.minted_forge_tokens())
+        .map(|t| t.value.clone())
+        .collect();
+    let mut all = true;
+    for g in values.generations() {
+        if g.revoked_at.is_some() {
+            continue;
+        }
+        let keep = match scope {
+            RevokeScope::OlderThan { gen, .. } if g.gen >= gen => continue,
+            RevokeScope::OlderThan { keep, .. } => Some(keep),
+            RevokeScope::All => None,
+        };
+        let mut generation_ended = true;
+        for t in g.minted_forge_tokens() {
+            if ended.contains(&t.value) {
+                continue;
+            }
+            if keep.is_some_and(|k| k.as_bytes() == t.value.as_slice()) {
+                // Mounted by the launch asking: not its to end.
+                generation_ended = false;
+                continue;
+            }
+            let token = String::from_utf8_lossy(&t.value).into_owned();
+            if revoke_one(forge, &entry_repo(t), &token).await {
+                ended.insert(t.value.clone());
+            } else {
+                generation_ended = false;
+            }
+        }
+        if !generation_ended {
+            all = false;
+            continue;
+        }
+        if let Err(e) = logs
+            .db()
+            .mark_log_generation_revoked(unit, g.gen, now)
+            .await
+        {
+            tracing::debug!(error = %e, "recording a ledger generation revoked failed; revoked again later");
+            all = false;
         }
     }
     all
@@ -1041,14 +1122,49 @@ impl Executor for ForgeCredentialExecutor {
                 });
             }
             let launched = self.inner.launch(step, &enriched).await?;
+            let (Some(c), Some(unit)) = (&credential, crate::log_ledger::step_unit(step)) else {
+                return Ok(launched);
+            };
+            // The ledger layer under this one recorded the token before the
+            // backend mounted it. A ledger that does not hold it (the stack
+            // built without that layer) means the unit's log is not redacted
+            // for it: the token ends now and the launch fails.
+            let Some(gen) = self.ledger_generation_holding(&unit, &c.token).await else {
+                tracing::error!(
+                    repo = %format!("{}/{}", repo.owner, repo.name),
+                    "the unit's value ledger does not hold the forge token this launch mounted; \
+                     revoking it and failing the launch"
+                );
+                if c.minted {
+                    revoke_one(self.forge.as_ref(), &repo, &c.token).await;
+                }
+                if let Err(e) = self.inner.cancel(&launched).await {
+                    tracing::debug!(error = %e, "cancelling a unit whose token was not in its ledger failed");
+                }
+                return Err(ExecError::Launch(
+                    "the unit's value ledger does not hold the forge token mounted for it, so its \
+                     log could not be redacted; the token was revoked"
+                        .to_string(),
+                ));
+            };
             // A re-drive of the same Attempt replaced the token the unit holds:
-            // every other minted token in its ledger, minted by this replica or
-            // another, ends now. A launch that failed revokes nothing (its token
-            // may be mounted); the Attempt's end and the purge sweep cover it.
-            if let Some(unit) = crate::log_ledger::step_unit(step) {
-                let mounted = credential.as_ref().map(|c| c.token.as_str());
-                self.revoke_from_ledger(&unit, mounted).await;
-            }
+            // the minted tokens of every older generation of its ledger,
+            // minted by this replica or another, end now; a newer launch's
+            // token is left alone. A launch that failed revokes nothing (its
+            // token may be mounted); the Attempt's end and the ledger sweep
+            // cover it.
+            let now = self.clock.now().await;
+            revoke_ledger_generations(
+                &self.logs,
+                self.forge.as_ref(),
+                &unit,
+                RevokeScope::OlderThan {
+                    gen,
+                    keep: &c.token,
+                },
+                now,
+            )
+            .await;
             Ok(launched)
         }
         .await;
@@ -1232,7 +1348,11 @@ mod tests {
     async fn forwards_launch_service_to_inner() {
         let inner = Arc::new(FakeExecutor::new());
         let forge: Arc<dyn ForgePort> = Arc::new(FakeForge::new());
-        let decorator = ForgeCredentialExecutor::new(inner.clone(), forge);
+        let logs = Arc::new(crate::LogService::new(
+            Arc::new(scarab_testkit::InMemoryObjectStore::new()),
+            Arc::new(scarab_testkit::InMemoryDb::new()),
+        ));
+        let decorator = ForgeCredentialExecutor::new(inner.clone(), forge, logs);
 
         let run = RunId("run-1".into());
         let spec = scarab_pipeline::ServiceSpec {

@@ -233,8 +233,6 @@ pub struct LogTailer {
     owner: String,
     timing: TailTiming,
     state: Arc<Mutex<TailState>>,
-    /// Revokes a unit's minted tokens before the sweep purges its ledger.
-    forge: Option<Arc<dyn scarab_forge::ForgePort>>,
     last_sweep: Mutex<Option<Instant>>,
     /// Where the next pending-final-read pass resumes.
     pending_cursor: Mutex<scarab_engine::PendingReadCursor>,
@@ -249,7 +247,6 @@ impl LogTailer {
             owner: format!("tail-{}", uuid::Uuid::new_v4()),
             timing: TailTiming::default(),
             state: Arc::new(Mutex::new(TailState::default())),
-            forge: None,
             last_sweep: Mutex::new(None),
             pending_cursor: Mutex::new(Default::default()),
         }
@@ -275,13 +272,6 @@ impl LogTailer {
     pub fn with_lease(mut self, db: Arc<dyn Db>, owner: impl Into<String>) -> Self {
         self.db = db;
         self.owner = owner.into();
-        self
-    }
-
-    /// Revoke a unit's minted forge tokens with `forge` before the ledger
-    /// sweep purges it.
-    pub fn with_forge(mut self, forge: Arc<dyn scarab_forge::ForgePort>) -> Self {
-        self.forge = Some(forge);
         self
     }
 
@@ -349,10 +339,11 @@ impl LogTailer {
     }
 
     /// The periodic part of a driver pass, at most every 30 s: mark units
-    /// whose attempt or service left `Running` settled; read once more the
-    /// units that left `Running` while no tail of this process saw them
-    /// (the pending-final-read query); revoke and purge ledgers that are
-    /// due (I7, I8).
+    /// whose attempt or service left `Running` settled, and read once more
+    /// the units that left `Running` while no tail of this process saw them
+    /// (the pending-final-read query). Both are database work and spawned
+    /// reads; no forge call is made here. Revoking and purging ledgers is
+    /// the ledger sweep's ([`spawn_ledger_sweeper`]), a task of its own.
     pub async fn sweep(&self) {
         {
             let mut last = self.last_sweep.lock().unwrap();
@@ -366,7 +357,6 @@ impl LogTailer {
             tracing::debug!(error = %e, "log ledger: marking settled units failed");
         }
         self.pending_pass().await;
-        sweep_ledgers(&self.logs, self.forge.as_deref(), now).await;
     }
 
     /// Read the units the pending-final-read query names: one page of each
@@ -1368,38 +1358,85 @@ pub async fn pump_log_stream(
     Ok(appended)
 }
 
-/// Purge the ledgers the store says are due (I7), after attempting a
-/// revoke of every minted token in each (I8): a unit whose revocation has
-/// not succeeded is kept until its hard cap, then purged anyway (logging
-/// the repositories, never tokens).
+/// The lease one replica holds to run the ledger sweep.
+pub const LEDGER_SWEEP_LEASE: &str = "ledger-sweep";
+
+/// How often the ledger sweep runs.
+pub const LEDGER_SWEEP_EVERY: Duration = Duration::from_secs(30);
+
+/// The longest the ledger sweep waits on one unit's revocations.
+pub const LEDGER_REVOKE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The longest one ledger sweep pass runs; the units it did not reach are
+/// the next pass's.
+pub const LEDGER_SWEEP_PASS_BOUND: Duration = Duration::from_secs(300);
+
+/// The ledger sweep lease's TTL: longer than a pass, so a pass in progress
+/// is never taken over.
+const LEDGER_SWEEP_LEASE_TTL_MS: i64 = 360_000;
+
+/// Units one ledger sweep pass reads.
+const LEDGER_SWEEP_PAGE: u32 = 100;
+
+/// What one ledger sweep pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerSweep {
+    /// Ledgers purged.
+    pub purged: usize,
+    /// Units whose revocation failed or timed out: each waits out its
+    /// backoff before it is tried again.
+    pub failed: usize,
+}
+
+/// One ledger sweep pass (I7, I8): the due units, oldest first, skipping
+/// units whose revocation is backing off. Each unit's minted tokens not
+/// revoked yet are revoked under [`LEDGER_REVOKE_TIMEOUT`]; a unit whose
+/// revocation succeeded is purged; one that failed or timed out backs off
+/// (one minute, doubling to an hour) and is purged anyway once past its
+/// hard cap (logging where, never the tokens). The pass stops at
+/// [`LEDGER_SWEEP_PASS_BOUND`].
 pub async fn sweep_ledgers(
     logs: &LogService,
-    forge: Option<&dyn scarab_forge::ForgePort>,
+    forge: &dyn scarab_forge::ForgePort,
     now: Timestamp,
-) {
+) -> LedgerSweep {
+    let deadline = tokio::time::Instant::now() + LEDGER_SWEEP_PASS_BOUND;
+    let mut out = LedgerSweep::default();
     let due = match logs
         .db()
-        .log_units_to_purge(now, scarab_engine::LEDGER_HARD_CAP_MS, 100)
+        .log_units_to_purge(now, scarab_engine::LEDGER_HARD_CAP_MS, LEDGER_SWEEP_PAGE)
         .await
     {
         Ok(d) => d,
         Err(e) => {
             tracing::debug!(error = %e, "log ledger: the purge query failed");
-            return;
+            return out;
         }
     };
     for c in due {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
         if c.row.revoke_attempted_at.is_none() {
-            let revoked = match (logs.reload_values(&c.unit).await, forge) {
-                (Ok(values), Some(forge)) => {
-                    crate::forge_token::revoke_tokens(forge, &values, None).await
-                }
-                (Ok(values), None) => values.minted_forge_tokens().is_empty(),
-                (Err(_), _) => false,
-            };
+            let revoked = tokio::time::timeout(
+                LEDGER_REVOKE_TIMEOUT,
+                crate::forge_token::revoke_ledger_generations(
+                    logs,
+                    forge,
+                    &c.unit,
+                    crate::forge_token::RevokeScope::All,
+                    now,
+                ),
+            )
+            .await
+            .unwrap_or(false);
             if revoked {
                 let _ = logs.db().mark_log_unit_revoked(&c.unit, now).await;
             } else if !c.past_cap {
+                out.failed += 1;
+                if let Err(e) = logs.db().record_log_unit_revoke_failure(&c.unit, now).await {
+                    tracing::debug!(error = %e, "log ledger: recording a failed revocation failed");
+                }
                 continue;
             } else {
                 tracing::warn!(
@@ -1412,9 +1449,41 @@ pub async fn sweep_ledgers(
         if let Err(e) = logs.db().purge_log_unit(&c.unit).await {
             tracing::debug!(error = %e, "log ledger: purge failed; retried");
         } else {
+            out.purged += 1;
             logs.forget_values(&c.unit);
         }
     }
+    out
+}
+
+/// Run the ledger sweep every [`LEDGER_SWEEP_EVERY`] while this process
+/// (`owner`) holds [`LEDGER_SWEEP_LEASE`]: one replica sweeps. Its own task,
+/// off the scheduler's tick, so a forge that does not answer delays
+/// nothing else.
+pub fn spawn_ledger_sweeper(
+    logs: Arc<LogService>,
+    forge: Arc<dyn scarab_forge::ForgePort>,
+    owner: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let held = matches!(
+                logs.db().lease(LEDGER_SWEEP_LEASE, &owner, LEDGER_SWEEP_LEASE_TTL_MS).await,
+                Ok(l) if l.owner == owner
+            );
+            if held {
+                let pass = sweep_ledgers(&logs, forge.as_ref(), Timestamp(now_ms())).await;
+                if pass.failed > 0 {
+                    tracing::info!(
+                        purged = pass.purged,
+                        failed = pass.failed,
+                        "log ledger sweep: some revocations failed; each is retried after its backoff"
+                    );
+                }
+            }
+            tokio::time::sleep(LEDGER_SWEEP_EVERY).await;
+        }
+    })
 }
 
 /// Report a failed read. The common benign case is a step Pod that has not

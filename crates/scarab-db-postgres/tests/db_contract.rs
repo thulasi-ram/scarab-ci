@@ -1954,6 +1954,120 @@ contract_test!(
     two_units_with_one_handle_resolve_to_the_newer
 );
 
+/// REV-M1: the ledger sweep's candidates come oldest settled first (then
+/// by unit), and a unit whose revocation is backing off is left out until
+/// its retry time, unless it is past its hard cap. Kills: no ORDER BY; the
+/// backoff ignored; the cap not overriding it.
+async fn purge_candidates_come_oldest_first_and_skip_units_in_backoff(db: &dyn Db) {
+    let run = RunId("lr".into());
+    let step = StepId("build".into());
+    seed_run_and_step(db, &run, &step).await;
+    let end = |a: &'static str| {
+        let (run, step) = (run.clone(), step.clone());
+        async move {
+            db.set_attempt_outcome(
+                &run,
+                &step,
+                &AttemptId(a.into()),
+                scarab_engine::AttemptOutcome::Succeeded,
+            )
+            .await
+            .unwrap();
+        }
+    };
+    for a in ["a0", "a1", "a2"] {
+        db.record_attempt(&run, &step, &attempt(a, 0))
+            .await
+            .unwrap();
+        db.write_log_unit(
+            &stream_id("build", a),
+            None,
+            0,
+            Some(b"sealed"),
+            Timestamp(0),
+        )
+        .await
+        .unwrap();
+    }
+    end("a2").await;
+    db.settle_log_units(Timestamp(1_000)).await.unwrap();
+    end("a0").await;
+    end("a1").await;
+    db.settle_log_units(Timestamp(2_000)).await.unwrap();
+    let (now, no_cap) = (Timestamp(10_000_000), 1_000_000_000_000);
+    let ids = |due: Vec<scarab_engine::PurgeCandidate>| {
+        due.into_iter()
+            .map(|c| c.unit.attempt.0)
+            .collect::<Vec<_>>()
+    };
+    let due = db.log_units_to_purge(now, no_cap, 100).await.unwrap();
+    assert_eq!(ids(due), ["a2", "a0", "a1"], "oldest settled first");
+    db.record_log_unit_revoke_failure(&stream_id("build", "a0"), now)
+        .await
+        .unwrap();
+    let due = db.log_units_to_purge(now, no_cap, 100).await.unwrap();
+    assert_eq!(ids(due), ["a2", "a1"], "a0 waits out its backoff");
+    let after = Timestamp(now.0 + scarab_engine::LEDGER_REVOKE_BACKOFF_MS);
+    let due = db.log_units_to_purge(after, no_cap, 100).await.unwrap();
+    assert_eq!(due[1].unit.attempt.0, "a0");
+    assert_eq!(due[1].row.revoke_failures, 1);
+    assert_eq!(due[1].row.revoke_retry_at, Some(after.0));
+    // A second failure doubles the wait.
+    db.record_log_unit_revoke_failure(&stream_id("build", "a0"), after)
+        .await
+        .unwrap();
+    let a0 = db
+        .log_unit_ledger(&stream_id("build", "a0"))
+        .await
+        .unwrap()
+        .unwrap()
+        .unit;
+    assert_eq!(
+        a0.revoke_retry_at,
+        Some(after.0 + 2 * scarab_engine::LEDGER_REVOKE_BACKOFF_MS)
+    );
+    // Past its cap, a unit is a candidate whatever its backoff.
+    let due = db.log_units_to_purge(after, 1_000, 100).await.unwrap();
+    assert_eq!(ids(due), ["a2", "a0", "a1"]);
+}
+
+contract_test!(
+    log_purge_order_and_backoff,
+    purge_candidates_come_oldest_first_and_skip_units_in_backoff
+);
+
+/// J-1: a ledger generation marked revoked keeps the first time it was
+/// marked, and the ledger reports which generations are marked, so a
+/// token in one is never revoked again. Kills: a mark that overwrites;
+/// `revoked_at` not read back.
+async fn a_revoked_generation_is_not_revoked_again(db: &dyn Db) {
+    let u = stream_id("build", "a1");
+    db.write_log_unit(&u, Some("pod-r"), 0, Some(b"one"), Timestamp(1))
+        .await
+        .unwrap();
+    db.write_log_unit(&u, None, 1, Some(b"two"), Timestamp(2))
+        .await
+        .unwrap();
+    db.mark_log_generation_revoked(&u, 1, Timestamp(5))
+        .await
+        .unwrap();
+    db.mark_log_generation_revoked(&u, 1, Timestamp(9))
+        .await
+        .unwrap();
+    let ledger = db.log_unit_ledger(&u).await.unwrap().unwrap();
+    let marks: Vec<_> = ledger
+        .generations
+        .iter()
+        .map(|g| (g.gen, g.revoked_at))
+        .collect();
+    assert_eq!(marks, vec![(1, Some(5)), (2, None)]);
+}
+
+contract_test!(
+    log_generation_revoked_once,
+    a_revoked_generation_is_not_revoked_again
+);
+
 /// REV-m15: a step attempt claimed by a server whose clock is behind the
 /// database's, just before the epoch, is still read once more (and closed
 /// with no source read); one claimed well before it is not. Kills: an
