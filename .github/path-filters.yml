@@ -74,6 +74,22 @@ contracts:
   - *ui
   - "openapi.json"
 
+# The docs site build (`ci.yml`'s `docs-build`, `just docs build`). Its inputs:
+# the site itself; `docs/` and `CONTEXT.md`, which the prebuild step
+# (scripts/sync-content.mjs) copies in and checks the repo links of;
+# `openapi.json`, the API reference's source; and the Justfile that holds the
+# recipe. An ADR that links a repo file which is later renamed fails the build
+# on the next PR that matches here, not on the rename: the price of not
+# building the site on every PR.
+docs_site:
+  - "ui/scarab-docs-ui/**"
+  - "docs/**"
+  - "CONTEXT.md"
+  - "openapi.json"
+  - "Justfile"
+  - ".github/workflows/ci.yml"
+  - ".github/path-filters.yml"
+
 # ---------------------------------------------------------------------------
 # Per-image filters for `image.yml`. Each image's filter is the set of paths
 # its OWN build context reads — which is why a stylesheet edit rebuilds

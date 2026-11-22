@@ -84,6 +84,7 @@ jobs:
       test_and_coverage: ${{ (github.event_name != 'pull_request' && steps.validated.outputs.hit != 'true') || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.filter.outputs.test_and_coverage == 'true' }}
       ui: ${{ (github.event_name != 'pull_request' && steps.validated.outputs.hit != 'true') || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.filter.outputs.ui == 'true' }}
       contracts: ${{ (github.event_name != 'pull_request' && steps.validated.outputs.hit != 'true') || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.filter.outputs.contracts == 'true' }}
+      docs_build: ${{ (github.event_name != 'pull_request' && steps.validated.outputs.hit != 'true') || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.filter.outputs.docs_site == 'true' }}
     steps:
       - uses: actions/checkout@v4
       # Non-PR only: has a passing PR run already validated this exact tree?
@@ -347,6 +348,29 @@ jobs:
             exit 1
           }
 
+  # The docs site build. docs.yml builds it only on a `v*` tag, so an MDX
+  # error (a `<file>` in prose read as a tag, a broken repo link in an ADR)
+  # used to show first in a release. This builds it on a PR that touches what
+  # the build reads (`docs_site` in .github/path-filters.yml), with the recipe
+  # a developer runs; it publishes nothing.
+  docs-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: changes
+    if: needs.changes.outputs.docs_build == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24 # as docs.yml
+          cache: npm
+          cache-dependency-path: ui/scarab-docs-ui/package-lock.json
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: just docs build
+        run: just docs build
+
   # The other half of the validated-tree skip (see `changes`): a PR run whose
   # gates all passed — or were correctly skipped by the path filter — records
   # the exact tree it tested. Expires in 7 days; a merge older than that just
@@ -356,7 +380,7 @@ jobs:
   # label's change) every need is `skipped`, which is neither a failure nor a
   # cancel, and a tree nothing tested must never be recorded as validated.
   record-validated-tree:
-    needs: [changes, test-and-coverage, ui-tests, openapi-drift]
+    needs: [changes, test-and-coverage, ui-tests, openapi-drift, docs-build]
     if: >-
       always() && github.event_name == 'pull_request' &&
       needs.changes.result == 'success' &&
