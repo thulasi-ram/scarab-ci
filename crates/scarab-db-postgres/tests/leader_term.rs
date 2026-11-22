@@ -292,23 +292,10 @@ async fn lock_run_row(pool: &sqlx::PgPool) -> sqlx::Transaction<'static, sqlx::P
     blocker
 }
 
-/// Wait until some backend is blocked on a lock running `UPDATE runs`.
-async fn wait_for_run_update_blocked(pool: &sqlx::PgPool) {
-    for _ in 0..200 {
-        let n: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity
-             WHERE wait_event_type = 'Lock' AND query LIKE 'UPDATE runs%'",
-        )
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        if n > 0 {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("the fenced UPDATE never blocked on the row lock");
-}
+/// The query a blocked fenced run write shows in `pg_stat_activity`. Its
+/// transaction takes the lease row `FOR SHARE` first (`begin_maybe_fenced`),
+/// so once this blocks on the run row, the lease row is held.
+const RUN_UPDATE: &str = "UPDATE runs%";
 
 /// B tries to take the lease over until it does; panics past `within`.
 async fn takeover_by_b(db: &dyn Db, within: Duration) -> (LeaderTerm, Duration) {
@@ -345,7 +332,7 @@ async fn pg_a_takeover_is_ordered_after_an_inflight_fenced_write() {
         let (db, a) = (db.clone(), a.clone());
         tokio::spawn(async move { admit_run(&*db, &a).await })
     };
-    wait_for_run_update_blocked(&tdb.pool).await;
+    common::wait_until_blocked(&tdb.pool, RUN_UPDATE).await;
     // A's write holds the lease row FOR SHARE: B's takeover gives up after
     // its short wait and reports A.
     let seen = db.lease(SCHEDULER_LEASE, "b", TTL_MS).await.unwrap();
@@ -365,6 +352,61 @@ async fn pg_a_takeover_is_ordered_after_an_inflight_fenced_write() {
         Some(RunStatus::Running)
     );
     tdb.cleanup().await;
+}
+
+/// git-bug 789ed54: `pg_a_takeover_is_ordered_after_an_inflight_fenced_write`
+/// failed once on CI with B taking over mid-write. Its wait counted blocked
+/// `UPDATE runs` backends across the whole cluster, so another test's blocked
+/// UPDATE (nextest runs each test in its own process and database) ended the
+/// wait before A's write held the lease row. The interleaving is constructed:
+/// a decoy database holds a blocked `UPDATE runs`; the wait on this database
+/// sees nothing blocked, and still sees A's write once it blocks.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_the_blocked_write_wait_ignores_other_databases() {
+    let Some(own) = fresh_db().await else { return };
+    let Some(decoy) = fresh_db().await else {
+        own.cleanup().await;
+        return;
+    };
+    let db = Arc::new(PostgresDb::with_pool(own.pool.clone()));
+    let decoy_db = PostgresDb::with_pool(decoy.pool.clone());
+    db.migrate().await.unwrap();
+    decoy_db.migrate().await.unwrap();
+    seed_ready(&*db).await;
+    seed_ready(&decoy_db).await;
+
+    // Another test's write, blocked on a row lock in its own database.
+    let decoy_blocker = lock_run_row(&decoy.pool).await;
+    let decoy_write = {
+        let pool = decoy.pool.clone();
+        tokio::spawn(async move {
+            sqlx::query("UPDATE runs SET updated_at = updated_at WHERE id = 'r1'")
+                .execute(&pool)
+                .await
+        })
+    };
+    common::wait_until_blocked(&decoy.pool, RUN_UPDATE).await;
+    assert_eq!(
+        common::blocked_count(&own.pool, RUN_UPDATE).await,
+        0,
+        "the wait counts a blocked write of another database as this test's"
+    );
+
+    // This test's fenced write, blocked the same way: the wait sees it.
+    let a = term_of(&*db, "a").await.unwrap();
+    let blocker = lock_run_row(&own.pool).await;
+    let write = {
+        let (db, a) = (db.clone(), a.clone());
+        tokio::spawn(async move { admit_run(&*db, &a).await })
+    };
+    common::wait_until_blocked(&own.pool, RUN_UPDATE).await;
+
+    blocker.rollback().await.unwrap();
+    write.await.unwrap().expect("a's write commits");
+    decoy_blocker.rollback().await.unwrap();
+    decoy_write.await.unwrap().expect("the decoy write commits");
+    own.cleanup().await;
+    decoy.cleanup().await;
 }
 
 /// Red team A1 (review of the fence-pool design): a deposed leader's write
@@ -388,7 +430,7 @@ async fn pg_a_stopped_leaders_blocked_write_never_commits_after_the_takeover() {
     let mut stopped = Box::pin(admit_run(&*db, &a));
     tokio::select! {
         r = &mut stopped => panic!("A's write cannot finish while the row is locked: {r:?}"),
-        _ = wait_for_run_update_blocked(&tdb.pool) => {}
+        _ = common::wait_until_blocked(&tdb.pool, RUN_UPDATE) => {}
     }
     // A is stopped from here on: `stopped` is not polled.
 
