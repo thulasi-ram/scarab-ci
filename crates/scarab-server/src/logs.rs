@@ -535,7 +535,8 @@ impl LogService {
     }
 
     /// Append one chunk the way a tail does, for tests and tools that feed
-    /// the pipeline directly: under a tail lease this service takes, after
+    /// the pipeline directly: under the stream's append lease (not its tail
+    /// lease), taken for the one write and let go after it, after
     /// giving the stream's unit a ledger (with no values) if it has none,
     /// redacted with the unit's current values. Not a production path.
     pub async fn append(
