@@ -115,3 +115,64 @@ async fn readyz_is_ok_and_every_response_carries_a_request_id() {
         Some("corr-123")
     );
 }
+
+/// A request's span is current only while the request is polled. With a
+/// `span.enter()` guard held across the handler's await, the span stayed
+/// the thread's current span after the request yielded. A request that then
+/// finished on another worker left its closed span on the first worker's
+/// span stack, and the next span made there panicked in tracing-subscriber's
+/// registry ("tried to clone a span that already closed"), failing that
+/// request (the e2e plugin-argocd pass on PR #205). Kills: the guard held
+/// across the await.
+#[test]
+fn a_waiting_request_leaves_no_span_entered_on_its_thread() {
+    use std::future::Future;
+    use std::sync::Mutex;
+    use std::task::{Context, Poll, Waker};
+
+    let _default = tracing::subscriber::set_default(tracing_subscriber::registry());
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let released = Arc::new(Mutex::new(Some(released)));
+    let seen = Arc::new(Mutex::new(None::<&'static str>));
+    let handler = {
+        let (released, seen) = (released.clone(), seen.clone());
+        move || async move {
+            *seen.lock().unwrap() = tracing::Span::current().metadata().map(|m| m.name());
+            let rx = released.lock().unwrap().take().expect("one request");
+            let _ = rx.await;
+            "ok"
+        }
+    };
+    let app = axum::Router::new()
+        .route("/wait", axum::routing::get(handler))
+        .layer(axum::middleware::from_fn(
+            scarab_server::request_id_middleware,
+        ));
+
+    let mut call =
+        Box::pin(app.oneshot(Request::builder().uri("/wait").body(Body::empty()).unwrap()));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+        call.as_mut().poll(&mut cx).is_pending(),
+        "the handler waits"
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some("request"),
+        "the handler runs in the request span"
+    );
+    assert_eq!(
+        tracing::Span::current().metadata().map(|m| m.name()),
+        None,
+        "the waiting request's span is still entered on this thread"
+    );
+
+    release.send(()).unwrap();
+    let resp = match call.as_mut().poll(&mut cx) {
+        Poll::Ready(r) => r.unwrap(),
+        Poll::Pending => panic!("the request finishes once released"),
+    };
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().contains_key("x-request-id"));
+    assert!(tracing::Span::current().is_none());
+}

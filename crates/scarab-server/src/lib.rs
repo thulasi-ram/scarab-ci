@@ -14918,10 +14918,13 @@ pub async fn request_id_middleware(
         .map(String::from)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let span = tracing::info_span!("request", request_id = %id, method = %req.method(), path = %req.uri().path());
-    let mut resp = {
-        let _enter = span.enter();
-        next.run(req).await
-    };
+    // Entered on each poll only, not through a `span.enter()` guard held
+    // across the await. A held guard keeps the span on the worker thread's
+    // span stack while the request waits; the request can finish on another
+    // worker, and the next span made on the first worker then takes the
+    // closed span as its parent, which panics in tracing-subscriber's
+    // registry ("tried to clone a span that already closed").
+    let mut resp = tracing::Instrument::instrument(next.run(req), span).await;
     if let Ok(v) = axum::http::HeaderValue::from_str(&id) {
         resp.headers_mut().insert("x-request-id", v);
     }
