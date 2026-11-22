@@ -275,9 +275,14 @@ text. These are the notes:
 `incomplete` is written when the step's Pod is gone before the end of its log was read, or when
 the server could not read the end of the log within 30 minutes after the step ended. A step
 cancelled before it started gets no note. Output the kubelet rotated away before the server read
-it is gone; a note does not recover it. When that happens before the server's first read of the
-log, the log starts at the oldest byte the kubelet kept, with no note: the kubelet's log API does
-not say that an earlier file was deleted.
+it is gone, and no note marks the gap: the kubelet's log API does not say that an earlier file was
+deleted. When that happens before the server's first read of the log, the log starts at the oldest
+byte the kubelet kept.
+
+Scarab stores a step's log so you can read it with the Run; it is not a log store. A step that
+writes more than the kubelet keeps for one container (`containerLogMaxSize`, 10 MiB by default)
+between two reads can lose lines. To keep all of a large log, send the container output to a log
+store with a node log agent, such as Vector or Fluent Bit.
 
 Logs stored by Scarab 0.6 and earlier keep their notes as they were stored, as output lines that
 start with `scarab:`.
