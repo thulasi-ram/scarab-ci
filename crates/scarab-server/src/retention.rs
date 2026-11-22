@@ -860,8 +860,7 @@ pub fn spawn_sweeper(
                 Ok(n) => tracing::info!(runs = n, "retention sweep pass complete"),
                 Err(e) => tracing::warn!(error = %e, "retention sweep pass failed"),
             }
-            match sweep_webhook_deliveries(&db, &clock, &owner, cfg.webhook_delivery_ttl_ms).await
-            {
+            match sweep_webhook_deliveries(&db, &clock, &owner, cfg.webhook_delivery_ttl_ms).await {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(deliveries = n, "retention: pruned webhook deliveries"),
                 Err(e) => tracing::warn!(error = %e, "webhook delivery prune failed"),

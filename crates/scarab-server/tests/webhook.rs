@@ -2486,7 +2486,11 @@ async fn a_partial_delivery_is_repaired_by_its_redelivery() {
     let (status, body) = send(&app, push_request("d1")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["ignored"], "duplicate delivery");
-    assert_eq!(t.forge.file_reads(), reads, "a finished delivery read the forge");
+    assert_eq!(
+        t.forge.file_reads(),
+        reads,
+        "a finished delivery read the forge"
+    );
 }
 
 /// S2 (red team B1): the first try decides `a` as no match and `x` as every
@@ -2574,7 +2578,10 @@ async fn a_recorded_compile_refusal_stops_the_files_a_later_try_reads() {
         ["scarab/alpha", "scarab/checks", "scarab/delta"],
         "{failures:?}"
     );
-    let delta = failures.iter().find(|s| s.context == "scarab/delta").unwrap();
+    let delta = failures
+        .iter()
+        .find(|s| s.context == "scarab/delta")
+        .unwrap();
     assert!(
         delta
             .description
@@ -2583,7 +2590,10 @@ async fn a_recorded_compile_refusal_stops_the_files_a_later_try_reads() {
             .contains(".scarab/c.yaml"),
         "{delta:?}"
     );
-    let refused = t.db.refused_runs_for_tenant("acme", "app", 10).await.unwrap();
+    let refused =
+        t.db.refused_runs_for_tenant("acme", "app", 10)
+            .await
+            .unwrap();
     assert_eq!(refused.len(), 1, "{refused:?}");
     assert_eq!(refused[0].pipeline, ".scarab/c.yaml");
 
@@ -2665,7 +2675,11 @@ async fn a_late_push_redelivery_does_not_cancel_the_newer_push() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["run_ids"].as_array().map_or(0, Vec::len), 0, "{body}");
     for o in t.outcomes("p1").await {
-        assert_eq!(o.outcome, scarab_engine::DeliveryOutcomeKind::NotRun, "{o:?}");
+        assert_eq!(
+            o.outcome,
+            scarab_engine::DeliveryOutcomeKind::NotRun,
+            "{o:?}"
+        );
         assert_eq!(o.reason_kind.as_deref(), Some("not_head"));
     }
     assert_eq!(t.db.active_runs().await.unwrap().len(), 2, "no Run at sha1");
@@ -2794,7 +2808,10 @@ async fn a_late_pr_comment_redelivery_is_not_the_head() {
         .expect("the deploy file is decided");
     assert_eq!(deploy.outcome, scarab_engine::DeliveryOutcomeKind::NotRun);
     assert_eq!(deploy.reason_kind.as_deref(), Some("not_head"));
-    assert_eq!(t.db.active_runs().await.unwrap(), std::slice::from_ref(&pr_run));
+    assert_eq!(
+        t.db.active_runs().await.unwrap(),
+        std::slice::from_ref(&pr_run)
+    );
     assert!(live(&t.db, &pr_run).await);
 }
 
@@ -2889,11 +2906,14 @@ async fn a_redelivery_while_another_replica_holds_the_try_is_answered_409() {
         String::from_utf8_lossy(&text).contains("another try"),
         "{text:?}"
     );
-    assert_eq!(t.forge.file_reads(), reads, "the forge was read under a held lease");
+    assert_eq!(
+        t.forge.file_reads(),
+        reads,
+        "the forge was read under a held lease"
+    );
     assert!(t.db.active_runs().await.unwrap().is_empty());
 
-    t.db
-        .expire_delivery_try(scarab_forge::ForgeKind::GitHub, "d1");
+    t.db.expire_delivery_try(scarab_forge::ForgeKind::GitHub, "d1");
     let (status, body) = send(&replica_b, push_request("d1")).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     assert_eq!(t.db.active_runs().await.unwrap().len(), 2);
@@ -2950,8 +2970,7 @@ async fn replaced_b() -> (
     let old_b = t.run_of("d1", ".scarab/b.yaml").await;
 
     let other = t.replica();
-    t.db
-        .expire_delivery_try(scarab_forge::ForgeKind::GitHub, "d1");
+    t.db.expire_delivery_try(scarab_forge::ForgeKind::GitHub, "d1");
     let resp = other.clone().oneshot(push_request("d1")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     t.run_of("d1", ".scarab/c.yaml").await;
@@ -2961,9 +2980,9 @@ async fn replaced_b() -> (
     );
     assert_eq!(t.run_of("d1", ".scarab/b.yaml").await, old_b);
 
-    t.clock.advance(scarab_engine::UNFINISHED_CREATION_BOUND_MS + 1);
-    t.db
-        .expire_delivery_try(scarab_forge::ForgeKind::GitHub, "d1");
+    t.clock
+        .advance(scarab_engine::UNFINISHED_CREATION_BOUND_MS + 1);
+    t.db.expire_delivery_try(scarab_forge::ForgeKind::GitHub, "d1");
     let (status, body) = send(&other, push_request("d1")).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     let new_b = t.run_of("d1", ".scarab/b.yaml").await;
@@ -3097,24 +3116,26 @@ steps:
     let (entered, release) = hold_next(&t.db, "begin_run_creation");
     let first = tokio::spawn(replica_a.oneshot(push_request("d1")));
     entered.await.unwrap();
-    t.db
-        .expire_delivery_try(scarab_forge::ForgeKind::GitHub, "d1");
+    t.db.expire_delivery_try(scarab_forge::ForgeKind::GitHub, "d1");
     let (status, body) = send(&replica_b, push_request("d1")).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     release.send(()).unwrap();
     let answer = json_of(first.await.unwrap().unwrap()).await;
-    assert_eq!(answer["run_ids"].as_array().map_or(0, Vec::len), 0, "{answer}");
+    assert_eq!(
+        answer["run_ids"].as_array().map_or(0, Vec::len),
+        0,
+        "{answer}"
+    );
 
     let runs = t.db.active_runs().await.unwrap();
     assert_eq!(runs, [t.run_of("d1", ".scarab/a.yaml").await]);
-    let mut refused: Vec<String> = t
-        .db
-        .refused_runs_for_tenant("acme", "app", 10)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|r| r.pipeline)
-        .collect();
+    let mut refused: Vec<String> =
+        t.db.refused_runs_for_tenant("acme", "app", 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.pipeline)
+            .collect();
     refused.sort();
     assert_eq!(refused, [".scarab/r.yaml", ".scarab/u.yaml"]);
     let mut failures: Vec<String> = t
@@ -3126,10 +3147,9 @@ steps:
         .collect();
     failures.sort();
     assert_eq!(failures, ["scarab/rollout", "scarab/u"]);
-    let (unfinished, held, _) = t
-        .db
-        .delivery_row(scarab_forge::ForgeKind::GitHub, "d1")
-        .unwrap();
+    let (unfinished, held, _) =
+        t.db.delivery_row(scarab_forge::ForgeKind::GitHub, "d1")
+            .unwrap();
     assert!(!unfinished && !held);
 }
 
@@ -3143,8 +3163,7 @@ async fn a_run_whose_creation_failed_is_replaced_at_once() {
     let a = on_push("alpha");
     let t = Redelivery::new(&[(".scarab/a.yaml", &a)]).await;
     let app = t.replica();
-    t.db
-        .fail_next_event_append(|p| matches!(p, scarab_engine::EventPayload::RunCreated));
+    t.db.fail_next_event_append(|p| matches!(p, scarab_engine::EventPayload::RunCreated));
     let (status, body) = send(&app, push_request("d1")).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert_eq!(listed(&body, "undecided"), [".scarab/a.yaml"], "{body}");

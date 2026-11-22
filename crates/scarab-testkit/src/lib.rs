@@ -1091,7 +1091,8 @@ impl Db for InMemoryDb {
         let free = match (&claim.replaces, &current) {
             (None, None) => true,
             (Some(old), Some(o)) => {
-                o.outcome == scarab_engine::DeliveryOutcomeKind::Run && o.run_id.as_ref() == Some(old)
+                o.outcome == scarab_engine::DeliveryOutcomeKind::Run
+                    && o.run_id.as_ref() == Some(old)
             }
             _ => false,
         };
@@ -1127,12 +1128,15 @@ impl Db for InMemoryDb {
         run: &RunId,
     ) -> Result<Option<scarab_engine::RunCreationState>, DbError> {
         let st = self.state.lock().unwrap();
-        Ok(st.runs.get(run).map(|status| scarab_engine::RunCreationState {
-            status: *status,
-            creating: st.creating.contains(run),
-            created_at: st.run_created.get(run).copied().unwrap_or(Timestamp(0)),
-            replaced_by: st.run_replaced_by.get(run).cloned(),
-        }))
+        Ok(st
+            .runs
+            .get(run)
+            .map(|status| scarab_engine::RunCreationState {
+                status: *status,
+                creating: st.creating.contains(run),
+                created_at: st.run_created.get(run).copied().unwrap_or(Timestamp(0)),
+                replaced_by: st.run_replaced_by.get(run).cloned(),
+            }))
     }
 
     async fn record_delivery_refusal(
@@ -1151,7 +1155,8 @@ impl Db for InMemoryDb {
         let free = match (&refusal.replaces, &current) {
             (None, None) => true,
             (Some(old), Some(o)) => {
-                o.outcome == scarab_engine::DeliveryOutcomeKind::Run && o.run_id.as_ref() == Some(old)
+                o.outcome == scarab_engine::DeliveryOutcomeKind::Run
+                    && o.run_id.as_ref() == Some(old)
             }
             _ => false,
         };
@@ -1245,9 +1250,7 @@ impl Db for InMemoryDb {
                         scarab_engine::HeadScope::PullRequest(n) => o.4 == Some(*n),
                     })
             })
-            .max_by(|a, b| {
-                (st.run_created.get(*a), &a.0).cmp(&(st.run_created.get(*b), &b.0))
-            });
+            .max_by(|a, b| (st.run_created.get(*a), &a.0).cmp(&(st.run_created.get(*b), &b.0)));
         if let Some(run) = newest {
             let sha = st.run_origin.get(run).and_then(|o| o.3.as_deref());
             if sha != Some(q.head_sha.as_str()) {
@@ -1255,21 +1258,24 @@ impl Db for InMemoryDb {
             }
         }
         let scope = q.scope.key(&q.org, &q.project);
-        Ok(st.delivery_outcomes.iter().any(|((_, d, path), (forge, _))| {
-            q.pipeline_path.as_ref().is_none_or(|p| p == path)
-                && st
-                    .webhook_deliveries
-                    .get(&(forge.clone(), d.clone()))
-                    .is_some_and(|row| {
-                        row.at > q.after.0
-                            && row.pins.as_ref().is_some_and(|p| {
-                                p.head_scope.as_deref() == Some(scope.as_str())
-                                    && p.head_sha
-                                        .as_deref()
-                                        .is_some_and(|s| s != q.head_sha.as_str())
-                            })
-                    })
-        }))
+        Ok(st
+            .delivery_outcomes
+            .iter()
+            .any(|((_, d, path), (forge, _))| {
+                q.pipeline_path.as_ref().is_none_or(|p| p == path)
+                    && st
+                        .webhook_deliveries
+                        .get(&(forge.clone(), d.clone()))
+                        .is_some_and(|row| {
+                            row.at > q.after.0
+                                && row.pins.as_ref().is_some_and(|p| {
+                                    p.head_scope.as_deref() == Some(scope.as_str())
+                                        && p.head_sha
+                                            .as_deref()
+                                            .is_some_and(|s| s != q.head_sha.as_str())
+                                })
+                        })
+            }))
     }
 
     async fn prune_webhook_deliveries(

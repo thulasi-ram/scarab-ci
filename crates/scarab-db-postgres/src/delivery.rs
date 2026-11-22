@@ -175,13 +175,12 @@ pub(crate) async fn run_creation_state(
     db: &PostgresDb,
     run: &RunId,
 ) -> Result<Option<RunCreationState>, DbError> {
-    let row = sqlx::query(
-        "SELECT status, creating, created_at, replaced_by FROM runs WHERE id = $1",
-    )
-    .bind(&run.0)
-    .fetch_optional(db.pool())
-    .await
-    .map_err(db_err)?;
+    let row =
+        sqlx::query("SELECT status, creating, created_at, replaced_by FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(db.pool())
+            .await
+            .map_err(db_err)?;
     row.map(|r| {
         Ok(RunCreationState {
             status: run_status_from_str(r.get("status"))?,
@@ -443,13 +442,14 @@ pub(crate) async fn begin_delivery_try(
             pins,
         });
     }
-    let unfinished: Option<bool> =
-        sqlx::query_scalar("SELECT unfinished FROM webhook_deliveries WHERE forge = $1 AND id = $2")
-            .bind(forge.as_str())
-            .bind(delivery_id)
-            .fetch_optional(db.pool())
-            .await
-            .map_err(reg_err)?;
+    let unfinished: Option<bool> = sqlx::query_scalar(
+        "SELECT unfinished FROM webhook_deliveries WHERE forge = $1 AND id = $2",
+    )
+    .bind(forge.as_str())
+    .bind(delivery_id)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(reg_err)?;
     // A row pruned between the two statements is a delivery older than the
     // retention period: answered as held, and its next redelivery is a first
     // try.

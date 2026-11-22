@@ -185,8 +185,7 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
             // A comment on a pull request carries `is_pull: true`, and its
             // issue a `pull_request` object.
             let pull_request = p.pointer("/is_pull").and_then(Value::as_bool) == Some(true)
-                || p
-                    .pointer("/issue/pull_request")
+                || p.pointer("/issue/pull_request")
                     .is_some_and(|v| !v.is_null());
             Ok(Event::Comment {
                 actor,

@@ -1648,10 +1648,7 @@ pub enum DeliveryTry {
     First { at: i64 },
     /// A later try of an unfinished delivery; it took the lease. `pins` is
     /// what an earlier try pinned, if any.
-    Again {
-        at: i64,
-        pins: Option<DeliveryPins>,
-    },
+    Again { at: i64, pins: Option<DeliveryPins> },
     /// The delivery is finished: a replay.
     Finished,
     /// Another try holds the lease.

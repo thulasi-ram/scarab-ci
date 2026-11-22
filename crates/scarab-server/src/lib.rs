@@ -5672,7 +5672,10 @@ async fn record_quiet_outcome(
         return Recorded::Written;
     };
     match replaces {
-        None => db.record_delivery_outcome(&d.key(path), kind, now).await.into(),
+        None => db
+            .record_delivery_outcome(&d.key(path), kind, now)
+            .await
+            .into(),
         Some(old) => db
             .record_delivery_refusal(
                 &d.key(path),
@@ -7201,14 +7204,15 @@ async fn enqueue_refusal_status(
     target_path: &str,
 ) {
     let now = clock.now().await;
-    let Some(msg) = refusal_status_message(event, path, pipeline_name, description, target_path, now)
+    let Some(msg) =
+        refusal_status_message(event, path, pipeline_name, description, target_path, now)
     else {
         return;
     };
     if let Err(e) = db.enqueue_outbox(&msg).await {
-        let (org, project) = event
-            .repo()
-            .map_or((String::new(), String::new()), |r| (r.owner.clone(), r.name.clone()));
+        let (org, project) = event.repo().map_or((String::new(), String::new()), |r| {
+            (r.owner.clone(), r.name.clone())
+        });
         tracing::warn!(
             org = %org,
             project = %project,
@@ -7836,9 +7840,7 @@ async fn consult_run_create(
         return match policies.record_run_create_decision(&record, &row).await {
             Ok((_, true)) => Ok(Ok(RunRow::Written)),
             Ok((_, false)) => Ok(Ok(RunRow::NotWritten)),
-            Err(scarab_policy::store::PolicyStoreError::DeliveryClaimed) => {
-                Ok(Ok(RunRow::Claimed))
-            }
+            Err(scarab_policy::store::PolicyStoreError::DeliveryClaimed) => Ok(Ok(RunRow::Claimed)),
             Err(e) => Err(policy_store_err(e)),
         };
     }
@@ -8278,9 +8280,7 @@ pub async fn dispatch_run(
         }
         Admission::Refused(refusal) => refusal,
         // Only the webhook path claims a delivery outcome.
-        Admission::Claimed => {
-            return Err(DispatchError::Db(DbError::Conflict))
-        }
+        Admission::Claimed => return Err(DispatchError::Db(DbError::Conflict)),
     };
     let repo = event
         .repo()
@@ -9441,9 +9441,7 @@ async fn start_delivery_try(
 
 /// The answer to a delivery another try is processing (ADR-0083 §7).
 fn delivery_held() -> ApiError {
-    ApiError::Conflict(
-        "this delivery is being processed by another try; redeliver later".into(),
-    )
+    ApiError::Conflict("this delivery is being processed by another try; redeliver later".into())
 }
 
 /// End a try begun with [`start_delivery_try`]: clear its lease, and mark
@@ -9454,10 +9452,7 @@ async fn end_delivery_try(st: &AppState, try_: Option<&DeliveryTryState>, finish
     let (Some(t), Some(connections)) = (try_, st.connections.as_ref()) else {
         return;
     };
-    if let Err(e) = connections
-        .end_delivery_try(t.forge, &t.id, finished)
-        .await
-    {
+    if let Err(e) = connections.end_delivery_try(t.forge, &t.id, finished).await {
         tracing::warn!(
             forge = t.forge.as_str(),
             delivery = %t.id,
@@ -9486,9 +9481,7 @@ async fn resolve_delivery_pins(
             .map(|c| c.sha)
     };
     let scope_key = |scope: scarab_engine::HeadScope| {
-        event
-            .repo()
-            .map(|repo| scope.key(&repo.owner, &repo.name))
+        event.repo().map(|repo| scope.key(&repo.owner, &repo.name))
     };
     Ok(match event {
         Event::Push { r#ref, after, .. } => scarab_forge::DeliveryPins {
@@ -9592,7 +9585,10 @@ async fn ingest_event(
     event: scarab_forge::Event,
     kind: scarab_forge::ForgeKind,
     try_: Option<&DeliveryTryState>,
-) -> (Result<(StatusCode, Json<serde_json::Value>), ApiError>, bool) {
+) -> (
+    Result<(StatusCode, Json<serde_json::Value>), ApiError>,
+    bool,
+) {
     let delivery_id = try_.map_or("", |t| t.id.as_str());
     let Some(forge) = st.forge.as_ref() else {
         return (
@@ -9659,7 +9655,10 @@ async fn ingest_event(
                 let resolved = match resolve_delivery_pins(forge.as_ref(), &event).await {
                     Ok(pins) => pins,
                     Err(e) => {
-                        return (refuse_unread_delivery(kind, delivery_id, &e.to_string()), false)
+                        return (
+                            refuse_unread_delivery(kind, delivery_id, &e.to_string()),
+                            false,
+                        )
                     }
                 };
                 match connections.pin_delivery(t.forge, &t.id, &resolved).await {
@@ -9685,7 +9684,10 @@ async fn ingest_event(
     let read = match read_event_pipelines(forge.as_ref(), &event, &read_ref).await {
         Ok(read) => read,
         Err(TriggerError::Forge(e)) => {
-            return (refuse_unread_delivery(kind, delivery_id, &e.to_string()), false)
+            return (
+                refuse_unread_delivery(kind, delivery_id, &e.to_string()),
+                false,
+            )
         }
         Err(TriggerError::Db(e)) => return (Err(ApiError::Db(e)), false),
         // A file that is not UTF-8 stays so on every try.
@@ -9731,7 +9733,10 @@ async fn ingest_event(
         // Without a try (dev): an `invoke:` library the forge could not
         // read, before anything was recorded.
         Err(TriggerError::Forge(e)) => {
-            return (refuse_unread_delivery(kind, delivery_id, &e.to_string()), false)
+            return (
+                refuse_unread_delivery(kind, delivery_id, &e.to_string()),
+                false,
+            )
         }
         Err(TriggerError::Db(e)) => return (Err(ApiError::Db(e)), false),
         Err(e @ TriggerError::Pipeline(_)) if !complete => {
@@ -9755,7 +9760,10 @@ fn delivery_answer(
     delivery_id: &str,
     complete: bool,
     outcome: TriggerOutcome,
-) -> (Result<(StatusCode, Json<serde_json::Value>), ApiError>, bool) {
+) -> (
+    Result<(StatusCode, Json<serde_json::Value>), ApiError>,
+    bool,
+) {
     let undecided = !outcome.undecided.is_empty() || !complete;
     let run_ids: Vec<&str> = outcome.runs.iter().map(|r| r.0.as_str()).collect();
     let mut body = serde_json::json!({
@@ -9798,7 +9806,8 @@ fn delivery_answer(
         body["undecided"] = serde_json::json!(outcome.undecided);
         body["incomplete"] = serde_json::json!(true);
         body["error"] = serde_json::json!(match &outcome.compile_error {
-            Some(text) => format!("pipeline: {text}; another Pipeline file could not be decided; redeliver"),
+            Some(text) =>
+                format!("pipeline: {text}; another Pipeline file could not be decided; redeliver"),
             None => "a Pipeline file could not be decided; redeliver".to_string(),
         });
         return (Ok((StatusCode::BAD_GATEWAY, Json(body))), false);
@@ -10099,7 +10108,10 @@ async fn github_delivery(
     st: &AppState,
     delivery: &scarab_forge::WebhookDelivery,
     try_: Option<&DeliveryTryState>,
-) -> (Result<(StatusCode, Json<serde_json::Value>), ApiError>, bool) {
+) -> (
+    Result<(StatusCode, Json<serde_json::Value>), ApiError>,
+    bool,
+) {
     let kind = scarab_forge::ForgeKind::GitHub;
     // Installation lifecycle → the connection's registration (ADR-0046).
     if let Some(sync) = scarab_forge_github::installation_sync(delivery) {
