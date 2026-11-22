@@ -451,6 +451,55 @@ With the policy on, the render fails when:
 | `scarab.admissionPolicy.allowSecrets` | `[]` | Secrets a step Pod may name besides its own and the placement config's |
 | `scarab.admissionPolicy.allowServiceAccounts` | `[]` | ServiceAccounts a step Pod may run as besides `default` and the placement config's |
 
+### Hardening the nodes that run step Pods
+
+We recommend `kernel.yama.ptrace_scope` set to 1 or more on the nodes that run step Pods. Scarab
+does not check it, and runs at any value.
+
+At 1, a process can attach to (`ptrace`, `/proc/<pid>/mem`) only its own descendants unless it
+holds `CAP_SYS_PTRACE`. It is hardening, not a boundary Scarab relies on: Yama checks attach-mode
+access only, not reads of `/proc/<pid>/root` or `/proc/<pid>/environ`. What keeps a Dockerfile
+`RUN` in the build library away from buildkitd and buildctl is the kernel's capability rule, which
+holds at any `ptrace_scope` (measured on 2026-11-12 in Docker with the executor's settings).
+Amazon Linux 2023, the EKS default, ships with 0; Ubuntu ships with 1.
+
+The cost at 1: `strace -p`, `gdb -p` and `py-spy --pid` against a process that is not a child need
+`CAP_SYS_PTRACE`. `strace <command>` and `gdb ./<program>` still work.
+
+The setting is the node's, not the Pod's, so any Pod on a node shows it:
+
+```bash
+kubectl -n <step namespace> exec <pod> -- cat /proc/sys/kernel/yama/ptrace_scope
+```
+
+On Amazon Linux 2023 nodes, add a sysctl drop-in through the node's user data. With Karpenter, in
+the `EC2NodeClass` of the pool that runs step Pods (a launch template's user data takes the same
+part):
+
+```yaml
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: steps
+spec:
+  amiSelectorTerms:
+    - alias: al2023@latest
+  userData: |
+    MIME-Version: 1.0
+    Content-Type: multipart/mixed; boundary="BOUNDARY"
+
+    --BOUNDARY
+    Content-Type: text/x-shellscript; charset="us-ascii"
+
+    #!/bin/bash
+    echo 'kernel.yama.ptrace_scope = 1' > /etc/sysctl.d/90-ptrace-scope.conf
+    sysctl --system
+    --BOUNDARY--
+  # role, subnetSelectorTerms, securityGroupSelectorTerms as for your other pools
+```
+
+New nodes pick it up; replace the existing nodes of the pool to apply it there.
+
 ### Health checks
 
 The server answers three health endpoints. The chart's probes use `/livez` and `/readyz`.
