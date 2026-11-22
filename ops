@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1794429375,"nonce":"AKFIWJOI4g4lJESm11aFsb4iExM=","added":["type:bug","area:server","area:pipeline"],"removed":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1795328086,"nonce":"BLclK/Qr4yWEwQ4HW/9ADj8hOBk=","message":"Fixed in PR #205 (merge 79b1643b on main), 2026-11-22; ships in 0.7.0.","files":null}]}
