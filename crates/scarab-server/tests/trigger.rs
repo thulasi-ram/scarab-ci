@@ -35,6 +35,7 @@ fn push(branch: &str) -> Event {
         after: "sha123".into(),
         // A subject + body — the Headline extractor keeps only the first line.
         message: "fix: the login redirect\n\nA longer body explaining the fix.".into(),
+        before: String::new(),
         changed_paths: Default::default(),
     }
 }
@@ -131,6 +132,7 @@ async fn run_number_is_per_repo_sequential() {
         r#ref: "refs/heads/main".into(),
         after: "sha999".into(),
         message: "init".into(),
+        before: String::new(),
         changed_paths: Default::default(),
     };
     let r3 = trigger_run_from_event(

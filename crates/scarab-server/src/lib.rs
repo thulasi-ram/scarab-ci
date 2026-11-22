@@ -2262,9 +2262,47 @@ fn run_pipeline_name(ir: &scarab_pipeline::PipelineIr, path: &str) -> String {
     ir.name.clone().unwrap_or_else(|| bare_pipeline_name(path))
 }
 
+/// The paths a push from `before` to `after` changed, from the forge's
+/// compare API (ADR-0081), waiting at most
+/// [`CHANGED_FILES_TIMEOUT_SECS`](scarab_forge::CHANGED_FILES_TIMEOUT_SECS)
+/// for the whole call, the adapter's rate-limit waits included. A failed,
+/// slow or incomplete answer is "unknown", never a refused trigger and never
+/// the payload's own commit lists: the `when:` that wanted the paths counts
+/// as true, and the Run says why.
+async fn push_paths(
+    forge: &dyn scarab_forge::ForgePort,
+    repo: &scarab_forge::RepoRef,
+    before: &str,
+    after: &str,
+) -> scarab_forge::ChangedPaths {
+    use scarab_forge::{ChangedPaths, PathsUnknown};
+    let wait = std::time::Duration::from_secs(scarab_forge::CHANGED_FILES_TIMEOUT_SECS);
+    let Ok(answer) =
+        tokio::time::timeout(wait, forge.push_changed_paths(repo, before, after)).await
+    else {
+        tracing::warn!(
+            org = %repo.owner,
+            project = %repo.name,
+            after,
+            "comparing a push's commits timed out; its changed paths are unknown"
+        );
+        return ChangedPaths::Unknown(PathsUnknown::TimedOut);
+    };
+    if let ChangedPaths::Unknown(why) = &answer {
+        tracing::info!(
+            org = %repo.owner,
+            project = %repo.name,
+            after,
+            reason = %why.reason(),
+            "a push's changed paths are unknown"
+        );
+    }
+    answer
+}
+
 /// The paths pull request `number` changes, from the forge's files API
 /// (git-bug 418f55e), waiting at most
-/// [`PULL_REQUEST_FILES_TIMEOUT_SECS`](scarab_forge::PULL_REQUEST_FILES_TIMEOUT_SECS).
+/// [`CHANGED_FILES_TIMEOUT_SECS`](scarab_forge::CHANGED_FILES_TIMEOUT_SECS).
 /// A failed or slow request is "unknown", never a refused trigger: the `when:` that wanted the paths counts as true, and the Run
 /// says why.
 async fn pull_request_paths(
@@ -2273,7 +2311,7 @@ async fn pull_request_paths(
     number: u64,
 ) -> scarab_forge::ChangedPaths {
     use scarab_forge::{ChangedPaths, PathsUnknown};
-    let wait = std::time::Duration::from_secs(scarab_forge::PULL_REQUEST_FILES_TIMEOUT_SECS);
+    let wait = std::time::Duration::from_secs(scarab_forge::CHANGED_FILES_TIMEOUT_SECS);
     let Ok(answer) = tokio::time::timeout(wait, forge.pull_request_files(repo, number)).await
     else {
         tracing::warn!(
@@ -2286,7 +2324,9 @@ async fn pull_request_paths(
     };
     match answer {
         Ok(Some(files)) => ChangedPaths::from_paths(files),
-        Ok(None) => ChangedPaths::Unknown(PathsUnknown::TooMany),
+        Ok(None) => ChangedPaths::Unknown(PathsUnknown::TooMany {
+            limit: scarab_forge::CHANGED_PATHS_MAX,
+        }),
         Err(e) => {
             tracing::warn!(
                 org = %repo.owner,
@@ -5323,9 +5363,10 @@ pub(crate) async fn trigger_runs_from_files(
         return Ok(TriggerOutcome::default());
     };
     let git_ref = config_ref(event);
-    // `event.changed_paths` (git-bug 418f55e): a push carries its own; a
+    // `event.changed_paths` (git-bug 418f55e): a push's (ADR-0081) and a
     // pull request's are asked of the forge once, and only when a Pipeline
-    // reads them.
+    // reads them; a push payload may already have decided them (a new
+    // branch, a forced push, ...).
     let mut ctx = event.when_context();
     let mut paths = event.changed_paths();
     let kind = event.trigger_kind();
@@ -6215,7 +6256,8 @@ enum TriggerDecision {
 }
 
 /// The delivery whose Pipelines' triggers are decided: the event, its
-/// trigger kind, and the forge a pull request's changed paths are asked of.
+/// trigger kind, and the forge a push's or pull request's changed paths are
+/// asked of.
 struct DeliveryTrigger<'a> {
     forge: &'a dyn scarab_forge::ForgePort,
     event: &'a scarab_forge::Event,
@@ -6228,12 +6270,14 @@ impl DeliveryTrigger<'_> {
     /// ([`refuse_uncompiled_delivery`]), so the two cannot answer
     /// differently.
     ///
-    /// The trigger is matched first with a pull request's paths not yet
-    /// asked for (unknown), so a Pipeline whose trigger does not match
-    /// (another kind, a false branch test) costs no files request. Only a
-    /// match that may have rested on the unknown paths asks, once per
-    /// delivery (`ctx` and `paths` keep the answer for the next Pipeline),
-    /// and is decided again with the answer.
+    /// The trigger is matched first with a push's or pull request's paths
+    /// not yet asked for (unknown), so a Pipeline whose trigger does not
+    /// match (another kind, a false branch test) costs no request. Only a
+    /// match that may have rested on the unknown paths asks (a push the
+    /// compare API, ADR-0081; a pull request the files API), once per
+    /// delivery (`ctx` and `paths` keep the answer for the next Pipeline,
+    /// for its run-scope Step `when:`s and for the Run's note), and is
+    /// decided again with the answer.
     async fn decide(
         &self,
         ir: &scarab_pipeline::PipelineIr,
@@ -6253,18 +6297,27 @@ impl DeliveryTrigger<'_> {
         if first != TriggerDecision::Matches {
             return first;
         }
-        if let (
-            scarab_forge::ChangedPaths::Unknown(scarab_forge::PathsUnknown::NotFetched),
-            scarab_forge::Event::PullRequest { repo, number, .. },
-        ) = (&*paths, self.event)
-        {
-            if scarab_pipeline::reads_changed_paths(ir, kind) {
-                *paths = pull_request_paths(self.forge, repo, *number).await;
-                paths.apply_to(ctx);
-                return decide(ctx);
-            }
+        let not_fetched = matches!(
+            paths,
+            scarab_forge::ChangedPaths::Unknown(scarab_forge::PathsUnknown::NotFetched)
+        );
+        if !not_fetched || !scarab_pipeline::reads_changed_paths(ir, kind) {
+            return first;
         }
-        first
+        *paths = match self.event {
+            scarab_forge::Event::PullRequest { repo, number, .. } => {
+                pull_request_paths(self.forge, repo, *number).await
+            }
+            scarab_forge::Event::Push {
+                repo,
+                before,
+                after,
+                ..
+            } => push_paths(self.forge, repo, before, after).await,
+            _ => return first,
+        };
+        paths.apply_to(ctx);
+        decide(ctx)
     }
 }
 
@@ -8826,31 +8879,54 @@ async fn github_webhook(
             Json(serde_json::json!({ "ignored": "duplicate delivery" })),
         ));
     }
-
-    // Installation lifecycle → the connection's registration (ADR-0046).
-    if let Some(sync) = scarab_forge_github::installation_sync(&delivery) {
-        if let Some(connections) = st.connections.as_ref() {
-            return register_installation(&st, connections.as_ref(), &sync).await;
+    finish_delivery(async move {
+        // Installation lifecycle → the connection's registration (ADR-0046).
+        if let Some(sync) = scarab_forge_github::installation_sync(&delivery) {
+            if let Some(connections) = st.connections.as_ref() {
+                return register_installation(&st, connections.as_ref(), &sync).await;
+            }
+            return Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({ "ignored": "no registry configured" })),
+            ));
         }
-        return Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({ "ignored": "no registry configured" })),
-        ));
+
+        let event = match scarab_forge_github::normalize(&delivery) {
+            Ok(e) => e,
+            // Acknowledge-and-ignore events we don't act on (ping, unsupported).
+            Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => {
+                return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true }))));
+            }
+            // A supported event that starts nothing (a closed pull request, ...).
+            Err(scarab_forge::ForgeError::Ignored(why)) => {
+                return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": why }))));
+            }
+            Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+        };
+        ingest_event(&st, event).await
+    })
+    .await
+}
+
+/// Do the rest of a fresh delivery in its own task and wait for it (ADR-0081
+/// §7, git-bug 23e3a09). [`delivery_is_fresh`] has recorded the delivery id,
+/// so a redelivery is answered "duplicate delivery" and cannot repair this
+/// one. A forge that stops waiting (GitHub after 10 seconds, Forgejo after
+/// its `DELIVER_TIMEOUT`) closes the connection, and the HTTP server then
+/// drops the handler; in a task of its own the work goes on, reads the
+/// Pipeline files, asks for the changed files and creates the Runs, and only
+/// the wait is dropped.
+async fn finish_delivery(
+    work: impl std::future::Future<Output = Result<(StatusCode, Json<serde_json::Value>), ApiError>>
+        + Send
+        + 'static,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    match tokio::spawn(work).await {
+        Ok(answer) => answer,
+        Err(e) => Err(ApiError::Db(DbError::Other(format!(
+            "the delivery's task stopped: {e}"
+        )))),
     }
-
-    let event = match scarab_forge_github::normalize(&delivery) {
-        Ok(e) => e,
-        // Acknowledge-and-ignore events we don't act on (ping, unsupported).
-        Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => {
-            return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true }))));
-        }
-        // A supported event that starts nothing (a closed pull request, ...).
-        Err(scarab_forge::ForgeError::Ignored(why)) => {
-            return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": why }))));
-        }
-        Err(e) => return Err(ApiError::BadRequest(e.to_string())),
-    };
-    ingest_event(&st, event).await
 }
 
 /// Inbound Forgejo webhook ingest (ADR-0046): the second per-forge endpoint,
@@ -8916,7 +8992,7 @@ async fn forgejo_webhook(
         }
         Err(e) => return Err(ApiError::BadRequest(e.to_string())),
     };
-    ingest_event(&st, event).await
+    finish_delivery(async move { ingest_event(&st, event).await }).await
 }
 
 fn header_str(headers: &HeaderMap, name: &str) -> String {

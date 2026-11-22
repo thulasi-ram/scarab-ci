@@ -314,6 +314,20 @@ impl ForgePort for RegistryForge {
         )))
     }
 
+    /// The adapter's answer; a repo with no adapter is
+    /// [`ForgeError`](scarab_forge::PathsUnknown::ForgeError).
+    async fn push_changed_paths(
+        &self,
+        repo: &RepoRef,
+        before: &str,
+        after: &str,
+    ) -> scarab_forge::ChangedPaths {
+        match self.adapter_for(repo).await {
+            Ok(adapter) => adapter.push_changed_paths(repo, before, after).await,
+            Err(_) => scarab_forge::ChangedPaths::Unknown(scarab_forge::PathsUnknown::ForgeError),
+        }
+    }
+
     async fn pull_request_files(
         &self,
         repo: &RepoRef,

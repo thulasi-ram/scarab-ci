@@ -1,0 +1,15 @@
+{
+  "recorded_from": "hand-written from the Forgejo 16.0.1 API shape, not recorded yet: run `just test record-compare`",
+  "ff_merge": {
+    "before": "ae4f281df5a5d0ff3cad6371f76d5c29b6d953ec",
+    "after": "5b307cff920d2d06dabc8c785bbd13f98d18ac9d"
+  },
+  "forced": {
+    "before": "511993d3c99719e38a6779073019dacd7178ddb9",
+    "after": "8cd61eb32833f235f4137d7083be6e47e60692b1"
+  },
+  "pull_merge": {
+    "before": "511993d3c99719e38a6779073019dacd7178ddb9",
+    "after": "dfaa0a7be83703ef97cf4eddbb5b941ec85635fb"
+  }
+}

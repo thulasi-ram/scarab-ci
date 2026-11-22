@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use scarab_engine::ports::{ExecHandle, ExecState, LeaderTerm, Lease};
@@ -4362,6 +4362,41 @@ pub struct FakeForge {
     pr_files_calls: Mutex<usize>,
     /// How long `pull_request_files` takes to answer: a slow forge.
     pr_files_delay: Mutex<Option<std::time::Duration>>,
+    /// What [`push_changed_paths`](ForgePort::push_changed_paths) answers,
+    /// per `(before, after)` pair (ADR-0081). A pair with no entry answers
+    /// [`ForgeError`](scarab_forge::PathsUnknown::ForgeError), so a Run that
+    /// started on a scripted answer proves the right two ids reached the
+    /// port.
+    push_paths: Mutex<HashMap<(String, String), scarab_forge::ChangedPaths>>,
+    /// How many `push_changed_paths` calls were made.
+    push_paths_calls: Mutex<usize>,
+    /// How long `push_changed_paths` takes to answer: a slow forge.
+    push_paths_delay: Mutex<Option<std::time::Duration>>,
+    /// When set, `push_changed_paths` signals `entered` and waits for
+    /// `release` before it answers ([`FakeForge::hold_push_paths`]).
+    push_paths_gate: Mutex<Option<Arc<ForgeGate>>>,
+}
+
+/// A point a [`FakeForge`] call stops at until the test lets it go: the call
+/// signals [`entered`](ForgeGate::entered) and waits for
+/// [`release`](ForgeGate::release). Both are `Notify` permits, so neither
+/// side can miss the other whatever order they run in.
+#[derive(Default)]
+pub struct ForgeGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl ForgeGate {
+    /// Wait until the call reached the gate.
+    pub async fn entered(&self) {
+        self.entered.notified().await;
+    }
+
+    /// Let the call that reached the gate answer.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 impl FakeForge {
@@ -4391,6 +4426,32 @@ impl FakeForge {
     /// How many `pull_request_files` calls were made.
     pub fn pr_files_calls(&self) -> usize {
         *self.pr_files_calls.lock().unwrap()
+    }
+
+    /// Script what the compare of a push from `before` to `after` answers.
+    pub fn set_push_paths(&self, before: &str, after: &str, answer: scarab_forge::ChangedPaths) {
+        self.push_paths
+            .lock()
+            .unwrap()
+            .insert((before.to_string(), after.to_string()), answer);
+    }
+
+    /// Make `push_changed_paths` take `delay` before it answers.
+    pub fn set_push_paths_delay(&self, delay: std::time::Duration) {
+        *self.push_paths_delay.lock().unwrap() = Some(delay);
+    }
+
+    /// Make the next `push_changed_paths` calls stop at a gate the test
+    /// opens: the returned [`ForgeGate`].
+    pub fn hold_push_paths(&self) -> Arc<ForgeGate> {
+        let gate = Arc::new(ForgeGate::default());
+        *self.push_paths_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    /// How many `push_changed_paths` calls were made.
+    pub fn push_paths_calls(&self) -> usize {
+        *self.push_paths_calls.lock().unwrap()
     }
 
     pub fn new() -> Self {
@@ -4953,6 +5014,32 @@ pub fn fake_commit_sha(r#ref: &str) -> String {
 
 #[async_trait]
 impl ForgePort for FakeForge {
+    async fn push_changed_paths(
+        &self,
+        _repo: &RepoRef,
+        before: &str,
+        after: &str,
+    ) -> scarab_forge::ChangedPaths {
+        *self.push_paths_calls.lock().unwrap() += 1;
+        let gate = self.push_paths_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        let delay = *self.push_paths_delay.lock().unwrap();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        self.push_paths
+            .lock()
+            .unwrap()
+            .get(&(before.to_string(), after.to_string()))
+            .cloned()
+            .unwrap_or(scarab_forge::ChangedPaths::Unknown(
+                scarab_forge::PathsUnknown::ForgeError,
+            ))
+    }
+
     async fn pull_request_files(
         &self,
         _repo: &RepoRef,

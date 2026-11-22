@@ -246,12 +246,25 @@ pub fn encode_url_component(s: &str) -> String {
 }
 
 /// The most changed files Scarab takes from one trigger (git-bug 418f55e). A
-/// push or pull request that changes this many files or more has unknown
-/// changed paths. GitHub's pull request files API lists at most 3000 files and
-/// says nothing when it stops there, so a list of 3000 may be cut short; the
-/// same number applies to a push so that one rule covers both. It also bounds
-/// the forge calls one pull request costs: 30 pages on GitHub, 60 on Forgejo.
+/// trigger that changes this many files or more has unknown changed paths.
+/// GitHub's pull request files API lists at most 3000 files and says nothing
+/// when it stops there, so a list of 3000 may be cut short; the same number
+/// applies to every list so that one rule covers them all. It also bounds the
+/// forge calls one pull request costs: 30 pages on GitHub, 60 on Forgejo.
 pub const CHANGED_PATHS_MAX: usize = 3000;
+
+/// The most commits a push may carry before Scarab stops asking the forge for
+/// its changed files (ADR-0081 §3). Forgejo's compare answer lists every
+/// pushed commit with its files and runs one `git log --name-status` per
+/// commit to build it, so a push that merges a long-lived branch would load
+/// the forge for one `when:`. A Forgejo push payload says how many commits it
+/// carries (`total_commits`); over this many, the paths are
+/// [`TooManyCommits`](PathsUnknown::TooManyCommits) and no request is made.
+pub const PUSH_COMPARE_COMMITS_MAX: u64 = 1000;
+
+/// The largest compare answer an adapter reads (ADR-0081 §3). A longer body
+/// is [`TooLarge`](PathsUnknown::TooLarge) and is never parsed.
+pub const COMPARE_BODY_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// The repository paths a trigger changed, as a `when:` reads them through
 /// `event.changed_paths` (git-bug 418f55e), or the reason they are unknown.
@@ -279,23 +292,11 @@ impl ChangedPaths {
         let set: std::collections::BTreeSet<String> =
             paths.into_iter().filter(|p| !p.is_empty()).collect();
         if set.len() >= CHANGED_PATHS_MAX {
-            return ChangedPaths::Unknown(PathsUnknown::TooMany);
+            return ChangedPaths::Unknown(PathsUnknown::TooMany {
+                limit: CHANGED_PATHS_MAX,
+            });
         }
         ChangedPaths::Known(set.into_iter().collect())
-    }
-
-    /// The union of `added`, `modified` and `removed` over a push payload's
-    /// `commits` array, the shape GitHub and Forgejo share.
-    pub fn of_commits(commits: &[serde_json::Value]) -> Self {
-        let mut paths = Vec::new();
-        for c in commits {
-            for key in ["added", "modified", "removed"] {
-                if let Some(list) = c.get(key).and_then(serde_json::Value::as_array) {
-                    paths.extend(list.iter().filter_map(|p| p.as_str().map(str::to_string)));
-                }
-            }
-        }
-        Self::from_paths(paths)
     }
 
     /// Put the list into a `{ "event": { … } }` context as
@@ -312,79 +313,132 @@ impl ChangedPaths {
     }
 }
 
-/// Why a trigger's changed paths are unknown (git-bug 418f55e).
+/// Why a trigger's changed paths are unknown (git-bug 418f55e, ADR-0081).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PathsUnknown {
     /// The trigger kind has no changed paths (a tag, a cron fire, a
     /// dispatch, a comment, a release, a follow-up).
     NotGiven,
-    /// A pull request whose files have not been asked of the forge yet.
+    /// A push or pull request whose changed files have not been asked of the
+    /// forge yet.
     NotFetched,
     /// The push created the branch: there is no earlier commit to compare with.
     NewBranch,
-    /// The push was forced: commits it dropped are not in the payload.
+    /// The push was forced: the branch's earlier head is not an ancestor of
+    /// the new one.
     Forced,
     /// The push deleted the ref.
     Deleted,
-    /// The push payload has no commit list.
-    NoCommits,
-    /// The push payload lists only part of the pushed commits.
-    Truncated,
-    /// [`CHANGED_PATHS_MAX`] or more files changed.
-    TooMany,
-    /// The forge's pull request files request failed.
+    /// The forge answered 404: it no longer has the earlier head, or Scarab
+    /// can no longer read the repository.
+    NotFound,
+    /// The branch's earlier head is an ancestor of the new head but not on its
+    /// first-parent line (Forgejo), so no listed commit's files cover it.
+    MergedHead,
+    /// The forge's answer did not list every pushed commit or file.
+    Incomplete,
+    /// `limit` or more files changed: the most the source lists, or
+    /// [`CHANGED_PATHS_MAX`].
+    TooMany { limit: usize },
+    /// More than [`PUSH_COMPARE_COMMITS_MAX`] commits were pushed, so the
+    /// changed files were not asked for.
+    TooManyCommits,
+    /// The forge's changed files answer was over [`COMPARE_BODY_MAX_BYTES`].
+    TooLarge,
+    /// The push payload's commit ids are not commit ids.
+    BadPayload,
+    /// The forge's changed files request failed.
     ForgeError,
-    /// The forge did not list the pull request's files within
-    /// [`PULL_REQUEST_FILES_TIMEOUT_SECS`].
+    /// The forge did not list the changed files within
+    /// [`CHANGED_FILES_TIMEOUT_SECS`].
     TimedOut,
 }
 
-/// How long the server waits for a pull request's files (git-bug 418f55e).
-/// A webhook delivery is answered only after its Runs are created, and GitHub
-/// marks a delivery failed when it gets no answer within 10 seconds; the
-/// same delivery also reads and compiles the Pipeline files. Half of that
-/// budget goes to the files walk. Past it the paths are unknown, so the Run
-/// still starts.
-pub const PULL_REQUEST_FILES_TIMEOUT_SECS: u64 = 5;
+/// How long the server waits for a push's or pull request's changed files
+/// (git-bug 418f55e, ADR-0081 §7). A webhook delivery is answered only after
+/// its Runs are created, and GitHub marks a delivery failed when it gets no
+/// answer within 10 seconds; the same delivery also reads and compiles the
+/// Pipeline files. Half of that budget goes to the files request. Past it the
+/// paths are unknown, so the Run still starts.
+pub const CHANGED_FILES_TIMEOUT_SECS: u64 = 5;
 
 impl PathsUnknown {
     /// The reason, as the Run's event log states it.
     pub fn reason(&self) -> String {
         match self {
             PathsUnknown::NotGiven => "this trigger does not say which files changed".into(),
-            PathsUnknown::NotFetched => "the pull request's files were not asked for".into(),
+            PathsUnknown::NotFetched => "the changed files were not asked for".into(),
             PathsUnknown::NewBranch => "new branch".into(),
             PathsUnknown::Forced => "forced push".into(),
             PathsUnknown::Deleted => "the push deleted the branch".into(),
-            PathsUnknown::NoCommits => "the push payload lists no commits".into(),
-            PathsUnknown::Truncated => "the push payload lists only some of its commits".into(),
-            PathsUnknown::TooMany => format!("{CHANGED_PATHS_MAX} or more files changed"),
-            PathsUnknown::ForgeError => {
-                "the forge did not answer the pull request files request".into()
+            PathsUnknown::NotFound => "the forge answered 404: it no longer has the earlier \
+                 head (removed after a forced push), or Scarab can no longer read the \
+                 repository"
+                .into(),
+            PathsUnknown::MergedHead => {
+                "the branch's earlier head is not on the new head's first-parent line".into()
             }
+            PathsUnknown::Incomplete => {
+                "the forge's answer did not list every pushed commit or file".into()
+            }
+            PathsUnknown::TooMany { limit } => format!("{limit} or more files changed"),
+            PathsUnknown::TooManyCommits => format!(
+                "more than {PUSH_COMPARE_COMMITS_MAX} commits were pushed, so the changed \
+                 files were not asked for"
+            ),
+            PathsUnknown::TooLarge => format!(
+                "the forge's changed files answer was over {} MiB",
+                COMPARE_BODY_MAX_BYTES / (1024 * 1024)
+            ),
+            PathsUnknown::BadPayload => "the push payload's commit ids are not commit ids".into(),
+            PathsUnknown::ForgeError => "the forge did not answer the changed files request".into(),
             PathsUnknown::TimedOut => format!(
-                "the forge did not list the pull request's files within \
-                 {PULL_REQUEST_FILES_TIMEOUT_SECS} seconds"
+                "the forge did not list the changed files within \
+                 {CHANGED_FILES_TIMEOUT_SECS} seconds"
             ),
         }
     }
 }
 
-/// The changed paths of a GitHub or Forgejo push payload (git-bug 418f55e):
-/// the union of every listed commit's `added`, `modified` and `removed`, or
-/// why that union is not the whole change.
+/// What a push's two commit ids alone say of its changed paths (ADR-0081
+/// §1), before any request: [`Deleted`](PathsUnknown::Deleted) when `after`
+/// is all zeros, [`NewBranch`](PathsUnknown::NewBranch) when `before` is,
+/// [`BadPayload`](PathsUnknown::BadPayload) when either is not a full commit
+/// id ([`is_full_commit_id`]), a known empty list when they are equal.
+/// `None` means the forge has to be asked.
 ///
-/// Unknown when the push deleted the ref (`deleted`, or `after` all zeros),
-/// created it (`created`, or `before` all zeros), was forced (`forced`), has
-/// no commits listed, or may list fewer commits than it has.
+/// The adapters' [`ForgePort::push_changed_paths`] calls this before it
+/// builds a URL, as well as [`push_payload_paths`] at normalize time: the ids
+/// go into a URL path, and an event read back with no `before` (its serde
+/// default) has an empty one.
+pub fn push_ids_answer(before: &str, after: &str) -> Option<ChangedPaths> {
+    let unknown = |why| Some(ChangedPaths::Unknown(why));
+    if is_zero_sha(after) {
+        return unknown(PathsUnknown::Deleted);
+    }
+    if is_zero_sha(before) {
+        return unknown(PathsUnknown::NewBranch);
+    }
+    if !is_full_commit_id(before) || !is_full_commit_id(after) {
+        return unknown(PathsUnknown::BadPayload);
+    }
+    (before == after).then(|| ChangedPaths::Known(Vec::new()))
+}
+
+/// What a GitHub or Forgejo push payload says of its changed paths without a
+/// request (ADR-0081 §1). [`NotFetched`](PathsUnknown::NotFetched) when the
+/// forge's compare API has to be asked; otherwise the reason the paths are
+/// unknown, or a known empty list for a push that did not move the branch.
 ///
-/// `listed_cap` says how to tell: `Some(cap)` for GitHub, which lists at
-/// most `cap` commits and sends no total, so `cap` or more listed is cut
-/// short; `None` for Forgejo, which lists only the first few commits of a
-/// push and sends `total_commits`, so a list shorter than that total, or a
-/// payload with no total, is cut short.
-pub fn push_changed_paths(payload: &serde_json::Value, listed_cap: Option<usize>) -> ChangedPaths {
+/// In order: `deleted` or `after` all zeros, `created` or `before` all zeros,
+/// `forced` (GitHub only), ids that are not full commit ids, a
+/// `total_commits` over `commits_max` (Forgejo, [`PUSH_COMPARE_COMMITS_MAX`];
+/// `None` for GitHub, which sends no total), `before` equal to `after`.
+///
+/// The payload's per-commit file lists are not read: they miss merge
+/// resolutions, and Forgejo's do not show a forced push (ADR-0081).
+pub fn push_payload_paths(payload: &serde_json::Value, commits_max: Option<u64>) -> ChangedPaths {
     use serde_json::Value;
     let flag = |k: &str| payload.get(k).and_then(Value::as_bool) == Some(true);
     let sha = |k: &str| payload.get(k).and_then(Value::as_str).unwrap_or_default();
@@ -398,28 +452,33 @@ pub fn push_changed_paths(payload: &serde_json::Value, listed_cap: Option<usize>
     if flag("forced") {
         return unknown(PathsUnknown::Forced);
     }
-    let Some(commits) = payload
-        .get("commits")
-        .and_then(Value::as_array)
-        .filter(|c| !c.is_empty())
-    else {
-        return unknown(PathsUnknown::NoCommits);
-    };
-    let total = payload.get("total_commits").and_then(Value::as_u64);
-    let cut_short = match listed_cap {
-        Some(cap) => commits.len() >= cap || total.is_some_and(|t| t > commits.len() as u64),
-        None => total.is_none_or(|t| t > commits.len() as u64),
-    };
-    if cut_short {
-        return unknown(PathsUnknown::Truncated);
+    if !is_full_commit_id(sha("before")) || !is_full_commit_id(sha("after")) {
+        return unknown(PathsUnknown::BadPayload);
     }
-    ChangedPaths::of_commits(commits)
+    if let (Some(max), Some(total)) = (
+        commits_max,
+        payload.get("total_commits").and_then(Value::as_u64),
+    ) {
+        if total > max {
+            return unknown(PathsUnknown::TooManyCommits);
+        }
+    }
+    push_ids_answer(sha("before"), sha("after"))
+        .unwrap_or(ChangedPaths::Unknown(PathsUnknown::NotFetched))
 }
 
 /// Whether `sha` is all zeros: the `before` of a push that created its ref,
 /// or the `after` of one that deleted it.
 pub fn is_zero_sha(sha: &str) -> bool {
     !sha.is_empty() && sha.bytes().all(|b| b == b'0')
+}
+
+/// Whether `s` is a full commit id: 40 (SHA-1) or 64 (SHA-256) lower-case hex
+/// digits. A push's `before` and `after` must be, before an adapter puts them
+/// into a compare URL: an abbreviation is ambiguous and a branch name is
+/// accepted by both compare APIs but names a ref that moves.
+pub fn is_full_commit_id(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// A forge event, normalized across providers into Scarab's own vocabulary.
@@ -441,6 +500,11 @@ pub enum Event {
         actor_id: String,
         repo: RepoRef,
         r#ref: String,
+        /// The branch's head before the push (the payload's `before`): the
+        /// other end of the compare a push's changed files come from
+        /// (ADR-0081). Empty for an event that carried none.
+        #[serde(default)]
+        before: String,
         after: String,
         /// The head commit's full message (`head_commit.message`). Source of the
         /// run **Headline** (its first line = the commit subject) via
@@ -448,10 +512,12 @@ pub enum Event {
         /// **deliberately excluded from [`Event::context()`]** (see that method's
         /// security note). Empty when the payload carried no head commit.
         message: String,
-        /// The paths the push changed, from the payload's commit list, or why
-        /// they are not known (git-bug 418f55e). A `when:` reads them as
-        /// `event.changed_paths` ([`Event::when_context`]); a template never
-        /// does, and the Run does not store them.
+        /// What the payload alone says of the paths the push changed
+        /// (git-bug 418f55e, ADR-0081): [`NotFetched`](PathsUnknown::NotFetched)
+        /// when the forge's compare API must be asked, else why they are
+        /// unknown, or a known empty list ([`push_payload_paths`]). A `when:`
+        /// reads them as `event.changed_paths` ([`Event::when_context`]); a
+        /// template never does, and the Run does not store them.
         #[serde(default)]
         changed_paths: ChangedPaths,
     },
@@ -835,10 +901,12 @@ impl Event {
     }
 
     /// The paths this event changed, or why they are unknown (git-bug
-    /// 418f55e). A push carries its own; a pull request's come from the
-    /// forge's files API, which the server asks only when a Pipeline reads
-    /// them, so here they are [`NotFetched`](PathsUnknown::NotFetched). Every
-    /// other kind has none.
+    /// 418f55e). A push's come from the forge's compare API (ADR-0081) and a
+    /// pull request's from its files API; the server asks either only when a
+    /// Pipeline reads them, so here they are
+    /// [`NotFetched`](PathsUnknown::NotFetched), or for a push whatever its
+    /// payload already decided ([`push_payload_paths`]). Every other kind has
+    /// none.
     pub fn changed_paths(&self) -> ChangedPaths {
         match self {
             Event::Push { changed_paths, .. } => changed_paths.clone(),
@@ -1166,6 +1234,26 @@ pub trait ForgePort: Send + Sync {
     }
 
     async fn normalize_event(&self, raw: WebhookDelivery) -> Result<Event, ForgeError>;
+
+    /// The paths a push from `before` to `after` changed, from the forge's
+    /// compare API, for `event.changed_paths` (ADR-0081). A known list comes
+    /// only from an answer that is complete by its own fields; anything else
+    /// is unknown with its reason, never a partial list. The adapter checks
+    /// the ids first ([`push_ids_answer`]) and makes no request for ids that
+    /// are not full commit ids. The server asks only when a Pipeline's
+    /// `when:` reads the field, at most once per delivery, and bounds the call
+    /// by [`CHANGED_FILES_TIMEOUT_SECS`].
+    ///
+    /// Defaults to [`ForgeError`](PathsUnknown::ForgeError): a forge that
+    /// cannot compare gives unknown paths, so a path filter counts as true.
+    async fn push_changed_paths(
+        &self,
+        _repo: &RepoRef,
+        _before: &str,
+        _after: &str,
+    ) -> ChangedPaths {
+        ChangedPaths::Unknown(PathsUnknown::ForgeError)
+    }
 
     /// The paths pull request `number` changes, as the forge's PR files API
     /// lists them (a renamed file gives both its old and new path), for
@@ -1919,6 +2007,7 @@ mod tests {
                     r#ref: "refs/heads/main".into(),
                     after: "deadbeef".into(),
                     message: "fix: the thing".into(),
+                    before: String::new(),
                     changed_paths: Default::default(),
                 },
                 TriggerKind::Push,
@@ -2016,6 +2105,7 @@ mod tests {
                 r#ref: "refs/heads/main".into(),
                 after: "abc".into(),
                 message: "subject".into(),
+                before: String::new(),
                 changed_paths: Default::default(),
             }
             .actor(),
@@ -2044,6 +2134,7 @@ mod tests {
                 r#ref: "refs/heads/main".into(),
                 after: "abc".into(),
                 message: "subject".into(),
+                before: String::new(),
                 changed_paths: Default::default(),
             }
             .actor(),
@@ -2084,6 +2175,7 @@ mod tests {
             r#ref: "main".into(),
             after: "z".into(),
             message: "subject".into(),
+            before: String::new(),
             changed_paths: Default::default(),
         }
         .is_fork_pr());
@@ -2134,6 +2226,7 @@ mod tests {
                 r#ref: "main".into(),
                 after: "x".into(),
                 message: "subject".into(),
+                before: String::new(),
                 changed_paths: Default::default(),
             }
             .repo(),
@@ -2153,6 +2246,7 @@ mod tests {
                 r#ref: "refs/heads/main".into(),
                 after: "deadbeef".into(),
                 message: "subject".into(),
+                before: String::new(),
                 changed_paths: Default::default(),
             }
             .protection_ref()
@@ -2280,6 +2374,7 @@ mod tests {
             r#ref: "refs/heads/main".into(),
             after: "deadbeef".into(),
             message: "feat: add the widget".into(),
+            before: String::new(),
             changed_paths: Default::default(),
         }
         .context();
@@ -2302,6 +2397,7 @@ mod tests {
             r#ref: "refs/heads/main".into(),
             after: "deadbeef".into(),
             message: "$(rm -rf /) evil subject".into(),
+            before: String::new(),
             changed_paths: Default::default(),
         }
         .context();
@@ -2316,23 +2412,20 @@ mod tests {
         );
     }
 
-    // Attack: a pushed commit names files with shell and template syntax and
-    // a newline, and repeats a path across commits.
+    // Attack: a forge answer names files with shell and template syntax and
+    // a newline, and repeats a path.
     // Safe outcome: the names are list items in the `when:` context only, once
     // each, and never in the context `${{ }}` templates read.
     #[test]
     fn hostile_path_names_stay_out_of_the_template_context() {
         let hostile = ["$(rm -rf /)", "${{ secrets.TOKEN }}", "a\n- b: c", "q\"';`"];
-        let payload = serde_json::json!({
-            "before": "1111111111111111111111111111111111111111",
-            "after": "2222222222222222222222222222222222222222",
-            "total_commits": 2,
-            "commits": [
-                {"added": hostile, "modified": ["src/a.rs"], "removed": []},
-                {"added": [], "modified": ["src/a.rs", "", 7, null], "removed": hostile},
-            ],
-        });
-        let changed_paths = push_changed_paths(&payload, None);
+        let changed_paths = ChangedPaths::from_paths(
+            hostile
+                .iter()
+                .chain(hostile.iter())
+                .chain(["src/a.rs", "", "src/a.rs"].iter())
+                .map(|p| p.to_string()),
+        );
         let ChangedPaths::Known(paths) = &changed_paths else {
             panic!("expected a known list, got {changed_paths:?}");
         };
@@ -2347,6 +2440,7 @@ mod tests {
             actor_id: String::new(),
             repo: repo(),
             r#ref: "refs/heads/main".into(),
+            before: "1111111111111111111111111111111111111111".into(),
             after: "deadbeef".into(),
             message: "subject".into(),
             changed_paths,
@@ -2355,6 +2449,10 @@ mod tests {
         assert!(template_ctx["event"].get("changed_paths").is_none());
         assert!(!template_ctx.to_string().contains("rm -rf"));
         assert!(!template_ctx.to_string().contains("secrets.TOKEN"));
+        assert!(
+            !template_ctx.to_string().contains("1111111111"),
+            "`before` is not a context field"
+        );
         assert_eq!(
             event.when_context()["event"]["changed_paths"]
                 .as_array()
@@ -2363,47 +2461,29 @@ mod tests {
         );
     }
 
-    // Attack: a payload whose commit list is shorter than the push (a
-    // `total_commits` above the listed count), or whose commits name 3000
-    // paths. Safe outcome: the list is unknown, never a short known list.
+    /// 3000 paths is unknown, never a list cut at the cap, and the reason
+    /// names the limit that was reached.
     #[test]
-    fn a_short_commit_list_or_3000_paths_is_unknown_not_a_partial_list() {
-        let base = |commits: serde_json::Value, total: u64| {
-            serde_json::json!({
-                "before": "1111111111111111111111111111111111111111",
-                "after": "2222222222222222222222222222222222222222",
-                "total_commits": total,
-                "commits": commits,
-            })
-        };
-        let one = serde_json::json!([{"added": ["README.md"]}]);
-        assert_eq!(
-            push_changed_paths(&base(one.clone(), 2), None),
-            ChangedPaths::Unknown(PathsUnknown::Truncated)
-        );
-        assert_eq!(
-            push_changed_paths(&base(one, 1), None),
-            ChangedPaths::Known(vec!["README.md".into()])
-        );
-        // Forgejo sends a total; a payload without one may be cut short too.
-        let mut no_total = base(serde_json::json!([{"added": ["README.md"]}]), 1);
-        no_total.as_object_mut().unwrap().remove("total_commits");
-        assert_eq!(
-            push_changed_paths(&no_total, None),
-            ChangedPaths::Unknown(PathsUnknown::Truncated)
-        );
+    fn too_many_names_the_limit_that_was_reached() {
         let many: Vec<String> = (0..CHANGED_PATHS_MAX).map(|i| format!("f{i}")).collect();
-        assert_eq!(
-            push_changed_paths(&base(serde_json::json!([{"added": many}]), 1), None),
-            ChangedPaths::Unknown(PathsUnknown::TooMany)
+        let ChangedPaths::Unknown(why) = ChangedPaths::from_paths(many) else {
+            panic!("3000 paths must be unknown");
+        };
+        assert!(
+            why.reason().contains(&CHANGED_PATHS_MAX.to_string()),
+            "{why:?}"
+        );
+        let github = PathsUnknown::TooMany { limit: 300 }.reason();
+        assert!(
+            github.contains("300") && !github.contains("3000"),
+            "{github}"
         );
     }
 
-    /// A push that deleted, created or force-moved its ref, or lists no
-    /// commits, has no trustworthy file list: each says why, so a `when:` that
-    /// reads the list runs and the Run's log names the reason.
+    /// A push payload decides its paths without a request only for the facts
+    /// it carries; everything else is asked of the forge (ADR-0081 §1).
     #[test]
-    fn a_deleted_new_forced_or_empty_push_has_unknown_paths_and_says_why() {
+    fn a_push_payload_decides_only_what_it_carries() {
         let zero = "0000000000000000000000000000000000000000";
         let push = |extra: serde_json::Value| {
             let mut p = serde_json::json!({
@@ -2417,55 +2497,111 @@ mod tests {
             }
             p
         };
+        let unknown = ChangedPaths::Unknown;
         let cases = [
-            (serde_json::json!({"deleted": true}), PathsUnknown::Deleted),
-            (serde_json::json!({"after": zero}), PathsUnknown::Deleted),
+            (serde_json::json!({}), unknown(PathsUnknown::NotFetched)),
+            (
+                serde_json::json!({"commits": []}),
+                unknown(PathsUnknown::NotFetched),
+            ),
+            (
+                serde_json::json!({"deleted": true}),
+                unknown(PathsUnknown::Deleted),
+            ),
+            (
+                serde_json::json!({"after": zero}),
+                unknown(PathsUnknown::Deleted),
+            ),
             (
                 serde_json::json!({"created": true}),
-                PathsUnknown::NewBranch,
+                unknown(PathsUnknown::NewBranch),
             ),
-            (serde_json::json!({"before": zero}), PathsUnknown::NewBranch),
-            (serde_json::json!({"forced": true}), PathsUnknown::Forced),
-            (serde_json::json!({"commits": []}), PathsUnknown::NoCommits),
             (
-                serde_json::json!({"commits": null}),
-                PathsUnknown::NoCommits,
+                serde_json::json!({"before": zero}),
+                unknown(PathsUnknown::NewBranch),
+            ),
+            (
+                serde_json::json!({"forced": true}),
+                unknown(PathsUnknown::Forced),
+            ),
+            (
+                serde_json::json!({"after": "1111111111111111111111111111111111111111"}),
+                ChangedPaths::Known(vec![]),
             ),
         ];
         for (extra, want) in cases {
-            for cap in [None, Some(20)] {
+            for max in [None, Some(PUSH_COMPARE_COMMITS_MAX)] {
                 assert_eq!(
-                    push_changed_paths(&push(extra.clone()), cap),
-                    ChangedPaths::Unknown(want),
-                    "{extra} with cap {cap:?}"
+                    push_payload_paths(&push(extra.clone()), max),
+                    want,
+                    "{extra} with max {max:?}"
                 );
             }
         }
-        // GitHub (a cap, no total): reaching the cap means the list may be cut.
-        let two = serde_json::json!({"commits": [{"added": ["a"]}, {"added": ["b"]}]});
+        let total = |n: u64| push(serde_json::json!({ "total_commits": n }));
         assert_eq!(
-            push_changed_paths(&push(two.clone()), Some(2)),
-            ChangedPaths::Unknown(PathsUnknown::Truncated)
+            push_payload_paths(
+                &total(PUSH_COMPARE_COMMITS_MAX),
+                Some(PUSH_COMPARE_COMMITS_MAX)
+            ),
+            unknown(PathsUnknown::NotFetched)
         );
         assert_eq!(
-            push_changed_paths(&push(two), Some(20)),
-            ChangedPaths::Known(vec!["a".into(), "b".into()]),
-            "under the cap, a smaller total does not cut the list"
+            push_payload_paths(
+                &total(PUSH_COMPARE_COMMITS_MAX + 1),
+                Some(PUSH_COMPARE_COMMITS_MAX)
+            ),
+            unknown(PathsUnknown::TooManyCommits)
         );
         assert_eq!(
-            push_changed_paths(&push(serde_json::json!({"total_commits": 5})), Some(20)),
-            ChangedPaths::Unknown(PathsUnknown::Truncated),
-            "a total above the listed commits means some are missing"
-        );
-        assert_eq!(
-            push_changed_paths(&push(serde_json::json!({"total_commits": 1})), Some(20)),
-            ChangedPaths::Known(vec!["README.md".into()])
+            push_payload_paths(&total(PUSH_COMPARE_COMMITS_MAX + 1), None),
+            unknown(PathsUnknown::NotFetched),
+            "GitHub sends no total and has no commit limit"
         );
         assert!(!is_zero_sha(""), "an absent sha is not a zero sha");
     }
 
+    /// The ids go into a URL path: anything but 40 or 64 lower-case hex digits
+    /// is a bad payload, a branch name included, since both compare APIs
+    /// would accept it and compare against a ref that moves.
+    #[test]
+    fn ids_that_are_not_commit_ids_are_a_bad_payload() {
+        let after = "2222222222222222222222222222222222222222";
+        let bad = [
+            "",
+            "main",
+            "111111111111111111111111111111111111111",
+            "11111111111111111111111111111111111111111",
+            "111111111111111111111111111111111111111g",
+            "1111111111111111111111111111111111111111/../x",
+            "ABCDEF1111111111111111111111111111111111",
+        ];
+        for before in bad {
+            assert_eq!(
+                push_ids_answer(before, after),
+                Some(ChangedPaths::Unknown(PathsUnknown::BadPayload)),
+                "{before:?}"
+            );
+            assert_eq!(
+                push_ids_answer(after, before),
+                Some(ChangedPaths::Unknown(PathsUnknown::BadPayload)),
+                "{before:?} as after"
+            );
+        }
+        let (b64, a64) = ("1".repeat(64), "2".repeat(64));
+        assert_eq!(
+            push_ids_answer(&b64, &a64),
+            None,
+            "SHA-256 ids are asked for"
+        );
+        assert_eq!(
+            push_ids_answer(&"0".repeat(64), &a64),
+            Some(ChangedPaths::Unknown(PathsUnknown::NewBranch))
+        );
+    }
+
     /// Each reason is the text the Run's event log shows; none is empty, no
-    /// two read the same, and the two with a number name it.
+    /// two read the same, and the ones with a number name it.
     #[test]
     fn every_unknown_paths_reason_is_its_own_sentence() {
         let all = [
@@ -2474,9 +2610,15 @@ mod tests {
             PathsUnknown::NewBranch,
             PathsUnknown::Forced,
             PathsUnknown::Deleted,
-            PathsUnknown::NoCommits,
-            PathsUnknown::Truncated,
-            PathsUnknown::TooMany,
+            PathsUnknown::NotFound,
+            PathsUnknown::MergedHead,
+            PathsUnknown::Incomplete,
+            PathsUnknown::TooMany {
+                limit: CHANGED_PATHS_MAX,
+            },
+            PathsUnknown::TooManyCommits,
+            PathsUnknown::TooLarge,
+            PathsUnknown::BadPayload,
             PathsUnknown::ForgeError,
             PathsUnknown::TimedOut,
         ];
@@ -2484,12 +2626,12 @@ mod tests {
             all.iter().map(PathsUnknown::reason).collect();
         assert_eq!(reasons.len(), all.len(), "{reasons:?}");
         assert!(reasons.iter().all(|r| !r.trim().is_empty()));
-        assert!(PathsUnknown::TooMany
-            .reason()
-            .contains(&CHANGED_PATHS_MAX.to_string()));
         assert!(PathsUnknown::TimedOut
             .reason()
-            .contains(&format!("{PULL_REQUEST_FILES_TIMEOUT_SECS} seconds")));
+            .contains(&format!("{CHANGED_FILES_TIMEOUT_SECS} seconds")));
+        assert!(PathsUnknown::TooManyCommits
+            .reason()
+            .contains(&PUSH_COMPARE_COMMITS_MAX.to_string()));
     }
 
     /// A pull request's paths come from the forge's files API, asked later,
@@ -2708,6 +2850,7 @@ mod tests {
             r#ref: "refs/heads/main".into(),
             after: "deadbeef".into(),
             message: "fix: handle empty input\n\nA longer body explaining why.\n".into(),
+            before: String::new(),
             changed_paths: Default::default(),
         }
         .trigger_title();
@@ -2722,6 +2865,7 @@ mod tests {
                 r#ref: "refs/heads/main".into(),
                 after: "deadbeef".into(),
                 message: String::new(),
+                before: String::new(),
                 changed_paths: Default::default(),
             }
             .trigger_title(),
@@ -2754,6 +2898,7 @@ mod tests {
             r#ref: "refs/heads/main".into(),
             after: "deadbeef".into(),
             message: subject,
+            before: String::new(),
             changed_paths: Default::default(),
         }
         .trigger_title()

@@ -1324,6 +1324,7 @@ fn test_event(
             r#ref: needs_ref()?,
             after: sha,
             message: String::new(),
+            before: String::new(),
             changed_paths: Default::default(),
         },
         TriggerKind::PullRequest => {

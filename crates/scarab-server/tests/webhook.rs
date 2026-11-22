@@ -1758,3 +1758,151 @@ async fn forgejo_pull_request_actions_start_runs_only_for_new_code() {
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     assert_eq!(db.active_runs().await.unwrap().len(), 1);
 }
+
+/// Runs only when something under `infra/` changed.
+const INFRA_ONLY_YAML: &str = r#"
+on:
+  push:
+    when: 'event.changed_paths.exists(p, p.startsWith("infra/"))'
+steps:
+  - { id: plan, image: busybox, command: ["true"] }
+"#;
+
+/// The `note` lines in a Run's event log.
+async fn run_notes(db: &InMemoryDb, run: &RunId) -> Vec<String> {
+    db.events(run)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.kind {
+            scarab_engine::EventPayload::Raw(v) => v["note"].as_str().map(str::to_string),
+            _ => None,
+        })
+        .collect()
+}
+
+/// git-bug 0354b5a (ADR-0081): GitHub's push payload does not list a file
+/// changed only in a merge's conflict resolution (`infra/main.tf` here). The
+/// compare answer for the payload's own `before` and `after` does, so the
+/// Pipeline filtered on `infra/` starts. Built from the payload's commit
+/// lists, the paths would be known and miss `infra/`, and no Run would start.
+#[tokio::test]
+async fn a_push_whose_merge_resolution_touches_the_filter_starts_the_run() {
+    let body = include_bytes!("../../scarab-forge-github/tests/fixtures/push_merge.json");
+    let payload: serde_json::Value = serde_json::from_slice(body).unwrap();
+    let id = |k: &str| payload[k].as_str().unwrap().to_string();
+    let forge = Arc::new(FakeForge::new().with_file(".scarab/infra.yaml", INFRA_ONLY_YAML));
+    forge.set_push_paths(
+        &id("before"),
+        &id("after"),
+        scarab_forge::ChangedPaths::from_paths(
+            ["conf/app.yaml", "infra/main.tf", "side/feature.txt"].map(String::from),
+        ),
+    );
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let app = multi_forge_app_arc(db.clone(), forge.clone());
+
+    let sig = scarab_forge_github::sign_hex(SECRET, body);
+    let resp = app
+        .oneshot(webhook_request("push", body, &sig))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let runs = db.active_runs().await.unwrap();
+    assert_eq!(runs.len(), 1);
+    assert!(
+        run_notes(&db, &runs[0]).await.is_empty(),
+        "the filter was applied"
+    );
+    assert_eq!(forge.push_paths_calls(), 1);
+}
+
+/// git-bug 63dbeee (ADR-0081): Forgejo's push payload does not say a push
+/// was forced, and its commits are only the new ones. The compare answer
+/// says the old head is not an ancestor: the paths are unknown, the
+/// Pipeline filtered on `infra/` starts, and its log says it was a forced
+/// push. Built from the payload, the paths would be known, miss `infra/`,
+/// and no Run would start.
+#[tokio::test]
+async fn a_forced_forgejo_push_starts_the_run_with_the_forced_note() {
+    let before = "6113728f27ae82c7b1a177c8d03f9e96e0adf246";
+    let after = "0d1a26e67d8f5eaf1f6ba5c57fc3c7d91ac0fd1c";
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::Forgejo).await;
+    let forge = FakeForge::new().with_file(".scarab/infra.yaml", INFRA_ONLY_YAML);
+    forge.set_push_paths(
+        before,
+        after,
+        scarab_forge::ChangedPaths::Unknown(scarab_forge::PathsUnknown::Forced),
+    );
+    let app = multi_forge_app_with(db.clone(), forge);
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "ref": "refs/heads/main",
+        "before": before,
+        "after": after,
+        "total_commits": 1,
+        "commits": [{ "id": after, "added": ["README.md"], "removed": [], "modified": [] }],
+        "repository": { "name": "app", "owner": { "username": "acme" } }
+    }))
+    .unwrap();
+    let sig = scarab_forge_forgejo::sign_hex(b"forgejo-secret", &body);
+    let resp = app
+        .oneshot(forgejo_request("push", "fj-forced", &body, &sig))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let runs = db.active_runs().await.unwrap();
+    assert_eq!(runs.len(), 1);
+    let notes = run_notes(&db, &runs[0]).await;
+    assert_eq!(notes.len(), 1);
+    assert!(
+        notes[0].contains(&scarab_forge::PathsUnknown::Forced.reason()),
+        "{notes:?}"
+    );
+}
+
+/// ADR-0081 §7, git-bug 23e3a09: a forge that stops waiting for the answer
+/// closes the connection, and the HTTP server drops the handler. The
+/// delivery id is already recorded, so a redelivery is answered "duplicate
+/// delivery" and could not repair it. Dropping the router's response future
+/// while the compare is pending is what the server does on a disconnect;
+/// the Run must still be created.
+#[tokio::test]
+async fn a_delivery_whose_client_went_away_still_creates_its_runs() {
+    let body = include_bytes!("../../scarab-forge-github/tests/fixtures/push_merge.json");
+    let payload: serde_json::Value = serde_json::from_slice(body).unwrap();
+    let id = |k: &str| payload[k].as_str().unwrap().to_string();
+    let forge = Arc::new(FakeForge::new().with_file(".scarab/infra.yaml", INFRA_ONLY_YAML));
+    forge.set_push_paths(
+        &id("before"),
+        &id("after"),
+        scarab_forge::ChangedPaths::from_paths(["infra/main.tf".to_string()]),
+    );
+    let gate = forge.hold_push_paths();
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+    let app = multi_forge_app_arc(db.clone(), forge.clone());
+
+    let sig = scarab_forge_github::sign_hex(SECRET, body);
+    let mut answer = Box::pin(app.oneshot(webhook_request("push", body, &sig)));
+    tokio::select! {
+        _ = &mut answer => panic!("the delivery was answered before the compare"),
+        _ = gate.entered() => {}
+    }
+    drop(answer);
+    gate.release();
+
+    let created = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if !db.active_runs().await.unwrap().is_empty() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(created.is_ok(), "the Run was lost with the dropped handler");
+    assert_eq!(db.active_runs().await.unwrap().len(), 1);
+}

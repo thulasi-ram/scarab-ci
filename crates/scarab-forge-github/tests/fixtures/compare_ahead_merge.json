@@ -1,0 +1,225 @@
+{
+  "url": "https://api.github.com/repos/acme/app/compare/7cea710f62cb9d71c3f545e815375058d590b7f1...568f433822aff1dddd7d15836cdc87bb2ac0266e",
+  "html_url": "https://github.com/acme/app/compare/7cea710f62cb9d71c3f545e815375058d590b7f1...568f433822aff1dddd7d15836cdc87bb2ac0266e",
+  "permalink_url": "https://github.com/acme/app/compare/acme:7cea710...acme:568f433",
+  "diff_url": "https://github.com/acme/app/compare/7cea710f62cb9d71c3f545e815375058d590b7f1...568f433822aff1dddd7d15836cdc87bb2ac0266e.diff",
+  "patch_url": "https://github.com/acme/app/compare/7cea710f62cb9d71c3f545e815375058d590b7f1...568f433822aff1dddd7d15836cdc87bb2ac0266e.patch",
+  "base_commit": {
+    "sha": "7cea710f62cb9d71c3f545e815375058d590b7f1",
+    "node_id": "C_7cea710f62cb9d71c3f5",
+    "commit": {
+      "author": {
+        "name": "Octo Cat",
+        "email": "octocat@example.com",
+        "date": "2026-11-22T10:00:00Z"
+      },
+      "committer": {
+        "name": "Octo Cat",
+        "email": "octocat@example.com",
+        "date": "2026-11-22T10:00:00Z"
+      },
+      "message": "infra: last deploy",
+      "tree": {
+        "sha": "93d89db9cb5fe41516e417170d557b311daf34d4",
+        "url": "https://api.github.com/repos/acme/app/git/trees/93d89db9cb5fe41516e417170d557b311daf34d4"
+      },
+      "url": "https://api.github.com/repos/acme/app/git/commits/7cea710f62cb9d71c3f545e815375058d590b7f1",
+      "comment_count": 0,
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "signature": null,
+        "payload": null,
+        "verified_at": null
+      }
+    },
+    "url": "https://api.github.com/repos/acme/app/commits/7cea710f62cb9d71c3f545e815375058d590b7f1",
+    "html_url": "https://github.com/acme/app/commit/7cea710f62cb9d71c3f545e815375058d590b7f1",
+    "comments_url": "https://api.github.com/repos/acme/app/commits/7cea710f62cb9d71c3f545e815375058d590b7f1/comments",
+    "author": {
+      "login": "octocat",
+      "id": 583231,
+      "type": "User"
+    },
+    "committer": {
+      "login": "octocat",
+      "id": 583231,
+      "type": "User"
+    },
+    "parents": [
+      {
+        "sha": "3b0d93c881eb75ce565c4aefd2c7dc02ae09524b",
+        "url": "https://api.github.com/repos/acme/app/commits/3b0d93c881eb75ce565c4aefd2c7dc02ae09524b",
+        "html_url": "https://github.com/acme/app/commit/3b0d93c881eb75ce565c4aefd2c7dc02ae09524b"
+      }
+    ]
+  },
+  "merge_base_commit": {
+    "sha": "7cea710f62cb9d71c3f545e815375058d590b7f1",
+    "node_id": "C_7cea710f62cb9d71c3f5",
+    "commit": {
+      "author": {
+        "name": "Octo Cat",
+        "email": "octocat@example.com",
+        "date": "2026-11-22T10:00:00Z"
+      },
+      "committer": {
+        "name": "Octo Cat",
+        "email": "octocat@example.com",
+        "date": "2026-11-22T10:00:00Z"
+      },
+      "message": "infra: last deploy",
+      "tree": {
+        "sha": "93d89db9cb5fe41516e417170d557b311daf34d4",
+        "url": "https://api.github.com/repos/acme/app/git/trees/93d89db9cb5fe41516e417170d557b311daf34d4"
+      },
+      "url": "https://api.github.com/repos/acme/app/git/commits/7cea710f62cb9d71c3f545e815375058d590b7f1",
+      "comment_count": 0,
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "signature": null,
+        "payload": null,
+        "verified_at": null
+      }
+    },
+    "url": "https://api.github.com/repos/acme/app/commits/7cea710f62cb9d71c3f545e815375058d590b7f1",
+    "html_url": "https://github.com/acme/app/commit/7cea710f62cb9d71c3f545e815375058d590b7f1",
+    "comments_url": "https://api.github.com/repos/acme/app/commits/7cea710f62cb9d71c3f545e815375058d590b7f1/comments",
+    "author": {
+      "login": "octocat",
+      "id": 583231,
+      "type": "User"
+    },
+    "committer": {
+      "login": "octocat",
+      "id": 583231,
+      "type": "User"
+    },
+    "parents": [
+      {
+        "sha": "3b0d93c881eb75ce565c4aefd2c7dc02ae09524b",
+        "url": "https://api.github.com/repos/acme/app/commits/3b0d93c881eb75ce565c4aefd2c7dc02ae09524b",
+        "html_url": "https://github.com/acme/app/commit/3b0d93c881eb75ce565c4aefd2c7dc02ae09524b"
+      }
+    ]
+  },
+  "status": "ahead",
+  "ahead_by": 3,
+  "behind_by": 0,
+  "total_commits": 3,
+  "commits": [
+    {
+      "sha": "9b80ed92f7bee0abce8d7eba2925dcc0f353090b",
+      "node_id": "C_9b80ed92f7bee0abce8d",
+      "commit": {
+        "author": {
+          "name": "Octo Cat",
+          "email": "octocat@example.com",
+          "date": "2026-11-22T10:00:00Z"
+        },
+        "committer": {
+          "name": "Octo Cat",
+          "email": "octocat@example.com",
+          "date": "2026-11-22T10:00:00Z"
+        },
+        "message": "line: rename docs, drop scratch",
+        "tree": {
+          "sha": "5396e1c7a5983d4ed8e4eba5b1f1eff716ac5e4c",
+          "url": "https://api.github.com/repos/acme/app/git/trees/5396e1c7a5983d4ed8e4eba5b1f1eff716ac5e4c"
+        },
+        "url": "https://api.github.com/repos/acme/app/git/commits/9b80ed92f7bee0abce8d7eba2925dcc0f353090b",
+        "comment_count": 0,
+        "verification": {
+          "verified": false,
+          "reason": "unsigned",
+          "signature": null,
+          "payload": null,
+          "verified_at": null
+        }
+      },
+      "url": "https://api.github.com/repos/acme/app/commits/9b80ed92f7bee0abce8d7eba2925dcc0f353090b",
+      "html_url": "https://github.com/acme/app/commit/9b80ed92f7bee0abce8d7eba2925dcc0f353090b",
+      "comments_url": "https://api.github.com/repos/acme/app/commits/9b80ed92f7bee0abce8d7eba2925dcc0f353090b/comments",
+      "author": {
+        "login": "octocat",
+        "id": 583231,
+        "type": "User"
+      },
+      "committer": {
+        "login": "octocat",
+        "id": 583231,
+        "type": "User"
+      },
+      "parents": [
+        {
+          "sha": "7cea710f62cb9d71c3f545e815375058d590b7f1",
+          "url": "https://api.github.com/repos/acme/app/commits/7cea710f62cb9d71c3f545e815375058d590b7f1",
+          "html_url": "https://github.com/acme/app/commit/7cea710f62cb9d71c3f545e815375058d590b7f1"
+        }
+      ]
+    }
+  ],
+  "files": [
+    {
+      "sha": "1328598a760be47d10debcb93aebc23959ff132c",
+      "filename": "conf/app.yaml",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/acme/app/blob/568f433822aff1dddd7d15836cdc87bb2ac0266e/conf/app.yaml",
+      "raw_url": "https://github.com/acme/app/raw/568f433822aff1dddd7d15836cdc87bb2ac0266e/conf/app.yaml",
+      "contents_url": "https://api.github.com/repos/acme/app/contents/conf/app.yaml?ref=568f433822aff1dddd7d15836cdc87bb2ac0266e",
+      "patch": "@@ -1 +1 @@\n-old\n+new"
+    },
+    {
+      "sha": "31583ff095954876cc1dc4d521028bc4008eaa25",
+      "filename": "docs/new.md",
+      "status": "renamed",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/acme/app/blob/568f433822aff1dddd7d15836cdc87bb2ac0266e/docs/new.md",
+      "raw_url": "https://github.com/acme/app/raw/568f433822aff1dddd7d15836cdc87bb2ac0266e/docs/new.md",
+      "contents_url": "https://api.github.com/repos/acme/app/contents/docs/new.md?ref=568f433822aff1dddd7d15836cdc87bb2ac0266e",
+      "previous_filename": "docs/old.md",
+      "patch": "@@ -1 +1 @@\n-old\n+new"
+    },
+    {
+      "sha": "da3382d5d6b183b1518a8d580b7ca5d1ba24dfba",
+      "filename": "infra/main.tf",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/acme/app/blob/568f433822aff1dddd7d15836cdc87bb2ac0266e/infra/main.tf",
+      "raw_url": "https://github.com/acme/app/raw/568f433822aff1dddd7d15836cdc87bb2ac0266e/infra/main.tf",
+      "contents_url": "https://api.github.com/repos/acme/app/contents/infra/main.tf?ref=568f433822aff1dddd7d15836cdc87bb2ac0266e",
+      "patch": "@@ -1 +1 @@\n-old\n+new"
+    },
+    {
+      "sha": "59508c083fcc86872b3f1306680242afcb27fa46",
+      "filename": "side/feature.txt",
+      "status": "added",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/acme/app/blob/568f433822aff1dddd7d15836cdc87bb2ac0266e/side/feature.txt",
+      "raw_url": "https://github.com/acme/app/raw/568f433822aff1dddd7d15836cdc87bb2ac0266e/side/feature.txt",
+      "contents_url": "https://api.github.com/repos/acme/app/contents/side/feature.txt?ref=568f433822aff1dddd7d15836cdc87bb2ac0266e",
+      "patch": "@@ -1 +1 @@\n-old\n+new"
+    },
+    {
+      "sha": "53285179f7074ce8fc6461090ba97af3021e60df",
+      "filename": "tmp/scratch.txt",
+      "status": "removed",
+      "additions": 0,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/acme/app/blob/568f433822aff1dddd7d15836cdc87bb2ac0266e/tmp/scratch.txt",
+      "raw_url": "https://github.com/acme/app/raw/568f433822aff1dddd7d15836cdc87bb2ac0266e/tmp/scratch.txt",
+      "contents_url": "https://api.github.com/repos/acme/app/contents/tmp/scratch.txt?ref=568f433822aff1dddd7d15836cdc87bb2ac0266e"
+    }
+  ]
+}

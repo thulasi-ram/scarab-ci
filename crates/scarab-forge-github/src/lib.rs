@@ -9,8 +9,9 @@
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use scarab_forge::{
-    filter_refs, preflight::ForgeCapabilities, CheckoutCredential, Collaborator, Commit, Event,
-    ForgeError, ForgePort, ForgeRef, Permissions, RefKind, RepoRef, Status, WebhookDelivery,
+    filter_refs, preflight::ForgeCapabilities, ChangedPaths, CheckoutCredential, Collaborator,
+    Commit, Event, ForgeError, ForgePort, ForgeRef, PathsUnknown, Permissions, RefKind, RepoRef,
+    Status, WebhookDelivery,
 };
 use serde_json::Value;
 use sha2::Sha256;
@@ -42,10 +43,68 @@ pub fn sign_hex(secret: &[u8], body: &[u8]) -> String {
     format!("sha256={}", to_hex(&mac.finalize().into_bytes()))
 }
 
-/// The most commits a GitHub push webhook lists (GitHub's documented cap). A
-/// payload listing this many may have been cut short, and it carries no total
-/// to compare with, so its changed paths are unknown (git-bug 418f55e).
-pub const GITHUB_PUSH_COMMITS_MAX: usize = 2048;
+/// The most files a GitHub compare answer lists (ADR-0081 §2). GitHub stops
+/// there without saying so, so an answer listing this many is
+/// [`TooMany`](scarab_forge::PathsUnknown::TooMany).
+pub const GITHUB_COMPARE_FILES_MAX: usize = 300;
+
+/// The changed paths in a GitHub compare answer,
+/// `GET /repos/{o}/{r}/compare/{before}...{after}` (ADR-0081 §2). Pure, so
+/// every rule is tested on fixtures without a network.
+///
+/// A known list comes only from `status: ahead` with `ahead_by` above 0 and a
+/// non-empty `files` array of fewer than [`GITHUB_COMPARE_FILES_MAX`]
+/// entries: each entry's `filename`, and a rename's `previous_filename`. On
+/// `ahead`, `files` is the tree diff from `before` to `after`, so a file
+/// changed only in a merge's conflict resolution is in it.
+///
+/// - `identical`: a known empty list.
+/// - `behind` or `diverged`: [`Forced`](PathsUnknown::Forced).
+/// - `ahead` with no `files`, or an empty one:
+///   [`Incomplete`](PathsUnknown::Incomplete). GitHub can answer an empty
+///   `files` for a comparison it did not compute, and an empty known list is
+///   the one answer that skips a Pipeline.
+/// - [`GITHUB_COMPARE_FILES_MAX`] entries:
+///   [`TooMany`](PathsUnknown::TooMany) with that limit.
+/// - Anything else (another `status`, no `ahead_by`, a body that is not the
+///   expected JSON): [`ForgeError`](PathsUnknown::ForgeError).
+pub fn compare_changed_paths(body: &[u8]) -> ChangedPaths {
+    let unknown = ChangedPaths::Unknown;
+    let Ok(answer) = serde_json::from_slice::<Value>(body) else {
+        return unknown(PathsUnknown::ForgeError);
+    };
+    match answer.get("status").and_then(Value::as_str) {
+        Some("identical") => return ChangedPaths::Known(Vec::new()),
+        Some("behind" | "diverged") => return unknown(PathsUnknown::Forced),
+        Some("ahead") => {}
+        _ => return unknown(PathsUnknown::ForgeError),
+    }
+    match answer.get("ahead_by").and_then(Value::as_u64) {
+        Some(n) if n > 0 => {}
+        _ => return unknown(PathsUnknown::ForgeError),
+    }
+    let files = match answer.get("files") {
+        None | Some(Value::Null) => return unknown(PathsUnknown::Incomplete),
+        Some(Value::Array(files)) => files,
+        Some(_) => return unknown(PathsUnknown::ForgeError),
+    };
+    if files.is_empty() {
+        return unknown(PathsUnknown::Incomplete);
+    }
+    if files.len() >= GITHUB_COMPARE_FILES_MAX {
+        return unknown(PathsUnknown::TooMany {
+            limit: GITHUB_COMPARE_FILES_MAX,
+        });
+    }
+    let mut paths = Vec::with_capacity(files.len());
+    for file in files {
+        if file.get("filename").and_then(Value::as_str).is_none() {
+            return unknown(PathsUnknown::ForgeError);
+        }
+        paths.extend(pr_file_paths(file));
+    }
+    ChangedPaths::from_paths(paths)
+}
 
 /// The paths one entry of `GET /repos/{o}/{r}/pulls/{n}/files` names: its
 /// `filename`, and the `previous_filename` of a renamed file.
@@ -87,17 +146,22 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                 if !scarab_forge::is_commit_sha(&after) {
                     return Err(ForgeError::Malformed("after is not a commit SHA".into()));
                 }
+                // GitHub sends no commit total and its compare needs no
+                // commit limit: `per_page=1` lists one commit (ADR-0081 §3).
+                let changed_paths = scarab_forge::push_payload_paths(p, None);
                 Ok(Event::Push {
                     actor,
                     actor_id,
                     repo,
                     r#ref,
+                    before: p
+                        .get("before")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
                     after,
                     message,
-                    changed_paths: scarab_forge::push_changed_paths(
-                        p,
-                        Some(GITHUB_PUSH_COMMITS_MAX),
-                    ),
+                    changed_paths,
                 })
             }
         }
@@ -902,6 +966,26 @@ fn next_link(headers: &reqwest::header::HeaderMap) -> Option<String> {
     })
 }
 
+/// The body of `resp`, read as a stream and stopped once it passes `cap`
+/// bytes: `Ok(None)` then, and the part read is dropped, never parsed.
+async fn read_capped(
+    mut resp: reqwest::Response,
+    cap: usize,
+) -> Result<Option<Vec<u8>>, ForgeError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| ForgeError::Api(e.to_string()))?
+    {
+        if body.len() + chunk.len() > cap {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Some(body))
+}
+
 /// Fail non-2xx with the response body in the error; parse JSON otherwise.
 async fn ok_json(resp: reqwest::Response) -> Result<Value, ForgeError> {
     let status = resp.status();
@@ -1240,6 +1324,40 @@ impl ForgePort for GithubForge {
 
     async fn normalize_event(&self, raw: WebhookDelivery) -> Result<Event, ForgeError> {
         normalize(&raw)
+    }
+
+    /// `GET /repos/{o}/{r}/compare/{before}...{after}?per_page=1`, one
+    /// request: the file list is on the first page and covers the whole
+    /// comparison, and the commit list is not read (ADR-0081 §2). The body is
+    /// read up to [`COMPARE_BODY_MAX_BYTES`](scarab_forge::COMPARE_BODY_MAX_BYTES),
+    /// then [`compare_changed_paths`] decides. A 404 is
+    /// [`NotFound`](PathsUnknown::NotFound); any other failure, a rate limit
+    /// past the retries included, is [`ForgeError`](PathsUnknown::ForgeError).
+    async fn push_changed_paths(&self, repo: &RepoRef, before: &str, after: &str) -> ChangedPaths {
+        if let Some(answer) = scarab_forge::push_ids_answer(before, after) {
+            return answer;
+        }
+        let unknown = ChangedPaths::Unknown;
+        let Ok(token) = self.auth_token_for(repo).await else {
+            return unknown(PathsUnknown::ForgeError);
+        };
+        let url = self.url(&format!(
+            "/repos/{}/{}/compare/{before}...{after}?per_page=1",
+            repo.owner, repo.name
+        ));
+        let Ok(resp) = self.send(|| self.client.get(&url), &token).await else {
+            return unknown(PathsUnknown::ForgeError);
+        };
+        match resp.status() {
+            s if s.is_success() => {}
+            reqwest::StatusCode::NOT_FOUND => return unknown(PathsUnknown::NotFound),
+            _ => return unknown(PathsUnknown::ForgeError),
+        }
+        match read_capped(resp, scarab_forge::COMPARE_BODY_MAX_BYTES).await {
+            Ok(Some(body)) => compare_changed_paths(&body),
+            Ok(None) => unknown(PathsUnknown::TooLarge),
+            Err(_) => unknown(PathsUnknown::ForgeError),
+        }
     }
 
     /// `GET /repos/{o}/{r}/pulls/{n}/files`, 100 per page, following `Link`
@@ -1627,13 +1745,14 @@ mod tests {
                     name: "app".into()
                 },
                 r#ref: "refs/heads/main".into(),
+                before: String::new(),
                 after: "abc123".into(),
                 // The full head-commit message is parsed onto the event; the
                 // Headline extractor (scarab-forge) later takes its first line.
                 message: "fix: handle empty input\n\nbody line".into(),
-                // No commit list in this payload.
+                // No `before`, and `after` is not a full commit id.
                 changed_paths: scarab_forge::ChangedPaths::Unknown(
-                    scarab_forge::PathsUnknown::NoCommits
+                    scarab_forge::PathsUnknown::BadPayload
                 ),
             }
         );

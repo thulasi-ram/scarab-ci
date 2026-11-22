@@ -1,14 +1,15 @@
-//! `event.changed_paths` in a trigger's `when:` (git-bug 418f55e). A Pipeline
-//! that builds an image only when `docker/ci-tools/` changes runs for a push
-//! or pull request that touches it and not for one that touches only
-//! `README.md`. When the paths are unknown (a new branch, a failed files
-//! request), a `when:` that needs them counts as true and the Run's event
-//! log says why. A pull request's files are asked of the forge only when a
-//! Pipeline reads them. Hermetic: FakeForge, InMemoryDb.
+//! `event.changed_paths` in a trigger's `when:` (git-bug 418f55e, ADR-0081).
+//! A Pipeline that builds an image only when `docker/ci-tools/` changes runs
+//! for a push or pull request that touches it and not for one that touches
+//! only `README.md`. A push's paths come from the forge's compare API and a
+//! pull request's from its files API, each asked once per delivery and only
+//! when a Pipeline reads them. When the paths are unknown (a new branch, a
+//! failed or slow request), a `when:` that needs them counts as true and the
+//! Run's event log says why. Hermetic: FakeForge, InMemoryDb.
 
 use std::sync::Arc;
 
-use scarab_engine::{Db, EventPayload, RunId};
+use scarab_engine::{Db, EventPayload, RunId, StepStatus};
 use scarab_forge::{ChangedPaths, Event, PathsUnknown, RepoRef};
 use scarab_server::trigger_run_from_event;
 use scarab_testkit::{FakeClock, FakeForge, InMemoryDb};
@@ -40,14 +41,48 @@ fn repo() -> RepoRef {
     }
 }
 
-fn push(branch: &str, changed_paths: ChangedPaths) -> Event {
+const BEFORE: &str = "1111111111111111111111111111111111111111";
+const AFTER: &str = "2222222222222222222222222222222222222222";
+
+/// A push from `before` to `after` as normalize makes it: its paths not
+/// asked for yet, so a Run that starts on a scripted compare answer proves
+/// the compare was called with these two ids.
+fn push(branch: &str, before: &str, after: &str) -> Event {
     Event::Push {
         actor: "octocat".into(),
         actor_id: String::new(),
         repo: repo(),
         r#ref: format!("refs/heads/{branch}"),
-        after: "abc123".into(),
+        before: before.into(),
+        after: after.into(),
         message: "a change".into(),
+        changed_paths: ChangedPaths::Unknown(PathsUnknown::NotFetched),
+    }
+}
+
+/// A push whose payload already decided its paths: no request.
+fn decided_push(branch: &str, changed_paths: ChangedPaths) -> Event {
+    let Event::Push {
+        actor,
+        actor_id,
+        repo,
+        r#ref,
+        before,
+        after,
+        message,
+        ..
+    } = push(branch, BEFORE, AFTER)
+    else {
+        unreachable!()
+    };
+    Event::Push {
+        actor,
+        actor_id,
+        repo,
+        r#ref,
+        before,
+        after,
+        message,
         changed_paths,
     }
 }
@@ -95,20 +130,245 @@ async fn notes(db: &InMemoryDb, run: &RunId) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn a_push_runs_only_when_it_touches_the_filtered_directory() {
+async fn a_push_runs_only_when_the_forge_says_it_touched_the_directory() {
     let forge = FakeForge::new().with_file(".scarab/ci-tools.yaml", CI_TOOLS);
+    let other = "3333333333333333333333333333333333333333";
+    forge.set_push_paths(BEFORE, AFTER, known(&["docker/ci-tools/Dockerfile"]));
+    forge.set_push_paths(AFTER, other, known(&["README.md"]));
     let db = Arc::new(InMemoryDb::new());
 
-    let readme = push("main", known(&["README.md"]));
-    assert!(trigger(&forge, &db, &readme).await.is_empty());
-
-    let dockerfile = push("main", known(&["README.md", "docker/ci-tools/Dockerfile"]));
-    let runs = trigger(&forge, &db, &dockerfile).await;
+    let runs = trigger(&forge, &db, &push("main", BEFORE, AFTER)).await;
     assert_eq!(runs.len(), 1);
     assert!(
         notes(&db, &runs[0]).await.is_empty(),
         "the filter was applied"
     );
+    assert!(trigger(&forge, &db, &push("main", AFTER, other))
+        .await
+        .is_empty());
+    assert_eq!(forge.push_paths_calls(), 2, "one compare per delivery");
+}
+
+// Attack: a push adds many Pipeline files that each read
+// `event.changed_paths`, to multiply the forge API calls one webhook costs.
+// Safe outcome: one compare for the delivery, whatever the answer, and none
+// for a delivery no Pipeline would ask for.
+#[tokio::test]
+async fn a_push_delivery_asks_once_however_many_pipelines_read_the_paths() {
+    let mut forge = FakeForge::new();
+    for i in 0..20 {
+        forge = forge.with_file(&format!(".scarab/p{i:02}.yaml"), CI_TOOLS);
+    }
+    let db = Arc::new(InMemoryDb::new());
+    // No answer scripted for the pair: the compare fails, the paths stay
+    // unknown, and every Pipeline runs.
+    assert_eq!(
+        trigger(&forge, &db, &push("main", BEFORE, AFTER))
+            .await
+            .len(),
+        20
+    );
+    assert_eq!(
+        forge.push_paths_calls(),
+        1,
+        "a failed compare is not repeated"
+    );
+
+    let forge = FakeForge::new().with_file(".scarab/ci.yaml", MAIN_ONLY);
+    assert_eq!(
+        trigger(&forge, &db, &push("main", BEFORE, AFTER))
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(forge.push_paths_calls(), 0, "no Pipeline reads the paths");
+
+    // The branch test decides first: on another branch the trigger cannot
+    // match, so the paths are never needed.
+    let forge = FakeForge::new().with_file(".scarab/main-tools.yaml", MAIN_TOOLS);
+    assert!(trigger(&forge, &db, &push("feature", BEFORE, AFTER))
+        .await
+        .is_empty());
+    assert_eq!(forge.push_paths_calls(), 0);
+}
+
+/// Runs on `main` only, and there only when `docker/ci-tools/` changed.
+const MAIN_TOOLS: &str = r#"
+on:
+  push:
+    when: 'event.branch == "main" && event.changed_paths.exists(p, p.startsWith("docker/ci-tools/"))'
+steps:
+  - { id: image, image: busybox, command: ["true"] }
+"#;
+
+/// Runs on every push; one step reads the paths.
+const PUSH_STEP_FILTER: &str = r#"
+on:
+  push: {}
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+  - id: image
+    image: busybox
+    command: ["true"]
+    when: 'event.changed_paths.exists(p, p.startsWith("docker/ci-tools/"))'
+"#;
+
+#[tokio::test]
+async fn a_step_when_reading_the_paths_asks_once_and_sees_the_answer() {
+    let forge = FakeForge::new().with_file(".scarab/ci.yaml", PUSH_STEP_FILTER);
+    forge.set_push_paths(BEFORE, AFTER, known(&["README.md"]));
+    let db = Arc::new(InMemoryDb::new());
+
+    let runs = trigger(&forge, &db, &push("main", BEFORE, AFTER)).await;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(forge.push_paths_calls(), 1);
+    let image = db
+        .steps_of_run(&runs[0])
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.step.0 == "image");
+    assert_eq!(
+        image.map(|s| s.status),
+        Some(StepStatus::Skipped),
+        "the compare's answer reached the step's `when:`"
+    );
+    assert!(notes(&db, &runs[0]).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_reason_the_payload_decided_makes_no_request() {
+    let forge = FakeForge::new().with_file(".scarab/ci-tools.yaml", CI_TOOLS);
+    let db = Arc::new(InMemoryDb::new());
+
+    let forced = decided_push("main", ChangedPaths::Unknown(PathsUnknown::Forced));
+    let runs = trigger(&forge, &db, &forced).await;
+    assert_eq!(
+        runs.len(),
+        1,
+        "a `when:` that needs unknown paths counts as true"
+    );
+    assert_eq!(
+        notes(&db, &runs[0]).await,
+        vec![
+            "changed paths unknown: forced push; the path filter in `when:` was not applied \
+             (on.push)"
+                .to_string()
+        ]
+    );
+    // `before` equal to `after`: the push changed nothing.
+    assert!(trigger(&forge, &db, &decided_push("main", known(&[])))
+        .await
+        .is_empty());
+    assert_eq!(forge.push_paths_calls(), 0);
+}
+
+#[tokio::test]
+async fn the_forges_reason_reaches_the_runs_log() {
+    let forge = FakeForge::new().with_file(".scarab/ci-tools.yaml", CI_TOOLS);
+    forge.set_push_paths(BEFORE, AFTER, ChangedPaths::Unknown(PathsUnknown::NotFound));
+    let db = Arc::new(InMemoryDb::new());
+
+    let runs = trigger(&forge, &db, &push("main", BEFORE, AFTER)).await;
+    assert_eq!(runs.len(), 1);
+    let notes = notes(&db, &runs[0]).await;
+    assert_eq!(notes.len(), 1);
+    assert!(
+        notes[0].contains(&PathsUnknown::NotFound.reason()) && notes[0].contains("on.push"),
+        "{notes:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_compare_starts_the_runs_once_with_the_timed_out_note() {
+    let forge = FakeForge::new()
+        .with_file(".scarab/a.yaml", CI_TOOLS)
+        .with_file(".scarab/b.yaml", CI_TOOLS);
+    forge.set_push_paths(BEFORE, AFTER, known(&["README.md"]));
+    let limit = scarab_forge::CHANGED_FILES_TIMEOUT_SECS;
+    forge.set_push_paths_delay(std::time::Duration::from_secs(limit + 60));
+    let db = Arc::new(InMemoryDb::new());
+
+    let started = tokio::time::Instant::now();
+    let runs = trigger(&forge, &db, &push("main", BEFORE, AFTER)).await;
+    assert_eq!(runs.len(), 2, "a slow forge leaves the paths unknown");
+    for run in &runs {
+        let notes = notes(&db, run).await;
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].contains(&PathsUnknown::TimedOut.reason()),
+            "{notes:?}"
+        );
+    }
+    assert_eq!(forge.push_paths_calls(), 1);
+    // A second wait would take the delivery past GitHub's 10 seconds.
+    assert!(started.elapsed() < std::time::Duration::from_secs(2 * limit));
+}
+
+#[tokio::test]
+async fn a_when_that_does_not_read_the_paths_is_evaluated_as_before() {
+    let forge = FakeForge::new().with_file(".scarab/ci.yaml", MAIN_ONLY);
+    let db = Arc::new(InMemoryDb::new());
+
+    let unknown = ChangedPaths::Unknown(PathsUnknown::NewBranch);
+    assert!(
+        trigger(&forge, &db, &decided_push("feat/x", unknown.clone()))
+            .await
+            .is_empty()
+    );
+    let runs = trigger(&forge, &db, &decided_push("main", unknown)).await;
+    assert_eq!(runs.len(), 1);
+    assert!(notes(&db, &runs[0]).await.is_empty());
+}
+
+const BROKEN: &str = r#"
+on:
+  push: {}
+steps:
+  - { id: a, image: busybox, command: ["true"], needs: [ghost] }
+"#;
+
+/// A delivery with a file that does not compile decides every other
+/// Pipeline's trigger to fail its check as not run (git-bug e5089fd), with
+/// the same one compare.
+#[tokio::test]
+async fn a_broken_file_does_not_cost_a_second_compare() {
+    for (paths, ci_tools_fails) in [
+        (["docker/ci-tools/Dockerfile"], true),
+        (["README.md"], false),
+    ] {
+        let forge = FakeForge::new()
+            .with_file(".scarab/broken.yaml", BROKEN)
+            .with_file(".scarab/ci-tools.yaml", CI_TOOLS)
+            .with_file(".scarab/ci-tools-2.yaml", CI_TOOLS);
+        forge.set_push_paths(BEFORE, AFTER, known(&paths));
+        let db = Arc::new(InMemoryDb::new());
+        let refused = trigger_run_from_event(
+            &forge,
+            db.as_ref(),
+            &FakeClock::new(1_000),
+            scarab_server::AdmissionPorts::governance(None),
+            &push("main", BEFORE, AFTER),
+        )
+        .await;
+        assert!(refused.is_err(), "a broken file stops the delivery");
+        assert_eq!(forge.push_paths_calls(), 1, "{paths:?}");
+        scarab_server::drain_forge_statuses(&forge, db.as_ref(), "test", 100, 0, "https://s/")
+            .await
+            .expect("drain");
+        let failed: Vec<String> = forge
+            .statuses_on(AFTER)
+            .into_iter()
+            .filter(|s| s.state == scarab_forge::StatusState::Failure)
+            .map(|s| s.context)
+            .filter(|c| c.starts_with("scarab/ci-tools"))
+            .collect();
+        assert_eq!(
+            failed.len(),
+            if ci_tools_fails { 2 } else { 0 },
+            "{paths:?}: {failed:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -121,28 +381,6 @@ async fn a_pull_request_runs_only_when_its_files_touch_the_filtered_directory() 
     assert!(trigger(&forge, &db, &pr(7)).await.is_empty());
     assert_eq!(trigger(&forge, &db, &pr(8)).await.len(), 1);
     assert_eq!(forge.pr_files_calls(), 2, "one files request per delivery");
-}
-
-#[tokio::test]
-async fn unknown_paths_start_the_run_and_its_log_says_why() {
-    let forge = FakeForge::new().with_file(".scarab/ci-tools.yaml", CI_TOOLS);
-    let db = Arc::new(InMemoryDb::new());
-
-    let new_branch = push("feat/x", ChangedPaths::Unknown(PathsUnknown::NewBranch));
-    let runs = trigger(&forge, &db, &new_branch).await;
-    assert_eq!(
-        runs.len(),
-        1,
-        "a `when:` that needs unknown paths counts as true"
-    );
-    assert_eq!(
-        notes(&db, &runs[0]).await,
-        vec![
-            "changed paths unknown: new branch; the path filter in `when:` was not applied \
-             (on.push)"
-                .to_string()
-        ]
-    );
 }
 
 #[tokio::test]
@@ -164,20 +402,6 @@ async fn a_failed_files_request_starts_the_run_and_its_log_says_why() {
             && notes[0].contains("on.pull_request"),
         "{notes:?}"
     );
-}
-
-#[tokio::test]
-async fn a_when_that_does_not_read_the_paths_is_evaluated_as_before() {
-    let forge = FakeForge::new().with_file(".scarab/ci.yaml", MAIN_ONLY);
-    let db = Arc::new(InMemoryDb::new());
-
-    let unknown = ChangedPaths::Unknown(PathsUnknown::NewBranch);
-    assert!(trigger(&forge, &db, &push("feat/x", unknown.clone()))
-        .await
-        .is_empty());
-    let runs = trigger(&forge, &db, &push("main", unknown)).await;
-    assert_eq!(runs.len(), 1);
-    assert!(notes(&db, &runs[0]).await.is_empty());
 }
 
 #[tokio::test]
@@ -239,7 +463,7 @@ async fn a_files_request_that_does_not_answer_in_time_starts_the_run_with_a_note
     let forge = FakeForge::new().with_file(".scarab/ci-tools.yaml", CI_TOOLS);
     forge.set_pr_files(12, &["README.md"]);
     forge.set_pr_files_delay(std::time::Duration::from_secs(
-        scarab_forge::PULL_REQUEST_FILES_TIMEOUT_SECS + 60,
+        scarab_forge::CHANGED_FILES_TIMEOUT_SECS + 60,
     ));
     let db = Arc::new(InMemoryDb::new());
 
