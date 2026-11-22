@@ -4,14 +4,14 @@
 //!
 //! VALIDATE can only fail on rows written before 0099 (Postgres enforced the
 //! checks on every row since), so the database is migrated up to just before
-//! 0099, holds `log_chunks` rows as 0.6 wrote them, and then the server's own
-//! `migrate` runs the rest. Skips cleanly when `SCARAB_TEST_DATABASE_URL` is
-//! unset.
+//! 0099, holds `log_chunks` rows as 0.6 wrote them, and then 0099 and every
+//! later migration run over them. Skips cleanly when
+//! `SCARAB_TEST_DATABASE_URL` is unset.
 
 mod common;
 
 use common::fresh_db;
-use scarab_db_postgres::{PostgresDb, MIGRATOR};
+use scarab_db_postgres::MIGRATOR;
 use sqlx::PgPool;
 
 async fn apply(pool: &PgPool, which: impl Fn(i64) -> bool) {
@@ -49,10 +49,10 @@ async fn rows_from_0_6_pass_validation_and_fenced_stays_not_valid() {
         .expect("insert a 0.6 log row");
     }
 
-    PostgresDb::with_pool(pool.clone())
-        .migrate()
-        .await
-        .expect("0099 and every later migration run over rows from 0.6");
+    // 0099 and every later migration, over the rows from 0.6. `apply` runs
+    // the migrations' SQL without recording them, so `migrate` (which would
+    // start again at 1) is not the way up from here.
+    apply(&pool, |v| v >= 99).await;
 
     let checks: Vec<(String, bool)> = sqlx::query_as(
         "SELECT conname::text, convalidated FROM pg_constraint

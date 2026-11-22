@@ -8669,12 +8669,19 @@ mod tests {
         use axum::http::{Method, StatusCode, Uri};
         use axum::response::IntoResponse;
         let _ = rustls::crypto::ring::default_provider().install_default();
+        // As the API server answers: the `reason` goes with the code (kube's
+        // `get_opt` reads a missing Pod from `reason: NotFound`).
         let status = |code: u16, message: &str| {
+            let reason = match code {
+                403 => "Forbidden",
+                404 => "NotFound",
+                _ => "Invalid",
+            };
             (
                 StatusCode::from_u16(code).unwrap(),
                 axum::Json(serde_json::json!({
                     "kind": "Status", "apiVersion": "v1", "metadata": {},
-                    "status": "Failure", "message": message, "reason": "Forbidden",
+                    "status": "Failure", "message": message, "reason": reason,
                     "code": code,
                 })),
             )
