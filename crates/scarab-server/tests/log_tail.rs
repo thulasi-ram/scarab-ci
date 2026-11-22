@@ -2174,3 +2174,105 @@ async fn a_forge_that_hangs_on_revoke_does_not_hold_the_tick() {
         .await
         .expect("the tick returned while the forge hangs");
 }
+
+/// A forge token `token` of acme/web, minted, as a launch records it.
+fn minted(token: &str) -> scarab_engine::MountedValue {
+    scarab_engine::MountedValue {
+        kind: scarab_engine::MountedValueKind::ForgeToken,
+        value: token.as_bytes().to_vec(),
+        repo: Some(scarab_engine::MountedRepo {
+            owner: "acme".into(),
+            name: "web".into(),
+        }),
+        minted: Some(true),
+    }
+}
+
+/// REV-M1: 101 units whose revocations fail sit ahead of one that can be
+/// revoked. One pass reaches it and purges it; each failing unit is tried
+/// once and not again before its backoff. Kills: a pass limited to one
+/// page of an unordered query; failing units retried every pass.
+#[tokio::test]
+async fn a_failed_revoke_backs_off_and_does_not_starve_later_units() {
+    let w = World::new().await;
+    let logs = w.logs();
+    let t0 = 10 * 3_600_000;
+    let unit = |step: &str| {
+        LogStreamId::new(
+            &RunId("r2".into()),
+            &StepId(step.into()),
+            &AttemptId("a1".into()),
+        )
+    };
+    for i in 0..101 {
+        let token = format!("bad-{i}");
+        w.forge.fail_revocation_of(token.clone());
+        logs.record_launch_values(
+            &unit(&format!("s{i:03}")),
+            None,
+            vec![minted(&token)],
+            Timestamp(t0),
+        )
+        .await
+        .unwrap();
+    }
+    logs.record_launch_values(&unit("zzz"), None, vec![minted("good")], Timestamp(t0))
+        .await
+        .unwrap();
+    w.db.settle_log_units(Timestamp(t0)).await.unwrap();
+    let now = Timestamp(t0 + 2 * 3_600_000);
+    let pass = scarab_server::log_tail::sweep_ledgers(&logs, w.forge.as_ref(), now).await;
+    assert_eq!(pass.purged, 1, "{pass:?}");
+    assert_eq!(pass.failed, 101, "{pass:?}");
+    assert_eq!(w.forge.revoked(), vec!["good".to_string()]);
+    assert!(
+        w.db.log_unit_ledger(&unit("zzz"))
+            .await
+            .unwrap()
+            .unwrap()
+            .unit
+            .purged
+    );
+    assert_eq!(w.forge.revoke_tries().len(), 102, "each unit tried once");
+    // Inside their backoff: no unit is tried again.
+    let pass =
+        scarab_server::log_tail::sweep_ledgers(&logs, w.forge.as_ref(), Timestamp(now.0 + 1_000))
+            .await;
+    assert_eq!(pass, Default::default());
+    assert_eq!(w.forge.revoke_tries().len(), 102);
+}
+
+/// REV-M1: a revocation the forge never answers is cut off at the
+/// per-unit timeout; the pass ends and the unit backs off. Kills: a revoke
+/// awaited without a bound.
+#[tokio::test(start_paused = true)]
+async fn a_revocation_that_never_answers_is_cut_off_and_backs_off() {
+    let w = World::new().await;
+    let logs = w.logs();
+    let u = LogStreamId::new(
+        &RunId("r2".into()),
+        &StepId("s".into()),
+        &AttemptId("a1".into()),
+    );
+    logs.record_launch_values(&u, None, vec![minted("t")], Timestamp(0))
+        .await
+        .unwrap();
+    w.db.settle_log_units(Timestamp(0)).await.unwrap();
+    w.forge.hang_revocations(true);
+    let now = Timestamp(2 * 3_600_000);
+    let started = tokio::time::Instant::now();
+    let pass = scarab_server::log_tail::sweep_ledgers(&logs, w.forge.as_ref(), now).await;
+    assert_eq!(pass.failed, 1);
+    let took = started.elapsed();
+    let limit = scarab_server::log_tail::LEDGER_REVOKE_TIMEOUT;
+    assert!(
+        took >= limit && took < limit + Duration::from_secs(1),
+        "{took:?}"
+    );
+    let row = w.db.log_unit_ledger(&u).await.unwrap().unwrap().unit;
+    assert!(!row.purged);
+    assert_eq!(
+        row.revoke_retry_at,
+        Some(now.0 + scarab_engine::LEDGER_REVOKE_BACKOFF_MS)
+    );
+}

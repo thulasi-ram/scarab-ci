@@ -1375,7 +1375,7 @@ pub const LEDGER_SWEEP_PASS_BOUND: Duration = Duration::from_secs(300);
 /// is never taken over.
 const LEDGER_SWEEP_LEASE_TTL_MS: i64 = 360_000;
 
-/// Units one ledger sweep pass reads.
+/// Units one page of a ledger sweep pass reads.
 const LEDGER_SWEEP_PAGE: u32 = 100;
 
 /// What one ledger sweep pass did.
@@ -1389,12 +1389,14 @@ pub struct LedgerSweep {
 }
 
 /// One ledger sweep pass (I7, I8): the due units, oldest first, skipping
-/// units whose revocation is backing off. Each unit's minted tokens not
-/// revoked yet are revoked under [`LEDGER_REVOKE_TIMEOUT`]; a unit whose
-/// revocation succeeded is purged; one that failed or timed out backs off
-/// (one minute, doubling to an hour) and is purged anyway once past its
-/// hard cap (logging where, never the tokens). The pass stops at
-/// [`LEDGER_SWEEP_PASS_BOUND`].
+/// units whose revocation is backing off, page after page. Each unit's
+/// minted tokens not revoked yet are revoked under
+/// [`LEDGER_REVOKE_TIMEOUT`]; a unit whose revocation succeeded is purged;
+/// one that failed or timed out backs off (one minute, doubling to an
+/// hour) and is purged anyway once past its hard cap (logging where, never
+/// the tokens). A unit in backoff is left out of the next page, so units
+/// that keep failing never hide the ones behind them. The pass ends when a
+/// page brings no unit it has not seen, or at [`LEDGER_SWEEP_PASS_BOUND`].
 pub async fn sweep_ledgers(
     logs: &LogService,
     forge: &dyn scarab_forge::ForgePort,
@@ -1402,58 +1404,83 @@ pub async fn sweep_ledgers(
 ) -> LedgerSweep {
     let deadline = tokio::time::Instant::now() + LEDGER_SWEEP_PASS_BOUND;
     let mut out = LedgerSweep::default();
-    let due = match logs
-        .db()
-        .log_units_to_purge(now, scarab_engine::LEDGER_HARD_CAP_MS, LEDGER_SWEEP_PAGE)
-        .await
-    {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::debug!(error = %e, "log ledger: the purge query failed");
-            return out;
-        }
-    };
-    for c in due {
-        if tokio::time::Instant::now() >= deadline {
+    let mut seen: HashSet<LogStreamId> = HashSet::new();
+    while tokio::time::Instant::now() < deadline {
+        let due = match logs
+            .db()
+            .log_units_to_purge(now, scarab_engine::LEDGER_HARD_CAP_MS, LEDGER_SWEEP_PAGE)
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::debug!(error = %e, "log ledger: the purge query failed");
+                break;
+            }
+        };
+        let full = due.len() >= LEDGER_SWEEP_PAGE as usize;
+        let fresh: Vec<_> = due
+            .into_iter()
+            .filter(|c| seen.insert(c.unit.clone()))
+            .collect();
+        if fresh.is_empty() {
             break;
         }
-        if c.row.revoke_attempted_at.is_none() {
-            let revoked = tokio::time::timeout(
-                LEDGER_REVOKE_TIMEOUT,
-                crate::forge_token::revoke_ledger_generations(
-                    logs,
-                    forge,
-                    &c.unit,
-                    crate::forge_token::RevokeScope::All,
-                    now,
-                ),
-            )
-            .await
-            .unwrap_or(false);
-            if revoked {
-                let _ = logs.db().mark_log_unit_revoked(&c.unit, now).await;
-            } else if !c.past_cap {
-                out.failed += 1;
-                if let Err(e) = logs.db().record_log_unit_revoke_failure(&c.unit, now).await {
-                    tracing::debug!(error = %e, "log ledger: recording a failed revocation failed");
-                }
-                continue;
-            } else {
-                tracing::warn!(
-                    run = %c.unit.run.0, step = %c.unit.step.0, attempt = %c.unit.attempt.0,
-                    "log ledger: purging a unit whose forge tokens could not all be revoked; \
-                     they expire on their own"
-                );
+        for c in fresh {
+            if tokio::time::Instant::now() >= deadline {
+                break;
             }
+            sweep_unit(logs, forge, &c, now, &mut out).await;
         }
-        if let Err(e) = logs.db().purge_log_unit(&c.unit).await {
-            tracing::debug!(error = %e, "log ledger: purge failed; retried");
-        } else {
-            out.purged += 1;
-            logs.forget_values(&c.unit);
+        if !full {
+            break;
         }
     }
     out
+}
+
+/// Revoke and purge one due unit (see [`sweep_ledgers`]).
+async fn sweep_unit(
+    logs: &LogService,
+    forge: &dyn scarab_forge::ForgePort,
+    c: &scarab_engine::PurgeCandidate,
+    now: Timestamp,
+    out: &mut LedgerSweep,
+) {
+    if c.row.revoke_attempted_at.is_none() {
+        let revoked = tokio::time::timeout(
+            LEDGER_REVOKE_TIMEOUT,
+            crate::forge_token::revoke_ledger_generations(
+                logs,
+                forge,
+                &c.unit,
+                crate::forge_token::RevokeScope::All,
+                now,
+            ),
+        )
+        .await
+        .unwrap_or(false);
+        if revoked {
+            let _ = logs.db().mark_log_unit_revoked(&c.unit, now).await;
+        } else if !c.past_cap {
+            out.failed += 1;
+            if let Err(e) = logs.db().record_log_unit_revoke_failure(&c.unit, now).await {
+                tracing::debug!(error = %e, "log ledger: recording a failed revocation failed");
+            }
+            return;
+        } else {
+            tracing::warn!(
+                run = %c.unit.run.0, step = %c.unit.step.0, attempt = %c.unit.attempt.0,
+                "log ledger: purging a unit whose forge tokens could not all be revoked; \
+                 they expire on their own"
+            );
+        }
+    }
+    if let Err(e) = logs.db().purge_log_unit(&c.unit).await {
+        tracing::debug!(error = %e, "log ledger: purge failed; retried");
+    } else {
+        out.purged += 1;
+        logs.forget_values(&c.unit);
+    }
 }
 
 /// Run the ledger sweep every [`LEDGER_SWEEP_EVERY`] while this process
