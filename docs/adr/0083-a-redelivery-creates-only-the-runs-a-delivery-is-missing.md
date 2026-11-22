@@ -32,6 +32,13 @@
 > rule; a comment not on a pull request has no head and runs, like tags and releases. The
 > item that left comments out of §5 is removed from Not solved.
 
+> **2026-11-22, orchestrator decisions after the test plan.** A comment on a pull request
+> stores the pull request and its head commit on the first try (§5); a replacement whose head
+> moved records `not_run` / `not_head` instead of a new Run (§5); the delivery row's `at` and
+> lease use the store's clock (§5, §7); a Run whose creation fails leaves its Pipeline
+> undecided and the answer 502 (§1); newer delivery outcomes count for the head rule as
+> newer Runs do (§5).
+
 ## Context
 
 A verified webhook delivery runs in its own task (`finish_delivery`, `scarab-server/src/lib.rs`)
@@ -177,15 +184,16 @@ counts as true, so a Pipeline the first try did not match could become a Run on 
 | Every Step excluded by its `when:` | `all_excluded` | none |
 | Ref not allowed by the Environment (silent today) | `ref_not_allowed` | none |
 | File, or its `invoke:` library, could not be read | not recorded | none; read again by the next try |
-| An error from the store or from admission | not recorded | none; the delivery stays unfinished |
+| An error from the store or from admission | not recorded | none; the delivery stays unfinished and the answer is 502 |
 
 `reason_kind` takes the values `refused_runs.reason_kind` takes today, plus `when` and
 `not_head`.
 
-The last row covers an error returned out of the loop in `trigger_runs_from_files`, which
-leaves the Pipelines sorted after it undecided too. One that repeats, such as a concurrency
-group that cannot be rendered (`concurrency_group_key`), repeats on every redelivery; see
-Not solved.
+The last row covers an error from Run creation, including a write that fails after the Run's
+first row (that Run ends `Failed`, and the next try replaces it under §4). The Pipeline is
+left undecided and the try goes on with the files after it. One that repeats, such as a
+concurrency group that cannot be rendered (`concurrency_group_key`), repeats on every
+redelivery; see Not solved.
 
 Not keyed: the path-filter note (`record_path_filter_note`) and the follow-up record
 (`record_followups`), written on a Run after its creation finished by the try that created
@@ -341,15 +349,31 @@ creates nothing.
   `at`. If such a Run exists and its `origin_sha` is not the delivery's commit, the head has
   moved. The lower bound on `created_at` is needed: without it the newest Run before this
   delivery, at the previous commit, would make every redelivery look stale.
-- **A comment on a pull request.** A comment carries no head commit, and the Pipeline it runs
-  is not a pull request Pipeline, so the pull request's own Runs stand for its head: the
-  newest Run of the same Project with the comment's `origin_pr_number` (any Pipeline) created
-  after the delivery row's `at`, compared with the newest one created before it. The head has
-  moved when the later Run is at another commit, or when there is a later Run and no earlier
-  one to compare it with.
+- **Newer deliveries count too.** The head has also moved when a delivery of the same ref or
+  pull request that arrived after this one, at another commit, recorded an outcome for the
+  same Pipeline file, whatever the outcome (`refused`, `not_run`, `no_match`, ...). So a
+  newer push whose Pipeline was refused, did not compile or did not match still stops a late
+  redelivery of the older push. For this the first try stores the scope (`head_scope`: the
+  repository and the ref, or the repository and the pull request number) and its commit
+  (`head_sha`) on the delivery row, beside `config_sha`.
+- **A comment on a pull request.** The first try resolves the pull request's head
+  (`refs/pull/<n>/head`, `ForgePort::latest_commit`) and stores the pull request as
+  `head_scope` and that commit as `head_sha`. A later try applies the rule against that pull
+  request with any Pipeline: a Run of the pull request (`origin_pr_number`) or an outcome of
+  a delivery of it, newer than this delivery and at another commit, means the head moved. If
+  the head cannot be resolved, nothing is stored and the try is answered as an unreadable
+  forge (502).
+- **Clocks.** The delivery row's `at` and its lease are written with the store's clock:
+  Postgres `now()` (the database's), and in the in-memory test store a clock the tests set.
+  `created_at` of a Run is the creating server's clock, so the comparison with `at` carries
+  the same skew as §4's bound.
 - **What is recorded.** `not_run` with `reason_kind = not_head`, a `failure` commit status
   on the delivery's commit reading "no longer the head of `<ref>`" (or "of pull request
-  #`<n>`"; a comment has no commit to post on), and the Pipeline counts as decided. A replacement under §4 applies the same check.
+  #`<n>`"; a comment has no commit to post on), and the Pipeline counts as decided.
+- **A replacement under §4 applies the same check.** When the head moved, no new Run is
+  created: the outcome `run` naming the unfinished Run is overwritten with `not_run` /
+  `not_head` (only while it still names that Run), the unfinished Run is ended `Failed` and
+  is not marked replaced, and the delivery can finish.
 
 "Head" here means "no newer Run of this Pipeline". A newer push whose own trigger did not
 match this Pipeline leaves the older commit the head for it, and the redelivery creates the
@@ -390,6 +414,7 @@ The 64-permit semaphore and the shutdown drain stay as they are.
 
 - `unfinished BOOLEAN NOT NULL DEFAULT FALSE`;
 - `config_sha TEXT`, the commit of §1;
+- `head_scope TEXT` and `head_sha TEXT`, the ref or pull request of §5 and its commit;
 - `try_until BIGINT`, the lease of the try processing the delivery.
 
 A try:
@@ -459,7 +484,8 @@ database delete many rows, 1,000 deliveries at a time.
 - **0104** (in a transaction, `SET LOCAL lock_timeout = '5s'` as 0101 does):
   - `CREATE TABLE webhook_delivery_pipelines` and its index (a new table, no lock on another);
   - `ALTER TABLE webhook_deliveries ADD COLUMN unfinished BOOLEAN NOT NULL DEFAULT FALSE,
-    ADD COLUMN config_sha TEXT, ADD COLUMN try_until BIGINT`;
+    ADD COLUMN config_sha TEXT, ADD COLUMN head_scope TEXT, ADD COLUMN head_sha TEXT,
+    ADD COLUMN try_until BIGINT`;
   - `ALTER TABLE runs ADD COLUMN replaced_by TEXT`.
 
   Since Postgres 11 a constant default is stored in the catalog, and a nullable column
@@ -544,9 +570,9 @@ Owner decision (2026-11-22): nothing is built for this. A new delivery id is a n
   re-runs unfinished deliveries would have to store their signed payloads; not decided here.
 - **A delivery Scarab never received** (the server was down for longer than the forge waits)
   has no row at all; the forge shows it failed.
-- **An admission error that repeats** (a concurrency group that cannot be rendered) stops
-  every try at the same Pipeline, and the files sorted after it stay undecided. Recording it
-  as a refusal is a change to admission, not to delivery handling.
+- **An admission error that repeats** (a concurrency group that cannot be rendered) leaves
+  the same Pipeline undecided on every try, so the delivery never finishes. Recording it as a
+  refusal is a change to admission, not to delivery handling.
 - **A resend under a new id** (§10), Forgejo Replay included.
 - **Follow-up refusals** (a chain loop or cap) are recorded again when a `run_finished` is
   delivered twice; their status is not, through the derived id. Pre-existing, not on the
