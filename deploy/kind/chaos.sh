@@ -196,9 +196,14 @@ cleanup() {
   # terminates, so wait (bounded) until none is left.
   # They run in the step namespace, read after the switch; read here when the
   # recipe stopped before that (in a subshell: read_step_ns dies on failure).
+  # No step namespace, no delete: the release namespace runs no step Pod.
   [ -n "${step_ns:-}" ] || step_ns="$( (read_step_ns && printf '%s' "$step_ns") 2>/dev/null || true)"
-  ( kc delete pods -n "${step_ns:-$ns}" -l scarab.io/run --field-selector=status.phase!=Succeeded,status.phase!=Failed \
-      --ignore-not-found --wait=false >/dev/null 2>&1 ) || true
+  if [ -n "$step_ns" ]; then
+    ( kc delete pods -n "$step_ns" -l scarab.io/run --field-selector=status.phase!=Succeeded,status.phase!=Failed \
+        --ignore-not-found --wait=false >/dev/null 2>&1 ) || true
+  else
+    echo "warning: could not read the step namespace; leftover step Pods were not deleted" >&2
+  fi
   local left=""
   for _ in $(seq 1 60); do
     left="$( (active_step_pods) 2>/dev/null || echo '?')"
