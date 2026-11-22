@@ -25,6 +25,16 @@
 > `leading_suffix`, `redact_scan` and `Scan` with one definition (the union of every match)
 > and one streaming algorithm. §1's mechanism is superseded; its acceptance test stays. The
 > status stays Proposed until §3 is red-teamed.
+>
+> **2026-11-22, after the design red team.** The red team could not separate the streaming
+> algorithm from the reference (3.3M exhaustive runs, 32,000 fuzzed value sets). It found that the
+> reference stored a part that lies wholly inside a value, and that the automata had no memory
+> bound or build site. §3 now adds the whole-part interval, decides how and where the automata are
+> built, caps a unit's values at 256 KiB (over it the log is not stored), and names the
+> assumption that one read is contiguous. The cap adds a `not_stored` reason and migration 0102,
+> so §2's "No schema change" holds for §2 only. The Context's "a line over 16 KiB" is not the
+> common way a part starts inside a value: a rotation between two lines of a multi-line value (a
+> PEM key, a kubeconfig) is. The status stays Proposed.
 
 ## Context
 
@@ -129,17 +139,42 @@ marked intervals are:
   `S[..n]` is a suffix of some value. A whole value at the start counts too; it is also an
   occurrence, so the union is the same as with proper suffixes only. `redact_text` has no
   leading interval;
+- at a confirmed end only, the whole-part interval `[0, |S|)`, when `|S| >= MIN_SUFFIX` and
+  `S` occurs in some value with at least one byte of that value after it: a part that lies
+  wholly inside a value (lines 2-3 of a PEM key, the process ended). A value that began before
+  the part either ends inside it (the leading interval) or runs past its end (this interval); a
+  value that begins inside the part and is cut is the trailing interval. A shorter part is
+  stored (R-1). `redact_text` has none;
 - at a confirmed end only, the trailing interval `[p, |S|)`, where `p` is the smallest `p`
   such that `S[p..]` is a non-empty proper prefix of some value (any length, as the 0.7.0
   prefix rule). `redact_text` has none.
+
+Value bytes that start a part, stop before the value's end, and have more output after them are
+no interval and are stored, as in 0.7.0: the part does not end inside the value, and its start
+ends no value.
 
 Intervals that share a byte form one span, transitively. Intervals that only touch (one ends
 where the next starts) stay separate spans. The stored output is `S` with each span replaced
 by one `***` and every byte outside a span copied. Touching spans stay separate because
 0.7.0 stores `abcdef` with values `abc` and `def` as `******`, and a value printed twice in a
-row as `******`; merging them would change the digests of ordinary logs.
+row as `******`; merging them would change the digests of ordinary logs. The exception is a
+value whose end begins it again (a repeated word): `abab` printed twice shares bytes with the
+occurrence across the join, so it is one `***` (0.7.0: `******`), and `aaaa` on nine `a` is
+one `***`.
 
-**Per value set** (built once per ledger generation and kept in the `Arc<ValueSet>`):
+`MIN_SUFFIX` (8) is a field of the redactor, not a constant inside the rules, so tests search
+small inputs with it lowered to 1, 2 or 3.
+
+**Assumption: one read is contiguous.** Every rule assumes the bytes of one read are one
+unbroken run of the container's log. If the kubelet's follow skipped bytes inside one stream (a
+reader that lags across two rotations and is moved to the newest file), the first bytes of a value
+before the gap would be released when the bytes after it do not continue the value, and a value's
+tail after the gap is not at a part's start, so it would be stored at any length. This is not
+verified against the kubelet; `Read::pump` awaits the object store between source reads, so a
+slow store makes the reader lag. A gap would need a check on the stream (a later ADR), not a
+redactor rule.
+
+**Per value set** (built at most once per ledger generation, see Building the automata below):
 
 - An Aho–Corasick automaton of the values: a trie with failure links. Each node has `best`,
   the length of the longest value that ends the node's string (0 if none), and `pend`, the
@@ -186,9 +221,12 @@ nothing has been emitted, so it merges from the front.
    `open = c` and stop. A span with `a > h` stays held: a value starting in `[h, a)` could
    still extend it to the left.
 
-**`finish_confirmed`**: a pending `lead` is decided with the best `n` so far; the trailing
-interval `[k - pend[node], k)` is added if `pend[node] > 0`; then step 7 runs with `h = k`,
-so an open span closes and every held byte is emitted or starred. **`redact_text`** runs the
+**`finish_confirmed`**: a pending `lead` with `k >= MIN_SUFFIX` adds the whole-part interval
+`[0, k)` (pending at the end means `S` is inside a value with at least one more byte of it after
+`S`, and `[0, k)` covers the best `n`); a pending `lead` with fewer bytes adds `[0, n)` if
+`n > 0`. Then the trailing interval `[k - pend[node], k)` is added if `pend[node] > 0`, and step
+7 runs with `h = k`, so an open span closes and every held byte is emitted or starred. Nothing is
+emitted while `lead` is pending, so the whole-part interval does not affect the prefix property. **`redact_text`** runs the
 same steps with no leading and no trailing interval and `h = k` at the end.
 
 **Why it stores the reference.** An interval found later is an occurrence that ends after
@@ -200,10 +238,13 @@ therefore a prefix of the reference output of every continuation of the source, 
 end at that point included. How the source is cut changes when bytes are emitted, never
 which.
 
-**Held bytes.** While `lead` is pending, `S[..k]` is a substring of a value with at least
-one more byte inside it, so `k <= longest - 1`. After that, `held` is `S[F..k]` with
-`F >= h`, and `k - h = pend[node] <= longest - 1`. So a redactor holds at most the longest
-value less one byte, as today, plus the list of spans inside those bytes. The bytes of a
+**Held bytes, after each push.** While `lead` is pending, `S[..k]` is a substring of a value
+with at least one more byte inside it, so `k <= longest - 1`. After that, `held` is `S[F..k]`
+with `F >= h`, and `k - h = pend[node] <= longest - 1`. So after each push a redactor holds at
+most the longest value less one byte, as today, plus the list of spans inside those bytes.
+During a push, `held` and the spans also hold that push's chunk (value `a` against one 8 KiB
+chunk of `a`: 8,192 bytes and 8,192 touching spans until the emit); the tail reads chunks of at
+most 8 KiB (`LOG_CHUNK_BYTES`), and `redact_text` and the test paths pass whole texts. The bytes of a
 span are not held once its `***` is out. That is what bounds the hold when occurrences
 overlap without end (value `aa` against a megabyte of `a`); holding a span until its end is
 known would hold the whole run.
@@ -213,8 +254,8 @@ as in §1. After that, a push whose bytes end in no value's first bytes is emitt
 today.
 
 **Cost.** Building: the trie has at most `Σ|v| + 1` nodes and the suffix automaton at most
-`2·Σ|v|` states and `3·Σ|v|` transitions; transitions are kept in sorted vectors, so the build
-is `O(Σ|v| · log 256)` time and `O(Σ|v|)` memory, once per generation. Per read: `O(|S|)`
+`2·Σ|v|` states and `3·Σ|v|` transitions; transitions are kept in flat sorted arrays, so the
+build is `O(Σ|v| · log 256)` time and `O(Σ|v|)` memory, once per generation. Per read: `O(|S|)`
 amortized. A failure-link walk lowers the trie depth, which grows by at most 1 per byte, so
 the walks add up to at most one step per byte across pushes. The suffix automaton takes one
 step per byte for at most `longest - 1` bytes. Each interval is merged or popped once. No step
@@ -229,6 +270,60 @@ byte (values `a`, `aa`, `aaa`, … give states with many). Both automata are wri
 `scarab-server` (about 200 lines, a `redact` module beside `logs.rs`), each with a test of
 its per-node fields against brute force. No new crate; `Cargo.lock` does not change.
 
+**Building the automata.**
+
+- *Lazily, where a redactor needs them.* `ValueSet` holds the trie and the suffix automaton in two
+  `OnceLock`s. Loading a ledger builds neither, so a launch (`record_launch_values`) builds
+  nothing. `redact_text` (a failure cause) builds the trie only. A stream redactor builds both.
+- *Off the async workers.* `ValueSet::prepare_stream` and `prepare_text` build on a
+  `spawn_blocking` thread when the values are over 16 KiB, and inline below that. The tail
+  prepares the set before it opens the source.
+- *Once per generation.* A reload of the same generation with the same values (the cache's
+  600-second TTL, `redact_text_for_handle`'s reload) shares the built automata of the cached set.
+  A new generation builds again.
+- *Flat arrays, no recursion.* Each automaton is a few `Vec`s: an offset per node or state, one
+  array of edge bytes and one of targets, and the per-node fields. No node owns a heap block. The
+  trie is built from the sorted values (each node's children come in byte order, so a counting
+  sort by parent gives each node's edges sorted) and its failure links breadth first. The suffix
+  automaton is built with one edge array, a list of edges per state (to copy a state when it is
+  cloned) and one hash map from `(state, byte)` to edge, then frozen into sorted arrays and the
+  map dropped. `room` is filled in decreasing state length (a transition goes to a longer state),
+  by a counting sort, without recursion.
+- *Build traps* the red team listed, kept: `suffix` is marked after the whole build, by walking
+  each value and its suffix-link chain (a clone a later value makes can sit on an earlier value's
+  chain); the generalised construction keeps the branch for a transition that already exists (a
+  value that is a prefix of an earlier one); a merge from the back pops every span the new
+  interval reaches, and one from the front absorbs every span that starts before the growing end;
+  an interval extends the open span only when `s < open`, and a span closes at `c <= h`.
+- *Size.* Kept: the trie takes 21 bytes per node (offset, edge byte and target, failure link,
+  `best`, `pend`), the suffix automaton 8 bytes per state (offset, `room` with `suffix` in its top
+  bit) and 5 per transition. At most 52 bytes per value byte (2 states and 3 transitions per
+  byte); measured with the model on 64 KiB of random bytes, base64, hex and PEM lines, 1.17 to
+  1.35 states and 2.17 to 2.34 transitions per byte, about 44 bytes per value byte. While the
+  suffix automaton is built, its edge lists and hash map take up to about 100 more bytes per value
+  byte, dropped when it is frozen.
+
+**A cap on a unit's values: 256 KiB, fail closed.** `MAX_VALUE_BYTES` is 256 KiB of value bytes
+per unit (every distinct value, added up). At 52 bytes per value byte that keeps the automata of
+one unit under 13 MiB, and the build under about 36 MiB while it runs. A PEM key is about 3 KiB,
+a kubeconfig under 10 KiB, the Mozilla CA bundle about 220 KiB. A unit over the cap is never
+redacted in part (*Capping the length of a value that is redacted* is rejected below):
+
+- the tail checks the size before it opens the source and closes the stream with one
+  `not_stored` marker, reason `values_too_large`: "the rest of this log was not stored: this
+  step's secret values add up to more than 256 KiB, more than a log is checked against". No
+  source byte is read. It is the 0.7.0 fail-closed path for a unit without a complete ledger
+  (`close_not_stored`), with a new reason. Values only grow across generations, so a unit that
+  passes the cap stays over it, and every replica finds the same;
+- `redact_text` gives `CAUSE_NOT_STORED`, as for a unit with no ledger;
+- `LogService::append` and `pump_log_stream` (tests and tools) return an error.
+
+The reason is a new value of the `log_chunks_reason` check, so migration 0102 drops the check and
+adds it again `NOT VALID` (0101 has just validated every stored row; a later release can
+validate it). A rollback to 0.7.0 deletes versions 101 and 102 from `_sqlx_migrations`; a 0.7.0
+replica reads `values_too_large` as a `not_stored` marker with no reason it knows and shows the
+`no_ledger` text. `rollback/0099_revert.sql` deletes version 102 too.
+
 **What the Verifier needs** (`log_tail.rs`, `Verifier::check`). A re-read compares what its
 redactor emits with the stored rows' digests, as a prefix: the stored part must be a prefix
 of what the re-read emits. A read that broke stored only what its redactor had emitted, and
@@ -236,8 +331,11 @@ the re-read reads the same file from its first byte. Since emitted output is a p
 reference of every continuation, the stored part is a prefix of the re-read's output however
 either read was cut. The `***` of an open span can be stored before the span's end is read;
 the re-read emits the same `***` at the same place. A re-read that ends inside the last
-stored row (`ends_inside_matches`) compares a prefix of that row's body with the re-read's
-output at a confirmed end, which is one of those continuations.
+stored row (`ends_inside_matches`) checks that what it emitted for that row, at its own
+confirmed end, is a prefix of the row's body. That is the reverse of the prefix property: the
+row came from a longer source, and the re-read's output with its trailing `***` can differ from
+it (stored `tokio`, a re-read that ends at `tok` emits `***`). Then the result is `Mismatch`: a
+`source_restarted` marker and a second copy, never a stored value byte.
 
 **What changes against the code §1 and §2 describe.** Nothing, for a source in which no two
 marked intervals share a byte: secrets printed apart from each other and from the start and
@@ -248,6 +346,12 @@ end in clear (the four rows above; value `aa` on `aaa` stored `***a`) or several
 holds, plus §2's change at the start of a first part. A re-read of a part stored by 0.7.0
 that holds such an overlap gets one `source_restarted` note and a second copy, as in §2.
 Rows already stored are not rewritten, including a value's end that 0.7.0 stored.
+
+**Mixed versions.** During a rolling upgrade, or after a rollback, a 0.7.0 replica that takes the
+tail lease of a part this version stored with an overlap finds a mismatch and stores its own copy
+with the 0.7.0 scan, after a `source_restarted` marker, which is the output that keeps a value's
+end. The lease can move back and forth, one marker and one copy per move. Overlapping values are
+redacted in full once every replica runs this version; the CHANGELOG says so.
 
 **Model run.** A throwaway Python model of this section (brute-force reference, the
 streaming algorithm with both automata, and a port of the §1 code) agreed with the reference
@@ -301,6 +405,32 @@ below, and the tail half stays):
   read and re-read one byte per chunk, matches its digests with no `source_restarted`.
 - Docs: "Edges of a value" in `run-logs.mdx` gets a sentence that where values overlap in a
   log, the run they cover is one `***`; a CHANGELOG line.
+
+**Test plan additions after the design red team** (built with §3):
+
+- The whole-part interval in the brute force; an interior part of 8 or more bytes at a confirmed
+  end is `***`, one of 7 bytes is stored; lines 2-3 of a PEM-like value.
+- Generators: alphabets of 1 and 2 letters and ones with `*` and `\n`; free values, prefix
+  chains, suffix chains, repeats of a word, infixes of one value, lengths `MIN_SUFFIX - 1`,
+  `MIN_SUFFIX`, `MIN_SUFFIX + 1` and 1, rotations; the minimum lowered to 1, 2 and 3 as well as 8.
+- After every push of every chunking (not only one byte per push): the output is a prefix of the
+  reference of the whole source and of the bytes read so far with a confirmed end, it equals what
+  one byte per push emitted after the same bytes, and the held bytes are at most the longest value
+  less one byte.
+- An exhaustive pass with the minimum at 2: every set of one or two values of 1 to 4 bytes over
+  `ab` against every source of up to 8 bytes over `ab`, one byte per push, one push and a middle
+  cut.
+- Fixed pins: `ab`, `abX`, `cd` fed `ab` then `cd` is `******`; `XXXXabcdefgh`, `tok` on
+  `abcdefghtok!` is `******!`; `tok`, `abZ` on `tokab` is `******`; `XXabcdefghij`, `bc`, `ef`,
+  `ijKL` on `abcdefghijKL.` is `***.`.
+- Tail: a read broken with a span open stores a row that ends inside the `***` and no byte of the
+  span, and the re-read in other chunks matches with no `source_restarted`; a read broken while
+  the lead is pending stores nothing; a first part that is lines 2-3 of a value; a unit over the
+  cap gets one `values_too_large` marker and its source is not opened.
+- Build: per value byte at most 2 states, 3 transitions and 52 kept bytes, for random bytes, a
+  repeated byte, `abb…bc` and many short tokens, at 256 KiB (which also shows the build uses no
+  recursion); a launch builds no automaton, a failure cause builds the trie only, and a reload of
+  the same generation shares the built automata.
 
 ## Consequences
 

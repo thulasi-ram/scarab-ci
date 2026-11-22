@@ -912,13 +912,13 @@ which it does not know, and stops. To go back:
    `kubectl -n scarab scale deploy/scarab --replicas=0`.
 3. Back up the database.
 4. Run the revert below once. It is `crates/scarab-db-postgres/rollback/0099_revert.sql` in the
-   repository, and it reverts migrations 0100 and 0101 too:
+   repository, and it reverts migrations 0100, 0101 and 0102 too:
    `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0099_revert.sql`.
 5. Install the 0.6 chart and image:
    `helm upgrade scarab oci://ghcr.io/thulasi-ram/charts/scarab --version 0.6.1 -n scarab -f values.yaml`.
 
 The revert deletes the notes of logs stored by 0.7 and every value ledger. Output rows stay, and
-0.6 reads them as before. Upgrading again runs 0099, 0100 and 0101 again.
+0.6 reads them as before. Upgrading again runs 0099 to 0102 again.
 
 ```sql
 BEGIN;
@@ -949,7 +949,7 @@ ALTER TABLE log_chunks
 
 DROP INDEX IF EXISTS attempts_started_at_idx;
 
-DELETE FROM _sqlx_migrations WHERE version IN (99, 100, 101);
+DELETE FROM _sqlx_migrations WHERE version IN (99, 100, 101, 102);
 
 COMMIT;
 ```
@@ -976,9 +976,19 @@ FROM pg_stat_activity
 WHERE pid IN (SELECT pid FROM pg_locks WHERE relation = 'log_chunks'::regclass);
 ```
 
-A 0.7.0 server does not start on a database that ran 0101. To go back to it, scale the server to
-zero, run `DELETE FROM _sqlx_migrations WHERE version = 101;` and install 0.7.0. The checks stay
-validated, and 0.7.0 writes no row that breaks them.
+### Migration 0102
+
+The same release runs migration 0102 right after 0101. It adds a third reason to the
+`log_chunks_reason` check, `values_too_large`: a step whose secret values add up to more than
+256 KiB gets a `not_stored` note in place of its log (see
+[Run logs](/scarab-ci/usage/run-logs/#edges-of-a-value)). It drops the check and adds it again
+`NOT VALID`, so it scans no row; 0101 has just validated every stored row. It waits at most
+5 seconds for its lock, like 0101.
+
+A 0.7.0 server does not start on a database that ran 0101 or 0102. To go back to it, scale the
+server to zero, run `DELETE FROM _sqlx_migrations WHERE version IN (101, 102);` and install 0.7.0.
+The checks stay, and 0.7.0 writes no row that breaks them. A 0.7.0 server shows a
+`values_too_large` note with the text of the `no_ledger` note.
 
 ## The chart on a local kind cluster
 

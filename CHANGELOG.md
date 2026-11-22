@@ -44,10 +44,13 @@ release.yml uses that version's section as the GitHub Release text. See
   The migration waits at most 5 seconds for that lock: while a manual `VACUUM` or `ANALYZE`, an
   anti-wraparound autovacuum or a `CREATE INDEX CONCURRENTLY` runs on `log_chunks`, the server
   stops with `canceling statement due to lock timeout` and Kubernetes restarts it until the other
-  session ends. A 0.7.0 server does not start on a database that ran 0101: to go back, scale the
-  server to zero, run `DELETE FROM _sqlx_migrations WHERE version = 101;` and install 0.7.0. To go
-  back to 0.6, `rollback/0099_revert.sql` now reverts 0101 too. See
-  [Migration 0101](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#migration-0101).
+  session ends. Migration 0102, right after it, adds the `values_too_large` reason to
+  `log_chunks_reason` (see Security) and leaves that check `NOT VALID`; it scans no row. A 0.7.0
+  server does not start on a database that ran 0101 or 0102: to go back, scale the server to zero,
+  run `DELETE FROM _sqlx_migrations WHERE version IN (101, 102);` and install 0.7.0. To go back to
+  0.6, `rollback/0099_revert.sql` now reverts 0101 and 0102 too. See
+  [Migration 0101](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#migration-0101)
+  and [Migration 0102](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#migration-0102).
 - **A webhook delivery without a delivery id is refused with 400** when forge connections are
   configured, since it could not be deduplicated. GitHub and Forgejo send the header on every
   delivery; a hand-made request or script that posts to `/webhooks/github` or `/webhooks/forgejo`
@@ -59,7 +62,37 @@ release.yml uses that version's section as the GitHub Release text. See
   named every profile in the registry, so a repository author could list them by naming one that
   does not exist. It now names the step and the profile only. See
   [Placement & resources](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#placement--resources).
-<!-- redactor entry: added by the redactor build -->
+- **Overlapping secret values are redacted as one `***`, and no byte of either is stored.** The
+  redactor replaced the longest value at a position and went on after it, so a value that started
+  inside it and ended after it kept its end in clear: with the values `user:hunter2pw` and
+  `hunter2pw-and-more-secret`, `dsn=user:hunter2pw-and-more-secret` was stored as
+  `dsn=***-and-more-secret` (git-bug 32c3c10, present before 0.7.0). The redactor now finds every
+  match first and stores each run of bytes they cover as one `***`; values that only touch stay
+  two. A value that repeats a word, printed twice in a row, is now one `***` (`abab` twice, was
+  `******`). See [Edges of a value](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/#edges-of-a-value).
+- **A log part that starts inside a value no longer stores the value's end, however the log was
+  read in chunks.** In 0.7.0, a part after a `source_restarted` note that began with 8 bytes ending
+  one value and starting another stored the second value's last bytes when the read was cut after
+  those 8 bytes (git-bug 2599a7b). That case now stores `***`.
+- **The start of every log is checked against the ends of values.** 0.7.0 starred a value's last
+  8 or more bytes only at the start of a part after a `source_restarted` note; now the first part
+  of every log gets the same rule. Output that begins with 8 or more bytes that end a secret value
+  shows `***` there, and the first bytes of a log can appear a moment later.
+- **A log part that lies wholly inside a value is `***`.** A part that starts after a value's first
+  byte and whose container ended before the value's last byte (the kubelet rotated the file between
+  two lines of a PEM key, and the process ended) stored those lines. It now stores `***` when the
+  part is 8 bytes or longer.
+- **A step whose secret values add up to more than 256 KiB has its log not stored.** It gets one
+  `not_stored` note with the reason `values_too_large`, the server reads none of its log, and a
+  failure cause about it is replaced by "the cause was not stored". The redactor keeps up to 52
+  bytes of lookup tables per value byte, so the cap holds them at 13 MiB per step being read. A
+  value is never redacted in part.
+- **Rows already stored are not rewritten.** A value's end that 0.7.0 stored stays stored. A
+  re-read of a part stored by 0.7.0 that held an overlap stores one `source_restarted` note and a
+  second, redacted copy.
+- **Overlapping values are redacted in full only once every replica runs this version.** During a
+  rolling upgrade, a 0.7.0 replica that takes over a log's tail can store its own copy with the
+  0.7.0 redactor after a `source_restarted` note.
 
 ### Enhancement
 
