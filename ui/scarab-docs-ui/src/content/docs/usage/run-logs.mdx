@@ -182,10 +182,16 @@ Two edges of a log can cut a value:
 
 - When the server has confirmed that the container ended and the log ends in the first bytes of a
   value, it stores `***` for them.
-- After a `source_restarted` note (below), when the new part starts inside a value, the server
-  stores `***` for the value's last bytes if there are 8 or more of them. Fewer than 8 bytes of a
-  value's end can be stored there. This needs a line over 16 KiB with the value across the
-  kubelet's split point and a log rotation between the two halves.
+- When a log, or its part after a `source_restarted` note (below), starts inside a value, the
+  server stores `***` for the value's last bytes if there are 8 or more of them. Fewer than 8
+  bytes of a value's end can be stored there. A log starts inside a value when a line over 16 KiB
+  holds the value across the kubelet's split point and the kubelet rotates the log file between
+  the two halves.
+
+The second rule applies to the start of every log. So when a step's output begins with 8 or more
+bytes that end a secret value, the log shows `***` there, even when the step printed those bytes
+for another reason. Up to one value's length of a log's first bytes can show a moment later than
+the rest, until the server reads enough to tell whether a value starts there.
 
 ### When a read ends
 

@@ -488,10 +488,10 @@ impl LogService {
         self.cache.lock().unwrap().remove(&unit_key(unit));
     }
 
-    /// A redactor for one read of `values`' unit. `after_restart`: the part
-    /// it stores starts after a `source_restarted` row (the suffix rule).
-    pub fn redactor(&self, values: Arc<ValueSet>, after_restart: bool) -> StreamRedactor {
-        StreamRedactor::new(values, after_restart)
+    /// A redactor for one read of a part of `values`' unit, with the
+    /// suffix rule on at the part's first byte.
+    pub fn redactor(&self, values: Arc<ValueSet>) -> StreamRedactor {
+        StreamRedactor::new(values)
     }
 
     // -- fenced writes -----------------------------------------------------
@@ -577,7 +577,7 @@ impl LogService {
                 .held_by(&resource, &self.owner)
                 .ok_or(LogError::Db(DbError::NotLeader))?,
         );
-        let mut redactor = StreamRedactor::new(values.clone(), false);
+        let mut redactor = StreamRedactor::new(values.clone());
         let mut out = redactor.push(chunk);
         out.extend(redactor.finish_confirmed());
         let appended = self
@@ -743,8 +743,7 @@ fn gunzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
 const REDACTED: &[u8] = b"***";
 
 /// The shortest leading proper suffix of a value that is redacted at the
-/// start of a part that follows a `source_restarted` row (residual R-1: a
-/// shorter one is stored).
+/// start of a part (residual R-1: a shorter one is stored).
 pub const MIN_SUFFIX: usize = 8;
 
 /// Redact a whole `text` with `values`. The text is known whole, so its
@@ -779,12 +778,15 @@ enum Scan {
 /// delayed.
 ///
 /// Edges (I1): [`finish_confirmed`](Self::finish_confirmed), at a confirmed
-/// end of the source, writes a held proper prefix of a value as `***`. A
-/// redactor made `after_restart` (its part starts after a `source_restarted`
-/// row) writes the longest leading proper suffix of a value of at least
-/// [`MIN_SUFFIX`] bytes at its first byte as `***`. A read that fails drops
-/// the redactor and its held bytes: they may be the start of a secret, and
-/// the next read sees them again.
+/// end of the source, writes a held proper prefix of a value as `***`. At
+/// the first byte of a part (the first part of a stream, or one after a
+/// `source_restarted` row) it writes the longest leading proper suffix of a
+/// value of at least [`MIN_SUFFIX`] bytes as `***`: a read can start inside
+/// a value when the kubelet rotated the log file. Until the bytes held at
+/// the start show whether a longer value matches there, nothing is emitted,
+/// so what is stored does not depend on how the source is chunked. A read
+/// that fails drops the redactor and its held bytes: they may be the start
+/// of a secret, and the next read sees them again.
 pub struct StreamRedactor {
     values: Arc<ValueSet>,
     held: Vec<u8>,
@@ -793,11 +795,11 @@ pub struct StreamRedactor {
 }
 
 impl StreamRedactor {
-    pub fn new(values: Arc<ValueSet>, after_restart: bool) -> Self {
+    pub fn new(values: Arc<ValueSet>) -> Self {
         Self {
             values,
             held: Vec::new(),
-            suffix_pending: after_restart,
+            suffix_pending: true,
         }
     }
 
@@ -855,7 +857,7 @@ impl StreamRedactor {
 
 /// What the suffix rule finds at the start of a part.
 enum SuffixAt {
-    /// More bytes could still make a longer suffix match.
+    /// More bytes could still make a longer suffix or a whole value match.
     Undecided,
     None,
     /// The first `n` bytes are a proper suffix of a value (`n >=
@@ -863,7 +865,19 @@ enum SuffixAt {
     Len(usize),
 }
 
+/// The suffix rule at the start of `buf`. Before a confirmed end (`at_end`
+/// false) it decides only once no suffix and no whole value longer than
+/// `buf` can still match there, so every chunking of a source decides as
+/// the whole source in one chunk does (2599a7b: deciding on a suffix while
+/// a longer whole value could still match stored that value's tail).
 fn leading_suffix(buf: &[u8], values: &[Vec<u8>], at_end: bool) -> SuffixAt {
+    if !at_end
+        && values
+            .iter()
+            .any(|v| v.len() > buf.len() && v.starts_with(buf))
+    {
+        return SuffixAt::Undecided;
+    }
     let mut best: Option<usize> = None;
     for v in values {
         for n in MIN_SUFFIX..v.len() {
@@ -933,6 +947,8 @@ fn redact_scan(buf: &[u8], values: &[Vec<u8>], scan: Scan) -> (Vec<u8>, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use proptest::sample::Index;
     use scarab_engine::{MountedValueKind, StepId};
 
     fn set(values: &[&[u8]]) -> Arc<ValueSet> {
@@ -953,11 +969,7 @@ mod tests {
     /// Feed `chunks` through one redactor and return everything it emitted
     /// up to a confirmed end.
     fn run(values: &[&[u8]], chunks: &[&[u8]]) -> Vec<u8> {
-        run_part(values, chunks, false)
-    }
-
-    fn run_part(values: &[&[u8]], chunks: &[&[u8]], after_restart: bool) -> Vec<u8> {
-        let mut r = StreamRedactor::new(set(values), after_restart);
+        let mut r = StreamRedactor::new(set(values));
         let mut out = Vec::new();
         for c in chunks {
             out.extend(r.push(c));
@@ -979,10 +991,12 @@ mod tests {
     }
 
     /// Only a suffix that could start a secret is held; a line ending in
-    /// anything else is emitted at once.
+    /// anything else is emitted at once, the first one included. Kills: a
+    /// suffix rule that holds the start of every part (a quiet step's first
+    /// line would show only when the step ends).
     #[test]
     fn only_the_start_of_a_secret_is_held() {
-        let mut r = StreamRedactor::new(set(&[b"token-value"]), false);
+        let mut r = StreamRedactor::new(set(&[b"token-value"]));
         assert_eq!(r.push(b"line one\n"), b"line one\n".to_vec());
         assert_eq!(r.push(b"abc tok"), b"abc ".to_vec());
         assert_eq!(r.push(b"io\n"), b"tokio\n".to_vec());
@@ -1014,43 +1028,244 @@ mod tests {
         );
     }
 
-    /// I1 suffix rule (R-1): a part that starts after a `source_restarted`
-    /// row, inside a value, stores the value's tail of at least 8 bytes as
-    /// `***`. Kills: no suffix rule after a restart.
+    /// I1 suffix rule (R-1): a part that starts inside a value (a rotated
+    /// log file, before the first read or after a `source_restarted` row)
+    /// stores the value's tail of at least 8 bytes as `***`. Kills: no
+    /// suffix rule at the start of a part.
     #[test]
-    fn a_part_after_a_restart_starting_inside_a_value_stores_stars() {
+    fn a_first_part_starting_inside_a_value_stores_stars() {
         let value: &[u8] = b"ghs_0123456789abcdef";
         // The part starts with the last 13 bytes of the value, split.
         assert_eq!(
-            run_part(&[value], &[b"456", b"789abcdef rest\n"], true),
+            run(&[value], &[b"456", b"789abcdef rest\n"]),
             b"*** rest\n".to_vec()
         );
     }
 
-    /// The suffix rule applies only after a restart, and only from 8 bytes.
-    /// Kills: the rule at seq 0; the rule below 8 bytes.
+    /// R-1: the suffix rule starts at 8 bytes. Kills: both off-by-one
+    /// mutants of `MIN_SUFFIX`.
     #[test]
-    fn a_log_whose_first_byte_ends_a_value_is_stored_unchanged() {
+    fn a_start_that_ends_a_value_is_starred_from_8_bytes() {
         let value: &[u8] = b"ghs_0123456789abcdef";
         assert_eq!(
-            run_part(&[value], &[b"9abcdef rest\n"], false),
-            b"9abcdef rest\n".to_vec()
+            run(&[value], &[b"9abcdef rest\n"]),
+            b"9abcdef rest\n".to_vec(),
+            "7 bytes of a value's end are stored"
         );
         assert_eq!(
-            run_part(&[value], &[b"f\n"], true),
-            b"f\n".to_vec(),
-            "the last byte of a value alone is stored"
+            run(&[value], &[b"89abcdef rest\n"]),
+            b"*** rest\n".to_vec(),
+            "8 bytes of a value's end are `***`"
         );
     }
 
-    /// R-1: a suffix shorter than 8 bytes at a part start is stored.
+    /// The stated cost of the suffix rule on every part: output that
+    /// begins with 8 or more bytes that end a value shows `***` there,
+    /// although the step printed them itself. Pinned so the rule is not
+    /// narrowed into storing a value's tail.
     #[test]
-    fn a_short_suffix_is_not_starred() {
-        let value: &[u8] = b"ghs_0123456789abcdef";
+    fn output_that_begins_with_the_end_of_a_value_is_starred() {
         assert_eq!(
-            run_part(&[value], &[b"bcdef rest\n"], true),
-            b"bcdef rest\n".to_vec()
+            run(
+                &[b"deploy-to-production"],
+                &[b"production deploy started\n"]
+            ),
+            b"*** deploy started\n".to_vec()
         );
+    }
+
+    /// 2599a7b: V1's 8-byte tail is V2's head. A part that starts with V2
+    /// stores `***` however the source is cut, as in one chunk; before
+    /// the fix the cut after 8 bytes stored `***MNOPQRST`, V2's last 8
+    /// bytes. A part that starts with V1's tail and no longer value still
+    /// gets `***` once the next bytes show V2 does not match.
+    #[test]
+    fn a_part_starting_with_a_value_whose_head_ends_another_stores_stars() {
+        let values: &[&[u8]] = &[b"abcdefghijkl", b"efghijklMNOPQRST"];
+        let src: &[u8] = b"efghijklMNOPQRST";
+        assert_eq!(run(values, &[b"efghijkl", b"MNOPQRST"]), b"***".to_vec());
+        for cut in 1..src.len() {
+            let (a, b) = src.split_at(cut);
+            assert_eq!(run(values, &[a, b]), b"***".to_vec(), "cut at {cut}");
+        }
+        let bytes: Vec<&[u8]> = src.chunks(1).collect();
+        assert_eq!(run(values, &bytes), b"***".to_vec(), "one byte per chunk");
+        assert_eq!(
+            run(values, &[b"efghijkl", b" rest\n"]),
+            b"*** rest\n".to_vec()
+        );
+    }
+
+    /// A start held because a longer value could still match is decided
+    /// at a confirmed end with the bytes held: V1's tail is `***`.
+    #[test]
+    fn a_held_start_at_a_confirmed_end_is_starred() {
+        let mut r = StreamRedactor::new(set(&[b"abcdefghijkl", b"efghijklMNOPQRST"]));
+        assert_eq!(
+            r.push(b"efghijkl"),
+            Vec::<u8>::new(),
+            "held: V2 could match"
+        );
+        assert_eq!(r.finish_confirmed(), b"***".to_vec());
+    }
+
+    // -- properties of the redactor over chunkings --------------------------
+    //
+    // Value bytes come from `VALUE_BYTES` and filler from `FILLER`, which
+    // share no byte and hold no `*`. Values are built to overlap: V1 is a
+    // base, V2 starts with an 8-byte or longer tail of V1 (the 2599a7b
+    // shape), and optionally V3 is a tail of V1, V4 extends V2, and one
+    // free value. Three letters make further overlaps common.
+
+    const VALUE_BYTES: &[u8] = b"abc";
+    const FILLER: &[u8] = b"x \n";
+
+    fn bytes_of(
+        alphabet: &'static [u8],
+        len: std::ops::RangeInclusive<usize>,
+    ) -> impl Strategy<Value = Vec<u8>> {
+        proptest::collection::vec(proptest::sample::select(alphabet), len)
+    }
+
+    fn overlapping_values() -> impl Strategy<Value = Vec<Vec<u8>>> {
+        (
+            bytes_of(VALUE_BYTES, 9..=16),
+            any::<Index>(),
+            bytes_of(VALUE_BYTES, 1..=8),
+            proptest::option::of(any::<Index>()),
+            proptest::option::of(bytes_of(VALUE_BYTES, 1..=4)),
+            proptest::option::of(bytes_of(VALUE_BYTES, 2..=12)),
+        )
+            .prop_map(|(v1, k, ext, v3, v4, free)| {
+                let len = v1.len();
+                // A tail of V1 of 8..len bytes.
+                let tail = |i: Index| v1[len - (8 + i.index(len - 8))..].to_vec();
+                let v2 = [tail(k), ext].concat();
+                let mut values = vec![v1.clone(), v2.clone()];
+                values.extend(v3.map(tail));
+                values.extend(v4.map(|t| [v2.clone(), t].concat()));
+                values.extend(free);
+                values
+            })
+    }
+
+    /// Sorted cut points of `len` bytes, repeats allowed (empty chunks).
+    fn cuts(len: usize) -> impl Strategy<Value = Vec<usize>> {
+        proptest::collection::vec(0..=len, 0..=8).prop_map(|mut c| {
+            c.sort_unstable();
+            c
+        })
+    }
+
+    fn chunked<'a>(src: &'a [u8], cuts: &[usize]) -> Vec<&'a [u8]> {
+        let mut out = Vec::new();
+        let mut from = 0;
+        for &c in cuts {
+            out.push(&src[from..c]);
+            from = c;
+        }
+        out.push(&src[from..]);
+        out
+    }
+
+    fn redacted(values: &[Vec<u8>], chunks: &[&[u8]]) -> Vec<u8> {
+        let values: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+        run(&values, chunks)
+    }
+
+    /// A source of whole values between filler, which may start with a
+    /// value's tail of 8 or more bytes, cut into chunks.
+    fn separated_source() -> impl Strategy<Value = (Vec<Vec<u8>>, Vec<u8>, Vec<usize>)> {
+        overlapping_values()
+            .prop_flat_map(|values| {
+                let n = values.len();
+                let first = prop_oneof![
+                    Just(None),
+                    (0..n).prop_map(|i| Some((i, None))),
+                    (any::<Index>(), any::<Index>())
+                        .prop_map(move |(i, t)| Some((i.index(n), Some(t)))),
+                ];
+                let groups = proptest::collection::vec((bytes_of(FILLER, 1..=4), 0..n), 0..=4);
+                (Just(values), first, groups, bytes_of(FILLER, 0..=4))
+            })
+            .prop_map(|(values, first, groups, trail)| {
+                let mut src = Vec::new();
+                match first {
+                    None => {}
+                    Some((i, None)) => src.extend_from_slice(&values[i]),
+                    Some((i, Some(t))) => {
+                        // A tail of 8 or more bytes of a value longer than 8.
+                        let long: Vec<&Vec<u8>> = values.iter().filter(|v| v.len() > 8).collect();
+                        let v = long[i % long.len()];
+                        let n = 8 + t.index(v.len() - 8);
+                        src.extend_from_slice(&v[v.len() - n..]);
+                    }
+                }
+                for (filler, i) in groups {
+                    src.extend(filler);
+                    src.extend_from_slice(&values[i]);
+                }
+                src.extend(trail);
+                (values, src)
+            })
+            .prop_flat_map(|(values, src)| {
+                let len = src.len();
+                (Just(values), Just(src), cuts(len))
+            })
+    }
+
+    /// What the redactor must store for a [`separated_source`]: every run
+    /// of value bytes is `***`, filler is copied.
+    fn reference(src: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut in_value = false;
+        for &b in src {
+            if VALUE_BYTES.contains(&b) {
+                if !in_value {
+                    out.extend_from_slice(REDACTED);
+                }
+                in_value = true;
+            } else {
+                out.push(b);
+                in_value = false;
+            }
+        }
+        out
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            max_shrink_iters: 1024,
+            ..ProptestConfig::default()
+        })]
+
+        /// No value byte is stored, however the source is cut: each whole
+        /// value, and a part's leading value tail of 8 or more bytes, is
+        /// `***`. Kills 2599a7b (V2's end stored after V1's tail) and any
+        /// redactor that stores a value consistently in clear.
+        #[test]
+        fn any_chunking_stores_the_reference_output((values, src, cuts) in separated_source()) {
+            prop_assert_eq!(redacted(&values, &chunked(&src, &cuts)), reference(&src));
+        }
+
+        /// Any cut of any source of value and filler bytes (short tails,
+        /// heads, values run together) stores what the source in one chunk
+        /// stores, so a re-read cut differently matches the stored digests.
+        #[test]
+        fn any_chunking_stores_what_one_chunk_stores(
+            (values, src, cuts) in overlapping_values().prop_flat_map(|values| {
+                (Just(values), bytes_of(b"abcx \n", 0..=48))
+            }).prop_flat_map(|(values, src)| {
+                let len = src.len();
+                (Just(values), Just(src), cuts(len))
+            })
+        ) {
+            prop_assert_eq!(
+                redacted(&values, &chunked(&src, &cuts)),
+                redacted(&values, &[&src])
+            );
+        }
     }
 
     /// A value starting with `***` is redacted like any other value.

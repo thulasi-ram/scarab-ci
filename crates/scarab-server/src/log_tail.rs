@@ -842,7 +842,7 @@ async fn read_stream(
             final_read,
             before,
         };
-        match read.pump(chunks, values, part, part_start > 0).await {
+        match read.pump(chunks, values, part).await {
             PumpEnd::Complete => {
                 ctx.logs.purge_if_done(&unit, None).await;
                 return Outcome::Terminal;
@@ -1102,10 +1102,9 @@ impl Read<'_> {
         mut chunks: Box<dyn LogChunks>,
         values: Arc<ValueSet>,
         part: Vec<LogChunkMeta>,
-        after_restart: bool,
     ) -> PumpEnd {
         let gen = values.gen();
-        let mut redactor = Some(crate::logs::StreamRedactor::new(values, after_restart));
+        let mut redactor = Some(crate::logs::StreamRedactor::new(values));
         let mut verify = Verifier::new(part);
         let mut batch = Batch::default();
         let mut last_byte = tokio::time::Instant::now();
@@ -1419,7 +1418,7 @@ pub async fn pump_log_stream(
             .held_by(&resource, owner)
             .ok_or(LogError::Db(scarab_engine::DbError::NotLeader))?,
     );
-    let mut redactor = crate::logs::StreamRedactor::new(values.clone(), false);
+    let mut redactor = crate::logs::StreamRedactor::new(values.clone());
     let mut appended = 0u64;
     let mut out = Vec::new();
     while let Some(chunk) = chunks.next_chunk().await? {

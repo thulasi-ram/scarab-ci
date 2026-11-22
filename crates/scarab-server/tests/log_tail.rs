@@ -923,6 +923,43 @@ async fn a_part_after_a_restart_starting_inside_a_value_stores_stars() {
     assert_eq!(w.stored(&logs, &stream()).await, b"first\n*** rest\n");
 }
 
+/// I1 suffix rule on the first part (ADR-0082): the kubelet rotated the
+/// file before the first read, so the log starts with the last 12 bytes
+/// of a value; they are `***`. The first read is cut into 5-byte chunks
+/// and breaks; the second reads the log in one chunk and matches the
+/// stored digests, so no `source_restarted` row and no second copy. Kills:
+/// the suffix rule only after a restart; a start decided by how the source
+/// is cut.
+#[tokio::test]
+async fn a_first_part_starting_inside_a_value_stores_stars_and_rereads_equal() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[b"ghs_0123456789abcdef"]).await;
+    let live = LiveLog::new(b"456789abcdef rest\n", true);
+    live.script(ReadScript {
+        chunk: 5,
+        fail_after: Some(3),
+        ..Default::default()
+    });
+    live.script(ReadScript {
+        chunk: 64,
+        ..Default::default()
+    });
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    tailer.ensure(&running());
+    until("the first read's part", || async {
+        w.stored(&logs, &stream()).await.starts_with(b"*** re")
+    })
+    .await;
+    live.stop();
+    drive_until(&tailer, &running(), "complete", || async {
+        w.state(&stream()).await == Some(LogStreamState::Complete)
+    })
+    .await;
+    assert_eq!(w.stored(&logs, &stream()).await, b"*** rest\n");
+    assert!(w.markers(&stream()).await.is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // I2: how a read ends
 // ---------------------------------------------------------------------------
