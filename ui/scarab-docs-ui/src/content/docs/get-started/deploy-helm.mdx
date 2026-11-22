@@ -226,24 +226,49 @@ its own connection first.
 
 ### Webhook deliveries
 
-The forge posts each event to `/webhooks/github` or `/webhooks/forgejo`. Scarab records the
-delivery's id (`X-GitHub-Delivery`, `X-Forgejo-Delivery` or `X-Gitea-Delivery`) so a delivery sent
-twice starts its Runs once. The forge's delivery log shows the answer:
+The forge posts each event to `/webhooks/github` or `/webhooks/forgejo`. Scarab keeps the
+delivery's id (`X-GitHub-Delivery`, `X-Forgejo-Delivery` or `X-Gitea-Delivery`) and, for each
+Pipeline file, what that delivery decided: a Run, a refusal, not run, or no match. A redelivery
+with the same id decides only the files no earlier try decided, so it creates the Runs the
+delivery is missing and no Run twice. The forge's delivery log shows the answer:
 
 | Answer | What happened | What to do |
 |---|---|---|
-| 202 | Runs were created; the body lists their ids. `"incomplete": true` means a Pipeline file could not be read from the forge, so that Pipeline started nothing | Start the missing Pipeline by hand: a redelivery is answered as a duplicate, so it would not create the Runs again |
-| 200 | Nothing started: `{"ignored": "<reason>"}` (for example `no matching pipeline` or `duplicate delivery`), or `refused` lists the Pipelines that were refused. With `refused`, `"incomplete": true` means another Pipeline file could not be read | Nothing, or start the missing Pipeline by hand |
+| 202 | Runs were created; the body lists their ids. `earlier` lists what an earlier try of the same delivery decided | Nothing |
+| 200 | Nothing started: `{"ignored": "<reason>"}` (for example `no matching pipeline`, or `duplicate delivery` when every Pipeline is already decided), or `refused` lists the Pipelines that were refused | Nothing |
 | 400 | A Pipeline file does not compile (the text says why; its check is posted as failed), the body is not an event Scarab reads, or the delivery has no id header (with forge connections configured) | Fix the Pipeline and push again; a hand-made request needs the forge's delivery id header |
 | 401 | The signature does not match the webhook secret | Check the secret on both sides |
-| 502 | A Pipeline file could not be read from the forge (three tries, 0.5 and 2 seconds apart), and nothing was created or refused. The id is not kept | Redeliver it from the forge's webhook page |
-| 503 | 64 deliveries were already running and none ended within 10 seconds, or this delivery is still running on the server from an earlier try. Nothing was recorded | Redeliver it later |
+| 409 | Another try of this delivery is running, on this server replica or another, or a Run of it is still being created. The lease of a try lasts 10 minutes | Redeliver it later |
+| 502 | The forge could not be read (three tries, 0.5 and 2 seconds apart), or a Pipeline was left undecided: its file could not be read, or its Run could not be created. The body lists `run_ids`, `refused`, `earlier` and `undecided` | Redeliver it from the forge's webhook page |
+| 503 | 64 deliveries were already running and none ended within 10 seconds. Nothing was recorded | Redeliver it later |
+
+On a redelivery:
+
+- `.scarab/` is read at the commit the first try read it at. For a comment that is `HEAD`
+  then, and for a tag or release the tag's commit then.
+- A push, a pull request or a comment on a pull request creates no Run when its ref or pull
+  request has moved on since the delivery arrived: when a newer Run or a newer delivery of
+  that Pipeline is at another commit. The Pipeline is recorded as not run, and its check fails
+  with "no longer the head of" the ref or pull request. Tags, releases and comments that are
+  not on a pull request always run.
+- A Run whose creation stopped part way (the server stopped, a write failed) is replaced: after
+  10 minutes, or at once when it already ended `Failed`. The old Run stays `Failed`, names its
+  replacement, and cannot be rerun.
+
+GitHub's Redeliver sends the same id, so it repairs the delivery. A Forgejo Replay sends a new
+id: Scarab treats it as a new delivery and starts its Runs again. Neither forge redelivers on
+its own, so a delivery answered 502 or 409 waits until someone redelivers it (GitHub keeps
+deliveries for 3 days).
+
+Scarab keeps deliveries for `retention.webhookDeliveryDays` (`SCARAB_RETENTION_WEBHOOK_DELIVERY_DAYS`,
+default 30) and refuses to start with fewer than 7: a redelivery of a delivery already pruned
+would create its Runs again.
 
 A delivery's work runs in a task of its own. When the forge stops waiting (GitHub after 10
 seconds, Forgejo after its `DELIVER_TIMEOUT`), the delivery still creates its Runs; only the
-answer is lost. A redelivery sent while that work is still running on the same server is
-answered 503; one that reaches another server replica is answered as a duplicate. When the server shuts down, it waits up to 20 seconds for running deliveries to
-finish, then logs how many it left. The chart sets no `terminationGracePeriodSeconds`, so a Pod
+answer is lost. When the server shuts down, it waits up to 20 seconds for running deliveries to
+finish, then logs how many it left. A try the shutdown cuts short leaves its delivery for a
+redelivery once its lease lapses. The chart sets no `terminationGracePeriodSeconds`, so a Pod
 has Kubernetes' default 30 seconds to stop.
 
 ## Settings

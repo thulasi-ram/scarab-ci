@@ -563,6 +563,45 @@ The StatefulSet's `serviceName` is unchanged, so upgrading needs no migration.
 
 > **Unverified in this chart version:** per-availability-zone placement.
 
+### Upgrading from 0.7.1: webhook delivery outcomes
+
+Migrations 0104 and 0105 record what each webhook delivery decided for each
+Pipeline file, so a redelivery creates only the Runs it is missing.
+
+- **0104** runs in a transaction with a 5-second lock timeout, as 0101 does. It
+  adds the `webhook_delivery_pipelines` table, five columns on
+  `webhook_deliveries` (`unfinished`, `config_sha`, `head_scope`, `head_sha`,
+  `try_until`) and `runs.replaced_by`. No row is rewritten: `unfinished` has a
+  constant default and the other columns are nullable. Each `ALTER` takes an
+  ACCESS EXCLUSIVE lock for a moment. `runs` is written on every scheduler
+  tick, so on a busy database the wait can pass 5 seconds; the server then
+  stops with `canceling statement due to lock timeout`, Kubernetes restarts it,
+  and it tries again.
+- **0105** builds `webhook_deliveries_at_idx` with `CREATE INDEX CONCURRENTLY`,
+  outside a transaction, so deliveries go on being recorded while it builds. A
+  build that fails leaves an invalid index; the server drops it and builds it
+  again when it starts.
+
+Deliveries recorded before the upgrade read as finished: a redelivery of one is
+answered `duplicate delivery`, as in 0.7.1. During a rolling update, a delivery
+a new server answered 502 is answered `duplicate delivery` if its redelivery
+reaches a 0.7.1 server; redeliver it again once the rollout ends.
+
+The retention sweeper now deletes deliveries older than
+`retention.webhookDeliveryDays` (default 30, at least 7). `webhook_deliveries`
+was never pruned before, so the first passes on an old database delete 1,000
+deliveries at a time.
+
+To roll back: scale the server to zero
+(`kubectl -n scarab scale deploy/scarab --replicas=0`), back up the database,
+run
+[`rollback/0104_revert.sql`](../../../crates/scarab-db-postgres/rollback/0104_revert.sql)
+(`psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0104_revert.sql`; it reverts 0105
+too, and a second run changes nothing), then install the 0.7.1 chart. 0.7.1
+reads every recorded delivery as done, including ones the newer server left
+unfinished, and a Run a redelivery replaced becomes an ordinary `Failed` Run.
+To go back to 0.6.x, run it before `0099_revert.sql`.
+
 ### Upgrading to 0.7.0
 
 Read the Breaking changes of 0.7.0 in `CHANGELOG.md` first. 0.7 changes how
