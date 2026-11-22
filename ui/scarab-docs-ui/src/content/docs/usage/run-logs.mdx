@@ -125,13 +125,18 @@ one stream, so a value split between two chunks of output is still replaced. A s
 redact only that step's log (and its sidecars' logs), never another step's.
 
 The values come from the step's value ledger. Each time Scarab launches a step, before it creates
-the Pod or any Secret, it stores the values that launch hands the step, encrypted with the
-server's master key, in Postgres. Every replica reads the ledger, so the replica that reads a log
-does not have to be the one that launched the step, and a step launched again with a new token is
-redacted with both tokens. A replica that cannot decrypt the ledger (it has a different master
-key) reads none of that log and leaves it to a replica that can. The ledger is deleted once the
-step's logs are stored and its forge tokens revoked, or an hour after the step ends (up to a day
-while a revocation keeps failing). Scarab never reads a value back from a Kubernetes Secret.
+the Pod or any Secret, it stores the values that launch hands the step as a new generation of the
+ledger, encrypted with the server's master key, in Postgres. Every replica reads the ledger, so
+the replica that reads a log does not have to be the one that launched the step, and a step
+launched again with a new token is redacted with both tokens. A replica loads every generation or
+none: one that cannot decrypt the ledger (it has a different master key) reads none of that log
+and leaves it to a replica that can. Scarab never reads a value back from a Kubernetes Secret.
+
+A failure cause or infra message about a step (what the Run page shows when a step fails) is
+redacted with the same values. The server reads the ledger from Postgres each time it stores a
+cause, so a token another replica added after this one last loaded the ledger is redacted too. A
+cause about a step with no ledger is replaced by "the cause was not stored: it may quote secret
+values that could not be checked".
 
 A Pod that a Scarab server keeps a ledger for carries the label `scarab.io/value-ledger: "1"`, and
 Scarab's per-Pod Secrets for it are named `<pod>-v-secrets`, `<pod>-v-registry`, `<pod>-v-token`
@@ -144,6 +149,32 @@ started by an earlier Scarab version, and its log gets one note in place of the 
 
 Someone who can create Pods in the step namespace can create a labelled Pod themselves. Scarab
 does not defend against that: that person can already read the step's Secrets.
+
+### Forge tokens and when a ledger is deleted
+
+Each ledger generation that holds a minted forge token records when that token was revoked, so
+each token is revoked once:
+
+- A launch that replaces an earlier one (a re-drive) revokes the tokens of older generations,
+  never the one it mounted, so a launch that returns late does not revoke a newer launch's token.
+- When the try ends, the server that sees the end revokes the tokens not revoked yet.
+- A launch whose minted token is in no generation of the ledger revokes that token and fails, so a
+  token is never left live with nothing to revoke it.
+
+The ledger is deleted:
+
+- once every log of the try (the step's and each sidecar's) is stored to its end or closed with a
+  note, and its tokens are revoked;
+- otherwise an hour after the try ends or its Run ends, once its tokens are revoked;
+- at the latest 24.5 hours after its first generation (the longest step timeout, the 30-minute
+  provisioning deadline and an hour), once the try is not running, even while a revocation still
+  fails. Those tokens then expire on their own: a GitHub App token lasts an hour.
+
+One replica retries failed revocations and deletes ledgers: the one that holds the lease
+`ledger-sweep`. It runs every 30 seconds in a task of its own, so a forge that does not answer
+delays no scheduling. It waits at most 20 seconds for one try's revocations, and a revocation that
+fails or times out is tried again after 1 minute, then 2, 4 and so on up to an hour. A log whose
+end was not read when its ledger was deleted gets the `ledger_purged` note.
 
 ### Edges of a value
 
@@ -163,6 +194,16 @@ between the API server and the kubelet). So when a read ends, the server asks Ku
 container for up to 10 seconds. The log is complete only once the container has ended at about the
 time the read ended. Otherwise the server keeps what it stored, drops the bytes it held back, and
 reads again.
+
+A followed read that gets no byte for 5 minutes fails and is opened again. A node or a load
+balancer can drop a connection without telling either end, and the Kubernetes client Scarab uses
+(kube 4.0) has no TCP keepalive setting, so without this read timeout the live log would stop until
+the step ended. A step that prints nothing for 5 minutes is read again from the start each time;
+when the log begins with the stored part, nothing new is stored and no note is added.
+
+A sidecar or shared service whose container ended and waits to restart (for example in
+`CrashLoopBackOff`) is read again after 3 seconds, then 6, 12 and so on up to 60 seconds. A new
+container that already runs is read at once.
 
 A read that breaks part way, or a later read, reads the container's log again from the start and
 compares it with the part already stored, by a SHA-256 digest of each stored chunk:
@@ -184,26 +225,45 @@ text. These are the notes:
 | `not_stored` (`ledger_purged`) | the rest of this log was not stored: its secret values were removed before it could be read |
 | `incomplete` | the end of this log could not be read |
 
+`not_stored` covers the rest of the log, and the server stores none of the step's output after it:
+
+- `no_ledger`: the step has no value ledger, or its Pod has no `scarab.io/value-ledger` label. An
+  earlier Scarab version started it, for example a step that ran across the upgrade to 0.7. A step
+  of an earlier version whose Pod is gone when the server reads its end gets this note if it
+  started, and no note if it never started.
+- `ledger_purged`: the step's ledger was deleted before its log was read to the end (see
+  [above](#forge-tokens-and-when-a-ledger-is-deleted)).
+
 `incomplete` is written when the step's Pod is gone before the end of its log was read, or when
-the server could not read the end of the log within 30 minutes after the step ended. Output the
-kubelet rotated away before the server read it is gone; a note does not recover it.
+the server could not read the end of the log within 30 minutes after the step ended. A step
+cancelled before it started gets no note. Output the kubelet rotated away before the server read
+it is gone; a note does not recover it. When that happens before the server's first read of the
+log, the log starts at the oldest byte the kubelet kept, with no note: the kubelet's log API does
+not say that an earlier file was deleted.
 
 Logs stored by Scarab 0.6 and earlier keep their notes as they were stored, as output lines that
 start with `scarab:`.
 
 ## Upgrading from Scarab 0.6
 
+Read [Upgrading to Scarab 0.7](/scarab-ci/get-started/deploy-helm/#upgrading-to-scarab-07) first.
+For logs, the upgrade means:
+
 - Let running Runs finish before you upgrade. A step or shared service that runs across the
   upgrade was started without a value ledger, so the new server stores none of its output after
-  the upgrade: its log gets the `no_ledger` note after the part the old server stored.
-- During a rolling upgrade, a server of the old version cannot store log chunks any more (the
-  database refuses them), so it stops storing logs until it is replaced.
-- Roll back only when no step is running. A server of the old version cannot store logs at all on
-  the new schema. Do not remove the `log_chunks_fenced` check to let it: it would read a step the
-  new version launched without its secret values and store that step's output with them in clear.
-  The old version also does not delete the `<pod>-v-…` Secrets of steps the new version launched,
-  or revoke their forge tokens; the Secrets go with their Pods and the tokens expire on their own.
-  When you upgrade again, steps the old version launched get the `no_ledger` note.
-- Every replica must use the same master keys (`SCARAB_MASTER_KEYS`: the first is the active key,
-  the rest decrypt only). To rotate a key, add the new key after the active one on every replica
-  first, then move it to the front.
+  the upgrade: its log gets the `no_ledger` note after the part the old server stored, and a
+  failure cause about it reads "the cause was not stored".
+- Once migration 0099 has run, the database refuses log chunks from a 0.6 server. With the chart's
+  default `strategy.type: Recreate` no 0.6 server runs by then. With `RollingUpdate`, the 0.6
+  servers still running store no log, and a step one of them launches gets the `no_ledger` note and
+  nothing else.
+- Never drop the `log_chunks_fenced` check on `log_chunks`. It is what stops a 0.6 server that is
+  still running during a rolling update from storing output it cannot redact.
+- Forge tokens minted by 0.6 are in no ledger, so 0.7 does not revoke them; they expire on their
+  own.
+- A 0.6 server does not start on the migrated database. To go back, see
+  [Rolling back to Scarab 0.6](/scarab-ci/get-started/deploy-helm/#rolling-back-to-scarab-06): the
+  revert deletes the notes of logs stored by 0.7 and every value ledger, and the output stays
+  readable.
+- Every replica must use the same master keys (see
+  [Master keys and value ledgers](/scarab-ci/get-started/deploy-helm/#master-keys-and-value-ledgers)).
