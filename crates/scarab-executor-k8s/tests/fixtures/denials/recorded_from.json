@@ -1,3 +1,3 @@
 {
-  "recorded_from": "hand-written from the Kubernetes source message formats; to be re-recorded with `just test record-denials`"
+  "recorded_from": "Kubernetes v1.36.1, deploy/kind/record-denials.sh, 2026-11-22"
 }
