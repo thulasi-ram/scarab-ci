@@ -96,3 +96,100 @@ async fn rerun_creates_a_new_take_with_fresh_attempt_evidence() {
         "expected the rerun attempt's output in the logs (>=2 occurrences), got {occurrences}: {text:?}"
     );
 }
+
+/// git-bug 9b795be: a rerun whose step writes the same bytes again skips the
+/// step downstream of it. `a` writes a fixed file into the workspace and `b`
+/// reads it; nothing in `a` depends on the time or a random value. Rerunning
+/// `a` runs it again in a new Pod; its content identity matches the first
+/// Attempt's, so `b`'s inputs are unchanged and `b` is skipped with its
+/// output carried forward (ADR-0027). Before content identity (ADR-0061 s8)
+/// two Pods of one step always differed (mtime, drain order), so `b` always
+/// ran again; the in-memory executor cannot show that difference.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rerun_with_identical_output_skips_the_downstream_step() {
+    require_e2e!();
+
+    let base = base_url();
+    let http = client();
+
+    let run = create_inline_run(
+        &http,
+        &base,
+        serde_json::json!([
+            { "id": "a", "image": "busybox:latest",
+              "security": { "run_as_root": true },
+              "command": ["sh", "-c", "printf fixed > /workspace/out"] },
+            { "id": "b", "image": "busybox:latest", "needs": ["a"],
+              "security": { "run_as_root": true },
+              "command": ["sh", "-c", "cat /workspace/out"] }
+        ]),
+    )
+    .await;
+
+    let rs = wait_for_terminal(&http, &base, &run, Duration::from_secs(180)).await;
+    assert_eq!(rs.status, "succeeded", "baseline run must succeed first");
+    assert_eq!((rs.step("a").attempts, rs.step("b").attempts), (1, 1));
+
+    let resp = http
+        .post(format!("{base}/v1/runs/{run}/steps/a/rerun"))
+        .send()
+        .await
+        .expect("POST rerun");
+    assert_eq!(resp.status().as_u16(), 202, "rerun must be accepted");
+
+    // The Run is still `succeeded` right after the 202, so the attempt count
+    // is part of what is waited for.
+    wait_for_run(
+        &http,
+        &base,
+        &run,
+        Duration::from_secs(180),
+        "succeeded again with a second attempt of `a`",
+        |rs| rs.status == "succeeded" && rs.step("a").attempts == 2,
+    )
+    .await;
+
+    let evs = events(&http, &base, &run).await;
+    let kinds: Vec<&str> = evs.iter().map(event_kind).collect();
+    let rerun_at = kinds
+        .iter()
+        .position(|k| *k == "RunRerunRequested")
+        .unwrap_or_else(|| panic!("no RunRerunRequested event: {kinds:?}"));
+    // Positions in the event log, which is in append order.
+    let skipped: Vec<usize> = evs
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| event_kind(e) == "StepSkipped" && e["kind"]["StepSkipped"]["step"] == "b")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        skipped.len(),
+        1,
+        "expected exactly one StepSkipped for `b` (its input is unchanged): {kinds:?}"
+    );
+    assert!(
+        skipped[0] > rerun_at,
+        "the StepSkipped for `b` must follow the RunRerunRequested: {kinds:?}"
+    );
+
+    let started = events_of_kind(&evs, "AttemptStarted");
+    let of = |step: &str| -> Vec<&serde_json::Value> {
+        started
+            .iter()
+            .copied()
+            .filter(|p| p["step"] == step)
+            .collect()
+    };
+    assert_eq!(
+        of("b").len(),
+        1,
+        "`b` ran once, in the first Take only: {:?}",
+        of("b")
+    );
+    let a = of("a");
+    assert_eq!(a.len(), 2, "`a` ran twice: {a:?}");
+    assert_ne!(
+        a[0]["attempt"], a[1]["attempt"],
+        "the rerun of `a` is a new attempt"
+    );
+}
