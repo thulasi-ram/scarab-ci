@@ -79,6 +79,10 @@ const STUCK_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// How often the settle pass and the pending-final-read query run.
 const SWEEP_EVERY: Duration = Duration::from_secs(30);
 
+/// The longest wait before reading again a container that waits to start
+/// again (the kubelet's crash-loop backoff reaches 5 minutes).
+const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
 /// Units per leg of one pending-final-read pass.
 const PENDING_PAGE: u32 = 64;
 
@@ -203,11 +207,15 @@ struct TailState {
     /// Fences with a read in flight.
     active: HashSet<LogStreamId>,
     /// Fences found terminal (`complete` or `closed`), or with no log source:
-    /// never read again by this process.
+    /// not read again by this process while it ensures them. A fence no
+    /// pass ensures is forgotten; its `log_streams` row answers for it.
     done: HashSet<LogStreamId>,
     retry_at: HashMap<LogStreamId, Instant>,
     /// The wait before the next final read of a fence (doubling).
     final_backoff: HashMap<LogStreamId, Duration>,
+    /// The wait before reading a container that ended and waits to start
+    /// again (a crash loop), doubling from the retry backoff.
+    restart_backoff: HashMap<LogStreamId, Duration>,
     open: HashMap<LogStreamId, OpenTail>,
     /// Fences ensured since the last [`LogTailer::end_pass`].
     seen: HashSet<LogStreamId>,
@@ -326,6 +334,17 @@ impl LogTailer {
             if !complete {
                 return;
             }
+            // Bounded state: forget what this pass did not ensure and no
+            // read or open tail holds.
+            let st = &mut *st;
+            let (open, active) = (&st.open, &st.active);
+            let kept =
+                |f: &LogStreamId| seen.contains(f) || open.contains_key(f) || active.contains(f);
+            st.done.retain(|f| seen.contains(f) || active.contains(f));
+            st.retry_at.retain(|f, _| kept(f));
+            st.final_backoff.retain(|f, _| kept(f));
+            st.restart_backoff.retain(|f, _| kept(f));
+            st.not_ready.retain(|f, _| kept(f));
             st.open
                 .iter()
                 .filter(|(fence, _)| !seen.contains(*fence))
@@ -421,6 +440,23 @@ impl LogTailer {
                 );
             }
         }
+    }
+
+    /// How many streams this process keeps state for (reads, waits,
+    /// streams found terminal): it falls back to zero once the units it
+    /// tailed have ended and been read.
+    pub fn tracked_streams(&self) -> usize {
+        let st = self.state.lock().unwrap();
+        let mut all: HashSet<&LogStreamId> = HashSet::new();
+        all.extend(st.active.iter());
+        all.extend(st.done.iter());
+        all.extend(st.retry_at.keys());
+        all.extend(st.final_backoff.keys());
+        all.extend(st.restart_backoff.keys());
+        all.extend(st.open.keys());
+        all.extend(st.seen.iter());
+        all.extend(st.not_ready.keys());
+        all.len()
     }
 
     /// Close the streams of a unit that has no ledger and left `Running`
@@ -522,7 +558,18 @@ impl LogTailer {
                     st.open.remove(&fence);
                     st.retry_at.remove(&fence);
                     st.final_backoff.remove(&fence);
+                    st.restart_backoff.remove(&fence);
                     st.not_ready.remove(&fence);
+                }
+                Outcome::WaitRestart => {
+                    let wait = st
+                        .restart_backoff
+                        .get(&fence)
+                        .copied()
+                        .unwrap_or(ctx.timing.retry_backoff);
+                    st.retry_at.insert(fence.clone(), Instant::now() + wait);
+                    st.restart_backoff
+                        .insert(fence.clone(), (wait * 2).min(RESTART_BACKOFF_MAX));
                 }
                 Outcome::Retry if final_read => {
                     let wait = st
@@ -538,10 +585,12 @@ impl LogTailer {
                     st.retry_at
                         .insert(fence.clone(), Instant::now() + ctx.timing.retry_backoff);
                 }
-                // The unit ended during a live read: the final read runs
-                // at the next pass, without a wait.
+                // The unit ended during a live read, or a restarted
+                // container already runs: read again at the next pass,
+                // without a wait.
                 Outcome::Again => {
                     st.retry_at.remove(&fence);
+                    st.restart_backoff.remove(&fence);
                 }
                 Outcome::Stop => {}
             }
@@ -570,6 +619,9 @@ enum Outcome {
     Retry,
     /// Read again at the next pass, without the backoff.
     Again,
+    /// The container ended and waits to start again: read again after a
+    /// backoff that doubles while it keeps doing so.
+    WaitRestart,
     /// Another replica holds or took the lease: nothing to do here.
     Stop,
 }
@@ -740,7 +792,20 @@ async fn read_stream(
             }
             Err(e) => {
                 if final_read && matches!(before, Some(LogSourceState::Gone)) {
-                    return gone_unconfirmed(ctx, fence, &unit, writer, row.is_some()).await;
+                    // Rows stored, not a stream row: a budget creates the
+                    // row of a unit that never started.
+                    let has_rows = row.as_ref().is_some_and(|r| r.next_seq > 0);
+                    if values.is_none() {
+                        // No ledger row and the Pod is gone: an earlier
+                        // version launched it. The no-ledger close.
+                        let started = has_rows || attempt_started(ctx, &unit).await;
+                        return if started {
+                            close_not_stored(ctx, fence, writer, NotStoredReason::NoLedger).await
+                        } else {
+                            close_incomplete(ctx, fence, writer, false).await
+                        };
+                    }
+                    return gone_unconfirmed(ctx, fence, &unit, writer, has_rows).await;
                 }
                 failure = Some(Failure::Source(e.to_string()));
                 break;
@@ -782,7 +847,8 @@ async fn read_stream(
                 ctx.logs.purge_if_done(&unit, None).await;
                 return Outcome::Terminal;
             }
-            PumpEnd::Restarting => return Outcome::Again,
+            PumpEnd::Restarting { running: true } => return Outcome::Again,
+            PumpEnd::Restarting { running: false } => return Outcome::WaitRestart,
             PumpEnd::Mismatch => {
                 tracing::warn!(
                     run = %fence.run.0, step = %fence.step.0, attempt = %fence.attempt.0,
@@ -897,6 +963,17 @@ async fn unit_started(ctx: &Ctx, unit: &LogStreamId, has_rows: bool) -> bool {
             .is_some_and(|l| l.unit.started_at.is_some())
 }
 
+/// Whether the store saw the unit's step process run (an earlier version
+/// records that on the attempt; a unit with no ledger has nothing else).
+async fn attempt_started(ctx: &Ctx, unit: &LogStreamId) -> bool {
+    ctx.db
+        .attempt_execution_started(&unit.run, &unit.step, &unit.attempt)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 /// A final read found the unit gone before its end was confirmed: an
 /// `incomplete` marker if it started, and `closed`.
 async fn gone_unconfirmed(
@@ -979,9 +1056,10 @@ async fn check_budget(
 enum PumpEnd {
     /// The end was confirmed and the stream is `complete`.
     Complete,
-    /// A restartable container ended and will start again; the stream stays
-    /// open.
-    Restarting,
+    /// A restartable container ended; the stream stays open. `running`:
+    /// its next container already runs (read it now), else it waits to
+    /// start again (read it after a backoff).
+    Restarting { running: bool },
     /// The source does not begin with the stored part. Nothing appended.
     Mismatch,
     /// The unit's ledger moved: reload and read again.
@@ -1011,7 +1089,10 @@ struct Read<'a> {
 /// What [`Read::confirm_end`] found after a clean end.
 enum EndKind {
     Confirmed,
+    /// The container ended and waits to start again.
     Restarting,
+    /// The container ended and its next one already runs.
+    Restarted,
     Unconfirmed(String),
 }
 
@@ -1104,9 +1185,10 @@ impl Read<'_> {
                 if verify.ends_inside() && !self.ends_inside_matches(&verify).await {
                     return PumpEnd::Mismatch;
                 }
-                if matches!(kind, EndKind::Restarting) {
+                if let EndKind::Restarting | EndKind::Restarted = kind {
+                    let running = matches!(kind, EndKind::Restarted);
                     return match self.store(&mut batch, gen, None).await {
-                        Ok(()) => PumpEnd::Restarting,
+                        Ok(()) => PumpEnd::Restarting { running },
                         Err(e) => e,
                     };
                 }
@@ -1167,7 +1249,7 @@ impl Read<'_> {
                 Some(LogSourceState::Restarting) => return EndKind::Restarting,
                 Some(LogSourceState::Running { container_id }) => {
                     if opened_id.is_some() && container_id.is_some() && container_id != opened_id {
-                        return EndKind::Restarting;
+                        return EndKind::Restarted;
                     }
                 }
                 None => return EndKind::Unconfirmed("the source state could not be read".into()),

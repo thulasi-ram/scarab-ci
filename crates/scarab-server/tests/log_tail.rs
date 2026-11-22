@@ -2276,3 +2276,53 @@ async fn a_revocation_that_never_answers_is_cut_off_and_backs_off() {
         Some(now.0 + scarab_engine::LEDGER_REVOKE_BACKOFF_MS)
     );
 }
+
+/// REV-m7: the tailer's per-stream state falls back to nothing once the
+/// units it read have ended and been read to their end, and the ledger
+/// layer forgets a handle once its unit ends (a unit an earlier version
+/// launched, with no unit row, is remembered while it runs so it is asked
+/// for once). Kills: sets that only grow.
+#[tokio::test]
+async fn the_tailer_forgets_streams_of_runs_that_ended() {
+    let w = World::new().await;
+    let logs = w.logs();
+    w.ledger(&logs, &[]).await;
+    let live = LiveLog::new(b"hi\n", true);
+    let tailer = w.tailer(live.clone(), &logs, "a");
+    drive_until(&tailer, &running(), "the first line", || async {
+        w.stored(&logs, &stream()).await == b"hi\n"
+    })
+    .await;
+    assert!(tailer.tracked_streams() > 0);
+    live.stop();
+    w.end_attempt().await;
+    drive_until(
+        &tailer,
+        &step_run(AttemptOutcome::Succeeded),
+        "complete",
+        || async { w.state(&stream()).await == Some(LogStreamState::Complete) },
+    )
+    .await;
+    until("the tailer's state is empty", || async {
+        tailer.end_pass(true);
+        tailer.tracked_streams() == 0
+    })
+    .await;
+
+    let ledger = scarab_server::RedactionLedgerExecutor::new(
+        live.clone(),
+        logs.clone(),
+        Arc::new(scarab_testkit::FakeClock::new(now_ms())),
+    );
+    let h = ledger.launch(&running(), &spec()).await.unwrap();
+    let old = ExecHandle("pod-from-0-6".into());
+    *live.poll_state.lock().unwrap() = ExecState::Running;
+    ledger.poll(&h).await.unwrap();
+    ledger.poll(&old).await.unwrap();
+    ledger.poll(&old).await.unwrap();
+    assert_eq!(ledger.remembered_handles(), 2);
+    *live.poll_state.lock().unwrap() = ExecState::Succeeded;
+    ledger.poll(&h).await.unwrap();
+    ledger.cancel(&old).await.unwrap();
+    assert_eq!(ledger.remembered_handles(), 0);
+}

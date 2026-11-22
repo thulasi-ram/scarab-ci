@@ -57,8 +57,10 @@ pub struct RedactionLedgerExecutor {
     inner: Arc<dyn Executor>,
     logs: Arc<LogService>,
     clock: Arc<dyn Clock>,
-    /// Handles whose unit's start is recorded already, so a poll does not
-    /// write it again.
+    /// Handles whose unit's start is recorded already, or that have no
+    /// unit row (an earlier version launched them), so a poll does not ask
+    /// again. A handle is dropped once its unit ends, so the set holds
+    /// live units only.
     started: Mutex<HashSet<String>>,
 }
 
@@ -78,13 +80,29 @@ impl RedactionLedgerExecutor {
             return;
         }
         let db = self.logs.db();
-        let Ok(Some(unit)) = db.log_unit_by_handle(&handle.0).await else {
-            return;
+        let unit = match db.log_unit_by_handle(&handle.0).await {
+            Ok(Some(unit)) => unit,
+            // No unit row: an earlier version launched it. Asked once.
+            Ok(None) => {
+                self.started.lock().unwrap().insert(handle.0.clone());
+                return;
+            }
+            Err(_) => return,
         };
         let now = self.clock.now().await;
         if db.mark_log_unit_started(&unit, now).await.is_ok() {
             self.started.lock().unwrap().insert(handle.0.clone());
         }
+    }
+
+    /// Forget `handle`: its unit ended.
+    fn forget(&self, handle: &ExecHandle) {
+        self.started.lock().unwrap().remove(&handle.0);
+    }
+
+    /// How many handles this layer remembers: its live units.
+    pub fn remembered_handles(&self) -> usize {
+        self.started.lock().unwrap().len()
     }
 
     /// Whether `state` means the unit's process ran.
@@ -151,6 +169,12 @@ impl Executor for RedactionLedgerExecutor {
         if Self::ran(&state) {
             self.mark_started(handle).await;
         }
+        if matches!(
+            state,
+            ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost
+        ) {
+            self.forget(handle);
+        }
         Ok(state)
     }
 
@@ -162,7 +186,9 @@ impl Executor for RedactionLedgerExecutor {
                 self.mark_started(handle).await;
             }
         }
-        self.inner.cancel(handle).await
+        let cancelled = self.inner.cancel(handle).await;
+        self.forget(handle);
+        cancelled
     }
 
     fn unit_handle(&self, step: &StepRun) -> Option<ExecHandle> {
