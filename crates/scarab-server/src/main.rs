@@ -527,7 +527,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // keys, so every replica opens what any replica sealed (git-bug 2d78464).
     let logs = Arc::new(
         LogService::new(store.clone(), db.clone())
-            .with_sealer(pg_secrets.clone() as Arc<dyn scarab_secrets::Sealer>),
+            .with_sealer(pg_secrets.clone() as Arc<dyn scarab_secrets::Sealer>)
+            .with_automata_budget(config.log_automata_budget_mib as usize * 1024 * 1024),
     );
     // Ledger generations under an old key cannot be rewrapped; they live at
     // most a day. Remove an old key only once this metric reads 0 on every

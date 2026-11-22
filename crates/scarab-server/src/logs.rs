@@ -228,12 +228,17 @@ impl ValueSet {
             .iter()
             .flat_map(|g| g.entries.iter().cloned())
             .collect();
+        // One pass with a set (a `contains` per value was quadratic: 87,381
+        // distinct 3-byte values took about 30 s on an async worker). The
+        // size the cap checks is known here, before any automaton work.
+        let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
         let mut values: Vec<Vec<u8>> = Vec::new();
         for e in &entries {
-            if !e.value.is_empty() && !values.contains(&e.value) {
+            if !e.value.is_empty() && seen.insert(e.value.as_slice()) {
                 values.push(e.value.clone());
             }
         }
+        drop(seen);
         let value_bytes = values.iter().map(Vec::len).sum();
         Self {
             gen,
@@ -370,11 +375,15 @@ impl ValueSet {
         Ok((t, s))
     }
 
-    /// Which automata a reader holds now: (trie, suffix automaton).
+    /// Which automata a reader holds now: (trie, suffix automaton). Only
+    /// when no build or wait holds the cell (a locked cell panics).
     #[cfg(test)]
     fn built(&self) -> (bool, bool) {
         fn alive<T>(c: &tokio::sync::Mutex<Weak<T>>) -> bool {
-            c.try_lock().map(|w| w.strong_count() > 0).unwrap_or(true)
+            c.try_lock()
+                .expect("no build or wait holds the cell")
+                .strong_count()
+                > 0
         }
         (alive(&self.cells.trie), alive(&self.cells.sam))
     }
@@ -1052,14 +1061,26 @@ pub enum PrepareError {
     Build(String),
 }
 
-/// Redact a whole `text` with the trie of a value set
+/// What a cut failure cause ends with (the executor marks a message it cut
+/// with it).
+const CAUSE_CUT: &str = "\u{2026}";
+
+/// Redact a failure cause with the trie of a value set
 /// ([`ValueSet::text_automaton`]): every occurrence of a value, with
-/// overlapping ones as one `***`. The text is known whole, so its start and
-/// end are not cuts.
+/// overlapping ones as one `***`, and the trailing interval: an end of the
+/// text that is the start of a value is `***`, as at a log's confirmed end.
+/// A cause can be cut inside a value (the executor keeps 1,024 bytes of an
+/// API server message and ends it with `…`), so the end before a final `…`
+/// counts as the end. Its start is not a cut.
 pub(crate) fn redact_text_with(trie: &Built<Trie>, text: &str) -> String {
+    let (body, cut) = match text.strip_suffix(CAUSE_CUT) {
+        Some(body) => (body, CAUSE_CUT),
+        None => (text, ""),
+    };
     let mut core = Core::text(trie.value.clone());
-    let mut out = core.push(text.as_bytes());
-    out.extend(core.finish(false));
+    let mut out = core.push(body.as_bytes());
+    out.extend(core.finish(true));
+    out.extend_from_slice(cut.as_bytes());
     String::from_utf8_lossy(&out).into_owned()
 }
 
@@ -1155,7 +1176,7 @@ impl StreamRedactor {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use proptest::prelude::*;
     use proptest::sample::Index;
@@ -1815,7 +1836,7 @@ mod tests {
             let text = String::from_utf8(src.clone()).expect("ASCII alphabets");
             prop_assert_eq!(
                 redact_text(&set, &text).into_bytes(),
-                render(&src, intervals(&values, &src, false, false, min))
+                render(&src, intervals(&values, &src, false, true, min))
             );
         }
     }
@@ -1962,6 +1983,24 @@ mod tests {
         );
     }
 
+    /// A failure cause cut inside a secret value (the executor keeps 1,024
+    /// bytes of an API server message and ends it with `…`) stores `***`
+    /// for the value's first bytes, before the `…` or at the text's end.
+    /// Kills: no trailing rule for a cause (red team m-c).
+    #[test]
+    fn a_cause_cut_inside_a_value_stars_its_start() {
+        let values = set(&[b"hunter2-secret-value"]);
+        let cut = format!("{} token hunter2-sec\u{2026}", "x".repeat(1000));
+        assert_eq!(
+            redact_text(&values, &cut),
+            format!("{} token ***\u{2026}", "x".repeat(1000))
+        );
+        assert_eq!(redact_text(&values, "token hunter2-sec"), "token ***");
+        assert_eq!(redact_text(&values, "a hunter2-secret-value b"), "a *** b");
+        // A `…` in the middle is text, not a cut.
+        assert_eq!(redact_text(&values, "h\u{2026} ok"), "h\u{2026} ok");
+    }
+
     /// The whole-part interval: a part that lies wholly inside a value (a
     /// rotation between two lines of a multi-line value, and the process
     /// ended) is `***` from 8 bytes; 7 bytes are stored (R-1). Kills: no
@@ -2049,7 +2088,7 @@ mod tests {
 
     /// A log service over in-memory stores and the ledgers of `units`
     /// (one value each), with an automata budget of `budget` bytes.
-    async fn service_with(
+    pub(crate) async fn service_with(
         budget: usize,
         units: &[(&str, &[u8])],
     ) -> (LogService, Vec<LogStreamId>) {
@@ -2147,7 +2186,10 @@ mod tests {
             futures::poll!(&mut waiting).is_pending(),
             "the budget is full"
         );
-        assert_eq!(b.built(), (false, false));
+        // The waiter took no budget (it holds `b`'s cells while it waits,
+        // so `built()` cannot read them): it still waits.
+        assert!(futures::poll!(&mut waiting).is_pending(), "still full");
+        assert_eq!(logs.limits.budget.available_permits(), 0);
         drop(first);
         let mut second = waiting.await.unwrap();
         assert_eq!(second.push(b"x other-secret y"), b"x *** y");

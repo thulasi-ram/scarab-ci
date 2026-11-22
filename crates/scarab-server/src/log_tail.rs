@@ -785,13 +785,18 @@ async fn read_stream(
         // byte is read), and a read waits here for room in the process's
         // automata budget, never reading without them.
         let redactor = match &values {
-            Some(v) => match ctx.logs.stream_redactor(v.clone()).await {
-                Ok(r) => Some(r),
-                Err(PrepareError::TooLarge(_)) => {
+            Some(v) => match wait_for_redactor(&ctx.logs, v.clone(), lost).await {
+                RedactorWait::Ready(Ok(r)) => Some(r),
+                RedactorWait::Ready(Err(PrepareError::TooLarge(_))) => {
                     return close_not_stored(ctx, fence, writer, NotStoredReason::ValuesTooLarge)
                         .await;
                 }
-                Err(PrepareError::Build(e)) => return report(ctx, fence, Failure::Local(e)),
+                RedactorWait::Ready(Err(PrepareError::Build(e))) => {
+                    return report(ctx, fence, Failure::Local(e));
+                }
+                // Another replica holds the stream now: no source byte is
+                // read, and no write is tried.
+                RedactorWait::LeaseLost => return Outcome::Stop,
             },
             None => None,
         };
@@ -1067,6 +1072,46 @@ async fn check_budget(
         .is_some_and(|r| r.next_seq > 0);
     let started = unit_started(ctx, unit, has_rows).await;
     Some(close_incomplete(ctx, fence, writer, started).await)
+}
+
+/// How often a read waiting for room in the automata budget checks its
+/// tail lease.
+const LEASE_CHECK: Duration = Duration::from_millis(200);
+
+/// What waiting for a read's redactor ended with.
+enum RedactorWait {
+    Ready(Result<StreamRedactor, PrepareError>),
+    /// The tail lease was lost while the read waited (or as it got room):
+    /// the read does not start.
+    LeaseLost,
+}
+
+/// A redactor for `values`, waiting for room in the process's automata
+/// budget, unless the tail lease is lost first. Dropping the wait gives
+/// back nothing it did not take: a budget wait is cancelled cleanly.
+async fn wait_for_redactor(
+    logs: &LogService,
+    values: Arc<crate::logs::ValueSet>,
+    lost: &AtomicBool,
+) -> RedactorWait {
+    let ready = logs.stream_redactor(values);
+    tokio::pin!(ready);
+    loop {
+        if lost.load(Ordering::SeqCst) {
+            return RedactorWait::LeaseLost;
+        }
+        tokio::select! {
+            r = &mut ready => {
+                // Checked again: the lease can be lost while the build ran.
+                return if lost.load(Ordering::SeqCst) {
+                    RedactorWait::LeaseLost
+                } else {
+                    RedactorWait::Ready(r)
+                };
+            }
+            () = tokio::time::sleep(LEASE_CHECK) => {}
+        }
+    }
 }
 
 /// How one read of a source ended.
@@ -1723,8 +1768,46 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        classify_tail_error, is_pod_not_ready, TailErrorClass, NOT_READY_GRACE, STUCK_WARN_INTERVAL,
+        classify_tail_error, is_pod_not_ready, wait_for_redactor, RedactorWait, TailErrorClass,
+        NOT_READY_GRACE, STUCK_WARN_INTERVAL,
     };
+
+    /// A read waiting for room in the automata budget stops when its tail
+    /// lease is lost, takes no budget, and does not start; one that is
+    /// told the lease is lost as it gets room gives the room back. The
+    /// clock is paused: the lease checks advance it, no test time passes.
+    /// Kills: a waiter that holds on after another replica took the
+    /// stream; a read started after the lease was lost.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_waiting_for_the_budget_stops_when_its_lease_is_lost() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (logs, units) = crate::logs::tests::service_with(
+            1024,
+            &[("a", b"s3cr3t-value"), ("b", b"other-secret")],
+        )
+        .await;
+        let a = logs.load_values(&units[0]).await.unwrap();
+        let b = logs.load_values(&units[1]).await.unwrap();
+        let first = logs.stream_redactor(a).await.unwrap();
+        let lost = AtomicBool::new(false);
+        let mut waiting = Box::pin(wait_for_redactor(&logs, b.clone(), &lost));
+        assert!(
+            futures::poll!(&mut waiting).is_pending(),
+            "the budget is full"
+        );
+        lost.store(true, Ordering::SeqCst);
+        assert!(matches!(waiting.await, RedactorWait::LeaseLost));
+        // The abandoned wait took nothing: the room `first` frees goes to
+        // the next reader at once.
+        drop(first);
+        let next = logs.stream_redactor(b.clone()).await.unwrap();
+        drop(next);
+        // Room is there, but the lease is already lost: no redactor.
+        assert!(matches!(
+            wait_for_redactor(&logs, b, &lost).await,
+            RedactorWait::LeaseLost
+        ));
+    }
 
     const INITIALIZING: &str = "executor error: exec error: ApiError: container \"step\" in pod \
                                 \"scarab-check-a1-7893ca80\" is waiting to start: PodInitializing: \

@@ -10,7 +10,7 @@
 --   2. scale every Scarab server to zero (no server of 0.7 or later may run
 --      against the database while this runs, or after it);
 --   3. back up the database.
--- Then run it once, e.g. `psql "$DATABASE_URL" -f 0099_revert.sql`, and
+-- Then run it, e.g. `psql "$DATABASE_URL" -f 0099_revert.sql`, and
 -- start 0.6.x.
 --
 -- What it deletes: the marker rows of logs stored by 0.7 (`kind` other than
@@ -19,7 +19,17 @@
 
 BEGIN;
 
-DELETE FROM log_chunks WHERE kind <> 'output';
+-- A second run changes nothing: the delete below runs only while the
+-- `kind` column exists, and every other statement is safe to repeat.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = 'log_chunks' AND column_name = 'kind') THEN
+    DELETE FROM log_chunks WHERE kind <> 'output';
+  END IF;
+END
+$$;
 
 DROP FUNCTION IF EXISTS scarab_append_log_row(
   TEXT, TEXT, TEXT, TEXT, TEXT, BIGINT, TEXT, TEXT, TEXT, BIGINT, BYTEA, BIGINT, TEXT, BIGINT);

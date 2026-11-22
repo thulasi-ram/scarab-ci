@@ -49,6 +49,7 @@
 //! | `SCARAB_STEP_TIMEOUT_SECS` | env | global default step deadline (ADR-0047); default 3600 (1h), per-step overridable via `timeout:` |
 //! | `SCARAB_DRIVER_STALL_CUTOFF_SECS` | env | seconds a scheduler driver cycle may go without progress before it is cut off and the next starts (git-bug afa9f07); default 60, from 30 to 3600 |
 //! | `SCARAB_DRIVER_STALLED_AFTER_SECS` | env | seconds the scheduler driver may go without progress before `/livez` fails, so Kubernetes restarts the Pod; default 90 (or the cutoff plus 30 when that is more), at least the cutoff plus 30, at most 3600 |
+//! | `SCARAB_LOG_AUTOMATA_BUDGET_MIB` | env | MiB of log redaction tables (ADR-0082 §3) the server keeps built at once; a log read that does not fit waits for another to end. Default 512, from 16 to 65536 |
 //! | `SCARAB_PROJECT_RUN_CAP` | env | how many of one project's Runs may be `Running` at once; the rest wait `Pending` (ADR-0011). Unset or `0` = no cap (default). A Run waiting on a gate is not counted |
 //! | `SCARAB_PUBLIC_URL` | env | Scarab's public base URL — the run deep-link every forge status carries (ADR-0046); default `http://localhost:8080` (dev) |
 //! | `SCARAB_UI_URL` | env | the URL people open the web UI at, when it is not `SCARAB_PUBLIC_URL` (a staging stack whose public hostname serves only `/webhooks/`). Three things are built from it: the OAuth callback (`{ui_url}/v1/auth/callback`), the passkey (WebAuthn) origin, and the step-up confirmation link. Webhook URLs and forge status links stay on `SCARAB_PUBLIC_URL`. Default `SCARAB_PUBLIC_URL`. An `http(s)` URL with no query or fragment; with step-up enforced it must be `https` or loopback `http`. Browsers refuse passkeys on an IP literal, so a local one is `http://localhost:<port>` |
@@ -656,6 +657,10 @@ pub struct Config {
     /// without progress before `/livez` fails and Kubernetes restarts the
     /// Pod. Default 90; at least the cutoff plus 30, at most 3600.
     pub driver_stalled_after_secs: u64,
+    /// `SCARAB_LOG_AUTOMATA_BUDGET_MIB`: the MiB of log redaction automata
+    /// (ADR-0082 §3) the process keeps built at once. Default 512, from 16
+    /// to 65536.
+    pub log_automata_budget_mib: u64,
     /// `SCARAB_PROJECT_RUN_CAP`: the most Runs of one project that may be
     /// `Running` at once (ADR-0011). `None` (unset or `0`) = no cap.
     pub project_run_cap: Option<u32>,
@@ -1400,6 +1405,14 @@ pub enum ConfigError {
     InvalidDriverStalledAfter(String, u64, u64),
 
     #[error(
+        "SCARAB_LOG_AUTOMATA_BUDGET_MIB is set but invalid (got {0:?}) — want 16 to 65536: \
+         the MiB of log redaction tables the server keeps built at once. A step's tables \
+         take at most 13 MiB, so under 16 one step at the cap could not be read beside \
+         another."
+    )]
+    InvalidLogAutomataBudget(String),
+
+    #[error(
         "{0} is set but invalid (got {1:?}) — want a non-negative integer: the wsfetch \
          helper resource axes (ticket 16a7768) are millicpu / MiB, applied requests==limits \
          to both helper containers of every workspace Step Pod; 0 opts the axis out."
@@ -1733,6 +1746,16 @@ impl Config {
                 None => STALLED_AFTER.as_secs().max(min_stalled_after),
             };
 
+        let log_automata_budget_mib =
+            match env("SCARAB_LOG_AUTOMATA_BUDGET_MIB").filter(|v| !v.trim().is_empty()) {
+                Some(v) => v
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|m| (16..=65536).contains(m))
+                    .ok_or(ConfigError::InvalidLogAutomataBudget(v))?,
+                None => (crate::logs::AUTOMATA_BUDGET_BYTES / (1024 * 1024)) as u64,
+            };
         let project_run_cap = match env("SCARAB_PROJECT_RUN_CAP").filter(|v| !v.trim().is_empty()) {
             Some(v) => match v.trim().parse::<u32>() {
                 Ok(0) => None,
@@ -1880,6 +1903,7 @@ impl Config {
             unschedulable_grace_secs,
             driver_stall_cutoff_secs,
             driver_stalled_after_secs,
+            log_automata_budget_mib,
             project_run_cap,
             public_url,
             ui_url,
@@ -2083,6 +2107,10 @@ impl Config {
                 "driver limits: a cycle with no progress for {}s is cut off; /livez fails \
                  after {}s",
                 self.driver_stall_cutoff_secs, self.driver_stalled_after_secs,
+            ),
+            format!(
+                "log redaction tables: at most {} MiB built at once",
+                self.log_automata_budget_mib
             ),
             format!("public url: {} (run deep-links, ADR-0046)", self.public_url),
             if self.ui_url == self.public_url.trim_end_matches('/') {
@@ -2606,6 +2634,27 @@ mod tests {
             ConfigError::InvalidDriverStalledAfter("89".into(), 90, 60)
         );
         assert!(err.to_string().contains("at least 30 more"), "{err}");
+    }
+
+    /// `SCARAB_LOG_AUTOMATA_BUDGET_MIB`: default 512, a set value, and the
+    /// bounds. Kills: the setting ignored; no lower bound.
+    #[test]
+    fn the_log_automata_budget_is_a_setting() {
+        let url = Some("postgres://localhost/scarab");
+        let c = Config::resolve_from(&cli(url), dev_env(&[])).unwrap();
+        assert_eq!(c.log_automata_budget_mib, 512);
+        let c = Config::resolve_from(
+            &cli(url),
+            dev_env(&[("SCARAB_LOG_AUTOMATA_BUDGET_MIB", "2048")]),
+        )
+        .unwrap();
+        assert_eq!(c.log_automata_budget_mib, 2048);
+        for bad in ["15", "0", "65537", "lots"] {
+            let env: &'static [(&str, &str)] =
+                Box::leak(Box::new([("SCARAB_LOG_AUTOMATA_BUDGET_MIB", bad)]));
+            let err = Config::resolve_from(&cli(url), dev_env(env)).unwrap_err();
+            assert_eq!(err, ConfigError::InvalidLogAutomataBudget(bad.into()));
+        }
     }
 
     #[test]

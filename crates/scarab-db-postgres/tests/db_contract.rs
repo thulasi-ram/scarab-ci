@@ -2398,7 +2398,8 @@ async fn a_stream_with_rows_from_before_0_7_continues_at_their_end() {
 /// REV-M4: the revert file takes a database that ran 0099 and 0100 back to
 /// the 0.6 schema (the `log_chunks` columns of 0.6, migrations up to 98),
 /// keeps the output rows, deletes the markers, and the migrator can upgrade
-/// it again. Kills: a revert that leaves a table, a column, a constraint or
+/// it again; a second run changes nothing (red team m-d). Kills: a revert
+/// that fails when run twice; one that leaves a table, a column, a constraint or
 /// a migration row behind.
 #[tokio::test]
 async fn the_0099_revert_leaves_a_schema_the_migrator_can_upgrade_again() {
@@ -2434,6 +2435,11 @@ async fn the_0099_revert_leaves_a_schema_the_migrator_can_upgrade_again() {
         .execute(&tdb.pool)
         .await
         .unwrap();
+    // A second run (an operator unsure the first finished) changes nothing.
+    sqlx::raw_sql(include_str!("../rollback/0099_revert.sql"))
+        .execute(&tdb.pool)
+        .await
+        .expect("the revert runs twice");
 
     let columns: Vec<String> = sqlx::query_scalar(
         "SELECT column_name::text FROM information_schema.columns

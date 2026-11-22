@@ -5771,16 +5771,22 @@ async fn dry_run_create(pods: &Api<Pod>, pod: &Pod) -> DryRun {
 /// message reaches the Run's author; a webhook's text can be long.
 const ADMISSION_MESSAGE_MAX_BYTES: usize = 1024;
 
-/// `message` cut to [`ADMISSION_MESSAGE_MAX_BYTES`] on a char boundary.
-fn capped_admission_message(message: &str) -> &str {
+/// What a cut message ends with, so a reader sees it was cut.
+const ADMISSION_MESSAGE_CUT: &str = "…";
+
+/// `message` cut to [`ADMISSION_MESSAGE_MAX_BYTES`] on a char boundary,
+/// with [`ADMISSION_MESSAGE_CUT`] after a cut. A cut can fall inside a
+/// secret value the message quotes; the server redacts a failure cause up
+/// to its end, so the value's first bytes there are `***` too.
+fn capped_admission_message(message: &str) -> std::borrow::Cow<'_, str> {
     if message.len() <= ADMISSION_MESSAGE_MAX_BYTES {
-        return message;
+        return message.into();
     }
     let mut end = ADMISSION_MESSAGE_MAX_BYTES;
     while !message.is_char_boundary(end) {
         end -= 1;
     }
-    &message[..end]
+    format!("{}{ADMISSION_MESSAGE_CUT}", &message[..end]).into()
 }
 
 /// The name every step Pod admission policy the chart renders starts with
@@ -8728,7 +8734,8 @@ mod tests {
     }
 
     // m8: the API server's message reaches the Run's author; both failures
-    // copy at most 1,024 bytes of it, cut on a char boundary.
+    // copy at most 1,024 bytes of it, cut on a char boundary and marked
+    // with `…` where it was cut.
     #[test]
     fn the_copied_admission_message_is_capped_at_1024_bytes() {
         // 1,023 ASCII bytes, then a 3-byte char across the 1,024th byte.
@@ -8740,7 +8747,7 @@ mod tests {
             panic!("refused");
         };
         let m = copied(m, "the step's k8s_overlay makes a Pod Kubernetes refuses: ");
-        assert_eq!(m, "a".repeat(1023));
+        assert_eq!(m, format!("{}…", "a".repeat(1023)));
         let policy = format!(
             "pods \"x\" is forbidden: ValidatingAdmissionPolicy 'scarab-step-pods.ci' {}",
             "é".repeat(2000)
@@ -8757,8 +8764,9 @@ mod tests {
             m,
             "the cluster's step Pod admission policy refused the step Pod: ",
         );
-        assert!(m.len() <= 1024 && m.len() > 1020, "{}", m.len());
-        assert!(policy.starts_with(&m));
+        let kept = m.strip_suffix('…').expect("the cut is marked");
+        assert!(kept.len() <= 1024 && kept.len() > 1020, "{}", kept.len());
+        assert!(policy.starts_with(kept));
         // A short message is copied whole.
         assert_eq!(capped_admission_message("short"), "short");
     }

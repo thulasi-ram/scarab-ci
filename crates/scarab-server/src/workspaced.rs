@@ -10107,6 +10107,7 @@ mod tests {
             unschedulable_grace_secs: 300,
             driver_stall_cutoff_secs: 60,
             driver_stalled_after_secs: 90,
+            log_automata_budget_mib: 512,
             project_run_cap: None,
             public_url: "http://localhost:8080".into(),
             ui_url: "http://localhost:8080".into(),

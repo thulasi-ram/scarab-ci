@@ -96,6 +96,12 @@ scarab:
   # call (a slow Kubernetes API, a large forge status batch) takes longer.
   driverStallCutoffSecs: ""
   driverStalledAfterSecs: ""
+  # MiB of log redaction tables the server keeps built at once (ADR-0082). A
+  # step's tables take up to 52 bytes per byte of its secret values (at most
+  # 13 MiB); a log read that does not fit waits until another read ends.
+  # Empty => server default (512). From 16 to 65536. Count it in the server
+  # Pod's memory limit.
+  logAutomataBudgetMib: ""
   # The most Runs of one project (repository) that may be Running at once; the
   # rest wait Pending and start in priority order as Runs finish (ADR-0011).
   # A Run waiting on a gate is not counted. Empty or 0 => no cap (default).
