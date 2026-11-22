@@ -130,13 +130,44 @@ async fn kill_server_from_node(target: &ServerContainer) -> i64 {
     pid
 }
 
-/// Waits for the kubelet to restart the killed container in the same Pod and
-/// for it to be ready again; returns its new state and the last termination.
+/// Waits until the API answers `/readyz` at `base_url()`, on a fresh
+/// connection each try. The container's `ready` is not enough: the
+/// Service's endpoints and kube-proxy's rules follow the Pod's Ready
+/// condition a moment later, and until then the host port accepts a
+/// connection and closes it without an answer (reqwest: IncompleteMessage).
+/// Each case also waits here before it starts, so a case that failed inside
+/// that window does not fail the next one too.
+async fn wait_api_answers() {
+    let base = base_url();
+    let http = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest client");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let last = match http.get(format!("{base}/readyz")).send().await {
+            Ok(r) if r.status().is_success() => return,
+            Ok(r) => r.status().to_string(),
+            Err(e) => format!("{e:?}"),
+        };
+        assert!(
+            Instant::now() < deadline,
+            "the API at {base} did not answer /readyz within 60s: {last}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Waits for the kubelet to restart the killed container in the same Pod,
+/// for it to be ready again and for the API to answer through the Service;
+/// returns its new state and the last termination.
 async fn wait_restarted(before: &ServerContainer) -> (ServerContainer, serde_json::Value) {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let now = server_container();
         if now.restarts > before.restarts && now.ready {
+            wait_api_answers().await;
             let raw = kubectl(&["get", "pod", "-n", &namespace(), &now.pod, "-o", "json"]);
             let v: serde_json::Value = serde_json::from_str(&raw).expect("pod JSON");
             let last = v["status"]["containerStatuses"]
@@ -157,6 +188,7 @@ async fn wait_restarted(before: &ServerContainer) -> (ServerContainer, serde_jso
 #[tokio::test(flavor = "multi_thread")]
 async fn crash_resume_completes_exactly_once() {
     require_e2e!();
+    wait_api_answers().await;
 
     let base = base_url();
     let client = client();
@@ -402,6 +434,7 @@ async fn seed_log_repo() -> LogRepo {
         EnvironmentGovernanceStore, EnvironmentProjectEligibility, OrgEnvironment,
         OrgEnvironmentStore,
     };
+    wait_api_answers().await;
     let base = base_url();
     let http = client();
     let forge_url = fake_forgejo().await;
@@ -618,6 +651,7 @@ fn check_counted_log(text: &str) -> usize {
 /// whole ([`check_counted_log`]) and the secret is in neither raw download
 /// (with and without marker lines) nor the log stream.
 async fn assert_log_whole_and_redacted(run: &str, secret: &str, fault: &str) {
+    wait_api_answers().await;
     let base = base_url();
     // A new client: a fault can kill the old one's pooled connection.
     let http = client();
