@@ -258,6 +258,19 @@ pub fn legacy_tail_lease_resource(run: &RunId, step: &StepId, attempt: &AttemptI
     }
 }
 
+/// How many stored value-ledger generations are sealed under a master key
+/// other than `keys`' active one (git-bug 2d78464). They cannot be
+/// rewrapped (the AAD binds unit and generation) and live at most a day;
+/// key rotation adds them to the rows under a non-active key, so an old
+/// key is not removed while a ledger still needs it.
+pub async fn ledger_rows_under_nonactive_key(
+    db: &dyn Db,
+    keys: &scarab_secrets_postgres::KeySealer,
+) -> Result<u64, DbError> {
+    db.count_log_values_not_sealed_with(&keys.active_seal_prefix())
+        .await
+}
+
 /// A loaded value set and when it was loaded.
 struct Cached {
     set: Arc<ValueSet>,

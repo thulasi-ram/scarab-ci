@@ -2326,3 +2326,54 @@ async fn the_tailer_forgets_streams_of_runs_that_ended() {
     ledger.cancel(&old).await.unwrap();
     assert_eq!(ledger.remembered_handles(), 0);
 }
+
+/// REV-m12: a ledger generation sealed under a key that is no longer the
+/// active one counts toward the rotation metric (it cannot be rewrapped),
+/// one under the active key does not, and a purged unit's do not. Kills:
+/// a boot sweep that counts `secrets` rows only.
+#[tokio::test]
+async fn ledger_rows_under_an_old_key_keep_the_rotation_metric_above_zero() {
+    use scarab_secrets_postgres::{KeySealer, MasterKeySet};
+    let w = World::new().await;
+    let (old, new) = ([1u8; 32], [2u8; 32]);
+    let before = KeySealer::new(MasterKeySet::single(old));
+    let after = KeySealer::new(MasterKeySet::new(vec![new, old]).unwrap());
+    let logs_before = replica(
+        &w.db,
+        w.store.clone(),
+        &(Arc::new(before) as Arc<dyn scarab_secrets::Sealer>),
+    );
+    let logs_after = replica(
+        &w.db,
+        w.store.clone(),
+        &(Arc::new(after.clone()) as Arc<dyn scarab_secrets::Sealer>),
+    );
+    let secret = |v: &[u8]| scarab_engine::MountedValue {
+        kind: scarab_engine::MountedValueKind::Secret,
+        value: v.to_vec(),
+        repo: None,
+        minted: None,
+    };
+    let (u1, u2) = (
+        LogStreamId::new(&run(), &StepId("one".into()), &AttemptId("a1".into())),
+        LogStreamId::new(&run(), &StepId("two".into()), &AttemptId("a1".into())),
+    );
+    logs_before
+        .record_launch_values(&u1, None, vec![secret(b"s1")], Timestamp(0))
+        .await
+        .unwrap();
+    logs_after
+        .record_launch_values(&u2, None, vec![secret(b"s2")], Timestamp(0))
+        .await
+        .unwrap();
+    // Every replica opens both: the old key is still in the set.
+    assert!(logs_after.reload_values(&u1).await.is_ok());
+    let count = || scarab_server::logs::ledger_rows_under_nonactive_key(w.db.as_ref(), &after);
+    assert_eq!(
+        count().await.unwrap(),
+        1,
+        "the generation under the old key"
+    );
+    w.db.purge_log_unit(&u1).await.unwrap();
+    assert_eq!(count().await.unwrap(), 0);
+}

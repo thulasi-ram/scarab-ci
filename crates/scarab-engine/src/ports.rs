@@ -1083,6 +1083,12 @@ pub trait Db: Send + Sync {
         at: Timestamp,
     ) -> Result<(), DbError>;
 
+    /// How many stored ledger generations (`log_unit_values` rows; a purged
+    /// unit has none) do not start with `seal_prefix`: the version byte and
+    /// active key fingerprint every seal under the active master key starts
+    /// with. Key rotation counts them as rows under a non-active key.
+    async fn count_log_values_not_sealed_with(&self, seal_prefix: &[u8]) -> Result<u64, DbError>;
+
     /// Record that every minted forge token of generation `gen` of `unit`'s
     /// ledger was revoked (first write wins): it is not revoked again.
     async fn mark_log_generation_revoked(

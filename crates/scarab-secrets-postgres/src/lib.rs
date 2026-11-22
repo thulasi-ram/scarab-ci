@@ -754,6 +754,15 @@ impl KeySealer {
         Self { keys }
     }
 
+    /// The bytes every seal under the active key starts with: the version
+    /// byte and the active key's fingerprint. A stored seal that does not
+    /// start with them is under another key (or is not this adapter's).
+    pub fn active_seal_prefix(&self) -> Vec<u8> {
+        let mut out = vec![SEAL_VERSION];
+        out.extend_from_slice(self.keys.active_fingerprint().as_bytes());
+        out
+    }
+
     /// A sealer under one fresh random key: what it seals opens only in
     /// this process.
     pub fn ephemeral() -> Self {

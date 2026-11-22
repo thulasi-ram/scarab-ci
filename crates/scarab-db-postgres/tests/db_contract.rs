@@ -2068,6 +2068,49 @@ contract_test!(
     a_revoked_generation_is_not_revoked_again
 );
 
+/// REV-m12: ledger generations whose seal does not start with the active
+/// key's prefix are counted; a purged unit's are gone. Kills: a prefix
+/// compared on the wrong bytes; purged values counted.
+async fn ledger_values_under_another_key_are_counted(db: &dyn Db) {
+    let (a, b) = (stream_id("build", "a1"), stream_id("test", "a1"));
+    db.write_log_unit(
+        &a,
+        None,
+        0,
+        Some(b"\x01oldkeyfp-------payload"),
+        Timestamp(1),
+    )
+    .await
+    .unwrap();
+    db.write_log_unit(
+        &a,
+        None,
+        1,
+        Some(b"\x01newkeyfp-------payload"),
+        Timestamp(1),
+    )
+    .await
+    .unwrap();
+    db.write_log_unit(&b, None, 0, Some(b"\x01oldkeyfp-------x"), Timestamp(1))
+        .await
+        .unwrap();
+    let prefix = b"\x01newkeyfp-------";
+    assert_eq!(
+        db.count_log_values_not_sealed_with(prefix).await.unwrap(),
+        2
+    );
+    db.purge_log_unit(&b).await.unwrap();
+    assert_eq!(
+        db.count_log_values_not_sealed_with(prefix).await.unwrap(),
+        1
+    );
+}
+
+contract_test!(
+    log_values_under_another_key,
+    ledger_values_under_another_key_are_counted
+);
+
 /// REV-m15: a step attempt claimed by a server whose clock is behind the
 /// database's, just before the epoch, is still read once more (and closed
 /// with no source read); one claimed well before it is not. Kills: an

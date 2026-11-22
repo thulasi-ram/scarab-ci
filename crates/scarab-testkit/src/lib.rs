@@ -2288,6 +2288,16 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
+    async fn count_log_values_not_sealed_with(&self, seal_prefix: &[u8]) -> Result<u64, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .log_unit_values
+            .values()
+            .flatten()
+            .filter(|g| !g.sealed.starts_with(seal_prefix))
+            .count() as u64)
+    }
+
     async fn mark_log_generation_revoked(
         &self,
         unit: &scarab_engine::LogStreamId,

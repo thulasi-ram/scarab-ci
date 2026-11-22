@@ -2474,6 +2474,19 @@ impl Db for PostgresDb {
         Ok(())
     }
 
+    async fn count_log_values_not_sealed_with(&self, seal_prefix: &[u8]) -> Result<u64, DbError> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM log_unit_values
+             WHERE substring(sealed FROM 1 FOR $2) IS DISTINCT FROM $1",
+        )
+        .bind(seal_prefix)
+        .bind(seal_prefix.len() as i32)
+        .fetch_one(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(n as u64)
+    }
+
     async fn mark_log_generation_revoked(
         &self,
         unit: &scarab_engine::LogStreamId,

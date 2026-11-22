@@ -173,10 +173,13 @@ pub fn depot_expiry_floor_held() -> u64 {
 }
 
 /// Secrets rows still sealed under a NON-active master key (git-bug f37463a),
-/// SET by the boot rewrap sweep on this replica. Zero (with no unreadable-row
-/// warnings) is the operator's "safe to drop the old key" signal; non-zero
-/// after a rotation deploy means unreadable rows (the pre-rotation key is
-/// gone, or corruption) or a sweep that has not run since the last write.
+/// SET by the boot rewrap sweep on this replica, plus the log value-ledger
+/// generations sealed under one (git-bug 2d78464: they cannot be rewrapped
+/// and are purged within a day of their step's end). Zero (with no
+/// unreadable-row warnings) is the operator's "safe to drop the old key"
+/// signal; non-zero after a rotation deploy means unreadable rows (the
+/// pre-rotation key is gone, or corruption), ledgers of recent steps, or a
+/// sweep that has not run since the last write.
 static SECRETS_ROWS_UNDER_NONACTIVE_KEY: AtomicU64 = AtomicU64::new(0);
 
 /// Set the count of secrets rows under a non-active master key (per sweep).
@@ -241,7 +244,7 @@ scarab_depot_expiry_floor_held {}
         depot_expiry_floor_held()
     ));
     out.push_str(&format!(
-        "# HELP scarab_secrets_rows_under_nonactive_key Secrets rows still sealed under a non-active master key as of this replica's boot rewrap sweep (0 = rotation drained, old key safe to drop).
+        "# HELP scarab_secrets_rows_under_nonactive_key Secrets rows and log value-ledger generations still sealed under a non-active master key as of this replica's boot (0 = rotation drained, old key safe to drop).
 # TYPE scarab_secrets_rows_under_nonactive_key gauge
 scarab_secrets_rows_under_nonactive_key {}
 ",

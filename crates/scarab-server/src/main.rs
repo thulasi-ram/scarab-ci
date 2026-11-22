@@ -491,6 +491,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     // Kept concrete as well: the same KEK envelope seals pending step-up
     // requests and derives the step-up digest key (ADR-0073 §5).
+    // The value ledger seals under the same keys; its rows count toward the
+    // rotation metric below.
+    let ledger_keys = scarab_secrets_postgres::KeySealer::new(master_keys.clone());
+    let mut secrets_under_old_keys = 0;
     let pg_secrets: Arc<scarab_secrets_postgres::PostgresSecrets> = {
         let s =
             scarab_secrets_postgres::PostgresSecrets::connect(&database_url, master_keys).await?;
@@ -511,7 +515,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     sum.unreadable,
                     sum.remaining,
                 );
-                scarab_server::metrics::set_secrets_rows_under_nonactive_key(sum.remaining);
+                secrets_under_old_keys = sum.remaining;
             }
             Err(e) => tracing::warn!(
                 "secrets rewrap sweep failed (boot continues; reads rewrap lazily): {e}"
@@ -525,6 +529,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         LogService::new(store.clone(), db.clone())
             .with_sealer(pg_secrets.clone() as Arc<dyn scarab_secrets::Sealer>),
     );
+    // Ledger generations under an old key cannot be rewrapped; they live at
+    // most a day. Remove an old key only once this metric reads 0 on every
+    // replica.
+    match scarab_server::logs::ledger_rows_under_nonactive_key(db.as_ref(), &ledger_keys).await {
+        Ok(n) => {
+            if n > 0 {
+                tracing::info!(
+                    "{n} log value-ledger generations are still sealed under a non-active \
+                     master key; they are purged within a day of their step's end"
+                );
+            }
+            secrets_under_old_keys += n;
+        }
+        Err(e) => tracing::warn!("counting log value ledgers under non-active keys failed: {e}"),
+    }
+    scarab_server::metrics::set_secrets_rows_under_nonactive_key(secrets_under_old_keys);
     let secrets: Arc<dyn scarab_secrets::SecretProvider> = pg_secrets.clone();
 
     // Retention sweeper (ADR-0050): leader-gated, prunes terminal runs' log
