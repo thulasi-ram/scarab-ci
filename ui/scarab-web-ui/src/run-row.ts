@@ -1,6 +1,6 @@
 // One row of the Runs list, as words: the status mark, the headline, line 2
 // (the trigger, where the Run came from, a deploy Run's Environment), the
-// status word and line 3's detail, the order and day groups of the list, and
+// status word and its hover card, the order and day groups of the list, and
 // the Runs that arrive while it is read. Pure, so the list and its tests agree
 // without a DOM.
 import type { components } from "./api/schema";
@@ -71,12 +71,13 @@ export type PhrasePart =
   | { t: "pr"; n: number };
 
 /** Line 2's first column: the trigger in words, with the PR number or the
- *  tag beside it (`PR #213`, `tag v0.7.2`). `muted` is a Run with no trigger
+ *  tag beside it (`pr #213`, `tag v0.7.2`). The words are lowercase, so
+ *  they read at one size. `muted` is a Run with no trigger
  *  recorded, whose words span the first two columns. */
 export type KindCell = { word: string; token: PhrasePart | null; muted: boolean };
 
 /** Line 2's first two parts: the trigger (a fixed column) and where the Run
- *  came from (which gives way first). `push` + `main`; `PR #213` +
+ *  came from (which gives way first). `push` + `main`; `pr #213` +
  *  `feat/x → main`; `tag v0.7.2` + nothing; `manual` + `on feat/x`;
  *  `schedule` + `0 2 * * * on main`. A pull_request Run records
  *  `refs/pull/<n>/head`, so its head branch comes from `head`; without it the
@@ -104,7 +105,7 @@ function kindAndWhere(o: Origin): { kind: KindCell; where: PhrasePart[] } {
       const head = o.head || branch;
       const where: PhrasePart[] = head ? [{ t: "mono", text: head }] : [];
       if (o.base) where.push({ t: "arrow" }, { t: "mono", text: o.base });
-      return { kind: cell("PR", n != null ? { t: "pr", n } : null), where };
+      return { kind: cell("pr", n != null ? { t: "pr", n } : null), where };
     }
     case "tag":
     case "release":
@@ -117,7 +118,7 @@ function kindAndWhere(o: Origin): { kind: KindCell; where: PhrasePart[] } {
     case "manual":
       return { kind: cell("manual"), where: on };
     case "api":
-      return { kind: cell("API"), where: on };
+      return { kind: cell("api"), where: on };
     default:
       return { kind: cell(o.kind.replace(/_/g, " ")), where: on };
   }
@@ -213,33 +214,45 @@ export function waitingWord(kind: string): string {
  *  Run is on the page, else `null`. */
 export type Replaced = { number: number | null };
 
-/** Line 3: what the status word leaves out, with its icon and ink. */
-export type StatusDetail = { text: string; icon: string; tone: "failed" | "waiting" | "replaced" };
+/** A piece of the status word's hover card: words, or a value set in Mono
+ *  (a step name, a Run number). */
+export type DetailPart = { t: "text"; text: string } | { t: "mono"; text: string };
+
+/** What the status word leaves out, for its hover card. `text` is the card
+ *  as one line (its accessible description). */
+export type StatusDetail = { parts: DetailPart[]; text: string; tone: "failed" | "waiting" | "replaced" };
 
 /** The right column's one word (`tone` is the status whose ink it takes),
- *  and line 3's detail when there is one. */
+ *  and its hover card's detail when there is one. */
 export type RowStatusView = { word: string; tone: string; detail: StatusDetail | null };
 
-/** A row's status: `Failed` over the time with `failed at test · macos +1`
- *  on line 3; `Waiting` with `waiting for approval`; `Replaced` with
- *  `replaced by #130, a newer push`; else the plain word and no line 3. An
- *  older server's row, without the runs list fields, reads its word. */
+const detail = (tone: StatusDetail["tone"], ...parts: DetailPart[]): StatusDetail => ({
+  parts,
+  text: parts.map((p) => p.text).join(""),
+  tone,
+});
+
+/** A row's status: `Failed`, with `failed at test · macos +1` in its card;
+ *  `Waiting`, with `waiting for approval`; `Replaced`, with `replaced by
+ *  #130, a newer push`; else the plain word and no card. An older server's
+ *  row, without the runs list fields, reads its word. */
 export function rowStatus(r: { status: string } & RunRowFields, replaced: Replaced | null): RowStatusView {
   if (replaced) {
-    const by = replaced.number != null ? `#${replaced.number}, a newer push` : "a newer push";
-    return { word: "Replaced", tone: "cancelled", detail: { text: `replaced by ${by}`, icon: "minus", tone: "replaced" } };
+    const d =
+      replaced.number != null
+        ? detail("replaced", { t: "text", text: "replaced by " }, { t: "mono", text: `#${replaced.number}` }, { t: "text", text: ", a newer push" })
+        : detail("replaced", { t: "text", text: "replaced by a newer push" });
+    return { word: "Replaced", tone: "cancelled", detail: d };
   }
   if (r.status === "suspended") {
-    const detail: StatusDetail | null = r.waiting_for
-      ? { text: `waiting for ${waitingWord(r.waiting_for.kind)}`, icon: "pause", tone: "waiting" }
-      : null;
-    return { word: "Waiting", tone: r.status, detail };
+    const d = r.waiting_for ? detail("waiting", { t: "text", text: `waiting for ${waitingWord(r.waiting_for.kind)}` }) : null;
+    return { word: "Waiting", tone: r.status, detail: d };
   }
   const word = statusWord(r.status);
   if ((r.status === "failed" || r.status === "dead_lettered") && r.failed_step) {
     const more = (r.failed_steps_count ?? 1) - 1;
-    const text = `failed at ${stepDisplayName(r.failed_step)}${more > 0 ? ` +${more}` : ""}`;
-    return { word, tone: r.status, detail: { text, icon: "x", tone: "failed" } };
+    const step = `${stepDisplayName(r.failed_step)}${more > 0 ? ` +${more}` : ""}`;
+    return { word, tone: r.status, detail: detail("failed", { t: "text", text: "failed at " }, { t: "mono", text: step }) };
   }
   return { word, tone: r.status, detail: null };
 }

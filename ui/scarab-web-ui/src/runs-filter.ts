@@ -176,7 +176,7 @@ export function filterChips(f: PanelFilters): FilterChip[] {
   add("env", "environment", f.env);
   add("author", "author", f.author);
   add("branch", "branch", f.branch);
-  if (f.pr) out.push({ param: "pr", key: "PR", value: `#${f.pr}`, full: `#${f.pr}` });
+  if (f.pr) out.push({ param: "pr", key: "pr", value: `#${f.pr}`, full: `#${f.pr}` });
   if (f.deploy) out.push({ param: "deploy", key: "deploys only", value: null, full: null });
   if (f.scheduled) out.push({ param: "scheduled", key: "scheduled only", value: null, full: null });
   return out;

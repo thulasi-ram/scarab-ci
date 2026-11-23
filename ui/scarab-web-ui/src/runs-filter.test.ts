@@ -137,7 +137,7 @@ describe("filter chips", () => {
   });
 
   it("shows a PR as #N and nothing when no filter is on", () => {
-    expect(filterChips({ ...none, pr: "213" }).map((c) => `${c.key} ${c.value}`)).toEqual(["PR #213"]);
+    expect(filterChips({ ...none, pr: "213" }).map((c) => `${c.key} ${c.value}`)).toEqual(["pr #213"]);
     expect(filterChips(none)).toEqual([]);
   });
 });
