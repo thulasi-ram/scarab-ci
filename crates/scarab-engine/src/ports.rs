@@ -806,6 +806,22 @@ pub trait Db: Send + Sync {
     /// The run's pipeline name, if stamped.
     async fn run_pipeline(&self, run: &RunId) -> Result<Option<String>, DbError>;
 
+    /// Record the Pipeline file the run was created from: its path, the YAML
+    /// as read, and the commit it was read at. Set at creation for trigger,
+    /// dispatch, cron and follow-up runs; inline runs never call it.
+    async fn set_run_pipeline_source(
+        &self,
+        run: &RunId,
+        source: &crate::RunPipelineSource,
+    ) -> Result<(), DbError>;
+
+    /// The Pipeline file the run was created from, or `None` for an inline
+    /// run, a run created before it was recorded, or an unknown run.
+    async fn run_pipeline_source(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<crate::RunPipelineSource>, DbError>;
+
     /// Stamp the run **Headline** (ADR-0057) — the one human line that says what
     /// this run is about (a push's commit subject; later a PR title / dispatch
     /// reason), already subject-only + capped by the caller. Display/audit only,

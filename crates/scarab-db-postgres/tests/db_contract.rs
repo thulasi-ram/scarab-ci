@@ -2730,3 +2730,35 @@ async fn step_keys_are_minted_unique_and_stable(db: &dyn Db) {
 }
 
 contract_test!(step_keys, step_keys_are_minted_unique_and_stable);
+
+/// A Run's Pipeline file reads back as written, a commit-less read keeps no
+/// sha, and a Run with none recorded (an inline Run) reads `None`.
+async fn run_pipeline_source_round_trips(db: &dyn Db) {
+    let run = RunId("r-manifest".into());
+    let inline = RunId("r-inline".into());
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.create_run(&inline, 1, 1, Timestamp(0)).await.unwrap();
+    assert_eq!(db.run_pipeline_source(&run).await.unwrap(), None);
+    let file = scarab_engine::RunPipelineSource {
+        path: ".scarab/ci.yaml".into(),
+        source: "on:\n  push: {}\nsteps:\n  - { id: test, image: busybox }\n".into(),
+        sha: Some("1234567890abcdef1234567890abcdef12345678".into()),
+    };
+    db.set_run_pipeline_source(&run, &file).await.unwrap();
+    assert_eq!(
+        db.run_pipeline_source(&run).await.unwrap(),
+        Some(file.clone())
+    );
+    let at_tag = scarab_engine::RunPipelineSource { sha: None, ..file };
+    db.set_run_pipeline_source(&run, &at_tag).await.unwrap();
+    assert_eq!(db.run_pipeline_source(&run).await.unwrap(), Some(at_tag));
+    assert_eq!(db.run_pipeline_source(&inline).await.unwrap(), None);
+    assert_eq!(
+        db.run_pipeline_source(&RunId("r-unknown".into()))
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+contract_test!(run_manifest_source, run_pipeline_source_round_trips);

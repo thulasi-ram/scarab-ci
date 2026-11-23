@@ -1389,6 +1389,20 @@ pub struct DeployContext {
     pub locked_out: bool,
 }
 
+/// The Pipeline file a Run was created from, recorded at creation so the Run
+/// page shows the YAML the Run compiled rather than the file as it reads now.
+/// Inline Runs have none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunPipelineSource {
+    /// The repo-relative path (`.scarab/ci.yaml`).
+    pub path: String,
+    /// The file as the forge returned it.
+    pub source: String,
+    /// The commit the file was read at; `None` when it was read at a
+    /// symbolic ref no commit was resolved for.
+    pub sha: Option<String>,
+}
+
 /// The discriminated payload carried by an [`EventKind`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventPayload {

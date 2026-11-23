@@ -1682,6 +1682,44 @@ impl Db for PostgresDb {
         Ok(row.and_then(|r| r.get::<Option<String>, _>("pipeline")))
     }
 
+    async fn set_run_pipeline_source(
+        &self,
+        run: &RunId,
+        source: &scarab_engine::RunPipelineSource,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE runs SET pipeline_path = $2, pipeline_source = $3, pipeline_source_sha = $4
+             WHERE id = $1",
+        )
+        .bind(&run.0)
+        .bind(&source.path)
+        .bind(&source.source)
+        .bind(source.sha.as_deref())
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn run_pipeline_source(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<scarab_engine::RunPipelineSource>, DbError> {
+        let row = sqlx::query(
+            "SELECT pipeline_path, pipeline_source, pipeline_source_sha FROM runs
+             WHERE id = $1 AND pipeline_path IS NOT NULL AND pipeline_source IS NOT NULL",
+        )
+        .bind(&run.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(|r| scarab_engine::RunPipelineSource {
+            path: r.get("pipeline_path"),
+            source: r.get("pipeline_source"),
+            sha: r.get("pipeline_source_sha"),
+        }))
+    }
+
     async fn set_run_trigger_title(&self, run: &RunId, title: &str) -> Result<(), DbError> {
         sqlx::query("UPDATE runs SET trigger_title = $2 WHERE id = $1")
             .bind(&run.0)

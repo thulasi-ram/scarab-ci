@@ -421,6 +421,9 @@ struct InMemoryState {
     run_cache_scope: HashMap<RunId, scarab_engine::CacheScope>,
     /// Per-run pipeline name (mirrors the `pipeline` run column).
     run_pipeline: HashMap<RunId, String>,
+    /// Per-run Pipeline file (mirrors the `pipeline_path`, `pipeline_source`
+    /// and `pipeline_source_sha` run columns).
+    run_pipeline_source: HashMap<RunId, scarab_engine::RunPipelineSource>,
     /// Per-run Headline / trigger title (mirrors the `trigger_title` column).
     run_trigger_title: HashMap<RunId, String>,
     /// Refused Run creations (ADR-0076; mirrors `refused_runs`).
@@ -1892,6 +1895,32 @@ impl Db for InMemoryDb {
 
     async fn run_pipeline(&self, run: &RunId) -> Result<Option<String>, DbError> {
         Ok(self.state.lock().unwrap().run_pipeline.get(run).cloned())
+    }
+
+    async fn set_run_pipeline_source(
+        &self,
+        run: &RunId,
+        source: &scarab_engine::RunPipelineSource,
+    ) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .run_pipeline_source
+            .insert(run.clone(), source.clone());
+        Ok(())
+    }
+
+    async fn run_pipeline_source(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<scarab_engine::RunPipelineSource>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .run_pipeline_source
+            .get(run)
+            .cloned())
     }
 
     async fn record_refused_run(&self, r: &scarab_engine::RefusedRun) -> Result<(), DbError> {
