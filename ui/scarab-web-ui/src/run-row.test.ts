@@ -29,9 +29,9 @@ describe("line 2, kind first", () => {
     expect(line({ kind: "push", ref: "refs/heads/main" })).toEqual(["push", "main"]);
   });
 
-  it("a pull request reads head → base when the server sends the head branch", () => {
+  it("a pull request reads its number and head branch, without the base", () => {
     const o = { kind: "pull_request", ref: "refs/pull/213/head", pr: 213, head: "feat/org-page", base: "main" };
-    expect(line(o)).toEqual(["pr #213", "feat/org-page → main"]);
+    expect(line(o)).toEqual(["pr #213", "feat/org-page"]);
     expect(kindFirst(o).tight).toBe(false);
     expect(kindFirst({ kind: "pull_request", pr: 212 }).kind.token).toEqual({ t: "pr", n: 212 });
   });
@@ -41,7 +41,7 @@ describe("line 2, kind first", () => {
     expect(line(o)).toEqual(["pr #212", "→ main"]);
     expect(kindFirst(o).tight).toBe(true);
     // A ref that names a branch stands in for the head.
-    expect(line({ kind: "pull_request", ref: "refs/heads/feat/x", pr: 212, base: "main" })).toEqual(["pr #212", "feat/x → main"]);
+    expect(line({ kind: "pull_request", ref: "refs/heads/feat/x", pr: 212, base: "main" })).toEqual(["pr #212", "feat/x"]);
     expect(kindFirst({ kind: "push", ref: "refs/heads/main" }).tight).toBe(false);
   });
 
@@ -54,10 +54,10 @@ describe("line 2, kind first", () => {
     expect(line({ kind: "tag", ref: "refs/tags/v0.7.2" })).toEqual(["tag v0.7.2", ""]);
   });
 
-  it("manual, API and a schedule say where they ran", () => {
+  it("manual and API say where they ran; a schedule shows its expression", () => {
     expect(line({ kind: "manual", ref: "refs/heads/feat/x" })).toEqual(["manual", "on feat/x"]);
     expect(line({ kind: "api", ref: "refs/heads/main" })).toEqual(["api", "on main"]);
-    expect(line({ kind: "cron", ref: "refs/heads/main", title: "0 2 * * *" })).toEqual(["schedule", "0 2 * * * on main"]);
+    expect(line({ kind: "cron", ref: "refs/heads/main", title: "0 2 * * *" })).toEqual(["schedule", "0 2 * * *"]);
     expect(line({ kind: "upstream_run", ref: "refs/heads/main" })).toEqual(["upstream run", "on main"]);
   });
 
@@ -90,9 +90,9 @@ describe("line 2's parts", () => {
     expect(parts({ kind: "tag", ref: "refs/tags/v0.7.2" }, "3f9c2ab", "a.kim", true, null)).toEqual(["tag v0.7.2", "3f9c2ab", "a.kim", "deploy"]);
     expect(parts({ kind: "cron", ref: "refs/heads/main", title: "0 2 * * *" }, null, null, false, "production")).toEqual([
       "schedule",
-      "0 2 * * * on main",
+      "0 2 * * *",
       "—",
-      "schedule",
+      "—",
     ]);
   });
 
@@ -119,8 +119,8 @@ describe("Runs that arrive between polls", () => {
 });
 
 describe("authorSlot", () => {
-  it("a schedule has no author and says so; anything else gets a dash", () => {
-    expect(authorSlot("cron", null)).toEqual({ text: "schedule", muted: true });
+  it("a Run with no author, a schedule included, gets a muted dash", () => {
+    expect(authorSlot("cron", null)).toEqual({ text: "—", muted: true });
     expect(authorSlot("api", null)).toEqual({ text: "—", muted: true });
     expect(authorSlot("push", "a.kim")).toEqual({ text: "a.kim", muted: false });
   });

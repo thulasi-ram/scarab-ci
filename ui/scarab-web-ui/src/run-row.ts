@@ -102,19 +102,23 @@ function kindAndWhere(o: Origin): { kind: KindCell; where: PhrasePart[] } {
       return { kind: cell("push"), where: branch ? [{ t: "mono", text: branch }] : [] };
     case "pull_request": {
       const n = o.pr ?? pullNumber(ref);
+      // The number and the head branch say which change it is; the base
+      // branch is left out. A Run saved before head branches were kept
+      // falls back to `→ base`.
       const head = o.head || branch;
-      const where: PhrasePart[] = head ? [{ t: "mono", text: head }] : [];
-      if (o.base) where.push({ t: "arrow" }, { t: "mono", text: o.base });
+      const where: PhrasePart[] = head
+        ? [{ t: "mono", text: head }]
+        : o.base
+          ? [{ t: "arrow" }, { t: "mono", text: o.base }]
+          : [];
       return { kind: cell("pr", n != null ? { t: "pr", n } : null), where };
     }
     case "tag":
     case "release":
       return { kind: cell(o.kind, branch ? { t: "mono", text: branch } : null), where: [] };
-    case "cron": {
-      const where: PhrasePart[] = o.title ? [{ t: "mono", text: o.title }] : [];
-      if (branch) where.push({ t: "text", text: where.length ? " on " : "on " }, { t: "mono", text: branch });
-      return { kind: cell("schedule"), where };
-    }
+    case "cron":
+      // The schedule's own expression is what tells two scheduled Runs apart.
+      return { kind: cell("schedule"), where: o.title ? [{ t: "mono", text: o.title }] : [] };
     case "manual":
       return { kind: cell("manual"), where: on };
     case "api":
@@ -129,11 +133,11 @@ export function kindText(k: KindCell): string {
   return k.token ? `${k.word} ${phraseText([k.token])}` : k.word;
 }
 
-/** The author's place on line 2: the Actor, or a muted stand-in. A schedule
- *  has no author, so it reads `schedule`. */
-export function authorSlot(kind: string | null | undefined, actor: string | null | undefined): { text: string; muted: boolean } {
+/** The author's place on line 2: the Actor, or a muted `—` (a schedule has
+ *  no author; its kind column already says `schedule`). */
+export function authorSlot(_kind: string | null | undefined, actor: string | null | undefined): { text: string; muted: boolean } {
   if (actor) return { text: actor, muted: false };
-  return { text: kind === "cron" ? "schedule" : "—", muted: true };
+  return { text: "—", muted: true };
 }
 
 /** A name cut to `max` characters with "…" at the end. Pipeline and

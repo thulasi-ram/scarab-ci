@@ -1941,9 +1941,10 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .rr-where { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rr-l2 .sep, .rr-l2 .muted { color: var(--muted-sage); }
 .rr-l2 .sha { color: var(--copper); }
-/* The group: even spacing between its parts; the author, then the
-   Environment, give way when it is full. */
-.rr-meta { grid-column: 3; display: flex; align-items: center; gap: 12px; min-width: 0; white-space: nowrap; }
+/* The group: hash · author · Environment, a dot between each part; the
+   author, then the Environment, give way when it is full. */
+.rr-meta { grid-column: 3; display: flex; align-items: center; gap: 0; min-width: 0; white-space: nowrap; }
+.rr-meta > * + *::before { content: "·"; color: var(--muted-sage); margin: 0 8px; flex: none; }
 .rr-sha, .rr-who, .rr-env { display: inline-flex; align-items: center; gap: 5px; min-width: 0; white-space: nowrap; }
 .rr-sha { flex: none; }
 .rr-who { flex: 0 1 auto; }

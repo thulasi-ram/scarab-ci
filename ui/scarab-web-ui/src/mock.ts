@@ -318,6 +318,10 @@ const strip = (pattern: string, first = 120): { runs: RunSummaryDto[] } =>
       sha: (0x9e3779b1 * (first - i)).toString(16).padStart(8, "0").slice(-7) + "0".repeat(33),
       trigger_kind: "push",
       trigger_title: STRIP_TITLES[i % STRIP_TITLES.length],
+      // Pushes land on main, with every fourth on a feature branch, by one
+      // of three people, so a row names its branch and its author.
+      git_ref: i % 4 === 1 ? "refs/heads/feat/cache-registry" : "refs/heads/main",
+      actor: ["a.kim", "m.diaz", "j.rao"][i % 3],
       status: c === "x" ? "failed" : c === "c" ? "cancelled" : "succeeded",
       ...(c === "x" ? { failed_step: "test", failed_steps_count: 1 } : {}),
       duration_ms: 40000 + ((i * 37) % 11) * 22000,
@@ -339,6 +343,7 @@ for (const i of [3, 7]) {
     trigger_kind: "cron",
     trigger_title: "0 2 * * *",
     pipeline: "nightly",
+    actor: null,
   });
 }
 // The newest of scarab's runs, above the filler: pull request #131 pushed
