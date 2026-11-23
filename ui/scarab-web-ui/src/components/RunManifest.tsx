@@ -1,13 +1,13 @@
 // The Run page's Manifest tab: the Pipeline file the Run was created from, as
-// recorded at creation. A bar names the file, the commit it was read at and the
-// branch, with Go to failure, Wrap, Copy, Download and a link to the file on the
-// forge. Each top-level step's `id:` line carries the result of the Run Steps
+// recorded at creation. A bar names the file, then the commit it was read at,
+// the branch or tag, its lines and size as one dotted group, with Go to
+// failure, Wrap, Copy, Download and a link to the file on the forge. Each top-level step's `id:` line carries the result of the Run Steps
 // it became in a gutter left of the line numbers (click opens the step on the
 // Pipeline tab); a failed step's lines are tinted; a matrix step lists its legs
 // under its id line; an `invoke:` line is followed by what it pulled in. The
 // file is repo content: every line renders as text nodes, never as markup, and
 // the rows added under lines are not part of what Copy and Download give.
-import { createEffect, createMemo, createResource, createSignal, For, Show, on, onCleanup, type JSX } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, Show, on, onCleanup } from "solid-js";
 import { runManifest, type RunManifest as RunManifestDto } from "../api/client";
 import {
   baseName,
@@ -31,7 +31,7 @@ import {
 } from "../manifest";
 import { shortHash } from "../libraries";
 import { stepDisplayName, stepName } from "../run-page";
-import { forgeFileUrl } from "../forge";
+import { forgeCommitUrl, forgeFileUrl } from "../forge";
 import Icon from "./Icon";
 import Pill from "./Pill";
 import "../run-manifest.css";
@@ -313,15 +313,14 @@ function ManifestFile(props: {
   };
 
   const sha = () => props.m.sha ?? null;
-  const refWords = (): JSX.Element | null => {
-    if (!props.gitRef) return null;
-    const tag = props.gitRef.startsWith("refs/tags/");
-    return (
-      <>
-        {tag ? "tag " : ""}
-        <span class="mono">{shortRef(props.gitRef)}</span>
-      </>
-    );
+  const commitUrl = () => forgeCommitUrl(props.repoUrl, sha());
+  // The branch or tag the file was read on: a tag by its name, else the
+  // trigger's branch, else its ref.
+  const where = (): { text: string; tag: boolean } | null => {
+    const ref = props.gitRef;
+    if (ref?.startsWith("refs/tags/")) return { text: shortRef(ref), tag: true };
+    if (props.branch) return { text: props.branch, tag: false };
+    return ref ? { text: shortRef(ref), tag: false } : null;
   };
   const forgeUrl = () => forgeFileUrl(props.repoUrl, sha(), props.m.path);
   const bytes = () => new TextEncoder().encode(source()).length;
@@ -330,32 +329,42 @@ function ManifestFile(props: {
   return (
     <div class="panel mf">
       <div class="mf-bar">
-        <span class="mf-file">
-          <Icon icon="file-code" size={13} />
-          <span class="mf-path">{props.m.path}</span>
-        </span>
-        <Show when={sha() || props.gitRef}>
-          <span class="mf-meta">
-            <Show when={sha()} fallback={<>read at {refWords()}</>}>
+        {/* The path, then one group: the commit, the branch or tag, the
+            line count and the size, a dot between each. */}
+        <div class="mf-info">
+          <span class="mf-file">
+            <Icon icon="file-code" size={13} />
+            <span class="mf-path">{props.m.path}</span>
+          </span>
+          <span class="mf-group">
+            <Show when={sha()}>
               {(s) => (
-                <>
-                  read at <span class="mono mf-sha">{s().slice(0, 8)}</span>
-                  <Show when={props.branch}>
-                    {(b) => (
-                      <>
-                        {" "}
-                        on <span class="mono">{b()}</span>
-                      </>
+                <span class="mf-part" title="The file as read at this commit when the Run was created">
+                  <Icon icon="git-commit-horizontal" size={12} />
+                  <Show when={commitUrl()} fallback={<span class="mf-sha">{s().slice(0, 8)}</span>}>
+                    {(href) => (
+                      <a class="mf-sha" href={href()} target="_blank" rel="noopener noreferrer">
+                        {s().slice(0, 8)}
+                      </a>
                     )}
                   </Show>
-                </>
+                </span>
               )}
             </Show>
+            <Show when={where()}>
+              {(w) => (
+                <span class="mf-part" title={w().tag ? `tag ${w().text}` : `branch ${w().text}`}>
+                  <Icon icon={w().tag ? "tag" : "git-branch"} size={12} />
+                  <span class="mf-where">{w().text}</span>
+                </span>
+              )}
+            </Show>
+            <span class="mf-part">
+              {count(lines().length)} {lines().length === 1 ? "line" : "lines"}
+            </span>
+            <span class="mf-part">{sizeWords(bytes())}</span>
           </span>
-        </Show>
-        <span class="mf-meta mono">
-          {lines().length} {lines().length === 1 ? "line" : "lines"} · {sizeWords(bytes())}
-        </span>
+        </div>
         <span class="mf-acts">
           <Show when={failure()}>
             <button type="button" class="btn btn-ghost btn-sm mf-btn mf-fail" onClick={goToFailure}>

@@ -20,15 +20,23 @@
 
 /* ── Bar ── */
 .mf-bar {
-  display: flex; align-items: center; flex-wrap: wrap; gap: 6px 14px;
+  display: flex; align-items: center; gap: 6px 14px;
   padding: 8px 14px; background: var(--pine-deep); border-bottom: 1px solid var(--border);
 }
+/* The path and the group wrap inside this box; the actions keep the right. */
+.mf-info { flex: 1 1 auto; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; }
 .mf-file { display: inline-flex; align-items: center; gap: 6px; min-width: 0; color: var(--sage); }
 .mf-path { font: var(--t-mono); color: var(--soft-white); overflow-wrap: anywhere; }
-.mf-meta { font: var(--t-body); color: var(--muted-sage); }
-.mf-meta.mono { font: var(--t-mono); }
-.mf-sha { color: var(--copper); }
-.mf-acts { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; flex-wrap: nowrap; }
+/* commit · branch · lines · size, each behind its icon, like the runs
+   list's group. */
+.mf-group { display: flex; flex-wrap: wrap; align-items: center; min-width: 0; font: var(--t-mono); color: var(--sage); }
+.mf-part { display: inline-flex; align-items: center; gap: 5px; min-width: 0; white-space: nowrap; }
+.mf-part + .mf-part::before { content: "·"; color: var(--muted-sage); margin: 0 3px 0 8px; }
+.mf-part > svg { color: var(--muted-sage); flex: none; }
+.mf-where { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.mf-sha { color: var(--copper); text-decoration: none; }
+a.mf-sha:hover { color: var(--emerald); text-decoration: underline; }
+.mf-acts { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; flex: none; flex-wrap: nowrap; }
 .mf-btn { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; line-height: 18px; }
 .mf-btn[aria-pressed="true"] {
   color: var(--soft-white); border-color: var(--emerald);
@@ -123,6 +131,9 @@ button.mf-mark:focus-visible { outline: 2px solid var(--emerald); outline-offset
 
 @media (max-width: 640px) {
   .mf { --mf-gutter: 22px; --mf-numbers: 36px; }
+  /* The path and the group take the bar's width; the actions keep the
+     right on the line under them. */
+  .mf-bar { flex-wrap: wrap; }
+  .mf-info { flex-basis: 100%; }
   .mf-no { padding-right: 10px; }
-  .mf-acts { margin-left: 0; }
 }
