@@ -1275,6 +1275,7 @@ fn pull_request(fork: bool) -> Event {
         head: "1234567890abcdef1234567890abcdef12345678".into(),
         title: "add a widget".into(),
         base: "main".into(),
+        head_branch: "feature".into(),
         fork,
     }
 }

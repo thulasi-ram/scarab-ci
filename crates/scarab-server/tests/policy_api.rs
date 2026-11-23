@@ -720,6 +720,7 @@ async fn policy_test_evaluates_the_input_admission_records() {
         head: SHA.into(),
         title: "fix".into(),
         base: "main".into(),
+        head_branch: "feature".into(),
         fork: true,
     };
     let cases = [

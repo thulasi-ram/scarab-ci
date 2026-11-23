@@ -182,6 +182,7 @@ fn pr() -> Event {
         head: "prsha456".into(),
         title: "feat: add the dashboard widget".into(),
         base: "main".into(),
+        head_branch: "feat/dashboard-widget".into(),
         fork: false,
     }
 }

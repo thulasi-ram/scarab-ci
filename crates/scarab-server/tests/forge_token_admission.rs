@@ -118,6 +118,7 @@ fn fork_pr() -> Event {
         head: SHA.into(),
         title: "fix".into(),
         base: "main".into(),
+        head_branch: "feature".into(),
         fork: true,
     }
 }

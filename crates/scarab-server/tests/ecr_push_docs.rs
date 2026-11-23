@@ -241,6 +241,7 @@ fn fork_pr() -> Event {
         head: SHA.into(),
         title: "bump".into(),
         base: "main".into(),
+        head_branch: "feature".into(),
         fork: true,
     }
 }

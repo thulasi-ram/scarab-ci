@@ -221,6 +221,7 @@ async fn a_fork_pull_request_starts_no_follow_up() {
         head: SHA.into(),
         title: "a change".into(),
         base: "main".into(),
+        head_branch: "feature".into(),
         fork: true,
     };
     let runs = w.start(&pr).await;
