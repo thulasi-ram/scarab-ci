@@ -107,7 +107,10 @@ async fn the_0106_revert_runs_twice_and_the_migrator_upgrades_again() {
         .expect("the revert runs twice");
     let cols = runs_columns(&pool).await;
     for c in ADDED {
-        assert!(!cols.iter().any(|x| x == c), "{c} left after the revert: {cols:?}");
+        assert!(
+            !cols.iter().any(|x| x == c),
+            "{c} left after the revert: {cols:?}"
+        );
     }
     let max: i64 = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
@@ -123,7 +126,10 @@ async fn the_0106_revert_runs_twice_and_the_migrator_upgrades_again() {
     db.migrate().await.unwrap();
     let cols = runs_columns(&pool).await;
     for c in ADDED {
-        assert!(cols.iter().any(|x| x == c), "{c} missing after upgrading again");
+        assert!(
+            cols.iter().any(|x| x == c),
+            "{c} missing after upgrading again"
+        );
     }
     tdb.cleanup().await;
 }
