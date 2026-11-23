@@ -454,3 +454,116 @@ async fn a_run_a_person_cancels_first_is_not_marked_superseded() {
     assert_eq!(row["status"], "cancelled");
     assert!(row.get("replaced_by").is_none(), "{row}");
 }
+
+/// A Run held at a `cancel-in-progress` group is cancelled by the next Run of
+/// the group, and the runs list names that Run as its replacement. A manual
+/// dispatch has no newest-wins key, so only the group cancels it.
+async fn a_cancel_in_progress_group_marks_the_run_it_cancels(db: Arc<dyn Db>) {
+    let clock = FakeClock::new(1_000);
+    let forge = FakeForge::new()
+        .with_file(
+            ".scarab/group.yaml",
+            "on:\n  manual: {}\nconcurrency: { group: ship, policy: cancel-in-progress }\n\
+             steps:\n  - { id: unit, image: busybox }\n",
+        )
+        .with_commit("refs/heads/main", SHA);
+    let app = app(db.clone());
+    let db = db.as_ref();
+    let holder = dispatched(&forge, db, &clock, "group").await;
+    tick_until(
+        db,
+        &clock,
+        &FakeExecutor::new(),
+        &holder,
+        RunStatus::Running,
+    )
+    .await;
+    clock.advance(1_000);
+    let next = dispatched(&forge, db, &clock, "group").await;
+    tick_until(db, &clock, &FakeExecutor::new(), &next, RunStatus::Running).await;
+
+    let row = listed(&app, &holder).await;
+    assert_eq!(row["status"], "cancelled");
+    assert_eq!(row["replaced_by"], next.0.as_str(), "{row}");
+}
+
+#[tokio::test]
+async fn a_cancel_in_progress_group_marks_the_run_it_cancels_in_memory() {
+    a_cancel_in_progress_group_marks_the_run_it_cancels(Arc::new(InMemoryDb::new())).await;
+}
+
+#[tokio::test]
+async fn a_cancel_in_progress_group_marks_the_run_it_cancels_on_postgres() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    a_cancel_in_progress_group_marks_the_run_it_cancels(pg).await;
+    tdb.cleanup().await;
+}
+
+/// A Run into an Environment, held at the `manual` gate before a Step that
+/// deploys (uses the Environment's authority), is listed as waiting for the
+/// Environment's approval.
+async fn a_run_held_for_an_environment_lists_its_approval_gate(db: Arc<dyn Db>) {
+    let clock = FakeClock::new(1_000);
+    let forge = FakeForge::new()
+        .with_file(
+            ".scarab/deploy.yaml",
+            "on:\n  manual: {}\nenvironment: prod\nsteps:\n  - { id: build, image: busybox }\n  \
+             - { id: approve, gate: manual, needs: [build] }\n  \
+             - { id: ship, image: busybox, needs: [approve], deploy: true }\n",
+        )
+        .with_commit("refs/heads/main", SHA);
+    let governance = scarab_testkit::InMemoryEnvironmentGovernance::new().with_environment(
+        "acme",
+        "prod",
+        scarab_project::EnvironmentProjectEligibility::AllProjects,
+    );
+    let app = app(db.clone());
+    let db = db.as_ref();
+    let run = dispatch_run(
+        &forge,
+        db,
+        &clock,
+        AdmissionPorts::governance(Some(&governance)),
+        "alice".into(),
+        repo(),
+        "refs/heads/main".into(),
+        "deploy".into(),
+        BTreeMap::new(),
+        DispatchKind::Manual,
+        None,
+    )
+    .await
+    .unwrap();
+    let exec = FakeExecutor::new();
+    exec.script_outcome(ExecState::Succeeded);
+    tick_until(db, &clock, &exec, &run, RunStatus::Suspended).await;
+
+    let row = listed(&app, &run).await;
+    assert_eq!(
+        row["waiting_for"],
+        serde_json::json!({ "step": "approve", "kind": "environment_approval" }),
+        "{row}"
+    );
+}
+
+#[tokio::test]
+async fn a_run_held_for_an_environment_lists_its_approval_gate_in_memory() {
+    a_run_held_for_an_environment_lists_its_approval_gate(Arc::new(InMemoryDb::new())).await;
+}
+
+#[tokio::test]
+async fn a_run_held_for_an_environment_lists_its_approval_gate_on_postgres() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    a_run_held_for_an_environment_lists_its_approval_gate(pg).await;
+    tdb.cleanup().await;
+}
