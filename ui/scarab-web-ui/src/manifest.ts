@@ -87,11 +87,16 @@ function toTokens(line: string, cls: (TokenClass | undefined)[]): Token[] {
   return out;
 }
 
+/** Colours every `${{ … }}` between `from` and `to`, in one pass: an
+ * expression with no `}}` after it ends the scan, since no later one can
+ * close either. */
 function markExprs(line: string, cls: (TokenClass | undefined)[], from: number, to: number) {
-  const re = /\$\{\{[\s\S]*?\}\}/g;
-  const part = line.slice(from, to);
-  for (let m = re.exec(part); m; m = re.exec(part)) {
-    for (let i = from + m.index; i < from + m.index + m[0].length; i++) cls[i] = "expr";
+  let at = line.indexOf("${{", from);
+  while (at >= 0 && at < to) {
+    const close = line.indexOf("}}", at + 3);
+    if (close < 0 || close + 2 > to) return;
+    for (let i = at; i < close + 2; i++) cls[i] = "expr";
+    at = line.indexOf("${{", close + 2);
   }
 }
 
@@ -116,8 +121,11 @@ export function tokenizeLine(line: string): Token[] {
       cls[at + lead[3].length] = "punct";
     }
   }
+  // Which characters are inside quotes, worked out once for the line.
+  const quotedAt = new Uint8Array(line.length);
+  for (const [a, b] of quoted) quotedAt.fill(1, a, b);
+  const inQuote = (i: number) => quotedAt[i] === 1;
   // Keys inside a flow mapping: `{ id: g, invoke: … }`.
-  const inQuote = (i: number) => quoted.some(([a, b]) => i >= a && i < b);
   const flowKey = /([{,]\s*)([\w.-]+)(:)(?=\s)/g;
   for (let m = flowKey.exec(code); m; m = flowKey.exec(code)) {
     const k = m.index + m[1]!.length;
@@ -152,21 +160,37 @@ function blockScalarOwner(line: string): number | null {
   return /^\s*[\w.-]+:\s+[|>][-+1-9]{0,2}$/.test(code) ? indentOf(code) : null;
 }
 
-/** Every line's tokens. The content of a block scalar (`|` or `>`) is text: a
- * `#` or a `key:` in it is not YAML, so only its `${{ … }}` expressions are
- * coloured. */
-export function tokenizeFile(lines: string[]): Token[][] {
+/** The lines the Manifest tab draws: a longer file ends in a note and the
+ * Download button. */
+export const SHOWN_LINES = 5000;
+/** The characters of a line the tab colours and shows: a longer line is
+ * shown as plain text, cut, with a note. */
+export const LINE_CHARS = 2000;
+
+/** Whether the tab cuts line `line`. */
+export const isCut = (line: string): boolean => line.length > LINE_CHARS;
+
+/** The tokens of the first `limit` lines. The content of a block scalar
+ * (`|` or `>`) is text: a `#` or a `key:` in it is not YAML, so only its
+ * `${{ … }}` expressions are coloured. A line longer than `LINE_CHARS` is
+ * one plain token of its first `LINE_CHARS` characters. */
+export function tokenizeFile(lines: string[], limit = SHOWN_LINES): Token[][] {
   const out: Token[][] = [];
   let owner: number | null = null;
-  for (const line of lines) {
-    if (owner !== null && (isBlank(line) || indentOf(line) > owner)) {
+  for (const line of lines.slice(0, limit)) {
+    const inBlock = owner !== null && (isBlank(line) || indentOf(line) > owner);
+    if (!inBlock) owner = blockScalarOwner(line);
+    if (line === "") {
+      out.push([]);
+    } else if (isCut(line)) {
+      out.push([{ text: line.slice(0, LINE_CHARS) }]);
+    } else if (inBlock) {
       const cls: (TokenClass | undefined)[] = new Array(line.length).fill(undefined);
       markExprs(line, cls, 0, line.length);
-      out.push(line === "" ? [] : toTokens(line, cls));
-      continue;
+      out.push(toTokens(line, cls));
+    } else {
+      out.push(tokenizeLine(line));
     }
-    owner = blockScalarOwner(line);
-    out.push(tokenizeLine(line));
   }
   return out;
 }
@@ -192,13 +216,117 @@ function scalar(raw: string): string {
   const v = raw.trim();
   const q = /^"((?:[^"\\]|\\.)*)"|^'((?:[^']|'')*)'/.exec(v);
   if (q) return q[1] ?? q[2]!.replace(/''/g, "'");
-  return v.replace(/\s+#.*$/, "").trim();
+  // A comment starts at a `#` after whitespace. One search, so a long run
+  // of spaces is read once.
+  const hash = v.search(/\s#/);
+  return (hash < 0 ? v : v.slice(0, hash)).trim();
 }
 
-/** A value from a flow mapping line: `{ id: g, invoke: plugin:a/b }`. */
-function flowValue(text: string, key: string): string | null {
-  const m = new RegExp(`[{,]\\s*${key}:\\s*("(?:[^"\\\\]|\\\\.)*"|'(?:[^']|'')*'|[^,}]+)`).exec(text);
-  return m ? scalar(m[1]!) : null;
+/** One key of a flow mapping, its value as written, and the line its key is
+ * on. */
+type FlowEntry = { key: string; value: string; line: number };
+
+/**
+ * The top-level keys of the flow mapping that opens at `lines[from][col]`
+ * (`{ id: g, invoke: … }`), which may go on over later lines. A key of a
+ * mapping nested in it (`with: { id: x }`) is part of a value, not a key.
+ * The mapping ends at its `}`, or before a line at `stopIndent` or less when
+ * it is not closed. `end` is its last line that is not blank.
+ */
+function flowMapping(lines: string[], from: number, col: number, stopIndent: number): { entries: FlowEntry[]; end: number } {
+  const entries: FlowEntry[] = [];
+  let depth = 0;
+  let quote: '"' | "'" | null = null;
+  // The last character outside quotes that is not whitespace: a quote opens
+  // a quoted scalar only after one of `{[,:`.
+  let prev = "";
+  // The key or value being read, and the line its first character is on.
+  let part = "";
+  let started = false;
+  let partLine = from;
+  let key: string | null = null;
+  let keyLine = from;
+  let end = from;
+  const add = (c: string, i: number) => {
+    if (depth < 1) return;
+    if (!started && c.trim() !== "") {
+      started = true;
+      partLine = i;
+    }
+    part += c;
+  };
+  const reset = () => {
+    part = "";
+    started = false;
+  };
+  const flush = () => {
+    if (key !== null) entries.push({ key, value: scalar(part), line: keyLine });
+    key = null;
+    reset();
+  };
+  for (let i = from; i < lines.length; i++) {
+    const l = lines[i]!;
+    if (i > from && !isBlank(l) && indentOf(l) <= stopIndent) break;
+    if (!isBlank(l)) end = i;
+    for (let k = i === from ? col : 0; k < l.length; k++) {
+      const c = l[k]!;
+      if (quote) {
+        add(c, i);
+        if (quote === '"' && c === "\\" && k + 1 < l.length) {
+          add(l[++k]!, i);
+        } else if (c === quote) {
+          // `''` inside single quotes is one quote.
+          if (quote === "'" && l[k + 1] === "'") add(l[++k]!, i);
+          else quote = null;
+        }
+        continue;
+      }
+      if (c === "#" && (k === 0 || /\s/.test(l[k - 1]!))) break;
+      if (c === "$" && l.startsWith("${{", k)) {
+        const close = l.indexOf("}}", k + 3);
+        const stop = close < 0 ? l.length : close + 2;
+        add(l.slice(k, stop), i);
+        k = stop - 1;
+        prev = "}";
+        continue;
+      }
+      if ((c === '"' || c === "'") && (prev === "" || "{[,:".includes(prev))) {
+        quote = c;
+        add(c, i);
+        prev = c;
+        continue;
+      }
+      if (c.trim() !== "") prev = c;
+      if (c === "{" || c === "[") {
+        depth++;
+        if (depth > 1) add(c, i);
+        continue;
+      }
+      if (c === "}" || c === "]") {
+        depth--;
+        if (depth === 0) {
+          flush();
+          return { entries, end: i };
+        }
+        add(c, i);
+        continue;
+      }
+      if (depth === 1 && c === ",") {
+        flush();
+        continue;
+      }
+      if (depth === 1 && key === null && c === ":" && (k + 1 === l.length || /[\s,}]/.test(l[k + 1]!))) {
+        key = part.trim();
+        keyLine = partLine;
+        reset();
+        continue;
+      }
+      add(c, i);
+    }
+    add(" ", i);
+  }
+  flush();
+  return { entries, end };
 }
 
 /**
@@ -254,12 +382,19 @@ export function fileSteps(lines: string[]): FileStep[] {
         invoke: null,
       };
       if (flow) {
-        cur.id = flowValue(rest, "id");
-        const inv = flowValue(rest, "invoke");
-        if (inv) {
-          cur.invokeLine = i;
-          cur.invoke = inv;
+        // `- { id: x, … }`, on this line or over the next ones.
+        const m = flowMapping(lines, i, ind + 1 + dash![2]!.length, itemIndent);
+        for (const e of m.entries) {
+          if (e.key === "id" && cur.id === null) {
+            cur.id = e.value || null;
+            cur.line = e.line;
+          } else if (e.key === "invoke" && cur.invokeLine === null) {
+            cur.invokeLine = e.line;
+            cur.invoke = e.value || null;
+          }
         }
+        cur.last = m.end;
+        i = m.end;
         continue;
       }
     }
@@ -314,8 +449,9 @@ export function matrixLegs<S extends RunStepLike>(id: string, steps: S[]): S[] {
 
 export type MarkKind = "passed" | "failed" | "mixed" | "skipped" | "notrun" | "running" | "cancelled";
 
-/** One Run Step's status as a mark. */
-export function markOf(status: string): MarkKind {
+/** One Run Step's status as a mark. On a Run that is no longer `live`, a
+ * Step that did not finish did not run. */
+export function markOf(status: string, live = true): MarkKind {
   switch (status) {
     case "succeeded":
       return "passed";
@@ -323,7 +459,7 @@ export function markOf(status: string): MarkKind {
     case "dead_lettered":
       return "failed";
     case "running":
-      return "running";
+      return live ? "running" : "notrun";
     case "skipped":
       return "skipped";
     case "cancelled":
@@ -333,22 +469,28 @@ export function markOf(status: string): MarkKind {
   return "notrun";
 }
 
+/** One Run Step's status in words, lowercase: a Step that did not run reads
+ * `not run`, and `not run yet` while the Run is `live`. */
+export function markWords(status: string, live = true): string {
+  if (markOf(status, live) === "notrun") return live && status !== "not_run" ? "not run yet" : "not run";
+  return statusWord(status).toLowerCase();
+}
+
 /** What one top-level step did, over the Run Steps it became: its mark, the
  * mark in words for the hover title, and the Step a click opens (the first
  * that failed, else the first running, else the first). */
 export type StepMark = { kind: MarkKind; words: string; open: string | null };
 
-export function stepMark(id: string, steps: RunStepLike[]): StepMark {
+/** `live` is whether the Run can still change: on a finished Run (or an
+ * older version in view) no step is running. */
+export function stepMark(id: string, steps: RunStepLike[], live = true): StepMark {
   const own = stepsOf(id, steps);
   if (own.length === 0) return { kind: "notrun", words: "not in this Run", open: null };
-  const kinds = own.map((s) => markOf(s.status));
+  const kinds = own.map((s) => markOf(s.status, live));
   const count = (k: MarkKind) => kinds.filter((x) => x === k).length;
   const pick = (k: MarkKind) => own[kinds.indexOf(k)]?.id;
   const open = pick("failed") ?? pick("running") ?? own[0]!.id;
-  if (own.length === 1) {
-    const w = kinds[0] === "notrun" ? "not run yet" : statusWord(own[0]!.status).toLowerCase();
-    return { kind: kinds[0]!, words: w, open };
-  }
+  if (own.length === 1) return { kind: kinds[0]!, words: markWords(own[0]!.status, live), open };
   const n = own.length;
   const noun = matrixLegs(id, own).length === n ? "legs" : "steps";
   const failed = count("failed");
@@ -359,6 +501,11 @@ export function stepMark(id: string, steps: RunStepLike[]): StepMark {
   }
   if (running > 0) return { kind: "running", words: `${running} of ${n} ${noun} running`, open };
   if (count("notrun") > 0) {
+    if (!live) {
+      return passed > 0
+        ? { kind: "notrun", words: `${passed} of ${n} ${noun} passed, the rest not run`, open }
+        : { kind: "notrun", words: `${n} ${noun}, none run`, open };
+    }
     return passed > 0
       ? { kind: "running", words: `${passed} of ${n} ${noun} passed, the rest not run yet`, open }
       : { kind: "notrun", words: `${n} ${noun}, none run yet`, open };

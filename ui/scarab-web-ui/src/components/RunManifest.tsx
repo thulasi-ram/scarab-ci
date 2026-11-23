@@ -7,7 +7,7 @@
 // under its id line; an `invoke:` line is followed by what it pulled in. The
 // file is repo content: every line renders as text nodes, never as markup, and
 // the rows added under lines are not part of what Copy and Download give.
-import { createMemo, createResource, createSignal, For, Show, onCleanup, type JSX } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, Show, on, onCleanup, type JSX } from "solid-js";
 import { runManifest, type RunManifest as RunManifestDto } from "../api/client";
 import {
   baseName,
@@ -15,8 +15,12 @@ import {
   fileSteps,
   firstFailure,
   invokeBoxes,
+  isCut,
+  LINE_CHARS,
   markOf,
+  markWords,
   matrixLegs,
+  SHOWN_LINES,
   shortRef,
   sizeWords,
   stepMark,
@@ -26,7 +30,7 @@ import {
   type MarkKind,
 } from "../manifest";
 import { shortHash } from "../libraries";
-import { stepDisplayName, stepName, statusWord } from "../run-page";
+import { stepDisplayName, stepName } from "../run-page";
 import { forgeFileUrl } from "../forge";
 import Icon from "./Icon";
 import Pill from "./Pill";
@@ -81,6 +85,9 @@ function Mark(props: { kind: MarkKind; title: string; onClick?: () => void }) {
 
 const KIND_LABEL: Record<string, string> = { library: "lib", file: "file", plugin: "plugin" };
 
+/** A count with thousands separators: `5,000`. */
+const count = (n: number) => n.toLocaleString("en-US");
+
 export default function RunManifest(props: {
   runId: string;
   /** The Run's Steps with their status in the version in view. */
@@ -91,8 +98,13 @@ export default function RunManifest(props: {
   /** The trigger's commit and branch or ref, when the event log has them. */
   triggerSha: string | null;
   branch: string | null;
-  ref: string | null;
+  /** The trigger's ref (`refs/tags/v0.7.2`). Not `ref`: Solid keeps that
+   *  name for element refs and drops it from props. */
+  gitRef: string | null;
   repoUrl: string | null;
+  /** The Run can still change: not finished, and not an older version in
+   *  view. On a finished Run a step that did not run reads `not run`. */
+  live: boolean;
   onOpenStep: (id: string) => void;
   onShowPipeline: () => void;
 }) {
@@ -215,49 +227,60 @@ type Row =
   | { kind: "invoke"; step: FileStep };
 
 function ManifestFile(props: {
+  runId: string;
   m: RunManifestDto;
   steps: ManifestStep[];
   yanks: { name: string; content_hash: string }[];
   branch: string | null;
-  ref: string | null;
+  gitRef: string | null;
   repoUrl: string | null;
+  live: boolean;
   onOpenStep: (id: string) => void;
 }) {
   const source = () => props.m.source ?? "";
   const lines = createMemo(() => fileLines(source()));
-  const tokens = createMemo(() => tokenizeFile(lines()));
+  // The page draws the first SHOWN_LINES lines: a longer file ends in a note
+  // and the Download button. Copy and Download give the whole file.
+  const shown = () => Math.min(lines().length, SHOWN_LINES);
+  const tokens = createMemo(() => tokenizeFile(lines(), SHOWN_LINES));
   const items = createMemo(() => fileSteps(lines()));
   const byIdLine = createMemo(() => new Map(items().map((s) => [s.line, s])));
   const rows = createMemo((): Row[] => {
     const out: Row[] = [];
     const legsAt = new Map(items().map((s) => [s.line, s]));
     const invokeAt = new Map(items().filter((s) => s.invokeLine !== null).map((s) => [s.invokeLine!, s]));
-    lines().forEach((_, i) => {
+    for (let i = 0; i < shown(); i++) {
       out.push({ kind: "line", i });
       const l = legsAt.get(i);
       if (l) out.push({ kind: "legs", step: l });
       const v = invokeAt.get(i);
       if (v) out.push({ kind: "invoke", step: v });
-    });
+    }
     return out;
   });
 
-  const mark = (s: FileStep) => stepMark(s.id, props.steps);
+  const mark = (s: FileStep) => stepMark(s.id, props.steps, props.live);
   const failing = (s: FileStep) => ["failed", "mixed"].includes(mark(s).kind);
   // The lines of every step with a failed Step, tinted.
   const bad = createMemo(() => {
     const out = new Set<number>();
     for (const s of items()) {
       if (!failing(s)) continue;
-      for (let i = s.start; i <= s.end; i++) out.add(i);
+      for (let i = s.start; i <= Math.min(s.end, SHOWN_LINES - 1); i++) out.add(i);
     }
     return out;
   });
-  const failure = () => firstFailure(items(), props.steps);
+  // A failure past the lines drawn has nowhere to go.
+  const failure = () => {
+    const f = firstFailure(items(), props.steps);
+    return f && f.line < SHOWN_LINES ? f : null;
+  };
   const unmapped = () => unmappedSteps(items(), props.steps);
 
   const [wrap, setWrap] = createSignal(false);
   const [focus, setFocus] = createSignal<FileStep | null>(null);
+  // Another Run's file: the last one's Go to failure no longer applies.
+  createEffect(on(() => props.runId, () => setFocus(null), { defer: true }));
   const [copied, setCopied] = createSignal(false);
   let copiedTimer: ReturnType<typeof setTimeout> | undefined;
   onCleanup(() => clearTimeout(copiedTimer));
@@ -291,12 +314,12 @@ function ManifestFile(props: {
 
   const sha = () => props.m.sha ?? null;
   const refWords = (): JSX.Element | null => {
-    if (!props.ref) return null;
-    const tag = props.ref.startsWith("refs/tags/");
+    if (!props.gitRef) return null;
+    const tag = props.gitRef.startsWith("refs/tags/");
     return (
       <>
         {tag ? "tag " : ""}
-        <span class="mono">{shortRef(props.ref)}</span>
+        <span class="mono">{shortRef(props.gitRef)}</span>
       </>
     );
   };
@@ -311,7 +334,7 @@ function ManifestFile(props: {
           <Icon icon="file-code" size={13} />
           <span class="mf-path">{props.m.path}</span>
         </span>
-        <Show when={sha() || props.ref}>
+        <Show when={sha() || props.gitRef}>
           <span class="mf-meta">
             <Show when={sha()} fallback={<>read at {refWords()}</>}>
               {(s) => (
@@ -386,8 +409,8 @@ function ManifestFile(props: {
         <div class="mf-banner" role="note">
           <Icon icon="alert-triangle" size={13} />
           <span>
-            <Show when={props.ref} fallback={<>The commit this file was read at was not recorded.</>}>
-              The commit behind <span class="mono">{shortRef(props.ref!)}</span> was not recorded.
+            <Show when={props.gitRef} fallback={<>The commit this file was read at was not recorded.</>}>
+              The commit behind <span class="mono">{shortRef(props.gitRef!)}</span> was not recorded.
             </Show>{" "}
             The text below is what ran.
           </span>
@@ -435,6 +458,12 @@ function ManifestFile(props: {
                       <For each={tokens()[i]} fallback={" "}>
                         {(t) => (t.cls ? <span class={`mf-${t.cls}`}>{t.text}</span> : t.text)}
                       </For>
+                      <Show when={isCut(lines()[i] ?? "")}>
+                        <span class="mf-cut">
+                          {" "}
+                          … the first {count(LINE_CHARS)} of {count(lines()[i]!.length)} characters
+                        </span>
+                      </Show>
                     </span>
                   </div>
                 );
@@ -451,8 +480,8 @@ function ManifestFile(props: {
                           {(leg) => (
                             <span class="mf-leg">
                               <Mark
-                                kind={markOf(leg.status)}
-                                title={`${stepDisplayName(leg.id)}: ${statusWord(leg.status).toLowerCase()} · open it on the Pipeline tab`}
+                                kind={markOf(leg.status, props.live)}
+                                title={`${stepDisplayName(leg.id)}: ${markWords(leg.status, props.live)} · open it on the Pipeline tab`}
                                 onClick={() => props.onOpenStep(leg.id)}
                               />
                               <button
@@ -463,7 +492,7 @@ function ManifestFile(props: {
                               >
                                 {stepName(leg.id).cell ?? leg.id}
                               </button>
-                              <span class="subtle">{statusWord(leg.status).toLowerCase()}</span>
+                              <span class="subtle">{markWords(leg.status, props.live)}</span>
                             </span>
                           )}
                         </For>
@@ -518,6 +547,14 @@ function ManifestFile(props: {
           </For>
         </div>
       </div>
+      <Show when={lines().length > shown()}>
+        <p class="mf-more">
+          Showing the first {count(shown())} of {count(lines().length)} lines.
+          <button type="button" class="btn btn-ghost btn-sm mf-btn" onClick={download}>
+            <Icon icon="download" size={13} /> Download
+          </button>
+        </p>
+      </Show>
       <Show when={unmapped().length > 0}>
         <p class="mf-foot">
           Not written in this file:{" "}

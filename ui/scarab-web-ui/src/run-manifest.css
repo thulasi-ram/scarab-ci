@@ -108,6 +108,12 @@ button.mf-mark:focus-visible { outline: 2px solid var(--emerald); outline-offset
 .mf-hash { color: var(--muted-sage); }
 .mf-yank { display: inline-flex; align-items: center; gap: 5px; color: var(--warn); }
 
+.mf-cut { color: var(--muted-sage); }
+.mf-more {
+  margin: 0; padding: 8px 14px; border-top: 1px solid var(--border-soft); font: var(--t-body); color: var(--sage);
+  display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px;
+}
+
 .mf-foot { margin: 0; padding: 8px 14px; border-top: 1px solid var(--border-soft); font: var(--t-body); color: var(--sage); }
 
 /* ── Empty and error states ── */

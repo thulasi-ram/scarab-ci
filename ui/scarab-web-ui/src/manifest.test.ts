@@ -6,6 +6,9 @@ import {
   fileSteps,
   firstFailure,
   invokeBoxes,
+  LINE_CHARS,
+  markWords,
+  SHOWN_LINES,
   stepMark,
   stepRoot,
   tokenizeFile,
@@ -79,6 +82,62 @@ describe("tokenizeFile", () => {
   });
 });
 
+describe("tokenizeFile limits", () => {
+  it("tokenizes the first SHOWN_LINES lines and cuts a long line to plain text", () => {
+    const long = `name: ${"x".repeat(LINE_CHARS + 10)}`;
+    const lines = [long, ...Array.from({ length: SHOWN_LINES + 5 }, () => "a: 1")];
+    const ts = tokenizeFile(lines);
+    expect(ts).toHaveLength(SHOWN_LINES);
+    expect(ts[0]).toEqual([{ text: long.slice(0, LINE_CHARS) }]);
+    expect(of(ts[1]!, "key")).toEqual(["a"]);
+  });
+
+  it("keeps a block scalar's state across a cut line", () => {
+    const ts = tokenizeFile(["run: |", `  ${"x".repeat(LINE_CHARS)}`, "  a: # not a comment", "b: 1"]);
+    expect(of(ts[2]!, "comment")).toEqual([]);
+    expect(of(ts[3]!, "key")).toEqual(["b"]);
+  });
+});
+
+// Files under the 1 MiB limit that once froze the tab. Each must be read in
+// a time that grows with its size; the bound is far above what that takes.
+describe("large files", () => {
+  const head = 'name: x\nsteps:\n  - id: a\n    image: alpine\n    command: ["true"]\n';
+  const within = (f: () => unknown) => {
+    const t = performance.now();
+    f();
+    return performance.now() - t;
+  };
+  const read = (source: string) => {
+    const lines = fileLines(source);
+    tokenizeFile(lines);
+    fileSteps(lines);
+  };
+
+  it("reads one line of 300,000 expression openers", () => {
+    const line = "${{".repeat(300_000);
+    expect(within(() => tokenizeLine(`    name: ${line}`))).toBeLessThan(500);
+    expect(within(() => read(`name: |\n  ${line}\n${head.slice(8)}`))).toBeLessThan(500);
+  });
+
+  it("reads a one-line flow list of quoted strings and references", () => {
+    const line = `    command: [${Array.from({ length: 90_000 }, () => "'', lib:a").join(", ")}]`;
+    expect(within(() => tokenizeLine(line))).toBeLessThan(500);
+    expect(within(() => read(`name: x\nsteps:\n  - id: a\n    image: alpine\n${line}\n`))).toBeLessThan(500);
+  });
+
+  it("reads a million blank lines and half a million comment lines", () => {
+    expect(within(() => read(head + "\n".repeat(1_000_000)))).toBeLessThan(500);
+    expect(within(() => read(head + "#\n".repeat(499_000)))).toBeLessThan(500);
+  });
+
+  it("reads a value with a long run of spaces", () => {
+    const steps = fileSteps(fileLines(`steps:\n  - id: a\n    invoke: a${" ".repeat(400_000)}b\n`));
+    expect(steps[0]!.invoke).toBe(`a${" ".repeat(400_000)}b`);
+    expect(within(() => read(`steps:\n  - id: a\n    invoke: a${" ".repeat(400_000)}b\n`))).toBeLessThan(500);
+  });
+});
+
 describe("fileLines", () => {
   it("drops the final newline only", () => {
     expect(fileLines("a\r\nb\n")).toEqual(["a", "b"]);
@@ -131,6 +190,24 @@ describe("fileSteps", () => {
     ]);
   });
 
+  it("reads a flow item's id on a later line, and only its own keys", () => {
+    const src = [
+      "steps:",
+      "  - {",
+      "      image: y,",
+      "      id: b, invoke: 'lib:acme::x' }",
+      "  - { image: x, with: { id: inner } }",
+      '  - { id: "c, d", with: { id: inner, n: "}" }, # a comment',
+      "      invoke: lib:z }",
+      "  - id: e",
+    ].join("\n");
+    expect(fileSteps(fileLines(src))).toEqual([
+      { id: "b", line: 3, start: 1, end: 3, invokeLine: 3, invoke: "lib:acme::x" },
+      { id: "c, d", line: 5, start: 5, end: 6, invokeLine: 6, invoke: "lib:z" },
+      { id: "e", line: 7, start: 7, end: 7, invokeLine: null, invoke: null },
+    ]);
+  });
+
   it("gives nothing without a block steps: list", () => {
     expect(fileSteps(fileLines("steps: [{ id: a }]\n"))).toEqual([]);
     expect(fileSteps(fileLines("name: x\n"))).toEqual([]);
@@ -173,6 +250,29 @@ describe("stepRoot and stepMark", () => {
         { id: "t[a=2]", status: "running" },
       ]),
     ).toEqual({ kind: "running", words: "1 of 2 legs running", open: "t[a=2]" });
+  });
+
+  it("reads a step that did not run on a finished Run as not run", () => {
+    const legs = [
+      { id: "t[a=1]", status: "succeeded" },
+      { id: "t[a=2]", status: "pending" },
+    ];
+    expect(stepMark("t", legs, true)).toEqual({
+      kind: "running",
+      words: "1 of 2 legs passed, the rest not run yet",
+      open: "t[a=1]",
+    });
+    expect(stepMark("t", legs, false)).toEqual({
+      kind: "notrun",
+      words: "1 of 2 legs passed, the rest not run",
+      open: "t[a=1]",
+    });
+    // A leg left `running` on a finished Run did not finish.
+    expect(stepMark("t", [legs[0]!, { id: "t[a=2]", status: "running" }], false).kind).toBe("notrun");
+    expect(stepMark("deploy", steps, false)).toEqual({ kind: "notrun", words: "not run", open: "deploy" });
+    expect(markWords("pending", true)).toBe("not run yet");
+    expect(markWords("not_run", true)).toBe("not run");
+    expect(markWords("failed", false)).toBe("failed");
   });
 
   it("names the steps no line maps to, and the first failure in file order", () => {

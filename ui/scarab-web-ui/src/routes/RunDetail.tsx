@@ -1736,8 +1736,9 @@ export default function RunDetail() {
                   const t = triggerInfo();
                   return t ? headBranch(t) : null;
                 })()}
-                ref={triggerInfo()?.ref ?? null}
+                gitRef={triggerInfo()?.ref ?? null}
                 repoUrl={repoUrl() ?? null}
+                live={!isTerminal(r().status) && !timeTraveling()}
                 onOpenStep={(sid) => {
                   selectNode(sid);
                   setRunTab("pipeline");
