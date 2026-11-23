@@ -3054,6 +3054,12 @@ async fn a_stalled_try_cannot_finish_a_replaced_run() {
 #[tokio::test(start_paused = true)]
 async fn a_replaced_runs_queued_status_is_dropped() {
     let (t, _first, _release, old_b, new_b) = replaced_b().await;
+    // The old Run's `failure` post is queued: the case rests on it.
+    let queued = t.db.claim_outbox("probe", None, 100, 0).await.unwrap();
+    assert!(
+        queued.iter().any(|m| m.run == old_b),
+        "the old Run's post was never queued: {queued:?}"
+    );
     t.forge.set_failing_status(true);
     let _ = t.statuses_on("abc123").await;
     t.forge.set_failing_status(false);
@@ -3208,4 +3214,178 @@ async fn a_refusal_that_could_not_be_written_keeps_the_delivery_open() {
         .map(|s| s.context)
         .collect();
     assert_eq!(failures, ["scarab/checks"]);
+}
+
+/// R1: P0 is held before it creates `c`; P1 arrives and leaves `c`
+/// undecided; P0 then creates its `c` Run, after P1 arrived. P1 is still the
+/// newest delivery of `main`, so its redelivery creates `c`. Red on
+/// b3ff7c06, which read P0's late Run as a newer head. Kills: a head rule
+/// that reads Runs.
+#[tokio::test(start_paused = true)]
+async fn a_late_run_of_an_older_delivery_does_not_stop_the_newer_one() {
+    let c = on_push("gamma");
+    let t = Redelivery::new(&[(".scarab/c.yaml", &c)]).await;
+    let app = t.replica();
+    let (entered, release) = hold_next(&t.db, "begin_run_creation");
+    let p0 = tokio::spawn(
+        app.clone()
+            .oneshot(push_of("p0", "refs/heads/main", "aaa000")),
+    );
+    entered.await.unwrap();
+
+    t.later();
+    t.forge
+        .set_read_error_for(".scarab/c.yaml", Some("502 bad gateway"));
+    let (status, _) = send(&app, push_of("p1", "refs/heads/main", "aaa111")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    t.forge.set_read_error_for(".scarab/c.yaml", None);
+    release.send(()).unwrap();
+    assert_eq!(p0.await.unwrap().unwrap().status(), StatusCode::ACCEPTED);
+
+    t.later();
+    let (status, body) = send(&app, push_of("p1", "refs/heads/main", "aaa111")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    t.run_of("p1", ".scarab/c.yaml").await;
+}
+
+/// R1: P0 and P1 both leave `c` undecided. The redelivery of P0, the older,
+/// records `not_head`. Red on b3ff7c06, which needed an outcome or a Run of
+/// P1. Kills: a newer delivery that decided nothing not counting.
+#[tokio::test(start_paused = true)]
+async fn a_newer_delivery_that_decided_nothing_stops_the_older_one() {
+    let c = on_push("gamma");
+    let t = Redelivery::new(&[(".scarab/c.yaml", &c)]).await;
+    let app = t.replica();
+    t.forge
+        .set_read_error_for(".scarab/c.yaml", Some("502 bad gateway"));
+    let (status, _) = send(&app, push_of("p0", "refs/heads/main", "aaa000")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    t.later();
+    let (status, _) = send(&app, push_of("p1", "refs/heads/main", "aaa111")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    t.forge.set_read_error_for(".scarab/c.yaml", None);
+
+    t.later();
+    let (status, body) = send(&app, push_of("p0", "refs/heads/main", "aaa000")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let o = &t.outcomes("p0").await[0];
+    assert_eq!(o.reason_kind.as_deref(), Some("not_head"), "{o:?}");
+    assert!(t.db.active_runs().await.unwrap().is_empty());
+}
+
+/// R1: a Run of an older commit on `main` created after P1 arrived, with no
+/// delivery (a dispatch, a follow-up), does not stop P1's redelivery.
+/// Kills: a head rule that reads Runs.
+#[tokio::test(start_paused = true)]
+async fn a_run_with_no_delivery_does_not_stop_a_redelivery() {
+    let c = on_push("gamma");
+    let t = Redelivery::new(&[(".scarab/c.yaml", &c)]).await;
+    let app = t.replica();
+    t.forge
+        .set_read_error_for(".scarab/c.yaml", Some("502 bad gateway"));
+    let (status, _) = send(&app, push_of("p1", "refs/heads/main", "aaa111")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    t.forge.set_read_error_for(".scarab/c.yaml", None);
+
+    t.later();
+    let run = RunId("dispatched".into());
+    t.db.create_run(&run, 1, 1, scarab_engine::Timestamp(t.clock.millis()))
+        .await
+        .unwrap();
+    t.db.set_run_tenant(&run, "acme", "app").await.unwrap();
+    t.db.set_run_pipeline(&run, "gamma").await.unwrap();
+    t.db.set_run_origin(
+        &run,
+        "manual",
+        None,
+        Some("refs/heads/main"),
+        Some("aaa000"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    t.later();
+    let (status, body) = send(&app, push_of("p1", "refs/heads/main", "aaa111")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    t.run_of("p1", ".scarab/c.yaml").await;
+}
+
+/// R2: the try stops before it finishes its Run; past the bound the sweep
+/// ends that Run `Failed`; the try goes on. The Pipeline is undecided and
+/// the answer 502, so the redelivery replaces the Run. Red on b3ff7c06,
+/// which listed it as earlier and finished the delivery. Kills: a try that
+/// counts its own ended Run as decided.
+#[tokio::test(start_paused = true)]
+async fn a_try_whose_run_the_sweep_ended_leaves_it_undecided() {
+    let a = on_push("alpha");
+    let t = Redelivery::new(&[(".scarab/a.yaml", &a)]).await;
+    let app = t.replica();
+    let (entered, release) = hold_next(&t.db, "finish_run_creation");
+    let first = tokio::spawn(app.clone().oneshot(push_request("d1")));
+    entered.await.unwrap();
+    let old = t.run_of("d1", ".scarab/a.yaml").await;
+    t.clock
+        .advance(scarab_engine::UNFINISHED_CREATION_BOUND_MS + 1);
+    scarab_engine::fail_run_creation(
+        t.db.as_ref(),
+        &old,
+        "the server stopped while creating this Run".into(),
+        scarab_engine::Timestamp(t.clock.millis()),
+    )
+    .await
+    .unwrap();
+    release.send(()).unwrap();
+    let resp = first.await.unwrap().unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let body = json_of(resp).await;
+    assert_eq!(listed(&body, "undecided"), [".scarab/a.yaml"], "{body}");
+
+    let (status, body) = send(&app, push_request("d1")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let new = t.run_of("d1", ".scarab/a.yaml").await;
+    assert_eq!(t.db.replaced_by(&old), Some(new));
+}
+
+/// R3 (a): a `/deploy` comment on pull request #7 whose head cannot be read
+/// runs, pinned with no head. Kills: a failed head read failing the
+/// delivery for good (every redelivery repeats it).
+#[tokio::test(start_paused = true)]
+async fn a_pr_comment_whose_head_cannot_be_read_runs() {
+    let t = Redelivery::new(&[(".scarab/deploy.yaml", DEPLOY_COMMENT_YAML)]).await;
+    let app = t.replica();
+    t.forge.fail_pull_request_head(true);
+    let (status, body) = send(&app, comment_of("c1", 7, "/deploy", true)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    t.run_of("c1", ".scarab/deploy.yaml").await;
+    let (_, _, pins) =
+        t.db.delivery_row(scarab_forge::ForgeKind::GitHub, "c1")
+            .unwrap();
+    let pins = pins.expect("the comment's commit is pinned");
+    assert_eq!((pins.head_scope, pins.head_sha), (None, None));
+}
+
+/// R3 (b): a tag delivery whose commit cannot be resolved reads `.scarab/`
+/// at the tag, as 0.7.1 did, runs, and pins nothing. Kills: a failed lookup
+/// answered 502 on every redelivery.
+#[tokio::test(start_paused = true)]
+async fn a_tag_whose_commit_cannot_be_resolved_runs_at_the_tag() {
+    const ON_TAG: &str = r#"
+name: release
+on:
+  tag: {}
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+"#;
+    let t = Redelivery::new(&[(".scarab/release.yaml", ON_TAG)]).await;
+    let app = t.replica();
+    t.forge.fail_latest_commit_for("refs/tags/v1", true);
+    let (status, body) = send(&app, push_of("t1", "refs/tags/v1", "aaa111")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    t.run_of("t1", ".scarab/release.yaml").await;
+    let (_, _, pins) =
+        t.db.delivery_row(scarab_forge::ForgeKind::GitHub, "t1")
+            .unwrap();
+    assert_eq!(pins, None, "nothing pinned when the lookup failed");
 }
