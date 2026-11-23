@@ -45,6 +45,7 @@ type PluginConnectionDto = components["schemas"]["PluginConnectionDto"];
 type BrokerJournalEntryDto = components["schemas"]["BrokerJournalEntryDto"];
 type ScheduleDto = components["schemas"]["ScheduleDto"];
 type RefusedRunDto = components["schemas"]["RefusedRunDto"];
+type RunManifestDto = components["schemas"]["RunManifestDto"];
 
 const now = Date.now();
 const ago = (ms: number) => now - ms;
@@ -348,6 +349,73 @@ const repoRuns: Record<string, ReturnType<typeof strip>> = {
 // A gentler pass mix so the shown percentages land ~64/64/50/93 like the
 // original: recompute deterministically by fixed strings above (close enough).
 
+// ── run manifests (`GET /v1/runs/{id}/manifest`) ───────────────────────────
+// The Pipeline file each run was created from, as recorded at creation. The
+// matrix run invokes the clone library; the retries run predates recording,
+// and any other run answers the same way.
+const runManifests: Record<string, RunManifestDto> = {
+  [RUN_ID]: {
+    recorded: true,
+    path: ".scarab/ci.yaml",
+    sha: "3f9a1c2d9e8b7a6c5d4e3f2a1b0c9d8e4f5a6b7c",
+    source: `name: ci
+on:
+  push: { branches: [main] }
+  pull_request: {}
+steps:
+  - id: clone
+    image: alpine/git:2.45.2
+    command: [git, clone, --depth=1, "\${{ event.clone_url }}", /workspace/src]
+  - id: build
+    image: rust:1.97
+    needs: [clone]
+    command: [cargo, build, --release, --locked]
+  - id: test
+    image: rust:1.97
+    needs: [build]
+    command: [cargo, nextest, run, --workspace]
+`,
+    invoked: [],
+  },
+  [MATRIX_RUN_ID]: {
+    recorded: true,
+    path: ".scarab/tofu-plan.yaml",
+    sha: "15f2297b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f",
+    source: `name: tofu-plan
+on:
+  pull_request: { branches: [develop] }
+steps:
+  - id: checkout
+    invoke: lib:thulasi-ram::scarab-ci::clone
+    with: { depth: "1" }
+  - id: plan
+    image: ghcr.io/opentofu/opentofu:1.8.3
+    needs: [checkout]
+    matrix:
+      cluster: [superhero-tools-common, treebo-production, treebo-staging]
+      phase: [aws-cluster, aws-post-cluster]
+    retry: { attempts: 2 }
+    command:
+      - sh
+      - -c
+      - |
+        cd live/\${{ matrix.cluster }}/\${{ matrix.phase }}
+        tofu init -input=false
+        tofu plan -input=false -out=/scarab/artifacts/plan.bin
+`,
+    invoked: [
+      {
+        kind: "library",
+        name: "thulasi-ram::scarab-ci::clone",
+        source: "github.com/thulasi-ram/scarab-ci//libs/clone.yaml@ac8c661a4e0f3b2d9c7a5e1f0b6d4c2a8e9f7b13",
+        content_hash: "9d4b1e7c3a2f8e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e2d",
+        steps: ["checkout/git"],
+      },
+    ],
+  },
+  [RETRIES_RUN_ID]: { recorded: false, invoked: [] },
+};
+
 // ── run detail ──────────────────────────────────────────────────────────────
 const runStatus: RunStatusDto = {
   id: RUN_ID,
@@ -548,7 +616,8 @@ const richEventsBody = [
 const wireStatus = (s: string): string => s.replace(/(^|_)([a-z])/g, (_m, _u, c: string) => c.toUpperCase());
 
 // ── the MATRIX run (summary line, matrix labels, retries) ───────────────────
-// checkout `git`, then `plan` over cluster × phase. treebo-production ×
+// checkout `checkout/git` (the clone library's Step), then `plan` over
+// cluster × phase. treebo-production ×
 // aws-cluster failed twice (the engine retried it), and its second try waited
 // about a minute for a node first; treebo-production × aws-post-cluster
 // failed once. The other four cells passed and published a plan each.
@@ -562,7 +631,7 @@ const MX_CELLS: [string, string, "ok" | "fail" | "fail2"][] = [
 ];
 const mxId = (cluster: string, phase: string) => `plan[cluster=${cluster},phase=${phase}]`;
 const MX_T0 = 12 * min; // the run started 12 minutes ago
-const MX_PLAN_AT = MX_T0 - 61_000; // the plan cells start when git finishes
+const MX_PLAN_AT = MX_T0 - 61_000; // the plan cells start when checkout/git finishes
 const matrixRunStatus: RunStatusDto = {
   id: MATRIX_RUN_ID,
   status: "failed",
@@ -574,10 +643,18 @@ const matrixRunStatus: RunStatusDto = {
   snapshot_retention: { retention_days: 14, expired: false, pinned: false },
   steps: [
     {
-      id: "git",
+      id: "checkout/git",
       status: "succeeded",
       attempts: 1,
       needs: [],
+      origin: [
+        {
+          kind: "library",
+          name: "thulasi-ram::scarab-ci::clone",
+          source: "github.com/thulasi-ram/scarab-ci//libs/clone.yaml@ac8c661a4e0f3b2d9c7a5e1f0b6d4c2a8e9f7b13",
+          content_hash: "9d4b1e7c3a2f8e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e2d",
+        },
+      ],
       attempt_list: [
         { id: "a1", started_at: ago(MX_T0), finished_at: ago(MX_PLAN_AT), failed: false, outcome: "succeeded" },
       ],
@@ -624,7 +701,7 @@ const matrixRunStatus: RunStatusDto = {
         id: mxId(cluster, phase),
         status: how === "ok" ? "succeeded" : "failed",
         attempts: attempt_list.length,
-        needs: ["git"],
+        needs: ["checkout/git"],
         attempt_list,
       };
     }),
@@ -647,9 +724,9 @@ const matrixEventsBody = (() => {
         },
       },
     }),
-    mxv(ago(MX_T0), { AttemptStarted: { step: "git", attempt: "a1" } }),
-    mxv(ago(MX_PLAN_AT), { AttemptFinished: { step: "git", attempt: "a1" } }),
-    mxv(ago(MX_PLAN_AT - 500), { StepTransitioned: { step: "git", from: "Running", to: "Succeeded" } }),
+    mxv(ago(MX_T0), { AttemptStarted: { step: "checkout/git", attempt: "a1" } }),
+    mxv(ago(MX_PLAN_AT), { AttemptFinished: { step: "checkout/git", attempt: "a1" } }),
+    mxv(ago(MX_PLAN_AT - 500), { StepTransitioned: { step: "checkout/git", from: "Running", to: "Succeeded" } }),
   ];
   const timed: [number, string][] = [];
   for (const s of matrixRunStatus.steps.slice(1)) {
@@ -2889,6 +2966,9 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   }
 
   // run-scoped
+  if ((m = p.match(/^\/v1\/runs\/([^/]+)\/manifest$/))) {
+    return json(runManifests[m[1]!] ?? { recorded: false, invoked: [] });
+  }
   if (p === `/v1/runs/${RUN_ID}`) return json(withStepKeys(runStatus));
   if (p === `/v1/runs/${RUN_ID}/events`)
     return new Response(eventsBody, {
