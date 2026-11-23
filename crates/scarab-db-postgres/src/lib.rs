@@ -1383,6 +1383,16 @@ impl Db for PostgresDb {
             .collect())
     }
 
+    async fn set_run_superseded_by(&self, run: &RunId, by: &RunId) -> Result<(), DbError> {
+        sqlx::query("UPDATE runs SET superseded_by = $2 WHERE id = $1 AND superseded_by IS NULL")
+            .bind(&run.0)
+            .bind(&by.0)
+            .execute(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn set_run_scheduling(
         &self,
         run: &RunId,
@@ -2042,14 +2052,11 @@ impl Db for PostgresDb {
     }
 
     async fn list_runs(&self, limit: u32) -> Result<Vec<RunSummary>, DbError> {
-        let rows = sqlx::query(
-            "SELECT id, status, created_at, updated_at, tenant_org, tenant_project, run_number,
-                    origin_trigger_kind, origin_actor, origin_ref, origin_sha, origin_pr_number,
-                    origin_pr_base, pipeline, trigger_title, deploy_environment, is_deploy_run
-             FROM runs
+        let rows = sqlx::query(&run_summaries_sql(
+            "SELECT * FROM runs
              ORDER BY created_at DESC, id DESC
              LIMIT $1",
-        )
+        ))
         .bind(limit as i64)
         .fetch_all(self.pool())
         .await
@@ -2059,15 +2066,12 @@ impl Db for PostgresDb {
 
     async fn list_runs_for_org(&self, org: &str, limit: u32) -> Result<Vec<RunSummary>, DbError> {
         // `runs_tenant_idx` leads with `tenant_org`.
-        let rows = sqlx::query(
-            "SELECT id, status, created_at, updated_at, tenant_org, tenant_project, run_number,
-                    origin_trigger_kind, origin_actor, origin_ref, origin_sha, origin_pr_number,
-                    origin_pr_base, pipeline, trigger_title, deploy_environment, is_deploy_run
-             FROM runs
+        let rows = sqlx::query(&run_summaries_sql(
+            "SELECT * FROM runs
              WHERE tenant_org = $1
              ORDER BY created_at DESC, id DESC
              LIMIT $2",
-        )
+        ))
         .bind(org)
         .bind(limit as i64)
         .fetch_all(self.pool())
@@ -2085,17 +2089,14 @@ impl Db for PostgresDb {
     ) -> Result<Vec<RunSummary>, DbError> {
         // A NULL parameter disengages its filter. Both apply in the WHERE,
         // before the LIMIT, so a filtered page is the newest matches.
-        let rows = sqlx::query(
-            "SELECT id, status, created_at, updated_at, tenant_org, tenant_project, run_number,
-                    origin_trigger_kind, origin_actor, origin_ref, origin_sha, origin_pr_number,
-                    origin_pr_base, pipeline, trigger_title, deploy_environment, is_deploy_run
-             FROM runs
+        let rows = sqlx::query(&run_summaries_sql(
+            "SELECT * FROM runs
              WHERE tenant_org = $1 AND tenant_project = $2
                AND ($3::text IS NULL OR deploy_environment = $3)
                AND ($4::boolean IS NULL OR is_deploy_run = $4)
              ORDER BY created_at DESC, id DESC
              LIMIT $5",
-        )
+        ))
         .bind(org)
         .bind(project)
         .bind(filter.environment.as_deref())
@@ -4830,6 +4831,47 @@ fn run_status_str(s: RunStatus) -> &'static str {
 /// Map a `runs` row (as selected by the two `list_runs*` queries) into a
 /// [`RunSummary`], including the tenancy and origin projections. Shared so the
 /// column set stays in lock-step between the global and per-tenant lists.
+/// The runs list query over `page`, a `SELECT * FROM runs ... LIMIT` that
+/// picks the page: each row of it with what the list shows beside the run's
+/// own columns, read in the same statement for the page's rows only.
+///
+/// - `replaced_by_run`: for a `cancelled` run the newer Run that cancelled
+///   it ([`Db::set_run_superseded_by`]), else the Run a redelivery created
+///   in its place (`replaced_by`, ADR-0083 §4).
+/// - `failed_step`, `failed_steps`: for a `failed` or `dead_lettered` run,
+///   its `failed` steps, the first by the time its row last changed (its
+///   move to `failed`), then by id.
+/// - `environment_approval_gates`: for a `suspended` run an Environment
+///   governs, the `manual` gates of its stored IR not marked `false`
+///   (as `StepSpec::counts_as_environment_approval_gate` counts them).
+fn run_summaries_sql(page: &str) -> String {
+    format!(
+        "WITH page AS ({page})
+         SELECT r.id, r.status, r.created_at, r.updated_at, r.tenant_org, r.tenant_project,
+                r.run_number, r.origin_trigger_kind, r.origin_actor, r.origin_ref, r.origin_sha,
+                r.origin_pr_number, r.origin_pr_base, r.pipeline, r.trigger_title,
+                r.deploy_environment, r.is_deploy_run,
+                COALESCE(CASE WHEN r.status = 'cancelled' THEN r.superseded_by END,
+                         r.replaced_by) AS replaced_by_run,
+                f.failed_step, f.failed_steps,
+                CASE WHEN r.status = 'suspended' AND r.deploy_environment IS NOT NULL
+                          AND jsonb_typeof(r.ir->'steps') = 'array'
+                     THEN ARRAY(SELECT s->>'id' FROM jsonb_array_elements(r.ir->'steps') s
+                                WHERE s->>'gate' = 'manual'
+                                  AND s->'environment_approval_gate' IS DISTINCT FROM 'false'::jsonb)
+                END AS environment_approval_gates
+         FROM page r
+         LEFT JOIN LATERAL (
+             SELECT (array_agg(s.step_id ORDER BY s.updated_at, s.step_id))[1] AS failed_step,
+                    count(*) AS failed_steps
+             FROM step_runs s
+             WHERE r.status IN ('failed', 'dead_lettered')
+               AND s.run_id = r.id AND s.status = 'failed'
+         ) f ON true
+         ORDER BY r.created_at DESC, r.id DESC"
+    )
+}
+
 fn run_summary_from_row(r: sqlx::postgres::PgRow) -> Result<RunSummary, DbError> {
     let tenant = match (
         r.get::<Option<String>, _>("tenant_org"),
@@ -4855,6 +4897,18 @@ fn run_summary_from_row(r: sqlx::postgres::PgRow) -> Result<RunSummary, DbError>
         trigger_title: r.get::<Option<String>, _>("trigger_title"),
         environment: r.get::<Option<String>, _>("deploy_environment"),
         deploy: r.get::<bool, _>("is_deploy_run"),
+        replaced_by: r.get::<Option<String>, _>("replaced_by_run").map(RunId),
+        failed_step: r.get::<Option<String>, _>("failed_step").map(StepId),
+        failed_steps: r
+            .get::<i64, _>("failed_steps")
+            .try_into()
+            .unwrap_or(u32::MAX),
+        environment_approval_gates: r
+            .get::<Option<Vec<String>>, _>("environment_approval_gates")
+            .unwrap_or_default()
+            .into_iter()
+            .map(StepId)
+            .collect(),
     })
 }
 

@@ -729,6 +729,13 @@ pub trait Db: Send + Sync {
     /// per run).
     async fn superseded_by(&self, run: &RunId) -> Result<Vec<RunId>, DbError>;
 
+    /// Record that `by` took `run`'s place: the scheduler cancels `run`
+    /// because `by` started (newest-wins, or a `cancel-in-progress` group).
+    /// Written before the cancel, so a crash between the two leaves the mark
+    /// for the next pass to cancel under; the runs list shows it only once
+    /// `run` is `Cancelled`. Keeps the first mark.
+    async fn set_run_superseded_by(&self, run: &RunId, by: &RunId) -> Result<(), DbError>;
+
     /// Set a run's `project` (for per-project fairness) and admission `priority`
     /// (higher admits first) — ADR-0011, 0032.
     async fn set_run_scheduling(

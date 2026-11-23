@@ -5745,6 +5745,18 @@ export interface components {
              *     deploy run, whose pipeline declared `environment:`.
              */
             environment?: string | null;
+            /**
+             * @description For a `failed` or `dead_lettered` Run, the id of the step that failed
+             *     first. Absent for any other status, and for a dead-lettered Run that
+             *     failed no step (the engine gave up on the Run, not on a step).
+             */
+            failed_step?: string | null;
+            /**
+             * Format: int32
+             * @description For a `failed` or `dead_lettered` Run, how many of its steps failed,
+             *     `failed_step` included. Absent when `failed_step` is.
+             */
+            failed_steps_count?: number | null;
             /** @description The symbolic branch/tag ref the run ran on. */
             git_ref?: string | null;
             id: string;
@@ -5768,6 +5780,15 @@ export interface components {
             pr_number?: number | null;
             /** @description The owning project (repo name), if tenanted. */
             project?: string | null;
+            /**
+             * @description The Run that took this one's place. For a `cancelled` Run, the newer
+             *     Run whose start cancelled it: a newer Run of the same pipeline on the
+             *     same ref or pull request, or a newer Run in a `cancel-in-progress`
+             *     concurrency group. Otherwise the Run a webhook redelivery created in
+             *     place of this one, whose creation never finished. Absent for a Run a
+             *     person cancelled, and for Runs cancelled before this was recorded.
+             */
+            replaced_by?: string | null;
             /**
              * Format: int64
              * @description The **run number** — the per-repo sequential `#N`,
@@ -5793,6 +5814,7 @@ export interface components {
              *     trigger carried no headline and on runs created before headline-stamping.
              */
             trigger_title?: string | null;
+            waiting_for?: null | components["schemas"]["WaitingForDto"];
             /**
              * @description The run's **waiting gates** (git-bug `c489346`): gate steps that are
              *     `Pending`, reached (every need `Succeeded`) and have an open Attempt —
@@ -6420,6 +6442,17 @@ export interface components {
              *     again here.
              */
             source: string;
+        };
+        /** @description The gate a suspended Run is held at ([`RunSummaryDto::waiting_for`]). */
+        WaitingForDto: {
+            /**
+             * @description `manual` (an approval anyone with write access gives),
+             *     `environment_approval` (a `manual` gate the Environment's approvers
+             *     release), `timer`, `external` or `plugin`.
+             */
+            kind: string;
+            /** @description The gate step's id. */
+            step: string;
         };
         /** @description One waiting gate of a run in the list view ([`RunSummaryDto::waiting_gates`]). */
         WaitingGateDto: {

@@ -2796,7 +2796,10 @@ impl<'a> Scheduler<'a> {
             // Newest-wins (ADR-0011, 0032): this run auto-cancels older in-flight
             // runs sharing its supersede key. Deploy runs carry no key and so
             // never supersede or get superseded.
+            // Each is marked replaced by this run first, so the runs list can
+            // tell it from a run a person cancelled.
             for older in self.db.superseded_by(run).await? {
+                self.db.set_run_superseded_by(&older, run).await?;
                 self.cancel_run(&older).await?;
             }
             // Backpressure + fairness (ADR-0011, 0032): hold the run Pending if
@@ -2816,6 +2819,7 @@ impl<'a> Scheduler<'a> {
             if let Some((group, policy)) = self.db.run_concurrency(run).await? {
                 if let Some(holder) = self.db.acquire_slot(leader, &group, run).await? {
                     if policy == ConcurrencyPolicy::CancelInProgress {
+                        self.db.set_run_superseded_by(&holder, run).await?;
                         self.cancel_run(&holder).await?;
                     }
                     return Ok(()); // slot busy — wait for it to free

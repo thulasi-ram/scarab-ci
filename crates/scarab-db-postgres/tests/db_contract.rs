@@ -2762,3 +2762,134 @@ async fn run_pipeline_source_round_trips(db: &dyn Db) {
 }
 
 contract_test!(run_manifest_source, run_pipeline_source_round_trips);
+
+/// What a runs-list row says beside the run's own columns: the first of a
+/// failed run's failed steps and how many failed, a suspended governed
+/// run's Environment approval gates from its IR, and the newer Run that
+/// cancelled a run (shown only once it is cancelled; the first mark kept).
+async fn run_summaries_carry_the_list_facts(db: &dyn Db) {
+    let tenant = |run: &RunId| {
+        let run = run.clone();
+        async move {
+            db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+            db.set_run_tenant(&run, "acme", "web").await.unwrap();
+        }
+    };
+    let walk = |run: &RunId, step: &str, to: StepStatus, started: i64| {
+        let (run, step) = (run.clone(), StepId(step.into()));
+        async move {
+            db.create_step_run(&run, &step, None, &[], Timestamp(0))
+                .await
+                .unwrap();
+            db.record_attempt(&run, &step, &attempt(&format!("{}-a1", step.0), started))
+                .await
+                .unwrap();
+            for (from, next) in [
+                (StepStatus::Pending, StepStatus::Ready),
+                (StepStatus::Ready, StepStatus::Running),
+                (StepStatus::Running, to),
+            ] {
+                db.record_step_transition(&run, &step, from, next)
+                    .await
+                    .unwrap();
+            }
+        }
+    };
+
+    // `build` fails before `test`; `lint` passes.
+    let failed = RunId("r-failed".into());
+    tenant(&failed).await;
+    walk(&failed, "build", StepStatus::Failed, 10).await;
+    walk(&failed, "test", StepStatus::Failed, 20).await;
+    walk(&failed, "lint", StepStatus::Succeeded, 30).await;
+    db.record_transition(&failed, RunStatus::Pending, RunStatus::Running)
+        .await
+        .unwrap();
+    db.record_transition(&failed, RunStatus::Running, RunStatus::Failed)
+        .await
+        .unwrap();
+
+    // Held at its gates, in a Run the `production` Environment governs.
+    let held = RunId("r-held".into());
+    tenant(&held).await;
+    db.store_run_ir(
+        &held,
+        &serde_json::json!({ "ir_version": 1, "steps": [
+            { "id": "build", "image": "busybox" },
+            { "id": "qa", "gate": "manual", "environment_approval_gate": false },
+            { "id": "environment-approval", "gate": "manual", "environment_approval_gate": true },
+            { "id": "legacy", "gate": "manual" },
+            { "id": "soak", "gate": "timer" },
+        ]}),
+    )
+    .await
+    .unwrap();
+    db.set_run_deploy_context(
+        &held,
+        &scarab_engine::DeployContext {
+            org: "acme".into(),
+            project: "web".into(),
+            environment: "production".into(),
+            git_ref: "refs/heads/main".into(),
+            locked_out: false,
+        },
+    )
+    .await
+    .unwrap();
+    db.record_transition(&held, RunStatus::Pending, RunStatus::Running)
+        .await
+        .unwrap();
+    db.record_transition(&held, RunStatus::Running, RunStatus::Suspended)
+        .await
+        .unwrap();
+
+    // `older` was cancelled for `newer`; `finished` was marked and then
+    // finished before the cancel reached it.
+    let (older, newer, other, finished) = (
+        RunId("r-older".into()),
+        RunId("r-newer".into()),
+        RunId("r-other".into()),
+        RunId("r-finished".into()),
+    );
+    for run in [&older, &newer, &finished] {
+        tenant(run).await;
+        db.record_transition(run, RunStatus::Pending, RunStatus::Running)
+            .await
+            .unwrap();
+    }
+    db.set_run_superseded_by(&older, &newer).await.unwrap();
+    db.set_run_superseded_by(&older, &other).await.unwrap();
+    db.record_transition(&older, RunStatus::Running, RunStatus::Cancelled)
+        .await
+        .unwrap();
+    db.set_run_superseded_by(&finished, &newer).await.unwrap();
+    db.record_transition(&finished, RunStatus::Running, RunStatus::Succeeded)
+        .await
+        .unwrap();
+
+    let rows = db
+        .list_runs_for_tenant("acme", "web", &Default::default(), 10)
+        .await
+        .unwrap();
+    let row = |run: &RunId| rows.iter().find(|r| &r.run == run).unwrap().clone();
+    let ids = |steps: &[StepId]| steps.iter().map(|s| s.0.clone()).collect::<Vec<_>>();
+
+    let f = row(&failed);
+    assert_eq!(f.failed_step, Some(StepId("build".into())));
+    assert_eq!(f.failed_steps, 2);
+    assert!(f.environment_approval_gates.is_empty());
+
+    let h = row(&held);
+    assert_eq!(h.failed_step, None);
+    assert_eq!(h.failed_steps, 0);
+    assert_eq!(
+        ids(&h.environment_approval_gates),
+        vec!["environment-approval", "legacy"]
+    );
+
+    assert_eq!(row(&older).replaced_by, Some(newer.clone()));
+    assert_eq!(row(&finished).replaced_by, None);
+    assert_eq!(row(&newer).replaced_by, None);
+}
+
+contract_test!(run_list_facts, run_summaries_carry_the_list_facts);

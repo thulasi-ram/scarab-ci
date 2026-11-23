@@ -15094,6 +15094,22 @@
             ],
             "description": "The Environment this run deploys into — present only for a\ndeploy run, whose pipeline declared `environment:`."
           },
+          "failed_step": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For a `failed` or `dead_lettered` Run, the id of the step that failed\nfirst. Absent for any other status, and for a dead-lettered Run that\nfailed no step (the engine gave up on the Run, not on a step)."
+          },
+          "failed_steps_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "For a `failed` or `dead_lettered` Run, how many of its steps failed,\n`failed_step` included. Absent when `failed_step` is.",
+            "minimum": 0
+          },
           "git_ref": {
             "type": [
               "string",
@@ -15140,6 +15156,13 @@
             ],
             "description": "The owning project (repo name), if tenanted."
           },
+          "replaced_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Run that took this one's place. For a `cancelled` Run, the newer\nRun whose start cancelled it: a newer Run of the same pipeline on the\nsame ref or pull request, or a newer Run in a `cancel-in-progress`\nconcurrency group. Otherwise the Run a webhook redelivery created in\nplace of this one, whose creation never finished. Absent for a Run a\nperson cancelled, and for Runs cancelled before this was recorded."
+          },
           "run_number": {
             "type": [
               "integer",
@@ -15171,6 +15194,17 @@
               "null"
             ],
             "description": "The run **Headline** — the one human line saying what this run\nis about (a push's commit subject; later a PR title / dispatch reason),\ndisambiguated by the trigger kind. Display/audit only; absent when the\ntrigger carried no headline and on runs created before headline-stamping."
+          },
+          "waiting_for": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WaitingForDto",
+                "description": "For a `suspended` Run, the gate it is held at: of its waiting gates,\nthe one whose wait opened first. A Run is suspended only on gates, so\nthis is absent only for a Run that is not suspended."
+              }
+            ]
           },
           "waiting_gates": {
             "type": "array",
@@ -16336,6 +16370,24 @@
           }
         },
         "additionalProperties": false
+      },
+      "WaitingForDto": {
+        "type": "object",
+        "description": "The gate a suspended Run is held at ([`RunSummaryDto::waiting_for`]).",
+        "required": [
+          "step",
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "`manual` (an approval anyone with write access gives),\n`environment_approval` (a `manual` gate the Environment's approvers\nrelease), `timer`, `external` or `plugin`."
+          },
+          "step": {
+            "type": "string",
+            "description": "The gate step's id."
+          }
+        }
       },
       "WaitingGateDto": {
         "type": "object",

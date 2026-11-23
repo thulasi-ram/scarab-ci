@@ -1411,6 +1411,39 @@ pub struct RunSummaryDto {
     /// terminal or queued Run).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waiting_gates: Vec<WaitingGateDto>,
+    /// The Run that took this one's place. For a `cancelled` Run, the newer
+    /// Run whose start cancelled it: a newer Run of the same pipeline on the
+    /// same ref or pull request, or a newer Run in a `cancel-in-progress`
+    /// concurrency group. Otherwise the Run a webhook redelivery created in
+    /// place of this one, whose creation never finished. Absent for a Run a
+    /// person cancelled, and for Runs cancelled before this was recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced_by: Option<String>,
+    /// For a `failed` or `dead_lettered` Run, the id of the step that failed
+    /// first. Absent for any other status, and for a dead-lettered Run that
+    /// failed no step (the engine gave up on the Run, not on a step).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_step: Option<String>,
+    /// For a `failed` or `dead_lettered` Run, how many of its steps failed,
+    /// `failed_step` included. Absent when `failed_step` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_steps_count: Option<u32>,
+    /// For a `suspended` Run, the gate it is held at: of its waiting gates,
+    /// the one whose wait opened first. A Run is suspended only on gates, so
+    /// this is absent only for a Run that is not suspended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<WaitingForDto>,
+}
+
+/// The gate a suspended Run is held at ([`RunSummaryDto::waiting_for`]).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WaitingForDto {
+    /// The gate step's id.
+    pub step: String,
+    /// `manual` (an approval anyone with write access gives),
+    /// `environment_approval` (a `manual` gate the Environment's approvers
+    /// release), `timer`, `external` or `plugin`.
+    pub kind: String,
 }
 
 /// One waiting gate of a run in the list view ([`RunSummaryDto::waiting_gates`]).
@@ -1448,7 +1481,9 @@ async fn run_summaries(
     let mut out = Vec::with_capacity(runs.len());
     for r in runs {
         let active = matches!(r.status, RunStatus::Running | RunStatus::Suspended);
+        let suspended = r.status == RunStatus::Suspended;
         let run = r.run.clone();
+        let approval_gates = r.environment_approval_gates.clone();
         let mut dto = RunSummaryDto::from(r);
         if active {
             let steps = steps_by_run.remove(&run).unwrap_or_default();
@@ -1463,6 +1498,20 @@ async fn run_summaries(
                     })
                 })
                 .collect();
+        }
+        if suspended {
+            dto.waiting_for = dto
+                .waiting_gates
+                .iter()
+                .min_by(|a, b| a.since.cmp(&b.since).then_with(|| a.step.cmp(&b.step)))
+                .map(|g| WaitingForDto {
+                    step: g.step.clone(),
+                    kind: if g.kind == "manual" && approval_gates.iter().any(|s| s.0 == g.step) {
+                        "environment_approval".to_string()
+                    } else {
+                        g.kind.clone()
+                    },
+                });
         }
         out.push(dto);
     }
@@ -1493,6 +1542,10 @@ impl From<scarab_engine::RunSummary> for RunSummaryDto {
             deploy: s.deploy,
             environment: s.environment,
             waiting_gates: Vec::new(),
+            replaced_by: s.replaced_by.map(|r| r.0),
+            failed_steps_count: s.failed_step.as_ref().map(|_| s.failed_steps),
+            failed_step: s.failed_step.map(|f| f.0),
+            waiting_for: None,
         }
     }
 }
@@ -17033,6 +17086,7 @@ impl utoipa::Modify for StepUpResponses {
         run_origin::RenderedSpecDto,
         run_origin::StepOriginDto,
         run_origin::InvokedDto,
+        WaitingForDto,
         run_origin::RunManifestDto,
         libraries::TrustedSourceDto,
         libraries::TrustGrantDto,

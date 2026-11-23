@@ -205,6 +205,25 @@ pub struct RunSummary {
     /// IR. Independent of `environment`.
     #[serde(default)]
     pub deploy: bool,
+    /// The Run that took this one's place: for a `Cancelled` run, the newer
+    /// Run whose start cancelled it (newest-wins on the same repo, ref and
+    /// pipeline, or a `cancel-in-progress` concurrency group); otherwise the
+    /// Run a webhook redelivery created in place of this one, whose creation
+    /// never finished (ADR-0083 §4). `None` for a run a person cancelled.
+    #[serde(default)]
+    pub replaced_by: Option<RunId>,
+    /// For a `Failed` or `DeadLettered` run, the Failed step that failed
+    /// first, and how many steps failed. `None` for any other status, and for
+    /// a dead-lettered run that failed no step.
+    #[serde(default)]
+    pub failed_step: Option<StepId>,
+    #[serde(default)]
+    pub failed_steps: u32,
+    /// For a `Suspended` run that an Environment governs, its `manual` gates
+    /// that are Environment approval gates (ADR-0078 §1), from the stored IR.
+    /// Empty for any other run.
+    #[serde(default)]
+    pub environment_approval_gates: Vec<StepId>,
 }
 
 /// Filters for a Project's runs list (`GET /v1/repos/{org}/{repo}/runs`),

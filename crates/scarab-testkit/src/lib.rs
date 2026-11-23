@@ -288,6 +288,36 @@ struct AttemptEvidenceRec {
 /// (`updated_at == created_at`).
 fn fake_run_summary(st: &InMemoryState, run: &RunId, status: RunStatus) -> RunSummary {
     let created = st.run_created.get(run).copied().unwrap_or(Timestamp(0));
+    // The fake keeps no step `updated_at`: a failed step's last Attempt start
+    // stands in for the time it failed.
+    let mut failed: Vec<(Timestamp, StepId)> =
+        if matches!(status, RunStatus::Failed | RunStatus::DeadLettered) {
+            st.steps
+                .iter()
+                .filter(|((r, _), rec)| r == run && rec.status == Some(StepStatus::Failed))
+                .map(|((_, step), rec)| {
+                    let at = rec.attempts.last().map_or(Timestamp(0), |a| a.started_at);
+                    (at, step.clone())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+    failed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1 .0.cmp(&b.1 .0)));
+    let environment_approval_gates: Vec<StepId> =
+        match (status, st.run_deploy.contains_key(run), st.run_ir.get(run)) {
+            (RunStatus::Suspended, true, Some(ir)) => ir["steps"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|s| {
+                    s["gate"] == "manual"
+                        && s["environment_approval_gate"] != serde_json::Value::Bool(false)
+                })
+                .filter_map(|s| s["id"].as_str().map(|id| StepId(id.to_string())))
+                .collect(),
+            _ => Vec::new(),
+        };
     let origin = st.run_origin.get(run);
     RunSummary {
         run: run.clone(),
@@ -306,6 +336,14 @@ fn fake_run_summary(st: &InMemoryState, run: &RunId, status: RunStatus) -> RunSu
         trigger_title: st.run_trigger_title.get(run).cloned(),
         environment: st.run_deploy.get(run).map(|d| d.environment.clone()),
         deploy: st.deploy_runs.contains_key(run),
+        replaced_by: (status == RunStatus::Cancelled)
+            .then(|| st.run_superseded_by.get(run))
+            .flatten()
+            .or_else(|| st.run_replaced_by.get(run))
+            .cloned(),
+        failed_step: failed.first().map(|(_, step)| step.clone()),
+        failed_steps: failed.len() as u32,
+        environment_approval_gates,
     }
 }
 
@@ -390,6 +428,8 @@ struct InMemoryState {
     snapshot_pins: HashMap<RunId, (Option<String>, Timestamp)>,
     /// Per-run supersede key `(repo, ref, pipeline)`.
     supersede_keys: HashMap<RunId, String>,
+    /// Per-run superseding Run (mirrors `runs.superseded_by`).
+    run_superseded_by: HashMap<RunId, RunId>,
     /// Per-run project (fairness) and admission priority.
     run_project: HashMap<RunId, String>,
     run_priority: HashMap<RunId, i32>,
@@ -1704,6 +1744,16 @@ impl Db for InMemoryDb {
             .unwrap()
             .supersede_keys
             .insert(run.clone(), key.to_string());
+        Ok(())
+    }
+
+    async fn set_run_superseded_by(&self, run: &RunId, by: &RunId) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .run_superseded_by
+            .entry(run.clone())
+            .or_insert_with(|| by.clone());
         Ok(())
     }
 
