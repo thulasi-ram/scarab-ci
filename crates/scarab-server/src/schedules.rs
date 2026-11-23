@@ -321,6 +321,10 @@ pub async fn dispatch_cron(
             &event,
             &ir,
             pipeline,
+            crate::PipelineRead {
+                yaml: &yaml,
+                sha: Some(sha),
+            },
             &excluded,
             Some(&params),
             None,

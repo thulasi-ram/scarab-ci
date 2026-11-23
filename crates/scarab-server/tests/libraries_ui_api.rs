@@ -560,3 +560,50 @@ async fn an_installation_is_read_by_its_id_in_its_own_org_only() {
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn a_triggered_runs_manifest_is_the_file_read_at_creation_and_its_libraries() {
+    let h = harness(CI_YAML).await;
+    let run = push_run(&h).await.runs[0].clone();
+    let (st, m) = call(&h.app, "GET", &format!("/v1/runs/{}/manifest", run.0), None).await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    assert_eq!(m["recorded"], true, "{m}");
+    assert_eq!(m["path"], ".scarab/ci.yaml");
+    assert_eq!(m["sha"], SHA);
+    assert_eq!(m["source"], CI_YAML);
+    assert_eq!(
+        m["invoked"],
+        json!([{
+            "kind": "library",
+            "name": "acme/deploy",
+            "source": source(),
+            "content_hash": content_hash(DEPLOY),
+            "steps": ["ship/helm"],
+        }])
+    );
+
+    let (st, _) = call(&h.app, "GET", "/v1/runs/nope/manifest", None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn an_inline_runs_manifest_is_not_recorded() {
+    let h = harness(CI_YAML).await;
+    let (st, created) = call(
+        &h.app,
+        "POST",
+        "/v1/runs",
+        Some(json!({
+            "pipeline": {
+                "ir_version": 1,
+                "steps": [{ "id": "build", "image": "busybox:latest", "command": ["true"] }]
+            }
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap();
+    let (st, m) = call(&h.app, "GET", &format!("/v1/runs/{id}/manifest"), None).await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    assert_eq!(m, json!({ "recorded": false, "invoked": [] }));
+}

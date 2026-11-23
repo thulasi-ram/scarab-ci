@@ -7858,6 +7858,49 @@
         ]
       }
     },
+    "/v1/runs/{id}/manifest": {
+      "get": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "The Pipeline file a Run was created from",
+        "operationId": "get_run_manifest",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunManifestDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such run"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/runs/{id}/policy-decisions": {
       "get": {
         "tags": [
@@ -11798,6 +11841,44 @@
           }
         }
       },
+      "InvokedDto": {
+        "type": "object",
+        "description": "One library or plugin gate a Run's Steps were inlined from.",
+        "required": [
+          "kind",
+          "name",
+          "content_hash",
+          "steps"
+        ],
+        "properties": {
+          "content_hash": {
+            "type": "string",
+            "description": "SHA-256 of the library source (or of the plugin's approved manifest)."
+          },
+          "kind": {
+            "type": "string",
+            "description": "`file`, `library` or `plugin`."
+          },
+          "name": {
+            "type": "string",
+            "description": "A repo-relative path (`file`), the library name (`library`) or the\nplugin installation and gate (`plugin`)."
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where an installed library comes from, at its commit."
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The Steps of the Run inlined through it, directly or through another\nlibrary, in the Run's order."
+          }
+        }
+      },
       "LibraryInstallationDto": {
         "type": "object",
         "required": [
@@ -14852,6 +14933,48 @@
             "items": {
               "$ref": "#/components/schemas/RunSummaryDto"
             }
+          }
+        }
+      },
+      "RunManifestDto": {
+        "type": "object",
+        "description": "`GET /v1/runs/{id}/manifest`.",
+        "required": [
+          "recorded",
+          "invoked"
+        ],
+        "properties": {
+          "invoked": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InvokedDto"
+            },
+            "description": "The libraries and plugin gates the Run's Steps were inlined from,\nonce each, in the order the Run first uses them. Read from the stored\nIR, so it is filled for an unrecorded Run too."
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The repo-relative path of the Pipeline file (`.scarab/ci.yaml`)."
+          },
+          "recorded": {
+            "type": "boolean",
+            "description": "Whether the Pipeline file was recorded when the Run was created.\n`false` for an inline Run and for a Run created before the file was\nrecorded; `path`, `sha` and `source` are then absent."
+          },
+          "sha": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The commit the file was read at; absent when it was read at a\nsymbolic ref no commit was resolved for."
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The file as read from the forge."
           }
         }
       },

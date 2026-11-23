@@ -2235,6 +2235,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/runs/{id}/manifest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The Pipeline file a Run was created from */
+        get: operations["get_run_manifest"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/runs/{id}/policy-decisions": {
         parameters: {
             query?: never;
@@ -4050,6 +4067,25 @@ export interface components {
             /** @description Pinned to `resolved_commit`. */
             source: string;
         };
+        /** @description One library or plugin gate a Run's Steps were inlined from. */
+        InvokedDto: {
+            /** @description SHA-256 of the library source (or of the plugin's approved manifest). */
+            content_hash: string;
+            /** @description `file`, `library` or `plugin`. */
+            kind: string;
+            /**
+             * @description A repo-relative path (`file`), the library name (`library`) or the
+             *     plugin installation and gate (`plugin`).
+             */
+            name: string;
+            /** @description Where an installed library comes from, at its commit. */
+            source?: string | null;
+            /**
+             * @description The Steps of the Run inlined through it, directly or through another
+             *     library, in the Run's order.
+             */
+            steps: string[];
+        };
         LibraryInstallationDto: {
             content_hash: string;
             /**
@@ -5608,6 +5644,30 @@ export interface components {
         /** @description `GET /v1/runs` body: the most recent runs, newest first. */
         RunListResponse: {
             runs: components["schemas"]["RunSummaryDto"][];
+        };
+        /** @description `GET /v1/runs/{id}/manifest`. */
+        RunManifestDto: {
+            /**
+             * @description The libraries and plugin gates the Run's Steps were inlined from,
+             *     once each, in the order the Run first uses them. Read from the stored
+             *     IR, so it is filled for an unrecorded Run too.
+             */
+            invoked: components["schemas"]["InvokedDto"][];
+            /** @description The repo-relative path of the Pipeline file (`.scarab/ci.yaml`). */
+            path?: string | null;
+            /**
+             * @description Whether the Pipeline file was recorded when the Run was created.
+             *     `false` for an inline Run and for a Run created before the file was
+             *     recorded; `path`, `sha` and `source` are then absent.
+             */
+            recorded: boolean;
+            /**
+             * @description The commit the file was read at; absent when it was read at a
+             *     symbolic ref no commit was resolved for.
+             */
+            sha?: string | null;
+            /** @description The file as read from the forge. */
+            source?: string | null;
         };
         RunStatusResponse: {
             environment?: null | components["schemas"]["RunEnvironmentDto"];
@@ -12272,6 +12332,35 @@ export interface operations {
         responses: {
             /** @description SSE stream of step log output (`data` events), with `event: marker` for each note the server stored with the log (data `{"kind","reason"?,"text"}`, an id like a data event's) */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_run_manifest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunManifestDto"];
+                };
+            };
+            /** @description no such run */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
