@@ -36,6 +36,9 @@
 #      that is not auto, true or false.
 #   6. The server's startupProbe (/livez, 30 minutes by default), so a long
 #      migration before the server listens is not killed by liveness.
+#   7. retention.webhookDeliveryDays reaches the ConfigMap, 30 by default,
+#      and 0 renders as "0" (not dropped for the default), so the server's
+#      start check refuses it.
 #
 # Run by `just check all`. Usage: scripts/chart_render_check.sh [chart-dir]
 # (needs helm, yq v4).
@@ -240,4 +243,14 @@ $probe"
 budget=$(yq '.periodSeconds * .failureThreshold' <<<"$probe")
 [ "$budget" -ge 1800 ] || fail "the server's startupProbe allows ${budget}s, want at least 1800s"
 
-echo "chart_render_check: SCARAB_UI_URL, the provider secrets, the step namespace, the placement config, the step Pod admission policy and the server's startupProbe render as expected"
+# 7. The webhook delivery retention: the default, and 0 kept as set.
+delivery_days() {
+  yq 'select(.kind == "ConfigMap" and .metadata.name == "t-scarab") | .data.SCARAB_RETENTION_WEBHOOK_DELIVERY_DAYS' \
+    <<<"$(helm template t "$chart" "$@")"
+}
+got=$(delivery_days)
+[ "$got" = "30" ] || fail "SCARAB_RETENTION_WEBHOOK_DELIVERY_DAYS is '$got' by default, want 30"
+got=$(delivery_days --set retention.webhookDeliveryDays=0)
+[ "$got" = "0" ] || fail "retention.webhookDeliveryDays=0 renders '$got', want 0 (the server refuses it)"
+
+echo "chart_render_check: SCARAB_UI_URL, the provider secrets, the step namespace, the placement config, the step Pod admission policy, the server's startupProbe and the webhook delivery retention render as expected"
