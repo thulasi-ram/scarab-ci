@@ -5576,8 +5576,14 @@ async fn revisit(
             // finishing it first: read it again.
             tracing::debug!(run = %run.0, error = %e, "ending an unfinished Run before its replacement");
             let again = db.run_creation_state(run).await?;
-            if again.is_none_or(|s| !s.creating || s.replaced_by.is_some()) {
-                return Ok(Revisit::Decided);
+            match again {
+                None => return Ok(Revisit::Decided),
+                Some(s) if !s.creating || s.replaced_by.is_some() => return Ok(Revisit::Decided),
+                // Not ended: the store would refuse the replacement, and the
+                // Run would stay unfinished under a finished delivery. Left
+                // for a later try, as one still being written is.
+                Some(s) if s.status == RunStatus::Pending => return Ok(Revisit::Busy),
+                Some(_) => {}
             }
         }
     }
@@ -9524,10 +9530,13 @@ async fn end_delivery_try(st: &AppState, try_: Option<&DeliveryTryState>, finish
 /// this try reads `.scarab/` at the symbolic ref, as 0.7.1 did, nothing is
 /// pinned, and the next try resolves again. A pull request whose head cannot
 /// be read is pinned with no head: the comment then runs on a later try as a
-/// comment not on a pull request does.
+/// comment not on a pull request does. A comment on a pull request that a
+/// later try (`first` false) pins gets no head either: the pull request's
+/// head then is not the one the comment arrived at.
 async fn resolve_delivery_pins(
     forge: &dyn scarab_forge::ForgePort,
     event: &scarab_forge::Event,
+    first: bool,
 ) -> Option<scarab_forge::DeliveryPins> {
     use scarab_forge::Event;
     let repo = event.repo()?;
@@ -9567,7 +9576,7 @@ async fn resolve_delivery_pins(
             ..
         } => {
             let config_sha = resolve(config_ref(event)).await?;
-            if !*pull_request {
+            if !*pull_request || !first {
                 return Some(unpinned(config_sha));
             }
             match forge_read_retried(|| forge.pull_request_head(repo, *issue)).await {
@@ -9713,7 +9722,7 @@ async fn ingest_event(
     {
         let pins = match &t.pins {
             Some(pins) => Some(pins.clone()),
-            None => match resolve_delivery_pins(forge.as_ref(), &event).await {
+            None => match resolve_delivery_pins(forge.as_ref(), &event, t.first).await {
                 Some(resolved) => match connections.pin_delivery(t.forge, &t.id, &resolved).await {
                     Ok(pins) => Some(pins),
                     Err(e) => return (Err(ApiError::Db(DbError::Other(e.to_string()))), false),

@@ -365,7 +365,10 @@ creates nothing.
   `head_scope` and that commit as `head_sha`. A later try applies the rule against that pull
   request: a delivery of it (its own events or another comment on it) that arrived later at
   another commit means the head moved. If the head cannot be read, the comment is pinned with
-  no head and runs on a later try as a comment not on a pull request does.
+  no head and runs on a later try as a comment not on a pull request does. Only the first try
+  reads the head: a comment its first try left unpinned (its `HEAD` could not be resolved, or
+  the try stopped first) is pinned by a later try with no head, for good, because the pull
+  request's head by then need not be the one the comment arrived at.
 - **Clocks.** The delivery row's `at` and its lease are written with the store's clock:
   Postgres `now()` (the database's), and in the in-memory test store a clock the tests set.
   Both sides of the comparison are `at` values, so there is one clock.

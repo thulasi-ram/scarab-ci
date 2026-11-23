@@ -3389,3 +3389,86 @@ steps:
             .unwrap();
     assert_eq!(pins, None, "nothing pinned when the lookup failed");
 }
+
+/// R4 gap: past the bound, ending the old Run fails (a store error, not a
+/// lost compare-and-set) and it is still `Pending`. The store would refuse
+/// to replace it, so the try leaves it for later (409) and the delivery
+/// stays open. Kills: a `Replace` that the store refuses, filed as decided,
+/// which finishes the delivery with an unfinished Run.
+#[tokio::test(start_paused = true)]
+async fn a_run_that_could_not_be_ended_is_left_for_a_later_try() {
+    let a = on_push("alpha");
+    let t = Redelivery::new(&[(".scarab/a.yaml", &a)]).await;
+    let (entered, _stalled) = hold_next(&t.db, "finish_run_creation");
+    let _first = tokio::spawn(t.replica().oneshot(push_request("d1")));
+    entered.await.unwrap();
+    let old = t.run_of("d1", ".scarab/a.yaml").await;
+
+    t.clock
+        .advance(scarab_engine::UNFINISHED_CREATION_BOUND_MS + 1);
+    t.db.expire_delivery_try(scarab_forge::ForgeKind::GitHub, "d1");
+    t.db.fail_next_event_append(|p| {
+        matches!(p, scarab_engine::EventPayload::RunCreationFailed { .. })
+    });
+    let resp = t.replica().oneshot(push_request("d1")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        t.db.run_status(&old).await.unwrap(),
+        Some(scarab_engine::RunStatus::Pending)
+    );
+    assert_eq!(t.run_of("d1", ".scarab/a.yaml").await, old);
+    assert_eq!(t.db.replaced_by(&old), None);
+    let (unfinished, _, _) =
+        t.db.delivery_row(scarab_forge::ForgeKind::GitHub, "d1")
+            .unwrap();
+    assert!(
+        unfinished,
+        "the delivery was finished with an unfinished Run"
+    );
+}
+
+/// R3, the weaker case: a `/deploy` comment on pull request #7 whose first
+/// try could not resolve `HEAD` pins nothing. The pull request then moves
+/// twice; the later try pins the comment with no head, so the head it reads
+/// now (`bbb333`) is not taken for the comment's, and the comment runs.
+/// Kills: a later try that pins the pull request's head as it is then, and
+/// refuses the comment against the delivery at `bbb222`.
+#[tokio::test(start_paused = true)]
+async fn a_pr_comment_pinned_by_a_later_try_gets_no_head() {
+    let pr = on_pull_request("checks");
+    let t = Redelivery::new(&[
+        (".scarab/deploy.yaml", DEPLOY_COMMENT_YAML),
+        (".scarab/pr.yaml", &pr),
+    ])
+    .await;
+    let app = t.replica();
+    t.forge.set_pr_head(7, "bbb111");
+    t.forge.fail_latest_commit_for("HEAD", true);
+    t.forge
+        .set_read_error_for(".scarab/deploy.yaml", Some("502 bad gateway"));
+    let (status, _) = send(&app, comment_of("c1", 7, "/deploy", true)).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let (_, _, pins) =
+        t.db.delivery_row(scarab_forge::ForgeKind::GitHub, "c1")
+            .unwrap();
+    assert_eq!(pins, None, "nothing pinned when HEAD could not be resolved");
+    t.forge.set_read_error_for(".scarab/deploy.yaml", None);
+    t.forge.fail_latest_commit_for("HEAD", false);
+
+    for (delivery, head) in [("pr2", "bbb222"), ("pr3", "bbb333")] {
+        t.later();
+        t.forge.set_pr_head(7, head);
+        let (status, _) = send(&app, pull_request_of(delivery, 7, head)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    t.later();
+    let (status, body) = send(&app, comment_of("c1", 7, "/deploy", true)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    t.run_of("c1", ".scarab/deploy.yaml").await;
+    let (_, _, pins) =
+        t.db.delivery_row(scarab_forge::ForgeKind::GitHub, "c1")
+            .unwrap();
+    let pins = pins.expect("the later try pins the commit");
+    assert_eq!((pins.head_scope, pins.head_sha), (None, None));
+}
