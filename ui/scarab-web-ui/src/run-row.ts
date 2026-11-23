@@ -1,6 +1,8 @@
 // One row of the Runs list, as words: the status mark, the headline, line 2
-// (the trigger, where the Run came from), the status phrase, the order and day
-// groups of the list, and the Runs that arrive while it is read. Pure, so the list and its tests agree without a DOM.
+// (the trigger, where the Run came from, a deploy Run's Environment), the
+// status word and line 3's detail, the order and day groups of the list, and
+// the Runs that arrive while it is read. Pure, so the list and its tests agree
+// without a DOM.
 import type { components } from "./api/schema";
 import { statusWord, stepDisplayName } from "./run-page";
 
@@ -51,6 +53,8 @@ export type Origin = {
   /** The ref as the server records it (`refs/heads/main`, `refs/pull/7/head`). */
   ref?: string | null;
   pr?: number | null;
+  /** A pull request's head branch, from a server that sends it. */
+  head?: string | null;
   /** A pull request's base branch. */
   base?: string | null;
   /** A cron Run's title: the expression that fired. */
@@ -71,12 +75,19 @@ export type PhrasePart =
  *  recorded, whose words span the first two columns. */
 export type KindCell = { word: string; token: PhrasePart | null; muted: boolean };
 
-/** Line 2 in two parts: the trigger (a fixed column) and where the Run came
- *  from (which gives way first). `push` + `main`; `PR #213` + `→ main` (a
- *  pull_request Run records `refs/pull/<n>/head`, so the head branch shows
- *  only when the ref names one); `tag v0.7.2` + nothing; `manual` + `on
- *  feat/x`; `schedule` + `0 2 * * * on main`. */
-export function kindFirst(o: Origin): { kind: KindCell; where: PhrasePart[] } {
+/** Line 2's first two parts: the trigger (a fixed column) and where the Run
+ *  came from (which gives way first). `push` + `main`; `PR #213` +
+ *  `feat/x → main`; `tag v0.7.2` + nothing; `manual` + `on feat/x`;
+ *  `schedule` + `0 2 * * * on main`. A pull_request Run records
+ *  `refs/pull/<n>/head`, so its head branch comes from `head`; without it the
+ *  phrase is `→ main`, and `tight` is set: it follows the trigger with no
+ *  column gap. */
+export function kindFirst(o: Origin): { kind: KindCell; where: PhrasePart[]; tight: boolean } {
+  const line = kindAndWhere(o);
+  return { ...line, tight: line.where[0]?.t === "arrow" };
+}
+
+function kindAndWhere(o: Origin): { kind: KindCell; where: PhrasePart[] } {
   const ref = o.ref ?? null;
   const branch = ref && !ref.startsWith("refs/pull/") ? shortRef(ref) : null;
   const on: PhrasePart[] = branch ? [{ t: "text", text: "on " }, { t: "mono", text: branch }] : [];
@@ -90,7 +101,8 @@ export function kindFirst(o: Origin): { kind: KindCell; where: PhrasePart[] } {
       return { kind: cell("push"), where: branch ? [{ t: "mono", text: branch }] : [] };
     case "pull_request": {
       const n = o.pr ?? pullNumber(ref);
-      const where: PhrasePart[] = branch ? [{ t: "mono", text: branch }] : [];
+      const head = o.head || branch;
+      const where: PhrasePart[] = head ? [{ t: "mono", text: head }] : [];
       if (o.base) where.push({ t: "arrow" }, { t: "mono", text: o.base });
       return { kind: cell("PR", n != null ? { t: "pr", n } : null), where };
     }
@@ -147,7 +159,33 @@ export function phraseText(parts: PhrasePart[]): string {
     .join("");
 }
 
-// ── The status phrase ──────────────────────────────────────────────────────
+/** A deploy Run's mark at the end of line 2: the Environment it deploys into
+ *  (cut at 18 characters), or `deploy` when it names none. `null` for a Run
+ *  that does not deploy. */
+export type DeployTag = { text: string; title: string };
+
+export function deployTag(deploy: boolean | null | undefined, environment: string | null | undefined): DeployTag | null {
+  if (!deploy) return null;
+  if (!environment) return { text: "deploy", title: "deploy run" };
+  return { text: cutName(environment, 18), title: `deploy run into ${environment}` };
+}
+
+/** Line 2 as the parts it shows, in their order on screen: the trigger,
+ *  where the Run came from, the short hash, the author, and a deploy Run's
+ *  Environment last. Empty parts are left out. */
+export function lineTwoParts(l: {
+  kind: KindCell;
+  where: PhrasePart[];
+  sha?: string | null;
+  author: { text: string };
+  deploy: DeployTag | null;
+}): string[] {
+  const parts = [kindText(l.kind), phraseText(l.where), l.sha ? l.sha.slice(0, 7) : "—", l.author.text];
+  if (l.deploy) parts.push(l.deploy.text);
+  return parts.filter((p) => p !== "");
+}
+
+// ── The status word and line 3 ──────────────────────────────────────────────────────
 
 /** The runs list fields the status phrase reads. Each is optional, so an
  *  older server's rows read as plain status words. */
@@ -171,37 +209,39 @@ export function waitingWord(kind: string): string {
   return kind.replace(/_/g, " ");
 }
 
-/** The right column's status phrase. `lead` is set in Label and `step` (a
- *  step name) in Mono after it; `tone` is the status whose colour it takes. */
-export type StatusPhrase = { lead: string; step: string | null; tone: string };
-
-/** How a Run was replaced, for its status phrase: `number` is the replacing
- *  Run's `#N` when that Run is on the page, else `null`. */
+/** How a Run was replaced: `number` is the replacing Run's `#N` when that
+ *  Run is on the page, else `null`. */
 export type Replaced = { number: number | null };
 
-/** A Run's status in words: `Failed at test · macos +1`, `Waiting for
- *  approval`, `Replaced by #130`, else the plain status word. */
-export function statusPhrase(
-  r: { status: string } & RunRowFields,
-  replaced: Replaced | null,
-): StatusPhrase {
+/** Line 3: what the status word leaves out, with its icon and ink. */
+export type StatusDetail = { text: string; icon: string; tone: "failed" | "waiting" | "replaced" };
+
+/** The right column's one word (`tone` is the status whose ink it takes),
+ *  and line 3's detail when there is one. */
+export type RowStatusView = { word: string; tone: string; detail: StatusDetail | null };
+
+/** A row's status: `Failed` over the time with `failed at test · macos +1`
+ *  on line 3; `Waiting` with `waiting for approval`; `Replaced` with
+ *  `replaced by #130, a newer push`; else the plain word and no line 3. An
+ *  older server's row, without the runs list fields, reads its word. */
+export function rowStatus(r: { status: string } & RunRowFields, replaced: Replaced | null): RowStatusView {
   if (replaced) {
-    return { lead: replaced.number != null ? `Replaced by #${replaced.number}` : "Replaced", step: null, tone: "cancelled" };
+    const by = replaced.number != null ? `#${replaced.number}, a newer push` : "a newer push";
+    return { word: "Replaced", tone: "cancelled", detail: { text: `replaced by ${by}`, icon: "minus", tone: "replaced" } };
+  }
+  if (r.status === "suspended") {
+    const detail: StatusDetail | null = r.waiting_for
+      ? { text: `waiting for ${waitingWord(r.waiting_for.kind)}`, icon: "pause", tone: "waiting" }
+      : null;
+    return { word: "Waiting", tone: r.status, detail };
   }
   const word = statusWord(r.status);
   if ((r.status === "failed" || r.status === "dead_lettered") && r.failed_step) {
     const more = (r.failed_steps_count ?? 1) - 1;
-    return { lead: `${word} at`, step: stepDisplayName(r.failed_step) + (more > 0 ? ` +${more}` : ""), tone: r.status };
+    const text = `failed at ${stepDisplayName(r.failed_step)}${more > 0 ? ` +${more}` : ""}`;
+    return { word, tone: r.status, detail: { text, icon: "x", tone: "failed" } };
   }
-  if (r.status === "suspended" && r.waiting_for) {
-    return { lead: `Waiting for ${waitingWord(r.waiting_for.kind)}`, step: null, tone: r.status };
-  }
-  return { lead: word, step: null, tone: r.status };
-}
-
-/** The phrase as one line of text, for a `title` and the tests. */
-export function statusText(p: StatusPhrase): string {
-  return p.step ? `${p.lead} ${p.step}` : p.lead;
+  return { word, tone: r.status, detail: null };
 }
 
 // ── Replaced Runs ──────────────────────────────────────────────────────────

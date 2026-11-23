@@ -10,9 +10,10 @@ import {
   pullNumber,
   runHeadline,
   statusGlyph,
-  statusPhrase,
-  statusText,
+  rowStatus,
   arrivedLabel,
+  deployTag,
+  lineTwoParts,
   kindFirst,
   kindText,
   splitArrived,
@@ -28,13 +29,20 @@ describe("line 2, kind first", () => {
     expect(line({ kind: "push", ref: "refs/heads/main" })).toEqual(["push", "main"]);
   });
 
-  it("a pull request recorded as refs/pull/N/head reads PR #N → base", () => {
-    expect(line({ kind: "pull_request", ref: "refs/pull/212/head", pr: 212, base: "main" })).toEqual(["PR #212", "→ main"]);
+  it("a pull request reads head → base when the server sends the head branch", () => {
+    const o = { kind: "pull_request", ref: "refs/pull/213/head", pr: 213, head: "feat/org-page", base: "main" };
+    expect(line(o)).toEqual(["PR #213", "feat/org-page → main"]);
+    expect(kindFirst(o).tight).toBe(false);
     expect(kindFirst({ kind: "pull_request", pr: 212 }).kind.token).toEqual({ t: "pr", n: 212 });
   });
 
-  it("a pull request whose ref names its head branch shows it", () => {
+  it("without the head branch, → base follows the trigger with no column gap", () => {
+    const o = { kind: "pull_request", ref: "refs/pull/212/head", pr: 212, base: "main" };
+    expect(line(o)).toEqual(["PR #212", "→ main"]);
+    expect(kindFirst(o).tight).toBe(true);
+    // A ref that names a branch stands in for the head.
     expect(line({ kind: "pull_request", ref: "refs/heads/feat/x", pr: 212, base: "main" })).toEqual(["PR #212", "feat/x → main"]);
+    expect(kindFirst({ kind: "push", ref: "refs/heads/main" }).tight).toBe(false);
   });
 
   it("a refused pull request takes its number from the ref", () => {
@@ -55,6 +63,39 @@ describe("line 2, kind first", () => {
 
   it("a Run with no trigger says so, muted", () => {
     expect(kindFirst({}).kind).toEqual({ word: "no trigger recorded", token: null, muted: true });
+  });
+});
+
+describe("line 2's parts", () => {
+  const parts = (o: Parameters<typeof kindFirst>[0], sha: string | null, actor: string | null, deploy: boolean, env: string | null) =>
+    lineTwoParts({ ...kindFirst(o), sha, author: authorSlot(o.kind, actor), deploy: deployTag(deploy, env) });
+
+  it("a deploy Run's Environment comes last, after the author", () => {
+    expect(parts({ kind: "push", ref: "refs/heads/main" }, "3f9c2ab9e0", "a.kim", true, "production")).toEqual([
+      "push",
+      "main",
+      "3f9c2ab",
+      "a.kim",
+      "production",
+    ]);
+  });
+
+  it("a deploy Run with no Environment reads deploy; other Runs have no tag", () => {
+    expect(parts({ kind: "tag", ref: "refs/tags/v0.7.2" }, "3f9c2ab", "a.kim", true, null)).toEqual(["tag v0.7.2", "3f9c2ab", "a.kim", "deploy"]);
+    expect(parts({ kind: "cron", ref: "refs/heads/main", title: "0 2 * * *" }, null, null, false, "production")).toEqual([
+      "schedule",
+      "0 2 * * * on main",
+      "—",
+      "schedule",
+    ]);
+  });
+
+  it("an Environment is cut at 18 characters; the title names it whole", () => {
+    expect(deployTag(true, "preview-org-page-repo-enable")).toEqual({
+      text: "preview-org-page-…",
+      title: "deploy run into preview-org-page-repo-enable",
+    });
+    expect(deployTag(true, null)).toEqual({ text: "deploy", title: "deploy run" });
   });
 });
 
@@ -107,34 +148,42 @@ describe("statusGlyph", () => {
   });
 });
 
-describe("statusPhrase", () => {
-  const text = (...a: Parameters<typeof statusPhrase>) => statusText(statusPhrase(...a));
-
-  it("a failed Run names its first failed step, and how many more failed", () => {
-    const p = statusPhrase({ status: "failed", failed_step: "test[os=macos]", failed_steps_count: 2 }, null);
-    expect(p).toEqual({ lead: "Failed at", step: "test · macos +1", tone: "failed" });
-    expect(text({ status: "failed", failed_step: "migrate", failed_steps_count: 1 }, null)).toBe("Failed at migrate");
-  });
-
-  it("a suspended Run says what it waits for", () => {
-    expect(text({ status: "suspended", waiting_for: { step: "approve", kind: "environment_approval" } }, null)).toBe(
-      "Waiting for approval",
-    );
-    expect(text({ status: "suspended", waiting_for: { step: "soak", kind: "timer" } }, null)).toBe("Waiting for a timer");
-  });
-
-  it("an older server's row, without the new fields, reads its status word", () => {
-    expect(text({ status: "failed" }, null)).toBe("Failed");
-    expect(text({ status: "suspended" }, null)).toBe("Suspended");
-  });
-
-  it("a replaced Run names its replacer when it is on the page", () => {
-    expect(statusPhrase({ status: "cancelled" }, { number: 130 })).toEqual({
-      lead: "Replaced by #130",
-      step: null,
-      tone: "cancelled",
+describe("rowStatus", () => {
+  it("a failed Run is one word; line 3 names its first failed step and how many more failed", () => {
+    expect(rowStatus({ status: "failed", failed_step: "test[os=macos]", failed_steps_count: 2 }, null)).toEqual({
+      word: "Failed",
+      tone: "failed",
+      detail: { text: "failed at test · macos +1", icon: "x", tone: "failed" },
     });
-    expect(text({ status: "cancelled" }, { number: null })).toBe("Replaced");
+    expect(rowStatus({ status: "dead_lettered", failed_step: "migrate", failed_steps_count: 1 }, null)).toEqual({
+      word: "Dead lettered",
+      tone: "dead_lettered",
+      detail: { text: "failed at migrate", icon: "x", tone: "failed" },
+    });
+  });
+
+  it("a suspended Run reads Waiting; line 3 says what it waits for", () => {
+    const approval = rowStatus({ status: "suspended", waiting_for: { step: "approve", kind: "environment_approval" } }, null);
+    expect(approval).toEqual({ word: "Waiting", tone: "suspended", detail: { text: "waiting for approval", icon: "pause", tone: "waiting" } });
+    expect(rowStatus({ status: "suspended", waiting_for: { step: "soak", kind: "timer" } }, null).detail?.text).toBe("waiting for a timer");
+  });
+
+  it("a replaced Run reads Replaced; line 3 names its replacer when it is on the page", () => {
+    expect(rowStatus({ status: "cancelled" }, { number: 130 })).toEqual({
+      word: "Replaced",
+      tone: "cancelled",
+      detail: { text: "replaced by #130, a newer push", icon: "minus", tone: "replaced" },
+    });
+    expect(rowStatus({ status: "cancelled" }, { number: null }).detail?.text).toBe("replaced by a newer push");
+  });
+
+  it("other Runs, and an older server's rows without the new fields, have no line 3", () => {
+    expect(rowStatus({ status: "failed" }, null)).toEqual({ word: "Failed", tone: "failed", detail: null });
+    expect(rowStatus({ status: "suspended" }, null)).toEqual({ word: "Waiting", tone: "suspended", detail: null });
+    expect(rowStatus({ status: "running" }, null).word).toBe("Running");
+    expect(rowStatus({ status: "pending" }, null).word).toBe("Pending");
+    expect(rowStatus({ status: "cancelled" }, null).word).toBe("Cancelled");
+    expect(rowStatus({ status: "succeeded" }, null)).toEqual({ word: "Passed", tone: "succeeded", detail: null });
   });
 });
 
