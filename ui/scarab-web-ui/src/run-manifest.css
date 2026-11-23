@@ -1,0 +1,122 @@
+/* The Run page's Manifest tab (components/RunManifest.tsx): the Pipeline file
+   with each top-level step's result in a gutter left of the line numbers.
+   Reads the page tokens only, so it follows the theme and the palette, and
+   sets fonts through the four text styles (src/styles.test.ts checks this
+   file too). */
+
+.mf {
+  /* Syntax colours, from the status and accent tokens so the Mono palette
+     re-points them too. */
+  --mf-key: var(--ok-ink);
+  --mf-punct: var(--muted-sage);
+  --mf-comment: var(--muted-sage);
+  --mf-string: var(--copper);
+  --mf-expr: color-mix(in srgb, var(--run) 62%, var(--soft-white));
+  --mf-ref: var(--running);
+  --mf-gutter: 26px;
+  --mf-numbers: 44px;
+}
+[data-theme="dark"] .mf { --mf-expr: var(--run); }
+
+/* ── Bar ── */
+.mf-bar {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 6px 14px;
+  padding: 8px 14px; background: var(--pine-deep); border-bottom: 1px solid var(--border);
+}
+.mf-file { display: inline-flex; align-items: center; gap: 6px; min-width: 0; color: var(--sage); }
+.mf-path { font: var(--t-mono); color: var(--soft-white); overflow-wrap: anywhere; }
+.mf-meta { font: var(--t-body); color: var(--muted-sage); }
+.mf-meta.mono { font: var(--t-mono); }
+.mf-sha { color: var(--copper); }
+.mf-acts { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; flex-wrap: nowrap; }
+.mf-btn { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; line-height: 18px; }
+.mf-btn[aria-pressed="true"] {
+  color: var(--soft-white); border-color: var(--emerald);
+  background: color-mix(in srgb, var(--emerald) 12%, transparent);
+}
+.mf-fail { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+.mf-fail:not(:disabled):hover { color: var(--danger); border-color: var(--danger); }
+
+.mf-banner {
+  display: flex; align-items: flex-start; gap: 8px; padding: 8px 14px;
+  font: var(--t-body); color: var(--sage); border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+}
+.mf-banner svg { color: var(--warn); margin-top: 3px; flex: none; }
+
+/* ── Code ── */
+.mf-code { overflow-x: auto; padding: 8px 0; container-type: inline-size; }
+/* The rows stretch to the longest line, so a tint spans the scrolled width. */
+.mf-lines { min-width: 100%; width: max-content; }
+.mf-code.wrap .mf-lines { width: auto; }
+.mf-ln, .mf-anno {
+  display: grid; grid-template-columns: var(--mf-gutter) var(--mf-numbers) minmax(0, 1fr); align-items: start;
+}
+.mf-ln { font: var(--t-mono); line-height: 20px; color: var(--soft-white); }
+.mf-ln:hover { background: color-mix(in srgb, var(--emerald) 5%, transparent); }
+.mf-ln.bad, .mf-anno.bad {
+  background: color-mix(in srgb, var(--danger) 9%, transparent); box-shadow: inset 2px 0 0 var(--danger);
+}
+.mf-ln.hl { background: color-mix(in srgb, var(--danger) 16%, transparent); }
+.mf-g { display: flex; justify-content: center; padding-top: 2px; user-select: none; }
+.mf-no { color: var(--muted-sage); text-align: right; padding-right: 14px; user-select: none; }
+.mf-tx { white-space: pre; padding-right: 16px; }
+.mf-code.wrap .mf-tx { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.mf-key { color: var(--mf-key); }
+.mf-punct { color: var(--mf-punct); }
+.mf-comment { color: var(--mf-comment); }
+.mf-string { color: var(--mf-string); }
+.mf-expr { color: var(--mf-expr); }
+.mf-ref { color: var(--mf-ref); }
+
+/* ── Status marks: the shapes and colours of the rest of the Run page ── */
+.mf-mark {
+  width: 15px; height: 15px; border-radius: 50%; display: inline-grid; place-items: center;
+  flex: none; box-sizing: border-box; padding: 0; border: 0; background: none; color: var(--muted-sage);
+}
+button.mf-mark { cursor: pointer; }
+button.mf-mark:focus-visible { outline: 2px solid var(--emerald); outline-offset: 1px; }
+.mf-mark svg { stroke-width: 3.2; }
+.mf-mark.passed { color: var(--ok); background: color-mix(in srgb, var(--ok) 20%, transparent); }
+.mf-mark.failed { color: var(--danger); background: color-mix(in srgb, var(--danger) 22%, transparent); }
+.mf-mark.mixed { background: conic-gradient(var(--danger) 0 50%, var(--ok) 50% 100%); }
+.mf-mark.skipped { border: 1.5px dotted var(--muted-sage); }
+.mf-mark.notrun { border: 1.5px dashed var(--border); }
+.mf-mark.cancelled { background: color-mix(in srgb, var(--muted-sage) 22%, transparent); }
+.mf-mark.running {
+  border: 2px solid color-mix(in srgb, var(--running-ink) 30%, transparent);
+  border-top-color: var(--running-ink);
+  animation: mf-spin 1s linear infinite;
+}
+@keyframes mf-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .mf-mark.running { animation: none; } }
+
+/* ── Rows added under a line: not part of the file ── */
+.mf-anno { user-select: none; }
+.mf-legs, .mf-box {
+  margin: 2px 16px 6px 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px;
+  font: var(--t-body); color: var(--sage); white-space: normal;
+  /* Wrap at the visible width, not at the longest line's. */
+  max-width: calc(100cqw - var(--mf-gutter) - var(--mf-numbers) - 16px);
+}
+.mf-legs { padding: 2px 0; }
+.mf-leg { display: inline-flex; align-items: center; gap: 6px; }
+.mf-anno .linklike { text-align: left; }
+.mf-box { border: 1px dashed var(--border); border-radius: var(--radius); padding: 6px 10px; }
+.mf-box.warn { border-color: var(--border-warn); }
+.mf-hash { color: var(--muted-sage); }
+.mf-yank { display: inline-flex; align-items: center; gap: 5px; color: var(--warn); }
+
+.mf-foot { margin: 0; padding: 8px 14px; border-top: 1px solid var(--border-soft); font: var(--t-body); color: var(--sage); }
+
+/* ── Empty and error states ── */
+.mf-empty { padding: 22px 18px; font: var(--t-body); color: var(--sage); }
+.mf-empty b { display: block; margin-bottom: 4px; font: var(--t-label); color: var(--soft-white); }
+.mf-empty a { color: var(--emerald); }
+
+@media (max-width: 640px) {
+  .mf { --mf-gutter: 22px; --mf-numbers: 36px; }
+  .mf-no { padding-right: 10px; }
+  .mf-acts { margin-left: 0; }
+}

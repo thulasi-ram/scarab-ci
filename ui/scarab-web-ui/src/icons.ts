@@ -51,6 +51,8 @@ import {
   Info,
   Minus,
   Pause,
+  Download,
+  ExternalLink,
 } from "lucide";
 
 // IconNode = Array<[tagName, attributes]>.
@@ -110,6 +112,9 @@ const ICONS: Record<string, IconNode> = {
   // The Runs list's status marks.
   minus: Minus as IconNode,
   pause: Pause as IconNode,
+  // The Run page's Manifest tab: download the file, open it on the forge.
+  download: Download as IconNode,
+  "external-link": ExternalLink as IconNode,
   // An exclamation mark with no outline, to sit inside a round status mark.
   exclamation: [
     ["path", { d: "M12 7v6" }],

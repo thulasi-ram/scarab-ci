@@ -1,11 +1,15 @@
 // The web UI has four text styles (Title, Label, Body, Mono; docs/DESIGN.md §3),
-// so no page uses more than four font variations. This reads the stylesheet
-// and fails on any text rule that sets a font outside those four tokens, and
-// on upper-casing, which reads as a fifth style.
+// so no page uses more than four font variations. This reads the stylesheet,
+// and the stylesheets a component imports beside it, and fails on any text
+// rule that sets a font outside those four tokens, and on upper-casing, which
+// reads as a fifth style.
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 const CSS = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+/** Stylesheets a component imports itself. They use the tokens styles.css
+ * defines and define none. */
+const COMPONENT_CSS = ["run-manifest.css"];
 
 /** The selectors that keep their own face or size (listed in styles.css). */
 const EXEMPT = new Set([
@@ -59,20 +63,26 @@ function declarations(css: string): Decl[] {
 }
 
 const DECLS = declarations(CSS);
+const SHEETS: [string, Decl[]][] = [
+  ["styles.css", DECLS],
+  ...COMPONENT_CSS.map((f): [string, Decl[]] => [f, declarations(readFileSync(new URL(`./${f}`, import.meta.url), "utf8"))]),
+];
 
 describe("the four text styles", () => {
-  it("reads the stylesheet", () => {
+  it("reads the stylesheets", () => {
     // A failed read must not pass the checks below with nothing to check.
     expect(DECLS.length).toBeGreaterThan(1000);
+    for (const [, decls] of SHEETS) expect(decls.length).toBeGreaterThan(10);
   });
 
-  it("defines exactly the four style tokens", () => {
+  it("defines exactly the four style tokens, in styles.css only", () => {
     const defined = DECLS.filter((d) => d.prop.startsWith("--t-"));
     expect(Object.fromEntries(defined.map((d) => [d.prop, d.value]))).toEqual(TOKENS);
+    for (const [, decls] of SHEETS.slice(1)) expect(decls.filter((d) => d.prop.startsWith("--t-"))).toEqual([]);
   });
 
-  it("sets a font only through one of the four tokens", () => {
-    const bad = DECLS.filter((d) => {
+  it.each(SHEETS)("%s sets a font only through one of the four tokens", (_f, decls) => {
+    const bad = decls.filter((d) => {
       if (EXEMPT.has(d.selector)) return false;
       if (d.prop === "font") return !FONT_VALUES.has(d.value);
       if (d.prop === "font-style") return d.value !== "normal";
@@ -81,8 +91,8 @@ describe("the four text styles", () => {
     expect(bad).toEqual([]);
   });
 
-  it("never upper-cases text", () => {
-    const bad = DECLS.filter((d) => d.prop === "text-transform" && d.value === "uppercase").map(
+  it.each(SHEETS)("%s never upper-cases text", (_f, decls) => {
+    const bad = decls.filter((d) => d.prop === "text-transform" && d.value === "uppercase").map(
       (d) => d.selector,
     );
     expect(bad).toEqual([]);

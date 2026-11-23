@@ -280,7 +280,7 @@ export function defaultSelection(o: {
 
 // ── URL state ───────────────────────────────────────────────────────────────
 
-export type RunTabParam = "artifacts" | "activity";
+export type RunTabParam = "artifacts" | "activity" | "manifest";
 export type PaneTabParam = "results" | "workspace" | "outputs" | "source";
 
 /**
@@ -306,7 +306,7 @@ export type RunUrlState = {
 
 type Params = Record<string, string | string[] | null | undefined>;
 
-const RUN_TABS: readonly string[] = ["artifacts", "activity"];
+const RUN_TABS: readonly string[] = ["artifacts", "activity", "manifest"];
 const PANE_TABS: readonly string[] = ["results", "workspace", "outputs", "source"];
 
 function first(v: string | string[] | null | undefined): string | undefined {

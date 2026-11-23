@@ -12,3 +12,21 @@ export function forgePrUrl(repoUrl?: string | null, pr?: number | null): string 
   if (!repoUrl || pr == null) return null;
   return `${repoUrl}/pull/${pr}`;
 }
+
+/** A file (or folder) at a commit. The repo base carries no forge kind, so the
+ * host decides: GitHub (`github.com`, or a GitHub Enterprise host named
+ * `github.…`) writes `/blob/<sha>/<path>`, which also opens a folder; any
+ * other host is taken as Forgejo, which writes `/src/commit/<sha>/<path>`. */
+export function forgeFileUrl(repoUrl?: string | null, sha?: string | null, path?: string | null): string | null {
+  if (!repoUrl || !sha || !path) return null;
+  let host = "";
+  try {
+    host = new URL(repoUrl).hostname;
+  } catch {
+    return null;
+  }
+  const file = path.replace(/^\/+/, "").split("/").map(encodeURIComponent).join("/");
+  return /^github\./.test(host)
+    ? `${repoUrl}/blob/${sha}/${file}`
+    : `${repoUrl}/src/commit/${sha}/${file}`;
+}
