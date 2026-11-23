@@ -246,3 +246,61 @@ async fn the_runs_list_names_the_replacing_run_the_failed_step_and_the_waiting_g
 
     tdb.cleanup().await;
 }
+
+/// GET `uri` on `app` and parse the JSON body.
+async fn get_json(app: &axum::Router, uri: &str) -> Value {
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// A Pipeline's `name:` is its author's text, a fork pull request's
+/// included: the Run is stamped with its first 200 characters, so a runs-list
+/// row never carries more.
+#[tokio::test]
+async fn a_run_is_stamped_with_at_most_200_characters_of_its_pipeline_name() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    let db: &dyn Db = pg.as_ref();
+    let clock = FakeClock::new(1_000);
+    // Two-byte characters: a cut by bytes would split one.
+    let long = "é".repeat(1_000);
+    let yaml =
+        format!("name: {long}\non:\n  manual: {{}}\nsteps:\n  - {{ id: unit, image: busybox }}\n");
+    let forge = FakeForge::new()
+        .with_file(".scarab/long.yaml", yaml.as_str())
+        .with_commit("refs/heads/main", SHA);
+    let run = dispatched(&forge, db, &clock, "long").await;
+
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        pg.clone(),
+    ));
+    let app = router(AppState::new(
+        pg.clone(),
+        Arc::new(FakeClock::new(10_000)),
+        logs,
+    ));
+    let list = get_json(&app, "/v1/repos/acme/web/runs").await;
+    let row = list["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == run.0.as_str())
+        .cloned()
+        .unwrap_or_else(|| panic!("{} not listed", run.0));
+    assert_eq!(row["pipeline"].as_str(), Some("é".repeat(200).as_str()));
+
+    tdb.cleanup().await;
+}

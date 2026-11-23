@@ -2392,9 +2392,26 @@ async fn dispatch(
 }
 
 /// The name a Run of the pipeline at `path` is stamped with: its `name:`,
-/// else the bare file name. Commit statuses and `on: upstream:` use it.
+/// else the bare file name, cut to [`RUN_PIPELINE_NAME_MAX`] characters.
+/// Commit statuses and `on: upstream:` use it.
 fn run_pipeline_name(ir: &scarab_pipeline::PipelineIr, path: &str) -> String {
-    ir.name.clone().unwrap_or_else(|| bare_pipeline_name(path))
+    cap_pipeline_name(ir.name.as_deref().unwrap_or(&bare_pipeline_name(path)))
+}
+
+/// The most characters of a pipeline name a Run is stamped with. The
+/// `name:` is the Pipeline file's text, a fork pull request's included, and
+/// every runs-list row carries the stamped name, so a longer one is cut
+/// rather than sent whole on each poll. The compiler accepts any length.
+const RUN_PIPELINE_NAME_MAX: usize = 200;
+
+/// `name` cut to [`RUN_PIPELINE_NAME_MAX`] characters on a char boundary:
+/// the pipeline name a Run is stamped with, and the form an `on: upstream:`
+/// pipeline name is compared to a stamped name in.
+pub(crate) fn cap_pipeline_name(name: &str) -> String {
+    match name.char_indices().nth(RUN_PIPELINE_NAME_MAX) {
+        Some((end, _)) => name[..end].to_string(),
+        None => name.to_string(),
+    }
 }
 
 /// The paths a push from `before` to `after` changed, from the forge's
@@ -2527,7 +2544,10 @@ async fn record_followups(
 ) {
     let paths: Vec<&str> = files
         .iter()
-        .filter(|(_, yaml)| scarab_pipeline::upstream_pipeline_of(yaml).as_deref() == Some(name))
+        .filter(|(_, yaml)| {
+            scarab_pipeline::upstream_pipeline_of(yaml).map(|p| cap_pipeline_name(&p))
+                == Some(name.to_string())
+        })
         .map(|(path, _)| path.as_str())
         .collect();
     let recorded = db
