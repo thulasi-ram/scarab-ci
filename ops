@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1795423718,"nonce":"b/3NdcvEqBLpdGBYVfFvQNZPp0g=","message":"Fixed by ADR-0083 (redelivery creates only the Runs a delivery is missing), shipped in v0.7.2 (PR #208, merge 93e0eb69). Live e2e + chaos rank2 green at 1dcf093f.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1795423719,"nonce":"QDCTDX+1LMFJdOqEpoAvX+VDBvo=","status":2}]}
