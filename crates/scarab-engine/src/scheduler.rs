@@ -2798,9 +2798,10 @@ impl<'a> Scheduler<'a> {
             // never supersede or get superseded.
             // Each is marked replaced by this run first, so the runs list can
             // tell it from a run a person cancelled.
+            // A run this cancel did not end (it had ended, or a person
+            // cancelled it first) loses the mark again.
             for older in self.db.superseded_by(run).await? {
-                self.db.set_run_superseded_by(&older, run).await?;
-                self.cancel_run(&older).await?;
+                self.supersede(&older, run).await?;
             }
             // Backpressure + fairness (ADR-0011, 0032): hold the run Pending if
             // the global or its project's in-flight cap is reached. tick_all
@@ -2819,8 +2820,7 @@ impl<'a> Scheduler<'a> {
             if let Some((group, policy)) = self.db.run_concurrency(run).await? {
                 if let Some(holder) = self.db.acquire_slot(leader, &group, run).await? {
                     if policy == ConcurrencyPolicy::CancelInProgress {
-                        self.db.set_run_superseded_by(&holder, run).await?;
-                        self.cancel_run(&holder).await?;
+                        self.supersede(&holder, run).await?;
                     }
                     return Ok(()); // slot busy — wait for it to free
                 }
@@ -4520,12 +4520,29 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
+    /// Cancel `run` because `by` started (newest-wins, or a
+    /// `cancel-in-progress` group), marking it superseded by `by` first. When
+    /// this cancel does not end `run` — it had ended, or a person cancelled
+    /// it first — the mark is removed again, so the runs list never names a
+    /// replacing Run for a run that was not replaced.
+    async fn supersede(&self, run: &RunId, by: &RunId) -> Result<(), SchedulerError> {
+        self.db.set_run_superseded_by(run, by).await?;
+        if !self.cancel_run(run).await? {
+            self.db.clear_run_superseded_by(run, by).await?;
+        }
+        Ok(())
+    }
+
     /// Cancel a run: drive its non-terminal steps and the run itself to
     /// `Cancelled` durably (no half-cancelled limbo, ADR-0020) and release its
     /// concurrency slot. Terminating the underlying Pods (SIGTERM + grace →
     /// kill) is the executor's job on the k8s-live path; the durable terminal
     /// state recorded here is the guarantee the control plane owns.
-    pub async fn cancel_run(&self, run: &RunId) -> Result<(), SchedulerError> {
+    ///
+    /// `true` when this call moved the run to `Cancelled`; `false` when it
+    /// had already ended or a peer moved it first. The teardown runs either
+    /// way.
+    pub async fn cancel_run(&self, run: &RunId) -> Result<bool, SchedulerError> {
         // The same teardown an operator cancel leaves (review fit-F3), never
         // a supersession: a cancel is not a Superseded attempt (CONTEXT.md).
         // Each step's commit carries the [`CANCEL_ATTEMPT`] of the attempt it
@@ -4536,6 +4553,7 @@ impl<'a> Scheduler<'a> {
         // there (red team R2-E2b).
         let now = self.clock.now().await;
         self.cancel_live_steps(run, now).await?;
+        let mut cancelled = false;
         if let Some(current) = self.db.run_status(run).await? {
             if !current.is_terminal() {
                 match commit_run_transition(
@@ -4550,7 +4568,8 @@ impl<'a> Scheduler<'a> {
                 )
                 .await
                 {
-                    Ok(()) | Err(DbError::Conflict) => {}
+                    Ok(()) => cancelled = true,
+                    Err(DbError::Conflict) => {}
                     Err(e) => return Err(e.into()),
                 }
             }
@@ -4560,7 +4579,7 @@ impl<'a> Scheduler<'a> {
         if let Some((group, _)) = self.db.run_concurrency(run).await? {
             self.db.release_slot(&group, run).await?;
         }
-        Ok(())
+        Ok(cancelled)
     }
 
     /// Evaluate **every** reached gate of `run` against its own clock (slice b,

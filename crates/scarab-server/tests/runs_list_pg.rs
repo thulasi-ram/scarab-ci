@@ -17,13 +17,13 @@ use tower::ServiceExt;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::ports::{ExecState, FailureClass};
-use scarab_engine::{Clock, Db, RunId, RunStatus, Scheduler};
+use scarab_engine::{Clock, Db, RunId, RunStatus, Scheduler, StepId};
 use scarab_forge::{Event, RepoRef};
 use scarab_server::{
     dispatch_run, router, trigger_runs_from_event, AdmissionPorts, AppState, DispatchKind,
     LogService,
 };
-use scarab_testkit::{FakeClock, FakeExecutor, FakeForge, InMemoryObjectStore};
+use scarab_testkit::{FakeClock, FakeExecutor, FakeForge, InMemoryDb, InMemoryObjectStore};
 
 const SHA: &str = "1234567890abcdef1234567890abcdef12345678";
 
@@ -303,4 +303,154 @@ async fn a_run_is_stamped_with_at_most_200_characters_of_its_pipeline_name() {
     assert_eq!(row["pipeline"].as_str(), Some("é".repeat(200).as_str()));
 
     tdb.cleanup().await;
+}
+
+/// The API over `db`.
+fn app(db: Arc<dyn Db>) -> axum::Router {
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    router(AppState::new(db, Arc::new(FakeClock::new(10_000)), logs))
+}
+
+/// `run`'s row of the `acme/web` runs list.
+async fn listed(app: &axum::Router, run: &RunId) -> Value {
+    let list = get_json(app, "/v1/repos/acme/web/runs").await;
+    list["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == run.0.as_str())
+        .cloned()
+        .unwrap_or_else(|| panic!("{} not listed: {list}", run.0))
+}
+
+/// A person cancels `run` through the API.
+async fn cancel_by_hand(app: &axum::Router, run: &RunId) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/runs/{}/cancel", run.0))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+}
+
+/// A rerun reopens a superseded Run and drops its mark: a person's cancel
+/// after it names no replacing Run, and a later supersede names the Run that
+/// made it, not the first one.
+async fn a_rerun_clears_the_supersede_mark(db: Arc<dyn Db>) {
+    let clock = FakeClock::new(1_000);
+    let forge = FakeForge::new()
+        .with_file(".scarab/ci.yaml", CI_YAML)
+        .with_commit("refs/heads/main", SHA);
+    let app = app(db.clone());
+    let db = db.as_ref();
+    let unit = StepId("unit".into());
+    let rerun = |run: RunId| {
+        let (clock, unit) = (&clock, &unit);
+        async move {
+            scarab_engine::rerun_step(db, clock, &run, unit, None)
+                .await
+                .expect("rerun");
+            assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Running));
+        }
+    };
+
+    let a = pushed(&forge, db, &clock, &"a".repeat(40)).await;
+    tick_until(db, &clock, &FakeExecutor::new(), &a, RunStatus::Running).await;
+    clock.advance(1_000);
+    let b = pushed(&forge, db, &clock, &"b".repeat(40)).await;
+    tick_until(db, &clock, &FakeExecutor::new(), &b, RunStatus::Running).await;
+    assert_eq!(listed(&app, &a).await["replaced_by"], b.0.as_str());
+
+    rerun(a.clone()).await;
+    cancel_by_hand(&app, &a).await;
+    let row = listed(&app, &a).await;
+    assert_eq!(row["status"], "cancelled");
+    assert!(row.get("replaced_by").is_none(), "{row}");
+
+    rerun(a.clone()).await;
+    clock.advance(1_000);
+    let c = pushed(&forge, db, &clock, &"c".repeat(40)).await;
+    tick_until(db, &clock, &FakeExecutor::new(), &c, RunStatus::Running).await;
+    let row = listed(&app, &a).await;
+    assert_eq!(row["status"], "cancelled");
+    assert_eq!(row["replaced_by"], c.0.as_str(), "{row}");
+}
+
+#[tokio::test]
+async fn a_rerun_clears_the_supersede_mark_in_memory() {
+    a_rerun_clears_the_supersede_mark(Arc::new(InMemoryDb::new())).await;
+}
+
+#[tokio::test]
+async fn a_rerun_clears_the_supersede_mark_on_postgres() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    a_rerun_clears_the_supersede_mark(pg).await;
+    tdb.cleanup().await;
+}
+
+/// A person cancels the older Run after the newer one's admission found it
+/// in flight and before its cancel: the scheduler's cancel ends nothing, so
+/// the Run names no Run that replaced it.
+#[tokio::test]
+async fn a_run_a_person_cancels_first_is_not_marked_superseded() {
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let forge = FakeForge::new()
+        .with_file(".scarab/ci.yaml", CI_YAML)
+        .with_commit("refs/heads/main", SHA);
+    let older = pushed(&forge, db.as_ref(), &clock, &"a".repeat(40)).await;
+    tick_until(
+        db.as_ref(),
+        &clock,
+        &FakeExecutor::new(),
+        &older,
+        RunStatus::Running,
+    )
+    .await;
+    clock.advance(1_000);
+    let newer = pushed(&forge, db.as_ref(), &clock, &"b".repeat(40)).await;
+
+    let (db2, clock2, run) = (db.clone(), clock.clone(), older.clone());
+    db.interleave_before_next(
+        "set_run_superseded_by",
+        Box::new(move || {
+            Box::pin(async move {
+                scarab_engine::cancel_run_request(
+                    db2.as_ref(),
+                    clock2.as_ref(),
+                    &run,
+                    Some("alice".into()),
+                )
+                .await
+                .expect("cancel");
+            })
+        }),
+    );
+    tick_until(
+        db.as_ref(),
+        &clock,
+        &FakeExecutor::new(),
+        &newer,
+        RunStatus::Running,
+    )
+    .await;
+    assert!(!db.interleave_armed(), "the person's cancel ran");
+
+    let row = listed(&app(db.clone()), &older).await;
+    assert_eq!(row["status"], "cancelled");
+    assert!(row.get("replaced_by").is_none(), "{row}");
 }

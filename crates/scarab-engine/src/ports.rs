@@ -733,8 +733,15 @@ pub trait Db: Send + Sync {
     /// because `by` started (newest-wins, or a `cancel-in-progress` group).
     /// Written before the cancel, so a crash between the two leaves the mark
     /// for the next pass to cancel under; the runs list shows it only once
-    /// `run` is `Cancelled`. Keeps the first mark.
+    /// `run` is `Cancelled`. Keeps the first mark. A reopen (a move out of a
+    /// terminal status) clears it in the same write, so a later cancel or
+    /// supersede records afresh.
     async fn set_run_superseded_by(&self, run: &RunId, by: &RunId) -> Result<(), DbError>;
+
+    /// Remove the mark [`set_run_superseded_by`](Self::set_run_superseded_by)
+    /// wrote, if it still names `by`: the cancel it was written for did not
+    /// cancel `run` (it had ended, or a person cancelled it first).
+    async fn clear_run_superseded_by(&self, run: &RunId, by: &RunId) -> Result<(), DbError>;
 
     /// Set a run's `project` (for per-project fairness) and admission `priority`
     /// (higher admits first) — ADR-0011, 0032.

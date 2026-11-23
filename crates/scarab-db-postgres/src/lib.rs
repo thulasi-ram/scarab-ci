@@ -1393,6 +1393,16 @@ impl Db for PostgresDb {
         Ok(())
     }
 
+    async fn clear_run_superseded_by(&self, run: &RunId, by: &RunId) -> Result<(), DbError> {
+        sqlx::query("UPDATE runs SET superseded_by = NULL WHERE id = $1 AND superseded_by = $2")
+            .bind(&run.0)
+            .bind(&by.0)
+            .execute(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn set_run_scheduling(
         &self,
         run: &RunId,
@@ -5091,7 +5101,8 @@ const TERMINAL_STREAMS: &str = "(SELECT count(*) FROM log_streams s
 /// The guarded run-status CAS on any executor: `true` iff the row was in
 /// `from` and is now `to`. Zero rows means a concurrent/duplicate writer
 /// already moved it. Moving a run OUT of a terminal status (a reopen) bumps
-/// its `reopen_generation` in the same write ([`Db::run_reopen_generation`]).
+/// its `reopen_generation` ([`Db::run_reopen_generation`]) and clears its
+/// `superseded_by` ([`Db::set_run_superseded_by`]) in the same write.
 async fn cas_run_status<'e, E: sqlx::PgExecutor<'e>>(
     exec: E,
     run: &RunId,
@@ -5104,7 +5115,8 @@ async fn cas_run_status<'e, E: sqlx::PgExecutor<'e>>(
     let affected = sqlx::query(
         "UPDATE runs
          SET status = $3, updated_at = (extract(epoch from now()) * 1000)::bigint,
-             reopen_generation = reopen_generation + CASE WHEN $4 THEN 1 ELSE 0 END
+             reopen_generation = reopen_generation + CASE WHEN $4 THEN 1 ELSE 0 END,
+             superseded_by = CASE WHEN $4 THEN NULL ELSE superseded_by END
          WHERE id = $1 AND status = $2
            AND ($5::BIGINT IS NULL OR reopen_generation = $5)",
     )

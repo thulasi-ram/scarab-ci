@@ -30,20 +30,6 @@ release.yml uses that version's section as the GitHub Release text. See
   While one waits, reads and writes of `runs` wait too, up to 5 seconds per migration. A 0.7.2
   server does not start on a database that ran them, and there is no rollback script.
 
-### Security
-
-- **A Run is stamped with at most 200 characters of its pipeline's `name:`.** The name is text
-  from the pipeline file, a fork pull request's included, and every runs list row sends it on
-  each poll, so a long one was sent whole every 10 seconds to everyone reading the list. Longer
-  names are cut on a character boundary. An `on: upstream:` name is compared in the same cut
-  form, so a follow-up of a pipeline with a long name still starts. The compiler still accepts a
-  name of any length.
-- **A pipeline file cannot stall the Run page's Manifest tab.** The tab colours each line in one
-  pass over it, shows a line over 2,000 characters cut and without colours, and draws the first
-  5,000 lines of a file, so a file under the compiler's 1 MiB limit (a fork pull request's
-  included) made to be slow to colour or to draw opens like any other. Copy and Download give the
-  whole file. See [Large files](https://thulasi-ram.github.io/scarab-ci/usage/runs/#large-files).
-
 ### Features
 
 - **The Run page's Manifest tab shows the pipeline file the Run was created from**, as Scarab
@@ -52,7 +38,9 @@ release.yml uses that version's section as the GitHub Release text. See
   if the version was yanked since), Go to failure, Wrap, Copy, Download and a link to the file
   on the forge at that commit. `GET /v1/runs/{id}/manifest` returns the file and the libraries the
   Run invoked. Runs created before this release, and Runs started through `POST /v1/runs`, have no
-  saved file. See [The Manifest tab](https://thulasi-ram.github.io/scarab-ci/usage/runs/#the-manifest-tab).
+  saved file. A long file shows its first 5,000 lines and a line over 2,000 characters shows cut
+  and without colours; Copy and Download give the whole file. See
+  [The Manifest tab](https://thulasi-ram.github.io/scarab-ci/usage/runs/#the-manifest-tab).
 - **The runs list on a repository's page is redesigned.** A status control with counts (All, Running,
   Waiting, Failed, Refused); one Filter panel (pipeline, Environment, author, branch, pull
   request, deploys only, scheduled only) with removable chips, kept in the URL; Runs grouped by
@@ -80,6 +68,12 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Bug Fixes
 
+- **A Run is stamped with at most 200 characters of its pipeline's `name:`.** The name is text
+  from the pipeline file, a fork pull request's included, and every runs list row sends it on
+  each poll, so a long one was sent whole every 10 seconds to everyone reading the list. Longer
+  names are cut on a character boundary. An `on: upstream:` name is compared in the same cut
+  form, so a follow-up of a pipeline with a long name still starts. The compiler still accepts a
+  name of any length.
 - **The step pane's Source tab names the pipeline file the Run was created from.** It guessed
   `.scarab/<pipeline>.yaml`, which is wrong when a file's `name:` differs from its file name. It
   now reads the saved path, and for a Run with no saved file it reads `the ci pipeline`.

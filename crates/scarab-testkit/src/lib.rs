@@ -834,10 +834,12 @@ fn take_event_append_failure(st: &mut InMemoryState, events: &[EventKind]) -> Re
 /// [`Db::enqueue_outbox`] under the caller's lock. Idempotent on the key: a
 /// duplicate enqueue is a no-op.
 /// The run-status CAS's reopen bump (mirrors the Postgres `cas_run_status`):
-/// moving `run` out of a terminal `from` opens its next generation.
+/// moving `run` out of a terminal `from` opens its next generation and
+/// clears the Run it was marked superseded by.
 fn bump_reopen_generation_locked(st: &mut InMemoryState, run: &RunId, from: RunStatus) {
     if from.is_terminal() {
         *st.run_reopen_generations.entry(run.clone()).or_default() += 1;
+        st.run_superseded_by.remove(run);
     }
 }
 
@@ -1751,12 +1753,21 @@ impl Db for InMemoryDb {
     }
 
     async fn set_run_superseded_by(&self, run: &RunId, by: &RunId) -> Result<(), DbError> {
+        self.interleave_point("set_run_superseded_by").await;
         self.state
             .lock()
             .unwrap()
             .run_superseded_by
             .entry(run.clone())
             .or_insert_with(|| by.clone());
+        Ok(())
+    }
+
+    async fn clear_run_superseded_by(&self, run: &RunId, by: &RunId) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        if st.run_superseded_by.get(run) == Some(by) {
+            st.run_superseded_by.remove(run);
+        }
         Ok(())
     }
 
