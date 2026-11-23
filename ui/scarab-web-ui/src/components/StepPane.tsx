@@ -73,6 +73,7 @@ import { shortHash } from "../libraries";
 import { waitApprovers, type WaitResolution } from "../run-tabs";
 import { absTime } from "../fmt";
 import Icon from "./Icon";
+import { loadRunManifest } from "./RunManifest";
 import AttemptsDropdown, { type FilmstripTry } from "./AttemptsDropdown";
 import TryTabs from "./TryTabs";
 import Pill from "./Pill";
@@ -138,7 +139,8 @@ export default function StepPane(props: {
   /** The step's gate verdict (gates.ts `gateStatus`) — shown under the stamp. `null` = nothing to say (or viewing
    * an older version, which this line does not describe). */
   gateStatus?: GateStatus | null;
-  /** The Run's pipeline name, for the origin line. */
+  /** The Run's pipeline name, for the origin line when the Run kept no
+   * file. */
   pipeline?: string | null;
   /** The page's clock tick, for a plugin gate's expiry countdown. */
   now?: number;
@@ -196,6 +198,17 @@ export default function StepPane(props: {
       return s && (t === "source" || t === "gate") ? { run: props.runId, step: s.id, n: s.attempt_list?.length ?? 0 } : null;
     }),
     (k) => stepOrigin(k.run, k.step).catch(() => null),
+  );
+  // The path of the Pipeline file the Run was created from, for the chain's
+  // first row: read once per Run, when the Source tab opens. Null while it
+  // loads, and for a Run that kept no file.
+  const [manifestPath] = createResource(
+    () => (tab() === "source" ? props.runId : null),
+    (run) =>
+      loadRunManifest(run).then(
+        (m) => (m.recorded ? (m.path ?? null) : null),
+        () => null,
+      ),
   );
   // A launch refused because a library version is yanked.
   const yankRefusal = () => {
@@ -1273,7 +1286,7 @@ export default function StepPane(props: {
                             <div class="t">
                               <div class="l1">
                                 <Pill tone="muted" look="dotted">pipeline</Pill>
-                                <span class="mono">{props.pipeline ? `.scarab/${props.pipeline}.yaml` : "the Pipeline file"}</span>
+                                <span class="mono">{manifestPath() ?? props.pipeline ?? "the Pipeline file"}</span>
                               </div>
                               <div class="lib-src">the Run's own file</div>
                             </div>
