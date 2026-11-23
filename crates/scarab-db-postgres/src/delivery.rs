@@ -52,12 +52,6 @@ impl<'a> RunClaim<'a> {
     }
 }
 
-/// Inside the transaction of `run`'s first row: record the outcome `run`
-/// for `claim`'s key, or move it from `claim.replaces` to `run` and mark that
-/// run replaced. `false` when the key is already recorded (or no longer
-/// names `claim.replaces`): the caller rolls back. A concurrent insert of the
-/// same key makes this wait for it, then answer `false`; no unique violation
-/// is raised.
 /// Lock `run` for its replacement (ADR-0083 §4) and say whether it may be
 /// replaced: its creation never finished, it has ended (so no stalled try
 /// can still finish it: `finish_run_creation` needs `pending`), and nothing
@@ -75,6 +69,12 @@ async fn lock_replaceable(tx: &mut sqlx::PgConnection, run: &str) -> Result<bool
     Ok(row.is_some())
 }
 
+/// Inside the transaction of `run`'s first row: record the outcome `run`
+/// for `claim`'s key, or move it from `claim.replaces` to `run` and mark that
+/// run replaced. `false` when the key is already recorded (or no longer
+/// names `claim.replaces`): the caller rolls back. A concurrent insert of the
+/// same key makes this wait for it, then answer `false`; no unique violation
+/// is raised.
 pub(crate) async fn claim_delivery_run(
     tx: &mut sqlx::PgConnection,
     claim: &RunClaim<'_>,

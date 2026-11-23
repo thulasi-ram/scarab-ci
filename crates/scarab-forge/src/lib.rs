@@ -186,14 +186,6 @@ pub fn cap_trigger_title(raw: &str) -> Option<String> {
     Some(truncate_on_char_boundary(trimmed, TRIGGER_TITLE_MAX))
 }
 
-/// Whether `s` has the shape of a git commit SHA: 4 to 64 lower-case hex
-/// digits (4 is git's shortest abbreviation, 64 a SHA-256 object name).
-///
-/// A Run's pinned commit reaches `git fetch` in the clone container as an
-/// argument, where a value starting with `-` is read as an option
-/// (`--upload-pack=<program>` runs that program). The SHA comes from the
-/// forge, so every place it enters Scarab checks this: webhook
-/// normalization, the dispatch path, and the clone launch.
 /// The head commit of a pull request from the forge's `GET pulls/{n}`
 /// answer: `head.sha`, the same field on GitHub and Forgejo. A missing or
 /// malformed one is an error.
@@ -205,6 +197,14 @@ pub fn pull_request_head_sha(body: &serde_json::Value) -> Result<String, ForgeEr
         .ok_or_else(|| ForgeError::Malformed("pull request head.sha".into()))
 }
 
+/// Whether `s` has the shape of a git commit SHA: 4 to 64 lower-case hex
+/// digits (4 is git's shortest abbreviation, 64 a SHA-256 object name).
+///
+/// A Run's pinned commit reaches `git fetch` in the clone container as an
+/// argument, where a value starting with `-` is read as an option
+/// (`--upload-pack=<program>` runs that program). The SHA comes from the
+/// forge, so every place it enters Scarab checks this: webhook
+/// normalization, the dispatch path, and the clone launch.
 pub fn is_commit_sha(s: &str) -> bool {
     (4..=64).contains(&s.len()) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
