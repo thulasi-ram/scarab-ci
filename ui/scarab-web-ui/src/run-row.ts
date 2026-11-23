@@ -39,6 +39,15 @@ export function pullNumber(ref: string | null | undefined): number | null {
   return m ? Number(m[1]) : null;
 }
 
+/** The branch the Branch filter lists and matches for a Run: a push's or a
+ *  manual Run's branch, a tag, or a pull request's head branch (what line 2
+ *  shows). A pull request ref (`refs/pull/7/head`) is never a branch. */
+export function runBranch(o: { kind?: string | null; ref?: string | null; head?: string | null }): string | null {
+  const ref = o.ref && !o.ref.startsWith("refs/pull/") ? shortRef(o.ref) : null;
+  if (o.kind === "pull_request") return o.head || ref;
+  return ref;
+}
+
 /** Line 1's headline. `muted` marks a stand-in for a Run that has none. */
 export function runHeadline(kind: string | null | undefined, title: string | null | undefined): { text: string; muted: boolean } {
   // A cron Run's title is its expression, which line 2 shows.
@@ -236,16 +245,24 @@ const detail = (tone: StatusDetail["tone"], ...parts: DetailPart[]): StatusDetai
   tone,
 });
 
+/** The Run that replaced this one, when it was replaced: only a cancelled
+ *  Run is. A Run in any other status with `replaced_by` set reads as its own
+ *  status and keeps its own place in the list. */
+export function replacedBy(r: { status: string; replaced_by?: string | null }): string | null {
+  return r.status === "cancelled" ? (r.replaced_by ?? null) : null;
+}
+
 /** A row's status: `Failed`, with `failed at test · macos +1` in its card;
- *  `Waiting`, with `waiting for approval`; `Replaced`, with `replaced by
- *  #130, a newer push`; else the plain word and no card. An older server's
- *  row, without the runs list fields, reads its word. */
+ *  `Waiting`, with `waiting for approval`; a cancelled Run that a newer one
+ *  replaced reads `Replaced`, with `replaced by #130`; else the plain word
+ *  and no card. An older server's row, without the runs list fields, reads
+ *  its word. */
 export function rowStatus(r: { status: string } & RunRowFields, replaced: Replaced | null): RowStatusView {
-  if (replaced) {
+  if (replaced && r.status === "cancelled") {
     const d =
       replaced.number != null
-        ? detail("replaced", { t: "text", text: "replaced by " }, { t: "mono", text: `#${replaced.number}` }, { t: "text", text: ", a newer push" })
-        : detail("replaced", { t: "text", text: "replaced by a newer push" });
+        ? detail("replaced", { t: "text", text: "replaced by " }, { t: "mono", text: `#${replaced.number}` })
+        : detail("replaced", { t: "text", text: "replaced by a newer Run" });
     return { word: "Replaced", tone: "cancelled", detail: d };
   }
   if (r.status === "suspended") {
@@ -350,22 +367,21 @@ export function clockTime(ms: number): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
-export type DayGroup<T> = { key: string; label: string; items: Placed<T>[]; count: number; failed: number };
+/** One local day of the list. `at` is its first row's time: the header's
+ *  name is `dayLabel(at, now)`, read where it is drawn, so the groups do not
+ *  depend on the clock. */
+export type DayGroup<T> = { key: string; at: number; items: Placed<T>[]; count: number; failed: number };
 
 /** Splits the placed list into local days, in list order. A replaced Run
  *  stays in the group of the Run it sits under. `failed` counts failed and
  *  dead-lettered Runs and refused triggers. */
-export function dayGroups<T extends RowLike>(
-  items: readonly Placed<T>[],
-  status: (row: T) => string,
-  now: number,
-): DayGroup<T>[] {
+export function dayGroups<T extends RowLike>(items: readonly Placed<T>[], status: (row: T) => string): DayGroup<T>[] {
   const out: DayGroup<T>[] = [];
   for (const item of items) {
     const key = dayKey(item.row.at);
     let g = out[out.length - 1];
     if (!g || (!item.child && g.key !== key)) {
-      g = { key, label: dayLabel(item.row.at, now), items: [], count: 0, failed: 0 };
+      g = { key, at: item.row.at, items: [], count: 0, failed: 0 };
       out.push(g);
     }
     g.items.push(item);
@@ -400,6 +416,15 @@ export function splitArrived<T>(
   const arrived: T[] = [];
   for (const row of rows) (seen.has(key(row)) ? shown : arrived).push(row);
   return { shown, arrived };
+}
+
+/** What happens to the Runs of the view that arrived: with rows on screen
+ *  they wait behind the pill (`pill` is how many); with none on screen
+ *  nothing would move, so they are shown at once (`showNow`). */
+export function arrivedView(onScreen: number, arrived: number): { showNow: boolean; pill: number } {
+  if (arrived === 0) return { showNow: false, pill: 0 };
+  if (onScreen === 0) return { showNow: true, pill: 0 };
+  return { showNow: false, pill: arrived };
 }
 
 /** The pill's words: `1 new Run`, `3 new Runs`. */

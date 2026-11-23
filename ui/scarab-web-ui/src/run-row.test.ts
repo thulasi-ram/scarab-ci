@@ -17,6 +17,9 @@ import {
   kindFirst,
   kindText,
   splitArrived,
+  arrivedView,
+  replacedBy,
+  runBranch,
 } from "./run-row";
 
 const line = (o: Parameters<typeof kindFirst>[0]) => {
@@ -180,9 +183,17 @@ describe("rowStatus", () => {
 
   it("a replaced Run reads Replaced; its card names the replacer, in Mono, when it is on the page", () => {
     const r = rowStatus({ status: "cancelled" }, { number: 130 });
-    expect([r.word, r.tone, r.detail?.text]).toEqual(["Replaced", "cancelled", "replaced by #130, a newer push"]);
+    expect([r.word, r.tone, r.detail?.text]).toEqual(["Replaced", "cancelled", "replaced by #130"]);
     expect(r.detail?.parts.filter((p) => p.t === "mono").map((p) => p.text)).toEqual(["#130"]);
-    expect(rowStatus({ status: "cancelled" }, { number: null }).detail?.text).toBe("replaced by a newer push");
+    expect(rowStatus({ status: "cancelled" }, { number: null }).detail?.text).toBe("replaced by a newer Run");
+  });
+
+  it("only a cancelled Run is replaced: any other status reads as itself", () => {
+    expect(rowStatus({ status: "succeeded" }, { number: 130 })).toEqual({ word: "Passed", tone: "succeeded", detail: null });
+    expect(rowStatus({ status: "failed" }, { number: 130 }).word).toBe("Failed");
+    expect(replacedBy({ status: "succeeded", replaced_by: "r2" })).toBeNull();
+    expect(replacedBy({ status: "cancelled", replaced_by: "r2" })).toBe("r2");
+    expect(replacedBy({ status: "cancelled" })).toBeNull();
   });
 
   it("other Runs, and an older server's rows without the new fields, have no card", () => {
@@ -248,12 +259,33 @@ describe("day groups", () => {
   it("counts Runs and refused triggers per day, and keeps a replaced Run with its replacer", () => {
     // #5 (yesterday) was replaced by #6 (today): it is listed under #6, in today's group.
     const rows = [run(6, at(24, 9), undefined, "failed"), refused(at(24, 8)), run(5, at(23, 23), 6), run(4, at(23, 10), undefined, "succeeded")];
-    const groups = dayGroups(placeReplaced(rows, (r) => r.run ?? null), (r) => r.run?.status ?? "refused", now);
-    expect(groups.map((g) => [g.label, g.items.map((i) => i.row.run?.run_number ?? "refused")])).toEqual([
+    const groups = dayGroups(placeReplaced(rows, (r) => r.run ?? null), (r) => r.run?.status ?? "refused");
+    expect(groups.map((g) => [dayLabel(g.at, now), g.items.map((i) => i.row.run?.run_number ?? "refused")])).toEqual([
       ["Today", [6, 5, "refused"]],
       ["Yesterday", [4]],
     ]);
     expect(daySummary(groups[0])).toEqual({ runs: "3 runs", failed: "2 failed or refused" });
     expect(daySummary(groups[1])).toEqual({ runs: "1 run", failed: null });
+  });
+});
+
+describe("the Branch filter's branch", () => {
+  it("a pull request Run's branch is its head branch, never its refs/pull ref", () => {
+    expect(runBranch({ kind: "pull_request", ref: "refs/pull/7/head", head: "feat/x" })).toBe("feat/x");
+    expect(runBranch({ kind: "pull_request", ref: "refs/pull/7/head" })).toBeNull();
+    expect(runBranch({ kind: "pull_request", ref: "refs/heads/feat/y" })).toBe("feat/y");
+    expect(runBranch({ kind: "push", ref: "refs/heads/main" })).toBe("main");
+    expect(runBranch({ kind: "tag", ref: "refs/tags/v0.7.2" })).toBe("v0.7.2");
+    expect(runBranch({ kind: "manual", ref: "refs/pull/7/head" })).toBeNull();
+    expect(runBranch({ kind: "api" })).toBeNull();
+  });
+});
+
+describe("arrived Runs", () => {
+  it("wait behind the pill while rows are on screen, and show at once when none are", () => {
+    expect(arrivedView(5, 2)).toEqual({ showNow: false, pill: 2 });
+    expect(arrivedView(0, 2)).toEqual({ showNow: true, pill: 0 });
+    expect(arrivedView(0, 0)).toEqual({ showNow: false, pill: 0 });
+    expect(arrivedView(5, 0)).toEqual({ showNow: false, pill: 0 });
   });
 });

@@ -12,13 +12,15 @@
 // and deploys filter on the server (it is how a Project's older deploys are
 // found), the rest over the loaded page. The list polls every 10 seconds
 // while the page is visible; rows on screen update in place, and Runs that
-// arrive wait behind a `N new Runs` pill so the list does not move.
+// arrive wait behind a `N new Runs` pill so the list does not move (with no
+// row on screen they are shown at once).
 //
 // The active tab and every filter live in the URL query (`?tab=secrets`,
 // `?pipeline=ci&env=production`), not in component signals — so a refresh, a
 // shared link and the back button all land where you were. The defaults (Runs
 // tab, no filter) are the absent params, which keeps the bare repo URL clean.
 import {
+  createComputed,
   createEffect,
   createMemo,
   createResource,
@@ -67,15 +69,19 @@ import { relTime, absTime, untilTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
 import {
   arrivedLabel,
+  arrivedView,
   authorSlot,
   clockTime,
   dayGroups,
+  dayLabel,
   daySummary,
   deployTag,
   kindFirst,
   placeReplaced,
   pullNumber,
+  replacedBy,
   rowStatus,
+  runBranch,
   splitArrived,
   type DayGroup,
   type Placed,
@@ -156,13 +162,10 @@ const TABS: [Tab, string][] = [
 const TERMINAL = new Set(["succeeded", "failed", "cancelled", "dead_lettered"]);
 const isLive = (status: string) => !TERMINAL.has(status);
 
-// The branch/tag a run ran on: `git_ref` with its `refs/{heads,tags}/` prefix
-// stripped, for the branch filter. `null` when refless.
-function branchLabel(r: RunSummary): string | null {
-  const ref = r.git_ref;
-  if (!ref) return null;
-  return ref.replace(/^refs\/heads\//, "").replace(/^refs\/tags\//, "");
-}
+// The branch the Branch filter lists and matches: the one line 2 shows (a
+// pull request Run's head branch). `null` when there is none.
+const branchLabel = (r: RunSummary): string | null =>
+  runBranch({ kind: r.trigger_kind, ref: r.git_ref, head: r.origin_pr_head });
 
 // Distinct, non-empty values a projection takes across the fetched rows — the
 // option set for a filter dropdown. Sorted by the caller.
@@ -382,6 +385,9 @@ export default function RepoView() {
   const [now, setNow] = createSignal(Date.now());
   const tick = setInterval(() => setNow(Date.now()), 1000);
   onCleanup(() => clearInterval(tick));
+  // The clock to the minute, for the day headers' names (`Today` becomes
+  // `Yesterday` at midnight): a memo, so it changes once a minute.
+  const minute = createMemo(() => Math.floor(now() / 60_000));
 
   // Option sets for the Filter panel's pickers, derived from whatever the
   // fetched rows carry — so you only ever pick a value that exists. A picker
@@ -447,21 +453,32 @@ export default function RepoView() {
   // triggers between them. Counts are over the same rows.
   const listRows = createMemo(() => segmentRows(shownRuns().filter(passes), shownRefused(), segment(), rowFilter()));
   const counts = createMemo(() => segmentCounts(shownRuns().filter(passes), shownRefused(), rowFilter()));
-  // How many rows of this view wait behind the pill.
+  // How many rows of this view arrived since the list was last shown.
   const arrived = createMemo(() => {
     const all = segmentRows((rows() ?? []).filter(passes), refused(), segment(), rowFilter());
     const on = new Set(listRows().map(listKey));
     return all.filter((r) => !on.has(listKey(r))).length;
   });
+  // With no row on screen (never ran, or no match) nothing would move, so
+  // what arrives is shown at once; otherwise it waits behind the pill.
+  // Computed, not an effect, so the empty state is never drawn for a list
+  // that has rows to show.
+  const arrivals = createMemo(() => arrivedView(listRows().length, arrived()));
+  createComputed(() => {
+    if (arrivals().showNow) untrack(showArrived);
+  });
 
   // The rows in day groups, each replaced Run under the Run that replaced
   // it, flattened to keys: a row keeps its DOM across polls and updates in
-  // place (a `<For>` over strings keys by value).
+  // place (a `<For>` over strings keys by value). Only a cancelled Run is
+  // replaced. The groups depend on the rows only; a header's day name reads
+  // the clock where it is drawn.
   const view = createMemo(() => {
     const groups = dayGroups(
-      placeReplaced(listRows(), (row) => (row.kind === "run" ? row.run : null)),
+      placeReplaced(listRows(), (row) =>
+        row.kind === "run" ? { ...row.run, replaced_by: replacedBy(row.run) } : null,
+      ),
       (row) => (row.kind === "run" ? row.run.status : "refused"),
-      now(),
     );
     const order: string[] = [];
     const byKey = new Map<string, Entry>();
@@ -642,6 +659,13 @@ export default function RepoView() {
           )}
         </Show>
 
+        <Show when={arrivals().pill > 0}>
+          <div class="rl-newpill">
+            <button type="button" onClick={showArrived}>
+              <Icon icon="arrow-up" size={13} /> {arrivedLabel(arrivals().pill)}
+            </button>
+          </div>
+        </Show>
         <Switch>
           <Match when={loading()}>
             <div class="runlist" aria-busy="true" aria-label="Loading the Runs">
@@ -690,13 +714,6 @@ export default function RepoView() {
             </div>
           </Match>
           <Match when={true}>
-            <Show when={arrived() > 0}>
-              <div class="rl-newpill">
-                <button type="button" onClick={showArrived}>
-                  <Icon icon="arrow-up" size={13} /> {arrivedLabel(arrived())}
-                </button>
-              </div>
-            </Show>
             <div class="runlist">
               <For each={view().order}>
                 {(k) => {
@@ -707,7 +724,9 @@ export default function RepoView() {
                         const ev = e();
                         if (ev.t === "day") {
                           const g = () => (entry() as Extract<Entry, { t: "day" }> | undefined)?.g ?? ev.g;
-                          return <DayHeader label={g().label} count={g().count} failed={g().failed} />;
+                          return (
+                            <DayHeader label={dayLabel(g().at, minute() * 60_000)} count={g().count} failed={g().failed} />
+                          );
                         }
                         const item = () => (entry() as Extract<Entry, { t: "row" }> | undefined)?.item ?? ev.item;
                         return (
@@ -1349,7 +1368,7 @@ function RunListRow(props: {
 }) {
   const nav = useNavigate();
   const r = () => props.r;
-  const ok = () => r().status === "succeeded" && !props.replaced;
+  const ok = () => r().status === "succeeded";
   const st = () => rowStatus(r(), props.replaced);
   return (
     <div
