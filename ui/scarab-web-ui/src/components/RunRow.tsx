@@ -1,10 +1,11 @@
 // The pieces of a Runs list row: the status mark at the left edge, line 1
 // (pipeline / headline), line 2 (the trigger, where the Run came from, the
-// commit and the author), and the status phrase over the time at the right,
-// with a deploy Run's chip before the time. The words come from ../run-row;
-// every text style is a class in styles.css.
+// commit, the author and a deploy Run's Environment), line 3 (what the status
+// word leaves out, when there is something), and the status word over the time
+// at the right. The words come from ../run-row; every text style is a class in
+// styles.css.
 import { Index, Match, Show, Switch } from "solid-js";
-import { cutName, runHeadline, statusGlyph, statusText, type KindCell, type PhrasePart, type StatusPhrase } from "../run-row";
+import { cutName, runHeadline, statusGlyph, type DeployTag, type KindCell, type PhrasePart, type StatusDetail } from "../run-row";
 import { statusWord } from "../run-page";
 import { triggerIcon } from "../trigger";
 import Icon from "./Icon";
@@ -58,23 +59,26 @@ export function RowTitle(props: { pipeline?: string | null; kind?: string | null
 export type OriginProps = {
   kind?: string | null;
   /** The trigger in words, and where the Run came from (`kindFirst`). */
-  line: { kind: KindCell; where: PhrasePart[] };
+  line: { kind: KindCell; where: PhrasePart[]; tight: boolean };
   sha?: string | null;
   author: { text: string; muted: boolean };
   commitUrl?: string | null;
   prUrl?: string | null;
+  /** A deploy Run's Environment (`deployTag`), last on the line. */
+  deploy?: DeployTag | null;
 };
 
 const stop = (e: MouseEvent) => e.stopPropagation();
 
 /** Line 2: the trigger in a fixed first column (`PR #213`, `push`, `tag
- *  v0.7.2`), where the Run came from (which gives way first), then the hash
- *  and the author at the right edge, at the same x on every row. On a phone
- *  it flows as one wrapped line in the same order. */
+ *  v0.7.2`), where the Run came from (which gives way first), the hash and
+ *  the author at the same x on every row, then a deploy Run's Environment.
+ *  A `tight` phrase (`→ main`) follows the trigger in its cell, with no column
+ *  gap. On a phone it flows as one wrapped line in the same order. */
 export function OriginLine(props: OriginProps) {
   return (
     <div class="rr-l2">
-      <span class="rr-kind" classList={{ wide: props.line.kind.muted }}>
+      <span class="rr-kind" classList={{ wide: props.line.kind.muted || props.line.tight }}>
         <Icon icon={triggerIcon(props.kind)} size={13} />
         <span class="rr-kword" classList={{ muted: props.line.kind.muted }}>
           {props.line.kind.word}
@@ -87,8 +91,13 @@ export function OriginLine(props: OriginProps) {
             </span>
           )}
         </Show>
+        <Show when={props.line.tight}>
+          <span class="rr-where">
+            <WhereParts parts={props.line.where} prUrl={props.prUrl} />
+          </span>
+        </Show>
       </span>
-      <Show when={!props.line.kind.muted}>
+      <Show when={!props.line.kind.muted && !props.line.tight}>
         <span class="rr-where">
           <WhereParts parts={props.line.where} prUrl={props.prUrl} />
         </span>
@@ -115,6 +124,26 @@ export function OriginLine(props: OriginProps) {
         </Show>
         <span class="rr-whoname">{props.author.text}</span>
       </span>
+      <Show when={props.deploy}>
+        {(d) => (
+          <span class="rr-env" title={d().title}>
+            <Icon icon="rocket" size={12} />
+            <span class="rr-envname">{d().text}</span>
+          </span>
+        )}
+      </Show>
+    </div>
+  );
+}
+
+/** Line 3: what the status word leaves out (`failed at test · macos +1`,
+ *  `waiting for approval`, `replaced by #130, a newer push`), behind its
+ *  icon. Drawn only when there is one. */
+export function StatusLine(props: { detail: StatusDetail }) {
+  return (
+    <div class={`rr-l3 ${props.detail.tone}`} title={props.detail.text}>
+      <Icon icon={props.detail.icon} size={12} />
+      <span class="rr-l3txt">{props.detail.text}</span>
     </div>
   );
 }
@@ -154,61 +183,39 @@ function WhereParts(props: { parts: PhrasePart[]; prUrl?: string | null }) {
   );
 }
 
-/** A deploy Run's chip, before its time: the Environment it deploys into,
- *  or `Deploy` when it names none. The only chip on a row. */
-export function DeployChip(props: { environment?: string | null }) {
-  return (
-    <span class="rr-dchip" title={props.environment ? `deploy run into ${props.environment}` : "deploy run"}>
-      <Icon icon="rocket" size={11} />
-      <Show when={props.environment} fallback={<span class="rr-dlabel">Deploy</span>}>
-        {(env) => <span class="rr-denv">{cutName(env(), 18)}</span>}
-      </Show>
-    </span>
-  );
-}
-
-/** The right column: the status phrase over `HH:MM · duration`, with a
- *  deploy Run's chip before the time. A passed Run shows no phrase (its
- *  check mark says it). */
+/** The right column: one status word over `HH:MM · duration`. A passed Run
+ *  shows no word (its check mark says it). The word's title carries line 3's
+ *  detail when there is one. */
 export function RowStatus(props: {
-  phrase: StatusPhrase;
+  word: string;
+  /** The status whose ink the word takes. */
+  tone: string;
+  /** The word's hover title: the full detail, else the word. */
+  title?: string | null;
   quiet?: boolean;
   clock: string;
   /** Relative and absolute time, for the hover title. */
   when: string;
   duration?: string | null;
   live?: boolean;
-  /** Set on a deploy Run: its Environment, or null for none. */
-  deploy?: { environment: string | null } | null;
 }) {
   return (
     <div class="rr-right">
       <Show when={!props.quiet}>
-        <span class={`rr-word ${props.phrase.tone}`} title={statusText(props.phrase)}>
-          {props.phrase.lead}
-          <Show when={props.phrase.step}>
-            {(s) => (
-              <>
-                {" "}
-                <span class="rr-step">{s()}</span>
-              </>
-            )}
-          </Show>
+        <span class={`rr-word ${props.tone}`} title={props.title ?? props.word}>
+          {props.word}
         </span>
       </Show>
-      <span class="rr-tline">
-        <Show when={props.deploy}>{(d) => <DeployChip environment={d().environment} />}</Show>
-        <span class="rr-time" classList={{ live: props.live }} title={props.when}>
-          <span class="mono">{props.clock}</span>
-          <Show when={props.duration}>
-            {(d) => (
-              <>
-                {" · "}
-                <span class="mono">{d()}</span>
-              </>
-            )}
-          </Show>
-        </span>
+      <span class="rr-time" classList={{ live: props.live }} title={props.when}>
+        <span class="mono">{props.clock}</span>
+        <Show when={props.duration}>
+          {(d) => (
+            <>
+              {" · "}
+              <span class="mono">{d()}</span>
+            </>
+          )}
+        </Show>
       </span>
     </div>
   );

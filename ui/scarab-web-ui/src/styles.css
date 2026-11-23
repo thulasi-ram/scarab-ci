@@ -1812,7 +1812,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .rl-empty { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 44px 24px 52px; text-align: center; }
 .rl-never { padding-top: 28px; }
 .rl-empty p { margin: 0; }
-.rl-empty-title { font: var(--t-label); color: var(--soft-white); }
+.rl-empty-title { font: var(--t-body); color: var(--soft-white); }
 .rl-empty-text { max-width: 52ch; font: var(--t-body); color: var(--sage); }
 .rl-mono { font: var(--t-mono); }
 .rl-code {
@@ -1820,6 +1820,9 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   background: var(--pine-deep); font: var(--t-mono); color: var(--soft-white);
 }
 .rl-empty-acts { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 6px; }
+/* The Runs tab has no bold: its ghost buttons (Try again, Clear filters) are
+   Body. The primary Run pipeline button keeps the app's button style. */
+.rl-errbar .btn, .rl-empty-acts .btn-ghost { font: var(--t-body); }
 /* Loading: rows the shape of real rows, so nothing moves when they arrive. */
 .rr-skel { cursor: default; padding-top: 18px; padding-bottom: 18px; }
 .rr-skel:hover { background: none; }
@@ -1838,30 +1841,31 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 @media (prefers-reduced-motion: reduce) { .rr-skel i { animation: none; } }
 
 /* ---- run list rows ---- */
-/* One grid per Run: status mark | #N | two lines | status phrase over time.
-   Line 1 is `pipeline / headline`; line 2 is the trigger, where the Run came
-   from, the commit and the author. Rows have no rules between them:
-   whitespace separates them and a hover band shows the row. Day headers sit
-   above each day's rows. 4px grid. Only the headline is bold: line 2, the
-   number and the time are Mono, the status phrase is Body. */
+/* One grid per Run: status mark | #N | two or three lines | status word over
+   time. Line 1 is `pipeline / headline`; line 2 is the trigger, where the Run
+   came from, the commit, the author and a deploy Run's Environment; line 3,
+   when there is one, is what the status word leaves out. Rows have no rules
+   between them: whitespace separates them and a hover band shows the row. Day
+   headers sit above each day's rows. 4px grid. Nothing is bold: hierarchy is
+   ink (primary, secondary, muted) and Mono against Body. */
 .runlist { border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; background: transparent; }
 .runrow {
   position: relative;
-  display: grid; grid-template-columns: 22px 52px minmax(0, 1fr) 250px; gap: 0 12px; align-items: start;
+  display: grid; grid-template-columns: 22px 52px minmax(0, 1fr) 180px; gap: 0 12px; align-items: start;
   padding: 14px 24px; cursor: pointer;
 }
 .runrow:hover { background: color-mix(in srgb, var(--emerald) 8%, transparent); }
 .runrow.refused { cursor: default; }
 .runrow.refused:hover { background: none; }
 .runrow > .rr-mark, .runrow > .rr-num { margin-top: 1px; }
-/* A deploy Run: a copper rail on the left edge, and its chip by the time. */
+/* A deploy Run: a copper rail on the left edge; its Environment ends line 2. */
 .runrow.deploy::before {
   content: ""; position: absolute; left: 0; top: 10px; bottom: 10px; width: 3px;
   border-radius: 0 3px 3px 0; background: var(--copper);
 }
 
 /* A day: `Today  9 runs · 3 failed or refused`. */
-.rr-day { display: flex; gap: 12px; align-items: baseline; padding: 28px 24px 4px; font: var(--t-label); color: var(--soft-white); }
+.rr-day { display: flex; gap: 12px; align-items: baseline; padding: 28px 24px 4px; font: var(--t-body); color: var(--soft-white); }
 .rr-day:first-child { padding-top: 14px; }
 .rr-day .sum { font: var(--t-body); color: var(--muted-sage); }
 .rr-day .sum .failed { color: var(--danger); }
@@ -1903,7 +1907,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 /* In the list the number is Mono in the secondary ink. */
 .rr-num .runnum .n { font: var(--t-mono); color: var(--sage); }
 
-.rr-main { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.rr-main { min-width: 0; display: flex; flex-direction: column; gap: 8px; }
 .rr-l1 { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
 /* The pipeline is text a person named, so plain Mono, not a chip. It is cut
    to 24 characters in code (`.rr-pcut`) and never shrinks; the headline wraps
@@ -1913,17 +1917,21 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .rr-pfull { display: none; }
 .rr-slash { font: var(--t-body); color: var(--muted-sage); flex: none; }
 .rr-title {
-  font: var(--t-label); color: var(--soft-white); flex: 1 1 0; min-width: 8ch; overflow-wrap: anywhere;
+  font: var(--t-body); color: var(--soft-white); flex: 1 1 0; min-width: 8ch; overflow-wrap: anywhere;
   display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden;
 }
 .rr-title.none { font: var(--t-body); color: var(--muted-sage); }
 
 /* Line 2 (OriginLine), all Mono: the trigger in a fixed first column (`PR
-   #213`), where the Run came from (it gives way first), then the hash and the
-   author, each behind its icon, at the right edge, at the same x on every
-   row. */
+   #213`), where the Run came from (it gives way first), the hash and the
+   author, each behind its icon, then a deploy Run's Environment. The first
+   four columns stop at 640px, so the hash and the author sit near the
+   where-from text, not at the far edge of a wide row. The Environment's
+   column is the same on every row, empty on most, so the hash and the author
+   are at one x on every row. */
 .rr-l2 {
-  display: grid; grid-template-columns: 13ch minmax(0, 1fr) 10ch 14ch; gap: 0 12px; align-items: center;
+  display: grid; grid-template-columns: 13ch minmax(0, 1fr) 10ch 14ch minmax(0, 21ch); gap: 0 12px; align-items: center;
+  max-width: calc(640px + 12px + 21ch);
   font: var(--t-mono); color: var(--sage); min-width: 0;
 }
 .rr-l2 * { font: var(--t-mono); }
@@ -1942,38 +1950,43 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .rr-l2 a { color: inherit; text-decoration: none; }
 .rr-l2 a.sha { color: var(--copper); }
 .rr-l2 a:hover { color: var(--emerald); text-decoration: underline; }
+/* A deploy Run's Environment: the rocket and the name in copper, no chip. */
+.rr-env { grid-column: 5; display: inline-flex; align-items: center; gap: 5px; min-width: 0; white-space: nowrap; color: var(--copper); }
+.rr-env > svg { flex: none; }
+.rr-envname { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+/* Line 3: what the status word leaves out, behind a small icon. Mono in the
+   muted ink; a failure leans to the danger ink, a wait takes the wait ink. */
+.rr-l3 { display: flex; align-items: center; gap: 6px; min-width: 0; font: var(--t-mono); color: var(--muted-sage); }
+.rr-l3 > svg { flex: none; }
+.rr-l3txt { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rr-l3.failed { color: color-mix(in srgb, var(--danger) 80%, var(--muted-sage)); }
+.rr-l3.waiting { color: var(--warn); }
 
 .rr-right { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; text-align: right; min-width: 0; }
 .rr-word {
   font: var(--t-body); color: var(--muted-sage); max-width: 100%;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.rr-word .rr-step { font: var(--t-body); }
 .rr-word.succeeded { color: var(--ok); }
 .rr-word.failed, .rr-word.dead_lettered, .rr-word.refused { color: var(--danger); }
 .rr-word.running, .rr-word.pending { color: var(--running-ink); }
 .rr-word.suspended { color: var(--warn); }
-/* The time line: a deploy Run's chip, then `HH:MM · duration` in Mono. */
-.rr-tline { display: flex; align-items: center; justify-content: flex-end; gap: 8px; max-width: 100%; min-width: 0; }
+/* The time line: `HH:MM · duration` in Mono. */
 .rr-time { flex: none; font: var(--t-mono); color: var(--muted-sage); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .rr-time .mono { font: var(--t-mono); color: var(--sage); font-variant-numeric: tabular-nums; }
 .rr-time.live, .rr-time.live .mono { color: var(--running-ink); }
-.rr-dchip {
-  display: inline-flex; align-items: center; gap: 5px; height: 20px; padding: 0 8px 0 7px; min-width: 0;
-  border-radius: 999px; background: color-mix(in srgb, var(--copper) 14%, transparent);
-  border: 1px solid color-mix(in srgb, var(--copper) 40%, transparent); color: var(--copper); white-space: nowrap;
-}
-.rr-dchip > svg { flex: none; }
-.rr-dlabel { font: var(--t-body); }
-.rr-denv { font: var(--t-mono); color: var(--soft-white); min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 
 /* Quiet success: a passed Run keeps its check mark and drops its status
-   word; its headline and line 2 drop to the secondary ink. */
+   word; its headline (Body) and line 2 drop to the secondary ink. */
 .runrow.ok .rr-title { color: var(--sage); }
 .runrow.ok .rr-l2 { color: var(--muted-sage); }
 
 /* A Run a newer one replaced, under its replacer. */
 .runrow.child .rr-main { padding-left: 16px; border-left: 2px solid var(--border); margin-left: 4px; }
+/* Its line 2 starts 22px in, so it stops 22px sooner: the hash and the
+   author stay at the x of the rows above. */
+.runrow.child .rr-l2 { max-width: calc(640px + 12px + 21ch - 22px); }
 .runrow.child .rr-title { color: var(--sage); }
 
 /* A refused trigger's reason, one line under the row: what, then the fix. */
@@ -2001,7 +2014,6 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   .rr-day { padding-left: 16px; padding-right: 16px; }
   .rr-num { display: none; }
   .rr-right { grid-column: 2; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin-top: 4px; }
-  .rr-tline { justify-content: flex-start; }
   .rr-reason { grid-column: 2; }
   .rr-l1 { flex-direction: column; align-items: stretch; gap: 0; }
   .rr-slash, .rr-pcut { display: none; }
@@ -2012,9 +2024,12 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   .rr-kind, .rr-where, .rr-ktok { display: inline; white-space: normal; }
   .rr-kind > svg { vertical-align: -2px; margin-right: 6px; }
   .rr-where:not(:empty)::before { content: " "; }
-  .rr-sha, .rr-who { display: inline; }
-  .rr-sha > svg, .rr-who > svg { vertical-align: -2px; margin-right: 4px; }
-  .rr-sha::before, .rr-who::before { content: "·"; color: var(--muted-sage); margin: 0 6px; }
+  /* The line may break after each `·`; a hash, an author or an Environment
+     stays whole. */
+  .rr-sha, .rr-who, .rr-env { display: inline; white-space: normal; }
+  .rr-sha > svg, .rr-who > svg, .rr-env > svg { vertical-align: -2px; margin-right: 4px; }
+  .rr-sha > :not(svg), .rr-who > :not(svg), .rr-env > :not(svg) { white-space: nowrap; }
+  .rr-sha::before, .rr-who::before, .rr-env::before { content: "· "; color: var(--muted-sage); margin-left: 6px; }
 }
 
 /* Status as a word, for other lists (a schedule's last fire). */

@@ -71,17 +71,18 @@ import {
   clockTime,
   dayGroups,
   daySummary,
+  deployTag,
   kindFirst,
   placeReplaced,
   pullNumber,
+  rowStatus,
   splitArrived,
-  statusPhrase,
   type DayGroup,
   type Placed,
   type Replaced,
 } from "../run-row";
 import { statusWord } from "../run-page";
-import { OriginLine, RowStatus, RowTitle, SkeletonRow, StatusMark } from "../components/RunRow";
+import { OriginLine, RowStatus, RowTitle, SkeletonRow, StatusLine, StatusMark } from "../components/RunRow";
 import RunNumber from "../components/RunNumber";
 import Icon from "../components/Icon";
 import { HomeCrumb, RepoCrumb } from "../components/PageCrumbs";
@@ -1349,6 +1350,7 @@ function RunListRow(props: {
   const nav = useNavigate();
   const r = () => props.r;
   const ok = () => r().status === "succeeded" && !props.replaced;
+  const st = () => rowStatus(r(), props.replaced);
   return (
     <div
       class="runrow"
@@ -1367,6 +1369,8 @@ function RunListRow(props: {
             kind: r().trigger_kind,
             ref: r().git_ref,
             pr: r().pr_number,
+            // A server that sends a pull request's head branch names it here.
+            head: (r() as RunSummary & { origin_pr_head?: string | null }).origin_pr_head,
             base: r().origin_pr_base,
             title: r().trigger_title,
           })}
@@ -1374,16 +1378,19 @@ function RunListRow(props: {
           author={authorSlot(r().trigger_kind, r().actor)}
           commitUrl={forgeCommitUrl(props.repoUrl, r().sha)}
           prUrl={forgePrUrl(props.repoUrl, r().pr_number)}
+          deploy={deployTag(r().deploy, r().environment)}
         />
+        <Show when={st().detail}>{(d) => <StatusLine detail={d()} />}</Show>
       </div>
       <RowStatus
-        phrase={statusPhrase(r(), props.replaced)}
+        word={st().word}
+        tone={st().tone}
+        title={st().detail?.text}
         quiet={ok()}
         clock={clockTime(r().created_at)}
         when={`${relTime(r().created_at)} · ${absTime(r().created_at)}`}
         duration={durationLabel(r(), props.now)}
         live={isLive(r().status)}
-        deploy={r().deploy ? { environment: r().environment ?? null } : null}
       />
     </div>
   );
@@ -1552,7 +1559,8 @@ function RefusedRow(props: { r: RefusedRun; repoUrl?: string | null }) {
         />
       </div>
       <RowStatus
-        phrase={{ lead: statusWord("refused"), step: null, tone: "refused" }}
+        word={statusWord("refused")}
+        tone="refused"
         clock={clockTime(r().created_at)}
         when={`${relTime(r().created_at)} · ${absTime(r().created_at)}`}
       />
