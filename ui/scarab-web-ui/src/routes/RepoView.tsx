@@ -1354,7 +1354,7 @@ function RunListRow(props: {
   return (
     <div
       class="runrow"
-      classList={{ ok: ok(), child: props.child, deploy: r().deploy }}
+      classList={{ ok: ok(), child: props.child }}
       onClick={() => nav(props.href)}
     >
       <StatusMark status={r().status} />

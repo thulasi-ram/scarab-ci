@@ -1858,11 +1858,6 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .runrow.refused { cursor: default; }
 .runrow.refused:hover { background: none; }
 .runrow > .rr-mark, .runrow > .rr-num { margin-top: 1px; }
-/* A deploy Run: a copper rail on the left edge; its Environment ends line 2. */
-.runrow.deploy::before {
-  content: ""; position: absolute; left: 0; top: 10px; bottom: 10px; width: 3px;
-  border-radius: 0 3px 3px 0; background: var(--copper);
-}
 
 /* A day: `Today  9 runs · 3 failed or refused`. */
 .rr-day { display: flex; gap: 12px; align-items: baseline; padding: 28px 24px 4px; font: var(--t-body); color: var(--soft-white); }
