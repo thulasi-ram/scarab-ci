@@ -690,6 +690,7 @@ async fn head_lookup_contract(s: &Store) {
         Some("s0"),
         None,
         None,
+        None,
     )
     .await
     .unwrap();

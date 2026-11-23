@@ -218,6 +218,11 @@ async fn pull_request_run_stamps_pr_title_headline_and_base() {
         Some("main"),
         "a PR run stamps origin_pr_base = the base ref"
     );
+    assert_eq!(
+        db.run_pr_head(&run).await.unwrap().as_deref(),
+        Some("feat/dashboard-widget"),
+        "a PR run stamps origin_pr_head = the head branch"
+    );
 }
 
 /// A committed `.scarab` authoring slice-4 engine features: a concurrency group

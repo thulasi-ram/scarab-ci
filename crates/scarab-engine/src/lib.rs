@@ -184,6 +184,11 @@ pub struct RunSummary {
     /// fact, `None` for non-PR runs and pre-stamping runs.
     #[serde(default)]
     pub pr_base: Option<String>,
+    /// The PR **head** branch (`origin_pr_head`): the branch a `pull_request`
+    /// run comes from, as the forge sent it (a fork PR's is the fork's
+    /// branch). `None` for non-PR runs and runs created before it was stamped.
+    #[serde(default)]
+    pub pr_head: Option<String>,
     /// The bare name of the pipeline this run executed (the `.scarab/<name>`
     /// selection), stamped at creation for trigger/dispatch runs. `None` for
     /// inline runs (no named pipeline) and pre-stamping runs.

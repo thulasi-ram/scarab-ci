@@ -15008,6 +15008,13 @@
             ],
             "description": "The PR **base** branch — the branch a `pull_request` run\ntargets, rendered `base ← head` in the ref cluster. A discrete origin\nfact; absent for non-PR runs and runs created before base-stamping."
           },
+          "origin_pr_head": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The PR **head** branch — the branch a `pull_request` run comes from\n(`pull_request.head.ref`, without `refs/heads/`), as the forge sent\nit: a fork PR's is the fork's branch name. The run's `git_ref` is\n`refs/pull/<N>/head`, which does not name it. Absent for non-PR runs\nand runs created before head-stamping."
+          },
           "params": {
             "type": "object",
             "description": "The run's frozen launch parameters, `name → typed value`.\nA run-level constant resolved once at creation; non-secret by contract,\nso safe to expose. Empty when the run took none. Lets the UI's\nre-run flow pre-fill the form from the prior run's params."
@@ -15133,6 +15140,13 @@
               "null"
             ],
             "description": "The PR **base** branch — the branch a `pull_request` run\ntargets, rendered `base ← head` in the ref cluster. A discrete origin\nfact; absent for non-PR runs and runs created before base-stamping."
+          },
+          "origin_pr_head": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The PR **head** branch — the branch a `pull_request` run comes from\n(`pull_request.head.ref`, without `refs/heads/`), as the forge sent\nit: a fork PR's is the fork's branch name. The run's `git_ref` is\n`refs/pull/<N>/head`, which does not name it. Absent for non-PR runs\nand runs created before head-stamping."
           },
           "pipeline": {
             "type": [

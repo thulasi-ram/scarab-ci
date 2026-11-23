@@ -3302,6 +3302,7 @@ async fn a_run_with_no_delivery_does_not_stop_a_redelivery() {
         Some("aaa000"),
         None,
         None,
+        None,
     )
     .await
     .unwrap();

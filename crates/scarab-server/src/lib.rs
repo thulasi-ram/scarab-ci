@@ -1249,6 +1249,13 @@ pub struct RunStatusResponse {
     /// fact; absent for non-PR runs and runs created before base-stamping.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin_pr_base: Option<String>,
+    /// The PR **head** branch — the branch a `pull_request` run comes from
+    /// (`pull_request.head.ref`, without `refs/heads/`), as the forge sent
+    /// it: a fork PR's is the fork's branch name. The run's `git_ref` is
+    /// `refs/pull/<N>/head`, which does not name it. Absent for non-PR runs
+    /// and runs created before head-stamping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_pr_head: Option<String>,
     /// This run's **Workspace Snapshot** retention promise — the
     /// cold tier's time bound, made explicit rather than left implicit in a
     /// sweeper's config, plus any manual pin over it.
@@ -1385,6 +1392,13 @@ pub struct RunSummaryDto {
     /// fact; absent for non-PR runs and runs created before base-stamping.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin_pr_base: Option<String>,
+    /// The PR **head** branch — the branch a `pull_request` run comes from
+    /// (`pull_request.head.ref`, without `refs/heads/`), as the forge sent
+    /// it: a fork PR's is the fork's branch name. The run's `git_ref` is
+    /// `refs/pull/<N>/head`, which does not name it. Absent for non-PR runs
+    /// and runs created before head-stamping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_pr_head: Option<String>,
     /// The pipeline this run executed (the bare `.scarab/<name>` selection).
     /// Absent for inline runs and runs created before pipeline-stamping.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1537,6 +1551,7 @@ impl From<scarab_engine::RunSummary> for RunSummaryDto {
             sha: s.sha,
             pr_number: s.pr_number,
             origin_pr_base: s.pr_base,
+            origin_pr_head: s.pr_head,
             pipeline: s.pipeline,
             trigger_title: s.trigger_title,
             deploy: s.deploy,
@@ -3009,6 +3024,7 @@ async fn get_run(
     let pipeline = st.db.run_pipeline(&run).await?;
     let trigger_title = st.db.run_trigger_title(&run).await?;
     let origin_pr_base = st.db.run_pr_base(&run).await?;
+    let origin_pr_head = st.db.run_pr_head(&run).await?;
     let run_number = st.db.run_number(&run).await?;
     // The cold tier's TIME bound, stated rather than implied (ADR-0061 s5). Cheap
     // by construction: one row read plus arithmetic, no object-store round-trip —
@@ -3093,6 +3109,7 @@ async fn get_run(
         pipeline,
         trigger_title,
         origin_pr_base,
+        origin_pr_head,
         snapshot_retention,
         yanked_libraries,
         environment,
@@ -5162,6 +5179,18 @@ fn origin_pr_number(event: &scarab_forge::Event) -> Option<i64> {
 fn origin_pr_base(event: &scarab_forge::Event) -> Option<String> {
     match event {
         scarab_forge::Event::PullRequest { base, .. } if !base.is_empty() => Some(base.clone()),
+        _ => None,
+    }
+}
+
+/// The PR **head** branch for a `pull_request` event, for `origin_pr_head`
+/// (the runs list's `head → base`). `None` for every other kind, and when the
+/// payload carried no head ref.
+fn origin_pr_head(event: &scarab_forge::Event) -> Option<String> {
+    match event {
+        scarab_forge::Event::PullRequest { head_branch, .. } if !head_branch.is_empty() => {
+            Some(head_branch.clone())
+        }
         _ => None,
     }
 }
@@ -8845,8 +8874,9 @@ async fn write_run_from_ir(
     }
     // Origin (the runs-list surface): stamp the trigger facts this run was born
     // from — trigger kind (always), Actor, symbolic ref, resolved commit, PR
-    // number, and PR base branch — as discrete columns beside tenancy. Sparse by
-    // nature (a cron run has no actor/ref/sha; only a PR has a number + base);
+    // number, and PR base and head branches — as discrete columns beside
+    // tenancy. Sparse by nature (a cron run has no actor/ref/sha; only a PR has
+    // a number, a base and a head);
     // carries no scheduling authority, purely for display/audit.
     db.set_run_origin(
         run,
@@ -8856,6 +8886,7 @@ async fn write_run_from_ir(
         origin_sha(event).as_deref(),
         origin_pr_number(event),
         origin_pr_base(event).as_deref(),
+        origin_pr_head(event).as_deref(),
     )
     .await?;
     // The pipeline name (the runs-list/detail "which pipeline is this") — the

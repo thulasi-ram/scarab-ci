@@ -5679,6 +5679,14 @@ export interface components {
              */
             origin_pr_base?: string | null;
             /**
+             * @description The PR **head** branch — the branch a `pull_request` run comes from
+             *     (`pull_request.head.ref`, without `refs/heads/`), as the forge sent
+             *     it: a fork PR's is the fork's branch name. The run's `git_ref` is
+             *     `refs/pull/<N>/head`, which does not name it. Absent for non-PR runs
+             *     and runs created before head-stamping.
+             */
+            origin_pr_head?: string | null;
+            /**
              * @description The run's frozen launch parameters, `name → typed value`.
              *     A run-level constant resolved once at creation; non-secret by contract,
              *     so safe to expose. Empty when the run took none. Lets the UI's
@@ -5768,6 +5776,14 @@ export interface components {
              *     fact; absent for non-PR runs and runs created before base-stamping.
              */
             origin_pr_base?: string | null;
+            /**
+             * @description The PR **head** branch — the branch a `pull_request` run comes from
+             *     (`pull_request.head.ref`, without `refs/heads/`), as the forge sent
+             *     it: a fork PR's is the fork's branch name. The run's `git_ref` is
+             *     `refs/pull/<N>/head`, which does not name it. Absent for non-PR runs
+             *     and runs created before head-stamping.
+             */
+            origin_pr_head?: string | null;
             /**
              * @description The pipeline this run executed (the bare `.scarab/<name>` selection).
              *     Absent for inline runs and runs created before pipeline-stamping.

@@ -331,6 +331,7 @@ fn fake_run_summary(st: &InMemoryState, run: &RunId, status: RunStatus) -> RunSu
         sha: origin.and_then(|o| o.3.clone()),
         pr_number: origin.and_then(|o| o.4),
         pr_base: origin.and_then(|o| o.5.clone()),
+        pr_head: origin.and_then(|o| o.6.clone()),
         run_number: st.run_number.get(run).copied(),
         pipeline: st.run_pipeline.get(run).cloned(),
         trigger_title: st.run_trigger_title.get(run).cloned(),
@@ -438,7 +439,8 @@ struct InMemoryState {
     /// hands them out (mirrors `runs.run_number` + `repo_run_counters`).
     run_number: HashMap<RunId, i64>,
     repo_run_counters: HashMap<(String, String), i64>,
-    /// Per-run origin `(trigger_kind, actor, git_ref, sha, pr_number, pr_base)` —
+    /// Per-run origin `(trigger_kind, actor, git_ref, sha, pr_number, pr_base,
+    /// pr_head)` —
     /// the trigger facts stamped at creation (mirrors the `origin_*` run columns).
     #[allow(clippy::type_complexity)]
     run_origin: HashMap<
@@ -449,6 +451,7 @@ struct InMemoryState {
             Option<String>,
             Option<String>,
             Option<i64>,
+            Option<String>,
             Option<String>,
         ),
     >,
@@ -1840,6 +1843,7 @@ impl Db for InMemoryDb {
         Ok(self.state.lock().unwrap().run_number.get(run).copied())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn set_run_origin(
         &self,
         run: &RunId,
@@ -1849,6 +1853,7 @@ impl Db for InMemoryDb {
         sha: Option<&str>,
         pr_number: Option<i64>,
         pr_base: Option<&str>,
+        pr_head: Option<&str>,
     ) -> Result<(), DbError> {
         self.state.lock().unwrap().run_origin.insert(
             run.clone(),
@@ -1859,6 +1864,7 @@ impl Db for InMemoryDb {
                 sha.map(str::to_string),
                 pr_number,
                 pr_base.map(str::to_string),
+                pr_head.map(str::to_string),
             ),
         );
         Ok(())
@@ -1872,6 +1878,16 @@ impl Db for InMemoryDb {
             .run_origin
             .get(run)
             .and_then(|o| o.5.clone()))
+    }
+
+    async fn run_pr_head(&self, run: &RunId) -> Result<Option<String>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .run_origin
+            .get(run)
+            .and_then(|o| o.6.clone()))
     }
 
     async fn set_run_cache_scope(

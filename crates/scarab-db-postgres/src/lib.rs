@@ -1528,6 +1528,7 @@ impl Db for PostgresDb {
         Ok(row.and_then(|r| r.get::<Option<i64>, _>("run_number")))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn set_run_origin(
         &self,
         run: &RunId,
@@ -1537,11 +1538,12 @@ impl Db for PostgresDb {
         sha: Option<&str>,
         pr_number: Option<i64>,
         pr_base: Option<&str>,
+        pr_head: Option<&str>,
     ) -> Result<(), DbError> {
         sqlx::query(
             "UPDATE runs SET origin_trigger_kind = $2, origin_actor = $3,
                  origin_ref = $4, origin_sha = $5, origin_pr_number = $6,
-                 origin_pr_base = $7,
+                 origin_pr_base = $7, origin_pr_head = $8,
                  updated_at = (extract(epoch from now()) * 1000)::bigint
              WHERE id = $1",
         )
@@ -1552,6 +1554,7 @@ impl Db for PostgresDb {
         .bind(sha)
         .bind(pr_number)
         .bind(pr_base)
+        .bind(pr_head)
         .execute(self.pool())
         .await
         .map_err(db_err)?;
@@ -1565,6 +1568,15 @@ impl Db for PostgresDb {
             .await
             .map_err(db_err)?;
         Ok(row.and_then(|r| r.get::<Option<String>, _>("origin_pr_base")))
+    }
+
+    async fn run_pr_head(&self, run: &RunId) -> Result<Option<String>, DbError> {
+        let row = sqlx::query("SELECT origin_pr_head FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("origin_pr_head")))
     }
 
     async fn cache_record(
@@ -4849,7 +4861,8 @@ fn run_summaries_sql(page: &str) -> String {
         "WITH page AS ({page})
          SELECT r.id, r.status, r.created_at, r.updated_at, r.tenant_org, r.tenant_project,
                 r.run_number, r.origin_trigger_kind, r.origin_actor, r.origin_ref, r.origin_sha,
-                r.origin_pr_number, r.origin_pr_base, r.pipeline, r.trigger_title,
+                r.origin_pr_number, r.origin_pr_base, r.origin_pr_head, r.pipeline,
+                r.trigger_title,
                 r.deploy_environment, r.is_deploy_run,
                 COALESCE(CASE WHEN r.status = 'cancelled' THEN r.superseded_by END,
                          r.replaced_by) AS replaced_by_run,
@@ -4893,6 +4906,7 @@ fn run_summary_from_row(r: sqlx::postgres::PgRow) -> Result<RunSummary, DbError>
         sha: r.get::<Option<String>, _>("origin_sha"),
         pr_number: r.get::<Option<i64>, _>("origin_pr_number"),
         pr_base: r.get::<Option<String>, _>("origin_pr_base"),
+        pr_head: r.get::<Option<String>, _>("origin_pr_head"),
         pipeline: r.get::<Option<String>, _>("pipeline"),
         trigger_title: r.get::<Option<String>, _>("trigger_title"),
         environment: r.get::<Option<String>, _>("deploy_environment"),
