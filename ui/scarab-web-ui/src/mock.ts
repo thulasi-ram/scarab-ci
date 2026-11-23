@@ -265,6 +265,7 @@ const runs = [
     project: "scarab",
     created_at: ago(12 * 60000),
     waiting_gates: [{ step: "approve", key: mockStepKey("approve"), kind: "manual", since: ago(10 * 60000) }],
+    waiting_for: { step: "approve", kind: "manual" },
   }),
   summary({
     id: "01984f22bb334d8e9a1122cd44ef6600",
@@ -273,6 +274,7 @@ const runs = [
     project: "billing",
     created_at: ago(27 * 60000),
     waiting_gates: [{ step: "release", key: mockStepKey("release"), kind: "manual", since: ago(20 * 60000) }],
+    waiting_for: { step: "release", kind: "environment_approval" },
   }),
   // git-bug c489346: a gate holds only its dependents, so this run is still
   // `running` (its `version` sibling runs) while its `approve` gate waits.
@@ -308,7 +310,7 @@ const STRIP_TITLES = [
   "Fix timezone in the nightly report",
   "Drop the unused staging secret",
 ];
-const strip = (pattern: string, first = 120) =>
+const strip = (pattern: string, first = 120): { runs: RunSummaryDto[] } =>
   ({
     runs: pattern.split("").map((c, i) => ({
       id: `r${i}`,
@@ -317,6 +319,7 @@ const strip = (pattern: string, first = 120) =>
       trigger_kind: "push",
       trigger_title: STRIP_TITLES[i % STRIP_TITLES.length],
       status: c === "x" ? "failed" : c === "c" ? "cancelled" : "succeeded",
+      ...(c === "x" ? { failed_step: "test", failed_steps_count: 1 } : {}),
       duration_ms: 40000 + ((i * 37) % 11) * 22000,
       created_at: ago((i + 1) * 900000),
       // Every third run is a deploy — marked `deploy: true`, with an
@@ -338,6 +341,92 @@ for (const i of [3, 7]) {
     pipeline: "nightly",
   });
 }
+// The newest of scarab's runs, above the filler: pull request #131 pushed
+// three times (each newer push cancelled the Run before it), a deploy held
+// at its Environment's approval, a Run held at a manual gate, and a failed
+// Run whose two plan cells failed. The last three open the run fixtures
+// below; the pull request #131 Runs have no run page in the mock.
+const pr131 = (o: Partial<RunSummaryDto> & Pick<RunSummaryDto, "id" | "status">): RunSummaryDto => ({
+  trigger_kind: "pull_request",
+  git_ref: "refs/pull/131/head",
+  pr_number: 131,
+  origin_pr_base: "main",
+  actor: "a.kim",
+  trigger_title: "Wire shared postgres into the integration suite",
+  duration_ms: 0,
+  created_at: 0,
+  pipeline: "ci",
+  deploy: false,
+  ...o,
+});
+scarabRuns.runs.unshift(
+  pr131({
+    id: "0190f8a2000071fb8c00c0ffee000003",
+    status: "running",
+    run_number: 155,
+    sha: "e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5",
+    created_at: ago(90_000),
+  }),
+  pr131({
+    id: "0190f8a2000071fb8c00c0ffee000002",
+    status: "cancelled",
+    run_number: 154,
+    sha: "d3c2b1a0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4",
+    duration_ms: 70_000,
+    created_at: ago(4 * 60_000),
+    replaced_by: "0190f8a2000071fb8c00c0ffee000003",
+  }),
+  pr131({
+    id: "0190f8a2000071fb8c00c0ffee000001",
+    status: "cancelled",
+    run_number: 153,
+    sha: "c2b1a0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3",
+    duration_ms: 95_000,
+    created_at: ago(7 * 60_000),
+    replaced_by: "0190f8a2000071fb8c00c0ffee000002",
+  }),
+  pr131({
+    id: ENV_GATE_RUN_ID,
+    status: "suspended",
+    run_number: 152,
+    trigger_kind: "push",
+    git_ref: "refs/heads/main",
+    pr_number: null,
+    origin_pr_base: null,
+    trigger_title: "Deploy 7c1e2d4 to production",
+    sha: "7c1e2d4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d",
+    created_at: ago(5 * 60_000),
+    pipeline: "deploy",
+    deploy: true,
+    environment: "production",
+    waiting_for: { step: "environment-approval", kind: "environment_approval" },
+  }),
+  pr131({
+    id: RICH_RUN_ID,
+    status: "suspended",
+    run_number: 147,
+    sha: "7c2e91d04b8a3f5e6d1c0b9a87654321fedcba98",
+    created_at: ago(9 * 60_000),
+    pipeline: "release",
+    waiting_for: { step: "approve", kind: "manual" },
+  }),
+  pr131({
+    id: MATRIX_RUN_ID,
+    status: "failed",
+    run_number: 33,
+    git_ref: "refs/pull/2949/head",
+    pr_number: 2949,
+    origin_pr_base: "develop",
+    actor: "thulasi",
+    trigger_title: "Smoke-run the plan pipelines on the new cluster module",
+    sha: "15f2297b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f",
+    duration_ms: 11 * 60_000,
+    created_at: ago(12 * 60_000),
+    pipeline: "tofu-plan",
+    failed_step: "plan[cluster=treebo-production,phase=aws-post-cluster]",
+    failed_steps_count: 2,
+  }),
+);
 const repoRuns: Record<string, ReturnType<typeof strip>> = {
   scarab: scarabRuns, // ~64% pass window near the older tail
   "orders-api": strip("oxooxooxooooo"),
