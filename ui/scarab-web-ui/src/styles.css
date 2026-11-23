@@ -1922,16 +1922,14 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 }
 .rr-title.none { font: var(--t-body); color: var(--muted-sage); }
 
-/* Line 2 (OriginLine), all Mono: the trigger in a fixed first column (`PR
-   #213`), where the Run came from (it gives way first), the hash and the
-   author, each behind its icon, then a deploy Run's Environment. The first
-   four columns stop at 640px, so the hash and the author sit near the
-   where-from text, not at the far edge of a wide row. The Environment's
-   column is the same on every row, empty on most, so the hash and the author
-   are at one x on every row. */
+/* Line 2 (OriginLine), all Mono: the trigger in a fixed first column (`pr
+   #213`), where the Run came from (it gives way first), then one group: the
+   hash, the author and a deploy Run's Environment, each behind its icon. The
+   line stops at 640px and the group's column has a fixed width, so the group
+   starts at one x on every row, near the where-from text. */
 .rr-l2 {
-  display: grid; grid-template-columns: 13ch minmax(0, 1fr) 10ch 14ch minmax(0, 21ch); gap: 0 12px; align-items: center;
-  max-width: calc(640px + 12px + 21ch);
+  display: grid; grid-template-columns: 13ch minmax(0, 1fr) 40ch; gap: 0 12px; align-items: center;
+  max-width: 640px;
   font: var(--t-mono); color: var(--sage); min-width: 0;
 }
 .rr-l2 * { font: var(--t-mono); }
@@ -1943,25 +1941,20 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .rr-where { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rr-l2 .sep, .rr-l2 .muted { color: var(--muted-sage); }
 .rr-l2 .sha { color: var(--copper); }
-/* The hash and the author each lead with a small icon in the muted ink. */
-.rr-sha, .rr-who { display: inline-flex; align-items: center; gap: 5px; min-width: 0; white-space: nowrap; }
+/* The group: even spacing between its parts; the author, then the
+   Environment, give way when it is full. */
+.rr-meta { grid-column: 3; display: flex; align-items: center; gap: 12px; min-width: 0; white-space: nowrap; }
+.rr-sha, .rr-who, .rr-env { display: inline-flex; align-items: center; gap: 5px; min-width: 0; white-space: nowrap; }
+.rr-sha { flex: none; }
+.rr-who { flex: 0 1 auto; }
 .rr-sha > svg, .rr-who > svg { color: var(--muted-sage); flex: none; }
-.rr-whoname { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.rr-whoname, .rr-envname { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .rr-l2 a { color: inherit; text-decoration: none; }
 .rr-l2 a.sha { color: var(--copper); }
 .rr-l2 a:hover { color: var(--emerald); text-decoration: underline; }
 /* A deploy Run's Environment: the rocket and the name in copper, no chip. */
-.rr-env { grid-column: 5; display: inline-flex; align-items: center; gap: 5px; min-width: 0; white-space: nowrap; color: var(--copper); }
+.rr-env { flex: 0 1 auto; color: var(--copper); }
 .rr-env > svg { flex: none; }
-.rr-envname { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-
-/* Line 3: what the status word leaves out, behind a small icon. Mono in the
-   muted ink; a failure leans to the danger ink, a wait takes the wait ink. */
-.rr-l3 { display: flex; align-items: center; gap: 6px; min-width: 0; font: var(--t-mono); color: var(--muted-sage); }
-.rr-l3 > svg { flex: none; }
-.rr-l3txt { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.rr-l3.failed { color: color-mix(in srgb, var(--danger) 80%, var(--muted-sage)); }
-.rr-l3.waiting { color: var(--warn); }
 
 .rr-right { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; text-align: right; min-width: 0; }
 .rr-word {
@@ -1972,6 +1965,21 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .rr-word.failed, .rr-word.dead_lettered, .rr-word.refused { color: var(--danger); }
 .rr-word.running, .rr-word.pending { color: var(--running-ink); }
 .rr-word.suspended { color: var(--warn); }
+/* A word with more to say: a faint dotted underline, and a card on hover,
+   keyboard focus or a tap. */
+.rr-word.has-card {
+  text-decoration: underline dotted color-mix(in srgb, currentColor 45%, transparent);
+  text-underline-offset: 3px; cursor: default;
+}
+.rr-word.has-card:focus-visible { outline: 2px solid var(--emerald); outline-offset: 2px; border-radius: 2px; }
+/* The card: below the word, kept in the viewport by the code that places it. */
+.rr-card {
+  position: fixed; z-index: 40; max-width: 320px; padding: 7px 10px; pointer-events: none;
+  background: var(--emerald-elevated); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.16); font: var(--t-body); color: var(--soft-white); overflow-wrap: anywhere;
+}
+.rr-card[hidden] { display: none; }
+.rr-card-mono { font: var(--t-mono); }
 /* The time line: `HH:MM · duration` in Mono. */
 .rr-time { flex: none; font: var(--t-mono); color: var(--muted-sage); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .rr-time .mono { font: var(--t-mono); color: var(--sage); font-variant-numeric: tabular-nums; }
@@ -1986,7 +1994,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .runrow.child .rr-main { padding-left: 16px; border-left: 2px solid var(--border); margin-left: 4px; }
 /* Its line 2 starts 22px in, so it stops 22px sooner: the hash and the
    author stay at the x of the rows above. */
-.runrow.child .rr-l2 { max-width: calc(640px + 12px + 21ch - 22px); }
+.runrow.child .rr-l2 { max-width: calc(640px - 22px); }
 .runrow.child .rr-title { color: var(--sage); }
 
 /* A refused trigger's reason, one line under the row: what, then the fix. */
@@ -2024,12 +2032,8 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   .rr-kind, .rr-where, .rr-ktok { display: inline; white-space: normal; }
   .rr-kind > svg { vertical-align: -2px; margin-right: 6px; }
   .rr-where:not(:empty)::before { content: " "; }
-  /* The line may break after each `·`; a hash, an author or an Environment
-     stays whole. */
-  .rr-sha, .rr-who, .rr-env { display: inline; white-space: normal; }
-  .rr-sha > svg, .rr-who > svg, .rr-env > svg { vertical-align: -2px; margin-right: 4px; }
-  .rr-sha > :not(svg), .rr-who > :not(svg), .rr-env > :not(svg) { white-space: nowrap; }
-  .rr-sha::before, .rr-who::before, .rr-env::before { content: "· "; color: var(--muted-sage); margin-left: 6px; }
+  /* The group wraps as a unit after the where-from. */
+  .rr-meta { display: inline-flex; max-width: 100%; vertical-align: top; }
 }
 
 /* Status as a word, for other lists (a schedule's last fire). */

@@ -82,7 +82,7 @@ import {
   type Replaced,
 } from "../run-row";
 import { statusWord } from "../run-page";
-import { OriginLine, RowStatus, RowTitle, SkeletonRow, StatusLine, StatusMark } from "../components/RunRow";
+import { OriginLine, RowStatus, RowTitle, SkeletonRow, StatusMark } from "../components/RunRow";
 import RunNumber from "../components/RunNumber";
 import Icon from "../components/Icon";
 import { HomeCrumb, RepoCrumb } from "../components/PageCrumbs";
@@ -580,7 +580,7 @@ export default function RepoView() {
             environment={{ value: envFilter(), set: setEnvFilter, options: environments().map((e) => ({ value: e, label: envLabel(e) })) }}
             author={{ value: authorFilter(), set: setAuthorFilter, options: authors().map((a) => ({ value: a, label: a })) }}
             branch={{ value: branchFilter(), set: setBranchFilter, options: branches().map((b) => ({ value: b, label: b })) }}
-            pr={{ value: prFilter(), set: setPrFilter, options: prNumbers().map((p) => ({ value: String(p), label: `PR #${p}` })) }}
+            pr={{ value: prFilter(), set: setPrFilter, options: prNumbers().map((p) => ({ value: String(p), label: `pr #${p}` })) }}
             deploys={deploysOnly()}
             onDeploys={setDeploysOnly}
             scheduled={scheduledOnly()}
@@ -1380,12 +1380,11 @@ function RunListRow(props: {
           prUrl={forgePrUrl(props.repoUrl, r().pr_number)}
           deploy={deployTag(r().deploy, r().environment)}
         />
-        <Show when={st().detail}>{(d) => <StatusLine detail={d()} />}</Show>
       </div>
       <RowStatus
         word={st().word}
         tone={st().tone}
-        title={st().detail?.text}
+        detail={st().detail}
         quiet={ok()}
         clock={clockTime(r().created_at)}
         when={`${relTime(r().created_at)} · ${absTime(r().created_at)}`}
