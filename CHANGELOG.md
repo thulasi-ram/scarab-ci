@@ -28,7 +28,9 @@ release.yml uses that version's section as the GitHub Release text. See
   Each `ALTER` waits at most 5 seconds for its lock on `runs`; on a busy database the server stops
   with `canceling statement due to lock timeout` and runs it again when Kubernetes restarts it.
   While one waits, reads and writes of `runs` wait too, up to 5 seconds per migration. A 0.7.2
-  server does not start on a database that ran them, and there is no rollback script.
+  server does not start on a database that ran them: to roll back, run
+  `crates/scarab-db-postgres/rollback/0106_revert.sql` with the server scaled to zero. See the
+  chart README, "Upgrading from 0.7.2".
 
 ### Features
 

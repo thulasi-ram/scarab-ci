@@ -563,6 +563,27 @@ The StatefulSet's `serviceName` is unchanged, so upgrading needs no migration.
 
 > **Unverified in this chart version:** per-availability-zone placement.
 
+### Upgrading from 0.7.2: saved pipeline files
+
+Migrations 0106, 0107 and 0108 add nullable columns to `runs`: the pipeline
+file a Run was created from (`pipeline_path`, `pipeline_source`,
+`pipeline_source_sha`), the newer Run that replaced it (`superseded_by`) and a
+pull request's head branch (`origin_pr_head`). No row is rewritten and none is
+backfilled, so Runs from before the upgrade have no saved file, no recorded
+replacement and no head branch. Each `ALTER` waits at most 5 seconds for its
+lock on `runs`; on a busy database the server stops with `canceling statement
+due to lock timeout`, Kubernetes restarts it, and it tries again. While one
+waits, reads and writes of `runs` wait too, up to 5 seconds per migration.
+
+To roll back: scale the server to zero
+(`kubectl -n scarab scale deploy/scarab --replicas=0`), back up the database,
+run
+[`rollback/0106_revert.sql`](../../../crates/scarab-db-postgres/rollback/0106_revert.sql)
+(`psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0106_revert.sql`; a second run
+changes nothing), then install the 0.7.2 chart. The saved files, the
+replacements and the head branches are dropped. To go back to 0.7.1, run
+`0104_revert.sql` next.
+
 ### Upgrading from 0.7.1: webhook delivery outcomes
 
 Migrations 0104 and 0105 record what each webhook delivery decided for each
