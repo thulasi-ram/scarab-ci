@@ -586,6 +586,35 @@ async fn a_triggered_runs_manifest_is_the_file_read_at_creation_and_its_librarie
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
 
+/// A dispatched Run's Pipeline file is recorded with the commit its ref
+/// resolved to, not the ref.
+#[tokio::test]
+async fn a_dispatched_runs_manifest_names_the_commit_its_ref_resolved_to() {
+    const MANUAL_YAML: &str = "on:\n  manual: {}\nsteps:\n  - { id: test, image: busybox }\n";
+    let h = harness(MANUAL_YAML).await;
+    let run = scarab_server::dispatch_run(
+        h.forge.as_ref(),
+        h.db.as_ref(),
+        &FakeClock::new(1_000),
+        AdmissionPorts::default().with_libraries(h.libs.as_ref()),
+        "alice".into(),
+        repo(),
+        "main".into(),
+        "ci".into(),
+        Default::default(),
+        scarab_server::DispatchKind::Manual,
+        None,
+    )
+    .await
+    .unwrap();
+    let (st, m) = call(&h.app, "GET", &format!("/v1/runs/{}/manifest", run.0), None).await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    assert_eq!(m["recorded"], true, "{m}");
+    assert_eq!(m["path"], ".scarab/ci.yaml");
+    assert_eq!(m["sha"], SHA);
+    assert_eq!(m["source"], MANUAL_YAML);
+}
+
 #[tokio::test]
 async fn an_inline_runs_manifest_is_not_recorded() {
     let h = harness(CI_YAML).await;
