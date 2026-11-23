@@ -7,7 +7,7 @@
       "name": "AGPL-3.0-only",
       "identifier": "AGPL-3.0-only"
     },
-    "version": "0.7.1"
+    "version": "0.7.2"
   },
   "paths": {
     "/.well-known/jwks.json": {
@@ -9465,11 +9465,14 @@
           "401": {
             "description": "bad signature"
           },
+          "409": {
+            "description": "another try is processing this delivery; redeliver later"
+          },
           "502": {
-            "description": "the forge could not be read and nothing was created; redeliver"
+            "description": "the forge could not be read, or a Pipeline was left undecided; the body names what ran, what did not and what is undecided; redeliver"
           },
           "503": {
-            "description": "too many deliveries running, or this delivery is still running; redeliver later"
+            "description": "too many deliveries running; redeliver later"
           }
         },
         "security": []
@@ -9492,11 +9495,14 @@
           "401": {
             "description": "bad signature"
           },
+          "409": {
+            "description": "another try is processing this delivery; redeliver later"
+          },
           "502": {
-            "description": "the forge could not be read and nothing was created; redeliver"
+            "description": "the forge could not be read, or a Pipeline was left undecided; the body names what ran, what did not and what is undecided; redeliver"
           },
           "503": {
-            "description": "too many deliveries running, or this delivery is still running; redeliver later"
+            "description": "too many deliveries running; redeliver later"
           }
         },
         "security": []

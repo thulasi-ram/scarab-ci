@@ -263,12 +263,17 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            // A comment on a pull request carries `issue.pull_request`.
+            let pull_request = p
+                .pointer("/issue/pull_request")
+                .is_some_and(|v| !v.is_null());
             Ok(Event::Comment {
                 actor,
                 actor_id,
                 repo,
                 issue,
                 body,
+                pull_request,
             })
         }
         other => Err(ForgeError::UnsupportedEvent(other.to_string())),
@@ -1430,6 +1435,16 @@ impl ForgePort for GithubForge {
             paths.extend(items.iter().flat_map(pr_file_paths));
         }
         Ok(Some(paths))
+    }
+
+    async fn pull_request_head(&self, repo: &RepoRef, number: u64) -> Result<String, ForgeError> {
+        let token = self.auth_token_for(repo).await?;
+        let url = self.url(&format!(
+            "/repos/{}/{}/pulls/{number}",
+            repo.owner, repo.name
+        ));
+        let body = ok_json(self.send(|| self.client.get(&url), &token).await?).await?;
+        scarab_forge::pull_request_head_sha(&body)
     }
 
     async fn set_status(

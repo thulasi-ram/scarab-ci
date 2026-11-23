@@ -13373,14 +13373,21 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description the forge could not be read and nothing was created; redeliver */
+            /** @description another try is processing this delivery; redeliver later */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the forge could not be read, or a Pipeline was left undecided; the body names what ran, what did not and what is undecided; redeliver */
             502: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description too many deliveries running, or this delivery is still running; redeliver later */
+            /** @description too many deliveries running; redeliver later */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -13419,14 +13426,21 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description the forge could not be read and nothing was created; redeliver */
+            /** @description another try is processing this delivery; redeliver later */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the forge could not be read, or a Pipeline was left undecided; the body names what ran, what did not and what is undecided; redeliver */
             502: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description too many deliveries running, or this delivery is still running; redeliver later */
+            /** @description too many deliveries running; redeliver later */
             503: {
                 headers: {
                     [name: string]: unknown;

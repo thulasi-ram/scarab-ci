@@ -18,6 +18,53 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-11-23
+
+### Breaking changes
+
+- **A webhook delivery that left a Pipeline undecided answers 502, and one another try is
+  processing answers 409.** A delivery that created some Runs while a Pipeline file could not be
+  read answered 202 with `"incomplete": true`; it now answers 502, and the body lists `run_ids`,
+  `refused`, `earlier` and `undecided`. A redelivery while an earlier try of the same delivery
+  runs answered 503 on the same server replica and `duplicate delivery` on another; it now
+  answers 409 on any replica. The overload answer stays 503. Without forge connections
+  configured (no delivery ids kept), a delivery that created some Runs while a file could not be
+  read also answers 502 now. A tool that watches the forge's delivery log sees these codes. See
+  [Webhook deliveries](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#webhook-deliveries).
+- **Migrations 0104 and 0105.** 0104 alters `runs` and then `webhook_deliveries` with a 5-second
+  lock timeout; on a busy database the server can stop with `canceling statement due to lock
+  timeout` and start on its next restart. While it waits, reads and writes of `runs` wait too,
+  up to 5 seconds per start attempt. 0105 builds an index concurrently. To roll back, run
+  `crates/scarab-db-postgres/rollback/0104_revert.sql` with the server scaled to zero. See the
+  chart README, "Upgrading from 0.7.1".
+
+### Bug Fixes
+
+- **A redelivery creates only the Runs a delivery is missing** (git-bug 61174ee). A delivery kept
+  its id as "done" once recorded, so a redelivery could not repair one that stopped part way: a
+  Pipeline file the forge could not read, a server that stopped mid-delivery, or a second server
+  replica that saw the id while the first was still working. Scarab now records what each
+  delivery decided for each Pipeline file, in the same transaction as the Run's first row or the
+  refusal, and a GitHub Redeliver decides only the files no earlier try decided. A push, a pull
+  request or a comment on a pull request creates nothing on a redelivery when a newer delivery of
+  that ref or pull request arrived at another commit, and fails its check with "no longer the
+  head of". A comment, tag or release delivery reads `.scarab/` at the commit its first try
+  resolved; when that commit cannot be resolved it reads at the ref, as before, and a comment on
+  a pull request whose head cannot be read runs without the head rule. A Run whose creation stopped
+  part way is replaced by the redelivery. A Forgejo Replay has a new id and starts the Runs
+  again, as before. See
+  [Webhook deliveries](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#webhook-deliveries).
+
+### Enhancement
+
+- **Rerun, retry and gate actions on a Run a redelivery replaced answer 409**, naming the Run that
+  replaced it. See
+  [Webhook deliveries](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#webhook-deliveries).
+- **Webhook deliveries are pruned after 30 days.** `retention.webhookDeliveryDays`
+  (`SCARAB_RETENTION_WEBHOOK_DELIVERY_DAYS`) sets the period; the server refuses to start under
+  7 days. The table was never pruned before. See
+  [Environment variables](https://thulasi-ram.github.io/scarab-ci/usage/environment-variables/).
+
 ## [0.7.1] - 2026-11-22
 
 ### Breaking changes
@@ -2316,7 +2363,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.6.0...v0.6.1

@@ -228,6 +228,11 @@ pub enum PolicyStoreError {
     Invalid(String),
     #[error("policy store: {0}")]
     Store(String),
+    /// [`PolicyStore::record_run_create_decision`] for a webhook delivery
+    /// whose outcome another try recorded first (ADR-0083 §2): nothing was
+    /// written, the decision included.
+    #[error("another try of this webhook delivery decided this Pipeline")]
+    DeliveryClaimed,
 }
 
 #[async_trait]
@@ -405,6 +410,25 @@ pub struct RunCreationRow {
     pub ir_version: u32,
     pub event_schema_version: u32,
     pub created_at: i64,
+    /// The webhook delivery outcome written with the row (ADR-0083 §2), on
+    /// the webhook path only. A store that writes the row writes it too, in
+    /// the same transaction, or answers
+    /// [`PolicyStoreError::DeliveryClaimed`] with nothing written.
+    pub delivery: Option<RunCreationDelivery>,
+}
+
+/// The key of a webhook delivery outcome `run`, as [`RunCreationRow`]
+/// carries it: the engine's `DeliveryRunClaim`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunCreationDelivery {
+    pub connection_id: String,
+    pub delivery_id: String,
+    pub pipeline: String,
+    pub forge: String,
+    /// The outcome names this Run, whose creation never finished; it is
+    /// moved to the new Run only while it still names it, and this Run is
+    /// marked replaced.
+    pub replaces: Option<String>,
 }
 
 /// A page size as stores apply it.

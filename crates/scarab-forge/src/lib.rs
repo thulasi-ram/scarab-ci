@@ -186,6 +186,17 @@ pub fn cap_trigger_title(raw: &str) -> Option<String> {
     Some(truncate_on_char_boundary(trimmed, TRIGGER_TITLE_MAX))
 }
 
+/// The head commit of a pull request from the forge's `GET pulls/{n}`
+/// answer: `head.sha`, the same field on GitHub and Forgejo. A missing or
+/// malformed one is an error.
+pub fn pull_request_head_sha(body: &serde_json::Value) -> Result<String, ForgeError> {
+    body.pointer("/head/sha")
+        .and_then(serde_json::Value::as_str)
+        .filter(|sha| is_commit_sha(sha))
+        .map(str::to_string)
+        .ok_or_else(|| ForgeError::Malformed("pull request head.sha".into()))
+}
+
 /// Whether `s` has the shape of a git commit SHA: 4 to 64 lower-case hex
 /// digits (4 is git's shortest abbreviation, 64 a SHA-256 object name).
 ///
@@ -659,6 +670,11 @@ pub enum Event {
         repo: RepoRef,
         issue: u64,
         body: String,
+        /// The issue is a pull request (GitHub `issue.pull_request`, Forgejo
+        /// `is_pull`): a later try of the delivery applies the head rule
+        /// against it (ADR-0083 §5).
+        #[serde(default)]
+        pull_request: bool,
     },
     /// A scheduled fire of an `on: cron:` Pipeline (git-bug 5d5fc8a). The
     /// server builds it at fire time from what it just read from the forge:
@@ -1348,6 +1364,13 @@ pub trait ForgePort: Send + Sync {
         Err(ForgeError::Unsupported("listing pull request files".into()))
     }
 
+    /// The head commit of pull request `number` (`GET pulls/{number}`,
+    /// `head.sha`): the commit a comment on it is pinned to for the head
+    /// rule (ADR-0083 §5).
+    async fn pull_request_head(&self, _repo: &RepoRef, _number: u64) -> Result<String, ForgeError> {
+        Err(ForgeError::Unsupported("reading a pull request".into()))
+    }
+
     async fn set_status(
         &self,
         repo: &RepoRef,
@@ -1634,6 +1657,39 @@ pub fn is_reserved_org(org: &str) -> bool {
     org.starts_with('_')
 }
 
+/// What the store found when a try of a webhook delivery began
+/// ([`ForgeConnectionStore::begin_delivery_try`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryTry {
+    /// This try inserted the delivery row; it holds the lease. `at` is when
+    /// the delivery arrived (unix ms, the store's clock); `token` names this
+    /// try's lease for [`ForgeConnectionStore::end_delivery_try`].
+    First { at: i64, token: String },
+    /// A later try of an unfinished delivery; it took the lease. `pins` is
+    /// what an earlier try pinned, if any.
+    Again {
+        at: i64,
+        pins: Option<DeliveryPins>,
+        token: String,
+    },
+    /// The delivery is finished: a replay.
+    Finished,
+    /// Another try holds the lease.
+    Held,
+}
+
+/// What a delivery is pinned to on its first try (ADR-0083 §1, §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryPins {
+    /// The commit every try reads `.scarab/` at.
+    pub config_sha: String,
+    /// The ref or pull request the delivery is about (`HeadScope::key`), for
+    /// the head rule; `None` for a delivery the rule does not apply to.
+    pub head_scope: Option<String>,
+    /// The scope's commit when the delivery arrived.
+    pub head_sha: Option<String>,
+}
+
 /// Durable store for [`ForgeConnection`]s and the [`RepoRef`]s they own —
 /// the repo/Project **registry** (ADR-0046). Persistence is an adapter
 /// (Postgres); this port keeps the pure crate I/O-free. In v1 a `RepoRef`
@@ -1748,24 +1804,45 @@ pub trait ForgeConnectionStore: Send + Sync {
     /// an unregistered repo (its webhooks are dropped).
     async fn resolve(&self, repo: &RepoRef) -> Result<Option<ResolvedRepo>, RegistryError>;
 
-    /// Record a webhook delivery id for `forge` — the replay guard (ADR-0046).
-    /// Returns `true` if this is the FIRST time the id is seen; `false` for a
-    /// replay (the caller acknowledges without re-processing). Idempotent.
-    async fn record_delivery(
+    /// Begin a try of webhook delivery `delivery_id` of `forge` (ADR-0046,
+    /// ADR-0083 §7), with the store's clock:
+    ///
+    /// * no row: insert it unfinished, leased for `lease_ms`, and answer
+    ///   [`DeliveryTry::First`];
+    /// * a finished row: [`DeliveryTry::Finished`] (a replay, acknowledged
+    ///   without processing);
+    /// * an unfinished row whose lease is free or expired: take the lease
+    ///   and answer [`DeliveryTry::Again`] with what the first try pinned;
+    /// * an unfinished row another try holds: [`DeliveryTry::Held`].
+    async fn begin_delivery_try(
         &self,
         forge: ForgeKind,
         delivery_id: &str,
-    ) -> Result<bool, RegistryError>;
+        lease_ms: i64,
+    ) -> Result<DeliveryTry, RegistryError>;
 
-    /// Remove a delivery id [`record_delivery`](Self::record_delivery)
-    /// recorded, so a redelivery of it is processed. Called only for a
-    /// delivery that created no Run because the forge could not be read: its
-    /// redelivery cannot duplicate a Run. Removing an id that is not there
-    /// is not an error.
-    async fn forget_delivery(
+    /// Store what a delivery is pinned to (ADR-0083 §1, §5) unless a try
+    /// stored it first, and answer what is stored. Every try reads
+    /// `.scarab/` at the answered `config_sha`.
+    async fn pin_delivery(
         &self,
         forge: ForgeKind,
         delivery_id: &str,
+        pins: &DeliveryPins,
+    ) -> Result<DeliveryPins, RegistryError>;
+
+    /// End a try begun with [`begin_delivery_try`](Self::begin_delivery_try):
+    /// clear its lease, and mark the delivery finished when `finished` (every
+    /// Pipeline decided). Only while `token` still names the lease: a try
+    /// whose lease lapsed and was taken by a later try changes nothing, and
+    /// the later try's lease stands. An unfinished delivery is processed
+    /// again by its next redelivery.
+    async fn end_delivery_try(
+        &self,
+        forge: ForgeKind,
+        delivery_id: &str,
+        token: &str,
+        finished: bool,
     ) -> Result<(), RegistryError>;
 
     /// Unix-ms of the most recent delivery recorded for `forge`, if any — a
@@ -2068,6 +2145,51 @@ pub mod contract {
 
 #[cfg(test)]
 mod tests {
+    /// ADR-0083 §5: the pull request head a comment is pinned to, from a
+    /// GitHub and a Forgejo `GET pulls/{n}` answer (trimmed to the fields
+    /// around `head`), and a refusal of one without a commit id.
+    #[test]
+    fn a_pull_request_head_is_read_from_both_forges_answers() {
+        let github = serde_json::json!({
+            "number": 7,
+            "state": "open",
+            "head": {
+                "label": "octocat:widget",
+                "ref": "widget",
+                "sha": "6dcb09b5b57875f334f61aebed695e2e4193db5e",
+                "repo": { "full_name": "octocat/app" }
+            },
+            "base": { "ref": "main", "sha": "aaaa09b5b57875f334f61aebed695e2e4193db5e" }
+        });
+        assert_eq!(
+            super::pull_request_head_sha(&github).unwrap(),
+            "6dcb09b5b57875f334f61aebed695e2e4193db5e"
+        );
+        let forgejo = serde_json::json!({
+            "id": 12,
+            "number": 7,
+            "state": "open",
+            "head": {
+                "label": "widget",
+                "ref": "widget",
+                "sha": "e3f2c1b0a9d8c7b6a5f4e3d2c1b0a9d8c7b6a5f4",
+                "repo_id": 3
+            },
+            "base": { "label": "main", "ref": "main", "sha": "1111c1b0a9d8c7b6a5f4e3d2c1b0a9d8c7b6a5f4" },
+            "merge_base": "1111c1b0a9d8c7b6a5f4e3d2c1b0a9d8c7b6a5f4"
+        });
+        assert_eq!(
+            super::pull_request_head_sha(&forgejo).unwrap(),
+            "e3f2c1b0a9d8c7b6a5f4e3d2c1b0a9d8c7b6a5f4"
+        );
+        for bad in [
+            serde_json::json!({ "head": { "sha": "--upload-pack=x" } }),
+            serde_json::json!({ "head": {} }),
+        ] {
+            assert!(super::pull_request_head_sha(&bad).is_err(), "{bad}");
+        }
+    }
+
     use super::*;
 
     fn repo() -> RepoRef {
@@ -2140,6 +2262,7 @@ mod tests {
                     repo: repo(),
                     issue: 1,
                     body: "/deploy".into(),
+                    pull_request: false,
                 },
                 TriggerKind::Comment,
             ),
@@ -2418,7 +2541,8 @@ mod tests {
                 actor_id: String::new(),
                 repo: repo(),
                 issue: 1,
-                body: "/deploy".into()
+                body: "/deploy".into(),
+                pull_request: false,
             }
             .protection_ref(),
             None,

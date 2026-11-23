@@ -382,15 +382,14 @@ pub const WEBHOOK_DELIVERY_SLOTS: u32 = 64;
 /// nothing recorded: GitHub's delivery timeout.
 pub const WEBHOOK_DELIVERY_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The permits webhook deliveries take ([`WEBHOOK_DELIVERY_SLOTS`]), how
-/// long one waits for a permit, and the delivery ids whose task is running
-/// on this server ([`RunningDelivery`]).
+/// The permits webhook deliveries take ([`WEBHOOK_DELIVERY_SLOTS`]) and how
+/// long one waits for a permit. Which try of a delivery runs is decided by
+/// the database, on every replica (the try lease, ADR-0083 §7).
 #[derive(Clone)]
 struct DeliverySlots {
     permits: Arc<tokio::sync::Semaphore>,
     count: u32,
     wait: std::time::Duration,
-    running: Arc<std::sync::Mutex<std::collections::HashSet<(&'static str, String)>>>,
 }
 
 impl DeliverySlots {
@@ -399,65 +398,15 @@ impl DeliverySlots {
             permits: Arc::new(tokio::sync::Semaphore::new(count as usize)),
             count,
             wait,
-            running: Arc::default(),
         }
     }
-}
-
-/// A delivery id whose task is running on this server, from before its id
-/// is recorded until the task ends. A redelivery of a running id is
-/// answered 503 instead of "duplicate delivery": the first try may still
-/// fail to read the forge, forget the id and answer 502 to a forge that
-/// stopped waiting, and a 200 to the redelivery would then end the
-/// delivery with no Run. The set is per server: a redelivery that reaches
-/// another replica finds the id recorded and is answered as a duplicate.
-struct RunningDelivery {
-    running: Arc<std::sync::Mutex<std::collections::HashSet<(&'static str, String)>>>,
-    key: Option<(&'static str, String)>,
-}
-
-impl RunningDelivery {
-    /// Mark `delivery_id` of `forge` running, or `None` when it already
-    /// is. An empty id (no registry wired) is never deduplicated.
-    fn claim(st: &AppState, forge: scarab_forge::ForgeKind, delivery_id: &str) -> Option<Self> {
-        let running = st.delivery_slots.running.clone();
-        if delivery_id.is_empty() {
-            return Some(Self { running, key: None });
-        }
-        let key = (forge.as_str(), delivery_id.to_string());
-        if !running.lock().unwrap().insert(key.clone()) {
-            return None;
-        }
-        Some(Self {
-            running,
-            key: Some(key),
-        })
-    }
-}
-
-impl Drop for RunningDelivery {
-    fn drop(&mut self) {
-        if let Some(key) = self.key.take() {
-            self.running.lock().unwrap().remove(&key);
-        }
-    }
-}
-
-/// [`RunningDelivery::claim`], answering 503 when the id is running.
-fn claim_delivery(
-    st: &AppState,
-    forge: scarab_forge::ForgeKind,
-    delivery_id: &str,
-) -> Result<RunningDelivery, ApiError> {
-    RunningDelivery::claim(st, forge, delivery_id).ok_or_else(|| {
-        ApiError::Unavailable("this delivery is still running; redeliver later".into())
-    })
 }
 
 /// Wait, at most `wait`, for every webhook delivery task to end, and return
 /// how many were still running when the wait ended. The shutdown path calls
 /// it after the HTTP server stopped: a delivery whose forge stopped waiting
-/// runs in a task nothing else waits for, and its id is already recorded.
+/// runs in a task nothing else waits for, and its try holds the delivery
+/// until it ends or its lease lapses.
 pub async fn drain_webhook_deliveries(st: &AppState, wait: std::time::Duration) -> usize {
     let slots = &st.delivery_slots;
     let all = slots.permits.acquire_many(slots.count);
@@ -2267,7 +2216,10 @@ async fn create_run(
         Ok(())
     }
     .await;
-    end_run_creation(st.db.as_ref(), &run, now, written).await?;
+    if !end_run_creation(st.db.as_ref(), &run, now, written).await? {
+        // The creation sweep ended it while it was being written.
+        return Err(ApiError::Db(DbError::Conflict));
+    }
 
     Ok((
         StatusCode::CREATED,
@@ -3621,7 +3573,9 @@ fn rerun_outcome<T>(res: Result<T, RerunError>) -> Result<T, ApiError> {
             Err(ApiError::Conflict(e.to_string()))
         }
         Err(e @ RerunError::NotFailed { .. }) => Err(ApiError::Conflict(e.to_string())),
-        Err(e @ RerunError::CreationUnfinished) => Err(ApiError::Conflict(e.to_string())),
+        Err(e @ (RerunError::CreationUnfinished | RerunError::Replaced(_))) => {
+            Err(ApiError::Conflict(e.to_string()))
+        }
         // Gate-approval-only variants (never produced by rerun/retry); mapped to
         // 409 for exhaustiveness.
         Err(
@@ -5382,6 +5336,33 @@ pub struct RefusedPipeline {
 pub struct TriggerOutcome {
     pub runs: Vec<RunId>,
     pub refused: Vec<RefusedPipeline>,
+    /// What earlier tries of the same webhook delivery decided (ADR-0083 §3).
+    pub earlier: Vec<EarlierOutcome>,
+    /// The Pipeline files left undecided for a redelivery: not read, or
+    /// their decision not recorded.
+    pub undecided: Vec<String>,
+    /// The Pipeline files this try decided without a Run or a listed
+    /// refusal: no match, every Step excluded, a ref not allowed, not run.
+    pub not_run: Vec<String>,
+    /// A Pipeline whose Run another try is still creating (ADR-0083 §4).
+    pub busy: bool,
+    /// On the webhook path, the compile error that stopped the delivery
+    /// (ADR-0009): found by this try or recorded by an earlier one.
+    pub compile_error: Option<String>,
+}
+
+/// A Pipeline an earlier try of the same webhook delivery decided, as the
+/// answer lists it under `earlier` (ADR-0083 §3): its Run, its refusal's
+/// reason kind, or why it was not run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EarlierOutcome {
+    pub pipeline: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_run: Option<String>,
 }
 
 /// [`trigger_run_from_event`], also reporting every pipeline refused as
@@ -5398,8 +5379,18 @@ pub async fn trigger_runs_from_event(
     if matches!(event, scarab_forge::Event::Cron { .. }) {
         return Ok(TriggerOutcome::default());
     }
-    let read = read_event_pipelines(forge, event).await?;
-    trigger_runs_from_files(forge, db, clock, ports, event, &read.files, read.complete).await
+    let read = read_event_pipelines(forge, event, &config_ref(event)).await?;
+    trigger_runs_from_files(
+        forge,
+        db,
+        clock,
+        ports,
+        event,
+        &read.files,
+        read.complete,
+        None,
+    )
+    .await
 }
 
 /// The `.scarab/` Pipeline files of an event, read at its commit.
@@ -5411,6 +5402,10 @@ struct EventPipelines {
     /// files are still used to trigger, as before, but the cron schedule
     /// index is not rewritten from an incomplete list (git-bug 5d5fc8a).
     complete: bool,
+    /// `.scarab/` was listed: `false` when the listing itself failed.
+    listed: bool,
+    /// The files whose read failed.
+    unread: Vec<String>,
 }
 
 /// The pauses before the second and third try of a forge read of the
@@ -5441,29 +5436,32 @@ where
     read().await
 }
 
-/// The event's `.scarab/` Pipeline files and their YAML, read at the event's
-/// commit. An absent directory yields nothing (not an error); a file that
+/// The event's `.scarab/` Pipeline files and their YAML, read at `git_ref`
+/// (the event's commit, [`config_ref`], or the commit its delivery is pinned
+/// to). An absent directory yields nothing (not an error); a file that
 /// vanished between list and read is left out. A read that fails with
 /// [`Api`](scarab_forge::ForgeError::Api) is tried three times
 /// ([`forge_read_retried`]) before the list is marked incomplete.
 async fn read_event_pipelines(
     forge: &dyn scarab_forge::ForgePort,
     event: &scarab_forge::Event,
+    git_ref: &str,
 ) -> Result<EventPipelines, TriggerError> {
     let mut read = EventPipelines {
         files: Vec::new(),
         complete: true,
+        listed: true,
+        unread: Vec::new(),
     };
     let Some(repo) = event.repo() else {
         return Ok(read);
     };
-    let git_ref = config_ref(event);
-    let git_ref = git_ref.as_str();
     let entries =
         match forge_read_retried(|| forge.list_dir_at_ref(repo, git_ref, CONFIG_DIR)).await {
             Ok(e) => e,
             Err(scarab_forge::ForgeError::Api(_)) => {
                 read.complete = false;
+                read.listed = false;
                 return Ok(read);
             }
             Err(e) => return Err(TriggerError::Forge(e)),
@@ -5483,6 +5481,7 @@ async fn read_event_pipelines(
             // list is no longer the whole of `.scarab/`.
             Err(scarab_forge::ForgeError::Api(_)) => {
                 read.complete = false;
+                read.unread.push(path.clone());
                 continue;
             }
             Err(e) => return Err(TriggerError::Forge(e)),
@@ -5493,14 +5492,288 @@ async fn read_event_pipelines(
     Ok(read)
 }
 
+/// A try of a webhook delivery as Run creation sees it (ADR-0083): the key
+/// its outcomes are recorded under, the commit it reads `.scarab/` at, and
+/// the head a later try checks.
+pub(crate) struct DeliveryRun {
+    connection_id: String,
+    delivery_id: String,
+    forge: scarab_forge::ForgeKind,
+    /// This try inserted the delivery row (§5: it behaves as today).
+    first: bool,
+    /// When the delivery arrived.
+    at: Timestamp,
+    /// The head a later try checks; `None` when the rule does not apply.
+    head: Option<DeliveryHead>,
+    /// The commit `.scarab/` and its libraries are read at.
+    read_ref: String,
+    /// The Pipeline files this try could not read.
+    unread: Vec<String>,
+}
+
+/// The ref or pull request a delivery is about, and its commit when the
+/// delivery arrived (ADR-0083 §5).
+pub(crate) struct DeliveryHead {
+    scope: scarab_engine::HeadScope,
+    sha: String,
+    /// What a `not_head` status names: "`refs/heads/main`", "pull request #7".
+    name: String,
+}
+
+impl DeliveryRun {
+    fn key(&self, pipeline: &str) -> scarab_engine::DeliveryPipeline {
+        scarab_engine::DeliveryPipeline {
+            connection_id: self.connection_id.clone(),
+            delivery_id: self.delivery_id.clone(),
+            pipeline: pipeline.to_string(),
+            forge: self.forge.as_str().to_string(),
+        }
+    }
+}
+
+/// What a recorded outcome means to a later try (ADR-0083 §4).
+enum Revisit {
+    /// Decided: skipped.
+    Decided,
+    /// Its Run is still being created, maybe by another try now.
+    Busy,
+    /// Its Run's creation never finished: this try replaces it.
+    Replace(RunId),
+}
+
+/// [`Revisit`] for `recorded`. A Run older than the unfinished-creation
+/// bound, or already ended, is ended `Failed` here (a compare-and-set from
+/// `Pending`) before it is replaced.
+async fn revisit(
+    db: &dyn Db,
+    recorded: &scarab_engine::DeliveryOutcome,
+    now: Timestamp,
+) -> Result<Revisit, DbError> {
+    let (scarab_engine::DeliveryOutcomeKind::Run, Some(run)) =
+        (recorded.outcome, recorded.run_id.as_ref())
+    else {
+        return Ok(Revisit::Decided);
+    };
+    let Some(state) = db.run_creation_state(run).await? else {
+        return Ok(Revisit::Decided);
+    };
+    if !state.creating || state.replaced_by.is_some() {
+        return Ok(Revisit::Decided);
+    }
+    if state.status == RunStatus::Pending {
+        if now.0 - state.created_at.0 < scarab_engine::UNFINISHED_CREATION_BOUND_MS {
+            return Ok(Revisit::Busy);
+        }
+        if let Err(e) = scarab_engine::fail_run_creation(
+            db,
+            run,
+            scarab_engine::scheduler::UNFINISHED_CREATION_REASON.to_string(),
+            now,
+        )
+        .await
+        {
+            // A conflict is the sweep, another try, or the stalled try
+            // finishing it first: read it again.
+            tracing::debug!(run = %run.0, error = %e, "ending an unfinished Run before its replacement");
+            let again = db.run_creation_state(run).await?;
+            match again {
+                None => return Ok(Revisit::Decided),
+                Some(s) if !s.creating || s.replaced_by.is_some() => return Ok(Revisit::Decided),
+                // Not ended: the store would refuse the replacement, and the
+                // Run would stay unfinished under a finished delivery. Left
+                // for a later try, as one still being written is.
+                Some(s) if s.status == RunStatus::Pending => return Ok(Revisit::Busy),
+                Some(_) => {}
+            }
+        }
+    }
+    // The store checks again, under a row lock, that the Run has ended and
+    // is not finished or replaced (ADR-0083 §4).
+    Ok(Revisit::Replace(run.clone()))
+}
+
+/// What an outcome write of one Pipeline did.
+enum Recorded {
+    Written,
+    /// Another try decided this Pipeline first.
+    Claimed(Option<scarab_engine::DeliveryOutcome>),
+    /// The write failed: the Pipeline is left undecided.
+    Failed,
+}
+
+impl From<Result<scarab_engine::OutcomeWrite, DbError>> for Recorded {
+    fn from(w: Result<scarab_engine::OutcomeWrite, DbError>) -> Self {
+        match w {
+            Ok(scarab_engine::OutcomeWrite::Written) => Recorded::Written,
+            Ok(scarab_engine::OutcomeWrite::Claimed(o)) => Recorded::Claimed(o),
+            Err(e) => {
+                tracing::warn!(error = %e, "recording a webhook delivery outcome failed");
+                Recorded::Failed
+            }
+        }
+    }
+}
+
+impl TriggerOutcome {
+    /// Note an outcome an earlier try recorded (ADR-0083 §3).
+    fn note_earlier(&mut self, recorded: &scarab_engine::DeliveryOutcome) {
+        use scarab_engine::DeliveryOutcomeKind as K;
+        let entry = match recorded.outcome {
+            K::Run => EarlierOutcome {
+                pipeline: recorded.pipeline.clone(),
+                run_id: recorded.run_id.as_ref().map(|r| r.0.clone()),
+                refused: None,
+                not_run: None,
+            },
+            K::Refused => EarlierOutcome {
+                pipeline: recorded.pipeline.clone(),
+                run_id: None,
+                refused: Some(recorded.reason_kind.clone().unwrap_or_default()),
+                not_run: None,
+            },
+            K::NotRun => EarlierOutcome {
+                pipeline: recorded.pipeline.clone(),
+                run_id: None,
+                refused: None,
+                not_run: Some(recorded.reason_kind.clone().unwrap_or_default()),
+            },
+            K::NoMatch | K::AllExcluded | K::RefNotAllowed => EarlierOutcome {
+                pipeline: recorded.pipeline.clone(),
+                run_id: None,
+                refused: None,
+                not_run: None,
+            },
+        };
+        self.earlier.push(entry);
+    }
+
+    /// Settle one Pipeline after its outcome write: `refused` is listed when
+    /// this try recorded it.
+    fn settle(&mut self, path: &str, recorded: Recorded, refused: Option<RefusedPipeline>) {
+        match recorded {
+            Recorded::Written => match refused {
+                Some(refused) => self.refused.push(refused),
+                None => self.not_run.push(path.to_string()),
+            },
+            Recorded::Claimed(Some(o)) => self.note_earlier(&o),
+            Recorded::Claimed(None) => self.earlier.push(EarlierOutcome {
+                pipeline: path.to_string(),
+                run_id: None,
+                refused: None,
+                not_run: None,
+            }),
+            Recorded::Failed => self.undecided.push(path.to_string()),
+        }
+    }
+}
+
+/// Record that this try decided `path` without a Run and without a refusal
+/// (`no_match`, `all_excluded`, `ref_not_allowed`), on the webhook path. A
+/// Pipeline whose recorded Run is being replaced is overwritten as `not_run`
+/// with the kind as its reason instead: the first try matched it.
+async fn record_quiet_outcome(
+    db: &dyn Db,
+    delivery: Option<&DeliveryRun>,
+    path: &str,
+    kind: scarab_engine::DeliveryOutcomeKind,
+    replaces: Option<&RunId>,
+    now: Timestamp,
+) -> Recorded {
+    let Some(d) = delivery else {
+        return Recorded::Written;
+    };
+    match replaces {
+        None => db
+            .record_delivery_outcome(&d.key(path), kind, now)
+            .await
+            .into(),
+        Some(old) => db
+            .record_delivery_refusal(
+                &d.key(path),
+                &scarab_engine::DeliveryRefusal {
+                    outcome: scarab_engine::DeliveryOutcomeKind::NotRun,
+                    reason_kind: kind.as_str().to_string(),
+                    refused: None,
+                    status: None,
+                    replaces: Some(old.clone()),
+                    at: now,
+                },
+            )
+            .await
+            .into(),
+    }
+}
+
+/// One Pipeline `event` did not run: its refused-Run row (`record`: reason
+/// kind, message, errors) and its `failure` status (`status`: the
+/// Pipeline's name, the text, the UI page).
+struct PipelineRefusal<'a> {
+    path: &'a str,
+    outcome: scarab_engine::DeliveryOutcomeKind,
+    reason_kind: &'a str,
+    record: Option<(String, Vec<CompileErrorDto>)>,
+    status: Option<(String, String, String)>,
+    replaces: Option<RunId>,
+}
+
+/// Record a refusal. Off the webhook path, as before: the status is queued
+/// and the refused row written, each best effort. On it (ADR-0083 §2): the
+/// outcome, the refused row and the status in one transaction, once per
+/// delivery and Pipeline.
+async fn record_pipeline_refusal(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    event: &scarab_forge::Event,
+    delivery: Option<&DeliveryRun>,
+    r: PipelineRefusal<'_>,
+) -> Recorded {
+    let Some(d) = delivery else {
+        if let Some((name, description, target)) = &r.status {
+            enqueue_refusal_status(db, clock, event, r.path, name, description, target).await;
+        }
+        if let Some((message, errors)) = r.record {
+            record_refusal(db, clock, event, r.path, r.reason_kind, message, &errors).await;
+        }
+        return Recorded::Written;
+    };
+    let now = clock.now().await;
+    let refused = r.record.and_then(|(message, errors)| {
+        refused_run_row(event, r.path, r.reason_kind, message, &errors, now)
+    });
+    let status = r.status.as_ref().and_then(|(name, description, target)| {
+        refusal_status_message(event, r.path, name, description, target, now)
+    });
+    db.record_delivery_refusal(
+        &d.key(r.path),
+        &scarab_engine::DeliveryRefusal {
+            outcome: r.outcome,
+            reason_kind: r.reason_kind.to_string(),
+            refused,
+            status,
+            replaces: r.replaces,
+            at: now,
+        },
+    )
+    .await
+    .into()
+}
+
 /// [`trigger_runs_from_event`] over Pipeline files already read at the
 /// event's commit ([`read_event_pipelines`]). `complete` says `files` is the
 /// whole of `.scarab/` at that commit: each Run started then records which
 /// of them follow it (`on: upstream:`), so its `run_finished` needs no forge
 /// read when nothing does.
 ///
-/// A [`TriggerError::Forge`] comes only from reading an `invoke:` library,
-/// before any Run or refusal is recorded.
+/// With `delivery` (the webhook path, ADR-0083), what each file decided is
+/// recorded once per delivery: the outcomes earlier tries recorded are read
+/// first and those files are not decided again; a file that could not be
+/// read, or whose decision could not be recorded (a store or admission
+/// error), is left undecided for a redelivery and the others go on; a file
+/// that does not compile is reported in the outcome rather than as an error.
+///
+/// Without it, a [`TriggerError::Forge`] comes only from reading an
+/// `invoke:` library, before any Run or refusal is recorded.
+#[allow(clippy::too_many_arguments)] // the delivery's context beside the trigger's
 pub(crate) async fn trigger_runs_from_files(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
@@ -5509,11 +5782,12 @@ pub(crate) async fn trigger_runs_from_files(
     event: &scarab_forge::Event,
     files: &[(String, String)],
     complete: bool,
+    delivery: Option<&DeliveryRun>,
 ) -> Result<TriggerOutcome, TriggerError> {
     let Some(repo) = event.repo() else {
         return Ok(TriggerOutcome::default());
     };
-    let git_ref = config_ref(event);
+    let git_ref = delivery.map_or_else(|| config_ref(event), |d| d.read_ref.clone());
     // `event.changed_paths` (git-bug 418f55e): a push's (ADR-0081) and a
     // pull request's are asked of the forge once, and only when a Pipeline
     // reads them; a push payload may already have decided them (a new
@@ -5526,10 +5800,30 @@ pub(crate) async fn trigger_runs_from_files(
     let installed = installed_libraries(ports.libraries, ports.plugins, &repo.owner)
         .await
         .map_err(TriggerError::Db)?;
+    // ADR-0083 §3: what earlier tries of this delivery decided, read once.
+    let recorded: std::collections::BTreeMap<String, scarab_engine::DeliveryOutcome> =
+        match delivery {
+            Some(d) => db
+                .delivery_outcomes(&d.connection_id, &d.delivery_id)
+                .await?
+                .into_iter()
+                .map(|o| (o.pipeline.clone(), o))
+                .collect(),
+            None => Default::default(),
+        };
+    let recorded_broken = recorded
+        .values()
+        .find(|o| {
+            o.outcome == scarab_engine::DeliveryOutcomeKind::Refused
+                && o.reason_kind.as_deref() == Some(scarab_engine::REASON_COMPILE)
+        })
+        .map(|o| o.pipeline.clone());
+    let now = clock.now().await;
     // Every Pipeline file is compiled before any Run is created. A file that
     // does not compile fails the whole delivery and nothing runs (ADR-0009).
-    let mut compiled: Vec<(&String, scarab_pipeline::PipelineIr)> = Vec::new();
-    let mut broken: Vec<(&String, &str, String)> = Vec::new();
+    // Each carries the unfinished Run it replaces, if any (ADR-0083 §4).
+    let mut compiled: Vec<(&String, scarab_pipeline::PipelineIr, Option<RunId>)> = Vec::new();
+    let mut broken: Vec<(&String, &str, String, Option<RunId>)> = Vec::new();
     for (path, yaml) in files {
         let yaml = yaml.as_str();
         // A library (`kind: library`, ADR-0076 §2) runs only where it is
@@ -5544,32 +5838,79 @@ pub(crate) async fn trigger_runs_from_files(
         {
             continue;
         }
+        let mut replaces = None;
+        if let Some(o) = recorded.get(path) {
+            match revisit(db, o, now).await {
+                Ok(Revisit::Decided) => {
+                    outcome.note_earlier(o);
+                    continue;
+                }
+                Ok(Revisit::Busy) => {
+                    outcome.busy = true;
+                    continue;
+                }
+                Ok(Revisit::Replace(old)) => replaces = Some(old),
+                Err(e) => {
+                    tracing::warn!(pipeline = %path, error = %e, "reading a recorded Run failed");
+                    outcome.undecided.push(path.clone());
+                    continue;
+                }
+            }
+        }
         // Pre-fetch transitive `invoke:` libraries at this ref and compile
         // (ADR-0038) — the shared read-at-ref → compile primitive also used by
         // the manual/api dispatch path.
         match prefetch_libs_and_compile(forge, repo, &git_ref, yaml, &installed).await {
-            Ok(ir) => compiled.push((path, ir)),
-            Err(TriggerError::Pipeline(text)) => broken.push((path, yaml, text)),
+            Ok(ir) => compiled.push((path, ir, replaces)),
+            Err(TriggerError::Pipeline(text)) => broken.push((path, yaml, text, replaces)),
+            // A library the forge could not read: undecided, read again by
+            // the next try (ADR-0083 §1).
+            Err(e) if delivery.is_some() => {
+                tracing::warn!(pipeline = %path, error = %e, "a Pipeline's library could not be read");
+                outcome.undecided.push(path.clone());
+            }
             // Before anything is recorded for the delivery. This is the only
-            // `TriggerError::Forge` this function returns, and the webhook
-            // ingest relies on that to forget the delivery (`ingest_event`).
+            // `TriggerError::Forge` this function returns.
             Err(e) => return Err(e),
         }
     }
-    if let Some((first_broken, _, first_text)) = broken.first() {
-        let error = TriggerError::Pipeline(first_text.clone());
-        let delivery = DeliveryTrigger {
-            forge,
-            event,
-            kind: kind.as_str(),
-        };
+    // A file this try could not read and no try decided.
+    if let Some(d) = delivery {
+        outcome.undecided.extend(
+            d.unread
+                .iter()
+                .filter(|path| !recorded.contains_key(*path))
+                .cloned(),
+        );
+    }
+
+    let trigger = DeliveryTrigger {
+        forge,
+        event,
+        kind: kind.as_str(),
+    };
+    // ADR-0083 §3: a file found broken by this try, or recorded broken by
+    // an earlier one, stops every Pipeline not yet decided.
+    let first_broken = broken
+        .first()
+        .map(|(path, _, text, _)| ((*path).clone(), text.clone()))
+        .or_else(|| {
+            recorded_broken.map(|path| {
+                let text = format!("{path} does not compile");
+                (path, text)
+            })
+        });
+    if let Some((first_broken, first_text)) = first_broken {
         refuse_uncompiled_delivery(
             db,
             clock,
-            &delivery,
+            &trigger,
             &compiled,
             &broken,
+            &first_broken,
             (&mut ctx, &mut paths),
+            delivery,
+            &mut outcome,
         )
         .await;
         tracing::warn!(
@@ -5578,30 +5919,58 @@ pub(crate) async fn trigger_runs_from_files(
             pipeline = %first_broken,
             "no pipeline run: a pipeline file does not compile"
         );
-        return Err(error);
+        if delivery.is_none() {
+            return Err(TriggerError::Pipeline(first_text));
+        }
+        outcome.compile_error = Some(first_text);
+        return Ok(outcome);
     }
 
-    let delivery = DeliveryTrigger {
-        forge,
-        event,
-        kind: kind.as_str(),
-    };
-    for (path, ir) in compiled {
-        // A `when:` that cannot be decided refuses this Pipeline only: it is
-        // recorded and its check fails, and the files after it are still
-        // evaluated (git-bug 2a680c8).
-        match delivery.decide(&ir, &mut ctx, &mut paths).await {
-            TriggerDecision::Matches => {}
-            TriggerDecision::NoMatch => continue,
-            TriggerDecision::Undecided(message) => {
-                refuse_undecided_when(db, clock, event, path, &ir, message, &mut outcome).await;
-                continue;
+    // The head rule's answer, once asked (ADR-0083 §5).
+    let mut head_moved: Option<Result<bool, String>> = None;
+    for (path, ir, replaces) in compiled {
+        let name = run_pipeline_name(&ir, path);
+        // A Pipeline whose Run a first try began matched then; its trigger
+        // is not decided again (ADR-0083 §1).
+        if replaces.is_none() {
+            // A `when:` that cannot be decided refuses this Pipeline only: it
+            // is recorded and its check fails, and the files after it are
+            // still evaluated (git-bug 2a680c8).
+            match trigger.decide(&ir, &mut ctx, &mut paths).await {
+                TriggerDecision::Matches => {}
+                TriggerDecision::NoMatch => {
+                    let recorded = record_quiet_outcome(
+                        db,
+                        delivery,
+                        path,
+                        scarab_engine::DeliveryOutcomeKind::NoMatch,
+                        None,
+                        now,
+                    )
+                    .await;
+                    outcome.settle(path, recorded, None);
+                    continue;
+                }
+                TriggerDecision::Undecided(message) => {
+                    refuse_undecided_when(
+                        db,
+                        clock,
+                        event,
+                        path,
+                        &ir,
+                        message,
+                        delivery,
+                        None,
+                        &mut outcome,
+                    )
+                    .await;
+                    continue;
+                }
             }
         }
         // A chain of follow-ups stops at a pipeline already in it (a loop)
         // and at its length cap; either is a refused Run.
         if let scarab_forge::Event::Upstream { chain, .. } = event {
-            let name = run_pipeline_name(&ir, path);
             let refusal = if chain.contains(&name) {
                 Some(format!(
                     "pipeline `{name}` is already in this chain of upstream Runs ({}), so it \
@@ -5644,12 +6013,100 @@ pub(crate) async fn trigger_runs_from_files(
             Ok(excluded) => excluded,
             Err(e) => {
                 let message = format!("a Step's `when:` could not be decided: {e}");
-                refuse_undecided_when(db, clock, event, path, &ir, message, &mut outcome).await;
+                refuse_undecided_when(
+                    db,
+                    clock,
+                    event,
+                    path,
+                    &ir,
+                    message,
+                    delivery,
+                    replaces,
+                    &mut outcome,
+                )
+                .await;
                 continue;
             }
         };
         if excluded.len() == ir.steps.len() {
+            let recorded = record_quiet_outcome(
+                db,
+                delivery,
+                path,
+                scarab_engine::DeliveryOutcomeKind::AllExcluded,
+                replaces.as_ref(),
+                now,
+            )
+            .await;
+            outcome.settle(path, recorded, None);
             continue;
+        }
+
+        // ADR-0083 §5: a later try creates nothing for a push, a pull
+        // request or a comment on a pull request whose head has moved: a
+        // delivery of the same ref or pull request arrived later at another
+        // commit. Asked once per try, when the first Pipeline would run.
+        if let Some((d, head)) = delivery.and_then(|d| d.head.as_ref().map(|h| (d, h))) {
+            if !d.first {
+                if head_moved.is_none() {
+                    let query = scarab_engine::HeadQuery {
+                        org: repo.owner.clone(),
+                        project: repo.name.clone(),
+                        scope: head.scope.clone(),
+                        head_sha: head.sha.clone(),
+                        after: d.at,
+                    };
+                    head_moved = Some(db.head_moved(&query).await.map_err(|e| e.to_string()));
+                }
+                match head_moved.clone().unwrap_or(Ok(false)) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        let reason = format!("not run: no longer the head of {}", head.name);
+                        tracing::warn!(
+                            org = %repo.owner,
+                            project = %repo.name,
+                            pipeline = %path,
+                            "pipeline {reason}"
+                        );
+                        let recorded = record_pipeline_refusal(
+                            db,
+                            clock,
+                            event,
+                            delivery,
+                            PipelineRefusal {
+                                path,
+                                outcome: scarab_engine::DeliveryOutcomeKind::NotRun,
+                                reason_kind: scarab_engine::REASON_NOT_HEAD,
+                                record: None,
+                                status: Some((
+                                    name.clone(),
+                                    reason.clone(),
+                                    repo_page_path(&repo.owner, &repo.name),
+                                )),
+                                replaces,
+                            },
+                        )
+                        .await;
+                        outcome.settle(
+                            path,
+                            recorded,
+                            Some(RefusedPipeline {
+                                pipeline: path.clone(),
+                                environment: ir.environment.clone(),
+                                reason,
+                                decision_id: None,
+                                messages: Vec::new(),
+                            }),
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(pipeline = %path, error = %e, "the head rule could not be checked");
+                        outcome.undecided.push(path.clone());
+                        continue;
+                    }
+                }
+            }
         }
 
         // Resolve governance, refuse what may not deploy, admit privilege
@@ -5658,132 +6115,195 @@ pub(crate) async fn trigger_runs_from_files(
         // skips this pipeline only (the dispatch path turns the same refusal
         // into a fail-closed error). Webhook-triggered runs supply no launch
         // parameters.
-        let admission =
-            admit_and_create_run(forge, db, clock, ports, event, &ir, path, &excluded, None)
-                .await?;
-        // A refused Pipeline posts its check as `failure`, saying why, so a
-        // required check does not wait for a Run that will not come.
-        if let Admission::Refused(refusal) = &admission {
-            if let Some((description, target_path)) =
-                admission_refusal_status(refusal, &repo.owner, &repo.name)
-            {
-                enqueue_refusal_status(
-                    db,
-                    clock,
-                    event,
-                    path,
-                    &run_pipeline_name(&ir, path),
-                    &description,
-                    &target_path,
-                )
-                .await;
+        let claim = delivery.map(|d| scarab_engine::DeliveryRunClaim {
+            key: d.key(path),
+            replaces: replaces.clone(),
+            at: now,
+        });
+        let admission = match admit_and_create_run(
+            forge,
+            db,
+            clock,
+            ports,
+            event,
+            &ir,
+            path,
+            &excluded,
+            None,
+            claim.as_ref(),
+        )
+        .await
+        {
+            Ok(admission) => admission,
+            // ADR-0083: a store or admission error leaves this Pipeline
+            // undecided, for a redelivery; the others go on.
+            Err(e) if delivery.is_some() => {
+                tracing::warn!(
+                    org = %repo.owner,
+                    project = %repo.name,
+                    pipeline = %path,
+                    error = %e,
+                    "pipeline left undecided: its Run could not be created"
+                );
+                outcome.undecided.push(path.clone());
+                continue;
             }
-        }
+            Err(e) => return Err(e),
+        };
+        let admission_run = match &admission {
+            Admission::Ended(run) => Some(run.clone()),
+            _ => None,
+        };
         match admission {
             Admission::Created(run) => {
                 record_path_filter_note(db, clock, &run, &ir, kind.as_str(), &ctx, &paths).await;
                 if complete {
                     let at = clock.now().await;
-                    record_followups(db, &run, &run_pipeline_name(&ir, path), files, at).await;
+                    record_followups(db, &run, &name, files, at).await;
                 }
                 outcome.runs.push(run)
             }
-            // A branch-scoped Environment ignoring every other branch is the
-            // rule working, not news: silent, as it always was.
-            Admission::Refused(AdmissionRefusal::RefNotAllowed) => {}
-            // ADR-0071 §2, §10: an Environment that does not exist or does not
-            // admit this Project is a configuration gap an operator must see.
-            // Logged AND returned: the delivery body is where a forge's
-            // "recent deliveries" view shows it, and for a name the migration
-            // could not see (never run before ADR-0071) it is the first sign.
-            Admission::Refused(
-                ref refusal @ (AdmissionRefusal::UnknownEnvironment { ref environment }
-                | AdmissionRefusal::NotEligible { ref environment }),
-            ) => {
-                let reason = admission_refusal_message(refusal, &repo.owner, &repo.name);
-                tracing::warn!(
-                    org = %repo.owner,
-                    project = %repo.name,
-                    pipeline = %path,
-                    trigger = event.trigger_kind().as_str(),
-                    "deploy pipeline not run: {reason}"
-                );
-                outcome.refused.push(RefusedPipeline {
-                    pipeline: path.clone(),
-                    environment: Some(environment.clone()),
-                    reason,
-                    decision_id: None,
-                    messages: Vec::new(),
-                });
+            // Another try decided it first (ADR-0083 §2), or this try's Run
+            // was ended or replaced while it was written (§4).
+            Admission::Claimed | Admission::Ended(_) => {
+                let recorded = match delivery {
+                    Some(d) => db
+                        .delivery_outcomes(&d.connection_id, &d.delivery_id)
+                        .await
+                        .ok()
+                        .and_then(|all| all.into_iter().find(|o| &o.pipeline == path)),
+                    None => None,
+                };
+                // The outcome still names this try's own Run, which the
+                // sweep ended: nothing is decided until a redelivery
+                // replaces it.
+                let own = match (&admission_run, &recorded) {
+                    (Some(run), Some(o)) => o.run_id.as_ref() == Some(run),
+                    _ => false,
+                };
+                if own {
+                    outcome.undecided.push(path.clone());
+                } else {
+                    outcome.settle(path, Recorded::Claimed(recorded), None);
+                }
             }
-            // ADR-0075 §9: a `run.create` Policy denied this Run. Its
-            // decision is in the org's decision log; the body names it and
-            // carries every message.
-            Admission::Refused(
-                ref refusal @ AdmissionRefusal::PolicyDenied {
-                    ref decision_id,
-                    ref messages,
-                },
-            ) => {
-                let reason = admission_refusal_message(refusal, &repo.owner, &repo.name);
-                tracing::warn!(
-                    org = %repo.owner,
-                    project = %repo.name,
-                    pipeline = %path,
-                    trigger = event.trigger_kind().as_str(),
-                    decision = %decision_id,
-                    "pipeline not run: {reason}"
-                );
-                outcome.refused.push(RefusedPipeline {
-                    pipeline: path.clone(),
-                    environment: ir.environment.clone(),
-                    reason,
-                    decision_id: Some(decision_id.clone()),
-                    messages: messages.clone(),
-                });
-            }
-            // ADR-0076 §6: a yanked library version, refused whatever the
-            // Policies say.
-            Admission::Refused(
-                ref refusal @ (AdmissionRefusal::EventField { ref messages }
-                | AdmissionRefusal::ForgeToken { ref messages }
-                | AdmissionRefusal::Sandbox { ref messages }
-                | AdmissionRefusal::MissingApprovalGate { ref messages }),
-            ) => {
-                let reason = admission_refusal_message(refusal, &repo.owner, &repo.name);
-                tracing::warn!(
-                    org = %repo.owner,
-                    project = %repo.name,
-                    pipeline = %path,
-                    "pipeline not run: {reason}"
-                );
-                outcome.refused.push(RefusedPipeline {
-                    pipeline: path.clone(),
-                    environment: ir.environment.clone(),
-                    reason,
-                    decision_id: None,
-                    messages: messages.clone(),
-                });
-            }
-            Admission::Refused(ref refusal @ AdmissionRefusal::LibraryYanked { ref messages }) => {
-                let reason = admission_refusal_message(refusal, &repo.owner, &repo.name);
-                tracing::warn!(
-                    org = %repo.owner,
-                    project = %repo.name,
-                    pipeline = %path,
-                    "pipeline not run: {reason}"
-                );
-                outcome.refused.push(RefusedPipeline {
-                    pipeline: path.clone(),
-                    environment: ir.environment.clone(),
-                    reason,
-                    decision_id: None,
-                    messages: messages.clone(),
-                });
+            Admission::Refused(refusal) => {
+                let entry = refused_pipeline_entry(&refusal, &ir, path, event, repo);
+                let recorded = match admission_refusal_record(&refusal, &repo.owner, &repo.name) {
+                    // A branch-scoped Environment ignoring every other branch
+                    // is the rule working, not news: silent, as it always was.
+                    None => {
+                        record_quiet_outcome(
+                            db,
+                            delivery,
+                            path,
+                            scarab_engine::DeliveryOutcomeKind::RefNotAllowed,
+                            replaces.as_ref(),
+                            now,
+                        )
+                        .await
+                    }
+                    // A refused Pipeline posts its check as `failure`, saying
+                    // why, so a required check does not wait for a Run that
+                    // will not come.
+                    Some((reason_kind, message, errors)) => {
+                        let status = admission_refusal_status(&refusal, &repo.owner, &repo.name)
+                            .map(|(description, target)| (name.clone(), description, target));
+                        record_pipeline_refusal(
+                            db,
+                            clock,
+                            event,
+                            delivery,
+                            PipelineRefusal {
+                                path,
+                                outcome: scarab_engine::DeliveryOutcomeKind::Refused,
+                                reason_kind,
+                                // Off the webhook path admission recorded it.
+                                record: delivery.map(|_| (message, errors)),
+                                status,
+                                replaces,
+                            },
+                        )
+                        .await
+                    }
+                };
+                outcome.settle(path, recorded, entry);
             }
         }
     }
     Ok(outcome)
+}
+
+/// The body entry, and the log line, of a Pipeline admission refused
+/// (ADR-0071 §2, ADR-0075 §9, ADR-0076): `None` for a ref the Environment
+/// does not allow, which is silent.
+fn refused_pipeline_entry(
+    refusal: &AdmissionRefusal,
+    ir: &scarab_pipeline::PipelineIr,
+    path: &str,
+    event: &scarab_forge::Event,
+    repo: &scarab_forge::RepoRef,
+) -> Option<RefusedPipeline> {
+    let reason = admission_refusal_message(refusal, &repo.owner, &repo.name);
+    let (environment, decision_id, messages) = match refusal {
+        AdmissionRefusal::RefNotAllowed => return None,
+        // ADR-0071 §2, §10: an Environment that does not exist or does not
+        // admit this Project is a configuration gap an operator must see.
+        // Logged AND returned: the delivery body is where a forge's "recent
+        // deliveries" view shows it.
+        AdmissionRefusal::UnknownEnvironment { environment }
+        | AdmissionRefusal::NotEligible { environment } => {
+            tracing::warn!(
+                org = %repo.owner,
+                project = %repo.name,
+                pipeline = %path,
+                trigger = event.trigger_kind().as_str(),
+                "deploy pipeline not run: {reason}"
+            );
+            (Some(environment.clone()), None, Vec::new())
+        }
+        // ADR-0075 §9: a `run.create` Policy denied this Run. Its decision
+        // is in the org's decision log; the body names it and carries every
+        // message.
+        AdmissionRefusal::PolicyDenied {
+            decision_id,
+            messages,
+        } => {
+            tracing::warn!(
+                org = %repo.owner,
+                project = %repo.name,
+                pipeline = %path,
+                trigger = event.trigger_kind().as_str(),
+                decision = %decision_id,
+                "pipeline not run: {reason}"
+            );
+            (
+                ir.environment.clone(),
+                Some(decision_id.clone()),
+                messages.clone(),
+            )
+        }
+        AdmissionRefusal::LibraryYanked { messages }
+        | AdmissionRefusal::EventField { messages }
+        | AdmissionRefusal::ForgeToken { messages }
+        | AdmissionRefusal::Sandbox { messages }
+        | AdmissionRefusal::MissingApprovalGate { messages } => {
+            tracing::warn!(
+                org = %repo.owner,
+                project = %repo.name,
+                pipeline = %path,
+                "pipeline not run: {reason}"
+            );
+            (ir.environment.clone(), None, messages.clone())
+        }
+    };
+    Some(RefusedPipeline {
+        pipeline: path.to_string(),
+        environment,
+        reason,
+        decision_id,
+        messages,
+    })
 }
 
 /// Pre-fetch a pipeline's transitive `invoke:` library sources at `read_ref`
@@ -6040,6 +6560,13 @@ async fn run_cache_scope(
 enum Admission {
     Created(RunId),
     Refused(AdmissionRefusal),
+    /// The webhook path only (ADR-0083 §2): another try of the delivery
+    /// recorded this Pipeline first, and nothing of this try's Run exists.
+    Claimed,
+    /// The webhook path only (ADR-0083 §4): this try wrote the Run's first
+    /// row, and the Run was ended (the creation sweep) or replaced before
+    /// its creation finished.
+    Ended(RunId),
 }
 
 /// Governance resolved once for a run from its `environment:` reference
@@ -6218,37 +6745,58 @@ async fn admit_and_create_run(
     path: &str,
     excluded: &[String],
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
+    claim: Option<&scarab_engine::DeliveryRunClaim>,
 ) -> Result<Admission, TriggerError> {
-    let admission =
-        admit_unrecorded(forge, db, clock, ports, event, ir, path, excluded, params).await?;
+    let admission = admit_unrecorded(
+        forge, db, clock, ports, event, ir, path, excluded, params, claim,
+    )
+    .await?;
+    // On the webhook path the caller records the refusal with its delivery
+    // outcome, in one transaction (ADR-0083 §2).
+    if claim.is_some() {
+        return Ok(admission);
+    }
     if let (Admission::Refused(refusal), Some(repo)) = (&admission, event.repo()) {
-        let (kind, messages): (&str, &[String]) = match refusal {
-            AdmissionRefusal::RefNotAllowed => ("", &[]),
-            AdmissionRefusal::UnknownEnvironment { .. } | AdmissionRefusal::NotEligible { .. } => {
-                ("environment", &[])
-            }
-            AdmissionRefusal::PolicyDenied { messages, .. } => ("policy", messages),
-            AdmissionRefusal::LibraryYanked { messages } => ("yanked", messages),
-            AdmissionRefusal::EventField { messages } => ("event_field", messages),
-            AdmissionRefusal::ForgeToken { messages } => ("forge_token", messages),
-            AdmissionRefusal::Sandbox { messages } => ("sandbox", messages),
-            AdmissionRefusal::MissingApprovalGate { messages } => ("approval_gate", messages),
-        };
-        if !kind.is_empty() {
-            let message = admission_refusal_message(refusal, &repo.owner, &repo.name);
-            let errors: Vec<CompileErrorDto> = if messages.is_empty() {
-                vec![CompileErrorDto::other(message.clone())]
-            } else {
-                messages
-                    .iter()
-                    .cloned()
-                    .map(CompileErrorDto::other)
-                    .collect()
-            };
+        if let Some((kind, message, errors)) =
+            admission_refusal_record(refusal, &repo.owner, &repo.name)
+        {
             record_refusal(db, clock, event, path, kind, message, &errors).await;
         }
     }
     Ok(admission)
+}
+
+/// The refused-Run row of an admission refusal: its reason kind, message
+/// and errors. `None` for a ref an Environment does not allow, which is the
+/// rule working and is not recorded.
+fn admission_refusal_record(
+    refusal: &AdmissionRefusal,
+    org: &str,
+    project: &str,
+) -> Option<(&'static str, String, Vec<CompileErrorDto>)> {
+    let (kind, messages): (&str, &[String]) = match refusal {
+        AdmissionRefusal::RefNotAllowed => return None,
+        AdmissionRefusal::UnknownEnvironment { .. } | AdmissionRefusal::NotEligible { .. } => {
+            ("environment", &[])
+        }
+        AdmissionRefusal::PolicyDenied { messages, .. } => ("policy", messages),
+        AdmissionRefusal::LibraryYanked { messages } => ("yanked", messages),
+        AdmissionRefusal::EventField { messages } => ("event_field", messages),
+        AdmissionRefusal::ForgeToken { messages } => ("forge_token", messages),
+        AdmissionRefusal::Sandbox { messages } => ("sandbox", messages),
+        AdmissionRefusal::MissingApprovalGate { messages } => ("approval_gate", messages),
+    };
+    let message = admission_refusal_message(refusal, org, project);
+    let errors: Vec<CompileErrorDto> = if messages.is_empty() {
+        vec![CompileErrorDto::other(message.clone())]
+    } else {
+        messages
+            .iter()
+            .cloned()
+            .map(CompileErrorDto::other)
+            .collect()
+    };
+    Some((kind, message, errors))
 }
 
 /// Record that `event` did not become a Run of `pipeline` (ADR-0076). Best
@@ -6262,10 +6810,33 @@ async fn record_refusal(
     message: String,
     errors: &[CompileErrorDto],
 ) {
-    let Some(repo) = event.repo() else {
+    let now = clock.now().await;
+    let Some(refused) = refused_run_row(event, pipeline, reason_kind, message, errors, now) else {
         return;
     };
-    let refused = scarab_engine::RefusedRun {
+    if let Err(e) = db.record_refused_run(&refused).await {
+        tracing::warn!(
+            org = %refused.org,
+            project = %refused.project,
+            pipeline = %refused.pipeline,
+            error = %e,
+            "recording a refused Run failed"
+        );
+    }
+}
+
+/// The refused-Run row recording that `event` did not become a Run of
+/// `pipeline` (ADR-0076), or `None` for an event with no repository.
+fn refused_run_row(
+    event: &scarab_forge::Event,
+    pipeline: &str,
+    reason_kind: &str,
+    message: String,
+    errors: &[CompileErrorDto],
+    now: Timestamp,
+) -> Option<scarab_engine::RefusedRun> {
+    let repo = event.repo()?;
+    Some(scarab_engine::RefusedRun {
         id: 0,
         org: repo.owner.clone(),
         project: repo.name.clone(),
@@ -6278,17 +6849,8 @@ async fn record_refusal(
         reason_kind: reason_kind.to_string(),
         message,
         errors: serde_json::to_value(errors).unwrap_or(serde_json::Value::Array(Vec::new())),
-        created_at: clock.now().await,
-    };
-    if let Err(e) = db.record_refused_run(&refused).await {
-        tracing::warn!(
-            org = %refused.org,
-            project = %refused.project,
-            pipeline = %refused.pipeline,
-            error = %e,
-            "recording a refused Run failed"
-        );
-    }
+        created_at: now,
+    })
 }
 
 /// Record a Pipeline that did not compile for `event`, and pass the error on.
@@ -6500,55 +7062,95 @@ impl DeliveryTrigger<'_> {
 /// that cannot be decided fails the check, as the Pipeline may have run. A
 /// file that does not compile cannot be decided: it fails its check when
 /// its `on:` names the event or cannot be read ([`may_trigger_on`]).
+///
+/// On the webhook path (ADR-0083 §3) `compiled` holds only the Pipelines no
+/// earlier try decided, and `first_broken` may be a file an earlier try
+/// recorded as broken: each is decided as the first try would have decided
+/// it with that file broken, `not_run` where its trigger matches and
+/// `no_match` where it does not.
+#[allow(clippy::too_many_arguments)] // the delivery's context beside the refusal's
 async fn refuse_uncompiled_delivery(
     db: &dyn Db,
     clock: &dyn Clock,
-    delivery: &DeliveryTrigger<'_>,
-    compiled: &[(&String, scarab_pipeline::PipelineIr)],
-    broken: &[(&String, &str, String)],
+    trigger: &DeliveryTrigger<'_>,
+    compiled: &[(&String, scarab_pipeline::PipelineIr, Option<RunId>)],
+    broken: &[(&String, &str, String, Option<RunId>)],
+    first_broken: &str,
     (ctx, paths): (&mut serde_json::Value, &mut scarab_forge::ChangedPaths),
+    delivery: Option<&DeliveryRun>,
+    outcome: &mut TriggerOutcome,
 ) {
-    let (event, kind) = (delivery.event, delivery.kind);
+    let (event, kind) = (trigger.event, trigger.kind);
     let Some(repo) = event.repo() else {
         return;
     };
-    let Some((first_broken, _, _)) = broken.first() else {
-        return;
-    };
     let target_path = repo_page_path(&repo.owner, &repo.name);
-    for (path, yaml, text) in broken {
-        if may_trigger_on(yaml, kind) {
-            enqueue_refusal_status(
-                db,
-                clock,
-                event,
-                path,
-                &declared_pipeline_name(yaml, path),
-                &first_diagnostic(text),
-                &target_path,
+    for (path, yaml, text, replaces) in broken {
+        let status = may_trigger_on(yaml, kind).then(|| {
+            (
+                declared_pipeline_name(yaml, path),
+                first_diagnostic(text),
+                target_path.clone(),
             )
-            .await;
-        }
+        });
         let message = format!("pipeline: {text}");
         let errors = compile_errors(&message);
-        record_refusal(db, clock, event, path, "compile", message, &errors).await;
+        let recorded = record_pipeline_refusal(
+            db,
+            clock,
+            event,
+            delivery,
+            PipelineRefusal {
+                path,
+                outcome: scarab_engine::DeliveryOutcomeKind::Refused,
+                reason_kind: scarab_engine::REASON_COMPILE,
+                record: Some((message, errors)),
+                status,
+                replaces: replaces.clone(),
+            },
+        )
+        .await;
+        outcome.settle(path, recorded, None);
     }
     let not_run = format!("not run: {first_broken} failed to compile");
-    for (path, ir) in compiled {
+    let now = clock.now().await;
+    for (path, ir, replaces) in compiled {
         // A `when:` that cannot be decided fails closed: the Pipeline may
-        // have run.
-        if delivery.decide(ir, ctx, paths).await != TriggerDecision::NoMatch {
-            enqueue_refusal_status(
+        // have run. A Run a first try began matched then.
+        let matched =
+            replaces.is_some() || trigger.decide(ir, ctx, paths).await != TriggerDecision::NoMatch;
+        let recorded = if matched {
+            record_pipeline_refusal(
                 db,
                 clock,
                 event,
-                path,
-                &run_pipeline_name(ir, path),
-                &not_run,
-                &target_path,
+                delivery,
+                PipelineRefusal {
+                    path,
+                    outcome: scarab_engine::DeliveryOutcomeKind::NotRun,
+                    reason_kind: scarab_engine::REASON_COMPILE,
+                    record: None,
+                    status: Some((
+                        run_pipeline_name(ir, path),
+                        not_run.clone(),
+                        target_path.clone(),
+                    )),
+                    replaces: replaces.clone(),
+                },
             )
-            .await;
-        }
+            .await
+        } else {
+            record_quiet_outcome(
+                db,
+                delivery,
+                path,
+                scarab_engine::DeliveryOutcomeKind::NoMatch,
+                None,
+                now,
+            )
+            .await
+        };
+        outcome.settle(path, recorded, None);
     }
 }
 
@@ -6556,6 +7158,7 @@ async fn refuse_uncompiled_delivery(
 /// decided for `event`: the refused Run is recorded, the delivery body names
 /// it, and its check fails on the commit. The files after it are still
 /// evaluated (git-bug 2a680c8).
+#[allow(clippy::too_many_arguments)] // the delivery's context beside the refusal's
 async fn refuse_undecided_when(
     db: &dyn Db,
     clock: &dyn Clock,
@@ -6563,6 +7166,8 @@ async fn refuse_undecided_when(
     path: &str,
     ir: &scarab_pipeline::PipelineIr,
     message: String,
+    delivery: Option<&DeliveryRun>,
+    replaces: Option<RunId>,
     outcome: &mut TriggerOutcome,
 ) {
     let Some(repo) = event.repo() else {
@@ -6575,25 +7180,37 @@ async fn refuse_undecided_when(
         trigger = event.trigger_kind().as_str(),
         "pipeline not run: {message}"
     );
-    enqueue_refusal_status(
+    let errors = vec![CompileErrorDto::other(message.clone())];
+    let recorded = record_pipeline_refusal(
         db,
         clock,
         event,
-        path,
-        &run_pipeline_name(ir, path),
-        &format!("{path}: {message}"),
-        &repo_page_path(&repo.owner, &repo.name),
+        delivery,
+        PipelineRefusal {
+            path,
+            outcome: scarab_engine::DeliveryOutcomeKind::Refused,
+            reason_kind: "when",
+            record: Some((message.clone(), errors)),
+            status: Some((
+                run_pipeline_name(ir, path),
+                format!("{path}: {message}"),
+                repo_page_path(&repo.owner, &repo.name),
+            )),
+            replaces,
+        },
     )
     .await;
-    outcome.refused.push(RefusedPipeline {
-        pipeline: path.to_string(),
-        environment: ir.environment.clone(),
-        reason: message.clone(),
-        decision_id: None,
-        messages: Vec::new(),
-    });
-    let errors = vec![CompileErrorDto::other(message.clone())];
-    record_refusal(db, clock, event, path, "when", message, &errors).await;
+    outcome.settle(
+        path,
+        recorded,
+        Some(RefusedPipeline {
+            pipeline: path.to_string(),
+            environment: ir.environment.clone(),
+            reason: message,
+            decision_id: None,
+            messages: Vec::new(),
+        }),
+    );
 }
 
 /// Queue a `failure` commit status on the event's commit for a pipeline
@@ -6620,14 +7237,40 @@ async fn enqueue_refusal_status(
     description: &str,
     target_path: &str,
 ) {
+    let now = clock.now().await;
+    let Some(msg) =
+        refusal_status_message(event, path, pipeline_name, description, target_path, now)
+    else {
+        return;
+    };
+    if let Err(e) = db.enqueue_outbox(&msg).await {
+        let (org, project) = event.repo().map_or((String::new(), String::new()), |r| {
+            (r.owner.clone(), r.name.clone())
+        });
+        tracing::warn!(
+            org = %org,
+            project = %project,
+            pipeline = %path,
+            error = %e,
+            "queueing the refusal's commit status failed; the commit shows no status"
+        );
+    }
+}
+
+/// The outbox row of [`enqueue_refusal_status`]: `None` for an event with no
+/// commit to post on.
+fn refusal_status_message(
+    event: &scarab_forge::Event,
+    path: &str,
+    pipeline_name: &str,
+    description: &str,
+    target_path: &str,
+    now: Timestamp,
+) -> Option<scarab_engine::OutboxMessage> {
     use sha2::{Digest, Sha256};
-    let Some(repo) = event.repo() else {
-        return;
-    };
+    let repo = event.repo()?;
     let ctx = event.context();
-    let Some(sha) = ctx["event"]["sha"].as_str().filter(|s| !s.is_empty()) else {
-        return;
-    };
+    let sha = ctx["event"]["sha"].as_str().filter(|s| !s.is_empty())?;
     let (org, project) = (&repo.owner, &repo.name);
     let context = status_context(Some(pipeline_name));
     let description = scarab_forge::cap_status_description(description);
@@ -6637,7 +7280,7 @@ async fn enqueue_refusal_status(
         run.0
     ));
     let key: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
-    let msg = scarab_engine::OutboxMessage {
+    Some(scarab_engine::OutboxMessage {
         id: scarab_engine::OutboxId(0),
         run,
         kind: REFUSAL_STATUS.to_string(),
@@ -6649,17 +7292,8 @@ async fn enqueue_refusal_status(
             "target_path": target_path,
         }),
         idempotency_key: format!("{REFUSAL_STATUS}:{key}"),
-        at: clock.now().await,
-    };
-    if let Err(e) = db.enqueue_outbox(&msg).await {
-        tracing::warn!(
-            org = %org,
-            project = %project,
-            pipeline = %path,
-            error = %e,
-            "queueing the refusal's commit status failed; the commit shows no status"
-        );
-    }
+        at: now,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6673,6 +7307,7 @@ async fn admit_unrecorded(
     path: &str,
     excluded: &[String],
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
+    claim: Option<&scarab_engine::DeliveryRunClaim>,
 ) -> Result<Admission, TriggerError> {
     // Both callers pass a repo-aware event (webhook events carry a repo; dispatch
     // builds a repo+ref Manual/Api event, ADR-0043).
@@ -6708,7 +7343,7 @@ async fn admit_unrecorded(
                     repo,
                     &gov,
                     &run,
-                    false,
+                    None,
                     now,
                     params,
                     &serde_json::Map::new(),
@@ -6778,7 +7413,7 @@ async fn admit_unrecorded(
             repo,
             &gov,
             &run,
-            true,
+            Some(claim),
             now,
             params,
             &facts,
@@ -6786,14 +7421,17 @@ async fn admit_unrecorded(
         )
         .await?
         {
-            Ok(written) => run_row_written = written,
+            Ok(RunRow::Written) => run_row_written = true,
+            Ok(RunRow::NotWritten) => {}
+            Ok(RunRow::Claimed) => return Ok(Admission::Claimed),
             Err(refusal) => return Ok(Admission::Refused(refusal)),
         }
     }
-    persist_run_from_ir(
+    let persisted = persist_run_from_ir(
         db,
         &run,
         run_row_written,
+        claim,
         ir,
         event,
         path,
@@ -6805,7 +7443,11 @@ async fn admit_unrecorded(
         now,
     )
     .await?;
-    Ok(Admission::Created(run))
+    Ok(match persisted {
+        Persisted::Created => Admission::Created(run),
+        Persisted::Claimed => Admission::Claimed,
+        Persisted::Ended => Admission::Ended(run),
+    })
 }
 
 /// What the library and credential PolicyInvariants decided for a Run
@@ -7151,12 +7793,12 @@ async fn consult_run_create(
     repo: &scarab_forge::RepoRef,
     gov: &RunGovernance,
     run: &RunId,
-    creates_run: bool,
+    creates_run: Option<Option<&scarab_engine::DeliveryRunClaim>>,
     now: scarab_engine::Timestamp,
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
     event_facts: &serde_json::Map<String, serde_json::Value>,
     builtins: Vec<scarab_policy::evaluate::PolicyResult>,
-) -> Result<Result<bool, AdmissionRefusal>, TriggerError> {
+) -> Result<Result<RunRow, AdmissionRefusal>, TriggerError> {
     use scarab_policy::evaluate::evaluate_with_builtins;
     use scarab_policy::policy::Checkpoint;
     use scarab_policy::run_create;
@@ -7169,7 +7811,7 @@ async fn consult_run_create(
     // default denies it until an org lists the plugin (ADR-0075 §7). So is
     // a Run a built-in Environment rule applies to (ADR-0078 §6).
     if stored.is_empty() && !run_create::has_plugin_gate(ir) && builtins.is_empty() {
-        return Ok(Ok(false));
+        return Ok(Ok(RunRow::NotWritten));
     }
 
     let linked = links.principal_of(event, repo).await?;
@@ -7215,18 +7857,26 @@ async fn consult_run_create(
         decision,
         at: now.0,
     };
-    if !denied && creates_run {
+    if let (false, Some(claim)) = (denied, creates_run) {
         let row = scarab_policy::store::RunCreationRow {
             run_id: run.0.clone(),
             ir_version: ir.ir_version,
             event_schema_version: EVENT_VERSION,
             created_at: now.0,
+            delivery: claim.map(|c| scarab_policy::store::RunCreationDelivery {
+                connection_id: c.key.connection_id.clone(),
+                delivery_id: c.key.delivery_id.clone(),
+                pipeline: c.key.pipeline.clone(),
+                forge: c.key.forge.clone(),
+                replaces: c.replaces.as_ref().map(|r| r.0.clone()),
+            }),
         };
-        let (_, written) = policies
-            .record_run_create_decision(&record, &row)
-            .await
-            .map_err(policy_store_err)?;
-        return Ok(Ok(written));
+        return match policies.record_run_create_decision(&record, &row).await {
+            Ok((_, true)) => Ok(Ok(RunRow::Written)),
+            Ok((_, false)) => Ok(Ok(RunRow::NotWritten)),
+            Err(scarab_policy::store::PolicyStoreError::DeliveryClaimed) => Ok(Ok(RunRow::Claimed)),
+            Err(e) => Err(policy_store_err(e)),
+        };
     }
     let decision_id = policies
         .record_decision(&record)
@@ -7238,7 +7888,18 @@ async fn consult_run_create(
             messages,
         }));
     }
-    Ok(Ok(false))
+    Ok(Ok(RunRow::NotWritten))
+}
+
+/// What [`consult_run_create`] did with the Run's first row.
+enum RunRow {
+    /// Written with the allow decision.
+    Written,
+    /// Not written: the caller writes it.
+    NotWritten,
+    /// The webhook path: another try recorded the delivery outcome first,
+    /// and nothing was written (ADR-0083 §2).
+    Claimed,
 }
 
 /// Which trigger a dispatch opts into: a human [`Manual`](DispatchKind::Manual)
@@ -7633,6 +8294,7 @@ pub async fn dispatch_run(
         &path,
         &excluded,
         Some(&resolved),
+        None,
     )
     .await?
     {
@@ -7651,6 +8313,10 @@ pub async fn dispatch_run(
             return Ok(run);
         }
         Admission::Refused(refusal) => refusal,
+        // Only the webhook path claims a delivery outcome.
+        Admission::Claimed | Admission::Ended(_) => {
+            return Err(DispatchError::Db(DbError::Conflict))
+        }
     };
     let repo = event
         .repo()
@@ -7901,6 +8567,7 @@ async fn persist_run_from_ir(
     db: &dyn Db,
     run: &RunId,
     run_row_written: bool,
+    claim: Option<&scarab_engine::DeliveryRunClaim>,
     ir: &scarab_pipeline::PipelineIr,
     event: &scarab_forge::Event,
     pipeline: &str,
@@ -7910,13 +8577,27 @@ async fn persist_run_from_ir(
     admitted: &AdmittedFacts<'_>,
     concurrency_group: Option<&str>,
     now: Timestamp,
-) -> Result<(), TriggerError> {
+) -> Result<Persisted, TriggerError> {
     // The Run's first row may already be written, in its `run.create`
     // decision's transaction (git-bug bbc433e). Written to a database this
     // `db` does not read (stores paired differently), it is written here.
+    // On the webhook path the delivery outcome is written with it
+    // (ADR-0083 §2); another try's outcome leaves nothing of this Run.
     if !run_row_written || db.run_status(run).await?.is_none() {
-        db.begin_run_creation(run, ir.ir_version, EVENT_VERSION, now)
-            .await?;
+        match claim {
+            Some(claim) => {
+                let written = db
+                    .begin_delivery_run_creation(run, ir.ir_version, EVENT_VERSION, claim)
+                    .await?;
+                if let scarab_engine::OutcomeWrite::Claimed(_) = written {
+                    return Ok(Persisted::Claimed);
+                }
+            }
+            None => {
+                db.begin_run_creation(run, ir.ir_version, EVENT_VERSION, now)
+                    .await?
+            }
+        }
     }
     let written = write_run_from_ir(
         db,
@@ -7932,7 +8613,23 @@ async fn persist_run_from_ir(
         now,
     )
     .await;
-    end_run_creation(db, run, now, written).await
+    Ok(if end_run_creation(db, run, now, written).await? {
+        Persisted::Created
+    } else {
+        Persisted::Ended
+    })
+}
+
+/// What [`persist_run_from_ir`] made of the Run.
+enum Persisted {
+    /// Every write landed and the Run is schedulable.
+    Created,
+    /// The webhook path: another try recorded the delivery outcome first,
+    /// and nothing of this Run was written (ADR-0083 §2).
+    Claimed,
+    /// The Run's first row was written, and the Run was ended or replaced
+    /// before its creation finished (ADR-0083 §4).
+    Ended,
 }
 
 /// The concurrency group's key for a Run of `ir`, rendered before its
@@ -7988,12 +8685,16 @@ fn concurrency_group_key(
 /// ([`scarab_engine::fail_run_creation`]), so a half-written run is never
 /// scheduled and never sits `Pending` for good. The creation error is
 /// returned either way.
+///
+/// `Ok(false)`: the run was ended (the creation sweep) or replaced by a
+/// redelivery while it was being written (ADR-0083 §4), so it is not
+/// created and is left as it is.
 async fn end_run_creation<E>(
     db: &dyn Db,
     run: &RunId,
     now: Timestamp,
     written: Result<(), E>,
-) -> Result<(), E>
+) -> Result<bool, E>
 where
     E: std::fmt::Display + From<DbError>,
 {
@@ -8583,13 +9284,24 @@ fn refusal_status_post(
 ///   still pending is check-then-act across replicas: replica A can have
 ///   the forge accept the terminal post and not yet mark it dispatched
 ///   while replica B sees it pending and posts `pending` after it (red team
-///   F9), leaving a settled Run's check pending for good.
+///   F9), leaving a settled Run's check pending for good; or
+/// - a redelivery replaced the run (ADR-0083 §4): a `failure` post still on
+///   the outbox would otherwise land after its replacement's `success`.
 async fn status_post_superseded(
     db: &dyn Db,
     run: &RunId,
     generation: u64,
     to: RunStatus,
 ) -> Result<bool, DbError> {
+    // A Run a redelivery replaced (ADR-0083 §4): its posts are older than
+    // every post of its replacement, which was created after it.
+    if db
+        .run_creation_state(run)
+        .await?
+        .is_some_and(|s| s.replaced_by.is_some())
+    {
+        return Ok(true);
+    }
     let current = db.run_reopen_generation(run).await?;
     if generation < current {
         return Ok(true);
@@ -8703,101 +9415,294 @@ fn duplicate_delivery() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-/// A delivery that recorded nothing (no Run, no refusal) because the forge
-/// could not be read: its id is removed from the replay guard, so the
-/// forge's redelivery is processed and cannot duplicate a Run or a refusal,
-/// and the answer is 502.
-async fn refuse_unread_delivery(
-    st: &AppState,
+/// A try that read nothing because the forge could not be read: the
+/// delivery stays unfinished, so the forge's redelivery is processed, and
+/// the answer is 502.
+fn refuse_unread_delivery(
     forge: scarab_forge::ForgeKind,
     delivery_id: &str,
     why: &str,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    if let (Some(connections), false) = (st.connections.as_ref(), delivery_id.is_empty()) {
-        connections
-            .forget_delivery(forge, delivery_id)
-            .await
-            .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
-    }
     tracing::warn!(
         forge = forge.as_str(),
         delivery = %delivery_id,
         reason = %why,
-        "webhook delivery created nothing: the forge could not be read"
+        "webhook delivery decided nothing: the forge could not be read"
     );
     Err(ApiError::BadGateway(
         "the forge could not be read; redeliver".into(),
     ))
 }
 
-/// Replay guard (ADR-0046): record the delivery id against the registry;
-/// `Ok(false)` means this exact delivery was already processed (a replay —
-/// even a correctly-signed one) and must be acknowledged without re-processing.
-/// With no registry wired (dev), dedup is skipped. With one wired, an empty
-/// id was refused before this ([`require_delivery_id`]).
-async fn delivery_is_fresh(
+/// One try of a webhook delivery (ADR-0083 §7), as the store began it.
+pub(crate) struct DeliveryTryState {
+    forge: scarab_forge::ForgeKind,
+    id: String,
+    /// This try inserted the delivery row.
+    first: bool,
+    /// When the delivery arrived (unix ms, the store's clock).
+    at: i64,
+    /// What an earlier try pinned.
+    pins: Option<scarab_forge::DeliveryPins>,
+    /// This try's lease token: only it ends the try.
+    token: String,
+}
+
+/// How a try of a webhook delivery starts.
+enum TryStart {
+    /// Process it; `None` with no registry wired (dev), where nothing is
+    /// deduplicated.
+    Run(Option<DeliveryTryState>),
+    /// The delivery is finished: a replay.
+    Duplicate,
+}
+
+/// The replay guard and try lease (ADR-0046, ADR-0083 §7): begin a try of
+/// `delivery_id`. A finished delivery is a duplicate; one another try holds
+/// is answered 409 on any replica, before any forge read. With no registry
+/// wired (dev) nothing is deduplicated. With one wired, an empty id was
+/// refused before this ([`require_delivery_id`]).
+async fn start_delivery_try(
     st: &AppState,
     forge: scarab_forge::ForgeKind,
     delivery_id: &str,
-) -> Result<bool, ApiError> {
+) -> Result<TryStart, ApiError> {
     let (Some(connections), false) = (st.connections.as_ref(), delivery_id.is_empty()) else {
-        return Ok(true);
+        return Ok(TryStart::Run(None));
     };
-    connections
-        .record_delivery(forge, delivery_id)
+    let begun = connections
+        .begin_delivery_try(
+            forge,
+            delivery_id,
+            scarab_engine::UNFINISHED_CREATION_BOUND_MS,
+        )
         .await
-        .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))
+        .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
+    let (first, at, pins, token) = match begun {
+        scarab_forge::DeliveryTry::Finished => return Ok(TryStart::Duplicate),
+        scarab_forge::DeliveryTry::Held => return Err(delivery_held()),
+        scarab_forge::DeliveryTry::First { at, token } => (true, at, None, token),
+        scarab_forge::DeliveryTry::Again { at, pins, token } => (false, at, pins, token),
+    };
+    Ok(TryStart::Run(Some(DeliveryTryState {
+        forge,
+        id: delivery_id.to_string(),
+        first,
+        at,
+        pins,
+        token,
+    })))
+}
+
+/// The answer to a delivery another try is processing (ADR-0083 §7).
+fn delivery_held() -> ApiError {
+    ApiError::Conflict("this delivery is being processed by another try; redeliver later".into())
+}
+
+/// End a try begun with [`start_delivery_try`]: clear its lease, and mark
+/// the delivery finished when every Pipeline is decided. A failure is
+/// logged: the lease then lapses on its own, and the delivery stays as it
+/// was.
+async fn end_delivery_try(st: &AppState, try_: Option<&DeliveryTryState>, finished: bool) {
+    let (Some(t), Some(connections)) = (try_, st.connections.as_ref()) else {
+        return;
+    };
+    if let Err(e) = connections
+        .end_delivery_try(t.forge, &t.id, &t.token, finished)
+        .await
+    {
+        tracing::warn!(
+            forge = t.forge.as_str(),
+            delivery = %t.id,
+            error = %e,
+            "ending a webhook delivery's try failed; its lease lapses on its own"
+        );
+    }
+}
+
+/// What a delivery is pinned to on its first try (ADR-0083 §1, §5): the
+/// commit `.scarab/` is read at — the event's commit, or for a comment `HEAD`
+/// and for a tag or release the tag, resolved once — and, for a push, a pull
+/// request or a comment on a pull request, the ref or pull request and its
+/// commit then.
+///
+/// `None` when a comment's, tag's or release's commit cannot be resolved:
+/// this try reads `.scarab/` at the symbolic ref, as 0.7.1 did, nothing is
+/// pinned, and the next try resolves again. A pull request whose head cannot
+/// be read is pinned with no head: the comment then runs on a later try as a
+/// comment not on a pull request does. A comment on a pull request that a
+/// later try (`first` false) pins gets no head either: the pull request's
+/// head then is not the one the comment arrived at.
+async fn resolve_delivery_pins(
+    forge: &dyn scarab_forge::ForgePort,
+    event: &scarab_forge::Event,
+    first: bool,
+) -> Option<scarab_forge::DeliveryPins> {
+    use scarab_forge::Event;
+    let repo = event.repo()?;
+    let scope_key = |scope: scarab_engine::HeadScope| Some(scope.key(&repo.owner, &repo.name));
+    let resolve = |r: String| async move {
+        match forge_read_retried(|| forge.latest_commit(repo, &r)).await {
+            Ok(c) => Some(c.sha),
+            Err(e) => {
+                tracing::warn!(
+                    git_ref = %r,
+                    error = %e,
+                    "the delivery's commit could not be resolved; reading .scarab/ at the ref"
+                );
+                None
+            }
+        }
+    };
+    let unpinned = |config_sha: String| scarab_forge::DeliveryPins {
+        config_sha,
+        head_scope: None,
+        head_sha: None,
+    };
+    Some(match event {
+        Event::Push { r#ref, after, .. } => scarab_forge::DeliveryPins {
+            config_sha: after.clone(),
+            head_scope: scope_key(scarab_engine::HeadScope::Ref(r#ref.clone())),
+            head_sha: Some(after.clone()),
+        },
+        Event::PullRequest { number, head, .. } => scarab_forge::DeliveryPins {
+            config_sha: head.clone(),
+            head_scope: scope_key(scarab_engine::HeadScope::PullRequest(*number as i64)),
+            head_sha: Some(head.clone()),
+        },
+        Event::Comment {
+            issue,
+            pull_request,
+            ..
+        } => {
+            let config_sha = resolve(config_ref(event)).await?;
+            if !*pull_request || !first {
+                return Some(unpinned(config_sha));
+            }
+            match forge_read_retried(|| forge.pull_request_head(repo, *issue)).await {
+                Ok(head) => scarab_forge::DeliveryPins {
+                    config_sha,
+                    head_scope: scope_key(scarab_engine::HeadScope::PullRequest(*issue as i64)),
+                    head_sha: Some(head),
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        pull_request = issue,
+                        error = %e,
+                        "the pull request's head could not be read; the comment is pinned \
+                         with no head"
+                    );
+                    unpinned(config_sha)
+                }
+            }
+        }
+        Event::Tag { .. } | Event::Release { .. } => unpinned(resolve(config_ref(event)).await?),
+        _ => unpinned(config_ref(event)),
+    })
+}
+
+/// The head a later try of a delivery checks (ADR-0083 §5), from what its
+/// first try pinned: a push's ref, a pull request, or the pull request a
+/// comment is on. `None` for a tag, a release and a comment not on a pull
+/// request, which always run.
+fn delivery_head(
+    event: &scarab_forge::Event,
+    pins: &scarab_forge::DeliveryPins,
+) -> Option<DeliveryHead> {
+    use scarab_forge::Event;
+    let sha = pins.head_sha.clone()?;
+    pins.head_scope.as_ref()?;
+    match event {
+        Event::Push { r#ref, .. } => Some(DeliveryHead {
+            scope: scarab_engine::HeadScope::Ref(r#ref.clone()),
+            sha,
+            name: format!("`{ref}`", ref = r#ref),
+        }),
+        Event::PullRequest { number, .. } => Some(DeliveryHead {
+            scope: scarab_engine::HeadScope::PullRequest(*number as i64),
+            sha,
+            name: format!("pull request #{number}"),
+        }),
+        Event::Comment {
+            issue,
+            pull_request: true,
+            ..
+        } => Some(DeliveryHead {
+            scope: scarab_engine::HeadScope::PullRequest(*issue as i64),
+            sha,
+            name: format!("pull request #{issue}"),
+        }),
+        _ => None,
+    }
 }
 
 /// The shared tail of every webhook ingest: read in-repo `.scarab` config at
-/// the event ref, compile, and start Runs if a pipeline's `on:` matches
-/// (ADR-0010). Without a forge wired we can only acknowledge the delivery.
+/// the commit the delivery is pinned to, compile, and start Runs if a
+/// pipeline's `on:` matches (ADR-0010). Without a forge wired we can only
+/// acknowledge the delivery.
 ///
-/// A Pipeline file the forge could not read (after
-/// [`read_event_pipelines`]'s retries) and nothing recorded: the delivery
-/// id `delivery_id` of `kind` is forgotten and the answer is 502, so the
-/// forge's redelivery is processed ([`refuse_unread_delivery`]). Some Runs
-/// created or Pipelines refused: the usual answer with `"incomplete": true`
-/// (a 400 says so in its text); a redelivery would record them again, so
-/// the id stays recorded.
+/// With a try (`try_`), what each Pipeline file decided is recorded once
+/// per delivery (ADR-0083), and the second value says whether every
+/// Pipeline is decided, so the delivery is finished:
+///
+/// * the forge could not be read and nothing was decided: 502;
+/// * some decided and a file left undecided (unreadable, a store or
+///   admission error): 502, the body naming what ran, what did not and
+///   what is undecided;
+/// * a Pipeline whose Run another try is still creating: 409;
+/// * every Pipeline decided by earlier tries: 200 `duplicate delivery`.
 async fn ingest_event(
     st: &AppState,
     event: scarab_forge::Event,
     kind: scarab_forge::ForgeKind,
-    delivery_id: &str,
-) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    try_: Option<&DeliveryTryState>,
+) -> (
+    Result<(StatusCode, Json<serde_json::Value>), ApiError>,
+    bool,
+) {
+    let delivery_id = try_.map_or("", |t| t.id.as_str());
     let Some(forge) = st.forge.as_ref() else {
-        return Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({ "ignored": "no forge configured" })),
-        ));
+        return (
+            Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({ "ignored": "no forge configured" })),
+            )),
+            true,
+        );
     };
     // A repo the forge covers but no admin has enabled has no Project, and a
     // bound one the connection no longer reaches cannot be read: their events
     // are acknowledged and dropped, before any forge read. A 2xx, so
     // the forge does not retry a delivery that will never be acted on (a
     // GitHub App delivers every covered repo's events, enabled or not).
+    let mut connection_id = None;
     if let (Some(connections), Some(repo)) = (st.connections.as_ref(), event.repo()) {
-        let bound = connections
-            .resolve(repo)
-            .await
-            .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
+        let bound = match connections.resolve(repo).await {
+            Ok(bound) => bound,
+            Err(e) => return (Err(ApiError::Db(DbError::Other(e.to_string()))), false),
+        };
         match bound {
             None => {
-                return Ok((
-                    StatusCode::OK,
-                    Json(serde_json::json!({ "ignored": "repository not enabled" })),
-                ))
+                return (
+                    Ok((
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "ignored": "repository not enabled" })),
+                    )),
+                    true,
+                )
             }
             // The connection no longer reaches it (the App's installation
             // stopped covering it): no forge read could succeed.
             Some(r) if r.unreachable_since.is_some() => {
-                return Ok((
-                    StatusCode::OK,
-                    Json(serde_json::json!({ "ignored": "repository unreachable" })),
-                ))
+                return (
+                    Ok((
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "ignored": "repository unreachable" })),
+                    )),
+                    true,
+                )
             }
-            Some(_) => {}
+            Some(r) => connection_id = Some(r.connection.id),
         }
     }
     let no_match = || {
@@ -8807,18 +9712,62 @@ async fn ingest_event(
         ))
     };
     if matches!(event, scarab_forge::Event::Cron { .. }) {
-        return no_match();
+        return (no_match(), true);
     }
-    let read = match read_event_pipelines(forge.as_ref(), &event).await {
+    // ADR-0083 §1: every try reads `.scarab/` at the commit the first try
+    // resolved, and a later try checks the head the first try saw (§5).
+    let mut delivery = None;
+    if let (Some(t), Some(connection_id), Some(connections)) =
+        (try_, connection_id, st.connections.as_ref())
+    {
+        let pins = match &t.pins {
+            Some(pins) => Some(pins.clone()),
+            None => match resolve_delivery_pins(forge.as_ref(), &event, t.first).await {
+                Some(resolved) => match connections.pin_delivery(t.forge, &t.id, &resolved).await {
+                    Ok(pins) => Some(pins),
+                    Err(e) => return (Err(ApiError::Db(DbError::Other(e.to_string()))), false),
+                },
+                // Not pinned: this try reads at the symbolic ref.
+                None => None,
+            },
+        };
+        delivery = Some(DeliveryRun {
+            connection_id,
+            delivery_id: t.id.clone(),
+            forge: t.forge,
+            first: t.first,
+            at: Timestamp(t.at),
+            head: pins.as_ref().and_then(|p| delivery_head(&event, p)),
+            read_ref: pins.map_or_else(|| config_ref(&event), |p| p.config_sha),
+            unread: Vec::new(),
+        });
+    }
+    let read_ref = delivery
+        .as_ref()
+        .map_or_else(|| config_ref(&event), |d| d.read_ref.clone());
+    let read = match read_event_pipelines(forge.as_ref(), &event, &read_ref).await {
         Ok(read) => read,
         Err(TriggerError::Forge(e)) => {
-            return refuse_unread_delivery(st, kind, delivery_id, &e.to_string()).await
+            return (
+                refuse_unread_delivery(kind, delivery_id, &e.to_string()),
+                false,
+            )
         }
-        Err(TriggerError::Db(e)) => return Err(ApiError::Db(e)),
-        Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+        Err(TriggerError::Db(e)) => return (Err(ApiError::Db(e)), false),
+        // A file that is not UTF-8 stays so on every try.
+        Err(e) => return (Err(ApiError::BadRequest(e.to_string())), true),
     };
     let complete = read.complete;
     let files = read.files;
+    if let Some(d) = delivery.as_mut() {
+        d.unread = read.unread;
+    }
+    // On the webhook path a file that could not be read is listed as
+    // undecided; only a listing that failed leaves the answer without one.
+    let answer_complete = match &delivery {
+        Some(_) => read.listed,
+        None => complete,
+    };
     // A push to the live default branch rewrites the cron schedule index
     // (git-bug 5d5fc8a) from the files this delivery read anyway, when
     // every read succeeded.
@@ -8840,81 +9789,118 @@ async fn ingest_event(
         &event,
         &files,
         complete,
+        delivery.as_ref(),
     )
     .await;
-    // A library the forge could not read: returned before any Run or
-    // refusal was recorded ([`trigger_runs_from_files`] returns a forge error
-    // from its library reads only), so the delivery is forgotten as for an
-    // unreadable Pipeline file.
-    if let Err(TriggerError::Forge(e)) = &triggered {
-        return refuse_unread_delivery(st, kind, delivery_id, &e.to_string()).await;
-    }
-    if !complete {
-        // The id is forgotten only when the delivery recorded nothing: no
-        // Run, and no refusal (a refused-Run row, a failure status, a
-        // Policy decision), which a redelivery would record again. A file
-        // that does not compile records refusals for the delivery, so it
-        // keeps the id like a refusal does; anything else may have stopped
-        // after a Run was created.
-        let recorded_nothing = matches!(
-            &triggered,
-            Ok(outcome) if outcome.runs.is_empty() && outcome.refused.is_empty()
-        );
-        if recorded_nothing {
-            return refuse_unread_delivery(
-                st,
-                kind,
-                delivery_id,
-                "a Pipeline file could not be read",
+    let outcome = match triggered {
+        Ok(outcome) => outcome,
+        // Without a try (dev): an `invoke:` library the forge could not
+        // read, before anything was recorded.
+        Err(TriggerError::Forge(e)) => {
+            return (
+                refuse_unread_delivery(kind, delivery_id, &e.to_string()),
+                false,
             )
-            .await;
         }
+        Err(TriggerError::Db(e)) => return (Err(ApiError::Db(e)), false),
+        Err(e @ TriggerError::Pipeline(_)) if !complete => {
+            return (
+                Err(ApiError::BadRequest(format!(
+                    "{e}; another Pipeline file could not be read from the forge"
+                ))),
+                false,
+            )
+        }
+        Err(e) => return (Err(ApiError::BadRequest(e.to_string())), true),
+    };
+    delivery_answer(&event, kind, delivery_id, answer_complete, outcome)
+}
+
+/// The answer to a webhook delivery from what its try decided
+/// ([`ingest_event`]), and whether the delivery is finished.
+fn delivery_answer(
+    event: &scarab_forge::Event,
+    kind: scarab_forge::ForgeKind,
+    delivery_id: &str,
+    complete: bool,
+    outcome: TriggerOutcome,
+) -> (
+    Result<(StatusCode, Json<serde_json::Value>), ApiError>,
+    bool,
+) {
+    let undecided = !outcome.undecided.is_empty() || !complete;
+    let run_ids: Vec<&str> = outcome.runs.iter().map(|r| r.0.as_str()).collect();
+    let mut body = serde_json::json!({
+        "run_ids": run_ids,
+        "trigger": event.trigger_kind(),
+    });
+    if !outcome.refused.is_empty() {
+        body["refused"] = serde_json::json!(outcome.refused);
     }
-    match triggered {
-        // ADR-0071 §2: every deploy pipeline the Environment refused is named
-        // in the body as `refused: [{pipeline, environment, reason}]` — beside
-        // the runs that did start, or alone (200: nothing was accepted, but
-        // "no matching pipeline" would misdescribe a pipeline that matched
-        // and was refused).
-        Ok(outcome) if !outcome.runs.is_empty() => {
-            let run_ids: Vec<&str> = outcome.runs.iter().map(|r| r.0.as_str()).collect();
-            let mut body = serde_json::json!({
-                "run_ids": run_ids,
-                "trigger": event.trigger_kind(),
-            });
-            if !outcome.refused.is_empty() {
-                body["refused"] = serde_json::json!(outcome.refused);
-            }
-            // A Pipeline file could not be read: it started nothing, and a
-            // redelivery would duplicate the Runs above, so the id stays
-            // recorded and the answer says so.
-            if !complete {
-                body["incomplete"] = serde_json::json!(true);
-                tracing::warn!(
-                    forge = kind.as_str(),
-                    delivery = %delivery_id,
-                    "webhook delivery created Runs, but a Pipeline file could not be read"
-                );
-            }
-            Ok((StatusCode::ACCEPTED, Json(body)))
-        }
-        Ok(outcome) if !outcome.refused.is_empty() => {
-            let mut body = serde_json::json!({
-                "refused": outcome.refused,
-                "trigger": event.trigger_kind(),
-            });
-            if !complete {
-                body["incomplete"] = serde_json::json!(true);
-            }
-            Ok((StatusCode::OK, Json(body)))
-        }
-        Ok(_) => no_match(),
-        Err(TriggerError::Db(e)) => Err(ApiError::Db(e)),
-        Err(e @ TriggerError::Pipeline(_)) if !complete => Err(ApiError::BadRequest(format!(
-            "{e}; another Pipeline file could not be read from the forge"
-        ))),
-        Err(e) => Err(ApiError::BadRequest(e.to_string())),
+    if !outcome.earlier.is_empty() {
+        body["earlier"] = serde_json::json!(outcome.earlier);
     }
+    // A Run another try is still creating (ADR-0083 §4): the other
+    // Pipelines are decided; this one waits for that try or for the bound.
+    if outcome.busy {
+        tracing::warn!(
+            forge = kind.as_str(),
+            delivery = %delivery_id,
+            "webhook delivery left a Pipeline to another try that is still creating its Run"
+        );
+        return (Err(delivery_held()), false);
+    }
+    if undecided {
+        tracing::warn!(
+            forge = kind.as_str(),
+            delivery = %delivery_id,
+            undecided = ?outcome.undecided,
+            "webhook delivery left Pipelines undecided; a redelivery decides them"
+        );
+        let nothing = outcome.runs.is_empty()
+            && outcome.refused.is_empty()
+            && outcome.earlier.is_empty()
+            && outcome.compile_error.is_none();
+        if nothing && outcome.undecided.is_empty() {
+            return (
+                refuse_unread_delivery(kind, delivery_id, "a Pipeline file could not be read"),
+                false,
+            );
+        }
+        body["undecided"] = serde_json::json!(outcome.undecided);
+        body["incomplete"] = serde_json::json!(true);
+        body["error"] = serde_json::json!(match &outcome.compile_error {
+            Some(text) =>
+                format!("pipeline: {text}; another Pipeline file could not be decided; redeliver"),
+            None => "a Pipeline file could not be decided; redeliver".to_string(),
+        });
+        return (Ok((StatusCode::BAD_GATEWAY, Json(body))), false);
+    }
+    // ADR-0009: a file that does not compile stopped the delivery.
+    if let Some(text) = outcome.compile_error {
+        return (Err(ApiError::BadRequest(format!("pipeline: {text}"))), true);
+    }
+    // ADR-0071 §2: every deploy pipeline the Environment refused is named
+    // in the body as `refused: [{pipeline, environment, reason}]` — beside
+    // the runs that did start, or alone (200: nothing was accepted, but
+    // "no matching pipeline" would misdescribe a pipeline that matched
+    // and was refused).
+    if !outcome.runs.is_empty() {
+        return (Ok((StatusCode::ACCEPTED, Json(body))), true);
+    }
+    if !outcome.refused.is_empty() {
+        body.as_object_mut().map(|b| b.remove("run_ids"));
+        return (Ok((StatusCode::OK, Json(body))), true);
+    }
+    // Every Pipeline decided by earlier tries (ADR-0083 §7).
+    if outcome.not_run.is_empty() && !outcome.earlier.is_empty() {
+        return (Ok(duplicate_delivery()), true);
+    }
+    let mut body = serde_json::json!({ "ignored": "no matching pipeline" });
+    if !outcome.earlier.is_empty() {
+        body["earlier"] = serde_json::json!(outcome.earlier);
+    }
+    (Ok((StatusCode::OK, Json(body))), true)
 }
 
 /// The API base every GitHub App installation connection talks to.
@@ -9136,7 +10122,7 @@ fn delivery_assign_refusal(
 /// durably create the triggered Runs. Unverified deliveries are rejected;
 /// administrative events (e.g. `ping`) and events of a repo that is not
 /// enabled are acknowledged and ignored.
-#[utoipa::path(post, path = "/webhooks/github", summary = "GitHub webhook ingest (HMAC-verified)", responses((status = 202, description = "delivery accepted"), (status = 400, description = "malformed delivery, or no delivery id"), (status = 401, description = "bad signature"), (status = 502, description = "the forge could not be read and nothing was created; redeliver"), (status = 503, description = "too many deliveries running, or this delivery is still running; redeliver later")))]
+#[utoipa::path(post, path = "/webhooks/github", summary = "GitHub webhook ingest (HMAC-verified)", responses((status = 202, description = "delivery accepted"), (status = 400, description = "malformed delivery, or no delivery id"), (status = 401, description = "bad signature"), (status = 409, description = "another try is processing this delivery; redeliver later"), (status = 502, description = "the forge could not be read, or a Pipeline was left undecided; the body names what ran, what did not and what is undecided; redeliver"), (status = 503, description = "too many deliveries running; redeliver later")))]
 async fn github_webhook(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -9167,43 +10153,68 @@ async fn github_webhook(
     let slot = delivery_slot(&st).await?;
     finish_delivery(slot, async move {
         let kind = scarab_forge::ForgeKind::GitHub;
-        // Replay guard — only verified deliveries are recorded (ADR-0046).
-        let _running = claim_delivery(&st, kind, &delivery.id)?;
-        if !delivery_is_fresh(&st, kind, &delivery.id).await? {
-            return Ok(duplicate_delivery());
-        }
-        // Installation lifecycle → the connection's registration (ADR-0046).
-        if let Some(sync) = scarab_forge_github::installation_sync(&delivery) {
-            if let Some(connections) = st.connections.as_ref() {
-                return register_installation(&st, connections.as_ref(), &sync).await;
-            }
-            return Ok((
-                StatusCode::OK,
-                Json(serde_json::json!({ "ignored": "no registry configured" })),
-            ));
-        }
-
-        let event = match scarab_forge_github::normalize(&delivery) {
-            Ok(e) => e,
-            // Acknowledge-and-ignore events we don't act on (ping, unsupported).
-            Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => {
-                return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true }))));
-            }
-            // A supported event that starts nothing (a closed pull request, ...).
-            Err(scarab_forge::ForgeError::Ignored(why)) => {
-                return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": why }))));
-            }
-            Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+        // Replay guard and try lease — only verified deliveries are
+        // recorded (ADR-0046, ADR-0083 §7).
+        let try_ = match start_delivery_try(&st, kind, &delivery.id).await? {
+            TryStart::Duplicate => return Ok(duplicate_delivery()),
+            TryStart::Run(t) => t,
         };
-        ingest_event(&st, event, kind, &delivery.id).await
+        let (answer, finished) = github_delivery(&st, &delivery, try_.as_ref()).await;
+        end_delivery_try(&st, try_.as_ref(), finished).await;
+        answer
     })
     .await
 }
 
+/// A verified GitHub delivery's work, and whether the delivery is finished
+/// ([`ingest_event`]).
+async fn github_delivery(
+    st: &AppState,
+    delivery: &scarab_forge::WebhookDelivery,
+    try_: Option<&DeliveryTryState>,
+) -> (
+    Result<(StatusCode, Json<serde_json::Value>), ApiError>,
+    bool,
+) {
+    let kind = scarab_forge::ForgeKind::GitHub;
+    // Installation lifecycle → the connection's registration (ADR-0046).
+    if let Some(sync) = scarab_forge_github::installation_sync(delivery) {
+        let answer = match st.connections.as_ref() {
+            Some(connections) => register_installation(st, connections.as_ref(), &sync).await,
+            None => Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({ "ignored": "no registry configured" })),
+            )),
+        };
+        let finished = answer.is_ok();
+        return (answer, finished);
+    }
+    let event = match scarab_forge_github::normalize(delivery) {
+        Ok(e) => e,
+        // Acknowledge-and-ignore events we don't act on (ping, unsupported).
+        Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => {
+            return (
+                Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true })))),
+                true,
+            );
+        }
+        // A supported event that starts nothing (a closed pull request, ...).
+        Err(scarab_forge::ForgeError::Ignored(why)) => {
+            return (
+                Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": why })))),
+                true,
+            );
+        }
+        Err(e) => return (Err(ApiError::BadRequest(e.to_string())), true),
+    };
+    ingest_event(st, event, kind, try_).await
+}
+
 /// Do a verified delivery's work in its own task and wait for it (ADR-0081
-/// §7, git-bug 23e3a09). The work records the delivery id first
-/// ([`delivery_is_fresh`]); once it is recorded a redelivery is answered
-/// "duplicate delivery" and cannot repair this one. A forge that stops
+/// §7, git-bug 23e3a09). The work begins its try first
+/// ([`start_delivery_try`]); while the try holds the delivery a redelivery
+/// is answered 409, and once the delivery is finished it is answered
+/// "duplicate delivery" (ADR-0083 §7). A forge that stops
 /// waiting (GitHub after 10 seconds, Forgejo after its `DELIVER_TIMEOUT`)
 /// closes the connection, and the HTTP server then drops the handler; in a
 /// task of its own the work goes on, records the id, reads the Pipeline
@@ -9240,7 +10251,7 @@ async fn finish_delivery(
 /// bound to the Forgejo adapter's verification (plain-hex
 /// `X-Forgejo/Gitea-Signature`) and its own secret — no payload sniffing on a
 /// shared endpoint. Same replay guard, same canonical vocabulary downstream.
-#[utoipa::path(post, path = "/webhooks/forgejo", summary = "Forgejo webhook ingest (HMAC-verified)", responses((status = 202, description = "delivery accepted"), (status = 400, description = "malformed delivery, or no delivery id"), (status = 401, description = "bad signature"), (status = 502, description = "the forge could not be read and nothing was created; redeliver"), (status = 503, description = "too many deliveries running, or this delivery is still running; redeliver later")))]
+#[utoipa::path(post, path = "/webhooks/forgejo", summary = "Forgejo webhook ingest (HMAC-verified)", responses((status = 202, description = "delivery accepted"), (status = 400, description = "malformed delivery, or no delivery id"), (status = 401, description = "bad signature"), (status = 409, description = "another try is processing this delivery; redeliver later"), (status = 502, description = "the forge could not be read, or a Pipeline was left undecided; the body names what ran, what did not and what is undecided; redeliver"), (status = 503, description = "too many deliveries running; redeliver later")))]
 async fn forgejo_webhook(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -9286,21 +10297,24 @@ async fn forgejo_webhook(
     let slot = delivery_slot(&st).await?;
     finish_delivery(slot, async move {
         let kind = scarab_forge::ForgeKind::Forgejo;
-        let _running = claim_delivery(&st, kind, &delivery.id)?;
-        if !delivery_is_fresh(&st, kind, &delivery.id).await? {
-            return Ok(duplicate_delivery());
-        }
-        let event = match scarab_forge_forgejo::normalize(&delivery) {
-            Ok(e) => e,
-            Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => {
-                return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true }))));
-            }
-            Err(scarab_forge::ForgeError::Ignored(why)) => {
-                return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": why }))));
-            }
-            Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+        let try_ = match start_delivery_try(&st, kind, &delivery.id).await? {
+            TryStart::Duplicate => return Ok(duplicate_delivery()),
+            TryStart::Run(t) => t,
         };
-        ingest_event(&st, event, kind, &delivery.id).await
+        let (answer, finished) = match scarab_forge_forgejo::normalize(&delivery) {
+            Ok(event) => ingest_event(&st, event, kind, try_.as_ref()).await,
+            Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => (
+                Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true })))),
+                true,
+            ),
+            Err(scarab_forge::ForgeError::Ignored(why)) => (
+                Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": why })))),
+                true,
+            ),
+            Err(e) => (Err(ApiError::BadRequest(e.to_string())), true),
+        };
+        end_delivery_try(&st, try_.as_ref(), finished).await;
+        answer
     })
     .await
 }
@@ -12073,7 +13087,8 @@ async fn approve_gate(
             | RerunError::GateNotPending { .. }
             | RerunError::GateNotReached { .. }
             | RerunError::NotARejectableGate(_)
-            | RerunError::CreationUnfinished),
+            | RerunError::CreationUnfinished
+            | RerunError::Replaced(_)),
         ) => return Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
@@ -12204,7 +13219,8 @@ async fn approve_gate(
             | RerunError::GateNotPending { .. }
             | RerunError::GateNotReached { .. }
             | RerunError::NotARejectableGate(_)
-            | RerunError::CreationUnfinished),
+            | RerunError::CreationUnfinished
+            | RerunError::Replaced(_)),
         ) => return Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
@@ -12502,7 +13518,8 @@ async fn release_gate_external(
             | RerunError::GateNotPending { .. }
             | RerunError::GateNotReached { .. }
             | RerunError::NotARejectableGate(_)
-            | RerunError::CreationUnfinished),
+            | RerunError::CreationUnfinished
+            | RerunError::Replaced(_)),
         ) => Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => Err(ApiError::Db(e)),
     }

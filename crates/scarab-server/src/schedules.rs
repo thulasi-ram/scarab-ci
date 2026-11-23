@@ -323,6 +323,7 @@ pub async fn dispatch_cron(
             pipeline,
             &excluded,
             Some(&params),
+            None,
         )
         .await?
         {
@@ -342,6 +343,8 @@ pub async fn dispatch_cron(
             // Recorded by admission, except a branch-scoped Environment that
             // does not admit the default branch, which is the rule working.
             Admission::Refused(_) => Ok(FireOutcome::Refused),
+            // Only the webhook path claims a delivery outcome.
+            Admission::Claimed | Admission::Ended(_) => Ok(FireOutcome::Skipped),
         };
     }
     Ok(FireOutcome::Skipped)

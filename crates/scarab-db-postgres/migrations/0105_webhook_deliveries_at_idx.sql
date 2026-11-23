@@ -1,0 +1,11 @@
+-- no-transaction
+--
+-- ADR-0083 §8: the retention sweeper deletes `webhook_deliveries` rows by
+-- their `at`, and the connection page reads `max(at)` per forge. Built
+-- CONCURRENTLY, so webhook deliveries go on recording while it builds; that
+-- cannot run in a transaction, hence the directive on the first line and one
+-- statement in this file. A build that fails or is stopped leaves an invalid
+-- index behind, which `IF NOT EXISTS` passes over when this file runs again;
+-- the server drops it and builds it again at start, after the migrations
+-- (`CONCURRENT_INDEXES` in src/lib.rs).
+CREATE INDEX CONCURRENTLY IF NOT EXISTS webhook_deliveries_at_idx ON webhook_deliveries (at);

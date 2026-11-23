@@ -32,6 +32,7 @@ use scarab_project::ProjectError;
 
 /// `EnvironmentGovernanceStore` (ADR-0071 §2, §3, §8): baseline, eligibility,
 /// overlays and grants, and the one-snapshot read admission makes.
+mod delivery;
 mod environment_governance;
 /// `LibraryStore` (ADR-0076): installed libraries, their versions, yanks
 /// and the sources each org trusts with forge credentials.
@@ -59,10 +60,16 @@ pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 /// an invalid index of that name behind; the migration's `IF NOT EXISTS`
 /// passes over it when it runs again, and the planner never uses it, so
 /// [`PostgresDb::migrate`] drops and builds each invalid one again.
-const CONCURRENT_INDEXES: &[(&str, &str)] = &[(
-    "attempts_started_at_idx",
-    "CREATE INDEX CONCURRENTLY attempts_started_at_idx ON attempts (started_at)",
-)];
+const CONCURRENT_INDEXES: &[(&str, &str)] = &[
+    (
+        "attempts_started_at_idx",
+        "CREATE INDEX CONCURRENTLY attempts_started_at_idx ON attempts (started_at)",
+    ),
+    (
+        "webhook_deliveries_at_idx",
+        "CREATE INDEX CONCURRENTLY webhook_deliveries_at_idx ON webhook_deliveries (at)",
+    ),
+];
 
 /// The session advisory lock (`hashtextextended(key, 0)`) [`PostgresDb::migrate`]
 /// holds: two replicas starting at once neither run the migrations nor
@@ -450,13 +457,74 @@ impl Db for PostgresDb {
         Ok(())
     }
 
-    async fn finish_run_creation(&self, run: &RunId) -> Result<(), DbError> {
-        sqlx::query("UPDATE runs SET creating = FALSE WHERE id = $1")
-            .bind(&run.0)
-            .execute(self.pool())
+    async fn finish_run_creation(&self, run: &RunId) -> Result<bool, DbError> {
+        // A compare-and-set (ADR-0083 §4): a run the sweep or a failed write
+        // ended, or a redelivery replaced, while it was being written stays
+        // as it is.
+        let done = sqlx::query(
+            "UPDATE runs SET creating = FALSE
+             WHERE id = $1 AND creating AND status = 'pending' AND replaced_by IS NULL",
+        )
+        .bind(&run.0)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    async fn begin_delivery_run_creation(
+        &self,
+        run: &RunId,
+        ir_version: u32,
+        event_schema_version: u32,
+        claim: &scarab_engine::DeliveryRunClaim,
+    ) -> Result<scarab_engine::OutcomeWrite, DbError> {
+        delivery::begin_delivery_run_creation(self, run, ir_version, event_schema_version, claim)
             .await
-            .map_err(db_err)?;
-        Ok(())
+    }
+
+    async fn run_creation_state(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<scarab_engine::RunCreationState>, DbError> {
+        delivery::run_creation_state(self, run).await
+    }
+
+    async fn record_delivery_refusal(
+        &self,
+        key: &scarab_engine::DeliveryPipeline,
+        refusal: &scarab_engine::DeliveryRefusal,
+    ) -> Result<scarab_engine::OutcomeWrite, DbError> {
+        delivery::record_delivery_refusal(self, key, refusal).await
+    }
+
+    async fn record_delivery_outcome(
+        &self,
+        key: &scarab_engine::DeliveryPipeline,
+        outcome: scarab_engine::DeliveryOutcomeKind,
+        at: Timestamp,
+    ) -> Result<scarab_engine::OutcomeWrite, DbError> {
+        delivery::record_delivery_outcome(self, key, outcome, at).await
+    }
+
+    async fn delivery_outcomes(
+        &self,
+        connection_id: &str,
+        delivery_id: &str,
+    ) -> Result<Vec<scarab_engine::DeliveryOutcome>, DbError> {
+        delivery::delivery_outcomes(self, connection_id, delivery_id).await
+    }
+
+    async fn head_moved(&self, q: &scarab_engine::HeadQuery) -> Result<bool, DbError> {
+        delivery::head_moved(self, q).await
+    }
+
+    async fn prune_webhook_deliveries(
+        &self,
+        before: Timestamp,
+        limit: u32,
+    ) -> Result<u64, DbError> {
+        delivery::prune_webhook_deliveries(self, before, limit).await
     }
 
     async fn run_creation_unfinished(&self, run: &RunId) -> Result<bool, DbError> {
@@ -2020,26 +2088,9 @@ impl Db for PostgresDb {
     }
 
     async fn record_refused_run(&self, r: &scarab_engine::RefusedRun) -> Result<(), DbError> {
-        sqlx::query(
-            "INSERT INTO refused_runs (org, project, pipeline, trigger_kind, actor, git_ref, sha,
-                                       title, reason_kind, message, errors, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
-        )
-        .bind(&r.org)
-        .bind(&r.project)
-        .bind(&r.pipeline)
-        .bind(&r.trigger_kind)
-        .bind(r.actor.as_deref())
-        .bind(r.git_ref.as_deref())
-        .bind(r.sha.as_deref())
-        .bind(r.title.as_deref())
-        .bind(&r.reason_kind)
-        .bind(&r.message)
-        .bind(&r.errors)
-        .bind(r.created_at.0)
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?;
+        delivery::insert_refused_run(self.pool(), r)
+            .await
+            .map_err(db_err)?;
         Ok(())
     }
 
@@ -4370,37 +4421,32 @@ impl ForgeConnectionStore for PostgresDb {
         .transpose()
     }
 
-    async fn record_delivery(
+    async fn begin_delivery_try(
         &self,
         forge: ForgeKind,
         delivery_id: &str,
-    ) -> Result<bool, RegistryError> {
-        // First writer wins; a conflicting insert (a replay) affects zero rows.
-        let result = sqlx::query(
-            "INSERT INTO webhook_deliveries (forge, id, at)
-             VALUES ($1, $2, (extract(epoch from now()) * 1000)::bigint)
-             ON CONFLICT (forge, id) DO NOTHING",
-        )
-        .bind(forge.as_str())
-        .bind(delivery_id)
-        .execute(self.pool())
-        .await
-        .map_err(reg_err)?;
-        Ok(result.rows_affected() == 1)
+        lease_ms: i64,
+    ) -> Result<scarab_forge::DeliveryTry, RegistryError> {
+        delivery::begin_delivery_try(self, forge, delivery_id, lease_ms).await
     }
 
-    async fn forget_delivery(
+    async fn pin_delivery(
         &self,
         forge: ForgeKind,
         delivery_id: &str,
+        pins: &scarab_forge::DeliveryPins,
+    ) -> Result<scarab_forge::DeliveryPins, RegistryError> {
+        delivery::pin_delivery(self, forge, delivery_id, pins).await
+    }
+
+    async fn end_delivery_try(
+        &self,
+        forge: ForgeKind,
+        delivery_id: &str,
+        token: &str,
+        finished: bool,
     ) -> Result<(), RegistryError> {
-        sqlx::query("DELETE FROM webhook_deliveries WHERE forge = $1 AND id = $2")
-            .bind(forge.as_str())
-            .bind(delivery_id)
-            .execute(self.pool())
-            .await
-            .map_err(reg_err)?;
-        Ok(())
+        delivery::end_delivery_try(self, forge, delivery_id, token, finished).await
     }
 
     async fn last_delivery_at(&self, forge: ForgeKind) -> Result<Option<i64>, RegistryError> {

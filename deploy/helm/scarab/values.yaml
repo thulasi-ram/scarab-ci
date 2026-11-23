@@ -828,6 +828,15 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
+# What the server keeps, and for how long.
+retention:
+  # How long a webhook delivery and the outcome it recorded for each Pipeline
+  # file are kept, in days (SCARAB_RETENTION_WEBHOOK_DELIVERY_DAYS). A
+  # redelivery of a kept delivery creates only the Runs it is missing. The
+  # server refuses to start under 7: GitHub redelivers up to 3 days back, and
+  # a redelivery of a pruned delivery creates its Runs again.
+  webhookDeliveryDays: 30
+
 # Prometheus scraping (ADR-0053): render a ServiceMonitor when the Prometheus
 # Operator CRDs are installed.
 serviceMonitor:

@@ -310,8 +310,74 @@ pub trait Db: Send + Sync {
     ) -> Result<(), DbError>;
 
     /// Make a run from [`begin_run_creation`](Db::begin_run_creation) visible
-    /// to [`active_runs`](Db::active_runs).
-    async fn finish_run_creation(&self, run: &RunId) -> Result<(), DbError>;
+    /// to [`active_runs`](Db::active_runs): a compare-and-set on a run still
+    /// creating, still `Pending` and not replaced (ADR-0083 §4). `false` when
+    /// the run was ended (the creation sweep, a failed write) or replaced by
+    /// a redelivery while it was being written: nothing changes, and the
+    /// caller must not treat the run as created.
+    async fn finish_run_creation(&self, run: &RunId) -> Result<bool, DbError>;
+
+    /// [`begin_run_creation`](Db::begin_run_creation) for a webhook delivery
+    /// (ADR-0083 §2): in one transaction, the run's first row and the
+    /// delivery outcome `run` naming it — or, with `claim.replaces`, the
+    /// outcome moved from that run to this one and that run marked replaced
+    /// by it. When the key is already recorded (or no longer names
+    /// `claim.replaces`), nothing is written and the answer is
+    /// [`OutcomeWrite::Claimed`].
+    async fn begin_delivery_run_creation(
+        &self,
+        run: &RunId,
+        ir_version: u32,
+        event_schema_version: u32,
+        claim: &crate::DeliveryRunClaim,
+    ) -> Result<crate::OutcomeWrite, DbError>;
+
+    /// A run's status, whether its creation finished, when it was created and
+    /// the run that replaced it, or `None` for an unknown run.
+    async fn run_creation_state(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<crate::RunCreationState>, DbError>;
+
+    /// A `refused` or `not_run` delivery outcome (ADR-0083 §2), in one
+    /// transaction with its `refused_runs` row and its `failure` status
+    /// outbox row, when it has them. With `refusal.replaces`, the outcome
+    /// is overwritten only while it still names that run. A key already
+    /// recorded is [`OutcomeWrite::Claimed`] and nothing is written.
+    async fn record_delivery_refusal(
+        &self,
+        key: &crate::DeliveryPipeline,
+        refusal: &crate::DeliveryRefusal,
+    ) -> Result<crate::OutcomeWrite, DbError>;
+
+    /// A `no_match`, `all_excluded` or `ref_not_allowed` delivery outcome:
+    /// one insert. A key already recorded is [`OutcomeWrite::Claimed`].
+    async fn record_delivery_outcome(
+        &self,
+        key: &crate::DeliveryPipeline,
+        outcome: crate::DeliveryOutcomeKind,
+        at: Timestamp,
+    ) -> Result<crate::OutcomeWrite, DbError>;
+
+    /// Every outcome recorded for one delivery, by Pipeline file.
+    async fn delivery_outcomes(
+        &self,
+        connection_id: &str,
+        delivery_id: &str,
+    ) -> Result<Vec<crate::DeliveryOutcome>, DbError>;
+
+    /// The head rule of a later try (ADR-0083 §5): whether the head of
+    /// `q.scope` moved after `q.after`: a webhook delivery of the same scope
+    /// (`webhook_deliveries.head_scope`) arrived later, at another commit.
+    /// No Run is read.
+    async fn head_moved(&self, q: &crate::HeadQuery) -> Result<bool, DbError>;
+
+    /// Delete up to `limit` webhook deliveries that arrived before `before`
+    /// and that no try holds (a live lease keeps a delivery), each with
+    /// every outcome recorded for it, in one transaction (ADR-0083 §8).
+    /// Returns how many deliveries were deleted.
+    async fn prune_webhook_deliveries(&self, before: Timestamp, limit: u32)
+        -> Result<u64, DbError>;
 
     /// Whether `run` came from [`begin_run_creation`](Db::begin_run_creation)
     /// and its creation never finished — still being written, or failed

@@ -22,6 +22,9 @@ pub struct RetentionConfig {
     /// How long a terminal run's ARTIFACTS are kept, in milliseconds
     /// (ADR-0052: independent class, ~90d default).
     pub artifact_ttl_ms: i64,
+    /// How long a webhook delivery and its recorded outcomes are kept, in
+    /// milliseconds (ADR-0083 §8; 30d default, never under 7d).
+    pub webhook_delivery_ttl_ms: i64,
 }
 
 /// The lease name gating the sweeper to one replica at a time.
@@ -81,6 +84,35 @@ pub async fn sweep_retention(
         pruned += 1;
     }
     Ok(pruned)
+}
+
+/// Webhook deliveries pruned per sweep pass (ADR-0083 §8): the first passes
+/// on a database that never pruned them work through the backlog this many
+/// at a time.
+pub const WEBHOOK_DELIVERY_SWEEP_BATCH: u32 = 1_000;
+
+/// Prune webhook deliveries that arrived more than `ttl_ms` ago, each with
+/// every outcome it recorded, in one transaction per pass (ADR-0083 §8), at
+/// most [`WEBHOOK_DELIVERY_SWEEP_BATCH`] per pass, under the same leader
+/// lease as the log sweep. A delivery and its outcomes go together, so no
+/// later try of a delivery finds some of its outcomes and not others.
+pub async fn sweep_webhook_deliveries(
+    db: &Arc<dyn Db>,
+    clock: &Arc<dyn Clock>,
+    owner: &str,
+    ttl_ms: i64,
+) -> Result<u64, String> {
+    let lease = db
+        .lease(RETENTION_LEASE, owner, RETENTION_LEASE_TTL_MS)
+        .await
+        .map_err(|e| e.to_string())?;
+    if lease.owner != owner {
+        return Ok(0);
+    }
+    let cutoff = Timestamp(clock.now().await.0 - ttl_ms);
+    db.prune_webhook_deliveries(cutoff, WEBHOOK_DELIVERY_SWEEP_BATCH)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Prune CredentialBroker journal entries older than
@@ -827,6 +859,11 @@ pub fn spawn_sweeper(
                 Ok(0) => {}
                 Ok(n) => tracing::info!(runs = n, "retention sweep pass complete"),
                 Err(e) => tracing::warn!(error = %e, "retention sweep pass failed"),
+            }
+            match sweep_webhook_deliveries(&db, &clock, &owner, cfg.webhook_delivery_ttl_ms).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(deliveries = n, "retention: pruned webhook deliveries"),
+                Err(e) => tracing::warn!(error = %e, "webhook delivery prune failed"),
             }
             if let Some(plugins) = &plugins {
                 match sweep_plugin_broker_journal(&db, plugins.as_ref(), &clock, &owner).await {

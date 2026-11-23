@@ -1921,27 +1921,37 @@ async fn a_delivery_whose_client_went_away_still_creates_its_runs() {
     assert_eq!(db.active_runs().await.unwrap().len(), 1);
 }
 
-/// Hold the next `record_delivery` call of `db`: the first channel fires
-/// when the call got there, and the call goes on when the second is sent.
-fn hold_next_record_delivery(
+/// Hold the next `method` call of `db`: the first channel fires when the
+/// call got there, and the call goes on when the second is sent. Never
+/// sending it is a server that stopped there.
+fn hold_next(
     db: &InMemoryDb,
+    method: &'static str,
 ) -> (
     tokio::sync::oneshot::Receiver<()>,
     tokio::sync::oneshot::Sender<()>,
 ) {
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-    db.interleave_before_next(
-        "record_delivery",
-        Box::new(move || {
-            Box::pin(async move {
-                let _ = entered_tx.send(());
-                let _ = release_rx.await;
-            })
-        }),
-    );
+    db.interleave_before_next(method, hold_hook(entered_tx, release_rx));
     (entered_rx, release_tx)
 }
+
+/// The hook [`hold_next`] arms.
+fn hold_hook(
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) -> scarab_testkit::DbHook {
+    Box::new(move || {
+        Box::pin(async move {
+            let _ = entered.send(());
+            let _ = release.await;
+        })
+    })
+}
+
+/// The delivery row's begin, where a try records the delivery id.
+const BEGIN_TRY: &str = "begin_delivery_try";
 
 /// The red team's case (RT-12): the forge closes the connection while the
 /// delivery id is being recorded. Recorded in the handler, before the
@@ -1955,7 +1965,7 @@ async fn a_delivery_dropped_while_its_id_is_recorded_still_creates_its_runs() {
     let forge = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML));
     let state = multi_forge_state(db.clone(), forge);
     let app = router(state.clone());
-    let (entered, release) = hold_next_record_delivery(&db);
+    let (entered, release) = hold_next(&db, BEGIN_TRY);
 
     let mut answer = Box::pin(app.clone().oneshot(push_request("delivery-1")));
     tokio::select! {
@@ -2028,7 +2038,7 @@ async fn a_delivery_that_finds_every_slot_taken_is_answered_503_and_records_noth
         multi_forge_state(db.clone(), forge)
             .with_webhook_delivery_slots(1, std::time::Duration::ZERO),
     );
-    let (entered, release) = hold_next_record_delivery(&db);
+    let (entered, release) = hold_next(&db, BEGIN_TRY);
 
     let first = tokio::spawn(app.clone().oneshot(push_request("delivery-1")));
     entered.await.unwrap();
@@ -2123,36 +2133,6 @@ async fn a_pipeline_read_that_fails_once_is_tried_again() {
     assert_eq!(db.active_runs().await.unwrap().len(), 1);
 }
 
-/// One Pipeline file could not be read and another started a Run. A
-/// redelivery would start that Run again, so the id stays recorded and the
-/// answer says the delivery is incomplete.
-#[tokio::test(start_paused = true)]
-async fn a_delivery_that_started_runs_with_an_unreadable_file_is_incomplete() {
-    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
-    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
-    let forge = Arc::new(
-        FakeForge::new()
-            .with_file(".scarab/ci.yaml", CI_YAML)
-            .with_file(".scarab/lint.yaml", CI_YAML),
-    );
-    forge.set_read_error_for(".scarab/lint.yaml", Some("502 bad gateway"));
-    let app = multi_forge_app_arc(db.clone(), forge.clone());
-
-    let resp = app
-        .clone()
-        .oneshot(push_request("delivery-1"))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::ACCEPTED);
-    let body = json_of(resp).await;
-    assert_eq!(body["incomplete"], true, "{body}");
-    assert_eq!(body["run_ids"].as_array().unwrap().len(), 1, "{body}");
-
-    let again = app.oneshot(push_request("delivery-1")).await.unwrap();
-    assert_eq!(json_of(again).await["ignored"], "duplicate delivery");
-    assert_eq!(db.active_runs().await.unwrap().len(), 1);
-}
-
 /// The forge answers the read of `.scarab/` with an error that is not
 /// retried (here its rate limit). Nothing was recorded, so the id is
 /// forgotten and the answer is 502; the redelivery creates the Run.
@@ -2176,79 +2156,6 @@ async fn a_delivery_whose_pipeline_listing_failed_is_answered_502_and_repaired()
     let redelivery = app.oneshot(push_request("delivery-1")).await.unwrap();
     assert_eq!(redelivery.status(), StatusCode::ACCEPTED);
     assert_eq!(db.active_runs().await.unwrap().len(), 1);
-}
-
-/// Round-2 review #2: the forge redelivers while the first try is still
-/// running (in its forge reads). "duplicate delivery" would end the
-/// delivery if the first try then fails and forgets its id; the redelivery
-/// is answered 503 instead, so the forge tries again later.
-#[tokio::test]
-async fn a_redelivery_of_a_running_delivery_is_answered_503() {
-    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
-    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
-    let forge = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML));
-    let app = multi_forge_app_arc(db.clone(), forge);
-    let (entered, release) = hold_next_record_delivery(&db);
-
-    let first = tokio::spawn(app.clone().oneshot(push_request("delivery-1")));
-    entered.await.unwrap();
-    let redelivery = app
-        .clone()
-        .oneshot(push_request("delivery-1"))
-        .await
-        .unwrap();
-    assert_eq!(redelivery.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let text = axum::body::to_bytes(redelivery.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert!(
-        String::from_utf8_lossy(&text).contains("still running"),
-        "{text:?}"
-    );
-
-    release.send(()).unwrap();
-    assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::ACCEPTED);
-    let after = app.oneshot(push_request("delivery-1")).await.unwrap();
-    assert_eq!(json_of(after).await["ignored"], "duplicate delivery");
-    assert_eq!(db.active_runs().await.unwrap().len(), 1);
-}
-
-/// Round-2 review #3: one Pipeline file cannot be read and another does
-/// not compile. The compile failure is recorded (a refused Run, a failure
-/// status), so the id is kept: a redelivery is a duplicate and records it
-/// no second time. The 400 says a file could not be read.
-#[tokio::test(start_paused = true)]
-async fn a_recorded_compile_failure_keeps_the_id_when_another_file_was_unreadable() {
-    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
-    enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
-    let forge = Arc::new(
-        FakeForge::new()
-            .with_file(".scarab/checks.yaml", BROKEN_YAML)
-            .with_file(".scarab/lint.yaml", CI_YAML),
-    );
-    forge.set_read_error_for(".scarab/lint.yaml", Some("502 bad gateway"));
-    let app = multi_forge_app_arc(db.clone(), forge.clone());
-
-    let resp = app
-        .clone()
-        .oneshot(push_request("delivery-1"))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let text = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert!(
-        String::from_utf8_lossy(&text).contains("could not be read"),
-        "{text:?}"
-    );
-    assert_compile_failure_status(&statuses_on_push(&forge, &db).await);
-
-    forge.set_read_error_for(".scarab/lint.yaml", None);
-    let again = app.oneshot(push_request("delivery-1")).await.unwrap();
-    assert_eq!(json_of(again).await["ignored"], "duplicate delivery");
-    assert!(db.active_runs().await.unwrap().is_empty());
-    assert_compile_failure_status(&statuses_on_push(&forge, &db).await);
 }
 
 /// A Pipeline that invokes a library in its repository.
@@ -2317,4 +2224,1251 @@ async fn a_delivery_whose_library_is_missing_is_refused() {
     let again = app.oneshot(push_request("delivery-1")).await.unwrap();
     assert_eq!(json_of(again).await["ignored"], "duplicate delivery");
     assert!(db.active_runs().await.unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0083: a redelivery creates only the Runs a delivery is missing. Two
+// routers over one store are two server replicas; the store reads the
+// replicas' clock, so a Run's `created_at` and a delivery's `at` compare.
+// ---------------------------------------------------------------------------
+
+/// A Pipeline named `name` for every push.
+fn on_push(name: &str) -> String {
+    format!(
+        "name: {name}\non:\n  push: {{}}\nsteps:\n  - {{ id: build, image: busybox, command: [\"true\"] }}\n"
+    )
+}
+
+/// A Pipeline named `name` for every pull request.
+fn on_pull_request(name: &str) -> String {
+    format!(
+        "name: {name}\non:\n  pull_request: {{}}\nsteps:\n  - {{ id: build, image: busybox, command: [\"true\"] }}\n"
+    )
+}
+
+/// The `/deploy` comment command.
+const DEPLOY_COMMENT_YAML: &str = r#"
+name: deploy
+on:
+  comment:
+    when: "event.body == '/deploy'"
+steps:
+  - { id: ship, image: busybox, command: ["true"] }
+"#;
+
+/// A store, a forge and a clock shared by every replica of one test.
+struct Redelivery {
+    db: Arc<InMemoryDb>,
+    forge: Arc<FakeForge>,
+    clock: Arc<FakeClock>,
+    governance: Option<Arc<scarab_testkit::InMemoryEnvironmentGovernance>>,
+}
+
+impl Redelivery {
+    async fn new(files: &[(&str, &str)]) -> Self {
+        let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+        enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
+        let mut forge = FakeForge::new();
+        for (path, yaml) in files {
+            forge = forge.with_file(*path, *yaml);
+        }
+        let clock = Arc::new(FakeClock::new(1_000));
+        db.use_clock(clock.clone());
+        Self {
+            db,
+            forge: Arc::new(forge),
+            clock,
+            governance: None,
+        }
+    }
+
+    /// `prod` admits every Project of `acme`.
+    fn with_prod(mut self) -> Self {
+        self.governance = Some(Arc::new(
+            scarab_testkit::InMemoryEnvironmentGovernance::new().with_environment(
+                "acme",
+                "prod",
+                scarab_project::EnvironmentProjectEligibility::AllProjects,
+            ),
+        ));
+        self
+    }
+
+    /// One server replica over the shared store, forge and clock.
+    fn replica(&self) -> axum::Router {
+        let store = Arc::new(InMemoryObjectStore::new());
+        let logs = Arc::new(LogService::new(store, self.db.clone()));
+        let forge: Arc<dyn ForgePort> = self.forge.clone();
+        let mut state = AppState::new(self.db.clone(), self.clock.clone(), logs)
+            .with_github_webhook_secret(SECRET.to_vec())
+            .with_forge_connections(self.db.clone())
+            .with_forge(forge);
+        if let Some(g) = &self.governance {
+            state = state.with_environment_governance(g.clone());
+        }
+        router(state)
+    }
+
+    /// Let time pass between two events.
+    fn later(&self) {
+        self.clock.advance(1_000);
+    }
+
+    /// The outcomes recorded for `delivery`, by file.
+    async fn outcomes(&self, delivery: &str) -> Vec<scarab_engine::DeliveryOutcome> {
+        self.db
+            .delivery_outcomes("acme-conn", delivery)
+            .await
+            .unwrap()
+    }
+
+    /// The Run the outcome of `pipeline` in `delivery` names.
+    async fn run_of(&self, delivery: &str, pipeline: &str) -> RunId {
+        self.outcomes(delivery)
+            .await
+            .into_iter()
+            .find(|o| o.pipeline == pipeline)
+            .and_then(|o| o.run_id)
+            .unwrap_or_else(|| panic!("no Run recorded for {pipeline}"))
+    }
+
+    /// Every status posted on `sha`, after the queued ones are posted.
+    async fn statuses_on(&self, sha: &str) -> Vec<scarab_forge::Status> {
+        scarab_server::drain_forge_statuses(
+            self.forge.as_ref(),
+            self.db.as_ref(),
+            "test",
+            100,
+            0,
+            "https://scarab.example/",
+        )
+        .await
+        .expect("drain");
+        self.forge.statuses_on(sha)
+    }
+}
+
+/// Send `request` and read the answer.
+async fn send(app: &axum::Router, request: Request<Body>) -> (StatusCode, serde_json::Value) {
+    let resp = app.clone().oneshot(request).await.unwrap();
+    let status = resp.status();
+    (status, json_of(resp).await)
+}
+
+/// A signed GitHub delivery of `event` with id `delivery`.
+fn github(event: &str, delivery: &str, body: serde_json::Value) -> Request<Body> {
+    let body = serde_json::to_vec(&body).unwrap();
+    let sig = scarab_forge_github::sign_hex(SECRET, &body);
+    webhook_request_with_id(event, delivery, &body, &sig)
+}
+
+/// A push of `sha` to `git_ref`. Commit ids are lowercase hex here: both
+/// adapters answer a push or pull request whose commit id is not one with
+/// 400 (`is_commit_sha`).
+fn push_of(delivery: &str, git_ref: &str, sha: &str) -> Request<Body> {
+    github(
+        "push",
+        delivery,
+        serde_json::json!({
+            "ref": git_ref,
+            "after": sha,
+            "repository": { "name": "app", "owner": { "login": "acme" } },
+            "sender": { "login": "octocat" }
+        }),
+    )
+}
+
+/// New commits on pull request `number`, now at `head`.
+fn pull_request_of(delivery: &str, number: u64, head: &str) -> Request<Body> {
+    github(
+        "pull_request",
+        delivery,
+        serde_json::json!({
+            "action": "synchronize",
+            "number": number,
+            "pull_request": {
+                "number": number,
+                "state": "open",
+                "merged": false,
+                "title": "feat: the widget",
+                "base": { "ref": "main" },
+                "head": { "sha": head, "repo": { "full_name": "acme/app" } }
+            },
+            "repository": { "name": "app", "owner": { "login": "acme" }, "full_name": "acme/app" },
+            "sender": { "login": "octocat" }
+        }),
+    )
+}
+
+/// A comment `text` on issue `issue`, which is a pull request when
+/// `on_pull_request`.
+fn comment_of(delivery: &str, issue: u64, text: &str, on_pull_request: bool) -> Request<Body> {
+    let mut issue_json = serde_json::json!({ "number": issue });
+    if on_pull_request {
+        issue_json["pull_request"] =
+            serde_json::json!({ "url": format!("https://api.github.test/pulls/{issue}") });
+    }
+    github(
+        "issue_comment",
+        delivery,
+        serde_json::json!({
+            "action": "created",
+            "issue": issue_json,
+            "comment": { "body": text },
+            "repository": { "name": "app", "owner": { "login": "acme" } },
+            "sender": { "login": "octocat" }
+        }),
+    )
+}
+
+/// The pipeline files a body lists under `key`.
+fn listed(body: &serde_json::Value, key: &str) -> Vec<String> {
+    let mut out: Vec<String> = body[key]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| v["pipeline"].as_str().unwrap_or_default().to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+/// Whether `run` has not ended.
+async fn live(db: &InMemoryDb, run: &RunId) -> bool {
+    db.run_status(run)
+        .await
+        .unwrap()
+        .is_some_and(|s| !s.is_terminal())
+}
+
+/// S1 (window 1; red first on 8f4ae197, where the redelivery is a
+/// duplicate): `c.yaml` cannot be read, `a` and `b` start Runs, and the
+/// answer is 502 naming `c` as undecided. The redelivery starts `c` only and
+/// lists `a` and `b` as earlier; a third delivery is a duplicate and reads
+/// nothing from the forge. Kills: an id read as "done" once recorded; a
+/// redelivery that creates `a` and `b` again; a partial answer left at 202;
+/// a finished delivery that still reads the forge.
+#[tokio::test(start_paused = true)]
+async fn a_partial_delivery_is_repaired_by_its_redelivery() {
+    let (a, b, c) = (on_push("alpha"), on_push("beta"), on_push("gamma"));
+    let t = Redelivery::new(&[
+        (".scarab/a.yaml", &a),
+        (".scarab/b.yaml", &b),
+        (".scarab/c.yaml", &c),
+    ])
+    .await;
+    let app = t.replica();
+    t.forge
+        .set_read_error_for(".scarab/c.yaml", Some("502 bad gateway"));
+
+    let (status, body) = send(&app, push_request("d1")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["run_ids"].as_array().unwrap().len(), 2, "{body}");
+    assert_eq!(listed(&body, "undecided"), [".scarab/c.yaml"], "{body}");
+    assert_eq!(body["incomplete"], true, "{body}");
+
+    t.forge.set_read_error_for(".scarab/c.yaml", None);
+    let (status, body) = send(&app, push_request("d1")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["run_ids"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(
+        listed(&body, "earlier"),
+        [".scarab/a.yaml", ".scarab/b.yaml"],
+        "{body}"
+    );
+    assert_eq!(t.db.active_runs().await.unwrap().len(), 3);
+
+    let reads = t.forge.file_reads();
+    let (status, body) = send(&app, push_request("d1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ignored"], "duplicate delivery");
+    assert_eq!(
+        t.forge.file_reads(),
+        reads,
+        "a finished delivery read the forge"
+    );
+}
+
+/// S2 (red team B1): the first try decides `a` as no match and `x` as every
+/// Step excluded, on known pull request paths, and cannot read `c`. On the
+/// redelivery the pull request's paths are unknown, which counts as true;
+/// `a` and `x` are not decided again. Kills: recording only Runs and
+/// refusals; recording `no_match` and forgetting `all_excluded`.
+#[tokio::test(start_paused = true)]
+async fn a_recorded_no_match_is_not_decided_again() {
+    const SRC_ONLY: &str = r#"
+on:
+  pull_request:
+    when: 'event.changed_paths.exists(p, p.startsWith("src/"))'
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+"#;
+    const DOCS_STEP: &str = r#"
+on:
+  pull_request: {}
+steps:
+  - id: docs
+    image: busybox
+    command: ["true"]
+    when: 'event.changed_paths.exists(p, p.startsWith("docs/"))'
+"#;
+    let c = on_pull_request("gamma");
+    let t = Redelivery::new(&[
+        (".scarab/a.yaml", SRC_ONLY),
+        (".scarab/c.yaml", &c),
+        (".scarab/x.yaml", DOCS_STEP),
+    ])
+    .await;
+    let app = t.replica();
+    t.forge.set_pr_files(7, &["lib/widget.rs"]);
+    t.forge
+        .set_read_error_for(".scarab/c.yaml", Some("502 bad gateway"));
+    let (status, body) = send(&app, pull_request_of("d1", 7, "bbb111")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(t.db.active_runs().await.unwrap().is_empty());
+
+    t.forge.set_pr_files_unknown(7, Some("timeout"));
+    t.forge.set_read_error_for(".scarab/c.yaml", None);
+    let (status, body) = send(&app, pull_request_of("d1", 7, "bbb111")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let runs = t.db.active_runs().await.unwrap();
+    assert_eq!(runs.len(), 1, "only c runs: {body}");
+    assert_eq!(runs[0], t.run_of("d1", ".scarab/c.yaml").await);
+}
+
+/// S3 (red team B2): `c.yaml` does not compile and `d.yaml` cannot be read.
+/// The redelivery reads `d`, which matches; the recorded compile refusal
+/// stops it. Every context gets one `failure` in all, and `c` one refused
+/// row. Kills: a recorded path skipped before it enters the broken set (so
+/// `d` runs on a commit whose other Pipelines were stopped); a second refusal
+/// row or status post.
+#[tokio::test(start_paused = true)]
+async fn a_recorded_compile_refusal_stops_the_files_a_later_try_reads() {
+    let (a, d) = (on_push("alpha"), on_push("delta"));
+    let t = Redelivery::new(&[
+        (".scarab/a.yaml", &a),
+        (".scarab/c.yaml", BROKEN_YAML),
+        (".scarab/d.yaml", &d),
+    ])
+    .await;
+    let app = t.replica();
+    t.forge
+        .set_read_error_for(".scarab/d.yaml", Some("502 bad gateway"));
+    let (status, body) = send(&app, push_request("d1")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+
+    t.forge.set_read_error_for(".scarab/d.yaml", None);
+    let (status, _) = send(&app, push_request("d1")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(t.db.active_runs().await.unwrap().is_empty());
+    let failures: Vec<scarab_forge::Status> = t
+        .statuses_on("abc123")
+        .await
+        .into_iter()
+        .filter(|s| s.state == scarab_forge::StatusState::Failure)
+        .collect();
+    let mut contexts: Vec<&str> = failures.iter().map(|s| s.context.as_str()).collect();
+    contexts.sort();
+    assert_eq!(
+        contexts,
+        ["scarab/alpha", "scarab/checks", "scarab/delta"],
+        "{failures:?}"
+    );
+    let delta = failures
+        .iter()
+        .find(|s| s.context == "scarab/delta")
+        .unwrap();
+    assert!(
+        delta
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .contains(".scarab/c.yaml"),
+        "{delta:?}"
+    );
+    let refused =
+        t.db.refused_runs_for_tenant("acme", "app", 10)
+            .await
+            .unwrap();
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0].pipeline, ".scarab/c.yaml");
+
+    let (_, body) = send(&app, push_request("d1")).await;
+    assert_eq!(body["ignored"], "duplicate delivery");
+}
+
+/// S4 (red team A5): a comment reads `.scarab/` at the commit `HEAD` was at
+/// on its first try. Between the tries `HEAD` moves to a commit where the
+/// deploy file is renamed; the redelivery reads the first commit and creates
+/// nothing. Kills: a later try that resolves `HEAD` again; `config_sha`
+/// stored and not read.
+#[tokio::test(start_paused = true)]
+async fn a_comment_redelivery_reads_at_the_commit_its_first_try_resolved() {
+    let other = on_push("other");
+    let t = Redelivery::new(&[]).await;
+    let app = t.replica();
+    t.forge.set_commit("HEAD", "aaa111");
+    t.forge.put_tree_at(
+        "aaa111",
+        &[
+            (".scarab/deploy.yaml", DEPLOY_COMMENT_YAML),
+            (".scarab/other.yaml", &other),
+        ],
+    );
+    t.forge
+        .set_read_error_for(".scarab/other.yaml", Some("502 bad gateway"));
+    let (status, body) = send(&app, comment_of("d1", 9, "/deploy", false)).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["run_ids"].as_array().unwrap().len(), 1, "{body}");
+
+    t.forge.set_commit("HEAD", "aaa222");
+    t.forge.put_tree_at(
+        "aaa222",
+        &[
+            (".scarab/release.yaml", DEPLOY_COMMENT_YAML),
+            (".scarab/other.yaml", &other),
+        ],
+    );
+    t.forge.set_read_error_for(".scarab/other.yaml", None);
+    let (status, body) = send(&app, comment_of("d1", 9, "/deploy", false)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(listed(&body, "earlier"), [".scarab/deploy.yaml"], "{body}");
+    assert_eq!(t.db.active_runs().await.unwrap().len(), 1);
+}
+
+/// S5a (owner decision 1): push P1 leaves `c` and the Environment Pipeline
+/// undecided; push P2 creates both Runs; the redelivery of P1 records both
+/// `not_run` (`not_head`), posts one `failure` per context on P1's commit,
+/// and leaves P2's Runs running. Kills: a late Run cancelling the newer one
+/// through newest-wins; the check tied to the supersede key, which lets the
+/// Environment Pipeline deploy the older commit.
+#[tokio::test(start_paused = true)]
+async fn a_late_push_redelivery_does_not_cancel_the_newer_push() {
+    let c = on_push("gamma");
+    let t = Redelivery::new(&[(".scarab/c.yaml", &c), (".scarab/deploy.yaml", DEPLOY_YAML)])
+        .await
+        .with_prod();
+    let app = t.replica();
+    t.forge
+        .set_read_error_for(".scarab/c.yaml", Some("502 bad gateway"));
+    t.forge
+        .set_read_error_for(".scarab/deploy.yaml", Some("502 bad gateway"));
+    let (status, body) = send(&app, push_of("p1", "refs/heads/main", "aaa111")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+
+    t.later();
+    t.forge.set_read_error_for(".scarab/c.yaml", None);
+    t.forge.set_read_error_for(".scarab/deploy.yaml", None);
+    let (status, body) = send(&app, push_of("p2", "refs/heads/main", "aaa222")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let newer = [
+        t.run_of("p2", ".scarab/c.yaml").await,
+        t.run_of("p2", ".scarab/deploy.yaml").await,
+    ];
+
+    t.later();
+    let (status, body) = send(&app, push_of("p1", "refs/heads/main", "aaa111")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["run_ids"].as_array().map_or(0, Vec::len), 0, "{body}");
+    for o in t.outcomes("p1").await {
+        assert_eq!(
+            o.outcome,
+            scarab_engine::DeliveryOutcomeKind::NotRun,
+            "{o:?}"
+        );
+        assert_eq!(o.reason_kind.as_deref(), Some("not_head"));
+    }
+    assert_eq!(t.db.active_runs().await.unwrap().len(), 2, "no Run at sha1");
+    for run in &newer {
+        assert!(live(&t.db, run).await, "P2's Run {run:?} was cancelled");
+    }
+    let mut on_sha1: Vec<(String, String)> = t
+        .statuses_on("aaa111")
+        .await
+        .into_iter()
+        .map(|s| (s.context, s.description.unwrap_or_default()))
+        .collect();
+    on_sha1.sort();
+    assert_eq!(on_sha1.len(), 2, "{on_sha1:?}");
+    assert_eq!(on_sha1[0].0, "scarab/deploy");
+    assert_eq!(on_sha1[1].0, "scarab/gamma");
+    assert!(
+        on_sha1
+            .iter()
+            .all(|(_, d)| d.contains("no longer the head of")),
+        "{on_sha1:?}"
+    );
+    let (_, body) = send(&app, push_of("p1", "refs/heads/main", "aaa111")).await;
+    assert_eq!(body["ignored"], "duplicate delivery");
+}
+
+/// S5b: a Run of `c` from before P1 arrived, and one on another branch
+/// after it, leave P1 the head of `main`: its redelivery creates `c`.
+/// Kills: no lower bound on `created_at` (every redelivery reads as stale);
+/// a scope not limited to the ref.
+#[tokio::test(start_paused = true)]
+async fn a_push_redelivery_still_the_head_creates_its_run() {
+    let c = on_push("gamma");
+    let t = Redelivery::new(&[(".scarab/c.yaml", &c)]).await;
+    let app = t.replica();
+    let (status, _) = send(&app, push_of("p0", "refs/heads/main", "aaa000")).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    t.later();
+    t.forge
+        .set_read_error_for(".scarab/c.yaml", Some("502 bad gateway"));
+    let (status, _) = send(&app, push_of("p1", "refs/heads/main", "aaa111")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    t.forge.set_read_error_for(".scarab/c.yaml", None);
+
+    t.later();
+    let (status, _) = send(&app, push_of("o1", "refs/heads/other", "aaa999")).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    t.later();
+    let (status, body) = send(&app, push_of("p1", "refs/heads/main", "aaa111")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["run_ids"].as_array().unwrap().len(), 1, "{body}");
+}
+
+/// S5c: pull request #7 at `h1` leaves `c` undecided; new commits (`h2`)
+/// create its Run. The redelivery of the first records `not_head`, posts
+/// "of pull request #7" on `h1`, and leaves the `h2` Run alone. Kills: the
+/// rule built for pushes only; a pull request scope keyed by ref.
+#[tokio::test(start_paused = true)]
+async fn a_late_pull_request_redelivery_is_not_the_head() {
+    let c = on_pull_request("gamma");
+    let t = Redelivery::new(&[(".scarab/c.yaml", &c)]).await;
+    let app = t.replica();
+    t.forge
+        .set_read_error_for(".scarab/c.yaml", Some("502 bad gateway"));
+    let (status, _) = send(&app, pull_request_of("pr1", 7, "bbb111")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    t.forge.set_read_error_for(".scarab/c.yaml", None);
+
+    t.later();
+    let (status, _) = send(&app, pull_request_of("pr2", 7, "bbb222")).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let newer = t.run_of("pr2", ".scarab/c.yaml").await;
+
+    t.later();
+    let (status, body) = send(&app, pull_request_of("pr1", 7, "bbb111")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let o = &t.outcomes("pr1").await[0];
+    assert_eq!(o.reason_kind.as_deref(), Some("not_head"), "{o:?}");
+    assert!(live(&t.db, &newer).await);
+    let on_h1 = t.statuses_on("bbb111").await;
+    assert_eq!(on_h1.len(), 1, "{on_h1:?}");
+    assert!(on_h1[0]
+        .description
+        .as_deref()
+        .unwrap_or_default()
+        .contains("of pull request #7"));
+}
+
+/// S5d (the orchestrator's correction): a `/deploy` comment on pull request
+/// #7, pinned to its head `h1`, cannot read the deploy file; new commits on
+/// #7 (`h2`) create the pull request's Runs. The redelivery of the comment
+/// creates nothing and records `not_head`. Kills: comments exempted from the
+/// head rule.
+#[tokio::test(start_paused = true)]
+async fn a_late_pr_comment_redelivery_is_not_the_head() {
+    let pr = on_pull_request("checks");
+    let t = Redelivery::new(&[
+        (".scarab/deploy.yaml", DEPLOY_COMMENT_YAML),
+        (".scarab/pr.yaml", &pr),
+    ])
+    .await;
+    let app = t.replica();
+    t.forge.set_pr_head(7, "bbb111");
+    t.forge
+        .set_read_error_for(".scarab/deploy.yaml", Some("502 bad gateway"));
+    let (status, _) = send(&app, comment_of("c1", 7, "/deploy", true)).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    t.forge.set_read_error_for(".scarab/deploy.yaml", None);
+
+    t.later();
+    t.forge.set_pr_head(7, "bbb222");
+    let (status, _) = send(&app, pull_request_of("pr2", 7, "bbb222")).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let pr_run = t.run_of("pr2", ".scarab/pr.yaml").await;
+
+    t.later();
+    let (status, body) = send(&app, comment_of("c1", 7, "/deploy", true)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let deploy = t
+        .outcomes("c1")
+        .await
+        .into_iter()
+        .find(|o| o.pipeline == ".scarab/deploy.yaml")
+        .expect("the deploy file is decided");
+    assert_eq!(deploy.outcome, scarab_engine::DeliveryOutcomeKind::NotRun);
+    assert_eq!(deploy.reason_kind.as_deref(), Some("not_head"));
+    assert_eq!(
+        t.db.active_runs().await.unwrap(),
+        std::slice::from_ref(&pr_run)
+    );
+    assert!(live(&t.db, &pr_run).await);
+}
+
+/// S5e: a comment on issue #9, not a pull request, has no head. A push and
+/// new commits on pull request #9 after it do not stop its redelivery.
+/// Kills: the comment rule applied to every comment; an issue number matched
+/// against `origin_pr_number`.
+#[tokio::test(start_paused = true)]
+async fn a_comment_not_on_a_pull_request_runs_on_redelivery() {
+    let (ci, pr) = (on_push("ci"), on_pull_request("checks"));
+    let t = Redelivery::new(&[
+        (".scarab/ci.yaml", &ci),
+        (".scarab/deploy.yaml", DEPLOY_COMMENT_YAML),
+        (".scarab/pr.yaml", &pr),
+    ])
+    .await;
+    let app = t.replica();
+    t.forge
+        .set_read_error_for(".scarab/deploy.yaml", Some("502 bad gateway"));
+    let (status, _) = send(&app, comment_of("c1", 9, "/deploy", false)).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    t.forge.set_read_error_for(".scarab/deploy.yaml", None);
+
+    t.later();
+    let (status, _) = send(&app, push_of("p1", "refs/heads/main", "aaa222")).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (status, _) = send(&app, pull_request_of("pr9", 9, "bbb999")).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    t.later();
+    let (status, body) = send(&app, comment_of("c1", 9, "/deploy", false)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    t.run_of("c1", ".scarab/deploy.yaml").await;
+}
+
+/// S5f: a tag delivery always runs: a later push and a later tag that
+/// create `c` Runs do not stop the redelivery of `v1`. Kills: tags sent
+/// through the head rule.
+#[tokio::test(start_paused = true)]
+async fn a_tag_redelivery_always_runs() {
+    const PUSH_AND_TAG: &str = r#"
+name: gamma
+on:
+  push: {}
+  tag: {}
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+"#;
+    let t = Redelivery::new(&[(".scarab/c.yaml", PUSH_AND_TAG)]).await;
+    let app = t.replica();
+    t.forge
+        .set_read_error_for(".scarab/c.yaml", Some("502 bad gateway"));
+    let (status, _) = send(&app, push_of("t1", "refs/tags/v1", "aaa111")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    t.forge.set_read_error_for(".scarab/c.yaml", None);
+
+    t.later();
+    let (status, _) = send(&app, push_of("p1", "refs/heads/main", "aaa222")).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (status, _) = send(&app, push_of("t2", "refs/tags/v2", "aaa333")).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    t.later();
+    let (status, body) = send(&app, push_of("t1", "refs/tags/v1", "aaa111")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    t.run_of("t1", ".scarab/c.yaml").await;
+}
+
+/// S6 (window 3, and window 2 before any outcome; replaces the 0.7.1 503
+/// case): replica A's try stops at its first Run row and never goes on (the
+/// server died). Replica B is answered 409 before any forge read; once A's
+/// lease lapses, B creates every Run once. Red first on 8f4ae197, where B
+/// answers `duplicate delivery`. Kills: the in-process set (B answers
+/// duplicate); a 503 here; a lease read after the forge; a lease that never
+/// lapses.
+#[tokio::test(start_paused = true)]
+async fn a_redelivery_while_another_replica_holds_the_try_is_answered_409() {
+    let (a, b) = (on_push("alpha"), on_push("beta"));
+    let t = Redelivery::new(&[(".scarab/a.yaml", &a), (".scarab/b.yaml", &b)]).await;
+    let (replica_a, replica_b) = (t.replica(), t.replica());
+    let (entered, _never) = hold_next(&t.db, "begin_run_creation");
+    let _stopped = tokio::spawn(replica_a.oneshot(push_request("d1")));
+    entered.await.unwrap();
+
+    let reads = t.forge.file_reads();
+    let resp = replica_b.clone().oneshot(push_request("d1")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let text = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&text).contains("another try"),
+        "{text:?}"
+    );
+    assert_eq!(
+        t.forge.file_reads(),
+        reads,
+        "the forge was read under a held lease"
+    );
+    assert!(t.db.active_runs().await.unwrap().is_empty());
+
+    t.db.expire_delivery_try(scarab_forge::ForgeKind::GitHub, "d1");
+    let (status, body) = send(&replica_b, push_request("d1")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(t.db.active_runs().await.unwrap().len(), 2);
+    t.run_of("d1", ".scarab/a.yaml").await;
+    t.run_of("d1", ".scarab/b.yaml").await;
+}
+
+/// Hold the second `finish_run_creation` from now on: the first Run of the
+/// delivery finishes, the second stops after its first row.
+fn hold_second_finish(
+    db: &Arc<InMemoryDb>,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let rearm = db.clone();
+    db.interleave_before_next(
+        "finish_run_creation",
+        Box::new(move || {
+            Box::pin(async move {
+                rearm.interleave_before_next(
+                    "finish_run_creation",
+                    hold_hook(entered_tx, release_rx),
+                );
+            })
+        }),
+    );
+    (entered_rx, release_tx)
+}
+
+/// S7 to the point of its replacement: `a`, `b` and `c` match; try 1
+/// stops after `b`'s first row. A redelivery within the bound is answered
+/// 409 and creates `c`; one past the bound replaces `b`. Returns the
+/// fixture, the held try, its release and the old and new `b` Runs.
+async fn replaced_b() -> (
+    Redelivery,
+    tokio::task::JoinHandle<Result<axum::response::Response, std::convert::Infallible>>,
+    tokio::sync::oneshot::Sender<()>,
+    RunId,
+    RunId,
+) {
+    let (a, b, c) = (on_push("alpha"), on_push("beta"), on_push("gamma"));
+    let t = Redelivery::new(&[
+        (".scarab/a.yaml", &a),
+        (".scarab/b.yaml", &b),
+        (".scarab/c.yaml", &c),
+    ])
+    .await;
+    let (entered, release) = hold_second_finish(&t.db);
+    let first = tokio::spawn(t.replica().oneshot(push_request("d1")));
+    entered.await.unwrap();
+    let old_b = t.run_of("d1", ".scarab/b.yaml").await;
+
+    let other = t.replica();
+    t.db.expire_delivery_try(scarab_forge::ForgeKind::GitHub, "d1");
+    let resp = other.clone().oneshot(push_request("d1")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    t.run_of("d1", ".scarab/c.yaml").await;
+    assert_eq!(
+        t.db.run_status(&old_b).await.unwrap(),
+        Some(scarab_engine::RunStatus::Pending)
+    );
+    assert_eq!(t.run_of("d1", ".scarab/b.yaml").await, old_b);
+
+    t.clock
+        .advance(scarab_engine::UNFINISHED_CREATION_BOUND_MS + 1);
+    t.db.expire_delivery_try(scarab_forge::ForgeKind::GitHub, "d1");
+    let (status, body) = send(&other, push_request("d1")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let new_b = t.run_of("d1", ".scarab/b.yaml").await;
+    assert_ne!(new_b, old_b);
+    (t, first, release, old_b, new_b)
+}
+
+/// S7 (window 2 after the first row): within the bound the Run another try
+/// may be writing is left alone (409, and `c` is decided); past it the old
+/// `b` Run ends `Failed`, a new one is created, and both the outcome and
+/// the old Run's `replaced_by` name it. Red first on 8f4ae197. Kills:
+/// replacing a Run another try may be writing; a 409 that stops the try
+/// before `c`; a bound that never replaces; the outcome left on the dead Run.
+#[tokio::test(start_paused = true)]
+async fn a_run_whose_creation_stopped_is_replaced_after_the_bound() {
+    let (t, _first, _release, old_b, new_b) = replaced_b().await;
+    assert_eq!(
+        t.db.run_status(&old_b).await.unwrap(),
+        Some(scarab_engine::RunStatus::Failed)
+    );
+    assert_eq!(t.db.replaced_by(&old_b), Some(new_b.clone()));
+    assert!(live(&t.db, &new_b).await);
+    let (_, body) = send(&t.replica(), push_request("d1")).await;
+    assert_eq!(body["ignored"], "duplicate delivery");
+}
+
+/// S8 (red team A3): the stalled try 1 goes on after the replacement. Its
+/// finish updates nothing: the old Run stays `Failed` with its creation
+/// unfinished, try 1 does not report it created, it gets no path-filter
+/// note, and a rerun of it is refused naming the replacement. Kills: the
+/// unconditional finish; a miss treated as success; a rerun of a replaced
+/// Run.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_try_cannot_finish_a_replaced_run() {
+    let (t, first, release, old_b, new_b) = replaced_b().await;
+    release.send(()).unwrap();
+    let answer = json_of(first.await.unwrap().unwrap()).await;
+    let created: Vec<&str> = answer["run_ids"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    assert!(!created.contains(&old_b.0.as_str()), "{answer}");
+
+    let state = t.db.run_creation_state(&old_b).await.unwrap().unwrap();
+    assert_eq!(state.status, scarab_engine::RunStatus::Failed);
+    assert!(state.creating);
+    assert!(run_notes(&t.db, &old_b).await.is_empty());
+    let rerun = scarab_engine::rerun_step(
+        t.db.as_ref(),
+        t.clock.as_ref(),
+        &old_b,
+        &scarab_engine::StepId("build".into()),
+        None,
+    )
+    .await;
+    match rerun {
+        Err(scarab_engine::RerunError::Replaced(by)) => assert_eq!(by, new_b),
+        other => panic!("a rerun of a replaced Run: {other:?}"),
+    }
+    assert!(live(&t.db, &new_b).await);
+}
+
+/// S9 (red team A4): the old `b` Run's `failure` post fails while the forge
+/// is failing and stays queued. The new Run's `success` lands; the retried
+/// old post is dropped. Kills: `status_post_superseded` blind to
+/// `replaced_by` (a red required check on a green commit).
+#[tokio::test(start_paused = true)]
+async fn a_replaced_runs_queued_status_is_dropped() {
+    let (t, _first, _release, old_b, new_b) = replaced_b().await;
+    // The old Run's `failure` post is queued: the case rests on it.
+    let queued = t.db.claim_outbox("probe", None, 100, 0).await.unwrap();
+    assert!(
+        queued.iter().any(|m| m.run == old_b),
+        "the old Run's post was never queued: {queued:?}"
+    );
+    t.forge.set_failing_status(true);
+    let _ = t.statuses_on("abc123").await;
+    t.forge.set_failing_status(false);
+    t.forge
+        .set_status(
+            &scarab_forge::RepoRef {
+                owner: "acme".into(),
+                name: "app".into(),
+            },
+            &scarab_forge::Commit {
+                sha: "abc123".into(),
+                message: String::new(),
+            },
+            scarab_forge::Status {
+                context: "scarab/beta".into(),
+                state: scarab_forge::StatusState::Success,
+                target_url: format!("https://scarab.example/runs/{}", new_b.0),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+    let beta: Vec<scarab_forge::StatusState> = t
+        .statuses_on("abc123")
+        .await
+        .into_iter()
+        .filter(|s| s.context == "scarab/beta")
+        .map(|s| s.state)
+        .collect();
+    assert_eq!(beta, [scarab_forge::StatusState::Success], "{beta:?}");
+    let queued = t.db.claim_outbox("probe", None, 100, 0).await.unwrap();
+    assert!(
+        queued.iter().all(|m| m.run != old_b),
+        "the old Run's post is still queued: {queued:?}"
+    );
+}
+
+/// S10 (window 3, both tries live): replica A's try stops before its first
+/// write; its lease lapses and replica B decides every Pipeline; then A goes
+/// on. One Run of `a`, one refused row and one `failure` each for `r` and
+/// `u`, no `Failed` Run, and the delivery finished. Kills: `Claimed` handled
+/// as an error; the loser posting its own refusal; the loser's Run written.
+#[tokio::test(start_paused = true)]
+async fn two_tries_past_the_lease_create_one_run_per_pipeline() {
+    const NOWHERE: &str = r#"
+name: rollout
+on:
+  push: {}
+environment: nowhere
+steps:
+  - { id: ship, image: busybox, command: ["true"] }
+"#;
+    let a = on_push("alpha");
+    let t = Redelivery::new(&[
+        (".scarab/a.yaml", &a),
+        (".scarab/r.yaml", NOWHERE),
+        (".scarab/u.yaml", UNDECIDABLE_WHEN_YAML),
+    ])
+    .await
+    .with_prod();
+    let (replica_a, replica_b) = (t.replica(), t.replica());
+    let (entered, release) = hold_next(&t.db, "begin_run_creation");
+    let first = tokio::spawn(replica_a.oneshot(push_request("d1")));
+    entered.await.unwrap();
+    t.db.expire_delivery_try(scarab_forge::ForgeKind::GitHub, "d1");
+    let (status, body) = send(&replica_b, push_request("d1")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    release.send(()).unwrap();
+    let answer = json_of(first.await.unwrap().unwrap()).await;
+    assert_eq!(
+        answer["run_ids"].as_array().map_or(0, Vec::len),
+        0,
+        "{answer}"
+    );
+
+    let runs = t.db.active_runs().await.unwrap();
+    assert_eq!(runs, [t.run_of("d1", ".scarab/a.yaml").await]);
+    let mut refused: Vec<String> =
+        t.db.refused_runs_for_tenant("acme", "app", 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.pipeline)
+            .collect();
+    refused.sort();
+    assert_eq!(refused, [".scarab/r.yaml", ".scarab/u.yaml"]);
+    let mut failures: Vec<String> = t
+        .statuses_on("abc123")
+        .await
+        .into_iter()
+        .filter(|s| s.state == scarab_forge::StatusState::Failure)
+        .map(|s| s.context)
+        .collect();
+    failures.sort();
+    assert_eq!(failures, ["scarab/rollout", "scarab/u"]);
+    let (unfinished, held, _) =
+        t.db.delivery_row(scarab_forge::ForgeKind::GitHub, "d1")
+            .unwrap();
+    assert!(!unfinished && !held);
+}
+
+/// S11: `a`'s creation fails after its first row (a store error). The
+/// answer is 502 with `a` undecided; the redelivery, with no time passed, is
+/// not 409: the `Failed` Run is replaced at once. Kills: the age test
+/// applied to a Run already `Failed`; a delivery finished with a Run whose
+/// creation never finished.
+#[tokio::test(start_paused = true)]
+async fn a_run_whose_creation_failed_is_replaced_at_once() {
+    let a = on_push("alpha");
+    let t = Redelivery::new(&[(".scarab/a.yaml", &a)]).await;
+    let app = t.replica();
+    t.db.fail_next_event_append(|p| matches!(p, scarab_engine::EventPayload::RunCreated));
+    let (status, body) = send(&app, push_request("d1")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(listed(&body, "undecided"), [".scarab/a.yaml"], "{body}");
+    let old = t.run_of("d1", ".scarab/a.yaml").await;
+
+    let (status, body) = send(&app, push_request("d1")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let new = t.run_of("d1", ".scarab/a.yaml").await;
+    assert_ne!(new, old);
+    assert_eq!(t.db.replaced_by(&old), Some(new));
+}
+
+/// S12: the refusal of a file that does not compile cannot be written once.
+/// The delivery stays open (502, the file undecided); the redelivery records
+/// it once. Kills: the 0.7.1 best-effort write (log and go on) kept on the
+/// webhook path, which finishes the delivery with no refusal and no status.
+#[tokio::test(start_paused = true)]
+async fn a_refusal_that_could_not_be_written_keeps_the_delivery_open() {
+    let t = Redelivery::new(&[(".scarab/c.yaml", BROKEN_YAML)]).await;
+    let app = t.replica();
+    t.db.fail_next_delivery_refusal();
+    let (status, body) = send(&app, push_request("d1")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(listed(&body, "undecided"), [".scarab/c.yaml"], "{body}");
+
+    let (status, _) = send(&app, push_request("d1")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        t.db.refused_runs_for_tenant("acme", "app", 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let failures: Vec<String> = t
+        .statuses_on("abc123")
+        .await
+        .into_iter()
+        .filter(|s| s.state == scarab_forge::StatusState::Failure)
+        .map(|s| s.context)
+        .collect();
+    assert_eq!(failures, ["scarab/checks"]);
+}
+
+/// R1: P0 is held before it creates `c`; P1 arrives and leaves `c`
+/// undecided; P0 then creates its `c` Run, after P1 arrived. P1 is still the
+/// newest delivery of `main`, so its redelivery creates `c`. Red on
+/// b3ff7c06, which read P0's late Run as a newer head. Kills: a head rule
+/// that reads Runs.
+#[tokio::test(start_paused = true)]
+async fn a_late_run_of_an_older_delivery_does_not_stop_the_newer_one() {
+    let c = on_push("gamma");
+    let t = Redelivery::new(&[(".scarab/c.yaml", &c)]).await;
+    let app = t.replica();
+    let (entered, release) = hold_next(&t.db, "begin_run_creation");
+    let p0 = tokio::spawn(
+        app.clone()
+            .oneshot(push_of("p0", "refs/heads/main", "aaa000")),
+    );
+    entered.await.unwrap();
+
+    t.later();
+    t.forge
+        .set_read_error_for(".scarab/c.yaml", Some("502 bad gateway"));
+    let (status, _) = send(&app, push_of("p1", "refs/heads/main", "aaa111")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    t.forge.set_read_error_for(".scarab/c.yaml", None);
+    release.send(()).unwrap();
+    assert_eq!(p0.await.unwrap().unwrap().status(), StatusCode::ACCEPTED);
+
+    t.later();
+    let (status, body) = send(&app, push_of("p1", "refs/heads/main", "aaa111")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    t.run_of("p1", ".scarab/c.yaml").await;
+}
+
+/// R1: P0 and P1 both leave `c` undecided. The redelivery of P0, the older,
+/// records `not_head`. Red on b3ff7c06, which needed an outcome or a Run of
+/// P1. Kills: a newer delivery that decided nothing not counting.
+#[tokio::test(start_paused = true)]
+async fn a_newer_delivery_that_decided_nothing_stops_the_older_one() {
+    let c = on_push("gamma");
+    let t = Redelivery::new(&[(".scarab/c.yaml", &c)]).await;
+    let app = t.replica();
+    t.forge
+        .set_read_error_for(".scarab/c.yaml", Some("502 bad gateway"));
+    let (status, _) = send(&app, push_of("p0", "refs/heads/main", "aaa000")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    t.later();
+    let (status, _) = send(&app, push_of("p1", "refs/heads/main", "aaa111")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    t.forge.set_read_error_for(".scarab/c.yaml", None);
+
+    t.later();
+    let (status, body) = send(&app, push_of("p0", "refs/heads/main", "aaa000")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let o = &t.outcomes("p0").await[0];
+    assert_eq!(o.reason_kind.as_deref(), Some("not_head"), "{o:?}");
+    assert!(t.db.active_runs().await.unwrap().is_empty());
+}
+
+/// R1: a Run of an older commit on `main` created after P1 arrived, with no
+/// delivery (a dispatch, a follow-up), does not stop P1's redelivery.
+/// Kills: a head rule that reads Runs.
+#[tokio::test(start_paused = true)]
+async fn a_run_with_no_delivery_does_not_stop_a_redelivery() {
+    let c = on_push("gamma");
+    let t = Redelivery::new(&[(".scarab/c.yaml", &c)]).await;
+    let app = t.replica();
+    t.forge
+        .set_read_error_for(".scarab/c.yaml", Some("502 bad gateway"));
+    let (status, _) = send(&app, push_of("p1", "refs/heads/main", "aaa111")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    t.forge.set_read_error_for(".scarab/c.yaml", None);
+
+    t.later();
+    let run = RunId("dispatched".into());
+    t.db.create_run(&run, 1, 1, scarab_engine::Timestamp(t.clock.millis()))
+        .await
+        .unwrap();
+    t.db.set_run_tenant(&run, "acme", "app").await.unwrap();
+    t.db.set_run_pipeline(&run, "gamma").await.unwrap();
+    t.db.set_run_origin(
+        &run,
+        "manual",
+        None,
+        Some("refs/heads/main"),
+        Some("aaa000"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    t.later();
+    let (status, body) = send(&app, push_of("p1", "refs/heads/main", "aaa111")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    t.run_of("p1", ".scarab/c.yaml").await;
+}
+
+/// R2: the try stops before it finishes its Run; past the bound the sweep
+/// ends that Run `Failed`; the try goes on. The Pipeline is undecided and
+/// the answer 502, so the redelivery replaces the Run. Red on b3ff7c06,
+/// which listed it as earlier and finished the delivery. Kills: a try that
+/// counts its own ended Run as decided.
+#[tokio::test(start_paused = true)]
+async fn a_try_whose_run_the_sweep_ended_leaves_it_undecided() {
+    let a = on_push("alpha");
+    let t = Redelivery::new(&[(".scarab/a.yaml", &a)]).await;
+    let app = t.replica();
+    let (entered, release) = hold_next(&t.db, "finish_run_creation");
+    let first = tokio::spawn(app.clone().oneshot(push_request("d1")));
+    entered.await.unwrap();
+    let old = t.run_of("d1", ".scarab/a.yaml").await;
+    t.clock
+        .advance(scarab_engine::UNFINISHED_CREATION_BOUND_MS + 1);
+    scarab_engine::fail_run_creation(
+        t.db.as_ref(),
+        &old,
+        "the server stopped while creating this Run".into(),
+        scarab_engine::Timestamp(t.clock.millis()),
+    )
+    .await
+    .unwrap();
+    release.send(()).unwrap();
+    let resp = first.await.unwrap().unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let body = json_of(resp).await;
+    assert_eq!(listed(&body, "undecided"), [".scarab/a.yaml"], "{body}");
+
+    let (status, body) = send(&app, push_request("d1")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let new = t.run_of("d1", ".scarab/a.yaml").await;
+    assert_eq!(t.db.replaced_by(&old), Some(new));
+}
+
+/// R3 (a): a `/deploy` comment on pull request #7 whose head cannot be read
+/// runs, pinned with no head. Kills: a failed head read failing the
+/// delivery for good (every redelivery repeats it).
+#[tokio::test(start_paused = true)]
+async fn a_pr_comment_whose_head_cannot_be_read_runs() {
+    let t = Redelivery::new(&[(".scarab/deploy.yaml", DEPLOY_COMMENT_YAML)]).await;
+    let app = t.replica();
+    t.forge.fail_pull_request_head(true);
+    let (status, body) = send(&app, comment_of("c1", 7, "/deploy", true)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    t.run_of("c1", ".scarab/deploy.yaml").await;
+    let (_, _, pins) =
+        t.db.delivery_row(scarab_forge::ForgeKind::GitHub, "c1")
+            .unwrap();
+    let pins = pins.expect("the comment's commit is pinned");
+    assert_eq!((pins.head_scope, pins.head_sha), (None, None));
+}
+
+/// R3 (b): a tag delivery whose commit cannot be resolved reads `.scarab/`
+/// at the tag, as 0.7.1 did, runs, and pins nothing. Kills: a failed lookup
+/// answered 502 on every redelivery.
+#[tokio::test(start_paused = true)]
+async fn a_tag_whose_commit_cannot_be_resolved_runs_at_the_tag() {
+    const ON_TAG: &str = r#"
+name: release
+on:
+  tag: {}
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+"#;
+    let t = Redelivery::new(&[(".scarab/release.yaml", ON_TAG)]).await;
+    let app = t.replica();
+    t.forge.fail_latest_commit_for("refs/tags/v1", true);
+    let (status, body) = send(&app, push_of("t1", "refs/tags/v1", "aaa111")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    t.run_of("t1", ".scarab/release.yaml").await;
+    let (_, _, pins) =
+        t.db.delivery_row(scarab_forge::ForgeKind::GitHub, "t1")
+            .unwrap();
+    assert_eq!(pins, None, "nothing pinned when the lookup failed");
+}
+
+/// R4 gap: past the bound, ending the old Run fails (a store error, not a
+/// lost compare-and-set) and it is still `Pending`. The store would refuse
+/// to replace it, so the try leaves it for later (409) and the delivery
+/// stays open. Kills: a `Replace` that the store refuses, filed as decided,
+/// which finishes the delivery with an unfinished Run.
+#[tokio::test(start_paused = true)]
+async fn a_run_that_could_not_be_ended_is_left_for_a_later_try() {
+    let a = on_push("alpha");
+    let t = Redelivery::new(&[(".scarab/a.yaml", &a)]).await;
+    let (entered, _stalled) = hold_next(&t.db, "finish_run_creation");
+    let _first = tokio::spawn(t.replica().oneshot(push_request("d1")));
+    entered.await.unwrap();
+    let old = t.run_of("d1", ".scarab/a.yaml").await;
+
+    t.clock
+        .advance(scarab_engine::UNFINISHED_CREATION_BOUND_MS + 1);
+    t.db.expire_delivery_try(scarab_forge::ForgeKind::GitHub, "d1");
+    t.db.fail_next_event_append(|p| {
+        matches!(p, scarab_engine::EventPayload::RunCreationFailed { .. })
+    });
+    let resp = t.replica().oneshot(push_request("d1")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        t.db.run_status(&old).await.unwrap(),
+        Some(scarab_engine::RunStatus::Pending)
+    );
+    assert_eq!(t.run_of("d1", ".scarab/a.yaml").await, old);
+    assert_eq!(t.db.replaced_by(&old), None);
+    let (unfinished, _, _) =
+        t.db.delivery_row(scarab_forge::ForgeKind::GitHub, "d1")
+            .unwrap();
+    assert!(
+        unfinished,
+        "the delivery was finished with an unfinished Run"
+    );
+}
+
+/// R3, the weaker case: a `/deploy` comment on pull request #7 whose first
+/// try could not resolve `HEAD` pins nothing. The pull request then moves
+/// twice; the later try pins the comment with no head, so the head it reads
+/// now (`bbb333`) is not taken for the comment's, and the comment runs.
+/// Kills: a later try that pins the pull request's head as it is then, and
+/// refuses the comment against the delivery at `bbb222`.
+#[tokio::test(start_paused = true)]
+async fn a_pr_comment_pinned_by_a_later_try_gets_no_head() {
+    let pr = on_pull_request("checks");
+    let t = Redelivery::new(&[
+        (".scarab/deploy.yaml", DEPLOY_COMMENT_YAML),
+        (".scarab/pr.yaml", &pr),
+    ])
+    .await;
+    let app = t.replica();
+    t.forge.set_pr_head(7, "bbb111");
+    t.forge.fail_latest_commit_for("HEAD", true);
+    t.forge
+        .set_read_error_for(".scarab/deploy.yaml", Some("502 bad gateway"));
+    let (status, _) = send(&app, comment_of("c1", 7, "/deploy", true)).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let (_, _, pins) =
+        t.db.delivery_row(scarab_forge::ForgeKind::GitHub, "c1")
+            .unwrap();
+    assert_eq!(pins, None, "nothing pinned when HEAD could not be resolved");
+    t.forge.set_read_error_for(".scarab/deploy.yaml", None);
+    t.forge.fail_latest_commit_for("HEAD", false);
+
+    for (delivery, head) in [("pr2", "bbb222"), ("pr3", "bbb333")] {
+        t.later();
+        t.forge.set_pr_head(7, head);
+        let (status, _) = send(&app, pull_request_of(delivery, 7, head)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    t.later();
+    let (status, body) = send(&app, comment_of("c1", 7, "/deploy", true)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    t.run_of("c1", ".scarab/deploy.yaml").await;
+    let (_, _, pins) =
+        t.db.delivery_row(scarab_forge::ForgeKind::GitHub, "c1")
+            .unwrap();
+    let pins = pins.expect("the later try pins the commit");
+    assert_eq!((pins.head_scope, pins.head_sha), (None, None));
 }

@@ -579,6 +579,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             scarab_server::retention::RetentionConfig {
                 log_ttl_ms: (config.retention_log_days as i64) * 24 * 60 * 60 * 1000,
                 artifact_ttl_ms: (config.retention_artifact_days as i64) * 24 * 60 * 60 * 1000,
+                webhook_delivery_ttl_ms: (config.retention_webhook_delivery_days as i64)
+                    * 24
+                    * 60
+                    * 60
+                    * 1000,
             },
             scarab_server::retention::GcConfig {
                 workspace_ttl_ms: (config.retention_workspace_days as i64) * 24 * 60 * 60 * 1000,

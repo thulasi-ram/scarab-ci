@@ -62,6 +62,7 @@
 //! | `SCARAB_RETENTION_ARTIFACT_DAYS` | env | terminal runs' artifact TTL in days (ADR-0052); default 90 |
 //! | `SCARAB_RETENTION_WORKSPACE_DAYS` | env | terminal runs' workspace-CAS reachability TTL in days (ADR-0050 mark-sweep); default 14 — non-terminal runs always reachable |
 //! | `SCARAB_RETENTION_PACK_DAYS` | env | terminal runs' Depot pack TTL in days (git-bug 6499fb1, ADR-0065/0067); default = the workspace TTL, and must be ≥ it (packs back Workspace Snapshots) |
+//! | `SCARAB_RETENTION_WEBHOOK_DELIVERY_DAYS` | env | how long a webhook delivery and the outcomes it recorded are kept, in days (ADR-0083 §8); default 30, at least 7 (GitHub redelivers up to 3 days back, and a redelivery of a pruned delivery creates its Runs again) |
 //! | `SCARAB_RETENTION_STEP_POD_MINUTES` | env | how long after a Run finishes its step Pods, and a shared service's Service and NetworkPolicy, stay in the step namespace, in minutes (git-bug 986542a); default 60. The k8s executor only; a Pod whose Run this database does not know is never deleted |
 //! | `SCARAB_RETENTION_CONFIG_FILE` | env | path to the operator retention config (ADR-0065 s2): the named RetentionProfile registry, TTL-only (YAML/JSON, gitops-managed); a bad path/parse/validation is a boot failure |
 //! | `SCARAB_OAUTH_OWNERS` | env | comma-separated entries granted `Owner` at login (bootstrap until scoped RBAC, ADR-0049 C2); everyone else logs in as `Viewer`. An entry matches a **Principal id** (`alice` from the legacy provider, `github:alice` from a named one) **or** `<provider>:<email>` when THAT provider asserts `email_verified`. A bare email is accepted only with a single provider (ADR-0069) — unverified/absent verification never grants `Owner` |
@@ -604,6 +605,13 @@ struct RawCredential {
     secret_ref: Option<String>,
 }
 
+/// The default and the floor of `SCARAB_RETENTION_WEBHOOK_DELIVERY_DAYS`
+/// (ADR-0083 §8): under GitHub's 3-day redelivery window a Redeliver would
+/// find no outcomes and create every Run again; 7 days leaves room for clock
+/// and sweep timing.
+pub const DEFAULT_WEBHOOK_DELIVERY_RETENTION_DAYS: u32 = 30;
+pub const MIN_WEBHOOK_DELIVERY_RETENTION_DAYS: u32 = 7;
+
 /// A validated boot configuration: if a `Config` exists, the process may
 /// legitimately start. Construction is the startup gate (ADR-0048).
 #[derive(Debug, Clone)]
@@ -717,6 +725,10 @@ pub struct Config {
     /// How long after a Run finishes its step Pods stay, in minutes (git-bug
     /// 986542a; default 60). The step Pod sweep deletes them after that.
     pub retention_step_pod_minutes: u32,
+    /// How long a webhook delivery and its recorded outcomes are kept, in
+    /// days (ADR-0083 §8; default 30, at least
+    /// [`MIN_WEBHOOK_DELIVERY_RETENTION_DAYS`]).
+    pub retention_webhook_delivery_days: u32,
     /// Path to the operator **retention config** file (ADR-0065 s2): the named
     /// RetentionProfile registry (TTL-only), YAML/JSON, gitops-managed — the
     /// `placement_config_file` shape exactly. `None` = no profiles; every run
@@ -1360,6 +1372,14 @@ pub enum ConfigError {
     InvalidPackRetention(u32),
 
     #[error(
+        "SCARAB_RETENTION_WEBHOOK_DELIVERY_DAYS is set but invalid — want an integer number \
+         of days, at least {MIN_WEBHOOK_DELIVERY_RETENTION_DAYS}. GitHub redelivers a \
+         delivery up to 3 days after it was sent, and a redelivery of a delivery already \
+         pruned creates its Runs again (ADR-0083 §8)."
+    )]
+    InvalidWebhookDeliveryRetention,
+
+    #[error(
         "SCARAB_RETENTION_STEP_POD_MINUTES is set but invalid — want a positive integer \
          number of minutes (how long a finished Run's step Pods stay, default 60)."
     )]
@@ -1951,6 +1971,16 @@ impl Config {
                     .filter(|m| *m > 0)
                     .ok_or(ConfigError::InvalidStepPodRetention)?,
                 None => crate::step_pods::DEFAULT_GRACE_MINUTES,
+            },
+            retention_webhook_delivery_days: match env("SCARAB_RETENTION_WEBHOOK_DELIVERY_DAYS")
+                .filter(|v| !v.is_empty())
+            {
+                Some(v) => v
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|d| *d >= MIN_WEBHOOK_DELIVERY_RETENTION_DAYS)
+                    .ok_or(ConfigError::InvalidWebhookDeliveryRetention)?,
+                None => DEFAULT_WEBHOOK_DELIVERY_RETENTION_DAYS,
             },
             retention_config_file: env("SCARAB_RETENTION_CONFIG_FILE").filter(|v| !v.is_empty()),
             cas_concurrency,
@@ -2546,6 +2576,37 @@ fn redact_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0083 §8: webhook deliveries are kept 30 days by default; 7 is the
+    /// floor and is accepted; 6 refuses to start, naming the floor.
+    #[test]
+    fn webhook_delivery_retention_defaults_to_30_and_refuses_under_7() {
+        let url = Some("postgres://localhost/scarab");
+        let c = Config::resolve_from(&cli(url), dev_env(&[])).unwrap();
+        assert_eq!(c.retention_webhook_delivery_days, 30);
+        let c = Config::resolve_from(
+            &cli(url),
+            dev_env(&[("SCARAB_RETENTION_WEBHOOK_DELIVERY_DAYS", "7")]),
+        )
+        .unwrap();
+        assert_eq!(c.retention_webhook_delivery_days, 7);
+        for bad in ["6", "0", "seven"] {
+            let err = Config::resolve_from(
+                &cli(url),
+                dev_env(match bad {
+                    "6" => &[("SCARAB_RETENTION_WEBHOOK_DELIVERY_DAYS", "6")],
+                    "0" => &[("SCARAB_RETENTION_WEBHOOK_DELIVERY_DAYS", "0")],
+                    _ => &[("SCARAB_RETENTION_WEBHOOK_DELIVERY_DAYS", "seven")],
+                }),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidWebhookDeliveryRetention),
+                "{bad}: {err}"
+            );
+            assert!(err.to_string().contains("at least 7"), "{err}");
+        }
+    }
 
     fn cli(database_url: Option<&str>) -> Cli {
         Cli {
