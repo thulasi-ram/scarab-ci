@@ -11,7 +11,7 @@
 //! port method bodies remain stubs for this skeleton.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -252,6 +252,23 @@ struct StepRec {
     evidence_attempt: Option<AttemptId>,
     /// The step's key ([`StepRun::key`]), minted when the row is made.
     key: String,
+    /// When its status last changed, as an order (mirrors
+    /// `step_runs.updated_at`): the runs list names a failed run's failed
+    /// step by the time it moved to `Failed`.
+    status_changed: u64,
+}
+
+impl StepRec {
+    fn set_status(&mut self, to: StepStatus) {
+        self.status = Some(to);
+        self.status_changed = next_status_change();
+    }
+}
+
+/// The next step status change in the order of all of them in this process.
+fn next_status_change() -> u64 {
+    static CHANGES: AtomicU64 = AtomicU64::new(1);
+    CHANGES.fetch_add(1, Ordering::Relaxed)
 }
 
 /// A new step key for a step of `run`, distinct from every key the run's
@@ -288,17 +305,14 @@ struct AttemptEvidenceRec {
 /// (`updated_at == created_at`).
 fn fake_run_summary(st: &InMemoryState, run: &RunId, status: RunStatus) -> RunSummary {
     let created = st.run_created.get(run).copied().unwrap_or(Timestamp(0));
-    // The fake keeps no step `updated_at`: a failed step's last Attempt start
-    // stands in for the time it failed.
-    let mut failed: Vec<(Timestamp, StepId)> =
+    // Ordered by when each moved to `Failed`, then by id, as Postgres orders
+    // by `step_runs.updated_at`.
+    let mut failed: Vec<(u64, StepId)> =
         if matches!(status, RunStatus::Failed | RunStatus::DeadLettered) {
             st.steps
                 .iter()
                 .filter(|((r, _), rec)| r == run && rec.status == Some(StepStatus::Failed))
-                .map(|((_, step), rec)| {
-                    let at = rec.attempts.last().map_or(Timestamp(0), |a| a.started_at);
-                    (at, step.clone())
-                })
+                .map(|((_, step), rec)| (rec.status_changed, step.clone()))
                 .collect()
         } else {
             Vec::new()
@@ -721,6 +735,7 @@ impl InMemoryDb {
                 explicit_inputs: None,
                 evidence_attempt: None,
                 gate_releaser: None,
+                status_changed: next_status_change(),
             },
         );
     }
@@ -751,6 +766,7 @@ impl InMemoryDb {
                     explicit_inputs: None,
                     evidence_attempt: None,
                     gate_releaser: None,
+                    status_changed: next_status_change(),
                 },
             );
         }
@@ -913,7 +929,7 @@ fn check_step_transition_locked(
     if matches!(&st.toctou_race, Some((s, _)) if s == step) {
         let (_, attempt) = st.toctou_race.take().unwrap();
         if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
-            rec.status = Some(StepStatus::Running);
+            rec.set_status(StepStatus::Running);
             rec.attempts.push(Attempt {
                 id: attempt,
                 started_at: Timestamp(0),
@@ -990,7 +1006,7 @@ fn resolve_gate_wait_locked(
             }
         },
     };
-    rec.status = Some(if res.passed {
+    rec.set_status(if res.passed {
         StepStatus::Succeeded
     } else {
         StepStatus::Failed
@@ -1082,7 +1098,7 @@ impl Db for InMemoryDb {
                 .steps
                 .get_mut(&(step.run.clone(), step.step.clone()))
                 .expect("read above");
-            rec.status = Some(StepStatus::Running);
+            rec.set_status(StepStatus::Running);
             if !rec.attempts.iter().any(|a| a.id == launch.attempt.id) {
                 rec.attempts.push(launch.attempt);
             }
@@ -1384,6 +1400,7 @@ impl Db for InMemoryDb {
                 explicit_inputs: None,
                 evidence_attempt: None,
                 gate_releaser: None,
+                status_changed: next_status_change(),
             },
         );
         Ok(())
@@ -1641,7 +1658,7 @@ impl Db for InMemoryDb {
             .steps
             .get_mut(&(run.clone(), step.clone()))
             .expect("checked above");
-        rec.status = Some(StepStatus::Ready);
+        rec.set_status(StepStatus::Ready);
         rec.input = Some(signature.to_string());
         st.events.extend(events.iter().cloned());
         Ok(())
@@ -3093,7 +3110,7 @@ impl Db for InMemoryDb {
         st.steps
             .get_mut(&(run.clone(), step.clone()))
             .expect("checked above")
-            .status = Some(to);
+            .set_status(to);
         Ok(())
     }
 
@@ -3129,7 +3146,7 @@ impl Db for InMemoryDb {
         st.steps
             .get_mut(&(run.clone(), step.clone()))
             .expect("checked above")
-            .status = Some(to);
+            .set_status(to);
         if let Some((attempt, stamp)) = stamp {
             stamp_attempt_locked(&mut st, run, step, attempt, stamp);
         }

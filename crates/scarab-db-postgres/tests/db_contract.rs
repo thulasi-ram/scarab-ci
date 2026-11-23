@@ -2775,7 +2775,7 @@ async fn run_summaries_carry_the_list_facts(db: &dyn Db) {
             db.set_run_tenant(&run, "acme", "web").await.unwrap();
         }
     };
-    let walk = |run: &RunId, step: &str, to: StepStatus, started: i64| {
+    let start = |run: &RunId, step: &str, started: i64| {
         let (run, step) = (run.clone(), StepId(step.into()));
         async move {
             db.create_step_run(&run, &step, None, &[], Timestamp(0))
@@ -2787,7 +2787,6 @@ async fn run_summaries_carry_the_list_facts(db: &dyn Db) {
             for (from, next) in [
                 (StepStatus::Pending, StepStatus::Ready),
                 (StepStatus::Ready, StepStatus::Running),
-                (StepStatus::Running, to),
             ] {
                 db.record_step_transition(&run, &step, from, next)
                     .await
@@ -2795,13 +2794,27 @@ async fn run_summaries_carry_the_list_facts(db: &dyn Db) {
             }
         }
     };
+    let end = |run: &RunId, step: &str, to: StepStatus| {
+        let (run, step) = (run.clone(), StepId(step.into()));
+        async move {
+            db.record_step_transition(&run, &step, StepStatus::Running, to)
+                .await
+                .unwrap();
+            // Postgres stamps a step's change to the millisecond.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
 
-    // `build` fails before `test`; `lint` passes.
+    // `build` starts first and sorts first, but `test` fails first; `lint`
+    // passes.
     let failed = RunId("r-failed".into());
     tenant(&failed).await;
-    walk(&failed, "build", StepStatus::Failed, 10).await;
-    walk(&failed, "test", StepStatus::Failed, 20).await;
-    walk(&failed, "lint", StepStatus::Succeeded, 30).await;
+    start(&failed, "build", 10).await;
+    start(&failed, "test", 20).await;
+    start(&failed, "lint", 30).await;
+    end(&failed, "test", StepStatus::Failed).await;
+    end(&failed, "build", StepStatus::Failed).await;
+    end(&failed, "lint", StepStatus::Succeeded).await;
     db.record_transition(&failed, RunStatus::Pending, RunStatus::Running)
         .await
         .unwrap();
@@ -2875,7 +2888,7 @@ async fn run_summaries_carry_the_list_facts(db: &dyn Db) {
     let ids = |steps: &[StepId]| steps.iter().map(|s| s.0.clone()).collect::<Vec<_>>();
 
     let f = row(&failed);
-    assert_eq!(f.failed_step, Some(StepId("build".into())));
+    assert_eq!(f.failed_step, Some(StepId("test".into())));
     assert_eq!(f.failed_steps, 2);
     assert!(f.environment_approval_gates.is_empty());
 
