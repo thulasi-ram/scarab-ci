@@ -2626,6 +2626,17 @@ async fn a_comment_redelivery_reads_at_the_commit_its_first_try_resolved() {
     let (status, body) = send(&app, comment_of("d1", 9, "/deploy", false)).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert_eq!(body["run_ids"].as_array().unwrap().len(), 1, "{body}");
+    // The Run's Pipeline file is recorded at the commit the delivery pinned.
+    let run = RunId(body["run_ids"][0].as_str().unwrap().into());
+    let file =
+        t.db.run_pipeline_source(&run)
+            .await
+            .unwrap()
+            .expect("recorded");
+    assert_eq!(
+        (file.path.as_str(), file.sha.as_deref()),
+        (".scarab/deploy.yaml", Some("aaa111"))
+    );
 
     t.forge.set_commit("HEAD", "aaa222");
     t.forge.put_tree_at(
@@ -3300,6 +3311,7 @@ async fn a_run_with_no_delivery_does_not_stop_a_redelivery() {
         None,
         Some("refs/heads/main"),
         Some("aaa000"),
+        None,
         None,
         None,
     )

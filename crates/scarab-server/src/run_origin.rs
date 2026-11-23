@@ -9,6 +9,9 @@
 //! - `GET /v1/runs/{id}/steps/{step}/origin`: the chain, the inputs bound in
 //!   the Step's invocation, and the Step's image, command and env rendered as
 //!   its launch renders them.
+//! - `GET /v1/runs/{id}/manifest`: the Pipeline file the Run was created
+//!   from, as recorded at creation, and the libraries and plugin gates its
+//!   Steps were inlined from.
 //!
 //! Everything is read from the stored IR, leniently: a field this release
 //! does not know is ignored, so a Run created by a newer server still shows.
@@ -267,6 +270,47 @@ pub struct RenderedSpecDto {
     pub env: Vec<(String, String)>,
 }
 
+/// One library or plugin gate a Run's Steps were inlined from.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct InvokedDto {
+    /// `file`, `library` or `plugin`.
+    pub kind: String,
+    /// A repo-relative path (`file`), the library name (`library`) or the
+    /// plugin installation and gate (`plugin`).
+    pub name: String,
+    /// Where an installed library comes from, at its commit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// SHA-256 of the library source (or of the plugin's approved manifest).
+    pub content_hash: String,
+    /// The Steps of the Run inlined through it, directly or through another
+    /// library, in the Run's order.
+    pub steps: Vec<String>,
+}
+
+/// `GET /v1/runs/{id}/manifest`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RunManifestDto {
+    /// Whether the Pipeline file was recorded when the Run was created.
+    /// `false` for an inline Run and for a Run created before the file was
+    /// recorded; `path`, `sha` and `source` are then absent.
+    pub recorded: bool,
+    /// The repo-relative path of the Pipeline file (`.scarab/ci.yaml`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The commit the file was read at; absent when it was read at a
+    /// symbolic ref no commit was resolved for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    /// The file as read from the forge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The libraries and plugin gates the Run's Steps were inlined from,
+    /// once each, in the order the Run first uses them. Read from the stored
+    /// IR, so it is filled for an unrecorded Run too.
+    pub invoked: Vec<InvokedDto>,
+}
+
 /// `GET /v1/runs/{id}/steps/{step}/origin`.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct StepOriginDto {
@@ -467,6 +511,67 @@ async fn plugin_gate_view(
             })
             .collect(),
     })
+}
+
+/// The libraries and plugin gates `ir`'s Steps were inlined from, once each
+/// by (kind, name, content hash), in the order the Steps first name them.
+/// The gate an Environment added is not invoked, so it is left out.
+fn invoked(ir: &Ir) -> Vec<InvokedDto> {
+    let mut out: Vec<InvokedDto> = Vec::new();
+    for step in &ir.steps {
+        for o in step.origin.iter().filter(|o| o.kind != "environment") {
+            let seen = out
+                .iter_mut()
+                .find(|i| i.kind == o.kind && i.name == o.name && i.content_hash == o.content_hash);
+            match seen {
+                Some(i) => {
+                    if !i.steps.contains(&step.id) {
+                        i.steps.push(step.id.clone());
+                    }
+                }
+                None => out.push(InvokedDto {
+                    kind: o.kind.clone(),
+                    name: o.name.clone(),
+                    source: o.source.clone(),
+                    content_hash: o.content_hash.clone(),
+                    steps: vec![step.id.clone()],
+                }),
+            }
+        }
+    }
+    out
+}
+
+/// The Pipeline file a Run was created from, and the libraries and plugin
+/// gates its Steps were inlined from. Read on the Run's Project.
+#[utoipa::path(
+    get,
+    path = "/v1/runs/{id}/manifest",
+    params(("id" = String, Path, description = "run id")),
+    summary = "The Pipeline file a Run was created from",
+    responses(
+        (status = 200, body = RunManifestDto),
+        (status = 404, description = "no such run")
+    )
+)]
+pub(crate) async fn get_run_manifest(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<RunManifestDto>, ApiError> {
+    let run = RunId(id);
+    let scope = run_scope(&st, &run).await;
+    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
+    st.db.run_status(&run).await?.ok_or(ApiError::NotFound)?;
+    let file = st.db.run_pipeline_source(&run).await?;
+    let ir = read_ir(&st, &run).await?;
+    Ok(Json(RunManifestDto {
+        recorded: file.is_some(),
+        path: file.as_ref().map(|f| f.path.clone()),
+        sha: file.as_ref().and_then(|f| f.sha.clone()),
+        source: file.map(|f| f.source),
+        invoked: invoked(&ir),
+    }))
 }
 
 /// The inputs bound in a Step's own invocation, from its stored scope.

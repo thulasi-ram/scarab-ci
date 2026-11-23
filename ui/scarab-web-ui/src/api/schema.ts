@@ -2235,6 +2235,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/runs/{id}/manifest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The Pipeline file a Run was created from */
+        get: operations["get_run_manifest"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/runs/{id}/policy-decisions": {
         parameters: {
             query?: never;
@@ -4050,6 +4067,25 @@ export interface components {
             /** @description Pinned to `resolved_commit`. */
             source: string;
         };
+        /** @description One library or plugin gate a Run's Steps were inlined from. */
+        InvokedDto: {
+            /** @description SHA-256 of the library source (or of the plugin's approved manifest). */
+            content_hash: string;
+            /** @description `file`, `library` or `plugin`. */
+            kind: string;
+            /**
+             * @description A repo-relative path (`file`), the library name (`library`) or the
+             *     plugin installation and gate (`plugin`).
+             */
+            name: string;
+            /** @description Where an installed library comes from, at its commit. */
+            source?: string | null;
+            /**
+             * @description The Steps of the Run inlined through it, directly or through another
+             *     library, in the Run's order.
+             */
+            steps: string[];
+        };
         LibraryInstallationDto: {
             content_hash: string;
             /**
@@ -5609,6 +5645,30 @@ export interface components {
         RunListResponse: {
             runs: components["schemas"]["RunSummaryDto"][];
         };
+        /** @description `GET /v1/runs/{id}/manifest`. */
+        RunManifestDto: {
+            /**
+             * @description The libraries and plugin gates the Run's Steps were inlined from,
+             *     once each, in the order the Run first uses them. Read from the stored
+             *     IR, so it is filled for an unrecorded Run too.
+             */
+            invoked: components["schemas"]["InvokedDto"][];
+            /** @description The repo-relative path of the Pipeline file (`.scarab/ci.yaml`). */
+            path?: string | null;
+            /**
+             * @description Whether the Pipeline file was recorded when the Run was created.
+             *     `false` for an inline Run and for a Run created before the file was
+             *     recorded; `path`, `sha` and `source` are then absent.
+             */
+            recorded: boolean;
+            /**
+             * @description The commit the file was read at; absent when it was read at a
+             *     symbolic ref no commit was resolved for.
+             */
+            sha?: string | null;
+            /** @description The file as read from the forge. */
+            source?: string | null;
+        };
         RunStatusResponse: {
             environment?: null | components["schemas"]["RunEnvironmentDto"];
             id: string;
@@ -5618,6 +5678,14 @@ export interface components {
              *     fact; absent for non-PR runs and runs created before base-stamping.
              */
             origin_pr_base?: string | null;
+            /**
+             * @description The PR **head** branch — the branch a `pull_request` run comes from
+             *     (`pull_request.head.ref`, without `refs/heads/`), as the forge sent
+             *     it: a fork PR's is the fork's branch name. The run's `git_ref` is
+             *     `refs/pull/<N>/head`, which does not name it. Absent for non-PR runs
+             *     and runs created before head-stamping.
+             */
+            origin_pr_head?: string | null;
             /**
              * @description The run's frozen launch parameters, `name → typed value`.
              *     A run-level constant resolved once at creation; non-secret by contract,
@@ -5685,6 +5753,18 @@ export interface components {
              *     deploy run, whose pipeline declared `environment:`.
              */
             environment?: string | null;
+            /**
+             * @description For a `failed` or `dead_lettered` Run, the id of the step that failed
+             *     first. Absent for any other status, and for a dead-lettered Run that
+             *     failed no step (the engine gave up on the Run, not on a step).
+             */
+            failed_step?: string | null;
+            /**
+             * Format: int32
+             * @description For a `failed` or `dead_lettered` Run, how many of its steps failed,
+             *     `failed_step` included. Absent when `failed_step` is.
+             */
+            failed_steps_count?: number | null;
             /** @description The symbolic branch/tag ref the run ran on. */
             git_ref?: string | null;
             id: string;
@@ -5697,6 +5777,14 @@ export interface components {
              */
             origin_pr_base?: string | null;
             /**
+             * @description The PR **head** branch — the branch a `pull_request` run comes from
+             *     (`pull_request.head.ref`, without `refs/heads/`), as the forge sent
+             *     it: a fork PR's is the fork's branch name. The run's `git_ref` is
+             *     `refs/pull/<N>/head`, which does not name it. Absent for non-PR runs
+             *     and runs created before head-stamping.
+             */
+            origin_pr_head?: string | null;
+            /**
              * @description The pipeline this run executed (the bare `.scarab/<name>` selection).
              *     Absent for inline runs and runs created before pipeline-stamping.
              */
@@ -5708,6 +5796,14 @@ export interface components {
             pr_number?: number | null;
             /** @description The owning project (repo name), if tenanted. */
             project?: string | null;
+            /**
+             * @description For a `cancelled` Run, the newer Run whose start cancelled it: a newer
+             *     Run of the same pipeline on the same ref or pull request, or a newer
+             *     Run in a `cancel-in-progress` concurrency group. Absent for any other
+             *     status, for a Run a person cancelled, and for Runs cancelled before
+             *     this was recorded.
+             */
+            replaced_by?: string | null;
             /**
              * Format: int64
              * @description The **run number** — the per-repo sequential `#N`,
@@ -5733,6 +5829,7 @@ export interface components {
              *     trigger carried no headline and on runs created before headline-stamping.
              */
             trigger_title?: string | null;
+            waiting_for?: null | components["schemas"]["WaitingForDto"];
             /**
              * @description The run's **waiting gates** (git-bug `c489346`): gate steps that are
              *     `Pending`, reached (every need `Succeeded`) and have an open Attempt —
@@ -6360,6 +6457,17 @@ export interface components {
              *     again here.
              */
             source: string;
+        };
+        /** @description The gate a suspended Run is held at ([`RunSummaryDto::waiting_for`]). */
+        WaitingForDto: {
+            /**
+             * @description `manual` (an approval anyone with write access gives),
+             *     `environment_approval` (a `manual` gate the Environment's approvers
+             *     release), `timer`, `external` or `plugin`.
+             */
+            kind: string;
+            /** @description The gate step's id. */
+            step: string;
         };
         /** @description One waiting gate of a run in the list view ([`RunSummaryDto::waiting_gates`]). */
         WaitingGateDto: {
@@ -12272,6 +12380,35 @@ export interface operations {
         responses: {
             /** @description SSE stream of step log output (`data` events), with `event: marker` for each note the server stored with the log (data `{"kind","reason"?,"text"}`, an id like a data event's) */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_run_manifest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunManifestDto"];
+                };
+            };
+            /** @description no such run */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

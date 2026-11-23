@@ -77,6 +77,7 @@ fn pull_request(number: u64) -> Event {
         head: "abc".into(),
         title: "add a widget".into(),
         base: "trunk".into(),
+        head_branch: "feature".into(),
         fork: true,
     }
 }

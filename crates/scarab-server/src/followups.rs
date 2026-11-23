@@ -151,7 +151,10 @@ async fn follow(
     let files: Vec<(String, String)> = files
         .into_iter()
         .filter(|(_, yaml)| {
-            scarab_pipeline::upstream_pipeline_of(yaml).as_deref() == Some(pipeline.as_str())
+            scarab_pipeline::upstream_pipeline_of(yaml)
+                .map(|p| crate::cap_pipeline_name(&p))
+                .as_ref()
+                == Some(pipeline)
         })
         .collect();
     if files.is_empty() {

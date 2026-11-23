@@ -184,6 +184,11 @@ pub struct RunSummary {
     /// fact, `None` for non-PR runs and pre-stamping runs.
     #[serde(default)]
     pub pr_base: Option<String>,
+    /// The PR **head** branch (`origin_pr_head`): the branch a `pull_request`
+    /// run comes from, as the forge sent it (a fork PR's is the fork's
+    /// branch). `None` for non-PR runs and runs created before it was stamped.
+    #[serde(default)]
+    pub pr_head: Option<String>,
     /// The bare name of the pipeline this run executed (the `.scarab/<name>`
     /// selection), stamped at creation for trigger/dispatch runs. `None` for
     /// inline runs (no named pipeline) and pre-stamping runs.
@@ -205,6 +210,25 @@ pub struct RunSummary {
     /// IR. Independent of `environment`.
     #[serde(default)]
     pub deploy: bool,
+    /// For a `Cancelled` run, the newer Run whose start cancelled it
+    /// (newest-wins on the same repo, ref and pipeline, or a
+    /// `cancel-in-progress` concurrency group). `None` for any other run and
+    /// for a run a person cancelled. Not the Run a webhook redelivery created
+    /// in place of this one (ADR-0083 §4).
+    #[serde(default)]
+    pub replaced_by: Option<RunId>,
+    /// For a `Failed` or `DeadLettered` run, the Failed step that failed
+    /// first, and how many steps failed. `None` for any other status, and for
+    /// a dead-lettered run that failed no step.
+    #[serde(default)]
+    pub failed_step: Option<StepId>,
+    #[serde(default)]
+    pub failed_steps: u32,
+    /// For a `Suspended` run that an Environment governs, its `manual` gates
+    /// that are Environment approval gates (ADR-0078 §1), from the stored IR.
+    /// Empty for any other run.
+    #[serde(default)]
+    pub environment_approval_gates: Vec<StepId>,
 }
 
 /// Filters for a Project's runs list (`GET /v1/repos/{org}/{repo}/runs`),
@@ -1387,6 +1411,20 @@ pub struct DeployContext {
     /// true the launch path injects no secrets even for env-scoped steps.
     #[serde(default)]
     pub locked_out: bool,
+}
+
+/// The Pipeline file a Run was created from, recorded at creation so the Run
+/// page shows the YAML the Run compiled rather than the file as it reads now.
+/// Inline Runs have none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunPipelineSource {
+    /// The repo-relative path (`.scarab/ci.yaml`).
+    pub path: String,
+    /// The file as the forge returned it.
+    pub source: String,
+    /// The commit the file was read at; `None` when it was read at a
+    /// symbolic ref no commit was resolved for.
+    pub sha: Option<String>,
 }
 
 /// The discriminated payload carried by an [`EventKind`].

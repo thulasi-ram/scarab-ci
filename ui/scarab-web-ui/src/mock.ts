@@ -45,6 +45,7 @@ type PluginConnectionDto = components["schemas"]["PluginConnectionDto"];
 type BrokerJournalEntryDto = components["schemas"]["BrokerJournalEntryDto"];
 type ScheduleDto = components["schemas"]["ScheduleDto"];
 type RefusedRunDto = components["schemas"]["RefusedRunDto"];
+type RunManifestDto = components["schemas"]["RunManifestDto"];
 
 const now = Date.now();
 const ago = (ms: number) => now - ms;
@@ -264,6 +265,7 @@ const runs = [
     project: "scarab",
     created_at: ago(12 * 60000),
     waiting_gates: [{ step: "approve", key: mockStepKey("approve"), kind: "manual", since: ago(10 * 60000) }],
+    waiting_for: { step: "approve", kind: "manual" },
   }),
   summary({
     id: "01984f22bb334d8e9a1122cd44ef6600",
@@ -272,6 +274,7 @@ const runs = [
     project: "billing",
     created_at: ago(27 * 60000),
     waiting_gates: [{ step: "release", key: mockStepKey("release"), kind: "manual", since: ago(20 * 60000) }],
+    waiting_for: { step: "release", kind: "environment_approval" },
   }),
   // git-bug c489346: a gate holds only its dependents, so this run is still
   // `running` (its `version` sibling runs) while its `approve` gate waits.
@@ -307,7 +310,7 @@ const STRIP_TITLES = [
   "Fix timezone in the nightly report",
   "Drop the unused staging secret",
 ];
-const strip = (pattern: string, first = 120) =>
+const strip = (pattern: string, first = 120): { runs: RunSummaryDto[] } =>
   ({
     runs: pattern.split("").map((c, i) => ({
       id: `r${i}`,
@@ -315,7 +318,12 @@ const strip = (pattern: string, first = 120) =>
       sha: (0x9e3779b1 * (first - i)).toString(16).padStart(8, "0").slice(-7) + "0".repeat(33),
       trigger_kind: "push",
       trigger_title: STRIP_TITLES[i % STRIP_TITLES.length],
+      // Pushes land on main, with every fourth on a feature branch, by one
+      // of three people, so a row names its branch and its author.
+      git_ref: i % 4 === 1 ? "refs/heads/feat/cache-registry" : "refs/heads/main",
+      actor: ["a.kim", "m.diaz", "j.rao"][i % 3],
       status: c === "x" ? "failed" : c === "c" ? "cancelled" : "succeeded",
+      ...(c === "x" ? { failed_step: "test", failed_steps_count: 1 } : {}),
       duration_ms: 40000 + ((i * 37) % 11) * 22000,
       created_at: ago((i + 1) * 900000),
       // Every third run is a deploy — marked `deploy: true`, with an
@@ -335,8 +343,98 @@ for (const i of [3, 7]) {
     trigger_kind: "cron",
     trigger_title: "0 2 * * *",
     pipeline: "nightly",
+    actor: null,
   });
 }
+// The newest of scarab's runs, above the filler: pull request #131 pushed
+// three times (each newer push cancelled the Run before it), a deploy held
+// at its Environment's approval, a Run held at a manual gate, and a failed
+// Run whose two plan cells failed. The last three open the run fixtures
+// below; the pull request #131 Runs have no run page in the mock.
+const pr131 = (o: Partial<RunSummaryDto> & Pick<RunSummaryDto, "id" | "status">): RunSummaryDto => ({
+  trigger_kind: "pull_request",
+  git_ref: "refs/pull/131/head",
+  pr_number: 131,
+  origin_pr_base: "main",
+  origin_pr_head: "feat/shared-postgres",
+  actor: "a.kim",
+  trigger_title: "Wire shared postgres into the integration suite",
+  duration_ms: 0,
+  created_at: 0,
+  pipeline: "ci",
+  deploy: false,
+  ...o,
+});
+scarabRuns.runs.unshift(
+  pr131({
+    id: "0190f8a2000071fb8c00c0ffee000003",
+    status: "running",
+    run_number: 155,
+    sha: "e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5",
+    created_at: ago(90_000),
+  }),
+  pr131({
+    id: "0190f8a2000071fb8c00c0ffee000002",
+    status: "cancelled",
+    run_number: 154,
+    sha: "d3c2b1a0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4",
+    duration_ms: 70_000,
+    created_at: ago(4 * 60_000),
+    replaced_by: "0190f8a2000071fb8c00c0ffee000003",
+  }),
+  pr131({
+    id: "0190f8a2000071fb8c00c0ffee000001",
+    status: "cancelled",
+    run_number: 153,
+    sha: "c2b1a0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3",
+    duration_ms: 95_000,
+    created_at: ago(7 * 60_000),
+    replaced_by: "0190f8a2000071fb8c00c0ffee000002",
+  }),
+  pr131({
+    id: ENV_GATE_RUN_ID,
+    status: "suspended",
+    run_number: 152,
+    trigger_kind: "push",
+    git_ref: "refs/heads/main",
+    pr_number: null,
+    origin_pr_base: null,
+    origin_pr_head: null,
+    trigger_title: "Deploy 7c1e2d4 to production",
+    sha: "7c1e2d4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d",
+    created_at: ago(5 * 60_000),
+    pipeline: "deploy",
+    deploy: true,
+    environment: "production",
+    waiting_for: { step: "environment-approval", kind: "environment_approval" },
+  }),
+  pr131({
+    id: RICH_RUN_ID,
+    status: "suspended",
+    run_number: 147,
+    sha: "7c2e91d04b8a3f5e6d1c0b9a87654321fedcba98",
+    created_at: ago(9 * 60_000),
+    pipeline: "release",
+    waiting_for: { step: "approve", kind: "manual" },
+  }),
+  pr131({
+    id: MATRIX_RUN_ID,
+    status: "failed",
+    run_number: 33,
+    git_ref: "refs/pull/2949/head",
+    pr_number: 2949,
+    origin_pr_base: "develop",
+    origin_pr_head: "feature/cluster-module",
+    actor: "thulasi",
+    trigger_title: "Smoke-run the plan pipelines on the new cluster module",
+    sha: "15f2297b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f",
+    duration_ms: 11 * 60_000,
+    created_at: ago(12 * 60_000),
+    pipeline: "tofu-plan",
+    failed_step: "plan[cluster=treebo-production,phase=aws-post-cluster]",
+    failed_steps_count: 2,
+  }),
+);
 const repoRuns: Record<string, ReturnType<typeof strip>> = {
   scarab: scarabRuns, // ~64% pass window near the older tail
   "orders-api": strip("oxooxooxooooo"),
@@ -347,6 +445,73 @@ const repoRuns: Record<string, ReturnType<typeof strip>> = {
 };
 // A gentler pass mix so the shown percentages land ~64/64/50/93 like the
 // original: recompute deterministically by fixed strings above (close enough).
+
+// ── run manifests (`GET /v1/runs/{id}/manifest`) ───────────────────────────
+// The Pipeline file each run was created from, as recorded at creation. The
+// matrix run invokes the clone library; the retries run predates recording,
+// and any other run answers the same way.
+const runManifests: Record<string, RunManifestDto> = {
+  [RUN_ID]: {
+    recorded: true,
+    path: ".scarab/ci.yaml",
+    sha: "3f9a1c2d9e8b7a6c5d4e3f2a1b0c9d8e4f5a6b7c",
+    source: `name: ci
+on:
+  push: { branches: [main] }
+  pull_request: {}
+steps:
+  - id: clone
+    image: alpine/git:2.45.2
+    command: [git, clone, --depth=1, "\${{ event.clone_url }}", /workspace/src]
+  - id: build
+    image: rust:1.97
+    needs: [clone]
+    command: [cargo, build, --release, --locked]
+  - id: test
+    image: rust:1.97
+    needs: [build]
+    command: [cargo, nextest, run, --workspace]
+`,
+    invoked: [],
+  },
+  [MATRIX_RUN_ID]: {
+    recorded: true,
+    path: ".scarab/tofu-plan.yaml",
+    sha: "15f2297b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f",
+    source: `name: tofu-plan
+on:
+  pull_request: { branches: [develop] }
+steps:
+  - id: checkout
+    invoke: lib:thulasi-ram::scarab-ci::clone
+    with: { depth: "1" }
+  - id: plan
+    image: ghcr.io/opentofu/opentofu:1.8.3
+    needs: [checkout]
+    matrix:
+      cluster: [superhero-tools-common, treebo-production, treebo-staging]
+      phase: [aws-cluster, aws-post-cluster]
+    retry: { attempts: 2 }
+    command:
+      - sh
+      - -c
+      - |
+        cd live/\${{ matrix.cluster }}/\${{ matrix.phase }}
+        tofu init -input=false
+        tofu plan -input=false -out=/scarab/artifacts/plan.bin
+`,
+    invoked: [
+      {
+        kind: "library",
+        name: "thulasi-ram::scarab-ci::clone",
+        source: "github.com/thulasi-ram/scarab-ci//libs/clone.yaml@ac8c661a4e0f3b2d9c7a5e1f0b6d4c2a8e9f7b13",
+        content_hash: "9d4b1e7c3a2f8e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e2d",
+        steps: ["checkout/git"],
+      },
+    ],
+  },
+  [RETRIES_RUN_ID]: { recorded: false, invoked: [] },
+};
 
 // ── run detail ──────────────────────────────────────────────────────────────
 const runStatus: RunStatusDto = {
@@ -548,7 +713,8 @@ const richEventsBody = [
 const wireStatus = (s: string): string => s.replace(/(^|_)([a-z])/g, (_m, _u, c: string) => c.toUpperCase());
 
 // ── the MATRIX run (summary line, matrix labels, retries) ───────────────────
-// checkout `git`, then `plan` over cluster × phase. treebo-production ×
+// checkout `checkout/git` (the clone library's Step), then `plan` over
+// cluster × phase. treebo-production ×
 // aws-cluster failed twice (the engine retried it), and its second try waited
 // about a minute for a node first; treebo-production × aws-post-cluster
 // failed once. The other four cells passed and published a plan each.
@@ -562,7 +728,7 @@ const MX_CELLS: [string, string, "ok" | "fail" | "fail2"][] = [
 ];
 const mxId = (cluster: string, phase: string) => `plan[cluster=${cluster},phase=${phase}]`;
 const MX_T0 = 12 * min; // the run started 12 minutes ago
-const MX_PLAN_AT = MX_T0 - 61_000; // the plan cells start when git finishes
+const MX_PLAN_AT = MX_T0 - 61_000; // the plan cells start when checkout/git finishes
 const matrixRunStatus: RunStatusDto = {
   id: MATRIX_RUN_ID,
   status: "failed",
@@ -570,14 +736,23 @@ const matrixRunStatus: RunStatusDto = {
   pipeline: "tofu-plan",
   trigger_title: "Smoke-run the plan pipelines on the new cluster module",
   origin_pr_base: "develop",
+  origin_pr_head: "feature/cluster-module",
   params: {},
   snapshot_retention: { retention_days: 14, expired: false, pinned: false },
   steps: [
     {
-      id: "git",
+      id: "checkout/git",
       status: "succeeded",
       attempts: 1,
       needs: [],
+      origin: [
+        {
+          kind: "library",
+          name: "thulasi-ram::scarab-ci::clone",
+          source: "github.com/thulasi-ram/scarab-ci//libs/clone.yaml@ac8c661a4e0f3b2d9c7a5e1f0b6d4c2a8e9f7b13",
+          content_hash: "9d4b1e7c3a2f8e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e2d",
+        },
+      ],
       attempt_list: [
         { id: "a1", started_at: ago(MX_T0), finished_at: ago(MX_PLAN_AT), failed: false, outcome: "succeeded" },
       ],
@@ -624,7 +799,7 @@ const matrixRunStatus: RunStatusDto = {
         id: mxId(cluster, phase),
         status: how === "ok" ? "succeeded" : "failed",
         attempts: attempt_list.length,
-        needs: ["git"],
+        needs: ["checkout/git"],
         attempt_list,
       };
     }),
@@ -647,9 +822,9 @@ const matrixEventsBody = (() => {
         },
       },
     }),
-    mxv(ago(MX_T0), { AttemptStarted: { step: "git", attempt: "a1" } }),
-    mxv(ago(MX_PLAN_AT), { AttemptFinished: { step: "git", attempt: "a1" } }),
-    mxv(ago(MX_PLAN_AT - 500), { StepTransitioned: { step: "git", from: "Running", to: "Succeeded" } }),
+    mxv(ago(MX_T0), { AttemptStarted: { step: "checkout/git", attempt: "a1" } }),
+    mxv(ago(MX_PLAN_AT), { AttemptFinished: { step: "checkout/git", attempt: "a1" } }),
+    mxv(ago(MX_PLAN_AT - 500), { StepTransitioned: { step: "checkout/git", from: "Running", to: "Succeeded" } }),
   ];
   const timed: [number, string][] = [];
   for (const s of matrixRunStatus.steps.slice(1)) {
@@ -763,6 +938,7 @@ const retriesRunStatus: RunStatusDto = {
   pipeline: "ci",
   trigger_title: "Retry the flaky checkout tests",
   origin_pr_base: "main",
+  origin_pr_head: "fix/flaky-checkout",
   params: {},
   snapshot_retention: { retention_days: 14, expired: false, pinned: false },
   steps: Object.entries(RT_TRIES).map(([id, tries]) => {
@@ -2889,6 +3065,9 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   }
 
   // run-scoped
+  if ((m = p.match(/^\/v1\/runs\/([^/]+)\/manifest$/))) {
+    return json(runManifests[m[1]!] ?? { recorded: false, invoked: [] });
+  }
   if (p === `/v1/runs/${RUN_ID}`) return json(withStepKeys(runStatus));
   if (p === `/v1/runs/${RUN_ID}/events`)
     return new Response(eventsBody, {

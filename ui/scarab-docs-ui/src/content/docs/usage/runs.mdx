@@ -1,0 +1,223 @@
+---
+title: Runs
+description: The Runs tab on a repository's page lists its newest 50 Runs and the triggers that did not become one. A Run page's Manifest tab shows the pipeline file the Run was created from, as Scarab saved it then.
+---
+
+A repository's page opens on its Runs tab: the newest Runs, the triggers that were refused, and
+filters over both. Open a Run and its Manifest tab shows the pipeline file it was created from.
+
+## The runs list
+
+The list loads the newest 50 Runs of the repository and shows them newest first, grouped by day
+in your local time. Each day's header counts its rows and how many of them failed or were refused,
+for example `Today  9 runs · 3 failed or refused`. The foot of the list says how many Runs are
+shown. Click a row to open the Run.
+
+### What a row shows
+
+Each row has a status mark, the Run number, two lines of text and, on the right, the status word
+over the time.
+
+The status mark is a check for a passed Run, a cross for a failed one, `!` for a dead-lettered
+one, a dash for a cancelled one and a pause mark for one that waits at a gate. A running Run has a
+spinning ring, a pending one a dashed ring.
+
+Line 1 is the pipeline name, a slash, and the Run's headline: `ci / Fix the flaky test`. The
+pipeline name is cut at 24 characters; hover it for the whole name. A scheduled Run reads
+`Scheduled run`, a Run started through the API with no headline reads `Started from the API`, and
+a Run started with an inline pipeline shows `inline` in place of the name.
+
+Line 2 starts with the trigger and what it was about, `kind · subject`:
+
+| Trigger | Line 2 starts with |
+|---|---|
+| push | `push · main` |
+| pull request | `pr · #131 feat/x` (the number, then the branch the pull request comes from) |
+| tag or release | `tag · v0.7.2` |
+| schedule | `schedule · 0 2 * * *` (the cron expression that fired) |
+| manual | `manual · feat/x` |
+
+A pull request Run created before Scarab recorded the head branch shows the base branch instead:
+`pr · #131 → main`. After the trigger come the short commit hash, the author (`—` when there is
+none, as for a schedule) and, for a deploy Run, the Environment it deploys into, cut at 18
+characters, or `deploy` when it names none. The pull request number and the commit link to the
+forge.
+
+On the right is the status word over the time the Run was created and how long it ran:
+`14:05 · 3m 12s`. While a Run runs, its duration grows. A passed Run shows no word; its check mark
+says it. Hover the time for how long ago it was and the full date.
+
+### Statuses and the hover card
+
+The status word is one of Pending, Running, Waiting, Failed, Dead lettered, Cancelled, Replaced
+and Refused. A word with a dotted underline has more to say: hover it, focus it with the keyboard,
+or tap it on a touch screen, and a card opens under it.
+
+| Word | The card says |
+|---|---|
+| Failed, Dead lettered | where it failed: `failed at build`, and `+2` when two more steps failed |
+| Waiting | what it waits for: `waiting for approval` (a manual gate or an Environment's approval), `a timer`, `an external check` or `a plugin` |
+| Replaced | `replaced by #130`, or `replaced by a newer Run` when that Run is not in the list |
+
+A dead-lettered Run that failed no step (Scarab gave up on the Run, not on a step) has no card.
+
+### Status and filters
+
+Above the list, the status control has five parts: All, Running (running and pending Runs),
+Waiting (Runs held at a gate), Failed (failed and dead-lettered Runs) and Refused (triggers that
+did not become a Run). Each shows how many rows a click on it lists, under the other filters, over
+the loaded Runs.
+
+The **Filter** button opens a panel with five pickers and two switches:
+
+- **Pipeline**, **Author**, **Branch** and **Pull request** list the values the loaded Runs have.
+  The Branch filter matches a push's or a manual Run's branch, a tag, or the branch a pull request
+  comes from: the branch line 2 shows.
+- **Environment** lists the project's Environments and those of the loaded Runs.
+- **Deploys only** keeps Runs of a pipeline or step marked `deploy: true`.
+- **Scheduled only** keeps Runs a schedule started.
+
+Each filter that is on shows as a chip under the toolbar. The × on a chip removes that filter, and
+**Clear all** removes them all.
+
+Environment and Deploys only are sent to the server, so they list the newest 50 matching Runs,
+however old. The other filters and the status apply to the 50 Runs already loaded. When nothing
+matches, the list says what you asked for and over how many Runs, for example "No failed Run of
+`ci` by `j.rao` in the latest 50 Runs.", with a **Clear filters** button.
+
+The status and every filter are kept in the page's URL, so a refresh, a shared link and the back
+button show the same list:
+
+| Parameter | Filter |
+|---|---|
+| `status` | `running`, `waiting`, `failed` or `refused` |
+| `pipeline`, `env`, `author`, `branch` | the value picked |
+| `pr` | the pull request number |
+| `deploy=1`, `scheduled=1` | the two switches |
+
+### Live updates
+
+While the page is visible and on the Runs tab, the list checks for new Runs every 10 seconds, and
+once more when you come back to the tab. The toolbar says when it last loaded:
+`Live · updated 5s ago`.
+
+Rows already on screen change in place: a running Run's status and duration update without the
+list moving. Runs that start while you read wait behind a pill above the list, `3 new Runs`;
+click it to show them. When no row is on screen (the repository has not run, or no Run matches),
+new Runs show at once.
+
+While the first load runs, the list shows placeholder rows. When a later check fails, the list
+keeps what it last loaded and says so: "Could not refresh the Runs. Showing what loaded at 14:05.",
+with **Try again**.
+
+### Replaced Runs
+
+A newer Run can cancel an older one when it starts: a Run of the same pipeline on the same ref or
+pull request replaces the older one (newest wins), and a Run in a `cancel-in-progress`
+concurrency group replaces the one that holds the group. Scarab records which Run did it.
+
+The older Run then reads Replaced, and sits indented under the Run that replaced it. A Run replaced
+more than once sits under the newest. When the replacing Run is not in the list (not loaded, or
+hidden by a filter), the replaced Run keeps its own place and its card says `replaced by a newer
+Run`.
+
+A Run a person cancelled reads Cancelled. So does a Run cancelled before Scarab recorded
+replacements: no earlier Run reads Replaced.
+
+### Refused triggers
+
+A trigger that did not become a Run is listed where its Run would have been: a pipeline file that
+does not compile, a library version that was yanked, or a trigger a Policy refused. Its row has
+the Refused mark, `–` in place of a Run number, and a line under it with the reason and what to do
+about it. When the file has more than one error, a link shows the others.
+
+Refused triggers older than the oldest loaded Run are left out, except under Refused. The Author,
+Pipeline and Scheduled only filters apply to them too; a filter a refused trigger cannot match
+(Environment, Deploys only, Branch, Pull request) hides them.
+
+### A repository that has not run
+
+A repository with no Run and no refused trigger shows the smallest pipeline file that starts a Run,
+with a link to [Pipeline syntax](/scarab-ci/usage/pipeline-syntax/) and a **Run pipeline** button:
+
+```yaml
+# .scarab/ci.yaml
+on:
+  push: {}
+steps:
+  - id: test
+    image: rust:1-bookworm
+    command: [cargo, test]
+```
+
+## The Manifest tab
+
+A Run page has four tabs: Pipeline, Artifacts, Activity and Manifest. The Manifest tab shows the
+pipeline file the Run was created from, with line numbers.
+
+Scarab saves the file when it creates the Run: its path, its text and the commit it was read at.
+The tab shows that saved copy, so it is the file the Run compiled, not the file on the branch
+today. A later push that changes the file does not change what an earlier Run's tab shows.
+
+The bar above the file names its path, then the commit (a link to the forge), the branch or tag,
+the number of lines and the size. Its buttons:
+
+- **Go to failure** scrolls to the first step in the file that failed. It shows only when one
+  did.
+- **Wrap** wraps long lines.
+- **Copy** copies the file, and **Download** saves it under its file name.
+- The last button opens the file on the forge at the commit it was read at.
+
+### Step results in the file
+
+Each top-level step's `- id:` line has a mark in a column left of the line numbers: passed,
+failed, cancelled, skipped, running or not run, for the Run Steps the line became. Hover it for
+the result in words; click it to open that step on the Pipeline tab. The lines of a failed step
+are tinted.
+
+A matrix step lists its legs under its `- id:` line, each with its own result. When you view an
+earlier Take of the Run, the marks are that Take's results.
+
+Steps of the Run that no line of the file names, such as a gate an Environment added, are listed
+under the file after "Not written in this file", each a link to the step.
+
+### Invoked libraries
+
+Under each `invoke:` line, a row shows what it became: the library, file or plugin gate the line
+names, then any library that one invokes in turn. Each row has the kind (`lib`, `file` or
+`plugin`), the name, the start of the content hash of the version that ran, and the Steps it
+became (`became test, lint`). When an org admin has yanked that library version since the Run, the
+row says "yanked in this org since this Run".
+
+These rows are added by the page: Copy and Download give the file as it was saved, without them.
+
+### Runs with no saved file
+
+Two kinds of Run have no saved file:
+
+- A Run created before Scarab saved each Run's file (Scarab 0.7.2 and earlier). The tab says "No
+  file recorded for this Run" and links to `.scarab/` on the forge at the Run's commit. Scarab did
+  not fill in the file for these Runs.
+- A Run started through the API with a compiled pipeline (`POST /v1/runs`). It never had a file.
+  The tab says "Started without a file" and points to the Pipeline tab, which lists its steps.
+
+### Large files
+
+The compiler refuses a pipeline file over 1 MiB, so no saved file is larger. The tab draws the
+first 5,000 lines of a longer file, then says "Showing the first 5,000 of N lines." with a
+**Download** button. A line over 2,000 characters shows its first 2,000 as plain text, without
+colours, and a note under it gives its length. Go to failure does not reach a step past line
+5,000. Copy and Download always give the whole file.
+
+## Through the API
+
+| Call | What it returns |
+|---|---|
+| `GET /v1/runs/{id}/manifest` | the saved pipeline file: `recorded` (whether a file was saved), `path`, `sha` (the commit it was read at, absent when no commit was resolved for the ref), `source` (the text), and `invoked`: each library, file and plugin gate the Run's Steps came from, once each, with its `kind`, `name`, `source`, `content_hash` and `steps`. `invoked` is read from the Run's compiled pipeline, so it is filled for a Run with no saved file too. 404 when there is no such Run |
+| `GET /v1/repos/{org}/{repo}/runs` | the runs list. Each row has `replaced_by` (the Run that took this Run's place; for a cancelled Run, the newer Run whose start cancelled it), `failed_step` and `failed_steps_count` (for a failed or dead-lettered Run), `waiting_for` (for a suspended Run, the gate whose wait opened first: its `step` and `kind`) and `origin_pr_head` (a pull request Run's head branch) |
+| `GET /v1/runs/{id}` | the Run, with `origin_pr_head` |
+
+Reading a Run's manifest needs read access to the Run's project, as reading the Run does. A pull
+request Run's `origin_pr_head` is the branch name the forge sent; for a pull request from a fork,
+it is the fork's branch name, chosen by whoever opened the pull request. Scarab shows it and
+filters on it, and never uses it to decide what runs.

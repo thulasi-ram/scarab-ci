@@ -197,6 +197,10 @@ describe("parseRunUrl", () => {
     ).toEqual({});
   });
 
+  it("reads the Manifest tab", () => {
+    expect(parseRunUrl({ tab: "manifest" })).toEqual({ tab: "manifest" });
+  });
+
   it("takes the first of a repeated param", () => {
     expect(parseRunUrl({ step: ["2", "5"] })).toEqual({ step: 2 });
   });

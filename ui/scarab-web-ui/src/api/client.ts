@@ -1425,6 +1425,20 @@ export async function stepOrigin(run: string, step: string): Promise<StepOrigin>
   return data;
 }
 
+export type RunManifest = components["schemas"]["RunManifestDto"];
+
+/** The Pipeline file a Run was created from, as recorded at creation, and the
+ * libraries its Steps were inlined from (`GET /v1/runs/{id}/manifest`).
+ * `recorded` is false for an inline Run and for a Run created before the file
+ * was recorded. */
+export async function runManifest(run: string): Promise<RunManifest> {
+  const { data, error, response } = await api.GET("/v1/runs/{id}/manifest", {
+    params: { path: { id: run } },
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not load the run's pipeline file (${response.status})`);
+  return data;
+}
+
 /** Best-effort extraction of an error body to text. The dispatch/interface 4xx
  * bodies are plain text; openapi-fetch surfaces them in `error` (string), but a
  * stray JSON body is stringified rather than dropped. */

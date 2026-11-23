@@ -274,6 +274,7 @@ pub(crate) fn governed_routes() -> Routes {
             "/v1/runs/{id}/steps/{step}/origin",
             run_origin::get_step_origin,
         )
+        .get("/v1/runs/{id}/manifest", run_origin::get_run_manifest)
         // The manual Workspace-Snapshot pin (ADR-0061 s5) — one resource, two
         // verbs, because pin and unpin are the same fact in two states.
         .post(

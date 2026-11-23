@@ -235,6 +235,7 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                 head,
                 title,
                 base,
+                head_branch: scarab_forge::pull_request_head_branch(p),
                 fork,
             })
         }
@@ -1836,7 +1837,7 @@ mod tests {
                 "number": 42,
                 "title": "feat: add the widget",
                 "base": { "ref": "main" },
-                "head": { "sha": "feedface", "repo": { "full_name": "acme/app" } }
+                "head": { "sha": "feedface", "ref": "feat/widget", "repo": { "full_name": "acme/app" } }
             },
             "repository": { "name": "app", "owner": { "login": "acme" }, "full_name": "acme/app" },
             "sender": { "login": "octocat" }
@@ -1856,6 +1857,8 @@ mod tests {
                 // the title feeds the Headline, the base the `base ← head` display.
                 title: "feat: add the widget".into(),
                 base: "main".into(),
+                // pull_request.head.ref, the branch the PR comes from.
+                head_branch: "feat/widget".into(),
                 fork: false,
             }
         );
@@ -1865,12 +1868,17 @@ mod tests {
             "action": "opened",
             "pull_request": {
                 "number": 7,
-                "head": { "sha": "abc1234", "repo": { "full_name": "contributor/app" } }
+                "head": { "sha": "abc1234", "ref": "main", "repo": { "full_name": "contributor/app" } }
             },
             "repository": { "name": "app", "owner": { "login": "acme" }, "full_name": "acme/app" }
         });
         let event = normalize(&delivery("pull_request", fork)).unwrap();
         assert!(event.is_fork_pr(), "head repo != base → fork");
+        // A fork PR's head branch is the fork's branch name, as GitHub sends it.
+        assert!(
+            matches!(&event, Event::PullRequest { head_branch, .. } if head_branch == "main"),
+            "{event:?}"
+        );
     }
 
     #[test]

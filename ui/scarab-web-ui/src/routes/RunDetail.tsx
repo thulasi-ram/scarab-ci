@@ -6,12 +6,14 @@
 // - a notice slot: gate approvals, the read-only banner of an older version,
 //   the yank note, the retention note and the run's policy decisions;
 // - a summary line: which steps failed first, or what is running and waiting;
-// - the run tabs: Pipeline, Artifacts and Activity;
+// - the run tabs: Pipeline, Artifacts, Activity and Manifest;
 // - in Pipeline, the step graph or the step list, then the step pane for the
 //   selected step: its header and actions, its try tabs, the selected try's
 //   failure box, and its content tabs. The step pane stays mounted while
 //   another run tab is open, so a log stream does not restart;
-// - in Artifacts, the run's files grouped by step; in Activity, its events.
+// - in Artifacts, the run's files grouped by step; in Activity, its events;
+//   in Manifest, the Pipeline file it was created from, each step's result
+//   beside the line that defines it.
 // Versions and tries are derived from the event log; "Take" and "Attempt"
 // never show. Picking an older version turns the page into a read-only view
 // of the run as it stood then. The selected step, version, try and tab live in
@@ -123,6 +125,7 @@ import CancelRunConfirm from "../components/CancelRunConfirm";
 import RunMoreMenu from "../components/RunMoreMenu";
 import RunArtifacts from "../components/RunArtifacts";
 import RunActivity from "../components/RunActivity";
+import RunManifest from "../components/RunManifest";
 
 const POLL_MS = 1200;
 
@@ -130,7 +133,7 @@ const POLL_MS = 1200;
 const paneTabParam = (t: PaneTab): PaneTabParam | undefined =>
   t === "results" || t === "workspace" || t === "outputs" || t === "source" ? t : undefined;
 
-/** A run tab: Pipeline (absent from the URL), Artifacts or Activity. */
+/** A run tab: Pipeline (absent from the URL), Artifacts, Activity or Manifest. */
 type RunTab = "pipeline" | RunTabParam;
 
 export default function RunDetail() {
@@ -1437,6 +1440,15 @@ export default function RunDetail() {
                   <span class="run-tab-n">{activityCount()}</span>
                 </Show>
               </button>
+              <button
+                type="button"
+                role="tab"
+                class="run-tab"
+                aria-selected={runTab() === "manifest"}
+                onClick={() => setRunTab("manifest")}
+              >
+                Manifest
+              </button>
             </div>
 
             {/* ── Pipeline panel: the graph or the list ── */}
@@ -1711,6 +1723,27 @@ export default function RunDetail() {
                 active={heldNow()}
                 trigger={triggerSentence()}
                 needs={Object.fromEntries(stepList().map((s) => [s.id, s.needs ?? []]))}
+              />
+            </Show>
+            <Show when={runTab() === "manifest"}>
+              <RunManifest
+                runId={id()}
+                steps={dagSteps().map((s) => ({ id: s.id, status: s.status, addedBy: s.addedBy }))}
+                yanks={yanks()}
+                pipeline={r().pipeline ?? null}
+                triggerSha={triggerInfo()?.sha ?? null}
+                branch={(() => {
+                  const t = triggerInfo();
+                  return t ? headBranch(t) : null;
+                })()}
+                gitRef={triggerInfo()?.ref ?? null}
+                repoUrl={repoUrl() ?? null}
+                live={!isTerminal(r().status) && !timeTraveling()}
+                onOpenStep={(sid) => {
+                  selectNode(sid);
+                  setRunTab("pipeline");
+                }}
+                onShowPipeline={() => setRunTab("pipeline")}
               />
             </Show>
             <Show when={shellOpen() && sel()}>

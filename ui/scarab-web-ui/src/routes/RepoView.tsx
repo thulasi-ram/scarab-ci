@@ -1,17 +1,38 @@
 // Repo dashboard (tier 2) — tabs over one repository: Runs (default),
-// Schedules, Environments, Secrets, Settings. Each run row shows its origin as a grid of
-// facts (author · ref · duration) under a header line (sha · status · trigger ·
-// when), fed by the origin fields RunSummaryDto now carries. Duration ticks live
-// for in-flight runs. The runs list filters by status, author, branch, PR,
-// pipeline, environment, deploys and scheduled — environment and deploys on the server
-// (it is how a Project's older deploys are found), the rest over
-// the loaded page. The header CTA is contextual to the active tab.
+// Schedules, Environments, Secrets, Settings. The header's button is the
+// active tab's action (Run pipeline on Runs).
+//
+// The runs list is grouped by day; each row reads `pipeline / headline` over
+// line 2 (the trigger, where the Run came from, its commit and its author),
+// with its status and clock time on the right (see components/RunRow). A Run
+// a newer one replaced sits under its replacer. Over the list: a status
+// control with counts (All, Running, Waiting, Failed, Refused) and one Filter
+// button whose panel holds pipeline, environment, author, branch, PR, deploys
+// and scheduled; the filters that are on show as removable chips. Environment
+// and deploys filter on the server (it is how a Project's older deploys are
+// found), the rest over the loaded page. The list polls every 10 seconds
+// while the page is visible; rows on screen update in place, and Runs that
+// arrive wait behind a `N new Runs` pill so the list does not move (with no
+// row on screen they are shown at once).
 //
 // The active tab and every filter live in the URL query (`?tab=secrets`,
 // `?pipeline=ci&env=production`), not in component signals — so a refresh, a
 // shared link and the back button all land where you were. The defaults (Runs
 // tab, no filter) are the absent params, which keeps the bare repo URL clean.
-import { createResource, createSignal, createEffect, onCleanup, For, Show } from "solid-js";
+import {
+  createComputed,
+  createEffect,
+  createMemo,
+  createResource,
+  createSignal,
+  createUniqueId,
+  For,
+  Match,
+  onCleanup,
+  Show,
+  Switch,
+  untrack,
+} from "solid-js";
 import { A, useParams, useNavigate, useSearchParams } from "@solidjs/router";
 import { orgPageHref, UNREACHABLE_NOTE } from "../org-page";
 import { recordVisit } from "../visited";
@@ -46,11 +67,32 @@ import {
 } from "../repo-environments";
 import { relTime, absTime, untilTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
-import TriggerCell from "../components/TriggerCell";
+import {
+  arrivedLabel,
+  arrivedView,
+  authorSlot,
+  clockTime,
+  dayGroups,
+  dayLabel,
+  daySummary,
+  deployTag,
+  kindFirst,
+  placeReplaced,
+  pullNumber,
+  replacedBy,
+  rowStatus,
+  runBranch,
+  splitArrived,
+  type DayGroup,
+  type Placed,
+  type Replaced,
+} from "../run-row";
+import { statusWord } from "../run-page";
+import { OriginLine, RowStatus, RowTitle, SkeletonRow, StatusMark } from "../components/RunRow";
 import RunNumber from "../components/RunNumber";
 import Icon from "../components/Icon";
 import { HomeCrumb, RepoCrumb } from "../components/PageCrumbs";
-import SearchSelect from "../components/SearchSelect";
+import SearchSelect, { type SelectOption } from "../components/SearchSelect";
 import PrincipalSearch from "../components/PrincipalSearch";
 import Modal, { ModalMessage, ModalSection } from "../components/Modal";
 import ConfirmDestructive from "../components/ConfirmDestructive";
@@ -60,15 +102,53 @@ import SecretKeyList from "../components/SecretKeyList";
 import RepoSettings from "../components/RepoSettings";
 import Doodle from "../components/Doodle";
 import AsciiScene from "../components/AsciiScene";
-import { mergeRefused, runEnvironmentOptions, runListFilter } from "../runs-filter";
+import {
+  filterChips,
+  noMatchSentence,
+  parseSegment,
+  runEnvironmentOptions,
+  runListFilter,
+  segmentCounts,
+  segmentRows,
+  SEGMENTS,
+  type PanelFilters,
+  type RowFilter,
+  type RunListRow,
+  type StatusSegment,
+} from "../runs-filter";
 import { environmentLabel, nameBeside, shownName } from "../org-environments";
 import { refusalSummary } from "../compile-errors";
 import { fireOutcome, isScheduled, pipelineShortName, scheduledRunsHref } from "../schedules";
 import ponderIdle from "../../../brand/ascii/generated/ponder-ponder.json";
 import Pill from "../components/Pill";
 
+/** One loaded list and when: `items` is null until a load succeeds, and
+ *  a failed poll keeps the last items of the same request (`key`). */
+type Feed<T> = { key: string; items: T[] | null; at: number | null; failedAt: number | null };
+/** A row of the list: a Run, or a trigger that was refused. */
+type Row = RunListRow<RunSummary, RefusedRun>;
+/** One entry of the flattened list: a day header or a row. */
+type Entry = { t: "day"; g: DayGroup<Row> } | { t: "row"; item: Placed<Row> };
+/** A row's key, stable across polls. */
+const listKey = (row: Row): string => (row.kind === "run" ? `r:${row.run.id}` : `x:${row.refused.id}`);
+
+/** How many Runs the list loads (the newest), and how often it polls. */
+const RUNS_LIMIT = 50;
+const POLL_MS = 10_000;
+
+/** The pipeline guide, and the smallest pipeline file, for a repo that has
+ *  not run yet. */
+const PIPELINE_GUIDE = "https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/";
+const FIRST_PIPELINE = `.scarab/ci.yaml
+
+on:
+  push: {}
+steps:
+  - id: test
+    image: rust:1-bookworm
+    command: [cargo, test]`;
+
 type Tab = "runs" | "schedules" | "environments" | "secrets" | "settings";
-type StatusFilter = "all" | "running" | "failed" | "refused";
 
 const TABS: [Tab, string][] = [
   ["runs", "Runs"],
@@ -82,31 +162,10 @@ const TABS: [Tab, string][] = [
 const TERMINAL = new Set(["succeeded", "failed", "cancelled", "dead_lettered"]);
 const isLive = (status: string) => !TERMINAL.has(status);
 
-// The human ref a run ran on: a PR number wins (it's the clearer identity), else
-// the branch/tag with its `refs/{heads,tags}/` prefix stripped. `null` when the
-// run carries no ref (e.g. a cron trigger).
-function refLabel(r: RunSummary): string | null {
-  if (r.pr_number != null) return `PR #${r.pr_number}`;
-  const ref = r.git_ref;
-  if (!ref) return null;
-  return ref.replace(/^refs\/heads\//, "").replace(/^refs\/tags\//, "");
-}
-
-// The trigger kind as a short display token (`pull_request` → `PR`); the raw
-// TriggerKind vocabulary otherwise.
-function triggerLabel(kind: string | null | undefined): string | null {
-  if (!kind) return null;
-  return kind === "pull_request" ? "PR" : kind;
-}
-
-// The branch/tag a run ran on: `git_ref` with its `refs/{heads,tags}/` prefix
-// stripped. Unlike `refLabel`, this ignores `pr_number` — a PR run still ran on
-// a head branch, and the branch filter should match it. `null` when refless.
-function branchLabel(r: RunSummary): string | null {
-  const ref = r.git_ref;
-  if (!ref) return null;
-  return ref.replace(/^refs\/heads\//, "").replace(/^refs\/tags\//, "");
-}
+// The branch the Branch filter lists and matches: the one line 2 shows (a
+// pull request Run's head branch). `null` when there is none.
+const branchLabel = (r: RunSummary): string | null =>
+  runBranch({ kind: r.trigger_kind, ref: r.git_ref, head: r.origin_pr_head });
 
 // Distinct, non-empty values a projection takes across the fetched rows — the
 // option set for a filter dropdown. Sorted by the caller.
@@ -169,11 +228,8 @@ export default function RepoView() {
   // every keystroke of a search.
   const setTab = (t: Tab) => setSearch({ tab: t === "runs" ? "" : t });
   const filterSetter = (key: string) => (v: string) => setSearch({ [key]: v }, { replace: true });
-  const statusFilter = (): StatusFilter => {
-    const v = one(search.status);
-    return v === "running" || v === "failed" || v === "refused" ? v : "all";
-  };
-  const setStatusFilter = (f: StatusFilter) => filterSetter("status")(f === "all" ? "" : f);
+  const segment = (): StatusSegment => parseSegment(one(search.status));
+  const setSegment = (f: StatusSegment) => filterSetter("status")(f === "all" ? "" : f);
   // Origin filters, client-side over the already-fetched rows (the Environment
   // and Deploys filters are sent to the server instead; see `rows`). `""` = "any";
   // `prFilter` holds the PR number stringified (search params are strings).
@@ -204,18 +260,106 @@ export default function RepoView() {
   // Only this repo's tenanted runs, straight from the per-repo endpoint.
   // The Environment and Deploys filters are part of the request,
   // so they fetch the newest matching runs rather than filtering the newest
-  // page.
-  const [rows, { refetch }] = createResource(
-    () => ({ org: org(), repo: repo(), env: envFilter(), deploys: deploysOnly() }),
-    (k): Promise<RunSummary[]> =>
-      listRepoRuns(k.org, k.repo, 50, runListFilter(k.env, k.deploys)),
+  // page. The fetch never fails the resource: a failed poll keeps the last
+  // list that loaded (for the same request) and says when it loaded.
+  const feedKey = (k: { org: string; repo: string; env: string; deploys: boolean }) =>
+    `${k.org}/${k.repo}?env=${k.env}&deploy=${k.deploys}`;
+  const runsRequest = () => ({ org: org(), repo: repo(), env: envFilter(), deploys: deploysOnly() });
+  const [feed, { refetch }] = createResource(
+    runsRequest,
+    async (k, info): Promise<Feed<RunSummary>> => {
+      const key = feedKey(k);
+      try {
+        const items = await listRepoRuns(k.org, k.repo, RUNS_LIMIT, runListFilter(k.env, k.deploys));
+        return { key, items, at: Date.now(), failedAt: null };
+      } catch {
+        const prev = info.value?.key === key ? info.value : null;
+        return { key, items: prev?.items ?? null, at: prev?.at ?? null, failedAt: Date.now() };
+      }
+    },
   );
   // Triggers that did not become a Run: a compile error, a yanked
   // library, a Policy. Shown between the Runs; an older server has none.
-  const [refused, { refetch: refetchRefused }] = createResource(
+  // A failed poll keeps the last ones that loaded.
+  const [refusedFeed, { refetch: refetchRefused }] = createResource(
     () => ({ org: org(), repo: repo() }),
-    (k) => listRefusedRuns(k.org, k.repo).catch(() => [] as RefusedRun[]),
+    async (k, info): Promise<Feed<RefusedRun>> => {
+      const key = `${k.org}/${k.repo}`;
+      try {
+        return { key, items: await listRefusedRuns(k.org, k.repo), at: Date.now(), failedAt: null };
+      } catch {
+        const prev = info.value?.key === key ? info.value : null;
+        return { key, items: prev?.items ?? [], at: prev?.at ?? null, failedAt: Date.now() };
+      }
+    },
   );
+  // `.latest`, never a read that suspends: a poll must not blank the list.
+  // A list loaded for another request (the Environment just changed) is not
+  // shown while the new one loads.
+  const current = () => {
+    const f = feed.latest;
+    return f && f.key === feedKey(runsRequest()) ? f : null;
+  };
+  const rows = (): RunSummary[] | null => current()?.items ?? null;
+  const refused = (): RefusedRun[] => {
+    const f = refusedFeed.latest;
+    return f && f.key === `${org()}/${repo()}` ? (f.items ?? []) : [];
+  };
+
+  // Runs and refused triggers that arrive while the list is read wait
+  // behind the `N new Runs` pill. `seen` holds the keys on screen, per
+  // request: a new request (another repo, Environment or Deploys) shows all
+  // it loads.
+  const [seenRuns, setSeenRuns] = createSignal<{ key: string; ids: Set<string> } | null>(null);
+  const [seenRefused, setSeenRefused] = createSignal<{ key: string; ids: Set<string> } | null>(null);
+  createEffect(() => {
+    const f = feed.latest;
+    if (!f?.items) return;
+    if (untrack(seenRuns)?.key !== f.key) setSeenRuns({ key: f.key, ids: new Set(f.items.map((r) => r.id)) });
+  });
+  createEffect(() => {
+    const f = refusedFeed.latest;
+    if (!f) return;
+    if (untrack(seenRefused)?.key !== f.key) setSeenRefused({ key: f.key, ids: new Set(f.items?.map((r) => String(r.id))) });
+  });
+  // Until `seen` catches up with a new request, every row is on screen.
+  const shownRuns = () => {
+    const s = seenRuns();
+    return s && s.key === current()?.key ? splitArrived(rows() ?? [], (r) => r.id, s.ids).shown : (rows() ?? []);
+  };
+  const shownRefused = () => {
+    const s = seenRefused();
+    return s && s.key === `${org()}/${repo()}` ? splitArrived(refused(), (r) => String(r.id), s.ids).shown : refused();
+  };
+  /** Shows the rows that arrived: every loaded key is on screen. */
+  const showArrived = () => {
+    const f = feed.latest;
+    if (f?.items) setSeenRuns({ key: f.key, ids: new Set(f.items.map((r) => r.id)) });
+    const g = refusedFeed.latest;
+    if (g) setSeenRefused({ key: g.key, ids: new Set(g.items?.map((r) => String(r.id))) });
+  };
+
+  // Live: poll both lists every 10s while the page is visible and on the
+  // Runs tab, and once when it becomes visible again.
+  const poll = () => {
+    if (tab() !== "runs" || document.visibilityState !== "visible") return;
+    if (!feed.loading) refetch();
+    if (!refusedFeed.loading) refetchRefused();
+  };
+  const pollTimer = setInterval(poll, POLL_MS);
+  const onVisible = () => {
+    if (document.visibilityState === "visible") poll();
+  };
+  document.addEventListener("visibilitychange", onVisible);
+  onCleanup(() => {
+    clearInterval(pollTimer);
+    document.removeEventListener("visibilitychange", onVisible);
+  });
+  const retry = () => {
+    refetch();
+    refetchRefused();
+  };
+
   // The Project's Environments, for the Environment picker's options — the
   // loaded rows are already one Environment's once the filter is on. A caller
   // who can't read them still gets the Environments seen on runs.
@@ -236,16 +380,19 @@ export default function RepoView() {
   const [envDialog, setEnvDialog] = createSignal<string | undefined>(undefined);
   const [envEpoch, setEnvEpoch] = createSignal(0); // bump to refetch the env list after a create
 
-  // A 1s heartbeat so in-flight runs show a live, ticking elapsed time. Terminal
-  // runs use their frozen `duration_ms` and ignore this.
+  // A 1s heartbeat so in-flight runs show a live, ticking elapsed time, and
+  // `updated Ns ago` counts. Terminal runs use their frozen `duration_ms`.
   const [now, setNow] = createSignal(Date.now());
   const tick = setInterval(() => setNow(Date.now()), 1000);
   onCleanup(() => clearInterval(tick));
+  // The clock to the minute, for the day headers' names (`Today` becomes
+  // `Yesterday` at midnight): a memo, so it changes once a minute.
+  const minute = createMemo(() => Math.floor(now() / 60_000));
 
-  // Option sets for the origin dropdowns, derived from whatever the fetched rows
-  // actually carry — so you only ever pick a value that exists. A dropdown with
-  // no values is hidden (see the JSX), not shown empty. Environments also take
-  // the Project's own list, since the rows are filtered on the server.
+  // Option sets for the Filter panel's pickers, derived from whatever the
+  // fetched rows carry — so you only ever pick a value that exists. A picker
+  // with no values is left out unless it is set. Environments also take the
+  // Project's own list, since the rows are filtered on the server.
   const authors = () => distinct(rows() ?? [], (r) => r.actor).sort();
   const branches = () => distinct(rows() ?? [], branchLabel).sort();
   const prNumbers = () => distinct(rows() ?? [], (r) => r.pr_number).sort((a, b) => b - a);
@@ -253,57 +400,109 @@ export default function RepoView() {
   const environments = () =>
     runEnvironmentOptions(projectEnvs() ?? [], rows() ?? [], envFilter());
 
-  const anyFilterOn = () =>
-    statusFilter() !== "all" ||
-    !!authorFilter() ||
-    !!branchFilter() ||
-    !!prFilter() ||
-    !!pipelineFilter() ||
-    !!envFilter() ||
-    deploysOnly() ||
-    scheduledOnly();
+  const panelFilters = (): PanelFilters => ({
+    pipeline: pipelineFilter(),
+    env: envFilter(),
+    author: authorFilter(),
+    branch: branchFilter(),
+    pr: prFilter(),
+    deploy: deploysOnly(),
+    scheduled: scheduledOnly(),
+  });
+  const chips = () => filterChips(panelFilters());
 
-  const clearFilters = () =>
+  /** Clears the panel's filters; `status` too for the no-match state. */
+  const clearFilters = (status = false) =>
     setSearch(
-      { status: "", author: "", branch: "", pr: "", pipeline: "", env: "", deploy: "", scheduled: "" },
+      {
+        ...(status ? { status: "" } : {}),
+        author: "", branch: "", pr: "", pipeline: "", env: "", deploy: "", scheduled: "",
+      },
       { replace: true },
     );
 
-  // All predicates AND together. Each origin field is independently nullable, so
-  // an engaged filter simply excludes any row that can't match it (older runs
-  // predating origin-stamping fall out here) — but a disengaged filter (`""` /
-  // `"all"`) never hides a row for lacking that field.
-  const filtered = () => {
-    const s = statusFilter();
+  // Every filter but the status, ANDed. Each origin field is independently
+  // nullable, so an engaged filter excludes any row that can't match it
+  // (older runs predating origin-stamping fall out here), but a disengaged
+  // one (`""`) never hides a row for lacking that field.
+  const passes = (r: RunSummary) => {
     const author = authorFilter();
     const branch = branchFilter();
     const pr = prFilter();
     const pipeline = pipelineFilter();
     const env = envFilter();
-    return (rows() ?? []).filter((r) => {
-      if (s !== "all" && r.status !== s) return false;
-      if (author && r.actor !== author) return false;
-      if (branch && branchLabel(r) !== branch) return false;
-      if (pr && String(r.pr_number ?? "") !== pr) return false;
-      if (pipeline && r.pipeline !== pipeline) return false;
-      // Already applied by the server; kept so a page still in flight from
-      // the previous filter never shows under the new one.
-      if (env && r.environment !== env) return false;
-      if (deploysOnly() && !r.deploy) return false;
-      if (scheduledOnly() && !isScheduled(r.trigger_kind)) return false;
-      return true;
-    });
+    if (author && r.actor !== author) return false;
+    if (branch && branchLabel(r) !== branch) return false;
+    if (pr && String(r.pr_number ?? "") !== pr) return false;
+    if (pipeline && r.pipeline !== pipeline) return false;
+    // Already applied by the server; kept so a page still in flight from
+    // the previous filter never shows under the new one.
+    if (env && r.environment !== env) return false;
+    if (deploysOnly() && !r.deploy) return false;
+    if (scheduledOnly() && !isScheduled(r.trigger_kind)) return false;
+    return true;
   };
+  const rowFilter = (): RowFilter => ({
+    author: authorFilter(),
+    pipeline: pipelineFilter(),
+    scheduled: scheduledOnly(),
+    runOnly: !!branchFilter() || !!prFilter() || !!envFilter() || deploysOnly(),
+  });
 
-  // The rows on screen: the filtered Runs with refused triggers between them.
-  const listRows = () =>
-    mergeRefused(filtered(), refused() ?? [], {
-      status: statusFilter(),
-      author: authorFilter(),
-      pipeline: pipelineFilter(),
-      scheduled: scheduledOnly(),
-      runOnly: !!branchFilter() || !!prFilter() || !!envFilter() || deploysOnly(),
-    });
+  // The rows on screen: the filtered Runs of the segment with refused
+  // triggers between them. Counts are over the same rows.
+  const listRows = createMemo(() => segmentRows(shownRuns().filter(passes), shownRefused(), segment(), rowFilter()));
+  const counts = createMemo(() => segmentCounts(shownRuns().filter(passes), shownRefused(), rowFilter()));
+  // How many rows of this view arrived since the list was last shown.
+  const arrived = createMemo(() => {
+    const all = segmentRows((rows() ?? []).filter(passes), refused(), segment(), rowFilter());
+    const on = new Set(listRows().map(listKey));
+    return all.filter((r) => !on.has(listKey(r))).length;
+  });
+  // With no row on screen (never ran, or no match) nothing would move, so
+  // what arrives is shown at once; otherwise it waits behind the pill.
+  // Computed, not an effect, so the empty state is never drawn for a list
+  // that has rows to show.
+  const arrivals = createMemo(() => arrivedView(listRows().length, arrived()));
+  createComputed(() => {
+    if (arrivals().showNow) untrack(showArrived);
+  });
+
+  // The rows in day groups, each replaced Run under the Run that replaced
+  // it, flattened to keys: a row keeps its DOM across polls and updates in
+  // place (a `<For>` over strings keys by value). Only a cancelled Run is
+  // replaced. The groups depend on the rows only; a header's day name reads
+  // the clock where it is drawn.
+  const view = createMemo(() => {
+    const groups = dayGroups(
+      placeReplaced(listRows(), (row) =>
+        row.kind === "run" ? { ...row.run, replaced_by: replacedBy(row.run) } : null,
+      ),
+      (row) => (row.kind === "run" ? row.run.status : "refused"),
+    );
+    const order: string[] = [];
+    const byKey = new Map<string, Entry>();
+    for (const g of groups) {
+      let dk = `d:${g.key}`;
+      while (byKey.has(dk)) dk += "+";
+      order.push(dk);
+      byKey.set(dk, { t: "day", g });
+      for (const item of g.items) {
+        const k = listKey(item.row);
+        order.push(k);
+        byKey.set(k, { t: "row", item });
+      }
+    }
+    return { order, byKey };
+  });
+
+  // The list's state: loading (nothing loaded yet), failed with nothing to
+  // show, never ran, no match, or the list.
+  const failedAt = () => current()?.failedAt ?? null;
+  const loadedAt = () => current()?.at ?? null;
+  const loading = () => rows() === null && !failedAt();
+  const neverRan = () =>
+    (rows() ?? []).length === 0 && refused().length === 0 && !envFilter() && !deploysOnly();
 
   // The header CTA follows the tab: what you'd create in this context.
   const cta = () => {
@@ -323,7 +522,9 @@ export default function RepoView() {
     <section class="page">
       <Doodle icon="workflow" size={230} rotate={12} opacity={0.16} top="52px" right="48px" />
 
-      <div class="page-head">
+      {/* The heading row keeps the button's height on every tab, so the
+          tabs never shift between tabs with and without it. */}
+      <div class="page-head repo-head">
         <h1 class="crumb-head">
           <HomeCrumb size={20} sepClass="crumb-head-sep" />
           <RepoCrumb org={org()} repo={repo()} />
@@ -333,6 +534,13 @@ export default function RepoView() {
             </Pill>
           </Show>
         </h1>
+        <Show when={cta()}>
+          {(c) => (
+            <button class="btn btn-primary repo-cta" aria-label={c().label} title={c().label} onClick={() => c().onClick()}>
+              <Icon icon={c().icon} size={14} /> <span class="repo-cta-label">{c().label}</span>
+            </button>
+          )}
+        </Show>
       </div>
       <Show when={unreachable()}>
         <p class="repo-unreachable-note">
@@ -340,19 +548,8 @@ export default function RepoView() {
           <A href={orgPageHref(org())}>Organization page</A>
         </p>
       </Show>
-      {/* Always rendered (fixed height) so the tab row never shifts between
-          tabs with and without a CTA. */}
-      <div class="page-toolbar">
-        <Show when={cta()}>
-          {(c) => (
-            <button class="btn btn-primary" onClick={() => c().onClick()}>
-              <Icon icon={c().icon} size={14} /> {c().label}
-            </button>
-          )}
-        </Show>
-      </div>
 
-      <div class="tabs">
+      <div class="tabs repo-tabs">
         <For each={TABS}>
           {([key, label]) => (
             <button
@@ -368,264 +565,201 @@ export default function RepoView() {
 
       {/* ---- Runs ---- */}
       <Show when={tab() === "runs"}>
-        <div class="filters">
-          <For each={["all", "running", "failed", "refused"] as const}>
-            {(f) => (
-              <button
-                class={`fpill ${statusFilter() === f ? "on" : ""}`}
-                onClick={() => setStatusFilter(f)}
+        <div class="rl-bar">
+          <div class="rl-segs" role="group" aria-label="Status">
+            <For each={SEGMENTS}>
+              {([key, label]) => (
+                <button
+                  type="button"
+                  class="rl-seg"
+                  classList={{ on: segment() === key }}
+                  aria-pressed={segment() === key}
+                  onClick={() => setSegment(key)}
+                >
+                  {label}
+                  {/* No counts until the Runs load: the refused triggers
+                      alone would count. */}
+                  <Show when={rows() !== null}>
+                    <span
+                      class="rl-count"
+                      classList={{ bad: (key === "failed" || key === "refused") && counts()[key] > 0 }}
+                    >
+                      {counts()[key]}
+                    </span>
+                  </Show>
+                </button>
+              )}
+            </For>
+          </div>
+          <FilterPanel
+            count={chips().length}
+            pipeline={{ value: pipelineFilter(), set: setPipelineFilter, options: pipelines().map((p) => ({ value: p, label: p })) }}
+            environment={{ value: envFilter(), set: setEnvFilter, options: environments().map((e) => ({ value: e, label: envLabel(e) })) }}
+            author={{ value: authorFilter(), set: setAuthorFilter, options: authors().map((a) => ({ value: a, label: a })) }}
+            branch={{ value: branchFilter(), set: setBranchFilter, options: branches().map((b) => ({ value: b, label: b })) }}
+            pr={{ value: prFilter(), set: setPrFilter, options: prNumbers().map((p) => ({ value: String(p), label: `pr #${p}` })) }}
+            deploys={deploysOnly()}
+            onDeploys={setDeploysOnly}
+            scheduled={scheduledOnly()}
+            onScheduled={setScheduledOnly}
+          />
+          <span class="rl-spacer" />
+          <Show when={loadedAt()}>
+            {(at) => (
+              <span
+                class="rl-live"
+                role="status"
+                title="The list checks for new Runs every 10 seconds while this page is open"
               >
-                {f}
-              </button>
+                <span class="rl-pulse" aria-hidden="true" />
+                <span class="rl-live-text">Live · updated {(now(), relTime(at()))}</span>
+              </span>
             )}
-          </For>
-
-          <button
-            class={`fpill ${deploysOnly() ? "on" : ""}`}
-            title="only deploy runs: a pipeline or step marked `deploy: true`"
-            onClick={() => setDeploysOnly(!deploysOnly())}
-          >
-            <Icon icon="rocket" size={12} /> deploys
-          </button>
-
-          <button
-            class={`fpill ${scheduledOnly() ? "on" : ""}`}
-            title="only runs a schedule started: a pipeline's `on: cron:`"
-            onClick={() => setScheduledOnly(!scheduledOnly())}
-          >
-            <Icon icon="clock" size={12} /> scheduled
-          </button>
-
-          <Show when={pipelines().length > 0}>
-            <SearchSelect
-              icon="workflow"
-              clearable
-              placeholder="any pipeline"
-              searchPlaceholder="Search pipelines…"
-              value={pipelineFilter()}
-              onChange={setPipelineFilter}
-              options={pipelines().map((p) => ({ value: p, label: p }))}
-            />
           </Show>
-
-          {/* Only Environment-governed runs carry an environment (their
-              pipeline declared `environment:`), so this appears once the
-              Project has an Environment or a run governed by one. */}
-          <Show when={environments().length > 0}>
-            <SearchSelect
-              icon="shield-check"
-              clearable
-              placeholder="any environment"
-              searchPlaceholder="Search environments…"
-              value={envFilter()}
-              onChange={setEnvFilter}
-              options={environments().map((e) => ({ value: e, label: envLabel(e) }))}
-            />
-          </Show>
-
-          <Show when={authors().length > 0}>
-            <SearchSelect
-              icon="user"
-              clearable
-              placeholder="any author"
-              searchPlaceholder="Search authors…"
-              value={authorFilter()}
-              onChange={setAuthorFilter}
-              options={authors().map((a) => ({ value: a, label: a }))}
-            />
-          </Show>
-
-          <Show when={branches().length > 0}>
-            <SearchSelect
-              icon="git-branch"
-              clearable
-              placeholder="any branch"
-              searchPlaceholder="Search branches…"
-              value={branchFilter()}
-              onChange={setBranchFilter}
-              options={branches().map((b) => ({ value: b, label: b }))}
-            />
-          </Show>
-
-          <Show when={prNumbers().length > 0}>
-            <SearchSelect
-              icon="git-pull-request"
-              clearable
-              placeholder="any PR"
-              searchPlaceholder="Search PRs…"
-              value={prFilter()}
-              onChange={setPrFilter}
-              options={prNumbers().map((p) => ({ value: String(p), label: `PR #${p}` }))}
-            />
-          </Show>
-
-          <Show when={anyFilterOn()}>
-            <button class="fpill" onClick={clearFilters}>clear</button>
-          </Show>
-
-          <button
-            class="btn btn-ghost btn-sm filters-refresh"
-            onClick={() => {
-              refetch();
-              refetchRefused();
-            }}
-          >
-            <Icon icon="rotate-cw" size={13} /> Refresh
-          </button>
         </div>
-
-        <Show when={!rows.loading} fallback={<p class="empty">loading…</p>}>
-          <Show when={!rows.error} fallback={<p class="error">Could not load runs.</p>}>
-            <Show
-              when={listRows().length > 0}
-              fallback={
-                (rows() ?? []).length === 0 && !envFilter() ? (
-                  <div class="empty-scene">
-                    <div class="empty-land">
-                      <AsciiScene
-                        scene={ponderIdle}
-                        fontSize={4}
-                        label="Beetle dozing with its back against its dung ball"
-                      />
-                    </div>
-                    <p class="empty">This repo hasn't run yet.</p>
-                  </div>
-                ) : (
-                  <p class="empty">No runs match these filters.</p>
-                )
-              }
-            >
-              <div class="runlist">
-                <For each={listRows()}>
-                  {(row) => {
-                    if (row.kind === "refused") return <RefusedRow r={row.refused} />;
-                    const r = row.run;
-                    const commitUrl = () => forgeCommitUrl(repoUrl(), r.sha);
-                    const prUrl = () => forgePrUrl(repoUrl(), r.pr_number);
-                    const stop = (e: MouseEvent) => e.stopPropagation();
-                    return (
-                      <div class="runrow" onClick={() => nav(`/${org()}/${repo()}/runs/${r.id}`)}>
-                        {/* Run-number gutter: the per-repo `#N`
-                            handle, sequential so it scans down the list. */}
-                        <div class="rr-gutter">
-                          <RunNumber n={r.run_number} id={r.id} />
-                        </div>
-                        <div class="rr-body">
-                          {/* Primary line: the run Headline (trigger kind + title),
-                              the SAME shared cell the run-detail bar uses. */}
-                          <div class="rr-head">
-                            <TriggerCell kind={r.trigger_kind} title={r.trigger_title} />
-                          </div>
-                          {/* Secondary line: the origin facts — pipeline · commit ·
-                              base ← head · PR · who · when. */}
-                          <div class="rr-facts">
-                            <Show when={r.pipeline}>
-                              {(name) => (
-                                <span class="pfact strong" title="pipeline">
-                                  <Icon icon="workflow" size={12} />
-                                  <span class="mono">{name()}</span>
-                                </span>
-                              )}
-                            </Show>
-                            <Show when={r.deploy}>
-                              <span
-                                class="pfact strong"
-                                title="deploy run: its pipeline or a step is marked `deploy: true`"
-                              >
-                                <Icon icon="rocket" size={12} /> deploy
-                              </span>
-                            </Show>
-                            <Show when={r.environment}>
-                              {(env) => (
-                                <span class="pfact" title="environment">
-                                  <Icon icon="shield-check" size={12} />
-                                  <span class="mono">{env()}</span>
-                                </span>
-                              )}
-                            </Show>
-                            <a
-                              class="pfact"
-                              classList={{ link: !!commitUrl() }}
-                              href={commitUrl() ?? undefined}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              onClick={stop}
-                              title="commit on the forge"
-                            >
-                              <Icon icon="git-commit-horizontal" size={12} />
-                              <span class="mono sha">{(r.sha ?? r.id).slice(0, 7)}</span>
-                            </a>
-                            {/* base ← head on PR runs; else the branch/ref. */}
-                            <Show
-                              when={r.origin_pr_base}
-                              fallback={
-                                <Show when={branchLabel(r) && branchLabel(r) !== r.sha}>
-                                  {(b) => (
-                                    <span class="pfact" title="branch / ref">
-                                      <Icon icon="git-branch" size={12} />
-                                      <span class="mono">{b()}</span>
-                                    </span>
-                                  )}
-                                </Show>
-                              }
-                            >
-                              {(base) => (
-                                <span class="pfact" title="base ← head">
-                                  <Icon icon="git-branch" size={12} />
-                                  <span class="mono">{base()}</span>
-                                  <span class="pr-arrow">←</span>
-                                  <span class="mono sha">{(r.sha ?? "").slice(0, 7)}</span>
-                                </span>
-                              )}
-                            </Show>
-                            <Show when={r.pr_number != null}>
-                              <a
-                                class="pfact"
-                                classList={{ link: !!prUrl() }}
-                                href={prUrl() ?? undefined}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                onClick={stop}
-                                title="pull request on the forge"
-                              >
-                                <Icon icon="git-pull-request" size={12} />
-                                <span class="mono">#{r.pr_number}</span>
-                              </a>
-                            </Show>
-                            <Show when={r.actor}>
-                              {(actor) => (
-                                <span class="pfact" title="triggered by">
-                                  <Icon icon="user" size={12} />
-                                  <span>{actor()}</span>
-                                </span>
-                              )}
-                            </Show>
-                            <span
-                              class="pfact"
-                              classList={{ live: isLive(r.status) }}
-                              title={absTime(r.created_at)}
-                            >
-                              <Icon icon="timer" size={12} />
-                              <span>
-                                {relTime(r.created_at)} · <span class="mono">{durationLabel(r, now())}</span>
-                              </span>
-                            </span>
-                          </div>
-                        </div>
-
-                        <div class="rr-right">
-                          <span class={`rr-status ${r.status}`}>
-                            <span class={`sdot ${r.status}`} /> {r.status}
-                          </span>
-                        </div>
-                      </div>
-                    );
-                  }}
-                </For>
-              </div>
-            </Show>
-          </Show>
+        <Show when={chips().length > 0}>
+          <div class="rl-chips">
+            <For each={chips()}>
+              {(c) => (
+                <span class="rl-chip" title={c.full ?? undefined}>
+                  <span class="rl-chip-k">{c.key}</span>
+                  <Show when={c.value}>{(v) => <span class="rl-chip-v">{v()}</span>}</Show>
+                  <button
+                    type="button"
+                    class="rl-chip-x"
+                    aria-label={`Remove the ${c.key} filter`}
+                    title="Remove"
+                    onClick={() => filterSetter(c.param)("")}
+                  >
+                    <Icon icon="x" size={10} />
+                  </button>
+                </span>
+              )}
+            </For>
+            <button type="button" class="rl-linkbtn" onClick={() => clearFilters()}>
+              Clear all
+            </button>
+          </div>
         </Show>
+
+        <Show when={failedAt()}>
+          {(at) => (
+            <div class="rl-errbar" role="alert">
+              <Icon icon="alert-triangle" size={14} />
+              <span>
+                <Show when={rows() !== null} fallback="Could not load the Runs.">
+                  Could not refresh the Runs. Showing what loaded at {clockTime(loadedAt() ?? at())}.
+                </Show>
+              </span>
+              <span class="rl-spacer" />
+              <button type="button" class="btn btn-ghost btn-sm" onClick={retry}>
+                <Icon icon="rotate-cw" size={13} /> Try again
+              </button>
+            </div>
+          )}
+        </Show>
+
+        <Show when={arrivals().pill > 0}>
+          <div class="rl-newpill">
+            <button type="button" onClick={showArrived}>
+              <Icon icon="arrow-up" size={13} /> {arrivedLabel(arrivals().pill)}
+            </button>
+          </div>
+        </Show>
+        <Switch>
+          <Match when={loading()}>
+            <div class="runlist" aria-busy="true" aria-label="Loading the Runs">
+              <For each={[0, 1, 2, 3, 4, 5]}>{(n) => <SkeletonRow n={n} />}</For>
+            </div>
+          </Match>
+          <Match when={rows() === null}>{null}</Match>
+          <Match when={neverRan()}>
+            <div class="runlist">
+              <div class="rl-empty rl-never">
+                <div class="empty-land">
+                  <AsciiScene scene={ponderIdle} fontSize={4} label="Beetle dozing with its back against its dung ball" />
+                </div>
+                <p class="rl-empty-title">This repo has not run yet</p>
+                <p class="rl-empty-text">
+                  Scarab starts a Run when a pipeline file in <span class="rl-mono">.scarab/</span> matches a push, a
+                  pull request or a schedule.
+                </p>
+                <pre class="rl-code">{FIRST_PIPELINE}</pre>
+                <div class="rl-empty-acts">
+                  <a class="btn btn-ghost" href={PIPELINE_GUIDE} target="_blank" rel="noreferrer">
+                    Read the pipeline guide
+                  </a>
+                  <button class="btn btn-primary" onClick={() => nav(`/${org()}/${repo()}/run`)}>
+                    <Icon icon="play" size={14} /> Run pipeline
+                  </button>
+                </div>
+              </div>
+            </div>
+          </Match>
+          <Match when={listRows().length === 0}>
+            <div class="runlist">
+              <div class="rl-empty">
+                <p class="rl-empty-title">No Runs match these filters</p>
+                <p class="rl-empty-text">
+                  <For each={noMatchSentence(panelFilters(), segment(), shownRuns().length)}>
+                    {(p) => (p.t === "mono" ? <span class="rl-mono">{p.text}</span> : p.text)}
+                  </For>
+                </p>
+                <div class="rl-empty-acts">
+                  <button type="button" class="btn btn-ghost" onClick={() => clearFilters(true)}>
+                    Clear filters
+                  </button>
+                </div>
+              </div>
+            </div>
+          </Match>
+          <Match when={true}>
+            <div class="runlist">
+              <For each={view().order}>
+                {(k) => {
+                  const entry = () => view().byKey.get(k);
+                  return (
+                    <Show when={entry()}>
+                      {(e) => {
+                        const ev = e();
+                        if (ev.t === "day") {
+                          const g = () => (entry() as Extract<Entry, { t: "day" }> | undefined)?.g ?? ev.g;
+                          return (
+                            <DayHeader label={dayLabel(g().at, minute() * 60_000)} count={g().count} failed={g().failed} />
+                          );
+                        }
+                        const item = () => (entry() as Extract<Entry, { t: "row" }> | undefined)?.item ?? ev.item;
+                        return (
+                          <Show
+                            when={item().row.kind === "run"}
+                            fallback={
+                              <RefusedRow
+                                r={(item().row as Extract<Row, { kind: "refused" }>).refused}
+                                repoUrl={repoUrl()}
+                              />
+                            }
+                          >
+                            <RunListRow
+                              r={(item().row as Extract<Row, { kind: "run" }>).run}
+                              child={item().child}
+                              replaced={item().replaced}
+                              now={now()}
+                              repoUrl={repoUrl()}
+                              href={`/${org()}/${repo()}/runs/${(item().row as Extract<Row, { kind: "run" }>).run.id}`}
+                            />
+                          </Show>
+                        );
+                      }}
+                    </Show>
+                  );
+                }}
+              </For>
+            </div>
+            <p class="rl-foot">
+              Showing the latest {shownRuns().length} {shownRuns().length === 1 ? "Run" : "Runs"}
+            </p>
+          </Match>
+        </Switch>
       </Show>
 
       {/* ---- Schedules ---- */}
@@ -1199,104 +1333,279 @@ function ScheduleRow(props: { org: string; repo: string; s: Schedule }) {
   );
 }
 
-/** A trigger that did not become a Run: where a Run would be,
- *  with the compact reason and its fix. */
-function RefusedRow(props: { r: RefusedRun }) {
+// ---- the runs list ---------------------------------------------------------
+
+/** A day header: `Today  9 runs · 3 failed or refused`. */
+function DayHeader(props: { label: string; count: number; failed: number }) {
+  const sum = () => daySummary(props);
+  return (
+    <div class="rr-day">
+      {props.label}
+      <span class="sum">
+        {sum().runs}
+        <Show when={sum().failed}>
+          {(f) => (
+            <>
+              {" · "}
+              <span class="failed">{f()}</span>
+            </>
+          )}
+        </Show>
+      </span>
+    </div>
+  );
+}
+
+/** One Run's row. Its props are read where they are drawn, so a poll that
+ *  changes a Run updates this row in place. */
+function RunListRow(props: {
+  r: RunSummary;
+  child: boolean;
+  replaced: Replaced | null;
+  now: number;
+  repoUrl?: string | null;
+  href: string;
+}) {
+  const nav = useNavigate();
+  const r = () => props.r;
+  const ok = () => r().status === "succeeded";
+  const st = () => rowStatus(r(), props.replaced);
+  return (
+    <div
+      class="runrow"
+      classList={{ ok: ok(), child: props.child }}
+      onClick={() => nav(props.href)}
+    >
+      <StatusMark status={r().status} />
+      <div class="rr-num">
+        <RunNumber n={r().run_number} id={r().id} />
+      </div>
+      <div class="rr-main">
+        <RowTitle pipeline={r().pipeline} kind={r().trigger_kind} title={r().trigger_title} />
+        <OriginLine
+          kind={r().trigger_kind}
+          line={kindFirst({
+            kind: r().trigger_kind,
+            ref: r().git_ref,
+            pr: r().pr_number,
+            // A server that sends a pull request's head branch names it here.
+            head: r().origin_pr_head,
+            base: r().origin_pr_base,
+            title: r().trigger_title,
+          })}
+          sha={r().sha}
+          author={authorSlot(r().trigger_kind, r().actor)}
+          commitUrl={forgeCommitUrl(props.repoUrl, r().sha)}
+          prUrl={forgePrUrl(props.repoUrl, r().pr_number)}
+          deploy={deployTag(r().deploy, r().environment)}
+        />
+      </div>
+      <RowStatus
+        word={st().word}
+        tone={st().tone}
+        detail={st().detail}
+        quiet={ok()}
+        clock={clockTime(r().created_at)}
+        when={`${relTime(r().created_at)} · ${absTime(r().created_at)}`}
+        duration={durationLabel(r(), props.now)}
+        live={isLive(r().status)}
+      />
+    </div>
+  );
+}
+
+/** One picker of the Filter panel. */
+type PanelPick = { value: string; set: (v: string) => void; options: SelectOption[] };
+
+/** The Filter button and its panel: the pickers for pipeline, Environment,
+ *  author, branch and PR, and the Deploys only and Scheduled only switches.
+ *  A popover under the button; a sheet at the bottom of the screen on a
+ *  phone. Closes on Escape (focus returns to the button) and on a click
+ *  outside it. A picker's list is portalled to <body>, so a click in it is
+ *  not outside. */
+function FilterPanel(props: {
+  count: number;
+  pipeline: PanelPick;
+  environment: PanelPick;
+  author: PanelPick;
+  branch: PanelPick;
+  pr: PanelPick;
+  deploys: boolean;
+  onDeploys: (on: boolean) => void;
+  scheduled: boolean;
+  onScheduled: (on: boolean) => void;
+}) {
+  const [open, setOpen] = createSignal(false);
+  const id = createUniqueId();
+  let button: HTMLButtonElement | undefined;
+  let panel: HTMLDivElement | undefined;
+  const close = (refocus: boolean) => {
+    setOpen(false);
+    if (refocus) button?.focus();
+  };
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === "Escape" && open()) close(true);
+  };
+  const onDown = (e: PointerEvent) => {
+    const t = e.target as Node | null;
+    if (!open() || !t) return;
+    if (panel?.contains(t) || button?.contains(t)) return;
+    if (t instanceof Element && t.closest(".ss-pop")) return;
+    close(false);
+  };
+  document.addEventListener("keydown", onKey);
+  document.addEventListener("pointerdown", onDown);
+  onCleanup(() => {
+    document.removeEventListener("keydown", onKey);
+    document.removeEventListener("pointerdown", onDown);
+  });
+  const toggle = () => {
+    if (open()) return close(false);
+    setOpen(true);
+    queueMicrotask(() => panel?.querySelector<HTMLElement>("button, [tabindex]")?.focus());
+  };
+  // Label, icon, placeholder, the picker, and whether its values are
+  // machine values (set in Mono).
+  const picks: [string, string, string, () => PanelPick, boolean][] = [
+    ["Pipeline", "workflow", "any pipeline", () => props.pipeline, true],
+    ["Environment", "shield-check", "any environment", () => props.environment, false],
+    ["Author", "user", "any author", () => props.author, true],
+    ["Branch", "git-branch", "any branch", () => props.branch, true],
+    ["Pull request", "git-pull-request", "any PR", () => props.pr, false],
+  ];
+  return (
+    <span class="rl-pop">
+      <button
+        type="button"
+        class="rl-fbtn"
+        classList={{ on: open() }}
+        ref={button}
+        aria-expanded={open()}
+        aria-controls={id}
+        onClick={toggle}
+      >
+        <Icon icon="filter" size={13} /> Filter
+        <Show when={props.count > 0}>
+          <span class="rl-badge" aria-label={`${props.count} on`}>
+            {props.count}
+          </span>
+        </Show>
+      </button>
+      <Show when={open()}>
+        <div class="rl-sheet-backdrop" aria-hidden="true" />
+        <div class="rl-panel" id={id} role="dialog" aria-label="Filter the Runs" ref={panel}>
+          <For each={picks}>
+            {([label, icon, placeholder, pick, mono]) => (
+              <Show when={pick().options.length > 0 || pick().value}>
+                <div class="rl-prow">
+                  <span class="rl-pk">
+                    <Icon icon={icon} size={13} /> {label}
+                  </span>
+                  <SearchSelect
+                    class="ss-block"
+                    mono={mono}
+                    clearable
+                    placeholder={placeholder}
+                    searchPlaceholder={`Search ${label.toLowerCase()}s…`}
+                    aria-label={label}
+                    value={pick().value}
+                    onChange={pick().set}
+                    options={pick().options}
+                  />
+                </div>
+              </Show>
+            )}
+          </For>
+          <div class="rl-switches">
+            <button
+              type="button"
+              role="switch"
+              class="rl-switch"
+              aria-checked={props.deploys}
+              title="only deploy runs: a pipeline or step marked `deploy: true`"
+              onClick={() => props.onDeploys(!props.deploys)}
+            >
+              <span class="rl-track" aria-hidden="true" />
+              Deploys only
+            </button>
+            <button
+              type="button"
+              role="switch"
+              class="rl-switch"
+              aria-checked={props.scheduled}
+              title="only runs a schedule started: a pipeline's `on: cron:`"
+              onClick={() => props.onScheduled(!props.scheduled)}
+            >
+              <span class="rl-track" aria-hidden="true" />
+              Scheduled only
+            </button>
+          </div>
+        </div>
+      </Show>
+    </span>
+  );
+}
+
+/** A trigger that did not become a Run: where a Run would be, with the
+ *  reason and its fix on one line under it. */
+function RefusedRow(props: { r: RefusedRun; repoUrl?: string | null }) {
   const r = () => props.r;
   const sum = () => refusalSummary(r().errors, r().message);
   const [all, setAll] = createSignal(false);
-  const branch = () => r().git_ref?.replace(/^refs\/(heads|tags)\//, "");
+  const pr = () => pullNumber(r().git_ref);
+  const fixes = () =>
+    [sum().fix, r().reason_kind === "yanked" ? "an org admin upgrades the installation, then push again" : null].filter(
+      (f): f is string => !!f,
+    );
   return (
     <div class="runrow refused">
-      <div class="rr-gutter">
-        <span class="runnum none">
-          <span class="n">no run</span>
+      <StatusMark status="refused" />
+      <div class="rr-num">
+        <span class="rr-nonum" title="no Run: the trigger was refused">
+          –
         </span>
       </div>
-      <div class="rr-body">
-        <div class="rr-head">
-          <TriggerCell kind={r().trigger_kind} title={r().title} />
-        </div>
-        <div class="rr-facts">
-          <span class="pfact strong" title="pipeline">
-            <Icon icon="workflow" size={12} />
-            <span class="mono">{pipelineShortName(r().pipeline)}</span>
-          </span>
-          <Show when={r().sha}>
-            {(sha) => (
-              <span class="pfact" title="commit">
-                <Icon icon="git-commit-horizontal" size={12} />
-                <span class="mono sha">{sha().slice(0, 7)}</span>
-              </span>
-            )}
-          </Show>
-          <Show when={branch()}>
-            {(b) => (
-              <span class="pfact" title="branch / ref">
-                <Icon icon="git-branch" size={12} />
-                <span class="mono">{b()}</span>
-              </span>
-            )}
-          </Show>
-          <Show when={r().actor}>
-            {(a) => (
-              <span class="pfact" title="triggered by">
-                <Icon icon="user" size={12} />
-                <span>{a()}</span>
-              </span>
-            )}
-          </Show>
-          <span class="pfact subtle" title={absTime(r().created_at)}>
-            {relTime(r().created_at)}
-          </span>
-        </div>
-        <div class="rf">
-          <div class="rf-what">
-            <Icon icon={r().reason_kind === "compile" ? "circle-x" : "ban"} size={13} />
-            {/* A message may hold a YAML snippet to paste: keep its lines. */}
-            <span style={{ "white-space": "pre-wrap" }}>{sum().what}</span>
-            <Show when={sum().more > 0 && !all()}>
-              <span class="why">
-                · {sum().more} more {sum().more === 1 ? "error" : "errors"}
-              </span>
-            </Show>
-          </div>
-          <Show when={sum().fix}>
-            {(fix) => (
-              <div class="rf-fix">
-                <span class="lbl">Fix</span>
-                <span>{fix()}</span>
-              </div>
-            )}
-          </Show>
-          <Show when={r().reason_kind === "yanked"}>
-            <div class="rf-fix">
-              <span class="lbl">Fix</span>
-              <span>an org admin upgrades the installation, then push again</span>
-            </div>
-          </Show>
+      <div class="rr-main">
+        <RowTitle pipeline={pipelineShortName(r().pipeline)} kind={r().trigger_kind} title={r().title} />
+        <OriginLine
+          kind={r().trigger_kind}
+          line={kindFirst({ kind: r().trigger_kind, ref: r().git_ref, title: r().title })}
+          sha={r().sha}
+          author={authorSlot(r().trigger_kind, r().actor)}
+          commitUrl={forgeCommitUrl(props.repoUrl, r().sha)}
+          prUrl={forgePrUrl(props.repoUrl, pr())}
+        />
+      </div>
+      <RowStatus
+        word={statusWord("refused")}
+        tone="refused"
+        clock={clockTime(r().created_at)}
+        when={`${relTime(r().created_at)} · ${absTime(r().created_at)}`}
+      />
+      <div class="rr-reason">
+        <Icon icon={r().reason_kind === "compile" ? "circle-x" : "ban"} size={13} />
+        <span>
+          {/* A message may hold a YAML snippet to paste: keep its lines. */}
+          <span class="what">{sum().what}</span>
+          <For each={fixes()}>{(fix) => <span class="fix"> · {fix}</span>}</For>
           <Show when={sum().more > 0}>
-            <div class="rf-fix">
-              <button class="xs-link" onClick={() => setAll((v) => !v)}>
-                {all() ? "Hide the other errors" : `Show all ${r().errors.length} errors`}
-              </button>
-            </div>
-            <Show when={all()}>
-              <For each={r().errors.slice(1)}>
-                {(e) => (
-                  <div class="rf-what">
-                    <Icon icon="circle-x" size={13} />
-                    <span style={{ "white-space": "pre-wrap" }}>{refusalSummary([e], e.message).what}</span>
-                  </div>
-                )}
-              </For>
-            </Show>
+            <span class="fix"> · </span>
+            <button class="xs-link" onClick={() => setAll((v) => !v)}>
+              {all() ? "hide the other errors" : `${sum().more} more ${sum().more === 1 ? "error" : "errors"}`}
+            </button>
           </Show>
-        </div>
+        </span>
       </div>
-      <div class="rr-right">
-        <span class="rr-status refused">refused</span>
-      </div>
+      <Show when={all()}>
+        <For each={r().errors.slice(1)}>
+          {(e) => (
+            <div class="rr-reason">
+              <Icon icon="circle-x" size={13} />
+              <span class="what">{refusalSummary([e], e.message).what}</span>
+            </div>
+          )}
+        </For>
+      </Show>
     </div>
   );
 }

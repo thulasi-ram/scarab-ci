@@ -1349,6 +1349,7 @@ fn test_event(
                 head: sha,
                 title: String::new(),
                 base: String::new(),
+                head_branch: String::new(),
                 fork: t.fork,
             }
         }

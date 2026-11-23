@@ -1249,6 +1249,13 @@ pub struct RunStatusResponse {
     /// fact; absent for non-PR runs and runs created before base-stamping.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin_pr_base: Option<String>,
+    /// The PR **head** branch — the branch a `pull_request` run comes from
+    /// (`pull_request.head.ref`, without `refs/heads/`), as the forge sent
+    /// it: a fork PR's is the fork's branch name. The run's `git_ref` is
+    /// `refs/pull/<N>/head`, which does not name it. Absent for non-PR runs
+    /// and runs created before head-stamping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_pr_head: Option<String>,
     /// This run's **Workspace Snapshot** retention promise — the
     /// cold tier's time bound, made explicit rather than left implicit in a
     /// sweeper's config, plus any manual pin over it.
@@ -1385,6 +1392,13 @@ pub struct RunSummaryDto {
     /// fact; absent for non-PR runs and runs created before base-stamping.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin_pr_base: Option<String>,
+    /// The PR **head** branch — the branch a `pull_request` run comes from
+    /// (`pull_request.head.ref`, without `refs/heads/`), as the forge sent
+    /// it: a fork PR's is the fork's branch name. The run's `git_ref` is
+    /// `refs/pull/<N>/head`, which does not name it. Absent for non-PR runs
+    /// and runs created before head-stamping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_pr_head: Option<String>,
     /// The pipeline this run executed (the bare `.scarab/<name>` selection).
     /// Absent for inline runs and runs created before pipeline-stamping.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1411,6 +1425,38 @@ pub struct RunSummaryDto {
     /// terminal or queued Run).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waiting_gates: Vec<WaitingGateDto>,
+    /// For a `cancelled` Run, the newer Run whose start cancelled it: a newer
+    /// Run of the same pipeline on the same ref or pull request, or a newer
+    /// Run in a `cancel-in-progress` concurrency group. Absent for any other
+    /// status, for a Run a person cancelled, and for Runs cancelled before
+    /// this was recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced_by: Option<String>,
+    /// For a `failed` or `dead_lettered` Run, the id of the step that failed
+    /// first. Absent for any other status, and for a dead-lettered Run that
+    /// failed no step (the engine gave up on the Run, not on a step).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_step: Option<String>,
+    /// For a `failed` or `dead_lettered` Run, how many of its steps failed,
+    /// `failed_step` included. Absent when `failed_step` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_steps_count: Option<u32>,
+    /// For a `suspended` Run, the gate it is held at: of its waiting gates,
+    /// the one whose wait opened first. A Run is suspended only on gates, so
+    /// this is absent only for a Run that is not suspended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<WaitingForDto>,
+}
+
+/// The gate a suspended Run is held at ([`RunSummaryDto::waiting_for`]).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WaitingForDto {
+    /// The gate step's id.
+    pub step: String,
+    /// `manual` (an approval anyone with write access gives),
+    /// `environment_approval` (a `manual` gate the Environment's approvers
+    /// release), `timer`, `external` or `plugin`.
+    pub kind: String,
 }
 
 /// One waiting gate of a run in the list view ([`RunSummaryDto::waiting_gates`]).
@@ -1448,7 +1494,9 @@ async fn run_summaries(
     let mut out = Vec::with_capacity(runs.len());
     for r in runs {
         let active = matches!(r.status, RunStatus::Running | RunStatus::Suspended);
+        let suspended = r.status == RunStatus::Suspended;
         let run = r.run.clone();
+        let approval_gates = r.environment_approval_gates.clone();
         let mut dto = RunSummaryDto::from(r);
         if active {
             let steps = steps_by_run.remove(&run).unwrap_or_default();
@@ -1463,6 +1511,20 @@ async fn run_summaries(
                     })
                 })
                 .collect();
+        }
+        if suspended {
+            dto.waiting_for = dto
+                .waiting_gates
+                .iter()
+                .min_by(|a, b| a.since.cmp(&b.since).then_with(|| a.step.cmp(&b.step)))
+                .map(|g| WaitingForDto {
+                    step: g.step.clone(),
+                    kind: if g.kind == "manual" && approval_gates.iter().any(|s| s.0 == g.step) {
+                        "environment_approval".to_string()
+                    } else {
+                        g.kind.clone()
+                    },
+                });
         }
         out.push(dto);
     }
@@ -1488,11 +1550,16 @@ impl From<scarab_engine::RunSummary> for RunSummaryDto {
             sha: s.sha,
             pr_number: s.pr_number,
             origin_pr_base: s.pr_base,
+            origin_pr_head: s.pr_head,
             pipeline: s.pipeline,
             trigger_title: s.trigger_title,
             deploy: s.deploy,
             environment: s.environment,
             waiting_gates: Vec::new(),
+            replaced_by: s.replaced_by.map(|r| r.0),
+            failed_steps_count: s.failed_step.as_ref().map(|_| s.failed_steps),
+            failed_step: s.failed_step.map(|f| f.0),
+            waiting_for: None,
         }
     }
 }
@@ -2324,9 +2391,26 @@ async fn dispatch(
 }
 
 /// The name a Run of the pipeline at `path` is stamped with: its `name:`,
-/// else the bare file name. Commit statuses and `on: upstream:` use it.
+/// else the bare file name, cut to [`RUN_PIPELINE_NAME_MAX`] characters.
+/// Commit statuses and `on: upstream:` use it.
 fn run_pipeline_name(ir: &scarab_pipeline::PipelineIr, path: &str) -> String {
-    ir.name.clone().unwrap_or_else(|| bare_pipeline_name(path))
+    cap_pipeline_name(ir.name.as_deref().unwrap_or(&bare_pipeline_name(path)))
+}
+
+/// The most characters of a pipeline name a Run is stamped with. The
+/// `name:` is the Pipeline file's text, a fork pull request's included, and
+/// every runs-list row carries the stamped name, so a longer one is cut
+/// rather than sent whole on each poll. The compiler accepts any length.
+const RUN_PIPELINE_NAME_MAX: usize = 200;
+
+/// `name` cut to [`RUN_PIPELINE_NAME_MAX`] characters on a char boundary:
+/// the pipeline name a Run is stamped with, and the form an `on: upstream:`
+/// pipeline name is compared to a stamped name in.
+pub(crate) fn cap_pipeline_name(name: &str) -> String {
+    match name.char_indices().nth(RUN_PIPELINE_NAME_MAX) {
+        Some((end, _)) => name[..end].to_string(),
+        None => name.to_string(),
+    }
 }
 
 /// The paths a push from `before` to `after` changed, from the forge's
@@ -2459,7 +2543,10 @@ async fn record_followups(
 ) {
     let paths: Vec<&str> = files
         .iter()
-        .filter(|(_, yaml)| scarab_pipeline::upstream_pipeline_of(yaml).as_deref() == Some(name))
+        .filter(|(_, yaml)| {
+            scarab_pipeline::upstream_pipeline_of(yaml).map(|p| cap_pipeline_name(&p))
+                == Some(name.to_string())
+        })
         .map(|(path, _)| path.as_str())
         .collect();
     let recorded = db
@@ -2956,6 +3043,7 @@ async fn get_run(
     let pipeline = st.db.run_pipeline(&run).await?;
     let trigger_title = st.db.run_trigger_title(&run).await?;
     let origin_pr_base = st.db.run_pr_base(&run).await?;
+    let origin_pr_head = st.db.run_pr_head(&run).await?;
     let run_number = st.db.run_number(&run).await?;
     // The cold tier's TIME bound, stated rather than implied (ADR-0061 s5). Cheap
     // by construction: one row read plus arithmetic, no object-store round-trip —
@@ -3040,6 +3128,7 @@ async fn get_run(
         pipeline,
         trigger_title,
         origin_pr_base,
+        origin_pr_head,
         snapshot_retention,
         yanked_libraries,
         environment,
@@ -5113,6 +5202,18 @@ fn origin_pr_base(event: &scarab_forge::Event) -> Option<String> {
     }
 }
 
+/// The PR **head** branch for a `pull_request` event, for `origin_pr_head`
+/// (the runs list's `head → base`). `None` for every other kind, and when the
+/// payload carried no head ref.
+fn origin_pr_head(event: &scarab_forge::Event) -> Option<String> {
+    match event {
+        scarab_forge::Event::PullRequest { head_branch, .. } if !head_branch.is_empty() => {
+            Some(head_branch.clone())
+        }
+        _ => None,
+    }
+}
+
 /// "Commit a file, done" (ADR-0010): on a normalized `event`, discover every
 /// pipeline under `.scarab/` at the triggering ref, compile each, and durably
 /// create a Run for each whose `on:` matches this event. Returns the new run ids
@@ -5507,6 +5608,9 @@ pub(crate) struct DeliveryRun {
     head: Option<DeliveryHead>,
     /// The commit `.scarab/` and its libraries are read at.
     read_ref: String,
+    /// `read_ref` when it is a commit the first try pinned; `None` when this
+    /// try reads at a symbolic ref.
+    read_sha: Option<String>,
     /// The Pipeline files this try could not read.
     unread: Vec<String>,
 }
@@ -5788,6 +5892,14 @@ pub(crate) async fn trigger_runs_from_files(
         return Ok(TriggerOutcome::default());
     };
     let git_ref = delivery.map_or_else(|| config_ref(event), |d| d.read_ref.clone());
+    // The commit the files were read at, recorded with each Run's Pipeline
+    // file: without a delivery, `git_ref` is the event's commit where it has
+    // one ([`config_ref`]).
+    let read_sha = match delivery {
+        Some(d) => d.read_sha.clone(),
+        None => origin_sha(event),
+    }
+    .filter(|sha| !sha.is_empty());
     // `event.changed_paths` (git-bug 418f55e): a push's (ADR-0081) and a
     // pull request's are asked of the forge once, and only when a Pipeline
     // reads them; a push payload may already have decided them (a new
@@ -5822,7 +5934,7 @@ pub(crate) async fn trigger_runs_from_files(
     // Every Pipeline file is compiled before any Run is created. A file that
     // does not compile fails the whole delivery and nothing runs (ADR-0009).
     // Each carries the unfinished Run it replaces, if any (ADR-0083 §4).
-    let mut compiled: Vec<(&String, scarab_pipeline::PipelineIr, Option<RunId>)> = Vec::new();
+    let mut compiled: Vec<(&String, &str, scarab_pipeline::PipelineIr, Option<RunId>)> = Vec::new();
     let mut broken: Vec<(&String, &str, String, Option<RunId>)> = Vec::new();
     for (path, yaml) in files {
         let yaml = yaml.as_str();
@@ -5861,7 +5973,7 @@ pub(crate) async fn trigger_runs_from_files(
         // (ADR-0038) — the shared read-at-ref → compile primitive also used by
         // the manual/api dispatch path.
         match prefetch_libs_and_compile(forge, repo, &git_ref, yaml, &installed).await {
-            Ok(ir) => compiled.push((path, ir, replaces)),
+            Ok(ir) => compiled.push((path, yaml, ir, replaces)),
             Err(TriggerError::Pipeline(text)) => broken.push((path, yaml, text, replaces)),
             // A library the forge could not read: undecided, read again by
             // the next try (ADR-0083 §1).
@@ -5928,7 +6040,7 @@ pub(crate) async fn trigger_runs_from_files(
 
     // The head rule's answer, once asked (ADR-0083 §5).
     let mut head_moved: Option<Result<bool, String>> = None;
-    for (path, ir, replaces) in compiled {
+    for (path, yaml, ir, replaces) in compiled {
         let name = run_pipeline_name(&ir, path);
         // A Pipeline whose Run a first try began matched then; its trigger
         // is not decided again (ADR-0083 §1).
@@ -6128,6 +6240,10 @@ pub(crate) async fn trigger_runs_from_files(
             event,
             &ir,
             path,
+            PipelineRead {
+                yaml,
+                sha: read_sha.as_deref(),
+            },
             &excluded,
             None,
             claim.as_ref(),
@@ -6743,12 +6859,13 @@ async fn admit_and_create_run(
     event: &scarab_forge::Event,
     ir: &scarab_pipeline::PipelineIr,
     path: &str,
+    read: PipelineRead<'_>,
     excluded: &[String],
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
     claim: Option<&scarab_engine::DeliveryRunClaim>,
 ) -> Result<Admission, TriggerError> {
     let admission = admit_unrecorded(
-        forge, db, clock, ports, event, ir, path, excluded, params, claim,
+        forge, db, clock, ports, event, ir, path, read, excluded, params, claim,
     )
     .await?;
     // On the webhook path the caller records the refusal with its delivery
@@ -7073,7 +7190,7 @@ async fn refuse_uncompiled_delivery(
     db: &dyn Db,
     clock: &dyn Clock,
     trigger: &DeliveryTrigger<'_>,
-    compiled: &[(&String, scarab_pipeline::PipelineIr, Option<RunId>)],
+    compiled: &[(&String, &str, scarab_pipeline::PipelineIr, Option<RunId>)],
     broken: &[(&String, &str, String, Option<RunId>)],
     first_broken: &str,
     (ctx, paths): (&mut serde_json::Value, &mut scarab_forge::ChangedPaths),
@@ -7114,7 +7231,7 @@ async fn refuse_uncompiled_delivery(
     }
     let not_run = format!("not run: {first_broken} failed to compile");
     let now = clock.now().await;
-    for (path, ir, replaces) in compiled {
+    for (path, _, ir, replaces) in compiled {
         // A `when:` that cannot be decided fails closed: the Pipeline may
         // have run. A Run a first try began matched then.
         let matched =
@@ -7305,6 +7422,7 @@ async fn admit_unrecorded(
     event: &scarab_forge::Event,
     ir: &scarab_pipeline::PipelineIr,
     path: &str,
+    read: PipelineRead<'_>,
     excluded: &[String],
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
     claim: Option<&scarab_engine::DeliveryRunClaim>,
@@ -7435,6 +7553,7 @@ async fn admit_unrecorded(
         ir,
         event,
         path,
+        read,
         &gov,
         excluded,
         params,
@@ -8228,6 +8347,7 @@ pub async fn dispatch_run(
         )));
     }
     let sha = commit.sha;
+    let dispatched_sha = sha.clone();
 
     // Read the named pipeline at the resolved commit.
     let (path, yaml) = read_named_pipeline(forge, &repo, &sha, &pipeline).await?;
@@ -8292,6 +8412,10 @@ pub async fn dispatch_run(
         &event,
         &ir,
         &path,
+        PipelineRead {
+            yaml: &yaml,
+            sha: Some(&dispatched_sha),
+        },
         &excluded,
         Some(&resolved),
         None,
@@ -8571,6 +8695,7 @@ async fn persist_run_from_ir(
     ir: &scarab_pipeline::PipelineIr,
     event: &scarab_forge::Event,
     pipeline: &str,
+    read: PipelineRead<'_>,
     gov: &RunGovernance,
     excluded: &[String],
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
@@ -8605,6 +8730,7 @@ async fn persist_run_from_ir(
         ir,
         event,
         pipeline,
+        read,
         gov,
         excluded,
         params,
@@ -8618,6 +8744,15 @@ async fn persist_run_from_ir(
     } else {
         Persisted::Ended
     })
+}
+
+/// The Pipeline file a Run is created from, as read from the forge: its
+/// text and the commit it was read at (`None` when read at a symbolic ref no
+/// commit was resolved for). Its path travels beside it.
+#[derive(Clone, Copy)]
+pub(crate) struct PipelineRead<'a> {
+    pub(crate) yaml: &'a str,
+    pub(crate) sha: Option<&'a str>,
 }
 
 /// What [`persist_run_from_ir`] made of the Run.
@@ -8725,6 +8860,7 @@ async fn write_run_from_ir(
     ir: &scarab_pipeline::PipelineIr,
     event: &scarab_forge::Event,
     pipeline: &str,
+    read: PipelineRead<'_>,
     gov: &RunGovernance,
     excluded: &[String],
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
@@ -8757,8 +8893,9 @@ async fn write_run_from_ir(
     }
     // Origin (the runs-list surface): stamp the trigger facts this run was born
     // from — trigger kind (always), Actor, symbolic ref, resolved commit, PR
-    // number, and PR base branch — as discrete columns beside tenancy. Sparse by
-    // nature (a cron run has no actor/ref/sha; only a PR has a number + base);
+    // number, and PR base and head branches — as discrete columns beside
+    // tenancy. Sparse by nature (a cron run has no actor/ref/sha; only a PR has
+    // a number, a base and a head);
     // carries no scheduling authority, purely for display/audit.
     db.set_run_origin(
         run,
@@ -8768,6 +8905,7 @@ async fn write_run_from_ir(
         origin_sha(event).as_deref(),
         origin_pr_number(event),
         origin_pr_base(event).as_deref(),
+        origin_pr_head(event).as_deref(),
     )
     .await?;
     // The pipeline name (the runs-list/detail "which pipeline is this") — the
@@ -8775,6 +8913,17 @@ async fn write_run_from_ir(
     // selection. Stamped beside origin.
     let pipeline_name = run_pipeline_name(ir, pipeline);
     db.set_run_pipeline(run, &pipeline_name).await?;
+    // The Pipeline file as read, for the Run page's Manifest tab: the Run
+    // shows the YAML it compiled even after the file changes or goes.
+    db.set_run_pipeline_source(
+        run,
+        &scarab_engine::RunPipelineSource {
+            path: pipeline.to_string(),
+            source: read.yaml.to_string(),
+            sha: read.sha.map(str::to_string),
+        },
+    )
+    .await?;
     // The Headline (ADR-0057): the one human line saying what this run is about,
     // extracted from the trigger event (a push's commit subject; thread B/C fill
     // PR title / dispatch reason) — already subject-only + capped char-safe by
@@ -9738,6 +9887,7 @@ async fn ingest_event(
             first: t.first,
             at: Timestamp(t.at),
             head: pins.as_ref().and_then(|p| delivery_head(&event, p)),
+            read_sha: pins.as_ref().map(|p| p.config_sha.clone()),
             read_ref: pins.map_or_else(|| config_ref(&event), |p| p.config_sha),
             unread: Vec::new(),
         });
@@ -16754,6 +16904,7 @@ impl utoipa::Modify for StepUpResponses {
         libraries::untrust_library_source,
         libraries::get_yank_impact,
         run_origin::get_step_origin,
+        run_origin::get_run_manifest,
         refused_runs::list_refused_runs,
         schedules::list_schedules,
         policies::list_org_policies,
@@ -16984,6 +17135,9 @@ impl utoipa::Modify for StepUpResponses {
         run_origin::BoundInputDto,
         run_origin::RenderedSpecDto,
         run_origin::StepOriginDto,
+        run_origin::InvokedDto,
+        WaitingForDto,
+        run_origin::RunManifestDto,
         libraries::TrustedSourceDto,
         libraries::TrustGrantDto,
         libraries::TrustSourceRequest,

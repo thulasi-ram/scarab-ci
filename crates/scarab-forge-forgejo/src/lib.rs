@@ -154,6 +154,7 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                 head,
                 title,
                 base,
+                head_branch: scarab_forge::pull_request_head_branch(p),
                 fork,
             })
         }
@@ -1334,18 +1335,25 @@ mod tests {
             "pull_request": {
                 "title": "fix: the login redirect",
                 "base": { "ref": "develop" },
-                "head": { "sha": "abc1234", "repo": { "full_name": "contributor/app" } }
+                "head": {
+                    "sha": "abc1234",
+                    "ref": "fix/login-redirect",
+                    "repo": { "full_name": "contributor/app" }
+                }
             },
             "repository": { "name": "app", "owner": { "login": "acme" }, "full_name": "acme/app" }
         });
         let event = normalize(&delivery("pull_request", fork)).unwrap();
         assert!(event.is_fork_pr());
-        // Title + base are parsed onto the event (ADR-0057): the title feeds the
-        // Headline, the base the `base ← head` display.
+        // Title, base and head branch are parsed onto the event (ADR-0057):
+        // the title feeds the Headline, the branches the `head → base`
+        // display. A fork PR's head branch is the fork's branch name.
         assert!(matches!(
             &event,
-            Event::PullRequest { number: 9, title, base, .. }
-                if title == "fix: the login redirect" && base == "develop"
+            Event::PullRequest { number: 9, title, base, head_branch, .. }
+                if title == "fix: the login redirect"
+                    && base == "develop"
+                    && head_branch == "fix/login-redirect"
         ));
     }
 

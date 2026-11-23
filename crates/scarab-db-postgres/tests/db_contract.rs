@@ -2431,7 +2431,13 @@ async fn the_0099_revert_leaves_a_schema_the_migrator_can_upgrade_again() {
     .await
     .unwrap();
 
-    // Back to 0.7.1 first (ADR-0083's migrations), then to 0.6.
+    // Back to 0.7.2 first (the saved Pipeline file, the supersede mark and
+    // the pull request head), then to 0.7.1 (ADR-0083's migrations), then
+    // to 0.6.
+    sqlx::raw_sql(include_str!("../rollback/0106_revert.sql"))
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
     sqlx::raw_sql(include_str!("../rollback/0104_revert.sql"))
         .execute(&tdb.pool)
         .await
@@ -2730,3 +2736,179 @@ async fn step_keys_are_minted_unique_and_stable(db: &dyn Db) {
 }
 
 contract_test!(step_keys, step_keys_are_minted_unique_and_stable);
+
+/// A Run's Pipeline file reads back as written, a commit-less read keeps no
+/// sha, and a Run with none recorded (an inline Run) reads `None`.
+async fn run_pipeline_source_round_trips(db: &dyn Db) {
+    let run = RunId("r-manifest".into());
+    let inline = RunId("r-inline".into());
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.create_run(&inline, 1, 1, Timestamp(0)).await.unwrap();
+    assert_eq!(db.run_pipeline_source(&run).await.unwrap(), None);
+    let file = scarab_engine::RunPipelineSource {
+        path: ".scarab/ci.yaml".into(),
+        source: "on:\n  push: {}\nsteps:\n  - { id: test, image: busybox }\n".into(),
+        sha: Some("1234567890abcdef1234567890abcdef12345678".into()),
+    };
+    db.set_run_pipeline_source(&run, &file).await.unwrap();
+    assert_eq!(
+        db.run_pipeline_source(&run).await.unwrap(),
+        Some(file.clone())
+    );
+    let at_tag = scarab_engine::RunPipelineSource { sha: None, ..file };
+    db.set_run_pipeline_source(&run, &at_tag).await.unwrap();
+    assert_eq!(db.run_pipeline_source(&run).await.unwrap(), Some(at_tag));
+    assert_eq!(db.run_pipeline_source(&inline).await.unwrap(), None);
+    assert_eq!(
+        db.run_pipeline_source(&RunId("r-unknown".into()))
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+contract_test!(run_manifest_source, run_pipeline_source_round_trips);
+
+/// What a runs-list row says beside the run's own columns: the first of a
+/// failed run's failed steps and how many failed, a suspended governed
+/// run's Environment approval gates from its IR, and the newer Run that
+/// cancelled a run (shown only once it is cancelled; the first mark kept).
+async fn run_summaries_carry_the_list_facts(db: &dyn Db) {
+    let tenant = |run: &RunId| {
+        let run = run.clone();
+        async move {
+            db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+            db.set_run_tenant(&run, "acme", "web").await.unwrap();
+        }
+    };
+    let start = |run: &RunId, step: &str, started: i64| {
+        let (run, step) = (run.clone(), StepId(step.into()));
+        async move {
+            db.create_step_run(&run, &step, None, &[], Timestamp(0))
+                .await
+                .unwrap();
+            db.record_attempt(&run, &step, &attempt(&format!("{}-a1", step.0), started))
+                .await
+                .unwrap();
+            for (from, next) in [
+                (StepStatus::Pending, StepStatus::Ready),
+                (StepStatus::Ready, StepStatus::Running),
+            ] {
+                db.record_step_transition(&run, &step, from, next)
+                    .await
+                    .unwrap();
+            }
+        }
+    };
+    let end = |run: &RunId, step: &str, to: StepStatus| {
+        let (run, step) = (run.clone(), StepId(step.into()));
+        async move {
+            db.record_step_transition(&run, &step, StepStatus::Running, to)
+                .await
+                .unwrap();
+            // Postgres stamps a step's change to the millisecond.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
+
+    // `build` starts first and sorts first, but `test` fails first; `lint`
+    // passes.
+    let failed = RunId("r-failed".into());
+    tenant(&failed).await;
+    start(&failed, "build", 10).await;
+    start(&failed, "test", 20).await;
+    start(&failed, "lint", 30).await;
+    end(&failed, "test", StepStatus::Failed).await;
+    end(&failed, "build", StepStatus::Failed).await;
+    end(&failed, "lint", StepStatus::Succeeded).await;
+    db.record_transition(&failed, RunStatus::Pending, RunStatus::Running)
+        .await
+        .unwrap();
+    db.record_transition(&failed, RunStatus::Running, RunStatus::Failed)
+        .await
+        .unwrap();
+
+    // Held at its gates, in a Run the `production` Environment governs.
+    let held = RunId("r-held".into());
+    tenant(&held).await;
+    db.store_run_ir(
+        &held,
+        &serde_json::json!({ "ir_version": 1, "steps": [
+            { "id": "build", "image": "busybox" },
+            { "id": "qa", "gate": "manual", "environment_approval_gate": false },
+            { "id": "environment-approval", "gate": "manual", "environment_approval_gate": true },
+            { "id": "legacy", "gate": "manual" },
+            { "id": "soak", "gate": "timer" },
+        ]}),
+    )
+    .await
+    .unwrap();
+    db.set_run_deploy_context(
+        &held,
+        &scarab_engine::DeployContext {
+            org: "acme".into(),
+            project: "web".into(),
+            environment: "production".into(),
+            git_ref: "refs/heads/main".into(),
+            locked_out: false,
+        },
+    )
+    .await
+    .unwrap();
+    db.record_transition(&held, RunStatus::Pending, RunStatus::Running)
+        .await
+        .unwrap();
+    db.record_transition(&held, RunStatus::Running, RunStatus::Suspended)
+        .await
+        .unwrap();
+
+    // `older` was cancelled for `newer`; `finished` was marked and then
+    // finished before the cancel reached it.
+    let (older, newer, other, finished) = (
+        RunId("r-older".into()),
+        RunId("r-newer".into()),
+        RunId("r-other".into()),
+        RunId("r-finished".into()),
+    );
+    for run in [&older, &newer, &finished] {
+        tenant(run).await;
+        db.record_transition(run, RunStatus::Pending, RunStatus::Running)
+            .await
+            .unwrap();
+    }
+    db.set_run_superseded_by(&older, &newer).await.unwrap();
+    db.set_run_superseded_by(&older, &other).await.unwrap();
+    db.record_transition(&older, RunStatus::Running, RunStatus::Cancelled)
+        .await
+        .unwrap();
+    db.set_run_superseded_by(&finished, &newer).await.unwrap();
+    db.record_transition(&finished, RunStatus::Running, RunStatus::Succeeded)
+        .await
+        .unwrap();
+
+    let rows = db
+        .list_runs_for_tenant("acme", "web", &Default::default(), 10)
+        .await
+        .unwrap();
+    let row = |run: &RunId| rows.iter().find(|r| &r.run == run).unwrap().clone();
+    let ids = |steps: &[StepId]| steps.iter().map(|s| s.0.clone()).collect::<Vec<_>>();
+
+    let f = row(&failed);
+    assert_eq!(f.failed_step, Some(StepId("test".into())));
+    assert_eq!(f.failed_steps, 2);
+    assert!(f.environment_approval_gates.is_empty());
+
+    let h = row(&held);
+    assert_eq!(h.failed_step, None);
+    assert_eq!(h.failed_steps, 0);
+    assert_eq!(
+        ids(&h.environment_approval_gates),
+        vec!["environment-approval", "legacy"]
+    );
+
+    assert_eq!(row(&older).replaced_by, Some(newer.clone()));
+    assert_eq!(row(&finished).replaced_by, None);
+    assert_eq!(row(&newer).replaced_by, None);
+}
+
+contract_test!(run_list_facts, run_summaries_carry_the_list_facts);

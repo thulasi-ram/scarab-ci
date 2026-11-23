@@ -1,8 +1,9 @@
 //! Webhook redelivery (ADR-0083) on Postgres, where a `run.create` Policy's
 //! allow decision, the Run's first row and the delivery outcome are written
 //! in one transaction by the policy store: the path the in-memory cases in
-//! `webhook.rs` cannot reach. Skips cleanly when `SCARAB_TEST_DATABASE_URL`
-//! is unset.
+//! `webhook.rs` cannot reach; and a pull request Run's head branch read back
+//! through the runs list. Skips cleanly when `SCARAB_TEST_DATABASE_URL` is
+//! unset.
 
 mod common;
 
@@ -63,22 +64,10 @@ async fn send(app: &axum::Router, delivery: &str) -> (StatusCode, serde_json::Va
     )
 }
 
-/// SP1: S1's partial delivery with an enforced `run.create` Policy that
-/// allows every Run. Three Runs in all, one allow decision for each, three
-/// outcomes, and the delivery finished with no lease. Kills: the key not
-/// passed through `RunCreationRow` on the Policy path (every in-memory case
-/// passes while production creates `a` and `b` again on a redelivery); a
-/// `delivery_outcomes` query on the wrong column. Real time: the forge read
-/// of `c.yaml` is tried three times, 2.5 s in all, and paused time would
-/// also run the database pool's timers.
-#[tokio::test]
-async fn a_partial_delivery_under_a_run_create_policy_is_repaired_on_postgres() {
-    let Some(tdb) = fresh_db().await else {
-        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
-        return;
-    };
-    let pool = tdb.pool.clone();
-    let pg = Arc::new(PostgresDb::with_pool(pool.clone()));
+/// A migrated Postgres store with a GitHub connection that has `acme/app`
+/// enabled.
+async fn acme_app_on(tdb: &common::TestDb) -> Arc<PostgresDb> {
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
     pg.migrate().await.unwrap();
     pg.put_connection(&ForgeConnection {
         id: "acme-conn".into(),
@@ -103,6 +92,38 @@ async fn a_partial_delivery_under_a_run_create_policy_is_repaired_on_postgres() 
     )
     .await
     .unwrap();
+    pg
+}
+
+async fn get_json(app: &axum::Router, uri: &str) -> serde_json::Value {
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "GET {uri}");
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// SP1: S1's partial delivery with an enforced `run.create` Policy that
+/// allows every Run. Three Runs in all, one allow decision for each, three
+/// outcomes, and the delivery finished with no lease. Kills: the key not
+/// passed through `RunCreationRow` on the Policy path (every in-memory case
+/// passes while production creates `a` and `b` again on a redelivery); a
+/// `delivery_outcomes` query on the wrong column. Real time: the forge read
+/// of `c.yaml` is tried three times, 2.5 s in all, and paused time would
+/// also run the database pool's timers.
+#[tokio::test]
+async fn a_partial_delivery_under_a_run_create_policy_is_repaired_on_postgres() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pool = tdb.pool.clone();
+    let pg = acme_app_on(&tdb).await;
     pg.create(&NewPolicy {
         id: "allow-all".into(),
         scope: PolicyScope::Org { org: "acme".into() },
@@ -172,5 +193,77 @@ async fn a_partial_delivery_under_a_run_create_policy_is_repaired_on_postgres() 
     .unwrap();
     assert!(!unfinished);
     assert_eq!(lease, None);
+    tdb.cleanup().await;
+}
+
+/// A pull request Run keeps the branch the pull request comes from
+/// (`pull_request.head.ref`) beside its base: its ref is
+/// `refs/pull/<N>/head`, which does not name the branch. The runs list and
+/// the Run read it back from `runs.origin_pr_head`. Kills: the column not
+/// written at creation, not selected by the runs list query, or not mapped
+/// onto either DTO.
+#[tokio::test]
+async fn a_pull_request_run_lists_its_head_branch_on_postgres() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = acme_app_on(&tdb).await;
+    let forge = Arc::new(FakeForge::new().with_file(
+        ".scarab/ci.yaml",
+        "on:\n  pull_request: {}\nsteps:\n  - { id: build, image: busybox, command: [\"true\"] }\n",
+    ));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        pg.clone(),
+    ));
+    let forge_port: Arc<dyn ForgePort> = forge;
+    let app = router(
+        AppState::new(pg.clone(), Arc::new(FakeClock::new(1_000)), logs)
+            .with_github_webhook_secret(SECRET.to_vec())
+            .with_forge_connections(pg.clone())
+            .with_forge(forge_port),
+    );
+
+    let body = serde_json::to_vec(&json!({
+        "action": "opened",
+        "number": 213,
+        "pull_request": {
+            "number": 213,
+            "title": "feat: the org page",
+            "base": { "ref": "main" },
+            "head": { "sha": "feedface", "ref": "feat/org-page", "repo": { "full_name": "acme/app" } }
+        },
+        "repository": { "name": "app", "owner": { "login": "acme" }, "full_name": "acme/app" },
+        "sender": { "login": "octocat" }
+    }))
+    .unwrap();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/webhooks/github")
+        .header("content-type", "application/json")
+        .header("x-github-event", "pull_request")
+        .header("x-github-delivery", "pr-213")
+        .header(
+            "x-hub-signature-256",
+            scarab_forge_github::sign_hex(SECRET, &body),
+        )
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    let list = get_json(&app, "/v1/runs").await;
+    let runs = list["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1, "{list}");
+    let run = &runs[0];
+    assert_eq!(run["pr_number"], 213, "{run}");
+    assert_eq!(run["git_ref"], "refs/pull/213/head", "{run}");
+    assert_eq!(run["origin_pr_base"], "main", "{run}");
+    assert_eq!(run["origin_pr_head"], "feat/org-page", "{run}");
+
+    let id = run["id"].as_str().unwrap();
+    let detail = get_json(&app, &format!("/v1/runs/{id}")).await;
+    assert_eq!(detail["origin_pr_head"], "feat/org-page", "{detail}");
     tdb.cleanup().await;
 }

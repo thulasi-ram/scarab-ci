@@ -729,6 +729,20 @@ pub trait Db: Send + Sync {
     /// per run).
     async fn superseded_by(&self, run: &RunId) -> Result<Vec<RunId>, DbError>;
 
+    /// Record that `by` took `run`'s place: the scheduler cancels `run`
+    /// because `by` started (newest-wins, or a `cancel-in-progress` group).
+    /// Written before the cancel, so a crash between the two leaves the mark
+    /// for the next pass to cancel under; the runs list shows it only once
+    /// `run` is `Cancelled`. Keeps the first mark. A reopen (a move out of a
+    /// terminal status) clears it in the same write, so a later cancel or
+    /// supersede records afresh.
+    async fn set_run_superseded_by(&self, run: &RunId, by: &RunId) -> Result<(), DbError>;
+
+    /// Remove the mark [`set_run_superseded_by`](Self::set_run_superseded_by)
+    /// wrote, if it still names `by`: the cancel it was written for did not
+    /// cancel `run` (it had ended, or a person cancelled it first).
+    async fn clear_run_superseded_by(&self, run: &RunId, by: &RunId) -> Result<(), DbError>;
+
     /// Set a run's `project` (for per-project fairness) and admission `priority`
     /// (higher admits first) — ADR-0011, 0032.
     async fn set_run_scheduling(
@@ -778,10 +792,11 @@ pub trait Db: Send + Sync {
     /// Stamp the run's **origin** — the trigger facts it was born from, resolved
     /// from the normalized `Event` at creation (beside the tenant stamp). Passed
     /// as discrete, independently-nullable values (never a bundle): `trigger_kind`
-    /// is always known; `actor`/`git_ref`/`sha`/`pr_number`/`pr_base` are `None`
-    /// for the trigger kinds that lack them (a cron run has no actor/ref/sha; only
-    /// a PR has a number and a base branch). Surfaced by the runs list; carries no
-    /// scheduling authority.
+    /// is always known; `actor`/`git_ref`/`sha`/`pr_number`/`pr_base`/`pr_head`
+    /// are `None` for the trigger kinds that lack them (a cron run has no
+    /// actor/ref/sha; only a PR has a number, a base and a head branch). Surfaced
+    /// by the runs list; carries no scheduling authority.
+    #[allow(clippy::too_many_arguments)]
     async fn set_run_origin(
         &self,
         run: &RunId,
@@ -791,12 +806,18 @@ pub trait Db: Send + Sync {
         sha: Option<&str>,
         pr_number: Option<i64>,
         pr_base: Option<&str>,
+        pr_head: Option<&str>,
     ) -> Result<(), DbError>;
 
     /// The run's PR **base** branch (`origin_pr_base`, ADR-0057), if stamped. A
     /// discrete origin fact for the run-detail `base ← head` display; the runs
     /// list reads it off the summary row instead.
     async fn run_pr_base(&self, run: &RunId) -> Result<Option<String>, DbError>;
+
+    /// The run's PR **head** branch (`origin_pr_head`), if stamped: the
+    /// run-detail side of the `head → base` display; the runs list reads it
+    /// off the summary row instead.
+    async fn run_pr_head(&self, run: &RunId) -> Result<Option<String>, DbError>;
 
     /// Stamp the bare name of the pipeline this run executed (the `.scarab`
     /// selection), for display on the runs list + run detail. Set at creation
@@ -805,6 +826,22 @@ pub trait Db: Send + Sync {
 
     /// The run's pipeline name, if stamped.
     async fn run_pipeline(&self, run: &RunId) -> Result<Option<String>, DbError>;
+
+    /// Record the Pipeline file the run was created from: its path, the YAML
+    /// as read, and the commit it was read at. Set at creation for trigger,
+    /// dispatch, cron and follow-up runs; inline runs never call it.
+    async fn set_run_pipeline_source(
+        &self,
+        run: &RunId,
+        source: &crate::RunPipelineSource,
+    ) -> Result<(), DbError>;
+
+    /// The Pipeline file the run was created from, or `None` for an inline
+    /// run, a run created before it was recorded, or an unknown run.
+    async fn run_pipeline_source(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<crate::RunPipelineSource>, DbError>;
 
     /// Stamp the run **Headline** (ADR-0057) — the one human line that says what
     /// this run is about (a push's commit subject; later a PR title / dispatch

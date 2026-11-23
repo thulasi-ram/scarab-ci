@@ -100,6 +100,7 @@ fn pr(number: u64) -> Event {
         head: "def456".into(),
         title: "a change".into(),
         base: "main".into(),
+        head_branch: "feature".into(),
         fork: false,
     }
 }

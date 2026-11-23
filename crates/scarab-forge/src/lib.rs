@@ -240,6 +240,18 @@ pub fn pull_request_action_starts_runs(action: &str, base_changed: bool) -> Resu
     }
 }
 
+/// The head branch of a `pull_request` webhook payload
+/// (`pull_request.head.ref`), for [`Event::PullRequest`]'s `head_branch`.
+/// GitHub and Forgejo both send the bare branch name there; a leading
+/// `refs/heads/` is dropped should one come. Empty when the payload has none.
+pub fn pull_request_head_branch(payload: &serde_json::Value) -> String {
+    let r = payload
+        .pointer("/pull_request/head/ref")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    r.strip_prefix("refs/heads/").unwrap_or(r).to_string()
+}
+
 /// Percent-encode `s` as one URL path segment or one query value: every byte
 /// except the RFC 3986 unreserved characters (`A-Z a-z 0-9 - . _ ~`) is
 /// written as `%XX`, `/` included. For a value a caller typed, such as a
@@ -632,6 +644,15 @@ pub enum Event {
         /// `base ← head` display (ADR-0057 §4). Also excluded from
         /// [`Event::context()`]. Empty when the payload carried no base ref.
         base: String,
+        /// The PR **head** branch (`pull_request.head.ref`), the branch the PR
+        /// comes from, as the forge sends it (for a fork PR, the fork's branch
+        /// name). A discrete origin fact (`origin_pr_head`) for the runs list's
+        /// `head → base` display. Display only: excluded from
+        /// [`Event::context()`] and [`Event::template_fields`], since a fork's
+        /// branch name is chosen by whoever opened the PR. Empty when the
+        /// payload carried none.
+        #[serde(default)]
+        head_branch: String,
         /// True when the PR's head repo differs from its base repo — an
         /// untrusted fork PR (ADR-0015): such runs get no secrets and a
         /// downgraded OIDC subject.
@@ -2233,6 +2254,7 @@ mod tests {
                     head: "cafe".into(),
                     title: "add the widget".into(),
                     base: "main".into(),
+                    head_branch: "feature".into(),
                     fork: false,
                 },
                 TriggerKind::PullRequest,
@@ -2365,6 +2387,7 @@ mod tests {
             head: "x".into(),
             title: "fork PR".into(),
             base: "main".into(),
+            head_branch: "feature".into(),
             fork: true,
         };
         let internal = Event::PullRequest {
@@ -2375,6 +2398,7 @@ mod tests {
             head: "y".into(),
             title: "internal PR".into(),
             base: "main".into(),
+            head_branch: "feature".into(),
             fork: false,
         };
         assert!(fork.is_fork_pr());
@@ -2524,6 +2548,7 @@ mod tests {
                 head: "cafe".into(),
                 title: "add the widget".into(),
                 base: "main".into(),
+                head_branch: "feature".into(),
                 fork: false
             }
             .protection_ref()
@@ -2860,6 +2885,7 @@ mod tests {
             head: "2222222222222222222222222222222222222222".into(),
             title: "t".into(),
             base: "main".into(),
+            head_branch: "feature".into(),
             fork: false,
         };
         assert_eq!(
@@ -2892,6 +2918,7 @@ mod tests {
             head: "cafe".into(),
             title: "$(rm -rf /) evil title".into(),
             base: "release/injected".into(),
+            head_branch: "fork/injected".into(),
             fork: true,
         }
         .context();
@@ -2910,6 +2937,10 @@ mod tests {
             !flat.contains("release/injected"),
             "no part of the base may leak"
         );
+        assert!(
+            !flat.contains("fork/injected"),
+            "no part of the head branch may leak"
+        );
     }
 
     #[test]
@@ -2923,6 +2954,7 @@ mod tests {
             head: "cafe".into(),
             title: "feat:\u{0} add\u{0} the widget".into(),
             base: "main".into(),
+            head_branch: "feature".into(),
             fork: false,
         }
         .trigger_title();
@@ -2953,6 +2985,7 @@ mod tests {
             head: "cafe".into(),
             title: "feat: add the widget".into(),
             base: "main".into(),
+            head_branch: "feature".into(),
             fork: false,
         }
         .trigger_title();
@@ -2968,6 +3001,7 @@ mod tests {
                 head: "cafe".into(),
                 title: String::new(),
                 base: "main".into(),
+                head_branch: "feature".into(),
                 fork: false,
             }
             .trigger_title(),

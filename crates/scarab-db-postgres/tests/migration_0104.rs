@@ -163,6 +163,11 @@ async fn the_0104_revert_runs_twice_and_the_migrator_upgrades_again() {
     .await
     .unwrap();
 
+    // The migrator ran the newer migrations too: back to 0.7.2 first.
+    sqlx::raw_sql(include_str!("../rollback/0106_revert.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::raw_sql(REVERT).execute(&pool).await.unwrap();
     sqlx::raw_sql(REVERT)
         .execute(&pool)

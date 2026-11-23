@@ -171,6 +171,7 @@ async fn pull_request_is_denied_a_branch_scoped_environment() {
         head: "1234567890abcdef1234567890abcdef12345678".into(),
         title: "add a widget".into(),
         base: "main".into(),
+        head_branch: "feature".into(),
         fork: false,
     };
     let runs = trigger_run_from_event(
@@ -202,6 +203,7 @@ async fn pull_request_admitted_when_env_opts_in_via_pull_glob() {
         head: "1234567890abcdef1234567890abcdef12345678".into(),
         title: "add a widget".into(),
         base: "main".into(),
+        head_branch: "feature".into(),
         fork: false,
     };
     let runs = trigger_run_from_event(

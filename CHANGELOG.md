@@ -18,6 +18,68 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **Migrations 0106, 0107 and 0108 add nullable columns to `runs`.** 0106 adds `pipeline_path`,
+  `pipeline_source` and `pipeline_source_sha` (the pipeline file a Run was created from), 0107
+  adds `superseded_by` (the newer Run whose start cancelled this one) and 0108 adds
+  `origin_pr_head` (a pull request's head branch). No row is rewritten and none is backfilled:
+  Runs created before the upgrade have no saved file, no recorded replacement and no head branch.
+  Each `ALTER` waits at most 5 seconds for its lock on `runs`; on a busy database the server stops
+  with `canceling statement due to lock timeout` and runs it again when Kubernetes restarts it.
+  While one waits, reads and writes of `runs` wait too, up to 5 seconds per migration. A 0.7.2
+  server does not start on a database that ran them: to roll back, run
+  `crates/scarab-db-postgres/rollback/0106_revert.sql` with the server scaled to zero. See the
+  chart README, "Upgrading from 0.7.2".
+
+### Features
+
+- **The Run page's Manifest tab shows the pipeline file the Run was created from**, as Scarab
+  saved it when it created the Run, with each step's result beside its `- id:` line, a failed
+  step's lines tinted, what each `invoke:` line became (library, content hash, Steps, and a note
+  if the version was yanked since), Go to failure, Wrap, Copy, Download and a link to the file
+  on the forge at that commit. `GET /v1/runs/{id}/manifest` returns the file and the libraries the
+  Run invoked. Runs created before this release, and Runs started through `POST /v1/runs`, have no
+  saved file. A long file shows its first 5,000 lines and a line over 2,000 characters shows cut
+  and without colours; Copy and Download give the whole file. See
+  [The Manifest tab](https://thulasi-ram.github.io/scarab-ci/usage/runs/#the-manifest-tab).
+- **The runs list on a repository's page is redesigned.** A status control with counts (All, Running,
+  Waiting, Failed, Refused); one Filter panel (pipeline, Environment, author, branch, pull
+  request, deploys only, scheduled only) with removable chips, kept in the URL; Runs grouped by
+  day; each row names the trigger and what it was about (`pr · #131 feat/x`, `push · main`,
+  `tag · v0.7.2`, `schedule · 0 2 * * *`), the commit, the author and a deploy Run's Environment;
+  a status word whose card says where a Run failed or what it waits for; refused triggers with
+  their reason. The list checks for new Runs every 10 seconds while it is visible, and Runs that
+  start while you read wait behind an `N new Runs` pill. Runs list rows gain `failed_step`,
+  `failed_steps_count` and `waiting_for`. See
+  [The runs list](https://thulasi-ram.github.io/scarab-ci/usage/runs/#the-runs-list).
+- **A pull request Run records the branch it comes from**, as `origin_pr_head` on the runs list
+  and on `GET /v1/runs/{id}`. The runs list shows it after the number and the Branch filter
+  matches it. For a pull request from a fork it is the fork's branch name; Scarab shows it and
+  never uses it to decide what runs. See
+  [What a row shows](https://thulasi-ram.github.io/scarab-ci/usage/runs/#what-a-row-shows).
+
+### Enhancement
+
+- **A Run that a newer Run replaced is recorded as replaced, not only as cancelled.** When a newer
+  Run of the same pipeline on the same ref or pull request, or a newer Run in a
+  `cancel-in-progress` concurrency group, cancels an older one, Scarab records the newer Run on
+  it (`superseded_by`, sent as `replaced_by` on the runs list). The list shows the older Run as
+  Replaced, under the Run that replaced it; before, it read Cancelled, like a Run a person
+  cancelled. See [Replaced Runs](https://thulasi-ram.github.io/scarab-ci/usage/runs/#replaced-runs).
+
+### Bug Fixes
+
+- **A Run is stamped with at most 200 characters of its pipeline's `name:`.** The name is text
+  from the pipeline file, a fork pull request's included, and every runs list row sends it on
+  each poll, so a long one was sent whole every 10 seconds to everyone reading the list. Longer
+  names are cut on a character boundary. An `on: upstream:` name is compared in the same cut
+  form, so a follow-up of a pipeline with a long name still starts. The compiler still accepts a
+  name of any length.
+- **The step pane's Source tab names the pipeline file the Run was created from.** It guessed
+  `.scarab/<pipeline>.yaml`, which is wrong when a file's `name:` differs from its file name. It
+  now reads the saved path, and for a Run with no saved file it reads `the ci pipeline`.
+
 ## [0.7.2] - 2026-11-23
 
 ### Breaking changes

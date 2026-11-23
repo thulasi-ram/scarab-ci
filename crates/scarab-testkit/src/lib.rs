@@ -11,7 +11,7 @@
 //! port method bodies remain stubs for this skeleton.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -252,6 +252,23 @@ struct StepRec {
     evidence_attempt: Option<AttemptId>,
     /// The step's key ([`StepRun::key`]), minted when the row is made.
     key: String,
+    /// When its status last changed, as an order (mirrors
+    /// `step_runs.updated_at`): the runs list names a failed run's failed
+    /// step by the time it moved to `Failed`.
+    status_changed: u64,
+}
+
+impl StepRec {
+    fn set_status(&mut self, to: StepStatus) {
+        self.status = Some(to);
+        self.status_changed = next_status_change();
+    }
+}
+
+/// The next step status change in the order of all of them in this process.
+fn next_status_change() -> u64 {
+    static CHANGES: AtomicU64 = AtomicU64::new(1);
+    CHANGES.fetch_add(1, Ordering::Relaxed)
 }
 
 /// A new step key for a step of `run`, distinct from every key the run's
@@ -288,6 +305,33 @@ struct AttemptEvidenceRec {
 /// (`updated_at == created_at`).
 fn fake_run_summary(st: &InMemoryState, run: &RunId, status: RunStatus) -> RunSummary {
     let created = st.run_created.get(run).copied().unwrap_or(Timestamp(0));
+    // Ordered by when each moved to `Failed`, then by id, as Postgres orders
+    // by `step_runs.updated_at`.
+    let mut failed: Vec<(u64, StepId)> =
+        if matches!(status, RunStatus::Failed | RunStatus::DeadLettered) {
+            st.steps
+                .iter()
+                .filter(|((r, _), rec)| r == run && rec.status == Some(StepStatus::Failed))
+                .map(|((_, step), rec)| (rec.status_changed, step.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+    failed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1 .0.cmp(&b.1 .0)));
+    let environment_approval_gates: Vec<StepId> =
+        match (status, st.run_deploy.contains_key(run), st.run_ir.get(run)) {
+            (RunStatus::Suspended, true, Some(ir)) => ir["steps"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|s| {
+                    s["gate"] == "manual"
+                        && s["environment_approval_gate"] != serde_json::Value::Bool(false)
+                })
+                .filter_map(|s| s["id"].as_str().map(|id| StepId(id.to_string())))
+                .collect(),
+            _ => Vec::new(),
+        };
     let origin = st.run_origin.get(run);
     RunSummary {
         run: run.clone(),
@@ -301,11 +345,18 @@ fn fake_run_summary(st: &InMemoryState, run: &RunId, status: RunStatus) -> RunSu
         sha: origin.and_then(|o| o.3.clone()),
         pr_number: origin.and_then(|o| o.4),
         pr_base: origin.and_then(|o| o.5.clone()),
+        pr_head: origin.and_then(|o| o.6.clone()),
         run_number: st.run_number.get(run).copied(),
         pipeline: st.run_pipeline.get(run).cloned(),
         trigger_title: st.run_trigger_title.get(run).cloned(),
         environment: st.run_deploy.get(run).map(|d| d.environment.clone()),
         deploy: st.deploy_runs.contains_key(run),
+        replaced_by: (status == RunStatus::Cancelled)
+            .then(|| st.run_superseded_by.get(run).cloned())
+            .flatten(),
+        failed_step: failed.first().map(|(_, step)| step.clone()),
+        failed_steps: failed.len() as u32,
+        environment_approval_gates,
     }
 }
 
@@ -390,6 +441,8 @@ struct InMemoryState {
     snapshot_pins: HashMap<RunId, (Option<String>, Timestamp)>,
     /// Per-run supersede key `(repo, ref, pipeline)`.
     supersede_keys: HashMap<RunId, String>,
+    /// Per-run superseding Run (mirrors `runs.superseded_by`).
+    run_superseded_by: HashMap<RunId, RunId>,
     /// Per-run project (fairness) and admission priority.
     run_project: HashMap<RunId, String>,
     run_priority: HashMap<RunId, i32>,
@@ -398,7 +451,8 @@ struct InMemoryState {
     /// hands them out (mirrors `runs.run_number` + `repo_run_counters`).
     run_number: HashMap<RunId, i64>,
     repo_run_counters: HashMap<(String, String), i64>,
-    /// Per-run origin `(trigger_kind, actor, git_ref, sha, pr_number, pr_base)` —
+    /// Per-run origin `(trigger_kind, actor, git_ref, sha, pr_number, pr_base,
+    /// pr_head)` —
     /// the trigger facts stamped at creation (mirrors the `origin_*` run columns).
     #[allow(clippy::type_complexity)]
     run_origin: HashMap<
@@ -409,6 +463,7 @@ struct InMemoryState {
             Option<String>,
             Option<String>,
             Option<i64>,
+            Option<String>,
             Option<String>,
         ),
     >,
@@ -421,6 +476,9 @@ struct InMemoryState {
     run_cache_scope: HashMap<RunId, scarab_engine::CacheScope>,
     /// Per-run pipeline name (mirrors the `pipeline` run column).
     run_pipeline: HashMap<RunId, String>,
+    /// Per-run Pipeline file (mirrors the `pipeline_path`, `pipeline_source`
+    /// and `pipeline_source_sha` run columns).
+    run_pipeline_source: HashMap<RunId, scarab_engine::RunPipelineSource>,
     /// Per-run Headline / trigger title (mirrors the `trigger_title` column).
     run_trigger_title: HashMap<RunId, String>,
     /// Refused Run creations (ADR-0076; mirrors `refused_runs`).
@@ -677,6 +735,7 @@ impl InMemoryDb {
                 explicit_inputs: None,
                 evidence_attempt: None,
                 gate_releaser: None,
+                status_changed: next_status_change(),
             },
         );
     }
@@ -707,6 +766,7 @@ impl InMemoryDb {
                     explicit_inputs: None,
                     evidence_attempt: None,
                     gate_releaser: None,
+                    status_changed: next_status_change(),
                 },
             );
         }
@@ -788,10 +848,12 @@ fn take_event_append_failure(st: &mut InMemoryState, events: &[EventKind]) -> Re
 /// [`Db::enqueue_outbox`] under the caller's lock. Idempotent on the key: a
 /// duplicate enqueue is a no-op.
 /// The run-status CAS's reopen bump (mirrors the Postgres `cas_run_status`):
-/// moving `run` out of a terminal `from` opens its next generation.
+/// moving `run` out of a terminal `from` opens its next generation and
+/// clears the Run it was marked superseded by.
 fn bump_reopen_generation_locked(st: &mut InMemoryState, run: &RunId, from: RunStatus) {
     if from.is_terminal() {
         *st.run_reopen_generations.entry(run.clone()).or_default() += 1;
+        st.run_superseded_by.remove(run);
     }
 }
 
@@ -867,7 +929,7 @@ fn check_step_transition_locked(
     if matches!(&st.toctou_race, Some((s, _)) if s == step) {
         let (_, attempt) = st.toctou_race.take().unwrap();
         if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
-            rec.status = Some(StepStatus::Running);
+            rec.set_status(StepStatus::Running);
             rec.attempts.push(Attempt {
                 id: attempt,
                 started_at: Timestamp(0),
@@ -944,7 +1006,7 @@ fn resolve_gate_wait_locked(
             }
         },
     };
-    rec.status = Some(if res.passed {
+    rec.set_status(if res.passed {
         StepStatus::Succeeded
     } else {
         StepStatus::Failed
@@ -1036,7 +1098,7 @@ impl Db for InMemoryDb {
                 .steps
                 .get_mut(&(step.run.clone(), step.step.clone()))
                 .expect("read above");
-            rec.status = Some(StepStatus::Running);
+            rec.set_status(StepStatus::Running);
             if !rec.attempts.iter().any(|a| a.id == launch.attempt.id) {
                 rec.attempts.push(launch.attempt);
             }
@@ -1338,6 +1400,7 @@ impl Db for InMemoryDb {
                 explicit_inputs: None,
                 evidence_attempt: None,
                 gate_releaser: None,
+                status_changed: next_status_change(),
             },
         );
         Ok(())
@@ -1595,7 +1658,7 @@ impl Db for InMemoryDb {
             .steps
             .get_mut(&(run.clone(), step.clone()))
             .expect("checked above");
-        rec.status = Some(StepStatus::Ready);
+        rec.set_status(StepStatus::Ready);
         rec.input = Some(signature.to_string());
         st.events.extend(events.iter().cloned());
         Ok(())
@@ -1704,6 +1767,25 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
+    async fn set_run_superseded_by(&self, run: &RunId, by: &RunId) -> Result<(), DbError> {
+        self.interleave_point("set_run_superseded_by").await;
+        self.state
+            .lock()
+            .unwrap()
+            .run_superseded_by
+            .entry(run.clone())
+            .or_insert_with(|| by.clone());
+        Ok(())
+    }
+
+    async fn clear_run_superseded_by(&self, run: &RunId, by: &RunId) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        if st.run_superseded_by.get(run) == Some(by) {
+            st.run_superseded_by.remove(run);
+        }
+        Ok(())
+    }
+
     async fn superseded_by(&self, run: &RunId) -> Result<Vec<RunId>, DbError> {
         let st = self.state.lock().unwrap();
         if st.poisoned_runs.contains(run) {
@@ -1787,6 +1869,7 @@ impl Db for InMemoryDb {
         Ok(self.state.lock().unwrap().run_number.get(run).copied())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn set_run_origin(
         &self,
         run: &RunId,
@@ -1796,6 +1879,7 @@ impl Db for InMemoryDb {
         sha: Option<&str>,
         pr_number: Option<i64>,
         pr_base: Option<&str>,
+        pr_head: Option<&str>,
     ) -> Result<(), DbError> {
         self.state.lock().unwrap().run_origin.insert(
             run.clone(),
@@ -1806,6 +1890,7 @@ impl Db for InMemoryDb {
                 sha.map(str::to_string),
                 pr_number,
                 pr_base.map(str::to_string),
+                pr_head.map(str::to_string),
             ),
         );
         Ok(())
@@ -1819,6 +1904,16 @@ impl Db for InMemoryDb {
             .run_origin
             .get(run)
             .and_then(|o| o.5.clone()))
+    }
+
+    async fn run_pr_head(&self, run: &RunId) -> Result<Option<String>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .run_origin
+            .get(run)
+            .and_then(|o| o.6.clone()))
     }
 
     async fn set_run_cache_scope(
@@ -1892,6 +1987,32 @@ impl Db for InMemoryDb {
 
     async fn run_pipeline(&self, run: &RunId) -> Result<Option<String>, DbError> {
         Ok(self.state.lock().unwrap().run_pipeline.get(run).cloned())
+    }
+
+    async fn set_run_pipeline_source(
+        &self,
+        run: &RunId,
+        source: &scarab_engine::RunPipelineSource,
+    ) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .run_pipeline_source
+            .insert(run.clone(), source.clone());
+        Ok(())
+    }
+
+    async fn run_pipeline_source(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<scarab_engine::RunPipelineSource>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .run_pipeline_source
+            .get(run)
+            .cloned())
     }
 
     async fn record_refused_run(&self, r: &scarab_engine::RefusedRun) -> Result<(), DbError> {
@@ -2989,7 +3110,7 @@ impl Db for InMemoryDb {
         st.steps
             .get_mut(&(run.clone(), step.clone()))
             .expect("checked above")
-            .status = Some(to);
+            .set_status(to);
         Ok(())
     }
 
@@ -3025,7 +3146,7 @@ impl Db for InMemoryDb {
         st.steps
             .get_mut(&(run.clone(), step.clone()))
             .expect("checked above")
-            .status = Some(to);
+            .set_status(to);
         if let Some((attempt, stamp)) = stamp {
             stamp_attempt_locked(&mut st, run, step, attempt, stamp);
         }
