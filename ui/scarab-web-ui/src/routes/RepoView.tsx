@@ -1370,7 +1370,7 @@ function RunListRow(props: {
             ref: r().git_ref,
             pr: r().pr_number,
             // A server that sends a pull request's head branch names it here.
-            head: (r() as RunSummary & { origin_pr_head?: string | null }).origin_pr_head,
+            head: r().origin_pr_head,
             base: r().origin_pr_base,
             title: r().trigger_title,
           })}
