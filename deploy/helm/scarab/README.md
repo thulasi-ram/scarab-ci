@@ -569,14 +569,16 @@ Migrations 0104 and 0105 record what each webhook delivery decided for each
 Pipeline file, so a redelivery creates only the Runs it is missing.
 
 - **0104** runs in a transaction with a 5-second lock timeout, as 0101 does. It
-  adds the `webhook_delivery_pipelines` table, five columns on
-  `webhook_deliveries` (`unfinished`, `config_sha`, `head_scope`, `head_sha`,
-  `try_until`) and `runs.replaced_by`. No row is rewritten: `unfinished` has a
-  constant default and the other columns are nullable. Each `ALTER` takes an
-  ACCESS EXCLUSIVE lock for a moment. `runs` is written on every scheduler
-  tick, so on a busy database the wait can pass 5 seconds; the server then
-  stops with `canceling statement due to lock timeout`, Kubernetes restarts it,
-  and it tries again.
+  adds the `webhook_delivery_pipelines` table, `runs.replaced_by`, and six
+  columns on `webhook_deliveries` (`unfinished`, `config_sha`, `head_scope`,
+  `head_sha`, `try_until`, `try_token`). No row is rewritten: `unfinished` has
+  a constant default and the other columns are nullable. Each `ALTER` takes an
+  ACCESS EXCLUSIVE lock for a moment; `runs` comes first, so while the
+  migration waits for it no other table is locked. `runs` is written on every
+  scheduler tick, so on a busy database the wait can pass 5 seconds; the
+  server then stops with `canceling statement due to lock timeout`,
+  Kubernetes restarts it, and it tries again. While it waits, reads and
+  writes of `runs` wait too, up to 5 seconds per start attempt.
 - **0105** builds `webhook_deliveries_at_idx` with `CREATE INDEX CONCURRENTLY`,
   outside a transaction, so deliveries go on being recorded while it builds. A
   build that fails leaves an invalid index; the server drops it and builds it

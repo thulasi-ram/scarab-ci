@@ -25,12 +25,14 @@ release.yml uses that version's section as the GitHub Release text. See
   read answered 202 with `"incomplete": true`; it now answers 502, and the body lists `run_ids`,
   `refused`, `earlier` and `undecided`. A redelivery while an earlier try of the same delivery
   runs answered 503 on the same server replica and `duplicate delivery` on another; it now
-  answers 409 on any replica. The overload answer stays 503. A tool that watches the forge's
-  delivery log sees these codes. See
+  answers 409 on any replica. The overload answer stays 503. Without forge connections
+  configured (no delivery ids kept), a delivery that created some Runs while a file could not be
+  read also answers 502 now. A tool that watches the forge's delivery log sees these codes. See
   [Webhook deliveries](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#webhook-deliveries).
-- **Migrations 0104 and 0105.** 0104 alters `webhook_deliveries` and `runs` with a 5-second lock
-  timeout; on a busy database the server can stop with `canceling statement due to lock timeout`
-  and start on its next restart. 0105 builds an index concurrently. To roll back, run
+- **Migrations 0104 and 0105.** 0104 alters `runs` and then `webhook_deliveries` with a 5-second
+  lock timeout; on a busy database the server can stop with `canceling statement due to lock
+  timeout` and start on its next restart. While it waits, reads and writes of `runs` wait too,
+  up to 5 seconds per start attempt. 0105 builds an index concurrently. To roll back, run
   `crates/scarab-db-postgres/rollback/0104_revert.sql` with the server scaled to zero. See the
   chart README, "Upgrading from 0.7.1".
 
@@ -42,14 +44,20 @@ release.yml uses that version's section as the GitHub Release text. See
   replica that saw the id while the first was still working. Scarab now records what each
   delivery decided for each Pipeline file, in the same transaction as the Run's first row or the
   refusal, and a GitHub Redeliver decides only the files no earlier try decided. A push, a pull
-  request or a comment on a pull request whose ref or pull request has moved on creates nothing
-  on a redelivery and fails its check with "no longer the head of". A Run whose creation stopped
+  request or a comment on a pull request creates nothing on a redelivery when a newer delivery of
+  that ref or pull request arrived at another commit, and fails its check with "no longer the
+  head of". A comment, tag or release delivery reads `.scarab/` at the commit its first try
+  resolved; when that commit cannot be resolved it reads at the ref, as before, and a comment on
+  a pull request whose head cannot be read runs without the head rule. A Run whose creation stopped
   part way is replaced by the redelivery. A Forgejo Replay has a new id and starts the Runs
   again, as before. See
   [Webhook deliveries](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#webhook-deliveries).
 
 ### Enhancement
 
+- **Rerun, retry and gate actions on a Run a redelivery replaced answer 409**, naming the Run that
+  replaced it. See
+  [Webhook deliveries](https://thulasi-ram.github.io/scarab-ci/get-started/deploy-helm/#webhook-deliveries).
 - **Webhook deliveries are pruned after 30 days.** `retention.webhookDeliveryDays`
   (`SCARAB_RETENTION_WEBHOOK_DELIVERY_DAYS`) sets the period; the server refuses to start under
   7 days. The table was never pruned before. See

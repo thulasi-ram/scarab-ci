@@ -245,15 +245,18 @@ delivery is missing and no Run twice. The forge's delivery log shows the answer:
 On a redelivery:
 
 - `.scarab/` is read at the commit the first try read it at. For a comment that is `HEAD`
-  then, and for a tag or release the tag's commit then.
-- A push, a pull request or a comment on a pull request creates no Run when its ref or pull
-  request has moved on since the delivery arrived: when a newer Run or a newer delivery of
-  that Pipeline is at another commit. The Pipeline is recorded as not run, and its check fails
-  with "no longer the head of" the ref or pull request. Tags, releases and comments that are
-  not on a pull request always run.
+  then, and for a tag or release the tag's commit then. When that commit cannot be looked up,
+  the try reads at `HEAD` or the tag, as before, and the next try looks it up again.
+- A push, a pull request or a comment on a pull request creates no Run when a newer delivery
+  of the same ref or pull request arrived at another commit, whatever that delivery started.
+  The Pipeline is recorded as not run, and its check fails with "no longer the head of" the ref
+  or pull request. Tags, releases and comments that are not on a pull request always run, and
+  so does a comment whose pull request's head could not be read on the first try. Scarab
+  orders deliveries by when they arrived: a forge that delivers two pushes out of order makes
+  the newer one look old.
 - A Run whose creation stopped part way (the server stopped, a write failed) is replaced: after
   10 minutes, or at once when it already ended `Failed`. The old Run stays `Failed`, names its
-  replacement, and cannot be rerun.
+  replacement, and rerun, retry and gate actions on it answer 409.
 
 GitHub's Redeliver sends the same id, so it repairs the delivery. A Forgejo Replay sends a new
 id: Scarab treats it as a new delivery and starts its Runs again. Neither forge redelivers on
