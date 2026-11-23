@@ -74,6 +74,7 @@ import { waitApprovers, type WaitResolution } from "../run-tabs";
 import { absTime } from "../fmt";
 import Icon from "./Icon";
 import { loadRunManifest } from "./RunManifest";
+import { pipelineShortName } from "../schedules";
 import AttemptsDropdown, { type FilmstripTry } from "./AttemptsDropdown";
 import TryTabs from "./TryTabs";
 import Pill from "./Pill";
@@ -1286,7 +1287,22 @@ export default function StepPane(props: {
                             <div class="t">
                               <div class="l1">
                                 <Pill tone="muted" look="dotted">pipeline</Pill>
-                                <span class="mono">{manifestPath() ?? props.pipeline ?? "the Pipeline file"}</span>
+                                {/* The file's path; while it loads, a muted mark; for a
+                                    Run that kept no file, the pipeline in words. */}
+                                <Show
+                                  when={manifestPath()}
+                                  fallback={
+                                    manifestPath.loading ? (
+                                      <span class="subtle" aria-label="Loading the file's path">…</span>
+                                    ) : (
+                                      <span>
+                                        {props.pipeline ? `the ${pipelineShortName(props.pipeline)} pipeline` : "the Run's pipeline"}
+                                      </span>
+                                    )
+                                  }
+                                >
+                                  {(path) => <span class="mono">{path()}</span>}
+                                </Show>
                               </div>
                               <div class="lib-src">the Run's own file</div>
                             </div>
