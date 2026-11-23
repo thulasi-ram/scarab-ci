@@ -18,6 +18,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-11-24
+
 ### Breaking changes
 
 - **Migrations 0106, 0107 and 0108 add nullable columns to `runs`.** 0106 adds `pipeline_path`,
@@ -2425,7 +2427,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.3...HEAD
+[0.7.3]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.6.1...v0.7.0
