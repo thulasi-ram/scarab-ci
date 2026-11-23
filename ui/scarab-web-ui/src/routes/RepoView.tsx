@@ -1,8 +1,8 @@
 // Repo dashboard (tier 2) — tabs over one repository: Runs (default),
-// Schedules, Environments, Secrets, Settings. Each run row shows its origin as a grid of
-// facts (author · ref · duration) under a header line (sha · status · trigger ·
-// when), fed by the origin fields RunSummaryDto now carries. Duration ticks live
-// for in-flight runs. The runs list filters by status, author, branch, PR,
+// Schedules, Environments, Secrets, Settings. Each run row reads
+// `pipeline / headline` over one phrase for where the Run came from (ref ·
+// commit · actor), with its status and time on the right (see components/RunRow).
+// Duration ticks live for in-flight runs. The runs list filters by status, author, branch, PR,
 // pipeline, environment, deploys and scheduled — environment and deploys on the server
 // (it is how a Project's older deploys are found), the rest over
 // the loaded page. The header CTA is contextual to the active tab.
@@ -46,7 +46,9 @@ import {
 } from "../repo-environments";
 import { relTime, absTime, untilTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
-import TriggerCell from "../components/TriggerCell";
+import { originPhrase, pullNumber } from "../run-row";
+import { statusWord } from "../run-page";
+import { OriginLine, RowTitle, StatusMark } from "../components/RunRow";
 import RunNumber from "../components/RunNumber";
 import Icon from "../components/Icon";
 import { HomeCrumb, RepoCrumb } from "../components/PageCrumbs";
@@ -82,26 +84,8 @@ const TABS: [Tab, string][] = [
 const TERMINAL = new Set(["succeeded", "failed", "cancelled", "dead_lettered"]);
 const isLive = (status: string) => !TERMINAL.has(status);
 
-// The human ref a run ran on: a PR number wins (it's the clearer identity), else
-// the branch/tag with its `refs/{heads,tags}/` prefix stripped. `null` when the
-// run carries no ref (e.g. a cron trigger).
-function refLabel(r: RunSummary): string | null {
-  if (r.pr_number != null) return `PR #${r.pr_number}`;
-  const ref = r.git_ref;
-  if (!ref) return null;
-  return ref.replace(/^refs\/heads\//, "").replace(/^refs\/tags\//, "");
-}
-
-// The trigger kind as a short display token (`pull_request` → `PR`); the raw
-// TriggerKind vocabulary otherwise.
-function triggerLabel(kind: string | null | undefined): string | null {
-  if (!kind) return null;
-  return kind === "pull_request" ? "PR" : kind;
-}
-
 // The branch/tag a run ran on: `git_ref` with its `refs/{heads,tags}/` prefix
-// stripped. Unlike `refLabel`, this ignores `pr_number` — a PR run still ran on
-// a head branch, and the branch filter should match it. `null` when refless.
+// stripped, for the branch filter. `null` when refless.
 function branchLabel(r: RunSummary): string | null {
   const ref = r.git_ref;
   if (!ref) return null;
@@ -498,124 +482,41 @@ export default function RepoView() {
               <div class="runlist">
                 <For each={listRows()}>
                   {(row) => {
-                    if (row.kind === "refused") return <RefusedRow r={row.refused} />;
+                    if (row.kind === "refused") return <RefusedRow r={row.refused} repoUrl={repoUrl()} />;
                     const r = row.run;
-                    const commitUrl = () => forgeCommitUrl(repoUrl(), r.sha);
-                    const prUrl = () => forgePrUrl(repoUrl(), r.pr_number);
-                    const stop = (e: MouseEvent) => e.stopPropagation();
                     return (
                       <div class="runrow" onClick={() => nav(`/${org()}/${repo()}/runs/${r.id}`)}>
-                        {/* Run-number gutter: the per-repo `#N`
-                            handle, sequential so it scans down the list. */}
-                        <div class="rr-gutter">
+                        <StatusMark status={r.status} />
+                        <div class="rr-num">
                           <RunNumber n={r.run_number} id={r.id} />
                         </div>
-                        <div class="rr-body">
-                          {/* Primary line: the run Headline (trigger kind + title),
-                              the SAME shared cell the run-detail bar uses. */}
-                          <div class="rr-head">
-                            <TriggerCell kind={r.trigger_kind} title={r.trigger_title} />
-                          </div>
-                          {/* Secondary line: the origin facts — pipeline · commit ·
-                              base ← head · PR · who · when. */}
-                          <div class="rr-facts">
-                            <Show when={r.pipeline}>
-                              {(name) => (
-                                <span class="pfact strong" title="pipeline">
-                                  <Icon icon="workflow" size={12} />
-                                  <span class="mono">{name()}</span>
-                                </span>
-                              )}
-                            </Show>
-                            <Show when={r.deploy}>
-                              <span
-                                class="pfact strong"
-                                title="deploy run: its pipeline or a step is marked `deploy: true`"
-                              >
-                                <Icon icon="rocket" size={12} /> deploy
-                              </span>
-                            </Show>
-                            <Show when={r.environment}>
-                              {(env) => (
-                                <span class="pfact" title="environment">
-                                  <Icon icon="shield-check" size={12} />
-                                  <span class="mono">{env()}</span>
-                                </span>
-                              )}
-                            </Show>
-                            <a
-                              class="pfact"
-                              classList={{ link: !!commitUrl() }}
-                              href={commitUrl() ?? undefined}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              onClick={stop}
-                              title="commit on the forge"
-                            >
-                              <Icon icon="git-commit-horizontal" size={12} />
-                              <span class="mono sha">{(r.sha ?? r.id).slice(0, 7)}</span>
-                            </a>
-                            {/* base ← head on PR runs; else the branch/ref. */}
-                            <Show
-                              when={r.origin_pr_base}
-                              fallback={
-                                <Show when={branchLabel(r) && branchLabel(r) !== r.sha}>
-                                  {(b) => (
-                                    <span class="pfact" title="branch / ref">
-                                      <Icon icon="git-branch" size={12} />
-                                      <span class="mono">{b()}</span>
-                                    </span>
-                                  )}
-                                </Show>
-                              }
-                            >
-                              {(base) => (
-                                <span class="pfact" title="base ← head">
-                                  <Icon icon="git-branch" size={12} />
-                                  <span class="mono">{base()}</span>
-                                  <span class="pr-arrow">←</span>
-                                  <span class="mono sha">{(r.sha ?? "").slice(0, 7)}</span>
-                                </span>
-                              )}
-                            </Show>
-                            <Show when={r.pr_number != null}>
-                              <a
-                                class="pfact"
-                                classList={{ link: !!prUrl() }}
-                                href={prUrl() ?? undefined}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                onClick={stop}
-                                title="pull request on the forge"
-                              >
-                                <Icon icon="git-pull-request" size={12} />
-                                <span class="mono">#{r.pr_number}</span>
-                              </a>
-                            </Show>
-                            <Show when={r.actor}>
-                              {(actor) => (
-                                <span class="pfact" title="triggered by">
-                                  <Icon icon="user" size={12} />
-                                  <span>{actor()}</span>
-                                </span>
-                              )}
-                            </Show>
-                            <span
-                              class="pfact"
-                              classList={{ live: isLive(r.status) }}
-                              title={absTime(r.created_at)}
-                            >
-                              <Icon icon="timer" size={12} />
-                              <span>
-                                {relTime(r.created_at)} · <span class="mono">{durationLabel(r, now())}</span>
-                              </span>
-                            </span>
-                          </div>
+                        <div class="rr-main">
+                          <RowTitle
+                            pipeline={r.pipeline}
+                            kind={r.trigger_kind}
+                            title={r.trigger_title}
+                            deploy={r.deploy}
+                            environment={r.environment}
+                          />
+                          <OriginLine
+                            kind={r.trigger_kind}
+                            parts={originPhrase({
+                              kind: r.trigger_kind,
+                              ref: r.git_ref,
+                              sha: r.sha,
+                              pr: r.pr_number,
+                              base: r.origin_pr_base,
+                              actor: r.actor,
+                              title: r.trigger_title,
+                            })}
+                            commitUrl={forgeCommitUrl(repoUrl(), r.sha)}
+                            prUrl={forgePrUrl(repoUrl(), r.pr_number)}
+                          />
                         </div>
-
                         <div class="rr-right">
-                          <span class={`rr-status ${r.status}`}>
-                            <span class={`sdot ${r.status}`} /> {r.status}
+                          <span class={`rr-word ${r.status}`}>{statusWord(r.status)}</span>
+                          <span class="rr-time" classList={{ live: isLive(r.status) }} title={absTime(r.created_at)}>
+                            {relTime(r.created_at)} · <span class="mono">{durationLabel(r, now())}</span>
                           </span>
                         </div>
                       </div>
@@ -1199,104 +1100,70 @@ function ScheduleRow(props: { org: string; repo: string; s: Schedule }) {
   );
 }
 
-/** A trigger that did not become a Run: where a Run would be,
- *  with the compact reason and its fix. */
-function RefusedRow(props: { r: RefusedRun }) {
+/** A trigger that did not become a Run: where a Run would be, with the
+ *  reason and its fix on one line under it. */
+function RefusedRow(props: { r: RefusedRun; repoUrl?: string | null }) {
   const r = () => props.r;
   const sum = () => refusalSummary(r().errors, r().message);
   const [all, setAll] = createSignal(false);
-  const branch = () => r().git_ref?.replace(/^refs\/(heads|tags)\//, "");
+  const pr = () => pullNumber(r().git_ref);
+  const fixes = () =>
+    [sum().fix, r().reason_kind === "yanked" ? "an org admin upgrades the installation, then push again" : null].filter(
+      (f): f is string => !!f,
+    );
   return (
     <div class="runrow refused">
-      <div class="rr-gutter">
+      <StatusMark status="refused" />
+      <div class="rr-num">
         <span class="runnum none">
           <span class="n">no run</span>
         </span>
       </div>
-      <div class="rr-body">
-        <div class="rr-head">
-          <TriggerCell kind={r().trigger_kind} title={r().title} />
-        </div>
-        <div class="rr-facts">
-          <span class="pfact strong" title="pipeline">
-            <Icon icon="workflow" size={12} />
-            <span class="mono">{pipelineShortName(r().pipeline)}</span>
-          </span>
-          <Show when={r().sha}>
-            {(sha) => (
-              <span class="pfact" title="commit">
-                <Icon icon="git-commit-horizontal" size={12} />
-                <span class="mono sha">{sha().slice(0, 7)}</span>
-              </span>
-            )}
-          </Show>
-          <Show when={branch()}>
-            {(b) => (
-              <span class="pfact" title="branch / ref">
-                <Icon icon="git-branch" size={12} />
-                <span class="mono">{b()}</span>
-              </span>
-            )}
-          </Show>
-          <Show when={r().actor}>
-            {(a) => (
-              <span class="pfact" title="triggered by">
-                <Icon icon="user" size={12} />
-                <span>{a()}</span>
-              </span>
-            )}
-          </Show>
-          <span class="pfact subtle" title={absTime(r().created_at)}>
-            {relTime(r().created_at)}
-          </span>
-        </div>
-        <div class="rf">
-          <div class="rf-what">
-            <Icon icon={r().reason_kind === "compile" ? "circle-x" : "ban"} size={13} />
-            {/* A message may hold a YAML snippet to paste: keep its lines. */}
-            <span style={{ "white-space": "pre-wrap" }}>{sum().what}</span>
-            <Show when={sum().more > 0 && !all()}>
-              <span class="why">
-                · {sum().more} more {sum().more === 1 ? "error" : "errors"}
-              </span>
-            </Show>
-          </div>
-          <Show when={sum().fix}>
-            {(fix) => (
-              <div class="rf-fix">
-                <span class="lbl">Fix</span>
-                <span>{fix()}</span>
-              </div>
-            )}
-          </Show>
-          <Show when={r().reason_kind === "yanked"}>
-            <div class="rf-fix">
-              <span class="lbl">Fix</span>
-              <span>an org admin upgrades the installation, then push again</span>
-            </div>
-          </Show>
-          <Show when={sum().more > 0}>
-            <div class="rf-fix">
-              <button class="xs-link" onClick={() => setAll((v) => !v)}>
-                {all() ? "Hide the other errors" : `Show all ${r().errors.length} errors`}
-              </button>
-            </div>
-            <Show when={all()}>
-              <For each={r().errors.slice(1)}>
-                {(e) => (
-                  <div class="rf-what">
-                    <Icon icon="circle-x" size={13} />
-                    <span style={{ "white-space": "pre-wrap" }}>{refusalSummary([e], e.message).what}</span>
-                  </div>
-                )}
-              </For>
-            </Show>
-          </Show>
-        </div>
+      <div class="rr-main">
+        <RowTitle pipeline={pipelineShortName(r().pipeline)} kind={r().trigger_kind} title={r().title} />
+        <OriginLine
+          kind={r().trigger_kind}
+          parts={originPhrase({
+            kind: r().trigger_kind,
+            ref: r().git_ref,
+            sha: r().sha,
+            actor: r().actor,
+            title: r().title,
+          })}
+          commitUrl={forgeCommitUrl(props.repoUrl, r().sha)}
+          prUrl={forgePrUrl(props.repoUrl, pr())}
+        />
       </div>
       <div class="rr-right">
-        <span class="rr-status refused">refused</span>
+        <span class="rr-word refused">{statusWord("refused")}</span>
+        <span class="rr-time" title={absTime(r().created_at)}>
+          {relTime(r().created_at)}
+        </span>
       </div>
+      <div class="rr-reason">
+        <Icon icon={r().reason_kind === "compile" ? "circle-x" : "ban"} size={13} />
+        <span>
+          {/* A message may hold a YAML snippet to paste: keep its lines. */}
+          <span class="what">{sum().what}</span>
+          <For each={fixes()}>{(fix) => <span class="fix"> · {fix}</span>}</For>
+          <Show when={sum().more > 0}>
+            <span class="fix"> · </span>
+            <button class="xs-link" onClick={() => setAll((v) => !v)}>
+              {all() ? "hide the other errors" : `${sum().more} more ${sum().more === 1 ? "error" : "errors"}`}
+            </button>
+          </Show>
+        </span>
+      </div>
+      <Show when={all()}>
+        <For each={r().errors.slice(1)}>
+          {(e) => (
+            <div class="rr-reason">
+              <Icon icon="circle-x" size={13} />
+              <span class="what">{refusalSummary([e], e.message).what}</span>
+            </div>
+          )}
+        </For>
+      </Show>
     </div>
   );
 }
