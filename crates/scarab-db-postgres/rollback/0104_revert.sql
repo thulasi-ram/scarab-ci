@@ -1,7 +1,7 @@
 -- Revert migrations 0104 (webhook delivery outcomes, the delivery row's
--- `unfinished`, `config_sha`, `head_scope`, `head_sha` and `try_until`, and
--- `runs.replaced_by`) and
--- 0105 (the `webhook_deliveries.at` index), so a 0.7.1 server starts on this
+-- `unfinished`, `config_sha`, `head_scope`, `head_sha`, `try_until` and
+-- `try_token`, and `runs.replaced_by`) and 0105 (the
+-- `webhook_deliveries.at` index), so a 0.7.1 server starts on this
 -- database again. Not a migration: the migrator never runs this file. A
 -- second run changes nothing.
 --
@@ -9,7 +9,8 @@
 --   1. scale every Scarab server to zero (no server that ran 0104 may run
 --      against the database while this runs, or after it);
 --   2. back up the database.
--- Then run it, e.g. `psql "$DATABASE_URL" -f 0104_revert.sql`, and start
+-- Then run it, e.g. `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0104_revert.sql`
+-- (so psql exits non-zero when a statement fails), and start
 -- 0.7.1.
 --
 -- What changes for 0.7.1: it reads every recorded delivery as done,
@@ -31,7 +32,8 @@ ALTER TABLE webhook_deliveries
   DROP COLUMN IF EXISTS config_sha,
   DROP COLUMN IF EXISTS head_scope,
   DROP COLUMN IF EXISTS head_sha,
-  DROP COLUMN IF EXISTS try_until;
+  DROP COLUMN IF EXISTS try_until,
+  DROP COLUMN IF EXISTS try_token;
 
 ALTER TABLE runs DROP COLUMN IF EXISTS replaced_by;
 

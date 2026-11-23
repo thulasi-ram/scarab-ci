@@ -5,7 +5,7 @@ use sqlx::Row;
 
 use scarab_engine::{
     DbError, DeliveryOutcome, DeliveryOutcomeKind, DeliveryPipeline, DeliveryRefusal, HeadQuery,
-    HeadScope, OutcomeWrite, RunCreationState, RunId, Timestamp,
+    OutcomeWrite, RunCreationState, RunId, Timestamp,
 };
 use scarab_forge::{DeliveryPins, DeliveryTry, ForgeKind, RegistryError};
 
@@ -14,6 +14,9 @@ use crate::{db_err, insert_outbox, reg_err, run_status_from_str, PostgresDb};
 /// The database clock in unix ms: the delivery row's `at` and its lease are
 /// read and written with it, so every replica agrees on them.
 const NOW_MS: &str = "(extract(epoch from now()) * 1000)::bigint";
+
+/// A fresh lease token for a try (ADR-0083 §7), made by the database.
+const NEW_TOKEN: &str = "md5(random()::text || clock_timestamp()::text)";
 
 /// The outcome key and the run a first row claims it for.
 pub(crate) struct RunClaim<'a> {
@@ -55,6 +58,23 @@ impl<'a> RunClaim<'a> {
 /// names `claim.replaces`): the caller rolls back. A concurrent insert of the
 /// same key makes this wait for it, then answer `false`; no unique violation
 /// is raised.
+/// Lock `run` for its replacement (ADR-0083 §4) and say whether it may be
+/// replaced: its creation never finished, it has ended (so no stalled try
+/// can still finish it: `finish_run_creation` needs `pending`), and nothing
+/// replaced it yet. The row lock holds until the transaction ends, so a
+/// concurrent finish or replacement waits and then finds it changed.
+async fn lock_replaceable(tx: &mut sqlx::PgConnection, run: &str) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT 1 FROM runs
+         WHERE id = $1 AND creating AND status <> 'pending' AND replaced_by IS NULL
+         FOR UPDATE",
+    )
+    .bind(run)
+    .fetch_optional(&mut *tx)
+    .await?;
+    Ok(row.is_some())
+}
+
 pub(crate) async fn claim_delivery_run(
     tx: &mut sqlx::PgConnection,
     claim: &RunClaim<'_>,
@@ -78,6 +98,9 @@ pub(crate) async fn claim_delivery_run(
         .await?;
         return Ok(inserted.is_some());
     };
+    if !lock_replaceable(tx, old).await? {
+        return Ok(false);
+    }
     let moved = sqlx::query(
         "UPDATE webhook_delivery_pipelines SET run_id = $4
          WHERE connection_id = $1 AND delivery_id = $2 AND pipeline = $3
@@ -248,6 +271,7 @@ pub(crate) async fn record_delivery_refusal(
         .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?,
+        Some(old) if !lock_replaceable(&mut tx, &old.0).await.map_err(db_err)? => None,
         Some(old) => sqlx::query(
             "UPDATE webhook_delivery_pipelines
              SET outcome = $4, reason_kind = $5, run_id = NULL, refused_run_id = $6
@@ -324,48 +348,18 @@ pub(crate) async fn delivery_outcomes(
 }
 
 pub(crate) async fn head_moved(db: &PostgresDb, q: &HeadQuery) -> Result<bool, DbError> {
-    let (by_ref, by_pr) = match &q.scope {
-        HeadScope::Ref(r) => (Some(r.as_str()), None),
-        HeadScope::PullRequest(n) => (None, Some(*n)),
-    };
-    let newest: Option<Option<String>> = sqlx::query_scalar(
-        "SELECT origin_sha FROM runs
-         WHERE tenant_org = $1 AND tenant_project = $2 AND created_at > $3
-           AND ($4::text IS NULL OR pipeline = $4)
-           AND ($5::text IS NULL OR origin_ref = $5)
-           AND ($6::bigint IS NULL OR origin_pr_number = $6)
-         ORDER BY created_at DESC, id DESC
-         LIMIT 1",
-    )
-    .bind(&q.org)
-    .bind(&q.project)
-    .bind(q.after.0)
-    .bind(q.pipeline_name.as_deref())
-    .bind(by_ref)
-    .bind(by_pr)
-    .fetch_optional(db.pool())
-    .await
-    .map_err(db_err)?;
-    if let Some(sha) = newest {
-        if sha.as_deref() != Some(q.head_sha.as_str()) {
-            return Ok(true);
-        }
-    }
-    let decided_elsewhere: bool = sqlx::query_scalar(
+    // Deliveries are ordered by arrival on the database clock (ADR-0083 §5).
+    sqlx::query_scalar(
         "SELECT EXISTS (
-           SELECT 1 FROM webhook_deliveries d
-           JOIN webhook_delivery_pipelines o ON o.forge = d.forge AND o.delivery_id = d.id
-           WHERE d.head_scope = $1 AND d.at > $2 AND d.head_sha <> $3
-             AND ($4::text IS NULL OR o.pipeline = $4))",
+           SELECT 1 FROM webhook_deliveries
+           WHERE head_scope = $1 AND at > $2 AND head_sha <> $3)",
     )
     .bind(q.scope.key(&q.org, &q.project))
     .bind(q.after.0)
     .bind(&q.head_sha)
-    .bind(q.pipeline_path.as_deref())
     .fetch_one(db.pool())
     .await
-    .map_err(db_err)?;
-    Ok(decided_elsewhere)
+    .map_err(db_err)
 }
 
 pub(crate) async fn prune_webhook_deliveries(
@@ -376,18 +370,20 @@ pub(crate) async fn prune_webhook_deliveries(
     // One statement, so one transaction: a delivery and its outcomes go
     // together, and no later try can find some of its outcomes and not
     // others (ADR-0083 §8).
-    let done = sqlx::query(
+    // A delivery a try holds stays: its try may still record outcomes.
+    let done = sqlx::query(&format!(
         "WITH gone AS (
            SELECT forge, id FROM webhook_deliveries
-           WHERE at < $1 ORDER BY at LIMIT $2
+           WHERE at < $1 AND (try_until IS NULL OR try_until < {NOW_MS})
+           ORDER BY at LIMIT $2
            FOR UPDATE SKIP LOCKED
          ), outcomes AS (
            DELETE FROM webhook_delivery_pipelines p USING gone
            WHERE p.forge = gone.forge AND p.delivery_id = gone.id
          )
          DELETE FROM webhook_deliveries w USING gone
-         WHERE w.forge = gone.forge AND w.id = gone.id",
-    )
+         WHERE w.forge = gone.forge AND w.id = gone.id"
+    ))
     .bind(before.0)
     .bind(i64::from(limit))
     .execute(db.pool())
@@ -402,11 +398,11 @@ pub(crate) async fn begin_delivery_try(
     delivery_id: &str,
     lease_ms: i64,
 ) -> Result<DeliveryTry, RegistryError> {
-    let inserted: Option<i64> = sqlx::query_scalar(&format!(
-        "INSERT INTO webhook_deliveries (forge, id, at, unfinished, try_until)
-         VALUES ($1, $2, {NOW_MS}, TRUE, {NOW_MS} + $3)
+    let inserted = sqlx::query(&format!(
+        "INSERT INTO webhook_deliveries (forge, id, at, unfinished, try_until, try_token)
+         VALUES ($1, $2, {NOW_MS}, TRUE, {NOW_MS} + $3, {NEW_TOKEN})
          ON CONFLICT (forge, id) DO NOTHING
-         RETURNING at"
+         RETURNING at, try_token"
     ))
     .bind(forge.as_str())
     .bind(delivery_id)
@@ -414,14 +410,17 @@ pub(crate) async fn begin_delivery_try(
     .fetch_optional(db.pool())
     .await
     .map_err(reg_err)?;
-    if let Some(at) = inserted {
-        return Ok(DeliveryTry::First { at });
+    if let Some(r) = inserted {
+        return Ok(DeliveryTry::First {
+            at: r.get("at"),
+            token: r.get("try_token"),
+        });
     }
     let taken = sqlx::query(&format!(
-        "UPDATE webhook_deliveries SET try_until = {NOW_MS} + $3
+        "UPDATE webhook_deliveries SET try_until = {NOW_MS} + $3, try_token = {NEW_TOKEN}
          WHERE forge = $1 AND id = $2 AND unfinished
            AND (try_until IS NULL OR try_until < {NOW_MS})
-         RETURNING at, config_sha, head_scope, head_sha"
+         RETURNING at, config_sha, head_scope, head_sha, try_token"
     ))
     .bind(forge.as_str())
     .bind(delivery_id)
@@ -440,6 +439,7 @@ pub(crate) async fn begin_delivery_try(
         return Ok(DeliveryTry::Again {
             at: r.get("at"),
             pins,
+            token: r.get("try_token"),
         });
     }
     let unfinished: Option<bool> = sqlx::query_scalar(
@@ -496,15 +496,20 @@ pub(crate) async fn end_delivery_try(
     db: &PostgresDb,
     forge: ForgeKind,
     delivery_id: &str,
+    token: &str,
     finished: bool,
 ) -> Result<(), RegistryError> {
+    // Only the lease holder ends the try (ADR-0083 §7): a try whose lease
+    // lapsed and was taken leaves the later try's lease alone.
     sqlx::query(
-        "UPDATE webhook_deliveries SET try_until = NULL, unfinished = unfinished AND NOT $3
-         WHERE forge = $1 AND id = $2",
+        "UPDATE webhook_deliveries
+         SET try_until = NULL, try_token = NULL, unfinished = unfinished AND NOT $3
+         WHERE forge = $1 AND id = $2 AND try_token = $4",
     )
     .bind(forge.as_str())
     .bind(delivery_id)
     .bind(finished)
+    .bind(token)
     .execute(db.pool())
     .await
     .map_err(reg_err)?;

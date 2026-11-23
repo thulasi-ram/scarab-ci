@@ -339,6 +339,13 @@ impl ForgePort for RegistryForge {
             .await
     }
 
+    async fn pull_request_head(&self, repo: &RepoRef, number: u64) -> Result<String, ForgeError> {
+        self.adapter_for(repo)
+            .await?
+            .pull_request_head(repo, number)
+            .await
+    }
+
     async fn set_status(
         &self,
         repo: &RepoRef,

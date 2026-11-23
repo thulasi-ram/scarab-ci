@@ -169,6 +169,14 @@ async fn queued_statuses(db: &dyn Db, keys: &[&str]) -> usize {
         .count()
 }
 
+/// The lease token a try got.
+fn token(t: &DeliveryTry) -> String {
+    match t {
+        DeliveryTry::First { token, .. } | DeliveryTry::Again { token, .. } => token.clone(),
+        other => panic!("no lease: {other:?}"),
+    }
+}
+
 /// C1: the four answers of a try's begin. The first call is the first try;
 /// a second while it holds the lease is held; an unfinished end clears the
 /// lease and the next call takes it with what was pinned; a lapsed lease is
@@ -177,12 +185,11 @@ async fn queued_statuses(db: &dyn Db, keys: &[&str]) -> usize {
 /// end.
 async fn try_lease_contract(s: &Store) {
     let r = s.registry();
-    assert!(matches!(
-        r.begin_delivery_try(ForgeKind::GitHub, "d1", LEASE_MS)
-            .await
-            .unwrap(),
-        DeliveryTry::First { .. }
-    ));
+    let first = r
+        .begin_delivery_try(ForgeKind::GitHub, "d1", LEASE_MS)
+        .await
+        .unwrap();
+    assert!(matches!(first, DeliveryTry::First { .. }));
     assert_eq!(
         r.begin_delivery_try(ForgeKind::GitHub, "d1", LEASE_MS)
             .await
@@ -220,15 +227,15 @@ async fn try_lease_contract(s: &Store) {
         "the first pin wins"
     );
 
-    r.end_delivery_try(ForgeKind::GitHub, "d1", false)
+    r.end_delivery_try(ForgeKind::GitHub, "d1", &token(&first), false)
         .await
         .unwrap();
-    match r
+    let again = r
         .begin_delivery_try(ForgeKind::GitHub, "d1", LEASE_MS)
         .await
-        .unwrap()
-    {
-        DeliveryTry::Again { pins: got, .. } => assert_eq!(got, Some(pins.clone())),
+        .unwrap();
+    match &again {
+        DeliveryTry::Again { pins: got, .. } => assert_eq!(got, &Some(pins.clone())),
         other => panic!("an unfinished delivery with a free lease: {other:?}"),
     }
     assert_eq!(
@@ -238,14 +245,13 @@ async fn try_lease_contract(s: &Store) {
         DeliveryTry::Held
     );
     s.expire("d1").await;
-    assert!(matches!(
-        r.begin_delivery_try(ForgeKind::GitHub, "d1", LEASE_MS)
-            .await
-            .unwrap(),
-        DeliveryTry::Again { .. }
-    ));
+    let last = r
+        .begin_delivery_try(ForgeKind::GitHub, "d1", LEASE_MS)
+        .await
+        .unwrap();
+    assert!(matches!(last, DeliveryTry::Again { .. }));
 
-    r.end_delivery_try(ForgeKind::GitHub, "d1", true)
+    r.end_delivery_try(ForgeKind::GitHub, "d1", &token(&last), true)
         .await
         .unwrap();
     for _ in 0..2 {
@@ -258,6 +264,48 @@ async fn try_lease_contract(s: &Store) {
     }
 }
 both!(try_lease_in_memory, try_lease_postgres, try_lease_contract);
+
+/// R5: a try whose lease lapsed and was taken by a later try ends nothing:
+/// the later try's lease stands (a third try is held) and only the later
+/// try finishes the delivery. Kills: an end that clears any lease, which
+/// lets a third try in beside the second.
+async fn an_expired_try_cannot_end_a_later_try_contract(s: &Store) {
+    let r = s.registry();
+    let stalled = r
+        .begin_delivery_try(ForgeKind::GitHub, "d1", LEASE_MS)
+        .await
+        .unwrap();
+    s.expire("d1").await;
+    let later = r
+        .begin_delivery_try(ForgeKind::GitHub, "d1", LEASE_MS)
+        .await
+        .unwrap();
+    assert!(matches!(later, DeliveryTry::Again { .. }));
+    r.end_delivery_try(ForgeKind::GitHub, "d1", &token(&stalled), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        r.begin_delivery_try(ForgeKind::GitHub, "d1", LEASE_MS)
+            .await
+            .unwrap(),
+        DeliveryTry::Held,
+        "the stalled try ended the later try's lease"
+    );
+    r.end_delivery_try(ForgeKind::GitHub, "d1", &token(&later), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        r.begin_delivery_try(ForgeKind::GitHub, "d1", LEASE_MS)
+            .await
+            .unwrap(),
+        DeliveryTry::Finished
+    );
+}
+both!(
+    an_expired_try_cannot_end_a_later_try_in_memory,
+    an_expired_try_cannot_end_a_later_try_postgres,
+    an_expired_try_cannot_end_a_later_try_contract
+);
 
 /// C2: the first outcome written for a key wins, and nothing of the losing
 /// write remains: no Run row, no second refused row, no second status. A
@@ -368,6 +416,7 @@ async fn a_replacement_moves_the_outcome_once_contract(s: &Store) {
     db.begin_delivery_run_creation(&r1, 1, 1, &claim("d1", ".scarab/a.yaml", None))
         .await
         .unwrap();
+    end_unfinished(db, &r1).await;
     assert_eq!(
         db.begin_delivery_run_creation(&r2, 1, 1, &claim("d1", ".scarab/a.yaml", Some(&r1)))
             .await
@@ -406,6 +455,7 @@ async fn a_replacement_moves_the_outcome_once_contract(s: &Store) {
         OutcomeWrite::Claimed(_)
     ));
     overwrite.replaces = Some(r2.clone());
+    end_unfinished(db, &r2).await;
     assert_eq!(
         db.record_delivery_refusal(&key("d1", ".scarab/a.yaml"), &overwrite)
             .await
@@ -422,6 +472,60 @@ both!(
     a_replacement_moves_the_outcome_once_postgres,
     a_replacement_moves_the_outcome_once_contract
 );
+
+/// R4: a Run whose creation finished (the stalled try got there first) is
+/// not replaced, by a new Run or by a refusal: the store checks it under a
+/// row lock in the replacing transaction. Kills: an unconditional
+/// `replaced_by` update, which marks a live Run replaced (its statuses
+/// dropped, its rerun refused) and creates a second one.
+async fn a_finished_run_is_not_replaced_contract(s: &Store) {
+    let db = s.db();
+    let (old, new) = (RunId("r-old".into()), RunId("r-new".into()));
+    db.begin_delivery_run_creation(&old, 1, 1, &claim("d1", ".scarab/a.yaml", None))
+        .await
+        .unwrap();
+    assert!(db.finish_run_creation(&old).await.unwrap());
+    let lost = db
+        .begin_delivery_run_creation(&new, 1, 1, &claim("d1", ".scarab/a.yaml", Some(&old)))
+        .await
+        .unwrap();
+    assert_eq!(claimed_run(lost), Some(old.clone()));
+    assert_eq!(db.run_status(&new).await.unwrap(), None);
+    assert_eq!(
+        db.run_creation_state(&old)
+            .await
+            .unwrap()
+            .unwrap()
+            .replaced_by,
+        None
+    );
+    let mut overwrite = refusal(".scarab/a.yaml", "a-1", Some(&old));
+    overwrite.outcome = DeliveryOutcomeKind::NotRun;
+    overwrite.reason_kind = "not_head".into();
+    overwrite.refused = None;
+    assert!(matches!(
+        db.record_delivery_refusal(&key("d1", ".scarab/a.yaml"), &overwrite)
+            .await
+            .unwrap(),
+        OutcomeWrite::Claimed(_)
+    ));
+    assert_eq!(queued_statuses(db, &["a-1"]).await, 0);
+    let outcome = &db.delivery_outcomes("acme-conn", "d1").await.unwrap()[0];
+    assert_eq!(outcome.run_id, Some(old));
+}
+both!(
+    a_finished_run_is_not_replaced_in_memory,
+    a_finished_run_is_not_replaced_postgres,
+    a_finished_run_is_not_replaced_contract
+);
+
+/// End `run` `Failed` before its creation finished, as the creation sweep or
+/// a redelivery past the bound does: only then may it be replaced.
+async fn end_unfinished(db: &dyn Db, run: &RunId) {
+    scarab_engine::fail_run_creation(db, run, "stopped".into(), Timestamp(2))
+        .await
+        .unwrap();
+}
 
 /// C4: finishing a Run's creation is a compare-and-set on a Run still
 /// creating, still `Pending` and not replaced. Kills: the unconditional
@@ -456,9 +560,13 @@ async fn finish_is_a_compare_and_set_contract(s: &Store) {
     db.begin_delivery_run_creation(&old, 1, 1, &claim("d1", ".scarab/a.yaml", None))
         .await
         .unwrap();
-    db.begin_delivery_run_creation(&new, 1, 1, &claim("d1", ".scarab/a.yaml", Some(&old)))
-        .await
-        .unwrap();
+    end_unfinished(db, &old).await;
+    assert_eq!(
+        db.begin_delivery_run_creation(&new, 1, 1, &claim("d1", ".scarab/a.yaml", Some(&old)))
+            .await
+            .unwrap(),
+        OutcomeWrite::Written
+    );
     assert!(
         !db.finish_run_creation(&old).await.unwrap(),
         "a replaced Run"
@@ -472,212 +580,96 @@ both!(
     finish_is_a_compare_and_set_contract
 );
 
-/// A Run of `pipeline` in `org/app`, on `git_ref` (and pull request `pr`)
-/// at `sha`, created at `at`.
-#[allow(clippy::too_many_arguments)] // one row's columns
-async fn seed_run(
-    db: &dyn Db,
-    id: &str,
-    org: &str,
-    pipeline: &str,
-    git_ref: &str,
-    pr: Option<i64>,
-    sha: &str,
-    at: i64,
-) {
-    let run = RunId(id.into());
-    db.create_run(&run, 1, 1, Timestamp(at)).await.unwrap();
-    db.set_run_tenant(&run, org, "app").await.unwrap();
-    db.set_run_pipeline(&run, pipeline).await.unwrap();
-    let kind = if pr.is_some() { "pull_request" } else { "push" };
-    db.set_run_origin(&run, kind, None, Some(git_ref), Some(sha), pr, None)
+/// Begin a try of `id` and pin it to `scope` at `sha`; its `at`.
+async fn arrive(s: &Store, id: &str, scope: Option<&HeadScope>, sha: &str) -> i64 {
+    let r = s.registry();
+    let at = match r
+        .begin_delivery_try(ForgeKind::GitHub, id, LEASE_MS)
         .await
-        .unwrap();
+        .unwrap()
+    {
+        DeliveryTry::First { at, .. } => at,
+        other => panic!("{other:?}"),
+    };
+    r.pin_delivery(
+        ForgeKind::GitHub,
+        id,
+        &DeliveryPins {
+            config_sha: sha.into(),
+            head_scope: scope.map(|sc| sc.key("acme", "app")),
+            head_sha: scope.map(|_| sha.to_string()),
+        },
+    )
+    .await
+    .unwrap();
+    at
 }
 
-fn head(scope: HeadScope, pipeline: Option<&str>, sha: &str, after: i64) -> HeadQuery {
+fn head(scope: HeadScope, sha: &str, after: i64) -> HeadQuery {
     HeadQuery {
         org: "acme".into(),
         project: "app".into(),
         scope,
-        pipeline_name: pipeline.map(str::to_string),
-        pipeline_path: pipeline.map(|p| format!(".scarab/{p}.yaml")),
         head_sha: sha.into(),
         after: Timestamp(after),
     }
 }
 
-/// C5: the head rule's lookup. Only a Run of the same tenant, Pipeline and
-/// scope created after the delivery counts, and only at another commit; a
-/// newer delivery of the same scope at another commit counts when it
-/// decided the same file. Kills: the Postgres query (which the server cases
-/// never run) missing the lower bound, the scope, the tenant or the file.
+/// C5 (R1): the head moved when a delivery of the same ref or pull request
+/// arrived later at another commit, whatever it decided (even nothing); an
+/// earlier one, one of another scope, one at the same commit, and a Run
+/// with no delivery do not count. Kills: a lookup without the lower bound,
+/// the scope or the commit; one that reads Runs (a late Run of an older
+/// commit refusing the real head).
 async fn head_lookup_contract(s: &Store) {
     let db = s.db();
     let main = || HeadScope::Ref("refs/heads/main".into());
-    seed_run(
-        db,
-        "before",
-        "acme",
-        "gamma",
-        "refs/heads/main",
-        None,
-        "s0",
-        100,
-    )
-    .await;
-    seed_run(
-        db,
-        "other-ref",
-        "acme",
-        "gamma",
-        "refs/heads/other",
-        None,
+    arrive(s, "d-before", Some(&main()), "s0").await;
+    s.later().await;
+    let at = arrive(s, "d1", Some(&main()), "s1").await;
+    s.later().await;
+    arrive(
+        s,
+        "d-other-ref",
+        Some(&HeadScope::Ref("refs/heads/other".into())),
         "s9",
-        300,
     )
     .await;
-    seed_run(
-        db,
-        "other-pipe",
-        "acme",
-        "delta",
-        "refs/heads/main",
-        None,
-        "s8",
-        300,
-    )
-    .await;
-    seed_run(
-        db,
-        "other-org",
-        "else",
-        "gamma",
-        "refs/heads/main",
-        None,
-        "s7",
-        300,
-    )
-    .await;
-    seed_run(
-        db,
-        "pr",
-        "acme",
-        "gamma",
-        "refs/pull/7/head",
-        Some(7),
-        "h2",
-        300,
-    )
-    .await;
-    assert!(!db
-        .head_moved(&head(main(), Some("gamma"), "s1", 200))
+    arrive(s, "d-tag", None, "s8").await;
+    arrive(s, "d-same", Some(&main()), "s1").await;
+    // A Run of an older commit on the ref, created late with no delivery.
+    let run = RunId("late-run".into());
+    db.create_run(&run, 1, 1, Timestamp(i64::MAX / 2))
         .await
-        .unwrap());
+        .unwrap();
+    db.set_run_tenant(&run, "acme", "app").await.unwrap();
+    db.set_run_origin(
+        &run,
+        "push",
+        None,
+        Some("refs/heads/main"),
+        Some("s0"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(!db.head_moved(&head(main(), "s1", at)).await.unwrap());
+
+    arrive(s, "d-pr", Some(&HeadScope::PullRequest(7)), "h2").await;
     assert!(db
-        .head_moved(&head(HeadScope::PullRequest(7), Some("gamma"), "h1", 200))
+        .head_moved(&head(HeadScope::PullRequest(7), "h1", at))
         .await
         .unwrap());
     assert!(!db
-        .head_moved(&head(HeadScope::PullRequest(7), Some("gamma"), "h2", 200))
-        .await
-        .unwrap());
-    assert!(db
-        .head_moved(&head(HeadScope::PullRequest(7), None, "h1", 200))
-        .await
-        .unwrap());
-    seed_run(
-        db,
-        "same",
-        "acme",
-        "gamma",
-        "refs/heads/main",
-        None,
-        "s1",
-        400,
-    )
-    .await;
-    assert!(!db
-        .head_moved(&head(main(), Some("gamma"), "s1", 200))
-        .await
-        .unwrap());
-    seed_run(
-        db,
-        "newer",
-        "acme",
-        "gamma",
-        "refs/heads/main",
-        None,
-        "s2",
-        500,
-    )
-    .await;
-    assert!(db
-        .head_moved(&head(main(), Some("gamma"), "s1", 200))
+        .head_moved(&head(HeadScope::PullRequest(7), "h2", at))
         .await
         .unwrap());
 
-    // Newer deliveries: no Run of `beta` anywhere, but a later delivery of
-    // `main` at another commit decided `.scarab/beta.yaml`.
-    let r = s.registry();
-    let at_old = match r
-        .begin_delivery_try(ForgeKind::GitHub, "d-old", LEASE_MS)
-        .await
-        .unwrap()
-    {
-        DeliveryTry::First { at } => at,
-        other => panic!("{other:?}"),
-    };
-    let scope = main().key("acme", "app");
-    r.pin_delivery(
-        ForgeKind::GitHub,
-        "d-old",
-        &DeliveryPins {
-            config_sha: "s1".into(),
-            head_scope: Some(scope.clone()),
-            head_sha: Some("s1".into()),
-        },
-    )
-    .await
-    .unwrap();
-    s.later().await;
-    r.begin_delivery_try(ForgeKind::GitHub, "d-new", LEASE_MS)
-        .await
-        .unwrap();
-    r.pin_delivery(
-        ForgeKind::GitHub,
-        "d-new",
-        &DeliveryPins {
-            config_sha: "s3".into(),
-            head_scope: Some(scope),
-            head_sha: Some("s3".into()),
-        },
-    )
-    .await
-    .unwrap();
-    assert!(!db
-        .head_moved(&head(main(), Some("beta"), "s1", at_old))
-        .await
-        .unwrap());
-    db.record_delivery_outcome(
-        &key("d-new", ".scarab/beta.yaml"),
-        DeliveryOutcomeKind::NoMatch,
-        Timestamp(at_old),
-    )
-    .await
-    .unwrap();
-    assert!(db
-        .head_moved(&head(main(), Some("beta"), "s1", at_old))
-        .await
-        .unwrap());
-    assert!(!db
-        .head_moved(&head(main(), Some("beta"), "s3", at_old))
-        .await
-        .unwrap());
-    assert!(!db
-        .head_moved(&head(main(), Some("other"), "s1", at_old))
-        .await
-        .unwrap());
+    // A newer push that decided nothing still moves the head.
+    arrive(s, "d-newer", Some(&main()), "s2").await;
+    assert!(db.head_moved(&head(main(), "s1", at)).await.unwrap());
+    assert!(!db.head_moved(&head(main(), "s2", at)).await.unwrap());
 }
 both!(
     head_lookup_in_memory,
@@ -686,21 +678,36 @@ both!(
 );
 
 /// R1's store half: a delivery and every outcome it recorded go together,
-/// by the delivery's arrival, whatever the outcomes' own `at`.
+/// by the delivery's arrival, whatever the outcomes' own `at`; and (A6) a
+/// delivery a try holds stays, outcomes and all, until its lease lapses.
+/// Kills: the two tables pruned by their own `at`; a prune under a live
+/// try, which leaves the try's later outcomes with no delivery row.
 async fn prune_takes_a_delivery_with_its_outcomes_contract(s: &Store) {
     let r = s.registry();
     let db = s.db();
-    let at = match r
+    let held = r
+        .begin_delivery_try(ForgeKind::GitHub, "d-held", LEASE_MS)
+        .await
+        .unwrap();
+    assert!(matches!(held, DeliveryTry::First { .. }));
+    let old = r
         .begin_delivery_try(ForgeKind::GitHub, "d-old", LEASE_MS)
         .await
-        .unwrap()
-    {
-        DeliveryTry::First { at } => at,
+        .unwrap();
+    let at = match &old {
+        DeliveryTry::First { at, .. } => *at,
         other => panic!("{other:?}"),
     };
-    for (pipeline, outcome_at) in [(".scarab/a.yaml", at), (".scarab/b.yaml", i64::MAX / 2)] {
+    r.end_delivery_try(ForgeKind::GitHub, "d-old", &token(&old), false)
+        .await
+        .unwrap();
+    for (delivery, pipeline, outcome_at) in [
+        ("d-old", ".scarab/a.yaml", at),
+        ("d-old", ".scarab/b.yaml", i64::MAX / 2),
+        ("d-held", ".scarab/a.yaml", at),
+    ] {
         db.record_delivery_outcome(
-            &key("d-old", pipeline),
+            &key(delivery, pipeline),
             DeliveryOutcomeKind::NoMatch,
             Timestamp(outcome_at),
         )
@@ -723,20 +730,33 @@ async fn prune_takes_a_delivery_with_its_outcomes_contract(s: &Store) {
         db.prune_webhook_deliveries(Timestamp(at + 1), 1_000)
             .await
             .unwrap(),
-        1
+        1,
+        "only the delivery no try holds"
     );
     assert!(db
         .delivery_outcomes("acme-conn", "d-old")
         .await
         .unwrap()
         .is_empty());
+    for kept in ["d-held", "d-new"] {
+        assert_eq!(
+            db.delivery_outcomes("acme-conn", kept).await.unwrap().len(),
+            1,
+            "{kept}"
+        );
+    }
+    s.expire("d-held").await;
     assert_eq!(
-        db.delivery_outcomes("acme-conn", "d-new")
+        db.prune_webhook_deliveries(Timestamp(at + 1), 1_000)
             .await
-            .unwrap()
-            .len(),
+            .unwrap(),
         1
     );
+    assert!(db
+        .delivery_outcomes("acme-conn", "d-held")
+        .await
+        .unwrap()
+        .is_empty());
     // The pruned id is a new delivery again; the kept one is held.
     assert!(matches!(
         r.begin_delivery_try(ForgeKind::GitHub, "d-old", LEASE_MS)

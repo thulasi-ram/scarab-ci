@@ -144,6 +144,9 @@ async fn the_0104_revert_runs_twice_and_the_migrator_upgrades_again() {
     db.begin_delivery_run_creation(&old, 1, 1, &claim(None))
         .await
         .unwrap();
+    scarab_engine::fail_run_creation(&db, &old, "stopped".into(), Timestamp(2))
+        .await
+        .unwrap();
     db.begin_delivery_run_creation(&new, 1, 1, &claim(Some(&old)))
         .await
         .unwrap();

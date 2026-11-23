@@ -4443,9 +4443,10 @@ impl ForgeConnectionStore for PostgresDb {
         &self,
         forge: ForgeKind,
         delivery_id: &str,
+        token: &str,
         finished: bool,
     ) -> Result<(), RegistryError> {
-        delivery::end_delivery_try(self, forge, delivery_id, finished).await
+        delivery::end_delivery_try(self, forge, delivery_id, token, finished).await
     }
 
     async fn last_delivery_at(&self, forge: ForgeKind) -> Result<Option<i64>, RegistryError> {

@@ -315,6 +315,17 @@ struct DeliveryRow {
     unfinished: bool,
     pins: Option<scarab_forge::DeliveryPins>,
     try_until: Option<i64>,
+    /// The lease holder's token (`webhook_deliveries.try_token`).
+    try_token: Option<String>,
+}
+
+/// Whether a redelivery may replace `run` (ADR-0083 §4; the Postgres
+/// store's `FOR UPDATE` guard): its creation never finished, it has ended
+/// (no try may still finish it), and nothing replaced it yet.
+fn replaceable(st: &InMemoryState, run: &RunId) -> bool {
+    st.creating.contains(run)
+        && st.runs.get(run).is_some_and(|s| *s != RunStatus::Pending)
+        && !st.run_replaced_by.contains_key(run)
 }
 
 /// A delivery outcome's key in the in-memory state.
@@ -441,6 +452,8 @@ struct InMemoryState {
     >,
     /// Per-run replacement (mirrors `runs.replaced_by`).
     run_replaced_by: HashMap<RunId, RunId>,
+    /// How many delivery try tokens were handed out.
+    delivery_tokens: u64,
     /// Test-only one-shot failure of the next
     /// [`record_delivery_refusal`](Db::record_delivery_refusal).
     delivery_refusal_failure: bool,
@@ -1093,6 +1106,7 @@ impl Db for InMemoryDb {
             (Some(old), Some(o)) => {
                 o.outcome == scarab_engine::DeliveryOutcomeKind::Run
                     && o.run_id.as_ref() == Some(old)
+                    && replaceable(&st, old)
             }
             _ => false,
         };
@@ -1157,6 +1171,7 @@ impl Db for InMemoryDb {
             (Some(old), Some(o)) => {
                 o.outcome == scarab_engine::DeliveryOutcomeKind::Run
                     && o.run_id.as_ref() == Some(old)
+                    && replaceable(&st, old)
             }
             _ => false,
         };
@@ -1236,46 +1251,14 @@ impl Db for InMemoryDb {
 
     async fn head_moved(&self, q: &scarab_engine::HeadQuery) -> Result<bool, DbError> {
         let st = self.state.lock().unwrap();
-        let newest = st
-            .runs
-            .keys()
-            .filter(|r| {
-                st.run_tenant.get(*r) == Some(&(q.org.clone(), q.project.clone()))
-                    && st.run_created.get(*r).is_some_and(|at| at.0 > q.after.0)
-                    && q.pipeline_name
-                        .as_ref()
-                        .is_none_or(|p| st.run_pipeline.get(*r) == Some(p))
-                    && st.run_origin.get(*r).is_some_and(|o| match &q.scope {
-                        scarab_engine::HeadScope::Ref(r) => o.2.as_deref() == Some(r.as_str()),
-                        scarab_engine::HeadScope::PullRequest(n) => o.4 == Some(*n),
-                    })
-            })
-            .max_by(|a, b| (st.run_created.get(*a), &a.0).cmp(&(st.run_created.get(*b), &b.0)));
-        if let Some(run) = newest {
-            let sha = st.run_origin.get(run).and_then(|o| o.3.as_deref());
-            if sha != Some(q.head_sha.as_str()) {
-                return Ok(true);
-            }
-        }
         let scope = q.scope.key(&q.org, &q.project);
-        Ok(st
-            .delivery_outcomes
-            .iter()
-            .any(|((_, d, path), (forge, _))| {
-                q.pipeline_path.as_ref().is_none_or(|p| p == path)
-                    && st
-                        .webhook_deliveries
-                        .get(&(forge.clone(), d.clone()))
-                        .is_some_and(|row| {
-                            row.at > q.after.0
-                                && row.pins.as_ref().is_some_and(|p| {
-                                    p.head_scope.as_deref() == Some(scope.as_str())
-                                        && p.head_sha
-                                            .as_deref()
-                                            .is_some_and(|s| s != q.head_sha.as_str())
-                                })
-                        })
-            }))
+        Ok(st.webhook_deliveries.values().any(|row| {
+            row.at > q.after.0
+                && row.pins.as_ref().is_some_and(|p| {
+                    p.head_scope.as_deref() == Some(scope.as_str())
+                        && p.head_sha.as_deref().is_some_and(|s| s != q.head_sha)
+                })
+        }))
     }
 
     async fn prune_webhook_deliveries(
@@ -1283,11 +1266,13 @@ impl Db for InMemoryDb {
         before: Timestamp,
         limit: u32,
     ) -> Result<u64, DbError> {
+        let now = self.store_now();
         let mut st = self.state.lock().unwrap();
         let mut gone: Vec<((String, String), i64)> = st
             .webhook_deliveries
             .iter()
-            .filter(|(_, row)| row.at < before.0)
+            // A delivery a try holds stays (ADR-0083 §8).
+            .filter(|(_, row)| row.at < before.0 && row.try_until.is_none_or(|u| u < now))
             .map(|(k, row)| (k.clone(), row.at))
             .collect();
         gone.sort_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
@@ -4614,6 +4599,13 @@ pub struct FakeForge {
     files: Mutex<HashMap<String, Vec<u8>>>,
     /// Trees served at one ref instead of `files` ([`put_tree_at`](Self::put_tree_at)).
     trees_at: Mutex<HashMap<String, HashMap<String, Vec<u8>>>>,
+    /// Pull request heads [`pull_request_head`](ForgePort::pull_request_head)
+    /// answers ([`set_pr_head`](Self::set_pr_head)).
+    pr_heads: Mutex<HashMap<u64, String>>,
+    /// When set, [`pull_request_head`](ForgePort::pull_request_head) fails.
+    pr_head_fails: Mutex<bool>,
+    /// Refs whose [`latest_commit`](ForgePort::latest_commit) fails.
+    latest_commit_fails: Mutex<std::collections::HashSet<String>>,
     /// Each posted status and the commit sha it was posted on.
     statuses: Mutex<Vec<(String, Status)>>,
     comments: Mutex<Vec<(u64, String)>>,
@@ -4826,6 +4818,28 @@ impl FakeForge {
                 .map(|(p, c)| (p.to_string(), c.as_bytes().to_vec()))
                 .collect(),
         );
+    }
+
+    /// The head commit pull request `number` is at.
+    pub fn set_pr_head(&self, number: u64, sha: impl Into<String>) {
+        self.pr_heads.lock().unwrap().insert(number, sha.into());
+    }
+
+    /// Make [`pull_request_head`](ForgePort::pull_request_head) fail
+    /// (`true`, an API error) or work again.
+    pub fn fail_pull_request_head(&self, fail: bool) {
+        *self.pr_head_fails.lock().unwrap() = fail;
+    }
+
+    /// Make [`latest_commit`](ForgePort::latest_commit) of `git_ref` fail
+    /// with an API error (`true`) or work again.
+    pub fn fail_latest_commit_for(&self, git_ref: &str, fail: bool) {
+        let mut fails = self.latest_commit_fails.lock().unwrap();
+        if fail {
+            fails.insert(git_ref.to_string());
+        } else {
+            fails.remove(git_ref);
+        }
     }
 
     /// Make [`set_status`](ForgePort::set_status) fail (`true`) or work again.
@@ -5314,6 +5328,8 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
         self.interleave_point("begin_delivery_try").await;
         let now = self.store_now();
         let mut st = self.state.lock().unwrap();
+        st.delivery_tokens += 1;
+        let token = format!("try-{}", st.delivery_tokens);
         let key = (forge.as_str().to_string(), delivery_id.to_string());
         let Some(row) = st.webhook_deliveries.get_mut(&key) else {
             st.webhook_deliveries.insert(
@@ -5323,9 +5339,10 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
                     unfinished: true,
                     pins: None,
                     try_until: Some(now.saturating_add(lease_ms)),
+                    try_token: Some(token.clone()),
                 },
             );
-            return Ok(scarab_forge::DeliveryTry::First { at: now });
+            return Ok(scarab_forge::DeliveryTry::First { at: now, token });
         };
         if !row.unfinished {
             return Ok(scarab_forge::DeliveryTry::Finished);
@@ -5334,9 +5351,11 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
             return Ok(scarab_forge::DeliveryTry::Held);
         }
         row.try_until = Some(now.saturating_add(lease_ms));
+        row.try_token = Some(token.clone());
         Ok(scarab_forge::DeliveryTry::Again {
             at: row.at,
             pins: row.pins.clone(),
+            token,
         })
     }
 
@@ -5358,13 +5377,18 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
         &self,
         forge: scarab_forge::ForgeKind,
         delivery_id: &str,
+        token: &str,
         finished: bool,
     ) -> Result<(), scarab_forge::RegistryError> {
         let mut st = self.state.lock().unwrap();
         let key = (forge.as_str().to_string(), delivery_id.to_string());
         if let Some(row) = st.webhook_deliveries.get_mut(&key) {
-            row.try_until = None;
-            row.unfinished = row.unfinished && !finished;
+            // Only the lease holder ends the try (ADR-0083 §7).
+            if row.try_token.as_deref() == Some(token) {
+                row.try_until = None;
+                row.try_token = None;
+                row.unfinished = row.unfinished && !finished;
+            }
         }
         Ok(())
     }
@@ -5483,6 +5507,21 @@ impl ForgePort for FakeForge {
             ))
     }
 
+    async fn pull_request_head(&self, _repo: &RepoRef, number: u64) -> Result<String, ForgeError> {
+        self.check_rate_limit()?;
+        if *self.pr_head_fails.lock().unwrap() {
+            return Err(ForgeError::Api(
+                "fake forge: pull request read failed".into(),
+            ));
+        }
+        self.pr_heads
+            .lock()
+            .unwrap()
+            .get(&number)
+            .cloned()
+            .ok_or_else(|| ForgeError::NotFound(format!("pull request #{number}")))
+    }
+
     async fn pull_request_files(
         &self,
         _repo: &RepoRef,
@@ -5509,6 +5548,12 @@ impl ForgePort for FakeForge {
 
     async fn latest_commit(&self, _repo: &RepoRef, r#ref: &str) -> Result<Commit, ForgeError> {
         self.check_rate_limit()?;
+        if self.latest_commit_fails.lock().unwrap().contains(r#ref) {
+            return Err(ForgeError::Api(format!(
+                "fake forge: no commit for {}",
+                r#ref
+            )));
+        }
         let sha = self
             .commits
             .lock()

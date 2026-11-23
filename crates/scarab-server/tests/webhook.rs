@@ -2786,7 +2786,7 @@ async fn a_late_pr_comment_redelivery_is_not_the_head() {
     ])
     .await;
     let app = t.replica();
-    t.forge.set_commit("refs/pull/7/head", "bbb111");
+    t.forge.set_pr_head(7, "bbb111");
     t.forge
         .set_read_error_for(".scarab/deploy.yaml", Some("502 bad gateway"));
     let (status, _) = send(&app, comment_of("c1", 7, "/deploy", true)).await;
@@ -2794,7 +2794,7 @@ async fn a_late_pr_comment_redelivery_is_not_the_head() {
     t.forge.set_read_error_for(".scarab/deploy.yaml", None);
 
     t.later();
-    t.forge.set_commit("refs/pull/7/head", "bbb222");
+    t.forge.set_pr_head(7, "bbb222");
     let (status, _) = send(&app, pull_request_of("pr2", 7, "bbb222")).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     let pr_run = t.run_of("pr2", ".scarab/pr.yaml").await;

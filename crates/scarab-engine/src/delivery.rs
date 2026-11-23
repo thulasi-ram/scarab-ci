@@ -158,19 +158,14 @@ impl HeadScope {
     }
 }
 
-/// The head rule's question: is there, after `after`, a newer Run of this
-/// Pipeline in this scope at another commit than `head_sha`, or a newer
-/// delivery of this scope at another commit that decided this Pipeline?
+/// The head rule's question (ADR-0083 §5): did a delivery of the same ref
+/// or pull request arrive after `after` at another commit than `head_sha`?
+/// Deliveries are ordered by arrival on the store's clock; no Run is read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeadQuery {
     pub org: String,
     pub project: String,
     pub scope: HeadScope,
-    /// The Run's pipeline name (`runs.pipeline`); `None` for any Pipeline
-    /// (a comment on a pull request).
-    pub pipeline_name: Option<String>,
-    /// The Pipeline file of the outcomes; `None` for any file.
-    pub pipeline_path: Option<String>,
     /// The commit the delivery is about.
     pub head_sha: String,
     /// The delivery row's `at`.

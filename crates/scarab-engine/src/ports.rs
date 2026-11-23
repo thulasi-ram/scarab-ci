@@ -367,17 +367,15 @@ pub trait Db: Send + Sync {
     ) -> Result<Vec<crate::DeliveryOutcome>, DbError>;
 
     /// The head rule of a later try (ADR-0083 §5): whether the head of
-    /// `q.scope` moved after `q.after`. It moved when the newest Run of the
-    /// project in that scope (of `q.pipeline_name`, or any Pipeline when
-    /// `None`) created after `q.after` is at another commit than
-    /// `q.head_sha`, or when a delivery of that scope that arrived after
-    /// `q.after`, at another commit, recorded an outcome for `q.pipeline_path`
-    /// (any file when `None`).
+    /// `q.scope` moved after `q.after`: a webhook delivery of the same scope
+    /// (`webhook_deliveries.head_scope`) arrived later, at another commit.
+    /// No Run is read.
     async fn head_moved(&self, q: &crate::HeadQuery) -> Result<bool, DbError>;
 
-    /// Delete up to `limit` webhook deliveries that arrived before `before`,
-    /// each with every outcome recorded for it, in one transaction
-    /// (ADR-0083 §8). Returns how many deliveries were deleted.
+    /// Delete up to `limit` webhook deliveries that arrived before `before`
+    /// and that no try holds (a live lease keeps a delivery), each with
+    /// every outcome recorded for it, in one transaction (ADR-0083 §8).
+    /// Returns how many deliveries were deleted.
     async fn prune_webhook_deliveries(&self, before: Timestamp, limit: u32)
         -> Result<u64, DbError>;
 

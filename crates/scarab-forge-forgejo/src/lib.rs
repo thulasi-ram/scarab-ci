@@ -1033,6 +1033,15 @@ impl ForgePort for ForgejoForge {
     /// ([`more_pages`]), or until [`CHANGED_PATHS_MAX`](scarab_forge::CHANGED_PATHS_MAX)
     /// files. A walk that hits the page ceiling first is an error: the list
     /// would not be whole.
+    async fn pull_request_head(&self, repo: &RepoRef, number: u64) -> Result<String, ForgeError> {
+        let url = self.url(&format!(
+            "/repos/{}/{}/pulls/{number}",
+            repo.owner, repo.name
+        ));
+        let body = ok_json(self.send(|| self.client.get(&url)).await?).await?;
+        scarab_forge::pull_request_head_sha(&body)
+    }
+
     async fn pull_request_files(
         &self,
         repo: &RepoRef,

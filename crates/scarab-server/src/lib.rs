@@ -5516,8 +5516,6 @@ pub(crate) struct DeliveryRun {
 pub(crate) struct DeliveryHead {
     scope: scarab_engine::HeadScope,
     sha: String,
-    /// A comment on a pull request: any Pipeline of the pull request counts.
-    comment: bool,
     /// What a `not_head` status names: "`refs/heads/main`", "pull request #7".
     name: String,
 }
@@ -5574,10 +5572,17 @@ async fn revisit(
         )
         .await
         {
-            // A conflict is the sweep, or another try, ending it first.
+            // A conflict is the sweep, another try, or the stalled try
+            // finishing it first: read it again.
             tracing::debug!(run = %run.0, error = %e, "ending an unfinished Run before its replacement");
+            let again = db.run_creation_state(run).await?;
+            if again.is_none_or(|s| !s.creating || s.replaced_by.is_some()) {
+                return Ok(Revisit::Decided);
+            }
         }
     }
+    // The store checks again, under a row lock, that the Run has ended and
+    // is not finished or replaced (ADR-0083 §4).
     Ok(Revisit::Replace(run.clone()))
 }
 
@@ -5915,6 +5920,8 @@ pub(crate) async fn trigger_runs_from_files(
         return Ok(outcome);
     }
 
+    // The head rule's answer, once asked (ADR-0083 §5).
+    let mut head_moved: Option<Result<bool, String>> = None;
     for (path, ir, replaces) in compiled {
         let name = run_pipeline_name(&ir, path);
         // A Pipeline whose Run a first try began matched then; its trigger
@@ -6030,19 +6037,22 @@ pub(crate) async fn trigger_runs_from_files(
         }
 
         // ADR-0083 §5: a later try creates nothing for a push, a pull
-        // request or a comment on a pull request whose head has moved.
+        // request or a comment on a pull request whose head has moved: a
+        // delivery of the same ref or pull request arrived later at another
+        // commit. Asked once per try, when the first Pipeline would run.
         if let Some((d, head)) = delivery.and_then(|d| d.head.as_ref().map(|h| (d, h))) {
             if !d.first {
-                let query = scarab_engine::HeadQuery {
-                    org: repo.owner.clone(),
-                    project: repo.name.clone(),
-                    scope: head.scope.clone(),
-                    pipeline_name: (!head.comment).then(|| name.clone()),
-                    pipeline_path: (!head.comment).then(|| path.clone()),
-                    head_sha: head.sha.clone(),
-                    after: d.at,
-                };
-                match db.head_moved(&query).await {
+                if head_moved.is_none() {
+                    let query = scarab_engine::HeadQuery {
+                        org: repo.owner.clone(),
+                        project: repo.name.clone(),
+                        scope: head.scope.clone(),
+                        head_sha: head.sha.clone(),
+                        after: d.at,
+                    };
+                    head_moved = Some(db.head_moved(&query).await.map_err(|e| e.to_string()));
+                }
+                match head_moved.clone().unwrap_or(Ok(false)) {
                     Ok(false) => {}
                     Ok(true) => {
                         let reason = format!("not run: no longer the head of {}", head.name);
@@ -6134,6 +6144,10 @@ pub(crate) async fn trigger_runs_from_files(
             }
             Err(e) => return Err(e),
         };
+        let admission_run = match &admission {
+            Admission::Ended(run) => Some(run.clone()),
+            _ => None,
+        };
         match admission {
             Admission::Created(run) => {
                 record_path_filter_note(db, clock, &run, &ir, kind.as_str(), &ctx, &paths).await;
@@ -6143,9 +6157,9 @@ pub(crate) async fn trigger_runs_from_files(
                 }
                 outcome.runs.push(run)
             }
-            // Another try decided it first, or ended or replaced the Run
-            // while this try was writing it (ADR-0083 §2, §4).
-            Admission::Claimed => {
+            // Another try decided it first (ADR-0083 §2), or this try's Run
+            // was ended or replaced while it was written (§4).
+            Admission::Claimed | Admission::Ended(_) => {
                 let recorded = match delivery {
                     Some(d) => db
                         .delivery_outcomes(&d.connection_id, &d.delivery_id)
@@ -6154,7 +6168,18 @@ pub(crate) async fn trigger_runs_from_files(
                         .and_then(|all| all.into_iter().find(|o| &o.pipeline == path)),
                     None => None,
                 };
-                outcome.settle(path, Recorded::Claimed(recorded), None);
+                // The outcome still names this try's own Run, which the
+                // sweep ended: nothing is decided until a redelivery
+                // replaces it.
+                let own = match (&admission_run, &recorded) {
+                    (Some(run), Some(o)) => o.run_id.as_ref() == Some(run),
+                    _ => false,
+                };
+                if own {
+                    outcome.undecided.push(path.clone());
+                } else {
+                    outcome.settle(path, Recorded::Claimed(recorded), None);
+                }
             }
             Admission::Refused(refusal) => {
                 let entry = refused_pipeline_entry(&refusal, &ir, path, event, repo);
@@ -6529,10 +6554,13 @@ async fn run_cache_scope(
 enum Admission {
     Created(RunId),
     Refused(AdmissionRefusal),
-    /// The webhook path only (ADR-0083): another try of the delivery decided
-    /// this Pipeline first, or ended or replaced the Run while this try was
-    /// writing it. Nothing of this try's Run remains in use.
+    /// The webhook path only (ADR-0083 §2): another try of the delivery
+    /// recorded this Pipeline first, and nothing of this try's Run exists.
     Claimed,
+    /// The webhook path only (ADR-0083 §4): this try wrote the Run's first
+    /// row, and the Run was ended (the creation sweep) or replaced before
+    /// its creation finished.
+    Ended(RunId),
 }
 
 /// Governance resolved once for a run from its `environment:` reference
@@ -7393,7 +7421,7 @@ async fn admit_unrecorded(
             Err(refusal) => return Ok(Admission::Refused(refusal)),
         }
     }
-    let created = persist_run_from_ir(
+    let persisted = persist_run_from_ir(
         db,
         &run,
         run_row_written,
@@ -7409,10 +7437,10 @@ async fn admit_unrecorded(
         now,
     )
     .await?;
-    Ok(if created {
-        Admission::Created(run)
-    } else {
-        Admission::Claimed
+    Ok(match persisted {
+        Persisted::Created => Admission::Created(run),
+        Persisted::Claimed => Admission::Claimed,
+        Persisted::Ended => Admission::Ended(run),
     })
 }
 
@@ -8280,7 +8308,9 @@ pub async fn dispatch_run(
         }
         Admission::Refused(refusal) => refusal,
         // Only the webhook path claims a delivery outcome.
-        Admission::Claimed => return Err(DispatchError::Db(DbError::Conflict)),
+        Admission::Claimed | Admission::Ended(_) => {
+            return Err(DispatchError::Db(DbError::Conflict))
+        }
     };
     let repo = event
         .repo()
@@ -8541,7 +8571,7 @@ async fn persist_run_from_ir(
     admitted: &AdmittedFacts<'_>,
     concurrency_group: Option<&str>,
     now: Timestamp,
-) -> Result<bool, TriggerError> {
+) -> Result<Persisted, TriggerError> {
     // The Run's first row may already be written, in its `run.create`
     // decision's transaction (git-bug bbc433e). Written to a database this
     // `db` does not read (stores paired differently), it is written here.
@@ -8554,7 +8584,7 @@ async fn persist_run_from_ir(
                     .begin_delivery_run_creation(run, ir.ir_version, EVENT_VERSION, claim)
                     .await?;
                 if let scarab_engine::OutcomeWrite::Claimed(_) = written {
-                    return Ok(false);
+                    return Ok(Persisted::Claimed);
                 }
             }
             None => {
@@ -8577,7 +8607,23 @@ async fn persist_run_from_ir(
         now,
     )
     .await;
-    end_run_creation(db, run, now, written).await
+    Ok(if end_run_creation(db, run, now, written).await? {
+        Persisted::Created
+    } else {
+        Persisted::Ended
+    })
+}
+
+/// What [`persist_run_from_ir`] made of the Run.
+enum Persisted {
+    /// Every write landed and the Run is schedulable.
+    Created,
+    /// The webhook path: another try recorded the delivery outcome first,
+    /// and nothing of this Run was written (ADR-0083 §2).
+    Claimed,
+    /// The Run's first row was written, and the Run was ended or replaced
+    /// before its creation finished (ADR-0083 §4).
+    Ended,
 }
 
 /// The concurrency group's key for a Run of `ir`, rendered before its
@@ -9392,6 +9438,8 @@ pub(crate) struct DeliveryTryState {
     at: i64,
     /// What an earlier try pinned.
     pins: Option<scarab_forge::DeliveryPins>,
+    /// This try's lease token: only it ends the try.
+    token: String,
 }
 
 /// How a try of a webhook delivery starts.
@@ -9424,11 +9472,11 @@ async fn start_delivery_try(
         )
         .await
         .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
-    let (first, at, pins) = match begun {
+    let (first, at, pins, token) = match begun {
         scarab_forge::DeliveryTry::Finished => return Ok(TryStart::Duplicate),
         scarab_forge::DeliveryTry::Held => return Err(delivery_held()),
-        scarab_forge::DeliveryTry::First { at } => (true, at, None),
-        scarab_forge::DeliveryTry::Again { at, pins } => (false, at, pins),
+        scarab_forge::DeliveryTry::First { at, token } => (true, at, None, token),
+        scarab_forge::DeliveryTry::Again { at, pins, token } => (false, at, pins, token),
     };
     Ok(TryStart::Run(Some(DeliveryTryState {
         forge,
@@ -9436,6 +9484,7 @@ async fn start_delivery_try(
         first,
         at,
         pins,
+        token,
     })))
 }
 
@@ -9452,7 +9501,10 @@ async fn end_delivery_try(st: &AppState, try_: Option<&DeliveryTryState>, finish
     let (Some(t), Some(connections)) = (try_, st.connections.as_ref()) else {
         return;
     };
-    if let Err(e) = connections.end_delivery_try(t.forge, &t.id, finished).await {
+    if let Err(e) = connections
+        .end_delivery_try(t.forge, &t.id, &t.token, finished)
+        .await
+    {
         tracing::warn!(
             forge = t.forge.as_str(),
             delivery = %t.id,
@@ -9467,23 +9519,38 @@ async fn end_delivery_try(st: &AppState, try_: Option<&DeliveryTryState>, finish
 /// and for a tag or release the tag, resolved once — and, for a push, a pull
 /// request or a comment on a pull request, the ref or pull request and its
 /// commit then.
+///
+/// `None` when a comment's, tag's or release's commit cannot be resolved:
+/// this try reads `.scarab/` at the symbolic ref, as 0.7.1 did, nothing is
+/// pinned, and the next try resolves again. A pull request whose head cannot
+/// be read is pinned with no head: the comment then runs on a later try as a
+/// comment not on a pull request does.
 async fn resolve_delivery_pins(
     forge: &dyn scarab_forge::ForgePort,
     event: &scarab_forge::Event,
-) -> Result<scarab_forge::DeliveryPins, scarab_forge::ForgeError> {
+) -> Option<scarab_forge::DeliveryPins> {
     use scarab_forge::Event;
+    let repo = event.repo()?;
+    let scope_key = |scope: scarab_engine::HeadScope| Some(scope.key(&repo.owner, &repo.name));
     let resolve = |r: String| async move {
-        let repo = event
-            .repo()
-            .ok_or_else(|| scarab_forge::ForgeError::Malformed("no repository".into()))?;
-        forge_read_retried(|| forge.latest_commit(repo, &r))
-            .await
-            .map(|c| c.sha)
+        match forge_read_retried(|| forge.latest_commit(repo, &r)).await {
+            Ok(c) => Some(c.sha),
+            Err(e) => {
+                tracing::warn!(
+                    git_ref = %r,
+                    error = %e,
+                    "the delivery's commit could not be resolved; reading .scarab/ at the ref"
+                );
+                None
+            }
+        }
     };
-    let scope_key = |scope: scarab_engine::HeadScope| {
-        event.repo().map(|repo| scope.key(&repo.owner, &repo.name))
+    let unpinned = |config_sha: String| scarab_forge::DeliveryPins {
+        config_sha,
+        head_scope: None,
+        head_sha: None,
     };
-    Ok(match event {
+    Some(match event {
         Event::Push { r#ref, after, .. } => scarab_forge::DeliveryPins {
             config_sha: after.clone(),
             head_scope: scope_key(scarab_engine::HeadScope::Ref(r#ref.clone())),
@@ -9500,30 +9567,28 @@ async fn resolve_delivery_pins(
             ..
         } => {
             let config_sha = resolve(config_ref(event)).await?;
-            if *pull_request {
-                scarab_forge::DeliveryPins {
+            if !*pull_request {
+                return Some(unpinned(config_sha));
+            }
+            match forge_read_retried(|| forge.pull_request_head(repo, *issue)).await {
+                Ok(head) => scarab_forge::DeliveryPins {
                     config_sha,
                     head_scope: scope_key(scarab_engine::HeadScope::PullRequest(*issue as i64)),
-                    head_sha: Some(resolve(format!("refs/pull/{issue}/head")).await?),
-                }
-            } else {
-                scarab_forge::DeliveryPins {
-                    config_sha,
-                    head_scope: None,
-                    head_sha: None,
+                    head_sha: Some(head),
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        pull_request = issue,
+                        error = %e,
+                        "the pull request's head could not be read; the comment is pinned \
+                         with no head"
+                    );
+                    unpinned(config_sha)
                 }
             }
         }
-        Event::Tag { .. } | Event::Release { .. } => scarab_forge::DeliveryPins {
-            config_sha: resolve(config_ref(event)).await?,
-            head_scope: None,
-            head_sha: None,
-        },
-        _ => scarab_forge::DeliveryPins {
-            config_sha: config_ref(event),
-            head_scope: None,
-            head_sha: None,
-        },
+        Event::Tag { .. } | Event::Release { .. } => unpinned(resolve(config_ref(event)).await?),
+        _ => unpinned(config_ref(event)),
     })
 }
 
@@ -9542,13 +9607,11 @@ fn delivery_head(
         Event::Push { r#ref, .. } => Some(DeliveryHead {
             scope: scarab_engine::HeadScope::Ref(r#ref.clone()),
             sha,
-            comment: false,
             name: format!("`{ref}`", ref = r#ref),
         }),
         Event::PullRequest { number, .. } => Some(DeliveryHead {
             scope: scarab_engine::HeadScope::PullRequest(*number as i64),
             sha,
-            comment: false,
             name: format!("pull request #{number}"),
         }),
         Event::Comment {
@@ -9558,7 +9621,6 @@ fn delivery_head(
         } => Some(DeliveryHead {
             scope: scarab_engine::HeadScope::PullRequest(*issue as i64),
             sha,
-            comment: true,
             name: format!("pull request #{issue}"),
         }),
         _ => None,
@@ -9650,22 +9712,15 @@ async fn ingest_event(
         (try_, connection_id, st.connections.as_ref())
     {
         let pins = match &t.pins {
-            Some(pins) => pins.clone(),
-            None => {
-                let resolved = match resolve_delivery_pins(forge.as_ref(), &event).await {
-                    Ok(pins) => pins,
-                    Err(e) => {
-                        return (
-                            refuse_unread_delivery(kind, delivery_id, &e.to_string()),
-                            false,
-                        )
-                    }
-                };
-                match connections.pin_delivery(t.forge, &t.id, &resolved).await {
-                    Ok(pins) => pins,
+            Some(pins) => Some(pins.clone()),
+            None => match resolve_delivery_pins(forge.as_ref(), &event).await {
+                Some(resolved) => match connections.pin_delivery(t.forge, &t.id, &resolved).await {
+                    Ok(pins) => Some(pins),
                     Err(e) => return (Err(ApiError::Db(DbError::Other(e.to_string()))), false),
-                }
-            }
+                },
+                // Not pinned: this try reads at the symbolic ref.
+                None => None,
+            },
         };
         delivery = Some(DeliveryRun {
             connection_id,
@@ -9673,8 +9728,8 @@ async fn ingest_event(
             forge: t.forge,
             first: t.first,
             at: Timestamp(t.at),
-            head: delivery_head(&event, &pins),
-            read_ref: pins.config_sha,
+            head: pins.as_ref().and_then(|p| delivery_head(&event, p)),
+            read_ref: pins.map_or_else(|| config_ref(&event), |p| p.config_sha),
             unread: Vec::new(),
         });
     }

@@ -1437,6 +1437,16 @@ impl ForgePort for GithubForge {
         Ok(Some(paths))
     }
 
+    async fn pull_request_head(&self, repo: &RepoRef, number: u64) -> Result<String, ForgeError> {
+        let token = self.auth_token_for(repo).await?;
+        let url = self.url(&format!(
+            "/repos/{}/{}/pulls/{number}",
+            repo.owner, repo.name
+        ));
+        let body = ok_json(self.send(|| self.client.get(&url), &token).await?).await?;
+        scarab_forge::pull_request_head_sha(&body)
+    }
+
     async fn set_status(
         &self,
         repo: &RepoRef,

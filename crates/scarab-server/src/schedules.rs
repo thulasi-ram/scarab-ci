@@ -344,7 +344,7 @@ pub async fn dispatch_cron(
             // does not admit the default branch, which is the rule working.
             Admission::Refused(_) => Ok(FireOutcome::Refused),
             // Only the webhook path claims a delivery outcome.
-            Admission::Claimed => Ok(FireOutcome::Skipped),
+            Admission::Claimed | Admission::Ended(_) => Ok(FireOutcome::Skipped),
         };
     }
     Ok(FireOutcome::Skipped)

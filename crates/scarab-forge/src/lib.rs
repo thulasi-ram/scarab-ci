@@ -194,6 +194,17 @@ pub fn cap_trigger_title(raw: &str) -> Option<String> {
 /// (`--upload-pack=<program>` runs that program). The SHA comes from the
 /// forge, so every place it enters Scarab checks this: webhook
 /// normalization, the dispatch path, and the clone launch.
+/// The head commit of a pull request from the forge's `GET pulls/{n}`
+/// answer: `head.sha`, the same field on GitHub and Forgejo. A missing or
+/// malformed one is an error.
+pub fn pull_request_head_sha(body: &serde_json::Value) -> Result<String, ForgeError> {
+    body.pointer("/head/sha")
+        .and_then(serde_json::Value::as_str)
+        .filter(|sha| is_commit_sha(sha))
+        .map(str::to_string)
+        .ok_or_else(|| ForgeError::Malformed("pull request head.sha".into()))
+}
+
 pub fn is_commit_sha(s: &str) -> bool {
     (4..=64).contains(&s.len()) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
@@ -1353,6 +1364,13 @@ pub trait ForgePort: Send + Sync {
         Err(ForgeError::Unsupported("listing pull request files".into()))
     }
 
+    /// The head commit of pull request `number` (`GET pulls/{number}`,
+    /// `head.sha`): the commit a comment on it is pinned to for the head
+    /// rule (ADR-0083 §5).
+    async fn pull_request_head(&self, _repo: &RepoRef, _number: u64) -> Result<String, ForgeError> {
+        Err(ForgeError::Unsupported("reading a pull request".into()))
+    }
+
     async fn set_status(
         &self,
         repo: &RepoRef,
@@ -1644,11 +1662,16 @@ pub fn is_reserved_org(org: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryTry {
     /// This try inserted the delivery row; it holds the lease. `at` is when
-    /// the delivery arrived (unix ms, the store's clock).
-    First { at: i64 },
+    /// the delivery arrived (unix ms, the store's clock); `token` names this
+    /// try's lease for [`ForgeConnectionStore::end_delivery_try`].
+    First { at: i64, token: String },
     /// A later try of an unfinished delivery; it took the lease. `pins` is
     /// what an earlier try pinned, if any.
-    Again { at: i64, pins: Option<DeliveryPins> },
+    Again {
+        at: i64,
+        pins: Option<DeliveryPins>,
+        token: String,
+    },
     /// The delivery is finished: a replay.
     Finished,
     /// Another try holds the lease.
@@ -1810,12 +1833,15 @@ pub trait ForgeConnectionStore: Send + Sync {
 
     /// End a try begun with [`begin_delivery_try`](Self::begin_delivery_try):
     /// clear its lease, and mark the delivery finished when `finished` (every
-    /// Pipeline decided). An unfinished delivery is processed again by its
-    /// next redelivery.
+    /// Pipeline decided). Only while `token` still names the lease: a try
+    /// whose lease lapsed and was taken by a later try changes nothing, and
+    /// the later try's lease stands. An unfinished delivery is processed
+    /// again by its next redelivery.
     async fn end_delivery_try(
         &self,
         forge: ForgeKind,
         delivery_id: &str,
+        token: &str,
         finished: bool,
     ) -> Result<(), RegistryError>;
 
@@ -2119,6 +2145,51 @@ pub mod contract {
 
 #[cfg(test)]
 mod tests {
+    /// ADR-0083 §5: the pull request head a comment is pinned to, from a
+    /// GitHub and a Forgejo `GET pulls/{n}` answer (trimmed to the fields
+    /// around `head`), and a refusal of one without a commit id.
+    #[test]
+    fn a_pull_request_head_is_read_from_both_forges_answers() {
+        let github = serde_json::json!({
+            "number": 7,
+            "state": "open",
+            "head": {
+                "label": "octocat:widget",
+                "ref": "widget",
+                "sha": "6dcb09b5b57875f334f61aebed695e2e4193db5e",
+                "repo": { "full_name": "octocat/app" }
+            },
+            "base": { "ref": "main", "sha": "aaaa09b5b57875f334f61aebed695e2e4193db5e" }
+        });
+        assert_eq!(
+            super::pull_request_head_sha(&github).unwrap(),
+            "6dcb09b5b57875f334f61aebed695e2e4193db5e"
+        );
+        let forgejo = serde_json::json!({
+            "id": 12,
+            "number": 7,
+            "state": "open",
+            "head": {
+                "label": "widget",
+                "ref": "widget",
+                "sha": "e3f2c1b0a9d8c7b6a5f4e3d2c1b0a9d8c7b6a5f4",
+                "repo_id": 3
+            },
+            "base": { "label": "main", "ref": "main", "sha": "1111c1b0a9d8c7b6a5f4e3d2c1b0a9d8c7b6a5f4" },
+            "merge_base": "1111c1b0a9d8c7b6a5f4e3d2c1b0a9d8c7b6a5f4"
+        });
+        assert_eq!(
+            super::pull_request_head_sha(&forgejo).unwrap(),
+            "e3f2c1b0a9d8c7b6a5f4e3d2c1b0a9d8c7b6a5f4"
+        );
+        for bad in [
+            serde_json::json!({ "head": { "sha": "--upload-pack=x" } }),
+            serde_json::json!({ "head": {} }),
+        ] {
+            assert!(super::pull_request_head_sha(&bad).is_err(), "{bad}");
+        }
+    }
+
     use super::*;
 
     fn repo() -> RepoRef {

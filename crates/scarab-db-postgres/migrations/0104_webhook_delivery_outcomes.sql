@@ -11,8 +11,9 @@
 -- `webhook_deliveries` gains `unfinished` (a delivery a redelivery may
 -- still repair), `config_sha` (the commit every try reads `.scarab/` at),
 -- `head_scope` and `head_sha` (the ref or pull request the delivery is
--- about and its commit then, for the head rule of a later try) and
--- `try_until` (the lease of the try processing it). The `FALSE` default
+-- about and its commit then, for the head rule of a later try),
+-- `try_until` and `try_token` (the lease of the try processing it, and the
+-- token only that try ends it with). The `FALSE` default
 -- makes every row written before this migration, and every row a 0.7.1
 -- replica writes during a rolling update, read as finished: those
 -- deliveries have no outcome rows, and running their trigger again would
@@ -26,7 +27,8 @@
 -- needs none, so no row is rewritten. Each ALTER takes an ACCESS EXCLUSIVE
 -- lock for that moment and waits at most 5 s for it; on a busy database the
 -- wait on `runs` can time out, the start fails with `canceling statement due
--- to lock timeout`, and the Pod's restart runs it again.
+-- to lock timeout`, and the Pod's restart runs it again. While it waits,
+-- reads and writes of `runs` wait behind it, up to 5 s per start attempt.
 --
 -- Rollback: `crates/scarab-db-postgres/rollback/0104_revert.sql` reverts
 -- this migration and 0105.
@@ -49,11 +51,14 @@ CREATE TABLE webhook_delivery_pipelines (
 CREATE INDEX webhook_delivery_pipelines_delivery_idx
     ON webhook_delivery_pipelines (forge, delivery_id);
 
+-- `runs` first: while this waits for `runs` it holds no lock on
+-- `webhook_deliveries`, so deliveries go on recording.
+ALTER TABLE runs ADD COLUMN replaced_by TEXT;
+
 ALTER TABLE webhook_deliveries
     ADD COLUMN unfinished BOOLEAN NOT NULL DEFAULT FALSE,
     ADD COLUMN config_sha TEXT,
     ADD COLUMN head_scope TEXT,
     ADD COLUMN head_sha   TEXT,
-    ADD COLUMN try_until  BIGINT;
-
-ALTER TABLE runs ADD COLUMN replaced_by TEXT;
+    ADD COLUMN try_until  BIGINT,
+    ADD COLUMN try_token  TEXT;
