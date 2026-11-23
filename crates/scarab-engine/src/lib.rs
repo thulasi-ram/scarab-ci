@@ -210,11 +210,11 @@ pub struct RunSummary {
     /// IR. Independent of `environment`.
     #[serde(default)]
     pub deploy: bool,
-    /// The Run that took this one's place: for a `Cancelled` run, the newer
-    /// Run whose start cancelled it (newest-wins on the same repo, ref and
-    /// pipeline, or a `cancel-in-progress` concurrency group); otherwise the
-    /// Run a webhook redelivery created in place of this one, whose creation
-    /// never finished (ADR-0083 §4). `None` for a run a person cancelled.
+    /// For a `Cancelled` run, the newer Run whose start cancelled it
+    /// (newest-wins on the same repo, ref and pipeline, or a
+    /// `cancel-in-progress` concurrency group). `None` for any other run and
+    /// for a run a person cancelled. Not the Run a webhook redelivery created
+    /// in place of this one (ADR-0083 §4).
     #[serde(default)]
     pub replaced_by: Option<RunId>,
     /// For a `Failed` or `DeadLettered` run, the Failed step that failed

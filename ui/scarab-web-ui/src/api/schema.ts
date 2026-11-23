@@ -5797,12 +5797,11 @@ export interface components {
             /** @description The owning project (repo name), if tenanted. */
             project?: string | null;
             /**
-             * @description The Run that took this one's place. For a `cancelled` Run, the newer
-             *     Run whose start cancelled it: a newer Run of the same pipeline on the
-             *     same ref or pull request, or a newer Run in a `cancel-in-progress`
-             *     concurrency group. Otherwise the Run a webhook redelivery created in
-             *     place of this one, whose creation never finished. Absent for a Run a
-             *     person cancelled, and for Runs cancelled before this was recorded.
+             * @description For a `cancelled` Run, the newer Run whose start cancelled it: a newer
+             *     Run of the same pipeline on the same ref or pull request, or a newer
+             *     Run in a `cancel-in-progress` concurrency group. Absent for any other
+             *     status, for a Run a person cancelled, and for Runs cancelled before
+             *     this was recorded.
              */
             replaced_by?: string | null;
             /**

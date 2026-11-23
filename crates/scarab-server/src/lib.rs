@@ -1425,12 +1425,11 @@ pub struct RunSummaryDto {
     /// terminal or queued Run).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waiting_gates: Vec<WaitingGateDto>,
-    /// The Run that took this one's place. For a `cancelled` Run, the newer
-    /// Run whose start cancelled it: a newer Run of the same pipeline on the
-    /// same ref or pull request, or a newer Run in a `cancel-in-progress`
-    /// concurrency group. Otherwise the Run a webhook redelivery created in
-    /// place of this one, whose creation never finished. Absent for a Run a
-    /// person cancelled, and for Runs cancelled before this was recorded.
+    /// For a `cancelled` Run, the newer Run whose start cancelled it: a newer
+    /// Run of the same pipeline on the same ref or pull request, or a newer
+    /// Run in a `cancel-in-progress` concurrency group. Absent for any other
+    /// status, for a Run a person cancelled, and for Runs cancelled before
+    /// this was recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replaced_by: Option<String>,
     /// For a `failed` or `dead_lettered` Run, the id of the step that failed

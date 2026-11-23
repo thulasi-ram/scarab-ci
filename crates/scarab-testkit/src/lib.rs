@@ -338,10 +338,8 @@ fn fake_run_summary(st: &InMemoryState, run: &RunId, status: RunStatus) -> RunSu
         environment: st.run_deploy.get(run).map(|d| d.environment.clone()),
         deploy: st.deploy_runs.contains_key(run),
         replaced_by: (status == RunStatus::Cancelled)
-            .then(|| st.run_superseded_by.get(run))
-            .flatten()
-            .or_else(|| st.run_replaced_by.get(run))
-            .cloned(),
+            .then(|| st.run_superseded_by.get(run).cloned())
+            .flatten(),
         failed_step: failed.first().map(|(_, step)| step.clone()),
         failed_steps: failed.len() as u32,
         environment_approval_gates,

@@ -4858,8 +4858,8 @@ fn run_status_str(s: RunStatus) -> &'static str {
 /// own columns, read in the same statement for the page's rows only.
 ///
 /// - `replaced_by_run`: for a `cancelled` run the newer Run that cancelled
-///   it ([`Db::set_run_superseded_by`]), else the Run a redelivery created
-///   in its place (`replaced_by`, ADR-0083 §4).
+///   it ([`Db::set_run_superseded_by`]); null for any other run. Not the Run
+///   a redelivery created in its place (`replaced_by`, ADR-0083 §4).
 /// - `failed_step`, `failed_steps`: for a `failed` or `dead_lettered` run,
 ///   its `failed` steps, the first by the time its row last changed (its
 ///   move to `failed`), then by id.
@@ -4874,8 +4874,7 @@ fn run_summaries_sql(page: &str) -> String {
                 r.origin_pr_number, r.origin_pr_base, r.origin_pr_head, r.pipeline,
                 r.trigger_title,
                 r.deploy_environment, r.is_deploy_run,
-                COALESCE(CASE WHEN r.status = 'cancelled' THEN r.superseded_by END,
-                         r.replaced_by) AS replaced_by_run,
+                CASE WHEN r.status = 'cancelled' THEN r.superseded_by END AS replaced_by_run,
                 f.failed_step, f.failed_steps,
                 CASE WHEN r.status = 'suspended' AND r.deploy_environment IS NOT NULL
                           AND jsonb_typeof(r.ir->'steps') = 'array'
