@@ -1,6 +1,7 @@
-// One row of the Runs list, as words: the status mark, the headline, the
-// phrase that says where a Run came from, the status phrase, and the order and
-// day groups of the list. Pure, so the list and its tests agree without a DOM.
+// One row of the Runs list, as words: the status mark, the headline, line 2
+// (the trigger, where the Run came from), the status phrase, the order and day
+// groups of the list, and the Runs that arrive while it is read. Pure, so the list and its tests agree without a DOM.
+import type { components } from "./api/schema";
 import { statusWord, stepDisplayName } from "./run-page";
 
 /** The glyph inside a row's status mark. `null` draws the mark with no glyph:
@@ -57,7 +58,7 @@ export type Origin = {
 };
 
 /** One piece of the phrase. `pr` is the forge link; `arrow` carries its own
- *  spaces when drawn (` → `). */
+ *  spaces when drawn (` → `, or `→ ` when it leads). */
 export type PhrasePart =
   | { t: "text"; text: string }
   | { t: "mono"; text: string }
@@ -65,49 +66,54 @@ export type PhrasePart =
   | { t: "arrow" }
   | { t: "pr"; n: number };
 
-/** Where a Run came from, without the commit and the author (line 2 shows
- *  those in their own places): `main`, `#212 → main`, `tag v0.7.2`,
- *  `schedule 0 2 * * * on main`, `manual on feat/x`. */
-export function wherePhrase(o: Origin): PhrasePart[] {
+/** Line 2's first column: the trigger in words, with the PR number or the
+ *  tag beside it (`PR #213`, `tag v0.7.2`). `muted` is a Run with no trigger
+ *  recorded, whose words span the first two columns. */
+export type KindCell = { word: string; token: PhrasePart | null; muted: boolean };
+
+/** Line 2 in two parts: the trigger (a fixed column) and where the Run came
+ *  from (which gives way first). `push` + `main`; `PR #213` + `→ main` (a
+ *  pull_request Run records `refs/pull/<n>/head`, so the head branch shows
+ *  only when the ref names one); `tag v0.7.2` + nothing; `manual` + `on
+ *  feat/x`; `schedule` + `0 2 * * * on main`. */
+export function kindFirst(o: Origin): { kind: KindCell; where: PhrasePart[] } {
   const ref = o.ref ?? null;
   const branch = ref && !ref.startsWith("refs/pull/") ? shortRef(ref) : null;
-  const on = (lead: string): PhrasePart[] =>
-    branch ? [{ t: "text", text: `${lead} on ` }, { t: "mono", text: branch }] : [{ t: "text", text: lead }];
+  const on: PhrasePart[] = branch ? [{ t: "text", text: "on " }, { t: "mono", text: branch }] : [];
+  const cell = (word: string, token: PhrasePart | null = null): KindCell => ({ word, token, muted: false });
   switch (o.kind) {
     case null:
     case undefined:
     case "":
-      return [{ t: "muted", text: "no trigger recorded" }];
+      return { kind: { word: "no trigger recorded", token: null, muted: true }, where: [] };
     case "push":
-      return branch ? [{ t: "mono", text: branch }] : [{ t: "text", text: "push" }];
+      return { kind: cell("push"), where: branch ? [{ t: "mono", text: branch }] : [] };
     case "pull_request": {
       const n = o.pr ?? pullNumber(ref);
-      const what: PhrasePart[] = n != null ? [{ t: "pr", n }] : [];
-      // The head branch only when the ref names one: a pull_request Run
-      // records `refs/pull/<n>/head`, which says nothing `#n` does not.
-      if (branch) {
-        if (what.length > 0) what.push({ t: "text", text: " " });
-        what.push({ t: "mono", text: branch });
-      }
-      if (o.base) what.push({ t: "arrow" }, { t: "mono", text: o.base });
-      return what.length > 0 ? what : [{ t: "text", text: "pull request" }];
+      const where: PhrasePart[] = branch ? [{ t: "mono", text: branch }] : [];
+      if (o.base) where.push({ t: "arrow" }, { t: "mono", text: o.base });
+      return { kind: cell("PR", n != null ? { t: "pr", n } : null), where };
     }
     case "tag":
     case "release":
-      return branch ? [{ t: "text", text: `${o.kind} ` }, { t: "mono", text: branch }] : [{ t: "text", text: o.kind }];
+      return { kind: cell(o.kind, branch ? { t: "mono", text: branch } : null), where: [] };
     case "cron": {
-      const what: PhrasePart[] = [{ t: "text", text: "schedule" }];
-      if (o.title) what.push({ t: "text", text: " " }, { t: "mono", text: o.title });
-      if (branch) what.push({ t: "text", text: " on " }, { t: "mono", text: branch });
-      return what;
+      const where: PhrasePart[] = o.title ? [{ t: "mono", text: o.title }] : [];
+      if (branch) where.push({ t: "text", text: where.length ? " on " : "on " }, { t: "mono", text: branch });
+      return { kind: cell("schedule"), where };
     }
     case "manual":
-      return on("manual");
+      return { kind: cell("manual"), where: on };
     case "api":
-      return on("API");
+      return { kind: cell("API"), where: on };
     default:
-      return on(o.kind);
+      return { kind: cell(o.kind.replace(/_/g, " ")), where: on };
   }
+}
+
+/** The first column as plain text, as it reads on screen. */
+export function kindText(k: KindCell): string {
+  return k.token ? `${k.word} ${phraseText([k.token])}` : k.word;
 }
 
 /** The author's place on line 2: the Actor, or a muted stand-in. A schedule
@@ -128,10 +134,10 @@ export function cutName(name: string, max = 24): string {
 /** The phrase as plain text, as it reads on screen. */
 export function phraseText(parts: PhrasePart[]): string {
   return parts
-    .map((p) => {
+    .map((p, i) => {
       switch (p.t) {
         case "arrow":
-          return " → ";
+          return i === 0 ? "→ " : " → ";
         case "pr":
           return `#${p.n}`;
         default:
@@ -143,22 +149,11 @@ export function phraseText(parts: PhrasePart[]): string {
 
 // ── The status phrase ──────────────────────────────────────────────────────
 
-/** The runs list fields this file reads beyond the generated `RunSummaryDto`
- *  today. Waiting on the server field: `replaced_by`, `failed_step`,
- *  `failed_steps_count` and `waiting_for` are being added to the runs list
- *  response; once the generated schema has them, this type goes. Each is
- *  optional, so an older server's rows read as plain status words. */
-export type RunRowFields = {
-  /** The Run that took this one's place (a newer push to the same pull
-   *  request or branch). */
-  replaced_by?: string | null;
-  /** A failed or dead-lettered Run's first failed step id. */
-  failed_step?: string | null;
-  /** How many steps failed, `failed_step` included. */
-  failed_steps_count?: number | null;
-  /** The gate a suspended Run is held at. */
-  waiting_for?: { step: string; kind: string } | null;
-};
+/** The runs list fields the status phrase reads. Each is optional, so an
+ *  older server's rows read as plain status words. */
+export type RunRowFields = Partial<
+  Pick<components["schemas"]["RunSummaryDto"], "replaced_by" | "failed_step" | "failed_steps_count" | "waiting_for">
+>;
 
 /** What a Run waits for, by gate kind: "approval", "a timer". */
 export function waitingWord(kind: string): string {
@@ -330,4 +325,27 @@ export function daySummary(g: { count: number; failed: number }): { runs: string
     runs: `${g.count} ${g.count === 1 ? "run" : "runs"}`,
     failed: g.failed > 0 ? `${g.failed} failed or refused` : null,
   };
+}
+
+// ── Runs that arrive while the list is read ──────────────────────────────
+
+/** Splits the latest rows into the ones on screen and the ones that arrived
+ *  since the reader last asked for them (`seen` holds the keys on screen).
+ *  A row on screen keeps its place and takes its new fields; an arrived row
+ *  waits behind the `N new Runs` pill, so the list does not move under the
+ *  reader. Order is kept in both parts. */
+export function splitArrived<T>(
+  rows: readonly T[],
+  key: (row: T) => string,
+  seen: ReadonlySet<string>,
+): { shown: T[]; arrived: T[] } {
+  const shown: T[] = [];
+  const arrived: T[] = [];
+  for (const row of rows) (seen.has(key(row)) ? shown : arrived).push(row);
+  return { shown, arrived };
+}
+
+/** The pill's words: `1 new Run`, `3 new Runs`. */
+export function arrivedLabel(n: number): string {
+  return `${n} new ${n === 1 ? "Run" : "Runs"}`;
 }

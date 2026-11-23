@@ -12,38 +12,62 @@ import {
   statusGlyph,
   statusPhrase,
   statusText,
-  wherePhrase,
+  arrivedLabel,
+  kindFirst,
+  kindText,
+  splitArrived,
 } from "./run-row";
 
-const read = (o: Parameters<typeof wherePhrase>[0]) => phraseText(wherePhrase(o));
+const line = (o: Parameters<typeof kindFirst>[0]) => {
+  const { kind, where } = kindFirst(o);
+  return [kindText(kind), phraseText(where)];
+};
 
-describe("wherePhrase", () => {
-  it("a push reads its branch", () => {
-    expect(read({ kind: "push", ref: "refs/heads/main" })).toBe("main");
+describe("line 2, kind first", () => {
+  it("a push names its branch", () => {
+    expect(line({ kind: "push", ref: "refs/heads/main" })).toEqual(["push", "main"]);
   });
 
-  it("a pull request recorded as refs/pull/N/head reads #N → base", () => {
-    expect(read({ kind: "pull_request", ref: "refs/pull/212/head", pr: 212, base: "main" })).toBe("#212 → main");
+  it("a pull request recorded as refs/pull/N/head reads PR #N → base", () => {
+    expect(line({ kind: "pull_request", ref: "refs/pull/212/head", pr: 212, base: "main" })).toEqual(["PR #212", "→ main"]);
+    expect(kindFirst({ kind: "pull_request", pr: 212 }).kind.token).toEqual({ t: "pr", n: 212 });
   });
 
   it("a pull request whose ref names its head branch shows it", () => {
-    expect(read({ kind: "pull_request", ref: "refs/heads/feat/x", pr: 212, base: "main" })).toBe("#212 feat/x → main");
+    expect(line({ kind: "pull_request", ref: "refs/heads/feat/x", pr: 212, base: "main" })).toEqual(["PR #212", "feat/x → main"]);
   });
 
   it("a refused pull request takes its number from the ref", () => {
     expect(pullNumber("refs/pull/205/head")).toBe(205);
-    expect(read({ kind: "pull_request", ref: "refs/pull/205/head" })).toBe("#205");
+    expect(line({ kind: "pull_request", ref: "refs/pull/205/head" })).toEqual(["PR #205", ""]);
   });
 
-  it("tag, manual, api and cron name their kind", () => {
-    expect(read({ kind: "tag", ref: "refs/tags/v0.7.2" })).toBe("tag v0.7.2");
-    expect(read({ kind: "manual", ref: "refs/heads/feat/x" })).toBe("manual on feat/x");
-    expect(read({ kind: "api", ref: "refs/heads/main" })).toBe("API on main");
-    expect(read({ kind: "cron", ref: "refs/heads/main", title: "0 2 * * *" })).toBe("schedule 0 2 * * * on main");
+  it("a tag names itself in the first column and nothing after", () => {
+    expect(line({ kind: "tag", ref: "refs/tags/v0.7.2" })).toEqual(["tag v0.7.2", ""]);
   });
 
-  it("a Run with no trigger says so", () => {
-    expect(read({})).toBe("no trigger recorded");
+  it("manual, API and a schedule say where they ran", () => {
+    expect(line({ kind: "manual", ref: "refs/heads/feat/x" })).toEqual(["manual", "on feat/x"]);
+    expect(line({ kind: "api", ref: "refs/heads/main" })).toEqual(["API", "on main"]);
+    expect(line({ kind: "cron", ref: "refs/heads/main", title: "0 2 * * *" })).toEqual(["schedule", "0 2 * * * on main"]);
+    expect(line({ kind: "upstream_run", ref: "refs/heads/main" })).toEqual(["upstream run", "on main"]);
+  });
+
+  it("a Run with no trigger says so, muted", () => {
+    expect(kindFirst({}).kind).toEqual({ word: "no trigger recorded", token: null, muted: true });
+  });
+});
+
+describe("Runs that arrive between polls", () => {
+  const key = (r: { id: string }) => r.id;
+
+  it("holds back the rows not on screen and keeps the order of both parts", () => {
+    const latest = [{ id: "r9" }, { id: "r8" }, { id: "r7" }, { id: "r6" }];
+    const { shown, arrived } = splitArrived(latest, key, new Set(["r7", "r6"]));
+    expect(shown.map(key)).toEqual(["r7", "r6"]);
+    expect(arrived.map(key)).toEqual(["r9", "r8"]);
+    expect(arrivedLabel(arrived.length)).toBe("2 new Runs");
+    expect(arrivedLabel(1)).toBe("1 new Run");
   });
 });
 

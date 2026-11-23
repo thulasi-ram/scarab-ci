@@ -543,7 +543,7 @@ h2 {
    ring reads as sluggish. Mouse clicks don't trigger it (:focus-visible). */
 .btn:focus-visible, .tab:focus-visible, .brand:focus-visible,
 .search-chip:focus-visible, .topbar-link:focus-visible, .avatar:focus-visible,
-.repo-card:focus-visible, .repo-row:focus-visible, .fpill:focus-visible,
+.repo-card:focus-visible, .repo-row:focus-visible,
 .um-item:focus-visible, .crumb:focus-visible,
 input:focus-visible, textarea:focus-visible, select:focus-visible {
   outline: 2px solid var(--emerald);
@@ -1695,30 +1695,170 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 }
 .tab[data-label]:hover { font: var(--t-label); }
 
-/* ---- filters ---- */
-.filters { display: flex; gap: 8px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
-.fpill {
-  background: none; cursor: pointer; font: var(--t-mono);
-  color: var(--sage); border: 1px solid var(--border); border-radius: 6px; padding: 4px 11px;
+/* ---- the repo page's heading row and tabs ---- */
+/* The heading row carries the active tab's action at its right (Run pipeline
+   on Runs). Its height is the button's on every tab, so the tabs never move
+   when a tab has no button. */
+.repo-head { min-height: 38px; flex-wrap: wrap; }
+.repo-head .crumb-head { flex: 1 1 auto; }
+.repo-cta { flex: none; }
+/* The repo tabs: the active one differs by ink and underline, not weight. */
+.repo-tabs .tab, .repo-tabs .tab.on, .repo-tabs .tab[data-label]:hover { font: var(--t-body); }
+.repo-tabs .tab.on { color: var(--soft-white); }
+.repo-tabs .tab[data-label]::after { display: none; }
+
+/* ---- the runs list toolbar ---- */
+/* Status as a segmented control with counts, one Filter button, and the
+   Live line at the right. Filters that are on show as chips under it. */
+/* `.page > *` makes each page child its own stacking context at z 1; the bar
+   sits above the list so the Filter panel opens over the rows. */
+.page > .rl-bar { z-index: 6; }
+.rl-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0 0 12px; }
+.rl-spacer { flex: 1; }
+.rl-segs { display: inline-flex; gap: 2px; padding: 3px; border-radius: var(--radius-lg); background: var(--pine-deep); max-width: 100%; overflow-x: auto; scrollbar-width: none; }
+.rl-seg {
+  display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; cursor: pointer;
+  border: 0; border-radius: var(--radius); background: transparent; padding: 4px 11px;
+  font: var(--t-body); color: var(--sage);
 }
-.fpill:hover { border-color: var(--emerald); }
-.fpill.on { border-color: var(--emerald); color: var(--emerald); }
-.filters-refresh { margin-left: auto; }
+.rl-seg:hover { color: var(--soft-white); }
+.rl-seg.on { background: var(--emerald-surface); color: var(--soft-white); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16); }
+.rl-count { font: var(--t-mono); color: var(--muted-sage); font-variant-numeric: tabular-nums; }
+.rl-count.bad { color: var(--danger); }
+.rl-seg:focus-visible, .rl-fbtn:focus-visible, .rl-chip-x:focus-visible, .rl-linkbtn:focus-visible,
+.rl-switch:focus-visible, .rl-newpill button:focus-visible {
+  outline: 2px solid var(--emerald); outline-offset: 2px;
+}
+
+.rl-pop { position: relative; }
+.rl-fbtn {
+  display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; cursor: pointer;
+  border: 1px solid var(--border); border-radius: var(--radius-lg); background: transparent;
+  padding: 5px 11px; font: var(--t-body); color: var(--sage);
+}
+.rl-fbtn:hover, .rl-fbtn.on { border-color: var(--emerald); color: var(--soft-white); }
+.rl-badge {
+  font: var(--t-mono); color: var(--on-pine); background: var(--emerald);
+  border-radius: 999px; padding: 0 6px; font-variant-numeric: tabular-nums;
+}
+/* The panel: a popover under the button; a sheet on a phone (below). */
+.rl-panel {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 30; width: 360px;
+  background: var(--emerald-elevated); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22); padding: 8px;
+}
+.rl-sheet-backdrop { display: none; }
+.rl-prow { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 10px; align-items: center; padding: 5px 8px; }
+/* A picker's placeholder (`any pipeline`) is words, though its values are Mono. */
+.rl-prow .ss-placeholder { font: var(--t-body); }
+.rl-pk { display: flex; gap: 7px; align-items: center; font: var(--t-body); color: var(--sage); }
+.rl-pk > svg { color: var(--muted-sage); flex: none; }
+.rl-switches { display: flex; flex-wrap: wrap; gap: 6px 16px; padding: 10px 8px 4px; margin-top: 4px; border-top: 1px solid var(--border-soft); }
+.rl-switch {
+  display: inline-flex; align-items: center; gap: 8px; cursor: pointer; border: 0; background: none; padding: 2px 0;
+  font: var(--t-body); color: var(--sage);
+}
+.rl-switch:hover { color: var(--soft-white); }
+.rl-track { position: relative; width: 28px; height: 16px; border-radius: 999px; background: var(--border); flex: none; transition: background 0.12s var(--ease-out); }
+.rl-track::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 50%;
+  background: var(--emerald-surface); transition: left 0.12s var(--ease-out);
+}
+.rl-switch[aria-checked="true"] { color: var(--soft-white); }
+.rl-switch[aria-checked="true"] .rl-track { background: var(--emerald); }
+.rl-switch[aria-checked="true"] .rl-track::after { left: 14px; }
+
+.rl-live { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; font: var(--t-body); color: var(--muted-sage); }
+.rl-pulse {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: none;
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 50%, transparent); animation: rl-pulse 2s infinite;
+}
+@keyframes rl-pulse { 70% { box-shadow: 0 0 0 6px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+@media (prefers-reduced-motion: reduce) { .rl-pulse { animation: none; } }
+
+.rl-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: -2px 0 12px; }
+.rl-chip {
+  display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 2px 4px 2px 10px;
+  background: color-mix(in srgb, var(--emerald) 12%, transparent); font: var(--t-body); color: var(--soft-white);
+}
+.rl-chip-k { color: var(--sage); }
+.rl-chip-v { font: var(--t-mono); }
+.rl-chip-x {
+  width: 20px; height: 20px; border-radius: 50%; display: inline-grid; place-items: center;
+  border: 0; background: none; color: var(--sage); cursor: pointer; padding: 0;
+}
+.rl-chip-x:hover { color: var(--soft-white); background: color-mix(in srgb, var(--emerald) 18%, transparent); }
+.rl-linkbtn { border: 0; background: none; padding: 2px 4px; cursor: pointer; font: var(--t-body); color: var(--emerald); }
+.rl-linkbtn:hover { text-decoration: underline; }
+
+/* ---- the runs list states ---- */
+/* A failed poll keeps the last list under this bar. */
+.rl-errbar {
+  display: flex; align-items: center; gap: 10px; margin: 0 0 12px; padding: 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent); border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--danger) 7%, transparent); font: var(--t-body); color: var(--soft-white);
+}
+.rl-errbar > svg { color: var(--danger); flex: none; }
+/* Runs that arrived wait behind this pill, at the top of the list while it
+   scrolls; the list under it does not move. */
+.rl-newpill { position: sticky; top: 8px; z-index: 5; display: flex; justify-content: center; align-items: flex-start; height: 0; pointer-events: none; }
+.rl-newpill button {
+  pointer-events: auto; transform: translateY(8px); display: inline-flex; align-items: center; gap: 7px; cursor: pointer;
+  border: 0; border-radius: 999px; padding: 6px 14px; background: var(--pine); color: var(--on-pine);
+  font: var(--t-body); box-shadow: 0 6px 18px rgba(0, 0, 0, 0.22);
+}
+.rl-newpill button:hover { background: var(--pine-hover); }
+.rl-foot { margin: 0; padding: 14px 0 4px; text-align: center; font: var(--t-body); color: var(--muted-sage); }
+.rl-empty { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 44px 24px 52px; text-align: center; }
+.rl-never { padding-top: 28px; }
+.rl-empty p { margin: 0; }
+.rl-empty-title { font: var(--t-label); color: var(--soft-white); }
+.rl-empty-text { max-width: 52ch; font: var(--t-body); color: var(--sage); }
+.rl-mono { font: var(--t-mono); }
+.rl-code {
+  margin: 4px 0 0; padding: 10px 16px; text-align: left; border-radius: var(--radius-lg);
+  background: var(--pine-deep); font: var(--t-mono); color: var(--soft-white);
+}
+.rl-empty-acts { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 6px; }
+/* Loading: rows the shape of real rows, so nothing moves when they arrive. */
+.rr-skel { cursor: default; padding-top: 18px; padding-bottom: 18px; }
+.rr-skel:hover { background: none; }
+.rr-skel i {
+  display: block; height: 11px; border-radius: 6px;
+  background: linear-gradient(90deg, var(--pine-deep) 0%, var(--border-soft) 50%, var(--pine-deep) 100%);
+  background-size: 200% 100%; animation: rl-shimmer 1.4s linear infinite;
+}
+.rr-skel .rr-main { gap: 9px; }
+.rr-skel .rr-right { gap: 9px; }
+.rr-skel .rr-skel-mark { width: 18px; height: 18px; border-radius: 50%; }
+.rr-skel .rr-skel-num { width: 32px; }
+.rr-skel .rr-skel-word { width: 70px; }
+.rr-skel .rr-skel-time { width: 96px; }
+@keyframes rl-shimmer { to { background-position: -200% 0; } }
+@media (prefers-reduced-motion: reduce) { .rr-skel i { animation: none; } }
 
 /* ---- run list rows ---- */
 /* One grid per Run: status mark | #N | two lines | status phrase over time.
-   Line 1 is `pipeline / headline`; line 2 is where the Run came from. Rows
-   have no rules between them: whitespace separates them and a hover band
-   shows the row. Day headers sit above each day's rows. 4px grid. */
+   Line 1 is `pipeline / headline`; line 2 is the trigger, where the Run came
+   from, the commit and the author. Rows have no rules between them:
+   whitespace separates them and a hover band shows the row. Day headers sit
+   above each day's rows. 4px grid. Only the headline is bold: line 2, the
+   number and the time are Mono, the status phrase is Body. */
 .runlist { border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; background: transparent; }
 .runrow {
-  display: grid; grid-template-columns: 22px 52px minmax(0, 1fr) 210px; gap: 0 12px; align-items: start;
+  position: relative;
+  display: grid; grid-template-columns: 22px 52px minmax(0, 1fr) 250px; gap: 0 12px; align-items: start;
   padding: 14px 24px; cursor: pointer;
 }
 .runrow:hover { background: color-mix(in srgb, var(--emerald) 8%, transparent); }
 .runrow.refused { cursor: default; }
 .runrow.refused:hover { background: none; }
 .runrow > .rr-mark, .runrow > .rr-num { margin-top: 1px; }
+/* A deploy Run: a copper rail on the left edge, and its chip by the time. */
+.runrow.deploy::before {
+  content: ""; position: absolute; left: 0; top: 10px; bottom: 10px; width: 3px;
+  border-radius: 0 3px 3px 0; background: var(--copper);
+}
 
 /* A day: `Today  9 runs · 3 failed or refused`. */
 .rr-day { display: flex; gap: 12px; align-items: baseline; padding: 28px 24px 4px; font: var(--t-label); color: var(--soft-white); }
@@ -1752,7 +1892,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
    straight down the list. `.runnum` is the shared identity chip (list
    column + run-detail bar). A refused trigger has no Run, so a dash. */
 .rr-num { min-width: 0; }
-.rr-nonum { font: var(--t-label); color: var(--muted-sage); cursor: default; }
+.rr-nonum { font: var(--t-mono); color: var(--muted-sage); cursor: default; }
 .runnum { display: inline-flex; flex-direction: column; gap: 1px; cursor: pointer; }
 .runnum .cap { font: var(--t-body); color: var(--muted-sage); }
 .runnum .n { font: var(--t-label); color: var(--soft-white); line-height: 1.1; }
@@ -1760,6 +1900,8 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .runnum:hover .n, .runnum:hover .n .hsh { color: var(--emerald); }
 /* Short-internal-id fallback (untenanted / pre-allocation runs) reads quieter. */
 .runnum.fallback .n { font: var(--t-mono); color: var(--muted-sage); }
+/* In the list the number is Mono in the secondary ink. */
+.rr-num .runnum .n { font: var(--t-mono); color: var(--sage); }
 
 .rr-main { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .rr-l1 { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
@@ -1769,42 +1911,61 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .rr-pipe { font: var(--t-mono); color: var(--sage); flex: none; white-space: nowrap; }
 .rr-pipe.none { color: var(--muted-sage); }
 .rr-pfull { display: none; }
-.rr-slash { color: var(--muted-sage); flex: none; }
+.rr-slash { font: var(--t-body); color: var(--muted-sage); flex: none; }
 .rr-title {
   font: var(--t-label); color: var(--soft-white); flex: 1 1 0; min-width: 8ch; overflow-wrap: anywhere;
   display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden;
 }
 .rr-title.none { font: var(--t-body); color: var(--muted-sage); }
 
-/* Line 2 (OriginLine): where from, then the hash and the author in two
-   columns at the right edge of the main column. */
-.rr-l2 { display: grid; grid-template-columns: minmax(0, 1fr) 7ch 13ch; gap: 0 12px; align-items: center; color: var(--sage); min-width: 0; }
-.rr-from { display: flex; align-items: center; gap: 6px; min-width: 0; }
-.rr-from > svg { color: var(--muted-sage); flex: none; }
-.rr-where { flex: 0 100 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.rr-into { flex: none; white-space: nowrap; }
-.rr-env { font: var(--t-mono); color: var(--copper); }
-.rr-l2 .mono, .rr-sha { font: var(--t-mono); }
+/* Line 2 (OriginLine), all Mono: the trigger in a fixed first column (`PR
+   #213`), where the Run came from (it gives way first), then the hash and the
+   author, each behind its icon, at the right edge, at the same x on every
+   row. */
+.rr-l2 {
+  display: grid; grid-template-columns: 13ch minmax(0, 1fr) 10ch 14ch; gap: 0 12px; align-items: center;
+  font: var(--t-mono); color: var(--sage); min-width: 0;
+}
+.rr-l2 * { font: var(--t-mono); }
+.rr-kind { display: flex; align-items: center; gap: 6px; min-width: 0; white-space: nowrap; }
+.rr-kind.wide { grid-column: 1 / 3; }
+.rr-kind > svg { color: var(--muted-sage); flex: none; }
+.rr-kword { flex: none; }
+.rr-ktok { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.rr-where { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rr-l2 .sep, .rr-l2 .muted { color: var(--muted-sage); }
 .rr-l2 .sha { color: var(--copper); }
-.rr-who { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The hash and the author each lead with a small icon in the muted ink. */
+.rr-sha, .rr-who { display: inline-flex; align-items: center; gap: 5px; min-width: 0; white-space: nowrap; }
+.rr-sha > svg, .rr-who > svg { color: var(--muted-sage); flex: none; }
+.rr-whoname { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .rr-l2 a { color: inherit; text-decoration: none; }
 .rr-l2 a.sha { color: var(--copper); }
 .rr-l2 a:hover { color: var(--emerald); text-decoration: underline; }
 
 .rr-right { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; text-align: right; min-width: 0; }
 .rr-word {
-  font: var(--t-label); color: var(--muted-sage); max-width: 100%;
+  font: var(--t-body); color: var(--muted-sage); max-width: 100%;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.rr-word .rr-step { font: var(--t-mono); }
+.rr-word .rr-step { font: var(--t-body); }
 .rr-word.succeeded { color: var(--ok); }
 .rr-word.failed, .rr-word.dead_lettered, .rr-word.refused { color: var(--danger); }
 .rr-word.running, .rr-word.pending { color: var(--running-ink); }
 .rr-word.suspended { color: var(--warn); }
-.rr-time { color: var(--muted-sage); white-space: nowrap; font-variant-numeric: tabular-nums; }
+/* The time line: a deploy Run's chip, then `HH:MM · duration` in Mono. */
+.rr-tline { display: flex; align-items: center; justify-content: flex-end; gap: 8px; max-width: 100%; min-width: 0; }
+.rr-time { flex: none; font: var(--t-mono); color: var(--muted-sage); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .rr-time .mono { font: var(--t-mono); color: var(--sage); font-variant-numeric: tabular-nums; }
 .rr-time.live, .rr-time.live .mono { color: var(--running-ink); }
+.rr-dchip {
+  display: inline-flex; align-items: center; gap: 5px; height: 20px; padding: 0 8px 0 7px; min-width: 0;
+  border-radius: 999px; background: color-mix(in srgb, var(--copper) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--copper) 40%, transparent); color: var(--copper); white-space: nowrap;
+}
+.rr-dchip > svg { flex: none; }
+.rr-dlabel { font: var(--t-body); }
+.rr-denv { font: var(--t-mono); color: var(--soft-white); min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 
 /* Quiet success: a passed Run keeps its check mark and drops its status
    word; its headline and line 2 drop to the secondary ink. */
@@ -1816,30 +1977,44 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .runrow.child .rr-title { color: var(--sage); }
 
 /* A refused trigger's reason, one line under the row: what, then the fix. */
-.rr-reason { grid-column: 3 / 5; display: flex; gap: 6px; align-items: baseline; margin-top: 4px; color: var(--soft-white); min-width: 0; }
+.rr-reason { grid-column: 3 / 5; display: flex; gap: 6px; align-items: baseline; margin-top: 4px; font: var(--t-body); color: var(--soft-white); min-width: 0; }
 .rr-reason > svg { color: var(--danger); align-self: center; flex: none; }
 /* A message may hold a YAML snippet to paste: keep its lines. */
 .rr-reason .what { white-space: pre-wrap; overflow-wrap: anywhere; }
 .rr-reason .fix { color: var(--sage); }
 
-/* Phone: no #N column; the full pipeline name on its own line above the
-   headline; status and time under the row. */
+/* Phone: the button keeps its icon, the status control takes its own line
+   and scrolls, the Filter panel is a sheet at the bottom. Rows lose the #N
+   column; the full pipeline name sits above the headline; line 2 flows as one
+   wrapped line; status and time go under the row. */
 @media (max-width: 620px) {
+  .repo-cta-label { display: none; }
+  .repo-cta { padding: 8px 10px; }
+  .rl-bar { gap: 8px; }
+  .rl-segs { order: 2; width: 100%; }
+  .rl-live-text { display: none; }
+  .rl-sheet-backdrop { display: block; position: fixed; inset: 0; z-index: 29; background: rgba(0, 0, 0, 0.32); }
+  .rl-panel { position: fixed; left: 8px; right: 8px; bottom: 8px; top: auto; width: auto; max-height: 80vh; overflow-y: auto; }
+  .rl-prow { grid-template-columns: 1fr; gap: 4px; }
+
   .runrow { grid-template-columns: 22px minmax(0, 1fr); padding: 14px 16px; }
   .rr-day { padding-left: 16px; padding-right: 16px; }
   .rr-num { display: none; }
-  .rr-right { grid-column: 2; flex-direction: row; align-items: baseline; gap: 12px; margin-top: 4px; }
+  .rr-right { grid-column: 2; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin-top: 4px; }
+  .rr-tline { justify-content: flex-start; }
   .rr-reason { grid-column: 2; }
   .rr-l1 { flex-direction: column; align-items: stretch; gap: 0; }
   .rr-slash, .rr-pcut { display: none; }
   .rr-pfull { display: block; color: var(--muted-sage); overflow: hidden; text-overflow: ellipsis; }
   .rr-title { flex: none; min-width: 0; }
   .runrow > .rr-mark { margin-top: 20px; }
-  /* Line 2 flows inline and wraps. */
   .rr-l2 { display: block; }
-  .rr-from, .rr-where { display: inline; white-space: normal; }
-  .rr-from > svg { vertical-align: -2px; margin-right: 6px; }
-  .rr-sha:not(:empty)::before, .rr-who::before { content: "·"; color: var(--muted-sage); margin: 0 4px; }
+  .rr-kind, .rr-where, .rr-ktok { display: inline; white-space: normal; }
+  .rr-kind > svg { vertical-align: -2px; margin-right: 6px; }
+  .rr-where:not(:empty)::before { content: " "; }
+  .rr-sha, .rr-who { display: inline; }
+  .rr-sha > svg, .rr-who > svg { vertical-align: -2px; margin-right: 4px; }
+  .rr-sha::before, .rr-who::before { content: "·"; color: var(--muted-sage); margin: 0 6px; }
 }
 
 /* Status as a word, for other lists (a schedule's last fire). */

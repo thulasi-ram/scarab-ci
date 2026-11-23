@@ -1769,18 +1769,25 @@ test("the Schedules tab lists the schedules and links to their scheduled runs", 
   await nightly.getByRole("link", { name: "Runs" }).click();
   await expect(page).toHaveURL(/\/acme\/scarab\?scheduled=1&pipeline=nightly$/);
   await expect(view.locator(".tabs .tab.on")).toHaveText("Runs");
-  await expect(view.locator(".filters").getByRole("button", { name: "scheduled" })).toHaveClass(/\bon\b/);
+  const chips = view.locator(".rl-chips");
+  await expect(chips.locator(".rl-chip")).toHaveText(["pipelinenightly", "scheduled only"]);
   const runs = view.locator(".runrow");
   await expect(runs).toHaveCount(2);
   for (const run of await runs.all()) {
-    await expect(run.locator(".rr-facts")).toContainText("nightly");
-    await expect(run.locator(".rr-head")).toContainText("0 2 * * *");
+    await expect(run.locator(".rr-l1")).toContainText("nightly");
+    await expect(run.locator(".rr-l2")).toContainText("0 2 * * *");
   }
 
   // Without the pipeline, the filter keeps only scheduled runs too.
-  await view.locator(".filters").getByRole("button", { name: "clear" }).click();
-  await expect(runs).toHaveCount(14);
-  await view.locator(".filters").getByRole("button", { name: "scheduled" }).click();
+  await chips.getByRole("button", { name: "Remove the pipeline filter" }).click();
+  await expect(page).toHaveURL(/\/acme\/scarab\?scheduled=1$/);
   await expect(runs).toHaveCount(2);
+  await chips.getByRole("button", { name: "Clear all" }).click();
+  await expect(chips).toHaveCount(0);
+  await view.getByRole("button", { name: "Filter" }).click();
+  await view.getByRole("switch", { name: "Scheduled only" }).click();
+  await expect(runs).toHaveCount(2);
+  await page.keyboard.press("Escape");
+  await expect(view.getByRole("dialog", { name: "Filter the Runs" })).toHaveCount(0);
   expect(errors).toEqual([]);
 });

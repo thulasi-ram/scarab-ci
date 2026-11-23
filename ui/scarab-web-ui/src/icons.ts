@@ -53,6 +53,7 @@ import {
   Pause,
   Download,
   ExternalLink,
+  ListFilter,
 } from "lucide";
 
 // IconNode = Array<[tagName, attributes]>.
@@ -115,6 +116,8 @@ const ICONS: Record<string, IconNode> = {
   // The Run page's Manifest tab: download the file, open it on the forge.
   download: Download as IconNode,
   "external-link": ExternalLink as IconNode,
+  // The Runs list's Filter button.
+  filter: ListFilter as IconNode,
   // An exclamation mark with no outline, to sit inside a round status mark.
   exclamation: [
     ["path", { d: "M12 7v6" }],
