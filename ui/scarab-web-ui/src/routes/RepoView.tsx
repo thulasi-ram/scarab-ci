@@ -1,7 +1,8 @@
 // Repo dashboard (tier 2) — tabs over one repository: Runs (default),
-// Schedules, Environments, Secrets, Settings. Each run row reads
-// `pipeline / headline` over one phrase for where the Run came from (ref ·
-// commit · actor), with its status and time on the right (see components/RunRow).
+// Schedules, Environments, Secrets, Settings. The runs list is grouped by day;
+// each row reads `pipeline / headline` over where the Run came from, its
+// commit and its author, with its status and clock time on the right (see
+// components/RunRow). A Run a newer one replaced sits under its replacer.
 // Duration ticks live for in-flight runs. The runs list filters by status, author, branch, PR,
 // pipeline, environment, deploys and scheduled — environment and deploys on the server
 // (it is how a Project's older deploys are found), the rest over
@@ -46,9 +47,19 @@ import {
 } from "../repo-environments";
 import { relTime, absTime, untilTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
-import { originPhrase, pullNumber } from "../run-row";
+import {
+  authorSlot,
+  clockTime,
+  dayGroups,
+  daySummary,
+  placeReplaced,
+  pullNumber,
+  statusPhrase,
+  wherePhrase,
+  type RunRowFields,
+} from "../run-row";
 import { statusWord } from "../run-page";
-import { OriginLine, RowTitle, StatusMark } from "../components/RunRow";
+import { OriginLine, RowStatus, RowTitle, StatusMark } from "../components/RunRow";
 import RunNumber from "../components/RunNumber";
 import Icon from "../components/Icon";
 import { HomeCrumb, RepoCrumb } from "../components/PageCrumbs";
@@ -68,6 +79,10 @@ import { refusalSummary } from "../compile-errors";
 import { fireOutcome, isScheduled, pipelineShortName, scheduledRunsHref } from "../schedules";
 import ponderIdle from "../../../brand/ascii/generated/ponder-ponder.json";
 import Pill from "../components/Pill";
+
+/** A runs list row as this page reads it: the generated summary and the
+ *  fields the server is adding (see `RunRowFields`). */
+type ListedRun = RunSummary & RunRowFields;
 
 type Tab = "runs" | "schedules" | "environments" | "secrets" | "settings";
 type StatusFilter = "all" | "running" | "failed" | "refused";
@@ -191,7 +206,7 @@ export default function RepoView() {
   // page.
   const [rows, { refetch }] = createResource(
     () => ({ org: org(), repo: repo(), env: envFilter(), deploys: deploysOnly() }),
-    (k): Promise<RunSummary[]> =>
+    (k): Promise<ListedRun[]> =>
       listRepoRuns(k.org, k.repo, 50, runListFilter(k.env, k.deploys)),
   );
   // Triggers that did not become a Run: a compile error, a yanked
@@ -288,6 +303,14 @@ export default function RepoView() {
       scheduled: scheduledOnly(),
       runOnly: !!branchFilter() || !!prFilter() || !!envFilter() || deploysOnly(),
     });
+
+  // The rows in day groups, each replaced Run under the Run that replaced it.
+  const groups = () =>
+    dayGroups(
+      placeReplaced(listRows(), (row) => (row.kind === "run" ? row.run : null)),
+      (row) => (row.kind === "run" ? row.run.status : "refused"),
+      now(),
+    );
 
   // The header CTA follows the tab: what you'd create in this context.
   const cta = () => {
@@ -480,48 +503,72 @@ export default function RepoView() {
               }
             >
               <div class="runlist">
-                <For each={listRows()}>
-                  {(row) => {
-                    if (row.kind === "refused") return <RefusedRow r={row.refused} repoUrl={repoUrl()} />;
-                    const r = row.run;
-                    return (
-                      <div class="runrow" onClick={() => nav(`/${org()}/${repo()}/runs/${r.id}`)}>
-                        <StatusMark status={r.status} />
-                        <div class="rr-num">
-                          <RunNumber n={r.run_number} id={r.id} />
-                        </div>
-                        <div class="rr-main">
-                          <RowTitle
-                            pipeline={r.pipeline}
-                            kind={r.trigger_kind}
-                            title={r.trigger_title}
-                            deploy={r.deploy}
-                            environment={r.environment}
-                          />
-                          <OriginLine
-                            kind={r.trigger_kind}
-                            parts={originPhrase({
-                              kind: r.trigger_kind,
-                              ref: r.git_ref,
-                              sha: r.sha,
-                              pr: r.pr_number,
-                              base: r.origin_pr_base,
-                              actor: r.actor,
-                              title: r.trigger_title,
-                            })}
-                            commitUrl={forgeCommitUrl(repoUrl(), r.sha)}
-                            prUrl={forgePrUrl(repoUrl(), r.pr_number)}
-                          />
-                        </div>
-                        <div class="rr-right">
-                          <span class={`rr-word ${r.status}`}>{statusWord(r.status)}</span>
-                          <span class="rr-time" classList={{ live: isLive(r.status) }} title={absTime(r.created_at)}>
-                            {relTime(r.created_at)} · <span class="mono">{durationLabel(r, now())}</span>
-                          </span>
-                        </div>
+                <For each={groups()}>
+                  {(g) => (
+                    <>
+                      <div class="rr-day">
+                        {g.label}
+                        <span class="sum">
+                          {daySummary(g).runs}
+                          <Show when={daySummary(g).failed}>
+                            {(f) => (
+                              <>
+                                {" · "}
+                                <span class="failed">{f()}</span>
+                              </>
+                            )}
+                          </Show>
+                        </span>
                       </div>
-                    );
-                  }}
+                      <For each={g.items}>
+                        {(item) => {
+                          const row = item.row;
+                          if (row.kind === "refused") return <RefusedRow r={row.refused} repoUrl={repoUrl()} />;
+                          const r = row.run;
+                          const ok = () => r.status === "succeeded" && !item.replaced;
+                          return (
+                            <div
+                              class="runrow"
+                              classList={{ ok: ok(), child: item.child }}
+                              onClick={() => nav(`/${org()}/${repo()}/runs/${r.id}`)}
+                            >
+                              <StatusMark status={r.status} />
+                              <div class="rr-num">
+                                <RunNumber n={r.run_number} id={r.id} />
+                              </div>
+                              <div class="rr-main">
+                                <RowTitle pipeline={r.pipeline} kind={r.trigger_kind} title={r.trigger_title} />
+                                <OriginLine
+                                  kind={r.trigger_kind}
+                                  where={wherePhrase({
+                                    kind: r.trigger_kind,
+                                    ref: r.git_ref,
+                                    pr: r.pr_number,
+                                    base: r.origin_pr_base,
+                                    title: r.trigger_title,
+                                  })}
+                                  environment={r.environment}
+                                  deploy={r.deploy}
+                                  sha={r.sha}
+                                  author={authorSlot(r.trigger_kind, r.actor)}
+                                  commitUrl={forgeCommitUrl(repoUrl(), r.sha)}
+                                  prUrl={forgePrUrl(repoUrl(), r.pr_number)}
+                                />
+                              </div>
+                              <RowStatus
+                                phrase={statusPhrase(r, item.replaced)}
+                                quiet={ok()}
+                                clock={clockTime(r.created_at)}
+                                when={`${relTime(r.created_at)} · ${absTime(r.created_at)}`}
+                                duration={durationLabel(r, now())}
+                                live={isLive(r.status)}
+                              />
+                            </div>
+                          );
+                        }}
+                      </For>
+                    </>
+                  )}
                 </For>
               </div>
             </Show>
@@ -1115,31 +1162,26 @@ function RefusedRow(props: { r: RefusedRun; repoUrl?: string | null }) {
     <div class="runrow refused">
       <StatusMark status="refused" />
       <div class="rr-num">
-        <span class="runnum none">
-          <span class="n">no run</span>
+        <span class="rr-nonum" title="no Run: the trigger was refused">
+          –
         </span>
       </div>
       <div class="rr-main">
         <RowTitle pipeline={pipelineShortName(r().pipeline)} kind={r().trigger_kind} title={r().title} />
         <OriginLine
           kind={r().trigger_kind}
-          parts={originPhrase({
-            kind: r().trigger_kind,
-            ref: r().git_ref,
-            sha: r().sha,
-            actor: r().actor,
-            title: r().title,
-          })}
+          where={wherePhrase({ kind: r().trigger_kind, ref: r().git_ref, title: r().title })}
+          sha={r().sha}
+          author={authorSlot(r().trigger_kind, r().actor)}
           commitUrl={forgeCommitUrl(props.repoUrl, r().sha)}
           prUrl={forgePrUrl(props.repoUrl, pr())}
         />
       </div>
-      <div class="rr-right">
-        <span class="rr-word refused">{statusWord("refused")}</span>
-        <span class="rr-time" title={absTime(r().created_at)}>
-          {relTime(r().created_at)}
-        </span>
-      </div>
+      <RowStatus
+        phrase={{ lead: statusWord("refused"), step: null, tone: "refused" }}
+        clock={clockTime(r().created_at)}
+        when={`${relTime(r().created_at)} · ${absTime(r().created_at)}`}
+      />
       <div class="rr-reason">
         <Icon icon={r().reason_kind === "compile" ? "circle-x" : "ban"} size={13} />
         <span>

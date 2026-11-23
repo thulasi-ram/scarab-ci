@@ -1706,17 +1706,25 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .filters-refresh { margin-left: auto; }
 
 /* ---- run list rows ---- */
-/* One grid per Run: status mark | #N | two lines | status word over time.
-   Line 1 is `pipeline / headline`, the pipeline as plain Mono text; line 2 is
-   one phrase for where the Run came from, after the trigger kind's icon. */
-.runlist { border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; background: var(--emerald-surface); }
+/* One grid per Run: status mark | #N | two lines | status phrase over time.
+   Line 1 is `pipeline / headline`; line 2 is where the Run came from. Rows
+   have no rules between them: whitespace separates them and a hover band
+   shows the row. Day headers sit above each day's rows. 4px grid. */
+.runlist { border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; background: transparent; }
 .runrow {
-  display: grid; grid-template-columns: 18px 52px minmax(0, 1fr) auto; gap: 0 12px; align-items: center;
-  padding: 10px 16px; border-bottom: 1px solid var(--border-soft); cursor: pointer;
+  display: grid; grid-template-columns: 22px 52px minmax(0, 1fr) 210px; gap: 0 12px; align-items: start;
+  padding: 14px 24px; cursor: pointer;
 }
-.runrow:last-child { border-bottom: none; }
-.runrow:hover { background: color-mix(in srgb, var(--emerald) 7%, transparent); }
-.runrow.refused { cursor: default; background: color-mix(in srgb, var(--danger) 4%, transparent); }
+.runrow:hover { background: color-mix(in srgb, var(--emerald) 8%, transparent); }
+.runrow.refused { cursor: default; }
+.runrow.refused:hover { background: none; }
+.runrow > .rr-mark, .runrow > .rr-num { margin-top: 1px; }
+
+/* A day: `Today  9 runs · 3 failed or refused`. */
+.rr-day { display: flex; gap: 12px; align-items: baseline; padding: 28px 24px 4px; font: var(--t-label); color: var(--soft-white); }
+.rr-day:first-child { padding-top: 14px; }
+.rr-day .sum { font: var(--t-body); color: var(--muted-sage); }
+.rr-day .sum .failed { color: var(--danger); }
 
 /* The status mark: a glyph on a tinted disc once a Run settles, a ring while
    it runs or waits to start. */
@@ -1742,8 +1750,9 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 
 /* Run number column: the per-repo `#N` handle, sequential so it scans
    straight down the list. `.runnum` is the shared identity chip (list
-   column + run-detail bar). */
+   column + run-detail bar). A refused trigger has no Run, so a dash. */
 .rr-num { min-width: 0; }
+.rr-nonum { font: var(--t-label); color: var(--muted-sage); cursor: default; }
 .runnum { display: inline-flex; flex-direction: column; gap: 1px; cursor: pointer; }
 .runnum .cap { font: var(--t-body); color: var(--muted-sage); }
 .runnum .n { font: var(--t-label); color: var(--soft-white); line-height: 1.1; }
@@ -1751,46 +1760,60 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .runnum:hover .n, .runnum:hover .n .hsh { color: var(--emerald); }
 /* Short-internal-id fallback (untenanted / pre-allocation runs) reads quieter. */
 .runnum.fallback .n { font: var(--t-mono); color: var(--muted-sage); }
-.runnum.none { cursor: default; }
-.runnum.none .n { color: var(--muted-sage); font: var(--t-mono); }
 
-.rr-main { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-.rr-l1 { display: flex; align-items: center; gap: 8px; min-width: 0; }
-/* The pipeline is text a person named, so plain Mono, not a chip. It keeps
-   its own width (capped); the headline is what truncates. */
-.rr-pipe {
-  font: var(--t-mono); color: var(--sage); flex: 0 0 auto; max-width: 32ch;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
+.rr-main { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.rr-l1 { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+/* The pipeline is text a person named, so plain Mono, not a chip. It is cut
+   to 24 characters in code (`.rr-pcut`) and never shrinks; the headline wraps
+   to two lines and then cuts. `.rr-pfull` is the phone's full name. */
+.rr-pipe { font: var(--t-mono); color: var(--sage); flex: none; white-space: nowrap; }
 .rr-pipe.none { color: var(--muted-sage); }
+.rr-pfull { display: none; }
 .rr-slash { color: var(--muted-sage); flex: none; }
-.rr-head { flex: 1 1 0; min-width: 8ch; display: flex; align-items: center; gap: 8px; }
 .rr-title {
-  font: var(--t-label); color: var(--soft-white); flex: 0 1 auto; min-width: 0;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font: var(--t-label); color: var(--soft-white); flex: 1 1 0; min-width: 8ch; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden;
 }
 .rr-title.none { font: var(--t-body); color: var(--muted-sage); }
-.rr-env { font: var(--t-mono); color: var(--warn); display: inline-flex; gap: 4px; align-items: center; flex: none; white-space: nowrap; }
-.rr-l2 { display: flex; align-items: center; gap: 6px; color: var(--sage); min-width: 0; }
-.rr-l2 > svg { color: var(--muted-sage); flex: none; }
-.rr-phrase { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.rr-phrase .mono { font: var(--t-mono); }
-.rr-phrase .sha { color: var(--copper); }
-.rr-phrase .sep { color: var(--muted-sage); }
-.rr-phrase .muted { color: var(--muted-sage); }
-.rr-phrase a { color: inherit; text-decoration: none; }
-.rr-phrase a.sha { color: var(--copper); }
-.rr-phrase a:hover { color: var(--emerald); text-decoration: underline; }
 
-.rr-right { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; text-align: right; }
-.rr-word { font: var(--t-label); color: var(--muted-sage); white-space: nowrap; }
+/* Line 2 (OriginLine): where from, then the hash and the author in two
+   columns at the right edge of the main column. */
+.rr-l2 { display: grid; grid-template-columns: minmax(0, 1fr) 7ch 13ch; gap: 0 12px; align-items: center; color: var(--sage); min-width: 0; }
+.rr-from { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.rr-from > svg { color: var(--muted-sage); flex: none; }
+.rr-where { flex: 0 100 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rr-into { flex: none; white-space: nowrap; }
+.rr-env { font: var(--t-mono); color: var(--copper); }
+.rr-l2 .mono, .rr-sha { font: var(--t-mono); }
+.rr-l2 .sep, .rr-l2 .muted { color: var(--muted-sage); }
+.rr-l2 .sha { color: var(--copper); }
+.rr-who { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rr-l2 a { color: inherit; text-decoration: none; }
+.rr-l2 a.sha { color: var(--copper); }
+.rr-l2 a:hover { color: var(--emerald); text-decoration: underline; }
+
+.rr-right { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; text-align: right; min-width: 0; }
+.rr-word {
+  font: var(--t-label); color: var(--muted-sage); max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rr-word .rr-step { font: var(--t-mono); }
 .rr-word.succeeded { color: var(--ok); }
 .rr-word.failed, .rr-word.dead_lettered, .rr-word.refused { color: var(--danger); }
 .rr-word.running, .rr-word.pending { color: var(--running-ink); }
 .rr-word.suspended { color: var(--warn); }
 .rr-time { color: var(--muted-sage); white-space: nowrap; font-variant-numeric: tabular-nums; }
-.rr-time .mono { font: var(--t-mono); color: var(--sage); }
+.rr-time .mono { font: var(--t-mono); color: var(--sage); font-variant-numeric: tabular-nums; }
 .rr-time.live, .rr-time.live .mono { color: var(--running-ink); }
+
+/* Quiet success: a passed Run keeps its check mark and drops its status
+   word; its headline and line 2 drop to the secondary ink. */
+.runrow.ok .rr-title { color: var(--sage); }
+.runrow.ok .rr-l2 { color: var(--muted-sage); }
+
+/* A Run a newer one replaced, under its replacer. */
+.runrow.child .rr-main { padding-left: 16px; border-left: 2px solid var(--border); margin-left: 4px; }
+.runrow.child .rr-title { color: var(--sage); }
 
 /* A refused trigger's reason, one line under the row: what, then the fix. */
 .rr-reason { grid-column: 3 / 5; display: flex; gap: 6px; align-items: baseline; margin-top: 4px; color: var(--soft-white); min-width: 0; }
@@ -1799,12 +1822,24 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .rr-reason .what { white-space: pre-wrap; overflow-wrap: anywhere; }
 .rr-reason .fix { color: var(--sage); }
 
+/* Phone: no #N column; the full pipeline name on its own line above the
+   headline; status and time under the row. */
 @media (max-width: 620px) {
-  .runrow { grid-template-columns: 18px minmax(0, 1fr); }
+  .runrow { grid-template-columns: 22px minmax(0, 1fr); padding: 14px 16px; }
+  .rr-day { padding-left: 16px; padding-right: 16px; }
   .rr-num { display: none; }
-  .rr-right { grid-column: 2; flex-direction: row; align-items: center; gap: 10px; margin-top: 3px; }
+  .rr-right { grid-column: 2; flex-direction: row; align-items: baseline; gap: 12px; margin-top: 4px; }
   .rr-reason { grid-column: 2; }
-  .rr-pipe { max-width: 18ch; }
+  .rr-l1 { flex-direction: column; align-items: stretch; gap: 0; }
+  .rr-slash, .rr-pcut { display: none; }
+  .rr-pfull { display: block; color: var(--muted-sage); overflow: hidden; text-overflow: ellipsis; }
+  .rr-title { flex: none; min-width: 0; }
+  .runrow > .rr-mark { margin-top: 20px; }
+  /* Line 2 flows inline and wraps. */
+  .rr-l2 { display: block; }
+  .rr-from, .rr-where { display: inline; white-space: normal; }
+  .rr-from > svg { vertical-align: -2px; margin-right: 6px; }
+  .rr-sha:not(:empty)::before, .rr-who::before { content: "·"; color: var(--muted-sage); margin: 0 4px; }
 }
 
 /* Status as a word, for other lists (a schedule's last fire). */
