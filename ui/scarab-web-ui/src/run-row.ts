@@ -91,7 +91,7 @@ export function kindFirst(o: Origin): { kind: KindCell; where: PhrasePart[]; tig
 function kindAndWhere(o: Origin): { kind: KindCell; where: PhrasePart[] } {
   const ref = o.ref ?? null;
   const branch = ref && !ref.startsWith("refs/pull/") ? shortRef(ref) : null;
-  const on: PhrasePart[] = branch ? [{ t: "text", text: "on " }, { t: "mono", text: branch }] : [];
+  const on: PhrasePart[] = branch ? [{ t: "mono", text: branch }] : [];
   const cell = (word: string, token: PhrasePart | null = null): KindCell => ({ word, token, muted: false });
   switch (o.kind) {
     case null:

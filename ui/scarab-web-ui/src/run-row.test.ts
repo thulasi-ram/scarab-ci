@@ -55,10 +55,10 @@ describe("line 2, kind first", () => {
   });
 
   it("manual and API say where they ran; a schedule shows its expression", () => {
-    expect(line({ kind: "manual", ref: "refs/heads/feat/x" })).toEqual(["manual", "on feat/x"]);
-    expect(line({ kind: "api", ref: "refs/heads/main" })).toEqual(["api", "on main"]);
+    expect(line({ kind: "manual", ref: "refs/heads/feat/x" })).toEqual(["manual", "feat/x"]);
+    expect(line({ kind: "api", ref: "refs/heads/main" })).toEqual(["api", "main"]);
     expect(line({ kind: "cron", ref: "refs/heads/main", title: "0 2 * * *" })).toEqual(["schedule", "0 2 * * *"]);
-    expect(line({ kind: "upstream_run", ref: "refs/heads/main" })).toEqual(["upstream run", "on main"]);
+    expect(line({ kind: "upstream_run", ref: "refs/heads/main" })).toEqual(["upstream run", "main"]);
   });
 
   it("every trigger word is lowercase, so they read at one size", () => {

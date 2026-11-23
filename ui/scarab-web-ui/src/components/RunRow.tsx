@@ -78,32 +78,31 @@ const stop = (e: MouseEvent) => e.stopPropagation();
  *  trigger in its cell, with no column gap. On a phone it flows as one
  *  wrapped line, the group wrapping as a unit. */
 export function OriginLine(props: OriginProps) {
+  // `kind · subject`: the subject is what the trigger was about. A pull
+  // request's number and head branch are one subject (`#131 feat/x`); a
+  // tag's is its name; a push names its branch, a schedule its expression.
+  const subject = (): PhrasePart[] => {
+    const { kind } = props.line;
+    const where = props.line.where;
+    if (!kind.token) return where;
+    return where.length ? [kind.token, { t: "text", text: " " }, ...where] : [kind.token];
+  };
   return (
     <div class="rr-l2">
-      <span class="rr-kind" classList={{ wide: props.line.kind.muted || props.line.tight }}>
+      <span class="rr-from">
         <Icon icon={triggerIcon(props.kind)} size={13} />
         <span class="rr-kword" classList={{ muted: props.line.kind.muted }}>
           {props.line.kind.word}
         </span>
-        <Show when={props.line.kind.token}>
-          {(t) => (
-            <span class="rr-ktok">
-              {" "}
-              <WhereParts parts={[t()]} prUrl={props.prUrl} />
-            </span>
-          )}
-        </Show>
-        <Show when={props.line.tight}>
+        <Show when={subject().length > 0}>
+          <span class="rr-dot" aria-hidden="true">
+            ·
+          </span>
           <span class="rr-where">
-            <WhereParts parts={props.line.where} prUrl={props.prUrl} />
+            <WhereParts parts={subject()} prUrl={props.prUrl} />
           </span>
         </Show>
       </span>
-      <Show when={!props.line.kind.muted && !props.line.tight}>
-        <span class="rr-where">
-          <WhereParts parts={props.line.where} prUrl={props.prUrl} />
-        </span>
-      </Show>
       {/* A break opportunity on a phone; a grid drops it. */}{" "}
       <RunMeta sha={props.sha} author={props.author} commitUrl={props.commitUrl} deploy={props.deploy} />
     </div>
