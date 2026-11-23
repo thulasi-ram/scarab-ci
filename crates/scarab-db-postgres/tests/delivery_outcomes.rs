@@ -519,6 +519,45 @@ both!(
     a_finished_run_is_not_replaced_contract
 );
 
+/// R4, the other half of the guard: a Run still `Pending` and creating
+/// (another try may be writing it) is not replaced, by a new Run or by a
+/// refusal. Kills: a guard on `creating` alone, which replaces a Run a live
+/// try then finishes.
+async fn a_pending_run_is_not_replaced_contract(s: &Store) {
+    let db = s.db();
+    let (old, new) = (RunId("r-old".into()), RunId("r-new".into()));
+    db.begin_delivery_run_creation(&old, 1, 1, &claim("d1", ".scarab/a.yaml", None))
+        .await
+        .unwrap();
+    let lost = db
+        .begin_delivery_run_creation(&new, 1, 1, &claim("d1", ".scarab/a.yaml", Some(&old)))
+        .await
+        .unwrap();
+    assert_eq!(claimed_run(lost), Some(old.clone()));
+    assert_eq!(db.run_status(&new).await.unwrap(), None);
+    let mut overwrite = refusal(".scarab/a.yaml", "a-1", Some(&old));
+    overwrite.outcome = DeliveryOutcomeKind::NotRun;
+    overwrite.reason_kind = "not_head".into();
+    overwrite.refused = None;
+    assert!(matches!(
+        db.record_delivery_refusal(&key("d1", ".scarab/a.yaml"), &overwrite)
+            .await
+            .unwrap(),
+        OutcomeWrite::Claimed(_)
+    ));
+    let state = db.run_creation_state(&old).await.unwrap().unwrap();
+    assert_eq!(state.replaced_by, None);
+    assert!(
+        db.finish_run_creation(&old).await.unwrap(),
+        "the live try finishes it"
+    );
+}
+both!(
+    a_pending_run_is_not_replaced_in_memory,
+    a_pending_run_is_not_replaced_postgres,
+    a_pending_run_is_not_replaced_contract
+);
+
 /// End `run` `Failed` before its creation finished, as the creation sweep or
 /// a redelivery past the bound does: only then may it be replaced.
 async fn end_unfinished(db: &dyn Db, run: &RunId) {
@@ -666,10 +705,11 @@ async fn head_lookup_contract(s: &Store) {
         .await
         .unwrap());
 
-    // A newer push that decided nothing still moves the head.
-    arrive(s, "d-newer", Some(&main()), "s2").await;
+    // A newer push that decided nothing still moves the head; for that
+    // newer push itself (its own `at`), nothing later has arrived.
+    let newer = arrive(s, "d-newer", Some(&main()), "s2").await;
     assert!(db.head_moved(&head(main(), "s1", at)).await.unwrap());
-    assert!(!db.head_moved(&head(main(), "s2", at)).await.unwrap());
+    assert!(!db.head_moved(&head(main(), "s2", newer)).await.unwrap());
 }
 both!(
     head_lookup_in_memory,
