@@ -14556,6 +14556,13 @@
           "refs"
         ],
         "properties": {
+          "default_branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The repo's default branch (`main`, `master`, …), which the picker\nstarts on. Absent when the forge could not say; the picker then reads\nthe catalog at `HEAD`."
+          },
           "refs": {
             "type": "array",
             "items": {

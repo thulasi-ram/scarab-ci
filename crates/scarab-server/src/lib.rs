@@ -1183,6 +1183,10 @@ pub struct RefsQuery {
 pub struct RefsResponse {
     /// Branches first, then tags; each group name-sorted.
     pub refs: Vec<RefDto>,
+    /// The repo's default branch (`main`, `master`, …), which the picker
+    /// starts on. Absent when the forge could not say; the picker then reads
+    /// the catalog at `HEAD`.
+    pub default_branch: Option<String>,
 }
 
 /// One branch or tag: its kind, bare name, and the short SHA of the commit it
@@ -2738,7 +2742,24 @@ async fn list_refs(
         })
         .collect();
 
-    Ok(Json(RefsResponse { refs }))
+    // Best-effort: a forge that cannot name the default branch still lists
+    // its refs, and the picker falls back to `HEAD`.
+    let default_branch = match forge.default_branch(&repo).await {
+        Ok(branch) => Some(branch),
+        Err(e) => {
+            tracing::warn!(
+                repo = %format!("{}/{}", repo.owner, repo.name),
+                error = %e,
+                "could not read the default branch for the ref picker"
+            );
+            None
+        }
+    };
+
+    Ok(Json(RefsResponse {
+        refs,
+        default_branch,
+    }))
 }
 
 /// The compiled, typed launch-parameter schema for one selected pipeline

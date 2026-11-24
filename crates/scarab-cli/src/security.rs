@@ -47,10 +47,15 @@ pub enum SecurityCommand {
 #[derive(Debug, Args)]
 pub struct Conn {
     /// Base URL of the Scarab server.
-    #[arg(long, env = "SCARAB_SERVER", default_value = "http://localhost:8080")]
+    #[arg(
+        long,
+        env = "SCARAB_SERVER",
+        hide_env_values = true,
+        default_value = "http://localhost:8080"
+    )]
     pub server: String,
     /// An API token (`scarab_pat_…`) or a session id, sent as `Bearer`.
-    #[arg(long, env = "SCARAB_TOKEN")]
+    #[arg(long, env = "SCARAB_TOKEN", hide_env_values = true)]
     pub token: Option<String>,
 }
 

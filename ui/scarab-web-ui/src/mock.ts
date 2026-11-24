@@ -2658,7 +2658,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     return json({ schedules: m[1] === "scarab" ? schedules : [] });
   }
   // /v1/repos/{org}/{repo}/refs  (ref picker — not on the shot screens)
-  if (/^\/v1\/repos\/[^/]+\/[^/]+\/refs$/.test(p)) return json({ refs: [] });
+  if (/^\/v1\/repos\/[^/]+\/[^/]+\/refs$/.test(p)) return json({ refs: [], default_branch: "main" });
 
   // API tokens (git-bug a4cb94f): your own under /v1/me/tokens, every token in
   // the org under /v1/orgs/{org}/tokens. A mint returns an obviously-fake

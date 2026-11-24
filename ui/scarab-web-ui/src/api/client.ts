@@ -1297,18 +1297,19 @@ export type ForgeRef = components["schemas"]["RefDto"];
 
 /** The repo's branches + tags for the ref picker (`GET …/refs?q=`), optionally
  * narrowed by a case-insensitive name substring. Branches sort before tags,
- * each group name-ascending, server-side. Returns `[]` on error so the picker
- * degrades to plain free-text entry rather than blocking dispatch. */
+ * each group name-ascending, server-side, plus the repo's default branch when
+ * the forge names it. Returns no refs and no default branch on error, so the
+ * picker degrades to plain free-text entry rather than blocking dispatch. */
 export async function listRefs(
   org: string,
   repo: string,
   q?: string,
-): Promise<ForgeRef[]> {
+): Promise<{ refs: ForgeRef[]; defaultBranch: string | null }> {
   const { data, error } = await api.GET("/v1/repos/{org}/{repo}/refs", {
     params: { path: { org, repo }, query: q ? { q } : {} },
   });
-  if (error || !data) return [];
-  return data.refs;
+  if (error || !data) return { refs: [], defaultBranch: null };
+  return { refs: data.refs, defaultBranch: data.default_branch ?? null };
 }
 
 /** The manually-dispatchable catalog at a ref (`GET …/pipelines?ref=`). */
