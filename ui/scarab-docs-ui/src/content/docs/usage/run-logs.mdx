@@ -10,6 +10,10 @@ with `scarab logs`, or through the API.
 
 Open a Run and pick a step. The Logs tab shows the try in view and follows it while it runs.
 
+A try that failed opens on its **Error** tab, before Logs. It says how the try failed and why, how
+long it waited for a node before it ran, when it started and what started it, and shows the last
+lines of its log. **Open in Logs** goes to the whole log. A try that did not fail has no Error tab.
+
 - The pane loads at least the last 2 MiB of the try's log, from the start of the stored chunk
   that holds the cut, so up to about 256 KiB more. When the log is longer, a notice above it says
   how much shows, for example "Showing the last 2.1 MiB of 14.3 MiB. Line numbers start here." The

@@ -126,7 +126,7 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   await try1.click();
   await expect(try1).toHaveAttribute("aria-selected", "true");
   await expect(page.locator(".sp-status")).toContainText("Failed");
-  await expect(page.locator(".sp-line")).toContainText("Not the latest try: try 2 passed");
+  await expect(page.locator(".sp-tries")).toContainText("Not the latest try: try 2 passed");
   await expect(page.getByRole("button", { name: /Debug pod/ })).toBeDisabled();
   await expect(page).toHaveURL(/[?&]try=1(&|$)/);
   // The same URL opens on the same step and try.
@@ -137,9 +137,9 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   await expect(try2).toHaveAttribute("aria-selected", "true");
 
   // ── (f) the Artifacts tab lists the artifact of record ───────────────────
-  // The step header counts build's files; the link opens the Artifacts tab
-  // on build's files.
-  await page.locator(".sp-head").getByRole("button", { name: "1 artifact", exact: true }).click();
+  // The step's tab row counts build's files; the link opens the Artifacts
+  // tab on build's files.
+  await page.locator(".pane-tabbar").getByRole("button", { name: "1 artifact →", exact: true }).click();
   await expect(page.getByRole("tab", { name: /^Artifacts 1/ })).toHaveAttribute("aria-selected", "true");
   await expect(page).toHaveURL(/[?&]tab=artifacts(&|$)/);
   await expect(page.getByText("Showing artifacts from build")).toBeVisible();
@@ -230,10 +230,9 @@ test("a failed matrix run names where it failed and opens on the first failure",
   await page.goto(`/acme/scarab/runs/${MATRIX_RUN_ID}`);
   await expect(page.getByRole("heading", { name: /#33/ })).toBeVisible();
 
-  // The summary line names the root failures, each a link to its step.
-  const summary = page.getByLabel("Run summary");
-  await expect(summary).toContainText("✕ 2 of 7 steps failed:");
-  await expect(summary.getByRole("button", { name: "plan · treebo-production · aws-post-cluster" })).toBeVisible();
+  // The run tabs row says what needs attention, counted, with no names.
+  const attn = page.getByLabel("Needs attention");
+  await expect(attn).toHaveText("✕ 2 steps failed");
 
   // The graph heads the matrix with its step and keys; each cell shows only
   // its values, and the cell that failed twice says so.
@@ -241,24 +240,30 @@ test("a failed matrix run names where it failed and opens on the first failure",
   const twice = page.getByRole("button", { name: /^treebo-production · aws-cluster/ });
   await expect(twice).toContainText("failed 2 of 2 tries");
 
-  // The page opens on the first root failure. One line under the step name
-  // gives the failure class, the executor's detail and the wait for a node.
+  // The page opens on the first root failure, on its Error tab: the failure
+  // class, the executor's detail in full and the wait for a node.
   await expect(page.locator(".sp-name")).toHaveText("plan · treebo-production · aws-cluster");
-  const line = page.locator(".sp-line");
-  await expect(line.locator(".sp-status")).toHaveText("✕ Failed after 2m06s: step error");
-  await expect(line.locator(".sp-reason")).toContainText("Error acquiring the state lock");
-  await expect(line).toContainText("waited about 1m for a node");
+  const err = page.locator(".errpane");
+  await expect(page.locator(".pane-tabbar .tab.active")).toHaveText("Error");
+  await expect(err.locator(".sp-status")).toHaveText("✕ Failed after 2m06s: step error");
+  await expect(err.locator(".ep-reason")).toContainText("Error acquiring the state lock");
+  await expect(err).toContainText("waited about 1m for a node");
+  // The tries band shows only the tries for a failed try.
+  await expect(page.locator(".sp-tries .sp-status")).toHaveCount(0);
+  // Open in Logs moves to the Logs tab.
+  await err.getByRole("button", { name: "Open in Logs →" }).click();
+  await expect(page.locator(".pane-tabbar .tab.active")).toHaveText("Logs");
   await expect(page.getByRole("button", { name: /^Retry step/ })).toBeVisible();
   await expect(page.getByRole("button", { name: /^Rerun from here/ })).toBeVisible();
 
-  // A summary link selects that step.
-  await summary.getByRole("button", { name: "plan · treebo-production · aws-post-cluster" }).click();
+  // A graph node selects that step.
+  await page.getByRole("button", { name: /^treebo-production · aws-post-cluster/ }).click();
   await expect(page.locator(".sp-name")).toHaveText("plan · treebo-production · aws-post-cluster");
   await expect(page).toHaveURL(/[?&]step=4(&|$)/);
 
-  // The List view: dependency order, a Failed filter.
-  await page.getByRole("button", { name: /^List/ }).click();
-  await page.getByRole("button", { name: /^Failed 2/ }).click();
+  // The List view: dependency order, a Failed filter in the pipeline bar.
+  await page.getByRole("group", { name: "Pipeline view" }).getByRole("button", { name: /List/ }).click();
+  await page.getByRole("group", { name: "Which steps" }).getByRole("button", { name: /^Failed 2/ }).click();
   await expect(page.locator(".slist-row")).toHaveCount(2);
   await page.locator(".slist-row", { hasText: "treebo-production · aws-cluster" }).click();
   await expect(page.locator(".sp-name")).toHaveText("plan · treebo-production · aws-cluster");
@@ -371,8 +376,8 @@ test("run tabs: the Activity filter hides cleared Pod conditions, Artifacts show
 }) => {
   await page.goto(`/acme/scarab/runs/${RETRIES_RUN_ID}`);
   await expect(page.getByRole("heading", { name: /#34/ })).toBeVisible();
-  // The summary names the cells waiting for a node; the run opens on one.
-  await expect(page.getByLabel("Run summary")).toContainText("◷ 2 waiting for a node");
+  // The run tabs row counts the cells waiting for a node; the run opens on one.
+  await expect(page.getByLabel("Needs attention")).toContainText("◷ 2 waiting for a node");
   await expect(page.locator(".sp-name")).toContainText("deploy-preview");
 
   const runTabs = page.getByRole("tablist", { name: "Run" });
@@ -403,7 +408,7 @@ test("run tabs: the Activity filter hides cleared Pod conditions, Artifacts show
   await expect(page.locator(".sp-name")).toContainText("deploy-preview");
 
   // ── Artifacts: of record by default, earlier copies on request ───────────
-  await page.getByLabel("Run summary").getByRole("button", { name: "4 artifacts" }).click();
+  await runTabs.getByRole("tab", { name: /^Artifacts 4/ }).click();
   await expect(runTabs.getByRole("tab", { name: /^Artifacts 4/ })).toHaveAttribute("aria-selected", "true");
   const copies = page.getByRole("group", { name: "Artifact copies" });
   await expect(copies.getByRole("button", { name: /^Of record 4/ })).toHaveAttribute("aria-pressed", "true");
@@ -429,7 +434,7 @@ test("try strip: every try oldest first in the header, and tries nested in the L
   await tries.getByRole("tab", { name: /Try 1 ·/ }).click();
   await expect(tries.getByRole("tab", { name: /Try 1 ·/ })).toHaveAttribute("aria-selected", "true");
   await expect(page).toHaveURL(/[?&]try=1(&|$)/);
-  await expect(page.locator(".sp-line")).toContainText("Not the latest try: try 6 passed");
+  await expect(page.locator(".sp-tries")).toContainText("Not the latest try: try 6 passed");
 
   // unit (step 1): three tries; the third was a retry by a.kim.
   await page.goto(`/acme/scarab/runs/${RETRIES_RUN_ID}?step=1`);
@@ -449,11 +454,13 @@ test("try strip: every try oldest first in the header, and tries nested in the L
   await expect(page.getByRole("tablist", { name: "Tries of this step" }).getByRole("tab")).toHaveCount(3);
 });
 
-// A step with one try has no try control: there is nothing to pick.
-test("a step with one try shows no try strip", async ({ page }) => {
+// A step with one try keeps the tries band, one dot, so the outcome always
+// sits in the same place; a try that passed has no Error tab.
+test("a step with one try keeps its tries band with one dot", async ({ page }) => {
   await page.goto(`/acme/scarab/runs/${RETRIES_RUN_ID}?step=0`);
-  await expect(page.locator(".sp-status")).toContainText("Passed");
-  await expect(page.getByRole("tablist", { name: "Tries of this step" })).toHaveCount(0);
+  await expect(page.locator(".sp-tries .sp-status")).toContainText("Passed");
+  await expect(page.getByRole("tablist", { name: "Tries of this step" }).getByRole("tab")).toHaveCount(1);
+  await expect(page.locator(".pane-tabbar .tab", { hasText: "Error" })).toHaveCount(0);
 });
 
 // The page polls a live run every 1.2s and its clock ticks every second.
@@ -554,10 +561,9 @@ test("a failed first read of the events keeps the URL's version and try", async 
   await failEventReads(page, 1);
   await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}?step=1&v=1&try=1`);
   await expect(page.locator(".vr-note")).toContainText("Version 1 of 2");
-  // build has one try in version 1: the status says what it did, and there
-  // is no try strip.
-  await expect(page.locator(".sp-status")).toContainText("Passed");
-  await expect(page.getByRole("tablist", { name: "Tries of this step" })).toHaveCount(0);
+  // build has one try in version 1: the band shows it and says what it did.
+  await expect(page.locator(".sp-tries .sp-status")).toContainText("Passed");
+  await expect(page.getByRole("tablist", { name: "Tries of this step" }).getByRole("tab")).toHaveCount(1);
   await expect(page).toHaveURL(/[?&]v=1(&|$)/);
   await expect(page).toHaveURL(/[?&]try=1(&|$)/);
 });

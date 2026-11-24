@@ -34,17 +34,34 @@ release.yml uses that version's section as the GitHub Release text. See
   scrolls: the edge with more fades out and ‹ › buttons page through. While an older version is in view, the
   line is the top edge of a frame around the rest of the page: a muted green on the latest version, grey
   on an older one, where it says the version is read-only and offers the latest. The graph is no
-  longer dimmed, and a strip above it says what that version did differently from the latest (on
-  the latest, that it is the latest). Approvals stay above the line; while an older version is
-  in view they are hidden but keep their space, so switching versions never moves the page. The
-  status badge says how the version in view ended. A run with one version shows no line.
-- **A step's tries are a row in its header drawn like the version line**: one numbered dot per
-  try, oldest first, coloured by outcome, the selected one outlined; each try's card says what it
-  did, how long it took, why it ran and when. A step with one try shows no try control, and the Logs, Results and
-  Workspace tabs no longer repeat the try.
-- **The step name is a title, with one line under it on the selected try**: what it did, why it
-  failed or what holds it back, how long it waited for a node, and the step's artifacts link at
-  its end. The red box above the tabs is gone; red is only on the failure words.
+  longer dimmed, and the bar above it says what that version did differently from the latest (on
+  the latest, that it is the latest). Approvals stay above the line. The status badge says how
+  the version in view ended. A run with one version shows no line.
+- **The run header reads like the runs list.** Line 1 is the pipeline, a slash and the headline;
+  line 2 is what started the run and what it was about, then the commit, the author and a deploy
+  run's Environment as one group. The start time and duration sit at the right edge, under the
+  actions. A run whose workspace snapshots are kept shows a "kept by …" mark there (an expired
+  one, "snapshots expired"), and its full note on hover, in place of a sentence of its own.
+- **The approval row always keeps its space**, with or without an approval waiting and on any
+  version, so the page never moves when an approval comes or goes.
+- **The summary line is gone.** Only what needs attention shows, at the right of the run tabs:
+  how many steps failed and how many are held back and why ("◷ 2 waiting for a node"). A run that
+  is fine shows nothing there.
+- **The graph panel opens with one dark bar**: what the version in view did differently and how
+  many steps it carried over on the left; fit and zoom (or the List view's All / Failed), then a
+  Graph | List switch on the right. The second row of tabs and the "select a step" hint are gone.
+  The List view is drawn in the same dark panel, and a carried-over step has a dashed "from v2"
+  tag, the list's form of the dashed outline.
+- **The step's name and actions sit above its card, and the card opens with its tries**: a band
+  drawn like the versions line, one numbered dot per try (one included), coloured by outcome;
+  each try's card says what it did, how long it took, why it ran and when. After the tries, the
+  band says how a try that did not fail is doing. The Logs, Results and Workspace tabs no longer
+  repeat the try, and the step's artifacts link sits at the right of the tab row.
+- **A failed try opens on an Error tab**: how it failed, the reason in full, how long it waited
+  for a node before it ran, when it started and why, and the last lines of its log, with a link
+  to the whole log. The red box above the tabs is gone. See
+  [Run logs](https://thulasi-ram.github.io/scarab-ci/usage/run-logs/).
+- **More room between the parts of the run page.**
 
 ## [0.7.4] - 2026-11-24
 
