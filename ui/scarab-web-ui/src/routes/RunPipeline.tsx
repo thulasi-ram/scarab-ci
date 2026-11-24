@@ -38,17 +38,22 @@ export default function RunPipeline() {
   const repo = () => params.repo!;
   const prefill = (location.state as RunPipelineState)?.prefillParams;
 
-  // The repo default branch (this UI treats `main` as default; HEAD is the
-  // server fallback). The chosen ref threads through every call.
-  const [ref, setRef] = createSignal("main");
-  const [loadedRef, setLoadedRef] = createSignal("main");
+  // The picker starts on the repo's default branch, which the refs call
+  // names; until it answers no catalog loads. The chosen ref threads through
+  // every call.
+  const [ref, setRef] = createSignal("");
+  const [loadedRef, setLoadedRef] = createSignal<string>();
   const [selected, setSelected] = createSignal<string | null>(null);
 
   const [catalog] = createResource(loadedRef, (r) => listPipelines(org(), repo(), r));
+  // Reading an errored resource throws, and with no error boundary the throw
+  // leaves the page's computations stale: a later ref that loads fine would
+  // never render. Every read of the catalog goes through this guard.
+  const catalogValue = () => (catalog.error ? undefined : catalog());
 
   const [iface] = createResource(
     () => {
-      const c = catalog();
+      const c = catalogValue();
       const name = selected();
       return c && name ? { name, sha: c.sha } : null;
     },
@@ -57,7 +62,7 @@ export default function RunPipeline() {
 
   // The human catalog: manually-dispatchable pipelines, plus any file that
   // failed to parse (shown disabled/annotated, never crashing the list).
-  const rows = () => (catalog()?.pipelines ?? []).filter((p) => p.manual || !!p.error);
+  const rows = () => (catalogValue()?.pipelines ?? []).filter((p) => p.manual || !!p.error);
 
   // ---- form state ---------------------------------------------------------
   const [values, setValues] = createSignal<Record<string, FieldValue>>({});
@@ -110,14 +115,25 @@ export default function RunPipeline() {
   // free-text entry it was before — you can still type a branch or full SHA.
   const [refs] = createResource(
     () => ({ org: org(), repo: repo() }),
-    (k) => listRefs(k.org, k.repo),
+    (k) =>
+      listRefs(k.org, k.repo).catch(() => ({ refs: [], defaultBranch: null })),
   );
+
+  // Start on the default branch once the refs call answers. A forge that
+  // cannot name it leaves the field empty and reads the catalog at `HEAD`,
+  // which the forge resolves to the default branch.
+  createEffect(() => {
+    const r = refs();
+    if (!r || loadedRef() !== undefined) return;
+    setRef(r.defaultBranch ?? "");
+    setLoadedRef(r.defaultBranch ?? "HEAD");
+  });
   const [refOpen, setRefOpen] = createSignal(false);
   const [refHi, setRefHi] = createSignal(0);
 
   const refMatches = () => {
     const q = ref().trim().toLowerCase();
-    const all = refs() ?? [];
+    const all = refs()?.refs ?? [];
     return q ? all.filter((r) => r.name.toLowerCase().includes(q)) : all;
   };
 
@@ -224,7 +240,7 @@ export default function RunPipeline() {
                   // Delay the close so a mouse click on an option still lands.
                   onBlur={() => setTimeout(() => setRefOpen(false), 120)}
                   onKeyDown={onRefKey}
-                  placeholder="main"
+                  placeholder="default branch"
                 />
                 <Show when={refOpen() && refMatches().length > 0}>
                   <ul class="rp-combo-menu">
@@ -253,7 +269,7 @@ export default function RunPipeline() {
               <Icon icon="search" size={14} /> Load pipelines
             </button>
           </div>
-          <Show when={catalog()}>
+          <Show when={catalogValue()}>
             {(c) => (
               <span class="mono rp-sha" title={`resolved to ${c().sha}`}>
                 <Icon icon="git-commit-horizontal" size={13} />
@@ -268,7 +284,10 @@ export default function RunPipeline() {
       <div class="panel">
         <div class="panel-h"><span>Pipelines · on: manual</span></div>
         <div class="rp-catalog">
-          <Show when={!catalog.loading} fallback={<p class="empty">loading…</p>}>
+          <Show
+            when={loadedRef() !== undefined && !catalog.loading}
+            fallback={<p class="empty">loading…</p>}
+          >
             <Show
               when={!catalog.error}
               fallback={<p class="empty">Could not read pipelines at this ref.</p>}

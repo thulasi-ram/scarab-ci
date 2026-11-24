@@ -5460,6 +5460,12 @@ export interface components {
          *     and open-PR head-refs are a deliberate follow-up, not part of v1.
          */
         RefsResponse: {
+            /**
+             * @description The repo's default branch (`main`, `master`, …), which the picker
+             *     starts on. Absent when the forge could not say; the picker then reads
+             *     the catalog at `HEAD`.
+             */
+            default_branch?: string | null;
             /** @description Branches first, then tags; each group name-sorted. */
             refs: components["schemas"]["RefDto"][];
         };
