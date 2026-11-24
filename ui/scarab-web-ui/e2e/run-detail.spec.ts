@@ -50,24 +50,35 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   await expect(page.locator(".sp-name")).toHaveText("approve");
   await expect(page).toHaveURL(/[?&]step=3(&|$)/);
 
-  // ── (b) version selector: canonical rerun language, two versions ─────────
-  await page.getByRole("button", { name: /^Version 2 of 2 · latest/ }).click();
-  const versionMenu = page.getByRole("menu", { name: "run versions" });
-  await expect(versionMenu).toBeVisible();
-  const latestRow = versionMenu.getByRole("menuitemradio", { name: /you reran from build/ });
-  const originalRow = versionMenu.getByRole("menuitemradio", { name: /Version 1/ });
-  await expect(latestRow).toBeVisible();
-  await expect(latestRow).toContainText("by a.kim");
-  await expect(originalRow).toBeVisible();
-  // The first version exists because of its trigger.
-  await expect(originalRow).toContainText("PR #131");
-  // Superseded evidence: the original run's outcome chips carry the ⊘ bucket
-  // (test@a1 was cut short by the rerun).
-  await expect(originalRow).toContainText("⊘");
-  // The glossary ban, checked WITH the version rows in the DOM.
+  // ── (b) the version ribbon: canonical rerun language, two versions ───────
+  const versions = page.getByRole("group", { name: "Versions" });
+  const latestDot = versions.getByRole("button", { name: /^v2 latest/ });
+  const originalDot = versions.getByRole("button", { name: /^v1/ });
+  await expect(latestDot).toHaveAttribute("aria-pressed", "true");
+  await expect(latestDot).toHaveAttribute("title", /you reran from build/);
+  await expect(latestDot).toHaveAttribute("title", /by a\.kim/);
+  // The first version exists because of its trigger, and a step of it was
+  // cut short by the rerun.
+  await expect(originalDot).toHaveAttribute("title", /PR #131/);
+  await expect(originalDot).toHaveAttribute("title", /superseded/);
   await expectGlossaryClean(page);
-  await page.keyboard.press("Escape");
-  await expect(versionMenu).toHaveCount(0);
+  // Picking version 1 frames the page as read-only, with the way back; the
+  // graph's strip says what it did differently from the latest.
+  await originalDot.click();
+  await expect(page.locator(".vframe.older")).toBeVisible();
+  await expect(page.locator(".vr-note")).toContainText("Version 1 of 2");
+  await expect(page.locator(".dag-changes")).toContainText("in the latest (v2)");
+  // The approval bar is hidden while version 1 is in view but keeps its
+  // space, so nothing below it moves.
+  await expect(page.locator(".gate-bar.reserved")).toBeHidden();
+  const tabsTop = await page.locator(".run-tabs").evaluate((el) => el.getBoundingClientRect().top);
+  await page.getByRole("button", { name: "Show latest" }).click();
+  await expect(page.locator(".vframe.older")).toHaveCount(0);
+  // The frame stays, faint, on the latest version, and so does the strip.
+  await expect(page.locator(".vframe.framed")).toBeVisible();
+  await expect(page.locator(".dag-changes")).toContainText("Latest version");
+  await expect(page.locator(".gate-bar").getByRole("button", { name: "Approve" })).toBeVisible();
+  expect(await page.locator(".run-tabs").evaluate((el) => el.getBoundingClientRect().top)).toBe(tabsTop);
 
   // ── (c) the Activity tab is newest-first ─────────────────────────────────
   await page.getByRole("tab", { name: /^Activity/ }).click();
@@ -93,14 +104,12 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   // ── (e) the failed→retried step's tries, with per-try outcomes ───────────
   await page.getByRole("button", { name: /^build/ }).click();
   await expect(page).toHaveURL(/[?&]step=1(&|$)/);
-  // With two tries the header names the selected try as text and a row of
-  // try tabs picks; the header says what the try did.
-  const sp = page.locator(".sp-head");
-  await expect(sp).toContainText("Try 2 of 2");
+  // With two tries the header carries a strip of numbered tries, the
+  // selected one filled; the status line says what that try did and nothing
+  // more for a passing try. No "try 2" on the content tabs.
   await expect(page.locator(".sp-status")).toContainText("✓ Passed in");
-  // It passed after an earlier failure in this version.
-  await expect(page.locator(".sp-box")).toContainText("Passed on try 2 (automatic retry)");
-  await expect(page.getByRole("button", { name: /^Logs try 2/ })).toBeVisible();
+  await expect(page.locator(".sp-reason")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Logs", exact: true })).toBeVisible();
   const tries = page.getByRole("tablist", { name: "Tries of this step" });
   const try1 = tries.getByRole("tab", { name: /Try 1 ·/ });
   const try2 = tries.getByRole("tab", { name: /Try 2 ·/ });
@@ -115,23 +124,22 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   // Picking the older try scopes the pane to it, keeps it in the URL, and
   // disables Debug pod (it reproduces the latest try).
   await try1.click();
-  await expect(sp).toContainText("Try 1 of 2");
   await expect(try1).toHaveAttribute("aria-selected", "true");
-  await expect(page.locator(".sp-box")).toContainText("Try 1 failed: step error");
-  await expect(page.locator(".sp-box")).toContainText("Not the latest try: try 2 passed");
+  await expect(page.locator(".sp-status")).toContainText("Failed");
+  await expect(page.locator(".sp-tries")).toContainText("Not the latest try: try 2 passed");
   await expect(page.getByRole("button", { name: /Debug pod/ })).toBeDisabled();
   await expect(page).toHaveURL(/[?&]try=1(&|$)/);
   // The same URL opens on the same step and try.
   await page.reload();
-  await expect(sp).toContainText("Try 1 of 2");
+  await expect(try1).toHaveAttribute("aria-selected", "true");
   // An index past the end is dropped, not an error: the default applies.
   await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}?step=1&try=9`);
-  await expect(sp).toContainText("Try 2 of 2");
+  await expect(try2).toHaveAttribute("aria-selected", "true");
 
   // ── (f) the Artifacts tab lists the artifact of record ───────────────────
-  // The step header counts build's files; the link opens the Artifacts tab
-  // on build's files.
-  await page.locator(".sp-head").getByRole("button", { name: "1 artifact", exact: true }).click();
+  // The step's tab row counts build's files; the link opens the Artifacts
+  // tab on build's files.
+  await page.locator(".pane-tabbar").getByRole("button", { name: "1 artifact →", exact: true }).click();
   await expect(page.getByRole("tab", { name: /^Artifacts 1/ })).toHaveAttribute("aria-selected", "true");
   await expect(page).toHaveURL(/[?&]tab=artifacts(&|$)/);
   await expect(page.getByText("Showing artifacts from build")).toBeVisible();
@@ -222,10 +230,9 @@ test("a failed matrix run names where it failed and opens on the first failure",
   await page.goto(`/acme/scarab/runs/${MATRIX_RUN_ID}`);
   await expect(page.getByRole("heading", { name: /#33/ })).toBeVisible();
 
-  // The summary line names the root failures, each a link to its step.
-  const summary = page.getByLabel("Run summary");
-  await expect(summary).toContainText("✕ 2 of 7 steps failed:");
-  await expect(summary.getByRole("button", { name: "plan · treebo-production · aws-post-cluster" })).toBeVisible();
+  // The run tabs row says what needs attention, counted, with no names.
+  const attn = page.getByLabel("Needs attention");
+  await expect(attn).toHaveText("✕ 2 steps failed");
 
   // The graph heads the matrix with its step and keys; each cell shows only
   // its values, and the cell that failed twice says so.
@@ -233,25 +240,30 @@ test("a failed matrix run names where it failed and opens on the first failure",
   const twice = page.getByRole("button", { name: /^treebo-production · aws-cluster/ });
   await expect(twice).toContainText("failed 2 of 2 tries");
 
-  // The page opens on the first root failure, with its failure box: the
-  // failure class, the executor's detail, and the wait for a node.
+  // The page opens on the first root failure, on its Error tab: the failure
+  // class, the executor's detail in full and the wait for a node.
   await expect(page.locator(".sp-name")).toHaveText("plan · treebo-production · aws-cluster");
-  await expect(page.locator(".sp-status")).toContainText("✕ Failed after 2m06s: step error");
-  const box = page.locator(".sp-box");
-  await expect(box).toContainText("Try 2 failed: step error");
-  await expect(box).toContainText("Error acquiring the state lock");
-  await expect(box).toContainText("unschedulable for about 1m before it started");
+  const err = page.locator(".errpane");
+  await expect(page.locator(".pane-tabbar .tab.active")).toHaveText("Error");
+  await expect(err.locator(".sp-status")).toHaveText("✕ Failed after 2m06s: step error");
+  await expect(err.locator(".ep-reason")).toContainText("Error acquiring the state lock");
+  await expect(err).toContainText("waited about 1m for a node");
+  // The tries band shows only the tries for a failed try.
+  await expect(page.locator(".sp-tries .sp-status")).toHaveCount(0);
+  // Open in Logs moves to the Logs tab.
+  await err.getByRole("button", { name: "Open in Logs →" }).click();
+  await expect(page.locator(".pane-tabbar .tab.active")).toHaveText("Logs");
   await expect(page.getByRole("button", { name: /^Retry step/ })).toBeVisible();
   await expect(page.getByRole("button", { name: /^Rerun from here/ })).toBeVisible();
 
-  // A summary link selects that step.
-  await summary.getByRole("button", { name: "plan · treebo-production · aws-post-cluster" }).click();
+  // A graph node selects that step.
+  await page.getByRole("button", { name: /^treebo-production · aws-post-cluster/ }).click();
   await expect(page.locator(".sp-name")).toHaveText("plan · treebo-production · aws-post-cluster");
   await expect(page).toHaveURL(/[?&]step=4(&|$)/);
 
-  // The List view: dependency order, a Failed filter.
-  await page.getByRole("button", { name: /^List/ }).click();
-  await page.getByRole("button", { name: /^Failed 2/ }).click();
+  // The List view: dependency order, a Failed filter in the pipeline bar.
+  await page.getByRole("group", { name: "Pipeline view" }).getByRole("button", { name: /List/ }).click();
+  await page.getByRole("group", { name: "Which steps" }).getByRole("button", { name: /^Failed 2/ }).click();
   await expect(page.locator(".slist-row")).toHaveCount(2);
   await page.locator(".slist-row", { hasText: "treebo-production · aws-cluster" }).click();
   await expect(page.locator(".sp-name")).toHaveText("plan · treebo-production · aws-cluster");
@@ -364,8 +376,8 @@ test("run tabs: the Activity filter hides cleared Pod conditions, Artifacts show
 }) => {
   await page.goto(`/acme/scarab/runs/${RETRIES_RUN_ID}`);
   await expect(page.getByRole("heading", { name: /#34/ })).toBeVisible();
-  // The summary names the cells waiting for a node; the run opens on one.
-  await expect(page.getByLabel("Run summary")).toContainText("◷ 2 waiting for a node");
+  // The run tabs row counts the cells waiting for a node; the run opens on one.
+  await expect(page.getByLabel("Needs attention")).toContainText("◷ 2 waiting for a node");
   await expect(page.locator(".sp-name")).toContainText("deploy-preview");
 
   const runTabs = page.getByRole("tablist", { name: "Run" });
@@ -396,7 +408,7 @@ test("run tabs: the Activity filter hides cleared Pod conditions, Artifacts show
   await expect(page.locator(".sp-name")).toContainText("deploy-preview");
 
   // ── Artifacts: of record by default, earlier copies on request ───────────
-  await page.getByLabel("Run summary").getByRole("button", { name: "4 artifacts" }).click();
+  await runTabs.getByRole("tab", { name: /^Artifacts 4/ }).click();
   await expect(runTabs.getByRole("tab", { name: /^Artifacts 4/ })).toHaveAttribute("aria-selected", "true");
   const copies = page.getByRole("group", { name: "Artifact copies" });
   await expect(copies.getByRole("button", { name: /^Of record 4/ })).toHaveAttribute("aria-pressed", "true");
@@ -409,42 +421,46 @@ test("run tabs: the Activity filter hides cleared Pod conditions, Artifacts show
   await expect(page.locator(".art-row", { hasText: "e2e · try 1" })).toContainText("from a failed try");
 });
 
-test("try tabs: every try newest first in one row, and tries nested in the List view", async ({ page }) => {
+test("try strip: every try oldest first in the header, and tries nested in the List view", async ({ page }) => {
   // e2e is step 2: six tries, the sixth passed.
   await page.goto(`/acme/scarab/runs/${RETRIES_RUN_ID}?step=2`);
-  const sp = page.locator(".sp-head");
-  await expect(sp).toContainText("Try 6 of 6");
   const tries = page.getByRole("tablist", { name: "Tries of this step" });
-  // Every try is a tab, newest first; nothing folds into a menu.
+  // Every try is a numbered button, oldest first; the newest is selected.
   await expect(tries.getByRole("tab")).toHaveCount(6);
-  await expect(tries.getByRole("tab").first()).toContainText("Try 6 · passed");
-  await expect(tries.getByRole("tab").first()).toContainText("of record");
-  await expect(tries.getByRole("tab").last()).toContainText("Try 1 · failed: step error");
-  await expect(page.getByRole("button", { name: /^Earlier tries/ })).toHaveCount(0);
+  await expect(tries.getByRole("tab").first()).toContainText("Try 1 · failed: step error");
+  await expect(tries.getByRole("tab").last()).toContainText("Try 6 · passed");
+  await expect(tries.getByRole("tab").last()).toContainText("of record");
+  await expect(tries.getByRole("tab").last()).toHaveAttribute("aria-selected", "true");
   await tries.getByRole("tab", { name: /Try 1 ·/ }).click();
-  await expect(sp).toContainText("Try 1 of 6");
+  await expect(tries.getByRole("tab", { name: /Try 1 ·/ })).toHaveAttribute("aria-selected", "true");
   await expect(page).toHaveURL(/[?&]try=1(&|$)/);
-  await expect(page.locator(".sp-box")).toContainText("Not the latest try: try 6 passed");
+  await expect(page.locator(".sp-tries")).toContainText("Not the latest try: try 6 passed");
 
   // unit (step 1): three tries; the third was a retry by a.kim.
   await page.goto(`/acme/scarab/runs/${RETRIES_RUN_ID}?step=1`);
   const unitTries = page.getByRole("tablist", { name: "Tries of this step" });
   await expect(unitTries.getByRole("tab")).toHaveCount(3);
-  await expect(unitTries.getByRole("tab").first()).toContainText("retried by a.kim");
+  await expect(unitTries.getByRole("tab").last()).toContainText("retried by a.kim");
 
   // The List view nests each step's tries; a try row opens that try.
   await page.getByRole("button", { name: /^List/ }).click();
   const nested = page.locator(".slist-try", { hasText: "Try 2 · failed: timed out" }).first();
   await nested.click();
-  await expect(sp).toContainText("Try 2 of 3");
+  await expect(unitTries.getByRole("tab", { name: /Try 2 ·/ })).toHaveAttribute("aria-selected", "true");
   await expect(page).toHaveURL(/[?&]try=2(&|$)/);
 
-  // A narrow screen keeps the same row; it scrolls sideways instead of
-  // turning into a dropdown.
+  // A narrow screen keeps the same strip.
   await page.setViewportSize({ width: 600, height: 900 });
   await expect(page.getByRole("tablist", { name: "Tries of this step" }).getByRole("tab")).toHaveCount(3);
-  await expect(page.getByRole("button", { name: /^Try 2 of 3/ })).toHaveCount(0);
-  await expect(sp).toContainText("Try 2 of 3");
+});
+
+// A step with one try keeps the tries band, one dot, so the outcome always
+// sits in the same place; a try that passed has no Error tab.
+test("a step with one try keeps its tries band with one dot", async ({ page }) => {
+  await page.goto(`/acme/scarab/runs/${RETRIES_RUN_ID}?step=0`);
+  await expect(page.locator(".sp-tries .sp-status")).toContainText("Passed");
+  await expect(page.getByRole("tablist", { name: "Tries of this step" }).getByRole("tab")).toHaveCount(1);
+  await expect(page.locator(".pane-tabbar .tab", { hasText: "Error" })).toHaveCount(0);
 });
 
 // The page polls a live run every 1.2s and its clock ticks every second.
@@ -464,7 +480,7 @@ test("a live run's polls keep focus, the open file and the step tab", async ({ p
   await page.waitForTimeout(2500);
   await expect(row).toBeFocused();
 
-  await page.getByRole("button", { name: /^Workspace try 3/ }).click();
+  await page.getByRole("button", { name: "Workspace", exact: true }).click();
   await expect(page).toHaveURL(/[?&]ptab=workspace(&|$)/);
   await page.getByRole("button", { name: /summary\.txt/ }).click();
   await expect(page.locator(".fileview")).toContainText("12 passed, 0 failed");
@@ -544,8 +560,10 @@ test("a log stream that fails says why and Retry loads the log", async ({ page }
 test("a failed first read of the events keeps the URL's version and try", async ({ page }) => {
   await failEventReads(page, 1);
   await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}?step=1&v=1&try=1`);
-  await expect(page.getByText(/Viewing version 1 of 2/)).toBeVisible();
-  await expect(page.locator(".sp-head")).toContainText("Try 1 of 1");
+  await expect(page.locator(".vr-note")).toContainText("Version 1 of 2");
+  // build has one try in version 1: the band shows it and says what it did.
+  await expect(page.locator(".sp-tries .sp-status")).toContainText("Passed");
+  await expect(page.getByRole("tablist", { name: "Tries of this step" }).getByRole("tab")).toHaveCount(1);
   await expect(page).toHaveURL(/[?&]v=1(&|$)/);
   await expect(page).toHaveURL(/[?&]try=1(&|$)/);
 });

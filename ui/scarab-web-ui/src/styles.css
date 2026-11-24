@@ -807,8 +807,9 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 
 /* Gates awaiting a decision. One row per gate — a run can suspend on
    several — so the emphasis sits on WHICH gate, not on a single verb. */
+/* The approval row's slot: one row's height, kept with or without a gate. */
+.gate-slot { min-height: 48px; margin: 28px 0; }
 .gate-bar {
-  margin-bottom: 16px;
   border: 1px solid color-mix(in srgb, var(--emerald) 35%, transparent);
   border-radius: 6px;
   background: color-mix(in srgb, var(--emerald) 6%, transparent);
@@ -817,7 +818,8 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 10px 12px;
+  min-height: 46px; box-sizing: border-box;
+  padding: 7px 12px;
   border-bottom: 1px solid color-mix(in srgb, var(--emerald) 18%, transparent);
 }
 .gate-row:last-child { border-bottom: none; }
@@ -869,11 +871,9 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   border-color: var(--border-warn);
   color: var(--warn);
 }
-/* The widened-rerun note sits under the step header, and the retention note
-   in the notice slot. Always visible: a scope change discovered on hover is
-   still a surprise. */
-.rd-widened,
-.rd-retention {
+/* The widened-rerun note sits under the step header. Always visible: a scope
+   change discovered on hover is still a surprise. */
+.rd-widened {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -1242,12 +1242,11 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   border-color: var(--warn);
 }
 
-/* Reused: while time-traveling, a step carried forward
- * untouched by the viewed Take — present and keeping its verdict colour, but
- * visibly muted so it doesn't read as having re-run in this rerun. */
+/* Reused: a step carried forward untouched from an earlier version keeps its
+ * verdict colour at full contrast and is outlined with dashes, so it doesn't
+ * read as having run in this version, or as disabled. */
 .dnode.reused {
-  opacity: 0.5;
-  filter: saturate(0.55);
+  border-style: dashed;
 }
 
 .dnode-id {
@@ -2704,7 +2703,16 @@ h1, .crumb-head, .run-title {
 .dnode.sel { border-color: var(--terminal-accent); box-shadow: inset 0 0 0 1px var(--terminal-accent); }
 .dnode.running { border-color: var(--warn); }
 .dnode.failed { border-color: color-mix(in srgb, var(--danger) 60%, var(--terminal-line)); }
-.dnode.reused { opacity: 0.5; filter: saturate(0.55); }
+.dnode.reused { border-style: dashed; }
+/* Hovering a node lights it and every step it needs; the rest steps back. */
+.dnode.lit { box-shadow: 0 0 0 1px color-mix(in srgb, var(--terminal-accent) 70%, transparent); }
+.dnode.sel.lit { box-shadow: inset 0 0 0 1px var(--terminal-accent); }
+.dnode.dim { opacity: 0.45; }
+.dag-edges path.lit { stroke: var(--terminal-accent); stroke-width: 2; }
+.dag-edges path.dim { opacity: 0.3; }
+@media (prefers-reduced-motion: no-preference) {
+  .dnode { transition: border-color 0.12s ease, box-shadow 0.12s ease, opacity 0.12s ease; }
+}
 
 .dnode-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 /* One line: a name that does not fit ends in an ellipsis, and the full id is
@@ -3105,32 +3113,40 @@ a.lgtog { text-decoration: none; }
 }
 .pipeline-panel > .panel-h .grow1 { flex: 1; }
 
-/* Pipeline panel header: the Graph | List switch and a hint on the left, zoom
-   controls pushed right. */
-.pipeline-toolbar {
-  position: relative; z-index: 6; overflow: visible;
-  gap: 10px;
+/* The pipeline bar: one dark bar over the graph or the list. What this
+   version did differently on the left; the view's own controls (zoom for the
+   graph, All / Failed for the list), then the Graph | List switch, on the
+   right. Canvas tokens: it is the top of the dark panel. */
+.pipeline-bar {
+  position: relative; z-index: 6;
+  display: flex; align-items: center; gap: 12px; min-height: 46px; box-sizing: border-box;
+  padding: 8px 12px 8px 16px; background: var(--terminal-elev);
+  border-bottom: 1px solid var(--terminal-line);
+  font: var(--t-body); color: var(--terminal-ink);
 }
-.pipeline-toolbar .pt-label {
-  font: var(--t-label);
-  color: var(--sage);
+.pipeline-bar .grow1 { flex: 1; }
+/* A two-way switch: Graph | List, All | Failed. */
+.pv-seg {
+  display: inline-flex; gap: 2px; padding: 2px; flex: none;
+  border: 1px solid var(--terminal-line); border-radius: 7px; background: var(--terminal);
 }
-.pipeline-toolbar .pt-count {
-  font: var(--t-body);
-  color: var(--muted-sage);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
+.pv-seg button {
+  display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 10px;
+  font: var(--t-label); color: var(--terminal-dim);
+  background: transparent; border: 0; border-radius: 5px; cursor: pointer;
 }
-/* Zoom control cluster (fit ⤢ / zoom ＋ / zoom －): page chrome — it sits on the
-   toolbar, not the dark canvas — so it reads page/theme tokens. */
+.pv-seg button:hover { color: var(--terminal-ink); }
+.pv-seg button[aria-pressed="true"] { color: var(--terminal-ink); background: var(--terminal-line); }
+.pv-n { font: var(--t-mono); opacity: 0.75; }
+/* Fit and zoom, beside the switch while the graph is in view. */
 .dag-zoomctl { display: inline-flex; gap: 5px; flex: none; }
 .dag-zoomctl button {
-  width: 28px; height: 28px; display: grid; place-items: center;
-  font: var(--t-mono); line-height: 1; cursor: pointer;
-  color: var(--muted-sage); background: var(--emerald-surface);
-  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  width: 28px; height: 28px; display: grid; place-items: center; cursor: pointer;
+  color: var(--terminal-dim); background: transparent;
+  border: 1px solid var(--terminal-line); border-radius: 6px;
   transition: color 0.12s var(--ease-out), border-color 0.12s var(--ease-out);
 }
-.dag-zoomctl button:hover { color: var(--soft-white); border-color: var(--emerald); }
+.dag-zoomctl button:hover { color: var(--terminal-ink); border-color: var(--terminal-accent); }
 
 /* The graph band: the dark canvas across the panel, edge to edge (the panel's
    rounding and overflow clip the corners). */
@@ -3176,115 +3192,130 @@ a.lgtog { text-decoration: none; }
 /* The step pane, below the Pipeline panel: its own card. The selected tab
    fills a comfortable height and scrolls in place, so logs are readable
    without stretching the page. */
-.rd-evidence > .steppane { display: flex; flex-direction: column; min-height: 0; overflow: visible; }
+.rd-evidence .steppane { display: flex; flex-direction: column; min-height: 0; overflow: visible; margin-bottom: 0; }
 .rd-evidence .steppane .tabpane {
   min-height: 300px; max-height: 52vh; overflow: auto;
 }
 
-/* Read-only (an older version): a faint wash and a gently desaturated body.
-   The read-only banner in the notice slot names the state. */
-.pipeline-panel.readonly { background: color-mix(in srgb, var(--emerald) 4%, transparent); }
-.pipeline-panel.readonly .dag-band,
-.pipeline-panel.readonly .slist,
-.rd-evidence.readonly { filter: saturate(0.72); opacity: 0.9; }
 
-/* Read-only banner: a caution strip in the notice slot while an older version
-   is in view. */
-.readonly-banner {
-  display: flex; align-items: center; gap: 8px;
-  padding: 8px 14px; border: 1px solid var(--border-warn); border-radius: var(--radius);
-  background: color-mix(in srgb, var(--warn) 12%, var(--emerald-surface));
-  font: var(--t-body); color: var(--sage);
-}
-.readonly-banner .rb-eye { font: var(--t-body); line-height: 1; }
-.readonly-banner b { color: var(--soft-white); font: var(--t-label); }
-.readonly-banner .rb-hint { color: var(--muted-sage); }
 
-/* ── Version dropdown: the version selector's menu in the run header's
-   provenance line. Page chrome, so it reads the page tokens. ──── */
-.vdrop { position: relative; display: inline-flex; flex: none; }
-.vdrop-btn {
-  display: inline-flex; align-items: center; gap: 6px; max-width: 240px;
-  font: var(--t-mono); line-height: 1; cursor: pointer;
-  color: var(--soft-white); background: var(--emerald-surface);
-  border: 1px solid var(--border); border-radius: var(--radius); padding: 5px 10px;
-  transition: color 0.12s var(--ease-out), border-color 0.12s var(--ease-out),
-    background 0.12s var(--ease-out);
+/* ── The version frame and ribbon ─────────────────────────────────────────
+   A run with more than one version gets a frame around the page below the
+   notices, its top edge the ribbon of versions. On the latest version the
+   frame is a muted green; on an older one it turns grey, the colour of the
+   past. Its size never changes, so switching versions only changes colour. */
+/* A plain block: its children keep the spacing they had on the page. */
+.vframe { min-width: 0; }
+.vframe > .vribbon { margin-bottom: 14px; }
+.vframe.framed {
+  border: 2px solid color-mix(in srgb, var(--emerald) 22%, transparent); border-radius: 12px;
+  padding: 0 20px 28px; overflow: hidden;
+  transition: border-color 0.25s var(--ease-out);
 }
-.vdrop-btn:hover { border-color: var(--emerald); }
-.vdrop-btn.open { border-color: var(--emerald); background: color-mix(in srgb, var(--emerald) 10%, transparent); }
-/* Time-travelling (an older version in view): copper tint, echoing the caution
-   read-only banner below the toolbar. */
-.vdrop-btn.traveling { color: var(--warn); border-color: var(--border-warn); }
-.vdrop-emblem { flex: none; color: var(--emerald); }
-.vdrop-btn.traveling .vdrop-emblem { color: var(--warn); }
-.vdrop-lbl { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: var(--t-label); }
-.vdrop-caret { flex: none; opacity: 0.75; margin-left: 1px; }
-/* Live pip (viewing the live frontier): a pulsing dot — in the trigger it sits
-   with no label; in a menu row it carries a "live" caption. */
-.vdrop-live {
-  flex: none; display: inline-flex; align-items: center; gap: 5px;
-  font: var(--t-label);
-  color: var(--running);
+.vframe.framed > .vribbon {
+  margin: 0 -20px 14px; padding: 4px 20px; min-height: 48px; border: 0; border-radius: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--emerald) 18%, transparent);
+  background: color-mix(in srgb, var(--emerald) 5%, var(--emerald-surface));
+  transition: background 0.25s var(--ease-out), border-color 0.25s var(--ease-out);
 }
-.vdrop-live .dot {
-  width: 6px; height: 6px; border-radius: 50%; background: var(--running);
-  box-shadow: 0 0 0 1px var(--border-warn); animation: pulse 1.4s ease-in-out infinite;
+.vframe.framed.older { border-color: color-mix(in srgb, var(--muted-sage) 75%, transparent); }
+.vframe.framed.older > .vribbon {
+  border-bottom-color: color-mix(in srgb, var(--muted-sage) 55%, transparent);
+  background: color-mix(in srgb, var(--muted-sage) 16%, var(--emerald-surface));
+}
+@media (prefers-reduced-motion: reduce) {
+  .vframe.framed, .vframe.framed > .vribbon { transition: none; }
+}
+/* A notice that only acts on the latest version keeps its space, hidden,
+   while an older version is in view, so the page below never moves. */
+.gate-bar.reserved, .rd-toast.reserved { visibility: hidden; }
+.vribbon {
+  display: flex; align-items: center; gap: 12px; min-height: 40px; padding: 0 14px;
+  background: var(--emerald-surface); border: 1px solid var(--border); border-radius: var(--radius);
+  font: var(--t-body);
+}
+.vr-k { color: var(--muted-sage); flex: none; }
+.vr-row { display: flex; align-items: center; gap: 2px; min-width: 0; flex: 0 1 auto; }
+.vr-link { width: 10px; height: 1px; background: var(--border); flex: none; }
+.vr-dot {
+  display: inline-flex; align-items: center; gap: 6px; flex: none;
+  font: var(--t-body); color: var(--soft-white); white-space: nowrap;
+  background: transparent; border: 0; border-radius: 999px; padding: 2px 7px; cursor: pointer;
+}
+.vr-dot:hover { background: color-mix(in srgb, var(--sage) 12%, transparent); }
+.vr-dot[aria-pressed="true"] { font: var(--t-label); box-shadow: inset 0 0 0 1px var(--emerald); }
+.vframe.older .vr-dot[aria-pressed="true"] { box-shadow: inset 0 0 0 1px var(--sage); background: var(--emerald-surface); }
+.vr-pip { width: 10px; height: 10px; border-radius: 50%; background: var(--muted-sage); flex: none; }
+.vr-end { font: var(--t-mono); color: var(--muted-sage); flex: none; }
+/* The versions scroll sideways when they do not fit (dots on a phone, ticks
+   past ~110): the scrollbar is hidden, the edge with more fades out, and the
+   ‹ › buttons page through. */
+.vr-scroll {
+  display: flex; align-items: center; gap: 2px; min-width: 0; height: 30px;
+  overflow-x: auto; scrollbar-width: none; overscroll-behavior-x: contain;
+  padding: 0 3px;
+}
+.vr-scroll::-webkit-scrollbar { display: none; }
+.vr-scroll.more-l { mask-image: linear-gradient(to right, transparent, #000 28px); }
+.vr-scroll.more-r { mask-image: linear-gradient(to left, transparent, #000 28px); }
+.vr-scroll.more-l.more-r {
+  mask-image: linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent);
+}
+.vr-pg {
+  flex: none; width: 24px; height: 24px; padding: 0; line-height: 1;
+  font: var(--t-label); color: var(--soft-white); cursor: pointer;
+  background: var(--emerald-surface); border: 1px solid var(--border); border-radius: 6px;
+}
+.vr-pg:hover:not(:disabled) { border-color: var(--emerald); }
+.vr-pg:disabled { color: var(--muted-sage); cursor: default; opacity: 0.5; }
+.vr-tick {
+  flex: none; width: 7px; height: 14px; padding: 0; border: 0; border-radius: 2px;
+  background: var(--muted-sage); opacity: 0.75; cursor: pointer;
+}
+.vr-tick:hover { opacity: 1; }
+.vr-tick[aria-pressed="true"] {
+  height: 24px; opacity: 1;
+  box-shadow: 0 0 0 2px var(--emerald-surface), 0 0 0 3px var(--emerald);
+}
+.vframe.older .vr-tick[aria-pressed="true"] { box-shadow: 0 0 0 2px var(--emerald-surface), 0 0 0 3px var(--sage); }
+.vr-pip.succeeded, .vr-tick.succeeded { background: var(--ok); }
+.vr-pip.failed, .vr-tick.failed { background: var(--danger); }
+.vr-pip.running, .vr-tick.running { background: var(--running); }
+.vr-pip.superseded, .vr-tick.superseded { background: var(--warn); }
+.vr-dot:focus-visible, .vr-tick:focus-visible { outline: 2px solid var(--emerald); outline-offset: 2px; }
+.vr-note { margin-left: auto; color: var(--sage); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.vr-note b { color: var(--soft-white); font: var(--t-label); }
+.vr-latest {
+  flex: none; font: var(--t-label); color: var(--soft-white); cursor: pointer;
+  background: var(--emerald-surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 3px 10px;
+}
+.vr-latest:hover { border-color: var(--emerald); }
+@media (max-width: 640px) {
+  /* A phone keeps only the frame's left edge: padding there costs the page. */
+  .vframe.framed { border-width: 0 0 0 3px; border-radius: 0; padding: 0 0 12px 10px; }
+  .vframe.framed > .vribbon { margin: 0 0 12px -10px; flex-wrap: wrap; padding: 6px 10px; }
+  .vr-note { white-space: normal; }
 }
 
-/* Backdrop: a transparent full-viewport click-catcher beneath the open menu. */
+/* What this version did differently from the latest, on the left of the
+   pipeline bar, and how many steps it carried over (the dashed outline). */
+.dag-changes {
+  display: flex; align-items: center; gap: 4px 10px; flex-wrap: wrap; min-width: 0;
+}
+.dag-changes .mono { font: var(--t-mono); }
+.dc-st.failed, .dc-st.dead_lettered, .dc-st.cancelled { color: var(--danger); }
+.dc-st.succeeded { color: var(--ok-ink); }
+.dc-sep, .dc-arrow, .dc-more, .dc-carried, .dc-same { color: color-mix(in srgb, var(--terminal-ink) 70%, transparent); }
+.dc-sep { margin: 0 6px; }
+.dc-carried { display: inline-flex; align-items: center; gap: 8px; }
+.ds-dash {
+  display: inline-block; width: 16px; height: 10px; flex: none;
+  border: 1px dashed currentColor; border-radius: 3px;
+}
+/* Backdrop: a transparent full-viewport click-catcher beneath an open menu
+   (the run header's ⋯ menu). */
 .vdrop-backdrop { position: fixed; inset: 0; z-index: 30; }
-/* Menu: hangs under the trigger, over the band; scrolls when there are many. */
-.vdrop-menu {
-  position: absolute; top: calc(100% + 6px); left: 0; z-index: 31;
-  min-width: max(100%, 268px); max-width: min(360px, 90vw);
-  max-height: 340px; overflow-y: auto;
-  display: flex; flex-direction: column; gap: 3px; padding: 6px;
-  background: var(--emerald-elevated); border: 1px solid var(--border);
-  border-radius: var(--radius); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
-  transform-origin: top left;
-  transition: opacity 0.14s var(--ease-out), transform 0.14s var(--ease-out);
-}
-@starting-style { .vdrop-menu { opacity: 0; transform: scale(0.97); } }
-/* A menu row: a slim selection pip down the left edge + a stacked body
-   (label · sub · outcome chips). The selected row gets an emerald wash + pip. */
-.vdrop-row {
-  display: flex; align-items: stretch; gap: 10px; width: 100%; cursor: pointer; text-align: left;
-  background: transparent; border: 1px solid transparent; border-radius: var(--radius-sm);
-  padding: 9px 10px; color: var(--sage); font: var(--t-body);
-  transition: background 0.12s var(--ease-out), border-color 0.12s var(--ease-out);
-}
-.vdrop-row:hover { background: color-mix(in srgb, var(--sage) 14%, transparent); color: var(--soft-white); }
-.vdrop-row.sel {
-  background: color-mix(in srgb, var(--emerald) 10%, transparent);
-  border-color: color-mix(in srgb, var(--emerald) 40%, transparent); color: var(--soft-white);
-}
-.vdrop-pip { flex: 0 0 3px; border-radius: 2px; background: transparent; }
-.vdrop-row.sel .vdrop-pip { background: var(--emerald); }
-.vdrop-rowbody { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
-.vdrop-rowtop { display: flex; align-items: center; gap: 8px; }
-.vdrop-rowlbl {
-  font: var(--t-label); color: inherit;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.vdrop-rowtop .vdrop-live { margin-left: auto; }
-.vdrop-sub {
-  font: var(--t-mono); color: var(--muted-sage);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-/* Outcome mini-summary: one colored count chip per non-empty status bucket,
-   using the shared status accent tokens (shared with the former rail). */
-.vr-sum { display: flex; flex-wrap: wrap; gap: 5px 7px; }
-.vr-chip {
-  display: inline-flex; align-items: center; gap: 2px;
-  font: var(--t-mono); line-height: 1; color: var(--muted-sage);
-}
-.vr-chip.ok { color: var(--ok); }
-.vr-chip.danger { color: var(--danger); }
-.vr-chip.running { color: var(--running); }
-.vr-chip.copper { color: var(--warn); }
-.vr-chip.sage,
-.vr-chip.other { color: var(--muted-sage); }
 
 /* Status moved into the top metadata bar (was on the breadcrumb). */
 .prov-status { display: inline-flex; align-items: center; gap: 10px; }
@@ -3324,90 +3355,6 @@ a.lgtog { text-decoration: none; }
 .steppane .coord-stamp .cs-step { color: var(--soft-white); font: var(--t-mono); }
 .steppane .coord-stamp .cs-ver { color: var(--copper); }
 .steppane .coord-stamp .cs-dot { color: var(--muted-sage); opacity: 0.5; }
-
-/* ── Attempts dropdown (design feedback — replaced the redesign-stage-3
-   filmstrip): the "which try" axis, folded INTO the coordinate stamp as its
-   "try N" segment. One try → a static outcome chip; many tries → a compact
-   dropdown whose trigger names the active try and whose menu lists every try
-   (oldest → newest, the active one marked), scrolling when the streak is long.
-   PAGE/theme chrome → page tokens, both themes. Coloured by outcome via the tone
-   classes below (emerald/danger/copper/running), echoing the DAG ring and the
-   version-rail chips. */
-.adrop { position: relative; display: inline-flex; }
-/* Shared trigger/chip shell — modelled on the version/take dropdown (`.vdrop-btn`)
-   so the two run-detail dropdowns read as one control family: same squared
-   surface, emblem, label and caret. Outcome tone (below) recolours the text +
-   border. A long label (a failure reason) ellipsizes rather than blowing out the
-   stamp. */
-.adrop-chip,
-.adrop-btn {
-  display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%;
-  font: var(--t-mono); line-height: 1;
-  color: var(--muted-sage); background: var(--emerald-surface);
-  border: 1px solid var(--border); border-radius: var(--radius); padding: 5px 10px;
-}
-.adrop-btn {
-  cursor: pointer;
-  transition: color 0.12s var(--ease-out), border-color 0.12s var(--ease-out),
-    background 0.12s var(--ease-out);
-}
-.adrop-btn:hover { border-color: var(--muted-sage); }
-/* Open: a faint tone wash + a full-strength tone border — the currentColor
-   treatment the filmstrip's active marker used. */
-.adrop-btn.open { border-color: currentColor; background: color-mix(in srgb, currentColor 10%, transparent); }
-/* Attempts emblem — the ⟳ that mirrors the version dropdown's ◈; inherits the
-   outcome tone via currentColor. */
-.adrop-emblem { flex: none; opacity: 0.9; }
-.adrop-lbl { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: var(--t-label); }
-.adrop-caret { flex: none; opacity: 0.75; margin-left: 1px; }
-/* Crash re-adoption marker — same attempt, same fence, not a new execution. */
-.adrop-readopt { flex: none; color: var(--copper); }
-
-/* Outcome tone — accent colour on the text + a tinted border on the pill. */
-.adrop-chip.emerald, .adrop-btn.emerald, .adrop-row.emerald { color: var(--ok); }
-.adrop-chip.danger,  .adrop-btn.danger,  .adrop-row.danger  { color: var(--danger); }
-.adrop-chip.copper,  .adrop-btn.copper,  .adrop-row.copper  { color: var(--warn); }
-.adrop-chip.running, .adrop-btn.running, .adrop-row.running { color: var(--running); }
-.adrop-chip.emerald, .adrop-btn.emerald { border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
-.adrop-chip.danger,  .adrop-btn.danger  { border-color: color-mix(in srgb, var(--danger) 55%, var(--border)); }
-.adrop-chip.copper,  .adrop-btn.copper  { border-color: var(--border-warn); }
-.adrop-chip.running, .adrop-btn.running { border-color: color-mix(in srgb, var(--running) 50%, var(--border)); }
-/* A shadowed success (a newer success took over as of-record) dims. */
-.adrop-chip.shadow, .adrop-btn.shadow, .adrop-row.shadow { opacity: 0.5; }
-
-/* Backdrop: a transparent full-viewport click-catcher beneath the open menu. */
-.adrop-backdrop { position: fixed; inset: 0; z-index: 30; }
-
-/* Menu: hangs under the trigger; scrolls in place when there are many tries. */
-.adrop-menu {
-  position: absolute; top: calc(100% + 5px); left: 0; z-index: 31;
-  min-width: max(100%, 232px); max-width: min(420px, 88vw);
-  max-height: 300px; overflow-y: auto;
-  display: flex; flex-direction: column; gap: 2px; padding: 5px;
-  background: var(--emerald-elevated); border: 1px solid var(--border);
-  border-radius: var(--radius); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
-  transform-origin: top left;
-  transition: opacity 0.14s var(--ease-out), transform 0.14s var(--ease-out);
-}
-@starting-style { .adrop-menu { opacity: 0; transform: scale(0.97); } }
-/* A row: `try N · cause · outcome`, coloured by outcome; the active one is
-   highlighted (a faint emerald wash + a trailing dot), echoing the version-rail
-   selected row. */
-.adrop-row {
-  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; cursor: pointer;
-  font: var(--t-mono); line-height: 1.3;
-  color: var(--muted-sage); background: transparent;
-  border: 1px solid transparent; border-radius: var(--radius-sm); padding: 6px 9px;
-  transition: background 0.12s var(--ease-out), border-color 0.12s var(--ease-out);
-}
-.adrop-row:hover { background: color-mix(in srgb, var(--sage) 14%, transparent); }
-.adrop-row.sel {
-  background: color-mix(in srgb, var(--emerald) 12%, transparent);
-  border-color: color-mix(in srgb, var(--emerald) 40%, transparent);
-}
-.adrop-row-lbl { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* Active-row marker: a small filled emerald dot (mirrors SearchSelect's dot). */
-.adrop-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--emerald); }
 
 /* Logs tab inside the pane: the terminal treatment, one attempt at a time. */
 .steppane .tabpane.logpane { padding: 0; background: var(--terminal); display: flex; flex-direction: column; min-height: 46vh; }
@@ -3476,22 +3423,42 @@ a.lgtog { text-decoration: none; }
 /* Run header: breadcrumb with `#N` and the title, status, actions. */
 /* Its own layer above the pipeline panel, whose toolbar sets z-index 6: the ⋯
    menu opens downward over it and must take the clicks. */
-.rh { position: relative; z-index: 20; display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+.rh { position: relative; z-index: 20; display: flex; flex-direction: column; gap: 10px; }
 .rh-row { display: flex; align-items: center; gap: 12px; min-width: 0; flex-wrap: wrap; }
+/* Above phone width the title shrinks (and ends in an ellipsis) before the
+   version picker, the badge or the actions wrap to a line of their own. */
+@media (min-width: 641px) {
+  .rh-row { flex-wrap: nowrap; }
+}
 .rh-row .grow1 { flex: 1; }
 .rh-crumbs { min-width: 0; flex: 0 1 auto; max-width: 100%; }
 .rh-num { flex: none; color: var(--display-ink); }
 .rh-title { color: var(--display-ink); }
+/* As the runs list's line 1: the pipeline (mono, muted), a slash, the title. */
+.rh-headline { display: inline-flex; align-items: baseline; gap: 8px; min-width: 0; flex: 1 1 auto; margin-left: 6px; }
+.rh-pipe { font: var(--t-mono); color: var(--sage); flex: none; }
+.rh-slash { font: var(--t-body); color: var(--muted-sage); flex: none; }
+/* On a phone the title keeps the row; the pipeline is on the runs list. */
+@media (max-width: 640px) {
+  .rh-pipe, .rh-slash { display: none; }
+  .run-tabs-row { flex-wrap: wrap; }
+  .rd-attn { margin-left: 0; padding: 6px 0 8px; }
+}
 .rh-actions { display: inline-flex; align-items: center; gap: 8px; flex: none; margin-left: auto; }
 .rh-actions .btn-sm { display: inline-flex; align-items: center; gap: 6px; }
-/* Provenance: one wrapping line of facts, ending in the version selector. */
-.rh-prov { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 16px; color: var(--sage); }
-.rh-prov .pfact { color: var(--sage); }
-.rh-prov .pfact a { color: var(--emerald); text-decoration: none; }
-.rh-prov .pfact a:hover { text-decoration: underline; }
-.rh-prov .pfact a.plain { color: inherit; pointer-events: none; }
-.rh-prov .pfact a.sha { color: var(--copper); margin-left: 4px; }
-.rh-prov .pfact .subtle { color: var(--muted-sage); }
+/* Line 2, as the runs list's line 2 (the same OriginLine), then the kept
+   mark and the times at the right edge, under the actions. */
+.rh-prov { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 20px; color: var(--sage); min-width: 0; }
+.rh-prov .rr-l2 { display: flex; gap: 0 22px; max-width: none; flex: 0 1 auto; }
+.rh-params { font: var(--t-mono); color: var(--muted-sage); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rh-prov .grow1 { flex: 1; }
+.rh-keep {
+  display: inline-flex; align-items: center; gap: 5px; flex: none; color: var(--muted-sage);
+  border-bottom: 1px dotted var(--muted-sage); cursor: help;
+}
+.rh-time { font: var(--t-body); color: var(--sage); flex: none; white-space: nowrap; }
+.rh-time .mono { font: var(--t-mono); }
+.rh-time.live .mono { color: var(--running-ink); }
 
 /* The ⋯ menu. */
 .rmenu { position: relative; display: inline-flex; }
@@ -3513,62 +3480,14 @@ a.lgtog { text-decoration: none; }
 .rmenu-lbl { font: var(--t-label); }
 .rmenu-item small { color: var(--muted-sage); overflow-wrap: anywhere; }
 
-/* The version and try selectors: "Version 2 of 3 · latest ▾", "Try 2 of 3 ▾".
-   Plain text, dashed, when there is only one. */
-.vpick, .trypick {
-  display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
-  font: var(--t-body); color: var(--soft-white);
-  background: var(--emerald-surface); border: 1px solid var(--border);
-  border-radius: var(--radius); padding: 3px 9px; cursor: pointer;
-  transition: border-color 0.12s var(--ease-out), background 0.12s var(--ease-out);
-}
-.vpick .k, .trypick .k { color: var(--muted-sage); }
-.vpick:hover, .trypick:hover, .vpick.open, .trypick.open { border-color: var(--emerald); }
-.vpick.static, .trypick.static { border-style: dashed; color: var(--sage); cursor: default; }
-.vpick.traveling { color: var(--warn); border-color: var(--border-warn); }
-.vdrop-why { font: var(--t-body); color: var(--soft-white); }
 
-/* Try menu rows: number, outcome and cause, duration. */
-.adrop-row { display: grid; grid-template-columns: 56px minmax(0, 1fr) auto; align-items: start; gap: 8px; }
-.adrop-menu { min-width: 340px; }
-.adrop-n { font: var(--t-label); color: var(--soft-white); }
-.adrop-body { display: flex; flex-direction: column; min-width: 0; }
-.adrop-out { font: var(--t-body); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.adrop-body small { color: var(--muted-sage); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.adrop-dur { font: var(--t-mono); color: var(--muted-sage); }
 
-/* Notice slot: each notice a full-width strip, in priority order. */
-.rd-notice { margin-bottom: 12px; }
-.rd-retention.rd-notice { color: var(--muted-sage); }
-
-/* Summary line: where the run failed, or what runs and waits. */
-.rd-summary {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px;
-  margin: 0 0 12px; min-height: 20px; color: var(--sage);
-}
-.rd-summary .linklike { font: var(--t-mono); overflow-wrap: anywhere; text-align: left; }
-.rd-sum-roots { min-width: 0; }
-.rd-sum-part { font: var(--t-label); white-space: nowrap; }
-.rd-sum-part.failed { color: var(--danger); }
-.rd-sum-part.running { color: var(--running-ink); }
-.rd-sum-part.warning { color: var(--warn); }
-.rd-sum-part.passed { color: var(--ok-ink); }
-.rd-sum-part.subtle { font: var(--t-body); color: var(--muted-sage); }
-
-/* Graph | List switch in the Pipeline panel header. */
-.pv-switch { display: inline-flex; gap: 2px; align-self: stretch; margin: -10px 0; }
-.pv-tab {
-  display: inline-flex; align-items: center; gap: 6px;
-  font: var(--t-label); color: var(--muted-sage);
-  background: none; border: 0; border-bottom: 2px solid transparent;
-  padding: 10px 10px 8px; cursor: pointer;
-}
-.pv-tab:hover { color: var(--sage); }
-.pv-tab[aria-pressed="true"] { color: var(--soft-white); border-bottom-color: var(--emerald); }
-.pv-count {
-  font: var(--t-mono); color: var(--muted-sage);
-  background: var(--emerald-surface); border: 1px solid var(--border); border-radius: 20px; padding: 0 6px;
-}
+/* What needs attention, at the right of the run tabs row: failures and
+   steps held back, counted, no names. */
+.rd-attn { display: inline-flex; align-items: center; gap: 14px; flex: none; margin-left: auto; padding-left: 16px; }
+.rd-attn-part { font: var(--t-label); white-space: nowrap; }
+.rd-attn-part.failed { color: var(--danger); }
+.rd-attn-part.warning { color: var(--warn); }
 
 /* A matrix in the graph: its cells under one heading naming the step and its
    keys. Canvas tokens only. */
@@ -3580,108 +3499,132 @@ a.lgtog { text-decoration: none; }
 }
 .dag-mxh b { font: inherit; color: var(--terminal-ink); }
 
-/* List view. */
-.slist { padding-bottom: 8px; }
-.slist-filter {
-  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
-  padding: 10px 12px; border-bottom: 1px solid var(--border-soft);
-}
-.slist .chip, .rt-filters .chip {
+/* List view: the same dark panel as the graph, canvas tokens. */
+.slist { padding: 10px 0 14px; background: var(--terminal); color: var(--terminal-ink); }
+.rt-filters .chip {
   display: inline-flex; align-items: center; gap: 6px;
   font: var(--t-label); color: var(--sage);
   background: var(--emerald-surface); border: 1px solid var(--border); border-radius: 12px;
   padding: 2px 10px; cursor: pointer;
 }
-.slist .chip[aria-pressed="true"], .rt-filters .chip[aria-pressed="true"] {
+.rt-filters .chip[aria-pressed="true"] {
   color: var(--emerald); border-color: var(--emerald);
   background: color-mix(in srgb, var(--emerald) 10%, transparent);
 }
-.slist-filter .subtle { color: var(--muted-sage); }
-.slist-grp { font: var(--t-label); color: var(--sage); padding: 10px 14px 4px; }
-.slist-grp .mono { color: var(--muted-sage); margin-left: 6px; }
+.slist-grp { font: var(--t-label); color: var(--terminal-ink); padding: 12px 16px 4px; }
+.slist-grp .mono { color: var(--terminal-dim); margin-left: 6px; }
 .slist-row {
-  display: grid; grid-template-columns: 16px minmax(0, 1fr) minmax(0, 220px) 72px;
+  display: grid; grid-template-columns: 16px minmax(0, 1fr) minmax(0, 260px) 72px;
   align-items: center; gap: 10px; width: 100%; text-align: left;
-  padding: 6px 14px; background: none; border: 0; border-left: 2px solid transparent;
-  cursor: pointer; color: var(--soft-white);
+  padding: 7px 16px; background: none; border: 0; border-left: 2px solid transparent;
+  cursor: pointer; color: var(--terminal-ink);
 }
-.slist-row.cell { padding-left: 24px; }
-.slist-row:hover { background: color-mix(in srgb, var(--emerald) 8%, transparent); }
+.slist-row.cell { padding-left: 30px; }
+.slist-row:hover { background: color-mix(in srgb, var(--terminal-accent) 10%, transparent); }
 .slist-row.sel {
-  background: color-mix(in srgb, var(--emerald) 10%, transparent);
-  border-left-color: var(--emerald);
+  background: color-mix(in srgb, var(--terminal-accent) 14%, transparent);
+  border-left-color: var(--terminal-accent);
 }
-.slist-g { font: var(--t-mono); color: var(--muted-sage); }
+.slist-g { font: var(--t-mono); color: var(--terminal-dim); text-align: center; }
 .slist-g.succeeded { color: var(--ok-ink); }
 .slist-g.failed { color: var(--danger); }
 .slist-g.running { color: var(--running-ink); }
 .slist-g.warning, .slist-g.service { color: var(--warn); }
 .slist-name { font: var(--t-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.slist-words { color: var(--sage); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.slist-dur { font: var(--t-mono); color: var(--muted-sage); text-align: right; }
-.slist-empty { padding: 10px 14px; }
+.slist-words { color: var(--terminal-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A step carried over from an earlier version: the dashed outline of its node
+   in the graph, as a tag. */
+.slist-from {
+  display: inline-block; margin-left: 10px; padding: 0 7px;
+  font: var(--t-mono); line-height: 18px; color: var(--terminal-ink);
+  border: 1px dashed var(--terminal-dim); border-radius: 3px;
+}
+.slist-dur { font: var(--t-mono); color: var(--terminal-dim); text-align: right; }
+.slist-empty { padding: 10px 16px; color: var(--terminal-dim); }
 
-/* Step header: name, try, status, files, actions. */
+/* The step's name and its actions, on the page above the card, indented to
+   line up with the card's content. Each item is centred on the 32px row the
+   buttons set, so the title and its matrix values share the buttons' middle. */
 .sp-head {
   display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px;
-  padding: 10px 14px; border-bottom: 1px solid var(--border);
+  min-height: 32px; margin: 28px 0 14px; padding-left: 16px;
 }
-.sp-head .grow1 { flex: 1; }
-.sp-name { font: var(--t-label); color: var(--display-ink); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sp-cell { font: var(--t-mono); color: var(--sage); }
-.sp-status { font: var(--t-label); white-space: nowrap; color: var(--muted-sage); }
+.sp-head .grow1, .sp-tries .grow1 { flex: 1 0 0; min-width: 0; }
+.sp-name {
+  display: inline-flex; align-items: center; gap: 12px; min-width: 0;
+  font: var(--t-title); line-height: 1; color: var(--display-ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sp-cell { font: var(--t-mono); line-height: 1; color: var(--sage); }
+.sp-actions { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.sp-actions .btn-sm { display: inline-flex; align-items: center; gap: 6px; }
+/* The tries band: as the versions band, the top of the card. */
+.sp-tries {
+  display: flex; align-items: center; gap: 8px; min-height: 46px; box-sizing: border-box;
+  padding: 7px 16px; border-bottom: 1px solid var(--border);
+  border-radius: var(--radius) var(--radius) 0 0;
+  background: color-mix(in srgb, var(--emerald) 5%, var(--emerald-surface));
+  white-space: nowrap;
+}
+.sp-tries .tstrip { margin-right: 8px; }
+.sp-tries > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.sp-status { font: var(--t-label); flex: none; color: var(--muted-sage); }
 .sp-status.passed { color: var(--ok-ink); }
 .sp-status.failed { color: var(--danger); }
 .sp-status.running { color: var(--running-ink); }
 .sp-status.warning { color: var(--warn); }
-.sp-files { color: var(--muted-sage); }
-.sp-actions { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px; }
-.sp-actions .btn-sm { display: inline-flex; align-items: center; gap: 6px; }
-
-/* The box above the content tabs: why the try failed, what holds it back. */
-.sp-box {
-  display: grid; gap: 3px; margin: 12px 14px 0; padding: 9px 12px;
-  border: 1px solid var(--border); border-radius: var(--radius);
-  background: var(--pine-deep); overflow-wrap: anywhere;
+.sp-reason { color: var(--muted-sage); flex: 0 1 auto; }
+.sp-aside { color: var(--muted-sage); flex: 0 2 auto; }
+.sp-files { flex: none; margin-right: 16px; white-space: nowrap; }
+@media (max-width: 640px) {
+  .sp-tries { flex-wrap: wrap; white-space: normal; }
+  .sp-head { padding-left: 0; }
 }
-.sp-box-h { font: var(--t-label); color: var(--soft-white); }
-.sp-box-d { color: var(--sage); }
-.sp-box.failed { border-color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, var(--emerald-surface)); }
-.sp-box.failed .sp-box-h { color: var(--danger); }
-.sp-box.warning { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, var(--emerald-surface)); }
-.sp-box.warning .sp-box-h { color: var(--warn); }
-.steppane .pane-tabbar { margin-top: 10px; }
+/* The Error tab: how the try failed and why, a few facts, the log's tail. */
+.steppane .tabpane.errpane { display: flex; flex-direction: column; gap: 20px; padding: 22px 22px 24px; }
+.ep-what { display: flex; flex-direction: column; gap: 6px; padding-left: 12px; border-left: 3px solid var(--danger); }
+.ep-reason { margin: 0; font: var(--t-body); color: var(--soft-white); overflow-wrap: anywhere; white-space: pre-wrap; }
+.ep-facts { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 8px 12px; margin: 0; }
+.ep-facts dt { color: var(--muted-sage); }
+.ep-facts dd { margin: 0; color: var(--soft-white); }
+.ep-facts:empty { display: none; }
+.ep-tail { display: flex; flex-direction: column; gap: 6px; }
+.ep-tail-h { display: flex; align-items: center; gap: 10px; color: var(--muted-sage); }
+.ep-tail-h .grow1 { flex: 1; }
+.ep-lines { font: var(--t-mono); background: var(--terminal); border-radius: var(--radius-sm); padding: 8px 0; overflow-x: auto; }
+.ep-tail-empty { margin: 0; color: var(--muted-sage); }
 .steppane .pane-tabbar .tabs { min-width: 0; }
 /* A content tab's scope: "try 2", "from try 3", "none". */
 .inspector .tab .tscope { font: var(--t-mono); color: var(--muted-sage); }
 
 /* List view: the tries nested under a step with more than one. */
 .slist-try {
-  display: grid; grid-template-columns: 16px minmax(0, 1fr) minmax(0, 220px) 72px;
+  display: grid; grid-template-columns: 16px minmax(0, 1fr) minmax(0, 260px) 72px;
   align-items: center; gap: 10px; width: 100%; text-align: left;
-  padding: 3px 14px 3px 38px; background: none; border: 0; border-left: 2px solid transparent;
-  cursor: pointer; color: var(--sage); font: var(--t-body);
+  padding: 5px 16px 5px 40px; background: none; border: 0; border-left: 2px solid transparent;
+  cursor: pointer; color: var(--terminal-ink); font: var(--t-body);
 }
-.slist-try.cell { padding-left: 48px; }
-.slist-try:hover { background: color-mix(in srgb, var(--emerald) 8%, transparent); }
+.slist-try.cell { padding-left: 52px; }
+.slist-try:hover { background: color-mix(in srgb, var(--terminal-accent) 10%, transparent); }
 .slist-try.sel {
-  background: color-mix(in srgb, var(--emerald) 10%, transparent);
-  border-left-color: var(--emerald); color: var(--soft-white);
+  background: color-mix(in srgb, var(--terminal-accent) 14%, transparent);
+  border-left-color: var(--terminal-accent);
 }
 .slist-try-w { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.slist-try .slist-words { color: var(--muted-sage); }
+.slist-try .slist-words { color: var(--terminal-dim); }
 
 /* Run tabs: Pipeline, Artifacts, Activity. Run scope, so they sit on the page
    with a heavier underline than a step's content tabs. */
-.run-tabs {
-  display: flex; gap: 6px; overflow-x: auto;
-  border-bottom: 1px solid var(--border); margin: 0 0 14px;
+.run-tabs-row {
+  display: flex; align-items: center; min-width: 0;
+  border-bottom: 1px solid var(--border); margin: 0 0 24px;
 }
+.run-tabs { display: flex; gap: 6px; overflow-x: auto; min-width: 0; }
 .run-tab {
   display: inline-flex; align-items: center; gap: 7px; white-space: nowrap;
   font: var(--t-label); color: var(--muted-sage);
   background: none; border: 0; border-bottom: 3px solid transparent; margin-bottom: -1px;
-  padding: 8px 14px 7px 2px; cursor: pointer;
+  padding: 11px 14px 10px 2px; cursor: pointer;
 }
 .run-tab:hover { color: var(--sage); }
 .run-tab[aria-selected="true"] { color: var(--display-ink); border-bottom-color: var(--emerald); }
@@ -3731,40 +3674,41 @@ a.lgtog { text-decoration: none; }
 .tl-item.tl-active { background: color-mix(in srgb, var(--warn) 10%, transparent); border-radius: var(--radius-sm); }
 .tl-still { color: var(--warn); }
 
-/* Try tabs under the step header. */
-/* Every try in one row, newest first; the row scrolls sideways when the
-   tries do not fit, at every width. */
-.trytabs {
-  display: flex; flex-wrap: nowrap; align-items: stretch; gap: 2px; overflow-x: auto;
-  padding: 0 8px; border-bottom: 1px solid var(--border-soft);
+/* The try strip in the step header, drawn like the version ribbon (it reuses
+   .vr-dot, .vr-pip, .vr-link and .vr-tick): one numbered dot per try, oldest
+   first, coloured by outcome, the selected one outlined, the try of record's
+   number underlined. Each try's card (outcome, duration, cause, start, of
+   record) shows on hover and focus. */
+.tstrip { display: inline-flex; align-items: center; gap: 2px; flex-wrap: wrap; }
+.tstrip-k { font: var(--t-body); color: var(--muted-sage); margin-right: 6px; }
+.tstrip-b { position: relative; }
+.tstrip .vr-dot[aria-selected="true"] { font: var(--t-label); box-shadow: inset 0 0 0 1px var(--emerald); }
+.tstrip .vr-tick[aria-selected="true"] {
+  height: 24px; opacity: 1;
+  box-shadow: 0 0 0 2px var(--emerald-surface), 0 0 0 3px var(--emerald);
 }
-.trytabs .tt { flex: none; }
-.tt {
-  display: flex; flex-direction: column; gap: 1px; text-align: left; white-space: nowrap;
-  font: var(--t-label); color: var(--sage);
-  background: none; border: 0; border-bottom: 2px solid transparent;
-  padding: 8px 12px 6px; cursor: pointer;
+.tstrip-n { font: var(--t-mono); }
+.tstrip-b.rec .tstrip-n { text-decoration: underline; text-underline-offset: 3px; }
+.vr-pip.cancelled, .vr-tick.cancelled { background: var(--danger); }
+.tstrip-card {
+  display: none; position: absolute; top: calc(100% + 6px); right: 0; z-index: 32;
+  flex-direction: column; gap: 2px; width: max-content; max-width: 320px;
+  padding: 8px 10px; text-align: left; white-space: normal;
+  font: var(--t-body); color: var(--soft-white);
+  background: var(--emerald-elevated); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
+  pointer-events: none;
 }
-.tt:hover { background: color-mix(in srgb, var(--emerald) 6%, transparent); }
-.tt small { font: var(--t-body); color: var(--muted-sage); }
-.tt.on {
-  color: var(--display-ink); border-bottom-color: var(--display-ink);
-  background: color-mix(in srgb, var(--emerald) 10%, transparent);
-}
-.tt-l1 { display: inline-flex; align-items: center; gap: 6px; }
-.tt-g { font: var(--t-mono); }
-.tt-g.passed { color: var(--ok-ink); }
-.tt-g.failed { color: var(--danger); }
-.tt-g.running { color: var(--running-ink); }
-.tt-g.muted { color: var(--muted-sage); }
-.tt-dur { font: var(--t-mono); color: var(--muted-sage); }
-.tt-rec { font: var(--t-mono); color: var(--ok-ink); border: 1px solid var(--ok-ink); border-radius: 8px; padding: 0 6px; }
+.tstrip-b:hover .tstrip-card, .tstrip-b:focus-visible .tstrip-card { display: flex; }
+.tstrip-l1 { font: var(--t-label); }
+.tstrip-dur { font: var(--t-mono); color: var(--muted-sage); }
+.tstrip-rec { margin-left: 6px; font: var(--t-mono); color: var(--ok-ink); }
+.tstrip-l2 { color: var(--muted-sage); }
 
 @media (max-width: 640px) {
   .rh-actions { margin-left: 0; }
   .slist-row, .slist-try { grid-template-columns: 16px minmax(0, 1fr) 64px; }
   .slist-words { display: none; }
-  .adrop-menu { min-width: 0; }
   .art-row { grid-template-columns: minmax(0, 1fr) auto auto; }
   .art-from { grid-column: 1 / -1; order: 1; }
   .art-type { display: none; }

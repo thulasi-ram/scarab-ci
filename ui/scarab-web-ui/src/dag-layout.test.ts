@@ -1,7 +1,7 @@
 // Longest-path DAG layering (extracted from Dag.tsx) — the layout answers
 // "which dependency column does each step sit in".
 import { describe, it, expect } from "vitest";
-import { layerSteps } from "./dag-layout";
+import { allNeeds, drawnNeeds, layerSteps } from "./dag-layout";
 
 const s = (id: string, ...needs: string[]) => ({ id, needs });
 const ids = (cols: { id: string }[][]) => cols.map((c) => c.map((x) => x.id));
@@ -101,5 +101,45 @@ describe("invocation groups", () => {
       { id: "b", needs: ["a"] },
     ];
     expect(shape(layoutGroups(steps))).toEqual([["a"], ["b"]]);
+  });
+});
+
+describe("drawnNeeds", () => {
+  // The dwh run that drew five edges out of `meta`: four of them are implied
+  // by a longer path and are not drawn.
+  const dwh = [
+    s("checkout/git"),
+    s("meta"),
+    s("amd64/image", "checkout/git", "meta"),
+    s("amd64/push", "amd64/image", "meta"),
+    s("arm64/image", "checkout/git", "meta"),
+    s("arm64/push", "arm64/image", "meta"),
+    s("manifest/index", "meta", "amd64/push", "arm64/push"),
+    s("manifest-latest/index", "amd64/push", "arm64/push"),
+    s("bump", "meta", "manifest/index"),
+  ];
+
+  it("drops a need another need already depends on", () => {
+    const d = drawnNeeds(dwh);
+    expect(d.get("amd64/push")).toEqual(["amd64/image"]);
+    expect(d.get("manifest/index")).toEqual(["amd64/push", "arm64/push"]);
+    expect(d.get("bump")).toEqual(["manifest/index"]);
+    expect(d.get("amd64/image")).toEqual(["checkout/git", "meta"]);
+  });
+
+  it("keeps needs no other need covers, and unknown ids", () => {
+    const d = drawnNeeds([s("a"), s("b"), s("c", "a", "b", "ext")]);
+    expect(d.get("c")).toEqual(["a", "b", "ext"]);
+  });
+
+  it("does not hang on a cycle", () => {
+    const d = drawnNeeds([s("a", "b"), s("b", "a")]);
+    expect(d.size).toBe(2);
+  });
+
+  it("allNeeds lists every step upstream", () => {
+    expect([...allNeeds(dwh, "bump")].sort()).toEqual(
+      ["amd64/image", "amd64/push", "arm64/image", "arm64/push", "checkout/git", "manifest/index", "meta"].sort(),
+    );
   });
 });

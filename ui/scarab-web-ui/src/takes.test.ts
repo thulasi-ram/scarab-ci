@@ -20,6 +20,8 @@ import {
   bucketOf,
   tally,
   versionRows,
+  versionOutcome,
+  versionChanges,
 } from "./takes";
 import type { Artifact } from "./api/client";
 import {
@@ -599,5 +601,49 @@ describe("artifactCount", () => {
     expect(
       artifactCount([{ name: "app.tar" }, { name: "app.tar" }, { name: "report.html" }]),
     ).toBe("2 files · 3 copies");
+  });
+});
+
+describe("versionOutcome", () => {
+  const c = (o: Partial<Record<"succeeded" | "failed" | "superseded" | "notRun" | "running" | "other", number>>) => ({
+    succeeded: 0, failed: 0, superseded: 0, notRun: 0, running: 0, other: 0, ...o,
+  });
+  it("a failed step makes the version failed, before anything else", () => {
+    expect(versionOutcome(c({ succeeded: 8, failed: 1, running: 1 }))).toBe("failed");
+  });
+  it("then running, then superseded, then succeeded", () => {
+    expect(versionOutcome(c({ succeeded: 2, running: 1 }))).toBe("running");
+    expect(versionOutcome(c({ succeeded: 2, superseded: 1, notRun: 1 }))).toBe("superseded");
+    expect(versionOutcome(c({ succeeded: 9 }))).toBe("succeeded");
+    expect(versionOutcome(c({ notRun: 3 }))).toBe("other");
+  });
+});
+
+describe("versionChanges", () => {
+  // The dwh run's version 2: bump failed there and passed in version 3; the
+  // eight other steps were carried over from version 1.
+  it("lists steps that ran here and ended differently in the latest, and counts the carried ones", () => {
+    const viewed = [
+      { id: "meta", status: "succeeded", reused: true },
+      { id: "manifest/index", status: "succeeded", reused: true },
+      { id: "bump", status: "failed" },
+    ];
+    const latest = [
+      { id: "meta", status: "succeeded" },
+      { id: "manifest/index", status: "succeeded" },
+      { id: "bump", status: "succeeded" },
+    ];
+    expect(versionChanges(viewed, latest)).toEqual({
+      changes: [{ id: "bump", here: "failed", latest: "succeeded" }],
+      carried: 2,
+    });
+  });
+  it("leaves out a step with the same outcome or one the latest lacks", () => {
+    expect(
+      versionChanges(
+        [{ id: "a", status: "succeeded" }, { id: "gone", status: "failed" }],
+        [{ id: "a", status: "succeeded" }],
+      ),
+    ).toEqual({ changes: [], carried: 0 });
   });
 });

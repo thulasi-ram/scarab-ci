@@ -1,5 +1,5 @@
 // Attempt-grain scoping + try mappers — the pure helpers behind
-// StepPane / AttemptsDropdown: take-window filtering, scoped/of-record try
+// StepPane / TryStrip: take-window filtering, scoped/of-record try
 // resolution, and the per-try outcome/tone copy.
 import { describe, it, expect } from "vitest";
 import {
@@ -129,7 +129,7 @@ describe("stripTries", () => {
   });
 });
 
-describe("try mappers (AttemptsDropdown copy)", () => {
+describe("try mappers (TryStrip copy)", () => {
   const t = (o: Partial<FilmstripTry>): FilmstripTry => ({
     id: "a1",
     index: 0,

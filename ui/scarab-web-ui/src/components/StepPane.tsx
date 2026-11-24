@@ -1,15 +1,16 @@
-// The step pane: one pane for the selected step. Its header names the step,
-// the selected try ("Try 2 of 3"), what that try did ("✕ Failed after
-// 2m06s: step error"), a link to the step's artifacts and the step's actions
-// (Retry step, Rerun from here, Debug pod, handed in by the page). A step with
-// two or more tries gets a row of try tabs under the header, every try,
-// scrolling sideways when they do not fit. A box below
-// says why the try failed, what holds it back, or where a step that did not
-// run in this version was reused from. Every content tab (Logs, Results, Workspace) is
-// scoped to the selected try and says so; Outputs reads the try of record and
-// names it when it is a different one. Causes (first run, automatic retry,
-// retried by, rerun of) and outcomes come from the event log; a crash
-// re-adoption is a marker inside its try, never a new execution.
+// The step pane: one pane for the selected step. The step's name and its
+// actions (Retry step, Rerun from here, Debug pod, handed in by the page) sit
+// on the page above the card. The card opens with the tries band, drawn like
+// the versions band: every try of the step, one included, then how the
+// selected try is doing, what holds it back, or where a step that did not run
+// in this version was reused from. A failed try adds an Error tab, first and
+// open by default: how it failed, why, how long it waited before it ran, when
+// it started and the last lines of its log. The step's artifacts link sits at
+// the right of the tab row. Every content tab (Logs, Results, Workspace) is
+// scoped to the selected try; Outputs reads the try of record and names it
+// when it is a different one. Causes (first run, automatic retry, retried by,
+// rerun of) and outcomes come from the event log; a crash re-adoption is a
+// marker inside its try, never a new execution.
 import {
   createSignal,
   createEffect,
@@ -49,7 +50,7 @@ import {
   causeText,
 } from "../attempts";
 import { heldBeforeStart } from "../events";
-import { failureBox, notLatestNote, statusWord, stepName, tryStatusWords } from "../run-page";
+import { notLatestNote, tryLine, statusWord, stepName, tryStatusWords } from "../run-page";
 import { levelOf, logBodyState } from "../logs";
 import {
   addMarker,
@@ -71,16 +72,16 @@ import { approvalReleaseIn, type GateStatus } from "../gates";
 import { clock, clockLow, expiryPercent, isYankRefusal, pluginGateState } from "../run-origin";
 import { shortHash } from "../libraries";
 import { waitApprovers, type WaitResolution } from "../run-tabs";
-import { absTime } from "../fmt";
+import { absTime, relTime } from "../fmt";
 import Icon from "./Icon";
 import { loadRunManifest } from "./RunManifest";
 import { pipelineShortName } from "../schedules";
-import AttemptsDropdown, { type FilmstripTry } from "./AttemptsDropdown";
-import TryTabs from "./TryTabs";
+import TryStrip from "./TryStrip";
+import { type FilmstripTry } from "../attempts";
 import Pill from "./Pill";
 import { LogError, LogLoading, LogMarkerRow, LogSkeleton } from "./LogStates";
 
-export type PaneTab = "logs" | "results" | "outputs" | "workspace" | "source" | "gate";
+export type PaneTab = "error" | "logs" | "results" | "outputs" | "workspace" | "source" | "gate";
 
 // Cap rendered lines so a giant attempt can't blow up the DOM (windowing v1).
 const MAX_LINES = 1500;
@@ -172,9 +173,9 @@ export default function StepPane(props: {
   reused?: boolean;
 }) {
   const [tab, setTab] = createSignal<PaneTab>(props.initialTab ?? "logs");
-  // Two or more tries get the try tabs (a row that scrolls sideways at every
-  // width); the header then names the selected try as text.
-  const tryTabs = () => props.tries.length > 1;
+  // Every step with a try gets the tries band, one try included, so the
+  // outcome always sits in the same place.
+  const tryTabs = () => props.tries.length > 0;
   createEffect(() => props.onTabChange?.(tab()));
   // A plugin gate opens on its Gate tab; any other step never
   // stays on one.
@@ -307,7 +308,7 @@ export default function StepPane(props: {
     };
   };
 
-  // ── Header, failure box and tab scope ──
+  // ── Header, status line and tab scope ──
   // A gate's tries are its waits.
   const noun = () => (props.step?.gate ? "Wait" : "Try");
   // The selected try's index in this version's tries, null when none ran.
@@ -330,28 +331,31 @@ export default function StepPane(props: {
     if (carried()) return { text: "○ Not run in this version", tone: "muted" };
     return { text: `○ ${statusWord(props.step?.status ?? "")}`, tone: "muted" };
   };
-  const box = createMemo(() =>
-    failureBox({
-      tries: props.tries.map((t) => ({
-        outcome: t.outcome,
-        failure: t.failure,
-        failureDetail: t.failureDetail,
-        cause: causeText(t.cause),
-      })),
+  const line = createMemo(() =>
+    tryLine({
+      tries: props.tries.map((t) => ({ outcome: t.outcome, failureDetail: t.failureDetail })),
       selected: selIndex(),
-      noun: noun(),
       heldBeforeMs: stepId() && selTry() ? heldBeforeStart(props.events, stepId()!, selTry()!.id) : null,
       held: heldHere(),
       carried: carried(),
-      viewedTake: props.viewedTake ?? null,
     }),
   );
   const notLatest = () => notLatestNote(props.tries, selIndex(), noun());
-  // The scope each content tab carries: "try 2".
-  const tryScope = () => {
-    const i = selIndex();
-    return i === null ? null : `${noun().toLowerCase()} ${i + 1}`;
-  };
+  // A failed try opens on its Error tab, first in the row; a try that did not
+  // fail has no Error tab. Keyed on a memo, so the poll (new objects every
+  // tick) does not move the reader off a tab they picked.
+  const errorTab = () => !isPluginGate() && selTry()?.outcome === "failed";
+  const errorKey = createMemo(() => `${stepId() ?? ""} ${selTry()?.id ?? ""} ${errorTab()}`);
+  createEffect(
+    on(errorKey, () => {
+      if (errorTab() && (tab() === "logs" || tab() === "error")) setTab("error");
+      else if (!errorTab() && tab() === "error") setTab("logs");
+    }),
+  );
+  // The Error tab's last lines of the log: the tail of the selected try's log,
+  // the same stream the Logs tab reads.
+  const ERROR_TAIL = 6;
+  const errorTail = () => logRows().filter((r) => !r.marker).slice(-ERROR_TAIL);
   // Outputs read the try of record: name it when it is not the selected one.
   const outputsScope = (): string | null => {
     const c = carried();
@@ -433,7 +437,7 @@ export default function StepPane(props: {
   const viewedKey = (): string | null => {
     const s = stepId();
     const a = scoped();
-    if (!s || !a || notRun() || tab() !== "logs") return null;
+    if (!s || !a || notRun() || (tab() !== "logs" && tab() !== "error")) return null;
     return logKey(s, a.id, container());
   };
   const [streamGen, setStreamGen] = createSignal(0);
@@ -694,8 +698,24 @@ export default function StepPane(props: {
   );
 
   return (
-    // `inspector` carries the shared tab styling; `steppane` adds the strip +
-    // in-pane log treatment.
+    <div class="steppane-wrap">
+      {/* The step's name and its actions sit on the page, above the card. */}
+      <Show when={props.step}>
+        {(s) => (
+          <div class="sp-head">
+            <span class="sp-name" title={s().id}>
+              {stepName(s().id).base}
+              <Show when={stepName(s().id).cell}>
+                {(cell) => <span class="sp-cell"> · {cell()}</span>}
+              </Show>
+            </span>
+            <span class="grow1" />
+            <span class="sp-actions">{props.actions}</span>
+          </div>
+        )}
+      </Show>
+    {/* `inspector` carries the shared tab styling; `steppane` adds the tries
+        band and the in-pane log treatment. */}
     <div class="panel inspector steppane">
       <Show
         when={props.step}
@@ -707,47 +727,58 @@ export default function StepPane(props: {
       >
         {(s) => (
           <>
-            {/* Step header: the step, the selected try, what it did, the
-                step's files, and its actions. */}
-            <div class="sp-head">
-              <span class="sp-name" title={s().id}>
-                {stepName(s().id).base}
-                <Show when={stepName(s().id).cell}>
-                  {(cell) => <span class="sp-cell"> · {cell()}</span>}
-                </Show>
-              </span>
-              <AttemptsDropdown
-                tries={props.tries}
-                active={props.activeAttempt}
-                onSelect={props.onAttemptSelect}
-                noun={noun()}
-                static={tryTabs()}
-              />
-              <span class={`sp-status ${status().tone}`}>{status().text}</span>
-              <Show when={(props.artifacts ?? 0) > 0}>
-                <button
-                  type="button"
-                  class="linklike sp-files"
-                  onClick={() => props.onShowArtifacts?.()}
-                  title="Open the Artifacts tab, showing this step's files"
-                >
-                  {props.artifacts} {props.artifacts === 1 ? "artifact" : "artifacts"}
-                </button>
+            {/* The tries band, drawn like the versions band: the step's tries,
+                then how the selected try is doing. A failed try's outcome is
+                in its Error tab instead. */}
+            <div class="sp-tries" role="status">
+              <Show when={tryTabs()}>
+                <TryStrip
+                  tries={props.tries}
+                  active={props.activeAttempt}
+                  ofRecord={notRun() ? null : ofRecordTry()}
+                  onSelect={props.onAttemptSelect}
+                  noun={noun()}
+                  now={props.now ?? Date.now()}
+                  resolution={waitResolution()}
+                />
               </Show>
-              <span class="grow1" />
-              <span class="sp-actions">{props.actions}</span>
+              <Show when={!errorTab()}>
+                <span class={`sp-status ${status().tone}`}>{status().text}</span>
+                <Show when={line().reason}>
+                  {(r) => (
+                    <span class="sp-reason" title={r()}>
+                      {r()}
+                    </span>
+                  )}
+                </Show>
+                <Show when={line().waited}>{(w) => <span class="sp-aside">· {w()}</span>}</Show>
+              </Show>
+              <Show when={line().reused}>
+                {(r) => (
+                  <span class="sp-aside">
+                    {"· reused from "}
+                    <Show
+                      when={props.onShowTry}
+                      fallback={`version ${r().take}, ${noun().toLowerCase()} ${r().try}`}
+                    >
+                      <button class="linklike" onClick={() => props.onShowTry!(r().take, carried()!.id)}>
+                        version {r().take}, {noun().toLowerCase()} {r().try}
+                      </button>
+                    </Show>
+                  </span>
+                )}
+              </Show>
+              <Show when={notLatest()}>
+                {(n) => (
+                  <span class="sp-aside">
+                    · {n().text} ·{" "}
+                    <button class="linklike" onClick={() => props.onAttemptSelect(props.tries[n().latest].id)}>
+                      Show {noun().toLowerCase()} {n().latest + 1}
+                    </button>
+                  </span>
+                )}
+              </Show>
             </div>
-            <Show when={tryTabs()}>
-              <TryTabs
-                tries={props.tries}
-                active={props.activeAttempt}
-                ofRecord={notRun() ? null : ofRecordTry()}
-                onSelect={props.onAttemptSelect}
-                noun={noun()}
-                now={props.now ?? Date.now()}
-                resolution={waitResolution()}
-              />
-            </Show>
             {props.note}
             <Show when={props.gateLabel}>
               {(label) => (
@@ -789,54 +820,18 @@ export default function StepPane(props: {
                 </div>
               )}
             </Show>
-            {/* Why the selected try failed, what holds it back, or where a
-                step that did not run here was reused from. */}
-            <Show when={box() || notLatest()}>
-              <div class={`sp-box ${box()?.tone ?? "info"}`} role="status">
-                <Show when={box()}>
-                  {(b) => (
-                    <>
-                      <span class="sp-box-h">{b().head}</span>
-                      <Show when={b().detail}>
-                        <span class="sp-box-d">{b().detail}</span>
-                      </Show>
-                    </>
-                  )}
-                </Show>
-                <Show when={!selTry() && carried() && props.onShowTry}>
-                  <span class="sp-box-d">
-                    <button
-                      class="linklike"
-                      onClick={() => props.onShowTry!(carried()!.take, carried()!.id)}
-                    >
-                      Show version {carried()!.take}, {noun().toLowerCase()} {carried()!.try}
-                    </button>
-                  </span>
-                </Show>
-                <Show when={notLatest()}>
-                  {(n) => (
-                    <span class="sp-box-d">
-                      {n().text} ·{" "}
-                      <button
-                        class="linklike"
-                        onClick={() => props.onAttemptSelect(props.tries[n().latest].id)}
-                      >
-                        Show {noun().toLowerCase()} {n().latest + 1}
-                      </button>
-                    </span>
-                  )}
-                </Show>
-              </div>
-            </Show>
             <div class="pane-tabbar">
               <div class="tabs">
                 <Show
                   when={isPluginGate()}
                   fallback={
                     <>
-                      <TabBtn id="logs" label="Logs" scope={tryScope()} />
-                      <TabBtn id="results" label="Results" scope={tryScope()} />
-                      <TabBtn id="workspace" label="Workspace" scope={tryScope()} />
+                      <Show when={errorTab()}>
+                        <TabBtn id="error" label="Error" />
+                      </Show>
+                      <TabBtn id="logs" label="Logs" />
+                      <TabBtn id="results" label="Results" />
+                      <TabBtn id="workspace" label="Workspace" />
                       <TabBtn id="outputs" label="Outputs" scope={outputsScope()} />
                       <Show when={(s().origin ?? []).length > 0}>
                         <TabBtn id="source" label="Source" />
@@ -857,7 +852,74 @@ export default function StepPane(props: {
               <span class="pane-load" classList={{ on: loading() }} aria-hidden="true">
                 <Icon icon="rotate-cw" size={13} />
               </span>
+              <Show when={(props.artifacts ?? 0) > 0}>
+                <button
+                  type="button"
+                  class="linklike sp-files"
+                  onClick={() => props.onShowArtifacts?.()}
+                  title="Open the Artifacts tab, showing this step's files"
+                >
+                  {props.artifacts} {props.artifacts === 1 ? "artifact" : "artifacts"} →
+                </button>
+              </Show>
             </div>
+
+            {/* Error: how the selected try failed, why, how long it waited
+                before it ran, when and why it started, and the last lines of
+                its log. */}
+            <Show when={tab() === "error" && errorTab()}>
+              <div class="tabpane errpane">
+                <div class="ep-what">
+                  <span class={`sp-status ${status().tone}`}>{status().text}</span>
+                  <Show when={line().reason}>{(r) => <p class="ep-reason">{r()}</p>}</Show>
+                </div>
+                <dl class="ep-facts">
+                  <Show when={line().waited}>
+                    {(w) => (
+                      <>
+                        <dt>Before it ran</dt>
+                        <dd>{w()}</dd>
+                      </>
+                    )}
+                  </Show>
+                  <Show when={selTry()?.startedAt}>
+                    {(at) => (
+                      <>
+                        <dt>Started</dt>
+                        <dd title={absTime(at())}>
+                          {relTime(at())}
+                          {selTry()?.cause ? ` · ${causeText(selTry()!.cause)}` : ""}
+                        </dd>
+                      </>
+                    )}
+                  </Show>
+                </dl>
+                <div class="ep-tail">
+                  <div class="ep-tail-h">
+                    <span>Last lines of the log</span>
+                    <span class="grow1" />
+                    <button type="button" class="linklike" onClick={() => setTab("logs")}>
+                      Open in Logs →
+                    </button>
+                  </div>
+                  <Show
+                    when={errorTail().length > 0}
+                    fallback={<p class="ep-tail-empty">{logState() === "loading" ? "loading the log…" : "No log output was captured for this try."}</p>}
+                  >
+                    <div class="ep-lines">
+                      <For each={errorTail()}>
+                        {(r) => (
+                          <div class={`lgrow ${r.lvl}`}>
+                            <span class="lgln">{r.n}</span>
+                            <span class="lgtx">{r.line}</span>
+                          </div>
+                        )}
+                      </For>
+                    </div>
+                  </Show>
+                </div>
+              </div>
+            </Show>
 
             {/* Logs — the scoped attempt's stream (per-try). */}
             <Show when={tab() === "logs"}>
@@ -1520,6 +1582,7 @@ export default function StepPane(props: {
           </>
         )}
       </Show>
+    </div>
     </div>
   );
 }

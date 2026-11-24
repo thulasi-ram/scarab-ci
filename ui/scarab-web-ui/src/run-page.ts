@@ -1,6 +1,6 @@
 // Pure helpers behind the Run page: matrix step labels, the summary line,
 // which step opens first, the URL query state, the graph node's meta line,
-// the graph band's fit, and the step header's status words and failure box.
+// the graph band's fit, and the step header's status words and status line.
 // No DOM, so the vitest suite covers them (run-page.test.ts).
 import { isGateOpen } from "./gates";
 import { duration } from "./fmt";
@@ -522,82 +522,36 @@ export function tryStatusWords(
   return { text: statusWord(t.outcome), tone: "muted" };
 }
 
-/** "tries" for "Try", "waits" for "Wait". */
-function plural(noun: string): string {
-  const n = noun.toLowerCase();
-  return n.endsWith("y") ? `${n.slice(0, -1)}ies` : `${n}s`;
-}
-
-/** One try as the failure box reads it. */
-export type BoxTry = {
-  outcome: string;
-  failure?: string | null;
-  failureDetail?: string | null;
-  /** Why the try exists, in words ("automatic retry"). */
-  cause?: string;
+/** What the status line under the step name adds after the selected try's
+ * status ("✕ Failed after 2m06s: step error"): why it failed or what holds it
+ * back (`reason`), how long it waited for a node before it started
+ * (`waited`), and, when no try ran in this version, the earlier version's try
+ * the step was reused from (`reused`). Empty when there is nothing to add. */
+export type TryLine = {
+  reason?: string;
+  waited?: string;
+  reused?: { take: number; try: number };
 };
 
-export type FailureBox = {
-  tone: "failed" | "info" | "warning";
-  head: string;
-  detail?: string;
-};
-
-/**
- * The box above the step's content tabs, for the selected try: why it failed,
- * what holds it back, that it passed after earlier failures, or where a step
- * that did not run in this version was reused from. Null when there is nothing
- * to add. `noun` is "Try", or "Wait" for a gate.
- */
-export function failureBox(o: {
-  tries: BoxTry[];
+export function tryLine(o: {
+  tries: { outcome: string; failureDetail?: string | null }[];
   /** Index of the selected try; null when nothing ran in this version. */
   selected: number | null;
-  noun?: string;
   /** How long a closed condition kept the selected try from starting. */
   heldBeforeMs?: number | null;
   /** The condition holding the selected try back now. */
   held?: { text: string; message?: string } | null;
   /** The earlier version's try a not-run step was reused from. */
   carried?: { take: number; try: number } | null;
-  viewedTake?: number | null;
-}): FailureBox | null {
-  const noun = o.noun ?? "Try";
-  if (o.selected === null) {
-    if (!o.carried || o.viewedTake == null) return null;
-    return {
-      tone: "info",
-      head: `Not run in version ${o.viewedTake}`,
-      detail: `Reused from version ${o.carried.take}, ${noun.toLowerCase()} ${o.carried.try}`,
-    };
-  }
+}): TryLine {
+  if (o.selected === null) return o.carried ? { reused: o.carried } : {};
   const t = o.tries[o.selected];
-  if (!t) return null;
-  const n = o.selected + 1;
-  if (o.held) {
-    const head = o.held.text.charAt(0).toUpperCase() + o.held.text.slice(1);
-    return { tone: "warning", head, ...(o.held.message ? { detail: o.held.message } : {}) };
-  }
-  if (t.outcome === "failed") {
-    const parts: string[] = [];
-    if (t.failureDetail) parts.push(t.failureDetail);
-    if (o.heldBeforeMs) parts.push(`unschedulable for ${aboutDuration(o.heldBeforeMs)} before it started`);
-    return {
-      tone: "failed",
-      head: `${noun} ${n} failed: ${failureWords(t.failure)}`,
-      ...(parts.length ? { detail: parts.join(" · ") } : {}),
-    };
-  }
-  if (t.outcome === "succeeded") {
-    const earlier = o.tries.slice(0, o.selected).filter((x) => x.outcome === "failed").length;
-    if (earlier === 0) return null;
-    return {
-      tone: "info",
-      head: `Passed on ${noun.toLowerCase()} ${n}${t.cause ? ` (${t.cause})` : ""}`,
-      detail: `${earlier} earlier ${earlier === 1 ? noun.toLowerCase() : plural(noun)} failed in this version`,
-    };
-  }
-  return null;
+  if (!t) return {};
+  if (o.held) return o.held.message ? { reason: o.held.message } : {};
+  const line: TryLine = {};
+  if (t.outcome === "failed" && t.failureDetail) line.reason = t.failureDetail;
+  if (o.heldBeforeMs) line.waited = `waited ${aboutDuration(o.heldBeforeMs)} for a node`;
+  return line;
 }
 
 /** "Not the latest try: try 3 is running", when the selected try is not the

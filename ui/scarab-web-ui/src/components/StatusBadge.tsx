@@ -15,6 +15,7 @@ const TONE_OF: Record<string, PillTone> = {
   pending: "motion",
   suspended: "motion",
   skipped: "muted",
+  superseded: "muted",
 };
 
 export default function StatusBadge(props: { status: string }) {

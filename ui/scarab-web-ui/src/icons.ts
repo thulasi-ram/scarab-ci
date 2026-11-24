@@ -54,6 +54,8 @@ import {
   Download,
   ExternalLink,
   ListFilter,
+  List,
+  Maximize2,
 } from "lucide";
 
 // IconNode = Array<[tagName, attributes]>.
@@ -67,6 +69,8 @@ const ICONS: Record<string, IconNode> = {
   boxes: Boxes as IconNode,
   database: Database as IconNode,
   workflow: Workflow as IconNode,
+  list: List as IconNode,
+  maximize: Maximize2 as IconNode,
   waypoints: Waypoints as IconNode,
   package: Package as IconNode,
   terminal: Terminal as IconNode,

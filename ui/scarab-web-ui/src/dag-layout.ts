@@ -3,6 +3,57 @@
 // column right of its deepest dependency. Cycles (validated away server-side)
 // are guarded so a malformed graph can't hang the layout.
 
+/** The needs worth drawing as edges: each step's `needs` minus any need that
+ * another of its needs already depends on, directly or through other steps
+ * (a transitive reduction). `bump` needing `meta` and `index`, where `index`
+ * needs `meta`, draws only `index → bump`. The order of each list is kept; a
+ * need naming an unknown step is kept. Cycles (validated away server-side)
+ * are guarded. */
+export function drawnNeeds(steps: { id: string; needs: string[] }[]): Map<string, string[]> {
+  const byId = new Map(steps.map((s) => [s.id, s]));
+  const memo = new Map<string, Set<string>>();
+  // Every step `id` depends on, directly or not.
+  const upstream = (id: string, seen: Set<string>): Set<string> => {
+    const hit = memo.get(id);
+    if (hit) return hit;
+    const out = new Set<string>();
+    if (seen.has(id)) return out; // cycle guard
+    seen.add(id);
+    for (const n of byId.get(id)?.needs ?? []) {
+      out.add(n);
+      for (const u of upstream(n, seen)) out.add(u);
+    }
+    seen.delete(id);
+    memo.set(id, out);
+    return out;
+  };
+  const drawn = new Map<string, string[]>();
+  for (const s of steps) {
+    const viaOthers = new Set<string>();
+    for (const n of s.needs) for (const u of upstream(n, new Set())) viaOthers.add(u);
+    drawn.set(
+      s.id,
+      s.needs.filter((n) => !viaOthers.has(n)),
+    );
+  }
+  return drawn;
+}
+
+/** Every step `id` depends on, directly or through other steps. */
+export function allNeeds(steps: { id: string; needs: string[] }[], id: string): Set<string> {
+  const byId = new Map(steps.map((s) => [s.id, s]));
+  const out = new Set<string>();
+  const stack = [...(byId.get(id)?.needs ?? [])];
+  while (stack.length) {
+    const n = stack.pop()!;
+    if (out.has(n)) continue;
+    out.add(n);
+    stack.push(...(byId.get(n)?.needs ?? []));
+  }
+  out.delete(id);
+  return out;
+}
+
 /** Group `steps` into dependency columns: `result[d]` holds every step whose
  * longest `needs` chain from a root has length `d`. Column order follows the
  * input order within a layer; empty layers are dropped. A `needs` entry naming

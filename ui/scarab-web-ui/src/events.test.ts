@@ -424,7 +424,7 @@ describe("infraReasonText", () => {
   });
 });
 
-// The failure box says how long a try waited for a node before it started:
+// The step's status line says how long a try waited for a node before it started:
 // the closed episodes of that one attempt, never another attempt's.
 describe("heldBeforeStart", () => {
   it("sums the closed node waits of one attempt", () => {

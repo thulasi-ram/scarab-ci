@@ -1,7 +1,7 @@
 // Attempt-grain derivations: pure helpers over a step's ordered
 // attempt list + the event log — Take-window scoping, the scoped/of-record
 // try resolution, and the filmstrip/dropdown try mappers. Extracted from
-// StepPane / RunDetail / AttemptsDropdown so the seam where the real bugs
+// StepPane / RunDetail / TryStrip so the seam where the real bugs
 // lived (take-scoped attempts, per-try outcome mapping) is testable without
 // a DOM.
 import type { RunEvent } from "./api/client";

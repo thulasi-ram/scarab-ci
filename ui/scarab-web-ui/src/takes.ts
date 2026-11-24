@@ -7,7 +7,7 @@
 // Take N, still in flight when Rerun was pressed — shows as `superseded` when
 // that Rerun re-armed its step (it was cut short), else as `running`.
 import type { RunEvent, Artifact } from "./api/client";
-import type { OutcomeCounts, VersionRow } from "./components/VersionDropdown";
+import type { OutcomeCounts, VersionRow } from "./components/VersionRibbon";
 import { eventStatus } from "./events";
 import { relTime } from "./fmt";
 
@@ -500,6 +500,41 @@ export function tally(statuses: string[]): OutcomeCounts {
  * caller's live statuses (backend-authoritative); a closed Take tallies its
  * snapshot-at-boundary replay. Takes are few — re-replaying per closed row each
  * render is cheap. `selectedN` null = viewing latest. */
+/** How a version ended, from its step tally: "failed" when a step failed,
+ * then "running", "superseded" (a rerun replaced a step), "succeeded" when
+ * every step that ran passed, else "other". Colours the version ribbon. */
+export function versionOutcome(c: OutcomeCounts): "failed" | "running" | "superseded" | "succeeded" | "other" {
+  if (c.failed > 0) return "failed";
+  if (c.running > 0) return "running";
+  if (c.superseded > 0) return "superseded";
+  if (c.succeeded > 0 && c.other === 0) return "succeeded";
+  return "other";
+}
+
+/** One step that ended differently in the older version in view than in the
+ * latest version. */
+export type VersionChange = { id: string; here: string; latest: string };
+
+/**
+ * What the older version in view did differently from the latest: each step
+ * that ran in the viewed version (`reused` false) and ended differently in the
+ * latest, in the viewed order, and how many steps the viewed version carried
+ * over from an earlier one. A step the latest does not have is left out.
+ */
+export function versionChanges(
+  viewed: { id: string; status: string; reused?: boolean }[],
+  latest: { id: string; status: string }[],
+): { changes: VersionChange[]; carried: number } {
+  const now = new Map(latest.map((s) => [s.id, s.status]));
+  const changes: VersionChange[] = [];
+  for (const s of viewed) {
+    if (s.reused) continue;
+    const l = now.get(s.id);
+    if (l !== undefined && l !== s.status) changes.push({ id: s.id, here: s.status, latest: l });
+  }
+  return { changes, carried: viewed.filter((s) => s.reused).length };
+}
+
 export function versionRows(
   events: RunEvent[],
   takes: Take[],
