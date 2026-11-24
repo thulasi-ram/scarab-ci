@@ -66,6 +66,7 @@ import {
   visibleArtifacts as visibleArtifactsIn,
   type Take,
   type TakeView,
+  versionChanges,
 } from "../takes";
 import { stripTries as stripTriesOf } from "../attempts";
 import {
@@ -96,6 +97,7 @@ import {
   type PaneTabParam,
   type RunTabParam,
   type RunUrlState,
+  statusWord,
 } from "../run-page";
 import {
   activityView,
@@ -115,7 +117,7 @@ import { HomeCrumb, RepoCrumb } from "../components/PageCrumbs";
 import Doodle from "../components/Doodle";
 import Dag, { type DagStep, type DagService, type DagControls } from "../components/Dag";
 import StepList from "../components/StepList";
-import VersionDropdown, { type VersionRow } from "../components/VersionDropdown";
+import VersionRibbon, { type VersionRow } from "../components/VersionRibbon";
 import StepPane, { type PaneTab } from "../components/StepPane";
 import ServicePane from "../components/ServicePane";
 import { type FilmstripTry } from "../attempts";
@@ -930,6 +932,13 @@ export default function RunDetail() {
       triggerWords(),
     );
 
+  // What the older version in view did differently from the latest.
+  const changes = () =>
+    versionChanges(
+      dagSteps().map((s) => ({ id: s.id, status: s.status, reused: s.reused })),
+      stepList().map((s) => ({ id: s.id, status: s.status })),
+    );
+
   // The header badge: the run's status, or how the older version in view
   // ended (a failed step makes it failed, a cancelled one cancelled, a step a
   // rerun replaced superseded).
@@ -1022,14 +1031,7 @@ export default function RunDetail() {
                     )}
                   </Show>
                 </h1>
-                {/* The version picker sits beside the run number in every
-                    version, so it never moves with the length of the meta
-                    line; the badge says how the version in view ended. */}
-                <VersionDropdown
-                  rows={versions()}
-                  live={live() && !timeTraveling()}
-                  onSelect={pickVersion}
-                />
+                {/* The badge says how the version in view ended. */}
                 <StatusBadge status={shownStatus()} />
                 <Show when={live() && !timeTraveling()}>
                   <span class="live-dot" title="live">
@@ -1319,19 +1321,6 @@ export default function RunDetail() {
                 </For>
               </div>
             </Show>
-            {/* Viewing an older version: the page is the run as it stood
-                then, and nothing on it acts. */}
-            <Show when={viewing()}>
-              {(v) => (
-                <div class="readonly-banner rd-notice" role="status">
-                  <Icon icon="history" size={13} />
-                  <span>
-                    Viewing <b>version {v().n} of {latestTakeN()}</b>, read-only
-                    <span class="rb-hint"> · pick the latest version to act</span>
-                  </span>
-                </div>
-              )}
-            </Show>
             {/* A version this Run uses was yanked: say what ran, what was
                 refused, and offer a new run, which compiles against the
                 installed version. */}
@@ -1366,6 +1355,14 @@ export default function RunDetail() {
             </Show>
             <RunPolicies runId={id()} live={live()} />
 
+            {/* ── The version frame ── */}
+            {/* The run's versions as a thin line; while an older version is
+                in view the line is the top edge of an amber frame around
+                everything below it, which is the run as it stood then and
+                read-only. The notices above (approvals first) stay outside:
+                they act on the present. */}
+            <div class="vframe" classList={{ older: timeTraveling() }}>
+            <VersionRibbon rows={versions()} onSelect={pickVersion} />
             {/* ── Summary line ── */}
             <div class="rd-summary" aria-label="Run summary">
               <Show when={summary().failed > 0}>
@@ -1513,23 +1510,41 @@ export default function RunDetail() {
                     </span>
                   </Show>
                 </div>
-                {/* An older version: say so across the top of the graph, and
-                    what a dashed outline means there. */}
-                <Show when={viewing()}>
-                  {(v) => (
-                    <div class="dag-strip" role="status">
-                      <Icon icon="history" size={13} />
-                      <span>
-                        You are looking at <b>version {v().n} of {latestTakeN()}</b>, an older version of this run.
-                      </span>
-                      <Show when={dagSteps().some((s) => s.reused)}>
-                        <span class="ds-hint">
-                          <span class="ds-dash" aria-hidden="true" /> carried over from an earlier version
+                {/* An older version: the frame says it is older and read-only;
+                    this strip says what it did differently from the latest
+                    and what a dashed outline means. */}
+                <Show when={timeTraveling() ? changes() : null}>
+                  {(c) => (
+                    <div class="dag-changes" role="status">
+                      <Show
+                        when={c().changes.length > 0}
+                        fallback={<span class="dc-same">Same outcomes as the latest (v{latestTakeN()})</span>}
+                      >
+                        <For each={c().changes.slice(0, 3)}>
+                          {(ch, i) => (
+                            <span class="dc-change">
+                              <Show when={i() > 0}>
+                                <span class="dc-sep">·</span>
+                              </Show>
+                              <span class="mono">{ch.id}</span>{" "}
+                              <span class={`dc-st ${ch.here}`}>{statusWord(ch.here).toLowerCase()} here</span>
+                              <span class="dc-arrow"> → </span>
+                              <span class={`dc-st ${ch.latest}`}>
+                                {statusWord(ch.latest).toLowerCase()} in the latest (v{latestTakeN()})
+                              </span>
+                            </span>
+                          )}
+                        </For>
+                        <Show when={c().changes.length > 3}>
+                          <span class="dc-more">and {c().changes.length - 3} more</span>
+                        </Show>
+                      </Show>
+                      <Show when={c().carried > 0}>
+                        <span class="dc-sep">·</span>
+                        <span class="dc-carried">
+                          <span class="ds-dash" aria-hidden="true" /> {c().carried} carried over from an earlier version
                         </span>
                       </Show>
-                      <button type="button" onClick={() => pickVersion(null)}>
-                        Show latest
-                      </button>
                     </div>
                   )}
                 </Show>
@@ -1790,6 +1805,7 @@ export default function RunDetail() {
                 onShowPipeline={() => setRunTab("pipeline")}
               />
             </Show>
+            </div>
             <Show when={shellOpen() && sel()}>
               <DebugShell runId={id()} step={sel()!} mode={shellMode()} onClose={() => setShellOpen(false)} />
             </Show>

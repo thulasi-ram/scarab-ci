@@ -50,24 +50,27 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   await expect(page.locator(".sp-name")).toHaveText("approve");
   await expect(page).toHaveURL(/[?&]step=3(&|$)/);
 
-  // ── (b) version selector: canonical rerun language, two versions ─────────
-  await page.getByRole("button", { name: /^Version 2 of 2 · latest/ }).click();
-  const versionMenu = page.getByRole("menu", { name: "run versions" });
-  await expect(versionMenu).toBeVisible();
-  const latestRow = versionMenu.getByRole("menuitemradio", { name: /you reran from build/ });
-  const originalRow = versionMenu.getByRole("menuitemradio", { name: /Version 1/ });
-  await expect(latestRow).toBeVisible();
-  await expect(latestRow).toContainText("by a.kim");
-  await expect(originalRow).toBeVisible();
-  // The first version exists because of its trigger.
-  await expect(originalRow).toContainText("PR #131");
-  // Superseded evidence: the original run's outcome chips carry the ⊘ bucket
-  // (test@a1 was cut short by the rerun).
-  await expect(originalRow).toContainText("⊘");
-  // The glossary ban, checked WITH the version rows in the DOM.
+  // ── (b) the version ribbon: canonical rerun language, two versions ───────
+  const versions = page.getByRole("group", { name: "Versions" });
+  const latestDot = versions.getByRole("button", { name: /^v2 latest/ });
+  const originalDot = versions.getByRole("button", { name: /^v1/ });
+  await expect(latestDot).toHaveAttribute("aria-pressed", "true");
+  await expect(latestDot).toHaveAttribute("title", /you reran from build/);
+  await expect(latestDot).toHaveAttribute("title", /by a\.kim/);
+  // The first version exists because of its trigger, and a step of it was
+  // cut short by the rerun.
+  await expect(originalDot).toHaveAttribute("title", /PR #131/);
+  await expect(originalDot).toHaveAttribute("title", /superseded/);
   await expectGlossaryClean(page);
-  await page.keyboard.press("Escape");
-  await expect(versionMenu).toHaveCount(0);
+  // Picking version 1 frames the page as read-only, with the way back; the
+  // graph's strip says what it did differently from the latest.
+  await originalDot.click();
+  await expect(page.locator(".vframe.older")).toBeVisible();
+  await expect(page.locator(".vr-note")).toContainText("Version 1 of 2");
+  await expect(page.locator(".dag-changes")).toContainText("in the latest (v2)");
+  await page.getByRole("button", { name: "Show latest" }).click();
+  await expect(page.locator(".vframe.older")).toHaveCount(0);
+  await expect(page.locator(".dag-changes")).toHaveCount(0);
 
   // ── (c) the Activity tab is newest-first ─────────────────────────────────
   await page.getByRole("tab", { name: /^Activity/ }).click();
@@ -543,7 +546,7 @@ test("a log stream that fails says why and Retry loads the log", async ({ page }
 test("a failed first read of the events keeps the URL's version and try", async ({ page }) => {
   await failEventReads(page, 1);
   await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}?step=1&v=1&try=1`);
-  await expect(page.getByText(/Viewing version 1 of 2/)).toBeVisible();
+  await expect(page.locator(".vr-note")).toContainText("Version 1 of 2");
   // build has one try in version 1: the status says what it did, and there
   // is no try strip.
   await expect(page.locator(".sp-status")).toContainText("Passed");

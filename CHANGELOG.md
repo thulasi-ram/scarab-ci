@@ -27,13 +27,14 @@ release.yml uses that version's section as the GitHub Release text. See
   every step it needs (drawn or not) and the edges between them. The selected step is scrolled
   into view when the page opens.
 - **A step carried over from an earlier version has a dashed outline at full contrast.** It was
-  drawn at half opacity, so a version where most steps were carried over looked disabled. An
-  older version no longer dims the graph either: a strip across the top of the graph says which
-  version is in view and offers the latest.
-- **The version picker sits beside the run number** and its menu opens toward the side with room;
-  it no longer moves with the length of the meta line or opens past the window edge. A run with
-  one version shows no picker. While an older version is in view, the status badge says how that
-  version ended.
+  drawn at half opacity, so a version where most steps were carried over looked disabled.
+- **A run's versions are one thin line under the notices, replacing the version dropdown.** Each
+  version is a dot coloured by how it ended (one tick each past 8, so 100 versions still fit on
+  one line); hovering names it, ← and → step through them. While an older version is in view, the
+  line is the top edge of an amber frame around the rest of the page, which says it is read-only
+  and offers the latest; the graph is no longer dimmed, and a strip above it says what that
+  version did differently from the latest. Approvals stay above the line. The status badge says
+  how the version in view ended. A run with one version shows no line.
 - **A step's tries are a row of numbered buttons in its header**, oldest first, coloured by
   outcome, the selected one filled; each button's card says what the try did, how long it took,
   why it ran and when. A step with one try shows no try control, and the Logs, Results and

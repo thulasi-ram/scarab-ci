@@ -3,7 +3,7 @@
 // named BEFORE anything re-arms (smart never means mysterious).
 //
 // Portalled to <body> with fixed positioning, the same machinery as
-// SearchSelect/VersionDropdown (amendment F5: never clipped by an ancestor's
+// SearchSelect (amendment F5: never clipped by an ancestor's
 // overflow). All copy comes from the pure derivations in ../rerun-confirm —
 // the no-DOM vitest tier covers those; this component only lays them out.
 //
