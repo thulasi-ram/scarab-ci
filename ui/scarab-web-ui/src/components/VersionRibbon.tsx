@@ -5,7 +5,7 @@
 // failing streak shows at a glance (the row scrolls sideways past about 110
 // and keeps the one in view visible). Hovering a version names it, why it
 // exists and when; ← and → step through them. While an older version is in
-// view the line is the top edge of the page's amber frame and says so on its
+// view the line is the top edge of the page's grey frame and says so on its
 // right: read-only, and the way back to the latest. A run with one version
 // shows no line. Page chrome, so it reads the page tokens.
 import { createEffect, For, on, Show } from "solid-js";

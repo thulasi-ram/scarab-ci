@@ -1367,7 +1367,7 @@ export default function RunDetail() {
 
             {/* ── The version frame ── */}
             {/* The run's versions as a thin line; while an older version is
-                in view the line is the top edge of an amber frame around
+                in view the line is the top edge of a grey frame around
                 everything below it, which is the run as it stood then and
                 read-only. The notices above (approvals first) stay outside:
                 they act on the present. */}

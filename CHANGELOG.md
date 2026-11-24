@@ -31,7 +31,7 @@ release.yml uses that version's section as the GitHub Release text. See
 - **A run's versions are one thin line under the notices, replacing the version dropdown.** Each
   version is a dot coloured by how it ended (one tick each past 8, so 100 versions still fit on
   one line); hovering names it, ← and → step through them. While an older version is in view, the
-  line is the top edge of a frame around the rest of the page: faint on the latest version, amber
+  line is the top edge of a frame around the rest of the page: a muted green on the latest version, grey
   on an older one, where it says the version is read-only and offers the latest. The graph is no
   longer dimmed, and a strip above it says what that version did differently from the latest (on
   the latest, that it is the latest). Approvals stay above the line; while an older version is
