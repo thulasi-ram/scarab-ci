@@ -18,6 +18,23 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-11-24
+
+### Security
+
+- **`scarab --help` no longer prints the value of `SCARAB_TOKEN`.** clap showed every
+  env-backed flag as `[env: NAME=value]`, so the help for `run`, `validate`, `logs`, `rerun` and
+  the `security` subcommands printed the API token to anyone reading the terminal. Help now names
+  the variable only.
+
+### Bug Fixes
+
+- **Run pipeline starts on the repository's default branch.** The page started on `main`; on a
+  repository without that branch the pipeline list failed to load, and after that the page no
+  longer updated, so choosing `master` fetched the list but never showed it. A failed load now
+  leaves the page working, and `GET /v1/repos/{org}/{repo}/refs` returns `default_branch`, which
+  the picker starts on. When the forge does not name one, the list loads at `HEAD`.
+
 ## [0.7.3] - 2026-11-24
 
 ### Breaking changes
@@ -2427,7 +2444,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.4...HEAD
+[0.7.4]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.0...v0.7.1
