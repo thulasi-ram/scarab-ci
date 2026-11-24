@@ -109,7 +109,10 @@ import {
 } from "../run-tabs";
 import { relTime, absTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
-import { triggerIcon, triggerText } from "../trigger";
+import { triggerText } from "../trigger";
+import { OriginLine } from "../components/RunRow";
+import { authorSlot, deployTag, kindFirst } from "../run-row";
+import { pipelineShortName } from "../schedules";
 import StatusBadge from "../components/StatusBadge";
 import RunPolicies from "../components/RunPolicies";
 import Icon from "../components/Icon";
@@ -118,6 +121,7 @@ import Doodle from "../components/Doodle";
 import Dag, { type DagStep, type DagService, type DagControls } from "../components/Dag";
 import StepList from "../components/StepList";
 import VersionRibbon, { type VersionRow } from "../components/VersionRibbon";
+import { reusedOfRecord } from "../takes";
 import StepPane, { type PaneTab } from "../components/StepPane";
 import ServicePane from "../components/ServicePane";
 import { type FilmstripTry } from "../attempts";
@@ -190,6 +194,8 @@ export default function RunDetail() {
   const [focusSidecar, setFocusSidecar] = createSignal<number | null>(null);
   // Graph or List in the Pipeline panel.
   const [view, setView] = createSignal<"graph" | "list">("graph");
+  // The List view's filter, switched from the pipeline bar.
+  const [listFilter, setListFilter] = createSignal<"all" | "failed">("all");
   // The step tab, mirrored from StepPane for the URL.
   const [paneTab, setPaneTab] = createSignal<PaneTab>(urlInit.ptab ?? "logs");
   // The initial selection (URL, else default) has been applied; the URL is
@@ -921,6 +927,22 @@ export default function RunDetail() {
   // published it the way the step pane does ("plan · try 2").
   const places = createMemo(() => attemptPlaces(events()));
 
+  // The version a step carried over from an earlier version was reused
+  // from (the List view's "from v2" tag); null for a step that ran here.
+  const carriedFrom = (stepId: string): number | null => {
+    const d = dagSteps().find((x) => x.id === stepId);
+    if (!d?.reused) return null;
+    const s = stepList().find((x) => x.id === stepId);
+    return (
+      reusedOfRecord({
+        reused: true,
+        list: s?.attempt_list ?? [],
+        places: places()[stepId],
+        viewedTake: selectedTake()?.n ?? null,
+      })?.take ?? null
+    );
+  };
+
   // The version selector's rows: one per version.
   const versions = (): VersionRow[] =>
     versionRows(
@@ -1023,13 +1045,27 @@ export default function RunDetail() {
                   <span class="rh-num" title={id()}>
                     {r().run_number != null ? `#${r().run_number}` : `run ${id().slice(0, 8)}`}
                   </span>
-                  <Show when={r().trigger_title}>
-                    {(t) => (
-                      <span class="crumb-head-title rh-title" title={t()}>
-                        {t()}
-                      </span>
-                    )}
-                  </Show>
+                  {/* As the runs list's line 1: the pipeline, a slash, the
+                      headline. */}
+                  <span class="rh-headline">
+                    <Show when={r().pipeline}>
+                      {(p) => (
+                        <>
+                          <span class="rh-pipe" title={`pipeline ${p()}`}>
+                            {pipelineShortName(p())}
+                          </span>
+                          <span class="rh-slash">/</span>
+                        </>
+                      )}
+                    </Show>
+                    <Show when={r().trigger_title}>
+                      {(t) => (
+                        <span class="crumb-head-title rh-title" title={t()}>
+                          {t()}
+                        </span>
+                      )}
+                    </Show>
+                  </span>
                 </h1>
                 {/* The badge says how the version in view ended. */}
                 <StatusBadge status={shownStatus()} />
@@ -1080,100 +1116,49 @@ export default function RunDetail() {
                 </span>
               </div>
 
-              {/* Provenance: trigger, branch and commit, pipeline, timing,
-                  parameters, and the version selector. */}
+              {/* As the runs list's line 2: what started the run and what
+                  it was about, then the commit, the author and a deploy run's
+                  Environment as one group. At the right edge, under the
+                  actions, a kept or expired workspace mark and the times. */}
               <div class="rh-prov">
-                <Show when={triggerInfo()}>
-                  {(t) => {
-                    const commitUrl = () => forgeCommitUrl(repoUrl(), t().sha);
-                    const prUrl = () => forgePrUrl(repoUrl(), t().pr);
-                    return (
-                      <>
-                        <Show when={t().kind}>
-                          {(kind) => (
-                            <span class="pfact" title="trigger">
-                              <Icon icon={triggerIcon(kind())} size={12} />
-                              <Show when={t().pr != null && kind() === "pull_request"} fallback={<span>{triggerText(kind())}</span>}>
-                                <a
-                                  classList={{ plain: !prUrl() }}
-                                  href={prUrl() ?? undefined}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  title="pull request on the forge"
-                                >
-                                  PR #{t().pr}
-                                </a>
-                              </Show>
-                              <Show when={t().actor}>
-                                {(actor) => <span class="subtle">by {actor()}</span>}
-                              </Show>
-                            </span>
-                          )}
-                        </Show>
-                        {/* `base ← head` and the commit once. */}
-                        <Show when={t().sha || t().branch || r().origin_pr_base}>
-                          <span class="pfact" title={r().origin_pr_base ? "base ← head" : "branch and commit"}>
-                            <Icon icon="git-branch" size={12} />
-                            <Show
-                              when={r().origin_pr_base}
-                              fallback={
-                                <Show when={headBranch(t())}>
-                                  {(b) => <span class="mono">{b()}</span>}
-                                </Show>
-                              }
-                            >
-                              {(base) => (
-                                <>
-                                  <span class="mono">{base()}</span>
-                                  <span class="pr-arrow">←</span>
-                                  <Show when={headBranch(t())}>
-                                    {(head) => <span class="mono">{head()}</span>}
-                                  </Show>
-                                </>
-                              )}
-                            </Show>
-                            <Show when={t().sha}>
-                              <a
-                                class="mono sha"
-                                classList={{ plain: !commitUrl() }}
-                                href={commitUrl() ?? undefined}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                title="commit on the forge"
-                              >
-                                {t().sha!.slice(0, 8)}
-                              </a>
-                            </Show>
-                          </span>
-                        </Show>
-                      </>
-                    );
-                  }}
+                <OriginLine
+                  kind={triggerInfo()?.kind}
+                  line={kindFirst({
+                    kind: triggerInfo()?.kind,
+                    ref: triggerInfo()?.ref ?? triggerInfo()?.branch,
+                    pr: triggerInfo()?.pr,
+                    head: r().origin_pr_head ?? (triggerInfo() ? headBranch(triggerInfo()!) : null),
+                    base: r().origin_pr_base,
+                    title: r().trigger_title,
+                  })}
+                  sha={triggerInfo()?.sha}
+                  author={authorSlot(triggerInfo()?.kind, triggerInfo()?.actor)}
+                  commitUrl={forgeCommitUrl(repoUrl(), triggerInfo()?.sha)}
+                  prUrl={forgePrUrl(repoUrl(), triggerInfo()?.pr)}
+                  deploy={deployTag(!!r().environment, r().environment?.display_name ?? r().environment?.name)}
+                />
+                <Show when={Object.keys(runParams(r())).length > 0}>
+                  <span class="rh-params mono" title="launch parameters">
+                    {Object.entries(runParams(r()))
+                      .map(([k, v]) => `${k}=${String(v)}`)
+                      .join(" · ")}
+                  </span>
                 </Show>
-                <Show when={r().pipeline}>
-                  {(name) => (
-                    <span class="pfact" title="pipeline">
-                      <Icon icon="workflow" size={12} />
-                      <span class="mono">{name()}</span>
-                    </span>
+                <span class="grow1" />
+                <Show when={retention()} keyed>
+                  {(wr) => (
+                    <Show when={wr.pinned || wr.expired}>
+                      <span class="rh-keep" title={retentionNote(wr, isTerminal(run()!.status))}>
+                        <Icon icon={wr.pinned ? "pin" : "clock"} size={12} />
+                        {wr.pinned ? (wr.pinned_by ? `kept by ${wr.pinned_by}` : "kept") : "snapshots expired"}
+                      </span>
+                    </Show>
                   )}
                 </Show>
                 <Show when={startedAt()}>
-                  <span class="pfact" classList={{ live: live() && !timeTraveling() }} title={absTime(startedAt()!)}>
-                    <Icon icon="timer" size={12} />
-                    <span>
-                      started {relTime(startedAt()!)} · {finishedAt() ? "took" : "running for"}{" "}
-                      <span class="mono">{duration(startedAt()!, finishedAt() ?? Date.now())}</span>
-                    </span>
-                  </span>
-                </Show>
-                <Show when={Object.keys(runParams(r())).length > 0}>
-                  <span class="pfact" title="launch parameters">
-                    <span class="mono">
-                      {Object.entries(runParams(r()))
-                        .map(([k, v]) => `${k}=${String(v)}`)
-                        .join(" · ")}
-                    </span>
+                  <span class="rh-time" classList={{ live: live() && !timeTraveling() }} title={absTime(startedAt()!)}>
+                    started {relTime(startedAt()!)} · {finishedAt() ? "" : "running for "}
+                    <span class="mono">{duration(startedAt()!, finishedAt() ?? Date.now())}</span>
                   </span>
                 </Show>
               </div>
@@ -1182,150 +1167,153 @@ export default function RunDetail() {
             {/* ── Notice slot ── */}
             {/* Gates awaiting a decision, one row per gate: a run can suspend
                 on more than one and "approve" has to say WHICH. While an older
-                version is in view (read-only) the bar is hidden but keeps its
-                space, so switching versions never moves the page. */}
-            <Show when={pendingGates().length > 0}>
-              <div
-                class="gate-bar"
-                classList={{ reserved: timeTraveling() }}
-                aria-hidden={timeTraveling() ? "true" : undefined}
-              >
-                {/* Keyed by gate ID: a poll replaces every step object, and a
-                    row keyed by object would re-mount an open Reject form. */}
-                <For each={pendingGateIds()}>
-                  {(gid) => (
-                    <Show when={gateStep(gid)}>
-                      {(g) => (
-                        <div class="gate-row" classList={{ blocked: blockersOf(g()).length > 0 }}>
-                          <Icon icon="shield-check" size={13} />
-                          <span class="gate-step mono">{g().id}</span>
-                          <span class="gate-kind mono">{g().gate}</span>
-                          <Show when={environmentGateLabel(g(), runEnv())}>
-                            {(label) => (
-                              <span
-                                class="gate-env"
-                                title={
-                                  addedByEnvironment(g()) !== null
-                                    ? "The pipeline has no approval gate here: the environment added this one. Its approvers release it."
-                                    : "A step after this gate uses the environment's authority (its secrets, a privilege grant, a k8s_overlay, a write forge token or the deploy mark): its approvers release it."
-                                }
-                              >
-                                {label()}
-                              </span>
-                            )}
-                          </Show>
-                          <span class="gate-hint" title={gateWaitHint(g(), statusOf)}>
-                            {gateWaitHint(g(), statusOf)}
-                          </span>
-                          <Show when={approvalReleaseIn(g(), nowTick())}>
-                            {(left) => (
-                              <span class="gate-clock">
-                                releases at{" "}
-                                <b class="mono">{new Date(g().approval_release_at!).toLocaleTimeString()}</b> · in{" "}
-                                <b class="mono">{clock(left())}</b>
-                              </span>
-                            )}
-                          </Show>
-                          <Show when={g().plugin_gate}>
-                            {(pg) => (
-                              <>
-                                <span class="gate-who">
-                                  {pg().releaser}/{pg().gate}
-                                </span>
-                                <Show when={gateLeft(g()) != null}>
-                                  <span class="gate-clock" classList={{ low: clockLow(gateLeft(g())!) }}>
-                                    expires in <b class="mono">{clock(gateLeft(g())!)}</b>
-                                  </span>
-                                </Show>
-                                <Show when={pg().plugin_state === "killed"}>
-                                  <span class="gate-note" style={{ color: "var(--danger)" }}>
-                                    {pg().installation} is killed: this gate waits for its expiry or a
-                                    reject
-                                  </span>
-                                </Show>
-                              </>
-                            )}
-                          </Show>
-                          <Show when={gateNotes()[g().id]}>
-                            {(note) => <span class="gate-note">{note()}</span>}
-                          </Show>
-                          <Show
-                            when={rejectFor() === g().id}
-                            fallback={
-                              <span class="gate-actions">
-                                <button
-                                  class="btn btn-sm btn-ghost"
-                                  onClick={() => openReject(g().id)}
-                                  disabled={rejecting() !== null || !isRejectable(g(), statusOf)}
+                version is in view (read-only) the bar is hidden. */}
+            {/* The approval row always keeps its space, empty when no gate
+                waits, so nothing below moves when an approval comes or goes. */}
+            <div class="gate-slot">
+              <Show when={pendingGates().length > 0}>
+                <div
+                  class="gate-bar"
+                  classList={{ reserved: timeTraveling() }}
+                  aria-hidden={timeTraveling() ? "true" : undefined}
+                >
+                  {/* Keyed by gate ID: a poll replaces every step object, and a
+                      row keyed by object would re-mount an open Reject form. */}
+                  <For each={pendingGateIds()}>
+                    {(gid) => (
+                      <Show when={gateStep(gid)}>
+                        {(g) => (
+                          <div class="gate-row" classList={{ blocked: blockersOf(g()).length > 0 }}>
+                            <Icon icon="shield-check" size={13} />
+                            <span class="gate-step mono">{g().id}</span>
+                            <span class="gate-kind mono">{g().gate}</span>
+                            <Show when={environmentGateLabel(g(), runEnv())}>
+                              {(label) => (
+                                <span
+                                  class="gate-env"
                                   title={
-                                    blockersOf(g()).length > 0
-                                      ? `blocked — ${blockersOf(g()).join(", ")} has not succeeded`
-                                      : `reject ${g().id} — fail it with a reason; the run fails`
+                                    addedByEnvironment(g()) !== null
+                                      ? "The pipeline has no approval gate here: the environment added this one. Its approvers release it."
+                                      : "A step after this gate uses the environment's authority (its secrets, a privilege grant, a k8s_overlay, a write forge token or the deploy mark): its approvers release it."
                                   }
                                 >
-                                  Reject
-                                </button>
-                                <Show when={isApprovable(g())}>
+                                  {label()}
+                                </span>
+                              )}
+                            </Show>
+                            <span class="gate-hint" title={gateWaitHint(g(), statusOf)}>
+                              {gateWaitHint(g(), statusOf)}
+                            </span>
+                            <Show when={approvalReleaseIn(g(), nowTick())}>
+                              {(left) => (
+                                <span class="gate-clock">
+                                  releases at{" "}
+                                  <b class="mono">{new Date(g().approval_release_at!).toLocaleTimeString()}</b> · in{" "}
+                                  <b class="mono">{clock(left())}</b>
+                                </span>
+                              )}
+                            </Show>
+                            <Show when={g().plugin_gate}>
+                              {(pg) => (
+                                <>
+                                  <span class="gate-who">
+                                    {pg().releaser}/{pg().gate}
+                                  </span>
+                                  <Show when={gateLeft(g()) != null}>
+                                    <span class="gate-clock" classList={{ low: clockLow(gateLeft(g())!) }}>
+                                      expires in <b class="mono">{clock(gateLeft(g())!)}</b>
+                                    </span>
+                                  </Show>
+                                  <Show when={pg().plugin_state === "killed"}>
+                                    <span class="gate-note" style={{ color: "var(--danger)" }}>
+                                      {pg().installation} is killed: this gate waits for its expiry or a
+                                      reject
+                                    </span>
+                                  </Show>
+                                </>
+                              )}
+                            </Show>
+                            <Show when={gateNotes()[g().id]}>
+                              {(note) => <span class="gate-note">{note()}</span>}
+                            </Show>
+                            <Show
+                              when={rejectFor() === g().id}
+                              fallback={
+                                <span class="gate-actions">
                                   <button
-                                    class="btn btn-sm btn-primary"
-                                    onClick={() => void onApprove(g().id)}
-                                    disabled={approving() !== null || blockersOf(g()).length > 0}
+                                    class="btn btn-sm btn-ghost"
+                                    onClick={() => openReject(g().id)}
+                                    disabled={rejecting() !== null || !isRejectable(g(), statusOf)}
                                     title={
                                       blockersOf(g()).length > 0
                                         ? `blocked — ${blockersOf(g()).join(", ")} has not succeeded`
-                                        : `approve ${g().id}`
+                                        : `reject ${g().id} — fail it with a reason; the run fails`
                                     }
                                   >
-                                    {approving() === g().id ? "approving…" : "Approve"}
+                                    Reject
                                   </button>
-                                </Show>
-                              </span>
-                            }
-                          >
-                            {/* The in-page confirm: a required reason, then an
-                                explicit "Reject gate". */}
-                            <form
-                              class="gate-reject"
-                              onSubmit={(e) => {
-                                e.preventDefault();
-                                void onReject(g().id);
-                              }}
+                                  <Show when={isApprovable(g())}>
+                                    <button
+                                      class="btn btn-sm btn-primary"
+                                      onClick={() => void onApprove(g().id)}
+                                      disabled={approving() !== null || blockersOf(g()).length > 0}
+                                      title={
+                                        blockersOf(g()).length > 0
+                                          ? `blocked — ${blockersOf(g()).join(", ")} has not succeeded`
+                                          : `approve ${g().id}`
+                                      }
+                                    >
+                                      {approving() === g().id ? "approving…" : "Approve"}
+                                    </button>
+                                  </Show>
+                                </span>
+                              }
                             >
-                              <input
-                                class="input input-sm"
-                                type="text"
-                                required
-                                maxlength={1024}
-                                placeholder="why reject? (required)"
-                                aria-label={`reason for rejecting ${g().id}`}
-                                value={rejectReason()}
-                                onInput={(e) => setRejectReason(e.currentTarget.value)}
-                                ref={(el) => queueMicrotask(() => el.focus())}
-                              />
-                              <button
-                                type="submit"
-                                class="btn btn-sm btn-danger"
-                                disabled={rejecting() !== null || rejectReasonError(rejectReason()) !== null}
+                              {/* The in-page confirm: a required reason, then an
+                                  explicit "Reject gate". */}
+                              <form
+                                class="gate-reject"
+                                onSubmit={(e) => {
+                                  e.preventDefault();
+                                  void onReject(g().id);
+                                }}
                               >
-                                {rejecting() === g().id ? "rejecting…" : "Reject gate"}
-                              </button>
-                              <button
-                                type="button"
-                                class="btn btn-sm btn-ghost"
-                                onClick={() => setRejectFor(null)}
-                                disabled={rejecting() !== null}
-                              >
-                                Cancel
-                              </button>
-                            </form>
-                          </Show>
-                        </div>
-                      )}
-                    </Show>
-                  )}
-                </For>
-              </div>
-            </Show>
+                                <input
+                                  class="input input-sm"
+                                  type="text"
+                                  required
+                                  maxlength={1024}
+                                  placeholder="why reject? (required)"
+                                  aria-label={`reason for rejecting ${g().id}`}
+                                  value={rejectReason()}
+                                  onInput={(e) => setRejectReason(e.currentTarget.value)}
+                                  ref={(el) => queueMicrotask(() => el.focus())}
+                                />
+                                <button
+                                  type="submit"
+                                  class="btn btn-sm btn-danger"
+                                  disabled={rejecting() !== null || rejectReasonError(rejectReason()) !== null}
+                                >
+                                  {rejecting() === g().id ? "rejecting…" : "Reject gate"}
+                                </button>
+                                <button
+                                  type="button"
+                                  class="btn btn-sm btn-ghost"
+                                  onClick={() => setRejectFor(null)}
+                                  disabled={rejecting() !== null}
+                                >
+                                  Cancel
+                                </button>
+                              </form>
+                            </Show>
+                          </div>
+                        )}
+                      </Show>
+                    )}
+                  </For>
+                </div>
+              </Show>
+            </div>
             {/* A version this Run uses was yanked: say what ran, what was
                 refused, and offer a new run, which compiles against the
                 installed version. */}
@@ -1351,18 +1339,6 @@ export default function RunDetail() {
                 </div>
               )}
             </Show>
-            {/* The cold tier's time bound, said out loud once it matters: a
-                pinned run, or one whose window has lapsed. */}
-            <Show when={retention()} keyed>
-              {(wr) => (
-                <Show when={wr.pinned || wr.expired}>
-                  <p class="subtle rd-retention rd-notice">
-                    <Icon icon={wr.pinned ? "pin" : "clock"} size={12} />{" "}
-                    {retentionNote(wr, isTerminal(run()!.status))}
-                  </p>
-                </Show>
-              )}
-            </Show>
             <RunPolicies runId={id()} live={live()} />
 
             {/* ── The version frame ── */}
@@ -1373,58 +1349,10 @@ export default function RunDetail() {
                 they act on the present. */}
             <div class="vframe" classList={{ framed: versions().length > 1, older: timeTraveling() }}>
             <VersionRibbon rows={versions()} onSelect={pickVersion} />
-            {/* ── Summary line ── */}
-            <div class="rd-summary" aria-label="Run summary">
-              <Show when={summary().failed > 0}>
-                <span class="rd-sum-part failed">
-                  ✕ {summary().failed} of {summary().total} steps failed
-                  {summary().roots.length ? ":" : ""}
-                </span>
-                <span class="rd-sum-roots">
-                  <For each={summary().roots}>
-                    {(sid, i) => (
-                      <>
-                        {i() > 0 ? ", " : ""}
-                        <button
-                          type="button"
-                          class="linklike mono"
-                          onClick={() => {
-                            selectNode(sid);
-                            setRunTab("pipeline");
-                          }}
-                        >
-                          {stepDisplayName(sid)}
-                        </button>
-                      </>
-                    )}
-                  </For>
-                </span>
-              </Show>
-              <Show when={summary().running > 0}>
-                <span class="rd-sum-part running">● {summary().running} running</span>
-              </Show>
-              <For each={summary().held}>
-                {(h) => (
-                  <span class="rd-sum-part warning">
-                    ◷ {h.count} {h.text}
-                  </span>
-                )}
-              </For>
-              <Show when={summary().failed === 0 && summary().passed > 0}>
-                <span class="rd-sum-part passed">✓ {summary().passed} passed</span>
-              </Show>
-              <Show when={distinctNames(visibleArtifacts()) > 0}>
-                <span class="rd-sum-part subtle">
-                  ·{" "}
-                  <button type="button" class="linklike" onClick={() => openArtifacts(null)}>
-                    {distinctNames(visibleArtifacts())}{" "}
-                    {distinctNames(visibleArtifacts()) === 1 ? "artifact" : "artifacts"}
-                  </button>
-                </span>
-              </Show>
-            </div>
-
-            {/* ── Run tabs ── */}
+            {/* ── Run tabs, and at their right only what needs attention in
+                the version in view: how many steps failed, and what holds
+                steps back. Nothing for a run that is fine. ── */}
+            <div class="run-tabs-row">
             <div class="run-tabs" role="tablist" aria-label="Run">
               <button
                 type="button"
@@ -1476,91 +1404,115 @@ export default function RunDetail() {
                 Manifest
               </button>
             </div>
+            <Show when={summary().failed > 0 || summary().held.length > 0}>
+              <span class="rd-attn" role="status" aria-label="Needs attention">
+                <Show when={summary().failed > 0}>
+                  <span class="rd-attn-part failed">
+                    ✕ {summary().failed} {summary().failed === 1 ? "step" : "steps"} failed
+                  </span>
+                </Show>
+                <For each={summary().held}>
+                  {(h) => (
+                    <span class="rd-attn-part warning">
+                      ◷ {h.count} {h.text}
+                    </span>
+                  )}
+                </For>
+              </span>
+            </Show>
+            </div>
 
             {/* ── Pipeline panel: the graph or the list ── */}
             <Show when={runTab() === "pipeline"}>
               <div class="panel pipeline-panel" classList={{ readonly: timeTraveling() }}>
-                <div class="panel-h pipeline-toolbar">
-                  <span class="pv-switch" role="group" aria-label="Pipeline view">
-                    <button
-                      type="button"
-                      class="pv-tab"
-                      aria-pressed={view() === "graph"}
-                      onClick={() => setView("graph")}
-                    >
-                      Graph
-                    </button>
-                    <button
-                      type="button"
-                      class="pv-tab"
-                      aria-pressed={view() === "list"}
-                      onClick={() => setView("list")}
-                    >
-                      List <span class="pv-count">{r().steps.length}</span>
-                    </button>
-                  </span>
-                  <span class="pt-count">select a step to open it below</span>
+                {/* One dark bar: what this version did differently on the
+                    left; the view's own controls, then the Graph | List switch,
+                    on the right. */}
+                <div class="pipeline-bar">
+                  <Show when={versions().length > 1 ? changes() : null}>
+                    {(c) => (
+                      <span class="dag-changes" role="status">
+                        <Show when={!timeTraveling()}>
+                          <span class="dc-same">Latest version</span>
+                        </Show>
+                        <Show
+                          when={!timeTraveling() || c().changes.length > 0}
+                          fallback={<span class="dc-same">Same outcomes as the latest (v{latestTakeN()})</span>}
+                        >
+                          <For each={c().changes.slice(0, 3)}>
+                            {(ch, i) => (
+                              <span class="dc-change">
+                                <Show when={i() > 0}>
+                                  <span class="dc-sep">·</span>
+                                </Show>
+                                <span class="mono">{ch.id}</span>{" "}
+                                <span class={`dc-st ${ch.here}`}>{statusWord(ch.here).toLowerCase()} here</span>
+                                <span class="dc-arrow"> → </span>
+                                <span class={`dc-st ${ch.latest}`}>
+                                  {statusWord(ch.latest).toLowerCase()} in the latest (v{latestTakeN()})
+                                </span>
+                              </span>
+                            )}
+                          </For>
+                          <Show when={c().changes.length > 3}>
+                            <span class="dc-more">and {c().changes.length - 3} more</span>
+                          </Show>
+                        </Show>
+                        <Show when={c().carried > 0}>
+                          <span class="dc-sep">·</span>
+                          <span class="dc-carried" title="Carried over from an earlier version">
+                            <span class="ds-dash" aria-hidden="true" />
+                            {c().carried} carried over
+                          </span>
+                        </Show>
+                      </span>
+                    )}
+                  </Show>
                   <span class="grow1" />
-                  <Show when={view() === "graph"}>
+                  <Show
+                    when={view() === "graph"}
+                    fallback={
+                      <span class="pv-seg" role="group" aria-label="Which steps">
+                        <button type="button" aria-pressed={listFilter() === "all"} onClick={() => setListFilter("all")}>
+                          All <span class="pv-n">{dagSteps().length}</span>
+                        </button>
+                        <button
+                          type="button"
+                          aria-pressed={listFilter() === "failed"}
+                          onClick={() => setListFilter("failed")}
+                        >
+                          Failed <span class="pv-n">{dagSteps().filter((s) => s.status === "failed").length}</span>
+                        </button>
+                      </span>
+                    }
+                  >
                     <span class="dag-zoomctl">
-                      <button type="button" title="Back to the fitted view" onClick={() => dagControls()?.fit()}>
-                        ⤢
+                      <button type="button" title="Back to the fitted view" aria-label="Fit the graph" onClick={() => dagControls()?.fit()}>
+                        <Icon icon="maximize" size={13} />
                       </button>
-                      <button type="button" title="Zoom in" onClick={() => dagControls()?.zoomIn()}>
-                        ＋
+                      <button type="button" title="Zoom in" aria-label="Zoom in" onClick={() => dagControls()?.zoomIn()}>
+                        <Icon icon="plus" size={13} />
                       </button>
-                      <button type="button" title="Zoom out" onClick={() => dagControls()?.zoomOut()}>
-                        －
+                      <button type="button" title="Zoom out" aria-label="Zoom out" onClick={() => dagControls()?.zoomOut()}>
+                        <Icon icon="minus" size={13} />
                       </button>
                     </span>
                   </Show>
+                  <span class="pv-seg" role="group" aria-label="Pipeline view">
+                    <button type="button" aria-pressed={view() === "graph"} onClick={() => setView("graph")}>
+                      <Icon icon="workflow" size={13} /> Graph
+                    </button>
+                    <button type="button" aria-pressed={view() === "list"} onClick={() => setView("list")}>
+                      <Icon icon="list" size={13} /> List
+                    </button>
+                  </span>
                 </div>
-                {/* A run with more than one version: on an older version, what
-                    it did differently from the latest; on the latest, that it
-                    is the latest. Both say what a dashed outline means. Shown
-                    in both, so switching versions never moves the graph. */}
-                <Show when={versions().length > 1 ? changes() : null}>
-                  {(c) => (
-                    <div class="dag-changes" role="status">
-                      <Show when={!timeTraveling()}>
-                        <span class="dc-same">Latest version</span>
-                      </Show>
-                      <Show
-                        when={!timeTraveling() || c().changes.length > 0}
-                        fallback={<span class="dc-same">Same outcomes as the latest (v{latestTakeN()})</span>}
-                      >
-                        <For each={c().changes.slice(0, 3)}>
-                          {(ch, i) => (
-                            <span class="dc-change">
-                              <Show when={i() > 0}>
-                                <span class="dc-sep">·</span>
-                              </Show>
-                              <span class="mono">{ch.id}</span>{" "}
-                              <span class={`dc-st ${ch.here}`}>{statusWord(ch.here).toLowerCase()} here</span>
-                              <span class="dc-arrow"> → </span>
-                              <span class={`dc-st ${ch.latest}`}>
-                                {statusWord(ch.latest).toLowerCase()} in the latest (v{latestTakeN()})
-                              </span>
-                            </span>
-                          )}
-                        </For>
-                        <Show when={c().changes.length > 3}>
-                          <span class="dc-more">and {c().changes.length - 3} more</span>
-                        </Show>
-                      </Show>
-                      <Show when={c().carried > 0}>
-                        <span class="dc-sep">·</span>
-                        <span class="dc-carried">
-                          <span class="ds-dash" aria-hidden="true" /> {c().carried} carried over from an earlier version
-                        </span>
-                      </Show>
-                    </div>
-                  )}
-                </Show>
                 <Show
                   when={view() === "graph"}
                   fallback={
                     <StepList
+                      filter={listFilter()}
+                      carriedFrom={carriedFrom}
                       steps={dagSteps()}
                       services={dagServices()}
                       selected={sel()}

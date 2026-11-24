@@ -807,8 +807,9 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 
 /* Gates awaiting a decision. One row per gate — a run can suspend on
    several — so the emphasis sits on WHICH gate, not on a single verb. */
+/* The approval row's slot: one row's height, kept with or without a gate. */
+.gate-slot { min-height: 48px; margin: 28px 0; }
 .gate-bar {
-  margin-bottom: 16px;
   border: 1px solid color-mix(in srgb, var(--emerald) 35%, transparent);
   border-radius: 6px;
   background: color-mix(in srgb, var(--emerald) 6%, transparent);
@@ -817,7 +818,8 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 10px 12px;
+  min-height: 46px; box-sizing: border-box;
+  padding: 7px 12px;
   border-bottom: 1px solid color-mix(in srgb, var(--emerald) 18%, transparent);
 }
 .gate-row:last-child { border-bottom: none; }
@@ -3113,32 +3115,40 @@ a.lgtog { text-decoration: none; }
 }
 .pipeline-panel > .panel-h .grow1 { flex: 1; }
 
-/* Pipeline panel header: the Graph | List switch and a hint on the left, zoom
-   controls pushed right. */
-.pipeline-toolbar {
-  position: relative; z-index: 6; overflow: visible;
-  gap: 10px;
+/* The pipeline bar: one dark bar over the graph or the list. What this
+   version did differently on the left; the view's own controls (zoom for the
+   graph, All / Failed for the list), then the Graph | List switch, on the
+   right. Canvas tokens: it is the top of the dark panel. */
+.pipeline-bar {
+  position: relative; z-index: 6;
+  display: flex; align-items: center; gap: 12px; min-height: 46px; box-sizing: border-box;
+  padding: 8px 12px 8px 16px; background: var(--terminal-elev);
+  border-bottom: 1px solid var(--terminal-line);
+  font: var(--t-body); color: var(--terminal-ink);
 }
-.pipeline-toolbar .pt-label {
-  font: var(--t-label);
-  color: var(--sage);
+.pipeline-bar .grow1 { flex: 1; }
+/* A two-way switch: Graph | List, All | Failed. */
+.pv-seg {
+  display: inline-flex; gap: 2px; padding: 2px; flex: none;
+  border: 1px solid var(--terminal-line); border-radius: 7px; background: var(--terminal);
 }
-.pipeline-toolbar .pt-count {
-  font: var(--t-body);
-  color: var(--muted-sage);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
+.pv-seg button {
+  display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 10px;
+  font: var(--t-label); font-size: 12px; color: var(--terminal-dim);
+  background: transparent; border: 0; border-radius: 5px; cursor: pointer;
 }
-/* Zoom control cluster (fit ⤢ / zoom ＋ / zoom －): page chrome — it sits on the
-   toolbar, not the dark canvas — so it reads page/theme tokens. */
+.pv-seg button:hover { color: var(--terminal-ink); }
+.pv-seg button[aria-pressed="true"] { color: var(--terminal-ink); background: var(--terminal-line); }
+.pv-n { font: var(--t-mono); opacity: 0.75; }
+/* Fit and zoom, beside the switch while the graph is in view. */
 .dag-zoomctl { display: inline-flex; gap: 5px; flex: none; }
 .dag-zoomctl button {
-  width: 28px; height: 28px; display: grid; place-items: center;
-  font: var(--t-mono); line-height: 1; cursor: pointer;
-  color: var(--muted-sage); background: var(--emerald-surface);
-  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  width: 28px; height: 28px; display: grid; place-items: center; cursor: pointer;
+  color: var(--terminal-dim); background: transparent;
+  border: 1px solid var(--terminal-line); border-radius: 6px;
   transition: color 0.12s var(--ease-out), border-color 0.12s var(--ease-out);
 }
-.dag-zoomctl button:hover { color: var(--soft-white); border-color: var(--emerald); }
+.dag-zoomctl button:hover { color: var(--terminal-ink); border-color: var(--terminal-accent); }
 
 /* The graph band: the dark canvas across the panel, edge to edge (the panel's
    rounding and overflow clip the corners). */
@@ -3184,7 +3194,7 @@ a.lgtog { text-decoration: none; }
 /* The step pane, below the Pipeline panel: its own card. The selected tab
    fills a comfortable height and scrolls in place, so logs are readable
    without stretching the page. */
-.rd-evidence > .steppane { display: flex; flex-direction: column; min-height: 0; overflow: visible; }
+.rd-evidence .steppane { display: flex; flex-direction: column; min-height: 0; overflow: visible; margin-bottom: 0; }
 .rd-evidence .steppane .tabpane {
   min-height: 300px; max-height: 52vh; overflow: auto;
 }
@@ -3198,14 +3208,14 @@ a.lgtog { text-decoration: none; }
    past. Its size never changes, so switching versions only changes colour. */
 /* A plain block: its children keep the spacing they had on the page. */
 .vframe { min-width: 0; }
-.vframe > .vribbon { margin-bottom: 12px; }
+.vframe > .vribbon { margin-bottom: 14px; }
 .vframe.framed {
   border: 2px solid color-mix(in srgb, var(--emerald) 22%, transparent); border-radius: 12px;
-  padding: 0 14px 14px; overflow: hidden;
+  padding: 0 20px 28px; overflow: hidden;
   transition: border-color 0.25s var(--ease-out);
 }
 .vframe.framed > .vribbon {
-  margin: 0 -14px 12px; border: 0; border-radius: 0;
+  margin: 0 -20px 14px; padding: 4px 20px; min-height: 48px; border: 0; border-radius: 0;
   border-bottom: 1px solid color-mix(in srgb, var(--emerald) 18%, transparent);
   background: color-mix(in srgb, var(--emerald) 5%, var(--emerald-surface));
   transition: background 0.25s var(--ease-out), border-color 0.25s var(--ease-out);
@@ -3290,23 +3300,20 @@ a.lgtog { text-decoration: none; }
   .vr-note { white-space: normal; }
 }
 
-/* The strip across the top of the Pipeline panel while an older version is
-   in view: what that version did differently from the latest, and how many
-   steps it carried over (the dashed outline). Dark, like the graph. */
+/* What this version did differently from the latest, on the left of the
+   pipeline bar, and how many steps it carried over (the dashed outline). */
 .dag-changes {
-  display: flex; align-items: center; gap: 4px 10px; flex-wrap: wrap;
-  padding: 8px 14px; background: var(--terminal-elev);
-  border-bottom: 1px solid var(--terminal-line);
-  font: var(--t-body); color: var(--terminal-ink);
+  display: flex; align-items: center; gap: 4px 10px; flex-wrap: wrap; min-width: 0;
 }
 .dag-changes .mono { font: var(--t-mono); }
 .dc-st.failed, .dc-st.dead_lettered, .dc-st.cancelled { color: var(--danger); }
 .dc-st.succeeded { color: var(--ok-ink); }
 .dc-sep, .dc-arrow, .dc-more, .dc-carried, .dc-same { color: color-mix(in srgb, var(--terminal-ink) 70%, transparent); }
 .dc-sep { margin: 0 6px; }
+.dc-carried { display: inline-flex; align-items: center; gap: 8px; }
 .ds-dash {
-  display: inline-block; width: 18px; height: 10px; vertical-align: -1px;
-  border: 1px dashed currentColor; border-radius: 2px;
+  display: inline-block; width: 16px; height: 10px; flex: none;
+  border: 1px dashed currentColor; border-radius: 3px;
 }
 /* Backdrop: a transparent full-viewport click-catcher beneath an open menu
    (the run header's ⋯ menu). */
@@ -3418,7 +3425,7 @@ a.lgtog { text-decoration: none; }
 /* Run header: breadcrumb with `#N` and the title, status, actions. */
 /* Its own layer above the pipeline panel, whose toolbar sets z-index 6: the ⋯
    menu opens downward over it and must take the clicks. */
-.rh { position: relative; z-index: 20; display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+.rh { position: relative; z-index: 20; display: flex; flex-direction: column; gap: 10px; }
 .rh-row { display: flex; align-items: center; gap: 12px; min-width: 0; flex-wrap: wrap; }
 /* Above phone width the title shrinks (and ends in an ellipsis) before the
    version picker, the badge or the actions wrap to a line of their own. */
@@ -3429,16 +3436,25 @@ a.lgtog { text-decoration: none; }
 .rh-crumbs { min-width: 0; flex: 0 1 auto; max-width: 100%; }
 .rh-num { flex: none; color: var(--display-ink); }
 .rh-title { color: var(--display-ink); }
+/* As the runs list's line 1: the pipeline (mono, muted), a slash, the title. */
+.rh-headline { display: inline-flex; align-items: baseline; gap: 8px; min-width: 0; flex: 1 1 auto; margin-left: 6px; }
+.rh-pipe { font: var(--t-mono); color: var(--sage); flex: none; }
+.rh-slash { font: var(--t-body); color: var(--muted-sage); flex: none; }
 .rh-actions { display: inline-flex; align-items: center; gap: 8px; flex: none; margin-left: auto; }
 .rh-actions .btn-sm { display: inline-flex; align-items: center; gap: 6px; }
-/* Provenance: one wrapping line of facts, ending in the version selector. */
-.rh-prov { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 16px; color: var(--sage); }
-.rh-prov .pfact { color: var(--sage); }
-.rh-prov .pfact a { color: var(--emerald); text-decoration: none; }
-.rh-prov .pfact a:hover { text-decoration: underline; }
-.rh-prov .pfact a.plain { color: inherit; pointer-events: none; }
-.rh-prov .pfact a.sha { color: var(--copper); margin-left: 4px; }
-.rh-prov .pfact .subtle { color: var(--muted-sage); }
+/* Line 2, as the runs list's line 2 (the same OriginLine), then the kept
+   mark and the times at the right edge, under the actions. */
+.rh-prov { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 20px; color: var(--sage); min-width: 0; }
+.rh-prov .rr-l2 { display: flex; gap: 0 22px; max-width: none; flex: 0 1 auto; }
+.rh-params { font: var(--t-mono); color: var(--muted-sage); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rh-prov .grow1 { flex: 1; }
+.rh-keep {
+  display: inline-flex; align-items: center; gap: 5px; flex: none; color: var(--muted-sage);
+  border-bottom: 1px dotted var(--muted-sage); cursor: help;
+}
+.rh-time { font: var(--t-body); color: var(--sage); flex: none; white-space: nowrap; }
+.rh-time .mono { font: var(--t-mono); }
+.rh-time.live .mono { color: var(--running-ink); }
 
 /* The ⋯ menu. */
 .rmenu { position: relative; display: inline-flex; }
@@ -3465,34 +3481,12 @@ a.lgtog { text-decoration: none; }
 .rd-notice { margin-bottom: 12px; }
 .rd-retention.rd-notice { color: var(--muted-sage); }
 
-/* Summary line: where the run failed, or what runs and waits. */
-.rd-summary {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px;
-  margin: 0 0 12px; min-height: 20px; color: var(--sage);
-}
-.rd-summary .linklike { font: var(--t-mono); overflow-wrap: anywhere; text-align: left; }
-.rd-sum-roots { min-width: 0; }
-.rd-sum-part { font: var(--t-label); white-space: nowrap; }
-.rd-sum-part.failed { color: var(--danger); }
-.rd-sum-part.running { color: var(--running-ink); }
-.rd-sum-part.warning { color: var(--warn); }
-.rd-sum-part.passed { color: var(--ok-ink); }
-.rd-sum-part.subtle { font: var(--t-body); color: var(--muted-sage); }
-
-/* Graph | List switch in the Pipeline panel header. */
-.pv-switch { display: inline-flex; gap: 2px; align-self: stretch; margin: -10px 0; }
-.pv-tab {
-  display: inline-flex; align-items: center; gap: 6px;
-  font: var(--t-label); color: var(--muted-sage);
-  background: none; border: 0; border-bottom: 2px solid transparent;
-  padding: 10px 10px 8px; cursor: pointer;
-}
-.pv-tab:hover { color: var(--sage); }
-.pv-tab[aria-pressed="true"] { color: var(--soft-white); border-bottom-color: var(--emerald); }
-.pv-count {
-  font: var(--t-mono); color: var(--muted-sage);
-  background: var(--emerald-surface); border: 1px solid var(--border); border-radius: 20px; padding: 0 6px;
-}
+/* What needs attention, at the right of the run tabs row: failures and
+   steps held back, counted, no names. */
+.rd-attn { display: inline-flex; align-items: center; gap: 14px; flex: none; margin-left: auto; padding-left: 16px; }
+.rd-attn-part { font: var(--t-label); white-space: nowrap; }
+.rd-attn-part.failed { color: var(--danger); }
+.rd-attn-part.warning { color: var(--warn); }
 
 /* A matrix in the graph: its cells under one heading naming the step and its
    keys. Canvas tokens only. */
@@ -3504,107 +3498,132 @@ a.lgtog { text-decoration: none; }
 }
 .dag-mxh b { font: inherit; color: var(--terminal-ink); }
 
-/* List view. */
-.slist { padding-bottom: 8px; }
-.slist-filter {
-  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
-  padding: 10px 12px; border-bottom: 1px solid var(--border-soft);
-}
-.slist .chip, .rt-filters .chip {
+/* List view: the same dark panel as the graph, canvas tokens. */
+.slist { padding: 10px 0 14px; background: var(--terminal); color: var(--terminal-ink); }
+.rt-filters .chip {
   display: inline-flex; align-items: center; gap: 6px;
   font: var(--t-label); color: var(--sage);
   background: var(--emerald-surface); border: 1px solid var(--border); border-radius: 12px;
   padding: 2px 10px; cursor: pointer;
 }
-.slist .chip[aria-pressed="true"], .rt-filters .chip[aria-pressed="true"] {
+.rt-filters .chip[aria-pressed="true"] {
   color: var(--emerald); border-color: var(--emerald);
   background: color-mix(in srgb, var(--emerald) 10%, transparent);
 }
-.slist-filter .subtle { color: var(--muted-sage); }
-.slist-grp { font: var(--t-label); color: var(--sage); padding: 10px 14px 4px; }
-.slist-grp .mono { color: var(--muted-sage); margin-left: 6px; }
+.slist-grp { font: var(--t-label); color: var(--terminal-ink); padding: 12px 16px 4px; }
+.slist-grp .mono { color: var(--terminal-dim); margin-left: 6px; }
 .slist-row {
-  display: grid; grid-template-columns: 16px minmax(0, 1fr) minmax(0, 220px) 72px;
+  display: grid; grid-template-columns: 16px minmax(0, 1fr) minmax(0, 260px) 72px;
   align-items: center; gap: 10px; width: 100%; text-align: left;
-  padding: 6px 14px; background: none; border: 0; border-left: 2px solid transparent;
-  cursor: pointer; color: var(--soft-white);
+  padding: 7px 16px; background: none; border: 0; border-left: 2px solid transparent;
+  cursor: pointer; color: var(--terminal-ink);
 }
-.slist-row.cell { padding-left: 24px; }
-.slist-row:hover { background: color-mix(in srgb, var(--emerald) 8%, transparent); }
+.slist-row.cell { padding-left: 30px; }
+.slist-row:hover { background: color-mix(in srgb, var(--terminal-accent) 10%, transparent); }
 .slist-row.sel {
-  background: color-mix(in srgb, var(--emerald) 10%, transparent);
-  border-left-color: var(--emerald);
+  background: color-mix(in srgb, var(--terminal-accent) 14%, transparent);
+  border-left-color: var(--terminal-accent);
 }
-.slist-g { font: var(--t-mono); color: var(--muted-sage); }
+.slist-g { font: var(--t-mono); color: var(--terminal-dim); text-align: center; }
 .slist-g.succeeded { color: var(--ok-ink); }
 .slist-g.failed { color: var(--danger); }
 .slist-g.running { color: var(--running-ink); }
 .slist-g.warning, .slist-g.service { color: var(--warn); }
 .slist-name { font: var(--t-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.slist-words { color: var(--sage); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.slist-dur { font: var(--t-mono); color: var(--muted-sage); text-align: right; }
-.slist-empty { padding: 10px 14px; }
+.slist-words { color: var(--terminal-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A step carried over from an earlier version: the dashed outline of its node
+   in the graph, as a tag. */
+.slist-from {
+  display: inline-block; margin-left: 10px; padding: 0 7px;
+  font: var(--t-mono); line-height: 18px; color: var(--terminal-ink);
+  border: 1px dashed var(--terminal-dim); border-radius: 3px;
+}
+.slist-dur { font: var(--t-mono); color: var(--terminal-dim); text-align: right; }
+.slist-empty { padding: 10px 16px; color: var(--terminal-dim); }
 
-/* Step header: the name, the tries and the actions; under it one line on the
-   selected try. Colour is only on the status words. */
+/* The step's name and its actions, on the page above the card, indented to
+   line up with the card's content. Each item is centred on the 32px row the
+   buttons set, so the title and its matrix values share the buttons' middle. */
 .sp-head {
   display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px;
-  padding: 12px 14px 2px;
+  min-height: 32px; margin: 28px 0 14px; padding-left: 16px;
 }
-.sp-head .grow1, .sp-line .grow1 { flex: 1 0 0; min-width: 0; }
-.sp-name { font: var(--t-title); color: var(--display-ink); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sp-cell { font: var(--t-mono); color: var(--sage); }
+.sp-head .grow1, .sp-tries .grow1 { flex: 1 0 0; min-width: 0; }
+.sp-name {
+  display: inline-flex; align-items: center; gap: 12px; min-width: 0;
+  font: var(--t-title); line-height: 1; color: var(--display-ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sp-cell { font: var(--t-mono); line-height: 1; color: var(--sage); }
 .sp-actions { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .sp-actions .btn-sm { display: inline-flex; align-items: center; gap: 6px; }
-.sp-line {
-  display: flex; align-items: baseline; gap: 8px;
-  padding: 2px 14px 10px; border-bottom: 1px solid var(--border);
+/* The tries band: as the versions band, the top of the card. */
+.sp-tries {
+  display: flex; align-items: center; gap: 8px; min-height: 46px; box-sizing: border-box;
+  padding: 7px 16px; border-bottom: 1px solid var(--border);
+  border-radius: var(--radius) var(--radius) 0 0;
+  background: color-mix(in srgb, var(--emerald) 5%, var(--emerald-surface));
+  white-space: nowrap;
 }
-.sp-line > * { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sp-tries .tstrip { margin-right: 8px; }
+.sp-tries > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .sp-status { font: var(--t-label); flex: none; color: var(--muted-sage); }
 .sp-status.passed { color: var(--ok-ink); }
 .sp-status.failed { color: var(--danger); }
 .sp-status.running { color: var(--running-ink); }
 .sp-status.warning { color: var(--warn); }
-.sp-reason { color: var(--soft-white); flex: 0 1 auto; }
+.sp-reason { color: var(--muted-sage); flex: 0 1 auto; }
 .sp-aside { color: var(--muted-sage); flex: 0 2 auto; }
-.sp-files { flex: none; }
+.sp-files { flex: none; margin-right: 16px; white-space: nowrap; }
 @media (max-width: 640px) {
-  .sp-line { flex-wrap: wrap; }
-  .sp-reason { white-space: normal; overflow-wrap: anywhere; }
+  .sp-tries { flex-wrap: wrap; white-space: normal; }
+  .sp-head { padding-left: 0; }
 }
-.steppane .pane-tabbar { margin-top: 10px; }
+/* The Error tab: how the try failed and why, a few facts, the log's tail. */
+.steppane .tabpane.errpane { display: flex; flex-direction: column; gap: 20px; padding: 22px 22px 24px; }
+.ep-what { display: flex; flex-direction: column; gap: 6px; padding-left: 12px; border-left: 3px solid var(--danger); }
+.ep-reason { margin: 0; font: var(--t-body); font-size: 14px; color: var(--soft-white); overflow-wrap: anywhere; white-space: pre-wrap; }
+.ep-facts { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 8px 12px; margin: 0; }
+.ep-facts dt { color: var(--muted-sage); }
+.ep-facts dd { margin: 0; color: var(--soft-white); }
+.ep-facts:empty { display: none; }
+.ep-tail { display: flex; flex-direction: column; gap: 6px; }
+.ep-tail-h { display: flex; align-items: center; gap: 10px; color: var(--muted-sage); }
+.ep-tail-h .grow1 { flex: 1; }
+.ep-lines { font: var(--t-mono); background: var(--terminal); border-radius: var(--radius-sm); padding: 8px 0; overflow-x: auto; }
+.ep-tail-empty { margin: 0; color: var(--muted-sage); }
 .steppane .pane-tabbar .tabs { min-width: 0; }
 /* A content tab's scope: "try 2", "from try 3", "none". */
 .inspector .tab .tscope { font: var(--t-mono); color: var(--muted-sage); }
 
 /* List view: the tries nested under a step with more than one. */
 .slist-try {
-  display: grid; grid-template-columns: 16px minmax(0, 1fr) minmax(0, 220px) 72px;
+  display: grid; grid-template-columns: 16px minmax(0, 1fr) minmax(0, 260px) 72px;
   align-items: center; gap: 10px; width: 100%; text-align: left;
-  padding: 3px 14px 3px 38px; background: none; border: 0; border-left: 2px solid transparent;
-  cursor: pointer; color: var(--sage); font: var(--t-body);
+  padding: 5px 16px 5px 40px; background: none; border: 0; border-left: 2px solid transparent;
+  cursor: pointer; color: var(--terminal-ink); font: var(--t-body);
 }
-.slist-try.cell { padding-left: 48px; }
-.slist-try:hover { background: color-mix(in srgb, var(--emerald) 8%, transparent); }
+.slist-try.cell { padding-left: 52px; }
+.slist-try:hover { background: color-mix(in srgb, var(--terminal-accent) 10%, transparent); }
 .slist-try.sel {
-  background: color-mix(in srgb, var(--emerald) 10%, transparent);
-  border-left-color: var(--emerald); color: var(--soft-white);
+  background: color-mix(in srgb, var(--terminal-accent) 14%, transparent);
+  border-left-color: var(--terminal-accent);
 }
 .slist-try-w { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.slist-try .slist-words { color: var(--muted-sage); }
+.slist-try .slist-words { color: var(--terminal-dim); }
 
 /* Run tabs: Pipeline, Artifacts, Activity. Run scope, so they sit on the page
    with a heavier underline than a step's content tabs. */
-.run-tabs {
-  display: flex; gap: 6px; overflow-x: auto;
-  border-bottom: 1px solid var(--border); margin: 0 0 14px;
+.run-tabs-row {
+  display: flex; align-items: center; min-width: 0;
+  border-bottom: 1px solid var(--border); margin: 0 0 24px;
 }
+.run-tabs { display: flex; gap: 6px; overflow-x: auto; min-width: 0; }
 .run-tab {
   display: inline-flex; align-items: center; gap: 7px; white-space: nowrap;
   font: var(--t-label); color: var(--muted-sage);
   background: none; border: 0; border-bottom: 3px solid transparent; margin-bottom: -1px;
-  padding: 8px 14px 7px 2px; cursor: pointer;
+  padding: 11px 14px 10px 2px; cursor: pointer;
 }
 .run-tab:hover { color: var(--sage); }
 .run-tab[aria-selected="true"] { color: var(--display-ink); border-bottom-color: var(--emerald); }

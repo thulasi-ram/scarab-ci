@@ -1,12 +1,14 @@
 // The Pipeline panel's List view: every step in the order the run lists it
 // (its definition order, so a step comes after what it needs), the cells of a
-// matrix grouped under one heading, with an All / Failed filter. Each row
-// gives the status glyph, the step's name or its cell values, its status in
-// words and how long it took. A step with two or more tries in the version in
+// matrix grouped under one heading. The All / Failed filter lives in the
+// pipeline bar and comes in as `filter`. Each row gives the status glyph, the
+// step's name or its cell values, its status in words (with a dashed "from
+// v2" tag for a step carried over from an earlier version) and how long it
+// took. A step with two or more tries in the version in
 // view lists them under its row, newest first, each opening that try. Shared
 // services come first, as rows that open the service. For runs too big to
-// read as a graph. Page chrome, so it reads the page tokens.
-import { createMemo, createSignal, For, Show } from "solid-js";
+// read as a graph. Drawn in the same dark panel as the graph.
+import { createMemo, For, Show } from "solid-js";
 import type { DagService, DagStep } from "./Dag";
 import {
   compactDuration,
@@ -46,9 +48,12 @@ export default function StepList(props: {
   onSelectTry?: (step: string, attempt: string) => void;
   /** How a gate step's latest wait was resolved. */
   resolutionOf?: (id: string) => WaitResolution | null;
+  /** Which steps to show; the pipeline bar switches it. */
+  filter?: "all" | "failed";
+  /** The version a carried-over step was reused from; null when it ran here. */
+  carriedFrom?: (id: string) => number | null;
 }) {
-  const [filter, setFilter] = createSignal<"all" | "failed">("all");
-  const failedCount = () => props.steps.filter((s) => s.status === "failed").length;
+  const filter = () => props.filter ?? "all";
   const shown = () => (filter() === "failed" ? props.steps.filter((s) => s.status === "failed") : props.steps);
   // Rows are keyed by id, never by object: the page rebuilds every step object
   // each second (the clock tick), and a row keyed by object would be re-created
@@ -80,25 +85,6 @@ export default function StepList(props: {
 
   return (
     <div class="slist">
-      <div class="slist-filter" role="group" aria-label="Filter steps">
-        <button
-          type="button"
-          class="chip"
-          aria-pressed={filter() === "all"}
-          onClick={() => setFilter("all")}
-        >
-          All <span class="mono">{props.steps.length}</span>
-        </button>
-        <button
-          type="button"
-          class="chip"
-          aria-pressed={filter() === "failed"}
-          onClick={() => setFilter("failed")}
-        >
-          Failed <span class="mono">{failedCount()}</span>
-        </button>
-        <span class="subtle">in dependency order</span>
-      </div>
       <Show when={filter() === "all" && serviceNames().length > 0}>
         <div class="slist-grp">Shared services</div>
         <For each={serviceNames()}>
@@ -158,7 +144,16 @@ export default function StepList(props: {
                             {step().note?.tone === "warning" ? "◷" : statusGlyph(step().status)}
                           </span>
                           <span class="slist-name">{it.label}</span>
-                          <span class="slist-words">{rowWords(step())}</span>
+                          <span class="slist-words">
+                            {rowWords(step())}
+                            <Show when={props.carriedFrom?.(id)}>
+                              {(v) => (
+                                <span class="slist-from" title="Carried over from an earlier version">
+                                  from v{v()}
+                                </span>
+                              )}
+                            </Show>
+                          </span>
                           <span class="slist-dur">{took(step())}</span>
                         </button>
                         <For each={tryIds()}>
