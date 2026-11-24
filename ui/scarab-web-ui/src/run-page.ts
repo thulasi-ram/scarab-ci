@@ -522,12 +522,6 @@ export function tryStatusWords(
   return { text: statusWord(t.outcome), tone: "muted" };
 }
 
-/** "tries" for "Try", "waits" for "Wait". */
-function plural(noun: string): string {
-  const n = noun.toLowerCase();
-  return n.endsWith("y") ? `${n.slice(0, -1)}ies` : `${n}s`;
-}
-
 /** One try as the failure box reads it. */
 export type BoxTry = {
   outcome: string;
@@ -544,10 +538,11 @@ export type FailureBox = {
 };
 
 /**
- * The box above the step's content tabs, for the selected try: why it failed,
- * what holds it back, that it passed after earlier failures, or where a step
- * that did not run in this version was reused from. Null when there is nothing
- * to add. `noun` is "Try", or "Wait" for a gate.
+ * The box above the step's content tabs, for the selected try: the detail of
+ * why it failed, what holds it back, or where a step that did not run in this
+ * version was reused from. Null when there is nothing to add to the header,
+ * which already says what the try did, and the try strip, which shows the
+ * earlier tries. `noun` is "Try", or "Wait" for a gate.
  */
 export function failureBox(o: {
   tries: BoxTry[];
@@ -582,19 +577,12 @@ export function failureBox(o: {
     const parts: string[] = [];
     if (t.failureDetail) parts.push(t.failureDetail);
     if (o.heldBeforeMs) parts.push(`unschedulable for ${aboutDuration(o.heldBeforeMs)} before it started`);
+    // Without a detail the box would only repeat the header's status.
+    if (parts.length === 0) return null;
     return {
       tone: "failed",
       head: `${noun} ${n} failed: ${failureWords(t.failure)}`,
-      ...(parts.length ? { detail: parts.join(" · ") } : {}),
-    };
-  }
-  if (t.outcome === "succeeded") {
-    const earlier = o.tries.slice(0, o.selected).filter((x) => x.outcome === "failed").length;
-    if (earlier === 0) return null;
-    return {
-      tone: "info",
-      head: `Passed on ${noun.toLowerCase()} ${n}${t.cause ? ` (${t.cause})` : ""}`,
-      detail: `${earlier} earlier ${earlier === 1 ? noun.toLowerCase() : plural(noun)} failed in this version`,
+      detail: parts.join(" · "),
     };
   }
   return null;

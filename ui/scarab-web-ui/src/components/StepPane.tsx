@@ -75,8 +75,8 @@ import { absTime } from "../fmt";
 import Icon from "./Icon";
 import { loadRunManifest } from "./RunManifest";
 import { pipelineShortName } from "../schedules";
-import AttemptsDropdown, { type FilmstripTry } from "./AttemptsDropdown";
-import TryTabs from "./TryTabs";
+import TryStrip from "./TryStrip";
+import { type FilmstripTry } from "../attempts";
 import Pill from "./Pill";
 import { LogError, LogLoading, LogMarkerRow, LogSkeleton } from "./LogStates";
 
@@ -172,8 +172,8 @@ export default function StepPane(props: {
   reused?: boolean;
 }) {
   const [tab, setTab] = createSignal<PaneTab>(props.initialTab ?? "logs");
-  // Two or more tries get the try tabs (a row that scrolls sideways at every
-  // width); the header then names the selected try as text.
+  // Two or more tries get the try strip in the header; one try gets no try
+  // control, since there is nothing to pick.
   const tryTabs = () => props.tries.length > 1;
   createEffect(() => props.onTabChange?.(tab()));
   // A plugin gate opens on its Gate tab; any other step never
@@ -347,11 +347,6 @@ export default function StepPane(props: {
     }),
   );
   const notLatest = () => notLatestNote(props.tries, selIndex(), noun());
-  // The scope each content tab carries: "try 2".
-  const tryScope = () => {
-    const i = selIndex();
-    return i === null ? null : `${noun().toLowerCase()} ${i + 1}`;
-  };
   // Outputs read the try of record: name it when it is not the selected one.
   const outputsScope = (): string | null => {
     const c = carried();
@@ -716,13 +711,6 @@ export default function StepPane(props: {
                   {(cell) => <span class="sp-cell"> · {cell()}</span>}
                 </Show>
               </span>
-              <AttemptsDropdown
-                tries={props.tries}
-                active={props.activeAttempt}
-                onSelect={props.onAttemptSelect}
-                noun={noun()}
-                static={tryTabs()}
-              />
               <span class={`sp-status ${status().tone}`}>{status().text}</span>
               <Show when={(props.artifacts ?? 0) > 0}>
                 <button
@@ -735,19 +723,19 @@ export default function StepPane(props: {
                 </button>
               </Show>
               <span class="grow1" />
+              <Show when={tryTabs()}>
+                <TryStrip
+                  tries={props.tries}
+                  active={props.activeAttempt}
+                  ofRecord={notRun() ? null : ofRecordTry()}
+                  onSelect={props.onAttemptSelect}
+                  noun={noun()}
+                  now={props.now ?? Date.now()}
+                  resolution={waitResolution()}
+                />
+              </Show>
               <span class="sp-actions">{props.actions}</span>
             </div>
-            <Show when={tryTabs()}>
-              <TryTabs
-                tries={props.tries}
-                active={props.activeAttempt}
-                ofRecord={notRun() ? null : ofRecordTry()}
-                onSelect={props.onAttemptSelect}
-                noun={noun()}
-                now={props.now ?? Date.now()}
-                resolution={waitResolution()}
-              />
-            </Show>
             {props.note}
             <Show when={props.gateLabel}>
               {(label) => (
@@ -834,9 +822,9 @@ export default function StepPane(props: {
                   when={isPluginGate()}
                   fallback={
                     <>
-                      <TabBtn id="logs" label="Logs" scope={tryScope()} />
-                      <TabBtn id="results" label="Results" scope={tryScope()} />
-                      <TabBtn id="workspace" label="Workspace" scope={tryScope()} />
+                      <TabBtn id="logs" label="Logs" />
+                      <TabBtn id="results" label="Results" />
+                      <TabBtn id="workspace" label="Workspace" />
                       <TabBtn id="outputs" label="Outputs" scope={outputsScope()} />
                       <Show when={(s().origin ?? []).length > 0}>
                         <TabBtn id="source" label="Source" />

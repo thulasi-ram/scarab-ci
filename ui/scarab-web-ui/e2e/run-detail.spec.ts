@@ -93,14 +93,12 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   // ── (e) the failed→retried step's tries, with per-try outcomes ───────────
   await page.getByRole("button", { name: /^build/ }).click();
   await expect(page).toHaveURL(/[?&]step=1(&|$)/);
-  // With two tries the header names the selected try as text and a row of
-  // try tabs picks; the header says what the try did.
-  const sp = page.locator(".sp-head");
-  await expect(sp).toContainText("Try 2 of 2");
+  // With two tries the header carries a strip of numbered tries, the
+  // selected one filled; the status says what that try did. The try is named
+  // once: no summary box, no "try 2" on the content tabs.
   await expect(page.locator(".sp-status")).toContainText("✓ Passed in");
-  // It passed after an earlier failure in this version.
-  await expect(page.locator(".sp-box")).toContainText("Passed on try 2 (automatic retry)");
-  await expect(page.getByRole("button", { name: /^Logs try 2/ })).toBeVisible();
+  await expect(page.locator(".sp-box")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Logs", exact: true })).toBeVisible();
   const tries = page.getByRole("tablist", { name: "Tries of this step" });
   const try1 = tries.getByRole("tab", { name: /Try 1 ·/ });
   const try2 = tries.getByRole("tab", { name: /Try 2 ·/ });
@@ -115,18 +113,17 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   // Picking the older try scopes the pane to it, keeps it in the URL, and
   // disables Debug pod (it reproduces the latest try).
   await try1.click();
-  await expect(sp).toContainText("Try 1 of 2");
   await expect(try1).toHaveAttribute("aria-selected", "true");
-  await expect(page.locator(".sp-box")).toContainText("Try 1 failed: step error");
+  await expect(page.locator(".sp-status")).toContainText("Failed");
   await expect(page.locator(".sp-box")).toContainText("Not the latest try: try 2 passed");
   await expect(page.getByRole("button", { name: /Debug pod/ })).toBeDisabled();
   await expect(page).toHaveURL(/[?&]try=1(&|$)/);
   // The same URL opens on the same step and try.
   await page.reload();
-  await expect(sp).toContainText("Try 1 of 2");
+  await expect(try1).toHaveAttribute("aria-selected", "true");
   // An index past the end is dropped, not an error: the default applies.
   await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}?step=1&try=9`);
-  await expect(sp).toContainText("Try 2 of 2");
+  await expect(try2).toHaveAttribute("aria-selected", "true");
 
   // ── (f) the Artifacts tab lists the artifact of record ───────────────────
   // The step header counts build's files; the link opens the Artifacts tab
@@ -409,20 +406,18 @@ test("run tabs: the Activity filter hides cleared Pod conditions, Artifacts show
   await expect(page.locator(".art-row", { hasText: "e2e · try 1" })).toContainText("from a failed try");
 });
 
-test("try tabs: every try newest first in one row, and tries nested in the List view", async ({ page }) => {
+test("try strip: every try oldest first in the header, and tries nested in the List view", async ({ page }) => {
   // e2e is step 2: six tries, the sixth passed.
   await page.goto(`/acme/scarab/runs/${RETRIES_RUN_ID}?step=2`);
-  const sp = page.locator(".sp-head");
-  await expect(sp).toContainText("Try 6 of 6");
   const tries = page.getByRole("tablist", { name: "Tries of this step" });
-  // Every try is a tab, newest first; nothing folds into a menu.
+  // Every try is a numbered button, oldest first; the newest is selected.
   await expect(tries.getByRole("tab")).toHaveCount(6);
-  await expect(tries.getByRole("tab").first()).toContainText("Try 6 · passed");
-  await expect(tries.getByRole("tab").first()).toContainText("of record");
-  await expect(tries.getByRole("tab").last()).toContainText("Try 1 · failed: step error");
-  await expect(page.getByRole("button", { name: /^Earlier tries/ })).toHaveCount(0);
+  await expect(tries.getByRole("tab").first()).toContainText("Try 1 · failed: step error");
+  await expect(tries.getByRole("tab").last()).toContainText("Try 6 · passed");
+  await expect(tries.getByRole("tab").last()).toContainText("of record");
+  await expect(tries.getByRole("tab").last()).toHaveAttribute("aria-selected", "true");
   await tries.getByRole("tab", { name: /Try 1 ·/ }).click();
-  await expect(sp).toContainText("Try 1 of 6");
+  await expect(tries.getByRole("tab", { name: /Try 1 ·/ })).toHaveAttribute("aria-selected", "true");
   await expect(page).toHaveURL(/[?&]try=1(&|$)/);
   await expect(page.locator(".sp-box")).toContainText("Not the latest try: try 6 passed");
 
@@ -430,21 +425,25 @@ test("try tabs: every try newest first in one row, and tries nested in the List 
   await page.goto(`/acme/scarab/runs/${RETRIES_RUN_ID}?step=1`);
   const unitTries = page.getByRole("tablist", { name: "Tries of this step" });
   await expect(unitTries.getByRole("tab")).toHaveCount(3);
-  await expect(unitTries.getByRole("tab").first()).toContainText("retried by a.kim");
+  await expect(unitTries.getByRole("tab").last()).toContainText("retried by a.kim");
 
   // The List view nests each step's tries; a try row opens that try.
   await page.getByRole("button", { name: /^List/ }).click();
   const nested = page.locator(".slist-try", { hasText: "Try 2 · failed: timed out" }).first();
   await nested.click();
-  await expect(sp).toContainText("Try 2 of 3");
+  await expect(unitTries.getByRole("tab", { name: /Try 2 ·/ })).toHaveAttribute("aria-selected", "true");
   await expect(page).toHaveURL(/[?&]try=2(&|$)/);
 
-  // A narrow screen keeps the same row; it scrolls sideways instead of
-  // turning into a dropdown.
+  // A narrow screen keeps the same strip.
   await page.setViewportSize({ width: 600, height: 900 });
   await expect(page.getByRole("tablist", { name: "Tries of this step" }).getByRole("tab")).toHaveCount(3);
-  await expect(page.getByRole("button", { name: /^Try 2 of 3/ })).toHaveCount(0);
-  await expect(sp).toContainText("Try 2 of 3");
+});
+
+// A step with one try has no try control: there is nothing to pick.
+test("a step with one try shows no try strip", async ({ page }) => {
+  await page.goto(`/acme/scarab/runs/${RETRIES_RUN_ID}?step=0`);
+  await expect(page.locator(".sp-status")).toContainText("Passed");
+  await expect(page.getByRole("tablist", { name: "Tries of this step" })).toHaveCount(0);
 });
 
 // The page polls a live run every 1.2s and its clock ticks every second.
@@ -464,7 +463,7 @@ test("a live run's polls keep focus, the open file and the step tab", async ({ p
   await page.waitForTimeout(2500);
   await expect(row).toBeFocused();
 
-  await page.getByRole("button", { name: /^Workspace try 3/ }).click();
+  await page.getByRole("button", { name: "Workspace", exact: true }).click();
   await expect(page).toHaveURL(/[?&]ptab=workspace(&|$)/);
   await page.getByRole("button", { name: /summary\.txt/ }).click();
   await expect(page.locator(".fileview")).toContainText("12 passed, 0 failed");
@@ -545,7 +544,10 @@ test("a failed first read of the events keeps the URL's version and try", async 
   await failEventReads(page, 1);
   await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}?step=1&v=1&try=1`);
   await expect(page.getByText(/Viewing version 1 of 2/)).toBeVisible();
-  await expect(page.locator(".sp-head")).toContainText("Try 1 of 1");
+  // build has one try in version 1: the status says what it did, and there
+  // is no try strip.
+  await expect(page.locator(".sp-status")).toContainText("Passed");
+  await expect(page.getByRole("tablist", { name: "Tries of this step" })).toHaveCount(0);
   await expect(page).toHaveURL(/[?&]v=1(&|$)/);
   await expect(page).toHaveURL(/[?&]try=1(&|$)/);
 });

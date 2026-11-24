@@ -1,5 +1,5 @@
-// The version selector in the run header's provenance line. A run with one
-// version reads as plain text, "Version 1 · only version". With more, it is a
+// The version selector beside the run number in the run header. A run with one
+// version shows nothing: there is nothing to pick. With more, it is a
 // dropdown, "Version 2 of 3 · latest ▾", with one row per version, newest
 // first: its outcome counts, why it exists (the trigger, or "you reran from
 // build"), who opened it and when. Picking an older version shows the run as
@@ -72,7 +72,12 @@ export default function VersionDropdown(props: {
   live: boolean;
 }) {
   const [open, setOpen] = createSignal(false);
+  // The menu opens toward the side of the trigger with room: right-aligned
+  // when a left-aligned menu would cross the window edge.
+  const [alignEnd, setAlignEnd] = createSignal(false);
   let menu: HTMLElement | undefined;
+  let trigger: HTMLButtonElement | undefined;
+  const MENU_MAX_W = 360;
   // Newest first, whatever order the caller assembled them in.
   const ordered = () => [...props.rows].sort((a, b) => b.n - a.n);
   const selected = () => props.rows.find((r) => r.isSelected) ?? ordered()[0];
@@ -98,23 +103,19 @@ export default function VersionDropdown(props: {
   };
 
   return (
-    <Show
-      when={props.rows.length > 1}
-      fallback={
-        <span class="vpick static">
-          <span class="k">Version</span> 1 · only version
-        </span>
-      }
-    >
+    <Show when={props.rows.length > 1}>
       <span class="vdrop">
         <button
           type="button"
           class="vpick"
+          ref={trigger}
           classList={{ open: open(), traveling: !viewingLatest() }}
           aria-haspopup="menu"
           aria-expanded={open()}
           title="Pick a version to see the run as it stood then"
           onClick={() => {
+            const r = trigger?.getBoundingClientRect();
+            setAlignEnd(!!r && r.left + Math.min(MENU_MAX_W, window.innerWidth * 0.9) > window.innerWidth - 8);
             setOpen((v) => !v);
             if (open()) queueMicrotask(() => menu?.querySelector<HTMLButtonElement>("[aria-checked=true]")?.focus());
           }}
@@ -128,7 +129,7 @@ export default function VersionDropdown(props: {
 
         <Show when={open()}>
           <div class="vdrop-backdrop" aria-hidden="true" onClick={() => setOpen(false)} />
-          <nav class="vdrop-menu" role="menu" aria-label="run versions" ref={menu} onKeyDown={onMenuKey}>
+          <nav class="vdrop-menu" classList={{ end: alignEnd() }} role="menu" aria-label="run versions" ref={menu} onKeyDown={onMenuKey}>
             <For each={ordered()}>
               {(row) => (
                 <button

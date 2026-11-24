@@ -118,7 +118,7 @@ import StepList from "../components/StepList";
 import VersionDropdown, { type VersionRow } from "../components/VersionDropdown";
 import StepPane, { type PaneTab } from "../components/StepPane";
 import ServicePane from "../components/ServicePane";
-import { type FilmstripTry } from "../components/AttemptsDropdown";
+import { type FilmstripTry } from "../attempts";
 import DebugShell from "../components/DebugShell";
 import RerunConfirm from "../components/RerunConfirm";
 import CancelRunConfirm from "../components/CancelRunConfirm";
@@ -246,6 +246,12 @@ export default function RunDetail() {
     return takes().find((t) => t.n === n) ?? null;
   };
   const timeTraveling = () => viewing() !== null;
+  // Pick a version from the header or the graph strip; null is the latest.
+  const pickVersion = (n: number | null) => {
+    userPicked = true;
+    setViewTake(n);
+    setFocusSidecar(null);
+  };
   // A closed version's view is a replay of the log up to the rerun that
   // closed it. Null on the latest version.
   const takeView = (): TakeView | null => {
@@ -924,6 +930,20 @@ export default function RunDetail() {
       triggerWords(),
     );
 
+  // The header badge: the run's status, or how the older version in view
+  // ended (a failed step makes it failed, a cancelled one cancelled, a step a
+  // rerun replaced superseded).
+  const shownStatus = (): string => {
+    const now = run()?.status ?? "";
+    if (!timeTraveling()) return now;
+    const st = dagSteps().map((s) => s.status);
+    if (st.some((x) => x === "failed" || x === "dead_lettered")) return "failed";
+    if (st.some((x) => x === "cancelled")) return "cancelled";
+    if (st.some((x) => x === "superseded")) return "superseded";
+    if (st.length > 0 && st.every((x) => x === "succeeded" || x === "skipped")) return "succeeded";
+    return now;
+  };
+
   // The summary line's counts, over the version in view.
   const summary = () => {
     const held: Record<string, string> = {};
@@ -1002,7 +1022,15 @@ export default function RunDetail() {
                     )}
                   </Show>
                 </h1>
-                <StatusBadge status={r().status} />
+                {/* The version picker sits beside the run number in every
+                    version, so it never moves with the length of the meta
+                    line; the badge says how the version in view ended. */}
+                <VersionDropdown
+                  rows={versions()}
+                  live={live() && !timeTraveling()}
+                  onSelect={pickVersion}
+                />
+                <StatusBadge status={shownStatus()} />
                 <Show when={live() && !timeTraveling()}>
                   <span class="live-dot" title="live">
                     <span class="dot" /> Live
@@ -1146,15 +1174,6 @@ export default function RunDetail() {
                     </span>
                   </span>
                 </Show>
-                <VersionDropdown
-                  rows={versions()}
-                  live={live() && !timeTraveling()}
-                  onSelect={(n) => {
-                    userPicked = true;
-                    setViewTake(n);
-                    setFocusSidecar(null);
-                  }}
-                />
               </div>
             </div>
 
@@ -1474,6 +1493,11 @@ export default function RunDetail() {
                     </button>
                   </span>
                   <span class="pt-count">select a step to open it below</span>
+                  <Show when={!timeTraveling() && dagSteps().some((s) => s.reused)}>
+                    <span class="pt-count">
+                      <span class="pt-dash" aria-hidden="true" /> carried over from an earlier version
+                    </span>
+                  </Show>
                   <span class="grow1" />
                   <Show when={view() === "graph"}>
                     <span class="dag-zoomctl">
@@ -1489,6 +1513,26 @@ export default function RunDetail() {
                     </span>
                   </Show>
                 </div>
+                {/* An older version: say so across the top of the graph, and
+                    what a dashed outline means there. */}
+                <Show when={viewing()}>
+                  {(v) => (
+                    <div class="dag-strip" role="status">
+                      <Icon icon="history" size={13} />
+                      <span>
+                        You are looking at <b>version {v().n} of {latestTakeN()}</b>, an older version of this run.
+                      </span>
+                      <Show when={dagSteps().some((s) => s.reused)}>
+                        <span class="ds-hint">
+                          <span class="ds-dash" aria-hidden="true" /> carried over from an earlier version
+                        </span>
+                      </Show>
+                      <button type="button" onClick={() => pickVersion(null)}>
+                        Show latest
+                      </button>
+                    </div>
+                  )}
+                </Show>
                 <Show
                   when={view() === "graph"}
                   fallback={

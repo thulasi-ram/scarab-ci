@@ -18,6 +18,27 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Enhancement
+
+- **The run graph draws fewer edges, and they no longer cross nodes.** A need that another need
+  already depends on is not drawn: when `bump` needs `meta` and `manifest/index`, and
+  `manifest/index` needs `meta`, only `manifest/index → bump` is drawn. Every edge turns in the gap
+  just before its target, so edges into one column share one line. Hovering a step lights it,
+  every step it needs (drawn or not) and the edges between them. The selected step is scrolled
+  into view when the page opens.
+- **A step carried over from an earlier version has a dashed outline at full contrast.** It was
+  drawn at half opacity, so a version where most steps were carried over looked disabled. An
+  older version no longer dims the graph either: a strip across the top of the graph says which
+  version is in view and offers the latest.
+- **The version picker sits beside the run number** and its menu opens toward the side with room;
+  it no longer moves with the length of the meta line or opens past the window edge. A run with
+  one version shows no picker. While an older version is in view, the status badge says how that
+  version ended.
+- **A step's tries are a row of numbered buttons in its header**, oldest first, coloured by
+  outcome, the selected one filled; each button's card says what the try did, how long it took,
+  why it ran and when. A step with one try shows no try control, and the Logs, Results and
+  Workspace tabs no longer repeat the try.
+
 ## [0.7.4] - 2026-11-24
 
 ### Security

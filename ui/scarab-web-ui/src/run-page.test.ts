@@ -387,13 +387,15 @@ describe("failureBox", () => {
     });
   });
 
-  it("says a passing try came after earlier failures", () => {
-    expect(failureBox({ tries, selected: 2 })).toEqual({
-      tone: "info",
-      head: "Passed on try 3 (retried by thulasi)",
-      detail: "2 earlier tries failed in this version",
-    });
+  // The header says the try passed and the try strip shows the failed ones
+  // before it; a box saying so again was the fifth place the try was named.
+  it("has nothing to add for a passing try, earlier failures or not", () => {
+    expect(failureBox({ tries, selected: 2 })).toBeNull();
     expect(failureBox({ tries: [{ outcome: "succeeded" }], selected: 0 })).toBeNull();
+  });
+
+  it("has nothing to add for a failed try with no detail: the header names the failure", () => {
+    expect(failureBox({ tries: [{ outcome: "failed", failure: "step" }], selected: 0 })).toBeNull();
   });
 
   it("names the version and try a step that did not run was reused from", () => {
@@ -416,9 +418,9 @@ describe("failureBox", () => {
     expect(
       failureBox({ tries: [{ outcome: "running" }], selected: 0, held: { text: "waiting for a node", message: "0/14 nodes" } }),
     ).toEqual({ tone: "warning", head: "Waiting for a node", detail: "0/14 nodes" });
-    expect(failureBox({ tries: [{ outcome: "failed", failure: "gate" }], selected: 0, noun: "Wait" })?.head).toBe(
-      "Wait 1 failed: gate failed",
-    );
+    expect(
+      failureBox({ tries: [{ outcome: "failed", failure: "gate", failureDetail: "rejected" }], selected: 0, noun: "Wait" })?.head,
+    ).toBe("Wait 1 failed: gate failed");
   });
 });
 

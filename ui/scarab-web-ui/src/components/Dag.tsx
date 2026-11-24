@@ -1,7 +1,10 @@
 // The run's step graph on the always-dark canvas. Steps lay out in dependency
 // layers (longest path from the roots); `needs` edges are drawn as measured
 // orthogonal connectors on an SVG under the nodes, and the edge feeding a
-// running step animates a dashed flow.
+// running step animates a dashed flow. A need that another need already
+// depends on is not drawn (`drawnNeeds`), and every edge turns in the gap just
+// before its target, so edges into one column share one vertical and never
+// cross a node. Hovering a step lights every step it needs, drawn or not.
 //
 // One node per step: its status ring, its name, a meta line ("passed on try 3
 // · 2m11s", "waiting for a node · 1m10s"), a gate or deploy icon, and a
@@ -11,7 +14,7 @@
 // shrinks, to 75% at most. Clicking a node selects it.
 import { createSignal, onMount, onCleanup, createEffect, createMemo, on, untrack, For, Index, Show } from "solid-js";
 import { isGateOpen, type GateStatus } from "../gates";
-import { layoutGroups, type DagCell, type OriginLink } from "../dag-layout";
+import { allNeeds, drawnNeeds, layoutGroups, type DagCell, type OriginLink } from "../dag-layout";
 import { columnNodeWidth, fitBand, matrixHeading, nodeMeta, segmentByMatrix } from "../run-page";
 import { shortHash } from "../libraries";
 import Icon from "./Icon";
@@ -34,8 +37,8 @@ export type DagStep = {
   attempts: number;
   /** Of those, the ones that failed ("failed 2 of 2 tries"). */
   failedTries?: number;
-  /** Time-travel only: this step was carried forward untouched by the viewed
-   * Take (0 attempts in it) — render muted, "not part of this rerun". */
+  /** This step was carried forward untouched from an earlier version (no
+   * tries in the version in view): drawn with a dashed outline. */
   reused?: boolean;
   needs: string[];
   gate?: string | null;
@@ -80,10 +83,14 @@ export type DagService = {
 // `vertical` picks the routing: `needs` flow left→right (horizontal-first),
 // while a `uses` edge drops from the top services lane (vertical-first).
 type Edge = {
+  from: string;
+  to: string;
   x1: number;
   y1: number;
   x2: number;
   y2: number;
+  /** Where a `needs` edge turns: the gap just before its target. */
+  bx: number;
   hot: boolean;
   dashed: boolean;
   vertical: boolean;
@@ -137,6 +144,9 @@ export default function Dag(props: {
   const [dragging, setDragging] = createSignal(false);
 
   const PAD = 24; // inset (px) between the graph and the band edges
+  // How far before its target an edge turns: past a library box's padding
+  // (10px) and inside the 48px gap between columns.
+  const BUS = 22;
   const MIN_Z = 0.2;
   const MAX_Z = 1.5;
   const clampZ = (z: number) => Math.min(MAX_Z, Math.max(MIN_Z, z));
@@ -182,17 +192,20 @@ export default function Dag(props: {
   function measure() {
     if (!graph) return;
     const byId = new Map(props.steps.map((s) => [s.id, s]));
+    const drawn = drawnNeeds(props.steps);
     const es: Edge[] = [];
     for (const s of props.steps) {
       const to = nodes.get(s.id);
       if (!to) continue;
       const tb = boxOf(to);
       const hot = s.status === "running";
-      for (const need of s.needs) {
+      for (const need of drawn.get(s.id) ?? s.needs) {
         const from = nodes.get(need);
         if (!from) continue;
         const fb = boxOf(from);
         es.push({
+          from: need,
+          to: s.id,
           // Left→right flow: out the RIGHT edge of the dependency, into the LEFT
           // edge of the dependent (endpoints are vertical mid-points). Unscaled
           // graph-space coords, so the zoom transform scales them onto the nodes.
@@ -200,6 +213,9 @@ export default function Dag(props: {
           y1: fb.top + fb.h / 2,
           x2: tb.left,
           y2: tb.top + tb.h / 2,
+          // Turn in the gap before the target, never between two far columns:
+          // edges into nodes with one left edge share one vertical.
+          bx: tb.left - BUS,
           // The edge glows when it feeds a running step (or a running dep).
           hot: hot || byId.get(need)?.status === "running",
           dashed: false,
@@ -222,6 +238,9 @@ export default function Dag(props: {
         if (!from) continue;
         const fb = boxOf(from);
         es.push({
+          from: `service:${name}`,
+          to: s.id,
+          bx: 0,
           x1: fb.left + fb.w / 2,
           y1: fb.bottom,
           x2: tb.left + tb.w / 2,
@@ -237,7 +256,9 @@ export default function Dag(props: {
 
   // Back to the fitted view and the top-left corner. Runs on mount, on a
   // topology change and on a width resize; never on a status poll.
-  function fit() {
+  // `revealSelected`: then scroll the selected node into view. The header's
+  // fit button passes false: it means "back to the top-left corner".
+  function fit(revealSelected = true) {
     if (!container || !graph) return;
     const cw = graph.offsetWidth;
     const ch = graph.offsetHeight;
@@ -250,6 +271,28 @@ export default function Dag(props: {
     setBandH(f.bandH);
     container.scrollLeft = 0;
     container.scrollTop = 0;
+    // After the sizer takes the new scale, or the band cannot scroll that far.
+    if (revealSelected) requestAnimationFrame(reveal);
+  }
+
+  // Scroll the band so the selected node is in view; a node already in view
+  // stays where it is.
+  function reveal() {
+    if (!container || !graph || !props.selected) return;
+    const el = nodes.get(props.selected);
+    if (!el || !el.isConnected) return;
+    const b = boxOf(el);
+    const z = scale();
+    const x = PAD + b.left * z;
+    const y = PAD + b.top * z;
+    const w = b.w * z;
+    const h = b.h * z;
+    const cw = container.clientWidth;
+    const ch = container.clientHeight;
+    if (x < container.scrollLeft || x + w > container.scrollLeft + cw)
+      container.scrollLeft = Math.max(0, x - (cw - w) / 2);
+    if (y < container.scrollTop || y + h > container.scrollTop + ch)
+      container.scrollTop = Math.max(0, y - (ch - h) / 2);
   }
 
   // Zoom to `nz` around the band's centre. The band keeps its height (a jump
@@ -307,7 +350,7 @@ export default function Dag(props: {
 
   onMount(() => {
     // Hand the zoom controls up to the panel header.
-    props.onControls?.({ fit, zoomIn, zoomOut });
+    props.onControls?.({ fit: () => fit(false), zoomIn, zoomOut });
     fitAndMeasure();
     // Re-fit on a WIDTH resize only: a height change is fit's own doing (it
     // sets the band height). A change smaller than a scrollbar is the band's
@@ -317,11 +360,11 @@ export default function Dag(props: {
       const w = container?.clientWidth ?? 0;
       if (Math.abs(w - lastW) < 24) return;
       lastW = w;
-      requestAnimationFrame(fit);
+      requestAnimationFrame(() => fit());
     });
     if (container) ro.observe(container);
     // The max band height tracks the viewport (~60vh), so re-fit on window resize.
-    const onWinResize = () => requestAnimationFrame(fit);
+    const onWinResize = () => requestAnimationFrame(() => fit());
     window.addEventListener("resize", onWinResize);
     const tick = setInterval(() => setNow(Date.now()), 1000);
     onCleanup(() => {
@@ -349,6 +392,25 @@ export default function Dag(props: {
   createEffect(() => {
     topologyKey();
     fitAndMeasure();
+  });
+  // A new selection (a deep link, the List view, a step pane link) scrolls
+  // its node into view.
+  createEffect(
+    on(
+      () => props.selected,
+      () => requestAnimationFrame(reveal),
+      { defer: true },
+    ),
+  );
+
+  // Hovering a node lights it and every step it needs, drawn or not.
+  const [hovered, setHovered] = createSignal<string | null>(null);
+  const lit = createMemo((): Set<string> | null => {
+    const h = hovered();
+    if (!h) return null;
+    const up = allNeeds(props.steps, h);
+    up.add(h);
+    return up;
   });
 
   // Re-measure EDGES (and the graph's size) when a node's box could have
@@ -411,9 +473,19 @@ export default function Dag(props: {
     return (
       <button
         class={`dnode ${s().status} ${sel() ? "sel" : ""}`}
-        classList={{ reused: !!s().reused, plugin: !!plugin(), waiting: !!plugin() && isGateOpen(s()) }}
+        classList={{
+          reused: !!s().reused,
+          plugin: !!plugin(),
+          waiting: !!plugin() && isGateOpen(s()),
+          lit: !!lit()?.has(p.s.id),
+          dim: !!lit() && !lit()!.has(p.s.id),
+        }}
         ref={(el) => nodes.set(p.s.id, el)}
         onClick={() => props.onSelect(p.s.id)}
+        onPointerEnter={() => setHovered(p.s.id)}
+        onPointerLeave={() => setHovered((h) => (h === p.s.id ? null : h))}
+        onFocus={() => setHovered(p.s.id)}
+        onBlur={() => setHovered((h) => (h === p.s.id ? null : h))}
         aria-pressed={sel()}
       >
         <span class={`dring ${s().status}`}>
@@ -426,6 +498,9 @@ export default function Dag(props: {
           </span>
           <Show when={plugin()}>
             {(o) => <span class="dnode-origin">plugin:{o().name.split("/")[0]}</span>}
+          </Show>
+          <Show when={s().reused}>
+            <span class="sr-only">, carried over from an earlier version</span>
           </Show>
           <Show when={s().addedBy}>
             {(label) => (
@@ -587,7 +662,9 @@ export default function Dag(props: {
               // Horizontal-first "circuit" (the left→right `needs` flow): out the
               // right, a mid VERTICAL jog, into the left — the engineering-
               // blueprint identity, re-oriented so depth runs along the wide axis.
-              const mx = (e.x1 + e.x2) / 2;
+              // Turn at the bus before the target; a target closer than the
+              // corner radius (a source inside the same gap) turns mid-way.
+              const mx = e.bx - r > e.x1 ? e.bx : (e.x1 + e.x2) / 2;
               const dir = e.y2 >= e.y1 ? 1 : -1;
               d =
                 Math.abs(e.y2 - e.y1) < 2
@@ -596,7 +673,15 @@ export default function Dag(props: {
                     `V ${e.y2 - r * dir} Q ${mx} ${e.y2} ${mx + r} ${e.y2} H ${e.x2}`;
             }
             return (
-              <path d={d} class={e.dashed ? "dashed" : e.hot ? "hot" : ""} fill="none" />
+              <path
+                d={d}
+                class={e.dashed ? "dashed" : e.hot ? "hot" : ""}
+                classList={{
+                  lit: !!lit()?.has(e.from) && !!lit()?.has(e.to),
+                  dim: !!lit() && !(lit()!.has(e.from) && lit()!.has(e.to)),
+                }}
+                fill="none"
+              />
             );
           }}
         </For>
