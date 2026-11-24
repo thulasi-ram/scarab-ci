@@ -18,6 +18,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-11-25
+
 ### Enhancement
 
 - **The run graph draws fewer edges, and they no longer cross nodes.** A need that another need
@@ -2489,7 +2491,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.4...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.5...HEAD
+[0.7.5]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.1...v0.7.2
