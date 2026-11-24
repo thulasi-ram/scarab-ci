@@ -8,7 +8,7 @@ import {
   columnNodeWidth,
   compactDuration,
   defaultSelection,
-  failureBox,
+  tryLine,
   failureWords,
   fitBand,
   matrixHeading,
@@ -372,55 +372,44 @@ describe("tryStatusWords", () => {
   });
 });
 
-describe("failureBox", () => {
+describe("tryLine", () => {
   const tries = [
-    { outcome: "failed", failure: "infra", failureDetail: "the node was drained", cause: "first run" },
-    { outcome: "failed", failure: "step", failureDetail: "exit 1", cause: "automatic retry" },
-    { outcome: "succeeded", cause: "retried by thulasi" },
+    { outcome: "failed", failureDetail: "the node was drained" },
+    { outcome: "failed", failureDetail: "exit 1" },
+    { outcome: "succeeded" },
   ];
 
-  it("names a failed try's class and detail, and how long it waited for a node", () => {
-    expect(failureBox({ tries, selected: 1, heldBeforeMs: 65_000 })).toEqual({
-      tone: "failed",
-      head: "Try 2 failed: step error",
-      detail: "exit 1 · unschedulable for about 1m before it started",
+  it("gives a failed try's reason, and how long it waited for a node", () => {
+    expect(tryLine({ tries, selected: 1, heldBeforeMs: 65_000 })).toEqual({
+      reason: "exit 1",
+      waited: "waited about 1m for a node",
     });
   });
 
-  // The header says the try passed and the try strip shows the failed ones
-  // before it; a box saying so again was the fifth place the try was named.
+  // The status already says the try passed and the try strip shows the failed
+  // ones before it.
   it("has nothing to add for a passing try, earlier failures or not", () => {
-    expect(failureBox({ tries, selected: 2 })).toBeNull();
-    expect(failureBox({ tries: [{ outcome: "succeeded" }], selected: 0 })).toBeNull();
-  });
-
-  it("has nothing to add for a failed try with no detail: the header names the failure", () => {
-    expect(failureBox({ tries: [{ outcome: "failed", failure: "step" }], selected: 0 })).toBeNull();
+    expect(tryLine({ tries, selected: 2 })).toEqual({});
+    expect(tryLine({ tries: [{ outcome: "failed" }], selected: 0 })).toEqual({});
   });
 
   it("names the version and try a step that did not run was reused from", () => {
-    expect(failureBox({ tries: [], selected: null, carried: { take: 2, try: 1 }, viewedTake: 3 })).toEqual({
-      tone: "info",
-      head: "Not run in version 3",
-      detail: "Reused from version 2, try 1",
+    expect(tryLine({ tries: [], selected: null, carried: { take: 2, try: 1 } })).toEqual({
+      reused: { take: 2, try: 1 },
     });
-    expect(failureBox({ tries: [], selected: null })).toBeNull();
   });
 
   // Regression: a downstream step a rerun re-armed, still pending, read as
   // "Reused from version 1". The pane passes `carried` only for a step the
-  // version reused (takes.ts `reusedOfRecord`), so a pending step has no box.
+  // version reused (takes.ts `reusedOfRecord`).
   it("has nothing to say for a step that is pending in this version", () => {
-    expect(failureBox({ tries: [], selected: null, carried: null, viewedTake: 2 })).toBeNull();
+    expect(tryLine({ tries: [], selected: null, carried: null })).toEqual({});
   });
 
-  it("shows an active condition in the warning tone, and a gate's waits as waits", () => {
+  it("gives an active condition's message as the reason", () => {
     expect(
-      failureBox({ tries: [{ outcome: "running" }], selected: 0, held: { text: "waiting for a node", message: "0/14 nodes" } }),
-    ).toEqual({ tone: "warning", head: "Waiting for a node", detail: "0/14 nodes" });
-    expect(
-      failureBox({ tries: [{ outcome: "failed", failure: "gate", failureDetail: "rejected" }], selected: 0, noun: "Wait" })?.head,
-    ).toBe("Wait 1 failed: gate failed");
+      tryLine({ tries: [{ outcome: "running" }], selected: 0, held: { text: "waiting for a node", message: "0/14 nodes" } }),
+    ).toEqual({ reason: "0/14 nodes" });
   });
 });
 

@@ -42,6 +42,9 @@ release.yml uses that version's section as the GitHub Release text. See
   try, oldest first, coloured by outcome, the selected one outlined; each try's card says what it
   did, how long it took, why it ran and when. A step with one try shows no try control, and the Logs, Results and
   Workspace tabs no longer repeat the try.
+- **The step name is a title, with one line under it on the selected try**: what it did, why it
+  failed or what holds it back, how long it waited for a node, and the step's artifacts link at
+  its end. The red box above the tabs is gone; red is only on the failure words.
 
 ## [0.7.4] - 2026-11-24
 

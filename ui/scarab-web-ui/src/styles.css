@@ -3545,35 +3545,34 @@ a.lgtog { text-decoration: none; }
 .slist-dur { font: var(--t-mono); color: var(--muted-sage); text-align: right; }
 .slist-empty { padding: 10px 14px; }
 
-/* Step header: name, try, status, files, actions. */
+/* Step header: the name, the tries and the actions; under it one line on the
+   selected try. Colour is only on the status words. */
 .sp-head {
   display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px;
-  padding: 10px 14px; border-bottom: 1px solid var(--border);
+  padding: 12px 14px 2px;
 }
-.sp-head .grow1 { flex: 1; }
-.sp-name { font: var(--t-label); color: var(--display-ink); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sp-head .grow1, .sp-line .grow1 { flex: 1 0 0; min-width: 0; }
+.sp-name { font: var(--t-title); color: var(--display-ink); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sp-cell { font: var(--t-mono); color: var(--sage); }
-.sp-status { font: var(--t-label); white-space: nowrap; color: var(--muted-sage); }
+.sp-actions { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.sp-actions .btn-sm { display: inline-flex; align-items: center; gap: 6px; }
+.sp-line {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 2px 14px 10px; border-bottom: 1px solid var(--border);
+}
+.sp-line > * { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sp-status { font: var(--t-label); flex: none; color: var(--muted-sage); }
 .sp-status.passed { color: var(--ok-ink); }
 .sp-status.failed { color: var(--danger); }
 .sp-status.running { color: var(--running-ink); }
 .sp-status.warning { color: var(--warn); }
-.sp-files { color: var(--muted-sage); }
-.sp-actions { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px; }
-.sp-actions .btn-sm { display: inline-flex; align-items: center; gap: 6px; }
-
-/* The box above the content tabs: why the try failed, what holds it back. */
-.sp-box {
-  display: grid; gap: 3px; margin: 12px 14px 0; padding: 9px 12px;
-  border: 1px solid var(--border); border-radius: var(--radius);
-  background: var(--pine-deep); overflow-wrap: anywhere;
+.sp-reason { color: var(--soft-white); flex: 0 1 auto; }
+.sp-aside { color: var(--muted-sage); flex: 0 2 auto; }
+.sp-files { flex: none; }
+@media (max-width: 640px) {
+  .sp-line { flex-wrap: wrap; }
+  .sp-reason { white-space: normal; overflow-wrap: anywhere; }
 }
-.sp-box-h { font: var(--t-label); color: var(--soft-white); }
-.sp-box-d { color: var(--sage); }
-.sp-box.failed { border-color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, var(--emerald-surface)); }
-.sp-box.failed .sp-box-h { color: var(--danger); }
-.sp-box.warning { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, var(--emerald-surface)); }
-.sp-box.warning .sp-box-h { color: var(--warn); }
 .steppane .pane-tabbar { margin-top: 10px; }
 .steppane .pane-tabbar .tabs { min-width: 0; }
 /* A content tab's scope: "try 2", "from try 3", "none". */

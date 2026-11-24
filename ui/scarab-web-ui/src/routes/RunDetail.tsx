@@ -9,7 +9,7 @@
 // - the run tabs: Pipeline, Artifacts, Activity and Manifest;
 // - in Pipeline, the step graph or the step list, then the step pane for the
 //   selected step: its header and actions, its try tabs, the selected try's
-//   failure box, and its content tabs. The step pane stays mounted while
+//   status line, and its content tabs. The step pane stays mounted while
 //   another run tab is open, so a log stream does not restart;
 // - in Artifacts, the run's files grouped by step; in Activity, its events;
 //   in Manifest, the Pipeline file it was created from, each step's result

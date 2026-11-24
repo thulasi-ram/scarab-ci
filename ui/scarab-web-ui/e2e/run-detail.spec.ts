@@ -105,10 +105,10 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   await page.getByRole("button", { name: /^build/ }).click();
   await expect(page).toHaveURL(/[?&]step=1(&|$)/);
   // With two tries the header carries a strip of numbered tries, the
-  // selected one filled; the status says what that try did. The try is named
-  // once: no summary box, no "try 2" on the content tabs.
+  // selected one filled; the status line says what that try did and nothing
+  // more for a passing try. No "try 2" on the content tabs.
   await expect(page.locator(".sp-status")).toContainText("✓ Passed in");
-  await expect(page.locator(".sp-box")).toHaveCount(0);
+  await expect(page.locator(".sp-reason")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Logs", exact: true })).toBeVisible();
   const tries = page.getByRole("tablist", { name: "Tries of this step" });
   const try1 = tries.getByRole("tab", { name: /Try 1 ·/ });
@@ -126,7 +126,7 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   await try1.click();
   await expect(try1).toHaveAttribute("aria-selected", "true");
   await expect(page.locator(".sp-status")).toContainText("Failed");
-  await expect(page.locator(".sp-box")).toContainText("Not the latest try: try 2 passed");
+  await expect(page.locator(".sp-line")).toContainText("Not the latest try: try 2 passed");
   await expect(page.getByRole("button", { name: /Debug pod/ })).toBeDisabled();
   await expect(page).toHaveURL(/[?&]try=1(&|$)/);
   // The same URL opens on the same step and try.
@@ -241,14 +241,13 @@ test("a failed matrix run names where it failed and opens on the first failure",
   const twice = page.getByRole("button", { name: /^treebo-production · aws-cluster/ });
   await expect(twice).toContainText("failed 2 of 2 tries");
 
-  // The page opens on the first root failure, with its failure box: the
-  // failure class, the executor's detail, and the wait for a node.
+  // The page opens on the first root failure. One line under the step name
+  // gives the failure class, the executor's detail and the wait for a node.
   await expect(page.locator(".sp-name")).toHaveText("plan · treebo-production · aws-cluster");
-  await expect(page.locator(".sp-status")).toContainText("✕ Failed after 2m06s: step error");
-  const box = page.locator(".sp-box");
-  await expect(box).toContainText("Try 2 failed: step error");
-  await expect(box).toContainText("Error acquiring the state lock");
-  await expect(box).toContainText("unschedulable for about 1m before it started");
+  const line = page.locator(".sp-line");
+  await expect(line.locator(".sp-status")).toHaveText("✕ Failed after 2m06s: step error");
+  await expect(line.locator(".sp-reason")).toContainText("Error acquiring the state lock");
+  await expect(line).toContainText("waited about 1m for a node");
   await expect(page.getByRole("button", { name: /^Retry step/ })).toBeVisible();
   await expect(page.getByRole("button", { name: /^Rerun from here/ })).toBeVisible();
 
@@ -430,7 +429,7 @@ test("try strip: every try oldest first in the header, and tries nested in the L
   await tries.getByRole("tab", { name: /Try 1 ·/ }).click();
   await expect(tries.getByRole("tab", { name: /Try 1 ·/ })).toHaveAttribute("aria-selected", "true");
   await expect(page).toHaveURL(/[?&]try=1(&|$)/);
-  await expect(page.locator(".sp-box")).toContainText("Not the latest try: try 6 passed");
+  await expect(page.locator(".sp-line")).toContainText("Not the latest try: try 6 passed");
 
   // unit (step 1): three tries; the third was a retry by a.kim.
   await page.goto(`/acme/scarab/runs/${RETRIES_RUN_ID}?step=1`);
