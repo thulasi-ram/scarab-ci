@@ -37,9 +37,9 @@ release.yml uses that version's section as the GitHub Release text. See
   the latest, that it is the latest). Approvals stay above the line; while an older version is
   in view they are hidden but keep their space, so switching versions never moves the page. The
   status badge says how the version in view ended. A run with one version shows no line.
-- **A step's tries are a row of numbered buttons in its header**, oldest first, coloured by
-  outcome, the selected one filled; each button's card says what the try did, how long it took,
-  why it ran and when. A step with one try shows no try control, and the Logs, Results and
+- **A step's tries are a row in its header drawn like the version line**: one numbered dot per
+  try, oldest first, coloured by outcome, the selected one outlined; each try's card says what it
+  did, how long it took, why it ran and when. A step with one try shows no try control, and the Logs, Results and
   Workspace tabs no longer repeat the try.
 
 ## [0.7.4] - 2026-11-24

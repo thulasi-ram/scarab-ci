@@ -1,7 +1,8 @@
 // The step header's tries, for a step with two or more tries in the version in
-// view: one numbered button per try, oldest first, coloured by its outcome, the
-// selected one filled. The row says at a glance what passed and failed and in
-// what order, and switches tries in one click. Hovering or focusing a button
+// view, drawn like the run's version ribbon: one numbered dot per try, oldest
+// first, coloured by its outcome and joined by a short line, the selected one
+// outlined; past RIBBON_DOTS tries, one tick each. The row says at a glance
+// what passed and failed and in what order, and switches tries in one click. Hovering or focusing a button
 // shows its card: the outcome ("Try 3 · failed: timed out"), how long it took,
 // why it exists and when it started, and "of record" on the try whose outputs
 // downstream steps read. A gate's tries are its waits, and a resolved wait says
@@ -12,9 +13,7 @@ import { causeText, type FilmstripTry } from "../attempts";
 import { compactDuration } from "../run-page";
 import { pluralNoun, tryDurationMs, tryWords, type WaitResolution } from "../run-tabs";
 import { absTime, relTime } from "../fmt";
-
-const tone = (t: FilmstripTry): string =>
-  t.outcome === "succeeded" ? "passed" : t.outcome === "failed" ? "failed" : t.outcome === "running" ? "running" : "muted";
+import { RIBBON_DOTS } from "./VersionRibbon";
 
 export default function TryStrip(props: {
   tries: FilmstripTry[];
@@ -44,7 +43,7 @@ export default function TryStrip(props: {
         {pluralNoun(props.noun)}
       </span>
       <For each={ids()}>
-        {(id) => (
+        {(id, i) => (
           <Show when={byId(id)}>
             {(t) => {
               const on = () => id === activeId();
@@ -55,19 +54,27 @@ export default function TryStrip(props: {
                   .filter(Boolean)
                   .join(" · ");
               const rec = () => id === props.ofRecord;
+              const dots = () => props.tries.length <= RIBBON_DOTS;
               return (
+                <>
+                <Show when={dots() && i() > 0}>
+                  <span class="vr-link" aria-hidden="true" />
+                </Show>
                 <button
                   type="button"
                   role="tab"
-                  class={`tstrip-b ${tone(t())}`}
-                  classList={{ on: on(), rec: rec() }}
+                  class={`tstrip-b ${dots() ? "vr-dot" : `vr-tick ${t().outcome}`}`}
+                  classList={{ rec: rec() }}
                   aria-selected={on()}
                   aria-label={[words(), dur() !== null ? compactDuration(dur()!) : "", rec() ? "of record" : "", sub()]
                     .filter(Boolean)
                     .join(", ")}
                   onClick={() => props.onSelect(id)}
                 >
-                  {t().index + 1}
+                  <Show when={dots()}>
+                    <span class={`vr-pip ${t().outcome}`} aria-hidden="true" />
+                    <span class="tstrip-n">{t().index + 1}</span>
+                  </Show>
                   <span class="tstrip-card" aria-hidden="true">
                     <span class="tstrip-l1">
                       {words()}
@@ -85,6 +92,7 @@ export default function TryStrip(props: {
                     </Show>
                   </span>
                 </button>
+                </>
               );
             }}
           </Show>
