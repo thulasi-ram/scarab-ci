@@ -75,9 +75,14 @@ struct FileArgs {
 struct LogsArgs {
     /// The run id.
     run: String,
-    #[arg(long, env = "SCARAB_SERVER", default_value = "http://localhost:8080")]
+    #[arg(
+        long,
+        env = "SCARAB_SERVER",
+        hide_env_values = true,
+        default_value = "http://localhost:8080"
+    )]
     server: String,
-    #[arg(long, env = "SCARAB_TOKEN")]
+    #[arg(long, env = "SCARAB_TOKEN", hide_env_values = true)]
     token: Option<String>,
 }
 
@@ -87,9 +92,14 @@ struct RerunArgs {
     run: String,
     /// The step to rerun (its descendants re-run too, ADR-0027).
     step: String,
-    #[arg(long, env = "SCARAB_SERVER", default_value = "http://localhost:8080")]
+    #[arg(
+        long,
+        env = "SCARAB_SERVER",
+        hide_env_values = true,
+        default_value = "http://localhost:8080"
+    )]
     server: String,
-    #[arg(long, env = "SCARAB_TOKEN")]
+    #[arg(long, env = "SCARAB_TOKEN", hide_env_values = true)]
     token: Option<String>,
 }
 
@@ -119,13 +129,18 @@ struct RunArgs {
     #[arg(long)]
     describe: bool,
     /// Base URL of the Scarab server.
-    #[arg(long, env = "SCARAB_SERVER", default_value = "http://localhost:8080")]
+    #[arg(
+        long,
+        env = "SCARAB_SERVER",
+        hide_env_values = true,
+        default_value = "http://localhost:8080"
+    )]
     server: String,
     /// Bearer token for authentication: an issued API token (`scarab_pat_…`),
     /// minted at `POST /v1/orgs/{org}/tokens`. A browser session id also works.
     /// When unset, no `Authorization` header is sent (a dev server with no
     /// session store treats callers as Owner).
-    #[arg(long, env = "SCARAB_TOKEN")]
+    #[arg(long, env = "SCARAB_TOKEN", hide_env_values = true)]
     token: Option<String>,
 }
 
@@ -548,6 +563,30 @@ fn read_data(d: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    /// `--help` prints an env-backed arg as `[env: NAME=value]` unless its
+    /// value is hidden, and `SCARAB_TOKEN` is a credential. Every env-backed
+    /// arg on every subcommand hides its value.
+    #[test]
+    fn help_never_prints_env_values() {
+        fn walk(cmd: &clap::Command, path: &str, leaks: &mut Vec<String>) {
+            for arg in cmd.get_arguments() {
+                if arg.get_env().is_some() && !arg.is_hide_env_values_set() {
+                    leaks.push(format!("{path} --{}", arg.get_id()));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), leaks);
+            }
+        }
+        let mut leaks = Vec::new();
+        walk(
+            &<super::Cli as clap::CommandFactory>::command(),
+            "scarab",
+            &mut leaks,
+        );
+        assert!(leaks.is_empty(), "env values shown in --help: {leaks:?}");
+    }
+
     #[test]
     fn rerun_names_the_step_by_its_key() {
         let detail = serde_json::json!({

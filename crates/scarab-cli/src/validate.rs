@@ -50,7 +50,7 @@ pub struct ValidateArgs {
     #[arg(long)]
     pub server: Option<String>,
     /// An API token (`scarab_pat_…`) or a session id, sent as `Bearer`.
-    #[arg(long, env = "SCARAB_TOKEN")]
+    #[arg(long, env = "SCARAB_TOKEN", hide_env_values = true)]
     pub token: Option<String>,
     /// The Org whose Policies are evaluated (with `--server`).
     #[arg(long, requires = "server")]
