@@ -2,13 +2,15 @@
 // oldest first, coloured by how it ended, the one in view marked. Up to
 // RIBBON_DOTS versions read as named dots ("v1", "v3 latest"); more read as one
 // tick per version, so a run with 100 reruns still fits on one line and a
-// failing streak shows at a glance (the row scrolls sideways past about 110
-// and keeps the one in view visible). Hovering a version names it, why it
+// failing streak shows at a glance. Either row scrolls sideways when it does
+// not fit (dots on a phone, ticks past about 110): the edge with more fades
+// and ‹ › buttons page through, and the version in view is kept visible.
+// Hovering a version names it, why it
 // exists and when; ← and → step through them. While an older version is in
 // view the line is the top edge of the page's grey frame and says so on its
 // right: read-only, and the way back to the latest. A run with one version
 // shows no line. Page chrome, so it reads the page tokens.
-import { createEffect, For, on, Show } from "solid-js";
+import { createEffect, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
 import { versionOutcome } from "../takes";
 
 /** How a version's steps landed, bucketed for its outcome. */
@@ -43,7 +45,22 @@ export type VersionRow = {
 export const RIBBON_DOTS = 8;
 
 export default function VersionRibbon(props: { rows: VersionRow[]; onSelect: (n: number | null) => void }) {
-  let ticks: HTMLDivElement | undefined;
+  let scroller: HTMLDivElement | undefined;
+  // Whether the row has more to either side, for the fades and ‹ › buttons.
+  const [more, setMore] = createSignal({ left: false, right: false });
+  const measure = () => {
+    if (!scroller) return;
+    const { scrollLeft, scrollWidth, clientWidth } = scroller;
+    setMore({ left: scrollLeft > 1, right: scrollLeft + clientWidth < scrollWidth - 1 });
+  };
+  const overflows = () => more().left || more().right;
+  const page = (dir: -1 | 1) =>
+    scroller?.scrollBy({ left: dir * Math.max(80, scroller.clientWidth * 0.8), behavior: "smooth" });
+  onMount(() => {
+    const ro = new ResizeObserver(measure);
+    if (scroller) ro.observe(scroller);
+    onCleanup(() => ro.disconnect());
+  });
   const ordered = () => [...props.rows].sort((a, b) => a.n - b.n);
   const selected = () => props.rows.find((r) => r.isSelected) ?? ordered()[ordered().length - 1];
   const older = () => !(selected()?.isLatest ?? true);
@@ -67,17 +84,19 @@ export default function VersionRibbon(props: { rows: VersionRow[]; onSelect: (n:
     );
   };
 
-  // Keep the version in view visible in a long row of ticks.
+  // Keep the version in view visible when the row scrolls, then re-measure.
   createEffect(
     on(
-      () => selected()?.n,
+      () => [selected()?.n, props.rows.length],
       () =>
         requestAnimationFrame(() => {
-          const el = ticks?.querySelector<HTMLElement>("[aria-pressed=true]");
-          if (!ticks || !el) return;
-          const r = el.getBoundingClientRect();
-          const c = ticks.getBoundingClientRect();
-          if (r.left < c.left || r.right > c.right) ticks.scrollLeft += r.left - c.left - c.width / 2;
+          const el = scroller?.querySelector<HTMLElement>("[aria-pressed=true]");
+          if (scroller && el) {
+            const r = el.getBoundingClientRect();
+            const c = scroller.getBoundingClientRect();
+            if (r.left < c.left || r.right > c.right) scroller.scrollLeft += r.left - c.left - (c.width - r.width) / 2;
+          }
+          measure();
         }),
     ),
   );
@@ -89,51 +108,80 @@ export default function VersionRibbon(props: { rows: VersionRow[]; onSelect: (n:
           Versions
         </span>
         <div class="vr-row" role="group" aria-labelledby="vr-k" onKeyDown={onKey}>
-          <Show
-            when={props.rows.length <= RIBBON_DOTS}
-            fallback={
-              <>
-                <span class="vr-end">v1</span>
-                <div class="vr-ticks" ref={ticks}>
-                  <For each={ordered()}>
-                    {(row) => (
-                      <button
-                        type="button"
-                        class={`vr-tick ${versionOutcome(row.summary)}`}
-                        data-n={row.n}
-                        aria-pressed={row.isSelected}
-                        aria-label={title(row)}
-                        title={title(row)}
-                        onClick={() => pick(row)}
-                      />
-                    )}
-                  </For>
-                </div>
-                <span class="vr-end">v{ordered().length}</span>
-              </>
-            }
+          <Show when={overflows()}>
+            <button
+              type="button"
+              class="vr-pg"
+              aria-label="Earlier versions"
+              disabled={!more().left}
+              onClick={() => page(-1)}
+            >
+              ‹
+            </button>
+          </Show>
+          <Show when={props.rows.length > RIBBON_DOTS}>
+            <span class="vr-end">v1</span>
+          </Show>
+          <div
+            class="vr-scroll"
+            classList={{ ticks: props.rows.length > RIBBON_DOTS, "more-l": more().left, "more-r": more().right }}
+            ref={scroller}
+            onScroll={measure}
           >
-            <For each={ordered()}>
-              {(row, i) => (
-                <>
-                  <Show when={i() > 0}>
-                    <span class="vr-link" aria-hidden="true" />
-                  </Show>
-                  <button
-                    type="button"
-                    class="vr-dot"
-                    data-n={row.n}
-                    aria-pressed={row.isSelected}
-                    title={title(row)}
-                    onClick={() => pick(row)}
-                  >
-                    <span class={`vr-pip ${versionOutcome(row.summary)}`} aria-hidden="true" />
-                    v{row.n}
-                    {row.isLatest ? " latest" : ""}
-                  </button>
-                </>
-              )}
-            </For>
+            <Show
+              when={props.rows.length <= RIBBON_DOTS}
+              fallback={
+                <For each={ordered()}>
+                  {(row) => (
+                    <button
+                      type="button"
+                      class={`vr-tick ${versionOutcome(row.summary)}`}
+                      data-n={row.n}
+                      aria-pressed={row.isSelected}
+                      aria-label={title(row)}
+                      title={title(row)}
+                      onClick={() => pick(row)}
+                    />
+                  )}
+                </For>
+              }
+            >
+              <For each={ordered()}>
+                {(row, i) => (
+                  <>
+                    <Show when={i() > 0}>
+                      <span class="vr-link" aria-hidden="true" />
+                    </Show>
+                    <button
+                      type="button"
+                      class="vr-dot"
+                      data-n={row.n}
+                      aria-pressed={row.isSelected}
+                      title={title(row)}
+                      onClick={() => pick(row)}
+                    >
+                      <span class={`vr-pip ${versionOutcome(row.summary)}`} aria-hidden="true" />
+                      v{row.n}
+                      {row.isLatest ? " latest" : ""}
+                    </button>
+                  </>
+                )}
+              </For>
+            </Show>
+          </div>
+          <Show when={props.rows.length > RIBBON_DOTS}>
+            <span class="vr-end">v{ordered().length}</span>
+          </Show>
+          <Show when={overflows()}>
+            <button
+              type="button"
+              class="vr-pg"
+              aria-label="Later versions"
+              disabled={!more().right}
+              onClick={() => page(1)}
+            >
+              ›
+            </button>
           </Show>
         </div>
         <Show when={older()}>
