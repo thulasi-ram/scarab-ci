@@ -68,9 +68,17 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
   await expect(page.locator(".vframe.older")).toBeVisible();
   await expect(page.locator(".vr-note")).toContainText("Version 1 of 2");
   await expect(page.locator(".dag-changes")).toContainText("in the latest (v2)");
+  // The approval bar is hidden while version 1 is in view but keeps its
+  // space, so nothing below it moves.
+  await expect(page.locator(".gate-bar.reserved")).toBeHidden();
+  const tabsTop = await page.locator(".run-tabs").evaluate((el) => el.getBoundingClientRect().top);
   await page.getByRole("button", { name: "Show latest" }).click();
   await expect(page.locator(".vframe.older")).toHaveCount(0);
-  await expect(page.locator(".dag-changes")).toHaveCount(0);
+  // The frame stays, faint, on the latest version, and so does the strip.
+  await expect(page.locator(".vframe.framed")).toBeVisible();
+  await expect(page.locator(".dag-changes")).toContainText("Latest version");
+  await expect(page.locator(".gate-bar").getByRole("button", { name: "Approve" })).toBeVisible();
+  expect(await page.locator(".run-tabs").evaluate((el) => el.getBoundingClientRect().top)).toBe(tabsTop);
 
   // ── (c) the Activity tab is newest-first ─────────────────────────────────
   await page.getByRole("tab", { name: /^Activity/ }).click();

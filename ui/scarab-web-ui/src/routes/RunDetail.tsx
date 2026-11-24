@@ -1181,10 +1181,15 @@ export default function RunDetail() {
 
             {/* ── Notice slot ── */}
             {/* Gates awaiting a decision, one row per gate: a run can suspend
-                on more than one and "approve" has to say WHICH. Hidden while
-                viewing an older version, which is read-only. */}
-            <Show when={pendingGates().length > 0 && !timeTraveling()}>
-              <div class="gate-bar">
+                on more than one and "approve" has to say WHICH. While an older
+                version is in view (read-only) the bar is hidden but keeps its
+                space, so switching versions never moves the page. */}
+            <Show when={pendingGates().length > 0}>
+              <div
+                class="gate-bar"
+                classList={{ reserved: timeTraveling() }}
+                aria-hidden={timeTraveling() ? "true" : undefined}
+              >
                 {/* Keyed by gate ID: a poll replaces every step object, and a
                     row keyed by object would re-mount an open Reject form. */}
                 <For each={pendingGateIds()}>
@@ -1324,9 +1329,14 @@ export default function RunDetail() {
             {/* A version this Run uses was yanked: say what ran, what was
                 refused, and offer a new run, which compiles against the
                 installed version. */}
-            <Show when={!timeTraveling() && yankNote(yanks(), stepList(), (ms) => new Date(ms).toLocaleTimeString())}>
+            <Show when={yankNote(yanks(), stepList(), (ms) => new Date(ms).toLocaleTimeString())}>
               {(note) => (
-                <div class="rd-toast rd-yank" role="status">
+                <div
+                  class="rd-toast rd-yank"
+                  classList={{ reserved: timeTraveling() }}
+                  aria-hidden={timeTraveling() ? "true" : undefined}
+                  role="status"
+                >
                   <Icon icon="ban" size={13} /> <span>{note()}</span>
                   <button
                     class="btn btn-primary btn-sm"
@@ -1361,7 +1371,7 @@ export default function RunDetail() {
                 everything below it, which is the run as it stood then and
                 read-only. The notices above (approvals first) stay outside:
                 they act on the present. */}
-            <div class="vframe" classList={{ older: timeTraveling() }}>
+            <div class="vframe" classList={{ framed: versions().length > 1, older: timeTraveling() }}>
             <VersionRibbon rows={versions()} onSelect={pickVersion} />
             {/* ── Summary line ── */}
             <div class="rd-summary" aria-label="Run summary">
@@ -1490,11 +1500,6 @@ export default function RunDetail() {
                     </button>
                   </span>
                   <span class="pt-count">select a step to open it below</span>
-                  <Show when={!timeTraveling() && dagSteps().some((s) => s.reused)}>
-                    <span class="pt-count">
-                      <span class="pt-dash" aria-hidden="true" /> carried over from an earlier version
-                    </span>
-                  </Show>
                   <span class="grow1" />
                   <Show when={view() === "graph"}>
                     <span class="dag-zoomctl">
@@ -1510,14 +1515,18 @@ export default function RunDetail() {
                     </span>
                   </Show>
                 </div>
-                {/* An older version: the frame says it is older and read-only;
-                    this strip says what it did differently from the latest
-                    and what a dashed outline means. */}
-                <Show when={timeTraveling() ? changes() : null}>
+                {/* A run with more than one version: on an older version, what
+                    it did differently from the latest; on the latest, that it
+                    is the latest. Both say what a dashed outline means. Shown
+                    in both, so switching versions never moves the graph. */}
+                <Show when={versions().length > 1 ? changes() : null}>
                   {(c) => (
                     <div class="dag-changes" role="status">
+                      <Show when={!timeTraveling()}>
+                        <span class="dc-same">Latest version</span>
+                      </Show>
                       <Show
-                        when={c().changes.length > 0}
+                        when={!timeTraveling() || c().changes.length > 0}
                         fallback={<span class="dc-same">Same outcomes as the latest (v{latestTakeN()})</span>}
                       >
                         <For each={c().changes.slice(0, 3)}>

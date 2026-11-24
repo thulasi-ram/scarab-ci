@@ -3192,21 +3192,35 @@ a.lgtog { text-decoration: none; }
 
 
 /* ── The version frame and ribbon ─────────────────────────────────────────
-   The ribbon is one thin line of the run's versions under the notices. While an
-   older version is in view it is the top edge of an amber frame around the
-   rest of the page: the frame is the only amber on it. */
+   A run with more than one version gets a frame around the page below the
+   notices, its top edge the ribbon of versions. On the latest version the
+   frame is faint; on an older one it turns amber (the only amber on the
+   page). Its size never changes, so switching versions only changes colour. */
 /* A plain block: its children keep the spacing they had on the page. */
 .vframe { min-width: 0; }
 .vframe > .vribbon { margin-bottom: 12px; }
-.vframe.older {
-  border: 2px solid var(--border-warn); border-radius: 12px;
+.vframe.framed {
+  border: 2px solid color-mix(in srgb, var(--border) 55%, transparent); border-radius: 12px;
   padding: 0 14px 14px; overflow: hidden;
+  transition: border-color 0.25s var(--ease-out);
 }
-.vframe.older > .vribbon {
+.vframe.framed > .vribbon {
   margin: 0 -14px 12px; border: 0; border-radius: 0;
-  border-bottom: 1px solid var(--border-warn);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+  background: color-mix(in srgb, var(--emerald-surface) 60%, transparent);
+  transition: background 0.25s var(--ease-out), border-color 0.25s var(--ease-out);
+}
+.vframe.framed.older { border-color: var(--border-warn); }
+.vframe.framed.older > .vribbon {
+  border-bottom-color: var(--border-warn);
   background: color-mix(in srgb, var(--warn) 12%, var(--emerald-surface));
 }
+@media (prefers-reduced-motion: reduce) {
+  .vframe.framed, .vframe.framed > .vribbon { transition: none; }
+}
+/* A notice that only acts on the latest version keeps its space, hidden,
+   while an older version is in view, so the page below never moves. */
+.gate-bar.reserved, .rd-toast.reserved { visibility: hidden; }
 .vribbon {
   display: flex; align-items: center; gap: 12px; min-height: 40px; padding: 0 14px;
   background: var(--emerald-surface); border: 1px solid var(--border); border-radius: var(--radius);
@@ -3255,8 +3269,8 @@ a.lgtog { text-decoration: none; }
 .vr-latest:hover { border-color: var(--warn); }
 @media (max-width: 640px) {
   /* A phone keeps only the frame's left edge: padding there costs the page. */
-  .vframe.older { border-width: 0 0 0 3px; border-radius: 0; padding: 0 0 12px 10px; }
-  .vframe.older > .vribbon { margin: 0 0 12px -10px; flex-wrap: wrap; padding: 6px 10px; }
+  .vframe.framed { border-width: 0 0 0 3px; border-radius: 0; padding: 0 0 12px 10px; }
+  .vframe.framed > .vribbon { margin: 0 0 12px -10px; flex-wrap: wrap; padding: 6px 10px; }
   .vr-note { white-space: normal; }
 }
 
@@ -3276,10 +3290,6 @@ a.lgtog { text-decoration: none; }
 .dc-sep { margin: 0 6px; }
 .ds-dash {
   display: inline-block; width: 18px; height: 10px; vertical-align: -1px;
-  border: 1px dashed currentColor; border-radius: 2px;
-}
-.pt-dash {
-  display: inline-block; width: 16px; height: 9px; vertical-align: -1px; margin-right: 2px;
   border: 1px dashed currentColor; border-radius: 2px;
 }
 /* Backdrop: a transparent full-viewport click-catcher beneath an open menu

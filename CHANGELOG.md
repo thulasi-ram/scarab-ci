@@ -31,10 +31,12 @@ release.yml uses that version's section as the GitHub Release text. See
 - **A run's versions are one thin line under the notices, replacing the version dropdown.** Each
   version is a dot coloured by how it ended (one tick each past 8, so 100 versions still fit on
   one line); hovering names it, ← and → step through them. While an older version is in view, the
-  line is the top edge of an amber frame around the rest of the page, which says it is read-only
-  and offers the latest; the graph is no longer dimmed, and a strip above it says what that
-  version did differently from the latest. Approvals stay above the line. The status badge says
-  how the version in view ended. A run with one version shows no line.
+  line is the top edge of a frame around the rest of the page: faint on the latest version, amber
+  on an older one, where it says the version is read-only and offers the latest. The graph is no
+  longer dimmed, and a strip above it says what that version did differently from the latest (on
+  the latest, that it is the latest). Approvals stay above the line; while an older version is
+  in view they are hidden but keep their space, so switching versions never moves the page. The
+  status badge says how the version in view ended. A run with one version shows no line.
 - **A step's tries are a row of numbered buttons in its header**, oldest first, coloured by
   outcome, the selected one filled; each button's card says what the try did, how long it took,
   why it ran and when. A step with one try shows no try control, and the Logs, Results and
