@@ -3227,12 +3227,12 @@ a.lgtog { text-decoration: none; }
   font: var(--t-body);
 }
 .vr-k { color: var(--muted-sage); flex: none; }
-.vr-row { display: flex; align-items: center; gap: 6px; min-width: 0; flex: 0 1 auto; }
-.vr-link { width: 20px; height: 1px; background: var(--border); flex: none; }
+.vr-row { display: flex; align-items: center; gap: 2px; min-width: 0; flex: 0 1 auto; }
+.vr-link { width: 10px; height: 1px; background: var(--border); flex: none; }
 .vr-dot {
   display: inline-flex; align-items: center; gap: 6px; flex: none;
   font: var(--t-body); color: var(--soft-white); white-space: nowrap;
-  background: transparent; border: 0; border-radius: 999px; padding: 2px 9px; cursor: pointer;
+  background: transparent; border: 0; border-radius: 999px; padding: 2px 7px; cursor: pointer;
 }
 .vr-dot:hover { background: color-mix(in srgb, var(--sage) 12%, transparent); }
 .vr-dot[aria-pressed="true"] { font: var(--t-label); box-shadow: inset 0 0 0 1px var(--emerald); }
