@@ -578,8 +578,9 @@ The server collects results when it has a results token secret: the chart value
 `secrets.resultsTokenSecret`, or a `SCARAB_RESULTS_TOKEN_SECRET` key in `secrets.existingSecret`
 ([Environment variables](/scarab-ci/usage/environment-variables/#server-configuration)). A build with `push: false` and a fork pull
 request's push step exit 0 before this check. The multi-architecture build library and the image
-index library's `layouts` need results too: without them the push step has no layout to read and
-refuses.
+index library's `layouts` need results too: without them the push step fails with
+`scarab: index refused: results are not collected, so the layouts' digests cannot be checked
+against the builds'; …`, which names the same secret.
 
 - **The registry credential.** Only the push step asks for `registry_auth: true`. It receives a
   credential only when the org trusts the library's source with the registry credential
@@ -714,7 +715,7 @@ Its inputs:
 | Input | Default | What it is |
 |---|---|---|
 | `image` | (required) | The tag to push the index to, such as `ghcr.io/acme/app:1.2.0`. It must name a tag, and no digest. |
-| `platforms` | `linux/amd64,linux/arm64` | The platforms to build, `linux/<architecture>[/<variant>]`, separated by commas or spaces. The architecture is one of `386`, `amd64`, `arm`, `arm64`, `loong64`, `mips`, `mipsle`, `mips64`, `mips64le`, `ppc64`, `ppc64le`, `riscv64` and `s390x`; the variant `v5` to `v8` for `arm`, or `v2` to `v4` for `amd64`. Write it as text: the build steps are made when the Pipeline compiles, before any `${{ }}` has a value, so a template here is a compile error. |
+| `platforms` | `linux/amd64,linux/arm64` | The platforms to build, separated by commas or spaces: `linux/amd64`, `linux/amd64/v2` to `v4`, `linux/arm/v5` to `v8`, `linux/arm64`, `linux/loong64`, `linux/ppc64`, `linux/ppc64le`, `linux/riscv64` or `linux/s390x`. 32-bit arm is written with its variant (`linux/arm/v7`). `linux/386` and the mips platforms are not offered: the check that a build runs on a node of its architecture cannot tell them apart. Write it as text: the build steps are made when the Pipeline compiles, before any `${{ }}` has a value, so a template here is a compile error. |
 | `extra_tags` | empty | More tags for the index, in `image`'s repository: tag names such as `latest`, not references, separated by spaces or line breaks. A tag named twice, or the same as `image`'s, is written once. |
 | `arch_tags` | `true` | Also tag each platform's image: `<tag>-amd64`, `<tag>-arm64`. |
 | `context`, `dockerfile`, `build_args`, `cache`, `cache_bucket`, `cache_region`, `cache_name` | as in the build library | The build library's inputs, with the same rules ([Building an image](#building-an-image)). Every build uses them, except that each build keeps its own layer cache: `<cache_name>-amd64`, `<cache_name>-arm64`, `<cache_name>-arm-v7` (`buildkit-amd64` and so on when `cache_name` is empty). |
@@ -741,9 +742,10 @@ the index, as crane reported the push. Deploy by `outputs.app.push.digest`.
 - **The push step needs disk for every layout.** Its Pod receives every build's workspace: the
   checkout they received and every image layout. Size its node's ephemeral storage for all of
   it.
-- **It needs step results.** The push step reads each build's layout from its `image` result.
-  With no results collected, every line is missing and the push step refuses
-  ([`push: true` needs step results](#building-an-image)).
+- **It needs step results.** The push step reads each build's layout from its `image` result. With
+  no results collected it refuses (exit 2) with `scarab: index refused: results are not collected,
+  …`, which names the results token secret ([`push: true` needs step
+  results](#building-an-image)).
 - **A fork pull request**, or a Run locked out of its Environment's secrets, gets no registry
   credential, and Scarab sets `SCARAB_FORK_PR=true` on every step. The builds run, export no
   layer cache and write no layout; the push step pushes nothing, exits 0 and publishes no `push`
@@ -940,6 +942,11 @@ or layouts and empty lines. A line written as `${{ outputs.amd64.push.ref }}` do
 when the build pushed nothing, and the index step fails before it launches. The steps that read
 `outputs.app.index` need `when: "event.kind == 'push'"`, or another condition that keeps them off
 a fork's Run.
+
+`layouts` needs the server to collect step results, since each line's digest comes from a build's
+result. With `layouts` set and no results collected, the step fails (exit 2) with `scarab: index
+refused: results are not collected, …`, which names the results token secret ([`push: true` needs
+step results](#building-an-image)). `images` alone does not need results.
 
 The step asks for `registry_auth: true` and is the library's only step, so a profile marked
 `registry_auth_only` (an ECR push role, say) can be named in a plain list:
@@ -1158,17 +1165,25 @@ wins), and never to a gate. `placement_profiles` never applies to a step with `f
 of the library to a list, which applies to that step only
 (`placement_profiles: { image: [arm64], push: [ecr-push] }`). A map key that is not a step of the
 library, or names a step with `forge_token` or with its own `placement_profiles`, is a compile
-error; a key naming a nested invoke applies to every step it inlines.
+error; a key naming a nested invoke applies to every step it inlines. Its `when` is ANDed with the `when` of every inlined step and gate.
+Any other field, `env` included, is a compile error on an invoke step.
 
 For a matrix step the library writes itself, a key may name a coordinate,
 `"<step>[<dimension>=<value>]"` (several pairs separated by `,`), and places each instance whose
 coordinate matches every pair. The value is written as the matrix holds it
-(`"build[arch=linux/arm64]"`). A plain key for the same step places the instances no coordinate
-key names. The compiler checks each key against the library's matrix when it inlines the
-invoke, and refuses a dimension or value the matrix does not have, two keys that could name one
-instance, and a key whose instances `exclude` removes. Each compiled step still holds a plain
-list of profiles, so Policies and admission see what they saw before. Its `when` is ANDed with the `when` of every inlined step and gate.
-Any other field, `env` included, is a compile error on an invoke step.
+(`"build[arch=linux/arm64]"`). Each instance takes the coordinate key that names it, else the
+plain key for its step, else the list an outer invoke gives when the library is itself invoked
+from another library. The compiler checks each key against the library's matrix when it inlines
+the invoke, and refuses a dimension or value the matrix does not have, two keys that could name
+one instance, and a key whose instances `exclude` removes. Each compiled step still holds a
+plain list of profiles, so Policies and admission see what they saw before.
+
+**Step ids beside an invoke.** An invoke's steps are named `<invoke id>/<step>`, so no other step
+at the same level may have an id that starts with `<invoke id>/`, or the invoke's own id. A
+step `app/build` written beside `invoke` `app` is a compile error: it would read as one of the
+library's steps, and the library would take its results as its own. A `[` or `]` in a step id
+must pair, since Scarab reads `[…]` as a matrix coordinate when it splits an inlined step's
+name.
 
 **Installed libraries are closed.** A `lib:` library may invoke only `lib:` and `plugin:`
 targets, never `file:`, so a repository cannot change the steps of a library its org installed.

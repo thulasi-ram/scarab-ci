@@ -371,8 +371,10 @@ the whole of it at install.
 instances of `build`. After the upgrade, a Pipeline whose invoke names `amd64:` or `arm64:` in its
 placement map fails to compile, and the error names the coordinate key to write
 (`"build[arch=linux/amd64]"`). Change the Pipelines that invoke it in the same change as the
-upgrade, or upgrade first and fix each Pipeline the error names. The library also needs a server
-that compiles to IR version 4 ([below](#a-matrix-from-an-input)).
+upgrade, or upgrade first and fix each Pipeline the error names. Upgrade every server replica
+before you upgrade the library: an older server cannot parse its matrix and refuses each Run
+that invokes it ([below](#a-matrix-from-an-input)). To roll the server back, first put the
+library back to its earlier version.
 
 The push step runs as uid 1000. The library pins the same BuildKit and crane images as the build
 library, by digest.
@@ -485,7 +487,10 @@ steps:
 ```
 
 - **The dimension is exactly `${{ inputs.<name> }}`**, as a quoted string. The input must be a
-  declared `string`. Its value is split on commas and whitespace, with empty pieces dropped and
+  declared `string` with a `default:`. An installed library is checked when it is installed,
+  with no caller, and the default gives the matrix real values to expand and check against
+  `validate:`; an input a matrix reads with no default is a compile error. A default that holds
+  `${{` is refused too. Its value is split on commas and whitespace, with empty pieces dropped and
   the order kept, so `"linux/amd64, linux/arm64"` gives two instances,
   `build[arch=linux/amd64]` and `build[arch=linux/arm64]`. `${{ matrix.arch }}` in the step reads
   one value.
@@ -517,15 +522,19 @@ own steps see no change. Results are text a step wrote, so they
 reach a step only through `env:`, as every result does.
 
 **`join`.** `<list>.join()` and `<list>.join(<separator>)` join a list of strings; any other
-element is an error when the step launches. It works in any `${{ }}`. In a YAML single-quoted
+element is an error when the step launches. It works in every Pipeline and library expression:
+`${{ }}`, `when:`, `validate:` and a matrix `exclude`. Policies do not have it. In a YAML single-quoted
 string, write the separator as `"\n"` so CEL reads a line break. `size`, `map` and `has` are
 standard CEL.
 
-**IR version 4.** A Pipeline whose steps read a list of instances, or that calls `join` in any
-expression (a template, a `when:`, a `validate:`), compiles to IR version 4. A server that knows only versions up to 3 refuses to launch
-a step of such a Run ("this Run was compiled for IR version 4; this server understands versions
-up to 3"). The chart's default `Recreate` strategy stops every old server before a new one starts;
-with a rolling update, rerun such a step once every replica runs the new version.
+**IR version 4.** A Pipeline whose steps read a list of instances, or that calls `join` in a
+template, a `when:` or a `validate:`, compiles to IR version 4. A server that knows only versions
+up to 3 refuses to launch a step of such a Run ("this Run was compiled for IR version 4; this
+server understands versions up to 3"). Not everything is covered by the version: a 0.7.7 server
+fails a trigger `when:` or a matrix `exclude` that calls `join` before any Run exists, and cannot
+parse a matrix dimension written as an input. So upgrade every server replica first, then
+upgrade libraries that use these features and start calling `join`. Redeliver the webhook, or
+rerun, for anything that failed in between.
 
 **Placement per instance.** A caller places each instance with a coordinate key in the
 invoke's `placement_profiles` map, `"build[arch=linux/arm64]": [arm64-builders]`

@@ -20,6 +20,13 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Breaking changes
 
+- **Order: servers first, then libraries and `join`.** Upgrade every server replica before an org
+  admin upgrades `build-multiarch`, and before any file calls `join`. A 0.7.7 server cannot parse
+  the new `build-multiarch` (a matrix dimension written as text), so a Run that invokes it is
+  refused at creation there; and it fails a trigger `when:` that calls `join`, so that delivery
+  makes no Run. Redeliver the webhook, or rerun, once every replica is upgraded. To roll back to
+  0.7.7, first put the library back to its earlier version. See the chart README, "Upgrading from
+  0.7.7".
 - **The build library's push step refuses when the server collects no step results** (#219).
   After an org upgrades `lib:thulasi-ram::scarab-ci::build`, a build with `push: true` on a
   server with no results token secret fails (exit 2) with `scarab: push refused: results are not
@@ -27,7 +34,9 @@ release.yml uses that version's section as the GitHub Release text. See
   value secrets.resultsTokenSecret)`. Earlier versions pushed without checking the layout
   against the build step's digest, and logged a warning. Set `secrets.resultsTokenSecret` (or a
   `SCARAB_RESULTS_TOKEN_SECRET` key in `secrets.existingSecret`) before you upgrade the library.
-  See the chart README, "Upgrading from 0.7.7", and
+  `build-multiarch` and `image-index` with `layouts`, which needed results already, now fail with
+  `scarab: index refused: results are not collected, …`, which names the same secret. See the
+  chart README, "Upgrading from 0.7.7", and
   [Building an image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#building-an-image).
 - **`build-multiarch` refuses its old `amd64:` and `arm64:` placement keys.** Its two fixed build
   steps are now one matrix step, `build`, with an instance per platform. After an org upgrades
@@ -36,10 +45,17 @@ release.yml uses that version's section as the GitHub Release text. See
   `"build[arch=linux/arm64]"`. Step ids change from `app/amd64` to
   `app/build[arch=linux/amd64]`. See
   [Building a multi-architecture image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#building-a-multi-architecture-image).
-- **Pipelines that use the new matrix features, or call `join` in any expression, compile to IR
-  version 4**, which a 0.7.7 server refuses to launch. The chart's default `Recreate` strategy stops every old server first; with
-  a rolling update, rerun a step that failed with "this Run was compiled for IR version 4" once
-  every replica is upgraded. See the chart README, "Upgrading from 0.7.7".
+- **Pipelines that use the new matrix features, or call `join` in a template, `when:` or
+  `validate:`, compile to IR version 4**, which a 0.7.7 server refuses to launch. The chart's
+  default `Recreate` strategy stops every old server first; with a rolling update, rerun a step
+  that failed with "this Run was compiled for IR version 4" once every replica is upgraded. See
+  the chart README, "Upgrading from 0.7.7".
+- **A step id may not start with `<invoke id>/` of an invoke beside it.** A step `app/build`
+  written beside `invoke` `app` read as one of the library's steps, and the library took its
+  results as its own; it is now a compile error. See
+  [Reuse: `invoke`](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#reuse-invoke).
+- **A `[` or `]` in a step id must pair.** Scarab reads `[…]` as a matrix coordinate when it
+  splits an inlined step's name, so an unpaired bracket is now a compile error.
 
 ### Security
 
@@ -90,26 +106,28 @@ release.yml uses that version's section as the GitHub Release text. See
   variant, `<tag>-arm-v7`. Two images that differ only by `arm64` and `arm64/v8` are one platform
   and are refused, `images` sources included. See
   [Joining images into one multi-architecture image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#joining-images-into-one-multi-architecture-image).
-
 - **`build-multiarch` builds the platforms you name.** A new `platforms` input, default
-  `linux/amd64,linux/arm64`, takes `linux/<architecture>[/<variant>]` values separated by commas
-  or spaces (386, amd64, arm, arm64, loong64, mips, mipsle, mips64, mips64le, ppc64, ppc64le,
-  riscv64, s390x). Each platform gets its own build step, `app/build[arch=linux/arm64]`, routed
-  with a coordinate key in `placement_profiles`, and the one push step joins them all. A build
-  step on a node of another architecture fails before BuildKit starts, with a message that names
-  the placement. See
+  `linux/amd64,linux/arm64`, takes platforms separated by commas or spaces: `linux/amd64` (and
+  `/v2` to `/v4`), `linux/arm/v5` to `v8`, `linux/arm64`, `linux/loong64`, `linux/ppc64`,
+  `linux/ppc64le`, `linux/riscv64` and `linux/s390x`. 32-bit arm is written with its variant;
+  `linux/386` and mips are not offered, because the node check cannot tell them apart. Each
+  platform gets its own build step, `app/build[arch=linux/arm64]`, routed with a coordinate key in
+  `placement_profiles`, and the one push step joins them all. A build step on a node of another
+  architecture fails before BuildKit starts, with a message that names the placement. See
   [Building a multi-architecture image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#building-a-multi-architecture-image).
 - **An invoke places each instance of a library's matrix step.** The map form of
   `placement_profiles` takes coordinate keys, `"build[arch=linux/arm64]": [arm64-builders]`,
-  checked when the invoke is inlined. A plain key for the step places the instances no
-  coordinate key names. Each compiled step still holds a plain list, so Policies and admission
-  see no change. See
+  checked when the invoke is inlined. An instance no coordinate key names takes the plain key for
+  its step, then the list an outer invoke gives. Each compiled step still holds a plain list, so
+  Policies and admission see no change. See
   [Reuse: `invoke`](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#reuse-invoke).
 - **A library's matrix can take its values from an input.** A library step's dimension may be
-  exactly `${{ inputs.<name> }}`, a `string` input whose comma- or space-separated value the
-  caller writes in `with:` (a template there is a compile error, since the matrix expands when
-  the Pipeline compiles). Another step of the library reads every instance as a list of
-  `{matrix, results}`, and the new CEL function `join` joins a list of strings. See
+  exactly `${{ inputs.<name> }}`, a `string` input with a default, whose comma- or
+  space-separated value the caller writes in `with:` (a template there is a compile error, since
+  the matrix expands when the Pipeline compiles). Another step of the library reads every
+  instance as a list of `{matrix, results}`, and the new CEL function `join` joins a list of
+  strings in any Pipeline or library expression (`${{ }}`, `when:`, `validate:`, `exclude`);
+  Policies do not have it. See
   [Libraries: a matrix from an input](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#a-matrix-from-an-input).
 
 ### Enhancement

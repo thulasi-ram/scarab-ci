@@ -59,9 +59,12 @@ steps:
   binding: the caller's literal `with:` value, or the input's default. The value is split on
   commas and whitespace, empty pieces are dropped, and the order is kept.
 - **A template is refused.** A `with:` value that holds `${{ }}` has a value only when a Step
-  launches, after the matrix has expanded. The compiler refuses it with a message that says so.
-  This also means a library that invokes this one cannot forward its own input to the
-  dimension.
+  launches, after the matrix has expanded. The compiler refuses it with a message that says so,
+  and refuses a default that holds `${{` the same way. This also means a library that invokes
+  this one cannot forward its own input to the dimension.
+- **The input must have a default.** An installed library is compiled when it is installed, with
+  no caller; the default gives the matrix real values to expand and check against `validate:`.
+  An input a matrix reads with no default is refused, in `lib:` and `file:` libraries alike.
 - **The input must be a declared `string`.** A boolean or number is refused. A YAML list is
   still a literal list, and `["${{ inputs.x }}"]` is still refused, as before.
 - **The values are checked** before they become Step ids: no `[`, `]`, `,`, `=`, control
@@ -90,9 +93,10 @@ itself:
 ```
 
 - A coordinate key places each instance whose coordinate matches all its pairs; it may name
-  any subset of the dimensions. A plain key `build` places the instances no coordinate key
-  names. An instance with neither gets no list from the invoke (the operator's default
-  applies).
+  any subset of the dimensions. An instance takes, in this order: the coordinate key that names
+  it, the plain key `build`, then the list an outer invoke gives (when the library is itself
+  invoked from another library). An instance with none of them gets no list (the operator's
+  default applies).
 - **Checked at inlining**: the step exists, is a matrix Step of this library (not a nested
   invoke), each dimension exists and each value is one of its values. Two keys that could name
   one instance are refused. A key that names nothing gets a hint: `amd64:` on `build-multiarch`
@@ -104,8 +108,8 @@ itself:
 - A key whose instances `exclude` removes is refused at expansion.
 - The existing refusals (a Step with `forge_token`, a Step with its own `placement_profiles`)
   apply to coordinate keys too. Through nesting, an instance placed by an inner invoke's
-  coordinate key keeps that placement; an outer invoke's list does not override it, the same
-  rule as "the library's own value wins".
+  coordinate or plain key keeps that placement; an outer invoke's list fills only the instances
+  the inner invoke leaves unplaced, the same rule as "the library's own value wins".
 
 ### 3. A library Step reads a matrix Step's instances as a list
 
@@ -126,7 +130,8 @@ Steps see no change.
 CEL gains one function, `join`: `<list>.join()` and `<list>.join(<separator>)`, on a list of
 strings. cel 0.15's strings extension has a `join` but is not enabled, and enabling it adds
 other functions too; Scarab registers only `join`, written in `scarab-pipeline`, with no new
-dependency. `size`, `map` and `has` are standard CEL.
+dependency. It works in every Pipeline and library expression: `${{ }}`, `when:`, `validate:`
+and a matrix `exclude`. Policies do not have it. `size`, `map` and `has` are standard CEL.
 
 Values read from results are text a build wrote. They reach a Step only through `env:`, as
 every result does (0041).
@@ -144,12 +149,14 @@ and sets `SCARAB_INDEX_LAYOUT_COUNT` to `${{ size(outputs.build) }}`.
 
 ### 4. IR version 4, and a rolling upgrade
 
-A compiled Pipeline is IR version 4 when a Step's scope lists a matrix Step's instances, or any
-expression it stores calls `join`: a `${{ }}` in a template (a Step's image, command or env, a
-caller's `with:` in a scope, `concurrency.group`) or a whole expression (a Step's or trigger's
-`when:`, a guard, a `validate:`). A server that predates `join` then refuses the Run by its
-version instead of failing on the expression. Otherwise its version is decided as before. Runs
-stored at versions 1 to 3 load and render unchanged. The stored scope gains one variant, `{"instances": [{"step", "matrix"}]}`.
+A compiled Pipeline is IR version 4 when a Step's scope lists a matrix Step's instances, or a
+stored expression calls `join`: a `${{ }}` span in any string of the IR, or one of the fields
+evaluated whole (a Step's `when:`, an invoke's guard, a trigger's `when:`, an input's or a
+binding's `validate:`). A command, env value or name that only looks like CEL does not raise the
+version. For a Step's `when:`, a guard, a `validate:` and a template, a server that predates
+`join` then refuses the Run by its version instead of failing on the expression. Otherwise the
+version is decided as before. Runs stored at versions 1 to 3 load and render unchanged. The stored
+scope gains one variant, `{"instances": [{"step", "matrix"}]}`.
 
 A server that knows versions up to 3 refuses to launch a Step of a version-4 Run, with the
 config failure "this Run was compiled for IR version 4; this server understands versions up to
@@ -157,17 +164,42 @@ config failure "this Run was compiled for IR version 4; this server understands 
 server before a new one starts. With a rolling update, a Step of a version-4 Run that an old
 replica launches fails that way; rerun it once every replica runs the new version.
 
+The version does not cover everything. A trigger's `when:` and a matrix `exclude` are evaluated
+from the file, before any version exists: a 0.7.7 replica fails that evaluation and makes no Run
+for the delivery it handles. A 0.7.7 replica that compiles a file calling `join` stores it
+without version 4, and a 0.7.7 replica then fails the launch on the expression. A 0.7.7 replica
+cannot parse the new `build-multiarch` (a matrix dimension written as text), so it refuses a Run
+that invokes it at creation. The order is therefore: upgrade every server replica first, then
+upgrade `build-multiarch` and start calling `join` or reading instance lists; redeliver the
+webhook, or rerun, for anything that failed in between. To roll back to 0.7.7, first put the
+library back to its earlier version.
+
 ### 5. Platforms are spelled `linux/amd64`
 
 `build-multiarch` takes `platforms`, a string, default `"linux/amd64,linux/arm64"`, validated
-against `linux/<architecture>[/<variant>]` for the architectures BuildKit builds on Linux. The
-`linux/` prefix leaves room for another os later without renaming the values Pipelines already
-use. The library has one matrix Step, `build`, and one push Step, `push`, with
-`inputs: [build]`.
+against the platforms the node check (§6) can decide: `linux/amd64`, `linux/amd64/v2` to `v4`,
+`linux/arm/v5` to `v8`, `linux/arm64`, `linux/loong64`, `linux/ppc64`, `linux/ppc64le`,
+`linux/riscv64` and `linux/s390x`. Three are left out on purpose. `linux/386`: an x86_64 node
+reports `x86_64`, so no node passes the check. The four mips names: `uname -m` does not tell the
+byte order, so the check would pass the wrong one. Bare `linux/arm`: BuildKit builds it as
+`arm/v7`, so `linux/arm,linux/arm/v7` built two images of one platform and failed at the push;
+32-bit arm is written with its variant. The `linux/` prefix leaves room for another os later
+without renaming the values Pipelines already use. The library has one matrix Step, `build`, and
+one push Step, `push`, with `inputs: [build]`.
 
 The `/` puts a `/` inside a Step id: `app/build[arch=linux/amd64]`. Code that took the invoke
 prefix as everything before the last `/` read `app/build[arch=linux` as the prefix. The
-compiler and the web UI now split an id at the last `/` outside its brackets.
+compiler and the web UI now split an id at the last `/` outside its brackets. Two id rules make
+that split and the instance lists hold:
+
+- **`[` and `]` in a Step id must pair**, in a Pipeline or a library, for a Step as written and
+  for each instance of a matrix on an invoke. An unpaired bracket made the split misname Steps.
+- **A Step id may not start with `<invoke id>/` of an invoke beside it** (or equal another Step's
+  id at that level). An authored matrix Step `app/build` beside invoke `app` would otherwise
+  merge with the library's instances, and the library's push Step would read the author's
+  results as its own builds'. The same holds one level down, inside a wrapper library. Two
+  Steps written with the same origin (two Pipeline Steps `a` with disjoint matrices) still
+  compile.
 
 Arch tags are unchanged: they come from the image's config, so `linux/amd64` still tags
 `<tag>-amd64`.
@@ -200,8 +232,11 @@ now fails (exit 2) after its `push: false` and fork checks: "results are not col
 image's digest cannot be checked against the build step's; set the server's results token
 secret (SCARAB_RESULTS_TOKEN_SECRET, the chart value secrets.resultsTokenSecret)". The path
 derived from the Step id and both warnings are removed. `build-layout` with `image-index` and
-`build-multiarch` already needed results: with none, their push Step gets no layout lines and
-refuses.
+`build-multiarch` already needed results: with none, their push Step got no layout lines and
+refused with a grammar message. The index script now checks first: with `layouts` set and no
+`/scarab/results`, it fails with "results are not collected, so the layouts' digests cannot be
+checked against the builds'", naming the same secret. `image-index` with `images`
+only does not need results.
 
 ## Consequences
 
@@ -216,8 +251,10 @@ refuses.
 - Pipelines that use instance lists or `join` need a server that knows IR version 4.
 - An existing library whose Step read `outputs.<matrix step>.<field>` now gets a compile error
   that shows the `map` form.
-- A library that wants the caller to choose its matrix exposes a string input; Pipelines bind it
-  as text, not as a template.
+- A library that wants the caller to choose its matrix exposes a string input with a default;
+  Pipelines bind it as text, not as a template.
+- A file that writes a Step id under a sibling invoke's `<id>/` prefix, or an id with an unpaired
+  `[` or `]`, no longer compiles. No file in the repository, the docs or the tests did either.
 
 ## Alternatives considered
 

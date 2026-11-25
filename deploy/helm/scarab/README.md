@@ -565,9 +565,17 @@ The StatefulSet's `serviceName` is unchanged, so upgrading needs no migration.
 
 ### Upgrading from 0.7.7: build libraries and IR version 4
 
-No migration. Three things change for Pipelines, the first two when an org
-admin upgrades a library to the version this release tags:
+No migration. The library changes below take effect when an org admin
+upgrades a library to the version this release tags.
 
+- **Order: servers first, then libraries and `join`.** Upgrade every server
+  replica before an org admin upgrades `build-multiarch`, and before any file
+  calls `join`. A 0.7.7 server cannot parse the new `build-multiarch` (a matrix
+  dimension written as text), so a Run that invokes it is refused at creation
+  there; and it fails a trigger `when:` that calls `join`, so that delivery
+  makes no Run. Redeliver the webhook, or rerun, once every replica is
+  upgraded. To roll back to 0.7.7, first put the library back to its earlier
+  version.
 - **`build`'s push step needs step results.** With `push: true` it refuses
   (exit 2) when the server collects no step results, with
   `scarab: push refused: results are not collected, …; set the server's results
@@ -576,19 +584,25 @@ admin upgrades a library to the version this release tags:
   layout against the build step's digest. Set `secrets.resultsTokenSecret` (or
   a `SCARAB_RESULTS_TOKEN_SECRET` key in `secrets.existingSecret`) before the
   orgs that push images upgrade the library. `build-multiarch` and
-  `image-index` with `layouts` needed results already.
+  `image-index` with `layouts` needed results already, and now fail with
+  `scarab: index refused: results are not collected, …`, which names the same
+  secret.
 - **`build-multiarch`'s placement keys change.** Its `amd64` and `arm64`
   steps are now instances of one matrix step, `build`. An invoke whose
   `placement_profiles` map names `amd64:` or `arm64:` fails to compile, and the
   error names the key to write instead, `"build[arch=linux/amd64]"`. Step ids
   change from `app/amd64` to `app/build[arch=linux/amd64]`.
 - **IR version 4.** A Pipeline that invokes the new `build-multiarch`, or any
-  library step that reads a matrix step's instances, or any expression that
-  calls `join`, compiles to IR version 4. A 0.7.7 server refuses to launch a
-  step of such a Run. The chart's default `strategy: Recreate` stops every old server first; with a
-  rolling update, rerun a step that failed that way once every replica runs the
-  new version. To roll back to 0.7.7, let version-4 Runs finish first, or
-  cancel them.
+  library step that reads a matrix step's instances, or a template, `when:` or
+  `validate:` that calls `join`, compiles to IR version 4. A 0.7.7 server
+  refuses to launch a step of such a Run. The chart's default
+  `strategy: Recreate` stops every old server first; with a rolling update,
+  rerun a step that failed that way once every replica runs the new version.
+  To roll back to 0.7.7, let version-4 Runs finish first, or cancel them.
+
+Two step id rules are new for every Pipeline: an id may not start with
+`<invoke id>/` of an invoke beside it, and a `[` or `]` in an id must pair.
+Neither was used in Scarab's own files.
 
 ### Upgrading from 0.7.5: leak-check limits
 
