@@ -2240,6 +2240,69 @@ function orgSecretMatrix() {
   return { columns: ["", ...environments], environments, keys };
 }
 
+// "Check a leaked value" (`POST /v1/orgs/{org}/secrets/match`). Three stored
+// values the mock knows, matched by the server's rules: a value of 20 bytes or
+// more anywhere in the paste, a shorter one only as the whole paste. A paste
+// holding `MOCK_RATE_LIMIT` is refused as the 21st check in an hour. With
+// either leak-check limit at 0 every check is refused as turned off.
+const mockMatchValues: { value: string; match: Record<string, unknown> }[] = [
+  {
+    value: "ghcr_mock_7Hq2Lw9xPzR4tYv8NbK3",
+    match: { kind: "secret", key: "GHCR_TOKEN", scope: "org", overridden_in: [], in_use: true },
+  },
+  {
+    // scarab sets its own AWS_DEPLOY_ROLE for production, so no Run gets this one.
+    value: "arn:aws:iam::123456789012:role/mock-deploy",
+    match: {
+      kind: "secret",
+      key: "AWS_DEPLOY_ROLE",
+      scope: "org_environment",
+      environment: "production",
+      overridden_in: ["scarab · production"],
+      in_use: false,
+    },
+  },
+  {
+    value: "forgejo_mock_token_4c1d9e3f0b4a2d6c",
+    match: {
+      kind: "connection",
+      connection: "forge",
+      id: "forgejo-7f3a91c2",
+      // The server names a forge connection by its account, else its host.
+      name: "git.acme.dev",
+      base_url: "https://git.acme.dev",
+    },
+  },
+];
+function mockSecretMatch(org: string, body: string): Response {
+  if (leakCheckLimits.per_hour === 0 || leakCheckLimits.per_day === 0) {
+    return json(
+      { code: "leak_checks_off", message: `Leak checks are turned off for ${org}.` },
+      { status: 403 },
+    );
+  }
+  const text = (JSON.parse(body || "{}") as { text?: string }).text ?? "";
+  if (new TextEncoder().encode(text).length > 4096) {
+    return json(
+      { code: "too_long", message: "the text is longer than 4096 bytes", max_bytes: 4096 },
+      { status: 413 },
+    );
+  }
+  const paste = text.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, "");
+  if (!paste) return json({ code: "empty", message: "There is no text to compare." }, { status: 400 });
+  if (paste.includes("MOCK_RATE_LIMIT")) {
+    const retry_at = Date.now() + 23 * min;
+    return json(
+      { code: "rate_limited", message: "the hourly limit on checks is reached", retry_at },
+      { status: 429, headers: { "content-type": "application/json", "retry-after": String(23 * 60) } },
+    );
+  }
+  const matches = mockMatchValues
+    .filter(({ value }) => (value.length >= 20 ? paste.includes(value) : paste === value))
+    .map(({ match }) => match);
+  return json({ matches, searched: { secrets: 9, repositories: 2, connections: 3 } });
+}
+
 // ── API tokens (git-bug a4cb94f) ────────────────────────────────
 // Four records covering every state the panels render differently: a live token
 // in daily use, one narrowed to a single project and held by someone else, one
@@ -2507,6 +2570,34 @@ const orgSecuritySummary: components["schemas"]["OrgSecuritySummary"] = {
   recent_refusals: securityEvents.filter((e) => e.kind === "step_up.refused"),
   pending_requests: 1,
 };
+// Leak-check limits (Org settings › Security), one set for every org in the
+// mock, changed by a PUT for the life of the page. The mock caller is an
+// Owner, so it may change them; the bounds are the server's.
+const leakCheckLimits: components["schemas"]["LeakCheckLimitsDto"] = {
+  per_hour: 20,
+  per_day: 40,
+  max_per_hour: 100,
+  max_per_day: 1000,
+  caller_role: "owner",
+};
+function mockLeakChecks(method: string, body: string): Response {
+  if (method === "PUT") {
+    const req = JSON.parse(body || "{}") as { per_hour?: unknown; per_day?: unknown };
+    const ok = (v: unknown, max: number) => Number.isInteger(v) && (v as number) >= 0 && (v as number) <= max;
+    if (!ok(req.per_hour, leakCheckLimits.max_per_hour) || !ok(req.per_day, leakCheckLimits.max_per_day)) {
+      return json(
+        {
+          code: "out_of_bounds",
+          message: `Checks per hour must be 0 to ${leakCheckLimits.max_per_hour} and per day 0 to ${leakCheckLimits.max_per_day}.`,
+        },
+        { status: 400 },
+      );
+    }
+    leakCheckLimits.per_hour = req.per_hour as number;
+    leakCheckLimits.per_day = req.per_day as number;
+  }
+  return json(leakCheckLimits);
+}
 const stepUpRequest: components["schemas"]["StepUpRequestDto"] = {
   id: "req-demo-1",
   state: "pending",
@@ -2578,6 +2669,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     return json({ events: securityEvents.filter((e) => e.subject === "a.kim") });
   }
   if (/^\/v1\/orgs\/[^/]+\/security\/summary$/.test(p)) return json(orgSecuritySummary);
+  if (/^\/v1\/orgs\/[^/]+\/security\/leak-checks$/.test(p)) return mockLeakChecks(method, body);
   if (/^\/v1\/orgs\/[^/]+\/security\/events$/.test(p)) return orgEventsPage(search);
   // An owner resets a member's passkeys. The mock lets it through with no
   // step-up; an admin left with none joins the summary's list.
@@ -3099,6 +3191,9 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   // The org scope's names change with a save or a delete, for the life of
   // the page.
   // The org's list: its own values by scope.
+  if ((m = p.match(/^\/v1\/orgs\/([^/]+)\/secrets\/match$/)) && method === "POST") {
+    return mockSecretMatch(decodeURIComponent(m[1]!), body);
+  }
   if (/^\/v1\/orgs\/[^/]+\/secrets\/matrix$/.test(p)) return json(orgSecretMatrix());
   if (p === "/v1/secrets") {
     const q = new URLSearchParams(search);

@@ -242,7 +242,7 @@ impl ForgeAdapters for RegistryForge {
             id: "github-app".into(),
             kind: ForgeKind::GitHub,
             base_url: crate::GITHUB_API_BASE.into(),
-            credential_ref: "github-app".into(),
+            credential_ref: crate::GITHUB_APP_CREDENTIAL_REF.into(),
             org: None,
             installation_id: None,
             account_id: None,

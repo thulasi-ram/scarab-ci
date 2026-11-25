@@ -34,6 +34,8 @@ use scarab_project::ProjectError;
 /// overlays and grants, and the one-snapshot read admission makes.
 mod delivery;
 mod environment_governance;
+/// `LeakCheckLimitsStore`: each org's limits on leak checks.
+mod leak_checks;
 /// `LibraryStore` (ADR-0076): installed libraries, their versions, yanks
 /// and the sources each org trusts with forge credentials.
 mod libraries;

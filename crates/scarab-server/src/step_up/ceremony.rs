@@ -724,6 +724,11 @@ pub(crate) async fn step_up_confirm(
     // The Org the guard resolved for the operation it was confirmed for, so
     // the confirmation lands in that Org's log and no other.
     let context = StepUpChallengeContext::of(&row);
+    let replaces = context
+        .as_ref()
+        .and_then(|c| c.op.as_deref())
+        .and_then(super::ops::by_id)
+        .is_some_and(|op| op.digest_without_redacted);
     let mut ev = event(
         kind::STEP_UP_CONFIRMED,
         &subject,
@@ -753,6 +758,18 @@ pub(crate) async fn step_up_confirm(
         ));
     }
     put_confirmation_while_usable(&svc, &confirmation, &passkey).await?;
+    // An operation whose digest leaves out its redacted fields (the leak
+    // check) has one digest for every request in the session: an unspent
+    // confirmation would stand for any later one. So a new confirmation
+    // replaces the unspent one before it, and the session never holds two.
+    if let (ConfirmationKind::Action, true, Some(digest)) =
+        (kind_, replaces, confirmation.action_digest.as_deref())
+    {
+        svc.confirmations
+            .delete_other_actions(&facts.id_hash, &subject, digest, &confirmation.id)
+            .await
+            .map_err(store_err)?;
+    }
     Ok(Json(StepUpConfirmResponse {
         confirmation_id: confirmation.id,
         kind: kind_.as_str().to_string(),

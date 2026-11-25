@@ -18,6 +18,14 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **Migration 0109 adds the table `org_leak_check_limits`** (each org's limits on leak checks).
+  It is a new table, so it takes no lock on another and nothing is backfilled. A 0.7.5 server does
+  not start on a database that ran it: to roll back, run
+  `crates/scarab-db-postgres/rollback/0109_revert.sql` with the server scaled to zero. See the
+  chart README, "Upgrading from 0.7.5".
+
 ### Features
 
 - **The org can set a secret for one Environment, for every repository.** In Org settings ›
@@ -31,6 +39,21 @@ release.yml uses that version's section as the GitHub Release text. See
   includes the org's values for it. During a rolling upgrade, replicas still on the old version
   give Runs the repository default instead of the org's value for the Environment, so set org
   Environment values once every replica runs this version. See
+  [Secrets](https://thulasi-ram.github.io/scarab-ci/usage/secrets/).
+- **An org Admin can check whether text found outside Scarab holds one of the org's secrets.**
+  In Org settings › Secrets, **Check a leaked value** takes pasted text (a token, an `.env` file,
+  a log excerpt) and compares it with every current value in the org, its repositories and its
+  forge and plugin connections. The answer names each match and its scope, never a value, and
+  says when no Run gets a matching value today. A stored value of 20 bytes or more matches
+  anywhere in the text; a shorter one only when it is the whole text. Values are compared byte
+  for byte, line endings included, so a key wrapped at another width or a file with other line
+  endings does not match. The server's own GitHub App key, shared by every installation, is not
+  compared. The check runs from the browser only (not with an API token or the CLI), asks for a
+  passkey confirmation on every check, takes up to 4096 bytes, and stores and logs nothing of
+  the text; each check writes one event with the names that matched. Each person gets a limit
+  of checks per org per hour and per day, 20 and 40 by default. Org Owners set the limits in Org
+  settings › Security › Leak checks, 0 to 100 per hour and 0 to 1000 per day; 0 turns the check
+  off for the org. A value replaced earlier is not kept, so it cannot match. See
   [Secrets](https://thulasi-ram.github.io/scarab-ci/usage/secrets/).
 
 ## [0.7.5] - 2026-11-25

@@ -741,6 +741,28 @@ impl StepUpStore for PostgresDb {
         .map_err(identity_err)
     }
 
+    async fn delete_other_actions(
+        &self,
+        session_hash: &str,
+        principal: &str,
+        digest: &[u8],
+        keep: &str,
+    ) -> Result<u64, IdentityError> {
+        Ok(sqlx::query(
+            "DELETE FROM step_up_confirmations
+             WHERE session_hash = $1 AND principal_id = $2 AND kind = 'action'
+               AND action_digest = $3 AND consumed_at IS NULL AND id <> $4",
+        )
+        .bind(session_hash)
+        .bind(principal)
+        .bind(digest)
+        .bind(keep)
+        .execute(self.pool())
+        .await
+        .map_err(identity_err)?
+        .rows_affected())
+    }
+
     async fn delete_standing_confirmations_for(
         &self,
         principal: &str,

@@ -279,7 +279,8 @@ pub struct Op {
     /// to that Project would be refused a request it could run.
     pub project_of: ProjectOf,
     /// JSON pointers into the body hidden in summaries and events
-    /// (`/value`, `/credential`). The digest still covers them.
+    /// (`/value`, `/credential`). The digest still covers them, unless
+    /// [`Op::digest_without_redacted`] is set.
     pub redact: &'static [&'static str],
     /// Where the summary's target comes from, joined with `/`:
     /// `path:<name>`, `query:<name>`, `body:<json pointer>`.
@@ -291,6 +292,22 @@ pub struct Op {
     /// a bigger one raises none (413). Well under the guard's 2 MiB: a
     /// request parks its body, sealed, until it settles or is reaped.
     pub max_request_body: usize,
+    /// The action digest is computed over the body with every [`Op::redact`]
+    /// pointer replaced by [`HIDDEN`], so a redacted field is never digested
+    /// (the pasted text of a leak check). A confirmation then stands for the
+    /// request whatever those fields hold; set it only on a browser-only
+    /// operation, whose body is never parked or replayed. A session holds at
+    /// most one unspent action confirmation for such an operation: a new one
+    /// replaces it (`POST /v1/me/step-up`).
+    pub digest_without_redacted: bool,
+}
+
+/// The operation with id `id`, from the route table.
+pub fn by_id(id: &str) -> Option<&'static Op> {
+    crate::route_table()
+        .iter()
+        .map(|e| e.op)
+        .find(|op| op.id == id)
 }
 
 /// [`Op::max_request_body`] unless an operation says otherwise.
@@ -334,6 +351,15 @@ impl Op {
     const fn max_request_body(self, bytes: usize) -> Op {
         Op {
             max_request_body: bytes,
+            ..self
+        }
+    }
+
+    /// Its action digest leaves out the [`Op::redact`] fields
+    /// ([`Op::digest_without_redacted`]).
+    const fn digest_without_redacted(self) -> Op {
+        Op {
+            digest_without_redacted: true,
             ..self
         }
     }
@@ -438,6 +464,17 @@ pub fn describe_library_unyank(op: &Op, input: &OpInput) -> OpSummary {
         operation: generic.operation,
         target: escape_invisible(&format!("version {} in {org}", short_hash(hash))),
         changes: vec![escape_invisible(&format!("content_hash = {hash}"))],
+    }
+}
+
+/// `secret.match`: the org only. The pasted text is never part of a
+/// summary, not even redacted: nothing about it is shown, stored with the
+/// request or written to an event.
+pub fn describe_secret_match(op: &Op, input: &OpInput) -> OpSummary {
+    OpSummary {
+        operation: op.label.to_string(),
+        target: escape_invisible(input.param("org").unwrap_or_default()),
+        changes: Vec::new(),
     }
 }
 
@@ -643,6 +680,7 @@ const fn op(
         describe: describe_generic,
         machine: StepUpMachineUse::Requestable,
         max_request_body: DEFAULT_MAX_REQUEST_BODY,
+        digest_without_redacted: false,
     }
 }
 
@@ -1022,6 +1060,47 @@ pub static SECRET_DELETE: Op = op(
     &["query:org", "query:repo", "query:environment", "query:name"],
 )
 .in_project(ProjectOf::Query("repo"));
+pub static SECRET_MATCH: Op = op(
+    "secret.match",
+    "Check a value against secrets",
+    // Every check asks for a passkey confirmation of its own; a window
+    // opened for another operation does not count. Conditional only so the
+    // handler asks after it has checked the request (role, size, the org's
+    // limits), so a refused check costs no confirmation.
+    Class::Conditional {
+        mode: A,
+        rule: "always, once the request is checked",
+    },
+    "§3 secret reads: compares pasted text with every stored value of the org",
+    ADMIN,
+    OrgOf::Path("org"),
+    &["/text"],
+    &["path:org"],
+)
+.describe_with(describe_secret_match)
+// Only a human in a browser: no API token or Bearer session may check, so
+// no request is raised and no body is parked or sealed.
+.browser_only()
+// The pasted text is not digested either: the confirmation's challenge
+// commits to the org and the operation only.
+.digest_without_redacted();
+pub static LEAK_CHECK_LIMITS_PUT: Op = op(
+    "secret.match_limits",
+    "Change the org's leak check limits",
+    // Every change asks for a passkey confirmation of its own. Conditional
+    // so the summary can show the old and the new limits, which only the
+    // handler knows; a request that changes nothing is exempt.
+    Class::Conditional {
+        mode: A,
+        rule: "always, unless the request changes nothing",
+    },
+    "§3 not on the list: the limits on secret.match (owner decision 2026-11-25)",
+    Some(Role::Owner),
+    OrgOf::Path("org"),
+    &[],
+    &["path:org"],
+)
+.browser_only();
 pub static ENVIRONMENT_DELETE: Op = op(
     "environment.delete",
     "Delete an Environment",
@@ -1643,7 +1722,8 @@ mod tests {
     }
 
     /// The operations a machine caller may never raise a request for: the
-    /// browser-only flows, token minting for a token (git-bug ff7a014), the
+    /// browser-only flows (the leak check and its limits among them), token
+    /// minting for a token (git-bug ff7a014), the
     /// personal token revoke (its handler refuses a token), and assigning a
     /// connection's org, which only a global admin may do and a token never
     /// is (git-bug 19b0a45).
@@ -1666,10 +1746,25 @@ mod tests {
                 "identity.link",
                 "identity.unlink",
                 "passkey.add",
+                "secret.match",
+                "secret.match_limits",
                 "step.attach",
                 "step.debug_pod"
             ]
         );
+        // An operation whose digest leaves out its redacted fields stands
+        // for any request of it once confirmed, so it must never be parked
+        // and replayed for a machine caller.
+        for e in crate::route_table() {
+            if e.op.digest_without_redacted {
+                assert_eq!(
+                    e.op.machine,
+                    StepUpMachineUse::BrowserOnly,
+                    "`{}` leaves its redacted fields out of the digest but is not browser-only",
+                    e.op.id
+                );
+            }
+        }
         not_by_token.sort_unstable();
         assert_eq!(
             not_by_token,
@@ -1691,6 +1786,25 @@ mod tests {
         let all = format!("{s:?}");
         assert!(!all.contains("hunter2"), "{all}");
         assert!(s.changes.contains(&"value = (hidden)".to_string()));
+    }
+
+    #[test]
+    fn a_match_check_summary_names_the_org_and_nothing_of_the_text() {
+        let i = OpInput {
+            method: "POST".into(),
+            path: "/v1/orgs/acme/secrets/match".into(),
+            params: vec![("org".into(), "acme".into())],
+            query: vec![],
+            body: redact(
+                &json!({"text": "PASTE-CANARY-1", "extra": "PASTE-CANARY-2"}),
+                SECRET_MATCH.redact,
+            ),
+        };
+        let s = SECRET_MATCH.summary(&i);
+        assert_eq!(s.operation, "Check a value against secrets");
+        assert_eq!(s.target, "acme");
+        assert!(s.changes.is_empty());
+        assert!(!format!("{s:?}").contains("PASTE-CANARY"));
     }
 
     #[test]

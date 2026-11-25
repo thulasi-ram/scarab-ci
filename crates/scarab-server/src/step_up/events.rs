@@ -86,7 +86,8 @@ pub struct SecurityEventDto {
     /// `step_up.confirmed`, `step_up.refused`, `op.authorised`,
     /// `op.completed`, `request.raised|confirmed|executed|failed`,
     /// `passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,
-    /// `guard.not_consulted`, `binding.operator_grant`.
+    /// `guard.not_consulted`, `binding.operator_grant`,
+    /// `secret.match_checked`, `secret.match_limits_changed`.
     pub kind: String,
     /// The handle of the human/principal it is about.
     pub subject: String,

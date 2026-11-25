@@ -198,6 +198,16 @@ pub(crate) fn governed_routes() -> Routes {
             "/v1/orgs/{org}/security/summary",
             step_up::events::org_security_summary,
         )
+        // An org's leak check limits: Admins read them, Owners change them.
+        .get(
+            "/v1/orgs/{org}/security/leak-checks",
+            crate::secret_match::get_leak_check_limits,
+        )
+        .put(
+            "/v1/orgs/{org}/security/leak-checks",
+            &ops::LEAK_CHECK_LIMITS_PUT,
+            crate::secret_match::put_leak_check_limits,
+        )
         .post(
             "/v1/orgs/{org}/members/{id}/passkeys/reset",
             &ops::PASSKEY_RESET,
@@ -356,6 +366,11 @@ pub(crate) fn governed_routes() -> Routes {
         .get("/v1/orgs/{org}/environments", oe::list_org_environments)
         .get("/v1/orgs/{org}/secrets/orphaned", oe::list_orphaned_secrets)
         .get("/v1/orgs/{org}/secrets/matrix", org_secret_matrix)
+        .post(
+            "/v1/orgs/{org}/secrets/match",
+            &ops::SECRET_MATCH,
+            crate::secret_match::org_secret_match,
+        )
         .put(
             "/v1/orgs/{org}/environments/{env}",
             &ops::ENVIRONMENT_PUT,

@@ -11,6 +11,13 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// An org's limits on leak checks (`secret.match`).
+mod leak_checks;
+pub use leak_checks::{
+    LeakCheckLimits, LeakCheckLimitsStore, DEFAULT_LEAK_CHECKS_PER_DAY,
+    DEFAULT_LEAK_CHECKS_PER_HOUR, MAX_LEAK_CHECKS_PER_DAY, MAX_LEAK_CHECKS_PER_HOUR,
+};
+
 /// Step-up confirmation ports (ADR-0073): passkeys, challenges,
 /// confirmations, requests and the OrgSecurityEventLog.
 mod step_up;

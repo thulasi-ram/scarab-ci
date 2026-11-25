@@ -56,6 +56,7 @@ import {
   ListFilter,
   List,
   Maximize2,
+  Plug,
 } from "lucide";
 
 // IconNode = Array<[tagName, attributes]>.
@@ -122,6 +123,8 @@ const ICONS: Record<string, IconNode> = {
   "external-link": ExternalLink as IconNode,
   // The Runs list's Filter button.
   filter: ListFilter as IconNode,
+  // A connection's credential among the matches of a leaked-value check.
+  plug: Plug as IconNode,
   // An exclamation mark with no outline, to sit inside a round status mark.
   exclamation: [
     ["path", { d: "M12 7v6" }],

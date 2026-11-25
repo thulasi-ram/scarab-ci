@@ -157,8 +157,16 @@ pub async fn guard_with(table: &[RouteEntry], st: AppState, req: Request, next: 
             Err(e) => return unreadable_body(&e),
         }
     };
-    let canonical = canonical_form(parts.method.as_str(), &path, &query, &bytes, json.as_ref());
+    let canonical = op_canonical_form(
+        op,
+        parts.method.as_str(),
+        &path,
+        &query,
+        &bytes,
+        json.as_ref(),
+    );
     let digest = svc.digest(&canonical);
+    drop(canonical);
     let body_view = json.clone().unwrap_or(Value::Null);
     let param = |name: &str| {
         params
@@ -461,6 +469,26 @@ fn percent_decode(s: &str, plus_is_space: bool) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// [`canonical_form`] for `op`: with [`Op::digest_without_redacted`], the
+/// body's [`Op::redact`] fields are replaced by [`ops::HIDDEN`] first, so
+/// what they hold is never digested.
+pub(crate) fn op_canonical_form(
+    op: &Op,
+    method: &str,
+    path: &str,
+    query: &[(String, String)],
+    raw_body: &[u8],
+    json: Option<&Value>,
+) -> Vec<u8> {
+    match json {
+        Some(v) if op.digest_without_redacted => {
+            let blanked = ops::redact(v, op.redact);
+            canonical_form(method, path, query, raw_body, Some(&blanked))
+        }
+        _ => canonical_form(method, path, query, raw_body, json),
+    }
+}
+
 /// The canonical form an action digest is computed over: method, concrete
 /// path, sorted decoded query, and the body — canonical JSON (keys sorted,
 /// compact) when it is JSON, the raw bytes otherwise. Length-prefixed, so no
@@ -560,6 +588,49 @@ mod tests {
             canonical_form("POST", "/p", &q1, b"", Some(&a)),
             canonical_form("PUT", "/p", &q1, b"", Some(&a))
         );
+    }
+
+    /// A leak check's digest covers the org and the operation, never the
+    /// pasted text: two different texts give the same canonical form (and
+    /// so the same digest), and the text is not in it. Another org is
+    /// another digest, and an operation without the flag still digests its
+    /// redacted fields.
+    #[test]
+    fn a_leak_checks_text_is_never_digested() {
+        let form = |op: &Op, path: &str, body: &Value| {
+            let raw = body.to_string();
+            op_canonical_form(op, "POST", path, &[], raw.as_bytes(), Some(body))
+        };
+        let path = "/v1/orgs/acme/secrets/match";
+        let a = form(&ops::SECRET_MATCH, path, &json!({"text": "PASTE-CANARY-1"}));
+        let b = form(
+            &ops::SECRET_MATCH,
+            path,
+            &json!({"text": "PASTE-CANARY-2 another paste"}),
+        );
+        assert_eq!(a, b);
+        for bytes in [&a, &b] {
+            assert!(
+                !String::from_utf8_lossy(bytes).contains("PASTE-CANARY"),
+                "{}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+        let other_org = form(
+            &ops::SECRET_MATCH,
+            "/v1/orgs/globex/secrets/match",
+            &json!({"text": "PASTE-CANARY-1"}),
+        );
+        assert_ne!(a, other_org);
+
+        let put = |value: &str| {
+            form(
+                &ops::SECRET_PUT,
+                "/v1/secrets",
+                &json!({"org": "acme", "name": "K", "value": value}),
+            )
+        };
+        assert_ne!(put("VALUE-CANARY-1"), put("VALUE-CANARY-2"));
     }
 
     #[test]

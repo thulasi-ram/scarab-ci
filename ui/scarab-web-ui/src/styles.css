@@ -2169,6 +2169,29 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
    expand. Lines wrap at phone width; actions drop under the state. */
 .skey-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .skey-bar .btn-primary { margin-left: auto; }
+/* Org list only: "Check a leaked value" sits right, before New secret. */
+.skey-bar .skey-check { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+.skey-bar .skey-check + .btn-primary { margin-left: 0; }
+/* The matches of a leaked-value check: name and where on one line, who gets
+   it under them, "open" at the right. */
+.smatch-list {
+  list-style: none; margin: 0; padding: 0;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.smatch {
+  display: grid; grid-template-columns: minmax(0, 1fr) max-content;
+  gap: 2px 10px; padding: 8px 12px;
+}
+.smatch + .smatch { border-top: 1px solid var(--border-soft); }
+.smatch-h { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; min-width: 0; }
+.smatch-key { font: var(--t-mono); color: var(--soft-white); overflow-wrap: anywhere; }
+.smatch-where {
+  display: inline-flex; align-items: center; gap: 4px;
+  font: var(--t-mono); color: var(--muted-sage); overflow-wrap: anywhere;
+}
+.smatch-use { grid-column: 1; margin: 0; font: var(--t-body); color: var(--sage); }
+.smatch-use.warn { color: var(--warn); }
+.smatch-open { grid-column: 2; grid-row: 1 / span 2; align-self: start; }
 /* The whole list is one grid, and each key and its open scope lines are
    subgrids of it, so scope, state and buttons line up across every open
    key: indent | glyph | scope | state | actions | right edge. The indent and

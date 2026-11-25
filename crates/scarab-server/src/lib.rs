@@ -126,6 +126,7 @@ pub mod schedules;
 pub mod test_support;
 pub use routes::{route_table, RouteEntry};
 pub mod secret_executor;
+pub mod secret_match;
 pub mod step_path;
 pub mod step_pods;
 pub mod step_up;
@@ -357,6 +358,17 @@ pub struct AppState {
     /// `SCARAB_DEV_INSECURE`; production wires
     /// [`with_step_up`](AppState::with_step_up) in `main.rs`.
     pub step_up: step_up::StepUpPolicy,
+    /// The OrgSecurityEventLog, for the records an operation writes beside
+    /// the step-up ones (`secret.match_checked`, and the hourly and daily
+    /// limits that count them). [`with_step_up`](AppState::with_step_up) sets it to
+    /// the step-up service's log; `main.rs` also wires it when login is on
+    /// and step-up is not enforced. `None` (dev-insecure, a hand-built
+    /// state): nothing is recorded or counted.
+    pub security_events: Option<Arc<dyn scarab_identity::OrgSecurityEventLog>>,
+    /// Each org's leak check limits (`/v1/orgs/{org}/security/leak-checks`).
+    /// `None` (a hand-built state): every org has the defaults and the
+    /// limits cannot be changed (PUT 404).
+    pub leak_check_limits: Option<Arc<dyn scarab_identity::LeakCheckLimitsStore>>,
     /// The label, annotation and toleration keys a step author's
     /// `k8s_overlay` may set, from the operator's placement config
     /// (`author_overlay`). Run admission checks an overlay against them, as
@@ -465,6 +477,8 @@ impl AppState {
             credential_overrides: Arc::new(connections_config::CredentialOverrides::new()),
             snapshot_retention_days: DEFAULT_SNAPSHOT_RETENTION_DAYS,
             step_up: step_up::StepUpPolicy::Off,
+            security_events: None,
+            leak_check_limits: None,
             author_overlay: scarab_executor_k8s::AuthorOverlayConfig::default(),
             placement: None,
             delivery_slots: DeliverySlots::new(WEBHOOK_DELIVERY_SLOTS, WEBHOOK_DELIVERY_SLOT_WAIT),
@@ -502,7 +516,29 @@ impl AppState {
     /// a passkey StepUpConfirmation, and the passkey ceremony endpoints are
     /// live.
     pub fn with_step_up(mut self, service: step_up::StepUpService) -> Self {
+        self.security_events = Some(service.events.clone());
         self.step_up = step_up::StepUpPolicy::Enforce(Arc::new(service));
+        self
+    }
+
+    /// Record operations in `log` ([`AppState::security_events`]) when
+    /// step-up is not enforced. [`with_step_up`](AppState::with_step_up)
+    /// sets it already.
+    pub fn with_security_events(
+        mut self,
+        log: Arc<dyn scarab_identity::OrgSecurityEventLog>,
+    ) -> Self {
+        self.security_events = Some(log);
+        self
+    }
+
+    /// Keep each org's leak check limits in `store`
+    /// ([`AppState::leak_check_limits`]).
+    pub fn with_leak_check_limits(
+        mut self,
+        store: Arc<dyn scarab_identity::LeakCheckLimitsStore>,
+    ) -> Self {
+        self.leak_check_limits = Some(store);
         self
     }
 
@@ -10169,7 +10205,7 @@ async fn register_installation(
                     base_url: GITHUB_API_BASE.into(),
                     // The App credential is shared across installations; the
                     // composition root registers it under this handle.
-                    credential_ref: "github-app".into(),
+                    credential_ref: GITHUB_APP_CREDENTIAL_REF.into(),
                     org: None,
                     installation_id: Some(sync.installation_id),
                     account_id: sync.account_id,
@@ -14714,6 +14750,11 @@ pub struct ResyncResultDto {
 /// here at use-time and never persisted on the connection.
 pub const FORGE_CREDENTIALS_ORG: &str = "_forge";
 
+/// The key, in [`FORGE_CREDENTIALS_ORG`], of the server's GitHub App
+/// credential. Every GitHub installation connection points at it: the App
+/// key is shared across installations, whichever org each serves.
+pub const GITHUB_APP_CREDENTIAL_REF: &str = "github-app";
+
 /// Org names Scarab keeps for itself: every `_`-prefixed name. Its own
 /// credential scopes live there — [`FORGE_CREDENTIALS_ORG`] and
 /// [`plugins::PLUGIN_CONNECTION_CREDENTIALS_ORG`] — so no Project is homed in
@@ -17162,6 +17203,9 @@ impl utoipa::Modify for StepUpResponses {
         plugins::delete_plugin_connection,
         secret_matrix,
         org_secret_matrix,
+        secret_match::org_secret_match,
+        secret_match::get_leak_check_limits,
+        secret_match::put_leak_check_limits,
         silence_secret_cell,
         unsilence_secret_cell,
         list_connections,
@@ -17271,6 +17315,16 @@ impl utoipa::Modify for StepUpResponses {
         SecretMatrixRow,
         OrgSecretMatrix,
         OrgSecretMatrixRow,
+        secret_match::SecretMatchRequest,
+        secret_match::SecretMatchResponse,
+        secret_match::SecretMatch,
+        secret_match::SecretMatchScope,
+        secret_match::SecretMatchConnectionKind,
+        secret_match::SecretMatchSearched,
+        secret_match::SecretMatchRefusal,
+        secret_match::LeakCheckLimitsDto,
+        secret_match::LeakCheckLimitsUpdate,
+        secret_match::LeakCheckCallerRole,
         SilenceCellRequest,
         ConnectionDto,
         CreateConnectionRequest,

@@ -569,6 +569,19 @@ pub trait StepUpStore: Send + Sync {
         now_ms: i64,
     ) -> Result<Option<String>, IdentityError>;
 
+    /// Delete every unconsumed action confirmation of `principal` in
+    /// `session_hash` for exactly `digest`, except the one with id `keep`.
+    /// Returns how many. Called after `keep` is stored, so of two
+    /// confirmations stored at once at most one is left (possibly none);
+    /// never two.
+    async fn delete_other_actions(
+        &self,
+        session_hash: &str,
+        principal: &str,
+        digest: &[u8],
+        keep: &str,
+    ) -> Result<u64, IdentityError>;
+
     /// Delete `principal`'s standing step-up authority — every window and
     /// every unconsumed action confirmation, in every session (a passkey
     /// reset). Returns how many.
@@ -685,6 +698,14 @@ pub mod security_event_kind {
     /// `scarab-server admin grant`: an operator seeded a role binding
     /// straight in the database.
     pub const BINDING_OPERATOR_GRANT: &str = "binding.operator_grant";
+    /// An org Admin compared pasted text with the org's stored secret
+    /// values and connection credentials. The detail names what matched
+    /// (key and scope, or connection), never the text or a value. Also what
+    /// the org's hourly and daily limits count.
+    pub const SECRET_MATCH_CHECKED: &str = "secret.match_checked";
+    /// An org Owner changed the org's leak check limits. The detail holds
+    /// the old and the new `per_hour` and `per_day`.
+    pub const SECRET_MATCH_LIMITS_CHANGED: &str = "secret.match_limits_changed";
 
     /// The Org-less kinds an Org's log shows about its members: the human's
     /// own confirmations and passkey lifecycle. Org-less operations,

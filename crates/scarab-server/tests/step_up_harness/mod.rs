@@ -103,6 +103,17 @@ pub fn harness_with(extra: impl FnOnce(AppState) -> AppState) -> Harness {
 
 /// [`harness_with`] over `backend`.
 pub fn harness_on(backend: Backend, extra: impl FnOnce(AppState) -> AppState) -> Harness {
+    harness_on_wrapping_log(backend, |log| log, extra)
+}
+
+/// [`harness_on`], with the event log the app writes passed through `wrap`
+/// first (a test that needs the log to fail, or to pause at a point).
+/// [`Harness::log`] is the wrapped log.
+pub fn harness_on_wrapping_log(
+    backend: Backend,
+    wrap: impl FnOnce(Arc<dyn OrgSecurityEventLog>) -> Arc<dyn OrgSecurityEventLog>,
+    extra: impl FnOnce(AppState) -> AppState,
+) -> Harness {
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(T0));
     let logs = Arc::new(LogService::new(
@@ -138,6 +149,7 @@ pub fn harness_on(backend: Backend, extra: impl FnOnce(AppState) -> AppState) ->
         }
         Backend::Pg(pg) => (None, pg.clone(), pg.clone(), pg.clone(), pg.clone(), pg),
     };
+    let log = wrap(log);
     let rp = RelyingParty::from_public_url(PUBLIC_URL, "Scarab").unwrap();
     let st = AppState::new(db.clone(), clock.clone(), logs)
         .with_auth(auth, sessions.clone())

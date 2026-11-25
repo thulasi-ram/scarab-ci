@@ -8,6 +8,8 @@
 //   the step-up middleware has the Owner confirm it with their own passkey.
 //   An admin without a passkey in the list opens the same dialog with that
 //   admin picked.
+// - Leak checks (`LeakChecks.tsx`): how many leak checks each person gets per
+//   hour and per day; an Owner changes them.
 // - The event log (`EventLog.tsx`) with its filters and paging; its
 //   "Refusals, last 24h" preset shows who was asked to confirm, for what.
 import { For, Show, createResource, createSignal } from "solid-js";
@@ -19,6 +21,8 @@ import Icon from "./Icon";
 import Modal from "./Modal";
 import ConfirmDestructive from "./ConfirmDestructive";
 import EventLog from "./EventLog";
+import LeakChecks from "./LeakChecks";
+import { canEditLeakChecks } from "../leak-checks";
 import Pill from "./Pill";
 
 export default function OrgSecurity(props: { org: string }) {
@@ -144,6 +148,8 @@ export default function OrgSecurity(props: { org: string }) {
           );
         }}
       </Show>
+
+      <LeakChecks org={props.org} owner={canEditLeakChecks(summary())} />
 
       <EventLog org={props.org} />
     </>
