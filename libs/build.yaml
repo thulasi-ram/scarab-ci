@@ -68,8 +68,8 @@
 #                               push Step fails (exit 2) with push: true.
 #
 # To build one architecture's image and leave the pushing to another Step,
-# use build-layout.yaml with image-index.yaml; to build amd64 and arm64 and
-# push both under one index, use build-multiarch.yaml.
+# use build-layout.yaml with image-index.yaml; to build an image for several
+# platforms and push them under one index, use build-multiarch.yaml.
 #
 # A fork pull request, or a Run locked out of its Environment's secrets, gets
 # no registry credential, and Scarab tells both Steps so with
@@ -257,8 +257,44 @@ steps:
             echo "scarab: not pushed: this Run is a fork pull request's, or is locked out of its Environment's secrets" >&2
           push=false
         fi
+        # A library that builds one Step per platform sets
+        # SCARAB_BUILD_PLATFORM (linux/<architecture>[/<variant>]). BuildKit
+        # here builds only for the node's own architecture, so a Step that
+        # landed on a node of another architecture is refused before
+        # BuildKit starts. Unset, the node's own platform is built.
+        platform=${SCARAB_BUILD_PLATFORM-}
+        if [ -n "$platform" ]; then
+          case "$platform" in
+            linux/386 | linux/amd64 | linux/amd64/v[2-4] | linux/arm | linux/arm/v[5-8] | \
+              linux/arm64 | linux/loong64 | linux/mips | linux/mipsle | linux/mips64 | \
+              linux/mips64le | linux/ppc64 | linux/ppc64le | linux/riscv64 | linux/s390x) ;;
+            *) fail "platform $platform is not linux/<architecture>[/<variant>] of an architecture this library builds" ;;
+          esac
+          want=${platform#linux/}
+          want=${want%%/*}
+          m=$(uname -m) || fail "cannot read this node's architecture"
+          case "$m" in
+            x86_64 | amd64) node=amd64 ;;
+            aarch64 | arm64) node=arm64 ;;
+            armv5* | armv6* | armv7* | armv8l | arm) node=arm ;;
+            i386 | i486 | i586 | i686) node=386 ;;
+            loongarch64) node=loong64 ;;
+            mips) node=mips ;;
+            mipsel) node=mipsle ;;
+            mips64) node=mips64 ;;
+            mips64el) node=mips64le ;;
+            ppc64) node=ppc64 ;;
+            ppc64le) node=ppc64le ;;
+            riscv64) node=riscv64 ;;
+            s390x) node=s390x ;;
+            *) node=$m ;;
+          esac
+          [ "$node" = "$want" ] ||
+            fail "this step builds $platform, but its node's architecture is $node (uname -m: $m); the placement map routes this instance to the wrong nodes"
+        fi
         set -- build --frontend dockerfile.v0 \
           --local "context=$ctx" --local "dockerfile=$ctx" --opt "filename=$df"
+        [ -z "$platform" ] || set -- "$@" --opt "platform=$platform"
         while IFS= read -r line; do
           [ -n "$line" ] || continue
           key=${line%%=*}
@@ -286,16 +322,25 @@ steps:
             # A library that builds one image per architecture from one set
             # of inputs sets SCARAB_BUILD_CACHE_PER_ARCH, so each
             # architecture keeps its own cache: <name>-<arch>, or
-            # buildkit-<arch> when no name is given.
+            # buildkit-<arch> when no name is given. <arch> is the platform
+            # this Step builds, without linux/ and with - for / (arm-v7),
+            # when SCARAB_BUILD_PLATFORM names one; else the node's.
             case "${SCARAB_BUILD_CACHE_PER_ARCH-false}" in
               false) ;;
               true)
-                m=$(uname -m) || fail "cannot read this node's architecture"
-                case "$m" in
-                  x86_64) m=amd64 ;;
-                  aarch64) m=arm64 ;;
-                  "" | *[!A-Za-z0-9_]*) fail "this node's architecture $m is not a name" ;;
-                esac
+                if [ -n "$platform" ]; then
+                  m=${platform#linux/}
+                  a=${m%%/*}
+                  v=${m#"$a"}
+                  m=$a${v:+-${v#/}}
+                else
+                  m=$(uname -m) || fail "cannot read this node's architecture"
+                  case "$m" in
+                    x86_64) m=amd64 ;;
+                    aarch64) m=arm64 ;;
+                    "" | *[!A-Za-z0-9_]*) fail "this node's architecture $m is not a name" ;;
+                  esac
+                fi
                 name=${name:-buildkit}-$m
                 ;;
               *) fail "SCARAB_BUILD_CACHE_PER_ARCH must be true or false" ;;
