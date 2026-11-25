@@ -36,9 +36,9 @@
 #              `placement_profiles`. Two builds that land on nodes of one
 #              architecture make two images of one platform, which the push
 #              Step refuses.
-#   app/push   pushes both images by digest, tags each
-#              <tag>-<architecture> (with `arch_tags`), pushes the index
-#              under `image`'s tag, then tags the index with each extra tag,
+#   app/push   pushes both images by digest, pushes the index under
+#              `image`'s tag, tags each image <tag>-amd64 and <tag>-arm64
+#              (with `arch_tags`), then tags the index with each extra tag,
 #              the same script as image-index.yaml's Step. It asks for
 #              `registry_auth: true`: Scarab mounts the Run's registry
 #              credential at /scarab/registry/config.json and points
@@ -48,10 +48,12 @@
 #              (`inputs: [amd64, arm64]`), so it needs disk for both
 #              layouts. It checks every layout before its first registry
 #              write (only directories and regular files, no symlink at any
-#              level, inside the workspace; the manifest and the config hash
-#              to their names; the manifest is the digest its build
-#              reported; one image per platform), as image-index.yaml
-#              describes. A retried push Step pushes both architectures
+#              level, inside the workspace; the manifest and every blob it
+#              names hash to their names; the manifest is the digest its
+#              build's result names; one image per platform), as
+#              image-index.yaml describes. That check shows a layout was not
+#              changed after the result named it, not that the build Step
+#              made it. A retried push Step pushes both architectures
 #              again; each write puts the same content under the same name.
 #
 # Output:
@@ -83,8 +85,9 @@
 #   extra_tags  more tags for the index, in `image`'s repository: tag names,
 #               not references, separated by spaces or line breaks
 #               (default empty)
-#   arch_tags   also tag each architecture's image <tag>-<architecture>, or
-#               <tag>-<architecture>-<variant> (default true). A registry
+#   arch_tags   also tag each architecture's image <tag>-amd64 and
+#               <tag>-arm64, whether or not the arm64 config names v8
+#               (default true). A registry
 #               rule that expires untagged images could otherwise remove an
 #               image the index names
 #   context     the build context, relative to the workspace (default ".")
