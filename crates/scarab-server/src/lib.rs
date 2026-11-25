@@ -1577,7 +1577,9 @@ pub struct PutSecretRequest {
     /// Repo, for a repo- or environment-scoped secret.
     #[serde(default)]
     pub repo: Option<String>,
-    /// Environment, for an environment-scoped secret (requires `repo`).
+    /// Environment, for an environment-scoped secret: with `repo`, that
+    /// repository's value for the Environment; without, the org's value for
+    /// it, which every repository's Runs there get unless they set their own.
     #[serde(default)]
     pub environment: Option<String>,
     /// Secret name (the key steps reference).
@@ -1636,14 +1638,43 @@ pub struct SecretMatrixRow {
     /// `silenced` = unset **on purpose** (a coverage marker). Only a genuinely
     /// unset cell can be silenced: a marker never hides a real value.
     pub status: std::collections::BTreeMap<String, String>,
-    /// For each `inherited` cell, the scope it resolves from — `"repo"` or
-    /// `"org"`. Lets a cell say *what* it would be overriding, so an edit reads
-    /// as "override the repo default" rather than an unexplained write.
+    /// For each `inherited` cell, the scope it resolves from — `"repo"`,
+    /// `"org"`, or `"org_environment"` (the org's value for that column's
+    /// Environment). Lets a cell say *what* it would be overriding, so an
+    /// edit reads as "override the repo default" rather than an unexplained
+    /// write.
     pub inherited_from: std::collections::BTreeMap<String, String>,
     /// For each `set` cell that hides a broader value, the scope it hides —
-    /// `"repo"` or `"org"`. The counterpart of `inherited_from`: a repo key that
+    /// `"repo"`, `"org"` or `"org_environment"`. The counterpart of `inherited_from`: a repo key that
     /// the org also defines reads as overriding the org, not as a lone key.
     pub overrides: std::collections::BTreeMap<String, String>,
+}
+
+/// `GET /v1/orgs/{org}/secrets/matrix`: the org's keys by scope.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OrgSecretMatrix {
+    /// Column ids in render order: [`REPO_DEFAULT_COLUMN`] (`""`, the org
+    /// default) first, then each org Environment.
+    pub columns: Vec<String>,
+    /// The org's Environments, in column order.
+    pub environments: Vec<String>,
+    pub keys: Vec<OrgSecretMatrixRow>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OrgSecretMatrixRow {
+    pub key: String,
+    /// `column id -> "set" | "inherited" | "unset"`: `inherited` is an
+    /// Environment column with no org value of its own that falls through to
+    /// the org default.
+    pub status: std::collections::BTreeMap<String, String>,
+    /// `column id -> repositories`, sorted: the repositories that set their
+    /// own value in front of that column — their repository default in front
+    /// of the org default, their value for an Environment in front of the
+    /// org's value for it. An `inherited` column names both: the org default
+    /// it falls to is behind each repository default as well. Absent for a
+    /// column no repository overrides.
+    pub repos_with_own: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// `PUT …/secrets/matrix/silenced` body — and, as a query, the `DELETE`
@@ -13868,8 +13899,9 @@ fn refuse_nul_reason(reason: Option<&str>) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Build a [`SecretScope`] from the flat org/repo/environment selector,
-/// enforcing that an environment scope names a repo (ADR-0014, 0024).
+/// Build a [`SecretScope`] from the flat org/repo/environment selector
+/// (ADR-0014, 0024): an environment with a repo is that repo's value for
+/// the Environment, an environment alone is the org's value for it.
 /// The RBAC scope of an (org, optional repo) coordinate (ADR-0049): a repo
 /// pins the Project; bare org is Org scope. Environment adds no RBAC scope —
 /// deploy authorization is the protection rules (ADR-0037).
@@ -13891,6 +13923,10 @@ fn secret_scope(
     if org.is_empty() {
         return Err(ApiError::BadRequest("org is required".into()));
     }
+    // An empty name is no Environment: refused rather than read as one.
+    if environment.as_deref() == Some("") {
+        return Err(ApiError::BadRequest("environment must not be empty".into()));
+    }
     match (repo, environment) {
         (None, None) => Ok(scarab_secrets::SecretScope::Org { org }),
         (Some(repo), None) => Ok(scarab_secrets::SecretScope::Repo { org, repo }),
@@ -13899,9 +13935,23 @@ fn secret_scope(
             project: repo,
             environment,
         }),
-        (None, Some(_)) => Err(ApiError::BadRequest(
-            "environment-scoped secret requires a repo".into(),
-        )),
+        (None, Some(environment)) => {
+            Ok(scarab_secrets::SecretScope::OrgEnvironment { org, environment })
+        }
+    }
+}
+
+/// The `(org, Environment)` a secret scope belongs to, for the two scopes
+/// that live only while their Environment does.
+fn scope_environment(scope: &scarab_secrets::SecretScope) -> Option<(&str, &str)> {
+    match scope {
+        scarab_secrets::SecretScope::EnvironmentProject {
+            org, environment, ..
+        }
+        | scarab_secrets::SecretScope::OrgEnvironment { org, environment } => {
+            Some((org.as_str(), environment.as_str()))
+        }
+        scarab_secrets::SecretScope::Org { .. } | scarab_secrets::SecretScope::Repo { .. } => None,
     }
 }
 
@@ -13948,13 +13998,11 @@ async fn put_secret(
     // The check and the write hold the Environment name's claim, which a
     // delete takes too, so the two cannot interleave (git-bug 1a81c63). It
     // is released before the answer.
-    let claim = match (&scope, st.environment_governance.as_deref()) {
-        (
-            scarab_secrets::SecretScope::EnvironmentProject {
-                org, environment, ..
-            },
-            Some(governance),
-        ) => Some(
+    let claim = match (
+        scope_environment(&scope),
+        st.environment_governance.as_deref(),
+    ) {
+        (Some((org, environment)), Some(governance)) => Some(
             governance
                 .claim_environment_name(org, environment)
                 .await
@@ -13969,12 +14017,8 @@ async fn put_secret(
         _ => None,
     };
     let written = async {
-        if let (
-            scarab_secrets::SecretScope::EnvironmentProject {
-                org, environment, ..
-            },
-            Some(envs),
-        ) = (&scope, st.org_environments.as_ref())
+        if let (Some((org, environment)), Some(envs)) =
+            (scope_environment(&scope), st.org_environments.as_ref())
         {
             let exists = envs
                 .get_org_environment(org, environment)
@@ -14187,10 +14231,18 @@ async fn secret_matrix(
     // into, plus any it still holds an overlay or grant in (ADR-0071): every
     // EnvironmentProjectSecretScope its Deploy Runs could resolve, and none
     // of another Project's.
-    let env_names: Vec<String> = governance
+    let env_governance = governance
         .project_environment_governance(&org, &repo)
         .await
-        .map_err(org_environments::org_environment_api_error)?
+        .map_err(org_environments::org_environment_api_error)?;
+    // The Environments it may deploy into: the only ones whose org values
+    // its Runs can resolve, so the only ones whose org key names it reads.
+    let eligible: std::collections::BTreeSet<String> = env_governance
+        .iter()
+        .filter(|g| g.eligible)
+        .map(|g| g.environment.name.clone())
+        .collect();
+    let env_names: Vec<String> = env_governance
         .into_iter()
         .map(|g| g.environment.name)
         .collect();
@@ -14212,12 +14264,25 @@ async fn secret_matrix(
     })
     .await?;
 
-    // Keys defined directly at each environment's scope.
+    // Keys defined directly at each environment's scope, and the org's
+    // values for each environment (which sit between the two: ahead of the
+    // repo default, behind the repo's own value for the environment).
     let mut env_keys: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    let mut org_env_keys: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
         std::collections::BTreeMap::new();
     let mut all_keys: std::collections::BTreeSet<String> =
         org_keys.union(&repo_keys).cloned().collect();
     for name in &env_names {
+        if eligible.contains(name) {
+            let keys = keys_at(scarab_secrets::SecretScope::OrgEnvironment {
+                org: org.clone(),
+                environment: name.clone(),
+            })
+            .await?;
+            all_keys.extend(keys.iter().cloned());
+            org_env_keys.insert(name.clone(), keys);
+        }
         let keys = keys_at(scarab_secrets::SecretScope::EnvironmentProject {
             org: org.clone(),
             project: repo.clone(),
@@ -14263,7 +14328,11 @@ async fn secret_matrix(
                 };
                 // The nearest broader scope that also holds the key: what an
                 // unset cell falls through to, or what a set cell hides.
-                let broader = if column != REPO_DEFAULT_COLUMN && repo_keys.contains(&key) {
+                let broader = if column != REPO_DEFAULT_COLUMN
+                    && org_env_keys.get(column).is_some_and(|k| k.contains(&key))
+                {
+                    Some("org_environment")
+                } else if column != REPO_DEFAULT_COLUMN && repo_keys.contains(&key) {
                     Some("repo")
                 } else if org_keys.contains(&key) {
                     Some("org")
@@ -14300,6 +14369,134 @@ async fn secret_matrix(
         .collect();
 
     Ok(Json(SecretMatrix {
+        columns,
+        environments: env_names,
+        keys,
+    }))
+}
+
+/// The org's secret list (Org Settings › Secrets): each key the org sets,
+/// in the **org default** column and in a column per org Environment —
+/// `set` (a value at exactly that scope), `inherited` (an Environment column
+/// falling through to the org default) or `unset` — and, per column, the
+/// repositories that set their own value in front of it: their repository
+/// default in front of the org default, their value for an Environment in
+/// front of the org's value for it. An Environment column that falls to the
+/// org default names both kinds: there a repository default wins too.
+///
+/// Names + status only, never values; `Administer` on the org, like
+/// listing its secrets.
+#[utoipa::path(get, path = "/v1/orgs/{org}/secrets/matrix", params(("org" = String, Path, description = "org")), summary = "The org's secret list - names + status, never values", responses((status = 200, body = OrgSecretMatrix), (status = 404, description = "secrets not configured")))]
+async fn org_secret_matrix(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(org): Path<String>,
+) -> Result<Json<OrgSecretMatrix>, ApiError> {
+    let scope = rbac_scope(&org, None);
+    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    refuse_reserved_secret_org(&org)?;
+    let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
+    let mut env_names: Vec<String> = match st.org_environments.as_ref() {
+        Some(store) => store
+            .list_org_environments(&org)
+            .await
+            .map_err(org_environments::org_environment_api_error)?
+            .into_iter()
+            .map(|e| e.name)
+            .collect(),
+        None => Vec::new(),
+    };
+    env_names.sort();
+
+    type Keys = std::collections::BTreeSet<String>;
+    let keys_at = |scope: scarab_secrets::SecretScope| async move {
+        secrets
+            .list_scoped(&scope)
+            .await
+            .map(|v| v.into_iter().collect::<Keys>())
+            .map_err(secret_err)
+    };
+    let org_keys = keys_at(scarab_secrets::SecretScope::Org { org: org.clone() }).await?;
+    let mut org_env_keys: std::collections::BTreeMap<String, Keys> = Default::default();
+    for name in &env_names {
+        let keys = keys_at(scarab_secrets::SecretScope::OrgEnvironment {
+            org: org.clone(),
+            environment: name.clone(),
+        })
+        .await?;
+        org_env_keys.insert(name.clone(), keys);
+    }
+    // The repositories' own values, by the column they stand in front of:
+    // a repository default by the org default's column, a value for an
+    // Environment by that Environment's. One read for the whole org.
+    let mut own: std::collections::BTreeMap<(String, String), Vec<String>> = Default::default();
+    for (project, environment, key) in secrets
+        .project_secret_keys(&org)
+        .await
+        .map_err(secret_err)?
+    {
+        let column = match environment {
+            None => REPO_DEFAULT_COLUMN.to_string(),
+            Some(environment) if org_env_keys.contains_key(&environment) => environment,
+            Some(_) => continue,
+        };
+        own.entry((column, key)).or_default().push(project);
+    }
+
+    // A key appears when the org sets it somewhere; a key only repositories
+    // set is theirs, listed on their own Secrets tabs.
+    let mut all_keys: Keys = org_keys.clone();
+    for keys in org_env_keys.values() {
+        all_keys.extend(keys.iter().cloned());
+    }
+    let mut columns = vec![REPO_DEFAULT_COLUMN.to_string()];
+    columns.extend(env_names.iter().cloned());
+    let keys = all_keys
+        .into_iter()
+        .map(|key| {
+            let mut status = std::collections::BTreeMap::new();
+            let mut repos_with_own = std::collections::BTreeMap::new();
+            for column in &columns {
+                let set_here = if column == REPO_DEFAULT_COLUMN {
+                    org_keys.contains(&key)
+                } else {
+                    org_env_keys.get(column).is_some_and(|k| k.contains(&key))
+                };
+                let s = if set_here {
+                    "set"
+                } else if column != REPO_DEFAULT_COLUMN && org_keys.contains(&key) {
+                    "inherited"
+                } else {
+                    "unset"
+                };
+                status.insert(column.clone(), s.to_string());
+                let mut repos: Vec<String> = own
+                    .get(&(column.clone(), key.clone()))
+                    .cloned()
+                    .unwrap_or_default();
+                // An Environment column that falls to the org default has a
+                // repository default in front of it too, wherever the
+                // repository sets one.
+                if s == "inherited" {
+                    if let Some(defaults) = own.get(&(REPO_DEFAULT_COLUMN.to_string(), key.clone()))
+                    {
+                        repos.extend(defaults.iter().cloned());
+                    }
+                }
+                if !repos.is_empty() {
+                    repos.sort();
+                    repos.dedup();
+                    repos_with_own.insert(column.clone(), repos);
+                }
+            }
+            OrgSecretMatrixRow {
+                key,
+                status,
+                repos_with_own,
+            }
+        })
+        .collect();
+    Ok(Json(OrgSecretMatrix {
         columns,
         environments: env_names,
         keys,
@@ -16964,6 +17161,7 @@ impl utoipa::Modify for StepUpResponses {
         plugins::put_plugin_connection,
         plugins::delete_plugin_connection,
         secret_matrix,
+        org_secret_matrix,
         silence_secret_cell,
         unsilence_secret_cell,
         list_connections,
@@ -17071,6 +17269,8 @@ impl utoipa::Modify for StepUpResponses {
         SecretListResponse,
         SecretMatrix,
         SecretMatrixRow,
+        OrgSecretMatrix,
+        OrgSecretMatrixRow,
         SilenceCellRequest,
         ConnectionDto,
         CreateConnectionRequest,

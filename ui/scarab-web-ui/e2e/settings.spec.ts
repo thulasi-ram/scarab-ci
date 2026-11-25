@@ -1346,54 +1346,63 @@ test("New organization lists the connections waiting for an org, and a global ad
   expect(errors).toEqual([]);
 });
 
-test("org secrets: one full-width list like a repository's, edit with the name filled in, delete with the name typed", async ({
+test("org secrets: the key list with the Org default and a line per Environment, scoped writes and clears", async ({
   page,
 }) => {
   const errors = collectErrors(page);
   await page.goto("/orgs/acme/settings/secrets");
   const panel = page.locator(".panel", { hasText: "Org secrets · acme" });
-  const list = panel.getByRole("list", { name: "Secrets" });
-  await expect(list.getByRole("listitem")).toHaveCount(2);
-
-  // The same list as a repository's Secrets tab, with the count in the header.
-  await expect(panel.locator(".panel-h .tok-count")).toHaveText("2");
-  await expect(list).toHaveClass(/skey-list/);
+  const rows = panel.locator("ul.skey-list > li.skey");
+  await expect(rows).toHaveCount(3);
+  await expect(panel.locator(".panel-h .tok-count")).toHaveText("3");
   // Full width: the list spans the panel body, not a capped column.
-  const listBox = (await list.boundingBox())!;
+  const listBox = (await panel.locator("ul.skey-list").boundingBox())!;
   const bodyBox = (await panel.locator(".secrets-body").boundingBox())!;
   expect(listBox.width).toBeGreaterThan(bodyBox.width - 60);
 
-  // New secret, from the bar above the list.
+  // A key the org sets for two Environments, which one repository overrides.
+  const role = panel.getByRole("button", { name: /AWS_DEPLOY_ROLE/ });
+  await expect(role).toContainText(
+    "unset by default · set in production and qa · scarab sets its own for production",
+  );
+  await role.click();
+  const roleItem = rows.filter({ hasText: "AWS_DEPLOY_ROLE" });
+  await expect(roleItem.locator(".skey-line").first()).toContainText("Org default");
+  await expect(roleItem.locator(".skey-line", { hasText: "production" })).toContainText(
+    "set here · scarab sets its own",
+  );
+  // No "unset on purpose" at org level: the markers belong to a repository.
+  await expect(roleItem.getByRole("button", { name: /unset on purpose/ })).toHaveCount(0);
+
+  // New secret, scoped to one Environment.
   await panel.getByRole("button", { name: "New secret" }).click();
   let dialog = page.getByRole("dialog");
   await expect(dialog.getByRole("heading", { name: "New secret" })).toBeVisible();
   await dialog.getByRole("textbox", { name: "Name" }).fill("NPM_TOKEN");
   await dialog.getByLabel("Value").fill("npm_x");
+  await choose(page, dialog.getByLabel("Scope"), "production");
   await dialog.getByRole("button", { name: "Save" }).click();
-  await expect(list.getByText("NPM_TOKEN", { exact: true })).toBeVisible();
+  await expect(panel.getByRole("button", { name: /NPM_TOKEN/ })).toContainText(
+    "unset by default · set in production",
+  );
 
-  // Edit keeps the name and still asks before overwriting.
-  await list.getByRole("button", { name: "Edit GHCR_TOKEN" }).click();
+  // Edit one line: the Org default of GHCR_TOKEN.
+  await panel.getByRole("button", { name: /GHCR_TOKEN/ }).click();
+  await panel.getByRole("button", { name: "Edit GHCR_TOKEN in the Org default" }).click();
   dialog = page.getByRole("dialog");
-  await expect(dialog.getByRole("heading", { name: "Replace secret" })).toBeVisible();
-  await expect(dialog.getByRole("textbox", { name: "Name" })).toHaveValue("GHCR_TOKEN");
-  const save = dialog.getByRole("button", { name: "Save" });
-  await expect(save).toBeDisabled();
-  await dialog.getByRole("checkbox").check();
-  await expect(save).toBeEnabled();
+  await expect(dialog).toContainText("GHCR_TOKEN · Org default");
+  await expect(dialog.getByRole("button", { name: "Replace" })).toBeDisabled();
   await dialog.getByRole("button", { name: "Cancel" }).click();
 
-  // Delete asks for the name typed exactly.
-  await list.getByRole("button", { name: "Delete SENTRY_DSN" }).click();
+  // Clearing the only scope that holds SENTRY_DSN takes the key off the list.
+  await panel.getByRole("button", { name: /SENTRY_DSN/ }).click();
+  await panel.getByRole("button", { name: "Clear SENTRY_DSN in the Org default" }).click();
   dialog = page.getByRole("dialog");
-  const go = dialog.getByRole("button", { name: "Delete secret" });
-  await expect(go).toBeDisabled();
-  await dialog.getByRole("textbox", { name: "Type SENTRY_DSN to confirm" }).fill("SENTRY_DSN");
-  await go.click();
-  await expect(list.getByText("SENTRY_DSN", { exact: true })).toHaveCount(0);
+  await dialog.getByRole("button", { name: "Clear here" }).click();
+  await expect(panel.getByRole("button", { name: /SENTRY_DSN/ })).toHaveCount(0);
 
-  // One note, inside the panel; no button under the list.
-  await expect(panel.getByText(/never displayed: you can overwrite a value but not read it back\. Setting a name again replaces it\./)).toHaveCount(1);
+  // One note, inside the panel; one New secret button.
+  await expect(panel.getByText(/never displayed: you can overwrite a value but not read it back\./)).toHaveCount(1);
   await expect(page.locator("section.page").getByRole("button", { name: "New secret" })).toHaveCount(1);
   expect(errors).toEqual([]);
 });

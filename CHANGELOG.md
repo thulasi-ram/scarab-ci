@@ -18,6 +18,21 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Features
+
+- **The org can set a secret for one Environment, for every repository.** In Org settings ›
+  Secrets, **New secret** asks for a scope: the Org default or one Environment. A Run of `web` in
+  `production` now looks a key up in `web · production`, then the org's value for `production`,
+  then `web`'s default, then the org default, so a production credential set once by the org is
+  not replaced by a repository default. A repository can still set its own value for the
+  Environment. The org's Secrets page is now the same list as a repository's Secrets tab: each
+  key expands to the Org default and one line per Environment, and each line says which
+  repositories set their own value in front of it. Deleting or duplicating an Environment
+  includes the org's values for it. During a rolling upgrade, replicas still on the old version
+  give Runs the repository default instead of the org's value for the Environment, so set org
+  Environment values once every replica runs this version. See
+  [Secrets](https://thulasi-ram.github.io/scarab-ci/usage/secrets/).
+
 ## [0.7.5] - 2026-11-25
 
 ### Enhancement

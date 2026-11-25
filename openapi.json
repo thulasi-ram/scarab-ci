@@ -1876,7 +1876,7 @@
           "Environments"
         ],
         "summary": "Create or replace an org Environment",
-        "description": "A create takes the same claim on the name a Duplicate holds, and is\nrefused (409) while a Duplicate to that name is in progress: that\nDuplicate has checked the name is free and may be writing secrets under\nit, and its cleanup deletes what it wrote by name. A replace of an\nexisting Environment takes no claim.",
+        "description": "A create takes the same claim on the name a Duplicate holds, and is\nrefused (409) while a Duplicate to that name is in progress: that\nDuplicate has checked the name is free and may be writing secrets under\nit, and its cleanup deletes what it wrote by name. A create is also\nrefused (409) while secrets an earlier Environment of the name left are\nstored, the org's or any Project's. A replace of an existing Environment\ntakes no claim.",
         "operationId": "put_org_environment",
         "parameters": [
           {
@@ -1961,7 +1961,7 @@
             "description": "org Environments not configured"
           },
           "409": {
-            "description": "a create while a duplicate to the name is in progress, or a concurrent write won; retry"
+            "description": "a create while a duplicate to the name is in progress, a create over secrets an earlier environment of the name left, or a concurrent write won"
           },
           "412": {
             "description": "`If-Match` or `If-None-Match: *` did not hold; reload"
@@ -6011,6 +6011,50 @@
           },
           "404": {
             "description": "no connection registry wired"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/secrets/matrix": {
+      "get": {
+        "tags": [
+          "Secrets"
+        ],
+        "summary": "The org's secret list - names + status, never values",
+        "description": "Names + status only, never values; `Administer` on the org, like\nlisting its secrets.",
+        "operationId": "org_secret_matrix",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgSecretMatrix"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "secrets not configured"
           }
         },
         "security": [
@@ -10679,9 +10723,17 @@
         "required": [
           "overlays",
           "privilege_grants",
-          "secrets"
+          "secrets",
+          "org_secrets"
         ],
         "properties": {
+          "org_secrets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The org's own values for the Environment copied, by key."
+          },
           "overlays": {
             "type": "array",
             "items": {
@@ -10892,7 +10944,8 @@
           "secret_count",
           "overlays",
           "privilege_grants",
-          "secrets"
+          "secrets",
+          "org_secrets"
         ],
         "properties": {
           "code": {
@@ -10901,6 +10954,13 @@
           },
           "message": {
             "type": "string"
+          },
+          "org_secrets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The org's own values for it (every Project's), by key."
           },
           "overlay_count": {
             "type": "integer",
@@ -12599,6 +12659,73 @@
           }
         }
       },
+      "OrgSecretMatrix": {
+        "type": "object",
+        "description": "`GET /v1/orgs/{org}/secrets/matrix`: the org's keys by scope.",
+        "required": [
+          "columns",
+          "environments",
+          "keys"
+        ],
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Column ids in render order: [`REPO_DEFAULT_COLUMN`] (`\"\"`, the org\ndefault) first, then each org Environment."
+          },
+          "environments": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The org's Environments, in column order."
+          },
+          "keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrgSecretMatrixRow"
+            }
+          }
+        }
+      },
+      "OrgSecretMatrixRow": {
+        "type": "object",
+        "required": [
+          "key",
+          "status",
+          "repos_with_own"
+        ],
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "repos_with_own": {
+            "type": "object",
+            "description": "`column id -> repositories`, sorted: the repositories that set their\nown value in front of that column — their repository default in front\nof the org default, their value for an Environment in front of the\norg's value for it. An `inherited` column names both: the org default\nit falls to is behind each repository default as well. Absent for a\ncolumn no repository overrides.",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "status": {
+            "type": "object",
+            "description": "`column id -> \"set\" | \"inherited\" | \"unset\"`: `inherited` is an\nEnvironment column with no org value of its own that falls through to\nthe org default.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
       "OrgSecuritySummary": {
         "type": "object",
         "description": "`GET /v1/orgs/{org}/security/summary`.",
@@ -12691,10 +12818,9 @@
       },
       "OrphanedSecretsDto": {
         "type": "object",
-        "description": "Secrets one Project holds under an Environment name that has no\nEnvironment. Names only, never values.",
+        "description": "Secrets one Project, or the org, holds under an Environment name that has\nno Environment. Names only, never values.",
         "required": [
           "environment",
-          "project",
           "keys"
         ],
         "properties": {
@@ -12708,7 +12834,11 @@
             }
           },
           "project": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Project holding them; `null` for the org's own values for the\nEnvironment."
           }
         }
       },
@@ -14503,7 +14633,7 @@
               "string",
               "null"
             ],
-            "description": "Environment, for an environment-scoped secret (requires `repo`)."
+            "description": "Environment, for an environment-scoped secret: with `repo`, that\nrepository's value for the Environment; without, the org's value for\nit, which every repository's Runs there get unless they set their own."
           },
           "name": {
             "type": "string",
@@ -15428,7 +15558,7 @@
         "properties": {
           "inherited_from": {
             "type": "object",
-            "description": "For each `inherited` cell, the scope it resolves from — `\"repo\"` or\n`\"org\"`. Lets a cell say *what* it would be overriding, so an edit reads\nas \"override the repo default\" rather than an unexplained write.",
+            "description": "For each `inherited` cell, the scope it resolves from — `\"repo\"`,\n`\"org\"`, or `\"org_environment\"` (the org's value for that column's\nEnvironment). Lets a cell say *what* it would be overriding, so an\nedit reads as \"override the repo default\" rather than an unexplained\nwrite.",
             "additionalProperties": {
               "type": "string"
             },
@@ -15441,7 +15571,7 @@
           },
           "overrides": {
             "type": "object",
-            "description": "For each `set` cell that hides a broader value, the scope it hides —\n`\"repo\"` or `\"org\"`. The counterpart of `inherited_from`: a repo key that\nthe org also defines reads as overriding the org, not as a lone key.",
+            "description": "For each `set` cell that hides a broader value, the scope it hides —\n`\"repo\"`, `\"org\"` or `\"org_environment\"`. The counterpart of `inherited_from`: a repo key that\nthe org also defines reads as overriding the org, not as a lone key.",
             "additionalProperties": {
               "type": "string"
             },

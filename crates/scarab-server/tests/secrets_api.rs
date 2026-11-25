@@ -7,6 +7,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
+use scarab_secrets::{SecretProvider, SecretScope};
 use scarab_server::{router, AppState, LogService};
 use scarab_testkit::{FakeClock, FakeSecrets, InMemoryDb, InMemoryObjectStore};
 
@@ -98,17 +99,52 @@ async fn create_list_delete_never_exposes_the_value() {
     assert!(!body_string(resp).await.contains("NPM_TOKEN"), "deleted");
 }
 
+/// An environment without a repo is the org's value for that Environment,
+/// for every repository's Runs there.
 #[tokio::test]
-async fn environment_scope_requires_a_repo() {
-    let app = router(state(Some(Arc::new(FakeSecrets::new()))));
-    // environment without repo → 400.
+async fn an_environment_without_a_repo_is_the_orgs_value_for_it() {
+    let secrets = Arc::new(FakeSecrets::new());
+    let app = router(state(Some(secrets.clone())));
     let resp = app
         .oneshot(put(
             r#"{"org":"acme","environment":"prod","name":"K","value":"v"}"#,
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let org_prod = SecretScope::OrgEnvironment {
+        org: "acme".into(),
+        environment: "prod".into(),
+    };
+    assert_eq!(secrets.get(&org_prod, "K").await.unwrap().value, b"v");
+    assert!(secrets
+        .get(&SecretScope::Org { org: "acme".into() }, "K")
+        .await
+        .is_err());
+}
+
+/// An empty `environment` names no Environment, with a repo or without: 400,
+/// and nothing is stored.
+#[tokio::test]
+async fn an_empty_environment_is_refused() {
+    let secrets = Arc::new(FakeSecrets::new());
+    let app = router(state(Some(secrets.clone())));
+    for body in [
+        r#"{"org":"acme","environment":"","name":"K","value":"v"}"#,
+        r#"{"org":"acme","repo":"web","environment":"","name":"K","value":"v"}"#,
+    ] {
+        let resp = app.clone().oneshot(put(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    for scope in [
+        SecretScope::Org { org: "acme".into() },
+        SecretScope::Repo {
+            org: "acme".into(),
+            repo: "web".into(),
+        },
+    ] {
+        assert!(secrets.list_scoped(&scope).await.unwrap().is_empty());
+    }
 }
 
 #[tokio::test]

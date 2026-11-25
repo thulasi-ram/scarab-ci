@@ -1,7 +1,9 @@
-// A repository's secrets as a key list. Each key is one row with a summary of
-// where it is set; expanding it shows one line per scope: the Repository
-// default (the repo scope every Environment falls back to), then each
-// Environment. Inherited and unset Environments fold behind a "N more" line, so
+// A repository's secrets, or the org's, as a key list. Each key is one row with
+// a summary of where it is set; expanding it shows one line per scope: the
+// Repository default (the repo scope every Environment falls back to), then
+// each Environment. Without a repo it is the org's list (Org settings ›
+// Secrets): the Org default, then the org's value for each Environment, each
+// line saying which repositories set their own in front of it. Inherited and unset Environments fold behind a "N more" line, so
 // the list stays readable with many Environments.
 //
 // Picking an Environment makes every row's summary say what a Run in that
@@ -16,6 +18,7 @@
 //   ⊘  unset on purpose  a marker for a gap that is meant to be there; advisory
 import { createResource, createSignal, createUniqueId, For, Show } from "solid-js";
 import {
+  fetchOrgSecretMatrix,
   fetchSecretMatrix,
   listSecrets,
   putSecret,
@@ -77,18 +80,23 @@ const toggleIn = (set: ReadonlySet<string>, name: string) => {
 
 export default function SecretKeyList(props: {
   org: string;
-  repo: string;
+  /** The repository; none is the org's own list. */
+  repo?: string;
   /** The picked Environment; `""` is all of them. */
   environment: string;
   onEnvironment: (environment: string) => void;
 }) {
   // The matrix carries every key the repo can resolve. Without it (a failed
   // read), the list falls back to the repo scope's own names.
+  const isOrg = () => !props.repo;
   const [data, { refetch }] = createResource(
     () => ({ org: props.org, repo: props.repo }),
     async (k): Promise<{ matrix: SecretMatrix; partial: boolean }> => {
       try {
-        return { matrix: await fetchSecretMatrix(k.org, k.repo), partial: false };
+        const matrix = k.repo
+          ? await fetchSecretMatrix(k.org, k.repo)
+          : await fetchOrgSecretMatrix(k.org);
+        return { matrix, partial: false };
       } catch {
         return { matrix: matrixFromNames(await listSecrets(k)), partial: true };
       }
@@ -111,11 +119,13 @@ export default function SecretKeyList(props: {
 
   const toggleSilenced = (cell: Cell, on: boolean) => {
     setSilenceFor(cell.key);
-    void silence.run(() => setSecretCellSilenced(props.org, props.repo, cell.column, cell.key, on));
+    const repo = props.repo;
+    if (!repo) return;
+    void silence.run(() => setSecretCellSilenced(props.org, repo, cell.column, cell.key, on));
   };
 
   const where = (column: string) =>
-    column === REPO_DEFAULT_COLUMN ? "the Repository default" : column;
+    column === REPO_DEFAULT_COLUMN ? `the ${scopeLabel(column, isOrg())}` : column;
 
   const ScopeLine = (p: { row: SecretKeyRow; column: string }) => {
     const s = () => statusAt(p.row, p.column);
@@ -125,9 +135,9 @@ export default function SecretKeyList(props: {
       <li class="skey-line">
         <span class={`skey-g skey-g-${s()}`} aria-hidden="true">{GLYPH[s()]}</span>
         <span class="skey-scope" classList={{ mono: p.column !== REPO_DEFAULT_COLUMN }}>
-          {scopeLabel(p.column)}
+          {scopeLabel(p.column, isOrg())}
         </span>
-        <span class="skey-state">{stateText(p.row, p.column)}</span>
+        <span class="skey-state">{stateText(p.row, p.column, isOrg())}</span>
         <span class="skey-acts">
           <button
             class="btn btn-ghost btn-sm"
@@ -147,7 +157,7 @@ export default function SecretKeyList(props: {
               clear
             </button>
           </Show>
-          <Show when={s() === "unset"}>
+          <Show when={s() === "unset" && !isOrg()}>
             <button
               class="btn btn-ghost btn-sm"
               type="button"
@@ -159,7 +169,7 @@ export default function SecretKeyList(props: {
               unset on purpose
             </button>
           </Show>
-          <Show when={s() === "silenced"}>
+          <Show when={s() === "silenced" && !isOrg()}>
             <button
               class="btn btn-ghost btn-sm"
               type="button"
@@ -196,15 +206,15 @@ export default function SecretKeyList(props: {
             >
               <Icon icon={isOpen() ? "chevron-down" : "chevron-right"} size={14} />
               <code class="mono skey-name">{p.name}</code>
-              <Show when={isOrgKey(r())}>
+              <Show when={!isOrg() && isOrgKey(r())}>
                 <span class="skey-tag">org</span>
               </Show>
               <span class="skey-sum">
-                <Show when={picked()} fallback={keySummary(matrix()!, r())}>
+                <Show when={picked()} fallback={keySummary(matrix()!, r(), isOrg())}>
                   <span class={`skey-g skey-g-${statusAt(r(), picked())}`} aria-hidden="true">
                     {GLYPH[statusAt(r(), picked())]}
                   </span>{" "}
-                  <span class="mono">{picked()}</span>: {envSummary(r(), picked())}
+                  <span class="mono">{picked()}</span>: {envSummary(r(), picked(), isOrg())}
                 </Show>
               </span>
             </button>
@@ -243,7 +253,7 @@ export default function SecretKeyList(props: {
   return (
     <div class="panel">
       <div class="panel-h">
-        <span>Secrets</span>
+        <span>{isOrg() ? `Org secrets · ${props.org}` : "Secrets"}</span>
         <Show when={names().length > 0}>
           <span class="tok-count">{names().length}</span>
         </Show>
@@ -267,12 +277,15 @@ export default function SecretKeyList(props: {
         </div>
 
         <Show when={data.error && !data.latest}>
-          <p class="error">Could not load this repository's secrets.</p>
+          <p class="error">
+            Could not load {isOrg() ? "the org's" : "this repository's"} secrets.
+          </p>
         </Show>
         <Show when={data.latest?.partial}>
           <p class="subtle">
             <small>
-              Showing the Repository default only: the per-environment view could not be loaded.
+              Showing the {scopeLabel(REPO_DEFAULT_COLUMN, isOrg())} only: the per-environment
+              view could not be loaded.
             </small>
           </p>
         </Show>
@@ -287,25 +300,42 @@ export default function SecretKeyList(props: {
         >
           <Show
             when={names().length > 0}
-            fallback={<p class="empty">No secrets yet. Add one with New secret.</p>}
+            fallback={
+              <p class="empty">
+                No {isOrg() ? "org " : ""}secrets yet. Add one with New secret.
+              </p>
+            }
           >
             <ul class="skey-list">
               <For each={names()}>{(name) => <KeyItem name={name} />}</For>
             </ul>
           </Show>
           <p class="subtle skey-legend">
-            <small>
-              <b>●</b> set here · <b>○</b> inherited · <b>–</b> unset · <b>⊘</b> unset on
-              purpose. Encrypted at rest and never displayed: you can overwrite a value but not
-              read it back. A gap never blocks a deploy.
-            </small>
+            <Show
+              when={isOrg()}
+              fallback={
+                <small>
+                  <b>●</b> set here · <b>○</b> inherited · <b>–</b> unset · <b>⊘</b> unset on
+                  purpose. Encrypted at rest and never displayed: you can overwrite a value but
+                  not read it back. A gap never blocks a deploy.
+                </small>
+              }
+            >
+              <small>
+                <b>●</b> set here · <b>○</b> inherited · <b>–</b> unset. Encrypted at rest and
+                never displayed: you can overwrite a value but not read it back. A repository's
+                default wins over the Org default, and a repository's value for one Environment
+                wins over the org's value for it.
+              </small>
+            </Show>
           </p>
         </Show>
       </div>
 
       <Show when={creating()}>
         <NewSecretDialog
-          scope={{ org: props.org, repo: props.repo }}
+          scope={props.repo ? { org: props.org, repo: props.repo } : { org: props.org }}
+          defaultLabel={scopeLabel(REPO_DEFAULT_COLUMN, isOrg())}
           existing={(env) => (matrix() ? namesSetAt(matrix()!, env) : [])}
           environments={envs()}
           environment={picked()}
@@ -341,10 +371,17 @@ export default function SecretKeyList(props: {
 }
 
 /** What clearing a scope falls back to: stated, never implied. */
-const fallbackOf = (column: string) =>
-  column === REPO_DEFAULT_COLUMN
-    ? "the org value, if the org has one"
-    : "whatever the Repository default resolves to";
+const fallbackOf = (column: string, repo: string | undefined) =>
+  repo
+    ? column === REPO_DEFAULT_COLUMN
+      ? "the org value, if the org has one"
+      : `the org value for ${column} if the org has one, else whatever the Repository default resolves to`
+    : column === REPO_DEFAULT_COLUMN
+      ? "nothing from the org; a repository's own value is not affected"
+      : "the Org default, unless the repository sets its own";
+
+const eyebrowOf = (org: string, repo: string | undefined) =>
+  `${repo ? `${org}/${repo}` : org} · secrets`;
 
 /**
  * Edit ONE scope of a key. Which actions it offers depends on the scope's
@@ -354,7 +391,7 @@ const fallbackOf = (column: string) =>
  */
 function CellEditor(props: {
   org: string;
-  repo: string;
+  repo?: string;
   cell: Cell;
   row: SecretKeyRow | undefined;
   onClose: () => void;
@@ -372,26 +409,30 @@ function CellEditor(props: {
   const save = () =>
     write.run(() => putSecret({ ...scope(), name: props.cell.key, value: value() }));
   const clear = () => write.run(() => deleteSecret(scope(), props.cell.key));
-  const toggleSilenced = () =>
-    write.run(() =>
+  const toggleSilenced = () => {
+    const repo = props.repo;
+    if (!repo) return;
+    return write.run(() =>
       setSecretCellSilenced(
         props.org,
-        props.repo,
+        repo,
         props.cell.column,
         props.cell.key,
         status() !== "silenced",
       ),
     );
+  };
 
   return (
     <Modal
-      eyebrow={`${props.org}/${props.repo} · secrets`}
+      eyebrow={eyebrowOf(props.org, props.repo)}
       title={
         <>
-          <span class="mono">{props.cell.key}</span> · {scopeLabel(props.cell.column)}
+          <span class="mono">{props.cell.key}</span> ·{" "}
+          {scopeLabel(props.cell.column, !props.repo)}
         </>
       }
-      purpose={`Encrypted at rest, never displayed. Clearing here falls back to ${fallbackOf(props.cell.column)}.`}
+      purpose={`Encrypted at rest, never displayed. Clearing here falls back to ${fallbackOf(props.cell.column, props.repo)}.`}
       busy={write.busy()}
       onClose={props.onClose}
       footer={
@@ -423,7 +464,15 @@ function CellEditor(props: {
       <p class="dlg-text">
         <Show when={status() === "set"}>A value is set at this scope. Saving replaces it.</Show>
         <Show when={status() === "inherited"}>
-          Inherited from the {inheritedFrom() === "org" ? "org" : "Repository default"} today.
+          Inherited from{" "}
+          {!props.repo
+            ? "the Org default"
+            : inheritedFrom() === "org_environment"
+              ? `the org's value for ${props.cell.column}`
+              : inheritedFrom() === "org"
+                ? "the org"
+                : "the Repository default"}{" "}
+          today.
           Saving <b>overrides it here only</b>.
         </Show>
         <Show when={status() === "unset" || status() === "silenced"}>
@@ -440,7 +489,7 @@ function CellEditor(props: {
           onValue={setValue}
         />
       </Field>
-      <Show when={status() === "unset" || status() === "silenced"}>
+      <Show when={props.repo && (status() === "unset" || status() === "silenced")}>
         <Checkbox
           tone="warn"
           checked={status() === "silenced"}
@@ -457,7 +506,7 @@ function CellEditor(props: {
 /** Confirm clearing one scope's value; says what the scope falls back to. */
 function ClearDialog(props: {
   org: string;
-  repo: string;
+  repo?: string;
   cell: Cell;
   onClose: () => void;
   onSaved: () => void;
@@ -473,13 +522,14 @@ function ClearDialog(props: {
   return (
     <Modal
       size="narrow"
-      eyebrow={`${props.org}/${props.repo} · secrets`}
+      eyebrow={eyebrowOf(props.org, props.repo)}
       title={
         <>
-          Clear <span class="mono">{props.cell.key}</span> · {scopeLabel(props.cell.column)}
+          Clear <span class="mono">{props.cell.key}</span> ·{" "}
+          {scopeLabel(props.cell.column, !props.repo)}
         </>
       }
-      purpose={`The value here is deleted. Runs then get ${fallbackOf(props.cell.column)}.`}
+      purpose={`The value here is deleted. Runs then get ${fallbackOf(props.cell.column, props.repo)}.`}
       busy={write.busy()}
       onClose={props.onClose}
       footer={

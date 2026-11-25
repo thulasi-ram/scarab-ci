@@ -767,8 +767,10 @@ export interface paths {
          * @description A create takes the same claim on the name a Duplicate holds, and is
          *     refused (409) while a Duplicate to that name is in progress: that
          *     Duplicate has checked the name is free and may be writing secrets under
-         *     it, and its cleanup deletes what it wrote by name. A replace of an
-         *     existing Environment takes no claim.
+         *     it, and its cleanup deletes what it wrote by name. A create is also
+         *     refused (409) while secrets an earlier Environment of the name left are
+         *     stored, the org's or any Project's. A replace of an existing Environment
+         *     takes no claim.
          */
         put: operations["put_org_environment"];
         post?: never;
@@ -1610,6 +1612,27 @@ export interface paths {
          *     may also act on it.
          */
         get: operations["org_repos"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/secrets/matrix": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The org's secret list - names + status, never values
+         * @description Names + status only, never values; `Administer` on the org, like
+         *     listing its secrets.
+         */
+        get: operations["org_secret_matrix"];
         put?: never;
         post?: never;
         delete?: never;
@@ -3483,6 +3506,8 @@ export interface components {
         };
         /** @description What a duplicate copied. */
         DuplicateCopiedDto: {
+            /** @description The org's own values for the Environment copied, by key. */
+            org_secrets: string[];
             /** @description Projects whose overlay was copied. */
             overlays: string[];
             /** @description Projects whose privilege grant was copied. */
@@ -3588,6 +3613,8 @@ export interface components {
             /** @description `environment_in_use`. */
             code: string;
             message: string;
+            /** @description The org's own values for it (every Project's), by key. */
+            org_secrets: string[];
             overlay_count: number;
             /** @description Projects holding an overlay in it. */
             overlays: string[];
@@ -4467,6 +4494,39 @@ export interface components {
              */
             unlisted: components["schemas"]["UnlistedConnectionDto"][];
         };
+        /** @description `GET /v1/orgs/{org}/secrets/matrix`: the org's keys by scope. */
+        OrgSecretMatrix: {
+            /**
+             * @description Column ids in render order: [`REPO_DEFAULT_COLUMN`] (`""`, the org
+             *     default) first, then each org Environment.
+             */
+            columns: string[];
+            /** @description The org's Environments, in column order. */
+            environments: string[];
+            keys: components["schemas"]["OrgSecretMatrixRow"][];
+        };
+        OrgSecretMatrixRow: {
+            key: string;
+            /**
+             * @description `column id -> repositories`, sorted: the repositories that set their
+             *     own value in front of that column — their repository default in front
+             *     of the org default, their value for an Environment in front of the
+             *     org's value for it. An `inherited` column names both: the org default
+             *     it falls to is behind each repository default as well. Absent for a
+             *     column no repository overrides.
+             */
+            repos_with_own: {
+                [key: string]: string[];
+            };
+            /**
+             * @description `column id -> "set" | "inherited" | "unset"`: `inherited` is an
+             *     Environment column with no org value of its own that falls through to
+             *     the org default.
+             */
+            status: {
+                [key: string]: string;
+            };
+        };
         /** @description `GET /v1/orgs/{org}/security/summary`. */
         OrgSecuritySummary: {
             /** Format: int64 */
@@ -4516,13 +4576,17 @@ export interface components {
             yanked?: boolean;
         };
         /**
-         * @description Secrets one Project holds under an Environment name that has no
-         *     Environment. Names only, never values.
+         * @description Secrets one Project, or the org, holds under an Environment name that has
+         *     no Environment. Names only, never values.
          */
         OrphanedSecretsDto: {
             environment: string;
             keys: string[];
-            project: string;
+            /**
+             * @description The Project holding them; `null` for the org's own values for the
+             *     Environment.
+             */
+            project?: string | null;
         };
         /** @description One of the caller's passkeys. */
         PasskeyDto: {
@@ -5429,7 +5493,11 @@ export interface components {
          *     `value` is **write-only** — no endpoint ever returns it.
          */
         PutSecretRequest: {
-            /** @description Environment, for an environment-scoped secret (requires `repo`). */
+            /**
+             * @description Environment, for an environment-scoped secret: with `repo`, that
+             *     repository's value for the Environment; without, the org's value for
+             *     it, which every repository's Runs there get unless they set their own.
+             */
             environment?: string | null;
             /** @description Secret name (the key steps reference). */
             name: string;
@@ -5930,9 +5998,11 @@ export interface components {
         };
         SecretMatrixRow: {
             /**
-             * @description For each `inherited` cell, the scope it resolves from — `"repo"` or
-             *     `"org"`. Lets a cell say *what* it would be overriding, so an edit reads
-             *     as "override the repo default" rather than an unexplained write.
+             * @description For each `inherited` cell, the scope it resolves from — `"repo"`,
+             *     `"org"`, or `"org_environment"` (the org's value for that column's
+             *     Environment). Lets a cell say *what* it would be overriding, so an
+             *     edit reads as "override the repo default" rather than an unexplained
+             *     write.
              */
             inherited_from: {
                 [key: string]: string;
@@ -5940,7 +6010,7 @@ export interface components {
             key: string;
             /**
              * @description For each `set` cell that hides a broader value, the scope it hides —
-             *     `"repo"` or `"org"`. The counterpart of `inherited_from`: a repo key that
+             *     `"repo"`, `"org"` or `"org_environment"`. The counterpart of `inherited_from`: a repo key that
              *     the org also defines reads as overriding the org, not as a lone key.
              */
             overrides: {
@@ -8247,7 +8317,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description a create while a duplicate to the name is in progress, or a concurrent write won; retry */
+            /** @description a create while a duplicate to the name is in progress, a create over secrets an earlier environment of the name left, or a concurrent write won */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -11216,6 +11286,35 @@ export interface operations {
                 content?: never;
             };
             /** @description no connection registry wired */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    org_secret_matrix: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgSecretMatrix"];
+                };
+            };
+            /** @description secrets not configured */
             404: {
                 headers: {
                     [name: string]: unknown;

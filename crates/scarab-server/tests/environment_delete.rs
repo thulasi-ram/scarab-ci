@@ -114,6 +114,15 @@ async fn fixture() -> Option<Fixture> {
             .with_secret(&env_scope("web", "prod"), "API_KEY", b"web-key")
             .with_secret(&env_scope("api", "prod"), "DB_PASSWORD", b"api-pw")
             .with_secret(&env_scope("web", "staging"), "DB_PASSWORD", b"stg")
+            // The org's own value for prod.
+            .with_secret(
+                &SecretScope::OrgEnvironment {
+                    org: "acme".into(),
+                    environment: "prod".into(),
+                },
+                "DEPLOY_ROLE",
+                b"org-role",
+            )
             .with_secret(
                 &SecretScope::Repo {
                     org: "acme".into(),
@@ -189,7 +198,8 @@ async fn a_plain_delete_lists_what_blocks_it_and_a_cascade_deletes_it_all() {
     assert_eq!(b["code"], "environment_in_use", "{b}");
     assert_eq!(b["overlay_count"], 1, "{b}");
     assert_eq!(b["privilege_grant_count"], 1, "{b}");
-    assert_eq!(b["secret_count"], 3, "{b}");
+    assert_eq!(b["secret_count"], 4, "{b}");
+    assert_eq!(b["org_secrets"], json!(["DEPLOY_ROLE"]), "{b}");
     assert_eq!(b["overlays"], json!(["web"]));
     assert_eq!(b["privilege_grants"], json!(["api"]));
     assert_eq!(
@@ -217,6 +227,11 @@ async fn a_plain_delete_lists_what_blocks_it_and_a_cascade_deletes_it_all() {
         .unwrap()
         .is_none());
     assert_eq!(secret_keys(&f, "prod").await, Vec::<String>::new());
+    let org_prod = SecretScope::OrgEnvironment {
+        org: "acme".into(),
+        environment: "prod".into(),
+    };
+    assert!(f.secrets.list_scoped(&org_prod).await.unwrap().is_empty());
     // Created again, the name starts with nothing of the old one.
     let (st, b) = h.cookie("PUT", PROD, Some(json!({})), &s).await;
     assert!(st.is_success(), "{st} {b}");
@@ -250,13 +265,14 @@ async fn a_plain_delete_lists_what_blocks_it_and_a_cascade_deletes_it_all() {
             "cascade": true,
             "overlay_count": 1,
             "privilege_grant_count": 1,
-            "secret_count": 3,
+            "secret_count": 4,
             "overlays": ["web"],
             "privilege_grants": ["api"],
             "secrets": [
                 { "project": "api", "keys": ["DB_PASSWORD"] },
                 { "project": "web", "keys": ["API_KEY", "DB_PASSWORD"] },
             ],
+            "org_secrets": ["DEPLOY_ROLE"],
         })
     );
     f.tdb.cleanup().await;
@@ -302,5 +318,65 @@ async fn only_an_org_admin_deletes_with_cascade() {
         .unwrap()
         .is_some());
     assert_eq!(secret_keys(&f, "prod").await.len(), 3);
+    f.tdb.cleanup().await;
+}
+
+/// A create of a name whose earlier Environment left secrets behind is
+/// refused (409), whether the org's or a Project's are left: the new
+/// Environment would otherwise take them over. Once they are deleted the
+/// create goes through. A replace of an existing Environment is not checked.
+#[tokio::test]
+async fn a_create_over_leftover_secrets_of_the_name_is_refused() {
+    let Some(f) = fixture().await else {
+        return;
+    };
+    let h = &f.h;
+    h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
+    let s = h.browser_session(owner("amy")).await;
+    let qa = "/v1/orgs/acme/environments/qa";
+    let org_qa = SecretScope::OrgEnvironment {
+        org: "acme".into(),
+        environment: "qa".into(),
+    };
+    let secret = |key: &str| scarab_secrets::Secret {
+        key: key.into(),
+        value: b"left".to_vec(),
+    };
+
+    // The org's value for `qa` is left.
+    f.secrets.put(&org_qa, secret("DEPLOY_ROLE")).await.unwrap();
+    let (st, b) = h.cookie("PUT", qa, Some(json!({})), &s).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    assert!(b.to_string().contains("DEPLOY_ROLE"), "{b}");
+    f.secrets.delete(&org_qa, "DEPLOY_ROLE").await.unwrap();
+
+    // A Project's value for `qa` is left.
+    f.secrets
+        .put(&env_scope("web", "qa"), secret("DB_PASSWORD"))
+        .await
+        .unwrap();
+    let (st, b) = h.cookie("PUT", qa, Some(json!({})), &s).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    assert!(b.to_string().contains("web"), "{b}");
+    assert!(f
+        .pg
+        .get_org_environment("acme", "qa")
+        .await
+        .unwrap()
+        .is_none());
+    f.secrets
+        .delete(&env_scope("web", "qa"), "DB_PASSWORD")
+        .await
+        .unwrap();
+
+    // Nothing left: created.
+    let (st, b) = h.cookie("PUT", qa, Some(json!({})), &s).await;
+    assert!(st.is_success(), "{st} {b}");
+
+    // `prod` exists and holds secrets: a replace of it is not refused.
+    let (st, b) = h
+        .cookie("PUT", PROD, Some(json!({ "description": "live" })), &s)
+        .await;
+    assert!(st.is_success(), "{st} {b}");
     f.tdb.cleanup().await;
 }

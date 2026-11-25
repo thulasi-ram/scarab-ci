@@ -149,6 +149,181 @@ async fn environment_secret_projects_reads_exactly_one_environment() {
     tdb.cleanup().await;
 }
 
+/// An org value for one Environment is its own row: it resolves for every
+/// Project's Runs in that Environment ahead of the repository default, it is
+/// not read as any Project's Environment scope, and the repositories holding
+/// their own default are read back from their scope keys alone.
+#[tokio::test]
+async fn org_environment_values_resolve_ahead_of_the_repo_default() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let secrets = PostgresSecrets::with_master(tdb.pool.clone(), [9u8; 32]);
+    secrets.migrate().await.unwrap();
+    let put = |scope: SecretScope, value: &'static str| {
+        let secrets = &secrets;
+        async move {
+            secrets
+                .put(
+                    &scope,
+                    Secret {
+                        key: "ROLE".into(),
+                        value: value.as_bytes().to_vec(),
+                    },
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let org_env = |environment: &str| SecretScope::OrgEnvironment {
+        org: "acme".into(),
+        environment: environment.into(),
+    };
+    let run_in = |project: &str, environment: &str| SecretScope::EnvironmentProject {
+        org: "acme".into(),
+        project: project.into(),
+        environment: environment.into(),
+    };
+    put(org_env("prod"), "org-prod").await;
+    put(repo_scope("web"), "web-default").await;
+    put(
+        SecretScope::Repo {
+            org: "acm%".into(),
+            repo: "api".into(),
+        },
+        "other-org",
+    )
+    .await;
+
+    let got = |scope: SecretScope| {
+        let secrets = &secrets;
+        async move { secrets.resolve(&scope, "ROLE").await.unwrap().value }
+    };
+    assert_eq!(got(run_in("web", "prod")).await, b"org-prod");
+    assert_eq!(got(run_in("api", "prod")).await, b"org-prod");
+    assert_eq!(got(run_in("web", "staging")).await, b"web-default");
+    put(run_in("web", "prod"), "web-prod").await;
+    assert_eq!(got(run_in("web", "prod")).await, b"web-prod");
+    assert_eq!(got(run_in("api", "prod")).await, b"org-prod");
+
+    assert_eq!(
+        secrets.list_scoped(&org_env("prod")).await.unwrap(),
+        ["ROLE"]
+    );
+    assert!(secrets
+        .list_scoped(&org_env("staging"))
+        .await
+        .unwrap()
+        .is_empty());
+    // Not a Project's Environment scope.
+    assert_eq!(
+        secrets.environment_secret_scopes("acme").await.unwrap(),
+        [("web".to_string(), "prod".to_string())]
+    );
+    assert_eq!(
+        secrets.project_secret_keys("acme").await.unwrap(),
+        [
+            ("web".to_string(), None, "ROLE".to_string()),
+            (
+                "web".to_string(),
+                Some("prod".to_string()),
+                "ROLE".to_string()
+            ),
+        ]
+    );
+    assert_eq!(
+        secrets
+            .org_environment_secret_environments("acme")
+            .await
+            .unwrap(),
+        ["prod"]
+    );
+    tdb.cleanup().await;
+}
+
+/// Every key an org's Projects hold, read in one pass: each repository
+/// default and each Project's value for an Environment, with no org value
+/// among them and nothing of another org, even when the org's name holds
+/// `%` and `_` that a LIKE pattern would read as wildcards.
+#[tokio::test]
+async fn the_keys_of_an_orgs_projects_are_read_back_in_one_pass() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let secrets = PostgresSecrets::with_master(tdb.pool.clone(), [3u8; 32]);
+    secrets.migrate().await.unwrap();
+    let put = |scope: SecretScope, key: &'static str| {
+        let secrets = &secrets;
+        async move {
+            secrets
+                .put(
+                    &scope,
+                    Secret {
+                        key: key.into(),
+                        value: b"v".to_vec(),
+                    },
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let repo = |org: &str, project: &str| SecretScope::Repo {
+        org: org.into(),
+        repo: project.into(),
+    };
+    let env = |org: &str, project: &str, environment: &str| SecretScope::EnvironmentProject {
+        org: org.into(),
+        project: project.into(),
+        environment: environment.into(),
+    };
+    // `abc1` matches `a_c%` as a LIKE pattern.
+    for org in ["a_c%", "abc1"] {
+        put(repo(org, "web"), "REPO_KEY").await;
+        put(env(org, "web", "prod"), "PROD_KEY").await;
+        put(
+            SecretScope::OrgEnvironment {
+                org: org.into(),
+                environment: "prod_eu".into(),
+            },
+            "ORG_ENV_KEY",
+        )
+        .await;
+    }
+    put(env("a_c%", "api", "prod_eu"), "EU_KEY").await;
+    put(SecretScope::Org { org: "a_c%".into() }, "ORG_KEY").await;
+
+    let own = |project: &str, environment: Option<&str>, key: &str| {
+        (
+            project.to_string(),
+            environment.map(str::to_string),
+            key.to_string(),
+        )
+    };
+    assert_eq!(
+        secrets.project_secret_keys("a_c%").await.unwrap(),
+        [
+            own("api", Some("prod_eu"), "EU_KEY"),
+            own("web", None, "REPO_KEY"),
+            own("web", Some("prod"), "PROD_KEY"),
+        ]
+    );
+    assert_eq!(
+        secrets
+            .org_environment_secret_environments("a_c%")
+            .await
+            .unwrap(),
+        ["prod_eu"]
+    );
+    assert!(secrets
+        .org_environment_secret_environments("a_c")
+        .await
+        .unwrap()
+        .is_empty());
+    tdb.cleanup().await;
+}
+
 /// A provider with the wrong master key cannot decrypt what another wrote —
 /// the value is protected by the master key, not just the database.
 #[tokio::test]

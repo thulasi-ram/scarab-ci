@@ -2105,12 +2105,56 @@ export type SecretMatrix = {
   keys: {
     key: string;
     status: Record<string, SecretCellStatus>;
-    /** For `inherited` cells: `"repo"` or `"org"` — what an edit would override. */
-    inherited_from: Record<string, "repo" | "org">;
-    /** For `set` cells that hide a broader value: `"repo"` or `"org"`. */
-    overrides?: Record<string, "repo" | "org">;
+    /**
+     * For `inherited` cells: what an edit would override. `"org_environment"` is
+     * the org's value for that column's Environment; in the org's own list,
+     * `"org"` is the Org default.
+     */
+    inherited_from: Record<string, SecretOrigin>;
+    /** For `set` cells that hide a broader value: the scope hidden. */
+    overrides?: Record<string, SecretOrigin>;
+    /**
+     * The org's list only: per column, the repositories that set their own
+     * value in front of it.
+     */
+    repos_with_own?: Record<string, string[]>;
   }[];
 };
+export type SecretOrigin = "repo" | "org" | "org_environment";
+
+/**
+ * The org's secret list (`GET /v1/orgs/{org}/secrets/matrix`), in the shape of
+ * a repository's matrix: the `""` column is the Org default, the others the
+ * org's Environments. An Environment with no value of its own falls through to
+ * the Org default.
+ */
+export async function fetchOrgSecretMatrix(org: string): Promise<SecretMatrix> {
+  const res = await send(`/v1/orgs/${encodeURIComponent(org)}/secrets/matrix`, "GET");
+  const raw = (await res.json()) as {
+    columns: string[];
+    environments: string[];
+    keys: {
+      key: string;
+      status: Record<string, SecretCellStatus>;
+      repos_with_own?: Record<string, string[]>;
+    }[];
+  };
+  return {
+    columns: raw.columns,
+    environments: raw.environments,
+    keys: raw.keys.map((k) => ({
+      key: k.key,
+      status: k.status,
+      inherited_from: Object.fromEntries(
+        Object.entries(k.status)
+          .filter(([, s]) => s === "inherited")
+          .map(([c]) => [c, "org" as const]),
+      ),
+      overrides: {},
+      repos_with_own: k.repos_with_own ?? {},
+    })),
+  };
+}
 
 const matrixUrl = (org: string, repo: string) =>
   `/v1/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/secrets/matrix`;
@@ -2122,11 +2166,13 @@ export async function fetchSecretMatrix(org: string, repo: string): Promise<Secr
 }
 
 /**
- * The secret scope a matrix column addresses. The repo-default column is the
- * `Repo` scope; every other column is that named `Environment`.
+ * The secret scope a matrix column addresses. The default column is the `Repo`
+ * scope (the `Org` scope with no repo); every other column is that named
+ * Environment, the repository's value for it or, with no repo, the org's.
  */
-export function columnScope(org: string, repo: string, column: string): SecretScope {
-  return column === REPO_DEFAULT_COLUMN ? { org, repo } : { org, repo, environment: column };
+export function columnScope(org: string, repo: string | undefined, column: string): SecretScope {
+  const base: SecretScope = repo ? { org, repo } : { org };
+  return column === REPO_DEFAULT_COLUMN ? base : { ...base, environment: column };
 }
 
 /**
