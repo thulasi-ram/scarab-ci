@@ -218,10 +218,6 @@ steps:
         cd "$root" || fail "cannot enter the workspace at $root"
         resolve . || fail "cannot resolve the workspace at $root"
         root=$r
-        # The push Step reads the image from here. Whatever an earlier Step
-        # left at this path (a symlink included) is removed first; rm does
-        # not follow a symlink it removes.
-        rm -rf ./.scarab-build
         ctx=${SCARAB_BUILD_CONTEXT-}
         df=${SCARAB_BUILD_DOCKERFILE-}
         [ -n "$ctx" ] || fail "no build context"
@@ -286,6 +282,23 @@ steps:
             bucket=${SCARAB_BUILD_CACHE_BUCKET-}
             region=${SCARAB_BUILD_CACHE_REGION-}
             name=${SCARAB_BUILD_CACHE_NAME-}
+            # A library that builds one image per architecture from one set
+            # of inputs sets SCARAB_BUILD_CACHE_PER_ARCH, so each
+            # architecture keeps its own cache: <name>-<arch>, or
+            # buildkit-<arch> when no name is given.
+            case "${SCARAB_BUILD_CACHE_PER_ARCH-false}" in
+              false) ;;
+              true)
+                m=$(uname -m) || fail "cannot read this node's architecture"
+                case "$m" in
+                  x86_64) m=amd64 ;;
+                  aarch64) m=arm64 ;;
+                  "" | *[!A-Za-z0-9_]*) fail "this node's architecture $m is not a name" ;;
+                esac
+                name=${name:-buildkit}-$m
+                ;;
+              *) fail "SCARAB_BUILD_CACHE_PER_ARCH must be true or false" ;;
+            esac
             [ -n "$bucket" ] || fail "cache s3 needs cache_bucket"
             [ -n "$region" ] || fail "cache s3 needs cache_region"
             case "$bucket$region$name" in
@@ -322,6 +335,15 @@ steps:
             *[!A-Za-z0-9._/-]*) fail "the workspace path $root holds a character an image layout path may not" ;;
           esac
           layout=$root/.scarab-build/$key/oci
+          # The push Step reads the image from here. An earlier Step ran
+          # repository code in this workspace. A .scarab-build that is not
+          # a plain directory is removed (rm does not follow a symlink it
+          # removes); otherwise only this Step's own key is, so a layout
+          # another build handed on stays.
+          if [ -L ./.scarab-build ] || [ ! -d ./.scarab-build ]; then
+            rm -rf ./.scarab-build
+          fi
+          rm -rf "./.scarab-build/$key"
           mkdir -p "./.scarab-build/$key"
           set -- "$@" --output "type=oci,dest=$layout,tar=false"
         else
@@ -335,10 +357,14 @@ steps:
           set -- "$@" --metadata-file "$meta"
         fi
         # The build runs as a child, not with exec, so this script can add to
-        # the result after it. A stop signal is passed on to it.
+        # the result after it. A stop signal is passed on to it; the trap is
+        # set before the child starts, so a signal in between is not lost.
+        pid=
+        stop=false
+        trap 'stop=true; [ -z "$pid" ] || kill -TERM "$pid" 2>/dev/null || :' TERM INT
         /usr/bin/buildctl-daemonless.sh "$@" &
         pid=$!
-        trap 'kill -TERM "$pid" 2>/dev/null || :' TERM INT
+        [ "$stop" = false ] || kill -TERM "$pid" 2>/dev/null || :
         code=0
         wait "$pid" || code=$?
         # A signal ends `wait` early; wait again for the build itself.
