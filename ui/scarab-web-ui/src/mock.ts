@@ -73,6 +73,33 @@ const MATRIX_RUN_ID = "0190f8a2000071fb8c00f00d4a7b1c33";
 // that earlier tries also wrote. /acme/scarab/runs/<id>.
 const RETRIES_RUN_ID = "0190f8a2000071fb8c00a11c3e5d7f34";
 
+// ── Run pipeline launcher ─────────────────────────────────────────────────
+// The manual catalog at any ref: `release` takes a spread of typed inputs,
+// `deploy` a few, `docs` none, and one file that does not parse.
+const MOCK_PIPELINE_SHA = "7c2e91d4b0a1f6e3c58d92a7b4e0f1c3d2a9b8e7";
+const mockCatalog = [
+  { name: "release", manual: true, api: true },
+  { name: "deploy", manual: true, api: false },
+  { name: "docs", manual: true, api: false },
+  { name: "nightly-bench", manual: false, api: false, error: "line 14: unknown key `timout` (did you mean `timeout`?)" },
+];
+const mockInputs: Record<string, unknown[]> = {
+  release: [
+    { name: "version", type: "string", required: true, description: "Semver of the release, without the leading v." },
+    { name: "channel", type: "choice", required: true, options: ["stable", "beta", "nightly"], description: "Where the images are published." },
+    { name: "platforms", type: "choice", required: false, default: "linux/amd64,linux/arm64", options: ["linux/amd64", "linux/arm64", "linux/amd64,linux/arm64"] },
+    { name: "parallelism", type: "number", required: false, default: 4, description: "Build jobs run at once." },
+    { name: "sign_images", type: "boolean", required: false, default: true, description: "Sign every pushed image with the release key." },
+    { name: "dry_run", type: "boolean", required: false, default: false, description: "Build and test, push nothing." },
+    { name: "notes", type: "string", required: false, default: "", description: "Extra text for the GitHub Release body." },
+  ],
+  deploy: [
+    { name: "environment", type: "choice", required: true, options: ["staging", "production"] },
+    { name: "image_tag", type: "string", required: true },
+    { name: "canary", type: "boolean", required: false, default: false },
+  ],
+};
+
 // ── /v1/me ────────────────────────────────────────────────────────────────
 // An Owner of the one implicit org, so the Settings gear renders.
 // The Owner role is global, so Avery is a global admin: the org dropdown in
@@ -606,7 +633,10 @@ const richRunStatus: RunStatusDto = {
   pipeline: "release",
   trigger_title: "Wire shared postgres into the integration suite",
   origin_pr_base: null,
-  params: {},
+  // The generated schema types params opaquely; the values are plain JSON.
+  // `channel: edge` is an option the pipeline has since removed, so a new run
+  // with these inputs starts `channel` from its default.
+  params: { version: "0.8.1", channel: "edge", parallelism: 8, sign_images: true, dry_run: false } as unknown as RunStatusDto["params"],
   // Suspended on a gate, so likewise never GC-eligible regardless of age
   // — but PINNED, to render the "keep this run's snapshots" state.
   snapshot_retention: {
@@ -2799,7 +2829,30 @@ function route(pathname: string, search: string, method: string, body = ""): Res
     return json({ schedules: m[1] === "scarab" ? schedules : [] });
   }
   // /v1/repos/{org}/{repo}/refs  (ref picker — not on the shot screens)
-  if (/^\/v1\/repos\/[^/]+\/[^/]+\/refs$/.test(p)) return json({ refs: [], default_branch: "main" });
+  if (/^\/v1\/repos\/[^/]+\/[^/]+\/refs$/.test(p)) {
+    return json({
+      refs: [
+        { name: "main", kind: "branch", short_sha: MOCK_PIPELINE_SHA.slice(0, 7) },
+        { name: "feature/shared-postgres", kind: "branch", short_sha: "4be1f2a" },
+        { name: "v0.8.0", kind: "tag", short_sha: "c0790f1" },
+      ],
+      default_branch: "main",
+    });
+  }
+  // The Run pipeline launcher: the catalog at a ref, one pipeline's typed
+  // inputs, and a dispatch that opens the rich run.
+  if (/^\/v1\/repos\/[^/]+\/[^/]+\/pipelines$/.test(p)) {
+    return json({ sha: MOCK_PIPELINE_SHA, pipelines: mockCatalog });
+  }
+  if ((m = p.match(/^\/v1\/repos\/[^/]+\/[^/]+\/pipelines\/([^/]+)\/interface$/))) {
+    const name = decodeURIComponent(m[1]!);
+    const entry = mockCatalog.find((c) => c.name === name);
+    if (!entry || entry.error) return new Response(`no pipeline "${name}"`, { status: 404 });
+    return json({ sha: MOCK_PIPELINE_SHA, manual: entry.manual, api: entry.api, inputs: mockInputs[name] ?? [] });
+  }
+  if (/^\/v1\/repos\/[^/]+\/[^/]+\/dispatch$/.test(p) && method === "POST") {
+    return json({ id: RICH_RUN_ID });
+  }
 
   // API tokens (git-bug a4cb94f): your own under /v1/me/tokens, every token in
   // the org under /v1/orgs/{org}/tokens. A mint returns an obviously-fake

@@ -120,28 +120,39 @@ export function mapServerError(
 }
 
 /** Reconcile a prior run's frozen params against the CURRENT interface for a
- * re-run: pre-fill values that still exist, drop prior params the
- * interface no longer declares (reported so the UI can note them). Type/validity
- * drift on a surviving param surfaces afterwards via `validateForm`. */
+ * new run with the same inputs: pre-fill values that still pass the static
+ * checks, drop prior params the interface no longer declares, and start a
+ * param whose prior value no longer passes (an option since removed, a type
+ * since changed) from its default instead. `dropped` and `reset` name those,
+ * so the UI can say what it did not carry over. */
 export function reconcilePrefill(
   specs: ParamSpec[],
   prior: Record<string, unknown>,
-): { values: Record<string, FieldValue>; dropped: string[] } {
+): { values: Record<string, FieldValue>; dropped: string[]; reset: string[] } {
   const values: Record<string, FieldValue> = {};
+  const reset: string[] = [];
   for (const spec of specs) {
-    if (Object.prototype.hasOwnProperty.call(prior, spec.name)) {
-      const raw = prior[spec.name];
-      values[spec.name] =
-        spec.type === "boolean"
-          ? Boolean(raw)
-          : raw === null || raw === undefined
-            ? ""
-            : String(raw);
-    } else {
+    if (!Object.prototype.hasOwnProperty.call(prior, spec.name)) {
       values[spec.name] = paramInitialValue(spec);
+      continue;
+    }
+    const raw = prior[spec.name];
+    const carried: FieldValue | null =
+      spec.type === "boolean"
+        ? typeof raw === "boolean"
+          ? raw
+          : null
+        : raw === null || raw === undefined || typeof raw === "object"
+          ? null
+          : String(raw);
+    if (carried === null || validateField(spec, carried) !== null) {
+      values[spec.name] = paramInitialValue(spec);
+      reset.push(spec.name);
+    } else {
+      values[spec.name] = carried;
     }
   }
   const declared = new Set(specs.map((s) => s.name));
   const dropped = Object.keys(prior).filter((k) => !declared.has(k));
-  return { values, dropped };
+  return { values, dropped, reset };
 }

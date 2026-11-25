@@ -1173,7 +1173,7 @@ export default function StepPane(props: {
                       <For each={outResults()}>
                         {(r) => (
                           <div class="expr mono">
-                            <span class="tok">{`\${{ outputs.${s().id}.${r.name} }}`}</span>
+                            <span class="expr-tok">{`\${{ outputs.${s().id}.${r.name} }}`}</span>
                             <span class="arrow">→</span>
                             <span class="val">{showValue(r.value)}</span>
                           </div>

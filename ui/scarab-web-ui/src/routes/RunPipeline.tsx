@@ -1,42 +1,21 @@
-// Run-Pipeline flow — repo → ref → catalog → pipeline →
-// typed parameter form → dispatch. One ref threads through; the catalog resolves
-// it to a concrete SHA that the interface read and the dispatch pin to, so the
-// form and the run see byte-identical config (no branch-moved skew). Client
-// validation is static-only (required / type / options); the `validate:` CEL
-// predicate runs server-side at dispatch and comes back as a per-field error.
+// Run-Pipeline flow — repo → ref → catalog → pick a pipeline → its run form
+// in a dialog (RunPipelineDialog). One ref threads through; the catalog
+// resolves it to a concrete SHA that the dialog reads the inputs at and the
+// dispatch pins to, so the form and the run see the same config.
 import { createResource, createSignal, createEffect, For, Show } from "solid-js";
-import { A, useParams, useNavigate, useLocation } from "@solidjs/router";
-import { listRefs, listPipelines, pipelineInterface, dispatchRun, PipelineCompileError } from "../api/client";
-import CompileErrors from "../components/CompileErrors";
-import {
-  initialValues,
-  reconcilePrefill,
-  validateForm,
-  toRequestParams,
-  mapServerError,
-  type FieldValue,
-  type ParamSpec,
-} from "../params";
+import { useParams } from "@solidjs/router";
+import { listRefs, listPipelines } from "../api/client";
 import Icon from "../components/Icon";
 import { HomeCrumb, RepoCrumb } from "../components/PageCrumbs";
-import { Checkbox, Input } from "../components/Field";
-import SearchSelect from "../components/SearchSelect";
+import { Input } from "../components/Field";
 import Doodle from "../components/Doodle";
 import Pill from "../components/Pill";
-
-// Re-run hands the prior run's frozen params through router state.
-// The run-status API carries params but not the pipeline/ref, so the launcher
-// re-picks those and the prior params reconcile against whatever interface is
-// selected.
-type RunPipelineState = { prefillParams?: Record<string, unknown> } | undefined;
+import RunPipelineDialog from "../components/RunPipelineDialog";
 
 export default function RunPipeline() {
   const params = useParams();
-  const nav = useNavigate();
-  const location = useLocation();
   const org = () => params.org!;
   const repo = () => params.repo!;
-  const prefill = (location.state as RunPipelineState)?.prefillParams;
 
   // The picker starts on the repo's default branch, which the refs call
   // names; until it answers no catalog loads. The chosen ref threads through
@@ -51,57 +30,9 @@ export default function RunPipeline() {
   // never render. Every read of the catalog goes through this guard.
   const catalogValue = () => (catalog.error ? undefined : catalog());
 
-  const [iface] = createResource(
-    () => {
-      const c = catalogValue();
-      const name = selected();
-      return c && name ? { name, sha: c.sha } : null;
-    },
-    (k) => pipelineInterface(org(), repo(), k.name, k.sha),
-  );
-
   // The human catalog: manually-dispatchable pipelines, plus any file that
   // failed to parse (shown disabled/annotated, never crashing the list).
   const rows = () => (catalogValue()?.pipelines ?? []).filter((p) => p.manual || !!p.error);
-
-  // ---- form state ---------------------------------------------------------
-  const [values, setValues] = createSignal<Record<string, FieldValue>>({});
-  const [fieldErrors, setFieldErrors] = createSignal<Record<string, string>>({});
-  const [formError, setFormError] = createSignal<string | null>(null);
-  const [dropped, setDropped] = createSignal<string[]>([]);
-  const [submitting, setSubmitting] = createSignal(false);
-  // Optional dispatch reason — free text, stamped as the run
-  // Headline. Not a pipeline parameter (it rides the dispatch, not the IR), so
-  // it lives outside the typed param form and is never validated client-side.
-  const [reason, setReason] = createSignal("");
-
-  // (Re)initialise the form whenever a fresh interface loads. A re-run reconciles
-  // the prior params against the current specs (dropping since-removed ones) and
-  // surfaces type/validity drift immediately as field errors.
-  createEffect(() => {
-    const i = iface();
-    if (!i) return;
-    if (prefill) {
-      const { values: v, dropped: d } = reconcilePrefill(i.inputs, prefill);
-      setValues(v);
-      setDropped(d);
-      setFieldErrors(validateForm(i.inputs, v));
-    } else {
-      setValues(initialValues(i.inputs));
-      setDropped([]);
-      setFieldErrors({});
-    }
-    setFormError(null);
-  });
-
-  const setField = (name: string, v: FieldValue) => {
-    setValues((prev) => ({ ...prev, [name]: v }));
-    setFieldErrors((prev) => {
-      const next = { ...prev };
-      delete next[name];
-      return next;
-    });
-  };
 
   const loadCatalog = () => {
     setSelected(null);
@@ -164,41 +95,6 @@ export default function RunPipeline() {
     }
   };
 
-  async function submit() {
-    const i = iface();
-    const name = selected();
-    if (!i || !name) return;
-    const errs = validateForm(i.inputs, values());
-    if (Object.keys(errs).length > 0) {
-      setFieldErrors(errs);
-      return;
-    }
-    setSubmitting(true);
-    setFormError(null);
-    try {
-      const trimmedReason = reason().trim();
-      const res = await dispatchRun(org(), repo(), {
-        ref: i.sha, // pin to the resolved commit the form was built against
-        pipeline: name,
-        params: toRequestParams(i.inputs, values()),
-        kind: "manual",
-        // Optional: omitted when blank; the endpoint stamps it as the
-        // run Headline and never requires it here (requiredness is an
-        // Environment ProtectionRule at admission).
-        ...(trimmedReason ? { reason: trimmedReason } : {}),
-      });
-      if (res.ok) {
-        nav(`/${org()}/${repo()}/runs/${res.id}`);
-        return;
-      }
-      const mapped = mapServerError(res.message, i.inputs.map((s) => s.name));
-      setFieldErrors(mapped.fieldErrors);
-      setFormError(mapped.formError);
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
   return (
     <section class="page">
       <Doodle icon="rocket" size={230} rotate={12} opacity={0.16} top="52px" right="48px" />
@@ -211,12 +107,6 @@ export default function RunPipeline() {
           <span class="crumb-head-title">Run pipeline</span>
         </h1>
       </div>
-
-      <Show when={prefill}>
-        <p class="subtle rp-rerun-note mono">
-          <Icon icon="rotate-cw" size={13} /> Re-run — pre-filled from the prior run's parameters.
-        </p>
-      </Show>
 
       {/* ---- ref picker ---- */}
       {/* overflow-visible so the combobox dropdown can spill past the card edge
@@ -319,188 +209,17 @@ export default function RunPipeline() {
         </div>
       </div>
 
-      {/* ---- typed parameter form ---- */}
-      <Show when={selected()}>
-        <div class="panel">
-          <div class="panel-h">
-            <span>Parameters · {selected()}</span>
-            {/* Read `iface()` only when it holds no error: reading an errored
-                resource throws, and the form below would never render. */}
-            <Show when={!iface.error && iface()}>
-              {(i) => <span class="subtle mono">{i().inputs.length} declared</span>}
-            </Show>
-            <Show when={iface.error instanceof PipelineCompileError ? iface.error : null}>
-              {(e) => (
-                <span class="subtle mono">
-                  {e().failure.errors.length} {e().failure.errors.length === 1 ? "error" : "errors"}
-                </span>
-              )}
-            </Show>
-          </div>
-          <div class="rp-form">
-            <Show when={!iface.loading} fallback={<p class="empty">compiling interface…</p>}>
-              <Show
-                when={!iface.error}
-                fallback={
-                  iface.error instanceof PipelineCompileError ? (
-                    <CompileErrors
-                      errors={iface.error.failure.errors}
-                      refName={loadedRef()}
-                      sha={iface.error.failure.sha}
-                    />
-                  ) : (
-                    <p class="error">{(iface.error as Error)?.message ?? "failed to load interface"}</p>
-                  )
-                }
-              >
-                {(() => {
-                  // `!loading && !error` does NOT imply the interface has
-                  // resolved — there's a window (just-selected pipeline, or the
-                  // catalog re-resolving) where iface() is still undefined.
-                  // Guard it so the form never reads `.inputs` on undefined.
-                  const i = iface();
-                  if (!i) return <p class="empty">compiling interface…</p>;
-                  return (
-                    <>
-                      <Show when={dropped().length > 0}>
-                        <p class="rp-notice mono">
-                          <Icon icon="timer" size={13} /> Dropped {dropped().length} parameter
-                          {dropped().length === 1 ? "" : "s"} no longer declared:{" "}
-                          <b>{dropped().join(", ")}</b>
-                        </p>
-                      </Show>
-                      {/* Optional dispatch reason — free text, stamped
-                          as the run Headline. Not a pipeline parameter, so it sits
-                          above the typed form and is never client-validated. */}
-                      <div class="field rp-field">
-                        <span class="field-label rp-field-label">
-                          <span class="mono">reason</span>
-                          <span class="rp-opt">optional</span>
-                        </span>
-                        <Input
-                          aria-label="reason"
-                          value={reason()}
-                          onValue={setReason}
-                          placeholder="why are you running this? (shown as the run headline)"
-                        />
-                        <span class="rp-help">
-                          Recorded as the run's headline for audit. Optional here.
-                        </span>
-                      </div>
-
-                      <Show
-                        when={i.inputs.length > 0}
-                        fallback={<p class="subtle">This pipeline declares no launch parameters.</p>}
-                      >
-                        <For each={i.inputs}>
-                          {(spec) => (
-                            <Field
-                              spec={spec}
-                              value={values()[spec.name]}
-                              error={fieldErrors()[spec.name]}
-                              onChange={(v) => setField(spec.name, v)}
-                            />
-                          )}
-                        </For>
-                      </Show>
-
-                      <Show when={formError()}>
-                        <p class="error rp-form-error">{formError()}</p>
-                      </Show>
-
-                      <div class="rp-actions">
-                        <button class="btn btn-primary" disabled={submitting()} onClick={submit}>
-                          <Icon icon="play" size={14} /> {submitting() ? "dispatching…" : "Run"}
-                        </button>
-                        <A class="btn btn-ghost" href={`/${org()}/${repo()}`}>Cancel</A>
-                      </div>
-                      <p class="subtle rp-hint">
-                        <small>
-                          Static checks (required · type · options) run here; the pipeline's{" "}
-                          <code class="mono">validate:</code> rules run server-side at dispatch.
-                        </small>
-                      </p>
-                    </>
-                  );
-                })()}
-              </Show>
-            </Show>
-          </div>
-        </div>
+      {/* ---- the picked pipeline's run form ---- */}
+      <Show when={selected() && catalogValue()}>
+        <RunPipelineDialog
+          org={org()}
+          repo={repo()}
+          pipeline={selected()!}
+          gitRef={catalogValue()!.sha}
+          refName={loadedRef() === "HEAD" ? null : loadedRef()}
+          onClose={() => setSelected(null)}
+        />
       </Show>
     </section>
-  );
-}
-
-// ---- one bounded widget per ParamType ---------------------------------------
-
-function Field(props: {
-  spec: ParamSpec;
-  value: FieldValue | undefined;
-  error: string | undefined;
-  onChange: (v: FieldValue) => void;
-}) {
-  const spec = props.spec;
-  const strValue = () => (typeof props.value === "string" ? props.value : "");
-  const boolValue = () => props.value === true;
-
-  return (
-    <div class={`field rp-field ${props.error ? "has-err" : ""}`}>
-      <span class="field-label rp-field-label">
-        <span class="mono">{spec.name}</span>
-        <Pill tone="muted">{spec.type}</Pill>
-        <Show when={spec.required} fallback={<span class="rp-opt">optional</span>}>
-          <span class="rp-req" title="required">★ required</span>
-        </Show>
-      </span>
-
-      <Show when={spec.type === "boolean"}>
-        <Checkbox
-          checked={boolValue()}
-          onChecked={(v) => props.onChange(v)}
-          label={<span class="mono">{boolValue() ? "true" : "false"}</span>}
-        />
-      </Show>
-
-      <Show when={spec.type === "choice"}>
-        <SearchSelect
-          class="ss-block"
-          placeholder="select…"
-          searchPlaceholder="Search options…"
-          value={strValue()}
-          onChange={(v) => props.onChange(v)}
-          options={(spec.options ?? []).map((o) => ({ value: o, label: o }))}
-        />
-      </Show>
-
-      <Show when={spec.type === "number"}>
-        <Input
-          mono
-          aria-label={spec.name}
-          inputmode="decimal"
-          invalid={!!props.error}
-          value={strValue()}
-          onValue={(v) => props.onChange(v)}
-          placeholder={spec.required ? "" : String(spec.default ?? "")}
-        />
-      </Show>
-
-      <Show when={spec.type === "string"}>
-        <Input
-          aria-label={spec.name}
-          invalid={!!props.error}
-          value={strValue()}
-          onValue={(v) => props.onChange(v)}
-          placeholder={spec.required ? spec.name : String(spec.default ?? "")}
-        />
-      </Show>
-
-      <Show when={spec.description}>
-        <span class="rp-help">{spec.description}</span>
-      </Show>
-      <Show when={props.error}>
-        <span class="rp-err-msg">{props.error}</span>
-      </Show>
-    </div>
   );
 }

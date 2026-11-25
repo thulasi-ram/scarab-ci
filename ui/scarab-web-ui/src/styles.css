@@ -343,6 +343,9 @@ samp {
 
 /* ---- Page shell ------------------------------------------------------- */
 
+/* The run page takes the window's width, so its graph has room for more
+   columns at 100% (the graph never shrinks to fit; it scrolls). */
+.page.page-run { max-width: none; }
 .page {
   position: relative;
   max-width: 1200px;
@@ -1196,7 +1199,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .dag-cols {
   display: flex;
   flex-direction: row; /* dependency layers flow left → right */
-  gap: 48px;
+  gap: 36px;
   /* `safe center` keeps a short graph vertically centered in the band but never
      clips a tall fan on the top edge. */
   align-items: safe center;
@@ -2708,11 +2711,12 @@ h1, .crumb-head, .run-title {
   display: grid;
   grid-template-columns: auto 1fr auto;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   /* Each column sets --node-w from its longest label (Dag.tsx
-     `columnNodeWidth`), so a matrix cell's values fit on one line. */
+     `columnNodeWidth`), so a matrix cell's values fit on one line. Padding,
+     ring and gaps are kept small so more columns fit at 100%. */
   width: var(--node-w, 320px);
-  padding: 10px 12px;
+  padding: 8px 10px;
   border: 1px solid var(--terminal-line);
   border-radius: 3px;
   background: var(--terminal-elev);
@@ -2759,9 +2763,9 @@ h1, .crumb-head, .run-title {
 @keyframes dnode-scan { 0% { background-position: -40% 0; } 100% { background-position: 140% 0; } }
 
 /* status ring (conic gauge) */
-.dring { width: 22px; height: 22px; border-radius: 50%; position: relative; display: grid; place-items: center; }
-.dring::after { content: ""; position: absolute; inset: 3px; border-radius: 50%; background: var(--terminal-elev); }
-.dring-core { position: relative; z-index: 1; width: 7px; height: 7px; border-radius: 50%; background: var(--muted-sage); }
+.dring { width: 16px; height: 16px; border-radius: 50%; position: relative; display: grid; place-items: center; }
+.dring::after { content: ""; position: absolute; inset: 2px; border-radius: 50%; background: var(--terminal-elev); }
+.dring-core { position: relative; z-index: 1; width: 6px; height: 6px; border-radius: 50%; background: var(--muted-sage); }
 .dring.succeeded { background: conic-gradient(var(--ok) 100%, var(--terminal-line) 0); }
 .dring.succeeded .dring-core { background: var(--ok); }
 .dring.running { background: conic-gradient(var(--running) 66%, var(--terminal-line) 0); animation: dring-spin 3s linear infinite; }
@@ -3017,11 +3021,22 @@ a.lgtog { text-decoration: none; }
 .kvcard .kvfrom { font: var(--t-mono); color: var(--muted-sage); margin-top: 6px; }
 .kvcard .kvfrom b { color: var(--emerald); font: var(--t-mono); }
 
-.exprs { display: flex; flex-direction: column; gap: 10px; max-width: 660px; }
-.expr { background: var(--pine-deep); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 10px; color: var(--sage); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.expr .tok { color: var(--emerald); }
-.expr .arrow { color: var(--muted-sage); }
-.expr .val { color: var(--soft-white); }
+/* One row per output: the expression a downstream step writes, then the value
+   it reads. The rows share one grid, so the arrows line up; a long value (a
+   digest, an image ref) wraps inside its column instead of leaving the box. */
+.exprs {
+  display: grid;
+  grid-template-columns: minmax(0, max-content) auto minmax(0, 1fr);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--pine-deep);
+}
+.expr { display: contents; color: var(--sage); }
+.expr > span { padding: 8px 10px; border-top: 1px solid var(--border-soft); min-width: 0; }
+.expr:first-child > span { border-top: 0; }
+.expr .expr-tok { color: var(--emerald); overflow-wrap: anywhere; }
+.expr .arrow { color: var(--muted-sage); padding-inline: 0; }
+.expr .val { color: var(--soft-white); overflow-wrap: anywhere; white-space: pre-wrap; }
 
 .filelist { list-style: none; margin: 0; padding: 0; }
 .filerow { display: grid; grid-template-columns: 1fr auto auto; gap: 16px; align-items: center; padding: 8px 4px; border-bottom: 1px solid var(--border-soft); font: var(--t-mono); }
@@ -3473,7 +3488,12 @@ a.lgtog { text-decoration: none; }
    mark and the times at the right edge, under the actions. */
 .rh-prov { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 20px; color: var(--sage); min-width: 0; }
 .rh-prov .rr-l2 { display: flex; gap: 0 22px; max-width: none; flex: 0 1 auto; }
-.rh-params { font: var(--t-mono); color: var(--muted-sage); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rh-params {
+  font: var(--t-mono); color: var(--muted-sage); min-width: 0; white-space: nowrap;
+  padding: 0; background: none; border: 0; cursor: pointer;
+  text-decoration: underline dotted; text-underline-offset: 3px;
+}
+.rh-params:hover { color: var(--emerald); }
 .rh-prov .grow1 { flex: 1; }
 .rh-keep {
   display: inline-flex; align-items: center; gap: 5px; flex: none; color: var(--muted-sage);
@@ -4720,3 +4740,47 @@ a.head-org:hover { color: var(--emerald); text-decoration: underline; text-under
 .mono {
   font: var(--t-mono);
 }
+
+/* ── Run pipeline dialog ──────────────────────────────────────────────────
+   Inputs in a two-column grid inside each numbered section, so short controls
+   sit side by side; on/off inputs come last in their section. One column on
+   a phone. */
+.rpd-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 20px; align-items: start; }
+.rpd-cell { min-width: 0; }
+.rpd-bool { padding-top: 2px; }
+@media (max-width: 640px) { .rpd-grid { grid-template-columns: minmax(0, 1fr); } }
+.rpd-seg {
+  display: flex; flex-wrap: wrap; gap: 0;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden;
+  width: fit-content; max-width: 100%;
+}
+.rpd-seg-opt {
+  padding: 5px 12px; min-height: 30px; background: none; border: 0; border-left: 1px solid var(--border);
+  color: var(--sage); font: var(--t-mono); cursor: pointer;
+}
+.rpd-seg-opt:first-child { border-left: 0; }
+.rpd-seg-opt:hover { color: var(--soft-white); }
+.rpd-seg-opt.on { background: color-mix(in srgb, var(--emerald) 18%, transparent); color: var(--soft-white); }
+.rpd-seg-opt:focus-visible { outline: 2px solid var(--emerald); outline-offset: -2px; }
+.rpd-notice, .rpd-none { margin: 0; padding: 14px 24px 0; color: var(--sage); }
+.rpd-notice { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.rpd-notice svg { color: var(--warn); }
+.rpd-none { padding-bottom: 14px; border-bottom: 1px solid var(--border-soft); }
+
+/* ── Run page: Inputs tab ─────────────────────────────────────────────────
+   The run's launch inputs, name then value, in one grid so the values line
+   up; a long value wraps in its column. */
+.ri-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 14px; background: var(--pine-deep); border-bottom: 1px solid var(--border);
+}
+.ri-what { flex: 1 1 auto; min-width: 0; color: var(--sage); }
+.ri-what .mono { color: var(--soft-white); }
+.ri-list { display: grid; grid-template-columns: minmax(0, max-content) minmax(0, 1fr); margin: 0; }
+.ri-row { display: contents; }
+.ri-row > * { margin: 0; padding: 9px 14px; border-top: 1px solid var(--border-soft); min-width: 0; }
+.ri-row:first-child > * { border-top: 0; }
+.ri-row dt { color: var(--sage); }
+.ri-row dd { color: var(--soft-white); overflow-wrap: anywhere; white-space: pre-wrap; }
+.ri-row dd.str { color: var(--copper); }
+.ri-empty { margin: 0; padding: 18px 14px; }

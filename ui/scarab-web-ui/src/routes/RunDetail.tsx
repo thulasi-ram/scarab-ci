@@ -132,6 +132,8 @@ import RunMoreMenu from "../components/RunMoreMenu";
 import RunArtifacts from "../components/RunArtifacts";
 import RunActivity from "../components/RunActivity";
 import RunManifest from "../components/RunManifest";
+import RunInputs from "../components/RunInputs";
+import RunPipelineDialog from "../components/RunPipelineDialog";
 
 const POLL_MS = 1200;
 
@@ -139,7 +141,7 @@ const POLL_MS = 1200;
 const paneTabParam = (t: PaneTab): PaneTabParam | undefined =>
   t === "results" || t === "workspace" || t === "outputs" || t === "source" ? t : undefined;
 
-/** A run tab: Pipeline (absent from the URL), Artifacts, Activity or Manifest. */
+/** A run tab: Pipeline (absent from the URL), Artifacts, Activity, Inputs or Manifest. */
 type RunTab = "pipeline" | RunTabParam;
 
 export default function RunDetail() {
@@ -923,6 +925,27 @@ export default function RunDetail() {
   const headBranch = (t: { branch?: string; sha?: string }): string | null =>
     t.branch && t.branch !== t.sha ? t.branch : null;
 
+  // "New run with these inputs": the run form for this run's pipeline at the
+  // latest commit on this run's branch (the run's own commit when it names no
+  // branch), filled in with this run's inputs. Without a pipeline name or a
+  // commit (an inline run), the launcher page instead.
+  const [relaunch, setRelaunch] = createSignal<{
+    pipeline: string;
+    gitRef: string;
+    refName: string | null;
+    params: Record<string, unknown>;
+  } | null>(null);
+  const newRunWithInputs = () => {
+    const r = run();
+    const t = triggerInfo();
+    if (r?.pipeline && t?.sha) {
+      const branch = headBranch(t);
+      setRelaunch({ pipeline: r.pipeline, gitRef: branch ?? t.sha, refName: branch, params: runParams(r) });
+    } else {
+      nav(`/${org()}/${repo()}/run`);
+    }
+  };
+
   // Every attempt's version and try number, so an artifact names the try that
   // published it the way the step pane does ("plan · try 2").
   const places = createMemo(() => attemptPlaces(events()));
@@ -1027,7 +1050,7 @@ export default function RunDetail() {
   };
 
   return (
-    <section class="page">
+    <section class="page page-run">
       <Doodle icon="container" size={230} rotate={14} opacity={0.16} top="52px" right="48px" />
 
       <Show when={run()} fallback={<p class="empty">loading…</p>}>
@@ -1084,12 +1107,8 @@ export default function RunDetail() {
                     fallback={
                       <button
                         class="btn btn-ghost btn-sm"
-                        onClick={() =>
-                          nav(`/${org()}/${repo()}/run`, {
-                            state: { prefillParams: runParams(r()) },
-                          })
-                        }
-                        title="Start a new run of this pipeline with these parameters"
+                        onClick={newRunWithInputs}
+                        title="Start a new run of this pipeline with this run's inputs"
                       >
                         <Icon icon="play" size={13} /> New run
                       </button>
@@ -1109,6 +1128,7 @@ export default function RunDetail() {
                   </Show>
                   <RunMoreMenu
                     runId={id()}
+                    onNewRun={newRunWithInputs}
                     retention={retention()}
                     pinning={pinning()}
                     onTogglePin={() => void onTogglePin()}
@@ -1137,12 +1157,20 @@ export default function RunDetail() {
                   prUrl={forgePrUrl(repoUrl(), triggerInfo()?.pr)}
                   deploy={deployTag(!!r().environment, r().environment?.display_name ?? r().environment?.name)}
                 />
-                <Show when={Object.keys(runParams(r())).length > 0}>
-                  <span class="rh-params mono" title="launch parameters">
-                    {Object.entries(runParams(r()))
-                      .map(([k, v]) => `${k}=${String(v)}`)
-                      .join(" · ")}
-                  </span>
+                {/* The inputs in full are on the Inputs tab; here, how many. */}
+                <Show when={Object.keys(runParams(r())).length}>
+                  {(n) => (
+                    <button
+                      type="button"
+                      class="rh-params mono"
+                      title={Object.entries(runParams(r()))
+                        .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
+                        .join("\n")}
+                      onClick={() => setRunTab("inputs")}
+                    >
+                      {n()} {n() === 1 ? "input" : "inputs"}
+                    </button>
+                  )}
                 </Show>
                 <span class="grow1" />
                 <Show when={retention()} keyed>
@@ -1328,11 +1356,7 @@ export default function RunDetail() {
                   <Icon icon="ban" size={13} /> <span>{note()}</span>
                   <button
                     class="btn btn-primary btn-sm"
-                    onClick={() =>
-                      nav(`/${org()}/${repo()}/run`, {
-                        state: { prefillParams: runParams(r()) },
-                      })
-                    }
+                    onClick={newRunWithInputs}
                   >
                     <Icon icon="rotate-cw" size={13} /> New run
                   </button>
@@ -1393,6 +1417,18 @@ export default function RunDetail() {
                 >
                   <span class="run-tab-n">{activityCount()}</span>
                 </Show>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                class="run-tab"
+                aria-selected={runTab() === "inputs"}
+                onClick={() => setRunTab("inputs")}
+              >
+                Inputs{" "}
+                <span class="run-tab-n" classList={{ zero: Object.keys(runParams(r())).length === 0 }}>
+                  {Object.keys(runParams(r())).length}
+                </span>
               </button>
               <button
                 type="button"
@@ -1487,7 +1523,7 @@ export default function RunDetail() {
                     }
                   >
                     <span class="dag-zoomctl">
-                      <button type="button" title="Back to the fitted view" aria-label="Fit the graph" onClick={() => dagControls()?.fit()}>
+                      <button type="button" title="Back to 100% and the start of the graph" aria-label="Reset the zoom" onClick={() => dagControls()?.fit()}>
                         <Icon icon="maximize" size={13} />
                       </button>
                       <button type="button" title="Zoom in" aria-label="Zoom in" onClick={() => dagControls()?.zoomIn()}>
@@ -1745,6 +1781,9 @@ export default function RunDetail() {
                 needs={Object.fromEntries(stepList().map((s) => [s.id, s.needs ?? []]))}
               />
             </Show>
+            <Show when={runTab() === "inputs"}>
+              <RunInputs params={runParams(r())} pipeline={r().pipeline ?? null} onNewRun={newRunWithInputs} />
+            </Show>
             <Show when={runTab() === "manifest"}>
               <RunManifest
                 runId={id()}
@@ -1767,6 +1806,19 @@ export default function RunDetail() {
               />
             </Show>
             </div>
+            <Show when={relaunch()}>
+              {(rl) => (
+                <RunPipelineDialog
+                  org={org()}
+                  repo={repo()}
+                  pipeline={rl().pipeline}
+                  gitRef={rl().gitRef}
+                  refName={rl().refName}
+                  prefill={rl().params}
+                  onClose={() => setRelaunch(null)}
+                />
+              )}
+            </Show>
             <Show when={shellOpen() && sel()}>
               <DebugShell runId={id()} step={sel()!} mode={shellMode()} onClose={() => setShellOpen(false)} />
             </Show>

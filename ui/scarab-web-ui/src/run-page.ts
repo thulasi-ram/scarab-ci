@@ -280,7 +280,7 @@ export function defaultSelection(o: {
 
 // ── URL state ───────────────────────────────────────────────────────────────
 
-export type RunTabParam = "artifacts" | "activity" | "manifest";
+export type RunTabParam = "artifacts" | "activity" | "inputs" | "manifest";
 export type PaneTabParam = "results" | "workspace" | "outputs" | "source";
 
 /**
@@ -306,7 +306,7 @@ export type RunUrlState = {
 
 type Params = Record<string, string | string[] | null | undefined>;
 
-const RUN_TABS: readonly string[] = ["artifacts", "activity", "manifest"];
+const RUN_TABS: readonly string[] = ["artifacts", "activity", "inputs", "manifest"];
 const PANE_TABS: readonly string[] = ["results", "workspace", "outputs", "source"];
 
 function first(v: string | string[] | null | undefined): string | undefined {
@@ -441,8 +441,9 @@ export function nodeMeta(s: NodeMetaInput, now: number): { text: string; tone: M
 /**
  * How the graph band draws its content. The graph is drawn at 100% and never
  * shrunk to fit the height: the band is as tall as the graph, up to `maxH`,
- * and scrolls inside past that. Only a graph wider than the band shrinks, and
- * not below `minScale`; past that it scrolls (and pans) sideways.
+ * and scrolls inside past that. A graph wider than the band is not shrunk
+ * either (`minScale` defaults to 1, so the step names stay at the Mono size):
+ * it scrolls (and pans) sideways, and the zoom buttons zoom out.
  */
 export function fitBand(o: {
   bandW: number;
@@ -451,10 +452,12 @@ export function fitBand(o: {
   maxH: number;
   pad: number;
   minScale?: number;
+  /** The viewer's remembered zoom: used as is instead of the fit. */
+  zoom?: number | null;
 }): { scale: number; bandH: number; pannable: boolean } {
-  const min = o.minScale ?? 0.75;
+  const min = o.minScale ?? 1;
   const avail = Math.max(1, o.bandW - o.pad * 2);
-  const scale = o.contentW <= avail ? 1 : Math.max(min, avail / o.contentW);
+  const scale = o.zoom ?? (o.contentW <= avail ? 1 : Math.max(min, avail / o.contentW));
   const fullH = Math.round(o.contentH * scale + o.pad * 2);
   const bandH = Math.min(fullH, o.maxH);
   return { scale, bandH, pannable: o.contentW * scale > avail + 0.5 || fullH > o.maxH };
@@ -476,9 +479,9 @@ export function columnNodeWidth(
   o: { charPx?: number; chromePx?: number; minChars?: number; min?: number; max?: number } = {},
 ): number {
   const charPx = o.charPx ?? 7.2;
-  const chrome = o.chromePx ?? 86;
+  const chrome = o.chromePx ?? 68;
   const longest = labels.reduce((n, l) => Math.max(n, [...l].length), o.minChars ?? 0);
-  return Math.round(Math.min(o.max ?? 460, Math.max(o.min ?? 240, longest * charPx + chrome)));
+  return Math.round(Math.min(o.max ?? 460, Math.max(o.min ?? 196, longest * charPx + chrome)));
 }
 
 // ── Step header ─────────────────────────────────────────────────────────────

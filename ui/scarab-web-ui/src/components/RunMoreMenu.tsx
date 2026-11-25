@@ -1,5 +1,7 @@
-// The run header's ⋯ menu: Keep workspace snapshots (pin or unpin this run's
-// snapshots past the retention window) and Copy run ID. Keyboard reachable:
+// The run header's ⋯ menu: New run with these inputs (the run form for this
+// run's pipeline, filled in with this run's inputs), Keep workspace snapshots
+// (pin or unpin this run's snapshots past the retention window) and Copy run
+// ID. Keyboard reachable:
 // Enter or Space opens it on its first enabled item, the arrow keys move
 // between enabled items, Escape closes and returns focus to the button.
 import { createSignal, onCleanup, onMount, Show } from "solid-js";
@@ -8,6 +10,8 @@ import { pinLabel, pinTitle } from "../snapshot-retention";
 
 export default function RunMoreMenu(props: {
   runId: string;
+  /** Opens the run form filled in with this run's inputs. */
+  onNewRun: () => void;
   /** The retention promise; null hides the pin item. */
   retention: RetentionInfo | null;
   pinning: boolean;
@@ -78,6 +82,19 @@ export default function RunMoreMenu(props: {
       <Show when={open()}>
         <div class="vdrop-backdrop" aria-hidden="true" onClick={() => close(false)} />
         <div class="rmenu-pop" role="menu" aria-label="More run actions" ref={menu} onKeyDown={onMenuKey}>
+          <button
+            type="button"
+            role="menuitem"
+            class="rmenu-item"
+            onClick={() => {
+              // Focus goes back to ⋯ first, so the dialog returns it there.
+              close();
+              props.onNewRun();
+            }}
+          >
+            <span class="rmenu-lbl">New run with these inputs</span>
+            <small>Open the run form filled in with this run's inputs.</small>
+          </button>
           <Show when={props.retention}>
             {(r) => (
               <button
