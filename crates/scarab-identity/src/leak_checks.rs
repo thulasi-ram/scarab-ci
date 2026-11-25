@@ -68,3 +68,38 @@ pub trait LeakCheckLimitsStore: Send + Sync {
         updated_at: i64,
     ) -> Result<Option<LeakCheckLimits>, IdentityError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_defaults_are_on_and_within_bounds() {
+        let d = LeakCheckLimits::default();
+        assert_eq!((d.per_hour, d.per_day), (20, 40));
+        assert!(!d.off());
+        assert!(d.within_bounds());
+    }
+
+    #[test]
+    fn either_limit_at_zero_turns_the_check_off() {
+        assert!(LeakCheckLimits {
+            per_hour: 0,
+            per_day: 40
+        }
+        .off());
+        assert!(LeakCheckLimits {
+            per_hour: 20,
+            per_day: 0
+        }
+        .off());
+    }
+
+    #[test]
+    fn the_bounds_are_inclusive() {
+        let at = |per_hour, per_day| LeakCheckLimits { per_hour, per_day }.within_bounds();
+        assert!(at(100, 1000));
+        assert!(!at(101, 1000));
+        assert!(!at(100, 1001));
+    }
+}
