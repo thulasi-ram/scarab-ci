@@ -563,6 +563,21 @@ The StatefulSet's `serviceName` is unchanged, so upgrading needs no migration.
 
 > **Unverified in this chart version:** per-availability-zone placement.
 
+### Upgrading from 0.7.5: leak-check limits
+
+Migration 0109 adds the table `org_leak_check_limits`, which holds the limits
+an org Owner sets on leak checks. It is a new table: it takes no lock on
+another, and every org starts on the defaults (20 checks per person an hour,
+40 a day).
+
+To roll back: scale the server to zero
+(`kubectl -n scarab scale deploy/scarab --replicas=0`), back up the database,
+run
+[`rollback/0109_revert.sql`](../../../crates/scarab-db-postgres/rollback/0109_revert.sql)
+(`psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0109_revert.sql`; a second run
+changes nothing), then install the 0.7.5 chart. The limits Owners set are
+dropped. To go back to 0.7.2, run `0106_revert.sql` next.
+
 ### Upgrading from 0.7.2: saved pipeline files
 
 Migrations 0106, 0107 and 0108 add nullable columns to `runs`: the pipeline

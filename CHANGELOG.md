@@ -18,6 +18,14 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **Migration 0109 adds the table `org_leak_check_limits`** (each org's limits on leak checks).
+  It is a new table, so it takes no lock on another and nothing is backfilled. A 0.7.5 server does
+  not start on a database that ran it: to roll back, run
+  `crates/scarab-db-postgres/rollback/0109_revert.sql` with the server scaled to zero. See the
+  chart README, "Upgrading from 0.7.5".
+
 ### Features
 
 - **The org can set a secret for one Environment, for every repository.** In Org settings ›
