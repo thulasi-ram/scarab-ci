@@ -3,15 +3,10 @@
 // Owners set the two limits; 0 in either turns the check off for the org.
 // This module is the wording and the validation around them, with no DOM.
 
+import type { components } from "./api/schema";
+
 /** `GET`/`PUT /v1/orgs/{org}/security/leak-checks`. */
-export type LeakCheckLimits = {
-  per_hour: number;
-  per_day: number;
-  /** The most `per_hour` may be set to. */
-  max_per_hour: number;
-  /** The most `per_day` may be set to. */
-  max_per_day: number;
-};
+export type LeakCheckLimits = components["schemas"]["LeakCheckLimitsDto"];
 
 /** Either limit at 0 turns the check off for the org. */
 export function leakChecksOff(l: Pick<LeakCheckLimits, "per_hour" | "per_day">): boolean {

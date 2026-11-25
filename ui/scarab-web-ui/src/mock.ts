@@ -2573,7 +2573,13 @@ const orgSecuritySummary: components["schemas"]["OrgSecuritySummary"] = {
 // Leak-check limits (Org settings › Security), one set for every org in the
 // mock, changed by a PUT for the life of the page. The mock caller is an
 // Owner, so it may change them; the bounds are the server's.
-const leakCheckLimits = { per_hour: 20, per_day: 40, max_per_hour: 100, max_per_day: 1000 };
+const leakCheckLimits: components["schemas"]["LeakCheckLimitsDto"] = {
+  per_hour: 20,
+  per_day: 40,
+  max_per_hour: 100,
+  max_per_day: 1000,
+  caller_role: "owner",
+};
 function mockLeakChecks(method: string, body: string): Response {
   if (method === "PUT") {
     const req = JSON.parse(body || "{}") as { per_hour?: unknown; per_day?: unknown };

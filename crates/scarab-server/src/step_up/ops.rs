@@ -296,8 +296,18 @@ pub struct Op {
     /// pointer replaced by [`HIDDEN`], so a redacted field is never digested
     /// (the pasted text of a leak check). A confirmation then stands for the
     /// request whatever those fields hold; set it only on a browser-only
-    /// operation, whose body is never parked or replayed.
+    /// operation, whose body is never parked or replayed. A session holds at
+    /// most one unspent action confirmation for such an operation: a new one
+    /// replaces it (`POST /v1/me/step-up`).
     pub digest_without_redacted: bool,
+}
+
+/// The operation with id `id`, from the route table.
+pub fn by_id(id: &str) -> Option<&'static Op> {
+    crate::route_table()
+        .iter()
+        .map(|e| e.op)
+        .find(|op| op.id == id)
 }
 
 /// [`Op::max_request_body`] unless an operation says otherwise.
@@ -1742,6 +1752,19 @@ mod tests {
                 "step.debug_pod"
             ]
         );
+        // An operation whose digest leaves out its redacted fields stands
+        // for any request of it once confirmed, so it must never be parked
+        // and replayed for a machine caller.
+        for e in crate::route_table() {
+            if e.op.digest_without_redacted {
+                assert_eq!(
+                    e.op.machine,
+                    StepUpMachineUse::BrowserOnly,
+                    "`{}` leaves its redacted fields out of the digest but is not browser-only",
+                    e.op.id
+                );
+            }
+        }
         not_by_token.sort_unstable();
         assert_eq!(
             not_by_token,

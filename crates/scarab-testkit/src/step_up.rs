@@ -411,6 +411,26 @@ impl StepUpStore for InMemoryStepUp {
         }))
     }
 
+    async fn delete_other_actions(
+        &self,
+        session_hash: &str,
+        principal: &str,
+        digest: &[u8],
+        keep: &str,
+    ) -> Result<u64, IdentityError> {
+        let mut state = self.state.lock().unwrap();
+        let before = state.confirmations.len();
+        state.confirmations.retain(|c| {
+            !(c.kind == ConfirmationKind::Action
+                && c.session_hash == session_hash
+                && c.principal == principal
+                && c.action_digest.as_deref() == Some(digest)
+                && c.consumed_at.is_none()
+                && c.id != keep)
+        });
+        Ok((before - state.confirmations.len()) as u64)
+    }
+
     async fn delete_standing_confirmations_for(
         &self,
         principal: &str,

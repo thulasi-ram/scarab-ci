@@ -6438,7 +6438,7 @@
             }
           },
           "403": {
-            "description": "not an owner of the org, or `step_up_required` (mode `action`)",
+            "description": "`browser_session_required` (an API token or a Bearer session, even for a request that changes nothing), with `code` and `message`; not an owner of the org; or `step_up_required` (mode `action`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -15919,7 +15919,7 @@
       },
       "SecretMatchRefusal": {
         "type": "object",
-        "description": "The JSON body of a refused check (400, 403, 413, 429), or of a refused\nchange of the limits (400).",
+        "description": "The JSON body of a refused check (400, 403, 413, 429), or of a refused\nchange of the limits (400, 403).",
         "required": [
           "code",
           "message"
@@ -15927,7 +15927,7 @@
         "properties": {
           "code": {
             "type": "string",
-            "description": "A check: `bad_body`, `empty`, `too_long`, `rate_limited`,\n`leak_checks_off` or `browser_session_required`. A change of the\nlimits: `bad_body` or `out_of_bounds`."
+            "description": "A check: `bad_body`, `empty`, `too_long`, `rate_limited`,\n`leak_checks_off` or `browser_session_required`. A change of the\nlimits: `bad_body`, `out_of_bounds` or `browser_session_required`."
           },
           "max_bytes": {
             "type": [

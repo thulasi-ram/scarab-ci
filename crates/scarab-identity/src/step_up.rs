@@ -569,6 +569,19 @@ pub trait StepUpStore: Send + Sync {
         now_ms: i64,
     ) -> Result<Option<String>, IdentityError>;
 
+    /// Delete every unconsumed action confirmation of `principal` in
+    /// `session_hash` for exactly `digest`, except the one with id `keep`.
+    /// Returns how many. Called after `keep` is stored, so of two
+    /// confirmations stored at once at most one is left (possibly none);
+    /// never two.
+    async fn delete_other_actions(
+        &self,
+        session_hash: &str,
+        principal: &str,
+        digest: &[u8],
+        keep: &str,
+    ) -> Result<u64, IdentityError>;
+
     /// Delete `principal`'s standing step-up authority — every window and
     /// every unconsumed action confirmation, in every session (a passkey
     /// reset). Returns how many.

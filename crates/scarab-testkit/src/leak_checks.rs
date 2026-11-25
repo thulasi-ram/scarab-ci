@@ -31,8 +31,7 @@ impl LeakCheckLimitsStore for InMemoryLeakCheckLimits {
         limits: LeakCheckLimits,
         _updated_by: &str,
         _updated_at: i64,
-    ) -> Result<(), IdentityError> {
-        self.limits.lock().unwrap().insert(org.to_string(), limits);
-        Ok(())
+    ) -> Result<Option<LeakCheckLimits>, IdentityError> {
+        Ok(self.limits.lock().unwrap().insert(org.to_string(), limits))
     }
 }

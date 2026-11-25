@@ -207,12 +207,12 @@ pub struct SecretMatchResponse {
 }
 
 /// The JSON body of a refused check (400, 403, 413, 429), or of a refused
-/// change of the limits (400).
+/// change of the limits (400, 403).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SecretMatchRefusal {
     /// A check: `bad_body`, `empty`, `too_long`, `rate_limited`,
     /// `leak_checks_off` or `browser_session_required`. A change of the
-    /// limits: `bad_body` or `out_of_bounds`.
+    /// limits: `bad_body`, `out_of_bounds` or `browser_session_required`.
     pub code: String,
     pub message: String,
     /// `rate_limited`: when the next check is allowed (unix ms).
@@ -286,12 +286,45 @@ async fn org_limits(st: &AppState, org: &str) -> Result<LeakCheckLimits, ApiErro
     }
 }
 
-/// When the window of `window_ms` lets `subject` check in `org` again, if
-/// they already ran `limit` checks there in the window before `now`: one
-/// window after the oldest of their newest `limit` checks.
+/// Whose checks count against a limit: the caller's Principal id, and the
+/// other names its checks may be recorded under (its handle, and the ids
+/// and handles of the Principals merged into it).
+struct Checker {
+    subject: String,
+    aliases: Vec<String>,
+}
+
+impl Checker {
+    async fn of(st: &AppState, caller: &crate::Caller) -> Result<Self, ApiError> {
+        let subject = caller.principal.subject.clone();
+        let mut names = vec![caller.principal.handle().to_string()];
+        if let Some(store) = st.identities.as_ref() {
+            // A store failure refuses the check rather than count fewer.
+            for merged in store
+                .aliases_of(&subject)
+                .await
+                .map_err(crate::step_up::store_err)?
+            {
+                names.push(merged.id);
+                names.push(merged.handle);
+            }
+        }
+        names.sort();
+        names.dedup();
+        names.retain(|n| !n.is_empty() && *n != subject);
+        Ok(Self {
+            subject,
+            aliases: names,
+        })
+    }
+}
+
+/// When the window of `window_ms` lets `who` check in `org` again, if they
+/// already ran `limit` checks there in the window before `now`: one window
+/// after the oldest of their newest `limit` checks.
 async fn window_full(
     log: &dyn OrgSecurityEventLog,
-    subject: &str,
+    who: &Checker,
     org: &str,
     now: i64,
     window_ms: i64,
@@ -300,7 +333,8 @@ async fn window_full(
     let recent = log
         .list(&SecurityEventFilter {
             org: Some(org.to_string()),
-            subject: Some(subject.to_string()),
+            subject: Some(who.subject.clone()),
+            subject_aliases: who.aliases.clone(),
             kinds: vec![kind::SECRET_MATCH_CHECKED.to_string()],
             // A check exactly one window old no longer counts.
             from_at: Some(now - window_ms + 1),
@@ -320,12 +354,12 @@ async fn window_full(
 async fn limit_reached(
     log: &dyn OrgSecurityEventLog,
     limits: LeakCheckLimits,
-    subject: &str,
+    who: &Checker,
     org: &str,
     now: i64,
 ) -> Result<Option<i64>, ApiError> {
-    let hour = window_full(log, subject, org, now, HOUR_WINDOW_MS, limits.per_hour).await?;
-    let day = window_full(log, subject, org, now, DAY_WINDOW_MS, limits.per_day).await?;
+    let hour = window_full(log, who, org, now, HOUR_WINDOW_MS, limits.per_hour).await?;
+    let day = window_full(log, who, org, now, DAY_WINDOW_MS, limits.per_day).await?;
     Ok(match (hour, day) {
         (Some(h), Some(d)) => Some(h.max(d)),
         (one, other) => one.or(other),
@@ -335,25 +369,50 @@ async fn limit_reached(
 /// How many locks [`check_turn`] spreads (subject, org) pairs over.
 const CHECK_TURN_STRIPES: usize = 64;
 
-/// One check at a time per (subject, org) in this process, from the
-/// limit's count to its record, so two concurrent checks by one Admin in one
-/// org cannot both take the last slot of the hour. The pairs are spread over
-/// a fixed set of locks by hash, so the set never grows; two pairs that
-/// share a lock only wait for each other.
+/// The lock a (subject, org) pair takes to count its checks against the
+/// limits and, after the search, to count again and record the check, so two
+/// concurrent checks by one Admin in one org cannot both take the last slot.
+/// The search itself runs outside it. The pairs are spread over a fixed set
+/// of locks by a hash seeded once per process, so the set never grows and a
+/// caller cannot pick a name that shares another's lock on every server;
+/// two pairs that share a lock only wait for each other.
 ///
 /// The lock is per process: with N server replicas, one Admin checking from
 /// all of them at once can exceed a limit by at most N-1.
 fn check_turn(subject: &str, org: &str) -> &'static tokio::sync::Mutex<()> {
-    use std::hash::{Hash, Hasher};
-    static TURNS: OnceLock<Vec<tokio::sync::Mutex<()>>> = OnceLock::new();
-    let turns = TURNS.get_or_init(|| {
-        (0..CHECK_TURN_STRIPES)
-            .map(|_| tokio::sync::Mutex::new(()))
-            .collect()
+    use std::hash::BuildHasher;
+    type Turns = (
+        std::collections::hash_map::RandomState,
+        Vec<tokio::sync::Mutex<()>>,
+    );
+    static TURNS: OnceLock<Turns> = OnceLock::new();
+    let (seed, turns) = TURNS.get_or_init(|| {
+        (
+            std::collections::hash_map::RandomState::new(),
+            (0..CHECK_TURN_STRIPES)
+                .map(|_| tokio::sync::Mutex::new(()))
+                .collect(),
+        )
     });
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    (subject, org).hash(&mut hasher);
-    &turns[(hasher.finish() % CHECK_TURN_STRIPES as u64) as usize]
+    &turns[(seed.hash_one((subject, org)) % CHECK_TURN_STRIPES as u64) as usize]
+}
+
+/// The 403 for an API token or a session presented as Bearer, if the caller
+/// is one: leak checks and their limits are for a person in a browser.
+fn refuse_unless_browser(caller: &crate::Caller, what: &str) -> Option<Response> {
+    if caller.grant.is_none() && caller.via != Some(crate::AuthVia::Bearer) {
+        return None;
+    }
+    Some(refusal(
+        StatusCode::FORBIDDEN,
+        "browser_session_required",
+        format!(
+            "{what} only by a person in a signed-in browser, never with an API token or a \
+             session presented as Bearer."
+        ),
+        None,
+        None,
+    ))
 }
 
 /// Compare pasted text with every value the org holds now — its secrets at
@@ -398,16 +457,8 @@ pub(crate) async fn org_secret_match(
     let secrets = st.secrets.as_deref().ok_or(ApiError::NotFound)?;
     // A human in a browser only: an API token or a session presented as
     // Bearer is refused whether or not step-up is enforced.
-    if caller.grant.is_some() || caller.via == Some(crate::AuthVia::Bearer) {
-        return Ok(refusal(
-            StatusCode::FORBIDDEN,
-            "browser_session_required",
-            "A leak check can only be run by a person in a signed-in browser, never with an \
-             API token or a session presented as Bearer."
-                .into(),
-            None,
-            None,
-        ));
+    if let Some(refused) = refuse_unless_browser(&caller, "A leak check can be run") {
+        return Ok(refused);
     }
     let limits = org_limits(&st, &org).await?;
     if limits.off() {
@@ -447,32 +498,42 @@ pub(crate) async fn org_secret_match(
         ));
     }
     let log = st.security_events.clone();
-    let subject = caller.principal.subject.clone();
+    let who = Checker::of(&st, &caller).await?;
     // Refused before the step-up, so a check over a limit costs no
     // confirmation. Counted again below, in turn.
     if let Some(log) = log.as_deref() {
         let now = st.clock.now().await.0;
-        if let Some(retry_at) = limit_reached(log, limits, &subject, &org, now).await? {
+        if let Some(retry_at) = limit_reached(log, limits, &who, &org, now).await? {
             return Ok(rate_limited(limits, retry_at, now));
         }
     }
     guard.require(&st, Vec::new()).await?;
 
-    let _turn = check_turn(&subject, &org).lock().await;
+    // Counted in turn before the search, so a check another one just filled
+    // the limit for is not searched for nothing.
     if let Some(log) = log.as_deref() {
+        let _turn = check_turn(&who.subject, &org).lock().await;
         let now = st.clock.now().await.0;
-        if let Some(retry_at) = limit_reached(log, limits, &subject, &org, now).await? {
+        if let Some(retry_at) = limit_reached(log, limits, &who, &org, now).await? {
             return Ok(rate_limited(limits, retry_at, now));
         }
     }
+    // Outside the lock: a slow search does not hold up the caller's other
+    // checks, nor the pairs that share its lock.
     let (matches, searched) = search(&st, secrets, &org, text.as_bytes()).await?;
     drop(text);
 
     if let Some(log) = log.as_deref() {
+        // Counted again in turn: a check that filled the limit while this
+        // one searched wins, and this one's result is dropped unanswered.
+        let _turn = check_turn(&who.subject, &org).lock().await;
         let now = st.clock.now().await.0;
+        if let Some(retry_at) = limit_reached(log, limits, &who, &org, now).await? {
+            return Ok(rate_limited(limits, retry_at, now));
+        }
         let mut ev = crate::step_up::event(
             kind::SECRET_MATCH_CHECKED,
-            &subject,
+            &who.subject,
             caller.event_label(),
             Some(org.clone()),
             now,
@@ -624,7 +685,8 @@ pub(crate) async fn get_leak_check_limits(
 /// Change an org's leak check limits. Org Owner only, from a signed-in
 /// browser, with a passkey confirmation of its own; the confirmation shows
 /// the old and the new values. Recorded in the org's security events
-/// (`secret.match_limits_changed`) with both. A request that changes
+/// (`secret.match_limits_changed`) with both, the old ones as the write
+/// replaced them. A request that changes
 /// nothing asks for no confirmation and records nothing.
 #[utoipa::path(
     put,
@@ -635,7 +697,7 @@ pub(crate) async fn get_leak_check_limits(
     responses(
         (status = 200, body = LeakCheckLimitsDto),
         (status = 400, body = SecretMatchRefusal, description = "`bad_body` (not `{\"per_hour\": n, \"per_day\": n}`) or `out_of_bounds` (per_hour over 0-100, per_day over 0-1000); a reserved org (plain text)"),
-        (status = 403, description = "not an owner of the org, or `step_up_required` (mode `action`)"),
+        (status = 403, description = "`browser_session_required` (an API token or a Bearer session, even for a request that changes nothing), with `code` and `message`; not an owner of the org; or `step_up_required` (mode `action`)"),
         (status = 404, description = "limits cannot be stored on this server")
     )
 )]
@@ -647,6 +709,11 @@ pub(crate) async fn put_leak_check_limits(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let caller = authenticate(&st, &headers, Action::Administer).await?;
+    // A person in a browser only, before anything else: not even a request
+    // that changes nothing is answered for a token.
+    if let Some(refused) = refuse_unless_browser(&caller, "The leak check limits can be changed") {
+        return Ok(refused);
+    }
     if limits_role(&st, &caller, &org).await? != Some(LeakCheckCallerRole::Owner) {
         return Err(ApiError::Forbidden);
     }
@@ -700,10 +767,13 @@ pub(crate) async fn put_leak_check_limits(
 
     let subject = caller.principal.subject.clone();
     let now = st.clock.now().await.0;
-    store
+    // The limits this write replaced, read with it: what the confirmation
+    // showed is read before, and another Owner may have changed them since.
+    let old = store
         .put_leak_check_limits(&org, new, &subject, now)
         .await
-        .map_err(crate::step_up::store_err)?;
+        .map_err(crate::step_up::store_err)?
+        .unwrap_or_default();
     if let Some(log) = st.security_events.as_deref() {
         let mut ev = crate::step_up::event(
             kind::SECRET_MATCH_LIMITS_CHANGED,

@@ -6105,13 +6105,13 @@ export interface components {
         SecretMatchConnectionKind: "forge" | "plugin";
         /**
          * @description The JSON body of a refused check (400, 403, 413, 429), or of a refused
-         *     change of the limits (400).
+         *     change of the limits (400, 403).
          */
         SecretMatchRefusal: {
             /**
              * @description A check: `bad_body`, `empty`, `too_long`, `rate_limited`,
              *     `leak_checks_off` or `browser_session_required`. A change of the
-             *     limits: `bad_body` or `out_of_bounds`.
+             *     limits: `bad_body`, `out_of_bounds` or `browser_session_required`.
              */
             code: string;
             /** @description `too_long`: the largest text accepted, in bytes. */
@@ -11761,7 +11761,7 @@ export interface operations {
                     "application/json": components["schemas"]["SecretMatchRefusal"];
                 };
             };
-            /** @description not an owner of the org, or `step_up_required` (mode `action`) */
+            /** @description `browser_session_required` (an API token or a Bearer session, even for a request that changes nothing), with `code` and `message`; not an owner of the org; or `step_up_required` (mode `action`) */
             403: {
                 headers: {
                     [name: string]: unknown;

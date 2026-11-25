@@ -56,12 +56,15 @@ pub trait LeakCheckLimitsStore: Send + Sync {
     async fn leak_check_limits(&self, org: &str) -> Result<Option<LeakCheckLimits>, IdentityError>;
 
     /// Store `limits` for `org`, replacing any stored before, as changed by
-    /// `updated_by` at `updated_at` (unix ms).
+    /// `updated_by` at `updated_at` (unix ms). Returns the limits it
+    /// replaced (`None`: the org had none), read in the same transaction as
+    /// the write, so of two concurrent changes the second returns the
+    /// first's limits.
     async fn put_leak_check_limits(
         &self,
         org: &str,
         limits: LeakCheckLimits,
         updated_by: &str,
         updated_at: i64,
-    ) -> Result<(), IdentityError>;
+    ) -> Result<Option<LeakCheckLimits>, IdentityError>;
 }

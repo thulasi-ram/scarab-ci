@@ -33,7 +33,7 @@ use scarab_plugin::{
     RuntimeStatus,
 };
 use scarab_project::{OrgEnvironment, OrgEnvironmentStore};
-use scarab_secrets::SecretScope;
+use scarab_secrets::{Secret, SecretError, SecretProvider, SecretScope};
 use scarab_testkit::FakeSecrets;
 use scarab_webauthn::soft::SoftPasskey;
 
@@ -66,7 +66,16 @@ fn world_wrapping_log(
     secrets: &Arc<FakeSecrets>,
     wrap: impl FnOnce(Arc<dyn OrgSecurityEventLog>) -> Arc<dyn OrgSecurityEventLog>,
 ) -> Harness {
-    let (pg, secrets) = (pg.clone(), secrets.clone());
+    world_on(pg, secrets.clone(), wrap)
+}
+
+/// [`world_wrapping_log`] over any secret store.
+fn world_on(
+    pg: &Arc<PostgresDb>,
+    secrets: Arc<dyn SecretProvider>,
+    wrap: impl FnOnce(Arc<dyn OrgSecurityEventLog>) -> Arc<dyn OrgSecurityEventLog>,
+) -> Harness {
+    let pg = pg.clone();
     harness_on_wrapping_log(Backend::Pg(pg.clone()), wrap, move |st| {
         st.with_secrets(secrets)
             .with_org_environments(pg.clone())
@@ -97,21 +106,18 @@ impl OrgSecurityEventLog for RefusesCheckRecords {
     }
 }
 
-/// An event log that, once armed, holds each of the first two counts the
-/// limits make (a list of one subject's checks) until both have been made:
-/// two concurrent checks then both pass the count taken before the step-up
-/// with the same number, before either is recorded.
+/// An event log that, once armed, counts the counts the limits make (a list
+/// of one subject's checks).
 #[derive(Default)]
-struct MeetAtTheCount {
+struct CountsTheCounts {
     inner: OnceLock<Arc<dyn OrgSecurityEventLog>>,
     armed: AtomicBool,
     /// The limit's counts made since arming.
     counts: AtomicUsize,
-    both: OnceLock<tokio::sync::Barrier>,
 }
 
 #[async_trait::async_trait]
-impl OrgSecurityEventLog for MeetAtTheCount {
+impl OrgSecurityEventLog for CountsTheCounts {
     async fn append(&self, event: &SecurityEvent) -> Result<i64, IdentityError> {
         self.inner.get().unwrap().append(event).await
     }
@@ -120,18 +126,75 @@ impl OrgSecurityEventLog for MeetAtTheCount {
         &self,
         filter: &SecurityEventFilter,
     ) -> Result<Vec<SecurityEvent>, IdentityError> {
-        let out = self.inner.get().unwrap().list(filter).await;
         let a_count = filter.subject.is_some() && filter.kinds == [KIND.to_string()];
         if a_count && self.armed.load(Ordering::SeqCst) {
-            let n = self.counts.fetch_add(1, Ordering::SeqCst);
-            if n < 2 {
-                self.both
-                    .get_or_init(|| tokio::sync::Barrier::new(2))
-                    .wait()
-                    .await;
-            }
+            self.counts.fetch_add(1, Ordering::SeqCst);
         }
-        out
+        self.inner.get().unwrap().list(filter).await
+    }
+}
+
+/// A secret store that, once armed, holds the first two searches (each
+/// reads the repositories' keys once) until both have begun. A search runs
+/// after the count taken in turn and before the record, so two concurrent
+/// checks then both pass that count with the same number.
+struct MeetInTheSearch {
+    inner: Arc<FakeSecrets>,
+    armed: AtomicBool,
+    searches: AtomicUsize,
+    both: tokio::sync::Barrier,
+}
+
+#[async_trait::async_trait]
+impl SecretProvider for MeetInTheSearch {
+    async fn get(&self, scope: &SecretScope, key: &str) -> Result<Secret, SecretError> {
+        self.inner.get(scope, key).await
+    }
+
+    async fn put(&self, scope: &SecretScope, secret: Secret) -> Result<(), SecretError> {
+        self.inner.put(scope, secret).await
+    }
+
+    async fn list_scoped(&self, scope: &SecretScope) -> Result<Vec<String>, SecretError> {
+        self.inner.list_scoped(scope).await
+    }
+
+    async fn delete(&self, scope: &SecretScope, key: &str) -> Result<(), SecretError> {
+        self.inner.delete(scope, key).await
+    }
+
+    async fn environment_secret_projects(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Vec<String>, SecretError> {
+        self.inner
+            .environment_secret_projects(org, environment)
+            .await
+    }
+
+    async fn environment_secret_scopes(
+        &self,
+        org: &str,
+    ) -> Result<Vec<(String, String)>, SecretError> {
+        self.inner.environment_secret_scopes(org).await
+    }
+
+    async fn project_secret_keys(
+        &self,
+        org: &str,
+    ) -> Result<Vec<(String, Option<String>, String)>, SecretError> {
+        if self.armed.load(Ordering::SeqCst) && self.searches.fetch_add(1, Ordering::SeqCst) < 2 {
+            self.both.wait().await;
+        }
+        self.inner.project_secret_keys(org).await
+    }
+
+    async fn org_environment_secret_environments(
+        &self,
+        org: &str,
+    ) -> Result<Vec<String>, SecretError> {
+        self.inner.org_environment_secret_environments(org).await
     }
 }
 
@@ -1046,7 +1109,9 @@ async fn the_forty_first_check_in_a_day_is_refused_until_the_day_rolls() {
     assert_eq!(body["retry_at"], first + DAY, "{body}");
     assert_eq!(h.events(KIND).await.len(), 40);
 
+    // A session lasts a day: dan signs in again.
     h.clock.advance(first + DAY - h.now().await);
+    let s = h.browser_session(scoped("dan")).await;
     let (st, body) = checked(&h, &s, &mut key, "acme", "PASTE-CANARY-8").await;
     assert_eq!(st, StatusCode::OK, "{body}");
     tdb.cleanup().await;
@@ -1284,44 +1349,53 @@ async fn a_check_that_cannot_be_recorded_is_not_answered() {
 }
 
 /// With 19 checks in the hour, two concurrent checks by the same Admin in
-/// the same org, each with a confirmation of its own, both pass the count
-/// taken before the step-up (each sees 19); the count taken again in turn
-/// lets exactly one through.
+/// the same org (from two browsers, each with a confirmation of its own)
+/// both pass the counts taken before the step-up and in turn before the
+/// search (each sees 19), and meet in the search; the count taken again in
+/// turn after it lets exactly one through.
 #[tokio::test]
 async fn two_concurrent_checks_cannot_both_take_the_last_slot() {
     let Some((tdb, pg)) = fresh_pg().await else {
         return;
     };
-    let secrets = Arc::new(FakeSecrets::new());
-    let gate = Arc::new(MeetAtTheCount::default());
-    let g = gate.clone();
-    let h = world_wrapping_log(&pg, &secrets, move |log| {
-        g.inner.set(log).ok().expect("wrapped once");
-        g
+    let counter = Arc::new(CountsTheCounts::default());
+    let search = Arc::new(MeetInTheSearch {
+        inner: Arc::new(FakeSecrets::new()),
+        armed: AtomicBool::new(false),
+        searches: AtomicUsize::new(0),
+        both: tokio::sync::Barrier::new(2),
+    });
+    let c = counter.clone();
+    let h = world_on(&pg, search.clone(), move |log| {
+        c.inner.set(log).ok().expect("wrapped once");
+        c
     });
     let (s, mut key) = admin(&h, "dan", "acme").await;
     for i in 0..19 {
         let (st, body) = checked(&h, &s, &mut key, "acme", "PASTE-CANARY-7").await;
         assert_eq!(st, StatusCode::OK, "check {i}: {body}");
     }
-    // Two confirmations, one for each of the concurrent checks.
-    for _ in 0..2 {
-        let (st, body) = check(&h, &s, "acme", "PASTE-CANARY-7").await;
+    // A second browser: a session holds one unspent confirmation for a
+    // check, so each concurrent check is confirmed in a session of its own.
+    let s2 = h.browser_session(scoped("dan")).await;
+    for sess in [&s, &s2] {
+        let (st, body) = check(&h, sess, "acme", "PASTE-CANARY-7").await;
         assert_step_up(st, &body, "action");
-        let (st, conf) = h.answer(&s, &mut key, &body["challenge"]).await;
+        let (st, conf) = h.answer(sess, &mut key, &body["challenge"]).await;
         assert_eq!(st, StatusCode::OK, "{conf}");
     }
 
-    gate.armed.store(true, Ordering::SeqCst);
-    let send = || {
+    counter.armed.store(true, Ordering::SeqCst);
+    search.armed.store(true, Ordering::SeqCst);
+    let send = |sess: &Sess| {
         h.app.clone().oneshot(cookie_req(
             "POST",
             "/v1/orgs/acme/secrets/match",
             Some(json!({ "text": "PASTE-CANARY-7" })),
-            &s,
+            sess,
         ))
     };
-    let (a, b) = tokio::join!(send(), send());
+    let (a, b) = tokio::join!(send(&s), send(&s2));
     let mut statuses = [a.unwrap().status(), b.unwrap().status()];
     statuses.sort();
     assert_eq!(
@@ -1329,9 +1403,138 @@ async fn two_concurrent_checks_cannot_both_take_the_last_slot() {
         [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS],
         "exactly one takes the twentieth slot"
     );
-    // Both counted twice (the hour and the day each time): the 429 came
-    // from the count taken in turn.
-    assert_eq!(gate.counts.load(Ordering::SeqCst), 8);
+    assert_eq!(search.searches.load(Ordering::SeqCst), 2, "both searched");
+    // Each check counted three times (the hour and the day each time):
+    // before the step-up, in turn before the search and in turn after it.
+    // The 429 came from the last.
+    assert_eq!(counter.counts.load(Ordering::SeqCst), 12);
     assert_eq!(h.events(KIND).await.len(), 20);
+    tdb.cleanup().await;
+}
+
+/// A new confirmation of a check replaces the session's unspent one: the
+/// confirmation does not commit to the text, so two unspent ones would let
+/// two checks run on one. Two checks are asked, both are answered; one
+/// check runs, on the second confirmation, and the next is asked again.
+#[tokio::test]
+async fn a_new_confirmation_replaces_the_unspent_one() {
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
+    let secrets = Arc::new(FakeSecrets::new());
+    let h = world(&pg, &secrets);
+    let (s, mut key) = admin(&h, "dan", "acme").await;
+
+    let (st, first) = check(&h, &s, "acme", "PASTE-CANARY-11 text A").await;
+    assert_step_up(st, &first, "action");
+    let (st, second) = check(&h, &s, "acme", "PASTE-CANARY-11 text B").await;
+    assert_step_up(st, &second, "action");
+    let (st, _) = h.answer(&s, &mut key, &first["challenge"]).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, conf) = h.answer(&s, &mut key, &second["challenge"]).await;
+    assert_eq!(st, StatusCode::OK, "{conf}");
+
+    let (st, body) = check(&h, &s, "acme", "PASTE-CANARY-11 text A").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let (st, body) = check(&h, &s, "acme", "PASTE-CANARY-11 text B").await;
+    assert_step_up(st, &body, "action");
+
+    let events = h.events(KIND).await;
+    assert_eq!(events.len(), 1, "one confirmation, one check");
+    assert_eq!(
+        events[0].confirmation_id.as_deref(),
+        conf["confirmation_id"].as_str(),
+        "the check ran on the second confirmation"
+    );
+    tdb.cleanup().await;
+}
+
+/// An API token and a session presented as Bearer may not change the
+/// limits, not even with a request that changes nothing.
+#[tokio::test]
+async fn an_api_token_or_a_bearer_session_may_not_change_the_limits() {
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
+    let secrets = Arc::new(FakeSecrets::new());
+    let h = world(&pg, &secrets);
+    h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
+    let token = pat(&h, "t1", Scope::Org("acme".into()), Role::Admin).await;
+    let cli = h.session(scoped("amy"), LoginKind::Api).await;
+    let uri = "/v1/orgs/acme/security/leak-checks";
+
+    for bearer in [token.as_str(), cli.id.as_str()] {
+        for (per_hour, per_day) in [(50, 200), (20, 40)] {
+            let (st, body) = h
+                .bearer(
+                    "PUT",
+                    uri,
+                    Some(json!({ "per_hour": per_hour, "per_day": per_day })),
+                    bearer,
+                )
+                .await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(body["code"], "browser_session_required", "{body}");
+        }
+    }
+    let (olga, _) = member(&h, "olga", "acme", Role::Owner).await;
+    let (st, body) = h.cookie("GET", uri, None, &olga).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(
+        (body["per_hour"].clone(), body["per_day"].clone()),
+        (json!(20), json!(40))
+    );
+    assert!(h.events("request.raised").await.is_empty());
+    assert!(h.events("secret.match_limits_changed").await.is_empty());
+    tdb.cleanup().await;
+}
+
+/// Checks recorded under the caller's handle (rows written before a
+/// Principal was named by id) count against its limits too.
+#[tokio::test]
+async fn checks_recorded_under_the_handle_count() {
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
+    let secrets = Arc::new(FakeSecrets::new());
+    let h = world(&pg, &secrets);
+    h.grant("p_dan", Scope::Org("acme".into()), Role::Admin)
+        .await;
+    let s = h
+        .browser_session(scarab_identity::Principal {
+            subject: "p_dan".into(),
+            handle: "dan".into(),
+            display_name: None,
+            roles: vec![],
+        })
+        .await;
+    let mut key = passkey();
+    h.enroll(&s, &mut key, "dan's key").await;
+
+    let now = h.now().await;
+    for i in 0..20 {
+        h.log
+            .append(&SecurityEvent {
+                seq: 0,
+                id: format!("old-check-{i}"),
+                org: Some("acme".into()),
+                at: now - 60_000 + i,
+                kind: KIND.into(),
+                subject: "dan".into(),
+                caller: "session:cookie".into(),
+                op: Some("secret.match".into()),
+                target: Some("acme".into()),
+                confirmation_id: None,
+                request_id: None,
+                passkey_id: None,
+                session_hash: None,
+                detail: json!({}),
+            })
+            .await
+            .unwrap();
+    }
+    let (st, body) = check(&h, &s, "acme", "PASTE-CANARY-12").await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["retry_at"], now - 60_000 + HOUR, "{body}");
     tdb.cleanup().await;
 }

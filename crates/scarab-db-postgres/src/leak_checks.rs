@@ -41,28 +41,60 @@ impl LeakCheckLimitsStore for PostgresDb {
         limits: LeakCheckLimits,
         updated_by: &str,
         updated_at: i64,
-    ) -> Result<(), IdentityError> {
+    ) -> Result<Option<LeakCheckLimits>, IdentityError> {
         let per_hour = i32::try_from(limits.per_hour)
             .map_err(|_| IdentityError::Conflict("the hourly limit is out of range".into()))?;
         let per_day = i32::try_from(limits.per_day)
             .map_err(|_| IdentityError::Conflict("the daily limit is out of range".into()))?;
-        sqlx::query(
+        let mut tx = self.pool().begin().await.map_err(identity_err)?;
+        // An org with no row gets one, and had no limits before. A
+        // concurrent first insert makes this one wait for it and then do
+        // nothing, so the row is read below with that insert's limits.
+        let inserted = sqlx::query(
             "INSERT INTO org_leak_check_limits (org, per_hour, per_day, updated_by, updated_at)
              VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (org) DO UPDATE
-               SET per_hour = EXCLUDED.per_hour,
-                   per_day = EXCLUDED.per_day,
-                   updated_by = EXCLUDED.updated_by,
-                   updated_at = EXCLUDED.updated_at",
+             ON CONFLICT (org) DO NOTHING",
         )
         .bind(org)
         .bind(per_hour)
         .bind(per_day)
         .bind(updated_by)
         .bind(updated_at)
-        .execute(self.pool())
+        .execute(&mut *tx)
+        .await
+        .map_err(identity_err)?
+        .rows_affected();
+        if inserted == 1 {
+            tx.commit().await.map_err(identity_err)?;
+            return Ok(None);
+        }
+        // The row is locked until the commit: a concurrent change reads it
+        // only after this one, with this one's limits.
+        let row = sqlx::query(
+            "SELECT per_hour, per_day FROM org_leak_check_limits WHERE org = $1 FOR UPDATE",
+        )
+        .bind(org)
+        .fetch_one(&mut *tx)
         .await
         .map_err(identity_err)?;
-        Ok(())
+        let old = LeakCheckLimits {
+            per_hour: limit(&row, "per_hour")?,
+            per_day: limit(&row, "per_day")?,
+        };
+        sqlx::query(
+            "UPDATE org_leak_check_limits
+             SET per_hour = $2, per_day = $3, updated_by = $4, updated_at = $5
+             WHERE org = $1",
+        )
+        .bind(org)
+        .bind(per_hour)
+        .bind(per_day)
+        .bind(updated_by)
+        .bind(updated_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(identity_err)?;
+        tx.commit().await.map_err(identity_err)?;
+        Ok(Some(old))
     }
 }
