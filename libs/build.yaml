@@ -20,9 +20,12 @@
 #                so a Dockerfile RUN shares buildkitd's PID namespace and could
 #                read anything the Step holds. When the image is to be pushed
 #                it writes the image as an OCI image layout at
-#                /workspace/.scarab-build/oci, which reaches the push Step
-#                through the workspace (a large image costs Data Depot
-#                transfer). Otherwise it keeps the image in BuildKit.
+#                /workspace/.scarab-build/<key>/oci, which reaches the push
+#                Step through the workspace (a large image costs Data Depot
+#                transfer). The key is the first 32 hex characters of the
+#                SHA-256 of the build Step's id, so the layouts of two
+#                builds do not collide in a Step that needs both. Otherwise
+#                it keeps the image in BuildKit.
 #   image/push   pushes the layout with crane. It asks for `registry_auth: true`:
 #                Scarab mounts the Run's registry credential (the REGISTRY_AUTH
 #                secret at Repo scope, then Org scope, else the forge's own
@@ -52,12 +55,20 @@
 #                               by this digest.
 #   ${{ outputs.image.image }}  what buildctl wrote with `--metadata-file`; its
 #                               `containerimage.digest` is the digest of the
-#                               image built. When Scarab collects results, the
+#                               image built. The build Step adds that digest
+#                               as `digest` (a key with no ".") and, when it
+#                               wrote a layout, the layout's path as
+#                               `layout`. When Scarab collects results, the
 #                               push Step pushes only a layout whose manifest
 #                               has that digest, and fails (exit 2) on any
 #                               other, so the two digests match. When it does
-#                               not, the push Step pushes without the check
-#                               and logs a line starting `scarab: warning:`.
+#                               not, the push Step pushes without the check,
+#                               finds the layout from its own Step id, and
+#                               logs lines starting `scarab: warning:`.
+#
+# To build one architecture's image and leave the pushing to another Step,
+# use build-layout.yaml with image-index.yaml; to build amd64 and arm64 and
+# push both under one index, use build-multiarch.yaml.
 #
 # A fork pull request, or a Run locked out of its Environment's secrets, gets
 # no registry credential, and Scarab tells both Steps so with
@@ -288,20 +299,86 @@ steps:
           *) fail "cache must be none or s3" ;;
         esac
         # An image to push leaves this Step as an OCI image layout in the
-        # workspace; one that is not pushed stays in BuildKit, so it costs no
-        # workspace transfer. Both use OCI media types.
+        # workspace, at .scarab-build/<key>/oci; one that is not pushed stays
+        # in BuildKit, so it costs no workspace transfer. Both use OCI media
+        # types. The key is the first 32 hex characters of the SHA-256 of
+        # this Step's id (SCARAB_STEP, which Scarab sets), so two builds
+        # whose workspaces a later Step joins write different paths. The id
+        # itself is not used: an invoke matrix puts "[", "=" and "," in it,
+        # and a "," would end BuildKit's --output value.
+        layout=
         if [ "$push" = true ]; then
-          mkdir ./.scarab-build
-          set -- "$@" --output "type=oci,dest=$root/.scarab-build/oci,tar=false"
+          step=${SCARAB_STEP-}
+          [ -n "$step" ] || fail "SCARAB_STEP is not set, so the image layout has no path"
+          sum=$(printf '%s' "$step" | sha256sum) || fail "cannot hash the step id $step"
+          key=${sum%% *}
+          rest=${key#????????????????????????????????}
+          key=${key%"$rest"}
+          case "$key" in
+            *[!0-9a-f]*) fail "the step id hashed to $key, which is not hex" ;;
+          esac
+          [ "${#key}" -eq 32 ] || fail "the step id hashed to $key, which is not 32 hex characters"
+          case "$root" in
+            *[!A-Za-z0-9._/-]*) fail "the workspace path $root holds a character an image layout path may not" ;;
+          esac
+          layout=$root/.scarab-build/$key/oci
+          mkdir -p "./.scarab-build/$key"
+          set -- "$@" --output "type=oci,dest=$layout,tar=false"
         else
           set -- "$@" --output "type=image,name=$image,push=false,oci-mediatypes=true"
         fi
-        # The digest is the Step's `image` result when Scarab collects
-        # results (/scarab/results exists).
+        # BuildKit's metadata, the digest among it, is the Step's `image`
+        # result when Scarab collects results (/scarab/results exists).
+        meta=
         if [ -d /scarab/results ]; then
-          set -- "$@" --metadata-file /scarab/results/image.json
+          meta=/scarab/results/image.json
+          set -- "$@" --metadata-file "$meta"
         fi
-        exec /usr/bin/buildctl-daemonless.sh "$@"
+        # The build runs as a child, not with exec, so this script can add to
+        # the result after it. A stop signal is passed on to it.
+        /usr/bin/buildctl-daemonless.sh "$@" &
+        pid=$!
+        trap 'kill -TERM "$pid" 2>/dev/null || :' TERM INT
+        code=0
+        wait "$pid" || code=$?
+        # A signal ends `wait` early; wait again for the build itself.
+        while kill -0 "$pid" 2>/dev/null; do
+          code=0
+          wait "$pid" || code=$?
+        done
+        [ "$code" -eq 0 ] || exit "$code"
+        [ -n "$meta" ] || exit 0
+        # The result also gives the digest under a key with no "." in it
+        # (`digest`) and, when the image was written as a layout, the
+        # layout's path (`layout`), so a later Step reads
+        # `outputs.<step>.image.digest` and `outputs.<step>.image.layout`.
+        # Both keys are written last: a JSON reader keeps the last of two
+        # keys of one name, should BuildKit's metadata hold one of them.
+        # Without a layout, a result this script cannot extend is kept as
+        # BuildKit wrote it; with one, the Step fails, because the Step that
+        # pushes the layout needs both keys.
+        unextended() {
+          [ -z "$layout" ] || fail "$1, so the image layout cannot be handed on"
+          echo "scarab: warning: $1; the image result has no digest key" >&2
+          exit 0
+        }
+        [ -f "$meta" ] && [ ! -L "$meta" ] || unextended "BuildKit wrote no metadata file"
+        m=$(cat "$meta") || unextended "cannot read BuildKit's metadata"
+        found=$(printf '%s\n' "$m" | grep -o '"containerimage\.digest": *"sha256:[0-9a-f]\{64\}"') || found=
+        case "$found" in
+          "" | *"$nl"*) unextended "BuildKit's metadata does not name one image digest" ;;
+        esac
+        digest=${found##*\"sha256:}
+        digest=sha256:${digest%\"}
+        case "$m" in
+          "{"*"}") ;;
+          *) unextended "BuildKit's metadata is not one JSON object" ;;
+        esac
+        add="\"digest\":\"$digest\""
+        [ -z "$layout" ] || add="$add,\"layout\":\"$layout\""
+        { printf '%s,%s}\n' "${m%\}}" "$add" > "$meta.scarab" &&
+          mv -f "$meta.scarab" "$meta"; } ||
+          fail "cannot write the image result"
   - id: push
     image: gcr.io/go-containerregistry/crane:debug@sha256:e78770b31258a3846f878036d9c1f63fbe4c871f9f56990bf77fd95c013e3c1b
     needs: [image]
@@ -318,6 +395,9 @@ steps:
       # The digest BuildKit reported for the image it built (the build Step's
       # `image` result), or empty when the build Step published no result.
       - [SCARAB_BUILD_DIGEST, "${{ has(outputs.image) && has(outputs.image.image) && 'containerimage.digest' in outputs.image.image ? outputs.image.image['containerimage.digest'] : '' }}"]
+      # Where the build Step wrote the image layout (the `layout` key of its
+      # `image` result), or empty when it published none.
+      - [SCARAB_BUILD_LAYOUT, "${{ has(outputs.image) && has(outputs.image.image) && 'layout' in outputs.image.image ? outputs.image.image.layout : '' }}"]
     command:
       - /busybox/sh
       - -c
@@ -380,6 +460,38 @@ steps:
           echo "scarab: not pushed: this Run is a fork pull request's, or is locked out of its Environment's secrets"
           exit 0
         fi
+        # The build Step names the layout's path in its `image` result:
+        # <workspace>/.scarab-build/<key>/oci, the key 32 hex characters.
+        # When Scarab does not collect results (/scarab/results is absent),
+        # there is no result, and the path is found as the build Step found
+        # it: from the build Step's id, which is this Step's id with `image`
+        # for `push` at the end.
+        layout=${SCARAB_BUILD_LAYOUT-}
+        if [ -z "$layout" ]; then
+          [ ! -d /scarab/results ] ||
+            fail "the build step reported no image layout (its image result has no layout)"
+          step=${SCARAB_STEP-}
+          case "$step" in
+            ?*/push) ;;
+            *) fail "SCARAB_STEP ($step) is not this library's push step, so the image layout cannot be found" ;;
+          esac
+          sum=$(printf '%s' "${step%/push}/image" | sha256sum) || fail "cannot hash the build step's id"
+          key=${sum%% *}
+          rest=${key#????????????????????????????????}
+          layout=$root/.scarab-build/${key%"$rest"}/oci
+          echo "scarab: warning: results are not collected, so the layout's path is found from the step id" >&2
+        fi
+        case "$layout" in
+          "$root"/.scarab-build/*/oci) ;;
+          *) fail "the image layout $layout is not $root/.scarab-build/<key>/oci" ;;
+        esac
+        key=${layout#"$root"/.scarab-build/}
+        key=${key%/oci}
+        case "$key" in
+          "" | *[!0-9a-f]*) fail "the image layout $layout is not $root/.scarab-build/<key>/oci" ;;
+        esac
+        [ "${#key}" -eq 32 ] ||
+          fail "the image layout $layout is not $root/.scarab-build/<key>/oci"
         # Steps before this one ran repository code in this workspace, and
         # so did the Dockerfile. crane would upload what a symlink in the
         # layout points at (/scarab/registry/config.json, for one), so the
@@ -387,10 +499,13 @@ steps:
         # workspace.
         [ ! -L ./.scarab-build ] && [ -d ./.scarab-build ] ||
           fail ".scarab-build is not a directory the build step wrote"
-        [ ! -L ./.scarab-build/oci ] && [ -d ./.scarab-build/oci ] ||
-          fail "no image layout at .scarab-build/oci"
-        resolve ./.scarab-build/oci || fail "cannot resolve the image layout"
+        [ ! -L "./.scarab-build/$key" ] && [ -d "./.scarab-build/$key" ] ||
+          fail ".scarab-build/$key is not a directory the build step wrote"
+        [ ! -L "./.scarab-build/$key/oci" ] && [ -d "./.scarab-build/$key/oci" ] ||
+          fail "no image layout at .scarab-build/$key/oci"
+        resolve "./.scarab-build/$key/oci" || fail "cannot resolve the image layout"
         inside "$r" || fail "the image layout resolves outside the workspace"
+        [ "$r" = "$layout" ] || fail "the image layout resolves to $r, not $layout"
         layout=$r
         odd=$(find "$layout" ! -type f ! -type d | head -n 1)
         [ -z "$odd" ] ||
