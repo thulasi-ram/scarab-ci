@@ -374,22 +374,29 @@ async fn put_environment_stamps_canonical_scope_and_subject_when_body_omits_them
     };
     let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
     pg.migrate().await.unwrap();
-    let secrets = FakeSecrets::new().with_secret(
-        &SecretScope::EnvironmentProject {
-            org: "acme".into(),
-            project: "web".into(),
-            environment: "prod".into(),
-        },
-        "DEPLOY_KEY",
-        b"k",
-    );
-    let secrets: Arc<dyn SecretProvider> = Arc::new(secrets);
+    let fake = Arc::new(FakeSecrets::new());
+    let secrets: Arc<dyn SecretProvider> = fake.clone();
     let app = router(app_state(pg.clone()).with_secrets(secrets));
 
     // The old route, with exactly the body the old env form sent.
     assert_per_repo_write_gone(&app, "PUT", "prod").await;
 
     create_environment_for_web(&app, "prod").await;
+    // A secret in the Environment once it exists (a create over secrets left
+    // from an earlier Environment of the name is refused).
+    fake.put(
+        &SecretScope::EnvironmentProject {
+            org: "acme".into(),
+            project: "web".into(),
+            environment: "prod".into(),
+        },
+        scarab_secrets::Secret {
+            key: "DEPLOY_KEY".into(),
+            value: b"k".to_vec(),
+        },
+    )
+    .await
+    .unwrap();
     // Exactly the body the new "Tighten for this project" form sends — no
     // scope, no subject.
     let overlay = "/v1/orgs/acme/environments/prod/projects/web/overlay";

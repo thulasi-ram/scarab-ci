@@ -133,6 +133,17 @@ pub fn repo_project_of_scope_key(scope_key: &str, org: &str) -> Option<String> {
     (!project.is_empty() && !project.contains('/')).then(|| project.to_string())
 }
 
+/// The Environment of an `orgenv:{org}/{environment}` scope key — the flat
+/// form both stores key a [`SecretScope::OrgEnvironment`] by — when it is in
+/// `org`; `None` for any other key.
+pub fn org_environment_of_scope_key(scope_key: &str, org: &str) -> Option<String> {
+    let environment = scope_key
+        .strip_prefix("orgenv:")?
+        .strip_prefix(org)?
+        .strip_prefix('/')?;
+    (!environment.is_empty()).then(|| environment.to_string())
+}
+
 /// The `(project, environment)` of a [`SecretScope::EnvironmentProject`]
 /// scope key in `org`, or `None` for any other key. The Project is the part
 /// up to the first `/` after the org (a forge repository name holds none);
@@ -205,13 +216,32 @@ pub trait SecretProvider: Send + Sync {
         ))
     }
 
-    /// The Projects of `org` holding at least one secret in their
-    /// [`SecretScope::Repo`] scope, sorted: the repositories whose own
-    /// default can stand in front of an org value. A store that cannot
-    /// enumerate its scopes answers [`SecretError::Backend`].
-    async fn repo_secret_projects(&self, _org: &str) -> Result<Vec<String>, SecretError> {
+    /// Every key the Projects of `org` hold, as `(project, environment,
+    /// key)`, sorted: `None` for a key of the Project's [`SecretScope::Repo`]
+    /// scope, the Environment for one of its
+    /// [`SecretScope::EnvironmentProject`] scopes. What tells the org which
+    /// repositories set their own value in front of its values, read at
+    /// once rather than scope by scope. Names only, never values. A store
+    /// that cannot enumerate its scopes answers [`SecretError::Backend`].
+    async fn project_secret_keys(
+        &self,
+        _org: &str,
+    ) -> Result<Vec<(String, Option<String>, String)>, SecretError> {
         Err(SecretError::Backend(
-            "this secret store cannot list its repository scopes".into(),
+            "this secret store cannot list the keys of its repository scopes".into(),
+        ))
+    }
+
+    /// The Environments of `org` holding at least one
+    /// [`SecretScope::OrgEnvironment`] secret, sorted. What finds the org's
+    /// values left under an Environment that no longer exists. A store that
+    /// cannot enumerate its scopes answers [`SecretError::Backend`].
+    async fn org_environment_secret_environments(
+        &self,
+        _org: &str,
+    ) -> Result<Vec<String>, SecretError> {
+        Err(SecretError::Backend(
+            "this secret store cannot list the org's environment scopes".into(),
         ))
     }
 
@@ -425,6 +455,17 @@ mod tests {
         assert_eq!(of("repo:acmex/web", "acme"), None);
         assert_eq!(of("repo:acme/", "acme"), None);
         assert_eq!(of("env:acme/web/prod", "acme"), None);
+    }
+
+    #[test]
+    fn an_environment_is_read_back_from_its_org_environment_scope_key() {
+        let of = org_environment_of_scope_key;
+        assert_eq!(of("orgenv:acme/prod", "acme"), Some("prod".into()));
+        assert_eq!(of("orgenv:acme/prod/eu", "acme"), Some("prod/eu".into()));
+        assert_eq!(of("orgenv:acmex/prod", "acme"), None);
+        assert_eq!(of("orgenv:acme/", "acme"), None);
+        assert_eq!(of("env:acme/web/prod", "acme"), None);
+        assert_eq!(of("repo:acme/prod", "acme"), None);
     }
 
     #[tokio::test]

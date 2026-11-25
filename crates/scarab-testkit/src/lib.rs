@@ -6829,13 +6829,38 @@ impl SecretProvider for FakeSecrets {
         Ok(projects)
     }
 
-    async fn repo_secret_projects(&self, org: &str) -> Result<Vec<String>, SecretError> {
+    async fn project_secret_keys(
+        &self,
+        org: &str,
+    ) -> Result<Vec<(String, Option<String>, String)>, SecretError> {
+        let mut out: Vec<(String, Option<String>, String)> = self
+            .values
+            .lock()
+            .unwrap()
+            .keys()
+            .filter_map(|(s, key)| {
+                if let Some(project) = scarab_secrets::repo_project_of_scope_key(s, org) {
+                    return Some((project, None, key.clone()));
+                }
+                scarab_secrets::environment_scope_of_scope_key(s, org)
+                    .map(|(project, environment)| (project, Some(environment), key.clone()))
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    async fn org_environment_secret_environments(
+        &self,
+        org: &str,
+    ) -> Result<Vec<String>, SecretError> {
         let mut out: Vec<String> = self
             .values
             .lock()
             .unwrap()
             .keys()
-            .filter_map(|(s, _)| scarab_secrets::repo_project_of_scope_key(s, org))
+            .filter_map(|(s, _)| scarab_secrets::org_environment_of_scope_key(s, org))
             .collect();
         out.sort();
         out.dedup();

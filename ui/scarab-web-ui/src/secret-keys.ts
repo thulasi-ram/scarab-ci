@@ -28,17 +28,16 @@ export const statusAt = (row: SecretKeyRow, column: string): SecretCellStatus =>
   row.status[column] ?? "unset";
 
 /**
- * The org holds the key and the repository does not set its default: the
- * repository default comes from the org, or only the org sets it, for one
- * Environment or more.
+ * A Run of this repository gets the org's value for the key somewhere: the
+ * repository default comes from the org, or, with no repository default, an
+ * Environment gets the org's value for it. A value the repository sets in
+ * front of the org's does not count: there the Run gets the repository's.
  */
 export const isOrgKey = (row: SecretKeyRow) =>
   (statusAt(row, REPO_DEFAULT_COLUMN) === "inherited" &&
     row.inherited_from[REPO_DEFAULT_COLUMN] === "org") ||
   (statusAt(row, REPO_DEFAULT_COLUMN) !== "set" &&
-    [...Object.values(row.inherited_from), ...Object.values(row.overrides ?? {})].includes(
-      "org_environment",
-    ));
+    Object.values(row.inherited_from).includes("org_environment"));
 
 /**
  * The org's list: who sets their own value in front of one line —
@@ -160,11 +159,12 @@ export function keySummary(matrix: SecretMatrix, row: SecretKeyRow, org = false)
   const at = (s: SecretCellStatus) => envs.filter((e) => statusAt(row, e) === s);
   const set = at("set");
   const silenced = at("silenced");
+  // Where a Run gets the org's value for the Environment.
   const fromOrgEnv = envs.filter(
-    (e) =>
-      (statusAt(row, e) === "inherited" && row.inherited_from[e] === "org_environment") ||
-      (statusAt(row, e) === "set" && row.overrides?.[e] === "org_environment"),
+    (e) => statusAt(row, e) === "inherited" && row.inherited_from[e] === "org_environment",
   );
+  // A value set here hides another one: the default's, or the org's.
+  const hidesOne = set.some((e) => row.overrides?.[e] !== undefined);
   const parts: string[] = [];
 
   const base = statusAt(row, REPO_DEFAULT_COLUMN);
@@ -183,7 +183,7 @@ export function keySummary(matrix: SecretMatrix, row: SecretKeyRow, org = false)
     if (fromOrgEnv.length > 0) parts.push(`from the org in ${where(fromOrgEnv, envs.length)}`);
     if (set.length > 0) {
       parts.push(
-        `${resolves || fromOrgEnv.length > 0 ? "overridden in" : "set in"} ${where(set, envs.length)}`,
+        `${resolves || hidesOne ? "overridden in" : "set in"} ${where(set, envs.length)}`,
       );
     } else if (base === "inherited" && fromOrgEnv.length === 0) {
       parts.push("inherited everywhere");

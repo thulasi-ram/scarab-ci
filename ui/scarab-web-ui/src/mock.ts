@@ -2211,6 +2211,7 @@ const orgSecretScopes = new Map<string, Set<string>>([
   ["SENTRY_DSN", new Set([""])],
   ["AWS_DEPLOY_ROLE", new Set(["production", "qa"])],
 ]);
+// The repositories' own values, by the scope they stand in front of.
 const orgSecretReposWithOwn: Record<string, Record<string, string[]>> = {
   SENTRY_DSN: { "": ["scarab"] },
   AWS_DEPLOY_ROLE: { production: ["scarab"] },
@@ -2219,16 +2220,23 @@ function orgSecretMatrix() {
   const environments = orgEnvironments.map((e) => e.name).sort();
   const keys = [...orgSecretScopes.entries()]
     .filter(([, scopes]) => scopes.size > 0)
-    .map(([key, scopes]) => ({
-      key,
-      status: Object.fromEntries(
+    .map(([key, scopes]) => {
+      const own = orgSecretReposWithOwn[key] ?? {};
+      const status: Record<string, string> = Object.fromEntries(
         ["", ...environments].map((c) => [
           c,
           scopes.has(c) ? "set" : c !== "" && scopes.has("") ? "inherited" : "unset",
         ]),
-      ),
-      repos_with_own: orgSecretReposWithOwn[key] ?? {},
-    }));
+      );
+      // An Environment that falls to the Org default has each repository
+      // default in front of it too, as the server answers.
+      const repos_with_own: Record<string, string[]> = {};
+      for (const c of ["", ...environments]) {
+        const repos = new Set([...(own[c] ?? []), ...(status[c] === "inherited" ? (own[""] ?? []) : [])]);
+        if (repos.size > 0) repos_with_own[c] = [...repos].sort();
+      }
+      return { key, status, repos_with_own };
+    });
   return { columns: ["", ...environments], environments, keys };
 }
 

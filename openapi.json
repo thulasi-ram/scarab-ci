@@ -1876,7 +1876,7 @@
           "Environments"
         ],
         "summary": "Create or replace an org Environment",
-        "description": "A create takes the same claim on the name a Duplicate holds, and is\nrefused (409) while a Duplicate to that name is in progress: that\nDuplicate has checked the name is free and may be writing secrets under\nit, and its cleanup deletes what it wrote by name. A replace of an\nexisting Environment takes no claim.",
+        "description": "A create takes the same claim on the name a Duplicate holds, and is\nrefused (409) while a Duplicate to that name is in progress: that\nDuplicate has checked the name is free and may be writing secrets under\nit, and its cleanup deletes what it wrote by name. A create is also\nrefused (409) while secrets an earlier Environment of the name left are\nstored, the org's or any Project's. A replace of an existing Environment\ntakes no claim.",
         "operationId": "put_org_environment",
         "parameters": [
           {
@@ -1961,7 +1961,7 @@
             "description": "org Environments not configured"
           },
           "409": {
-            "description": "a create while a duplicate to the name is in progress, or a concurrent write won; retry"
+            "description": "a create while a duplicate to the name is in progress, a create over secrets an earlier environment of the name left, or a concurrent write won"
           },
           "412": {
             "description": "`If-Match` or `If-None-Match: *` did not hold; reload"
@@ -6054,7 +6054,7 @@
             }
           },
           "404": {
-            "description": "secrets or Environments not configured"
+            "description": "secrets not configured"
           }
         },
         "security": [
@@ -12703,7 +12703,7 @@
           },
           "repos_with_own": {
             "type": "object",
-            "description": "`column id -> repositories`, sorted: the repositories that set their\nown value in front of that column — their repository default in front\nof the org default, their value for an Environment in front of the\norg's value for it. Absent for a column no repository overrides.",
+            "description": "`column id -> repositories`, sorted: the repositories that set their\nown value in front of that column — their repository default in front\nof the org default, their value for an Environment in front of the\norg's value for it. An `inherited` column names both: the org default\nit falls to is behind each repository default as well. Absent for a\ncolumn no repository overrides.",
             "additionalProperties": {
               "type": "array",
               "items": {
@@ -12818,10 +12818,9 @@
       },
       "OrphanedSecretsDto": {
         "type": "object",
-        "description": "Secrets one Project holds under an Environment name that has no\nEnvironment. Names only, never values.",
+        "description": "Secrets one Project, or the org, holds under an Environment name that has\nno Environment. Names only, never values.",
         "required": [
           "environment",
-          "project",
           "keys"
         ],
         "properties": {
@@ -12835,7 +12834,11 @@
             }
           },
           "project": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Project holding them; `null` for the org's own values for the\nEnvironment."
           }
         }
       },

@@ -767,8 +767,10 @@ export interface paths {
          * @description A create takes the same claim on the name a Duplicate holds, and is
          *     refused (409) while a Duplicate to that name is in progress: that
          *     Duplicate has checked the name is free and may be writing secrets under
-         *     it, and its cleanup deletes what it wrote by name. A replace of an
-         *     existing Environment takes no claim.
+         *     it, and its cleanup deletes what it wrote by name. A create is also
+         *     refused (409) while secrets an earlier Environment of the name left are
+         *     stored, the org's or any Project's. A replace of an existing Environment
+         *     takes no claim.
          */
         put: operations["put_org_environment"];
         post?: never;
@@ -4509,7 +4511,9 @@ export interface components {
              * @description `column id -> repositories`, sorted: the repositories that set their
              *     own value in front of that column — their repository default in front
              *     of the org default, their value for an Environment in front of the
-             *     org's value for it. Absent for a column no repository overrides.
+             *     org's value for it. An `inherited` column names both: the org default
+             *     it falls to is behind each repository default as well. Absent for a
+             *     column no repository overrides.
              */
             repos_with_own: {
                 [key: string]: string[];
@@ -4572,13 +4576,17 @@ export interface components {
             yanked?: boolean;
         };
         /**
-         * @description Secrets one Project holds under an Environment name that has no
-         *     Environment. Names only, never values.
+         * @description Secrets one Project, or the org, holds under an Environment name that has
+         *     no Environment. Names only, never values.
          */
         OrphanedSecretsDto: {
             environment: string;
             keys: string[];
-            project: string;
+            /**
+             * @description The Project holding them; `null` for the org's own values for the
+             *     Environment.
+             */
+            project?: string | null;
         };
         /** @description One of the caller's passkeys. */
         PasskeyDto: {
@@ -8309,7 +8317,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description a create while a duplicate to the name is in progress, or a concurrent write won; retry */
+            /** @description a create while a duplicate to the name is in progress, a create over secrets an earlier environment of the name left, or a concurrent write won */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -11306,7 +11314,7 @@ export interface operations {
                     "application/json": components["schemas"]["OrgSecretMatrix"];
                 };
             };
-            /** @description secrets or Environments not configured */
+            /** @description secrets not configured */
             404: {
                 headers: {
                     [name: string]: unknown;

@@ -28,7 +28,10 @@ release.yml uses that version's section as the GitHub Release text. See
   Environment. The org's Secrets page is now the same list as a repository's Secrets tab: each
   key expands to the Org default and one line per Environment, and each line says which
   repositories set their own value in front of it. Deleting or duplicating an Environment
-  includes the org's values for it. See [Secrets](https://thulasi-ram.github.io/scarab-ci/usage/secrets/).
+  includes the org's values for it. During a rolling upgrade, replicas still on the old version
+  give Runs the repository default instead of the org's value for the Environment, so set org
+  Environment values once every replica runs this version. See
+  [Secrets](https://thulasi-ram.github.io/scarab-ci/usage/secrets/).
 
 ## [0.7.5] - 2026-11-25
 

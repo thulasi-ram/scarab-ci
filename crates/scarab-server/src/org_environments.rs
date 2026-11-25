@@ -452,8 +452,10 @@ fn write_precondition(headers: &HeaderMap) -> Result<WritePrecondition, ApiError
 /// A create takes the same claim on the name a Duplicate holds, and is
 /// refused (409) while a Duplicate to that name is in progress: that
 /// Duplicate has checked the name is free and may be writing secrets under
-/// it, and its cleanup deletes what it wrote by name. A replace of an
-/// existing Environment takes no claim.
+/// it, and its cleanup deletes what it wrote by name. A create is also
+/// refused (409) while secrets an earlier Environment of the name left are
+/// stored, the org's or any Project's. A replace of an existing Environment
+/// takes no claim.
 #[utoipa::path(
     put,
     path = "/v1/orgs/{org}/environments/{env}",
@@ -472,7 +474,7 @@ fn write_precondition(headers: &HeaderMap) -> Result<WritePrecondition, ApiError
         (status = 400, description = "invalid name, display name or description, an unknown field, or a malformed precondition"),
         (status = 403, description = "not an org admin"),
         (status = 404, description = "org Environments not configured"),
-        (status = 409, description = "a create while a duplicate to the name is in progress, or a concurrent write won; retry"),
+        (status = 409, description = "a create while a duplicate to the name is in progress, a create over secrets an earlier environment of the name left, or a concurrent write won"),
         (status = 412, description = "`If-Match` or `If-None-Match: *` did not hold; reload")
     )
 )]
@@ -526,7 +528,13 @@ pub(crate) async fn put_org_environment(
         }
         _ => None,
     };
+    let creating = claim.is_some();
     let stored = async {
+        // A create (the claim is held) must not take over secrets an earlier
+        // Environment of the name left behind.
+        if let (true, Some(secrets)) = (creating, st.secrets.as_deref()) {
+            refuse_leftover_secrets(secrets, &environment.org, &environment.name).await?;
+        }
         crate::note_org(&st, &environment.org).await?;
         store
             .put_org_environment_if(&environment, &precondition)
@@ -863,18 +871,21 @@ async fn delete_org_environment_holding(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// Secrets one Project holds under an Environment name that has no
-/// Environment. Names only, never values.
+/// Secrets one Project, or the org, holds under an Environment name that has
+/// no Environment. Names only, never values.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct OrphanedSecretsDto {
     pub environment: String,
-    pub project: String,
+    /// The Project holding them; `null` for the org's own values for the
+    /// Environment.
+    pub project: Option<String>,
     pub keys: Vec<String>,
 }
 
 /// List the secrets left under Environment names that no longer exist
 /// (git-bug 52964b4): written before an Environment had to exist, or left
-/// when one was deleted before deleting refused. Names only. Delete each
+/// when one was deleted before deleting refused. The org's own values for
+/// such a name come first (`project` null), then each Project's. Names only. Delete each
 /// with `DELETE /v1/secrets`. Administer on the Org.
 #[utoipa::path(
     get,
@@ -904,6 +915,27 @@ pub(crate) async fn list_orphaned_secrets(
         .map(|e| e.name)
         .collect();
     let mut out = Vec::new();
+    for environment in secrets
+        .org_environment_secret_environments(&org)
+        .await
+        .map_err(crate::secret_err)?
+    {
+        if live.contains(&environment) {
+            continue;
+        }
+        let mut keys = secrets
+            .list_scoped(&environment_scope(&org, None, &environment))
+            .await
+            .map_err(crate::secret_err)?;
+        keys.sort();
+        if !keys.is_empty() {
+            out.push(OrphanedSecretsDto {
+                environment,
+                project: None,
+                keys,
+            });
+        }
+    }
     for (project, environment) in secrets
         .environment_secret_scopes(&org)
         .await
@@ -923,7 +955,7 @@ pub(crate) async fn list_orphaned_secrets(
         if !keys.is_empty() {
             out.push(OrphanedSecretsDto {
                 environment,
-                project,
+                project: Some(project),
                 keys,
             });
         }
@@ -1041,6 +1073,42 @@ fn environment_scope(org: &str, project: Option<&str>, env: &str) -> scarab_secr
             environment: env.to_string(),
         },
     }
+}
+
+/// Refuse (409) a new Environment named `name` while secrets of an earlier
+/// Environment of that name are left: the org's own or any Project's. A new
+/// Environment would otherwise take them over, and Runs in it would get
+/// values nobody set for it. Called under the name's claim, by a create and
+/// by a Duplicate.
+async fn refuse_leftover_secrets(
+    secrets: &dyn scarab_secrets::SecretProvider,
+    org: &str,
+    name: &str,
+) -> Result<(), ApiError> {
+    let left = secrets
+        .environment_secret_projects(org, name)
+        .await
+        .map_err(crate::secret_err)?;
+    if !left.is_empty() {
+        return Err(ApiError::Conflict(format!(
+            "secrets for environment `{name}` already exist (projects: {}), left from an \
+             earlier environment of that name; delete them first",
+            left.join(", ")
+        )));
+    }
+    let mut org_left = secrets
+        .list_scoped(&environment_scope(org, None, name))
+        .await
+        .map_err(crate::secret_err)?;
+    if !org_left.is_empty() {
+        org_left.sort();
+        return Err(ApiError::Conflict(format!(
+            "the org's secrets for environment `{name}` already exist (keys: {}), left from \
+             an earlier environment of that name; delete them first",
+            org_left.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 /// Every secret of `env`, value included: the org's own (`None`) first,
@@ -1213,28 +1281,7 @@ async fn duplicate_org_environment_holding(
         .map_err(org_environment_api_error)?;
     let to_copy = match st.secrets.as_deref() {
         Some(secrets) => {
-            let left = secrets
-                .environment_secret_projects(&org, &new_name)
-                .await
-                .map_err(crate::secret_err)?;
-            if !left.is_empty() {
-                return Err(ApiError::Conflict(format!(
-                    "secrets for environment `{new_name}` already exist (projects: {}), left \
-                     from an earlier environment of that name; delete them first",
-                    left.join(", ")
-                )));
-            }
-            let org_left = secrets
-                .list_scoped(&environment_scope(&org, None, &new_name))
-                .await
-                .map_err(crate::secret_err)?;
-            if !org_left.is_empty() {
-                return Err(ApiError::Conflict(format!(
-                    "the org's secrets for environment `{new_name}` already exist (keys: {}), \
-                     left from an earlier environment of that name; delete them first",
-                    org_left.join(", ")
-                )));
-            }
+            refuse_leftover_secrets(secrets, &org, &new_name).await?;
             environment_secrets(secrets, &org, &env).await?
         }
         None => Vec::new(),

@@ -123,6 +123,30 @@ async fn an_environment_without_a_repo_is_the_orgs_value_for_it() {
         .is_err());
 }
 
+/// An empty `environment` names no Environment, with a repo or without: 400,
+/// and nothing is stored.
+#[tokio::test]
+async fn an_empty_environment_is_refused() {
+    let secrets = Arc::new(FakeSecrets::new());
+    let app = router(state(Some(secrets.clone())));
+    for body in [
+        r#"{"org":"acme","environment":"","name":"K","value":"v"}"#,
+        r#"{"org":"acme","repo":"web","environment":"","name":"K","value":"v"}"#,
+    ] {
+        let resp = app.clone().oneshot(put(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    for scope in [
+        SecretScope::Org { org: "acme".into() },
+        SecretScope::Repo {
+            org: "acme".into(),
+            repo: "web".into(),
+        },
+    ] {
+        assert!(secrets.list_scoped(&scope).await.unwrap().is_empty());
+    }
+}
+
 #[tokio::test]
 async fn secrets_disabled_without_a_provider_is_404() {
     let app = router(state(None)); // no secrets provider

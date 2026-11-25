@@ -25,7 +25,10 @@ use common::fresh_db;
 use common::governance::seed_project_overlay;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::Db;
-use scarab_project::SecretCoverageStore;
+use scarab_project::{
+    EnvironmentGovernanceStore, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
+    OrgEnvironment, OrgEnvironmentStore, SecretCoverageStore,
+};
 use scarab_secrets::{SecretProvider, SecretScope};
 use scarab_server::{router, AppState, LogService};
 use scarab_testkit::{FakeClock, FakeSecrets, InMemoryObjectStore};
@@ -499,9 +502,90 @@ async fn the_org_value_for_an_environment_sits_between_the_repo_and_its_environm
         role["status"],
         serde_json::json!({ "": "set", "prod": "set", "staging": "inherited" })
     );
+    // staging falls to the org default, so web's repository default stands
+    // in front of it there too; prod is the org's own value, so only web's
+    // value for prod does.
     assert_eq!(
         role["repos_with_own"],
-        serde_json::json!({ "": [REPO], "prod": [REPO] })
+        serde_json::json!({ "": [REPO], "prod": [REPO], "staging": [REPO] })
+    );
+
+    tdb.cleanup().await;
+}
+
+/// A repository reads the org's key names for an Environment only where it
+/// may deploy. Holding an overlay there is not enough: its Runs cannot
+/// resolve the org's values for an Environment they cannot deploy into.
+#[tokio::test]
+async fn the_org_values_of_an_environment_the_repo_cannot_deploy_into_stay_hidden() {
+    let Some(tdb) = fresh_db().await else { return };
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    seed_project_overlay(&pg, ORG, REPO, "prod", Default::default()).await;
+    // `qa` admits only `api`; web holds an overlay there and nothing else.
+    pg.put_org_environment(&OrgEnvironment {
+        org: ORG.into(),
+        name: "qa".into(),
+        display_name: None,
+        description: String::new(),
+        protection: Default::default(),
+        eligibility: Default::default(),
+        created_at: 0,
+        updated_at: 0,
+        updated_by: "test".into(),
+    })
+    .await
+    .unwrap();
+    pg.put_environment_eligibility(
+        ORG,
+        "qa",
+        &EnvironmentProjectEligibility::Projects(vec!["api".into()]),
+        "test",
+        0,
+    )
+    .await
+    .unwrap();
+    pg.put_environment_project_overlay(
+        &EnvironmentProjectOverlay {
+            org: ORG.into(),
+            environment: "qa".into(),
+            project: REPO.into(),
+            rules: Default::default(),
+        },
+        "test",
+        0,
+    )
+    .await
+    .unwrap();
+    let h = harness(pg, &[]).await;
+    for (environment, key) in [("qa", "QA_ONLY"), ("prod", "PROD_ROLE")] {
+        h.secrets
+            .put(
+                &SecretScope::OrgEnvironment {
+                    org: ORG.into(),
+                    environment: environment.into(),
+                },
+                scarab_secrets::Secret {
+                    key: key.into(),
+                    value: b"v".to_vec(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let m = matrix(&h.app).await;
+    assert_eq!(m["environments"], serde_json::json!(["prod", "qa"]), "{m}");
+    let keys: Vec<&str> = m["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, vec!["PROD_ROLE"], "{m}");
+    assert_eq!(
+        row(&m, "PROD_ROLE"),
+        serde_json::json!({ "": "unset", "prod": "inherited", "qa": "unset" })
     );
 
     tdb.cleanup().await;

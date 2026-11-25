@@ -673,8 +673,41 @@ impl SecretProvider for PostgresSecrets {
         Ok(projects)
     }
 
-    async fn repo_secret_projects(&self, org: &str) -> Result<Vec<String>, SecretError> {
-        let prefix = format!("repo:{org}/");
+    async fn project_secret_keys(
+        &self,
+        org: &str,
+    ) -> Result<Vec<(String, Option<String>, String)>, SecretError> {
+        // One query over both prefixes; `starts_with` rather than LIKE, as
+        // org names may hold `%` and `_`. The Project and Environment are
+        // read back in Rust.
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT scope, key FROM secrets WHERE starts_with(scope, $1) OR starts_with(scope, $2)",
+        )
+        .bind(format!("repo:{org}/"))
+        .bind(format!("env:{org}/"))
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| SecretError::Backend(e.to_string()))?;
+        let mut out: Vec<(String, Option<String>, String)> = rows
+            .into_iter()
+            .filter_map(|(scope, key)| {
+                if let Some(project) = scarab_secrets::repo_project_of_scope_key(&scope, org) {
+                    return Some((project, None, key));
+                }
+                scarab_secrets::environment_scope_of_scope_key(&scope, org)
+                    .map(|(project, environment)| (project, Some(environment), key))
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    async fn org_environment_secret_environments(
+        &self,
+        org: &str,
+    ) -> Result<Vec<String>, SecretError> {
+        let prefix = format!("orgenv:{org}/");
         let scopes: Vec<String> =
             sqlx::query_scalar("SELECT DISTINCT scope FROM secrets WHERE starts_with(scope, $1)")
                 .bind(&prefix)
@@ -683,7 +716,7 @@ impl SecretProvider for PostgresSecrets {
                 .map_err(|e| SecretError::Backend(e.to_string()))?;
         let mut out: Vec<String> = scopes
             .iter()
-            .filter_map(|s| scarab_secrets::repo_project_of_scope_key(s, org))
+            .filter_map(|s| scarab_secrets::org_environment_of_scope_key(s, org))
             .collect();
         out.sort();
         out.dedup();

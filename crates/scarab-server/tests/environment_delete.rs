@@ -320,3 +320,63 @@ async fn only_an_org_admin_deletes_with_cascade() {
     assert_eq!(secret_keys(&f, "prod").await.len(), 3);
     f.tdb.cleanup().await;
 }
+
+/// A create of a name whose earlier Environment left secrets behind is
+/// refused (409), whether the org's or a Project's are left: the new
+/// Environment would otherwise take them over. Once they are deleted the
+/// create goes through. A replace of an existing Environment is not checked.
+#[tokio::test]
+async fn a_create_over_leftover_secrets_of_the_name_is_refused() {
+    let Some(f) = fixture().await else {
+        return;
+    };
+    let h = &f.h;
+    h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
+    let s = h.browser_session(owner("amy")).await;
+    let qa = "/v1/orgs/acme/environments/qa";
+    let org_qa = SecretScope::OrgEnvironment {
+        org: "acme".into(),
+        environment: "qa".into(),
+    };
+    let secret = |key: &str| scarab_secrets::Secret {
+        key: key.into(),
+        value: b"left".to_vec(),
+    };
+
+    // The org's value for `qa` is left.
+    f.secrets.put(&org_qa, secret("DEPLOY_ROLE")).await.unwrap();
+    let (st, b) = h.cookie("PUT", qa, Some(json!({})), &s).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    assert!(b.to_string().contains("DEPLOY_ROLE"), "{b}");
+    f.secrets.delete(&org_qa, "DEPLOY_ROLE").await.unwrap();
+
+    // A Project's value for `qa` is left.
+    f.secrets
+        .put(&env_scope("web", "qa"), secret("DB_PASSWORD"))
+        .await
+        .unwrap();
+    let (st, b) = h.cookie("PUT", qa, Some(json!({})), &s).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    assert!(b.to_string().contains("web"), "{b}");
+    assert!(f
+        .pg
+        .get_org_environment("acme", "qa")
+        .await
+        .unwrap()
+        .is_none());
+    f.secrets
+        .delete(&env_scope("web", "qa"), "DB_PASSWORD")
+        .await
+        .unwrap();
+
+    // Nothing left: created.
+    let (st, b) = h.cookie("PUT", qa, Some(json!({})), &s).await;
+    assert!(st.is_success(), "{st} {b}");
+
+    // `prod` exists and holds secrets: a replace of it is not refused.
+    let (st, b) = h
+        .cookie("PUT", PROD, Some(json!({ "description": "live" })), &s)
+        .await;
+    assert!(st.is_success(), "{st} {b}");
+    f.tdb.cleanup().await;
+}

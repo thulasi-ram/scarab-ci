@@ -543,24 +543,19 @@ async fn a_taken_name_is_409_and_changes_nothing() {
     let uri = format!("{PROD}/duplicate");
 
     let (st, _) = h
-        .cookie(
-            "PUT",
-            "/v1/orgs/acme/environments/staging",
-            Some(json!({})),
-            &s,
-        )
+        .cookie("PUT", "/v1/orgs/acme/environments/qa", Some(json!({})), &s)
         .await;
     assert_eq!(st, StatusCode::OK);
-    let staging = snapshot(&f, "staging").await;
+    let qa = snapshot(&f, "qa").await;
     let prod = snapshot(&f, "prod").await;
 
-    for name in ["staging", "prod"] {
+    for name in ["qa", "prod"] {
         let (st, b) = h
             .cookie("POST", &uri, Some(json!({ "name": name })), &s)
             .await;
         assert_eq!(st, StatusCode::CONFLICT, "{name}: {b}");
     }
-    assert_eq!(snapshot(&f, "staging").await, staging);
+    assert_eq!(snapshot(&f, "qa").await, qa);
     assert_eq!(snapshot(&f, "prod").await, prod);
 
     // Secrets left under a name no Environment has are refused too, so a
@@ -1056,8 +1051,9 @@ async fn an_environment_secret_lives_only_while_its_environment_does() {
 }
 
 /// git-bug 52964b4: secrets already left under a name with no Environment
-/// (here `web`'s under `staging`) are listed by name, so an admin can
-/// delete them. Live Environments' secrets are not listed.
+/// (here `web`'s and the org's under `staging`) are listed by name, so an
+/// admin can delete them; the org's carry no Project. Live Environments'
+/// secrets are not listed.
 #[tokio::test]
 async fn orphaned_secrets_lists_the_secrets_of_environments_that_do_not_exist() {
     let Some(f) = fixture(|s| s).await else {
@@ -1065,13 +1061,31 @@ async fn orphaned_secrets_lists_the_secrets_of_environments_that_do_not_exist() 
     };
     let h = &f.h;
     let (s, _soft) = signed_in_admin(h).await;
+    for environment in ["staging", "prod"] {
+        f.secrets
+            .put(
+                &SecretScope::OrgEnvironment {
+                    org: "acme".into(),
+                    environment: environment.into(),
+                },
+                Secret {
+                    key: "DEPLOY_ROLE".into(),
+                    value: b"org-role".to_vec(),
+                },
+            )
+            .await
+            .unwrap();
+    }
     let (st, b) = h
         .cookie("GET", "/v1/orgs/acme/secrets/orphaned", None, &s)
         .await;
     assert_eq!(st, StatusCode::OK, "{b}");
     assert_eq!(
         b,
-        json!([{ "environment": "staging", "project": "web", "keys": ["DB_PASSWORD"] }])
+        json!([
+            { "environment": "staging", "project": null, "keys": ["DEPLOY_ROLE"] },
+            { "environment": "staging", "project": "web", "keys": ["DB_PASSWORD"] },
+        ])
     );
 
     f.tdb.cleanup().await;

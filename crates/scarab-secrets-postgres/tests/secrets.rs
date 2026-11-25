@@ -221,7 +221,106 @@ async fn org_environment_values_resolve_ahead_of_the_repo_default() {
         secrets.environment_secret_scopes("acme").await.unwrap(),
         [("web".to_string(), "prod".to_string())]
     );
-    assert_eq!(secrets.repo_secret_projects("acme").await.unwrap(), ["web"]);
+    assert_eq!(
+        secrets.project_secret_keys("acme").await.unwrap(),
+        [
+            ("web".to_string(), None, "ROLE".to_string()),
+            (
+                "web".to_string(),
+                Some("prod".to_string()),
+                "ROLE".to_string()
+            ),
+        ]
+    );
+    assert_eq!(
+        secrets
+            .org_environment_secret_environments("acme")
+            .await
+            .unwrap(),
+        ["prod"]
+    );
+    tdb.cleanup().await;
+}
+
+/// Every key an org's Projects hold, read in one pass: each repository
+/// default and each Project's value for an Environment, with no org value
+/// among them and nothing of another org, even when the org's name holds
+/// `%` and `_` that a LIKE pattern would read as wildcards.
+#[tokio::test]
+async fn the_keys_of_an_orgs_projects_are_read_back_in_one_pass() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let secrets = PostgresSecrets::with_master(tdb.pool.clone(), [3u8; 32]);
+    secrets.migrate().await.unwrap();
+    let put = |scope: SecretScope, key: &'static str| {
+        let secrets = &secrets;
+        async move {
+            secrets
+                .put(
+                    &scope,
+                    Secret {
+                        key: key.into(),
+                        value: b"v".to_vec(),
+                    },
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let repo = |org: &str, project: &str| SecretScope::Repo {
+        org: org.into(),
+        repo: project.into(),
+    };
+    let env = |org: &str, project: &str, environment: &str| SecretScope::EnvironmentProject {
+        org: org.into(),
+        project: project.into(),
+        environment: environment.into(),
+    };
+    // `abc1` matches `a_c%` as a LIKE pattern.
+    for org in ["a_c%", "abc1"] {
+        put(repo(org, "web"), "REPO_KEY").await;
+        put(env(org, "web", "prod"), "PROD_KEY").await;
+        put(
+            SecretScope::OrgEnvironment {
+                org: org.into(),
+                environment: "prod_eu".into(),
+            },
+            "ORG_ENV_KEY",
+        )
+        .await;
+    }
+    put(env("a_c%", "api", "prod_eu"), "EU_KEY").await;
+    put(SecretScope::Org { org: "a_c%".into() }, "ORG_KEY").await;
+
+    let own = |project: &str, environment: Option<&str>, key: &str| {
+        (
+            project.to_string(),
+            environment.map(str::to_string),
+            key.to_string(),
+        )
+    };
+    assert_eq!(
+        secrets.project_secret_keys("a_c%").await.unwrap(),
+        [
+            own("api", Some("prod_eu"), "EU_KEY"),
+            own("web", None, "REPO_KEY"),
+            own("web", Some("prod"), "PROD_KEY"),
+        ]
+    );
+    assert_eq!(
+        secrets
+            .org_environment_secret_environments("a_c%")
+            .await
+            .unwrap(),
+        ["prod_eu"]
+    );
+    assert!(secrets
+        .org_environment_secret_environments("a_c")
+        .await
+        .unwrap()
+        .is_empty());
     tdb.cleanup().await;
 }
 
