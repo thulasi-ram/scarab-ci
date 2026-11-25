@@ -1875,10 +1875,15 @@ fn build_library_ir(with: &str) -> scarab_pipeline::PipelineIr {
 
 /// The running fence of the build library's Step `image/<id>` in `run`.
 fn build_library_step_run(run: &str, id: &str, needs: Vec<StepId>) -> StepRun {
+    library_step_run(run, &format!("image/{id}"), needs)
+}
+
+/// The running fence of the Step `step` (its full id) in `run`.
+fn library_step_run(run: &str, step: &str, needs: Vec<StepId>) -> StepRun {
     StepRun {
         key: None,
         run: RunId(run.to_string()),
-        step: StepId(format!("image/{id}")),
+        step: StepId(step.to_string()),
         status: StepStatus::Running,
         attempts: vec![Attempt {
             id: AttemptId("a1".into()),
@@ -1906,11 +1911,23 @@ fn build_library_spec_with(
     inputs: Vec<String>,
     results: &scarab_pipeline::Results,
 ) -> StepSpec {
+    library_spec_with(ir, &format!("image/{id}"), inputs, results)
+}
+
+/// The library Step `step` (its full id) from `ir`, rendered as the
+/// scheduler renders it at launch with `results` as its needs' results and
+/// the workspace `inputs`, and admitted as Run creation admits it.
+fn library_spec_with(
+    ir: &scarab_pipeline::PipelineIr,
+    step: &str,
+    inputs: Vec<String>,
+    results: &scarab_pipeline::Results,
+) -> StepSpec {
     let s = ir
         .steps
         .iter()
-        .find(|s| s.id == format!("image/{id}"))
-        .expect("the build library's Step");
+        .find(|s| s.id == step)
+        .expect("the library's Step");
     let rendered = scarab_pipeline::render(
         scarab_pipeline::Templates {
             image: &s.image,
@@ -2103,6 +2120,19 @@ async fn the_build_library_builds_and_pushes_to_a_local_registry() {
         .unwrap_or_else(|| panic!("no containerimage.digest in {metadata}"))
         .to_string();
     assert!(digest.starts_with("sha256:"), "{digest}");
+    // Issue #218: the script extends BuildKit's metadata in the BuildKit
+    // image itself (its `sha256sum` hashes the Step id): `digest` copies
+    // `containerimage.digest`, and `layout` names the keyed layout path.
+    assert_eq!(metadata["digest"], digest.as_str(), "{metadata}");
+    assert_eq!(
+        metadata["layout"],
+        format!(
+            "/workspace/.scarab-build/{}/oci",
+            &scarab_storage::sha256_hex(b"image/image")[..32]
+        )
+        .as_str(),
+        "{metadata}"
+    );
     let reported = |image: serde_json::Value| -> scarab_pipeline::Results {
         std::collections::BTreeMap::from([(
             "image/image".to_string(),
@@ -2228,6 +2258,249 @@ async fn the_build_library_builds_and_pushes_to_a_local_registry() {
         .expect("cleanup push with another digest");
     exec.cancel(&ph).await.expect("cleanup push");
     exec.cancel(&h).await.expect("cleanup build");
+}
+
+/// `libs/build-layout.yaml` (invoke `amd64`) feeding `libs/image-index.yaml`
+/// (invoke `app`) through the documented `layouts` line, compiled as Run
+/// creation stores them, the index pushed to `target` with the extra tag
+/// `live2`, over plain HTTP.
+fn layout_to_index_ir(target: &str) -> scarab_pipeline::PipelineIr {
+    let installed = |name: &str, content: &str| {
+        (
+            format!("thulasi-ram::scarab-ci::{name}"),
+            scarab_pipeline::InstalledLibrary {
+                content: content.to_string(),
+                source: format!("github.com/thulasi-ram/scarab-ci//libs/{name}.yaml@test"),
+            },
+        )
+    };
+    let yaml = r#"
+steps:
+  - id: amd64
+    invoke: lib:thulasi-ram::scarab-ci::build-layout
+  - id: app
+    invoke: lib:thulasi-ram::scarab-ci::image-index
+    needs: [amd64]
+    with:
+      image: "TARGET"
+      extra_tags: live2
+      insecure: "true"
+      layouts: |
+        ${{ has(outputs.amd64.image) && has(outputs.amd64.image.layout) ? outputs.amd64.image.layout + ' ' + outputs.amd64.image.digest : '' }}
+"#
+    .replace("TARGET", target);
+    let ir = scarab_pipeline::compile_with_libraries(
+        &yaml,
+        &scarab_pipeline::Libraries {
+            installed: std::collections::BTreeMap::from([
+                installed(
+                    "build-layout",
+                    include_str!("../../../libs/build-layout.yaml"),
+                ),
+                installed(
+                    "image-index",
+                    include_str!("../../../libs/image-index.yaml"),
+                ),
+            ]),
+            ..Default::default()
+        },
+    )
+    .expect("build-layout and image-index compile");
+    let find = |id: &str| ir.steps.iter().find(|s| s.id == id).expect(id);
+    assert!(!find("amd64/image").registry_auth);
+    assert_eq!(
+        find("amd64/image").sandbox(),
+        Some(scarab_pipeline::Sandbox::RootlessBuildkit)
+    );
+    assert!(find("app/index").registry_auth);
+    ir
+}
+
+/// LIVE issue #218: `lib:thulasi-ram::scarab-ci::build-layout` builds an
+/// image in the `rootless-buildkit` sandbox with no registry credential and
+/// leaves it as an OCI layout in its workspace; its `image` result (posted
+/// by the real results sidecar to a stub listener) names the layout and the
+/// digest. `lib:thulasi-ram::scarab-ci::image-index`, rendered with that
+/// result through the documented `layouts` line, receives the layout through
+/// the Depot in a second Pod and, with the pinned crane, pushes it by
+/// digest, tags it `live-<arch>`, joins it under `live` and tags the index
+/// `live2`. A verification Step reads the registry back. This proves what
+/// the unit tests run with host tools: `sha256sum` and the metadata rewrite
+/// in the BuildKit image, `realpath` and `find` in crane's busybox, `crane
+/// push <dir> <repo>@<digest>`, and the architecture BuildKit writes in a
+/// real config. Needs SCARAB_TEST_REGISTRY, SCARAB_TEST_SIDECAR_IMAGE and
+/// SCARAB_TEST_HOST_IP, as the build library's case does. `#[ignore]`d +
+/// SCARAB_TEST_KUBE gated.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn the_build_layout_library_hands_a_layout_to_image_index_in_a_local_registry() {
+    let ns = enter_tier();
+    let registry = tier_var("SCARAB_TEST_REGISTRY");
+    let sidecar_image = tier_var("SCARAB_TEST_SIDECAR_IMAGE");
+    let host_ip = tier_var("SCARAB_TEST_HOST_IP");
+    let ws = workspace_fixture();
+    let run_id = unique_run("run-layout");
+
+    // A stub results API on the server's route, recording the Step id and
+    // the body of every POST the results sidecars make.
+    let received: std::sync::Arc<tokio::sync::Mutex<Vec<(String, serde_json::Value)>>> =
+        Default::default();
+    let rec = received.clone();
+    let app = axum::Router::new().route(
+        "/v1/runs/{run}/steps/{step}/results",
+        axum::routing::post(
+            move |axum::extract::Path((_run, step)): axum::extract::Path<(String, String)>,
+                  axum::Json(body): axum::Json<serde_json::Value>| {
+                let rec = rec.clone();
+                async move {
+                    rec.lock().await.push((step, body));
+                    axum::http::StatusCode::ACCEPTED
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let client = kube_client().await;
+    let exec = K8sExecutor::with_client(ns, client)
+        .with_workspace_cas(ws.cas.clone())
+        .with_workspace_depot(ws.depot.clone())
+        .with_workspace_service(ws.fetch.clone())
+        .with_results_egress(scarab_executor_k8s::ResultsEgress {
+            base_url: format!("http://{host_ip}:{port}"),
+            token_secret: b"live-layout-results-secret".to_vec(),
+            sidecar_image,
+        });
+
+    use scarab_storage::Cas as _;
+    let ctx = tempfile::tempdir().expect("context dir");
+    std::fs::write(
+        ctx.path().join("Dockerfile"),
+        "FROM busybox\nRUN echo scarab-layout > /built.txt\n",
+    )
+    .unwrap();
+    let root = ws
+        .depot
+        .ingest(ctx.path().to_str().unwrap())
+        .await
+        .expect("ingest context")
+        .root
+        .0;
+
+    let repo = format!("{registry}/scarab-layout");
+    let target = format!("{repo}:live");
+    let ir = layout_to_index_ir(&target);
+    let none = scarab_pipeline::Results::default();
+
+    let build = library_step_run(&run_id, "amd64/image", vec![StepId("checkout".into())]);
+    let h = exec
+        .launch(
+            &build,
+            &library_spec_with(&ir, "amd64/image", vec![root], &none),
+        )
+        .await
+        .expect("launch build-layout");
+    assert_eq!(
+        poll_to_terminal(&exec, &h, 300).await,
+        Some(ExecState::Succeeded),
+        "the build-layout Step succeeds"
+    );
+    let built = exec
+        .output(&h)
+        .await
+        .expect("output")
+        .expect("the build Step published its workspace");
+    let mut image = None;
+    for _ in 0..60 {
+        image = received
+            .lock()
+            .await
+            .iter()
+            .filter(|(step, _)| step == "amd64/image")
+            .find_map(|(_, body)| body.get("image").cloned());
+        if image.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let image = image.expect("the build Step published its image result");
+    let digest = image["digest"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no digest in {image}"))
+        .to_string();
+    assert_eq!(image["containerimage.digest"], digest.as_str(), "{image}");
+    assert_eq!(
+        image["layout"],
+        format!(
+            "/workspace/.scarab-build/{}/oci",
+            &scarab_storage::sha256_hex(b"amd64/image")[..32]
+        )
+        .as_str(),
+        "{image}"
+    );
+
+    let results: scarab_pipeline::Results = std::collections::BTreeMap::from([(
+        "amd64/image".to_string(),
+        std::collections::BTreeMap::from([("image".to_string(), image.clone())]),
+    )]);
+    let index = library_spec_with(&ir, "app/index", vec![built], &results);
+    assert!(
+        index.env.iter().any(|(k, v)| k == "SCARAB_INDEX_LAYOUTS"
+            && *v == format!("{} {digest}\n", image["layout"].as_str().unwrap())),
+        "{:?}",
+        index.env
+    );
+    let ih = exec
+        .launch(
+            &library_step_run(&run_id, "app/index", vec![StepId("amd64/image".into())]),
+            &index,
+        )
+        .await
+        .expect("launch image-index");
+    assert_eq!(
+        poll_to_terminal(&exec, &ih, 300).await,
+        Some(ExecState::Succeeded),
+        "the image-index Step pushes the layout and joins it"
+    );
+
+    // The registry, read from inside the cluster in the same crane image:
+    // the index names the built image, which is tagged by its architecture
+    // (read from its config), and the index carries the extra tag.
+    let verify = StepSpec {
+        command: vec![
+            "/busybox/sh".into(),
+            "-c".into(),
+            format!(
+                "set -eu; m=$(crane manifest --insecure {target}); echo \"$m\"; \
+                 echo \"$m\" | grep -q '{digest}'; \
+                 tags=$(crane ls --insecure {repo}); echo \"$tags\"; \
+                 echo \"$tags\" | grep -qx live; echo \"$tags\" | grep -qx live2; \
+                 a=$(crane config --insecure {repo}@{digest} | grep -o '\"architecture\":\"[^\"]*\"' | cut -d'\"' -f4); \
+                 t=$(echo \"$tags\" | grep -Ex \"live-$a(-v[0-9]+)?\"); echo \"arch tag $t\"; \
+                 [ \"$(crane digest --insecure {repo}:$t)\" = '{digest}' ]; \
+                 [ \"$(crane digest --insecure {repo}:live2)\" = \"$(crane digest --insecure {target})\" ]"
+            ),
+        ],
+        env: vec![],
+        workspace_inputs: vec![],
+        registry_auth: None,
+        ..index.clone()
+    };
+    let vh = exec
+        .launch(&library_step_run(&run_id, "verify", vec![]), &verify)
+        .await
+        .expect("launch verify");
+    assert_eq!(
+        poll_to_terminal(&exec, &vh, 120).await,
+        Some(ExecState::Succeeded),
+        "the registry holds the index, the arch tag and the extra tag"
+    );
+
+    for handle in [&vh, &ih, &h] {
+        exec.cancel(handle).await.expect("cleanup");
+    }
 }
 
 // Attack: a commit holds a symlink (`escape -> /etc`, or relative, `up -> ../../etc`) and the Pipeline names it as the build context, so BuildKit would send files from outside the workspace (the build Pod's own filesystem, a credential mount) as the context. The unit tests run the guard with the host's `/bin/sh` and `realpath`; this runs it in the build image itself (busybox in moby/buildkit:rootless). Safe outcome: the build Step exits 2 before buildctl runs.
