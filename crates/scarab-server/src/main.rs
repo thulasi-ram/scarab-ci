@@ -1047,6 +1047,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_libraries(pg.clone())
         // Org-level Environments (ADR-0071): their admin API.
         .with_org_environments(pg.clone())
+        // Each org's leak check limits.
+        .with_leak_check_limits(pg.clone())
         // The PluginInstallation registry (ADR-0072). Wired whatever
         // SCARAB_PLUGINS says: it is data — an operator who turned plugins
         // off can still list, kill and uninstall. The policy decides whether
@@ -1204,7 +1206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_api_tokens(pg.clone())
             // Operations record to the security event log even when
             // step-up is not enforced (the leaked-value check's record and
-            // its hourly limit).
+            // its hourly and daily limits).
             .with_security_events(pg.clone());
         tracing::info!(
             "authn: OAuth/OIDC login + PG sessions + scoped RBAC + issued API tokens wired (ADR-0049)"

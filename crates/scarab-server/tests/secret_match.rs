@@ -13,7 +13,8 @@ mod common;
 mod step_up_harness;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use axum::http::StatusCode;
 use serde_json::{json, Value};
@@ -22,7 +23,10 @@ use tower::ServiceExt;
 use common::fresh_pg;
 use scarab_db_postgres::PostgresDb;
 use scarab_forge::{ForgeConnection, ForgeConnectionStore, ForgeKind, RepoRef};
-use scarab_identity::{api_token_hash, ApiToken, ApiTokenStore, Role, Scope};
+use scarab_identity::{
+    api_token_hash, ApiToken, ApiTokenStore, IdentityError, LoginKind, OrgSecurityEventLog, Role,
+    Scope, SecurityEvent, SecurityEventFilter,
+};
 use scarab_plugin::{
     ConnectionSlot, InstallationState, PluginCapability, PluginConnection,
     PluginConnectionAuthScheme, PluginInstallation, PluginManifest, PluginStore, RequestRule,
@@ -37,6 +41,7 @@ use step_up_harness::*;
 
 const KIND: &str = "secret.match_checked";
 const HOUR: i64 = 60 * 60 * 1000;
+const DAY: i64 = 24 * HOUR;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -50,8 +55,84 @@ fn world(pg: &Arc<PostgresDb>, secrets: &Arc<FakeSecrets>) -> Harness {
         st.with_secrets(secrets)
             .with_org_environments(pg.clone())
             .with_forge_connections(pg.clone())
-            .with_plugins(pg, scarab_server::plugins::PluginPolicy::off())
+            .with_plugins(pg.clone(), scarab_server::plugins::PluginPolicy::off())
+            .with_leak_check_limits(pg)
     })
+}
+
+/// [`world`], with the event log the app writes wrapped by `wrap`.
+fn world_wrapping_log(
+    pg: &Arc<PostgresDb>,
+    secrets: &Arc<FakeSecrets>,
+    wrap: impl FnOnce(Arc<dyn OrgSecurityEventLog>) -> Arc<dyn OrgSecurityEventLog>,
+) -> Harness {
+    let (pg, secrets) = (pg.clone(), secrets.clone());
+    harness_on_wrapping_log(Backend::Pg(pg.clone()), wrap, move |st| {
+        st.with_secrets(secrets)
+            .with_org_environments(pg.clone())
+            .with_forge_connections(pg.clone())
+            .with_plugins(pg.clone(), scarab_server::plugins::PluginPolicy::off())
+            .with_leak_check_limits(pg)
+    })
+}
+
+/// An event log that refuses to record a check (every other event goes
+/// through).
+struct RefusesCheckRecords(Arc<dyn OrgSecurityEventLog>);
+
+#[async_trait::async_trait]
+impl OrgSecurityEventLog for RefusesCheckRecords {
+    async fn append(&self, event: &SecurityEvent) -> Result<i64, IdentityError> {
+        if event.kind == KIND {
+            return Err(IdentityError::Conflict("the log is down".into()));
+        }
+        self.0.append(event).await
+    }
+
+    async fn list(
+        &self,
+        filter: &SecurityEventFilter,
+    ) -> Result<Vec<SecurityEvent>, IdentityError> {
+        self.0.list(filter).await
+    }
+}
+
+/// An event log that, once armed, holds each of the first two counts the
+/// limits make (a list of one subject's checks) until both have been made:
+/// two concurrent checks then both pass the count taken before the step-up
+/// with the same number, before either is recorded.
+#[derive(Default)]
+struct MeetAtTheCount {
+    inner: OnceLock<Arc<dyn OrgSecurityEventLog>>,
+    armed: AtomicBool,
+    /// The limit's counts made since arming.
+    counts: AtomicUsize,
+    both: OnceLock<tokio::sync::Barrier>,
+}
+
+#[async_trait::async_trait]
+impl OrgSecurityEventLog for MeetAtTheCount {
+    async fn append(&self, event: &SecurityEvent) -> Result<i64, IdentityError> {
+        self.inner.get().unwrap().append(event).await
+    }
+
+    async fn list(
+        &self,
+        filter: &SecurityEventFilter,
+    ) -> Result<Vec<SecurityEvent>, IdentityError> {
+        let out = self.inner.get().unwrap().list(filter).await;
+        let a_count = filter.subject.is_some() && filter.kinds == [KIND.to_string()];
+        if a_count && self.armed.load(Ordering::SeqCst) {
+            let n = self.counts.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                self.both
+                    .get_or_init(|| tokio::sync::Barrier::new(2))
+                    .wait()
+                    .await;
+            }
+        }
+        out
+    }
 }
 
 fn org_scope(org: &str) -> SecretScope {
@@ -216,11 +297,9 @@ async fn member(h: &Harness, subject: &str, org: &str, role: Role) -> (Sess, Sof
     (s, soft)
 }
 
-/// An org Admin of `org` with an open step-up window.
+/// An org Admin of `org` in a browser, with a passkey.
 async fn admin(h: &Harness, subject: &str, org: &str) -> (Sess, SoftPasskey) {
-    let (s, mut soft) = member(h, subject, org, Role::Admin).await;
-    h.open_window(&s, &mut soft).await;
-    (s, soft)
+    member(h, subject, org, Role::Admin).await
 }
 
 async fn check(h: &Harness, s: &Sess, org: &str, text: &str) -> (StatusCode, Value) {
@@ -231,6 +310,49 @@ async fn check(h: &Harness, s: &Sess, org: &str, text: &str) -> (StatusCode, Val
         s,
     )
     .await
+}
+
+/// A check as `s` that confirms with `key` when asked: each check is asked
+/// for a confirmation of its own (mode `action`), answered, and sent again.
+/// A check refused before the ask (or answered without one) is returned as
+/// it is.
+async fn checked(
+    h: &Harness,
+    s: &Sess,
+    key: &mut SoftPasskey,
+    org: &str,
+    text: &str,
+) -> (StatusCode, Value) {
+    let (st, body) = check(h, s, org, text).await;
+    if !is_step_up(st, &body) {
+        return (st, body);
+    }
+    assert_eq!(body["mode"], "action", "{body}");
+    let (st, conf) = h.answer(s, key, &body["challenge"]).await;
+    assert_eq!(st, StatusCode::OK, "{conf}");
+    check(h, s, org, text).await
+}
+
+/// `PUT /v1/orgs/{org}/security/leak-checks` as `s`, confirming with `key`
+/// when asked.
+async fn set_limits(
+    h: &Harness,
+    s: &Sess,
+    key: &mut SoftPasskey,
+    org: &str,
+    per_hour: i64,
+    per_day: i64,
+) -> (StatusCode, Value) {
+    let uri = format!("/v1/orgs/{org}/security/leak-checks");
+    let body = json!({ "per_hour": per_hour, "per_day": per_day });
+    let (st, b) = h.cookie("PUT", &uri, Some(body.clone()), s).await;
+    if !is_step_up(st, &b) {
+        return (st, b);
+    }
+    assert_eq!(b["mode"], "action", "{b}");
+    let (st, conf) = h.answer(s, key, &b["challenge"]).await;
+    assert_eq!(st, StatusCode::OK, "{conf}");
+    h.cookie("PUT", &uri, Some(body), s).await
 }
 
 /// The match whose `key` (a secret) or `connection` kind (a connection) is
@@ -341,7 +463,7 @@ async fn every_scope_is_searched_and_named() {
     )
     .await;
     let h = world(&pg, &secrets);
-    let (s, _) = admin(&h, "dan", "acme").await;
+    let (s, mut key) = admin(&h, "dan", "acme").await;
 
     let paste = "PASTE-CANARY-env\n\
                  ORG=VALUE-CANARY-org-0000001\n\
@@ -350,7 +472,7 @@ async fn every_scope_is_searched_and_named() {
                  WP=VALUE-CANARY-web-prod-001\n\
                  F=VALUE-CANARY-forge-000001\n\
                  P=VALUE-CANARY-plugin-00001\n";
-    let (st, body) = check(&h, &s, "acme", paste).await;
+    let (st, body) = checked(&h, &s, &mut key, "acme", paste).await;
     assert_eq!(st, StatusCode::OK, "{body}");
     assert_eq!(body["matches"].as_array().unwrap().len(), 6, "{body}");
     assert_eq!(
@@ -432,10 +554,10 @@ async fn an_overridden_value_is_still_reported_with_who_overrides_it() {
     )
     .await;
     let h = world(&pg, &secrets);
-    let (s, _) = admin(&h, "dan", "acme").await;
+    let (s, mut key) = admin(&h, "dan", "acme").await;
     let paste = "leaked: VALUE-CANARY-shared-0001";
 
-    let (st, body) = check(&h, &s, "acme", paste).await;
+    let (st, body) = checked(&h, &s, &mut key, "acme", paste).await;
     assert_eq!(st, StatusCode::OK, "{body}");
     let m = find(&body, |m| m["key"] == "SHARED");
     assert_eq!(m["scope"], "org");
@@ -458,7 +580,7 @@ async fn an_overridden_value_is_still_reported_with_who_overrides_it() {
     )
     .await
     .unwrap();
-    let (st, body) = check(&h, &s, "acme", paste).await;
+    let (st, body) = checked(&h, &s, &mut key, "acme", paste).await;
     assert_eq!(st, StatusCode::OK, "{body}");
     let m = find(&body, |m| m["key"] == "SHARED");
     assert_eq!(m["in_use"], true, "{body}");
@@ -500,13 +622,13 @@ async fn another_orgs_values_and_connections_never_match() {
     )
     .await;
     let h = world(&pg, &secrets);
-    let (s, _) = admin(&h, "dan", "acme").await;
+    let (s, mut key) = admin(&h, "dan", "acme").await;
     h.grant("dan", Scope::Org("globex".into()), Role::Admin)
         .await;
     let paste = "VALUE-CANARY-shared-0001 VALUE-CANARY-globex-web-1 \
                  VALUE-CANARY-forge-globex VALUE-CANARY-plugin-globx";
 
-    let (st, body) = check(&h, &s, "acme", paste).await;
+    let (st, body) = checked(&h, &s, &mut key, "acme", paste).await;
     assert_eq!(st, StatusCode::OK, "{body}");
     assert_eq!(body["matches"], json!([]), "{body}");
     assert_eq!(
@@ -515,9 +637,55 @@ async fn another_orgs_values_and_connections_never_match() {
     );
 
     // The same paste in globex finds all four: the fixture is live.
-    let (st, body) = check(&h, &s, "globex", paste).await;
+    let (st, body) = checked(&h, &s, &mut key, "globex", paste).await;
     assert_eq!(st, StatusCode::OK, "{body}");
     assert_eq!(body["matches"].as_array().unwrap().len(), 4, "{body}");
+
+    tdb.cleanup().await;
+}
+
+/// A GitHub installation assigned to the org points at the server's own
+/// App key, shared by every installation of every org: it is not compared
+/// and not counted. The org's own Forgejo token still is.
+#[tokio::test]
+async fn the_shared_github_app_key_is_not_compared() {
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
+    let secrets = Arc::new(FakeSecrets::new());
+    ForgeConnectionStore::put_connection(
+        &*pg,
+        &ForgeConnection {
+            id: "github-install-42".into(),
+            kind: ForgeKind::GitHub,
+            base_url: "https://api.github.com".into(),
+            credential_ref: scarab_server::GITHUB_APP_CREDENTIAL_REF.into(),
+            org: Some("acme".into()),
+            installation_id: Some(42),
+            account_id: None,
+            account_login: Some("acme".into()),
+        },
+    )
+    .await
+    .unwrap();
+    put(
+        &secrets,
+        org_scope(scarab_server::FORGE_CREDENTIALS_ORG),
+        scarab_server::GITHUB_APP_CREDENTIAL_REF,
+        "VALUE-CANARY-github-app-key",
+    )
+    .await;
+    let forgejo = forge(&pg, &secrets, "acme", "VALUE-CANARY-forge-000001").await;
+    let h = world(&pg, &secrets);
+    let (s, mut key) = admin(&h, "dan", "acme").await;
+
+    let paste = "VALUE-CANARY-github-app-key VALUE-CANARY-forge-000001";
+    let (st, body) = checked(&h, &s, &mut key, "acme", paste).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let matches = body["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 1, "{body}");
+    assert_eq!(matches[0]["id"], forgejo);
+    assert_eq!(body["searched"]["connections"], 1, "{body}");
 
     tdb.cleanup().await;
 }
@@ -577,23 +745,23 @@ async fn blank_and_oversized_text_is_refused() {
     };
     let secrets = Arc::new(FakeSecrets::new());
     let h = world(&pg, &secrets);
-    let (s, _) = admin(&h, "dan", "acme").await;
+    let (s, mut key) = admin(&h, "dan", "acme").await;
 
     for blank in ["", "   ", "\n\t \r\n"] {
-        let (st, body) = check(&h, &s, "acme", blank).await;
+        let (st, body) = checked(&h, &s, &mut key, "acme", blank).await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["code"], "empty");
     }
-    let (st, body) = check(&h, &s, "acme", &"a".repeat(4097)).await;
+    let (st, body) = checked(&h, &s, &mut key, "acme", &"a".repeat(4097)).await;
     assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
     assert_eq!(body["code"], "too_long");
     assert_eq!(body["max_bytes"], 4096);
-    let (st, body) = check(&h, &s, "acme", &"a".repeat(4096)).await;
+    let (st, body) = checked(&h, &s, &mut key, "acme", &"a".repeat(4096)).await;
     assert_eq!(st, StatusCode::OK, "{body}");
     // 2049 two-byte characters: 4098 bytes.
-    let (st, body) = check(&h, &s, "acme", &"é".repeat(2049)).await;
+    let (st, body) = checked(&h, &s, &mut key, "acme", &"é".repeat(2049)).await;
     assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
-    let (st, body) = check(&h, &s, "acme", &"é".repeat(2048)).await;
+    let (st, body) = checked(&h, &s, &mut key, "acme", &"é".repeat(2048)).await;
     assert_eq!(st, StatusCode::OK, "{body}");
     // Not `{"text": ...}`.
     let (st, body) = h
@@ -612,16 +780,15 @@ async fn blank_and_oversized_text_is_refused() {
     assert_eq!(h.events(KIND).await.len(), 2);
     tdb.cleanup().await;
 }
-
 // ---------------------------------------------------------------------------
-// C. Step-up, the record, the hourly limit
+// C. Step-up, browser only, the record
 // ---------------------------------------------------------------------------
 
-/// Every check needs a step-up. Neither the refusal, nor a machine's parked
-/// request (its summary, its stored row), nor the event log shows the text;
-/// once confirmed, the check answers.
+/// Every check needs a passkey confirmation of its own: a window does not
+/// count, and a confirmation is spent by the one check it was made for.
+/// Neither the refusal nor the event log shows the text.
 #[tokio::test]
-async fn a_check_needs_step_up_and_the_parked_request_never_shows_the_text() {
+async fn every_check_needs_a_confirmation_of_its_own() {
     let Some((tdb, pg)) = fresh_pg().await else {
         return;
     };
@@ -629,90 +796,74 @@ async fn a_check_needs_step_up_and_the_parked_request_never_shows_the_text() {
     put(&secrets, org_scope("acme"), "K", "VALUE-CANARY-org-0000001").await;
     let h = world(&pg, &secrets);
     let paste = "PASTE-CANARY-1 VALUE-CANARY-org-0000001";
+    let (s, mut key) = admin(&h, "dan", "acme").await;
 
-    // A browser with no window: asked, and the refusal does not echo.
-    let (s, mut soft) = member(&h, "dan", "acme", Role::Admin).await;
+    // An open window does not satisfy a check.
+    h.open_window(&s, &mut key).await;
     let (st, body) = check(&h, &s, "acme", paste).await;
-    assert_step_up(st, &body, "window");
+    assert_step_up(st, &body, "action");
     assert_eq!(body["op"], "secret.match");
     assert_eq!(body["summary"]["target"], "acme");
     assert_eq!(body["summary"]["changes"], json!([]));
     assert!(!body.to_string().contains("CANARY"), "{body}");
-    let (st, conf) = h.answer(&s, &mut soft, &body["challenge"]).await;
+
+    // Confirmed, the check runs once.
+    let (st, conf) = h.answer(&s, &mut key, &body["challenge"]).await;
     assert_eq!(st, StatusCode::OK, "{conf}");
     let (st, body) = check(&h, &s, "acme", paste).await;
     assert_eq!(st, StatusCode::OK, "{body}");
     assert_eq!(body["matches"].as_array().unwrap().len(), 1);
 
-    // An API token parks a request for its human.
+    // The second check is asked again, whatever it pastes.
+    let (st, body) = check(&h, &s, "acme", paste).await;
+    assert_step_up(st, &body, "action");
+    let (st, body) = check(&h, &s, "acme", "PASTE-CANARY-other").await;
+    assert_step_up(st, &body, "action");
+    let (st, body) = checked(&h, &s, &mut key, "acme", paste).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+
+    let log = log_text(&h).await;
+    assert!(!log.contains("CANARY"), "an event recorded the text: {log}");
+    assert_eq!(h.events(KIND).await.len(), 2);
+    tdb.cleanup().await;
+}
+
+/// An API token, and a session presented as Bearer, are refused: a plain
+/// 403 `browser_session_required`, no confirmation request raised, nothing
+/// parked or checked.
+#[tokio::test]
+async fn an_api_token_or_a_bearer_session_is_refused() {
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
+    let secrets = Arc::new(FakeSecrets::new());
+    put(&secrets, org_scope("acme"), "K", "VALUE-CANARY-org-0000001").await;
+    let h = world(&pg, &secrets);
     h.grant("amy", Scope::Org("acme".into()), Role::Admin).await;
     let amy = h.browser_session(scoped("amy")).await;
     let mut amy_key = passkey();
     h.enroll(&amy, &mut amy_key, "Laptop").await;
     let token = pat(&h, "t1", Scope::Org("acme".into()), Role::Admin).await;
-    let (st, raised) = h
-        .bearer(
-            "POST",
-            "/v1/orgs/acme/secrets/match",
-            Some(json!({ "text": paste })),
-            &token,
-        )
-        .await;
-    assert_step_up(st, &raised, "window");
-    assert!(!raised.to_string().contains("CANARY"), "{raised}");
-    let id = raised["request_id"]
-        .as_str()
-        .expect("a request")
-        .to_string();
+    let cli = h.session(scoped("amy"), LoginKind::Api).await;
 
-    let row = h.requests.get_request(&id).await.unwrap().expect("stored");
-    assert!(
-        !row.summary.to_string().contains("CANARY"),
-        "{}",
-        row.summary
-    );
-    let sealed = row.sealed.clone().expect("sealed while pending");
-    assert!(!String::from_utf8_lossy(&sealed).contains("CANARY"));
-    let (st, seen) = h
-        .cookie("GET", &format!("/v1/step-up/requests/{id}"), None, &amy)
-        .await;
-    assert_eq!(st, StatusCode::OK, "{seen}");
-    assert_eq!(seen["op"], "secret.match");
-    assert_eq!(seen["summary"]["target"], "acme");
-    assert!(!seen.to_string().contains("CANARY"), "{seen}");
-    let (st, summary) = h
-        .cookie("GET", "/v1/orgs/acme/security/summary", None, &amy)
-        .await;
-    assert_eq!(st, StatusCode::OK, "{summary}");
-    assert!(!summary.to_string().contains("CANARY"));
-
-    // amy confirms; the check runs once and the answer goes to her.
-    let (st, ch) = h
-        .cookie(
-            "POST",
-            &format!("/v1/step-up/requests/{id}/options"),
-            None,
-            &amy,
-        )
-        .await;
-    assert_eq!(st, StatusCode::OK, "{ch}");
-    let cred = amy_key.assert(&ch["public_key"], ORIGIN).unwrap();
-    let (st, done) = h
-        .cookie(
-            "POST",
-            &format!("/v1/step-up/requests/{id}/confirm"),
-            Some(json!({ "challenge_id": ch["id"], "credential": cred })),
-            &amy,
-        )
-        .await;
-    assert_eq!(st, StatusCode::OK, "{done}");
-    assert_eq!(done["result_status"], 200, "{done}");
-    assert_eq!(done["result_body"]["matches"][0]["key"], "K");
-    assert!(!done.to_string().contains("CANARY"), "{done}");
-
+    for bearer in [token.as_str(), cli.id.as_str()] {
+        let (st, body) = h
+            .bearer(
+                "POST",
+                "/v1/orgs/acme/secrets/match",
+                Some(json!({ "text": "PASTE-CANARY-1 VALUE-CANARY-org-0000001" })),
+                bearer,
+            )
+            .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["code"], "browser_session_required", "{body}");
+        assert!(body.get("request_id").is_none(), "{body}");
+        assert!(!body.to_string().contains("CANARY"), "{body}");
+    }
+    assert!(h.events("request.raised").await.is_empty());
+    assert!(h.events(KIND).await.is_empty());
     let log = log_text(&h).await;
-    assert!(!log.contains("CANARY"), "an event recorded the text: {log}");
-    assert_eq!(h.events(KIND).await.len(), 2);
+    assert!(!log.contains("CANARY"), "{log}");
     tdb.cleanup().await;
 }
 
@@ -740,10 +891,10 @@ async fn the_answer_and_the_event_carry_names_never_text_or_values() {
     )
     .await;
     let h = world(&pg, &secrets);
-    let (s, _) = admin(&h, "dan", "acme").await;
+    let (s, mut key) = admin(&h, "dan", "acme").await;
 
     let paste = "PASTE-CANARY-2 VALUE-CANARY-org-0000001 VALUE-CANARY-web-prod-001";
-    let (st, body) = check(&h, &s, "acme", paste).await;
+    let (st, body) = checked(&h, &s, &mut key, "acme", paste).await;
     assert_eq!(st, StatusCode::OK, "{body}");
     assert_eq!(body["matches"].as_array().unwrap().len(), 2);
     assert!(!body.to_string().contains("CANARY"), "{body}");
@@ -767,7 +918,14 @@ async fn the_answer_and_the_event_carry_names_never_text_or_values() {
         "environment": "production"
     })));
 
-    let (st, body) = check(&h, &s, "acme", "PASTE-CANARY-3 nothing stored here").await;
+    let (st, body) = checked(
+        &h,
+        &s,
+        &mut key,
+        "acme",
+        "PASTE-CANARY-3 nothing stored here",
+    )
+    .await;
     assert_eq!(st, StatusCode::OK, "{body}");
     assert_eq!(body["matches"], json!([]));
     let events = h.events(KIND).await;
@@ -780,9 +938,14 @@ async fn the_answer_and_the_event_carry_names_never_text_or_values() {
     tdb.cleanup().await;
 }
 
-/// Twenty checks in an hour pass; the twenty-first is refused with when the
-/// next is allowed, until an hour after the first. Another Admin, and the
-/// same Admin in another org, are counted apart.
+// ---------------------------------------------------------------------------
+// D. The org's limits
+// ---------------------------------------------------------------------------
+
+/// With the default limits, twenty checks in an hour pass; the
+/// twenty-first is refused with when the next is allowed, until an hour
+/// after the first. Another Admin, and the same Admin in another org, are
+/// counted apart.
 #[tokio::test]
 async fn the_twenty_first_check_in_an_hour_is_refused_until_the_window_rolls() {
     let Some((tdb, pg)) = fresh_pg().await else {
@@ -790,14 +953,14 @@ async fn the_twenty_first_check_in_an_hour_is_refused_until_the_window_rolls() {
     };
     let secrets = Arc::new(FakeSecrets::new());
     let h = world(&pg, &secrets);
-    let (s, mut soft) = admin(&h, "dan", "acme").await;
+    let (s, mut key) = admin(&h, "dan", "acme").await;
     h.grant("dan", Scope::Org("globex".into()), Role::Admin)
         .await;
-    let (eve, _) = admin(&h, "eve", "acme").await;
+    let (eve, mut eve_key) = admin(&h, "eve", "acme").await;
 
     let first = h.now().await;
     for i in 0..20 {
-        let (st, body) = check(&h, &s, "acme", "PASTE-CANARY-4").await;
+        let (st, body) = checked(&h, &s, &mut key, "acme", "PASTE-CANARY-4").await;
         assert_eq!(st, StatusCode::OK, "check {i}: {body}");
         h.clock.advance(1_000);
     }
@@ -829,18 +992,346 @@ async fn the_twenty_first_check_in_an_hour_is_refused_until_the_window_rolls() {
     assert_eq!(h.events(KIND).await.len(), 20, "a refusal is not counted");
 
     // Counted per Admin and per org.
-    let (st, body) = check(&h, &eve, "acme", "PASTE-CANARY-4").await;
+    let (st, body) = checked(&h, &eve, &mut eve_key, "acme", "PASTE-CANARY-4").await;
     assert_eq!(st, StatusCode::OK, "{body}");
-    let (st, body) = check(&h, &s, "globex", "PASTE-CANARY-4").await;
+    let (st, body) = checked(&h, &s, &mut key, "globex", "PASTE-CANARY-4").await;
     assert_eq!(st, StatusCode::OK, "{body}");
 
-    // One millisecond before the first check is an hour old: still refused.
+    // One millisecond before the first check is an hour old: still refused,
+    // before any confirmation is asked for.
     h.clock.advance(first + HOUR - 1 - h.now().await);
-    h.open_window(&s, &mut soft).await;
     let (st, body) = check(&h, &s, "acme", "PASTE-CANARY-4").await;
     assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{body}");
     h.clock.advance(1);
-    let (st, body) = check(&h, &s, "acme", "PASTE-CANARY-4").await;
+    let (st, body) = checked(&h, &s, &mut key, "acme", "PASTE-CANARY-4").await;
     assert_eq!(st, StatusCode::OK, "{body}");
+    tdb.cleanup().await;
+}
+
+/// With the default limits, forty checks in a day pass, twenty in each of
+/// two hours; the forty-first is refused although its hour is empty, until
+/// a day after the first. While both are reached, `retry_at` is when both
+/// allow a check: the later of the two.
+#[tokio::test]
+async fn the_forty_first_check_in_a_day_is_refused_until_the_day_rolls() {
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
+    let secrets = Arc::new(FakeSecrets::new());
+    let h = world(&pg, &secrets);
+    let (s, mut key) = admin(&h, "dan", "acme").await;
+
+    let first = h.now().await;
+    // The second twenty start once the first twenty are all over an hour
+    // old.
+    for start in [first, first + HOUR + 30_000] {
+        h.clock.advance(start - h.now().await);
+        for i in 0..20 {
+            let (st, body) = checked(&h, &s, &mut key, "acme", "PASTE-CANARY-8").await;
+            assert_eq!(st, StatusCode::OK, "from {start}, check {i}: {body}");
+            h.clock.advance(1_000);
+        }
+    }
+    // Both reached: the hour allows one an hour after the second twenty
+    // started, the day a day after the first check.
+    let (st, body) = check(&h, &s, "acme", "PASTE-CANARY-8").await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["retry_at"], first + DAY, "{body}");
+
+    // The hour is empty again; the day is not.
+    h.clock.advance(first + 3 * HOUR - h.now().await);
+    let (st, body) = check(&h, &s, "acme", "PASTE-CANARY-8").await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["code"], "rate_limited");
+    assert_eq!(body["retry_at"], first + DAY, "{body}");
+    assert_eq!(h.events(KIND).await.len(), 40);
+
+    h.clock.advance(first + DAY - h.now().await);
+    let (st, body) = checked(&h, &s, &mut key, "acme", "PASTE-CANARY-8").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    tdb.cleanup().await;
+}
+
+/// The check reads the org's limits: an hourly limit an Owner lowered to 2
+/// refuses the third check in the hour; another org keeps the defaults.
+#[tokio::test]
+async fn a_lowered_hourly_limit_takes_effect() {
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
+    let secrets = Arc::new(FakeSecrets::new());
+    let h = world(&pg, &secrets);
+    let (olga, mut olga_key) = member(&h, "olga", "acme", Role::Owner).await;
+    let (st, body) = set_limits(&h, &olga, &mut olga_key, "acme", 2, 40).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+
+    let (s, mut key) = admin(&h, "dan", "acme").await;
+    h.grant("dan", Scope::Org("globex".into()), Role::Admin)
+        .await;
+    let first = h.now().await;
+    for i in 0..2 {
+        let (st, body) = checked(&h, &s, &mut key, "acme", "PASTE-CANARY-9").await;
+        assert_eq!(st, StatusCode::OK, "check {i}: {body}");
+        h.clock.advance(1_000);
+    }
+    let (st, body) = check(&h, &s, "acme", "PASTE-CANARY-9").await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["retry_at"], first + HOUR, "{body}");
+    let (st, body) = checked(&h, &s, &mut key, "globex", "PASTE-CANARY-9").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    tdb.cleanup().await;
+}
+
+/// A limit of 0 turns the check off for the org: 403 `leak_checks_off`,
+/// before any confirmation is asked for, and nothing is checked.
+#[tokio::test]
+async fn a_limit_of_zero_turns_the_check_off() {
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
+    let secrets = Arc::new(FakeSecrets::new());
+    let h = world(&pg, &secrets);
+    let (olga, mut olga_key) = member(&h, "olga", "acme", Role::Owner).await;
+    let (s, _) = admin(&h, "dan", "acme").await;
+    for (per_hour, per_day) in [(0, 40), (20, 0)] {
+        let (st, body) = set_limits(&h, &olga, &mut olga_key, "acme", per_hour, per_day).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let (st, body) = check(&h, &s, "acme", "PASTE-CANARY-10").await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["code"], "leak_checks_off", "{body}");
+        assert!(body.get("challenge").is_none(), "{body}");
+    }
+    let refused = h.events("step_up.refused").await;
+    assert!(
+        refused
+            .iter()
+            .all(|e| e.op.as_deref() != Some("secret.match")),
+        "{refused:?}"
+    );
+    assert!(h.events(KIND).await.is_empty());
+    tdb.cleanup().await;
+}
+
+/// The defaults, the bounds and whether the caller may change them, for an
+/// org no Owner has changed; an Admin reads them, a Member may not.
+#[tokio::test]
+async fn an_org_without_limits_has_the_defaults() {
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
+    let secrets = Arc::new(FakeSecrets::new());
+    let h = world(&pg, &secrets);
+    let uri = "/v1/orgs/acme/security/leak-checks";
+    let (s, _) = admin(&h, "dan", "acme").await;
+    let (st, body) = h.cookie("GET", uri, None, &s).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "per_hour": 20, "per_day": 40, "max_per_hour": 100, "max_per_day": 1000,
+            "caller_role": "admin"
+        })
+    );
+    let (olga, _) = member(&h, "olga", "acme", Role::Owner).await;
+    let (st, body) = h.cookie("GET", uri, None, &olga).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["caller_role"], "owner");
+    let (mia, _) = member(&h, "mia", "acme", Role::Member).await;
+    let (st, body) = h.cookie("GET", uri, None, &mia).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+    tdb.cleanup().await;
+}
+
+/// Only an org Owner changes the limits, within the bounds, with a
+/// confirmation of its own that shows the old and the new values; the
+/// change is recorded with both.
+#[tokio::test]
+async fn an_owner_changes_the_limits_with_a_confirmation_and_a_record() {
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
+    let secrets = Arc::new(FakeSecrets::new());
+    let h = world(&pg, &secrets);
+    let uri = "/v1/orgs/acme/security/leak-checks";
+
+    // An Admin may not.
+    let (dan, mut dan_key) = admin(&h, "dan", "acme").await;
+    let (st, body) = set_limits(&h, &dan, &mut dan_key, "acme", 50, 200).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+    assert_ne!(body["code"], "step_up_required", "{body}");
+
+    // Out of bounds, or not the body.
+    let (olga, mut olga_key) = member(&h, "olga", "acme", Role::Owner).await;
+    for (per_hour, per_day) in [(101, 40), (20, 1001), (-1, 40), (20, -1)] {
+        let (st, body) = h
+            .cookie(
+                "PUT",
+                uri,
+                Some(json!({ "per_hour": per_hour, "per_day": per_day })),
+                &olga,
+            )
+            .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{per_hour}/{per_day}: {body}");
+        assert_eq!(body["code"], "out_of_bounds", "{body}");
+    }
+    let (st, body) = h
+        .cookie("PUT", uri, Some(json!({ "per_hour": 20 })), &olga)
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "bad_body", "{body}");
+
+    // Within bounds: asked, with the old and the new values.
+    h.open_window(&olga, &mut olga_key).await;
+    let change = json!({ "per_hour": 50, "per_day": 200 });
+    let (st, body) = h.cookie("PUT", uri, Some(change.clone()), &olga).await;
+    assert_step_up(st, &body, "action");
+    assert_eq!(body["op"], "secret.match_limits");
+    assert_eq!(body["summary"]["target"], "acme");
+    assert_eq!(
+        body["summary"]["changes"],
+        json!(["per_hour = 20 → 50", "per_day = 40 → 200"])
+    );
+    let (st, conf) = h.answer(&olga, &mut olga_key, &body["challenge"]).await;
+    assert_eq!(st, StatusCode::OK, "{conf}");
+    let (st, body) = h.cookie("PUT", uri, Some(change), &olga).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "per_hour": 50, "per_day": 200, "max_per_hour": 100, "max_per_day": 1000,
+            "caller_role": "owner"
+        })
+    );
+    let (st, body) = h.cookie("GET", uri, None, &dan).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(
+        (body["per_hour"].clone(), body["per_day"].clone()),
+        (json!(50), json!(200))
+    );
+
+    let events = h.events("secret.match_limits_changed").await;
+    assert_eq!(events.len(), 1);
+    let ev = &events[0];
+    assert_eq!(ev.subject, "olga");
+    assert_eq!(ev.org.as_deref(), Some("acme"));
+    assert_eq!(ev.op.as_deref(), Some("secret.match_limits"));
+    assert!(ev.confirmation_id.is_some(), "linked to the step-up");
+    assert_eq!(
+        ev.detail,
+        json!({
+            "old": { "per_hour": 20, "per_day": 40 },
+            "new": { "per_hour": 50, "per_day": 200 }
+        })
+    );
+
+    // The next change asks again; one that changes nothing does not.
+    let (st, body) = h
+        .cookie(
+            "PUT",
+            uri,
+            Some(json!({ "per_hour": 10, "per_day": 200 })),
+            &olga,
+        )
+        .await;
+    assert_step_up(st, &body, "action");
+    assert_eq!(body["summary"]["changes"], json!(["per_hour = 50 → 10"]));
+    let (st, body) = h
+        .cookie(
+            "PUT",
+            uri,
+            Some(json!({ "per_hour": 50, "per_day": 200 })),
+            &olga,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(h.events("secret.match_limits_changed").await.len(), 1);
+    tdb.cleanup().await;
+}
+
+/// A check that cannot be recorded is not answered: a 503 that names
+/// nothing it found, and no record.
+#[tokio::test]
+async fn a_check_that_cannot_be_recorded_is_not_answered() {
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
+    let secrets = Arc::new(FakeSecrets::new());
+    put(
+        &secrets,
+        org_scope("acme"),
+        "LEAKED_KEY",
+        "VALUE-CANARY-org-0000001",
+    )
+    .await;
+    let h = world_wrapping_log(&pg, &secrets, |log| Arc::new(RefusesCheckRecords(log)));
+    let (s, mut key) = admin(&h, "dan", "acme").await;
+
+    let (st, body) = checked(
+        &h,
+        &s,
+        &mut key,
+        "acme",
+        "PASTE-CANARY-6 VALUE-CANARY-org-0000001",
+    )
+    .await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let text = body.to_string();
+    for absent in ["matches", "LEAKED_KEY", "CANARY", "searched"] {
+        assert!(!text.contains(absent), "the 503 holds {absent}: {text}");
+    }
+    assert!(h.events(KIND).await.is_empty());
+    tdb.cleanup().await;
+}
+
+/// With 19 checks in the hour, two concurrent checks by the same Admin in
+/// the same org, each with a confirmation of its own, both pass the count
+/// taken before the step-up (each sees 19); the count taken again in turn
+/// lets exactly one through.
+#[tokio::test]
+async fn two_concurrent_checks_cannot_both_take_the_last_slot() {
+    let Some((tdb, pg)) = fresh_pg().await else {
+        return;
+    };
+    let secrets = Arc::new(FakeSecrets::new());
+    let gate = Arc::new(MeetAtTheCount::default());
+    let g = gate.clone();
+    let h = world_wrapping_log(&pg, &secrets, move |log| {
+        g.inner.set(log).ok().expect("wrapped once");
+        g
+    });
+    let (s, mut key) = admin(&h, "dan", "acme").await;
+    for i in 0..19 {
+        let (st, body) = checked(&h, &s, &mut key, "acme", "PASTE-CANARY-7").await;
+        assert_eq!(st, StatusCode::OK, "check {i}: {body}");
+    }
+    // Two confirmations, one for each of the concurrent checks.
+    for _ in 0..2 {
+        let (st, body) = check(&h, &s, "acme", "PASTE-CANARY-7").await;
+        assert_step_up(st, &body, "action");
+        let (st, conf) = h.answer(&s, &mut key, &body["challenge"]).await;
+        assert_eq!(st, StatusCode::OK, "{conf}");
+    }
+
+    gate.armed.store(true, Ordering::SeqCst);
+    let send = || {
+        h.app.clone().oneshot(cookie_req(
+            "POST",
+            "/v1/orgs/acme/secrets/match",
+            Some(json!({ "text": "PASTE-CANARY-7" })),
+            &s,
+        ))
+    };
+    let (a, b) = tokio::join!(send(), send());
+    let mut statuses = [a.unwrap().status(), b.unwrap().status()];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS],
+        "exactly one takes the twentieth slot"
+    );
+    // Both counted twice (the hour and the day each time): the 429 came
+    // from the count taken in turn.
+    assert_eq!(gate.counts.load(Ordering::SeqCst), 8);
+    assert_eq!(h.events(KIND).await.len(), 20);
     tdb.cleanup().await;
 }

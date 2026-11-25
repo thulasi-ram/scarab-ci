@@ -47,28 +47,6 @@ enum Command {
     /// A crown-jewel operation answers with a one-time link its human
     /// confirms it at in a browser (ADR-0073 §6).
     Api(ApiArgs),
-    /// Secrets.
-    #[command(subcommand)]
-    Secrets(SecretsCommand),
-}
-
-#[derive(Debug, Subcommand)]
-enum SecretsCommand {
-    /// Compare text read from stdin (a token, an .env file, a log excerpt)
-    /// with every current secret value of an org, its repositories and its
-    /// connections, and list the names that match. Never the values. Needs
-    /// an org Admin and a step-up confirmation in a browser.
-    Match(MatchArgs),
-}
-
-/// `scarab secrets match --org <org> < leaked.txt`.
-#[derive(Debug, Args)]
-struct MatchArgs {
-    /// The org whose values to compare with.
-    #[arg(long)]
-    org: String,
-    #[command(flatten)]
-    conn: security::Conn,
 }
 
 /// `scarab api <path> [-X method] [-d json|@file|@-]`.
@@ -234,7 +212,6 @@ async fn main() {
         Command::Rerun(args) => rerun(args).await,
         Command::Security(cmd) => security::run(cmd).await,
         Command::Api(args) => api(args).await,
-        Command::Secrets(SecretsCommand::Match(args)) => secrets_match(args).await,
     };
     std::process::exit(code);
 }
@@ -570,70 +547,6 @@ async fn api(args: ApiArgs) -> i32 {
     0
 }
 
-/// `scarab secrets match`: the text comes from stdin only, never from an
-/// argument, so it stays out of shell history and process lists.
-async fn secrets_match(args: MatchArgs) -> i32 {
-    let mut text = String::new();
-    if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text) {
-        eprintln!("error: stdin: {e}");
-        return 2;
-    }
-    if text.trim().is_empty() {
-        eprintln!("error: nothing to compare: pipe the text in on stdin");
-        return 2;
-    }
-    let api = security::Api::new(&args.conn.server, &args.conn.token);
-    let path = format!("/v1/orgs/{}/secrets/match", encode_query(&args.org));
-    let answer = api
-        .post_json(&path, &serde_json::json!({ "text": text }))
-        .await;
-    drop(text);
-    match answer {
-        Ok(v) => {
-            for line in match_lines(&v) {
-                println!("{line}");
-            }
-            0
-        }
-        Err(code) => code,
-    }
-}
-
-/// The lines `scarab secrets match` prints for an answer: a count, then one
-/// line per match naming the key (or connection) and where it is stored.
-fn match_lines(v: &serde_json::Value) -> Vec<String> {
-    let s = |x: &serde_json::Value| security::sanitize(x.as_str().unwrap_or_default());
-    let matches = v["matches"].as_array().cloned().unwrap_or_default();
-    let mut out = vec![match matches.len() {
-        0 => "No current value matches.".to_string(),
-        1 => "1 current value matches:".to_string(),
-        n => format!("{n} current values match:"),
-    }];
-    for m in &matches {
-        if m["kind"] == "connection" {
-            out.push(format!(
-                "  {} connection {} ({})",
-                s(&m["connection"]),
-                s(&m["name"]),
-                s(&m["id"])
-            ));
-            continue;
-        }
-        let place = match m["scope"].as_str().unwrap_or_default() {
-            "org" => "org default".to_string(),
-            "org_environment" => format!("{} (org)", s(&m["environment"])),
-            "repo" => s(&m["repo"]),
-            _ => format!("{} · {}", s(&m["repo"]), s(&m["environment"])),
-        };
-        let mut line = format!("  {}  {place}", s(&m["key"]));
-        if m["in_use"] == false {
-            line.push_str("  (no Run gets this value today)");
-        }
-        out.push(line);
-    }
-    out
-}
-
 /// `--data`: literal JSON, `@file`, or `@-` (stdin).
 fn read_data(d: &str) -> Result<String, String> {
     match d.strip_prefix('@') {
@@ -697,34 +610,6 @@ mod tests {
     }
 
     use super::*;
-
-    #[test]
-    fn a_match_answer_prints_names_and_places_only() {
-        let v = serde_json::json!({
-            "matches": [
-                {"kind": "secret", "key": "DEPLOY_TOKEN", "scope": "repo_environment",
-                 "repo": "web", "environment": "staging", "overridden_in": [], "in_use": true},
-                {"kind": "secret", "key": "ROLE", "scope": "org", "overridden_in": ["web"],
-                 "in_use": false},
-                {"kind": "connection", "connection": "forge", "id": "forgejo-acme",
-                 "name": "codeberg.org", "base_url": "https://codeberg.org"}
-            ],
-            "searched": {"secrets": 3, "repositories": 1, "connections": 1}
-        });
-        assert_eq!(
-            super::match_lines(&v),
-            vec![
-                "3 current values match:",
-                "  DEPLOY_TOKEN  web · staging",
-                "  ROLE  org default  (no Run gets this value today)",
-                "  forge connection codeberg.org (forgejo-acme)",
-            ]
-        );
-        assert_eq!(
-            super::match_lines(&serde_json::json!({"matches": []})),
-            vec!["No current value matches."]
-        );
-    }
 
     #[test]
     fn parse_param_splits_on_first_equals() {

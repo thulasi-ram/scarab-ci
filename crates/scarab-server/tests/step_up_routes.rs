@@ -77,6 +77,13 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("GET", "/v1/security/events", "read", "READ"),
     ("GET", "/v1/orgs/{org}/security/events", "read", "READ"),
     ("GET", "/v1/orgs/{org}/security/summary", "read", "READ"),
+    ("GET", "/v1/orgs/{org}/security/leak-checks", "read", "READ"),
+    (
+        "PUT",
+        "/v1/orgs/{org}/security/leak-checks",
+        "secret.match_limits",
+        "COND-A",
+    ),
     (
         "POST",
         "/v1/orgs/{org}/members/{id}/passkeys/reset",
@@ -257,7 +264,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "POST",
         "/v1/orgs/{org}/secrets/match",
         "secret.match",
-        "COND-W",
+        "COND-A",
     ),
     (
         "PUT",

@@ -363,7 +363,12 @@ export default function SecretKeyList(props: {
         />
       </Show>
       <Show when={checking() && isOrg()}>
-        <SecretMatchDialog org={props.org} onClose={() => setChecking(false)} onOpenKey={openKey} />
+        <SecretMatchDialog
+          org={props.org}
+          onClose={() => setChecking(false)}
+          onOpenKey={openKey}
+          hasKey={(key) => names().includes(key)}
+        />
       </Show>
       <Show when={editing()}>
         {(cell) => (

@@ -4,38 +4,25 @@
 // answer, with no DOM: where a match lives, who gets it, the byte counter, and
 // what a refusal says. The pasted text never reaches this module's output.
 
-/** The scope a matching secret value is stored at. */
-export type SecretMatchScope = "org" | "org_environment" | "repo" | "repo_environment";
+import type { components } from "./api/schema";
+import { leakChecksOffText } from "./leak-checks";
 
-/** One stored secret value that occurs in the pasted text. */
-export type SecretValueMatch = {
-  kind: "secret";
-  key: string;
-  scope: SecretMatchScope;
-  repo?: string | null;
-  environment?: string | null;
-  /** The places that set their own value in front of this one: `web`, `api · production`. */
-  overridden_in: string[];
-  /** Whether any Run of the org would get this exact value today. */
-  in_use: boolean;
-};
+type Schemas = components["schemas"];
+
+/** The scope a matching secret value is stored at. */
+export type SecretMatchScope = Schemas["SecretMatchScope"];
+
+/** One stored value that occurs in the pasted text: a secret or a connection's credential. */
+export type SecretMatch = Schemas["SecretMatch"];
+
+/** A stored secret value that occurs in the pasted text. */
+export type SecretValueMatch = Extract<SecretMatch, { kind: "secret" }>;
 
 /** A forge or plugin connection whose credential occurs in the pasted text. */
-export type ConnectionMatch = {
-  kind: "connection";
-  connection: "forge" | "plugin";
-  id: string;
-  name: string;
-  base_url?: string | null;
-};
-
-export type SecretMatch = SecretValueMatch | ConnectionMatch;
+export type ConnectionMatch = Extract<SecretMatch, { kind: "connection" }>;
 
 /** `POST /v1/orgs/{org}/secrets/match`. */
-export type SecretMatchAnswer = {
-  matches: SecretMatch[];
-  searched: { secrets: number; repositories: number; connections: number };
-};
+export type SecretMatchAnswer = Schemas["SecretMatchResponse"];
 
 /** The most a check takes, in UTF-8 bytes. */
 export const MAX_MATCH_BYTES = 4096;
@@ -61,7 +48,9 @@ export function canCheck(text: string): boolean {
 /** Where a match lives, as its row's mono line. */
 export function whereText(m: SecretMatch): string {
   if (m.kind === "connection") {
-    const kind = m.connection === "forge" ? "forge connection" : "plugin connection";
+    // A plugin installation can bind several connections: the slot tells them apart.
+    const kind =
+      m.connection === "forge" ? "forge connection" : m.slot ? `plugin connection ${m.slot}` : "plugin connection";
     return m.base_url ? `${kind} · ${m.base_url}` : kind;
   }
   switch (m.scope) {
@@ -152,6 +141,8 @@ export type MatchRefusal = {
   message?: string;
   /** For a 429: when the next check is allowed (unix ms). */
   retryAt?: number;
+  /** The org checked against, for a refusal that names it. */
+  org?: string;
 };
 
 /** `14:05`, in the viewer's time zone. */
@@ -160,16 +151,33 @@ function clockTime(ms: number): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
+/** `at 14:05`, `tomorrow at 14:05` or `on 27 Nov at 14:05`, seen from `now`.
+ * The daily limit can put the next check on another day. */
+function whenText(ms: number, now: number): string {
+  const day = (t: number) => {
+    const d = new Date(t);
+    return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  };
+  const days = Math.round((day(ms) - day(now)) / 86_400_000);
+  if (days <= 0) return `at ${clockTime(ms)}`;
+  if (days === 1) return `tomorrow at ${clockTime(ms)}`;
+  const d = new Date(ms);
+  const month = d.toLocaleString("en-GB", { month: "short" });
+  return `on ${d.getDate()} ${month} at ${clockTime(ms)}`;
+}
+
 /** What a refused check says above the dialog's buttons. */
-export function refusalText(r: MatchRefusal): string {
+export function refusalText(r: MatchRefusal, now: number = Date.now()): string {
   if (r.status === 429) {
-    const when = r.retryAt ? ` The next check is allowed at ${clockTime(r.retryAt)}.` : "";
-    return `You have run 20 checks in the last hour.${when}`;
+    // The hourly or the daily limit: `retryAt` is when both allow a check.
+    const when = r.retryAt ? ` The next check is allowed ${whenText(r.retryAt, now)}.` : "";
+    return `You have run as many checks as the org allows each person for now.${when}`;
   }
   if (r.status === 413) {
     return `The text is longer than ${MAX_MATCH_BYTES} bytes. Paste only the part you found.`;
   }
   if (r.status === 403) {
+    if (r.code === "leak_checks_off") return leakChecksOffText(r.org ?? "this org");
     if (r.code === "step_up_required") return "The check needs a passkey confirmation, and none was given.";
     if (r.code === "fresh_login_required") return r.message ?? "Log in again to confirm with a passkey.";
     return "Only an org Admin can check a value against the org's secrets.";

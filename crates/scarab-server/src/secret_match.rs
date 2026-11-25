@@ -4,7 +4,8 @@
 //! log excerpt). Scarab compares it with every value the org holds now — the
 //! org default, the org's value for each Environment, each repository's
 //! default and its value for each Environment, and the credentials of the
-//! org's forge and plugin connections — and answers with the names and
+//! org's forge and plugin connections (not the server's own GitHub App key,
+//! which every installation shares) — and answers with the names and
 //! scopes that match. Secrets stay write-only: the answer never carries a
 //! value, and the pasted text is not stored, logged, echoed or hashed.
 //!
@@ -15,9 +16,13 @@
 //! let a caller learn a value one character at a time. Every comparison
 //! runs over all its bytes and every position, with no early exit.
 //!
-//! Each check that runs is recorded (`secret.match_checked`) with what
-//! matched, and each Admin may run [`CHECKS_PER_HOUR`] per org in any
-//! rolling hour, counted from those records.
+//! Only a human in a signed-in browser may check, and each check needs a
+//! passkey confirmation of its own. Each check that runs is recorded
+//! (`secret.match_checked`) with what matched. Each person may run as many
+//! checks in an org as the org's limits allow, per rolling hour and per
+//! rolling day, counted from those records. An org Owner sets the limits
+//! (`/v1/orgs/{org}/security/leak-checks`); an org with none set has 20 an
+//! hour and 40 a day, and a limit of 0 turns the check off.
 
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
@@ -31,7 +36,8 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use scarab_identity::{
-    security_event_kind as kind, Action, OrgSecurityEventLog, SecurityEventFilter,
+    security_event_kind as kind, Action, LeakCheckLimits, OrgSecurityEventLog, Role,
+    SecurityEventFilter, MAX_LEAK_CHECKS_PER_DAY, MAX_LEAK_CHECKS_PER_HOUR,
 };
 use scarab_secrets::{SecretError, SecretProvider, SecretScope};
 
@@ -43,10 +49,10 @@ pub const MAX_TEXT_BYTES: usize = 4096;
 /// A stored value at least this long (after trimming) matches anywhere
 /// inside the paste; a shorter one only as the whole paste.
 pub const MIN_CONTAINED_BYTES: usize = 20;
-/// How many checks one Admin may run in one org per rolling hour.
-pub const CHECKS_PER_HOUR: usize = 20;
-/// The rolling window, in milliseconds.
-pub const CHECK_WINDOW_MS: i64 = 60 * 60 * 1000;
+/// The rolling hour the hourly limit counts over, in milliseconds.
+pub const HOUR_WINDOW_MS: i64 = 60 * 60 * 1000;
+/// The rolling day the daily limit counts over, in milliseconds.
+pub const DAY_WINDOW_MS: i64 = 24 * HOUR_WINDOW_MS;
 
 // ---------------------------------------------------------------------------
 // The matcher
@@ -200,10 +206,13 @@ pub struct SecretMatchResponse {
     pub searched: SecretMatchSearched,
 }
 
-/// The JSON body of a refused check (400, 413, 429).
+/// The JSON body of a refused check (400, 403, 413, 429), or of a refused
+/// change of the limits (400).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SecretMatchRefusal {
-    /// `bad_body`, `empty`, `too_long` or `rate_limited`.
+    /// A check: `bad_body`, `empty`, `too_long`, `rate_limited`,
+    /// `leak_checks_off` or `browser_session_required`. A change of the
+    /// limits: `bad_body` or `out_of_bounds`.
     pub code: String,
     pub message: String,
     /// `rate_limited`: when the next check is allowed (unix ms).
@@ -234,13 +243,14 @@ fn refusal(
 }
 
 /// The 429, with `Retry-After` in whole seconds.
-fn rate_limited(retry_at: i64, now: i64) -> Response {
+fn rate_limited(limits: LeakCheckLimits, retry_at: i64, now: i64) -> Response {
     let mut resp = refusal(
         StatusCode::TOO_MANY_REQUESTS,
         "rate_limited",
         format!(
-            "You ran {CHECKS_PER_HOUR} checks in this org in the last hour. The next one is \
-             allowed at the time in `retry_at`."
+            "This org allows {} checks per person in an hour and {} in a day, and you have \
+             reached one of them. The next check is allowed at the time in `retry_at`.",
+            limits.per_hour, limits.per_day
         ),
         Some(retry_at),
         None,
@@ -251,52 +261,109 @@ fn rate_limited(retry_at: i64, now: i64) -> Response {
     resp
 }
 
-/// When the caller may check again, if `subject` already ran
-/// [`CHECKS_PER_HOUR`] checks in `org` in the hour before `now`: an hour
-/// after the oldest of the newest [`CHECKS_PER_HOUR`].
-async fn limit_reached(
+/// The 403 of an org whose limits turn the check off.
+fn leak_checks_off() -> Response {
+    refusal(
+        StatusCode::FORBIDDEN,
+        "leak_checks_off",
+        "Leak checks are off in this org: one of its limits is 0. An org Owner can change \
+         them in Org settings, Security."
+            .into(),
+        None,
+        None,
+    )
+}
+
+/// The limits stored for `org`, or the defaults.
+async fn org_limits(st: &AppState, org: &str) -> Result<LeakCheckLimits, ApiError> {
+    match st.leak_check_limits.as_deref() {
+        Some(store) => Ok(store
+            .leak_check_limits(org)
+            .await
+            .map_err(crate::step_up::store_err)?
+            .unwrap_or_default()),
+        None => Ok(LeakCheckLimits::default()),
+    }
+}
+
+/// When the window of `window_ms` lets `subject` check in `org` again, if
+/// they already ran `limit` checks there in the window before `now`: one
+/// window after the oldest of their newest `limit` checks.
+async fn window_full(
     log: &dyn OrgSecurityEventLog,
     subject: &str,
     org: &str,
     now: i64,
+    window_ms: i64,
+    limit: u32,
 ) -> Result<Option<i64>, ApiError> {
     let recent = log
         .list(&SecurityEventFilter {
             org: Some(org.to_string()),
             subject: Some(subject.to_string()),
             kinds: vec![kind::SECRET_MATCH_CHECKED.to_string()],
-            // A check exactly an hour old no longer counts.
-            from_at: Some(now - CHECK_WINDOW_MS + 1),
-            limit: CHECKS_PER_HOUR as u32,
+            // A check exactly one window old no longer counts.
+            from_at: Some(now - window_ms + 1),
+            limit,
             ..Default::default()
         })
         .await
         .map_err(crate::step_up::store_err)?;
-    if recent.len() < CHECKS_PER_HOUR {
+    if recent.len() < limit as usize {
         return Ok(None);
     }
-    Ok(recent
-        .iter()
-        .map(|e| e.at)
-        .min()
-        .map(|t| t + CHECK_WINDOW_MS))
+    Ok(recent.iter().map(|e| e.at).min().map(|t| t + window_ms))
 }
 
-/// One check at a time in this process, from the limit's count to its
-/// record, so two concurrent checks cannot both pass the twentieth slot.
-/// Checks are rare, so one lock for every org is enough.
-fn check_turn() -> &'static tokio::sync::Mutex<()> {
-    static TURN: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    TURN.get_or_init(|| tokio::sync::Mutex::new(()))
+/// When the caller may check again, if either of the org's limits is
+/// reached: the earliest time both the hour and the day allow a check.
+async fn limit_reached(
+    log: &dyn OrgSecurityEventLog,
+    limits: LeakCheckLimits,
+    subject: &str,
+    org: &str,
+    now: i64,
+) -> Result<Option<i64>, ApiError> {
+    let hour = window_full(log, subject, org, now, HOUR_WINDOW_MS, limits.per_hour).await?;
+    let day = window_full(log, subject, org, now, DAY_WINDOW_MS, limits.per_day).await?;
+    Ok(match (hour, day) {
+        (Some(h), Some(d)) => Some(h.max(d)),
+        (one, other) => one.or(other),
+    })
+}
+
+/// How many locks [`check_turn`] spreads (subject, org) pairs over.
+const CHECK_TURN_STRIPES: usize = 64;
+
+/// One check at a time per (subject, org) in this process, from the
+/// limit's count to its record, so two concurrent checks by one Admin in one
+/// org cannot both take the last slot of the hour. The pairs are spread over
+/// a fixed set of locks by hash, so the set never grows; two pairs that
+/// share a lock only wait for each other.
+///
+/// The lock is per process: with N server replicas, one Admin checking from
+/// all of them at once can exceed a limit by at most N-1.
+fn check_turn(subject: &str, org: &str) -> &'static tokio::sync::Mutex<()> {
+    use std::hash::{Hash, Hasher};
+    static TURNS: OnceLock<Vec<tokio::sync::Mutex<()>>> = OnceLock::new();
+    let turns = TURNS.get_or_init(|| {
+        (0..CHECK_TURN_STRIPES)
+            .map(|_| tokio::sync::Mutex::new(()))
+            .collect()
+    });
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (subject, org).hash(&mut hasher);
+    &turns[(hasher.finish() % CHECK_TURN_STRIPES as u64) as usize]
 }
 
 /// Compare pasted text with every value the org holds now — its secrets at
 /// every scope (overridden ones included) and its forge and plugin
 /// connection credentials — and answer with the names and scopes that
-/// match, never a value. Administer on the org; a step-up confirmation for
-/// every check; at most 20 checks per Admin per org per rolling hour. Each
-/// check is recorded in the org's security events with what matched, never
-/// the text.
+/// match, never a value. Administer on the org, from a signed-in browser
+/// only; a passkey confirmation for every check; at most the org's limits
+/// per person per rolling hour and per rolling day (20 and 40 unless an
+/// Owner changed them). Each check is recorded in the org's security events
+/// with what matched, never the text.
 #[utoipa::path(
     post,
     path = "/v1/orgs/{org}/secrets/match",
@@ -306,10 +373,10 @@ fn check_turn() -> &'static tokio::sync::Mutex<()> {
     responses(
         (status = 200, body = SecretMatchResponse),
         (status = 400, body = SecretMatchRefusal, description = "blank text, or a body that is not `{\"text\": ...}`; a reserved org (plain text)"),
-        (status = 403, description = "not an org admin, or `step_up_required`"),
+        (status = 403, description = "`leak_checks_off` (a limit of the org is 0) or `browser_session_required` (an API token or a Bearer session), each with `code` and `message`; not an org admin; `step_up_required` (mode `action`: every check needs its own confirmation)"),
         (status = 404, description = "secrets not configured"),
         (status = 413, body = SecretMatchRefusal, description = "text over 4096 bytes"),
-        (status = 429, body = SecretMatchRefusal, description = "20 checks in the last hour; `retry_at` (and `Retry-After`) say when the next is allowed"),
+        (status = 429, body = SecretMatchRefusal, description = "the org's hourly or daily limit is reached; `retry_at` (and `Retry-After`) say when both allow the next check"),
         (status = 503, description = "the check could not be recorded, so it was not answered")
     )
 )]
@@ -329,6 +396,23 @@ pub(crate) async fn org_secret_match(
     }
     refuse_reserved_org(&org, "be checked for a leaked value")?;
     let secrets = st.secrets.as_deref().ok_or(ApiError::NotFound)?;
+    // A human in a browser only: an API token or a session presented as
+    // Bearer is refused whether or not step-up is enforced.
+    if caller.grant.is_some() || caller.via == Some(crate::AuthVia::Bearer) {
+        return Ok(refusal(
+            StatusCode::FORBIDDEN,
+            "browser_session_required",
+            "A leak check can only be run by a person in a signed-in browser, never with an \
+             API token or a session presented as Bearer."
+                .into(),
+            None,
+            None,
+        ));
+    }
+    let limits = org_limits(&st, &org).await?;
+    if limits.off() {
+        return Ok(leak_checks_off());
+    }
     // The parse error is not passed on: it could quote part of the body.
     let Ok(request) = serde_json::from_slice::<SecretMatchRequest>(&body) else {
         return Ok(refusal(
@@ -364,21 +448,21 @@ pub(crate) async fn org_secret_match(
     }
     let log = st.security_events.clone();
     let subject = caller.principal.subject.clone();
-    // Refused before the step-up, so a check over the limit costs no
+    // Refused before the step-up, so a check over a limit costs no
     // confirmation. Counted again below, in turn.
     if let Some(log) = log.as_deref() {
         let now = st.clock.now().await.0;
-        if let Some(retry_at) = limit_reached(log, &subject, &org, now).await? {
-            return Ok(rate_limited(retry_at, now));
+        if let Some(retry_at) = limit_reached(log, limits, &subject, &org, now).await? {
+            return Ok(rate_limited(limits, retry_at, now));
         }
     }
     guard.require(&st, Vec::new()).await?;
 
-    let _turn = check_turn().lock().await;
+    let _turn = check_turn(&subject, &org).lock().await;
     if let Some(log) = log.as_deref() {
         let now = st.clock.now().await.0;
-        if let Some(retry_at) = limit_reached(log, &subject, &org, now).await? {
-            return Ok(rate_limited(retry_at, now));
+        if let Some(retry_at) = limit_reached(log, limits, &subject, &org, now).await? {
+            return Ok(rate_limited(limits, retry_at, now));
         }
     }
     let (matches, searched) = search(&st, secrets, &org, text.as_bytes()).await?;
@@ -403,7 +487,7 @@ pub(crate) async fn org_secret_match(
             "searched": searched,
         });
         // A check that cannot be recorded is not answered: the record is
-        // both the audit line and what the hourly limit counts.
+        // both the audit line and what the limits count.
         if let Err(e) = log.append(&ev).await {
             tracing::error!(error = %e, org, "secret.match_checked could not be recorded; refusing");
             return Err(ApiError::Unavailable(
@@ -436,6 +520,214 @@ fn matched_name(m: &SecretMatch) -> serde_json::Value {
             "connection": connection, "id": id, "name": name, "slot": slot,
         }),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The org's limits
+// ---------------------------------------------------------------------------
+
+/// The caller's role in the org, as the limits endpoints see it: an Owner
+/// may change the limits, an Admin may read them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LeakCheckCallerRole {
+    Owner,
+    Admin,
+}
+
+/// An org's leak check limits: `GET` and `PUT`
+/// `/v1/orgs/{org}/security/leak-checks`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LeakCheckLimitsDto {
+    /// Checks one person may run in the org in any rolling hour. 0: off.
+    pub per_hour: u32,
+    /// Checks one person may run in the org in any rolling day. 0: off.
+    pub per_day: u32,
+    /// The highest `per_hour` accepted.
+    pub max_per_hour: u32,
+    /// The highest `per_day` accepted.
+    pub max_per_day: u32,
+    /// The caller's role in the org: only an `owner` may change the limits.
+    pub caller_role: LeakCheckCallerRole,
+}
+
+impl LeakCheckLimitsDto {
+    fn new(limits: LeakCheckLimits, caller_role: LeakCheckCallerRole) -> Self {
+        Self {
+            per_hour: limits.per_hour,
+            per_day: limits.per_day,
+            max_per_hour: MAX_LEAK_CHECKS_PER_HOUR,
+            max_per_day: MAX_LEAK_CHECKS_PER_DAY,
+            caller_role,
+        }
+    }
+}
+
+/// `PUT /v1/orgs/{org}/security/leak-checks` body.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LeakCheckLimitsUpdate {
+    /// 0 to 100. 0 turns leak checks off in the org.
+    pub per_hour: i64,
+    /// 0 to 1000. 0 turns leak checks off in the org.
+    pub per_day: i64,
+}
+
+/// The caller's role in `org` for the limits endpoints: `Owner` for an
+/// org Owner (or a bootstrap owner), `Admin` for anyone else who may
+/// administer the org, `None` for the rest.
+async fn limits_role(
+    st: &AppState,
+    caller: &crate::Caller,
+    org: &str,
+) -> Result<Option<LeakCheckCallerRole>, ApiError> {
+    let scope = scarab_identity::Scope::Org(org.to_string());
+    let role = caller.role_in(st, &scope).await?;
+    if role == Some(Role::Owner) {
+        return Ok(Some(LeakCheckCallerRole::Owner));
+    }
+    let admin = caller.may_globally(Action::Administer)
+        || role.is_some_and(|r| r.allows(Action::Administer));
+    Ok(admin.then_some(LeakCheckCallerRole::Admin))
+}
+
+/// An org's leak check limits: how many checks one person may run in the
+/// org per rolling hour and per rolling day, the highest values accepted,
+/// and whether the caller may change them. The defaults (20 and 40) when
+/// no Owner has changed them.
+#[utoipa::path(
+    get,
+    path = "/v1/orgs/{org}/security/leak-checks",
+    params(("org" = String, Path, description = "org")),
+    summary = "An org's leak check limits, per person per rolling hour and day",
+    responses(
+        (status = 200, body = LeakCheckLimitsDto),
+        (status = 400, description = "a reserved org (plain text)"),
+        (status = 401, description = "not signed in"),
+        (status = 403, description = "not an admin or owner of the org")
+    )
+)]
+pub(crate) async fn get_leak_check_limits(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(org): Path<String>,
+) -> Result<Json<LeakCheckLimitsDto>, ApiError> {
+    let caller = authenticate(&st, &headers, Action::Read).await?;
+    let role = limits_role(&st, &caller, &org)
+        .await?
+        .ok_or(ApiError::Forbidden)?;
+    refuse_reserved_org(&org, "have leak check limits")?;
+    let limits = org_limits(&st, &org).await?;
+    Ok(Json(LeakCheckLimitsDto::new(limits, role)))
+}
+
+/// Change an org's leak check limits. Org Owner only, from a signed-in
+/// browser, with a passkey confirmation of its own; the confirmation shows
+/// the old and the new values. Recorded in the org's security events
+/// (`secret.match_limits_changed`) with both. A request that changes
+/// nothing asks for no confirmation and records nothing.
+#[utoipa::path(
+    put,
+    path = "/v1/orgs/{org}/security/leak-checks",
+    params(("org" = String, Path, description = "org")),
+    request_body = LeakCheckLimitsUpdate,
+    summary = "Change an org's leak check limits (Owner, always-ask step-up)",
+    responses(
+        (status = 200, body = LeakCheckLimitsDto),
+        (status = 400, body = SecretMatchRefusal, description = "`bad_body` (not `{\"per_hour\": n, \"per_day\": n}`) or `out_of_bounds` (per_hour over 0-100, per_day over 0-1000); a reserved org (plain text)"),
+        (status = 403, description = "not an owner of the org, or `step_up_required` (mode `action`)"),
+        (status = 404, description = "limits cannot be stored on this server")
+    )
+)]
+pub(crate) async fn put_leak_check_limits(
+    State(st): State<AppState>,
+    Extension(guard): Extension<GuardCtx>,
+    headers: HeaderMap,
+    Path(org): Path<String>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let caller = authenticate(&st, &headers, Action::Administer).await?;
+    if limits_role(&st, &caller, &org).await? != Some(LeakCheckCallerRole::Owner) {
+        return Err(ApiError::Forbidden);
+    }
+    refuse_reserved_org(&org, "have leak check limits")?;
+    let store = st.leak_check_limits.clone().ok_or(ApiError::NotFound)?;
+    let Ok(update) = serde_json::from_slice::<LeakCheckLimitsUpdate>(&body) else {
+        return Ok(refusal(
+            StatusCode::BAD_REQUEST,
+            "bad_body",
+            "The body must be JSON of the form {\"per_hour\": n, \"per_day\": n}.".into(),
+            None,
+            None,
+        ));
+    };
+    let in_bounds = |v: i64, max: u32| u32::try_from(v).ok().filter(|v| *v <= max);
+    let (Some(per_hour), Some(per_day)) = (
+        in_bounds(update.per_hour, MAX_LEAK_CHECKS_PER_HOUR),
+        in_bounds(update.per_day, MAX_LEAK_CHECKS_PER_DAY),
+    ) else {
+        return Ok(refusal(
+            StatusCode::BAD_REQUEST,
+            "out_of_bounds",
+            format!(
+                "per_hour must be 0 to {MAX_LEAK_CHECKS_PER_HOUR} and per_day 0 to \
+                 {MAX_LEAK_CHECKS_PER_DAY}."
+            ),
+            None,
+            None,
+        ));
+    };
+    let new = LeakCheckLimits { per_hour, per_day };
+    let old = store
+        .leak_check_limits(&org)
+        .await
+        .map_err(crate::step_up::store_err)?
+        .unwrap_or_default();
+    if new == old {
+        guard.exempt("the limits do not change");
+        return Ok(Json(LeakCheckLimitsDto::new(old, LeakCheckCallerRole::Owner)).into_response());
+    }
+    let mut changes = Vec::new();
+    for (field, before, after) in [
+        ("per_hour", old.per_hour, new.per_hour),
+        ("per_day", old.per_day, new.per_day),
+    ] {
+        if before != after {
+            changes.push(format!("{field} = {before} → {after}"));
+        }
+    }
+    guard.require(&st, changes).await?;
+
+    let subject = caller.principal.subject.clone();
+    let now = st.clock.now().await.0;
+    store
+        .put_leak_check_limits(&org, new, &subject, now)
+        .await
+        .map_err(crate::step_up::store_err)?;
+    if let Some(log) = st.security_events.as_deref() {
+        let mut ev = crate::step_up::event(
+            kind::SECRET_MATCH_LIMITS_CHANGED,
+            &subject,
+            caller.event_label(),
+            Some(org.clone()),
+            now,
+        );
+        ev.op = Some(crate::step_up::ops::LEAK_CHECK_LIMITS_PUT.id.to_string());
+        ev.target = Some(org.clone());
+        ev.confirmation_id = guard.confirmation_id();
+        ev.session_hash = caller.session.as_ref().map(|s| s.id_hash.clone());
+        ev.detail = serde_json::json!({
+            "old": { "per_hour": old.per_hour, "per_day": old.per_day },
+            "new": { "per_hour": new.per_hour, "per_day": new.per_day },
+        });
+        // The change is stored; `op.authorised`, written before it, already
+        // records it with the old and new values. This record is
+        // best-effort.
+        if let Err(e) = log.append(&ev).await {
+            tracing::error!(error = %e, org, "secret.match_limits_changed could not be recorded");
+        }
+    }
+    Ok(Json(LeakCheckLimitsDto::new(new, LeakCheckCallerRole::Owner)).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -692,6 +984,11 @@ async fn search(
         org: crate::FORGE_CREDENTIALS_ORG.to_string(),
     };
     for conn in &forge_connections {
+        // The server's own GitHub App key is shared by every installation of
+        // every org; it is not this org's to report, so it is not compared.
+        if conn.credential_ref == crate::GITHUB_APP_CREDENTIAL_REF {
+            continue;
+        }
         let Some(value) = value_at(secrets, &forge_scope, &conn.credential_ref).await? else {
             continue;
         };

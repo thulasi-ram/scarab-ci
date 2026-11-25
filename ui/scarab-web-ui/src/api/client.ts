@@ -8,6 +8,7 @@ import { parseLogMarker, type LogStreamHandlers, type LogStreamQuery } from "../
 import { isDeleteBlockers } from "../org-environments";
 import { askStepUp, errorMessage, shareCeremony, withStepUp } from "../step-up";
 import { refusalText, type MatchRefusal, type SecretMatchAnswer } from "../secret-match";
+import type { LeakCheckLimits } from "../leak-checks";
 
 export type RunStatus = components["schemas"]["RunStatusResponse"];
 export type CreateRunRequest = components["schemas"]["CreateRunRequest"];
@@ -1871,9 +1872,10 @@ export class SecretMatchRefusedError extends Error {
 /**
  * Check pasted text against every current secret value of the org and its
  * connections (`POST /v1/orgs/{org}/secrets/match`). Answers with names and
- * scopes only. Step-up gated: the same retry `send` does, so a refusal opens
- * the StepUpDialog and the same request goes again once confirmed. The text
- * rides in the body only, never in the URL.
+ * scopes only. Browser only, and each check asks for its own passkey
+ * confirmation: the same retry `send` does, so a refusal opens the
+ * StepUpDialog and the same request goes again once confirmed. The text rides
+ * in the body only, never in the URL.
  */
 export async function checkSecretMatch(org: string, text: string): Promise<SecretMatchAnswer> {
   const path = `/v1/orgs/${encodeURIComponent(org)}/secrets/match`;
@@ -1904,6 +1906,7 @@ export async function checkSecretMatch(org: string, text: string): Promise<Secre
     code: typeof body.code === "string" ? body.code : undefined,
     message: typeof body.message === "string" && body.message ? body.message : raw.trim() || undefined,
     retryAt,
+    org,
   });
 }
 
@@ -2414,6 +2417,28 @@ export async function listOrgSecurityEvents(
   });
   if (error || !data) throw new Error(errorText(error) || `failed to load security events (${response.status})`);
   return data;
+}
+
+/** The org's leak-check limits (`GET /v1/orgs/{org}/security/leak-checks`):
+ * how many "Check a leaked value" runs each person gets per hour and per day.
+ * `null` when the caller may not read them or the server has no such route. */
+export async function getLeakCheckLimits(org: string): Promise<LeakCheckLimits | null> {
+  const res = await fetch(`/v1/orgs/${encodeURIComponent(org)}/security/leak-checks`);
+  if (res.status === 401) setUnauthenticated(true);
+  if (!res.ok) return null;
+  return (await res.json()) as LeakCheckLimits;
+}
+
+/** An Owner sets the org's leak-check limits (`PUT …/security/leak-checks`).
+ * Each change asks for its own passkey confirmation, through the same
+ * step-up retry `send` does. A refusal (`out_of_bounds`, not an Owner, a
+ * cancelled confirmation) throws the server's own message. */
+export async function setLeakCheckLimits(
+  org: string,
+  limits: { per_hour: number; per_day: number },
+): Promise<LeakCheckLimits> {
+  const res = await send(`/v1/orgs/${encodeURIComponent(org)}/security/leak-checks`, "PUT", limits);
+  return (await res.json()) as LeakCheckLimits;
 }
 
 /** An Owner resets a member's passkeys

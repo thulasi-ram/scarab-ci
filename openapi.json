@@ -6073,7 +6073,7 @@
             }
           },
           "403": {
-            "description": "not an org admin, or `step_up_required`",
+            "description": "`leak_checks_off` (a limit of the org is 0) or `browser_session_required` (an API token or a Bearer session), each with `code` and `message`; not an org admin; `step_up_required` (mode `action`: every check needs its own confirmation)",
             "content": {
               "application/json": {
                 "schema": {
@@ -6099,7 +6099,7 @@
             }
           },
           "429": {
-            "description": "20 checks in the last hour; `retry_at` (and `Retry-After`) say when the next is allowed",
+            "description": "the org's hourly or daily limit is reached; `retry_at` (and `Retry-After`) say when both allow the next check",
             "content": {
               "application/json": {
                 "schema": {
@@ -6329,6 +6329,132 @@
           },
           "403": {
             "description": "not an admin of the Org"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/security/leak-checks": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "An org's leak check limits, per person per rolling hour and day",
+        "operationId": "get_leak_check_limits",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeakCheckLimitsDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "a reserved org (plain text)"
+          },
+          "401": {
+            "description": "not signed in"
+          },
+          "403": {
+            "description": "not an admin or owner of the org"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Change an org's leak check limits (Owner, always-ask step-up)",
+        "operationId": "put_leak_check_limits",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LeakCheckLimitsUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeakCheckLimitsDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`bad_body` (not `{\"per_hour\": n, \"per_day\": n}`) or `out_of_bounds` (per_hour over 0-100, per_day over 0-1000); a reserved org (plain text)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretMatchRefusal"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an owner of the org, or `step_up_required` (mode `action`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "limits cannot be stored on this server"
+          },
+          "409": {
+            "description": "the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting"
           }
         },
         "security": [
@@ -12038,6 +12164,76 @@
           }
         }
       },
+      "LeakCheckCallerRole": {
+        "type": "string",
+        "description": "The caller's role in the org, as the limits endpoints see it: an Owner\nmay change the limits, an Admin may read them.",
+        "enum": [
+          "owner",
+          "admin"
+        ]
+      },
+      "LeakCheckLimitsDto": {
+        "type": "object",
+        "description": "An org's leak check limits: `GET` and `PUT`\n`/v1/orgs/{org}/security/leak-checks`.",
+        "required": [
+          "per_hour",
+          "per_day",
+          "max_per_hour",
+          "max_per_day",
+          "caller_role"
+        ],
+        "properties": {
+          "caller_role": {
+            "$ref": "#/components/schemas/LeakCheckCallerRole",
+            "description": "The caller's role in the org: only an `owner` may change the limits."
+          },
+          "max_per_day": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The highest `per_day` accepted.",
+            "minimum": 0
+          },
+          "max_per_hour": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The highest `per_hour` accepted.",
+            "minimum": 0
+          },
+          "per_day": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Checks one person may run in the org in any rolling day. 0: off.",
+            "minimum": 0
+          },
+          "per_hour": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Checks one person may run in the org in any rolling hour. 0: off.",
+            "minimum": 0
+          }
+        }
+      },
+      "LeakCheckLimitsUpdate": {
+        "type": "object",
+        "description": "`PUT /v1/orgs/{org}/security/leak-checks` body.",
+        "required": [
+          "per_hour",
+          "per_day"
+        ],
+        "properties": {
+          "per_day": {
+            "type": "integer",
+            "format": "int64",
+            "description": "0 to 1000. 0 turns leak checks off in the org."
+          },
+          "per_hour": {
+            "type": "integer",
+            "format": "int64",
+            "description": "0 to 100. 0 turns leak checks off in the org."
+          }
+        },
+        "additionalProperties": false
+      },
       "LibraryInstallationDto": {
         "type": "object",
         "required": [
@@ -15723,7 +15919,7 @@
       },
       "SecretMatchRefusal": {
         "type": "object",
-        "description": "The JSON body of a refused check (400, 413, 429).",
+        "description": "The JSON body of a refused check (400, 403, 413, 429), or of a refused\nchange of the limits (400).",
         "required": [
           "code",
           "message"
@@ -15731,7 +15927,7 @@
         "properties": {
           "code": {
             "type": "string",
-            "description": "`bad_body`, `empty`, `too_long` or `rate_limited`."
+            "description": "A check: `bad_body`, `empty`, `too_long`, `rate_limited`,\n`leak_checks_off` or `browser_session_required`. A change of the\nlimits: `bad_body` or `out_of_bounds`."
           },
           "max_bytes": {
             "type": [
@@ -15939,7 +16135,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`step_up.confirmed`, `step_up.refused`, `op.authorised`,\n`op.completed`, `request.raised|confirmed|executed|failed`,\n`passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,\n`guard.not_consulted`, `binding.operator_grant`,\n`secret.match_checked`."
+            "description": "`step_up.confirmed`, `step_up.refused`, `op.authorised`,\n`op.completed`, `request.raised|confirmed|executed|failed`,\n`passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,\n`guard.not_consulted`, `binding.operator_grant`,\n`secret.match_checked`, `secret.match_limits_changed`."
           },
           "op": {
             "type": [

@@ -37,11 +37,16 @@ release.yml uses that version's section as the GitHub Release text. See
   a log excerpt) and compares it with every current value in the org, its repositories and its
   forge and plugin connections. The answer names each match and its scope, never a value, and
   says when no Run gets a matching value today. A stored value of 20 bytes or more matches
-  anywhere in the text; a shorter one only when it is the whole text. The check needs a passkey
-  confirmation, takes up to 4096 bytes, allows 20 checks per person per org in an hour, and
-  stores and logs nothing of the text; each check writes one event with the names that matched.
-  A value replaced earlier is not kept, so it cannot match. `POST /v1/orgs/{org}/secrets/match`
-  is the API. See [Secrets](https://thulasi-ram.github.io/scarab-ci/usage/secrets/).
+  anywhere in the text; a shorter one only when it is the whole text. Values are compared byte
+  for byte, line endings included, so a key wrapped at another width or a file with other line
+  endings does not match. The server's own GitHub App key, shared by every installation, is not
+  compared. The check runs from the browser only (not with an API token or the CLI), asks for a
+  passkey confirmation on every check, takes up to 4096 bytes, and stores and logs nothing of
+  the text; each check writes one event with the names that matched. Each person gets a limit
+  of checks per org per hour and per day, 20 and 40 by default. Org Owners set the limits in Org
+  settings › Security › Leak checks, 0 to 100 per hour and 0 to 1000 per day; 0 turns the check
+  off for the org. A value replaced earlier is not kept, so it cannot match. See
+  [Secrets](https://thulasi-ram.github.io/scarab-ci/usage/secrets/).
 
 ## [0.7.5] - 2026-11-25
 

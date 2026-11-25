@@ -1,15 +1,17 @@
 // "Check a leaked value" (Org settings › Secrets). An org Admin pastes text
 // found outside Scarab; the server compares it with every current secret value
 // of the org, its repositories and its connections, and answers with the names
-// that match. The check is step-up gated: the client's step-up retry opens the
-// passkey dialog on the way.
+// that match. Each check asks for its own passkey confirmation: the client's
+// step-up retry opens the passkey dialog on the way. When the org's leak-check
+// limits turn the check off, the dialog says so in place of the box.
 //
 // The pasted text lives in this component's state only. It is cleared on
 // "Check another", and goes with the component when the dialog closes; nothing
 // here writes it anywhere else.
-import { createSignal, For, Show } from "solid-js";
+import { createResource, createSignal, For, Show } from "solid-js";
 import { A } from "@solidjs/router";
-import { checkSecretMatch, SecretMatchRefusedError } from "../api/client";
+import { checkSecretMatch, getLeakCheckLimits, SecretMatchRefusedError } from "../api/client";
+import { leakChecksOff, leakChecksOffText } from "../leak-checks";
 import {
   byteCount,
   byteLabel,
@@ -32,11 +34,20 @@ export default function SecretMatchDialog(props: {
   onClose: () => void;
   /** Open an org key in the list behind the dialog. */
   onOpenKey: (key: string, environment?: string) => void;
+  /** Whether the list behind the dialog shows this key: "open" is offered only then. */
+  hasKey: (key: string) => boolean;
 }) {
   const [text, setText] = createSignal("");
   const [answer, setAnswer] = createSignal<SecretMatchAnswer | null>(null);
   const [busy, setBusy] = createSignal(false);
   const [refusal, setRefusal] = createSignal<string | null>(null);
+  // The org's limits: `null` when they could not be read, and the server
+  // still refuses a check the limits do not allow.
+  const [limits] = createResource(() => props.org, getLeakCheckLimits);
+  const off = () => {
+    const l = limits();
+    return !!l && leakChecksOff(l);
+  };
 
   const tooLong = () => byteCount(text()) > MAX_MATCH_BYTES;
 
@@ -75,7 +86,12 @@ export default function SecretMatchDialog(props: {
   const Row = (p: { m: SecretMatch }) => {
     const use = () => usageLine(p.m);
     const repoHref = () =>
-      p.m.kind === "secret" && p.m.repo ? `/${props.org}/${p.m.repo}?tab=secrets` : null;
+      p.m.kind === "secret" && p.m.repo
+        ? `/${encodeURIComponent(props.org)}/${encodeURIComponent(p.m.repo)}?tab=secrets`
+        : null;
+    // An org-level key opens in the list behind the dialog, so only when the list shows it.
+    const canOpen = () => p.m.kind === "secret" && (repoHref() !== null || props.hasKey(p.m.key));
+    const openLabel = () => `Open ${matchName(p.m)}, ${whereText(p.m)}`;
     return (
       <li class="smatch">
         <div class="smatch-h">
@@ -90,7 +106,7 @@ export default function SecretMatchDialog(props: {
         <p class="smatch-use" classList={{ warn: use().warn }}>
           {use().text}
         </p>
-        <Show when={p.m.kind === "secret"}>
+        <Show when={canOpen()}>
           <span class="smatch-open">
             <Show
               when={repoHref()}
@@ -98,7 +114,7 @@ export default function SecretMatchDialog(props: {
                 <button
                   class="btn btn-ghost btn-sm"
                   type="button"
-                  aria-label={`Open ${matchName(p.m)} in the list`}
+                  aria-label={openLabel()}
                   onClick={() => open(p.m)}
                 >
                   open
@@ -106,7 +122,7 @@ export default function SecretMatchDialog(props: {
               }
             >
               {(href) => (
-                <A class="btn btn-ghost btn-sm" href={href()} onClick={close}>
+                <A class="btn btn-ghost btn-sm" href={href()} aria-label={openLabel()} onClick={close}>
                   open
                 </A>
               )}
@@ -133,7 +149,14 @@ export default function SecretMatchDialog(props: {
           <Show
             when={answer()}
             fallback={
-              <>
+              <Show
+                when={!off()}
+                fallback={
+                  <button class="btn btn-primary" type="button" onClick={close}>
+                    Close
+                  </button>
+                }
+              >
                 <button class="btn btn-ghost" type="button" onClick={close} disabled={busy()}>
                   Cancel
                 </button>
@@ -145,7 +168,7 @@ export default function SecretMatchDialog(props: {
                 >
                   <Icon icon="search" size={14} /> {busy() ? "Checking…" : "Check"}
                 </button>
-              </>
+              </Show>
             }
           >
             <button class="btn btn-ghost" type="button" onClick={again}>
@@ -161,7 +184,14 @@ export default function SecretMatchDialog(props: {
       <Show
         when={answer()}
         fallback={
-          <>
+          <Show
+            when={!off()}
+            fallback={
+              <div class="dlg-text">
+                <p>{leakChecksOffText(props.org)}</p>
+              </div>
+            }
+          >
             <div class="dlg-text">
               <p>
                 Paste what you found outside Scarab: a token, an .env file, a log excerpt. Scarab
@@ -172,6 +202,18 @@ export default function SecretMatchDialog(props: {
               <p>
                 Only current values are compared. A value you replaced earlier is not kept, so it
                 cannot match.
+              </p>
+              <p>
+                Each check asks for a passkey confirmation.
+                <Show when={limits()}>
+                  {(l) => (
+                    <>
+                      {" "}
+                      You can run {l().per_hour} an hour and {l().per_day} a day in{" "}
+                      <span class="mono">{props.org}</span>.
+                    </>
+                  )}
+                </Show>
               </p>
             </div>
             <Field
@@ -189,7 +231,7 @@ export default function SecretMatchDialog(props: {
                 disabled={busy()}
               />
             </Field>
-          </>
+          </Show>
         }
       >
         {(a) => (

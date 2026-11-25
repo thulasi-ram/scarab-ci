@@ -47,6 +47,19 @@ describe("whereText", () => {
       "plugin connection",
     );
   });
+
+  it("names a plugin connection's slot, so two connections of one installation differ", () => {
+    const plugin = (slot: string): SecretMatch => ({
+      kind: "connection",
+      connection: "plugin",
+      id: "0000000001",
+      name: "argocd",
+      slot,
+      base_url: "https://argo.acme.test",
+    });
+    expect(whereText(plugin("staging"))).toBe("plugin connection staging · https://argo.acme.test");
+    expect(whereText(plugin("production"))).not.toBe(whereText(plugin("staging")));
+  });
 });
 
 describe("usageLine", () => {
@@ -122,10 +135,24 @@ describe("the answer's wording", () => {
 });
 
 describe("refusalText", () => {
-  it("gives the time of the next check on a rate limit", () => {
-    const at = new Date(2026, 10, 25, 14, 5).getTime();
-    expect(refusalText({ status: 429, code: "rate_limited", retryAt: at })).toBe(
-      "You have run 20 checks in the last hour. The next check is allowed at 14:05.",
+  it("gives the time of the next check on a rate limit, and the day when it is not today", () => {
+    const now = new Date(2026, 10, 25, 13, 40).getTime();
+    const limit = "You have run as many checks as the org allows each person for now.";
+    const later = new Date(2026, 10, 25, 14, 5).getTime();
+    expect(refusalText({ status: 429, code: "rate_limited", retryAt: later }, now)).toBe(
+      `${limit} The next check is allowed at 14:05.`,
+    );
+    // The daily limit can move the next check to tomorrow.
+    const tomorrow = new Date(2026, 10, 26, 9, 30).getTime();
+    expect(refusalText({ status: 429, code: "rate_limited", retryAt: tomorrow }, now)).toBe(
+      `${limit} The next check is allowed tomorrow at 09:30.`,
+    );
+    expect(refusalText({ status: 429, code: "rate_limited" }, now)).toBe(limit);
+  });
+
+  it("says the org has the check turned off, and where to turn it on", () => {
+    expect(refusalText({ status: 403, code: "leak_checks_off", org: "acme" })).toBe(
+      "Leak checks are turned off for acme. An org Owner can turn them on in Settings › Security.",
     );
   });
 

@@ -1692,6 +1692,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/security/leak-checks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** An org's leak check limits, per person per rolling hour and day */
+        get: operations["get_leak_check_limits"];
+        /** Change an org's leak check limits (Owner, always-ask step-up) */
+        put: operations["put_leak_check_limits"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/security/summary": {
         parameters: {
             query?: never;
@@ -4130,6 +4148,53 @@ export interface components {
              */
             steps: string[];
         };
+        /**
+         * @description The caller's role in the org, as the limits endpoints see it: an Owner
+         *     may change the limits, an Admin may read them.
+         * @enum {string}
+         */
+        LeakCheckCallerRole: "owner" | "admin";
+        /**
+         * @description An org's leak check limits: `GET` and `PUT`
+         *     `/v1/orgs/{org}/security/leak-checks`.
+         */
+        LeakCheckLimitsDto: {
+            /** @description The caller's role in the org: only an `owner` may change the limits. */
+            caller_role: components["schemas"]["LeakCheckCallerRole"];
+            /**
+             * Format: int32
+             * @description The highest `per_day` accepted.
+             */
+            max_per_day: number;
+            /**
+             * Format: int32
+             * @description The highest `per_hour` accepted.
+             */
+            max_per_hour: number;
+            /**
+             * Format: int32
+             * @description Checks one person may run in the org in any rolling day. 0: off.
+             */
+            per_day: number;
+            /**
+             * Format: int32
+             * @description Checks one person may run in the org in any rolling hour. 0: off.
+             */
+            per_hour: number;
+        };
+        /** @description `PUT /v1/orgs/{org}/security/leak-checks` body. */
+        LeakCheckLimitsUpdate: {
+            /**
+             * Format: int64
+             * @description 0 to 1000. 0 turns leak checks off in the org.
+             */
+            per_day: number;
+            /**
+             * Format: int64
+             * @description 0 to 100. 0 turns leak checks off in the org.
+             */
+            per_hour: number;
+        };
         LibraryInstallationDto: {
             content_hash: string;
             /**
@@ -6038,9 +6103,16 @@ export interface components {
          * @enum {string}
          */
         SecretMatchConnectionKind: "forge" | "plugin";
-        /** @description The JSON body of a refused check (400, 413, 429). */
+        /**
+         * @description The JSON body of a refused check (400, 403, 413, 429), or of a refused
+         *     change of the limits (400).
+         */
         SecretMatchRefusal: {
-            /** @description `bad_body`, `empty`, `too_long` or `rate_limited`. */
+            /**
+             * @description A check: `bad_body`, `empty`, `too_long`, `rate_limited`,
+             *     `leak_checks_off` or `browser_session_required`. A change of the
+             *     limits: `bad_body` or `out_of_bounds`.
+             */
             code: string;
             /** @description `too_long`: the largest text accepted, in bytes. */
             max_bytes?: number | null;
@@ -6159,7 +6231,7 @@ export interface components {
              *     `op.completed`, `request.raised|confirmed|executed|failed`,
              *     `passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,
              *     `guard.not_consulted`, `binding.operator_grant`,
-             *     `secret.match_checked`.
+             *     `secret.match_checked`, `secret.match_limits_changed`.
              */
             kind: string;
             op?: string | null;
@@ -11438,7 +11510,7 @@ export interface operations {
                     "application/json": components["schemas"]["SecretMatchRefusal"];
                 };
             };
-            /** @description not an org admin, or `step_up_required` */
+            /** @description `leak_checks_off` (a limit of the org is 0) or `browser_session_required` (an API token or a Bearer session), each with `code` and `message`; not an org admin; `step_up_required` (mode `action`: every check needs its own confirmation) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -11470,7 +11542,7 @@ export interface operations {
                     "application/json": components["schemas"]["SecretMatchRefusal"];
                 };
             };
-            /** @description 20 checks in the last hour; `retry_at` (and `Retry-After`) say when the next is allowed */
+            /** @description the org's hourly or daily limit is reached; `retry_at` (and `Retry-After`) say when both allow the next check */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -11606,6 +11678,114 @@ export interface operations {
             };
             /** @description not an admin of the Org */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_leak_check_limits: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LeakCheckLimitsDto"];
+                };
+            };
+            /** @description a reserved org (plain text) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not signed in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an admin or owner of the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    put_leak_check_limits: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LeakCheckLimitsUpdate"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LeakCheckLimitsDto"];
+                };
+            };
+            /** @description `bad_body` (not `{"per_hour": n, "per_day": n}`) or `out_of_bounds` (per_hour over 0-100, per_day over 0-1000); a reserved org (plain text) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SecretMatchRefusal"];
+                };
+            };
+            /** @description not an owner of the org, or `step_up_required` (mode `action`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description limits cannot be stored on this server */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };

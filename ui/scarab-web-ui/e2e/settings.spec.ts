@@ -1454,12 +1454,14 @@ test("Check a leaked value: on the org list only, matches with who gets them, no
   // The limit: 20 checks an hour, with the time of the next.
   await box.fill("MOCK_RATE_LIMIT");
   await dialog.getByRole("button", { name: "Check", exact: true }).click();
-  await expect(dialog.getByRole("alert")).toContainText("The next check is allowed at");
+  await expect(dialog.getByRole("alert")).toContainText("The next check is allowed");
 
   // A match's "open" closes the dialog and opens its key in the list.
   await box.fill(env);
   await dialog.getByRole("button", { name: "Check", exact: true }).click();
-  await dialog.getByRole("button", { name: "Open AWS_DEPLOY_ROLE in the list" }).click();
+  // Each key the list shows has an "open"; the forge connection has none.
+  await expect(dialog.getByRole("button", { name: /^Open / })).toHaveCount(2);
+  await dialog.getByRole("button", { name: "Open AWS_DEPLOY_ROLE, production (org)" }).click();
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(panel.locator('li.skey[data-key="AWS_DEPLOY_ROLE"] > .skey-h')).toHaveAttribute(
     "aria-expanded",
@@ -1471,6 +1473,46 @@ test("Check a leaked value: on the org list only, matches with who gets them, no
   dialog = page.getByRole("dialog");
   await expect(dialog.getByLabel("Text to check")).toHaveValue("");
   await dialog.getByRole("button", { name: "Cancel" }).click();
+  expect(errors).toEqual([]);
+});
+
+test("an Owner sets the leak-check limits to 0 and the check says it is off", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/orgs/acme/settings/security");
+  const section = page.locator(".panel", { hasText: "Leak checks" });
+  await expect(section).toContainText("20 checks per person per hour · 40 per day");
+
+  // Out of bounds is caught before saving; 0 turns the check off.
+  await section.getByRole("button", { name: "Edit limits" }).click();
+  let dialog = page.getByRole("dialog");
+  const hour = dialog.getByLabel("Checks per hour");
+  await hour.fill("101");
+  await expect(dialog.getByText("Checks per hour must be a whole number from 0 to 100.")).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Save" })).toBeDisabled();
+  await hour.fill("0");
+  await dialog.getByRole("button", { name: "Save" }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(section).toContainText("Turned off");
+
+  // The mock keeps the limits for the life of the page: move with the
+  // settings nav, not a reload.
+  const nav = page.getByRole("navigation", { name: "Settings" });
+  await nav.getByRole("link", { name: "Secrets", exact: true }).click();
+  await page.getByRole("button", { name: "Check a leaked value" }).click();
+  dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText(
+    "Leak checks are turned off for acme. An org Owner can turn them on in Settings › Security.",
+  );
+  await expect(dialog.getByLabel("Text to check")).toHaveCount(0);
+  await dialog.locator(".dlg-f").getByRole("button", { name: "Close" }).click();
+
+  // Restore.
+  await nav.getByRole("link", { name: "Security", exact: true }).click();
+  await section.getByRole("button", { name: "Edit limits" }).click();
+  dialog = page.getByRole("dialog");
+  await dialog.getByLabel("Checks per hour").fill("20");
+  await dialog.getByRole("button", { name: "Save" }).click();
+  await expect(section).toContainText("20 checks per person per hour · 40 per day");
   expect(errors).toEqual([]);
 });
 

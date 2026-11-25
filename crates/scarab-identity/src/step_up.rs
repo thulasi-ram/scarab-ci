@@ -688,8 +688,11 @@ pub mod security_event_kind {
     /// An org Admin compared pasted text with the org's stored secret
     /// values and connection credentials. The detail names what matched
     /// (key and scope, or connection), never the text or a value. Also what
-    /// the check's hourly limit counts.
+    /// the org's hourly and daily limits count.
     pub const SECRET_MATCH_CHECKED: &str = "secret.match_checked";
+    /// An org Owner changed the org's leak check limits. The detail holds
+    /// the old and the new `per_hour` and `per_day`.
+    pub const SECRET_MATCH_LIMITS_CHANGED: &str = "secret.match_limits_changed";
 
     /// The Org-less kinds an Org's log shows about its members: the human's
     /// own confirmations and passkey lifecycle. Org-less operations,

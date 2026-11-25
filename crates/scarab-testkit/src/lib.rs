@@ -33,6 +33,8 @@ pub use environment_governance::InMemoryEnvironmentGovernance;
 mod policies;
 pub use policies::InMemoryPolicies;
 // The in-memory `LibraryStore` (ADR-0076).
+mod leak_checks;
+pub use leak_checks::InMemoryLeakCheckLimits;
 mod libraries;
 pub use libraries::InMemoryLibraries;
 
