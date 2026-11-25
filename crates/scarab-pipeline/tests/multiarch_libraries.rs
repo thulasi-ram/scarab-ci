@@ -515,10 +515,16 @@ fn platforms_validate_accepts_and_refuses() {
         "amd64",
         "",
         "linux/amd64;id",
+        // Platforms the build script's node check cannot decide.
+        "linux/386",
+        "linux/arm",
+        "linux/mipsle",
+        "linux/arm,linux/arm/v7",
     ] {
         match with(platforms) {
             Err(PipelineError::Validation(errs)) => assert!(
-                errs.iter().any(|e| e.contains("input `platforms`")),
+                errs.iter().any(|e| e.contains("input `platforms`")
+                    && e.contains("failed validation `value.matches(")),
                 "{platforms:?}: {errs:?}"
             ),
             other => panic!("{platforms:?}: expected a refusal, got {other:?}"),
@@ -830,5 +836,80 @@ fn only_build_multiarch_keeps_a_cache_per_architecture() {
     for lib in ["build", "build-layout"] {
         let ir = invoke(lib, &minimal_with(lib));
         assert!(per_arch(step(&ir, "x/image")).is_empty(), "{lib}");
+    }
+}
+
+// Attack (red team): a Pipeline writes its own matrix Step `app/build`
+// after the build-multiarch invoke `app`, so its instances would take the
+// names of the library's build instances, and the credentialed push Step
+// would read their results and workspaces. Safe outcome: the Pipeline
+// does not compile, naming the id; a `test/unit` id beside no invoke `test`
+// still compiles.
+#[test]
+fn an_authored_step_under_the_invoke_prefix_is_refused() {
+    let errs = match compile_with_libraries(
+        r#"
+steps:
+  - id: app
+    invoke: lib:thulasi-ram::scarab-ci::build-multiarch
+    with: { image: "registry.example/app:1" }
+  - id: app/build
+    image: alpine
+    command: [echo]
+    matrix: { dimensions: { arch: [linux/amd64] } }
+"#,
+        &libraries(),
+    ) {
+        Err(PipelineError::Validation(errs)) => errs,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    let want = "step `app/build`: its id starts with `app/`, the name of the Steps that invoke \
+                `app` inlines; give it another id";
+    assert!(errs.iter().any(|e| e == want), "{errs:?}");
+
+    compile_with_libraries(
+        r#"
+steps:
+  - id: app
+    invoke: lib:thulasi-ram::scarab-ci::build-multiarch
+    with: { image: "registry.example/app:1" }
+  - { id: test/unit, image: alpine, command: [echo] }
+"#,
+        &libraries(),
+    )
+    .expect("an id under no invoke's prefix compiles");
+}
+
+/// The repository's own Pipelines compile at the IR version they did
+/// before instance lists and `join`: none of them invokes build-multiarch.
+#[test]
+fn the_repository_pipelines_stay_below_version_4() {
+    let mut libraries = libraries();
+    libraries.installed.insert(
+        "thulasi-ram::scarab-ci::clone".to_string(),
+        InstalledLibrary {
+            content: include_str!("../../../libs/clone.yaml").to_string(),
+            source: "github.com/thulasi-ram/scarab-ci//libs/clone.yaml@1111111111111111111111111111111111111111".to_string(),
+        },
+    );
+    libraries.files.insert(
+        ".scarab/lib/notify.yaml".to_string(),
+        include_str!("../../../.scarab/lib/notify.yaml").to_string(),
+    );
+    for (name, yaml) in [
+        ("ci.yaml", include_str!("../../../.scarab/ci.yaml")),
+        (
+            "dogfood.yaml",
+            include_str!("../../../.scarab/dogfood.yaml"),
+        ),
+    ] {
+        assert!(!yaml.contains("build-multiarch"), "{name}");
+        let ir = compile_with_libraries(yaml, &libraries)
+            .unwrap_or_else(|e| panic!("{name} compiles: {e:?}"));
+        assert!(
+            ir.ir_version < scarab_pipeline::IR_VERSION_INSTANCES,
+            "{name}: version {}",
+            ir.ir_version
+        );
     }
 }

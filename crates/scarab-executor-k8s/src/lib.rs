@@ -12141,6 +12141,8 @@ exit "${{STUB_EXIT:-0}}"
             "image/image",
             "app[platform=linux/arm64,os=x]/image",
             "a/b/c/image",
+            "app/build[arch=linux/amd64]",
+            "app[x=1,y=2]/build[arch=linux/amd64]",
         ] {
             assert_eq!(
                 run(&[("SCARAB_BUILD_PUSH", "true"), ("SCARAB_STEP", step)]),
@@ -12175,15 +12177,18 @@ exit "${{STUB_EXIT:-0}}"
     fn a_build_step_removes_only_its_own_layout() {
         let (tmp, run) = build_library_harness();
         let ws = tmp.path().canonicalize().unwrap().join("workspace");
-        let other = ws.join(layout_rel("app/arm64"));
-        let own = ws.join(layout_rel("app/amd64"));
+        let other = ws.join(layout_rel("app/build[arch=linux/arm64]"));
+        let own = ws.join(layout_rel("app/build[arch=linux/amd64]"));
         for dir in [&other, &own] {
             std::fs::create_dir_all(dir).unwrap();
         }
         std::fs::write(other.join("index.json"), "arm64").unwrap();
         std::fs::write(own.join("index.json"), "stale").unwrap();
         assert_eq!(
-            run(&[("SCARAB_BUILD_PUSH", "true"), ("SCARAB_STEP", "app/amd64")]),
+            run(&[
+                ("SCARAB_BUILD_PUSH", "true"),
+                ("SCARAB_STEP", "app/build[arch=linux/amd64]")
+            ]),
             (Some(0), true)
         );
         assert_eq!(
@@ -12279,7 +12284,6 @@ exit "${{STUB_EXIT:-0}}"
         let (tmp, run) = build_script_harness(false);
         let base = tmp.path().canonicalize().unwrap();
         for (platform, node) in [
-            ("linux/386", "i686"),
             ("linux/amd64/v3", "x86_64"),
             ("linux/arm/v7", "armv7l"),
             ("linux/riscv64", "riscv64"),
@@ -12317,6 +12321,15 @@ exit "${{STUB_EXIT:-0}}"
             "windows/amd64",
             "amd64",
             "linux/amd64 ",
+            // The node check cannot decide these: an x86_64 node never
+            // passes 386, `uname -m` does not tell a mips byte order, and
+            // BuildKit builds bare arm as arm/v7.
+            "linux/386",
+            "linux/arm",
+            "linux/mips",
+            "linux/mipsle",
+            "linux/mips64",
+            "linux/mips64le",
         ] {
             let (out, reached) = run(&[
                 ("SCARAB_BUILD_PLATFORM", platform),
@@ -12326,6 +12339,10 @@ exit "${{STUB_EXIT:-0}}"
                 (out.status.code(), reached),
                 (Some(2), false),
                 "{platform:?}"
+            );
+            assert!(
+                !base.join("uname-called").exists(),
+                "{platform:?}: refused before uname is read"
             );
             assert_eq!(
                 String::from_utf8_lossy(&out.stderr).trim_end(),
@@ -12351,8 +12368,8 @@ exit "${{STUB_EXIT:-0}}"
             ("linux/arm64", "arm64"),
             ("linux/arm/v7", "armv7l"),
             ("linux/arm/v6", "armv6l"),
-            ("linux/386", "i686"),
-            ("linux/mips64le", "mips64el"),
+            ("linux/ppc64le", "ppc64le"),
+            ("linux/s390x", "s390x"),
             ("linux/loong64", "loongarch64"),
         ] {
             let (out, reached) = run(&[("SCARAB_BUILD_PLATFORM", platform), ("STUB_UNAME", node)]);

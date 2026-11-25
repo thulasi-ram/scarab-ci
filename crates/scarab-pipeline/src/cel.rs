@@ -944,6 +944,33 @@ mod tests {
         assert!(eval_bool_product("1 +", &[], &dims, &[]).is_err());
     }
 
+    /// A matrix `exclude` may call `join`, as any other expression may.
+    #[test]
+    fn eval_bool_product_has_join() {
+        let os: Vec<Arc<String>> = vec![Arc::new("linux".to_string())];
+        let arch: Vec<Arc<String>> = ["amd64", "arm64"].map(|v| Arc::new(v.to_string())).to_vec();
+        let dims = [
+            Dim {
+                name: "arch",
+                values: &arch,
+            },
+            Dim {
+                name: "os",
+                values: &os,
+            },
+        ];
+        assert_eq!(
+            eval_bool_product(
+                r#"[os, arch].join("/") == "linux/arm64""#,
+                &[],
+                &dims,
+                &[0, 1]
+            )
+            .unwrap(),
+            vec![false, true]
+        );
+    }
+
     /// `<list>.join()` and `<list>.join(<sep>)`: the list's strings in
     /// order with the separator between; a list holding anything but
     /// strings, or a separator that is not a string, is an error.

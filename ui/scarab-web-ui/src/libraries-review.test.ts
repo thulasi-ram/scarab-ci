@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, it, expect } from "vitest";
 import {
   carriedGrantBox,
@@ -11,6 +12,7 @@ import {
   numberDiff,
   reviewChecks,
   reviewHref,
+  withoutComments,
   sideBySide,
   trustKey,
   trustNote,
@@ -130,6 +132,31 @@ describe("review checks", () => {
     const clean = reviewChecks(OLD, []);
     expect(clean.map((c) => c.tone)).toEqual(["ok", "ok", "info"]);
   });
+  it("reads a library's Steps, not its comments", () => {
+    // build-multiarch's header shows an invoke of itself in a comment, and
+    // asks for no forge_token.
+    const multiarch = readFileSync(new URL("../../../libs/build-multiarch.yaml", import.meta.url), "utf8");
+    const checks = reviewChecks(multiarch, []);
+    expect(checks.filter((c) => c.text.startsWith("Invokes"))).toEqual([]);
+    expect(checks.at(-1)).toEqual({
+      tone: "info",
+      text: "No Step asks for forge_token, so trust with forge credentials does not apply",
+    });
+    expect(checks.find((c) => c.text.startsWith("Not pinned"))).toBeUndefined();
+
+    const commented = "steps:\n  - id: a\n    image: busybox@sha256:abc\n    # forge_token: read\n";
+    expect(reviewChecks(commented, []).at(-1)!.tone).toBe("info");
+    const noted = "steps:\n  - { id: a, invoke: lib:x/y } # note: invoke: lib:not/this\n";
+    expect(reviewChecks(noted, []).filter((c) => c.text.startsWith("Invokes")).map((c) => c.text)).toEqual([
+      "Invokes lib:x/y, which is not installed here",
+    ]);
+    // A # inside a quoted string, or not after white space, is text.
+    expect(withoutComments(`  env: [[A, "a # b"]] # c`)).toBe(`  env: [[A, "a # b"]] `);
+    expect(withoutComments(`  - [B, 'x #y'] # z`)).toBe(`  - [B, 'x #y'] `);
+    expect(withoutComments("  url: http://h/p#frag")).toBe("  url: http://h/p#frag");
+    expect(withoutComments("# whole line\nsteps:")).toBe("\nsteps:");
+  });
+
   it("links the review page with what is known", () => {
     expect(reviewHref("acme", {})).toBe("/orgs/acme/settings/libraries/review");
     expect(reviewHref("acme", { source: "s@c", name: "acme::x", ref: "", connection: undefined })).toBe(

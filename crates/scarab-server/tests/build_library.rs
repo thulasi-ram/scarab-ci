@@ -1051,9 +1051,9 @@ async fn build_layout_needs_no_registry_trust() {
 }
 
 /// A run.create Policy reads each build instance as a Step of its own,
-/// with the plain list of profiles its coordinate key named: the compiled
-/// coordinate placement reaches admission as any Step's list does, and no
-/// coordinate key text reaches it.
+/// with the plain list of profiles its coordinate key named, and no other
+/// key's: the compiled coordinate placement reaches admission as any
+/// Step's list does.
 #[tokio::test]
 async fn policy_input_for_an_instance_is_a_plain_list() {
     use scarab_policy::store::{NewPolicy, PolicyScope, PolicyStore};
@@ -1077,19 +1077,19 @@ steps:
 "#;
     for (when, matches) in [
         (
-            "steps.exists(s, s.id == 'app/build[arch=linux/arm64]' && s.placement_profiles == ['arm64'])",
+            "steps.exists(s, s.id == 'app/build[arch=linux/arm64]' && size(s.placement_profiles) == 1 && 'arm64' in s.placement_profiles)",
             true,
         ),
         (
-            "steps.exists(s, s.id == 'app/build[arch=linux/amd64]' && s.placement_profiles == ['amd64'])",
+            "steps.exists(s, s.id == 'app/build[arch=linux/amd64]' && size(s.placement_profiles) == 1 && 'amd64' in s.placement_profiles)",
             true,
         ),
         (
-            "steps.exists(s, s.id == 'app/push' && s.placement_profiles == ['ecr-push'])",
+            "steps.exists(s, s.id == 'app/push' && size(s.placement_profiles) == 1 && 'ecr-push' in s.placement_profiles)",
             true,
         ),
         (
-            "steps.exists(s, s.placement_profiles.exists(p, p.contains('[') || p.contains('=')))",
+            "steps.exists(s, s.id == 'app/build[arch=linux/arm64]' && ('amd64' in s.placement_profiles || 'ecr-push' in s.placement_profiles))",
             false,
         ),
         ("size(steps) == 3", true),
