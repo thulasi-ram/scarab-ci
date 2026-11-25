@@ -343,6 +343,9 @@ samp {
 
 /* ---- Page shell ------------------------------------------------------- */
 
+/* The run page takes the window's width, so its graph has room for more
+   columns at 100% (the graph never shrinks to fit; it scrolls). */
+.page.page-run { max-width: none; }
 .page {
   position: relative;
   max-width: 1200px;
@@ -1196,7 +1199,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .dag-cols {
   display: flex;
   flex-direction: row; /* dependency layers flow left → right */
-  gap: 48px;
+  gap: 36px;
   /* `safe center` keeps a short graph vertically centered in the band but never
      clips a tall fan on the top edge. */
   align-items: safe center;
@@ -2708,11 +2711,12 @@ h1, .crumb-head, .run-title {
   display: grid;
   grid-template-columns: auto 1fr auto;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   /* Each column sets --node-w from its longest label (Dag.tsx
-     `columnNodeWidth`), so a matrix cell's values fit on one line. */
+     `columnNodeWidth`), so a matrix cell's values fit on one line. Padding,
+     ring and gaps are kept small so more columns fit at 100%. */
   width: var(--node-w, 320px);
-  padding: 10px 12px;
+  padding: 8px 10px;
   border: 1px solid var(--terminal-line);
   border-radius: 3px;
   background: var(--terminal-elev);
@@ -2759,9 +2763,9 @@ h1, .crumb-head, .run-title {
 @keyframes dnode-scan { 0% { background-position: -40% 0; } 100% { background-position: 140% 0; } }
 
 /* status ring (conic gauge) */
-.dring { width: 22px; height: 22px; border-radius: 50%; position: relative; display: grid; place-items: center; }
-.dring::after { content: ""; position: absolute; inset: 3px; border-radius: 50%; background: var(--terminal-elev); }
-.dring-core { position: relative; z-index: 1; width: 7px; height: 7px; border-radius: 50%; background: var(--muted-sage); }
+.dring { width: 16px; height: 16px; border-radius: 50%; position: relative; display: grid; place-items: center; }
+.dring::after { content: ""; position: absolute; inset: 2px; border-radius: 50%; background: var(--terminal-elev); }
+.dring-core { position: relative; z-index: 1; width: 6px; height: 6px; border-radius: 50%; background: var(--muted-sage); }
 .dring.succeeded { background: conic-gradient(var(--ok) 100%, var(--terminal-line) 0); }
 .dring.succeeded .dring-core { background: var(--ok); }
 .dring.running { background: conic-gradient(var(--running) 66%, var(--terminal-line) 0); animation: dring-spin 3s linear infinite; }

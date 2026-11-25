@@ -133,7 +133,7 @@ export default function Dag(props: {
   // ── Zoom and scroll ─────────────────────────────────────────────────────
   // The graph sits in a zoom layer scaled by `scale`, inside a sizer as big as
   // the scaled graph, inside the band, which scrolls. `fit()` sets the scale
-  // (1, or less for a graph wider than the band, not below 0.9) and the band
+  // back to 1 (a wider graph scrolls sideways, never shrunk) and the band
   // height (the graph's, capped at ~60vh). Edges are measured in UNSCALED
   // graph coordinates (offsetLeft/offsetTop, which transforms don't touch), so
   // the zoom never moves them off their nodes.
@@ -145,8 +145,8 @@ export default function Dag(props: {
 
   const PAD = 24; // inset (px) between the graph and the band edges
   // How far before its target an edge turns: past a library box's padding
-  // (10px) and inside the 48px gap between columns.
-  const BUS = 22;
+  // (10px) and inside the 36px gap between columns.
+  const BUS = 18;
   const MIN_Z = 0.2;
   const MAX_Z = 1.5;
   const clampZ = (z: number) => Math.min(MAX_Z, Math.max(MIN_Z, z));

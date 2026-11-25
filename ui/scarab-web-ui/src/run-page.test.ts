@@ -318,13 +318,13 @@ describe("nodeMeta", () => {
 describe("columnNodeWidth", () => {
   it("fits the column's longest label, between the minimum and the maximum", () => {
     const w = columnNodeWidth(["superhero-tools-common · aws-post-cluster", "git"]);
-    expect(w).toBe(Math.round(41 * 7.2 + 86));
-    expect(columnNodeWidth(["git"])).toBe(240);
+    expect(w).toBe(Math.round(41 * 7.2 + 68));
+    expect(columnNodeWidth(["git"])).toBe(196);
     expect(columnNodeWidth(["x".repeat(200)])).toBe(460);
   });
 
   it("keeps room for the meta line", () => {
-    expect(columnNodeWidth(["git"], { minChars: 26 })).toBe(Math.round(26 * 7.2 + 86));
+    expect(columnNodeWidth(["git"], { minChars: 26 })).toBe(Math.round(26 * 7.2 + 68));
   });
 });
 
@@ -342,13 +342,14 @@ describe("fitBand", () => {
     });
   });
 
-  it("shrinks a wider graph, but not below 90%, then pans", () => {
+  it("never shrinks a wider graph: it pans sideways", () => {
     const a = fitBand({ bandW: 948, contentW: 1000, contentH: 100, maxH: 480, pad: 24 });
-    expect(a.scale).toBeCloseTo(0.9);
-    expect(a.pannable).toBe(false);
-    const b = fitBand({ bandW: 448, contentW: 1000, contentH: 100, maxH: 480, pad: 24 });
-    expect(b.scale).toBe(0.9);
-    expect(b.pannable).toBe(true);
+    expect(a.scale).toBe(1);
+    expect(a.pannable).toBe(true);
+    // A caller can still allow a shrink.
+    const b = fitBand({ bandW: 948, contentW: 1000, contentH: 100, maxH: 480, pad: 24, minScale: 0.8 });
+    expect(b.scale).toBeCloseTo(0.9);
+    expect(b.pannable).toBe(false);
   });
 });
 

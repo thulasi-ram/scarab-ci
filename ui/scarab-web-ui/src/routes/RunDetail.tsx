@@ -1050,7 +1050,7 @@ export default function RunDetail() {
   };
 
   return (
-    <section class="page">
+    <section class="page page-run">
       <Doodle icon="container" size={230} rotate={14} opacity={0.16} top="52px" right="48px" />
 
       <Show when={run()} fallback={<p class="empty">loading…</p>}>
@@ -1523,7 +1523,7 @@ export default function RunDetail() {
                     }
                   >
                     <span class="dag-zoomctl">
-                      <button type="button" title="Back to the fitted view" aria-label="Fit the graph" onClick={() => dagControls()?.fit()}>
+                      <button type="button" title="Back to 100% and the start of the graph" aria-label="Reset the zoom" onClick={() => dagControls()?.fit()}>
                         <Icon icon="maximize" size={13} />
                       </button>
                       <button type="button" title="Zoom in" aria-label="Zoom in" onClick={() => dagControls()?.zoomIn()}>
