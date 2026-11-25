@@ -18,6 +18,27 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Features
+
+- **New run with these inputs** (#225). A Run page's ⋯ menu opens the run form filled in with
+  that Run's inputs, at the latest commit on the Run's branch; an input whose earlier value no
+  longer passes starts from its default. A new **Inputs** tab lists the inputs a Run was started
+  with. See [Runs](https://thulasi-ram.github.io/scarab-ci/usage/runs/#new-run-with-these-inputs).
+
+### Enhancement
+
+- **Run pipeline opens the run form in a dialog** (#225): required inputs, then optional ones, two
+  to a row, then the reason. A choice with a few short options is one row of buttons.
+- **The run graph opens at 100% and remembers your zoom** (#225). It no longer shrinks to fit; a
+  wider graph scrolls sideways. Nodes are more compact and the Run page uses the window's width,
+  so up to five columns fit at 100% on a 1440px window. The graph opens at the zoom you last chose
+  with ＋/－ (kept in this browser); the reset button goes back to 100%.
+
+### Bug Fixes
+
+- **A long step output no longer runs past its box** in the Outputs tab (#225); each expression
+  also lost a stray inner border.
+
 ## [0.8.0] - 2026-11-25
 
 ### Breaking changes

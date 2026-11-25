@@ -150,10 +150,31 @@ steps:
     command: [cargo, test]
 ```
 
+## Starting a Run by hand
+
+**Run pipeline** on a repository lists the pipelines at a branch, tag or commit that declare
+`on: manual`. Pick one and its run form opens in a dialog: the required inputs, then the optional
+ones with their defaults, then an optional reason, which becomes the Run's title. The form checks
+that required inputs are set and that values have the right type and are allowed options; the
+pipeline's `validate:` rules run on the server when you press **Run**.
+
+### New run with these inputs
+
+On a Run page, the **⋯** menu's **New run with these inputs** (and **New run** in the header of a
+finished Run) opens the same form, filled in with that Run's inputs, at the latest commit on the
+Run's branch. A Run with no branch uses its own commit. An input whose earlier value no longer
+passes the form's checks, such as an option the pipeline has since removed, starts from its
+default, and the form names it. Inputs the pipeline no longer declares are left out.
+
+## The Inputs tab
+
+The Inputs tab lists the inputs the Run was started with, as Scarab stored them, one per row. The
+header line under the Run's title says how many there are and opens the tab.
+
 ## The Manifest tab
 
-A Run page has four tabs: Pipeline, Artifacts, Activity and Manifest. The Manifest tab shows the
-pipeline file the Run was created from, with line numbers.
+A Run page has five tabs: Pipeline, Artifacts, Activity, Inputs and Manifest. The Manifest tab
+shows the pipeline file the Run was created from, with line numbers.
 
 Scarab saves the file when it creates the Run: its path, its text and the commit it was read at.
 The tab shows that saved copy, so it is the file the Run compiled, not the file on the branch
