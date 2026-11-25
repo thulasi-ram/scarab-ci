@@ -3336,6 +3336,10 @@ fn inline_invokes(steps: &[StepSpec], libs: LibsRef<'_>) -> Result<Vec<StepSpec>
         &mut budget,
         &mut diagnostics,
     );
+    // A level checks the budget before each Step; the last Step of a level
+    // (an invoke's `placement_profiles` check, say) can spend it with none
+    // left to check it, so the note that the compiler stopped is added here.
+    budget.spent(&mut diagnostics);
     if diagnostics.is_empty() {
         Ok(out)
     } else {
@@ -4863,7 +4867,8 @@ fn placement_map(
         return coordinate;
     }
     for (key, names) in map {
-        // The caller's budget reports that the compiler stopped.
+        // The budget reports that the compiler stopped (`inline_invokes`
+        // checks it once more after the last Step).
         if diagnostics.len() >= MAX_INLINE_DIAGNOSTICS {
             break;
         }
