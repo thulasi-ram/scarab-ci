@@ -373,6 +373,32 @@ export function declaredInputs(content: string): string[] {
   return names;
 }
 
+/** `content` with each line's YAML comment cut: from the first `#` at the
+ *  line start or after whitespace that is outside `'…'` and `"…"`. Quotes
+ *  are read per line, which is enough to keep a comment from reading as a
+ *  key. */
+export function withoutComments(content: string): string {
+  return content
+    .split("\n")
+    .map((line) => {
+      let quote: string | null = null;
+      for (let i = 0; i < line.length; i++) {
+        const c = line[i]!;
+        if (quote === '"' && c === "\\") {
+          i++;
+        } else if (quote !== null) {
+          if (c === quote) quote = null;
+        } else if (c === "'" || c === '"') {
+          quote = c;
+        } else if (c === "#" && (i === 0 || /\s/.test(line[i - 1]!))) {
+          return line.slice(0, i);
+        }
+      }
+      return line;
+    })
+    .join("\n");
+}
+
 /** One line of the review page's check list. */
 export type ReviewCheck = { tone: "ok" | "info" | "warn"; text: string };
 
@@ -386,7 +412,9 @@ export function reviewChecks(
   const out: ReviewCheck[] = [
     { tone: "ok", text: "Compiles as a library that invokes only installed lib: and plugin: targets" },
   ];
-  const invoked = [...new Set([...content.matchAll(/invoke:\s*["']?lib:([A-Za-z0-9._:/-]+)/g)].map((m) => m[1]!))];
+  // A comment that mentions `invoke:`, `image:` or `forge_token` is not one.
+  const text = withoutComments(content);
+  const invoked = [...new Set([...text.matchAll(/invoke:\s*["']?lib:([A-Za-z0-9._:/-]+)/g)].map((m) => m[1]!))];
   for (const id of invoked) {
     const i = installed.find((x) => x.name === id);
     out.push(
@@ -395,7 +423,7 @@ export function reviewChecks(
         : { tone: "warn", text: `Invokes lib:${id}, which is not installed here` },
     );
   }
-  const images = [...content.matchAll(/^\s*(?:-\s*)?image:\s*["']?([^\s"']+)/gm)].map((m) => m[1]!);
+  const images = [...text.matchAll(/^\s*(?:-\s*)?image:\s*["']?([^\s"']+)/gm)].map((m) => m[1]!);
   const unpinned = images.filter((i) => !i.includes("@sha256:"));
   if (images.length > 0) {
     out.push(
@@ -405,7 +433,7 @@ export function reviewChecks(
     );
   }
   out.push(
-    /\bforge_token\b/.test(content)
+    /\bforge_token\b/.test(text)
       ? { tone: "warn", text: "A Step asks for forge_token: it receives a forge credential only if this source is trusted" }
       : { tone: "info", text: "No Step asks for forge_token, so trust with forge credentials does not apply" },
   );
