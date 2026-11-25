@@ -18,6 +18,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-11-25
+
 ### Breaking changes
 
 - **Migration 0109 adds the table `org_leak_check_limits`** (each org's limits on leak checks).
@@ -2529,7 +2531,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.5...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.6...HEAD
+[0.7.6]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.2...v0.7.3
