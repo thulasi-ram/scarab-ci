@@ -13,10 +13,12 @@
 //! mid-run.
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cel::common::ast::{operators, EntryExpr, Expr, IdedExpr, LiteralValue};
-use cel::{Context, Program};
+use cel::common::types::{CelString, LIST_TYPE, STRING_TYPE};
+use cel::common::value::CowVal;
+use cel::{Context, Env, ExecutionError, Program};
 
 use crate::PipelineError;
 
@@ -191,6 +193,59 @@ fn with_program<T: Send>(
     })
 }
 
+/// The functions an expression may call: CEL's standard library, plus
+/// `<list>.join()` and `<list>.join(<separator>)`, which join a list of
+/// strings into one (as cel-go's strings extension does). A Step reads every
+/// instance of a matrix Step as a list, and an environment variable takes
+/// text, so a template joins it. Built once.
+fn env() -> Arc<Env> {
+    static ENV: OnceLock<Arc<Env>> = OnceLock::new();
+    ENV.get_or_init(|| {
+        let mut env = Env::stdlib();
+        // Neither overload is in the standard library, so neither fails.
+        let _ = env.add_member_overload("join", "list.join()", LIST_TYPE, vec![], join);
+        let _ = env.add_member_overload(
+            "join",
+            "list.join(string)",
+            LIST_TYPE,
+            vec![STRING_TYPE],
+            join,
+        );
+        Arc::new(env)
+    })
+    .clone()
+}
+
+/// `list.join()` and `list.join(separator)`: the list's strings, in order,
+/// with the separator between each. A list holding anything but strings is
+/// an error.
+fn join<'b, 'v>(args: Vec<CowVal<'b, 'v>>) -> Result<CowVal<'b, 'v>, ExecutionError> {
+    let not_text = |what: &str| ExecutionError::function_error("join", what);
+    let (list, sep) = match args.as_slice() {
+        [list] => (list, ""),
+        [list, sep] => (
+            list,
+            sep.downcast_ref::<CelString>()
+                .ok_or_else(|| not_text("the separator is not a string"))?
+                .inner(),
+        ),
+        _ => return Err(ExecutionError::invalid_argument_count(2, args.len())),
+    };
+    let items = list
+        .as_iterable()
+        .ok_or_else(|| not_text("join is called on a list"))?;
+    let mut items = items.iter();
+    let mut parts: Vec<&str> = Vec::new();
+    while let Some(item) = items.next() {
+        parts.push(
+            item.downcast_ref::<CelString>()
+                .ok_or_else(|| not_text("the list holds a value that is not a string"))?
+                .inner(),
+        );
+    }
+    Ok(CowVal::owned(CelString::from(parts.join(sep))))
+}
+
 /// Parse-check a CEL expression without evaluating it. Used at submit time so a
 /// malformed `when:` / interpolation is rejected before a Run ever starts.
 pub fn check(expr: &str) -> Result<(), PipelineError> {
@@ -210,7 +265,7 @@ pub fn check_interpolation(template: &str) -> Result<(), PipelineError> {
 /// variable), returning the result as JSON.
 pub fn eval(expr: &str, ctx: &serde_json::Value) -> Result<serde_json::Value, PipelineError> {
     with_program(expr, |program| {
-        let mut context = Context::default();
+        let mut context = Context::with_env(env());
         bind(&mut context, ctx, expr)?;
         let value = program
             .execute(&context)
@@ -231,6 +286,41 @@ pub fn eval_bool(expr: &str, ctx: &serde_json::Value) -> Result<bool, PipelineEr
             shown(expr)
         ))),
     }
+}
+
+/// Whether `expr` calls the function or method `name` anywhere, by the
+/// parser. An expression that does not parse calls nothing.
+pub(crate) fn calls(expr: &str, name: &str) -> bool {
+    fn walk(e: &IdedExpr, name: &str) -> bool {
+        match &e.expr {
+            Expr::Call(c) => {
+                c.func_name == name
+                    || c.target.as_deref().is_some_and(|t| walk(t, name))
+                    || c.args.iter().any(|a| walk(a, name))
+            }
+            Expr::Select(s) => walk(&s.operand, name),
+            Expr::Comprehension(c) => [
+                &c.iter_range,
+                &c.accu_init,
+                &c.loop_cond,
+                &c.loop_step,
+                &c.result,
+            ]
+            .into_iter()
+            .any(|part| walk(part, name)),
+            Expr::List(l) => l.elements.iter().any(|x| walk(x, name)),
+            Expr::Map(m) => m.entries.iter().any(|x| entry(&x.expr, name)),
+            Expr::Struct(s) => s.entries.iter().any(|x| entry(&x.expr, name)),
+            Expr::Ident(_) | Expr::Literal(_) | Expr::Unspecified => false,
+        }
+    }
+    fn entry(e: &EntryExpr, name: &str) -> bool {
+        match e {
+            EntryExpr::StructField(f) => walk(&f.value, name),
+            EntryExpr::MapEntry(m) => walk(&m.key, name) || walk(&m.value, name),
+        }
+    }
+    with_program(expr, |program| Ok(walk(program.expression(), name))).unwrap_or(false)
 }
 
 /// One dimension of a product of string values, for [`eval_bool_product`].

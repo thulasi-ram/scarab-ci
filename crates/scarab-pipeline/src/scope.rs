@@ -72,6 +72,23 @@ pub enum OutputSource {
     /// An invoke's exposed outputs (ADR-0041 §2): `outputs.<name>.<out>` is
     /// the result `<out>` of the Step mapped to `<out>`.
     Invoke(BTreeMap<String, String>),
+    /// Every instance of a matrix Step of the same library, in expansion
+    /// order: `outputs.<name>` is a list with one entry per instance,
+    /// `{"matrix": {<dim>: <value>, …}, "results": {<result>: …}}`. An
+    /// instance that published no results has `"results": {}`. Since
+    /// [`crate::IR_VERSION_INSTANCES`].
+    Instances(Vec<InstanceSource>),
+}
+
+/// One instance of a matrix Step, as [`OutputSource::Instances`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstanceSource {
+    /// The instance's Step id (`app/build[arch=linux/amd64]`).
+    pub step: String,
+    /// Its own coordinate: the matrix Step's dimensions and this
+    /// instance's values.
+    pub matrix: BTreeMap<String, String>,
 }
 
 /// One bound input of a library invocation.

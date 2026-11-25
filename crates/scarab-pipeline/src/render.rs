@@ -597,6 +597,22 @@ fn bind(
                         .collect();
                     outputs.insert(name.clone(), Value::Object(values));
                 }
+                OutputSource::Instances(instances) => {
+                    let list = instances
+                        .iter()
+                        .map(|i| {
+                            let results: Map<String, Value> = results
+                                .get(&i.step)
+                                .map(|r| r.clone().into_iter().collect())
+                                .unwrap_or_default();
+                            let mut entry = Map::new();
+                            entry.insert("matrix".into(), coordinate(&i.matrix));
+                            entry.insert("results".into(), Value::Object(results));
+                            Value::Object(entry)
+                        })
+                        .collect();
+                    outputs.insert(name.clone(), Value::Array(list));
+                }
             }
         }
         ctx.insert("outputs".into(), Value::Object(outputs));
