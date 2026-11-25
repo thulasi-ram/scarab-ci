@@ -18,6 +18,29 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **The build library's push step refuses when the server collects no step results** (#219).
+  After an org upgrades `lib:thulasi-ram::scarab-ci::build`, a build with `push: true` on a
+  server with no results token secret fails (exit 2) with `scarab: push refused: results are not
+  collected, …; set the server's results token secret (SCARAB_RESULTS_TOKEN_SECRET, the chart
+  value secrets.resultsTokenSecret)`. Earlier versions pushed without checking the layout
+  against the build step's digest, and logged a warning. Set `secrets.resultsTokenSecret` (or a
+  `SCARAB_RESULTS_TOKEN_SECRET` key in `secrets.existingSecret`) before you upgrade the library.
+  See the chart README, "Upgrading from 0.7.7", and
+  [Building an image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#building-an-image).
+- **`build-multiarch` refuses its old `amd64:` and `arm64:` placement keys.** Its two fixed build
+  steps are now one matrix step, `build`, with an instance per platform. After an org upgrades
+  the library, an invoke whose `placement_profiles` map names `amd64:` or `arm64:` fails to
+  compile, and the error names the key to write: `"build[arch=linux/amd64]"` and
+  `"build[arch=linux/arm64]"`. Step ids change from `app/amd64` to
+  `app/build[arch=linux/amd64]`. See
+  [Building a multi-architecture image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#building-a-multi-architecture-image).
+- **Pipelines that use the new matrix features, or call `join` in any expression, compile to IR
+  version 4**, which a 0.7.7 server refuses to launch. The chart's default `Recreate` strategy stops every old server first; with
+  a rolling update, rerun a step that failed with "this Run was compiled for IR version 4" once
+  every replica is upgraded. See the chart README, "Upgrading from 0.7.7".
+
 ### Security
 
 - **Upgrading the image index library lets it upload workspace content under its existing
@@ -67,6 +90,27 @@ release.yml uses that version's section as the GitHub Release text. See
   variant, `<tag>-arm-v7`. Two images that differ only by `arm64` and `arm64/v8` are one platform
   and are refused, `images` sources included. See
   [Joining images into one multi-architecture image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#joining-images-into-one-multi-architecture-image).
+
+- **`build-multiarch` builds the platforms you name.** A new `platforms` input, default
+  `linux/amd64,linux/arm64`, takes `linux/<architecture>[/<variant>]` values separated by commas
+  or spaces (386, amd64, arm, arm64, loong64, mips, mipsle, mips64, mips64le, ppc64, ppc64le,
+  riscv64, s390x). Each platform gets its own build step, `app/build[arch=linux/arm64]`, routed
+  with a coordinate key in `placement_profiles`, and the one push step joins them all. A build
+  step on a node of another architecture fails before BuildKit starts, with a message that names
+  the placement. See
+  [Building a multi-architecture image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#building-a-multi-architecture-image).
+- **An invoke places each instance of a library's matrix step.** The map form of
+  `placement_profiles` takes coordinate keys, `"build[arch=linux/arm64]": [arm64-builders]`,
+  checked when the invoke is inlined. A plain key for the step places the instances no
+  coordinate key names. Each compiled step still holds a plain list, so Policies and admission
+  see no change. See
+  [Reuse: `invoke`](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#reuse-invoke).
+- **A library's matrix can take its values from an input.** A library step's dimension may be
+  exactly `${{ inputs.<name> }}`, a `string` input whose comma- or space-separated value the
+  caller writes in `with:` (a template there is a compile error, since the matrix expands when
+  the Pipeline compiles). Another step of the library reads every instance as a list of
+  `{matrix, results}`, and the new CEL function `join` joins a list of strings. See
+  [Libraries: a matrix from an input](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#a-matrix-from-an-input).
 
 ### Enhancement
 

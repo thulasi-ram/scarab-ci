@@ -256,6 +256,12 @@ curl -X POST "$SCARAB/v1/orgs/acme/library-trust" \
 Without that trust, `ecr-push` is left out of the push step, and crane pushes with no login, which
 ECR refuses.
 
+The push step also needs the server to collect step results: it checks the layout against the
+build step's `image` result, and with no results it refuses (exit 2) with a message that names
+the results token secret. Set the chart value `secrets.resultsTokenSecret` (or a
+`SCARAB_RESULTS_TOKEN_SECRET` key in `secrets.existingSecret`); see
+[Building an image](/scarab-ci/usage/pipeline-syntax/#building-an-image).
+
 ## 4. The Pipeline
 
 Route `ecr-push` to the push step with the map form of `placement_profiles`. Profiles for the
@@ -293,19 +299,21 @@ it, and a retry gets a new one.
 
 Use Scarab's multi-architecture build library
 ([Building a multi-architecture image](/scarab-ci/usage/pipeline-syntax/#building-a-multi-architecture-image)).
-It builds on an amd64 node and an arm64 node with no credential, and one step, `push`, pushes
-both images, the index, their arch tags and the index's extra tags. Install it and trust its source for
+It builds once per platform in `platforms` (`linux/amd64` and `linux/arm64` by default), each on
+a node of that architecture with no credential, and one step, `push`, pushes every image, the
+index, their arch tags and the index's extra tags. Install it and trust its source for
 the build sandbox and with the registry credential, as
 [Libraries](/scarab-ci/usage/libraries/#install-scarabs-multi-architecture-build-library)
-describes; the build library's trust does not reach it. Route `ecr-push` to `push` only:
+describes; the build library's trust does not reach it. Route each build instance to its nodes
+by its coordinate, and `ecr-push` to `push` only:
 
 ```yaml
   - id: app
     invoke: lib:thulasi-ram::scarab-ci::build-multiarch
     needs: [checkout]
     placement_profiles:
-      amd64: [amd64-builders, build-cache]
-      arm64: [arm64-builders, build-cache]
+      "build[arch=linux/amd64]": [amd64-builders, build-cache]
+      "build[arch=linux/arm64]": [arm64-builders, build-cache]
       push: [ecr-push]
     with:
       image: "444455556666.dkr.ecr.eu-west-1.amazonaws.com/app:${{ event.sha }}"
@@ -315,8 +323,10 @@ describes; the build library's trust does not reach it. Route `ecr-push` to `pus
       cache_region: eu-west-1
 ```
 
-Never name `ecr-push` for `amd64` or `arm64`, or in a plain list: those are build steps, and
-their launch fails.
+Never name `ecr-push` for `build`, for a `build[…]` coordinate, or in a plain list: those reach
+build steps, and their launch fails. The keys `amd64:` and `arm64:` of the library's earlier
+version are refused when the Pipeline compiles, with an error that names the coordinate key to
+write instead.
 
 The role in part 1 already reads and writes the `app` repository, which is all the push needs:
 `crane tag` uses `ecr:PutImage` too. Deploy by `${{ outputs.app.push.digest }}`, in a step with
@@ -331,8 +341,11 @@ a `when:` that keeps it off a fork's Run.
   of your lifecycle rules.
 - **Tag immutability.** A repository with tag immutability on refuses a tag that moves, such as
   `latest` on the next Run. Leave `extra_tags` empty for such a repository.
-- **Retry and disk.** A retried push step pushes both architectures again. Its Pod receives both
-  builds' workspaces, so it needs disk for the checkout and both image layouts.
+- **Retry and disk.** A retried push step pushes every platform again. Its Pod receives every
+  build's workspace, so it needs disk for the checkout and every image layout.
+- **Step results.** The push step reads each build's layout from its result, so the server must
+  collect step results (the chart value `secrets.resultsTokenSecret`), as for the build library's
+  push step.
 - **Order of writes.** Every check the step makes itself runs before the first registry write. A
   failure crane or the registry reports after that can leave images pushed by digest with no tag,
   and a retry pushes them again.
