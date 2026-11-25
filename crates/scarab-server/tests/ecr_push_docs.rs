@@ -630,6 +630,11 @@ fn assert_index_step_renders(pipeline: &str) {
     assert_eq!(pushed, format!("{repo}@{amd64}\n{repo}@{arm64}\n"));
 }
 
+/// The page's build instances: `build-multiarch`'s build Step, once per
+/// platform of its `platforms` default.
+const AMD: &str = "app/build[arch=linux/amd64]";
+const ARM: &str = "app/build[arch=linux/arm64]";
+
 /// The page's multi-architecture step compiles to two builds and one push
 /// Step that receives only the builds' workspaces; at launch its
 /// `SCARAB_INDEX_LAYOUTS` is the two builds' layouts and digests, one per
@@ -641,10 +646,9 @@ fn the_page_multiarch_push_step_renders_the_two_layouts() {
     let ir = scarab_pipeline::compile_with_libraries(&pipeline, &the_libraries())
         .unwrap_or_else(|e| panic!("the Pipeline compiles: {e:?}\n{pipeline}"));
     let push = ir.steps.iter().find(|s| s.id == "app/push").unwrap();
-    assert_eq!(
-        push.inputs.as_deref(),
-        Some(&["app/amd64".to_string(), "app/arm64".to_string()][..])
-    );
+    let mut inputs = push.inputs.clone().expect("the push Step names its inputs");
+    inputs.sort();
+    assert_eq!(inputs, [AMD, ARM]);
     let amd64 = format!("sha256:{}", "1".repeat(64));
     let arm64 = format!("sha256:{}", "2".repeat(64));
     let built = |l: String, d: &str| serde_json::json!({ "image": { "containerimage.digest": d, "digest": d, "layout": l } });
@@ -652,8 +656,8 @@ fn the_page_multiarch_push_step_renders_the_two_layouts() {
         &ir,
         "app/push",
         serde_json::json!({
-            "app/amd64": built(layout_path('a'), &amd64),
-            "app/arm64": built(layout_path('b'), &arm64),
+            AMD: built(layout_path('a'), &amd64),
+            ARM: built(layout_path('b'), &arm64),
         }),
     )
     .unwrap();
@@ -669,7 +673,7 @@ fn the_page_multiarch_push_step_renders_the_two_layouts() {
     let fork = launch_env(&ir, "app/push", serde_json::json!({})).unwrap();
     assert_eq!(
         env_value(&fork, "SCARAB_INDEX_LAYOUTS"),
-        "(amd64 wrote no layout)\n(arm64 wrote no layout)"
+        "(linux/amd64 wrote no layout)\n(linux/arm64 wrote no layout)"
     );
 }
 
@@ -719,6 +723,14 @@ fn the_pipeline_syntax_multiarch_examples_compile_and_render() {
         .unwrap_or_else(|e| panic!("the Pipeline compiles: {e:?}\n{pipeline}"));
     let deploy = ir.steps.iter().find(|s| s.id == "deploy").unwrap();
     assert_eq!(deploy.needs.0, ["app/push"]);
+    for (id, builders) in [(AMD, "amd64-builders"), (ARM, "arm64-builders")] {
+        let build = ir.steps.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(
+            build.placement_profiles.compiled().unwrap(),
+            [builders.to_string()],
+            "{id}"
+        );
+    }
 }
 
 /// The page's multi-architecture step: a push to main is admitted under
@@ -737,12 +749,11 @@ async fn the_page_multiarch_step_runs_with_ecr_push_on_the_push_step_only() {
         stored_profiles(&db, run, "app/push").await,
         vec!["ecr-push".to_string()]
     );
-    for id in ["app/amd64", "app/arm64"] {
-        assert!(
-            !stored_profiles(&db, run, id)
-                .await
-                .contains(&"ecr-push".to_string()),
-            "{id}"
+    for (id, builders) in [(AMD, "amd64-builders"), (ARM, "arm64-builders")] {
+        assert_eq!(
+            stored_profiles(&db, run, id).await,
+            vec![builders.to_string(), "build-cache".to_string()],
+            "{id}: the page's coordinate key places it"
         );
         let build = db
             .step_spec(run, &StepId(id.into()))

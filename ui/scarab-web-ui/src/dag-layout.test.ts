@@ -63,6 +63,16 @@ describe("invocation groups", () => {
     expect(idSegments("build[os=linux/amd64]/push")).toEqual(["build[os=linux/amd64]", "push"]);
   });
 
+  it("keeps a / inside an inlined Step's own matrix leg, so its invoke is the prefix", () => {
+    const app = idSegments("app/build[arch=linux/amd64]");
+    expect(app).toEqual(["app", "build[arch=linux/amd64]"]);
+    expect(app.slice(0, -1).join("/")).toBe("app");
+    expect(app[app.length - 1]).toBe("build[arch=linux/amd64]");
+    expect(idSegments("a/b/c[x=y/z]")).toEqual(["a", "b", "c[x=y/z]"]);
+    expect(idSegments("a/b/c[x=y/z]").slice(0, 2).join("/")).toBe("a/b");
+    expect(idSegments("app/build[arch=linux/arm/v7]/push")).toEqual(["app", "build[arch=linux/arm/v7]", "push"]);
+  });
+
   it("names each box a Step sits in, outermost first, and draws none for a plugin gate", () => {
     const g = stepGroups({
       id: "ship/smoke/probe",

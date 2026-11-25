@@ -975,7 +975,7 @@ async fn the_multiarch_library_needs_both_trust_grants() {
     let out = trigger_on(&db, &libs, MULTIARCH_YAML, &push()).await;
     assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
     let run = out.runs[0].clone();
-    for arch in ["amd64", "arm64"] {
+    for arch in ["build[arch=linux/amd64]", "build[arch=linux/arm64]"] {
         let build = spec(&db, run.clone(), arch).await;
         assert_eq!(build.sandbox, sandboxed, "{arch}");
         assert_eq!(build.registry_auth, None, "{arch} holds no credential");
@@ -993,7 +993,7 @@ async fn the_multiarch_library_needs_both_trust_grants() {
     let out = trigger_on(&db, &libs, MULTIARCH_YAML, &fork_pr()).await;
     assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
     let run = out.runs[0].clone();
-    for arch in ["amd64", "arm64"] {
+    for arch in ["build[arch=linux/amd64]", "build[arch=linux/arm64]"] {
         assert_eq!(spec(&db, run.clone(), arch).await.registry_auth, None);
     }
     let auth = spec(&db, run, "push")
@@ -1048,4 +1048,92 @@ async fn build_layout_needs_no_registry_trust() {
         })
     );
     assert_eq!(spec.registry_auth, None);
+}
+
+/// A run.create Policy reads each build instance as a Step of its own,
+/// with the plain list of profiles its coordinate key named: the compiled
+/// coordinate placement reaches admission as any Step's list does, and no
+/// coordinate key text reaches it.
+#[tokio::test]
+async fn policy_input_for_an_instance_is_a_plain_list() {
+    use scarab_policy::store::{NewPolicy, PolicyScope, PolicyStore};
+    let libs = library_trusted(
+        "build-multiarch",
+        MULTIARCH_SOURCE,
+        MULTIARCH,
+        &[TrustGrant::BuildSandbox, TrustGrant::RegistryCredential],
+    )
+    .await;
+    let yaml = r#"
+on: { push: {} }
+steps:
+  - id: app
+    invoke: lib:thulasi-ram::scarab-ci::build-multiarch
+    placement_profiles:
+      "build[arch=linux/amd64]": [amd64]
+      "build[arch=linux/arm64]": [arm64]
+      push: [ecr-push]
+    with: { image: "ghcr.io/acme/web:1" }
+"#;
+    for (when, matches) in [
+        (
+            "steps.exists(s, s.id == 'app/build[arch=linux/arm64]' && s.placement_profiles == ['arm64'])",
+            true,
+        ),
+        (
+            "steps.exists(s, s.id == 'app/build[arch=linux/amd64]' && s.placement_profiles == ['amd64'])",
+            true,
+        ),
+        (
+            "steps.exists(s, s.id == 'app/push' && s.placement_profiles == ['ecr-push'])",
+            true,
+        ),
+        (
+            "steps.exists(s, s.placement_profiles.exists(p, p.contains('[') || p.contains('=')))",
+            false,
+        ),
+        ("size(steps) == 3", true),
+    ] {
+        let policies = scarab_testkit::InMemoryPolicies::new();
+        let body: scarab_policy::policy::Policy = serde_yaml::from_str(&format!(
+            "kind: policy\nname: shape\ncheckpoint: run.create\nmode: enforce\nrules:\n  - when: \"{when}\"\n    effect: deny\n    message: \"matched\"\n"
+        ))
+        .unwrap();
+        policies
+            .create(&NewPolicy {
+                id: "pol-shape".into(),
+                scope: PolicyScope::Org { org: "acme".into() },
+                body,
+                author: "admin".into(),
+                reason: "test".into(),
+                at: 1,
+            })
+            .await
+            .expect("saved");
+        let forge = FakeForge::new()
+            .with_file(".scarab/ci.yaml", yaml)
+            .with_commit("refs/heads/main", SHA);
+        let db = InMemoryDb::new();
+        let out = trigger_runs_from_event(
+            &forge,
+            &db,
+            &FakeClock::new(1_000),
+            AdmissionPorts::default()
+                .with_libraries(&libs)
+                .with_policies(&policies),
+            &push(),
+        )
+        .await
+        .unwrap();
+        if matches {
+            assert!(out.runs.is_empty(), "{when}: {:?}", out.runs);
+            assert_eq!(
+                out.refused[0].messages,
+                vec!["policy `shape`: matched".to_string()],
+                "{when}"
+            );
+        } else {
+            assert_eq!(out.runs.len(), 1, "{when}: {:?}", out.refused);
+        }
+    }
 }
