@@ -254,6 +254,12 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("GET", "/v1/orgs/{org}/secrets/orphaned", "read", "READ"),
     ("GET", "/v1/orgs/{org}/secrets/matrix", "read", "READ"),
     (
+        "POST",
+        "/v1/orgs/{org}/secrets/match",
+        "secret.match",
+        "COND-W",
+    ),
+    (
         "PUT",
         "/v1/orgs/{org}/environments/{env}",
         "environment.put",

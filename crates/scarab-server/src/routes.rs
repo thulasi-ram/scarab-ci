@@ -356,6 +356,11 @@ pub(crate) fn governed_routes() -> Routes {
         .get("/v1/orgs/{org}/environments", oe::list_org_environments)
         .get("/v1/orgs/{org}/secrets/orphaned", oe::list_orphaned_secrets)
         .get("/v1/orgs/{org}/secrets/matrix", org_secret_matrix)
+        .post(
+            "/v1/orgs/{org}/secrets/match",
+            &ops::SECRET_MATCH,
+            crate::secret_match::org_secret_match,
+        )
         .put(
             "/v1/orgs/{org}/environments/{env}",
             &ops::ENVIRONMENT_PUT,

@@ -1201,7 +1201,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // can hold. Gated on the SAME OAuth config as sessions, because a
             // token is a narrowing of a human's authority — with no login there
             // is no minter for it to be bounded by.
-            .with_api_tokens(pg.clone());
+            .with_api_tokens(pg.clone())
+            // Operations record to the security event log even when
+            // step-up is not enforced (the leaked-value check's record and
+            // its hourly limit).
+            .with_security_events(pg.clone());
         tracing::info!(
             "authn: OAuth/OIDC login + PG sessions + scoped RBAC + issued API tokens wired (ADR-0049)"
         );

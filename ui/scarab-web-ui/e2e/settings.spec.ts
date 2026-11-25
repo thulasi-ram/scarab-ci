@@ -1407,6 +1407,73 @@ test("org secrets: the key list with the Org default and a line per Environment,
   expect(errors).toEqual([]);
 });
 
+test("Check a leaked value: on the org list only, matches with who gets them, no match, and an empty box on reopen", async ({
+  page,
+}) => {
+  const errors = collectErrors(page);
+  // Not on a repository's Secrets tab.
+  await page.goto("/acme/scarab?tab=secrets");
+  await expect(page.getByRole("button", { name: "New secret" }).first()).toBeVisible();
+  await expect(page.getByRole("button", { name: "Check a leaked value" })).toHaveCount(0);
+
+  await page.goto("/orgs/acme/settings/secrets");
+  const panel = page.locator(".panel", { hasText: "Org secrets · acme" });
+  await panel.getByRole("button", { name: "Check a leaked value" }).click();
+  let dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("heading", { name: "Check a leaked value" })).toBeVisible();
+  const box = dialog.getByLabel("Text to check");
+  await expect(dialog.getByRole("button", { name: "Check", exact: true })).toBeDisabled();
+  const env = [
+    "GHCR=ghcr_mock_7Hq2Lw9xPzR4tYv8NbK3",
+    "ROLE=arn:aws:iam::123456789012:role/mock-deploy",
+    "FORGE=forgejo_mock_token_4c1d9e3f0b4a2d6c",
+  ].join("\n");
+  await box.fill(env);
+  await expect(dialog.getByText(`${env.length} / 4096 B`)).toBeVisible();
+  await dialog.getByRole("button", { name: "Check", exact: true }).click();
+
+  await expect(dialog.getByText("3 current values match")).toBeVisible();
+  const rows = dialog.locator("li.smatch");
+  await expect(rows).toHaveCount(3);
+  await expect(rows.filter({ hasText: "GHCR_TOKEN" })).toContainText("org default");
+  const role = rows.filter({ hasText: "AWS_DEPLOY_ROLE" });
+  await expect(role).toContainText("production (org)");
+  await expect(role.locator(".smatch-use.warn")).toContainText("No Run gets this value today");
+  await expect(role).toContainText("It still works where it was issued.");
+  await expect(rows.filter({ hasText: "forge connection" })).toContainText("https://git.acme.dev");
+
+  // Check another: an empty box, and a paste that holds no stored value.
+  await dialog.getByRole("button", { name: "Check another" }).click();
+  await expect(box).toHaveValue("");
+  await box.fill("nothing we store");
+  await dialog.getByRole("button", { name: "Check", exact: true }).click();
+  await expect(dialog.getByText("No current value matches")).toBeVisible();
+  await expect(dialog).toContainText("does not keep old values");
+  await dialog.getByRole("button", { name: "Check another" }).click();
+
+  // The limit: 20 checks an hour, with the time of the next.
+  await box.fill("MOCK_RATE_LIMIT");
+  await dialog.getByRole("button", { name: "Check", exact: true }).click();
+  await expect(dialog.getByRole("alert")).toContainText("The next check is allowed at");
+
+  // A match's "open" closes the dialog and opens its key in the list.
+  await box.fill(env);
+  await dialog.getByRole("button", { name: "Check", exact: true }).click();
+  await dialog.getByRole("button", { name: "Open AWS_DEPLOY_ROLE in the list" }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(panel.locator('li.skey[data-key="AWS_DEPLOY_ROLE"] > .skey-h')).toHaveAttribute(
+    "aria-expanded",
+    "true",
+  );
+
+  // Reopened, the box is empty: the paste went with the dialog.
+  await panel.getByRole("button", { name: "Check a leaked value" }).click();
+  dialog = page.getByRole("dialog");
+  await expect(dialog.getByLabel("Text to check")).toHaveValue("");
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  expect(errors).toEqual([]);
+});
+
 test("a token minted under Account settings shows in the org's list", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/settings/tokens");

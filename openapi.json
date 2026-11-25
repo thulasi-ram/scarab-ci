@@ -6023,6 +6023,105 @@
         ]
       }
     },
+    "/v1/orgs/{org}/secrets/match": {
+      "post": {
+        "tags": [
+          "Secrets"
+        ],
+        "summary": "Check pasted text against the org's current secret values - names only, never values",
+        "operationId": "org_secret_match",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecretMatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretMatchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "blank text, or a body that is not `{\"text\": ...}`; a reserved org (plain text)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretMatchRefusal"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin, or `step_up_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "secrets not configured"
+          },
+          "409": {
+            "description": "the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state"
+          },
+          "413": {
+            "description": "text over 4096 bytes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretMatchRefusal"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "20 checks in the last hour; `retry_at` (and `Retry-After`) say when the next is allowed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretMatchRefusal"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the check could not be recorded, so it was not answered"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/secrets/matrix": {
       "get": {
         "tags": [
@@ -15516,6 +15615,218 @@
           }
         }
       },
+      "SecretMatch": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "A secret value.",
+            "required": [
+              "key",
+              "scope",
+              "overridden_in",
+              "in_use",
+              "kind"
+            ],
+            "properties": {
+              "environment": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The Environment, for `org_environment` and `repo_environment`."
+              },
+              "in_use": {
+                "type": "boolean",
+                "description": "Whether a Run gets this value today: some (known repository,\norg Environment) pair resolves the key to it. False with no\nrepositories or no Environments. A Run with no Environment gets\nno secrets."
+              },
+              "key": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "secret"
+                ]
+              },
+              "overridden_in": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "The values a Run gets instead of this one where it would\notherwise get it, sorted: `web` (a repository default),\n`web · staging` (a repository's value for an Environment),\n`production (org)` (the org's value for an Environment)."
+              },
+              "repo": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The repository, for `repo` and `repo_environment`."
+              },
+              "scope": {
+                "$ref": "#/components/schemas/SecretMatchScope"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A connection's credential.",
+            "required": [
+              "connection",
+              "id",
+              "name",
+              "kind"
+            ],
+            "properties": {
+              "base_url": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Where the credential is sent."
+              },
+              "connection": {
+                "$ref": "#/components/schemas/SecretMatchConnectionKind"
+              },
+              "id": {
+                "type": "string",
+                "description": "The forge connection's id, or the plugin installation's id."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "connection"
+                ]
+              },
+              "name": {
+                "type": "string",
+                "description": "The forge account (or the forge's host), or the plugin\ninstallation's name."
+              },
+              "slot": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The plugin connection slot; absent for a forge connection."
+              }
+            }
+          }
+        ],
+        "description": "One stored value that matched. Names and scopes only, never the value."
+      },
+      "SecretMatchConnectionKind": {
+        "type": "string",
+        "description": "Which kind of connection a matching credential belongs to.",
+        "enum": [
+          "forge",
+          "plugin"
+        ]
+      },
+      "SecretMatchRefusal": {
+        "type": "object",
+        "description": "The JSON body of a refused check (400, 413, 429).",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "`bad_body`, `empty`, `too_long` or `rate_limited`."
+          },
+          "max_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "`too_long`: the largest text accepted, in bytes.",
+            "minimum": 0
+          },
+          "message": {
+            "type": "string"
+          },
+          "retry_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "`rate_limited`: when the next check is allowed (unix ms)."
+          }
+        }
+      },
+      "SecretMatchRequest": {
+        "type": "object",
+        "description": "`POST /v1/orgs/{org}/secrets/match` body.",
+        "required": [
+          "text"
+        ],
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "The text to compare: at most 4096 bytes. Not stored or logged."
+          }
+        },
+        "additionalProperties": false
+      },
+      "SecretMatchResponse": {
+        "type": "object",
+        "description": "`200` answer of a check.",
+        "required": [
+          "matches",
+          "searched"
+        ],
+        "properties": {
+          "matches": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SecretMatch"
+            },
+            "description": "Every current value that matched; empty when none did."
+          },
+          "searched": {
+            "$ref": "#/components/schemas/SecretMatchSearched"
+          }
+        }
+      },
+      "SecretMatchScope": {
+        "type": "string",
+        "description": "Which scope a matching secret value is stored at.",
+        "enum": [
+          "org",
+          "org_environment",
+          "repo",
+          "repo_environment"
+        ]
+      },
+      "SecretMatchSearched": {
+        "type": "object",
+        "description": "What a check compared.",
+        "required": [
+          "secrets",
+          "repositories",
+          "connections"
+        ],
+        "properties": {
+          "connections": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Forge and plugin connection credentials compared.",
+            "minimum": 0
+          },
+          "repositories": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The org's repositories: those enabled in Scarab and those holding a\nsecret.",
+            "minimum": 0
+          },
+          "secrets": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Secret values compared, over every scope of the org.",
+            "minimum": 0
+          }
+        }
+      },
       "SecretMatrix": {
         "type": "object",
         "description": "`GET /v1/repos/{org}/{repo}/secrets/matrix` body: the advisory coverage view\nand the model behind the *editor* for repo-\nand environment-scoped values. For each key, its **effective** status per\ncolumn after inheritance; never a value.",
@@ -15628,7 +15939,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`step_up.confirmed`, `step_up.refused`, `op.authorised`,\n`op.completed`, `request.raised|confirmed|executed|failed`,\n`passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,\n`guard.not_consulted`, `binding.operator_grant`."
+            "description": "`step_up.confirmed`, `step_up.refused`, `op.authorised`,\n`op.completed`, `request.raised|confirmed|executed|failed`,\n`passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,\n`guard.not_consulted`, `binding.operator_grant`,\n`secret.match_checked`."
           },
           "op": {
             "type": [

@@ -2240,6 +2240,58 @@ function orgSecretMatrix() {
   return { columns: ["", ...environments], environments, keys };
 }
 
+// "Check a leaked value" (`POST /v1/orgs/{org}/secrets/match`). Three stored
+// values the mock knows, matched by the server's rules: a value of 20 bytes or
+// more anywhere in the paste, a shorter one only as the whole paste. A paste
+// holding `MOCK_RATE_LIMIT` is refused as the 21st check in an hour.
+const mockMatchValues: { value: string; match: Record<string, unknown> }[] = [
+  {
+    value: "ghcr_mock_7Hq2Lw9xPzR4tYv8NbK3",
+    match: { kind: "secret", key: "GHCR_TOKEN", scope: "org", overridden_in: [], in_use: true },
+  },
+  {
+    // scarab sets its own AWS_DEPLOY_ROLE for production, so no Run gets this one.
+    value: "arn:aws:iam::123456789012:role/mock-deploy",
+    match: {
+      kind: "secret",
+      key: "AWS_DEPLOY_ROLE",
+      scope: "org_environment",
+      environment: "production",
+      overridden_in: ["scarab · production"],
+      in_use: false,
+    },
+  },
+  {
+    value: "forgejo_mock_token_4c1d9e3f0b4a2d6c",
+    match: {
+      kind: "connection",
+      connection: "forge",
+      id: "forgejo-7f3a91c2",
+      name: "forgejo-7f3a91c2",
+      base_url: "https://git.acme.dev",
+    },
+  },
+];
+function mockSecretMatch(body: string): Response {
+  const text = (JSON.parse(body || "{}") as { text?: string }).text ?? "";
+  if (new TextEncoder().encode(text).length > 4096) {
+    return json({ message: "the text is longer than 4096 bytes" }, { status: 413 });
+  }
+  const paste = text.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, "");
+  if (!paste) return json({ message: "paste the text to check" }, { status: 400 });
+  if (paste.includes("MOCK_RATE_LIMIT")) {
+    const retry_at = Date.now() + 23 * min;
+    return json(
+      { code: "rate_limited", message: "20 checks in the last hour", retry_at },
+      { status: 429, headers: { "content-type": "application/json", "retry-after": String(23 * 60) } },
+    );
+  }
+  const matches = mockMatchValues
+    .filter(({ value }) => (value.length >= 20 ? paste.includes(value) : paste === value))
+    .map(({ match }) => match);
+  return json({ matches, searched: { secrets: 9, repositories: 2, connections: 3 } });
+}
+
 // ── API tokens (git-bug a4cb94f) ────────────────────────────────
 // Four records covering every state the panels render differently: a live token
 // in daily use, one narrowed to a single project and held by someone else, one
@@ -3099,6 +3151,7 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   // The org scope's names change with a save or a delete, for the life of
   // the page.
   // The org's list: its own values by scope.
+  if (/^\/v1\/orgs\/[^/]+\/secrets\/match$/.test(p) && method === "POST") return mockSecretMatch(body);
   if (/^\/v1\/orgs\/[^/]+\/secrets\/matrix$/.test(p)) return json(orgSecretMatrix());
   if (p === "/v1/secrets") {
     const q = new URLSearchParams(search);

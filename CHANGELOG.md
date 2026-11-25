@@ -32,6 +32,16 @@ release.yml uses that version's section as the GitHub Release text. See
   give Runs the repository default instead of the org's value for the Environment, so set org
   Environment values once every replica runs this version. See
   [Secrets](https://thulasi-ram.github.io/scarab-ci/usage/secrets/).
+- **An org Admin can check whether text found outside Scarab holds one of the org's secrets.**
+  In Org settings › Secrets, **Check a leaked value** takes pasted text (a token, an `.env` file,
+  a log excerpt) and compares it with every current value in the org, its repositories and its
+  forge and plugin connections. The answer names each match and its scope, never a value, and
+  says when no Run gets a matching value today. A stored value of 20 bytes or more matches
+  anywhere in the text; a shorter one only when it is the whole text. The check needs a passkey
+  confirmation, takes up to 4096 bytes, allows 20 checks per person per org in an hour, and
+  stores and logs nothing of the text; each check writes one event with the names that matched.
+  A value replaced earlier is not kept, so it cannot match. `POST /v1/orgs/{org}/secrets/match`
+  is the API. See [Secrets](https://thulasi-ram.github.io/scarab-ci/usage/secrets/).
 
 ## [0.7.5] - 2026-11-25
 

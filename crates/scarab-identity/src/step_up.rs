@@ -685,6 +685,11 @@ pub mod security_event_kind {
     /// `scarab-server admin grant`: an operator seeded a role binding
     /// straight in the database.
     pub const BINDING_OPERATOR_GRANT: &str = "binding.operator_grant";
+    /// An org Admin compared pasted text with the org's stored secret
+    /// values and connection credentials. The detail names what matched
+    /// (key and scope, or connection), never the text or a value. Also what
+    /// the check's hourly limit counts.
+    pub const SECRET_MATCH_CHECKED: &str = "secret.match_checked";
 
     /// The Org-less kinds an Org's log shows about its members: the human's
     /// own confirmations and passkey lifecycle. Org-less operations,

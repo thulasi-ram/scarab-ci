@@ -49,6 +49,7 @@ import Modal, { ModalMessage } from "./Modal";
 import { Checkbox, Field, Input } from "./Field";
 import SearchSelect from "./SearchSelect";
 import { NewSecretDialog } from "./ScopedSecrets";
+import SecretMatchDialog from "./SecretMatchDialog";
 
 type Cell = { key: string; column: string };
 
@@ -114,6 +115,7 @@ export default function SecretKeyList(props: {
   const [editing, setEditing] = createSignal<Cell | null>(null);
   const [clearing, setClearing] = createSignal<Cell | null>(null);
   const [creating, setCreating] = createSignal(false);
+  const [checking, setChecking] = createSignal(false);
   const [silenceFor, setSilenceFor] = createSignal<string | null>(null);
   const silence = useWrite(() => refetch());
 
@@ -122,6 +124,18 @@ export default function SecretKeyList(props: {
     const repo = props.repo;
     if (!repo) return;
     void silence.run(() => setSecretCellSilenced(props.org, repo, cell.column, cell.key, on));
+  };
+
+  // A match from "Check a leaked value": open its key, unfold its Environment
+  // line, and bring the row into view.
+  const openKey = (key: string, environment?: string) => {
+    setOpen((s) => new Set(s).add(key));
+    if (environment) setUnfolded((s) => new Set(s).add(key));
+    queueMicrotask(() =>
+      document
+        .querySelector<HTMLElement>(`li.skey[data-key="${CSS.escape(key)}"] .skey-h`)
+        ?.scrollIntoView({ block: "nearest" }),
+    );
   };
 
   const where = (column: string) =>
@@ -196,7 +210,7 @@ export default function SecretKeyList(props: {
     return (
       <Show when={row()}>
         {(r) => (
-          <li class="skey">
+          <li class="skey" data-key={p.name}>
             <button
               class="skey-h"
               type="button"
@@ -271,6 +285,11 @@ export default function SecretKeyList(props: {
               options={envs().map((e) => ({ value: e, label: e }))}
             />
           </Show>
+          <Show when={isOrg()}>
+            <button class="btn btn-ghost btn-sm skey-check" type="button" onClick={() => setChecking(true)}>
+              <Icon icon="search" size={14} /> Check a leaked value
+            </button>
+          </Show>
           <button class="btn btn-primary btn-sm" type="button" onClick={() => setCreating(true)}>
             <Icon icon="plus" size={14} /> New secret
           </button>
@@ -342,6 +361,9 @@ export default function SecretKeyList(props: {
           onClose={() => setCreating(false)}
           onSaved={() => refetch()}
         />
+      </Show>
+      <Show when={checking() && isOrg()}>
+        <SecretMatchDialog org={props.org} onClose={() => setChecking(false)} onOpenKey={openKey} />
       </Show>
       <Show when={editing()}>
         {(cell) => (

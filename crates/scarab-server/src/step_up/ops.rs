@@ -441,6 +441,17 @@ pub fn describe_library_unyank(op: &Op, input: &OpInput) -> OpSummary {
     }
 }
 
+/// `secret.match`: the org only. The pasted text is never part of a
+/// summary, not even redacted: nothing about it is shown, stored with the
+/// request or written to an event.
+pub fn describe_secret_match(op: &Op, input: &OpInput) -> OpSummary {
+    OpSummary {
+        operation: op.label.to_string(),
+        target: escape_invisible(input.param("org").unwrap_or_default()),
+        changes: Vec::new(),
+    }
+}
+
 /// One line per leaf of `map`, keys sorted, under `prefix`.
 fn flatten(map: &serde_json::Map<String, Value>, prefix: &str, out: &mut Vec<String>) {
     let mut keys: Vec<&String> = map.keys().collect();
@@ -1022,6 +1033,23 @@ pub static SECRET_DELETE: Op = op(
     &["query:org", "query:repo", "query:environment", "query:name"],
 )
 .in_project(ProjectOf::Query("repo"));
+pub static SECRET_MATCH: Op = op(
+    "secret.match",
+    "Check a value against secrets",
+    // Every check asks; conditional only so the handler asks after it has
+    // checked the request (role, size, the hourly limit), so a refused
+    // check costs no confirmation.
+    Class::Conditional {
+        mode: W,
+        rule: "always, once the request is checked",
+    },
+    "§3 secret reads: compares pasted text with every stored value of the org",
+    ADMIN,
+    OrgOf::Path("org"),
+    &["/text"],
+    &["path:org"],
+)
+.describe_with(describe_secret_match);
 pub static ENVIRONMENT_DELETE: Op = op(
     "environment.delete",
     "Delete an Environment",
@@ -1691,6 +1719,25 @@ mod tests {
         let all = format!("{s:?}");
         assert!(!all.contains("hunter2"), "{all}");
         assert!(s.changes.contains(&"value = (hidden)".to_string()));
+    }
+
+    #[test]
+    fn a_match_check_summary_names_the_org_and_nothing_of_the_text() {
+        let i = OpInput {
+            method: "POST".into(),
+            path: "/v1/orgs/acme/secrets/match".into(),
+            params: vec![("org".into(), "acme".into())],
+            query: vec![],
+            body: redact(
+                &json!({"text": "PASTE-CANARY-1", "extra": "PASTE-CANARY-2"}),
+                SECRET_MATCH.redact,
+            ),
+        };
+        let s = SECRET_MATCH.summary(&i);
+        assert_eq!(s.operation, "Check a value against secrets");
+        assert_eq!(s.target, "acme");
+        assert!(s.changes.is_empty());
+        assert!(!format!("{s:?}").contains("PASTE-CANARY"));
     }
 
     #[test]

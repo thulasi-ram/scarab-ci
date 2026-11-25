@@ -7,6 +7,7 @@ import type { ParamSpec } from "../params";
 import { parseLogMarker, type LogStreamHandlers, type LogStreamQuery } from "../log-stream";
 import { isDeleteBlockers } from "../org-environments";
 import { askStepUp, errorMessage, shareCeremony, withStepUp } from "../step-up";
+import { refusalText, type MatchRefusal, type SecretMatchAnswer } from "../secret-match";
 
 export type RunStatus = components["schemas"]["RunStatusResponse"];
 export type CreateRunRequest = components["schemas"]["CreateRunRequest"];
@@ -1857,6 +1858,53 @@ export async function deleteSecret(scope: SecretScope, name: string): Promise<vo
   if (error) {
     throw new Error("failed to delete secret");
   }
+}
+
+/** A refused match check, with what the dialog needs to word it. */
+export class SecretMatchRefusedError extends Error {
+  constructor(readonly refusal: MatchRefusal) {
+    super(refusalText(refusal));
+    this.name = "SecretMatchRefusedError";
+  }
+}
+
+/**
+ * Check pasted text against every current secret value of the org and its
+ * connections (`POST /v1/orgs/{org}/secrets/match`). Answers with names and
+ * scopes only. Step-up gated: the same retry `send` does, so a refusal opens
+ * the StepUpDialog and the same request goes again once confirmed. The text
+ * rides in the body only, never in the URL.
+ */
+export async function checkSecretMatch(org: string, text: string): Promise<SecretMatchAnswer> {
+  const path = `/v1/orgs/${encodeURIComponent(org)}/secrets/match`;
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  const csrf = csrfToken();
+  if (csrf) headers["x-csrf-token"] = csrf;
+  const init: RequestInit = { method: "POST", headers, body: JSON.stringify({ text }) };
+  const res = await withStepUp(await fetch(path, init), () => fetch(path, init), stepUpCeremony);
+  if (res.status === 401) setUnauthenticated(true);
+  if (res.ok) return (await res.json()) as SecretMatchAnswer;
+  const raw = await res.text().catch(() => "");
+  let body: { code?: unknown; message?: unknown; retry_at?: unknown } = {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === "object") body = parsed as typeof body;
+  } catch {
+    /* plain text */
+  }
+  const retryAfter = Number(res.headers.get("retry-after"));
+  const retryAt =
+    typeof body.retry_at === "number"
+      ? body.retry_at
+      : Number.isFinite(retryAfter) && retryAfter > 0
+        ? Date.now() + retryAfter * 1000
+        : undefined;
+  throw new SecretMatchRefusedError({
+    status: res.status,
+    code: typeof body.code === "string" ? body.code : undefined,
+    message: typeof body.message === "string" && body.message ? body.message : raw.trim() || undefined,
+    retryAt,
+  });
 }
 
 // --- Forge connections. Read + a re-sync heal action,
