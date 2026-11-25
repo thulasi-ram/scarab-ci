@@ -1,7 +1,8 @@
-# Scarab's multi-architecture build library: build an image for amd64 and
-# for arm64, each on its own node pool, and push both and the index that
-# joins them from one Step. Only that Step holds the registry credential.
-# An org admin installs it like any library, from
+# Scarab's multi-architecture build library: build an image for each
+# platform in `platforms` (amd64 and arm64 unless you name others), each on
+# its own node pool, and push every image and the index that joins them
+# from one Step. Only that Step holds the registry credential. An org admin
+# installs it like any library, from
 # github.com/thulasi-ram/scarab-ci//libs/build-multiarch.yaml at a release
 # commit, and trusts that source for the build sandbox and with the
 # registry credential before any Run may use it.
@@ -9,7 +10,10 @@
 #   - id: app
 #     invoke: lib:thulasi-ram::scarab-ci::build-multiarch
 #     needs: [checkout, meta]
-#     placement_profiles: { amd64: [amd64-builders], arm64: [arm64-builders], push: [ecr-push] }
+#     placement_profiles:
+#       "build[arch=linux/amd64]": [amd64-builders]
+#       "build[arch=linux/arm64]": [arm64-builders]
+#       push: [ecr-push]
 #     with:
 #       image: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/app:${{ outputs.meta.tag }}
 #       extra_tags: latest
@@ -18,43 +22,47 @@
 #
 # Deploy by `${{ outputs.app.push.digest }}`.
 #
-# It has three Steps, and `needs: [app]` reaches the last:
+# It has one build Step per platform and one push Step, and `needs: [app]`
+# reaches the push Step:
 #
-#   app/amd64  build the image with rootless BuildKit, the same script
-#   app/arm64  as build.yaml's build Step. Each asks for
-#              `security: { sandbox: rootless-buildkit }`, which Run creation
-#              admits only when the org trusts this file's source for the
-#              sandbox. They hold no registry credential: BuildKit runs with
-#              --oci-worker-no-process-sandbox, so a Dockerfile RUN shares
-#              buildkitd's PID namespace and could read anything the Step
-#              holds. Each writes its image as an OCI image layout at
-#              /workspace/.scarab-build/<key>/oci, the key the first 32 hex
-#              characters of the SHA-256 of the Step's id, and names the
-#              path and the image's digest in its `image` result. Each
-#              builds the architecture of the node it runs on, so route
-#              each to its node pool with the map form of
-#              `placement_profiles`. Two builds that land on nodes of one
-#              architecture make two images of one platform, which the push
-#              Step refuses.
-#   app/push   pushes both images by digest, pushes the index under
-#              `image`'s tag, tags each image <tag>-amd64 and <tag>-arm64
-#              (with `arch_tags`), then tags the index with each extra tag,
-#              the same script as image-index.yaml's Step. It asks for
+#   app/build[arch=<platform>]
+#              one per platform in `platforms`, such as
+#              app/build[arch=linux/amd64]. Each builds the image with
+#              rootless BuildKit, the same script as build.yaml's build
+#              Step, and asks for `security: { sandbox: rootless-buildkit }`,
+#              which Run creation admits only when the org trusts this
+#              file's source for the sandbox. They hold no registry
+#              credential: BuildKit runs with --oci-worker-no-process-sandbox,
+#              so a Dockerfile RUN shares buildkitd's PID namespace and could
+#              read anything the Step holds. Each writes its image as an OCI
+#              image layout at /workspace/.scarab-build/<key>/oci, the key
+#              the first 32 hex characters of the SHA-256 of the Step's id,
+#              and names the path and the image's digest in its `image`
+#              result. BuildKit builds only for the node's own architecture,
+#              so route each instance to its node pool with a coordinate key
+#              in the map form of `placement_profiles`, as above; a build
+#              Step whose node is of another architecture than its platform
+#              fails (exit 2) before BuildKit starts.
+#   app/push   pushes every image by digest, pushes the index under
+#              `image`'s tag, tags each image <tag>-<architecture> (with
+#              `arch_tags`), then tags the index with each extra tag, the
+#              same script as image-index.yaml's Step. It asks for
 #              `registry_auth: true`: Scarab mounts the Run's registry
 #              credential at /scarab/registry/config.json and points
 #              DOCKER_CONFIG at it, when the org trusts this file's source
 #              with the registry credential. It runs no code from the
-#              repository. It receives only the two builds' workspaces
-#              (`inputs: [amd64, arm64]`), so it needs disk for both
-#              layouts. It checks every layout before its first registry
-#              write (only directories and regular files, no symlink at any
-#              level, inside the workspace; the manifest and every blob it
-#              names hash to their names; the manifest is the digest its
-#              build's result names; one image per platform), as
-#              image-index.yaml describes. That check shows a layout was not
-#              changed after the result named it, not that the build Step
-#              made it. A retried push Step pushes both architectures
-#              again; each write puts the same content under the same name.
+#              repository. It receives only the build Steps' workspaces
+#              (`inputs: [build]`), so it needs disk for every layout. It
+#              takes exactly one layout per build Step, and checks every
+#              layout before its first registry write (only directories and
+#              regular files, no symlink at any level, inside the workspace;
+#              the manifest and every blob it names hash to their names; the
+#              manifest is the digest its build's result names; one image
+#              per platform), as image-index.yaml describes. That check
+#              shows a layout was not changed after the result named it,
+#              not that the build Step made it. A retried push Step pushes
+#              every platform again; each write puts the same content under
+#              the same name.
 #
 # Output:
 #   ${{ outputs.app.push }}  {"ref": "<repository>@sha256:…", "digest":
@@ -67,7 +75,7 @@
 # no layout, and the push Step pushes nothing and exits 0, whatever the
 # inputs say. A missing SCARAB_FORK_PR is treated the same way. On any
 # other Run, a build Step that published no layout fails the push Step
-# (exit 2), so the index never leaves an architecture out.
+# (exit 2), so the index never leaves a platform out.
 #
 # Every input reaches the scripts through an environment variable, never the
 # command. The layer cache is `none` or `s3`, reached with the build Pod's
@@ -82,14 +90,22 @@
 # Inputs:
 #   image       the tag to push the index to, e.g. ghcr.io/acme/app:1.2.0; a
 #               reference with a tag and no digest
+#   platforms   the platforms to build, linux/<architecture>[/<variant>],
+#               separated by commas or spaces (default
+#               "linux/amd64,linux/arm64"). The architecture is one of
+#               amd64, arm, arm64, loong64, ppc64, ppc64le, riscv64 and
+#               s390x; 32-bit arm is written with its variant, v5 to v8
+#               (linux/arm/v7), and amd64 may name v2 to v4. Write it as text in `with:`: the
+#               build Steps are made when the Pipeline compiles, before any
+#               template has a value
 #   extra_tags  more tags for the index, in `image`'s repository: tag names,
 #               not references, separated by spaces or line breaks
 #               (default empty)
-#   arch_tags   also tag each architecture's image <tag>-amd64 and
-#               <tag>-arm64, whether or not the arm64 config names v8
-#               (default true). A registry
-#               rule that expires untagged images could otherwise remove an
-#               image the index names
+#   arch_tags   also tag each platform's image <tag>-<architecture>, or
+#               <tag>-<architecture>-<variant> (<tag>-arm-v7); arm64 is
+#               <tag>-arm64 whether or not its config names v8 (default
+#               true). A registry rule that expires untagged images could
+#               otherwise remove an image the index names
 #   context     the build context, relative to the workspace (default ".")
 #   dockerfile  the Dockerfile, relative to the context (default "Dockerfile")
 #   build_args  one KEY=VALUE per line, each passed as a build argument. A
@@ -98,8 +114,9 @@
 #   cache       the layer cache: none or s3 (default none)
 #   cache_bucket, cache_region, cache_name
 #               for cache: s3, where the cache is kept; each build keeps
-#               its own cache, `<cache_name>-amd64` and `<cache_name>-arm64`
-#               (`buildkit-<arch>` when cache_name is empty)
+#               its own cache, `<cache_name>-<architecture>` (`-arm-v7` for
+#               linux/arm/v7), or `buildkit-<architecture>` when cache_name
+#               is empty
 #   insecure_push
 #               reach the registry over plain HTTP, for a registry with no
 #               TLS (default false); for a test or development registry
@@ -112,6 +129,12 @@ interface:
       type: string
       validate: 'value.matches("^[a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")'
       description: the tag to push the index to, with a tag and no digest
+    - name: platforms
+      type: string
+      required: false
+      default: "linux/amd64,linux/arm64"
+      validate: 'value.matches("^[ ,\t\n]*linux/(amd64(/v[2-4])?|arm/v[5-8]|arm64|loong64|ppc64|ppc64le|riscv64|s390x)([ ,\t\n]+linux/(amd64(/v[2-4])?|arm/v[5-8]|arm64|loong64|ppc64|ppc64le|riscv64|s390x))*[ ,\t\n]*$")'
+      description: the platforms to build, linux/<architecture>[/<variant>] separated by commas or spaces
     - name: extra_tags
       type: string
       required: false
@@ -172,13 +195,16 @@ interface:
       description: reach the registry over plain HTTP, for a test or development registry with no TLS
   outputs: [push]
 steps:
-  - id: amd64
+  - id: build
+    # One build Step per platform: app/build[arch=linux/amd64], …. The
+    # values come from the `platforms` input when the Pipeline compiles.
+    matrix:
+      dimensions:
+        arch: "${{ inputs.platforms }}"
     # The BuildKit image libs/build.yaml's build Step pins.
     image: moby/buildkit:rootless@sha256:5987568f92dafbfb679879de59c1cd8d26597f5f6635c314e166164e2615870c
     security: { sandbox: rootless-buildkit }
-    # arm64 below uses this env and this command (YAML aliases), so the two
-    # builds differ only in their Step id, and so in their layout's path.
-    env: &build_env
+    env:
       # Rootless buildkitd cannot use the process sandbox.
       - [BUILDKITD_FLAGS, --oci-worker-no-process-sandbox]
       - [SCARAB_BUILD_IMAGE, "${{ inputs.image }}"]
@@ -186,17 +212,19 @@ steps:
       - [SCARAB_BUILD_DOCKERFILE, "${{ inputs.dockerfile }}"]
       # "true" writes the image as a layout, for the push Step.
       - [SCARAB_BUILD_PUSH, "true"]
+      # The platform this instance builds; the script refuses a node of
+      # another architecture.
+      - [SCARAB_BUILD_PLATFORM, "${{ matrix.arch }}"]
       - [SCARAB_BUILD_ARGS, "${{ inputs.build_args }}"]
       - [SCARAB_BUILD_CACHE, "${{ inputs.cache }}"]
       - [SCARAB_BUILD_CACHE_BUCKET, "${{ inputs.cache_bucket }}"]
       - [SCARAB_BUILD_CACHE_REGION, "${{ inputs.cache_region }}"]
       - [SCARAB_BUILD_CACHE_NAME, "${{ inputs.cache_name }}"]
-      # Each architecture keeps its own layer cache: <cache_name>-amd64 and
-      # <cache_name>-arm64.
+      # Each platform keeps its own layer cache: <cache_name>-<architecture>.
       - [SCARAB_BUILD_CACHE_PER_ARCH, "true"]
     # A copy of libs/build.yaml's build script; a test holds the two the
     # same.
-    command: &build_command
+    command:
       - /bin/sh
       - -c
       - |
@@ -256,8 +284,42 @@ steps:
             echo "scarab: not pushed: this Run is a fork pull request's, or is locked out of its Environment's secrets" >&2
           push=false
         fi
+        # A library that builds one Step per platform sets
+        # SCARAB_BUILD_PLATFORM (linux/<architecture>[/<variant>]). BuildKit
+        # here builds only for the node's own architecture, so a Step that
+        # landed on a node of another architecture is refused before
+        # BuildKit starts. Unset, the node's own platform is built. Only
+        # platforms this check can tell apart are taken: not 386 (an x86_64
+        # node reports the same), not mips (uname -m does not give the byte
+        # order), and 32-bit arm only with its variant.
+        platform=${SCARAB_BUILD_PLATFORM-}
+        if [ -n "$platform" ]; then
+          case "$platform" in
+            linux/amd64 | linux/amd64/v[2-4] | linux/arm/v[5-8] | linux/arm64 | \
+              linux/loong64 | linux/ppc64 | linux/ppc64le | linux/riscv64 | linux/s390x) ;;
+            *) fail "platform $platform is not linux/<architecture>[/<variant>] of an architecture this library builds" ;;
+          esac
+          want=${platform#linux/}
+          want=${want%%/*}
+          m=$(uname -m) || fail "cannot read this node's architecture"
+          [ -n "$m" ] || fail "cannot read this node's architecture"
+          case "$m" in
+            x86_64 | amd64) node=amd64 ;;
+            aarch64 | arm64) node=arm64 ;;
+            armv5* | armv6* | armv7* | armv8l | arm) node=arm ;;
+            loongarch64) node=loong64 ;;
+            ppc64) node=ppc64 ;;
+            ppc64le) node=ppc64le ;;
+            riscv64) node=riscv64 ;;
+            s390x) node=s390x ;;
+            *) node=$m ;;
+          esac
+          [ "$node" = "$want" ] ||
+            fail "this step builds $platform, but its node's architecture is $node (uname -m: $m); the placement map routes this instance to the wrong nodes"
+        fi
         set -- build --frontend dockerfile.v0 \
           --local "context=$ctx" --local "dockerfile=$ctx" --opt "filename=$df"
+        [ -z "$platform" ] || set -- "$@" --opt "platform=$platform"
         while IFS= read -r line; do
           [ -n "$line" ] || continue
           key=${line%%=*}
@@ -285,16 +347,25 @@ steps:
             # A library that builds one image per architecture from one set
             # of inputs sets SCARAB_BUILD_CACHE_PER_ARCH, so each
             # architecture keeps its own cache: <name>-<arch>, or
-            # buildkit-<arch> when no name is given.
+            # buildkit-<arch> when no name is given. <arch> is the platform
+            # this Step builds, without linux/ and with - for / (arm-v7),
+            # when SCARAB_BUILD_PLATFORM names one; else the node's.
             case "${SCARAB_BUILD_CACHE_PER_ARCH-false}" in
               false) ;;
               true)
-                m=$(uname -m) || fail "cannot read this node's architecture"
-                case "$m" in
-                  x86_64) m=amd64 ;;
-                  aarch64) m=arm64 ;;
-                  "" | *[!A-Za-z0-9_]*) fail "this node's architecture $m is not a name" ;;
-                esac
+                if [ -n "$platform" ]; then
+                  m=${platform#linux/}
+                  a=${m%%/*}
+                  v=${m#"$a"}
+                  m=$a${v:+-${v#/}}
+                else
+                  m=$(uname -m) || fail "cannot read this node's architecture"
+                  case "$m" in
+                    x86_64) m=amd64 ;;
+                    aarch64) m=arm64 ;;
+                    "" | *[!A-Za-z0-9_]*) fail "this node's architecture $m is not a name" ;;
+                  esac
+                fi
                 name=${name:-buildkit}-$m
                 ;;
               *) fail "SCARAB_BUILD_CACHE_PER_ARCH must be true or false" ;;
@@ -405,16 +476,11 @@ steps:
         { printf '%s,%s}\n' "${m%\}}" "$add" > "$meta.scarab" &&
           mv -f "$meta.scarab" "$meta"; } ||
           fail "cannot write the image result"
-  - id: arm64
-    image: moby/buildkit:rootless@sha256:5987568f92dafbfb679879de59c1cd8d26597f5f6635c314e166164e2615870c
-    security: { sandbox: rootless-buildkit }
-    env: *build_env
-    command: *build_command
   - id: push
-    needs: [amd64, arm64]
-    # Only the two builds' workspaces reach this Step, not those of the
+    needs: [build]
+    # Only the build Steps' workspaces reach this Step, not those of the
     # Steps the invoke needs.
-    inputs: [amd64, arm64]
+    inputs: [build]
     # The crane image libs/image-index.yaml pins.
     image: gcr.io/go-containerregistry/crane:debug@sha256:e78770b31258a3846f878036d9c1f63fbe4c871f9f56990bf77fd95c013e3c1b
     registry_auth: true
@@ -428,14 +494,15 @@ steps:
       - [SCARAB_INDEX_RESULT, push]
       - [SCARAB_INDEX_IMAGE, "${{ inputs.image }}"]
       - [SCARAB_INDEX_IMAGES, ""]
-      # One line per build: its layout's path and digest, from its `image`
-      # result. A build that published none gives a line the script
-      # refuses, so the index never leaves an architecture out; a fork's
-      # Run exits 0 before the script reads it.
-      - [SCARAB_INDEX_LAYOUTS, "${{ has(outputs.amd64) && has(outputs.amd64.image) && has(outputs.amd64.image.layout) && has(outputs.amd64.image.digest) ? outputs.amd64.image.layout + ' ' + outputs.amd64.image.digest : '(amd64 wrote no layout)' }}\n${{ has(outputs.arm64) && has(outputs.arm64.image) && has(outputs.arm64.image.layout) && has(outputs.arm64.image.digest) ? outputs.arm64.image.layout + ' ' + outputs.arm64.image.digest : '(arm64 wrote no layout)' }}"]
+      # `outputs.build` is a list, one entry per build Step, each
+      # {matrix, results}. One line per build: its layout's path and digest
+      # from its `image` result. A build that published none gives a line
+      # the script refuses, so the index never leaves a platform out; a
+      # fork's Run exits 0 before the script reads it.
+      - [SCARAB_INDEX_LAYOUTS, '${{ outputs.build.map(b, has(b.results.image) && has(b.results.image.layout) && has(b.results.image.digest) ? b.results.image.layout + " " + b.results.image.digest : "(" + b.matrix.arch + " wrote no layout)").join("\n") }}']
       # Exactly one layout per build Step: a result whose `layout` holds a
       # line break cannot add an image to the index.
-      - [SCARAB_INDEX_LAYOUT_COUNT, "2"]
+      - [SCARAB_INDEX_LAYOUT_COUNT, "${{ size(outputs.build) }}"]
       - [SCARAB_INDEX_EXTRA_TAGS, "${{ inputs.extra_tags }}"]
       - [SCARAB_INDEX_ARCH_TAGS, "${{ inputs.arch_tags }}"]
       - [SCARAB_INDEX_INSECURE, "${{ inputs.insecure_push }}"]
@@ -460,6 +527,14 @@ steps:
         if [ "${SCARAB_FORK_PR-}" != false ]; then
           echo "scarab: not pushed: this Run is a fork pull request's, or is locked out of its Environment's secrets"
           exit 0
+        fi
+        # A layouts line carries a digest only a build's result supplies.
+        # Without results (/scarab/results is absent, because the server
+        # has no results token secret) nothing can be checked, so nothing
+        # is pushed. `images` alone does not need results.
+        named=$(printf '%s' "${SCARAB_INDEX_LAYOUTS-}" | tr -d '\n')
+        if [ -n "$named" ] && [ ! -d /scarab/results ]; then
+          fail "results are not collected, so the layouts' digests cannot be checked against the builds'; set the server's results token secret (SCARAB_RESULTS_TOKEN_SECRET, the chart value secrets.resultsTokenSecret)"
         fi
         # Sets r to the resolved path. The `.` keeps a trailing newline in a
         # directory name from being dropped by the command substitution.

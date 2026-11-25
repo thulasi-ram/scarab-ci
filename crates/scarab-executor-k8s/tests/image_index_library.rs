@@ -1294,8 +1294,8 @@ fn malformed_layouts_lines_are_refused() {
         format!("\n{l1}"),
         format!("{l1}\n{l2}\n\n"),
         format!("{l1}\n{l1}"),
-        "(amd64 wrote no layout)".to_string(),
-        format!("{l1}\n(arm64 wrote no layout)"),
+        "(linux/amd64 wrote no layout)".to_string(),
+        format!("{l1}\n(linux/arm64 wrote no layout)"),
     ] {
         let ran = h.ran(&[("SCARAB_INDEX_LAYOUTS", &layouts)]);
         assert_eq!(ran.code, Some(2), "{layouts:?}: {}", ran.stderr);
@@ -1599,6 +1599,8 @@ fn a_layout_count_other_than_the_one_expected_is_refused() {
         ("-1", format!("{l1}\n{l2}"), 2),
         ("", l1.clone(), 0),
         (UNSET, format!("{l1}\n{l2}\n{l3}"), 0),
+        // Three platforms, as build-multiarch counts them.
+        ("3", format!("{l1}\n{l2}\n{l3}"), 0),
         ("2", format!("{l1}\n{l2}"), 0),
         // Compared as text: "02" is not 2.
         ("02", format!("{l1}\n{l2}"), 2),
@@ -1625,4 +1627,37 @@ fn a_layout_count_other_than_the_one_expected_is_refused() {
             );
         }
     }
+}
+
+/// A layout line carries a digest only a build's result supplies: with
+/// `layouts` and no results directory (Scarab not collecting results) the
+/// Step is refused before any registry call, naming the setting that turns
+/// results on. `images` alone needs no result, and still pushes.
+#[test]
+fn layouts_without_results_are_refused() {
+    let h = Harness::new();
+    let l = h.layout("app/amd64", AMD64);
+    std::fs::remove_dir(h.base.join("results")).unwrap();
+    let ran = h.ran(&[("SCARAB_INDEX_LAYOUTS", &l.line())]);
+    assert_eq!(ran.code, Some(2), "{}", ran.stderr);
+    assert_eq!(
+        ran.stderr.trim_end(),
+        "scarab: index refused: results are not collected, so the layouts' digests cannot be \
+         checked against the builds'; set the server's results token secret \
+         (SCARAB_RESULTS_TOKEN_SECRET, the chart value secrets.resultsTokenSecret)"
+    );
+    assert!(ran.calls.is_empty(), "crane ran: {:?}", ran.calls);
+    assert!(h.build_dir_kept());
+
+    // Empty lines (a fork's builds rendered nothing) name no layout.
+    let a = by_digest('a');
+    let ran = h.ran(&[
+        ("SCARAB_INDEX_IMAGES", &a),
+        ("SCARAB_INDEX_LAYOUTS", "\n\n"),
+    ]);
+    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+    assert_eq!(
+        ran.calls.last().map(String::as_str),
+        Some(format!("index append -m {a} -t registry.example/app:1").as_str())
+    );
 }

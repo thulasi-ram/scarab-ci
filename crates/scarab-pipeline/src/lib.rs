@@ -29,7 +29,7 @@ pub mod render;
 pub mod scope;
 
 pub use render::{preview_image, render, render_inputs, Facts, Rendered, Results, Templates};
-pub use scope::{Binding, BoundValue, Guard, OutputSource, Scope, ScopeInputs};
+pub use scope::{Binding, BoundValue, Guard, InstanceSource, OutputSource, Scope, ScopeInputs};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -49,12 +49,19 @@ pub const IR_VERSION: u32 = 2;
 /// the Run's launch parameters. Recorded on the Run (`runs.ir_version`).
 pub const IR_VERSION_SCOPED: u32 = 3;
 
+/// The IR version of a Pipeline whose Steps need a renderer that has
+/// [`OutputSource::Instances`] (a library Step reading every instance of a
+/// matrix Step of its library as a list) or the CEL `join` function. A
+/// server that predates it would refuse the scope, or fail the template, at
+/// launch; it refuses the Run's Steps by their version instead.
+pub const IR_VERSION_INSTANCES: u32 = 4;
+
 /// The highest IR version this build understands. A Run stored with a higher
 /// one was compiled by a newer server, whose Steps may render in a way this
 /// one does not know: the engine refuses to launch them
 /// (`scarab_engine::render::render_launch_spec`), and the compiler refuses a
 /// Pipeline that declares one.
-pub const IR_VERSION_MAX: u32 = IR_VERSION_SCOPED;
+pub const IR_VERSION_MAX: u32 = IR_VERSION_INSTANCES;
 
 fn default_ir_version() -> u32 {
     IR_VERSION
@@ -1794,15 +1801,115 @@ pub struct Needs(pub Vec<String>);
 /// the cartesian product of its `dimensions` at submit time (ADR-0023), minus
 /// any combination for which an `exclude` CEL predicate holds. Predicates are
 /// evaluated against the combination's own coordinate (each dimension bound as a
-/// variable), so expansion stays fully static.
+/// variable), so expansion stays fully static. In a library, a dimension may
+/// be written as `"${{ inputs.<name> }}"` instead of a list
+/// ([`MatrixDimension::Input`]): its values are that input's, known when the
+/// library is inlined, before the matrix expands.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Matrix {
-    pub dimensions: BTreeMap<String, Vec<String>>,
+    pub dimensions: BTreeMap<String, MatrixDimension>,
     /// CEL predicates over the dimension variables; a combination is dropped if
     /// any predicate is true (e.g. `os == 'windows' && arch == 'arm64'`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<String>,
+    /// The placement profiles of single instances, from the coordinate keys
+    /// of the invoke step that inlined this library Step
+    /// (`"build[arch=linux/arm64]": [arm64]`). Written only by the compiler
+    /// and applied when the matrix expands, so every compiled Step holds a
+    /// plain list. Never read from or written to a file.
+    #[serde(skip)]
+    pub(crate) placement: Vec<CoordinatePlacement>,
+}
+
+/// One coordinate key of an invoke step's per-Step `placement_profiles`
+/// map, checked at inlining: the instances it places and their profiles.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CoordinatePlacement {
+    /// The key as written, for diagnostics.
+    pub(crate) key: String,
+    /// The dimension values an instance must have to be placed by it.
+    pub(crate) coordinate: BTreeMap<String, String>,
+    pub(crate) profiles: Vec<String>,
+}
+
+/// The values of one matrix dimension: a list, or, in a library only,
+/// exactly `${{ inputs.<name> }}`, which the compiler replaces with the
+/// values of that input when the library is inlined (the caller's literal
+/// `with:` value or the input's default, split on commas and whitespace).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatrixDimension {
+    /// The dimension's values, in order.
+    Values(Vec<String>),
+    /// The text written in place of a list. Resolved at inlining when it is
+    /// `${{ inputs.<name> }}` in a library; refused anywhere else.
+    Input(String),
+}
+
+impl MatrixDimension {
+    /// The values, once the dimension is a list.
+    pub fn values(&self) -> Option<&[String]> {
+        match self {
+            MatrixDimension::Values(v) => Some(v),
+            MatrixDimension::Input(_) => None,
+        }
+    }
+}
+
+impl From<Vec<String>> for MatrixDimension {
+    fn from(values: Vec<String>) -> Self {
+        MatrixDimension::Values(values)
+    }
+}
+
+impl Serialize for MatrixDimension {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            MatrixDimension::Values(v) => v.serialize(serializer),
+            MatrixDimension::Input(t) => t.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MatrixDimension {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct FormVisitor;
+        impl<'de> serde::de::Visitor<'de> for FormVisitor {
+            type Value = MatrixDimension;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(
+                    "a list of matrix values, or (in a library) `${{ inputs.<name> }}` to take \
+                     them from an input",
+                )
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<MatrixDimension, A::Error> {
+                Vec::<String>::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    .map(MatrixDimension::Values)
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<MatrixDimension, E> {
+                Ok(MatrixDimension::Input(v.to_string()))
+            }
+        }
+        deserializer.deserialize_any(FormVisitor)
+    }
+}
+
+/// The input a matrix dimension written as text reads: `name` when the
+/// text is exactly one `${{ inputs.<name> }}` and nothing else.
+fn matrix_input_name(text: &str) -> Option<String> {
+    let (found, unterminated) = cel::scan_interpolations(text);
+    match (found.as_slice(), unterminated) {
+        ([only], None) if only.outer == (0..text.len()) => {
+            match cel::path(text[only.inner.clone()].trim())?.as_slice() {
+                [var, name] if var == "inputs" => Some(name.clone()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// A conditional guard, expressed as a CEL expression (kept as a raw string
@@ -1886,11 +1993,17 @@ impl PlacementProfiles {
         match self {
             PlacementProfiles::List(l) => l,
             PlacementProfiles::PerStep(m) => {
-                // The id as the library writes it: before a nested invoke's
-                // `/` or a matrix coordinate's `[` (whose values may hold
-                // `/`), whichever comes first.
-                let id = lib_step.split(['/', '[']).next().unwrap_or(lib_step);
-                m.get(id).map(Vec::as_slice).unwrap_or(&[])
+                // The id as the library writes it, first hit wins: the id
+                // whole (a Step id may hold `[`); its first part, before a
+                // nested invoke's `/` outside a matrix coordinate's `[…]`;
+                // that part before its first `[`.
+                let first = first_id_segment(lib_step);
+                let bare = first.split('[').next().unwrap_or(first);
+                [lib_step, first, bare]
+                    .into_iter()
+                    .find_map(|id| m.get(id))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
             }
         }
     }
@@ -2355,16 +2468,52 @@ fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineErr
     let mut expanded: Vec<StepSpec> = Vec::new();
     // authored step id -> the concrete instance ids it expanded into.
     let mut instances: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // authored id of a matrix Step -> each instance and its own coordinate,
+    // in expansion order.
+    let mut matrixed: BTreeMap<String, Vec<InstanceSource>> = BTreeMap::new();
+    // authored id -> the `origin` of the Step that wrote it. Two Steps of
+    // one id from different places (a Pipeline Step and a library's, or two
+    // libraries') would share every reference to that id, so they are
+    // refused; two of one place keep the earlier behaviour (the later
+    // expansion shadows, and duplicate instance ids are caught by
+    // validate()).
+    let mut origins: BTreeMap<&str, &Vec<OriginEntry>> = BTreeMap::new();
 
     // The stored size of `expanded` so far: each instance is about the size
     // of the Step it was expanded from.
     let mut bytes: usize = 0;
     for step in &authored_steps {
+        match origins.get(step.id.as_str()) {
+            Some(earlier) if **earlier != step.origin => {
+                diagnostics.push(format!("duplicate step id `{}`", step.id));
+                continue;
+            }
+            Some(_) => {}
+            None => {
+                origins.insert(step.id.as_str(), &step.origin);
+            }
+        }
         match expand_step(step, &mut libs.work.borrow_mut().matrix) {
             Ok(concrete) => {
                 let ids = concrete.iter().map(|s| s.id.clone()).collect();
-                // A duplicate authored id shadows an earlier expansion; the
-                // resulting duplicate concrete ids are caught by validate().
+                if let Some(m) = &step.matrix {
+                    let list = concrete
+                        .iter()
+                        .map(|c| InstanceSource {
+                            step: c.id.clone(),
+                            matrix: c
+                                .matrix_values
+                                .iter()
+                                .filter(|(k, _)| m.dimensions.contains_key(*k))
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect(),
+                        })
+                        .collect();
+                    matrixed.insert(step.id.clone(), list);
+                }
+                // A duplicate authored id of one origin shadows an earlier
+                // expansion; the resulting duplicate concrete ids are caught
+                // by validate().
                 instances.insert(step.id.clone(), ids);
                 let each = json_len(step, MAX_COMPILED_IR_BYTES).unwrap_or(usize::MAX);
                 bytes = bytes.saturating_add(each.saturating_mul(concrete.len()));
@@ -2430,6 +2579,11 @@ fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineErr
         if let Some(inputs) = &step.inputs {
             step.inputs = Some(fan_in(inputs));
         }
+        // In a library, `outputs.<matrix Step>` is every instance, as a list
+        // in expansion order; `needs` above covers each one.
+        if let Some(scope) = &mut step.scope {
+            instances_view(scope, &matrixed);
+        }
     }
 
     // A Step with a scope renders differently from one without: a server
@@ -2439,7 +2593,7 @@ fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineErr
     } else {
         authored.ir_version
     };
-    let ir = PipelineIr {
+    let mut ir = PipelineIr {
         ir_version,
         kind: None,
         name: authored.name,
@@ -2461,8 +2615,108 @@ fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineErr
             "the pipeline",
         )]));
     }
+    // Nor may a server that predates instance lists and `join`
+    // ([`IR_VERSION_INSTANCES`]) render or evaluate any of it.
+    if ir.steps.iter().any(lists_instances) || calls_join(&ir) {
+        ir.ir_version = ir.ir_version.max(IR_VERSION_INSTANCES);
+    }
     validate_with(&ir, &written_build_needs).map_err(PipelineError::Validation)?;
     Ok(ir)
+}
+
+/// Make each `outputs` view of a library scope in `scope`'s chain that
+/// names a matrix Step by its authored id (`app/build`) list every instance
+/// of it ([`OutputSource::Instances`]). A Pipeline's own scope is left as
+/// it is.
+fn instances_view(scope: &mut Scope, matrixed: &BTreeMap<String, Vec<InstanceSource>>) {
+    let mut hop = 0;
+    while let Some(s) = scope.at_mut(hop) {
+        if matches!(s.inputs, ScopeInputs::Bound(_)) {
+            for source in s.outputs.values_mut() {
+                if let OutputSource::Step(id) = source {
+                    if let Some(list) = matrixed.get(id.as_str()) {
+                        *source = OutputSource::Instances(list.clone());
+                    }
+                }
+            }
+        }
+        hop += 1;
+    }
+}
+
+/// Whether a scope in `step`'s chain lists the instances of a matrix Step
+/// ([`OutputSource::Instances`]), which only a server that has
+/// [`IR_VERSION_INSTANCES`] renders.
+fn lists_instances(step: &StepSpec) -> bool {
+    step.scope.iter().flat_map(Scope::chain).any(|s| {
+        s.outputs
+            .values()
+            .any(|o| matches!(o, OutputSource::Instances(_)))
+    })
+}
+
+/// Whether any CEL the compiled Pipeline holds calls `join`, which only a
+/// server that has [`IR_VERSION_INSTANCES`] evaluates. Two kinds of place:
+///
+/// - the fields evaluated whole as one expression, read by their type: a
+///   Step's `when:` and its guards, a trigger's `when:`, the `validate:` of
+///   the Pipeline's inputs and of each input binding in a Step's scope chain;
+/// - every `${{ … }}` of any other string of the IR (image, command, env, a
+///   caller's `with:`, `concurrency.group`). A string is never parsed whole
+///   here, so text that parses as CEL by accident does not count.
+fn calls_join(ir: &PipelineIr) -> bool {
+    /// Each distinct string that mentions `join`: a matrix's copies of a
+    /// Step, and a library's bindings on each of its Steps, share text.
+    fn collect<'a>(v: &'a serde_json::Value, out: &mut BTreeSet<&'a str>) {
+        match v {
+            serde_json::Value::String(text) if text.contains("join") => {
+                out.insert(text);
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|x| collect(x, out)),
+            serde_json::Value::Object(fields) => fields.values().for_each(|x| collect(x, out)),
+            _ => {}
+        }
+    }
+    let mut whole: BTreeSet<&str> = BTreeSet::new();
+    whole.extend(ir.triggers.0.values().filter_map(|t| t.when.as_deref()));
+    whole.extend(
+        ir.interface
+            .inputs
+            .iter()
+            .filter_map(|p| p.validate.as_deref()),
+    );
+    for step in &ir.steps {
+        whole.extend(step.when.as_ref().map(|w| w.0.as_str()));
+        whole.extend(step.guards.iter().map(|g| g.when.as_str()));
+        for scope in step.scope.iter().flat_map(Scope::chain) {
+            if let ScopeInputs::Bound(bindings) = &scope.inputs {
+                whole.extend(
+                    bindings
+                        .values()
+                        .filter_map(|b| b.param.as_ref()?.validate.as_deref()),
+                );
+            }
+        }
+    }
+    if whole
+        .into_iter()
+        .filter(|e| e.contains("join"))
+        .any(|e| cel::calls(e.trim(), "join"))
+    {
+        return true;
+    }
+    let Ok(value) = serde_json::to_value(ir) else {
+        return false;
+    };
+    let mut texts = BTreeSet::new();
+    collect(&value, &mut texts);
+    let any_join = texts.into_iter().any(|text| {
+        cel::scan_interpolations(text)
+            .0
+            .iter()
+            .any(|i| cel::calls(text[i.inner.clone()].trim(), "join"))
+    });
+    any_join
 }
 
 /// The repository paths an authored pipeline's `invoke: file:` steps name, so
@@ -3082,6 +3336,10 @@ fn inline_invokes(steps: &[StepSpec], libs: LibsRef<'_>) -> Result<Vec<StepSpec>
         &mut budget,
         &mut diagnostics,
     );
+    // A level checks the budget before each Step; the last Step of a level
+    // (an invoke's `placement_profiles` check, say) can spend it with none
+    // left to check it, so the note that the compiler stopped is added here.
+    budget.spent(&mut diagnostics);
     if diagnostics.is_empty() {
         Ok(out)
     } else {
@@ -3209,13 +3467,33 @@ fn inline_level(
     // the invoke is inlined resolves too.
     let exposed = exposed_outputs(steps, libs);
 
+    // How a message names this level: nothing for the Pipeline file.
+    let place = match level.library {
+        Some((label, _)) => format!(" in library `{label}`"),
+        None => String::new(),
+    };
     // An invoke Step's id names its library's Steps (`<id>/…`) and its
-    // outputs (`outputs.<id>`): it must not be any other Step's id here.
-    for (i, s) in steps.iter().enumerate() {
-        if s.invoke.is_some() && steps[..i].iter().any(|t| t.id == s.id) {
-            diagnostics.push(format!("duplicate step id `{}`", s.id));
+    // outputs (`outputs.<id>`): it must not be any other Step's id here,
+    // written before it or after it. Reported once per id.
+    let mut by_id: BTreeMap<&str, (usize, bool)> = BTreeMap::new();
+    for s in steps {
+        let e = by_id.entry(s.id.as_str()).or_insert((0, false));
+        e.0 += 1;
+        e.1 |= s.invoke.is_some();
+    }
+    for (id, _) in by_id.iter().filter(|(_, (n, invoke))| *n > 1 && *invoke) {
+        diagnostics.push(format!("duplicate step id `{id}`"));
+    }
+    // An inlined Step's id is split at its last `/` outside `[…]`, so the
+    // brackets of every id must pair.
+    for s in steps {
+        if !brackets_pair(&s.id) {
+            diagnostics.push(unpaired_brackets(&s.id, &place));
         }
     }
+    // `<invoke instance id>/` -> the invoke Step's id: the names of the
+    // Steps each invoke here inlines, which no other Step here may take.
+    let mut prefixes: BTreeMap<String, String> = BTreeMap::new();
 
     // Stop when the list passes a cap: its length, or its stored size, which
     // only grows as outer levels namespace it.
@@ -3238,6 +3516,25 @@ fn inline_level(
         if budget.spent(diagnostics) {
             return out;
         }
+        // In a library, a matrix dimension may take its values from an
+        // input; they are known now, before the matrix expands.
+        let with_values;
+        let step = match (level.library, &step.matrix) {
+            (Some((label, _)), Some(matrix)) => {
+                match resolve_matrix_inputs(step, matrix, level, label, diagnostics) {
+                    Ok(None) => step,
+                    Ok(Some(matrix)) => {
+                        with_values = StepSpec {
+                            matrix: Some(matrix),
+                            ..step.clone()
+                        };
+                        &with_values
+                    }
+                    Err(()) => continue,
+                }
+            }
+            _ => step,
+        };
         // `origin` is the compiler's record of where a Step came from
         // (ADR-0075 §2); an authored one would let a Pipeline pass a
         // library Policy by claiming another source.
@@ -3593,41 +3890,16 @@ fn inline_level(
                 }
             }
         }
-        // A per-Step map names the library's own Step ids; a key naming
-        // none would place nothing, so it is refused. A Step that keeps its
-        // own profiles, a gate and a `forge_token` Step take none from it.
-        if let PlacementProfiles::PerStep(map) = &step.placement_profiles {
-            for (key, names) in map {
-                match lib.steps.iter().find(|s| &s.id == key) {
-                    None => diagnostics.push(format!(
-                        "step `{}`: `placement_profiles` names step `{key}`, which library \
-                         `{label}` does not have",
-                        step.id
-                    )),
-                    Some(target) if target.forge_token.is_some() => diagnostics.push(format!(
-                        "step `{}`: `placement_profiles` names step `{key}` of library \
-                         `{label}`, which has `forge_token`; an invoke gives such a step no \
-                         placement profile",
-                        step.id
-                    )),
-                    Some(target) if !target.placement_profiles.is_empty() => {
-                        diagnostics.push(format!(
-                            "step `{}`: `placement_profiles` names step `{key}` of library \
-                             `{label}`, which sets its own placement profiles; the library's \
-                             own value wins, so these would never apply",
-                            step.id
-                        ))
-                    }
-                    Some(_) => {}
-                }
-                if names.iter().any(|p| p.trim().is_empty()) {
-                    diagnostics.push(format!(
-                        "step `{}`: `placement_profiles.{key}` contains an empty profile name",
-                        step.id
-                    ));
-                }
+        // A per-Step map names the library's own Step ids, or one of a
+        // matrix Step's coordinates; a key naming none would place nothing,
+        // so it is refused. A Step that keeps its own profiles, a gate and a
+        // `forge_token` Step take none from it.
+        let coordinate_placement = match &step.placement_profiles {
+            PlacementProfiles::PerStep(map) => {
+                placement_map(step, map, &lib, &resolved, &label, diagnostics)
             }
-        }
+            PlacementProfiles::List(_) => BTreeMap::new(),
+        };
         // This library is the outermost link so far of every Step it
         // inlines: the nested levels already recorded theirs.
         let link = OriginEntry {
@@ -3649,6 +3921,13 @@ fn inline_level(
                 continue;
             }
         };
+        for inv in &invoke_instances {
+            // A matrix value can add a bracket to the id.
+            if inv.id != step.id && !brackets_pair(&inv.id) {
+                diagnostics.push(unpaired_brackets(&inv.id, &place));
+            }
+            prefixes.insert(format!("{}/", inv.id), step.id.clone());
+        }
 
         let internal: BTreeSet<&str> = resolved.iter().map(|s| s.id.as_str()).collect();
         let needed_inside: BTreeSet<&str> = resolved
@@ -3678,6 +3957,18 @@ fn inline_level(
                     inst.deploy = true;
                 }
                 carry_invoke_fields(inv, &ls.id, &mut inst);
+                // A coordinate key places single instances, applied when
+                // the matrix expands; the plain key, if any, is the list.
+                let takes = !inst.is_gate()
+                    && inst.forge_token.is_none()
+                    && ls.placement_profiles.is_empty();
+                if let (true, Some(placed), Some(m)) = (
+                    takes,
+                    coordinate_placement.get(&ls.id),
+                    inst.matrix.as_mut(),
+                ) {
+                    m.placement = placed.clone();
+                }
                 // Entry seam: a library root inherits the invoke step's upstreams;
                 // an internal need is namespaced.
                 inst.needs = if ls.needs.0.is_empty() {
@@ -3741,6 +4032,34 @@ fn inline_level(
             }
         }
         seam.insert(step.id.clone(), all_leaves);
+    }
+
+    // A Step written here under an invoke's prefix would take the name of
+    // a Step the invoke inlines (`app/build` beside invoke `app`), and
+    // with it that Step's `needs`, `inputs` and `outputs` reads.
+    for s in steps {
+        let taken =
+            s.id.char_indices()
+                .scan(0usize, |depth, (i, c)| {
+                    match c {
+                        '[' => *depth += 1,
+                        ']' => *depth = depth.saturating_sub(1),
+                        _ => {}
+                    }
+                    Some((i, c, *depth))
+                })
+                .filter(|&(_, c, depth)| c == '/' && depth == 0)
+                .find_map(|(i, _, _)| {
+                    let prefix = &s.id[..=i];
+                    prefixes.get(prefix).map(|invoke| (prefix, invoke))
+                });
+        if let Some((prefix, invoke)) = taken {
+            diagnostics.push(format!(
+                "step `{}`{place}: its id starts with `{prefix}`, the name of the Steps that \
+                 invoke `{invoke}` inlines; give it another id",
+                s.id
+            ));
+        }
     }
 
     // Second pass: rewrite every reference to an invoke-step id onto its leaves.
@@ -4408,6 +4727,11 @@ fn namespace_view(scope: &mut Scope, ns: &impl Fn(&str) -> String) {
                     *id = ns(id);
                 }
             }
+            OutputSource::Instances(instances) => {
+                for i in instances {
+                    i.step = ns(&i.step);
+                }
+            }
         }
     }
 }
@@ -4483,7 +4807,9 @@ fn invoke_output_scope(step: &mut StepSpec, exposed: &BTreeMap<String, Option<Ve
 /// found eligible for a credential; so a list naming one fails the sandboxed
 /// build Step, and the author writes the map form instead. Written as a map
 /// from library Step id, each Step gets only its own entry. `lib_step` is the
-/// Step's id in the library.
+/// Step's id in the library. An instance of a matrix Step is placed by the
+/// first that applies: an inner invoke's coordinate key that names it, then
+/// the inner invoke's plain key for the Step, then this list.
 fn carry_invoke_fields(invoke: &StepSpec, lib_step: &str, inst: &mut StepSpec) {
     if !inst.is_gate() {
         if inst.timeout.is_none() {
@@ -4495,6 +4821,9 @@ fn carry_invoke_fields(invoke: &StepSpec, lib_step: &str, inst: &mut StepSpec) {
         if inst.resources.memory_mib.is_none() {
             inst.resources.memory_mib = invoke.resources.memory_mib;
         }
+        // A matrix Step an inner invoke placed by coordinate keys gets this
+        // list too: when its matrix expands, an instance a coordinate key
+        // names takes that key's profiles instead.
         if inst.placement_profiles.is_empty() && inst.forge_token.is_none() {
             inst.placement_profiles = PlacementProfiles::List(
                 invoke
@@ -4503,6 +4832,232 @@ fn carry_invoke_fields(invoke: &StepSpec, lib_step: &str, inst: &mut StepSpec) {
                     .to_vec(),
             );
         }
+    }
+}
+
+/// Check an invoke step's per-Step `placement_profiles` map against the
+/// library it inlines (`lib` as written, `resolved` after its own invokes
+/// and matrix inputs), and return its coordinate keys by library Step id.
+///
+/// A key is a library Step id (`build`: every instance of a matrix Step
+/// that no coordinate key names), or a coordinate of a matrix Step the
+/// library writes itself: `<step>[<dimension>=<value>]`, with one or more
+/// `<dimension>=<value>` pairs separated by `,` (`build[arch=linux/arm64]`).
+/// An instance is placed by the coordinate key whose pairs it has; two keys
+/// that could both place one instance are refused.
+fn placement_map(
+    invoke: &StepSpec,
+    map: &BTreeMap<String, Vec<String>>,
+    lib: &PipelineIr,
+    resolved: &[StepSpec],
+    label: &str,
+    diagnostics: &mut Vec<String>,
+) -> BTreeMap<String, Vec<CoordinatePlacement>> {
+    let at = format!("step `{}`: `placement_profiles`", invoke.id);
+    let mut coordinate: BTreeMap<String, Vec<CoordinatePlacement>> = BTreeMap::new();
+    // Each key must place a Step or an instance no other key places, and a
+    // Pipeline compiles to at most MAX_COMPILED_STEPS Steps: a bound on the
+    // keys, and so on the work of comparing them.
+    let limit = 2 * MAX_COMPILED_STEPS;
+    if map.len() > limit {
+        diagnostics.push(format!(
+            "{at} has {} keys; the limit is {limit}, twice the most Steps a Pipeline compiles to",
+            map.len()
+        ));
+        return coordinate;
+    }
+    for (key, names) in map {
+        // The budget reports that the compiler stopped (`inline_invokes`
+        // checks it once more after the last Step).
+        if diagnostics.len() >= MAX_INLINE_DIAGNOSTICS {
+            break;
+        }
+        if names.iter().any(|p| p.trim().is_empty()) {
+            diagnostics.push(format!(
+                "step `{}`: `placement_profiles.{key}` contains an empty profile name",
+                invoke.id
+            ));
+        }
+        // A key that is a library Step id is one, `[` or not.
+        let (id, pairs) = if !key.contains('[') || lib.steps.iter().any(|s| &s.id == key) {
+            (key.as_str(), None)
+        } else {
+            match parse_coordinate_key(key) {
+                Some((id, pairs)) => (id, Some(pairs)),
+                None => {
+                    diagnostics.push(format!(
+                        "{at} key `{key}` is neither a step id nor a coordinate \
+                         `<step>[<dimension>=<value>]`"
+                    ));
+                    continue;
+                }
+            }
+        };
+        let Some(target) = lib.steps.iter().find(|s| s.id == id) else {
+            let hint = match pairs {
+                None => coordinate_key_hint(key, resolved),
+                Some(_) => String::new(),
+            };
+            diagnostics.push(format!(
+                "{at} names step `{id}`, which library `{label}` does not have{hint}"
+            ));
+            continue;
+        };
+        if target.forge_token.is_some() {
+            diagnostics.push(format!(
+                "{at} names step `{id}` of library `{label}`, which has `forge_token`; an \
+                 invoke gives such a step no placement profile"
+            ));
+            continue;
+        }
+        if !target.placement_profiles.is_empty() {
+            diagnostics.push(format!(
+                "{at} names step `{id}` of library `{label}`, which sets its own placement \
+                 profiles; the library's own value wins, so these would never apply"
+            ));
+            continue;
+        }
+        let Some(pairs) = pairs else { continue };
+        if target.invoke.is_some() {
+            diagnostics.push(format!(
+                "{at} key `{key}` names step `{id}` of library `{label}`, which is an invoke \
+                 step; a coordinate key places the instances of a matrix Step the library \
+                 writes itself, so write the key `{id}`"
+            ));
+            continue;
+        }
+        // A Step whose matrix input did not resolve is reported already.
+        let Some(this) = resolved.iter().find(|s| s.id == id) else {
+            continue;
+        };
+        let Some(matrix) = &this.matrix else {
+            diagnostics.push(format!(
+                "{at} key `{key}` names a matrix coordinate, but step `{id}` of library \
+                 `{label}` has no matrix; write the key `{id}`"
+            ));
+            continue;
+        };
+        let before = diagnostics.len();
+        let mut coord: BTreeMap<String, String> = BTreeMap::new();
+        for (dim, value) in pairs {
+            match matrix.dimensions.get(dim).map(MatrixDimension::values) {
+                None => diagnostics.push(format!(
+                    "{at} key `{key}` names dimension `{dim}`, which the matrix of step `{id}` \
+                     of library `{label}` does not have (it has: {})",
+                    shown_list(matrix.dimensions.keys().map(String::as_str))
+                )),
+                Some(Some(values)) if !values.iter().any(|v| v == value) => {
+                    diagnostics.push(format!(
+                        "{at} key `{key}` names `{dim}={value}`, which is not a value of \
+                         dimension `{dim}` of step `{id}` of library `{label}` (its values: {})",
+                        shown_list(values.iter().map(String::as_str))
+                    ))
+                }
+                Some(_) => {}
+            }
+            if coord.insert(dim.to_string(), value.to_string()).is_some() {
+                diagnostics.push(format!("{at} key `{key}` names dimension `{dim}` twice"));
+            }
+        }
+        if diagnostics.len() > before {
+            continue;
+        }
+        let earlier = coordinate.entry(id.to_string()).or_default();
+        if let Some(other) = earlier.iter().find(|o| {
+            o.coordinate
+                .iter()
+                .all(|(k, v)| coord.get(k).is_none_or(|w| w == v))
+        }) {
+            diagnostics.push(format!(
+                "{at} keys `{}` and `{key}` can both name one instance of step `{id}` of \
+                 library `{label}`; give each instance at most one key",
+                other.key
+            ));
+            continue;
+        }
+        earlier.push(CoordinatePlacement {
+            key: key.clone(),
+            coordinate: coord,
+            profiles: names.clone(),
+        });
+    }
+    coordinate
+}
+
+/// The first 10 of `items`, each cut to 80 characters, joined by `, `, then
+/// `, and <n> more` for the rest: a list a diagnostic quotes.
+fn shown_list<'a>(items: impl Iterator<Item = &'a str>) -> String {
+    const MAX_SHOWN: usize = 10;
+    let mut shown: Vec<String> = Vec::new();
+    let mut more = 0usize;
+    for item in items {
+        if shown.len() < MAX_SHOWN {
+            shown.push(cel::shown(item));
+        } else {
+            more += 1;
+        }
+    }
+    let mut out = shown.join(", ");
+    if more > 0 {
+        out.push_str(&format!(", and {more} more"));
+    }
+    out
+}
+
+/// A coordinate key of `placement_profiles`, `<step>[<dim>=<value>,…]`, as
+/// the step id and its pairs; `None` when the key is not of that form.
+fn parse_coordinate_key(key: &str) -> Option<(&str, Vec<(&str, &str)>)> {
+    let (id, rest) = key.split_once('[')?;
+    let inner = rest.strip_suffix(']')?;
+    if id.is_empty() || inner.contains(['[', ']']) {
+        return None;
+    }
+    let pairs = inner
+        .split(',')
+        .map(|p| {
+            p.split_once('=')
+                .filter(|(d, v)| !d.is_empty() && !v.is_empty() && !v.contains('='))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((id, pairs))
+}
+
+/// For a `placement_profiles` key that names no library Step: the
+/// coordinate keys to write when it is a value of a matrix Step's
+/// dimension, the second `/`-segment of one (the architecture of
+/// `os/arch[/variant]`: `amd64` for `linux/amd64`, `arm` for
+/// `linux/arm/v7`), or its last.
+fn coordinate_key_hint(key: &str, resolved: &[StepSpec]) -> String {
+    /// The most keys a hint names.
+    const MAX_HINTS: usize = 3;
+    let mut keys: Vec<String> = Vec::new();
+    'steps: for s in resolved.iter().filter(|s| !s.id.contains('/')) {
+        for (dim, values) in s.matrix.iter().flat_map(|m| m.dimensions.iter()) {
+            for v in values.values().unwrap_or_default() {
+                // `os/arch[/variant]`: the old key was the architecture
+                // (`arm` for `linux/arm/v7`); a value without `/` is
+                // matched whole.
+                let mut parts = v.split('/');
+                let arch = match (parts.next(), parts.next()) {
+                    (Some(_), Some(arch)) => arch,
+                    _ => v.as_str(),
+                };
+                if v == key || arch == key || v.rsplit('/').next() == Some(key) {
+                    keys.push(format!("`{}`", cel::shown(&format!("{}[{dim}={v}]", s.id))));
+                    if keys.len() == MAX_HINTS {
+                        break 'steps;
+                    }
+                }
+            }
+        }
+    }
+    if keys.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; to place one instance of a matrix Step, write its coordinate: {}",
+            keys.join(" or ")
+        )
     }
 }
 
@@ -4729,14 +5284,25 @@ fn guarded_by(step: &StepSpec) -> Option<&'static str> {
 
 /// Each `(input, step, what)` where a library Step with `forge_token`, a
 /// sandbox or `registry_auth` ([`guarded_by`], named by `what`) reads
-/// `inputs.<input>` in its image, command or env, once per pair. A read of
-/// `inputs` whole counts as a read of every input.
+/// `inputs.<input>` in its image, command or env, or takes a matrix
+/// dimension's values from it, once per pair. A read of `inputs` whole
+/// counts as a read of every input.
 fn guarded_input_reads(lib: &PipelineIr) -> BTreeSet<(String, String, &'static str)> {
     let mut out = BTreeSet::new();
     for step in &lib.steps {
         let Some(what) = guarded_by(step) else {
             continue;
         };
+        // A matrix dimension's values from an input are the Step's
+        // `matrix`, which its templates read.
+        for dim in step.matrix.iter().flat_map(|m| m.dimensions.values()) {
+            if let Some(name) = match dim {
+                MatrixDimension::Input(text) => matrix_input_name(text),
+                MatrixDimension::Values(_) => None,
+            } {
+                out.insert((name, step.id.clone(), what));
+            }
+        }
         let mut texts: Vec<&str> = vec![step.image.as_str()];
         texts.extend(step.command.iter().map(String::as_str));
         texts.extend(step.env.iter().map(|(_, v)| v.as_str()));
@@ -4824,6 +5390,153 @@ pub(crate) fn is_identifier(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// The characters a matrix value taken from an input may not hold: each
+/// would break the Step's id (`<step>[<dim>=<value>]`) or a coordinate key
+/// of `placement_profiles`. A `/` is allowed (`linux/amd64`).
+const MATRIX_INPUT_VALUE_FORBIDDEN: [char; 4] = ['[', ']', ',', '='];
+
+/// Resolve each dimension of a library Step's `matrix` written as
+/// `${{ inputs.<name> }}` from the invocation's bindings at `level`: the
+/// caller's literal `with:` value or the input's default, a string split on
+/// commas and whitespace into the dimension's values. `Ok(None)` when no
+/// dimension is written that way; `Err` after pushing why it cannot be
+/// resolved. A caller's template is refused: it has a value only when a
+/// Step launches, and a matrix expands when the Pipeline compiles.
+fn resolve_matrix_inputs(
+    step: &StepSpec,
+    matrix: &Matrix,
+    level: &Level<'_>,
+    label: &str,
+    diagnostics: &mut Vec<String>,
+) -> Result<Option<Matrix>, ()> {
+    if !matrix
+        .dimensions
+        .values()
+        .any(|d| matches!(d, MatrixDimension::Input(_)))
+    {
+        return Ok(None);
+    }
+    let at = format!("library `{label}`, step `{}`", step.id);
+    let declared = level.library.map_or(&[][..], |(_, d)| d);
+    let bindings = match &level.scope.inputs {
+        ScopeInputs::Bound(b) => Some(b),
+        ScopeInputs::Run => None,
+    };
+    let before = diagnostics.len();
+    let mut out = matrix.clone();
+    for (dim, values) in &mut out.dimensions {
+        let MatrixDimension::Input(text) = values else {
+            continue;
+        };
+        let Some(name) = matrix_input_name(text) else {
+            diagnostics.push(format!(
+                "{at}: matrix dimension `{dim}` is `{}`; a dimension is a list of values, or \
+                 exactly `${{{{ inputs.<name> }}}}` to take its values from an input",
+                cel::shown(text)
+            ));
+            continue;
+        };
+        let reads = format!("{at}: matrix dimension `{dim}` reads `inputs.{name}`");
+        let Some(param) = declared.iter().find(|p| p.name == name) else {
+            diagnostics.push(format!(
+                "{reads}, which library `{label}` does not declare in `interface.inputs`"
+            ));
+            continue;
+        };
+        // An installed library is checked with its defaults: without one,
+        // the matrix has no values to check.
+        if param.default.is_none() {
+            diagnostics.push(format!(
+                "{reads}, which has no default; an input that a matrix reads needs a default, so \
+                 the library is checked with real values when it is installed"
+            ));
+            continue;
+        }
+        let value = match bindings.and_then(|b| b.get(&name)).map(|b| &b.value) {
+            Some(BoundValue::Literal(v)) => v,
+            Some(BoundValue::Template(t)) => {
+                diagnostics.push(format!(
+                    "{reads}, which the caller's `with:` binds to the template `{}`; a matrix \
+                     expands when the Pipeline compiles and a template has a value only when a \
+                     Step launches, so write the values in `with.{name}` as text",
+                    cel::shown(t)
+                ));
+                continue;
+            }
+            // Not set and no default, or a value that does not convert
+            // (also reported with the caller's `with:`).
+            None => {
+                diagnostics.push(format!(
+                    "{reads}, which has no value: the caller's `with:` does not set it (or sets \
+                     a value that does not convert) and it has no default"
+                ));
+                continue;
+            }
+        };
+        let serde_json::Value::String(list) = value else {
+            diagnostics.push(format!(
+                "{reads}, which is `{value}`, not text; declare it as a `string` and list the \
+                 values separated by commas or spaces"
+            ));
+            continue;
+        };
+        // The first problem only: the text may be long. The number of
+        // values is bounded when the matrix expands.
+        if list.contains("${{") {
+            diagnostics.push(format!(
+                "{reads}, whose value holds `${{{{`; a matrix expands when the Pipeline compiles, \
+                 so write the values as text"
+            ));
+            continue;
+        }
+        let dim_before = diagnostics.len();
+        let mut resolved: Vec<String> = Vec::new();
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for v in list
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|v| !v.is_empty())
+        {
+            if let Some(c) = v
+                .chars()
+                .find(|c| MATRIX_INPUT_VALUE_FORBIDDEN.contains(c) || c.is_control())
+            {
+                diagnostics.push(format!(
+                    "{reads}, whose value `{}` holds `{}`; a value from an input may not hold \
+                     `[`, `]`, `,`, `=`, `{SIDECAR_LOG_SEPARATOR}` or a control character, which \
+                     would break the Step's id or a `placement_profiles` key",
+                    cel::shown(&v.escape_debug().to_string()),
+                    c.escape_debug()
+                ));
+                break;
+            }
+            if v.contains(SIDECAR_LOG_SEPARATOR) {
+                diagnostics.push(format!(
+                    "{reads}, whose value `{}` holds `{SIDECAR_LOG_SEPARATOR}`, which Scarab \
+                     uses to name a Step's sidecar logs; a Step id may not contain it",
+                    cel::shown(v)
+                ));
+                break;
+            }
+            if !seen.insert(v) {
+                diagnostics.push(format!("{reads}, which names `{}` twice", cel::shown(v)));
+                break;
+            }
+            resolved.push(v.to_string());
+        }
+        if resolved.is_empty() && diagnostics.len() == dim_before {
+            diagnostics.push(format!(
+                "{reads}, which names no value; list at least one, separated by commas or spaces"
+            ));
+        }
+        *values = MatrixDimension::Values(resolved);
+    }
+    if diagnostics.len() > before {
+        Err(())
+    } else {
+        Ok(Some(out))
+    }
+}
+
 /// Expand one authored step into its concrete instances.
 ///
 /// A step without a matrix yields itself (with an explicitly cleared `matrix`).
@@ -4840,18 +5553,41 @@ fn expand_step(step: &StepSpec, work: &mut MatrixWork) -> Result<Vec<StepSpec>, 
     if matrix.dimensions.is_empty() {
         return Err(format!("step `{}`: matrix has no dimensions", step.id));
     }
+    // A dimension written as text was resolved when its library was
+    // inlined; one left here is not in a library.
+    let mut dimensions: BTreeMap<&String, &Vec<String>> = BTreeMap::new();
     for (dim, values) in &matrix.dimensions {
+        let values = match values {
+            MatrixDimension::Values(v) => v,
+            MatrixDimension::Input(text) => {
+                return Err(match matrix_input_name(text) {
+                    Some(_) => format!(
+                        "step `{}`: matrix dimension `{dim}` is `{}`; only a library \
+                         Step's matrix may take its values from an input (the invoke's \
+                         `with:` value or the input's default), so list the values here",
+                        step.id,
+                        cel::shown(text)
+                    ),
+                    None => format!(
+                        "step `{}`: matrix dimension `{dim}` is `{}`; a dimension is a list \
+                         of values",
+                        step.id,
+                        cel::shown(text)
+                    ),
+                });
+            }
+        };
         if values.is_empty() {
             return Err(format!(
                 "step `{}`: matrix dimension `{dim}` has no values",
                 step.id
             ));
         }
+        dimensions.insert(dim, values);
     }
     // Refuse a product over the bound before building it. The cap on Steps
     // applies to the combinations `exclude` keeps, below.
-    let combinations = matrix
-        .dimensions
+    let combinations = dimensions
         .values()
         .try_fold(1usize, |n, v| n.checked_mul(v.len()));
     if combinations.is_none_or(|n| n > MAX_MATRIX_COMBINATIONS) {
@@ -4898,7 +5634,7 @@ fn expand_step(step: &StepSpec, work: &mut MatrixWork) -> Result<Vec<StepSpec>, 
     // A combination is a number: each dimension's value index, in the
     // (sorted) dimension order, the last changing fastest. Nothing is copied
     // per combination until the kept ones are known to fit.
-    let dims: Vec<(&String, &Vec<String>)> = matrix.dimensions.iter().collect();
+    let dims: Vec<(&String, &Vec<String>)> = dimensions.into_iter().collect();
     let mut stride = vec![1usize; dims.len()];
     for k in (0..dims.len().saturating_sub(1)).rev() {
         stride[k] = stride[k + 1] * dims[k + 1].1.len();
@@ -4986,13 +5722,33 @@ fn expand_step(step: &StepSpec, work: &mut MatrixWork) -> Result<Vec<StepSpec>, 
     if total.is_none() {
         return Err(ir_too_large(&format!("step `{}`", step.id)));
     }
-
-    Ok(kept
-        .into_iter()
-        .map(|c| {
-            let coord: BTreeMap<String, String> = (0..dims.len())
+    let coordinates: Vec<BTreeMap<String, String>> = kept
+        .iter()
+        .map(|&c| {
+            (0..dims.len())
                 .map(|k| (dims[k].0.clone(), dims[k].1[index(c, k)].clone()))
-                .collect();
+                .collect()
+        })
+        .collect();
+    let places = |p: &CoordinatePlacement, coord: &BTreeMap<String, String>| {
+        p.coordinate.iter().all(|(k, v)| coord.get(k) == Some(v))
+    };
+    // Coordinate keys of the invoke's `placement_profiles` (checked at
+    // inlining, so at most one places each instance): one that places no
+    // kept instance was emptied by `exclude`.
+    for p in &matrix.placement {
+        if !coordinates.iter().any(|coord| places(p, coord)) {
+            return Err(format!(
+                "step `{}`: `placement_profiles` key `{}` places no instance: `exclude` removes \
+                 every instance it names",
+                step.id, p.key
+            ));
+        }
+    }
+
+    Ok(coordinates
+        .into_iter()
+        .map(|coord| {
             let suffix = coord
                 .iter()
                 .map(|(k, v)| format!("{k}={v}"))
@@ -5001,6 +5757,11 @@ fn expand_step(step: &StepSpec, work: &mut MatrixWork) -> Result<Vec<StepSpec>, 
             let mut instance = step.clone();
             instance.id = format!("{}[{suffix}]", step.id);
             instance.matrix = None;
+            // An instance a coordinate key names runs on that key's
+            // profiles; any other keeps the Step's list (a plain key's).
+            if let Some(p) = matrix.placement.iter().find(|p| places(p, &coord)) {
+                instance.placement_profiles = PlacementProfiles::List(p.profiles.clone());
+            }
             // Merge onto any coordinate the step already carries (an invoke
             // step's coordinate propagated onto an inlined library step, ADR-0038)
             // rather than replacing it; for an ordinary step the map starts empty.
@@ -5488,7 +6249,7 @@ fn command_values(ir: &PipelineIr) -> Vec<String> {
                 });
                 let (at, caller) = match (&bound, step.origin.last()) {
                     (Some((name, template)), Some(lib)) => {
-                        let (invoke, own) = step.id.rsplit_once('/').unwrap_or(("", &step.id));
+                        let (invoke, own) = split_invoke_prefix(&step.id).unwrap_or(("", &step.id));
                         (
                             format!("library `{}`, step `{own}`", lib.name),
                             format!(", which step `{invoke}` binds with `with.{name}: {template}`",),
@@ -5512,6 +6273,61 @@ fn command_values(ir: &PipelineIr) -> Vec<String> {
         }
     }
     found
+}
+
+/// `id` split at its last `/` outside a matrix leg's `[…]`: an inlined
+/// Step's invoke prefix and its own id (`app/build[arch=linux/amd64]` is
+/// `app` and `build[arch=linux/amd64]`). `None` when there is no such `/`.
+fn split_invoke_prefix(id: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    let mut at = None;
+    for (i, c) in id.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            '/' if depth == 0 => at = Some(i),
+            _ => {}
+        }
+    }
+    at.map(|i| (&id[..i], &id[i + 1..]))
+}
+
+/// Whether each `[` in `id` has a `]` after it and each `]` a `[` before it.
+fn brackets_pair(id: &str) -> bool {
+    let mut depth = 0usize;
+    for c in id.chars() {
+        match c {
+            '[' => depth += 1,
+            ']' if depth == 0 => return false,
+            ']' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+/// The diagnostic for a step id whose brackets do not pair; `place` is
+/// ` in library `…`` or empty.
+fn unpaired_brackets(id: &str, place: &str) -> String {
+    format!(
+        "step `{id}`{place}: `[` and `]` in a step id must pair; Scarab reads `[…]` as a matrix \
+         coordinate when it splits an inlined Step's name"
+    )
+}
+
+/// `id` up to its first `/` outside a matrix leg's `[…]`: the outermost
+/// part of an inlined Step's id (`inner[k=a/b]` of `inner[k=a/b]/build`).
+fn first_id_segment(id: &str) -> &str {
+    let mut depth = 0usize;
+    for (i, c) in id.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            '/' if depth == 0 => return &id[..i],
+            _ => {}
+        }
+    }
+    id
 }
 
 /// `text` without its `[…]` parts: a matrix leg's id as its Step's.
@@ -5826,7 +6642,7 @@ fn validate_output_reads(ir: &PipelineIr, diagnostics: &mut Vec<String>) {
             if let (ScopeInputs::Bound(bindings), Some(caller)) = (&scope.inputs, &scope.caller) {
                 let invoke = match &t.plugin_gate {
                     Some(_) => t.id.as_str(),
-                    None => t.id.rsplit_once('/').map_or(t.id.as_str(), |(p, _)| p),
+                    None => split_invoke_prefix(&t.id).map_or(t.id.as_str(), |(p, _)| p),
                 };
                 for b in bindings.values() {
                     if let BoundValue::Template(text) = &b.value {
@@ -5881,6 +6697,17 @@ fn validate_output_reads(ir: &PipelineIr, diagnostics: &mut Vec<String>) {
                                 Some(id) => id.clone(),
                                 None => continue,
                             },
+                            // A list has no fields: each entry's results
+                            // are under `results`.
+                            Some(OutputSource::Instances(_)) => {
+                                diagnostics.push(format!(
+                                    "step `{reader}`: reads `outputs.{name}.{field}`, but \
+                                     `{name}` is a matrix Step, so `outputs.{name}` is a list \
+                                     of its instances, each `{{matrix, results}}`; read \
+                                     `outputs.{name}.map(i, i.results.{field})`"
+                                ));
+                                continue;
+                            }
                             None => continue,
                         },
                     };
@@ -13316,6 +14143,1223 @@ steps:
                     .unwrap()
                     .is_empty(),
                 "{when}"
+            );
+        }
+    }
+
+    // --- a library matrix from an input, coordinate placement, fan-in lists --
+
+    /// A file library `.scarab/lib/m.yaml` whose Step `build` takes its
+    /// matrix dimension `arch` from `dim` (YAML text), with string inputs
+    /// `p` (default `a,b`) and `t`, a number `n`, a boolean `f`, and the
+    /// extra `inputs` and `steps` YAML lines given.
+    fn matrix_input_lib(dim: &str, inputs: &str, steps: &str) -> BTreeMap<String, String> {
+        libs(&[(
+            ".scarab/lib/m.yaml",
+            &format!(
+                "interface:\n  inputs:\n    - {{ name: p, type: string, required: false, default: \"a,b\" }}\n    - {{ name: t, type: string, required: false, default: \"x\" }}\n    - {{ name: n, type: number, required: false, default: 3 }}\n    - {{ name: f, type: boolean, required: false, default: true }}\n{inputs}steps:\n  - id: build\n    image: alpine\n    command: [echo]\n    env: [[ARCH, \"${{{{ matrix.arch }}}}\"]]\n    matrix: {{ dimensions: {{ arch: {dim} }} }}\n{steps}"
+            ),
+        )])
+    }
+
+    /// The Pipeline that invokes `.scarab/lib/m.yaml` as `app` with `with`.
+    fn invoke_m(with: &str) -> String {
+        format!("steps: [{{ id: app, invoke: file:.scarab/lib/m.yaml, with: {with} }}]")
+    }
+
+    const AT_M: &str = "library `.scarab/lib/m.yaml`, step `build`";
+
+    /// Every refusal of a matrix dimension written as `${{ inputs.<name> }}`,
+    /// one compile per row, with its exact message; a dimension reports its
+    /// first problem only.
+    #[test]
+    fn matrix_input_refusals() {
+        let reads = |name: &str| format!("{AT_M}: matrix dimension `arch` reads `inputs.{name}`");
+        let not_one = |text: &str| {
+            format!(
+                "{AT_M}: matrix dimension `arch` is `{text}`; a dimension is a list of values, or \
+                 exactly `${{{{ inputs.<name> }}}}` to take its values from an input"
+            )
+        };
+        let holds = |v: &str, c: &str| {
+            format!(
+                "{}, whose value `{v}` holds `{c}`; a value from an input may not hold `[`, `]`, \
+                 `,`, `=`, `::service-` or a control character, which would break the Step's id \
+                 or a `placement_profiles` key",
+                reads("p")
+            )
+        };
+        let rows: Vec<(&str, &str, &str, String)> = vec![
+            (
+                r#""pre-${{ inputs.p }}""#,
+                "",
+                "{}",
+                not_one("pre-${{ inputs.p }}"),
+            ),
+            (
+                r#""${{ inputs.p }}${{ inputs.t }}""#,
+                "",
+                "{}",
+                not_one("${{ inputs.p }}${{ inputs.t }}"),
+            ),
+            (
+                r#""${{ outputs.a.b }}""#,
+                "",
+                "{}",
+                not_one("${{ outputs.a.b }}"),
+            ),
+            (
+                r#""${{ inputs.zz }}""#,
+                "",
+                "{}",
+                format!(
+                    "{}, which library `.scarab/lib/m.yaml` does not declare in `interface.inputs`",
+                    reads("zz")
+                ),
+            ),
+            (
+                r#""${{ inputs.p }}""#,
+                "",
+                r#"{ p: "${{ event.sha }}" }"#,
+                format!(
+                    "{}, which the caller's `with:` binds to the template `${{{{ event.sha }}}}`; \
+                     a matrix expands when the Pipeline compiles and a template has a value only \
+                     when a Step launches, so write the values in `with.p` as text",
+                    reads("p")
+                ),
+            ),
+            (
+                r#""${{ inputs.r }}""#,
+                "    - { name: r, type: string }\n",
+                r#"{ r: "a" }"#,
+                format!(
+                    "{}, which has no default; an input that a matrix reads needs a default, so \
+                     the library is checked with real values when it is installed",
+                    reads("r")
+                ),
+            ),
+            (
+                r#""${{ inputs.n }}""#,
+                "",
+                r#"{ n: "abc" }"#,
+                format!(
+                    "{}, which has no value: the caller's `with:` does not set it (or sets a value \
+                     that does not convert) and it has no default",
+                    reads("n")
+                ),
+            ),
+            (
+                r#""${{ inputs.d }}""#,
+                "    - { name: d, type: string, required: false, default: \"${{ event.sha }}\" }\n",
+                "{}",
+                format!(
+                    "{}, whose value holds `${{{{`; a matrix expands when the Pipeline compiles, so \
+                     write the values as text",
+                    reads("d")
+                ),
+            ),
+            (
+                r#""${{ inputs.n }}""#,
+                "",
+                "{}",
+                format!(
+                    "{}, which is `3`, not text; declare it as a `string` and list the values \
+                     separated by commas or spaces",
+                    reads("n")
+                ),
+            ),
+            (
+                r#""${{ inputs.f }}""#,
+                "",
+                "{}",
+                format!(
+                    "{}, which is `true`, not text; declare it as a `string` and list the values \
+                     separated by commas or spaces",
+                    reads("f")
+                ),
+            ),
+            (
+                r#""${{ inputs.p }}""#,
+                "",
+                r#"{ p: "a[b" }"#,
+                holds("a[b", "["),
+            ),
+            (
+                r#""${{ inputs.p }}""#,
+                "",
+                r#"{ p: "a]b" }"#,
+                holds("a]b", "]"),
+            ),
+            (
+                r#""${{ inputs.p }}""#,
+                "",
+                r#"{ p: "a=b" }"#,
+                holds("a=b", "="),
+            ),
+            (
+                r#""${{ inputs.p }}""#,
+                "",
+                r#"{ p: "a\x01b" }"#,
+                holds(r"a\u{1}b", r"\u{1}"),
+            ),
+            (
+                r#""${{ inputs.p }}""#,
+                "",
+                r#"{ p: "a::service-b" }"#,
+                format!(
+                    "{}, whose value `a::service-b` holds `::service-`, which Scarab uses to name \
+                     a Step's sidecar logs; a Step id may not contain it",
+                    reads("p")
+                ),
+            ),
+            (
+                r#""${{ inputs.p }}""#,
+                "",
+                r#"{ p: "a,b,a" }"#,
+                format!("{}, which names `a` twice", reads("p")),
+            ),
+            (
+                r#""${{ inputs.p }}""#,
+                "",
+                r#"{ p: "" }"#,
+                format!(
+                    "{}, which names no value; list at least one, separated by commas or spaces",
+                    reads("p")
+                ),
+            ),
+            (
+                r#""${{ inputs.p }}""#,
+                "",
+                r#"{ p: " , " }"#,
+                format!(
+                    "{}, which names no value; list at least one, separated by commas or spaces",
+                    reads("p")
+                ),
+            ),
+        ];
+        for (dim, inputs, with, want) in &rows {
+            let errs = errors_with(&invoke_m(with), &matrix_input_lib(dim, inputs, ""));
+            assert!(
+                errs.iter().any(|e| e == want),
+                "{dim} {with}:\nwant {want}\ngot {errs:?}"
+            );
+        }
+        // Two problems in one dimension: the first only.
+        let errs = errors_with(
+            &invoke_m(r#"{ p: "x[y,x=y" }"#),
+            &matrix_input_lib(r#""${{ inputs.p }}""#, "", ""),
+        );
+        let about: Vec<&String> = errs
+            .iter()
+            .filter(|e| e.contains("matrix dimension `arch`"))
+            .collect();
+        assert_eq!(about, [&holds("x[y", "[")], "{errs:?}");
+    }
+
+    /// Only a library's matrix takes values from an input; written in a
+    /// Pipeline file a dimension is a list, and text there is refused.
+    #[test]
+    fn matrix_input_outside_a_library_is_refused() {
+        let errs = errors(
+            "steps: [{ id: s, image: alpine, command: [echo], matrix: { dimensions: { arch: \"${{ inputs.x }}\" } } }]",
+        );
+        let want = "step `s`: matrix dimension `arch` is `${{ inputs.x }}`; only a library Step's \
+                    matrix may take its values from an input (the invoke's `with:` value or the \
+                    input's default), so list the values here";
+        assert!(errs.iter().any(|e| e == want), "{errs:?}");
+        let errs = errors(
+            "steps: [{ id: s, image: alpine, command: [echo], matrix: { dimensions: { arch: amd64 } } }]",
+        );
+        let want = "step `s`: matrix dimension `arch` is `amd64`; a dimension is a list of values";
+        assert!(errs.iter().any(|e| e == want), "{errs:?}");
+    }
+
+    /// An input's text splits on commas and white space, empty pieces
+    /// dropped and order kept; `inputs["p"]` and spaces inside the braces
+    /// read the same input; a `/` stays in the value.
+    #[test]
+    fn matrix_input_splits_and_keeps_order() {
+        let ids = |ir: &PipelineIr| {
+            ir.steps
+                .iter()
+                .map(|s| s.id.clone())
+                .collect::<Vec<String>>()
+        };
+        for dim in [
+            r#""${{ inputs.p }}""#,
+            r#""${{  inputs.p  }}""#,
+            r#"'${{ inputs["p"] }}'"#,
+        ] {
+            let ir = compile_with(
+                &invoke_m(r#"{ p: "b, a\tc" }"#),
+                &matrix_input_lib(dim, "", ""),
+            );
+            assert_eq!(
+                ids(&ir),
+                [
+                    "app/build[arch=b]",
+                    "app/build[arch=a]",
+                    "app/build[arch=c]"
+                ],
+                "{dim}"
+            );
+        }
+        let ir = compile_with(
+            &invoke_m(r#"{ p: "linux/amd64,linux/arm/v7" }"#),
+            &matrix_input_lib(r#""${{ inputs.p }}""#, "", ""),
+        );
+        assert_eq!(
+            ids(&ir),
+            [
+                "app/build[arch=linux/amd64]",
+                "app/build[arch=linux/arm/v7]"
+            ]
+        );
+        assert_eq!(ir.steps[1].matrix_values["arch"], "linux/arm/v7");
+        // The default, when the caller does not set it.
+        let ir = compile_with(
+            &invoke_m("{}"),
+            &matrix_input_lib(r#""${{ inputs.p }}""#, "", ""),
+        );
+        assert_eq!(ids(&ir), ["app/build[arch=a]", "app/build[arch=b]"]);
+    }
+
+    /// A library that invokes another cannot forward its own input to the
+    /// inner matrix: the binding is a template, which has no value when the
+    /// Pipeline compiles.
+    #[test]
+    fn a_nested_library_cannot_forward_a_matrix_input() {
+        let mut all = matrix_input_lib(r#""${{ inputs.p }}""#, "", "");
+        all.extend(libs(&[(
+            ".scarab/lib/o.yaml",
+            "interface:\n  inputs:\n    - { name: platforms, type: string, required: false, default: \"a\" }\nsteps:\n  - { id: inner, invoke: file:.scarab/lib/m.yaml, with: { p: \"${{ inputs.platforms }}\" } }\n",
+        )]));
+        let errs = errors_with(
+            "steps: [{ id: o, invoke: file:.scarab/lib/o.yaml, with: { platforms: \"a,b\" } }]",
+            &all,
+        );
+        assert!(
+            errs.iter().any(|e| {
+                e.contains(
+                "matrix dimension `arch` reads `inputs.p`, which the caller's `with:` binds to the \
+                 template `${{ inputs.platforms }}`"
+            )
+            }),
+            "{errs:?}"
+        );
+    }
+
+    /// An input that feeds the matrix of a sandboxed Step is read by that
+    /// Step (its templates read `matrix`): a free string is refused, as for
+    /// any guarded read, until it has a `validate:` rule.
+    #[test]
+    fn a_matrix_input_on_a_guarded_step_needs_validate() {
+        let lib = |validate: &str| {
+            format!(
+                "interface:\n  inputs:\n    - {{ name: p, type: string, required: false, default: \"a,b\"{validate} }}\nsteps:\n  - id: build\n    image: \"moby/buildkit:rootless@sha256:5987568f92dafbfb679879de59c1cd8d26597f5f6635c314e166164e2615870c\"\n    command: [/bin/sh, -c, id]\n    security: {{ sandbox: rootless-buildkit }}\n    matrix: {{ dimensions: {{ arch: \"${{{{ inputs.p }}}}\" }} }}\n"
+            )
+        };
+        let libraries = |content: &str| Libraries {
+            installed: installed(&[("acme/m", "github.com/acme/libs//m.yaml@0", content)]),
+            ..Default::default()
+        };
+        let errs = library_errors(
+            "steps: [{ id: app, invoke: lib:acme/m }]",
+            &libraries(&lib("")),
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("input `p` reaches step `build`")
+                    && e.contains("`security.sandbox`")),
+            "{errs:?}"
+        );
+        let ir = compile_with_libraries(
+            "steps: [{ id: app, invoke: lib:acme/m }]",
+            &libraries(&lib(r#", validate: 'value.matches("^[a-z,]+$")'"#)),
+        )
+        .unwrap();
+        assert_eq!(ir.steps.len(), 2);
+    }
+
+    /// A dimension from an input compiles to what the same values written
+    /// as a list compile to.
+    #[test]
+    fn list_vs_input_compile_the_same() {
+        let post = "  - { id: post, image: alpine, command: [echo], needs: [build] }\n";
+        let from_input = compile_with(
+            &invoke_m(r#"{ p: "a,b" }"#),
+            &matrix_input_lib(r#""${{ inputs.p }}""#, "", post),
+        );
+        let from_list = compile_with(&invoke_m("{}"), &matrix_input_lib("[a, b]", "", post));
+        let shape = |ir: &PipelineIr| {
+            ir.steps
+                .iter()
+                .map(|s| {
+                    (
+                        s.id.clone(),
+                        s.needs.0.clone(),
+                        s.env.clone(),
+                        s.placement_profiles.clone(),
+                        s.matrix_values.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&from_input), shape(&from_list));
+        assert_eq!(from_input.ir_version, from_list.ir_version);
+    }
+
+    /// An installed library with a two-dimension matrix Step `build`, a
+    /// plain Step, an invoke step, a `forge_token` Step and a Step with
+    /// its own profiles, for the placement key refusals.
+    fn placement_libraries() -> Libraries {
+        Libraries {
+            installed: installed(&[
+                (
+                    "acme/m",
+                    "github.com/acme/libs//m.yaml@0",
+                    "steps:\n  - id: build\n    image: alpine\n    command: [echo]\n    matrix: { dimensions: { arch: [a, b], os: [l, w] } }\n  - { id: plain, image: alpine, command: [echo] }\n  - { id: inv, invoke: lib:acme/leaf }\n  - { id: ft, image: alpine, command: [echo], forge_token: read }\n  - { id: own, image: alpine, command: [echo], placement_profiles: [z] }\n",
+                ),
+                (
+                    "acme/leaf",
+                    "github.com/acme/libs//leaf.yaml@0",
+                    "steps:\n  - { id: leaf, image: alpine, command: [echo] }\n",
+                ),
+            ]),
+            ..Default::default()
+        }
+    }
+
+    /// Every refusal of a `placement_profiles` key, one compile per row,
+    /// with its exact message.
+    #[test]
+    fn placement_key_refusals() {
+        let at = "step `c`: `placement_profiles`";
+        let label = "lib:acme/m";
+        let neither = |k: &str| {
+            format!(
+                "{at} key `{k}` is neither a step id nor a coordinate \
+                 `<step>[<dimension>=<value>]`"
+            )
+        };
+        let rows: Vec<(&str, String)> = vec![
+            (r#"{ "build[arch]": [p] }"#, neither("build[arch]")),
+            (r#"{ "build[]": [p] }"#, neither("build[]")),
+            (r#"{ "build[arch=x": [p] }"#, neither("build[arch=x")),
+            (r#"{ "[arch=x]": [p] }"#, neither("[arch=x]")),
+            (
+                r#"{ "nope[arch=x]": [p] }"#,
+                format!("{at} names step `nope`, which library `{label}` does not have"),
+            ),
+            (
+                r#"{ "inv[arch=a]": [p] }"#,
+                format!(
+                    "{at} key `inv[arch=a]` names step `inv` of library `{label}`, which is an \
+                     invoke step; a coordinate key places the instances of a matrix Step the \
+                     library writes itself, so write the key `inv`"
+                ),
+            ),
+            (
+                r#"{ "plain[arch=a]": [p] }"#,
+                format!(
+                    "{at} key `plain[arch=a]` names a matrix coordinate, but step `plain` of \
+                     library `{label}` has no matrix; write the key `plain`"
+                ),
+            ),
+            (
+                r#"{ "build[cpu=a]": [p] }"#,
+                format!(
+                    "{at} key `build[cpu=a]` names dimension `cpu`, which the matrix of step \
+                     `build` of library `{label}` does not have (it has: arch, os)"
+                ),
+            ),
+            (
+                r#"{ "build[arch=c]": [p] }"#,
+                format!(
+                    "{at} key `build[arch=c]` names `arch=c`, which is not a value of dimension \
+                     `arch` of step `build` of library `{label}` (its values: a, b)"
+                ),
+            ),
+            (
+                r#"{ "build[arch=a,arch=a]": [p] }"#,
+                format!("{at} key `build[arch=a,arch=a]` names dimension `arch` twice"),
+            ),
+            (
+                r#"{ "build[arch=a,os=l]": [p], "build[os=l,arch=a]": [q] }"#,
+                format!(
+                    "{at} keys `build[arch=a,os=l]` and `build[os=l,arch=a]` can both name one \
+                     instance of step `build` of library `{label}`; give each instance at most \
+                     one key"
+                ),
+            ),
+            (
+                r#"{ "build[arch=a]": [p], "build[os=l]": [q] }"#,
+                format!(
+                    "{at} keys `build[arch=a]` and `build[os=l]` can both name one instance of \
+                     step `build` of library `{label}`; give each instance at most one key"
+                ),
+            ),
+            (
+                "{ ft: [p] }",
+                format!(
+                    "{at} names step `ft` of library `{label}`, which has `forge_token`; an \
+                     invoke gives such a step no placement profile"
+                ),
+            ),
+            (
+                "{ own: [p] }",
+                format!(
+                    "{at} names step `own` of library `{label}`, which sets its own placement \
+                     profiles; the library's own value wins, so these would never apply"
+                ),
+            ),
+            (
+                r#"{ "build[arch=a]": [""] }"#,
+                "step `c`: `placement_profiles.build[arch=a]` contains an empty profile name"
+                    .to_string(),
+            ),
+        ];
+        for (map, want) in &rows {
+            let errs = library_errors(
+                &format!("steps: [{{ id: c, invoke: lib:acme/m, placement_profiles: {map} }}]"),
+                &placement_libraries(),
+            );
+            assert!(
+                errs.iter().any(|e| e == want),
+                "{map}:\nwant {want}\ngot {errs:?}"
+            );
+        }
+    }
+
+    /// An installed library `acme/one` whose Step `build` has one dimension
+    /// `arch: [a, b]` and `exclude` as given.
+    fn one_dimension(exclude: &str) -> Libraries {
+        Libraries {
+            installed: installed(&[(
+                "acme/one",
+                "github.com/acme/libs//one.yaml@0",
+                &format!(
+                    "steps:\n  - id: build\n    image: alpine\n    command: [echo]\n    matrix: {{ dimensions: {{ arch: [a, b] }}{exclude} }}\n"
+                ),
+            )]),
+            ..Default::default()
+        }
+    }
+
+    /// A coordinate key whose instances `exclude` removes places nothing,
+    /// and is refused.
+    #[test]
+    fn a_key_emptied_by_exclude_is_refused() {
+        let errs = library_errors(
+            r#"steps: [{ id: c, invoke: lib:acme/one, placement_profiles: { "build[arch=b]": [p] } }]"#,
+            &one_dimension(r#", exclude: ["arch == 'b'"]"#),
+        );
+        assert!(
+            errs.iter().any(|e| e.contains(
+                "`placement_profiles` key `build[arch=b]` places no instance: `exclude` removes \
+                 every instance it names"
+            )),
+            "{errs:?}"
+        );
+    }
+
+    /// A plain key places the instances no coordinate key names; with no
+    /// plain key they get no profile (the operator's default).
+    #[test]
+    fn plain_key_places_the_rest() {
+        let place = |map: &str| {
+            let ir = compile_with_libraries(
+                &format!("steps: [{{ id: c, invoke: lib:acme/one, placement_profiles: {map} }}]"),
+                &one_dimension(""),
+            )
+            .unwrap();
+            ["c/build[arch=a]", "c/build[arch=b]"].map(|id| {
+                ir.steps
+                    .iter()
+                    .find(|s| s.id == id)
+                    .unwrap()
+                    .placement_profiles
+                    .compiled()
+                    .unwrap()
+                    .to_vec()
+            })
+        };
+        assert_eq!(
+            place(r#"{ build: [p], "build[arch=a]": [q] }"#),
+            [vec!["q".to_string()], vec!["p".to_string()]]
+        );
+        assert_eq!(
+            place(r#"{ "build[arch=a]": [q] }"#),
+            [vec!["q".to_string()], vec![]]
+        );
+    }
+
+    /// A matrix Step placed by an inner invoke's coordinate keys keeps that
+    /// placement under an outer invoke's list.
+    #[test]
+    fn inner_coordinate_placement_survives_an_outer_list() {
+        let mut libraries = one_dimension("");
+        libraries.installed.extend(installed(&[(
+            "acme/outer",
+            "github.com/acme/libs//outer.yaml@0",
+            "steps:\n  - { id: inner, invoke: lib:acme/one, placement_profiles: { \"build[arch=a]\": [q] } }\n",
+        )]));
+        let ir = compile_with_libraries(
+            "steps: [{ id: c, invoke: lib:acme/outer, placement_profiles: [z] }]",
+            &libraries,
+        )
+        .unwrap();
+        let placed = |ir: &PipelineIr, id: &str| {
+            ir.steps
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("no step {id}"))
+                .placement_profiles
+                .clone()
+        };
+        assert_eq!(placed(&ir, "c/inner/build[arch=a]"), vec!["q"]);
+        // An instance no inner key names takes the outer invoke's list.
+        assert_eq!(placed(&ir, "c/inner/build[arch=b]"), vec!["z"]);
+
+        // An inner plain key wins over the outer list for the rest.
+        let mut libraries = one_dimension("");
+        libraries.installed.extend(installed(&[(
+            "acme/outer",
+            "github.com/acme/libs//outer.yaml@0",
+            "steps:\n  - { id: inner, invoke: lib:acme/one, placement_profiles: { \"build[arch=a]\": [q], build: [p] } }\n",
+        )]));
+        let ir = compile_with_libraries(
+            "steps: [{ id: c, invoke: lib:acme/outer, placement_profiles: [z] }]",
+            &libraries,
+        )
+        .unwrap();
+        assert_eq!(placed(&ir, "c/inner/build[arch=a]"), vec!["q"]);
+        assert_eq!(placed(&ir, "c/inner/build[arch=b]"), vec!["p"]);
+    }
+
+    /// The IR version is 4 when a Step reads a matrix sibling as a list or
+    /// any CEL calls `join`, and as before otherwise; text that only names
+    /// `join` outside CEL does not raise it.
+    #[test]
+    fn ir_version_table() {
+        let plain = |env: &str, command: &str| {
+            compile(&format!(
+                "steps: [{{ id: a, image: alpine, command: {command}, env: {env} }}]"
+            ))
+            .ir_version
+        };
+        assert_eq!(plain("[]", "[echo]"), IR_VERSION);
+        assert_eq!(plain("[]", "[echo, join]"), IR_VERSION);
+        // Text that parses as CEL by accident is not read as CEL: only a
+        // `${{ }}` span is, outside the fields that are expressions whole.
+        assert_eq!(
+            plain("[]", r#"[python, -c, "print(','.join(['a','b']))"]"#),
+            IR_VERSION
+        );
+        assert_eq!(plain(r#"[[SEP, '", ".join(x)']]"#, "[echo]"), IR_VERSION);
+        // Fields read whole as expressions: a Step's `when:`, a trigger's
+        // `when:`, an input's `validate:`; and a `${{ }}` in
+        // `concurrency.group`.
+        for (what, yaml) in [
+            (
+                "step when",
+                "steps: [{ id: a, image: alpine, command: [echo], when: \"['a'].join() == 'a'\" }]",
+            ),
+            (
+                "a when holding a ${{ }} span",
+                "steps: [{ id: a, image: alpine, command: [echo], when: \"['a','b'].join('${{ 0 }}') != ''\" }]",
+            ),
+            (
+                "trigger when",
+                "on: { push: { when: \"['a'].join() == 'a'\" } }\nsteps: [{ id: a, image: alpine, command: [echo] }]",
+            ),
+            (
+                "input validate",
+                "interface: { inputs: [{ name: x, type: string, required: false, default: a, validate: \"[value].join() == 'a'\" }] }\nsteps: [{ id: a, image: alpine, command: [echo] }]",
+            ),
+            (
+                "concurrency group",
+                "concurrency: { group: \"g-${{ ['a'].join() }}\" }\nsteps: [{ id: a, image: alpine, command: [echo] }]",
+            ),
+        ] {
+            assert_eq!(compile(yaml).ir_version, IR_VERSION_INSTANCES, "{what}");
+        }
+        // A trigger's `when:` is evaluated from the file before there is
+        // an IR (on every replica, whatever its version): the version only
+        // stops an older replica from launching the Run's Steps. The gap is
+        // documented, not closed; the compiled version is still 4.
+        assert_eq!(
+            plain(r#"[[J, '${{ ["a"].join() }}']]"#, "[echo]"),
+            IR_VERSION_INSTANCES
+        );
+
+        let lib = |steps: &str| matrix_input_lib("[a, b]", "", steps);
+        assert_eq!(
+            compile_with(&invoke_m("{}"), &lib("")).ir_version,
+            IR_VERSION_SCOPED
+        );
+        assert_eq!(
+            compile_with(
+                &invoke_m("{}"),
+                &lib("  - { id: post, image: alpine, command: [echo], needs: [build], env: [[N, \"${{ size(outputs.build) }}\"]] }\n"),
+            )
+            .ir_version,
+            IR_VERSION_INSTANCES
+        );
+        // An invoke's `when:` becomes a guard of each Step it inlines.
+        assert_eq!(
+            compile_with(
+                "steps: [{ id: app, invoke: file:.scarab/lib/m.yaml, when: \"['a'].join() == 'a'\" }]",
+                &lib(""),
+            )
+            .ir_version,
+            IR_VERSION_INSTANCES
+        );
+        // A caller's `with:` template that calls `join`.
+        assert_eq!(
+            compile_with(
+                &invoke_m(r#"{ t: "${{ ['a', 'b'].join() }}" }"#),
+                &lib("  - { id: post, image: alpine, command: [echo], env: [[T, \"${{ inputs.t }}\"]] }\n"),
+            )
+            .ir_version,
+            IR_VERSION_INSTANCES
+        );
+    }
+
+    /// A field read on a matrix sibling's list is refused, naming the form
+    /// that reads every instance's result.
+    #[test]
+    fn a_field_of_an_instance_list_is_refused() {
+        let errs = errors_with(
+            &invoke_m("{}"),
+            &matrix_input_lib(
+                "[a, b]",
+                "",
+                "  - { id: post, image: alpine, command: [echo], needs: [build], env: [[I, \"${{ outputs.build.image }}\"]] }\n",
+            ),
+        );
+        assert!(
+            errs.iter().any(|e| e.contains(
+                "reads `outputs.build.image`, but `build` is a matrix Step, so `outputs.build` is \
+                 a list of its instances, each `{matrix, results}`; read \
+                 `outputs.build.map(i, i.results.image)`"
+            )),
+            "{errs:?}"
+        );
+    }
+
+    /// A Pipeline file's own matrix Step is read per instance, as before:
+    /// no list, and the IR version is unchanged.
+    #[test]
+    fn a_pipeline_matrix_step_keeps_per_instance_outputs() {
+        let ir = compile(
+            r#"
+            steps:
+              - id: build
+                image: alpine
+                command: [echo]
+                results: [x]
+                matrix: { dimensions: { arch: [a, b] } }
+              - id: post
+                image: alpine
+                command: [echo]
+                needs: [build]
+                env: [[X, '${{ outputs["build[arch=a]"].x }}']]
+            "#,
+        );
+        assert_eq!(ir.ir_version, IR_VERSION);
+        assert!(!ir.steps.iter().any(lists_instances));
+    }
+
+    /// A library invoked by another lists its own matrix Step's instances
+    /// under its full ids, and renders their results.
+    #[test]
+    fn nested_instance_lists_are_namespaced() {
+        let libraries = Libraries {
+            installed: installed(&[
+                (
+                    "acme/a",
+                    "github.com/acme/libs//a.yaml@0",
+                    "steps:\n  - { id: b, invoke: lib:acme/b }\n",
+                ),
+                (
+                    "acme/b",
+                    "github.com/acme/libs//b.yaml@0",
+                    "steps:\n  - id: build\n    image: alpine\n    command: [echo]\n    matrix: { dimensions: { arch: [x, y] } }\n  - id: push\n    image: alpine\n    command: [echo]\n    needs: [build]\n    env: [[L, '${{ outputs.build.map(i, i.matrix.arch + \"=\" + i.results.r).join(\",\") }}']]\n",
+                ),
+            ]),
+            ..Default::default()
+        };
+        let ir =
+            compile_with_libraries("steps: [{ id: a, invoke: lib:acme/a }]", &libraries).unwrap();
+        assert_eq!(ir.ir_version, IR_VERSION_INSTANCES);
+        let push = ir.steps.iter().find(|s| s.id == "a/b/push").unwrap();
+        let results: Results = serde_json::from_value(json!({
+            "a/b/build[arch=x]": { "r": "1" },
+            "a/b/build[arch=y]": { "r": "2" },
+        }))
+        .unwrap();
+        let rendered = render(
+            Templates {
+                image: &push.image,
+                command: &push.command,
+                env: &push.env,
+            },
+            push.scope.as_ref(),
+            &push.matrix_values,
+            Facts::Launch {
+                params: &BTreeMap::new(),
+                declared: &[],
+                results: &results,
+                event: &serde_json::Map::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(rendered.env, vec![("L".to_string(), "x=1,y=2".to_string())]);
+    }
+
+    /// An inlined Step's id splits at its last `/` outside a matrix leg's
+    /// brackets, where a value may hold `/`.
+    #[test]
+    fn split_invoke_prefix_ignores_slashes_in_brackets() {
+        assert_eq!(
+            split_invoke_prefix("app/build[arch=linux/amd64]"),
+            Some(("app", "build[arch=linux/amd64]"))
+        );
+        assert_eq!(
+            split_invoke_prefix("a/b/c[x=y/z]"),
+            Some(("a/b", "c[x=y/z]"))
+        );
+        assert_eq!(split_invoke_prefix("x[a=b]/y"), Some(("x[a=b]", "y")));
+        assert_eq!(split_invoke_prefix("plain"), None);
+    }
+
+    /// A diagnostic about an instance whose value holds `/` names its invoke
+    /// (`app`) and its own id (`build[arch=linux/amd64]`), not a piece of
+    /// the value.
+    #[test]
+    fn diagnostics_name_the_invoke_of_a_slash_valued_instance() {
+        // A caller's free text reaches the command of an instance.
+        let errs = errors_with(
+            r#"steps: [{ id: app, invoke: file:.scarab/lib/m.yaml, with: { p: "linux/amd64", t: "${{ event.branch }}" } }]"#,
+            &libs(&[(
+                ".scarab/lib/m.yaml",
+                "interface:\n  inputs:\n    - { name: p, type: string, required: false, default: \"linux/amd64\" }\n    - { name: t, type: string }\nsteps:\n  - id: build\n    image: alpine\n    command: [echo, \"${{ inputs.t }}\"]\n    matrix: { dimensions: { arch: \"${{ inputs.p }}\" } }\n",
+            )]),
+        );
+        let found: Vec<&String> = errs
+            .iter()
+            .filter(|e| e.contains("`command[1]` reads"))
+            .collect();
+        assert!(
+            found
+                .iter()
+                .any(|e| e.contains("step `build[arch=linux/amd64]`")
+                    && e.contains("which step `app` binds with `with.t: ${{ event.branch }}`")),
+            "{errs:?}"
+        );
+        assert!(
+            found.iter().all(|e| !e.contains("app/build[arch=linux")),
+            "{found:?}"
+        );
+        // A caller's `with:` template reads an output its need does not
+        // declare: the message names the invoke Step.
+        let errs = errors_with(
+            r#"
+            steps:
+              - { id: meta, image: alpine, command: [echo], results: [tag] }
+              - id: app
+                invoke: file:.scarab/lib/m.yaml
+                needs: [meta]
+                with: { p: "linux/amd64", t: "${{ outputs.meta.nope }}" }
+            "#,
+            &libs(&[(
+                ".scarab/lib/m.yaml",
+                "interface:\n  inputs:\n    - { name: p, type: string, required: false, default: \"linux/amd64\" }\n    - { name: t, type: string }\nsteps:\n  - id: build\n    image: alpine\n    command: [echo]\n    env: [[T, \"${{ inputs.t }}\"]]\n    matrix: { dimensions: { arch: \"${{ inputs.p }}\" } }\n",
+            )]),
+        );
+        let found: Vec<&String> = errs
+            .iter()
+            .filter(|e| e.contains("reads `outputs.meta.nope`"))
+            .collect();
+        assert!(
+            found.iter().any(|e| e.starts_with("step `app`: ")),
+            "{errs:?}"
+        );
+        assert!(found.iter().all(|e| !e.contains("linux")), "{found:?}");
+    }
+
+    /// A list element written as an input read is still not interpolated.
+    #[test]
+    fn list_element_input_still_refused() {
+        let errs = errors_with(
+            &invoke_m("{}"),
+            &matrix_input_lib(r#"["${{ inputs.p }}"]"#, "", ""),
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("is not interpolated")),
+            "{errs:?}"
+        );
+    }
+
+    /// An instance list names each instance by its full id and its own
+    /// coordinate only: the coordinate of a matrix on the invoke is in the
+    /// id, not in `matrix`.
+    #[test]
+    fn an_instance_list_names_only_its_own_coordinate() {
+        let libraries = Libraries {
+            installed: installed(&[(
+                "acme/l",
+                "github.com/acme/libs//l.yaml@0",
+                "steps:\n  - id: build\n    image: alpine\n    command: [echo]\n    matrix: { dimensions: { arch: [a, b] } }\n  - { id: post, image: alpine, command: [echo], needs: [build], env: [[N, \"${{ size(outputs.build) }}\"]] }\n",
+            )]),
+            ..Default::default()
+        };
+        let ir = compile_with_libraries(
+            "steps: [{ id: c, invoke: lib:acme/l, matrix: { dimensions: { os: [l] } } }]",
+            &libraries,
+        )
+        .unwrap();
+        let post = ir.steps.iter().find(|s| s.id.ends_with("/post")).unwrap();
+        let listed = post
+            .scope
+            .iter()
+            .flat_map(Scope::chain)
+            .find_map(|s| match s.outputs.get("build") {
+                Some(OutputSource::Instances(list)) => Some(list.clone()),
+                _ => None,
+            })
+            .expect("the post Step lists the build instances");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|i| (i.step.clone(), i.matrix.clone()))
+                .collect::<Vec<_>>(),
+            ["a", "b"].map(|arch| (
+                format!("c[os=l]/build[arch={arch}]"),
+                BTreeMap::from([("arch".to_string(), arch.to_string())])
+            ))
+        );
+    }
+
+    // --- review ruling: ids under an invoke, bounds, brackets, defaults ------
+
+    /// A file library `.scarab/lib/b.yaml` with a matrix Step `build` and a
+    /// `push` that needs it, and a wrapper `.scarab/lib/w.yaml` around it.
+    fn build_and_push_libs(wrapper: &str) -> BTreeMap<String, String> {
+        libs(&[
+            (
+                ".scarab/lib/b.yaml",
+                "steps:\n  - id: build\n    image: alpine\n    command: [echo]\n    matrix: { dimensions: { arch: [a, b] } }\n  - { id: push, image: alpine, command: [echo], needs: [build] }\n",
+            ),
+            (".scarab/lib/w.yaml", wrapper),
+        ])
+    }
+
+    /// A Step written beside an invoke under that invoke's `<id>/` prefix
+    /// would take the name of the Steps it inlines (and with it their
+    /// `needs`, `inputs` and `outputs` reads): refused, written before the
+    /// invoke or after it, at the Pipeline's level and in a library. An
+    /// invoke id may equal no other Step's id. Two Pipeline Steps of one id
+    /// with disjoint matrices, and a `test/unit` id beside no invoke `test`,
+    /// still compile.
+    #[test]
+    fn an_id_under_an_invokes_prefix_is_refused() {
+        let taken = |id: &str, prefix: &str, invoke: &str, place: &str| {
+            format!(
+                "step `{id}`{place}: its id starts with `{prefix}`, the name of the Steps that \
+                 invoke `{invoke}` inlines; give it another id"
+            )
+        };
+        let authored = "{ id: app/build, image: alpine, command: [echo], matrix: { dimensions: { arch: [a] } } }";
+        let invoke = "{ id: app, invoke: file:.scarab/lib/b.yaml }";
+        let none = "steps: []\n";
+        for (yaml, want) in [
+            (
+                format!("steps: [{invoke}, {authored}]"),
+                taken("app/build", "app/", "app", ""),
+            ),
+            (
+                format!("steps: [{authored}, {invoke}]"),
+                taken("app/build", "app/", "app", ""),
+            ),
+            (
+                format!("steps: [{invoke}, {{ id: app/x, invoke: file:.scarab/lib/b.yaml }}]"),
+                taken("app/x", "app/", "app", ""),
+            ),
+            (
+                format!("steps: [{invoke}, {{ id: app, image: alpine, command: [echo] }}]"),
+                "duplicate step id `app`".to_string(),
+            ),
+            (
+                format!("steps: [{{ id: app, image: alpine, command: [echo] }}, {invoke}]"),
+                "duplicate step id `app`".to_string(),
+            ),
+        ] {
+            let errs = errors_with(&yaml, &build_and_push_libs(none));
+            assert!(
+                errs.iter().any(|e| e == &want),
+                "{yaml}\nwant {want}\ngot {errs:?}"
+            );
+        }
+        let errs = errors_with(
+            "steps: [{ id: w, invoke: file:.scarab/lib/w.yaml }]",
+            &build_and_push_libs(
+                "steps:\n  - { id: inner, invoke: file:.scarab/lib/b.yaml }\n  - { id: inner/build, image: alpine, command: [echo] }\n",
+            ),
+        );
+        let want = taken(
+            "inner/build",
+            "inner/",
+            "inner",
+            " in library `.scarab/lib/w.yaml`",
+        );
+        assert!(errs.iter().any(|e| e == &want), "{want}\n{errs:?}");
+
+        let ir = compile(
+            r#"
+            steps:
+              - { id: a, image: alpine, command: [echo], matrix: { dimensions: { os: [l] } } }
+              - { id: a, image: alpine, command: [echo], matrix: { dimensions: { os: [w] } } }
+              - { id: test/unit, image: alpine, command: [echo] }
+            "#,
+        );
+        let ids: Vec<&str> = ir.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["a[os=l]", "a[os=w]", "test/unit"]);
+        compile_with(
+            "steps: [{ id: test2, invoke: file:.scarab/lib/b.yaml }, { id: test/unit, image: alpine, command: [echo] }]",
+            &build_and_push_libs(none),
+        );
+    }
+
+    /// An input a matrix reads needs a default, so an installed library is
+    /// checked with real values; without one the library does not install,
+    /// whether the input is required or not.
+    #[test]
+    fn a_matrix_input_without_a_default_is_refused_at_install() {
+        for input in [
+            "{ name: r, type: string }",
+            "{ name: r, type: string, required: false }",
+        ] {
+            let content = format!(
+                "kind: library\ninterface:\n  inputs:\n    - {input}\nsteps:\n  - id: build\n    image: alpine\n    command: [echo]\n    matrix: {{ dimensions: {{ arch: \"${{{{ inputs.r }}}}\" }} }}\n"
+            );
+            let errs =
+                check_installed_library("acme/m", &content, &BTreeMap::new()).expect_err(input);
+            assert!(
+                errs.iter().any(|e| e.contains("default")),
+                "{input}: {errs:?}"
+            );
+            if input.contains("required: false") {
+                continue;
+            }
+            assert!(
+                errs.iter().any(|e| e.ends_with(
+                    "matrix dimension `arch` reads `inputs.r`, which has no default; an input \
+                     that a matrix reads needs a default, so the library is checked with real \
+                     values when it is installed"
+                )),
+                "{input}: {errs:?}"
+            );
+        }
+    }
+
+    /// `join` works in a matrix `exclude` as in any other expression.
+    #[test]
+    fn join_in_exclude_removes_an_instance() {
+        let ir = compile(
+            r#"
+            steps:
+              - id: build
+                image: alpine
+                command: [echo]
+                matrix:
+                  dimensions: { os: [linux], arch: [amd64, arm64] }
+                  exclude: ['[os, arch].join("/") == "linux/arm64"']
+            "#,
+        );
+        let ids: Vec<&str> = ir.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["build[arch=amd64,os=linux]"]);
+    }
+
+    /// The placement diagnostics are bounded: a map over twice the most
+    /// Steps a Pipeline compiles to is refused whole; many unknown keys
+    /// stop at the diagnostic budget; a long list of values is cut.
+    #[test]
+    fn placement_diagnostics_are_bounded() {
+        let keys = |n: usize| {
+            (0..n)
+                .map(|i| format!("k{i}: [p]"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let at = |map: String| {
+            errors_with(
+                &format!("steps: [{{ id: c, invoke: file:.scarab/lib/p.yaml, placement_profiles: {{ {map} }} }}]"),
+                &per_step_libs(),
+            )
+        };
+        let limit = 2 * MAX_COMPILED_STEPS;
+        let errs = at(keys(limit + 1));
+        let want = format!(
+            "step `c`: `placement_profiles` has {} keys; the limit is {limit}, twice the most \
+             Steps a Pipeline compiles to",
+            limit + 1
+        );
+        assert!(
+            errs.iter().any(|e| e == &want),
+            "{:?}",
+            &errs[..errs.len().min(3)]
+        );
+        assert!(!errs.iter().any(|e| e.contains("names step `k")));
+
+        let errs = at(keys(1500));
+        let unknown = errs.iter().filter(|e| e.contains("names step `k")).count();
+        assert!(
+            (1..=MAX_INLINE_DIAGNOSTICS).contains(&unknown),
+            "{unknown} unknown-key messages"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains(&format!("stopped after {MAX_INLINE_DIAGNOSTICS} problems"))),
+            "{:?}",
+            errs.last()
+        );
+
+        let values: Vec<String> = (0..500).map(|i| format!("v{i}")).collect();
+        let errs = errors_with(
+            r#"steps: [{ id: c, invoke: file:.scarab/lib/m.yaml, placement_profiles: { "build[arch=nope]": [p] } }]"#,
+            &libs(&[(
+                ".scarab/lib/m.yaml",
+                &format!(
+                    "steps:\n  - id: build\n    image: alpine\n    command: [echo]\n    matrix: {{ dimensions: {{ arch: [{}] }} }}\n",
+                    values.join(", ")
+                ),
+            )]),
+        );
+        let msg = errs
+            .iter()
+            .find(|e| e.contains("names `arch=nope`"))
+            .unwrap_or_else(|| panic!("{errs:?}"));
+        assert!(msg.len() < 2048, "{} bytes", msg.len());
+        assert!(
+            msg.ends_with("(its values: v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, and 490 more)"),
+            "{msg}"
+        );
+    }
+
+    /// `[` and `]` in a step id must pair: an inlined Step's name is split
+    /// at a `/` outside `[…]`. A paired bracket compiles.
+    #[test]
+    fn unpaired_brackets_in_an_id_are_refused() {
+        let pair = "`[` and `]` in a step id must pair; Scarab reads `[…]` as a matrix coordinate \
+                    when it splits an inlined Step's name";
+        for (yaml, id) in [
+            (
+                r#"steps: [{ id: "x[", invoke: file:.scarab/lib/p.yaml }]"#,
+                "x[",
+            ),
+            (
+                r#"steps: [{ id: "a]b", image: alpine, command: [echo] }]"#,
+                "a]b",
+            ),
+            (
+                r#"steps: [{ id: x, invoke: file:.scarab/lib/p.yaml, matrix: { dimensions: { v: ["a["] } } }]"#,
+                "x[v=a[]",
+            ),
+        ] {
+            let errs = errors_with(yaml, &per_step_libs());
+            let want = format!("step `{id}`: {pair}");
+            assert!(
+                errs.iter().any(|e| e == &want),
+                "{yaml}\nwant {want}\ngot {errs:?}"
+            );
+        }
+        let ir = compile(r#"steps: [{ id: "build[fast]", image: alpine, command: [echo] }]"#);
+        assert_eq!(ir.steps[0].id, "build[fast]");
+    }
+
+    /// A library Step whose own id holds brackets is placed by a plain key
+    /// spelt as its id.
+    #[test]
+    fn a_plain_key_for_a_bracketed_step_id_places_it() {
+        let ir = compile_with(
+            r#"steps: [{ id: c, invoke: file:.scarab/lib/q.yaml, placement_profiles: { "a[b]": [p] } }]"#,
+            &libs(&[(
+                ".scarab/lib/q.yaml",
+                "steps:\n  - { id: \"a[b]\", image: alpine, command: [echo] }\n  - { id: other, image: alpine, command: [echo] }\n",
+            )]),
+        );
+        let step = |id: &str| ir.steps.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(step("c/a[b]").placement_profiles, vec!["p"]);
+        assert!(step("c/other").placement_profiles.is_empty());
+    }
+
+    /// `exclude` reads the values an input gave the dimension.
+    #[test]
+    fn exclude_over_input_values() {
+        let ir = compile_with(
+            &invoke_m(r#"{ p: "a,b,c" }"#),
+            &libs(&[(
+                ".scarab/lib/m.yaml",
+                "interface:\n  inputs:\n    - { name: p, type: string, required: false, default: \"a\" }\nsteps:\n  - id: build\n    image: alpine\n    command: [echo]\n    matrix:\n      dimensions: { arch: \"${{ inputs.p }}\" }\n      exclude: [\"arch == 'b'\"]\n",
+            )]),
+        );
+        let ids: Vec<&str> = ir.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["app/build[arch=a]", "app/build[arch=c]"]);
+    }
+
+    /// A coordinate key may name a subset of the dimensions: it places
+    /// every instance with those values.
+    #[test]
+    fn multi_dimension_subset_key() {
+        let ir = compile_with_libraries(
+            r#"steps: [{ id: c, invoke: lib:acme/m, placement_profiles: { "build[os=l]": [p] } }]"#,
+            &placement_libraries(),
+        )
+        .unwrap();
+        for (id, want) in [
+            ("c/build[arch=a,os=l]", vec!["p"]),
+            ("c/build[arch=b,os=l]", vec!["p"]),
+            ("c/build[arch=a,os=w]", vec![]),
+            ("c/build[arch=b,os=w]", vec![]),
+        ] {
+            let s = ir.steps.iter().find(|s| s.id == id).unwrap();
+            assert_eq!(s.placement_profiles, want, "{id}");
+        }
+    }
+
+    /// The hint for a plain key that is a matrix value names every
+    /// coordinate that holds it, joined by ` or `.
+    #[test]
+    fn hint_lists_every_matching_coordinate() {
+        let errs = errors_with(
+            "steps: [{ id: c, invoke: file:.scarab/lib/h.yaml, placement_profiles: { x: [p] } }]",
+            &libs(&[(
+                ".scarab/lib/h.yaml",
+                "steps:\n  - { id: b1, image: alpine, command: [echo], matrix: { dimensions: { arch: [x, y] } } }\n  - { id: b2, image: alpine, command: [echo], matrix: { dimensions: { arch: [x] } } }\n",
+            )]),
+        );
+        let want = "step `c`: `placement_profiles` names step `x`, which library \
+                    `.scarab/lib/h.yaml` does not have; to place one instance of a matrix Step, \
+                    write its coordinate: `b1[arch=x]` or `b2[arch=x]`";
+        assert!(errs.iter().any(|e| e == want), "{errs:?}");
+    }
+
+    /// A dimension is a list or text: a number or a map does not parse,
+    /// and the message says what it may be.
+    #[test]
+    fn matrix_dimension_rejects_a_map_or_number() {
+        for dim in ["3", "{ a: b }"] {
+            let msg = parse_error(&format!(
+                "steps: [{{ id: s, image: alpine, command: [echo], matrix: {{ dimensions: {{ arch: {dim} }} }} }}]"
+            ));
+            assert!(
+                msg.contains(
+                    "a list of matrix values, or (in a library) `${{ inputs.<name> }}` to take \
+                     them from an input"
+                ),
+                "{dim}: {msg}"
             );
         }
     }

@@ -13,10 +13,12 @@
 //! mid-run.
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cel::common::ast::{operators, EntryExpr, Expr, IdedExpr, LiteralValue};
-use cel::{Context, Program};
+use cel::common::types::{CelString, LIST_TYPE, STRING_TYPE};
+use cel::common::value::CowVal;
+use cel::{Context, Env, ExecutionError, Program};
 
 use crate::PipelineError;
 
@@ -191,6 +193,59 @@ fn with_program<T: Send>(
     })
 }
 
+/// The functions an expression may call: CEL's standard library, plus
+/// `<list>.join()` and `<list>.join(<separator>)`, which join a list of
+/// strings into one (as cel-go's strings extension does). A Step reads every
+/// instance of a matrix Step as a list, and an environment variable takes
+/// text, so a template joins it. Built once.
+fn env() -> Arc<Env> {
+    static ENV: OnceLock<Arc<Env>> = OnceLock::new();
+    ENV.get_or_init(|| {
+        let mut env = Env::stdlib();
+        // Neither overload is in the standard library, so neither fails.
+        let _ = env.add_member_overload("join", "list.join()", LIST_TYPE, vec![], join);
+        let _ = env.add_member_overload(
+            "join",
+            "list.join(string)",
+            LIST_TYPE,
+            vec![STRING_TYPE],
+            join,
+        );
+        Arc::new(env)
+    })
+    .clone()
+}
+
+/// `list.join()` and `list.join(separator)`: the list's strings, in order,
+/// with the separator between each. A list holding anything but strings is
+/// an error.
+fn join<'b, 'v>(args: Vec<CowVal<'b, 'v>>) -> Result<CowVal<'b, 'v>, ExecutionError> {
+    let not_text = |what: &str| ExecutionError::function_error("join", what);
+    let (list, sep) = match args.as_slice() {
+        [list] => (list, ""),
+        [list, sep] => (
+            list,
+            sep.downcast_ref::<CelString>()
+                .ok_or_else(|| not_text("the separator is not a string"))?
+                .inner(),
+        ),
+        _ => return Err(ExecutionError::invalid_argument_count(2, args.len())),
+    };
+    let items = list
+        .as_iterable()
+        .ok_or_else(|| not_text("join is called on a list"))?;
+    let mut items = items.iter();
+    let mut parts: Vec<&str> = Vec::new();
+    while let Some(item) = items.next() {
+        parts.push(
+            item.downcast_ref::<CelString>()
+                .ok_or_else(|| not_text("the list holds a value that is not a string"))?
+                .inner(),
+        );
+    }
+    Ok(CowVal::owned(CelString::from(parts.join(sep))))
+}
+
 /// Parse-check a CEL expression without evaluating it. Used at submit time so a
 /// malformed `when:` / interpolation is rejected before a Run ever starts.
 pub fn check(expr: &str) -> Result<(), PipelineError> {
@@ -210,7 +265,7 @@ pub fn check_interpolation(template: &str) -> Result<(), PipelineError> {
 /// variable), returning the result as JSON.
 pub fn eval(expr: &str, ctx: &serde_json::Value) -> Result<serde_json::Value, PipelineError> {
     with_program(expr, |program| {
-        let mut context = Context::default();
+        let mut context = Context::with_env(env());
         bind(&mut context, ctx, expr)?;
         let value = program
             .execute(&context)
@@ -233,6 +288,41 @@ pub fn eval_bool(expr: &str, ctx: &serde_json::Value) -> Result<bool, PipelineEr
     }
 }
 
+/// Whether `expr` calls the function or method `name` anywhere, by the
+/// parser. An expression that does not parse calls nothing.
+pub(crate) fn calls(expr: &str, name: &str) -> bool {
+    fn walk(e: &IdedExpr, name: &str) -> bool {
+        match &e.expr {
+            Expr::Call(c) => {
+                c.func_name == name
+                    || c.target.as_deref().is_some_and(|t| walk(t, name))
+                    || c.args.iter().any(|a| walk(a, name))
+            }
+            Expr::Select(s) => walk(&s.operand, name),
+            Expr::Comprehension(c) => [
+                &c.iter_range,
+                &c.accu_init,
+                &c.loop_cond,
+                &c.loop_step,
+                &c.result,
+            ]
+            .into_iter()
+            .any(|part| walk(part, name)),
+            Expr::List(l) => l.elements.iter().any(|x| walk(x, name)),
+            Expr::Map(m) => m.entries.iter().any(|x| entry(&x.expr, name)),
+            Expr::Struct(s) => s.entries.iter().any(|x| entry(&x.expr, name)),
+            Expr::Ident(_) | Expr::Literal(_) | Expr::Unspecified => false,
+        }
+    }
+    fn entry(e: &EntryExpr, name: &str) -> bool {
+        match e {
+            EntryExpr::StructField(f) => walk(&f.value, name),
+            EntryExpr::MapEntry(m) => walk(&m.key, name) || walk(&m.value, name),
+        }
+    }
+    with_program(expr, |program| Ok(walk(program.expression(), name))).unwrap_or(false)
+}
+
 /// One dimension of a product of string values, for [`eval_bool_product`].
 pub(crate) struct Dim<'a> {
     pub name: &'a str,
@@ -251,9 +341,9 @@ pub(crate) fn eval_bool_product(
     points: &[usize],
 ) -> Result<Vec<bool>, PipelineError> {
     with_program(expr, |program| {
-        // One context: building one registers the standard functions, which
-        // costs more than the evaluation. Each binding replaces the last.
-        let mut context = Context::default();
+        // One context, over the functions every expression has (built once,
+        // `join` included). Each binding replaces the last.
+        let mut context = Context::with_env(env());
         for (name, value) in fixed {
             context.add_variable_from_value(*name, cel::Value::String(value.clone()));
         }
@@ -852,5 +942,88 @@ mod tests {
         assert!(err.contains("expected a boolean"), "{err}");
         assert!(eval_bool_product("missing", &[], &dims, &[0]).is_err());
         assert!(eval_bool_product("1 +", &[], &dims, &[]).is_err());
+    }
+
+    /// A matrix `exclude` may call `join`, as any other expression may.
+    #[test]
+    fn eval_bool_product_has_join() {
+        let os: Vec<Arc<String>> = vec![Arc::new("linux".to_string())];
+        let arch: Vec<Arc<String>> = ["amd64", "arm64"].map(|v| Arc::new(v.to_string())).to_vec();
+        let dims = [
+            Dim {
+                name: "arch",
+                values: &arch,
+            },
+            Dim {
+                name: "os",
+                values: &os,
+            },
+        ];
+        assert_eq!(
+            eval_bool_product(
+                r#"[os, arch].join("/") == "linux/arm64""#,
+                &[],
+                &dims,
+                &[0, 1]
+            )
+            .unwrap(),
+            vec![false, true]
+        );
+    }
+
+    /// `<list>.join()` and `<list>.join(<sep>)`: the list's strings in
+    /// order with the separator between; a list holding anything but
+    /// strings, or a separator that is not a string, is an error.
+    #[test]
+    fn join_table() {
+        let ctx = json!({});
+        for (expr, want) in [
+            ("[].join()", ""),
+            (r#"["a"].join(",")"#, "a"),
+            (r#"["a", "b"].join("\n")"#, "a\nb"),
+            (r#"["a", "b"].join()"#, "ab"),
+            (r#"["a", "b", "c"].join(", ")"#, "a, b, c"),
+        ] {
+            assert_eq!(eval(expr, &ctx).unwrap(), json!(want), "{expr}");
+        }
+        for expr in ["[1].join()", r#"["a", 1].join(",")"#, r#"["a"].join(1)"#] {
+            assert!(eval(expr, &ctx).is_err(), "{expr}");
+        }
+        assert!(eval_bool(r#"["a"].join() == "a""#, &ctx).unwrap());
+        // In a template, over a list from the context.
+        assert_eq!(
+            interpolate(
+                "${{ xs.map(x, x.n).join(\"-\") }}",
+                &json!({ "xs": [{ "n": "1" }, { "n": "2" }] })
+            )
+            .unwrap(),
+            "1-2"
+        );
+    }
+
+    /// `calls` finds a call to `join` wherever the parser puts it, and
+    /// nothing in a string literal, another name, or text that does not
+    /// parse.
+    #[test]
+    fn calls_finds_join() {
+        for expr in [
+            r#"["a"].join()"#,
+            "xs.map(x, [x].join(','))",
+            "{'k': xs.join()}",
+            "size(xs.join()) > 0",
+            "xs.join(',') == 'a' ? 1 : 2",
+        ] {
+            assert!(calls(expr, "join"), "{expr}");
+        }
+        for expr in [
+            "'join'",
+            "xs.joined()",
+            "join",
+            "echo join",
+            "1 +",
+            "xs.size()",
+        ] {
+            assert!(!calls(expr, "join"), "{expr}");
+        }
     }
 }

@@ -242,6 +242,12 @@ clone library, then give its source the trust its steps need:
 The push step runs as uid 1000 (`security: { run_as_user: 1000 }`), not as root, so an org
 Policy that denies run-as-root does not refuse it.
 
+`push: true` needs the server to collect step results: the push step checks the layout against
+the build step's `image` result, and refuses (exit 2) when there is none. Set the chart value
+`secrets.resultsTokenSecret`. An earlier version of the library pushed without the check, with a
+warning; upgrading it on a server with no results token secret makes every push fail
+([`push: true` needs step results](/scarab-ci/usage/pipeline-syntax/#building-an-image)).
+
 The library pins the rootless BuildKit image and the crane image by digest. A newer BuildKit or
 crane is a new version of the file: upgrade the installation, and trust carries over because the
 source is the same. To run a different builder, or BuildKit with other flags, install your own
@@ -334,11 +340,13 @@ Never route a profile that grants push access to its step: the step runs your Do
 
 ## Install Scarab's multi-architecture build library
 
-`lib:thulasi-ram::scarab-ci::build-multiarch` builds an image on an amd64 node and on an arm64
-node, and pushes both images, their tags and the index from one step
+`lib:thulasi-ram::scarab-ci::build-multiarch` builds an image once per platform its `platforms`
+input names (`linux/amd64` and `linux/arm64` by default), each on a node of that architecture,
+and pushes every image, their tags and the index from one step
 ([Building a multi-architecture image](/scarab-ci/usage/pipeline-syntax/#building-a-multi-architecture-image)).
-It is the file `libs/build-multiarch.yaml` in Scarab's repository. Its steps `amd64` and `arm64`
-build in the build sandbox and hold no credential; its step `push` holds the registry credential.
+It is the file `libs/build-multiarch.yaml` in Scarab's repository. Its matrix step `build` (one
+instance per platform) builds in the build sandbox and holds no credential; its step `push` holds
+the registry credential.
 It holds its own copy of the build and index scripts and invokes no other library, so you review
 the whole of it at install.
 
@@ -354,9 +362,19 @@ the whole of it at install.
    ([below](#trusting-a-library-with-the-registry-credential)). To push to the forge's own
    registry with no `REGISTRY_AUTH` secret, also trust it with forge credentials. Trust given to
    the build or image index library's source does not reach this one.
-5. A profile marked `registry_auth_only` goes to the push step with the map form,
-   `placement_profiles: { amd64: [...], arm64: [...], push: [<profile>] }`. Named on a build
-   step it fails that step's launch.
+5. A profile marked `registry_auth_only` goes to the push step with the map form, beside a
+   coordinate key for each build instance:
+   `placement_profiles: { "build[arch=linux/amd64]": [...], "build[arch=linux/arm64]": [...], push: [<profile>] }`.
+   Named on a build instance it fails that instance's launch.
+
+**Upgrading from the version with fixed `amd64` and `arm64` steps.** Those steps are now
+instances of `build`. After the upgrade, a Pipeline whose invoke names `amd64:` or `arm64:` in its
+placement map fails to compile, and the error names the coordinate key to write
+(`"build[arch=linux/amd64]"`). Change the Pipelines that invoke it in the same change as the
+upgrade, or upgrade first and fix each Pipeline the error names. Upgrade every server replica
+before you upgrade the library: an older server cannot parse its matrix and refuses each Run
+that invokes it ([below](#a-matrix-from-an-input)). To roll the server back, first put the
+library back to its earlier version.
 
 The push step runs as uid 1000. The library pins the same BuildKit and crane images as the build
 library, by digest.
@@ -437,6 +455,91 @@ A step that may not have the credential is not refused: it runs without one, and
 the registry. Each launch checks the trust again. A fork pull request never receives a registry
 credential. Settings › Libraries shows this trust on the library's page under **Registry
 credential**.
+
+## A matrix from an input
+
+For library authors. A library step's matrix dimension may be one input instead of a literal
+list, so the caller chooses how many instances the step has. `build-multiarch` uses it:
+
+```yaml
+kind: library
+interface:
+  inputs:
+    - name: platforms
+      type: string
+      required: false
+      default: "linux/amd64,linux/arm64"
+      validate: 'value.matches("^[ ,]*linux/[a-z0-9]+(/v[0-9])?([ ,]+linux/[a-z0-9]+(/v[0-9])?)*[ ,]*$")'
+  outputs: [push]
+steps:
+  - id: build
+    matrix:
+      dimensions:
+        arch: "${{ inputs.platforms }}"
+    image: …
+    env: [[PLATFORM, "${{ matrix.arch }}"]]
+  - id: push
+    needs: [build]
+    image: …
+    env:
+      - [LAYOUTS, '${{ outputs.build.map(b, has(b.results.image) ? b.results.image.layout : "").join("\n") }}']
+      - [COUNT, "${{ size(outputs.build) }}"]
+```
+
+- **The dimension is exactly `${{ inputs.<name> }}`**, as a quoted string. The input must be a
+  declared `string` with a `default:`. An installed library is checked when it is installed,
+  with no caller, and the default gives the matrix real values to expand and check against
+  `validate:`; an input a matrix reads with no default is a compile error. A default that holds
+  `${{` is refused too. Its value is split on commas and whitespace, with empty pieces dropped and
+  the order kept, so `"linux/amd64, linux/arm64"` gives two instances,
+  `build[arch=linux/amd64]` and `build[arch=linux/arm64]`. `${{ matrix.arch }}` in the step reads
+  one value.
+- **The value is known when the Pipeline compiles.** It is the caller's `with:` value or the
+  input's default. A `with:` value that holds `${{ }}` has a value only when a step launches, after
+  the matrix is expanded, so it is a compile error. A library that invokes this one cannot pass
+  its own input through.
+- **Values become step ids**, so a value may not hold `[`, `]`, `,`, `=`, `::service-` or a
+  control character, and may not appear twice. `/` is allowed. `exclude:` and the matrix limits
+  apply to the values as listed.
+- **Guarded steps need `validate:`.** An input that feeds the matrix of a step with the build
+  sandbox, `registry_auth` or `forge_token` counts as a read by that step, so it needs a
+  `validate:` rule, like any string input such a step reads.
+- **Only in a library.** A Pipeline file's own matrix is a literal list.
+
+**Reading every instance.** In a library, a step that needs a matrix step of the same library
+and reads `outputs.<step>` gets a list, one entry per instance, in expansion order (dimensions
+sorted by name, the last changing fastest, `exclude` applied):
+
+```
+[ { "matrix": { "arch": "linux/amd64" }, "results": { "image": { … } } },
+  { "matrix": { "arch": "linux/arm64" }, "results": {} } ]
+```
+
+`results` is `{}` for an instance that published nothing. Read fields with
+`outputs.build.map(b, …)`; `outputs.build.image` is a compile error that shows the `map` form.
+One instance stays readable by its id, `outputs["build[arch=linux/amd64]"]`. A Pipeline file's
+own steps see no change. Results are text a step wrote, so they
+reach a step only through `env:`, as every result does.
+
+**`join`.** `<list>.join()` and `<list>.join(<separator>)` join a list of strings; any other
+element is an error when the step launches. It works in every Pipeline and library expression:
+`${{ }}`, `when:`, `validate:` and a matrix `exclude`. Policies do not have it. In a YAML single-quoted
+string, write the separator as `"\n"` so CEL reads a line break. `size`, `map` and `has` are
+standard CEL.
+
+**IR version 4.** A Pipeline whose steps read a list of instances, or that calls `join` in a
+template, a `when:` or a `validate:`, compiles to IR version 4. A server that knows only versions
+up to 3 refuses to launch a step of such a Run ("this Run was compiled for IR version 4; this
+server understands versions up to 3"). Not everything is covered by the version: a 0.7.7 server
+fails a trigger `when:` or a matrix `exclude` that calls `join` before any Run exists, and cannot
+parse a matrix dimension written as an input. So upgrade every server replica first, then
+upgrade libraries that use these features and start calling `join`. Redeliver the webhook, or
+rerun, for anything that failed in between.
+
+**Placement per instance.** A caller places each instance with a coordinate key in the
+invoke's `placement_profiles` map, `"build[arch=linux/arm64]": [arm64-builders]`
+([Reuse: `invoke`](/scarab-ci/usage/pipeline-syntax/#reuse-invoke)), so which nodes each
+instance runs on stays the caller's choice, among the profiles the operator defined.
 
 ## Check a Pipeline before you push
 

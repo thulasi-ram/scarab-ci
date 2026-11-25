@@ -229,6 +229,14 @@ steps:
           echo "scarab: not pushed: this Run is a fork pull request's, or is locked out of its Environment's secrets"
           exit 0
         fi
+        # A layouts line carries a digest only a build's result supplies.
+        # Without results (/scarab/results is absent, because the server
+        # has no results token secret) nothing can be checked, so nothing
+        # is pushed. `images` alone does not need results.
+        named=$(printf '%s' "${SCARAB_INDEX_LAYOUTS-}" | tr -d '\n')
+        if [ -n "$named" ] && [ ! -d /scarab/results ]; then
+          fail "results are not collected, so the layouts' digests cannot be checked against the builds'; set the server's results token secret (SCARAB_RESULTS_TOKEN_SECRET, the chart value secrets.resultsTokenSecret)"
+        fi
         # Sets r to the resolved path. The `.` keeps a trailing newline in a
         # directory name from being dropped by the command substitution.
         resolve() {

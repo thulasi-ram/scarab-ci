@@ -152,9 +152,10 @@ Every build script (in `build`, `build-layout` and `build-multiarch`) writes its
 SHA-256 of the build Step's own `SCARAB_STEP`. The build Step adds two keys to the `image`
 result BuildKit's metadata fills: `digest` (a copy of `containerimage.digest`) and, when it
 wrote a layout, `layout` (the path). Consumers (`build`'s push Step, `image-index`,
-`build-multiarch`'s push Step) read the path from results. One exception: when the server
-collects no results, `build`'s push Step derives the path from its own `SCARAB_STEP`
-(`<invoke>/push` → `<invoke>/image`) and logs a `scarab: warning:` line.
+`build-multiarch`'s push Step) read the path from results. As first built, `build`'s push
+Step derived the path from its own `SCARAB_STEP` when the server collected no results; since
+issue #219 ([0085](0085-a-library-matrix-takes-its-values-from-an-input-and-an-invoke-places-each-instance.md) §8)
+it refuses instead.
 
 - **Why the Step id.** It is unique in the Run and Scarab sets it in every Pod, so two
   builds fanned into one Step write different paths without any input from the caller.
@@ -306,13 +307,13 @@ them, `build-multiarch` has two fixed build Steps, and the caller routes each th
 existing per-step map. A build Step placed on the wrong architecture yields two images of one
 platform, which §4 refuses before any write.
 
-Deferred, each a change to `crates/scarab-pipeline`:
-
-- matrix dimension values from an input, set at Run creation;
-- a placement map keyed by matrix coordinate (`{"build[arch=arm64]": [arm64]}`), resolved
-  after matrix expansion instead of at inlining;
-- a `platforms` input on `build-multiarch`, built on the two above, defaulting to amd64 and
-  arm64 so today's callers keep working.
+Deferred at the time, and decided in
+[0085](0085-a-library-matrix-takes-its-values-from-an-input-and-an-invoke-places-each-instance.md):
+matrix dimension values from a library input (resolved at inlining, not at Run creation), a
+placement map keyed by matrix coordinate (`{"build[arch=linux/arm64]": [arm64]}`), and a
+`platforms` input on `build-multiarch`, default `linux/amd64,linux/arm64`. The fixed
+`amd64` and `arm64` Steps are replaced by one matrix Step, `build`, so their placement keys
+are refused there.
 
 > Taken by default while the owner was away (2026-11-25); reversible until the release that ships it.
 
@@ -350,8 +351,8 @@ when it deserialises into the IR's structs.
   in the middle of the writes leaves a partial tag set until the Step is retried, and the
   order puts the index after the images it names.
 - `build.yaml`'s layout moves from `.scarab-build/oci` to `.scarab-build/<h>/oci`. Its push
-  Step reads the path from the build Step's result (from its own Step id when results are not
-  collected, §2); `with:` is unchanged. Its `image` result gains `digest` and `layout`.
+  Step reads the path from the build Step's result, and refuses when results are not collected
+  (§2, issue #219); `with:` is unchanged. Its `image` result gains `digest` and `layout`.
 - 0018's amendment of 2026-11-12 said multi-arch builds are one invoke per architecture plus
   a later index Step. That shape still works; `build-multiarch` is the one the docs lead with.
 - Four test crates read `libs/*.yaml` with `include_str!`, so `.github/path-filters.yml` adds

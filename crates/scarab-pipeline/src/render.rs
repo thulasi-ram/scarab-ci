@@ -597,6 +597,22 @@ fn bind(
                         .collect();
                     outputs.insert(name.clone(), Value::Object(values));
                 }
+                OutputSource::Instances(instances) => {
+                    let list = instances
+                        .iter()
+                        .map(|i| {
+                            let results: Map<String, Value> = results
+                                .get(&i.step)
+                                .map(|r| r.clone().into_iter().collect())
+                                .unwrap_or_default();
+                            let mut entry = Map::new();
+                            entry.insert("matrix".into(), coordinate(&i.matrix));
+                            entry.insert("results".into(), Value::Object(results));
+                            Value::Object(entry)
+                        })
+                        .collect();
+                    outputs.insert(name.clone(), Value::Array(list));
+                }
             }
         }
         ctx.insert("outputs".into(), Value::Object(outputs));
@@ -1389,5 +1405,71 @@ mod tests {
                 "value": { "template": "${{ inputs.p }}" }
             })
         );
+    }
+
+    /// Every instance of a matrix Step binds as one list, in the order the
+    /// scope lists them: each entry its own coordinate and its results, `{}`
+    /// for an instance that published none.
+    #[test]
+    fn instances_bind_as_a_list() {
+        let instance = |arch: &str| crate::scope::InstanceSource {
+            step: format!("x/build[arch={arch}]"),
+            matrix: BTreeMap::from([("arch".to_string(), arch.to_string())]),
+        };
+        let scope = Scope {
+            inputs: ScopeInputs::Bound(BTreeMap::new()),
+            outputs: BTreeMap::from([(
+                "build".to_string(),
+                OutputSource::Instances(vec![instance("b"), instance("a")]),
+            )]),
+            matrix: BTreeMap::new(),
+            caller: Some(Box::new(Scope::run())),
+        };
+        let res = results(json!({
+            "x/build[arch=a]": { "image": { "digest": "d" } },
+            "x/build[arch=c]": { "image": { "digest": "other" } },
+        }));
+        let v = env_values(
+            &["${{ outputs.build }}", "${{ size(outputs.build) }}"],
+            Some(&scope),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &res,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&v[0]).unwrap(),
+            json!([
+                { "matrix": { "arch": "b" }, "results": {} },
+                { "matrix": { "arch": "a" }, "results": { "image": { "digest": "d" } } },
+            ])
+        );
+        assert_eq!(v[1], "2");
+    }
+
+    /// Scopes stored by every earlier version load and write back byte for
+    /// byte, and so does the instance list; a field an instance does not
+    /// have is refused. A matrix dimension reads as a list or as text.
+    #[test]
+    fn stored_scopes_load() {
+        for text in [
+            r#"{"inputs":"run"}"#,
+            r#"{"inputs":{"bound":{"p":{"value":{"literal":"x"}},"t":{"param":{"name":"t","type":"string","required":true},"value":{"template":"${{ event.sha }}"}}}},"outputs":{"a":{"step":"a"},"b":{"invoke":{"o":"b/o"}}},"matrix":{"arch":"a"},"caller":{"inputs":"run"}}"#,
+            r#"{"inputs":{"bound":{}},"outputs":{"build":{"instances":[{"step":"x/build[arch=a]","matrix":{"arch":"a"}},{"step":"x/build[arch=b]","matrix":{"arch":"b"}}]}},"caller":{"inputs":"run"}}"#,
+        ] {
+            let scope: Scope = serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}: {text}"));
+            assert_eq!(serde_json::to_string(&scope).unwrap(), text);
+        }
+        assert!(serde_json::from_str::<Scope>(
+            r#"{"inputs":"run","outputs":{"b":{"instances":[{"step":"s","matrix":{},"extra":1}]}}}"#
+        )
+        .is_err());
+        for text in [
+            r#"{"dimensions":{"arch":["a","b"]},"exclude":["arch == 'b'"]}"#,
+            r#"{"dimensions":{"arch":"${{ inputs.p }}"}}"#,
+        ] {
+            let m: crate::Matrix = serde_json::from_str(text).unwrap();
+            assert_eq!(serde_json::to_string(&m).unwrap(), text);
+        }
     }
 }

@@ -71,6 +71,7 @@ import {
 import { approvalReleaseIn, type GateStatus } from "../gates";
 import { clock, clockLow, expiryPercent, isYankRefusal, pluginGateState } from "../run-origin";
 import { shortHash } from "../libraries";
+import { idSegments } from "../dag-layout";
 import { waitApprovers, type WaitResolution } from "../run-tabs";
 import { absTime, relTime } from "../fmt";
 import Icon from "./Icon";
@@ -1382,7 +1383,7 @@ export default function StepPane(props: {
                                     <span class="lib-hash">{shortHash(c.content_hash)}</span>
                                     <Show when={c.kind !== "plugin"}>
                                       <span class="subtle">
-                                        invoked as <span class="mono">{s().id.split("/").slice(0, k() + 1).join("/")}</span>
+                                        invoked as <span class="mono">{idSegments(s().id).slice(0, k() + 1).join("/")}</span>
                                       </span>
                                     </Show>
                                   </div>
@@ -1403,7 +1404,7 @@ export default function StepPane(props: {
                             <div class="t">
                               <div class="l1">
                                 <Pill tone="muted" look="dotted">step</Pill>
-                                <span class="mono">{s().id.split("/").pop()}</span>
+                                <span class="mono">{idSegments(s().id).pop()}</span>
                                 <span class="subtle">
                                   → <span class="mono">{s().id}</span> in this Run
                                 </span>

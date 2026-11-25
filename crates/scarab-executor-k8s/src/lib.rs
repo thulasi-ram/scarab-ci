@@ -11776,13 +11776,16 @@ exit "${{STUB_EXIT:-0}}"
         )
         .unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // `uname -m` reports STUB_UNAME: the node's architecture, for the
-        // per-architecture cache name.
+        // `uname -m` reports STUB_UNAME (the node's architecture), or exits
+        // STUB_UNAME_EXIT; each call is recorded in `uname-called`.
         let bin = base.join("bin");
         std::fs::create_dir(&bin).unwrap();
         std::fs::write(
             bin.join("uname"),
-            "#!/bin/sh\nprintf '%s\\n' \"${STUB_UNAME-}\"\n",
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n[ -z \"${{STUB_UNAME_EXIT-}}\" ] || exit \"$STUB_UNAME_EXIT\"\nprintf '%s\\n' \"${{STUB_UNAME-}}\"\n",
+                base.join("uname-called").display()
+            ),
         )
         .unwrap();
         std::fs::set_permissions(bin.join("uname"), std::fs::Permissions::from_mode(0o755))
@@ -11804,8 +11807,10 @@ exit "${{STUB_EXIT:-0}}"
             std::fs::create_dir(&dir).unwrap();
             script = script.replace("/scarab/results", &dir.display().to_string());
         }
+        let uname_called = base.join("uname-called");
         let run = move |given: &[(&str, &str)]| {
             let _ = std::fs::remove_file(&record);
+            let _ = std::fs::remove_file(uname_called.as_path());
             let mut cmd = std::process::Command::new("/bin/sh");
             cmd.args(["-c", &script, "scarab-build"])
                 .current_dir(&base)
@@ -11815,7 +11820,9 @@ exit "${{STUB_EXIT:-0}}"
                 "STUB_META_LINK",
                 "STUB_EXIT",
                 "STUB_UNAME",
+                "STUB_UNAME_EXIT",
                 "SCARAB_BUILD_CACHE_PER_ARCH",
+                "SCARAB_BUILD_PLATFORM",
             ] {
                 cmd.env_remove(name);
             }
@@ -12134,6 +12141,8 @@ exit "${{STUB_EXIT:-0}}"
             "image/image",
             "app[platform=linux/arm64,os=x]/image",
             "a/b/c/image",
+            "app/build[arch=linux/amd64]",
+            "app[x=1,y=2]/build[arch=linux/amd64]",
         ] {
             assert_eq!(
                 run(&[("SCARAB_BUILD_PUSH", "true"), ("SCARAB_STEP", step)]),
@@ -12168,15 +12177,18 @@ exit "${{STUB_EXIT:-0}}"
     fn a_build_step_removes_only_its_own_layout() {
         let (tmp, run) = build_library_harness();
         let ws = tmp.path().canonicalize().unwrap().join("workspace");
-        let other = ws.join(layout_rel("app/arm64"));
-        let own = ws.join(layout_rel("app/amd64"));
+        let other = ws.join(layout_rel("app/build[arch=linux/arm64]"));
+        let own = ws.join(layout_rel("app/build[arch=linux/amd64]"));
         for dir in [&other, &own] {
             std::fs::create_dir_all(dir).unwrap();
         }
         std::fs::write(other.join("index.json"), "arm64").unwrap();
         std::fs::write(own.join("index.json"), "stale").unwrap();
         assert_eq!(
-            run(&[("SCARAB_BUILD_PUSH", "true"), ("SCARAB_STEP", "app/amd64")]),
+            run(&[
+                ("SCARAB_BUILD_PUSH", "true"),
+                ("SCARAB_STEP", "app/build[arch=linux/amd64]")
+            ]),
             (Some(0), true)
         );
         assert_eq!(
@@ -12250,6 +12262,243 @@ exit "${{STUB_EXIT:-0}}"
                 "{per_arch:?} {machine:?}"
             );
         }
+    }
+
+    /// The buildctl argv the last run of [`build_script_harness`]'s runner
+    /// recorded, one argument per entry; `None` when buildctl did not run.
+    #[cfg(unix)]
+    fn argv_of(base: &std::path::Path) -> Option<Vec<String>> {
+        std::fs::read_to_string(base.join("called"))
+            .ok()
+            .map(|a| a.lines().map(str::to_string).collect())
+    }
+
+    /// SCARAB_BUILD_PLATFORM names the platform an instance builds: one
+    /// this library builds is passed to BuildKit as `--opt platform=`,
+    /// right after the Dockerfile and before the build arguments, on a
+    /// node of its architecture. Any other spelling exits 2 before buildctl
+    /// runs.
+    #[cfg(unix)]
+    #[test]
+    fn platform_values() {
+        let (tmp, run) = build_script_harness(false);
+        let base = tmp.path().canonicalize().unwrap();
+        for (platform, node) in [
+            ("linux/amd64/v3", "x86_64"),
+            ("linux/arm/v7", "armv7l"),
+            ("linux/riscv64", "riscv64"),
+        ] {
+            let (out, reached) = run(&[
+                ("SCARAB_BUILD_PLATFORM", platform),
+                ("STUB_UNAME", node),
+                ("SCARAB_BUILD_ARGS", "A=1"),
+            ]);
+            assert_eq!(
+                (out.status.code(), reached),
+                (Some(0), true),
+                "{platform}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let argv = argv_of(&base).unwrap();
+            let at = argv
+                .iter()
+                .position(|a| a == "filename=Dockerfile")
+                .unwrap();
+            assert_eq!(
+                &argv[at + 1..at + 5],
+                [
+                    "--opt",
+                    &format!("platform={platform}"),
+                    "--opt",
+                    "build-arg:A=1"
+                ],
+                "{platform}: {argv:?}"
+            );
+        }
+        for platform in [
+            "linux/amd64/v1",
+            "linux/arm64/v8",
+            "windows/amd64",
+            "amd64",
+            "linux/amd64 ",
+            // The node check cannot decide these: an x86_64 node never
+            // passes 386, `uname -m` does not tell a mips byte order, and
+            // BuildKit builds bare arm as arm/v7.
+            "linux/386",
+            "linux/arm",
+            "linux/mips",
+            "linux/mipsle",
+            "linux/mips64",
+            "linux/mips64le",
+        ] {
+            let (out, reached) = run(&[
+                ("SCARAB_BUILD_PLATFORM", platform),
+                ("STUB_UNAME", "x86_64"),
+            ]);
+            assert_eq!(
+                (out.status.code(), reached),
+                (Some(2), false),
+                "{platform:?}"
+            );
+            assert!(
+                !base.join("uname-called").exists(),
+                "{platform:?}: refused before uname is read"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stderr).trim_end(),
+                format!(
+                    "scarab: build refused: platform {platform} is not linux/<architecture>[/<variant>] of an architecture this library builds"
+                ),
+                "{platform:?}"
+            );
+        }
+    }
+
+    /// The node's architecture, read from `uname -m`, must be the
+    /// platform's: an instance the placement map sent to the wrong nodes
+    /// exits 2 before buildctl runs, naming both.
+    #[cfg(unix)]
+    #[test]
+    fn node_arch_check() {
+        let (_tmp, run) = build_script_harness(false);
+        for (platform, node) in [
+            ("linux/amd64", "x86_64"),
+            ("linux/amd64", "amd64"),
+            ("linux/arm64", "aarch64"),
+            ("linux/arm64", "arm64"),
+            ("linux/arm/v7", "armv7l"),
+            ("linux/arm/v6", "armv6l"),
+            ("linux/ppc64le", "ppc64le"),
+            ("linux/s390x", "s390x"),
+            ("linux/loong64", "loongarch64"),
+        ] {
+            let (out, reached) = run(&[("SCARAB_BUILD_PLATFORM", platform), ("STUB_UNAME", node)]);
+            assert_eq!(
+                (out.status.code(), reached),
+                (Some(0), true),
+                "{platform} on {node}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        for (platform, m, node) in [
+            ("linux/arm64", "x86_64", "amd64"),
+            ("linux/amd64", "armv7l", "arm"),
+            ("linux/arm/v7", "aarch64", "arm64"),
+            ("linux/amd64", "sparc64", "sparc64"),
+        ] {
+            let (out, reached) = run(&[("SCARAB_BUILD_PLATFORM", platform), ("STUB_UNAME", m)]);
+            assert_eq!(
+                (out.status.code(), reached),
+                (Some(2), false),
+                "{platform} on {m}"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stderr).trim_end(),
+                format!(
+                    "scarab: build refused: this step builds {platform}, but its node's architecture is {node} (uname -m: {m}); the placement map routes this instance to the wrong nodes"
+                )
+            );
+        }
+    }
+
+    /// A node whose architecture cannot be read (uname fails, or prints
+    /// nothing) is refused, not guessed at.
+    #[cfg(unix)]
+    #[test]
+    fn uname_failure_is_refused() {
+        let (_tmp, run) = build_script_harness(false);
+        for given in [
+            &[("STUB_UNAME_EXIT", "1"), ("STUB_UNAME", "x86_64")][..],
+            &[("STUB_UNAME", "")][..],
+        ] {
+            let mut given = given.to_vec();
+            given.push(("SCARAB_BUILD_PLATFORM", "linux/amd64"));
+            let (out, reached) = run(&given);
+            assert_eq!((out.status.code(), reached), (Some(2), false), "{given:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stderr).trim_end(),
+                "scarab: build refused: cannot read this node's architecture",
+                "{given:?}"
+            );
+        }
+    }
+
+    /// With no platform the build is what it was: no `--opt platform`, and
+    /// `uname` is not read unless the per-architecture cache needs it.
+    #[cfg(unix)]
+    #[test]
+    fn no_platform_no_change() {
+        let (tmp, run) = build_script_harness(false);
+        let base = tmp.path().canonicalize().unwrap();
+        assert_eq!(run(&[]).0.status.code(), Some(0));
+        let argv = argv_of(&base).unwrap();
+        assert!(!argv.iter().any(|a| a.starts_with("platform=")), "{argv:?}");
+        let at = argv
+            .iter()
+            .position(|a| a == "filename=Dockerfile")
+            .unwrap();
+        assert_eq!(argv[at + 1], "--output", "{argv:?}");
+        assert!(!base.join("uname-called").exists(), "uname ran");
+    }
+
+    /// The per-architecture cache name follows the platform an instance
+    /// builds, its variant included, not the node's `uname -m`.
+    #[cfg(unix)]
+    #[test]
+    fn per_arch_cache_suffix_from_platform() {
+        let (tmp, run) = build_script_harness(false);
+        let base = tmp.path().canonicalize().unwrap();
+        for (platform, node, name, want) in [
+            ("linux/amd64", "x86_64", "", "buildkit-amd64"),
+            ("linux/arm/v7", "armv7l", "app", "app-arm-v7"),
+            ("linux/amd64/v3", "x86_64", "c", "c-amd64-v3"),
+            ("linux/arm64", "aarch64", "app", "app-arm64"),
+        ] {
+            let (out, reached) = run(&[
+                ("SCARAB_BUILD_PLATFORM", platform),
+                ("STUB_UNAME", node),
+                ("SCARAB_BUILD_CACHE", "s3"),
+                ("SCARAB_BUILD_CACHE_BUCKET", "acme-cache"),
+                ("SCARAB_BUILD_CACHE_REGION", "ap-south-1"),
+                ("SCARAB_BUILD_CACHE_NAME", name),
+                ("SCARAB_BUILD_CACHE_PER_ARCH", "true"),
+            ]);
+            assert_eq!(
+                (out.status.code(), reached),
+                (Some(0), true),
+                "{platform}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let argv = argv_of(&base).unwrap();
+            let import = format!("type=s3,region=ap-south-1,bucket=acme-cache,name={want}");
+            let export = format!("{import},mode=max");
+            assert!(argv.contains(&import), "{platform}: {argv:?}");
+            assert!(argv.contains(&export), "{platform}: {argv:?}");
+            // The platform check reads uname once; the cache name does not.
+            assert_eq!(
+                std::fs::read_to_string(base.join("uname-called"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1,
+                "{platform}"
+            );
+        }
+    }
+
+    /// A fork's build still checks its platform against its node: the
+    /// check comes before buildctl whether or not the image is pushed.
+    #[cfg(unix)]
+    #[test]
+    fn fork_with_platform() {
+        let (_tmp, run) = build_script_harness(false);
+        let (out, reached) = run(&[
+            ("SCARAB_FORK_PR", "true"),
+            ("SCARAB_BUILD_PUSH", "true"),
+            ("SCARAB_BUILD_PLATFORM", "linux/arm64"),
+            ("STUB_UNAME", "x86_64"),
+        ]);
+        assert_eq!((out.status.code(), reached), (Some(2), false));
     }
 
     /// A layout needs the Step id for its path: a push with no SCARAB_STEP
@@ -12498,7 +12747,6 @@ exit "${{STUB_EXIT:-0}}"
                 ("SCARAB_BUILD_DIGEST", LAYOUT_DIGEST),
                 ("SCARAB_BUILD_LAYOUT", layout.as_str()),
                 ("SCARAB_FORK_PR", "false"),
-                ("SCARAB_STEP", "image/push"),
             ] {
                 cmd.env(name, value);
             }
@@ -12833,51 +13081,6 @@ exit "${{STUB_EXIT:-0}}"
         reset();
         assert_eq!(run(&[]), (Some(0), true));
         assert!(result.exists());
-    }
-
-    /// With no results collected, the push Step finds the layout from its
-    /// own id (`<invoke>/push` → `<invoke>/image`), by the rule the build
-    /// Step wrote it by: the two scripts hold separate copies of the rule,
-    /// and an invoke matrix's id is where they could part.
-    #[cfg(unix)]
-    #[test]
-    fn the_build_step_and_push_step_agree_on_the_key() {
-        let (btmp, build) = build_library_harness();
-        let bbase = btmp.path().canonicalize().unwrap();
-        assert_eq!(
-            build(&[
-                ("SCARAB_BUILD_PUSH", "true"),
-                ("SCARAB_STEP", "app[x=1,y=2]/image"),
-            ]),
-            (Some(0), true)
-        );
-        let argv = std::fs::read_to_string(bbase.join("called")).unwrap();
-        let dest = argv
-            .lines()
-            .find_map(|a| a.strip_prefix("type=oci,dest="))
-            .and_then(|a| a.strip_suffix(",tar=false"))
-            .unwrap_or_else(|| panic!("no layout output in {argv}"));
-        let rel = std::path::Path::new(dest)
-            .strip_prefix(bbase.join("workspace"))
-            .unwrap()
-            .to_path_buf();
-
-        let (ptmp, push) = push_library_harness();
-        let pbase = ptmp.path().canonicalize().unwrap();
-        let pws = pbase.join("workspace");
-        std::fs::remove_dir(pbase.join("results")).unwrap();
-        write_layout_at(&pws.join(&rel));
-        assert_eq!(
-            push(&[
-                ("SCARAB_STEP", "app[x=1,y=2]/push"),
-                ("SCARAB_BUILD_LAYOUT", ""),
-                ("SCARAB_BUILD_DIGEST", ""),
-            ]),
-            (Some(0), true)
-        );
-        let called = std::fs::read_to_string(pbase.join("called")).unwrap();
-        let pushed = pws.join(&rel).display().to_string();
-        assert_eq!(called.lines().nth(1), Some(pushed.as_str()));
     }
 
     #[test]
