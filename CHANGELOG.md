@@ -18,6 +18,69 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Security
+
+- **Upgrading the image index library lets it upload workspace content under its existing
+  trust.** Earlier versions read only images already in a registry, and their header said the
+  step reads nothing from the workspace. Trust is kept per source, so an org that trusted
+  `libs/image-index.yaml` with the registry credential keeps that grant on upgrade, and the new
+  `layouts` input then makes the step read image layouts from the workspace and upload them. It
+  still runs no repository code, and it checks each layout before its first registry write (no
+  symlink, only directories and regular files, manifest and config hashed, the manifest is the
+  digest the build reported). The upgrade's review page lists the grant it carries. Pipelines
+  that pass only `image` and `images` make the same registry calls as before and read nothing
+  from the workspace. See
+  [Libraries](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#install-scarabs-image-index-library).
+
+### Features
+
+- **One invoke builds and pushes an image for amd64 and arm64.** The new library
+  `lib:thulasi-ram::scarab-ci::build-multiarch` (`libs/build-multiarch.yaml`) builds on an amd64
+  node and an arm64 node with no credential, and its one `push` step pushes both images by
+  digest, tags each `<tag>-<architecture>`, pushes the index under `image`'s tag and tags it with
+  each of `extra_tags` (such as `latest`). Before, the same image took two build invokes and an
+  image index invoke per tag, with four steps holding the push credential; now one step holds it.
+  Deploy by `outputs.<id>.push.digest`. The architectures are fixed to amd64 and arm64, so the
+  cluster needs nodes of both. Arch tags are on by default (`arch_tags`), so a registry rule that
+  expires untagged images does not remove an image the index names. A retried push step pushes
+  both architectures again, and its Pod needs disk for the checkout and both image layouts. On a
+  fork pull request the builds write no layout and the push step pushes nothing and exits 0.
+  Install it and trust its source for the build sandbox and with the registry credential; an
+  ECR `ecr-push` Policy must list its source. See
+  [Building a multi-architecture image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#building-a-multi-architecture-image)
+  and [Pushing images to Amazon ECR](https://thulasi-ram.github.io/scarab-ci/usage/pushing-to-ecr/#one-image-for-amd64-and-arm64).
+- **The image index library pushes images that builds left in the workspace.** New inputs:
+  `layouts` (one `<path> sha256:<digest>` per line, from the new
+  `lib:thulasi-ram::scarab-ci::build-layout` library, which builds with no credential and pushes
+  nothing), `extra_tags` (more tags for the index, so a second tag no longer needs a second index
+  step) and `arch_tags` (default `true`, for images from `layouts` only). `images` is now
+  optional; at least one of `images` and `layouts` must name an image. Every check runs before
+  the first registry write. See
+  [Joining images into one multi-architecture image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#joining-images-into-one-multi-architecture-image).
+
+### Enhancement
+
+- **The build library writes its image layout at `/workspace/.scarab-build/<key>/oci`**, the key
+  the first 32 hex characters of the SHA-256 of the build step's id, so two builds whose
+  workspaces a later step receives no longer overwrite each other's `index.json`. Its `image`
+  result gains `digest` (a copy of `containerimage.digest` under a key with no `.`) and `layout`.
+  `with:` is unchanged. A step that read `.scarab-build/oci` itself must read
+  `outputs.<id>.image.layout` instead. See
+  [Building an image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#building-an-image).
+
+### Documentation
+
+- **Pushing images to Amazon ECR leads with the multi-architecture build library**, and its
+  `ecr-push` Policy lists `libs/build-multiarch.yaml` among the sources whose steps may name the
+  profile. A Policy copied from the earlier page refuses a Run whose `build-multiarch` push step
+  names `ecr-push` until you add that line.
+
+### Misc
+
+- **A pull request that changes only a library file runs the Rust suite.** Four test crates read
+  `libs/*.yaml`, so `.github/path-filters.yml` adds `libs/**` (and the two docs pages tests read)
+  to `test_and_coverage`.
+
 ## [0.7.6] - 2026-11-25
 
 ### Breaking changes

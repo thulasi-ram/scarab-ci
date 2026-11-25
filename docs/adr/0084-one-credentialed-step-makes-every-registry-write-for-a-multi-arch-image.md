@@ -124,12 +124,12 @@ The same work composed from the pieces, for a Pipeline that needs another shape:
   needs: [checkout]
   invoke: lib:thulasi-ram::scarab-ci::build-layout
   placement_profiles: [amd64]
-  with: {image: "<registry>/app", ...}
+  with: {context: ., dockerfile: Dockerfile}
 - id: arm64
   needs: [checkout]
   invoke: lib:thulasi-ram::scarab-ci::build-layout
   placement_profiles: [arm64]
-  with: {image: "<registry>/app", ...}
+  with: {context: ., dockerfile: Dockerfile}
 - id: image
   needs: [amd64, arm64, meta]
   invoke: lib:thulasi-ram::scarab-ci::image-index
@@ -141,16 +141,20 @@ The same work composed from the pieces, for a Pipeline that needs another shape:
       <amd64 layout> <amd64 digest>
       <arm64 layout> <arm64 digest>
 # each line is one build's `layout` and `digest` results; the library header shows the
-# has(...) form that renders a blank line when a build published none (§3)
+# has(...) form that renders a blank line when a build published none (§3).
+# build-layout takes build's inputs except image, push and insecure_push.
 ```
 
 ### 2. The layout path is keyed by a hash of the build Step's id
 
 Every build script (in `build`, `build-layout` and `build-multiarch`) writes its layout at
 `/workspace/.scarab-build/<h>/oci`, where `<h>` is the first 32 hex characters of the
-SHA-256 of the build Step's own `SCARAB_STEP`. The build Step publishes the path as `layout`
-in its result. Consumers (`build`'s push Step, `image-index`, `build-multiarch`'s push Step)
-read it from results and never compute it themselves, so one place decides the path.
+SHA-256 of the build Step's own `SCARAB_STEP`. The build Step adds two keys to the `image`
+result BuildKit's metadata fills: `digest` (a copy of `containerimage.digest`) and, when it
+wrote a layout, `layout` (the path). Consumers (`build`'s push Step, `image-index`,
+`build-multiarch`'s push Step) read the path from results. One exception: when the server
+collects no results, `build`'s push Step derives the path from its own `SCARAB_STEP`
+(`<invoke>/push` → `<invoke>/image`) and logs a `scarab: warning:` line.
 
 - **Why the Step id.** It is unique in the Run and Scarab sets it in every Pod, so two
   builds fanned into one Step write different paths without any input from the caller.
@@ -176,21 +180,28 @@ under a key with no dot, so a template reads it without brackets) and the metada
 build Step already publishes. Its source needs only the `build_sandbox` grant.
 
 On a fork pull request, or a Run locked out of its Environment's secrets (`SCARAB_FORK_PR`
-not `false`), `build-layout` writes no layout, publishes no `layout` key and exits 0. The
+not `false`, unset included), `build-layout` still builds, keeps the image in BuildKit, exports
+no layer cache, writes no layout and exits 0. Its result has `digest` and no `layout` key. The
 caller's `has(...)` form renders a blank line, and `image-index` exits 0 at its fork check,
-before it reads `layouts` or checks that a source was given.
+before it reads any input.
 
 ### 4. The push Step checks everything before its first registry write
 
 `image-index`'s Step, and `build-multiarch`'s `push` Step that runs the same script, work in
 this order:
 
-1. **Fork check.** `SCARAB_FORK_PR` not `false`: exit 0 before any layout is read.
+1. **Fork check.** `SCARAB_FORK_PR` not `false` (unset included): exit 0 before any input is
+   read.
 2. **Grammar of every env value**: image, extra tags, arch tags, insecure, images, layouts
    (`<path> sha256:<64 hex>` per line) and the result name. `build-multiarch` builds its
    layouts value from the results of Steps that ran repository code, with no `validate:` in
    between, so the script holds the whole grammar. At least one of `images` and `layouts`
-   must name a source.
+   must name a source, and a mix of sources and empty lines is refused.
+   `build-multiarch` renders a build that published no `layout` or `digest` as the line
+   `(<arch> wrote no layout)`, not as an empty line, so on a Run that is not a fork the grammar
+   check refuses it (exit 2) and the index never leaves an architecture out. It also sets
+   `SCARAB_INDEX_LAYOUT_COUNT=2`, so a build result whose `layout` holds a line break cannot add
+   an image.
 3. **Every layout, read locally:** the path is under `/workspace/.scarab-build/`; no symlink
    at any level, and nothing but directories and regular files; `oci-layout` and `index.json`
    have the expected shape and `index.json` names one manifest; the manifest blob hashes to
@@ -200,7 +211,9 @@ this order:
    `images` sources are read from the registry by digest, as today.
 4. **Every tag, computed:** for each layout source, `<tag>-<arch>`, or `<tag>-<arch>-<variant>`
    when the platform has a variant (`arm/v7` gives `<tag>-arm-v7`). Two sources of one
-   platform are refused, and so is any tag over 128 characters.
+   platform are refused, and so is any tag over 128 characters, and an arch tag that another
+   source or an extra tag would also write. An extra tag equal to `image`'s tag, or named twice,
+   is written once.
 5. **Only then, registry writes:** each layout pushed by digest
    (`crane push <layout> <repository>@sha256:…`), the arch tags, `crane index append` onto
    `image` (the first tag), and `crane tag` on the index digest for each extra tag. Then the
@@ -309,9 +322,9 @@ The BuildKit script is a verbatim copy in `build.yaml`, `build-layout.yaml` and
 runs in each file. A workspace-suite test asserts that the copies and the pinned BuildKit and
 crane image digests are equal across files.
 
-Inside `build-multiarch.yaml`, `arm64`'s `command` is a YAML alias of `amd64`'s
-(`command: &build [...]`, `command: *build`), so an admin reviewing the file at install reads
-the build script once. Merge keys (`<<: *x`) are not used: serde_yaml 0.9 does not apply them
+Inside `build-multiarch.yaml`, `arm64`'s `env` and `command` are YAML aliases of `amd64`'s
+(`env: &build_env [...]`, `command: &build_command [...]`, then `*build_env` and
+`*build_command`), so an admin reviewing the file at install reads the build script once. Merge keys (`<<: *x`) are not used: serde_yaml 0.9 does not apply them
 when it deserialises into the IR's structs.
 
 ## Consequences
@@ -322,7 +335,8 @@ when it deserialises into the IR's structs.
   in the middle of the writes leaves a partial tag set until the Step is retried, and the
   order puts the index after the images it names.
 - `build.yaml`'s layout moves from `.scarab-build/oci` to `.scarab-build/<h>/oci`. Its push
-  Step reads the path from the build Step's result; `with:` is unchanged.
+  Step reads the path from the build Step's result (from its own Step id when results are not
+  collected, §2); `with:` is unchanged. Its `image` result gains `digest` and `layout`.
 - 0018's amendment of 2026-11-12 said multi-arch builds are one invoke per architecture plus
   a later index Step. That shape still works; `build-multiarch` is the one the docs lead with.
 - Four test crates read `libs/*.yaml` with `include_str!`, so `.github/path-filters.yml` adds
