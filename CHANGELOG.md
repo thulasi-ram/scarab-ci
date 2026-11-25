@@ -18,6 +18,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.7.7] - 2026-11-25
+
 ### Security
 
 - **Upgrading the image index library lets it upload workspace content under its existing
@@ -2604,7 +2606,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.6...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.7...HEAD
+[0.7.7]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.6...v0.7.7
 [0.7.6]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.3...v0.7.4
