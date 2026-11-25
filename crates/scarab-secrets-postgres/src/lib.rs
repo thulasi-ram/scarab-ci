@@ -673,6 +673,23 @@ impl SecretProvider for PostgresSecrets {
         Ok(projects)
     }
 
+    async fn repo_secret_projects(&self, org: &str) -> Result<Vec<String>, SecretError> {
+        let prefix = format!("repo:{org}/");
+        let scopes: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT scope FROM secrets WHERE starts_with(scope, $1)")
+                .bind(&prefix)
+                .fetch_all(self.pool())
+                .await
+                .map_err(|e| SecretError::Backend(e.to_string()))?;
+        let mut out: Vec<String> = scopes
+            .iter()
+            .filter_map(|s| scarab_secrets::repo_project_of_scope_key(s, org))
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
     async fn environment_secret_scopes(
         &self,
         org: &str,
@@ -846,6 +863,9 @@ fn scope_key(scope: &SecretScope) -> String {
             project: repo,
             environment,
         } => format!("env:{org}/{repo}/{environment}"),
+        SecretScope::OrgEnvironment { org, environment } => {
+            format!("orgenv:{org}/{environment}")
+        }
     }
 }
 

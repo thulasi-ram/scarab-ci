@@ -362,3 +362,147 @@ async fn the_repo_default_column_can_be_silenced_too() {
 
     tdb.cleanup().await;
 }
+
+/// The org's value for one Environment (Org Settings › Secrets, a scope
+/// with an `environment` and no `repo`): every repository's Runs in that
+/// Environment get it ahead of the repository default, a repository can still
+/// set its own for the Environment, and both lists say where each value comes
+/// from — the repository's as `org_environment`, the org's as the
+/// repositories that set their own in front of it.
+#[tokio::test]
+async fn the_org_value_for_an_environment_sits_between_the_repo_and_its_environment() {
+    let Some(tdb) = fresh_db().await else { return };
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    for name in ["staging", "prod"] {
+        seed_project_overlay(&pg, ORG, REPO, name, Default::default()).await;
+    }
+    let secrets = Arc::new(FakeSecrets::new());
+    let db: Arc<dyn Db> = pg.clone();
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        pg.clone(),
+    ));
+    let app = router(
+        AppState::new(db, Arc::new(FakeClock::new(1_000)), logs)
+            .with_environment_governance(pg.clone())
+            .with_org_environments(pg.clone())
+            .with_secrets(secrets.clone()),
+    );
+    let org_write = |key: &str, environment: Option<&str>, value: &str| {
+        let mut body = serde_json::json!({ "org": ORG, "name": key, "value": value });
+        if let Some(e) = environment {
+            body["environment"] = e.into();
+        }
+        Request::builder()
+            .method("POST")
+            .uri("/v1/secrets")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    send(
+        &app,
+        write_cell("ROLE", None, "repo-default"),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    send(
+        &app,
+        org_write("ROLE", Some("prod"), "org-prod"),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    send(
+        &app,
+        org_write("ROLE", None, "org-default"),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    // An Environment the org does not have takes no values.
+    send(
+        &app,
+        org_write("ROLE", Some("nowhere"), "x"),
+        StatusCode::CONFLICT,
+    )
+    .await;
+
+    let resolved = |environment: &str| {
+        let secrets = secrets.clone();
+        let scope = SecretScope::EnvironmentProject {
+            org: ORG.into(),
+            project: REPO.into(),
+            environment: environment.into(),
+        };
+        async move { String::from_utf8(secrets.resolve(&scope, "ROLE").await.unwrap().value).unwrap() }
+    };
+    assert_eq!(
+        resolved("prod").await,
+        "org-prod",
+        "the org's prod value beats the repo default"
+    );
+    assert_eq!(resolved("staging").await, "repo-default");
+
+    let m = matrix(&app).await;
+    let field = |m: &serde_json::Value, f: &str| {
+        m["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["key"] == "ROLE")
+            .unwrap()[f]
+            .clone()
+    };
+    assert_eq!(
+        field(&m, "inherited_from"),
+        serde_json::json!({ "prod": "org_environment", "staging": "repo" })
+    );
+    assert_eq!(field(&m, "overrides"), serde_json::json!({ "": "org" }));
+
+    // The repository sets its own for prod: it wins, and hides the org's.
+    send(
+        &app,
+        write_cell("ROLE", Some("prod"), "web-prod"),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    assert_eq!(resolved("prod").await, "web-prod");
+    let m = matrix(&app).await;
+    assert_eq!(
+        field(&m, "overrides"),
+        serde_json::json!({ "": "org", "prod": "org_environment" })
+    );
+
+    // The org's list: its own values, and who stands in front of each.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/orgs/{ORG}/secrets/matrix"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let org = body_json(resp).await;
+    assert_eq!(org["environments"], serde_json::json!(["prod", "staging"]));
+    let role = org["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "ROLE")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        role["status"],
+        serde_json::json!({ "": "set", "prod": "set", "staging": "inherited" })
+    );
+    assert_eq!(
+        role["repos_with_own"],
+        serde_json::json!({ "": [REPO], "prod": [REPO] })
+    );
+
+    tdb.cleanup().await;
+}

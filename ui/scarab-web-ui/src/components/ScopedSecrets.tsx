@@ -1,141 +1,11 @@
-// Secret CRUD at ONE scope: list names, add, replace, delete. Values are
-// write-only: the API never returns them, so there is nothing to reveal.
-//
-// The org scope in Organization settings › Secrets uses it. It looks like a
-// repository's Secrets tab (SecretKeyList): the count in the header, New
-// secret on the right of the bar, and one full-width list with a row per name,
-// its edit (the same dialog with the name filled in) and delete, which asks
-// for the name to be typed. SecretKeyList shares the New secret dialog below.
-import { createResource, createSignal, For, Show, type JSX } from "solid-js";
-import { listSecrets, putSecret, deleteSecret, type SecretScope } from "../api/client";
+// The New secret dialog both key lists share (SecretKeyList: a repository's
+// Secrets tab and Org settings › Secrets). Values are write-only: the API never
+// returns them, so there is nothing to reveal.
+import { createSignal, For, Show } from "solid-js";
+import { putSecret, type SecretScope } from "../api/client";
 import Icon from "./Icon";
 import Modal, { ModalMessage } from "./Modal";
-import ConfirmDestructive from "./ConfirmDestructive";
 import { Checkbox, Field, Input, Select } from "./Field";
-
-export default function ScopedSecrets(props: {
-  /** The scope to read and write. Changing it refetches. */
-  scope: SecretScope;
-  /** Panel header: names the scope in the user's words. */
-  title: string;
-  /** Shown when the scope holds nothing yet. */
-  emptyLabel?: string;
-  /** Each row's summary: where a value at this scope applies. */
-  summary?: string;
-  /** More for the note under the list, after the sentence on values. */
-  note?: JSX.Element;
-}) {
-  const scope = () => props.scope;
-  const [names, { refetch }] = createResource(
-    () => props.scope,
-    async (s) => (await listSecrets(s)).slice().sort(),
-  );
-  // The dialog: `""` for a new secret, a name to replace that one.
-  const [editing, setEditing] = createSignal<string | null>(null);
-  const [deleting, setDeleting] = createSignal<string | null>(null);
-  const where = () => (props.scope.repo ? `${props.scope.org}/${props.scope.repo}` : props.scope.org);
-
-  const count = () => names()?.length ?? 0;
-
-  return (
-    <div class="panel">
-      <div class="panel-h">
-        <span>{props.title}</span>
-        <Show when={count() > 0}>
-          <span class="tok-count">{count()}</span>
-        </Show>
-      </div>
-      <div class="secrets-body">
-        <div class="skey-bar">
-          <button class="btn btn-primary btn-sm" type="button" onClick={() => setEditing("")}>
-            <Icon icon="plus" size={14} /> New secret
-          </button>
-        </div>
-        <Show when={names.error}>
-          <p class="error">Could not load the secrets.</p>
-        </Show>
-        <Show when={!names.loading} fallback={<p class="empty">loading…</p>}>
-          <Show
-            when={count() > 0}
-            fallback={
-              <Show when={!names.error}>
-                <p class="empty">{props.emptyLabel ?? "No secrets at this scope."}</p>
-              </Show>
-            }
-          >
-            <ul class="skey-list skey-list-flat" aria-label="Secrets">
-              <For each={names()}>
-                {(name) => (
-                  <li class="skey skey-row">
-                    <Icon icon="key-round" size={14} />
-                    <code class="mono skey-name">{name}</code>
-                    <Show when={props.summary}>
-                      <span class="skey-sum">{props.summary}</span>
-                    </Show>
-                    <span class="skey-acts">
-                      <button
-                        class="btn btn-ghost btn-sm"
-                        type="button"
-                        aria-label={`Edit ${name}`}
-                        onClick={() => setEditing(name)}
-                      >
-                        edit
-                      </button>
-                      <button
-                        class="btn btn-ghost btn-sm"
-                        type="button"
-                        aria-label={`Delete ${name}`}
-                        onClick={() => setDeleting(name)}
-                      >
-                        delete
-                      </button>
-                    </span>
-                  </li>
-                )}
-              </For>
-            </ul>
-          </Show>
-          <p class="subtle skey-legend">
-            <small>
-              Encrypted at rest and never displayed: you can overwrite a value but not read it
-              back. Setting a name again replaces it. {props.note}
-            </small>
-          </p>
-        </Show>
-      </div>
-      <Show when={editing() !== null}>
-        <NewSecretDialog
-          scope={scope()}
-          name={editing() || undefined}
-          existing={() => names() ?? []}
-          onClose={() => setEditing(null)}
-          onSaved={() => refetch()}
-        />
-      </Show>
-      <Show when={deleting()}>
-        {(name) => (
-          <ConfirmDestructive
-            eyebrow={`${where()} · secrets`}
-            title={`Delete ${name()}?`}
-            purpose="Its value cannot be recovered."
-            name={name()}
-            confirmLabel="Delete secret"
-            onConfirm={async () => {
-              await deleteSecret(scope(), name());
-              void refetch();
-            }}
-            onClose={() => setDeleting(null)}
-          >
-            <p>
-              A repository or Environment that sets its own value keeps it. Everywhere else, Steps
-              that read it get nothing.
-            </p>
-          </ConfirmDestructive>
-        )}
-      </Show>
-    </div>
-  );
-}
 
 // New-secret modal. `putSecret` is an unconditional upsert, so the overwrite
 // checkbox is a client-side guard: replacing an existing name requires opting
@@ -144,16 +14,19 @@ export default function ScopedSecrets(props: {
 // Given `name`, it replaces that secret: the name is filled in and read-only,
 // and the same guard asks to overwrite it.
 //
-// Given `environments`, it also asks for the scope: the Repository default
-// (`""`) or one Environment of the repository in `scope`.
+// Given `environments`, it also asks for the scope: the default (`""`, the
+// Repository default, or the Org default when `scope` names no repo) or one
+// Environment.
 export function NewSecretDialog(props: {
   scope: SecretScope;
   /** The names already set at a scope (`""` is the scope itself). */
   existing: (environment: string) => string[];
   /** The Environments a value can be set in; none hides the scope field. */
   environments?: string[];
-  /** The scope picked when the dialog opens; `""` is the Repository default. */
+  /** The scope picked when the dialog opens; `""` is the default. */
   environment?: string;
+  /** The default scope's name: "Repository default" unless told otherwise. */
+  defaultLabel?: string;
   /** Replace this secret: its name, filled in and read-only. */
   name?: string;
   onClose: () => void;
@@ -246,10 +119,14 @@ export function NewSecretDialog(props: {
       <Show when={(props.environments?.length ?? 0) > 0}>
         <Field
           label="Scope"
-          help="The Repository default applies in every environment that does not set its own value."
+          help={
+            props.scope.repo
+              ? "The Repository default applies in every environment that does not set its own value."
+              : "The Org default applies to every repository and Environment that does not set its own value. A value for one Environment applies to every repository's Runs there, unless the repository sets its own."
+          }
         >
           <Select value={environment()} onValue={setEnvironment}>
-            <option value="">Repository default</option>
+            <option value="">{props.defaultLabel ?? "Repository default"}</option>
             <For each={props.environments}>{(e) => <option value={e}>{e}</option>}</For>
           </Select>
         </Field>

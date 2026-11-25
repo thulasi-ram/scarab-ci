@@ -18,7 +18,7 @@
 // Gating here is presentation: the server enforces `Administer` on the org
 // for every request an org section makes.
 import { For, Match, Show, Switch, createMemo, type JSX } from "solid-js";
-import { A, Navigate, useLocation, useNavigate, useParams } from "@solidjs/router";
+import { A, Navigate, useLocation, useNavigate, useParams, useSearchParams } from "@solidjs/router";
 import { me } from "../session";
 import {
   activeSectionHref,
@@ -47,7 +47,7 @@ import Members from "../components/Members";
 import OrgEnvironments from "../components/OrgEnvironments";
 import Plugins from "../components/Plugins";
 import Libraries from "../components/Libraries";
-import ScopedSecrets from "../components/ScopedSecrets";
+import SecretKeyList from "../components/SecretKeyList";
 import { MyApiTokens, OrgApiTokens } from "../components/ApiTokens";
 import OrgSecurity from "../components/OrgSecurity";
 import OrgPolicies from "../components/OrgPolicies";
@@ -376,13 +376,7 @@ function orgBody(id: string, org: string): JSX.Element {
       );
     case "secrets":
       return (
-        <ScopedSecrets
-          scope={{ org }}
-          title={`Org secrets · ${org}`}
-          emptyLabel="No org-wide secrets yet."
-          summary="every repository that does not set its own"
-          note="A repository or Environment that sets the same name uses its own value; set those on the repository's Secrets tab."
-        />
+<OrgSecrets org={org} />
       );
     case "policies":
       return <OrgPolicies org={org} />;
@@ -393,6 +387,23 @@ function orgBody(id: string, org: string): JSX.Element {
     default:
       return <NotFound />;
   }
+}
+
+/**
+ * Org settings › Secrets: the org's key list, the Org default and the org's
+ * value for each Environment. The picked Environment is in the URL
+ * (`?secret_env=`), as on a repository's Secrets tab.
+ */
+function OrgSecrets(props: { org: string }) {
+  const [search, setSearch] = useSearchParams();
+  const env = () => (typeof search.secret_env === "string" ? search.secret_env : "");
+  return (
+    <SecretKeyList
+      org={props.org}
+      environment={env()}
+      onEnvironment={(e) => setSearch({ secret_env: e || undefined }, { replace: true })}
+    />
+  );
 }
 
 function NotYours(props: { org: string }) {

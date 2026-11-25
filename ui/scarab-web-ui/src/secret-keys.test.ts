@@ -168,3 +168,69 @@ describe("stateText", () => {
     expect(stateText(row("SLACK_WEBHOOK_URL"), "qa")).toBe("unset on purpose");
   });
 });
+
+// The org's value for an Environment, as a repository sees it: AWS_DEPLOY_ROLE
+// is set by the org for production and staging, and acme/web sets its own for
+// production.
+const orgEnvRow: SecretMatrix["keys"][number] = {
+  key: "AWS_DEPLOY_ROLE",
+  status: { "": "unset", production: "set", staging: "inherited", qa: "unset", dev: "unset" },
+  inherited_from: { staging: "org_environment" },
+  overrides: { production: "org_environment" },
+};
+
+describe("the org's value for an Environment, on a repository's list", () => {
+  const m: SecretMatrix = { ...matrix, keys: [orgEnvRow] };
+  it("tags the key as the org's and says where it comes from", () => {
+    expect(isOrgKey(orgEnvRow)).toBe(true);
+    expect(keySummary(m, orgEnvRow)).toBe(
+      "unset by default · from the org in production and staging · overridden in production",
+    );
+    expect(stateText(orgEnvRow, "staging")).toBe("inherited (org value for staging)");
+    expect(stateText(orgEnvRow, "production")).toBe(
+      "set here, overrides the org value for production",
+    );
+    expect(envSummary(orgEnvRow, "staging")).toBe("from the org value for staging");
+    expect(envSummary(orgEnvRow, "production")).toBe(
+      "set here, overrides the org value for production",
+    );
+  });
+});
+
+describe("the org's own list", () => {
+  const orgEnvs = ["production", "staging", "qa"];
+  const orgMatrix: SecretMatrix = {
+    columns: ["", ...orgEnvs],
+    environments: orgEnvs,
+    keys: [
+      {
+        key: "AWS_DEPLOY_ROLE",
+        status: { "": "unset", production: "set", staging: "set", qa: "unset" },
+        inherited_from: {},
+        overrides: {},
+        repos_with_own: { production: ["web"] },
+      },
+      {
+        key: "GHCR_TOKEN",
+        status: { "": "set", production: "inherited", staging: "inherited", qa: "inherited" },
+        inherited_from: { production: "org", staging: "org", qa: "org" },
+        overrides: {},
+        repos_with_own: { "": ["api", "web"] },
+      },
+    ],
+  };
+  const orgRow = (key: string) => orgMatrix.keys.find((r) => r.key === key)!;
+  it("names the Org default and says who sets their own", () => {
+    expect(keySummary(orgMatrix, orgRow("AWS_DEPLOY_ROLE"), true)).toBe(
+      "unset by default · set in production and staging · web sets its own for production",
+    );
+    expect(keySummary(orgMatrix, orgRow("GHCR_TOKEN"), true)).toBe(
+      "default set · api and web set their own",
+    );
+    expect(stateText(orgRow("AWS_DEPLOY_ROLE"), "production", true)).toBe(
+      "set here · web sets its own",
+    );
+    expect(stateText(orgRow("GHCR_TOKEN"), "qa", true)).toBe("inherited (Org default)");
+    expect(envSummary(orgRow("GHCR_TOKEN"), "staging", true)).toBe("from the Org default");
+  });
+});

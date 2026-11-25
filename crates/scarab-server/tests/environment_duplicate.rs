@@ -373,6 +373,22 @@ async fn a_duplicate_copies_rules_eligibility_projects_and_secret_values() {
     };
     let h = &f.h;
     let (s, mut soft) = signed_in_admin(h).await;
+    // The org's own value for prod is copied too, into the org's value for
+    // the new Environment.
+    let org_env = |environment: &str| SecretScope::OrgEnvironment {
+        org: "acme".into(),
+        environment: environment.into(),
+    };
+    f.secrets
+        .put(
+            &org_env("prod"),
+            Secret {
+                key: "DEPLOY_ROLE".into(),
+                value: b"org-role".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
     let before = snapshot(&f, "prod").await;
     let uri = format!("{PROD}/duplicate");
 
@@ -462,8 +478,17 @@ async fn a_duplicate_copies_rules_eligibility_projects_and_secret_values() {
             "secrets": [
                 { "project": "api", "keys": ["DB_PASSWORD"] },
                 { "project": "web", "keys": ["API_KEY", "DB_PASSWORD"] }
-            ]
+            ],
+            "org_secrets": ["DEPLOY_ROLE"]
         })
+    );
+    assert_eq!(
+        f.secrets
+            .get(&org_env("prod-eu"), "DEPLOY_ROLE")
+            .await
+            .unwrap()
+            .value,
+        b"org-role"
     );
     assert!(
         !b.to_string().contains("web-pw"),

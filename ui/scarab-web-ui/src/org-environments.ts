@@ -441,6 +441,8 @@ export type DeleteBlockersLike = {
   overlays: readonly string[];
   privilege_grants: readonly string[];
   secrets: readonly { project: string; keys: readonly string[] }[];
+  /** The org's own values for the Environment, by key (absent from an older server). */
+  org_secrets?: readonly string[];
 };
 
 /** Is `x` the 409 body that lists what blocks a delete? */
@@ -484,6 +486,9 @@ export function blockerLines(b: DeleteBlockersLike): string[] {
   if (b.privilege_grants.length > 0) {
     lines.push(`Privilege grants of ${andList(b.privilege_grants)}`);
   }
+  if ((b.org_secrets?.length ?? 0) > 0) {
+    lines.push(`The org's secrets: ${b.org_secrets!.join(", ")}`);
+  }
   for (const s of b.secrets) {
     lines.push(`Secrets of ${s.project}: ${s.keys.join(", ")}`);
   }
@@ -524,6 +529,8 @@ export type DuplicateResultLike = {
     overlays: string[];
     privilege_grants: string[];
     secrets: { project: string; keys: string[] }[];
+    /** The org's own values for the Environment (absent from an older server). */
+    org_secrets?: string[];
   };
   not_copied: {
     policies: { id: string; name: string; project?: string | null; environments: string[] }[];
@@ -537,13 +544,19 @@ export type DuplicateResultLike = {
 /** One line of the "what was copied" summary. */
 export function copiedSummary(r: DuplicateResultLike): string[] {
   const n = (count: number, one: string, many: string) => `${count} ${count === 1 ? one : many}`;
-  const secretCount = r.copied.secrets.reduce((sum, s) => sum + s.keys.length, 0);
+  const orgSecrets = r.copied.org_secrets?.length ?? 0;
+  const secretCount =
+    r.copied.secrets.reduce((sum, s) => sum + s.keys.length, 0) + orgSecrets;
+  const owners = [
+    ...(orgSecrets > 0 ? ["the org"] : []),
+    ...r.copied.secrets.map((s) => s.project),
+  ];
   return [
     "baseline rules and the projects that may use it",
     n(r.copied.overlays.length, "project overlay", "project overlays"),
     n(r.copied.privilege_grants.length, "privilege grant", "privilege grants"),
     `${n(secretCount, "secret", "secrets")} with their values${
-      r.copied.secrets.length > 0 ? ` (${r.copied.secrets.map((s) => s.project).join(", ")})` : ""
+      owners.length > 0 ? ` (${owners.join(", ")})` : ""
     }`,
   ];
 }

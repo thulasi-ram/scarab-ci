@@ -2188,8 +2188,49 @@ const secretMatrix = {
       inherited_from: {},
       overrides: {},
     },
+    // The org sets AWS_DEPLOY_ROLE for production and qa; scarab sets its own
+    // for production.
+    {
+      key: "AWS_DEPLOY_ROLE",
+      status: { "": "unset", qa: "inherited", production: "set" },
+      inherited_from: { qa: "org_environment" },
+      overrides: { production: "org_environment" },
+    },
   ],
 };
+
+/**
+ * The org's own values (Org settings › Secrets), by key: the scopes it sets
+ * (`""` the Org default, else an Environment). Writes and clears from the page
+ * change it for the life of the page. `orgSecretMatrix` builds
+ * `GET /v1/orgs/{org}/secrets/matrix` from it, with the repositories that set
+ * their own in front of each scope.
+ */
+const orgSecretScopes = new Map<string, Set<string>>([
+  ["GHCR_TOKEN", new Set([""])],
+  ["SENTRY_DSN", new Set([""])],
+  ["AWS_DEPLOY_ROLE", new Set(["production", "qa"])],
+]);
+const orgSecretReposWithOwn: Record<string, Record<string, string[]>> = {
+  SENTRY_DSN: { "": ["scarab"] },
+  AWS_DEPLOY_ROLE: { production: ["scarab"] },
+};
+function orgSecretMatrix() {
+  const environments = orgEnvironments.map((e) => e.name).sort();
+  const keys = [...orgSecretScopes.entries()]
+    .filter(([, scopes]) => scopes.size > 0)
+    .map(([key, scopes]) => ({
+      key,
+      status: Object.fromEntries(
+        ["", ...environments].map((c) => [
+          c,
+          scopes.has(c) ? "set" : c !== "" && scopes.has("") ? "inherited" : "unset",
+        ]),
+      ),
+      repos_with_own: orgSecretReposWithOwn[key] ?? {},
+    }));
+  return { columns: ["", ...environments], environments, keys };
+}
 
 // ── API tokens (git-bug a4cb94f) ────────────────────────────────
 // Four records covering every state the panels render differently: a live token
@@ -3049,18 +3090,29 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   // Secret names are scope-addressed: no `repo=` is the org scope.
   // The org scope's names change with a save or a delete, for the life of
   // the page.
+  // The org's list: its own values by scope.
+  if (/^\/v1\/orgs\/[^/]+\/secrets\/matrix$/.test(p)) return json(orgSecretMatrix());
   if (p === "/v1/secrets") {
     const q = new URLSearchParams(search);
     const scoped = q.has("repo");
-    if (!scoped && method === "POST") {
-      const req = JSON.parse(body || "{}") as { name?: string; repo?: string };
-      if (req.name && !req.repo && !orgSecretNames.names.includes(req.name)) orgSecretNames.names.push(req.name);
+    if (method === "POST") {
+      const req = JSON.parse(body || "{}") as { name?: string; repo?: string; environment?: string };
+      if (req.name && !req.repo) {
+        if (!req.environment && !orgSecretNames.names.includes(req.name)) orgSecretNames.names.push(req.name);
+        const scopes = orgSecretScopes.get(req.name) ?? new Set<string>();
+        scopes.add(req.environment ?? "");
+        orgSecretScopes.set(req.name, scopes);
+      }
       return new Response(null, { status: 204 });
     }
     if (!scoped && method === "DELETE") {
-      orgSecretNames.names = orgSecretNames.names.filter((n) => n !== q.get("name"));
+      const name = q.get("name") ?? "";
+      const environment = q.get("environment") ?? "";
+      if (!environment) orgSecretNames.names = orgSecretNames.names.filter((n) => n !== name);
+      orgSecretScopes.get(name)?.delete(environment);
       return new Response(null, { status: 204 });
     }
+    if (method === "DELETE") return new Response(null, { status: 204 });
     return json(scoped ? secretNames : orgSecretNames);
   }
 

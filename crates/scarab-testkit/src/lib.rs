@@ -6762,6 +6762,9 @@ fn scope_key(scope: &SecretScope) -> String {
             project: repo,
             environment,
         } => format!("env:{org}/{repo}/{environment}"),
+        SecretScope::OrgEnvironment { org, environment } => {
+            format!("orgenv:{org}/{environment}")
+        }
     }
 }
 
@@ -6824,6 +6827,19 @@ impl SecretProvider for FakeSecrets {
         projects.sort();
         projects.dedup();
         Ok(projects)
+    }
+
+    async fn repo_secret_projects(&self, org: &str) -> Result<Vec<String>, SecretError> {
+        let mut out: Vec<String> = self
+            .values
+            .lock()
+            .unwrap()
+            .keys()
+            .filter_map(|(s, _)| scarab_secrets::repo_project_of_scope_key(s, org))
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 
     async fn environment_secret_scopes(

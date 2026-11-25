@@ -114,6 +114,15 @@ async fn fixture() -> Option<Fixture> {
             .with_secret(&env_scope("web", "prod"), "API_KEY", b"web-key")
             .with_secret(&env_scope("api", "prod"), "DB_PASSWORD", b"api-pw")
             .with_secret(&env_scope("web", "staging"), "DB_PASSWORD", b"stg")
+            // The org's own value for prod.
+            .with_secret(
+                &SecretScope::OrgEnvironment {
+                    org: "acme".into(),
+                    environment: "prod".into(),
+                },
+                "DEPLOY_ROLE",
+                b"org-role",
+            )
             .with_secret(
                 &SecretScope::Repo {
                     org: "acme".into(),
@@ -189,7 +198,8 @@ async fn a_plain_delete_lists_what_blocks_it_and_a_cascade_deletes_it_all() {
     assert_eq!(b["code"], "environment_in_use", "{b}");
     assert_eq!(b["overlay_count"], 1, "{b}");
     assert_eq!(b["privilege_grant_count"], 1, "{b}");
-    assert_eq!(b["secret_count"], 3, "{b}");
+    assert_eq!(b["secret_count"], 4, "{b}");
+    assert_eq!(b["org_secrets"], json!(["DEPLOY_ROLE"]), "{b}");
     assert_eq!(b["overlays"], json!(["web"]));
     assert_eq!(b["privilege_grants"], json!(["api"]));
     assert_eq!(
@@ -217,6 +227,11 @@ async fn a_plain_delete_lists_what_blocks_it_and_a_cascade_deletes_it_all() {
         .unwrap()
         .is_none());
     assert_eq!(secret_keys(&f, "prod").await, Vec::<String>::new());
+    let org_prod = SecretScope::OrgEnvironment {
+        org: "acme".into(),
+        environment: "prod".into(),
+    };
+    assert!(f.secrets.list_scoped(&org_prod).await.unwrap().is_empty());
     // Created again, the name starts with nothing of the old one.
     let (st, b) = h.cookie("PUT", PROD, Some(json!({})), &s).await;
     assert!(st.is_success(), "{st} {b}");
@@ -250,13 +265,14 @@ async fn a_plain_delete_lists_what_blocks_it_and_a_cascade_deletes_it_all() {
             "cascade": true,
             "overlay_count": 1,
             "privilege_grant_count": 1,
-            "secret_count": 3,
+            "secret_count": 4,
             "overlays": ["web"],
             "privilege_grants": ["api"],
             "secrets": [
                 { "project": "api", "keys": ["DB_PASSWORD"] },
                 { "project": "web", "keys": ["API_KEY", "DB_PASSWORD"] },
             ],
+            "org_secrets": ["DEPLOY_ROLE"],
         })
     );
     f.tdb.cleanup().await;

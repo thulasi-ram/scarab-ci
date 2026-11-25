@@ -52,24 +52,46 @@ pub enum SecretScope {
         project: String,
         environment: String,
     },
+    /// One Environment, every Project of its org: the value an org admin
+    /// sets once for, say, production, which every repository's Runs in that
+    /// Environment get unless the repository sets its own for it. Named
+    /// `OrgEnvironment` rather than `Environment` because `Environment` is
+    /// the old wire name [`SecretScope::EnvironmentProject`] still reads.
+    OrgEnvironment {
+        org: String,
+        environment: String,
+    },
 }
 
 impl SecretScope {
     /// The lookup chain from most to least specific (ADR-0014, 0037): an
-    /// `EnvironmentProject` scope falls back to its Project's `Repo` scope,
-    /// then `Org`; a `Repo` scope
-    /// falls back to its `Org`. `resolve` walks this in order, first hit wins,
-    /// so a value shared across environments lives once at the repo/org level.
+    /// `EnvironmentProject` scope falls back to its Environment's
+    /// `OrgEnvironment` scope, then its Project's `Repo` scope, then `Org`;
+    /// a `Repo` or `OrgEnvironment` scope falls back to its `Org`. `resolve`
+    /// walks this in order, first hit wins, so a value shared across
+    /// environments lives once at the repo/org level.
+    ///
+    /// The org's value for an Environment comes before the repository's
+    /// default: a platform team's production credential is not quietly
+    /// replaced by a repository default meant for every other Environment.
+    /// A repository that needs its own value there sets it for that
+    /// Environment.
     pub fn resolution_chain(&self) -> Vec<SecretScope> {
         match self {
             SecretScope::Org { .. } => vec![self.clone()],
-            SecretScope::Repo { org, .. } => {
+            SecretScope::Repo { org, .. } | SecretScope::OrgEnvironment { org, .. } => {
                 vec![self.clone(), SecretScope::Org { org: org.clone() }]
             }
             SecretScope::EnvironmentProject {
-                org, project: repo, ..
+                org,
+                project: repo,
+                environment,
             } => vec![
                 self.clone(),
+                SecretScope::OrgEnvironment {
+                    org: org.clone(),
+                    environment: environment.clone(),
+                },
                 SecretScope::Repo {
                     org: org.clone(),
                     repo: repo.clone(),
@@ -97,6 +119,17 @@ pub fn environment_project_of_scope_key(
         .strip_prefix('/')?
         .strip_suffix(environment)?
         .strip_suffix('/')?;
+    (!project.is_empty() && !project.contains('/')).then(|| project.to_string())
+}
+
+/// The Project of a `repo:{org}/{project}` scope key — the flat form both
+/// stores key a [`SecretScope::Repo`] by — when it is in `org`; `None` for
+/// any other key.
+pub fn repo_project_of_scope_key(scope_key: &str, org: &str) -> Option<String> {
+    let project = scope_key
+        .strip_prefix("repo:")?
+        .strip_prefix(org)?
+        .strip_prefix('/')?;
     (!project.is_empty() && !project.contains('/')).then(|| project.to_string())
 }
 
@@ -172,6 +205,16 @@ pub trait SecretProvider: Send + Sync {
         ))
     }
 
+    /// The Projects of `org` holding at least one secret in their
+    /// [`SecretScope::Repo`] scope, sorted: the repositories whose own
+    /// default can stand in front of an org value. A store that cannot
+    /// enumerate its scopes answers [`SecretError::Backend`].
+    async fn repo_secret_projects(&self, _org: &str) -> Result<Vec<String>, SecretError> {
+        Err(SecretError::Backend(
+            "this secret store cannot list its repository scopes".into(),
+        ))
+    }
+
     /// Resolve `key` **with inheritance** (ADR-0014, 0037): try each scope in
     /// [`SecretScope::resolution_chain`] from most to least specific, returning
     /// the first hit. A [`NotFound`](SecretError::NotFound) at one scope falls
@@ -232,9 +275,27 @@ mod tests {
             env("prod").resolution_chain(),
             vec![
                 env("prod"),
+                SecretScope::OrgEnvironment {
+                    org: "acme".into(),
+                    environment: "prod".into()
+                },
                 SecretScope::Repo {
                     org: "acme".into(),
                     repo: "web".into()
+                },
+                SecretScope::Org { org: "acme".into() },
+            ]
+        );
+        assert_eq!(
+            SecretScope::OrgEnvironment {
+                org: "acme".into(),
+                environment: "prod".into()
+            }
+            .resolution_chain(),
+            vec![
+                SecretScope::OrgEnvironment {
+                    org: "acme".into(),
+                    environment: "prod".into()
                 },
                 SecretScope::Org { org: "acme".into() },
             ]
@@ -263,6 +324,9 @@ mod tests {
                 project: repo,
                 environment,
             } => format!("env:{org}/{repo}/{environment}"),
+            SecretScope::OrgEnvironment { org, environment } => {
+                format!("orgenv:{org}/{environment}")
+            }
         }
     }
     #[async_trait]
@@ -324,6 +388,43 @@ mod tests {
         });
         let got = p.resolve(&env("prod"), "K").await.unwrap();
         assert_eq!(got.value, b"env:acme/web/prod");
+    }
+
+    #[tokio::test]
+    async fn the_org_value_for_an_environment_beats_the_repo_default() {
+        let org_env = SecretScope::OrgEnvironment {
+            org: "acme".into(),
+            environment: "prod".into(),
+        };
+        let repo = SecretScope::Repo {
+            org: "acme".into(),
+            repo: "web".into(),
+        };
+        let p = Fake::default().with(&org_env).with(&repo);
+        assert_eq!(
+            p.resolve(&env("prod"), "K").await.unwrap().value,
+            b"orgenv:acme/prod"
+        );
+        // Another Environment still gets the repo default.
+        assert_eq!(
+            p.resolve(&env("staging"), "K").await.unwrap().value,
+            b"repo:acme/web"
+        );
+        // The repository's own value for the Environment beats the org's.
+        let p = p.with(&env("prod"));
+        assert_eq!(
+            p.resolve(&env("prod"), "K").await.unwrap().value,
+            b"env:acme/web/prod"
+        );
+    }
+
+    #[test]
+    fn a_project_is_read_back_from_its_repo_scope_key() {
+        let of = repo_project_of_scope_key;
+        assert_eq!(of("repo:acme/web", "acme"), Some("web".into()));
+        assert_eq!(of("repo:acmex/web", "acme"), None);
+        assert_eq!(of("repo:acme/", "acme"), None);
+        assert_eq!(of("env:acme/web/prod", "acme"), None);
     }
 
     #[tokio::test]
