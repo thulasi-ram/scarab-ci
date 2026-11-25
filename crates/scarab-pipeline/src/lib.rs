@@ -5488,7 +5488,7 @@ fn command_values(ir: &PipelineIr) -> Vec<String> {
                 });
                 let (at, caller) = match (&bound, step.origin.last()) {
                     (Some((name, template)), Some(lib)) => {
-                        let (invoke, own) = step.id.rsplit_once('/').unwrap_or(("", &step.id));
+                        let (invoke, own) = split_invoke_prefix(&step.id).unwrap_or(("", &step.id));
                         (
                             format!("library `{}`, step `{own}`", lib.name),
                             format!(", which step `{invoke}` binds with `with.{name}: {template}`",),
@@ -5512,6 +5512,23 @@ fn command_values(ir: &PipelineIr) -> Vec<String> {
         }
     }
     found
+}
+
+/// `id` split at its last `/` outside a matrix leg's `[…]`: an inlined
+/// Step's invoke prefix and its own id (`app/build[arch=linux/amd64]` is
+/// `app` and `build[arch=linux/amd64]`). `None` when there is no such `/`.
+fn split_invoke_prefix(id: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    let mut at = None;
+    for (i, c) in id.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            '/' if depth == 0 => at = Some(i),
+            _ => {}
+        }
+    }
+    at.map(|i| (&id[..i], &id[i + 1..]))
 }
 
 /// `text` without its `[…]` parts: a matrix leg's id as its Step's.
@@ -5826,7 +5843,7 @@ fn validate_output_reads(ir: &PipelineIr, diagnostics: &mut Vec<String>) {
             if let (ScopeInputs::Bound(bindings), Some(caller)) = (&scope.inputs, &scope.caller) {
                 let invoke = match &t.plugin_gate {
                     Some(_) => t.id.as_str(),
-                    None => t.id.rsplit_once('/').map_or(t.id.as_str(), |(p, _)| p),
+                    None => split_invoke_prefix(&t.id).map_or(t.id.as_str(), |(p, _)| p),
                 };
                 for b in bindings.values() {
                     if let BoundValue::Template(text) = &b.value {
