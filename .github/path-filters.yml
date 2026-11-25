@@ -61,6 +61,11 @@ test_and_coverage:
   # crates/scarab-executor-k8s/tests/clone_image_credential.rs runs the clone
   # image's scripts with the real git.
   - "docker/clone/**"
+  # Tests in crates/ read the library files and run their scripts
+  # (include_str!), and two read docs pages the same way.
+  - "libs/**"
+  - "ui/scarab-docs-ui/src/content/docs/usage/pipeline-syntax.mdx"
+  - "ui/scarab-docs-ui/src/content/docs/usage/pushing-to-ecr.mdx"
   - "scripts/coverage_ratchet.py"
   - "docs/audits/coverage-baseline.toml"
 

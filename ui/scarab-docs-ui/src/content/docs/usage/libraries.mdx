@@ -278,10 +278,11 @@ yet; the error shows in the repository's Runs list in Scarab.
 ## Install Scarab's image index library
 
 `lib:thulasi-ram::scarab-ci::image-index` joins images built for different architectures into one
-multi-architecture image with `crane index append`
+multi-architecture image with crane
 ([Joining images into one multi-architecture image](/scarab-ci/usage/pipeline-syntax/#joining-images-into-one-multi-architecture-image)).
 It is the file `libs/image-index.yaml` in Scarab's repository. Its one step, `index`, pushes the
-index, so it holds the registry credential. It needs no build sandbox.
+images that build layout steps left in the workspace (`layouts`) and the index, so it holds the
+registry credential. It needs no build sandbox.
 
 1. Settings › Libraries › **Install library**, with the file
    `github.com/thulasi-ram/scarab-ci//libs/image-index.yaml` and a Scarab release tag as the ref.
@@ -297,6 +298,68 @@ index, so it holds the registry credential. It needs no build sandbox.
    a plain list, `placement_profiles: [<profile>]`, since the library has no other step.
 
 The step runs as uid 1000 and pins the same crane image as the build library, by digest.
+
+**Upgrading from a version without `layouts`.** Earlier versions read only images already in a
+registry (`images`), and their header said the step reads nothing from the workspace. Many orgs
+trusted the source with the registry credential on that basis. Trust is kept per source, so it
+carries over to the upgrade, and with `layouts` the upgraded step reads image layouts from the
+workspace and uploads them to the registry under that trust. It still runs no code from your
+repository, and it checks each layout before it uploads anything (only directories and regular
+files, no symlink, the manifest and every blob it names hash to their names, the manifest is the
+digest its `layouts` line gives). The image index library pushes whatever layout its `layouts`
+lines name: any step of the Pipeline, a plain `run:` step included, can write a layout under
+`/workspace/.scarab-build/` and name its digest, so the digest check shows the layout was not
+changed after it was named, not that a build step made it. The upgrade's review page lists the registry credential under **Trust**, and you
+tick it to carry it over. A Pipeline that passes only `image` and `images` gets the same registry
+calls as before and no workspace read.
+
+## Install Scarab's build layout library
+
+`lib:thulasi-ram::scarab-ci::build-layout` is the build library's build step without its push
+step: it builds an image with rootless BuildKit and leaves it in the workspace as an OCI image
+layout for the image index library to push
+([Joining images into one multi-architecture image](/scarab-ci/usage/pipeline-syntax/#joining-images-into-one-multi-architecture-image)).
+It is the file `libs/build-layout.yaml` in Scarab's repository. Its one step holds no credential
+and pushes nothing.
+
+1. Settings › Libraries › **Install library**, with the file
+   `github.com/thulasi-ram/scarab-ci//libs/build-layout.yaml` and a Scarab release tag as the ref.
+2. Keep the default name, `thulasi-ram::scarab-ci::build-layout`. Review the file and install it.
+   Confirm with your passkey.
+3. Trust its source for the build sandbox
+   ([below](#trusting-a-library-for-the-build-sandbox)). It needs no registry credential trust,
+   and should not be given one.
+
+Never route a profile that grants push access to its step: the step runs your Dockerfile.
+
+## Install Scarab's multi-architecture build library
+
+`lib:thulasi-ram::scarab-ci::build-multiarch` builds an image on an amd64 node and on an arm64
+node, and pushes both images, their tags and the index from one step
+([Building a multi-architecture image](/scarab-ci/usage/pipeline-syntax/#building-a-multi-architecture-image)).
+It is the file `libs/build-multiarch.yaml` in Scarab's repository. Its steps `amd64` and `arm64`
+build in the build sandbox and hold no credential; its step `push` holds the registry credential.
+It holds its own copy of the build and index scripts and invokes no other library, so you review
+the whole of it at install.
+
+1. Settings › Libraries › **Install library**, with the file
+   `github.com/thulasi-ram/scarab-ci//libs/build-multiarch.yaml` and a Scarab release tag as the
+   ref.
+2. Keep the default name, `thulasi-ram::scarab-ci::build-multiarch`. Review the file and install
+   it. Confirm with your passkey.
+3. Trust its source for the build sandbox
+   ([below](#trusting-a-library-for-the-build-sandbox)). Without that, a Run that invokes it is
+   refused with the reason.
+4. Trust its source with the registry credential
+   ([below](#trusting-a-library-with-the-registry-credential)). To push to the forge's own
+   registry with no `REGISTRY_AUTH` secret, also trust it with forge credentials. Trust given to
+   the build or image index library's source does not reach this one.
+5. A profile marked `registry_auth_only` goes to the push step with the map form,
+   `placement_profiles: { amd64: [...], arm64: [...], push: [<profile>] }`. Named on a build
+   step it fails that step's launch.
+
+The push step runs as uid 1000. The library pins the same BuildKit and crane images as the build
+library, by digest.
 
 ## Trusting a library with forge credentials
 

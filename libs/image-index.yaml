@@ -4,6 +4,9 @@
 # github.com/thulasi-ram/scarab-ci//libs/image-index.yaml at a release
 # commit, and trusts that source with the registry credential.
 #
+# It takes images two ways. `images` names images already in a registry,
+# such as the build library's pushed references:
+#
 #   - id: app
 #     invoke: lib:thulasi-ram::scarab-ci::image-index
 #     needs: [amd64, arm64]
@@ -13,67 +16,142 @@
 #         ${{ has(outputs.amd64.push) ? outputs.amd64.push.ref : '' }}
 #         ${{ has(outputs.arm64.push) ? outputs.arm64.push.ref : '' }}
 #
-# A build library push Step that pushed nothing (a fork pull request, a Run
-# locked out of its Environment's secrets) publishes no `push` result, so
-# `outputs.amd64.push.ref` would not render and the Step would fail at
-# launch. The `has(...)` form renders an empty line instead.
+# `layouts` names OCI image layouts that build-layout.yaml left in the
+# workspace, each with the digest its build reported; this Step then pushes
+# them itself, so the builds hold no registry credential:
+#
+#   - id: app
+#     invoke: lib:thulasi-ram::scarab-ci::image-index
+#     needs: [amd64, arm64]
+#     with:
+#       image: ghcr.io/acme/app:${{ event.sha }}
+#       extra_tags: latest
+#       layouts: |
+#         ${{ has(outputs.amd64.image) && has(outputs.amd64.image.layout) ? outputs.amd64.image.layout + ' ' + outputs.amd64.image.digest : '' }}
+#         ${{ has(outputs.arm64.image) && has(outputs.arm64.image.layout) ? outputs.arm64.image.layout + ' ' + outputs.arm64.image.digest : '' }}
+#
+# A build that pushed nothing or wrote no layout (a fork pull request, a Run
+# locked out of its Environment's secrets) publishes no `push` result and no
+# `layout` key, so `outputs.amd64.push.ref` would not render and the Step
+# would fail at launch. The `has(...)` forms render an empty line instead.
 #
 # Its one Step is `app/index` (named after the invoke); `needs: [app]`
-# reaches it. It runs `crane index append`, which writes the index to the
-# registry, so it asks for `registry_auth: true`: Scarab mounts the Run's
-# registry credential at /scarab/registry/config.json and points
-# DOCKER_CONFIG at it, when the org trusts this file's source with the
-# registry credential. It runs no code from the repository and reads nothing
-# from the workspace.
+# reaches it. It writes to the registry, so it asks for
+# `registry_auth: true`: Scarab mounts the Run's registry credential at
+# /scarab/registry/config.json and points DOCKER_CONFIG at it, when the org
+# trusts this file's source with the registry credential. It runs no code
+# from the repository. With `images` alone it reads nothing from the
+# workspace. With `layouts` it reads each layout from the workspace and
+# uploads it, so trusting this source with the registry credential also
+# lets it upload what a build left in the workspace, after the checks
+# below.
 #
-# Each image is named by digest (`<repository>@sha256:…`), never by tag: a
-# tag can be moved, so an index built from tags could hold other images on a
-# retry. Before it pushes, the Step reads each image's manifest and config
-# from the registry (by digest, which crane checks against the content) and
-# refuses (exit 2) an image that is itself an index, a config that names no
-# os or architecture, and two images of the same platform
-# (os/architecture/variant, and the os.version a Windows image names). crane
-# then copies each image into the index's repository, when it is not
-# already there.
+# Each image is named by digest, never by tag: a tag can be moved, so an
+# index built from tags could hold other images on a retry. Every check the
+# Step makes itself runs before the first registry write, so a Step it
+# refuses writes nothing and leaves the workspace as it found it. A failure
+# crane or the registry reports after that can leave images pushed by
+# digest with no tag, and a retry pushes them again.
+#
+#   - Each layout must be at /workspace/.scarab-build/<key>/oci (the key 32
+#     hex characters) and hold only directories and regular files, with no
+#     symlink at any level, and resolve inside the workspace: a Step before
+#     this one, or a Dockerfile RUN, could plant a symlink to
+#     /scarab/registry/config.json, and crane would upload its target as a
+#     blob. Its index.json must name one manifest, that manifest must hash
+#     to its name and equal the digest `layouts` gives, and every blob the
+#     manifest names (the config and each layer) must be in the layout and
+#     hash to its name. A manifest that names a `subject` (a referrer) is
+#     refused. The config is read from the layout.
+#   - The digest check shows a layout was not changed after `layouts` named
+#     it, not that a build Step made it: any Step of the Pipeline, a plain
+#     `run:` Step included, can write a layout under
+#     /workspace/.scarab-build/ and name its digest.
+#   - Each image in `images` has its manifest and config read from the
+#     registry by digest, which crane checks against the content.
+#   - An image that is itself an index, a config that names no os or
+#     architecture at its top level, and two images of the same platform
+#     (os/architecture/variant, and the os.version a Windows image names)
+#     are refused (exit 2). `arm64/v8` counts as `arm64`, and `amd64/v1` as
+#     `amd64`.
+#   - An image from a layout must be of an architecture this Step knows
+#     (386, amd64, arm, arm64, loong64, mips, mipsle, mips64, mips64le,
+#     ppc64, ppc64le, riscv64, s390x), with no variant, or v5 to v8 for
+#     arm, or v2 to v4 for amd64.
+#   - With `arch_tags`, each image from a layout is also tagged
+#     <tag>-<architecture>, or <tag>-<architecture>-<variant> when it has a
+#     variant: arm64 is `<tag>-arm64` whether or not its config names v8,
+#     and a 32-bit arm image is `<tag>-arm-v7`. A tag over 128 characters,
+#     or one that two images or an extra tag would share, is refused.
+#
+# Then it writes, in this order: each layout's image by digest into the
+# index's repository, the index under `image`'s tag (crane copies an image
+# from `images` into the repository when it is not already there), the
+# arch tags, then each extra tag on the index. Until the index is pushed
+# only untagged images exist; crane reads every config again when it
+# pushes the index, and after that each write moves a tag to a digest
+# already in the registry. A retried Step writes all of them again; each
+# write puts the same content under the same name. The Pod receives every
+# layout through the workspace, so it needs disk for all of them. It
+# removes .scarab-build from its workspace after it pushes, so a Step that
+# needs only this one does not receive the layouts.
 #
 # The Step reads the manifest and config with grep, and crane reads them
 # with Go's JSON decoder, which decodes a `\u` escape in a key and matches
 # keys without regard to case. So the Step refuses (exit 2) a manifest or
 # config that spells a letter, digit, `.`, `_` or `-` with a `\u` escape or
 # holds one of the two non-ASCII letters Go folds onto ASCII ones (U+017F,
-# U+212A), and it matches `manifests`, `os`, `architecture`, `variant` and
-# `os.version` in any case, refusing a name it finds more than once. These
-# checks are about whoever made the source images, who chose their content
-# anyway; they keep a platform check from reading another field than crane
-# does.
+# U+212A), and it matches `manifests`, `config`, `digest`, `os`,
+# `architecture`, `variant` and `os.version` in any case, refusing a name
+# it finds more than once. It reads `config`, `os`, `architecture`,
+# `variant` and `os.version` only where they are keys of the top-level
+# object, as crane does, and refuses a document that does not start with
+# `{` (a byte-order mark, for one). These checks are about whoever made the source
+# images, who chose their content anyway; they keep a platform check from
+# reading another field than crane does.
 #
 # Output:
 #   ${{ outputs.app.index }}  {"ref": "<repository>@sha256:…", "digest":
-#                             "sha256:…"}, as crane reported the push.
-#                             Deploy by this digest.
+#                             "sha256:…"}, as crane reported the index
+#                             push. Deploy by this digest.
 #
 # A fork pull request, or a Run locked out of its Environment's secrets, gets
 # no registry credential, and Scarab tells the Step so with
-# SCARAB_FORK_PR=true: the Step then pushes nothing and exits 0, whether
-# `images` names images or is empty (the builds pushed nothing). A missing
-# SCARAB_FORK_PR is treated the same way. Otherwise an empty `images` fails
-# the Step (exit 2).
+# SCARAB_FORK_PR=true: the Step then pushes nothing and exits 0 before it
+# reads any input, whether `images` and `layouts` name images or are empty
+# (the builds pushed nothing and wrote no layout). A missing SCARAB_FORK_PR
+# is treated the same way. Otherwise `images` and `layouts` both empty
+# fails the Step (exit 2).
 #
 # Every input reaches the script through an environment variable, never the
 # command.
 #
 # Inputs:
-#   image     the tag to push the index to, e.g. ghcr.io/acme/app:1.2.0; a
-#             reference with a tag and no digest
-#   images    the images to join, one <repository>@sha256:<digest> per line,
-#             each a different platform; or only line breaks (empty
-#             included), which the `has(...)` form renders when no build
-#             pushed, and which only a fork's Step accepts. A mix of
-#             references and empty lines is refused
-#   insecure  reach the registry over plain HTTP, for a registry with no TLS
-#             (default false); for a test or development registry only. crane
-#             then skips TLS verification too, so the Step refuses it (exit 2)
-#             when it holds a registry login
+#   image       the tag to push the index to, e.g. ghcr.io/acme/app:1.2.0; a
+#               reference with a tag and no digest
+#   images      the images to join, one <repository>@sha256:<digest> per
+#               line, each a different platform; or only line breaks (empty
+#               included), which the `has(...)` form renders when no build
+#               pushed. A mix of references and empty lines is refused
+#               (default empty)
+#   layouts     the image layouts to push and join, one
+#               `<path> sha256:<digest>` per line, the path
+#               /workspace/.scarab-build/<key>/oci as build-layout.yaml
+#               reports it; or only line breaks. A mix of layouts and empty
+#               lines is refused (default empty)
+#   extra_tags  more tags for the index, in `image`'s repository: tag names,
+#               not references, separated by spaces or line breaks
+#               (default empty). A tag named twice, or the same as
+#               `image`'s, is written once
+#   arch_tags   also tag each image from `layouts` <tag>-<architecture>
+#               (default true). It does not apply to `images`. A registry
+#               rule that expires untagged images could otherwise remove an
+#               image the index names; whether a registry keeps an untagged
+#               image a tagged index names is not confirmed per registry
+#   insecure    reach the registry over plain HTTP, for a registry with no
+#               TLS (default false); for a test or development registry
+#               only. crane then skips TLS verification too, so the Step
+#               refuses it (exit 2) when it holds a registry login
 kind: library
 interface:
   inputs:
@@ -83,8 +161,27 @@ interface:
       description: the tag to push the index to, with a tag and no digest
     - name: images
       type: string
+      required: false
+      default: ""
       validate: 'value.matches("^\n*$") || value.matches("^([a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*@sha256:[a-f0-9]{64}\n)*[a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*@sha256:[a-f0-9]{64}\n?$")'
       description: the images to join, one <repository>@sha256:<digest> per line, or only line breaks when no build pushed
+    - name: layouts
+      type: string
+      required: false
+      default: ""
+      validate: 'value.matches("^\n*$") || value.matches("^(/workspace/[.]scarab-build/[0-9a-f]{32}/oci sha256:[a-f0-9]{64}\n)*/workspace/[.]scarab-build/[0-9a-f]{32}/oci sha256:[a-f0-9]{64}\n?$")'
+      description: the image layouts to push and join, one "<path> sha256:<digest>" per line, or only line breaks when no build wrote one
+    - name: extra_tags
+      type: string
+      required: false
+      default: ""
+      validate: 'value.matches("^[ \n]*([A-Za-z0-9_][A-Za-z0-9_.-]{0,127}([ \n]+[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})*)?[ \n]*$")'
+      description: more tags for the index, tag names separated by spaces or line breaks
+    - name: arch_tags
+      type: boolean
+      required: false
+      default: true
+      description: also tag each image from layouts <tag>-<architecture>
     - name: insecure
       type: boolean
       required: false
@@ -98,12 +195,20 @@ steps:
     registry_auth: true
     # The image's default user is root. crane and busybox need no user of
     # their own, so the Step runs as uid 1000 and reads the registry login
-    # Scarab mounts.
+    # Scarab mounts. It reads and cleans the workspace through the
+    # workspace group, as every Step does.
     security: { run_as_user: 1000 }
     env:
+      # The name of the result the Step writes (`index.json`).
+      - [SCARAB_INDEX_RESULT, index]
       - [SCARAB_INDEX_IMAGE, "${{ inputs.image }}"]
       - [SCARAB_INDEX_IMAGES, "${{ inputs.images }}"]
+      - [SCARAB_INDEX_LAYOUTS, "${{ inputs.layouts }}"]
+      - [SCARAB_INDEX_EXTRA_TAGS, "${{ inputs.extra_tags }}"]
+      - [SCARAB_INDEX_ARCH_TAGS, "${{ inputs.arch_tags }}"]
       - [SCARAB_INDEX_INSECURE, "${{ inputs.insecure }}"]
+    # libs/build-multiarch.yaml's push Step runs this script too, as a
+    # copy; a test holds the two the same.
     command:
       - /busybox/sh
       - -c
@@ -111,13 +216,38 @@ steps:
         set -eu
         # Bracket ranges in `case` follow the locale; C keeps [a-z] to a-z.
         export LC_ALL=C
+        root=/workspace
         fail() { echo "scarab: index refused: $*" >&2; exit 2; }
         nl='
         '
+        # Scarab sets SCARAB_FORK_PR on every launch of this Step; a value
+        # other than `false` (none included) is a fork pull request's Run,
+        # or a Run locked out of its Environment's secrets. Its builds
+        # pushed nothing and wrote no layout, so `images` and `layouts` are
+        # empty, and that is not a failure. Nothing else is read first.
+        if [ "${SCARAB_FORK_PR-}" != false ]; then
+          echo "scarab: not pushed: this Run is a fork pull request's, or is locked out of its Environment's secrets"
+          exit 0
+        fi
+        # Sets r to the resolved path. The `.` keeps a trailing newline in a
+        # directory name from being dropped by the command substitution.
+        resolve() {
+          r=$(realpath "$1" && echo .) || return 1
+          r=${r%.}
+          r=${r%"$nl"}
+        }
+        inside() {
+          case "$1" in
+            "$root" | "$root"/*) return 0 ;;
+            *) return 1 ;;
+          esac
+        }
         # The inputs were checked against their `validate:` rules when the
         # Step launched; the checks below hold the script to them too.
         image=${SCARAB_INDEX_IMAGE-}
         insecure=${SCARAB_INDEX_INSECURE-false}
+        archtags=${SCARAB_INDEX_ARCH_TAGS-true}
+        result=${SCARAB_INDEX_RESULT-index}
         case "$image" in
           "" | -* | *[!A-Za-z0-9._:/-]*) fail "image $image is not an image reference with a tag" ;;
         esac
@@ -125,10 +255,57 @@ steps:
           *:?*) ;;
           *) fail "image $image names no tag; name the tag the index is pushed to" ;;
         esac
+        tag=${image##*/}
+        tag=${tag#*:}
+        repo=${image%:"$tag"}
+        # Upper case and a host:port with no path are left to crane's
+        # parser, which reads them as this script does.
+        case "/$repo/" in
+          *//* | */./* | */../*) fail "image $image has an empty, '.' or '..' path segment" ;;
+        esac
+        case "$tag" in
+          [A-Za-z0-9_]*) ;;
+          *) fail "image $image has a tag that does not start with a letter, digit or '_'" ;;
+        esac
+        case "$tag" in
+          *[!A-Za-z0-9_.-]*) fail "image $image has a tag that is not letters, digits, '.', '_' or '-'" ;;
+        esac
+        [ "${#tag}" -le 128 ] || fail "image $image has a tag longer than 128 characters"
         case "$insecure" in
           true | false) ;;
           *) fail "insecure must be true or false, not $insecure" ;;
         esac
+        case "$archtags" in
+          true | false) ;;
+          *) fail "arch_tags must be true or false, not $archtags" ;;
+        esac
+        case "$result" in
+          [a-z]*) ;;
+          *) fail "the result name $result is not a name" ;;
+        esac
+        case "$result" in
+          *[!a-z0-9_-]*) fail "the result name $result is not a name" ;;
+        esac
+        # Tag names, separated by spaces or line breaks. One named twice, or
+        # the same as image's tag, is written once.
+        extras=
+        set -f
+        for t in ${SCARAB_INDEX_EXTRA_TAGS-}; do
+          case "$t" in
+            [A-Za-z0-9_]*) ;;
+            *) fail "extra tag $t does not start with a letter, digit or '_'" ;;
+          esac
+          case "$t" in
+            *[!A-Za-z0-9_.-]*) fail "extra tag $t is not letters, digits, '.', '_' or '-'" ;;
+          esac
+          [ "${#t}" -le 128 ] || fail "extra tag $t is longer than 128 characters"
+          [ "$t" != "$tag" ] || continue
+          case "$nl$extras" in
+            *"$nl$t$nl"*) continue ;;
+          esac
+          extras=$extras$t$nl
+        done
+        set +f
         # One <repository>@sha256:<digest> per line. A tag can be moved, so
         # an index built from tags is not the same index on a retry.
         sources=
@@ -138,15 +315,18 @@ steps:
           case "$src" in
             -* | *[!a-z0-9._:/@-]*) fail "$src is not an image reference" ;;
           esac
-          repo=${src%@sha256:*}
-          hex=${src#"$repo"@sha256:}
-          [ -n "$repo" ] && [ "$repo@sha256:$hex" = "$src" ] ||
+          repo_=${src%@sha256:*}
+          hex=${src#"$repo_"@sha256:}
+          [ -n "$repo_" ] && [ "$repo_@sha256:$hex" = "$src" ] ||
             fail "$src is not <repository>@sha256:<digest>; name each image by digest, not by tag"
-          case "$repo" in
+          case "$repo_" in
             *@*) fail "$src names more than one digest" ;;
           esac
-          case "${repo##*/}" in
+          case "${repo_##*/}" in
             *:*) fail "$src names a tag and a digest; name the image by digest alone" ;;
+          esac
+          case "/$repo_/" in
+            *//* | */./* | */../*) fail "$src has an empty, '.' or '..' path segment" ;;
           esac
           case "$hex" in
             *[!0-9a-f]*) fail "$src has a digest that is not lower-case hex" ;;
@@ -160,15 +340,74 @@ steps:
         done <<EOF
         ${SCARAB_INDEX_IMAGES-}
         EOF
-        # Scarab sets SCARAB_FORK_PR on every launch of this Step; a value
-        # other than `false` (none included) is a fork pull request's Run,
-        # or a Run locked out of its Environment's secrets. Its builds
-        # pushed nothing, so `images` is empty, and that is not a failure.
-        if [ "${SCARAB_FORK_PR-}" != false ]; then
-          echo "scarab: not pushed: this Run is a fork pull request's, or is locked out of its Environment's secrets"
-          exit 0
-        fi
-        [ "$count" -gt 0 ] || fail "images names no image"
+        # One `<path> sha256:<digest>` per line, the path
+        # <workspace>/.scarab-build/<key>/oci. Empty lines only, or none, is
+        # no layout; empty lines between layouts, or more than one at the
+        # end, are refused, so a build that published no layout is not
+        # left out of the index unnoticed.
+        layouts=
+        nlayouts=0
+        blanks=0
+        while IFS= read -r line; do
+          if [ -z "$line" ]; then
+            blanks=$((blanks + 1))
+            continue
+          fi
+          [ "$blanks" -eq 0 ] ||
+            fail "layouts holds an empty line before $line; a mix of layouts and empty lines is refused"
+          path=${line%% *}
+          want=${line#"$path" }
+          [ "$path $want" = "$line" ] ||
+            fail "layouts line $line is not <path> sha256:<digest>"
+          case "$path" in
+            /*/.scarab-build/*/oci) ;;
+            *) fail "layouts line $line does not name a path <workspace>/.scarab-build/<key>/oci" ;;
+          esac
+          case "$path" in
+            *[!A-Za-z0-9._/-]*) fail "layouts line $line names a path that is not letters, digits, '.', '_', '-' or '/'" ;;
+          esac
+          key=${path%/oci}
+          key=${key##*/}
+          case "$key" in
+            "" | *[!0-9a-f]*) fail "layouts line $line names a path whose key is not 32 hex characters" ;;
+          esac
+          [ "${#key}" -eq 32 ] ||
+            fail "layouts line $line names a path whose key is not 32 hex characters"
+          case "$want" in
+            sha256:*) ;;
+            *) fail "layouts line $line is not <path> sha256:<digest>" ;;
+          esac
+          hex=${want#sha256:}
+          case "$hex" in
+            "" | *[!0-9a-f]*) fail "layouts line $line has a digest that is not lower-case hex" ;;
+          esac
+          [ "${#hex}" -eq 64 ] || fail "layouts line $line has a digest that is not 64 hex characters"
+          case "$nl$layouts" in
+            *"$nl$path "*) fail "layout $path is named twice" ;;
+          esac
+          layouts=$layouts$line$nl
+          nlayouts=$((nlayouts + 1))
+        done <<EOF
+        ${SCARAB_INDEX_LAYOUTS-}
+        EOF
+        [ "$nlayouts" -eq 0 ] || [ "$blanks" -le 1 ] ||
+          fail "layouts ends in more than one empty line; a mix of layouts and empty lines is refused"
+        [ "$count" -gt 0 ] || [ "$nlayouts" -gt 0 ] ||
+          fail "images and layouts name no image"
+        # A library that knows how many layouts it hands this script (one
+        # per build Step) sets SCARAB_INDEX_LAYOUT_COUNT, so a result that
+        # adds a line cannot add an image to the index. Unset or empty, the
+        # count is not checked.
+        expected=${SCARAB_INDEX_LAYOUT_COUNT-}
+        case "$expected" in
+          "") ;;
+          *[!0-9]*) fail "SCARAB_INDEX_LAYOUT_COUNT must be a number, not $expected" ;;
+          *)
+            # Compared as text, so "02" is not 2.
+            [ "$nlayouts" = "$expected" ] ||
+              fail "layouts names $nlayouts layouts, but this step takes $expected, one per build"
+            ;;
+        esac
         # crane's --insecure also skips TLS verification, so a registry
         # login would go to whoever answers at the registry's host.
         if [ "$insecure" = true ] && [ -e "${DOCKER_CONFIG-}/config.json" ]; then
@@ -193,25 +432,251 @@ steps:
             *"$longs"* | *"$kelvin"*) fail "$1 holds a letter that JSON decoders read as s or k" ;;
           esac
         }
-        # Sets v to the string value of key $1 in $2, a JSON document, or to
-        # empty when the key is absent. The key is matched in any case, as
-        # crane's decoder matches it. A key named more than once (a label
-        # named "os", for one), or written where the value is not on the
-        # same line, is refused rather than guessed at.
+        # Sets flat to $2, the JSON text $1 names, with its line breaks and
+        # tabs removed, and refuses a text that is not one object: a
+        # byte-order mark or any other first byte fails crane's decoder,
+        # and would do so after this Step has written.
+        flatten() {
+          flat=$(printf '%s' "$2" | tr -d '\n\r\t') || fail "cannot read $1"
+          case "$flat" in
+            "{"*"}") ;;
+            *) fail "$1 is not one JSON object" ;;
+          esac
+        }
+        # Refuses $3, the flattened JSON text $1 names, unless the one "$2"
+        # in it is a key of the top-level object, the only place crane reads
+        # it. The text before the key, with every string removed and then
+        # every closed {} and [] removed, must be "{". In JSON a `"` outside
+        # a string opens one, so removing strings from left to right leaves
+        # only the structure.
+        toplevel() {
+          hit=$(printf '%s\n' "$3" | grep -oi "\"$2\" *:") ||
+            fail "$1 names \"$2\" in a form this step does not read"
+          case "$hit" in
+            *"$nl"*) fail "$1 names \"$2\" more than once" ;;
+          esac
+          pre=${3%%"$hit"*}
+          skel=$(printf '%s\n' "$pre" | sed 's/"[^"\\]*\(\\.[^"\\]*\)*"//g' | tr -cd '{}\133\135"')
+          while :; do
+            new=$(printf '%s\n' "$skel" | sed 's/{}//g; s/\[\]//g')
+            [ "$new" != "$skel" ] || break
+            skel=$new
+          done
+          [ "$skel" = "{" ] || fail "$1 names \"$2\" somewhere other than its top level"
+        }
+        # Sets v to the string value of key $1 in $flat, a flattened JSON
+        # object, or to empty when the key is absent. The key is matched in
+        # any case, as crane's decoder matches it, and only as a key of the
+        # top-level object. A key named more than once (a label named "os",
+        # for one), or one whose value is not a string, is refused rather
+        # than guessed at.
         field() {
-          n=$(printf '%s\n' "$2" | grep -oi "\"$1\"" | grep -c .) || n=0
+          n=$(printf '%s\n' "$flat" | grep -oi "\"$1\"" | grep -c .) || n=0
           [ "$n" -le 1 ] || fail "the config of $src names \"$1\" more than once"
           v=
           [ "$n" -eq 1 ] || return 0
-          v=$(printf '%s\n' "$2" | grep -oi "\"$1\" *: *\"[^\"]*\"") ||
+          toplevel "the config of $src" "$1" "$flat"
+          v=$(printf '%s\n' "$flat" | grep -oi "\"$1\" *: *\"[^\"]*\"") ||
             fail "the config of $src names \"$1\" in a form this step does not read"
           v=${v%\"}
           v=${v##*\"}
         }
-        # Each image must be one image, of a platform no other image has.
-        # crane fetches each by digest and checks the content against it.
+        # Reads the platform from $config, the config of $src, into arch,
+        # variant and platform, and refuses a platform an image before it
+        # has: an index holds one image per platform. arm64/v8 is arm64 and
+        # amd64/v1 is amd64, as containerd reads them; no variant is added
+        # where the config names none.
         platforms=
-        set -- index append
+        platform_of() {
+          plain "the config of $src" "$config"
+          flatten "the config of $src" "$config"
+          field os
+          os=$v
+          field architecture
+          arch=$v
+          field variant
+          variant=$v
+          field os.version
+          osversion=$v
+          [ -n "$os" ] && [ -n "$arch" ] ||
+            fail "the config of $src names no os or architecture, so the index could not say which platform it is"
+          case "$os$arch$variant$osversion" in
+            *[!A-Za-z0-9._-]*) fail "the config of $src names a platform that is not letters, digits, '.', '_' or '-'" ;;
+          esac
+          case "$arch/$variant" in
+            arm64/v8 | arm64/8 | amd64/v1) variant= ;;
+          esac
+          platform=$os/$arch
+          [ -z "$variant" ] || platform=$platform/$variant
+          [ -z "$osversion" ] || platform=$platform:$osversion
+          case "$nl$platforms" in
+            *"$nl$platform$nl"*) fail "$src is $platform, as an image before it is; an index holds one image per platform" ;;
+          esac
+          platforms=$platforms$platform$nl
+          echo "scarab: $src is $platform"
+        }
+        # Each layout, read from the workspace. Steps before this one ran
+        # repository code in this workspace, and so did the Dockerfile.
+        # crane would upload what a symlink in a layout points at
+        # (/scarab/registry/config.json, for one), so a layout must be
+        # plain directories and regular files, inside the workspace. Nothing
+        # in the workspace is changed until every check is done.
+        if [ "$nlayouts" -gt 0 ]; then
+          [ -d "$root" ] || fail "no workspace at $root"
+          cd "$root" || fail "cannot enter the workspace at $root"
+          resolve . || fail "cannot resolve the workspace at $root"
+          root=$r
+        fi
+        pushes=
+        archs=
+        while IFS= read -r line; do
+          [ -n "$line" ] || continue
+          path=${line%% *}
+          want=${line#* }
+          src=$path
+          case "$path" in
+            "$root"/.scarab-build/*/oci) ;;
+            *) fail "the image layout $path is not in $root/.scarab-build" ;;
+          esac
+          key=${path#"$root"/.scarab-build/}
+          key=${key%/oci}
+          case "$key" in
+            "" | *[!0-9a-f]*) fail "the image layout $path is not $root/.scarab-build/<key>/oci" ;;
+          esac
+          [ "${#key}" -eq 32 ] ||
+            fail "the image layout $path is not $root/.scarab-build/<key>/oci"
+          [ ! -L ./.scarab-build ] && [ -d ./.scarab-build ] ||
+            fail ".scarab-build is not a directory a build step wrote"
+          [ ! -L "./.scarab-build/$key" ] && [ -d "./.scarab-build/$key" ] ||
+            fail ".scarab-build/$key is not a directory a build step wrote"
+          [ ! -L "./.scarab-build/$key/oci" ] && [ -d "./.scarab-build/$key/oci" ] ||
+            fail "no image layout at .scarab-build/$key/oci"
+          resolve "./.scarab-build/$key/oci" || fail "cannot resolve the image layout $path"
+          inside "$r" || fail "the image layout $path resolves outside the workspace"
+          [ "$r" = "$path" ] || fail "the image layout $path resolves to $r"
+          layout=$r
+          # A directory find cannot read could hide a symlink, so a find
+          # that fails refuses the layout.
+          odd=$(find "$layout" ! -type f ! -type d) ||
+            fail "cannot list every file in the image layout $path"
+          odd=${odd%%"$nl"*}
+          [ -z "$odd" ] ||
+            fail "the image layout $path holds $odd, which is not a regular file or a directory"
+          [ -f "$layout/oci-layout" ] || fail "the image layout $path has no oci-layout file"
+          # The layout must hold the image `layouts` names: its index.json
+          # must name one manifest, that manifest's file must hash to its
+          # name, and its digest must be the one `layouts` gives.
+          #
+          # grep reads index.json here; crane would read it with Go's JSON
+          # decoder, which matches keys in any case and decodes \u escapes.
+          # So index.json is refused when it holds a backslash, a byte that
+          # is not printable ASCII or a line break, or the word "digest", in
+          # any case, other than once. crane then reads an index.json
+          # written just before it pushes, not this one.
+          index=$layout/index.json
+          [ -f "$index" ] || fail "the image layout $path has no index.json"
+          n=$(LC_ALL=C tr -d '\11\12\15\40-\176' < "$index" | wc -c) ||
+            fail "cannot read the index.json of $path"
+          [ $((n)) -eq 0 ] ||
+            fail "the index.json of $path holds a byte that is not printable ASCII"
+          if grep -q '\\' "$index"; then
+            fail "the index.json of $path holds a backslash"
+          fi
+          n=$(LC_ALL=C tr 'A-Z' 'a-z' < "$index" | grep -o digest | grep -c .) || n=0
+          [ "$n" -eq 1 ] ||
+            fail "the index.json of $path does not name exactly one image"
+          found=$(grep -o '"digest" *: *"sha256:[0-9a-f]\{64\}"' "$index") || found=
+          case "$found" in
+            "" | *"$nl"*) fail "the index.json of $path does not name exactly one image" ;;
+          esac
+          built=${found##*\"sha256:}
+          built=sha256:${built%\"}
+          blob=$layout/blobs/sha256/${built#sha256:}
+          [ -f "$blob" ] || fail "the image layout $path has no manifest $built"
+          sum=$(sha256sum < "$blob") || fail "cannot hash the manifest $built in $path"
+          [ "sha256:${sum%% *}" = "$built" ] ||
+            fail "the manifest in $path does not hash to its digest $built"
+          [ "$built" = "$want" ] ||
+            fail "the image layout $path holds $built, but layouts names $want"
+          # The config is read from the layout, so the platform is known
+          # before anything is pushed. Every blob the manifest names, the
+          # config and each layer, must be in the layout and hash to the
+          # digest the manifest names, so crane does not fail on one after
+          # this Step has written.
+          manifest=$(cat "$blob") || fail "cannot read the manifest $built in $path"
+          plain "the manifest in $path" "$manifest"
+          flatten "the manifest in $path" "$manifest"
+          mflat=$flat
+          if printf '%s\n' "$mflat" | grep -qi '"manifests"'; then
+            fail "$path holds an index, not one image"
+          fi
+          if printf '%s\n' "$mflat" | grep -qi '"subject"'; then
+            fail "the manifest in $path names a subject; this step pushes images, not referrers"
+          fi
+          n=$(printf '%s\n' "$mflat" | grep -oi '"config"' | grep -c .) || n=0
+          [ "$n" -eq 1 ] || fail "the manifest in $path does not name one config"
+          toplevel "the manifest in $path" config "$mflat"
+          cfg=$(printf '%s\n' "$mflat" | grep -oi '"config" *: *[{][^{}]*[}]') ||
+            fail "the manifest in $path names its config in a form this step does not read"
+          n=$(printf '%s\n' "$cfg" | grep -oi '"digest"' | grep -c .) || n=0
+          [ "$n" -eq 1 ] || fail "the manifest in $path does not name one config digest"
+          c=$(printf '%s\n' "$cfg" | grep -o '"digest" *: *"sha256:[0-9a-f]\{64\}"') ||
+            fail "the manifest in $path names its config digest in a form this step does not read"
+          c=${c##*\"sha256:}
+          c=${c%\"}
+          cblob=$layout/blobs/sha256/$c
+          [ -f "$cblob" ] || fail "the image layout $path has no config sha256:$c"
+          sum=$(sha256sum < "$cblob") || fail "cannot hash the config sha256:$c in $path"
+          [ "${sum%% *}" = "$c" ] ||
+            fail "the config in $path does not hash to its digest sha256:$c"
+          n=$(printf '%s\n' "$mflat" | grep -oi '"digest"' | grep -c .) || n=0
+          ds=$(printf '%s\n' "$mflat" | grep -o '"digest" *: *"sha256:[0-9a-f]\{64\}"') || ds=
+          m=$(printf '%s\n' "$ds" | grep -c .) || m=0
+          [ "$n" = "$m" ] ||
+            fail "the manifest in $path names a digest that is not sha256:<64 hex>"
+          while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            d=${d##*\"sha256:}
+            d=${d%\"}
+            [ "$d" != "$c" ] || continue
+            [ -f "$layout/blobs/sha256/$d" ] || fail "the image layout $path has no blob sha256:$d"
+            sum=$(sha256sum < "$layout/blobs/sha256/$d") || fail "cannot hash the blob sha256:$d in $path"
+            [ "${sum%% *}" = "$d" ] ||
+              fail "a blob in $path does not hash to its digest sha256:$d"
+          done <<EOF
+        $ds
+        EOF
+          config=$(cat "$cblob") || fail "cannot read the config sha256:$c in $path"
+          platform_of
+          # An image from a layout gets an arch tag, so its architecture and
+          # variant must be ones this Step knows, whatever arch_tags says.
+          case "$arch" in
+            386 | amd64 | arm | arm64 | loong64 | mips | mipsle | mips64 | mips64le | ppc64 | ppc64le | riscv64 | s390x) ;;
+            *) fail "$path is $platform, an architecture or variant this step does not tag" ;;
+          esac
+          case "$arch/$variant" in
+            */ | arm/v5 | arm/v6 | arm/v7 | arm/v8 | amd64/v2 | amd64/v3 | amd64/v4) ;;
+            *) fail "$path is $platform, an architecture or variant this step does not tag" ;;
+          esac
+          if [ "$archtags" = true ]; then
+            t=$tag-$arch
+            [ -z "$variant" ] || t=$t-$variant
+            [ "${#t}" -le 128 ] || fail "the arch tag $t of $path is longer than 128 characters"
+            case "$nl$archs" in
+              *" $t$nl"*) fail "$path would be tagged $t, as an image before it would" ;;
+            esac
+            case "$nl$extras" in
+              *"$nl$t$nl"*) fail "$path would be tagged $t, which extra_tags names for the index" ;;
+            esac
+            archs="$archs$built $t$nl"
+          fi
+          pushes="$pushes$layout $built$nl"
+        done <<EOF
+        $layouts
+        EOF
+        # Each image in `images` must be one image, of a platform no other
+        # image has. crane fetches each by digest and checks the content
+        # against it.
         while IFS= read -r src; do
           [ -n "$src" ] || continue
           manifest=$(crane manifest "$src" $tls </dev/null) || {
@@ -226,28 +691,68 @@ steps:
             echo "scarab: cannot read the config of $src" >&2
             exit 1
           }
-          plain "the config of $src" "$config"
-          field os "$config"
-          os=$v
-          field architecture "$config"
-          arch=$v
-          field variant "$config"
-          variant=$v
-          field os.version "$config"
-          osversion=$v
-          [ -n "$os" ] && [ -n "$arch" ] ||
-            fail "the config of $src names no os or architecture, so the index could not say which platform it is"
-          case "$os$arch$variant$osversion" in
-            *[!A-Za-z0-9._-]*) fail "the config of $src names a platform that is not letters, digits, '.', '_' or '-'" ;;
+          platform_of
+        done <<EOF
+        $sources
+        EOF
+        # Sets digest from $1, a reference crane printed, and exits 1 when it
+        # is not <repository>@sha256:<64 hex>.
+        reported() {
+          digest=${1##*@}
+          hex=${digest#sha256:}
+          case "$1$digest" in
+            *[!A-Za-z0-9._:/@-]*) echo "scarab: crane reported $1" >&2; exit 1 ;;
           esac
-          platform=$os/$arch
-          [ -z "$variant" ] || platform=$platform/$variant
-          [ -z "$osversion" ] || platform=$platform:$osversion
-          case "$nl$platforms" in
-            *"$nl$platform$nl"*) fail "$src is $platform, as an image before it is; an index holds one image per platform" ;;
+          case "$digest" in
+            sha256:*) ;;
+            *) echo "scarab: crane reported $1, with no digest" >&2; exit 1 ;;
           esac
-          platforms=$platforms$platform$nl
-          echo "scarab: $src is $platform"
+          case "$hex" in
+            *[!0-9a-f]*) echo "scarab: crane reported $1" >&2; exit 1 ;;
+          esac
+          [ "${#hex}" -eq 64 ] || { echo "scarab: crane reported $1" >&2; exit 1; }
+        }
+        # Every check is done. From here on the Step writes to the
+        # registry: each layout's image by digest, the index, the arch tags,
+        # then the extra tags. Until the index is pushed only untagged
+        # images exist; crane reads every config again when it pushes the
+        # index, and after that each write moves a tag to a digest already
+        # in the registry.
+        #
+        # crane pushes the manifest a layout's index.json names. It reads an
+        # index.json written here, naming only the manifest checked above,
+        # by its digest and size; BuildKit's oci exporter writes OCI media
+        # types. The config and layers are the ones that manifest names, by
+        # digest.
+        while IFS= read -r line; do
+          [ -n "$line" ] || continue
+          layout=${line%% *}
+          want=${line#* }
+          blob=$layout/blobs/sha256/${want#sha256:}
+          index=$layout/index.json
+          size=$(wc -c < "$blob") || fail "cannot read the manifest $want in $layout"
+          { printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","size":%d}]}\n' "$want" "$((size))" > "$index.scarab" &&
+            mv -f "$index.scarab" "$index"; } ||
+            fail "cannot write the index.json of $layout"
+          ref=$(crane push "$layout" "$repo@$want" $tls </dev/null)
+          reported "$ref"
+          if [ "$digest" != "$want" ]; then
+            echo "scarab: crane pushed $ref, but the image layout holds $want" >&2
+            exit 1
+          fi
+          echo "scarab: pushed $ref"
+        done <<EOF
+        $pushes
+        EOF
+        set -- index append
+        while IFS= read -r line; do
+          [ -n "$line" ] || continue
+          set -- "$@" -m "$repo@${line#* }"
+        done <<EOF
+        $pushes
+        EOF
+        while IFS= read -r src; do
+          [ -n "$src" ] || continue
           set -- "$@" -m "$src"
         done <<EOF
         $sources
@@ -255,22 +760,37 @@ steps:
         set -- "$@" -t "$image"
         [ "$insecure" = false ] || set -- "$@" --insecure
         ref=$(crane "$@")
-        digest=${ref##*@}
-        hex=${digest#sha256:}
-        case "$ref$digest" in
-          *[!A-Za-z0-9._:/@-]*) echo "scarab: crane reported $ref" >&2; exit 1 ;;
-        esac
-        case "$digest" in
-          sha256:*) ;;
-          *) echo "scarab: crane reported $ref, with no digest" >&2; exit 1 ;;
-        esac
-        case "$hex" in
-          *[!0-9a-f]*) echo "scarab: crane reported $ref" >&2; exit 1 ;;
-        esac
-        [ "${#hex}" -eq 64 ] || { echo "scarab: crane reported $ref" >&2; exit 1; }
-        echo "scarab: pushed $ref as $image"
-        # The pushed reference is the Step's `index` result when Scarab
-        # collects results (/scarab/results exists).
+        reported "$ref"
+        pushed=$ref
+        indexed=$digest
+        echo "scarab: pushed $pushed as $image"
+        while IFS= read -r line; do
+          [ -n "$line" ] || continue
+          want=${line%% *}
+          t=${line#* }
+          crane tag "$repo@$want" "$t" $tls </dev/null
+          echo "scarab: tagged $repo@$want as $t"
+        done <<EOF
+        $archs
+        EOF
+        while IFS= read -r t; do
+          [ -n "$t" ] || continue
+          crane tag "$repo@$indexed" "$t" $tls </dev/null
+          echo "scarab: tagged $repo@$indexed as $t"
+        done <<EOF
+        $extras
+        EOF
+        # The pushed reference is the Step's result, named by
+        # SCARAB_INDEX_RESULT, when Scarab collects results
+        # (/scarab/results exists).
         if [ -d /scarab/results ]; then
-          printf '{"ref":"%s","digest":"%s"}' "$ref" "$digest" > /scarab/results/index.json
+          printf '{"ref":"%s","digest":"%s"}' "$pushed" "$indexed" > "/scarab/results/$result.json"
+        fi
+        # The layouts were for this Step alone: they are removed from its
+        # workspace, so a Step that needs only this one does not receive
+        # them. A layout that cannot be removed is reported and does not
+        # fail a push that worked.
+        if [ "$nlayouts" -gt 0 ]; then
+          rm -rf ./.scarab-build ||
+            echo "scarab: could not remove .scarab-build; steps that need this one receive it" >&2
         fi

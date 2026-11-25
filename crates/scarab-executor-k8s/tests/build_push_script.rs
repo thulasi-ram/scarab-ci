@@ -92,8 +92,13 @@ echo "registry.example/app@$CRANE_DIGEST"
         }
     }
 
+    /// The layout the build Step `image/image` writes:
+    /// `workspace/.scarab-build/<key>/oci`.
     fn oci(&self) -> PathBuf {
-        self.base.join("workspace/.scarab-build/oci")
+        self.base
+            .join("workspace/.scarab-build")
+            .join(key("image/image"))
+            .join("oci")
     }
 
     /// Writes the layout the build Step leaves: [`MANIFEST`] under
@@ -112,7 +117,8 @@ echo "registry.example/app@$CRANE_DIGEST"
 
     /// Runs the script over the defaults (push `registry.example/app:1`,
     /// not a fork, not insecure, no registry login, the build Step reported
-    /// [`DIGEST`], crane reports [`DIGEST`]), then `given`.
+    /// [`DIGEST`] and the layout at [`Harness::oci`], the Step is
+    /// `image/push`, crane reports [`DIGEST`]), then `given`.
     fn run(&self, given: &[(&str, &str)]) -> Ran {
         let log = self.base.join("called");
         let saw = self.base.join("saw");
@@ -136,6 +142,8 @@ echo "registry.example/app@$CRANE_DIGEST"
             .env("SCARAB_BUILD_PUSH", "true")
             .env("SCARAB_BUILD_INSECURE_PUSH", "false")
             .env("SCARAB_BUILD_DIGEST", DIGEST)
+            .env("SCARAB_BUILD_LAYOUT", self.oci())
+            .env("SCARAB_STEP", "image/push")
             .env("SCARAB_FORK_PR", "false");
         for (name, value) in given {
             cmd.env(name, value);
@@ -156,6 +164,19 @@ echo "registry.example/app@$CRANE_DIGEST"
     fn pushed(&self) -> bool {
         self.base.join("results/push.json").exists()
     }
+}
+
+/// The first 32 hex characters of the SHA-256 of the build Step's id: the
+/// key its layout's directory is named by, computed here rather than copied
+/// from the script.
+fn key(step: &str) -> String {
+    scarab_storage::sha256_hex(step.as_bytes())[..32].to_string()
+}
+
+/// A JSON backslash-u escape of the code point `hex4`, written with the
+/// backslash as a char so no editor or tool reads the escape on the way.
+fn esc(hex4: &str) -> String {
+    format!("{}u{hex4}", char::from(92u8))
 }
 
 /// `index.json` as BuildKit writes it, naming `digest`.
@@ -208,7 +229,10 @@ fn an_index_json_crane_would_read_differently_is_refused() {
     };
     for (what, index) in [
         ("a Digest key", decoy("Digest")),
-        ("an escaped digest key", decoy(r"digest")),
+        (
+            "an escaped digest key",
+            decoy(&format!("di{}est", esc("0067"))),
+        ),
         ("a non-ASCII digest key", decoy("dige\u{17f}t")),
     ] {
         h.layout(&index);
@@ -220,26 +244,96 @@ fn an_index_json_crane_would_read_differently_is_refused() {
 }
 
 /// Owner decision: when Scarab does not collect results (no
-/// /scarab/results) the build Step's digest cannot reach this Step, so the
-/// push goes ahead without the check, and the log says so with a warning.
+/// /scarab/results) the build Step's result cannot reach this Step, so the
+/// push goes ahead without the digest check, and the layout's path is found
+/// from this Step's id (`image/push` → the build Step `image/image`); the
+/// log says both with a warning.
 #[test]
 fn without_results_the_push_warns_that_the_digest_check_was_skipped() {
     let h = Harness::new();
     std::fs::remove_dir(h.base.join("results")).unwrap();
     h.layout(&buildkit_index(DIGEST));
-    let ran = h.run(&[("SCARAB_BUILD_DIGEST", "")]);
+    let ran = h.run(&[("SCARAB_BUILD_DIGEST", ""), ("SCARAB_BUILD_LAYOUT", "")]);
     assert_eq!(ran.code, Some(0), "{}", ran.stderr);
-    assert!(
-        ran.stderr.lines().any(|l| l
-            == "scarab: warning: results are not collected, so the layout is not checked against the build step's digest"),
-        "{}",
-        ran.stderr
+    for warning in [
+        "scarab: warning: results are not collected, so the layout is not checked against the build step's digest",
+        "scarab: warning: results are not collected, so the layout's path is found from the step id",
+    ] {
+        assert!(
+            ran.stderr.lines().any(|l| l == warning),
+            "{warning}: {}",
+            ran.stderr
+        );
+    }
+    let layout = h.oci().display().to_string();
+    assert_eq!(
+        ran.crane,
+        ["push", layout.as_str(), "registry.example/app:1"]
     );
-    assert_eq!(ran.crane.first().map(String::as_str), Some("push"));
     // With results collected, the same push carries no warning.
     std::fs::create_dir(h.base.join("results")).unwrap();
     h.layout(&buildkit_index(DIGEST));
     let ran = h.run(&[]);
     assert_eq!(ran.code, Some(0), "{}", ran.stderr);
     assert!(!ran.stderr.contains("warning"), "{}", ran.stderr);
+}
+
+// Attack: the build Step's `image` result is written in the build Pod, where
+// a process a Dockerfile RUN left behind can rewrite it, so its `layout`
+// names a directory the build did not write: elsewhere on the Pod's disk,
+// up out of .scarab-build, a key that is not one, or the key's directory
+// rather than the layout. Safe outcome: exit 2 before crane runs, though a
+// valid layout sits at the build Step's own path.
+#[test]
+fn a_layout_path_the_result_names_outside_the_build_directory_is_refused() {
+    let h = Harness::new();
+    let root = h.base.join("workspace").display().to_string();
+    let k = key("image/image");
+    for layout in [
+        format!("/etc/x/{k}/oci"),
+        format!("{root}/.scarab-build/../{k}/oci"),
+        format!("{root}/.scarab-build/{}/oci", &k[..31]),
+        format!("{root}/.scarab-build/{}/oci", k.to_uppercase()),
+        format!("{root}/.scarab-build/{k}"),
+        format!("{root}/.scarab-build/{k}/oci/"),
+    ] {
+        h.layout(&buildkit_index(DIGEST));
+        let ran = h.run(&[("SCARAB_BUILD_LAYOUT", layout.as_str())]);
+        assert_eq!(ran.code, Some(2), "{layout}: {}", ran.stderr);
+        assert!(ran.crane.is_empty(), "{layout}: crane ran: {:?}", ran.crane);
+        assert!(!h.pushed(), "{layout}");
+    }
+}
+
+// Attack: results are collected but the build Step's result names no layout
+// (a rewritten result, or a build of another library). Falling back to the
+// path from the Step id would push whatever sits there. Safe outcome: exit
+// 2 before crane runs, though a valid layout sits at that path.
+#[test]
+fn results_present_but_no_layout_is_refused() {
+    let h = Harness::new();
+    h.layout(&buildkit_index(DIGEST));
+    let ran = h.run(&[("SCARAB_BUILD_LAYOUT", "")]);
+    assert_eq!(ran.code, Some(2), "{}", ran.stderr);
+    assert!(ran.crane.is_empty(), "crane ran: {:?}", ran.crane);
+    assert!(!h.pushed());
+}
+
+/// With no results, the path comes from the Step id, which must be this
+/// library's push Step (`<invoke>/push`); any other id (none included)
+/// exits 2 before crane runs.
+#[test]
+fn without_results_a_step_id_not_ending_in_push_is_refused() {
+    let h = Harness::new();
+    std::fs::remove_dir(h.base.join("results")).unwrap();
+    for step in ["image/image", "/push", ""] {
+        h.layout(&buildkit_index(DIGEST));
+        let ran = h.run(&[
+            ("SCARAB_BUILD_LAYOUT", ""),
+            ("SCARAB_BUILD_DIGEST", ""),
+            ("SCARAB_STEP", step),
+        ]);
+        assert_eq!(ran.code, Some(2), "{step:?}: {}", ran.stderr);
+        assert!(ran.crane.is_empty(), "{step:?}: crane ran: {:?}", ran.crane);
+    }
 }

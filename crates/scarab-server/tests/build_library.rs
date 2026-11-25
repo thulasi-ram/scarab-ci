@@ -838,3 +838,214 @@ async fn a_fork_pull_request_build_does_not_push() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #218: build-multiarch and build-layout
+// ---------------------------------------------------------------------------
+
+const MULTIARCH: &str = include_str!("../../../libs/build-multiarch.yaml");
+const MULTIARCH_SOURCE: &str =
+    "github.com/thulasi-ram/scarab-ci//libs/build-multiarch.yaml@1111111111111111111111111111111111111111";
+const LAYOUT: &str = include_str!("../../../libs/build-layout.yaml");
+const LAYOUT_SOURCE: &str =
+    "github.com/thulasi-ram/scarab-ci//libs/build-layout.yaml@1111111111111111111111111111111111111111";
+
+/// `content`, installed in `acme` as `lib:thulasi-ram::scarab-ci::<name>`
+/// from `source`, which the org trusts with `grants`.
+async fn library_trusted(
+    name: &str,
+    source: &str,
+    content: &str,
+    grants: &[TrustGrant],
+) -> InMemoryLibraries {
+    let libs = InMemoryLibraries::new();
+    install(
+        &libs,
+        &format!("thulasi-ram::scarab-ci::{name}"),
+        source,
+        content,
+    )
+    .await;
+    for grant in grants {
+        libs.trust_source(&TrustedSource {
+            org: "acme".into(),
+            source: trust_key(source).into(),
+            grant: *grant,
+            trusted_by: "amy".into(),
+            trusted_at: 2,
+            step_up_ref: Some("su-1".into()),
+        })
+        .await
+        .unwrap();
+    }
+    libs
+}
+
+/// Triggers the Pipeline `yaml` on `event`.
+async fn trigger_on(
+    db: &dyn Db,
+    libs: &InMemoryLibraries,
+    yaml: &str,
+    event: &Event,
+) -> TriggerOutcome {
+    let forge = FakeForge::new()
+        .with_file(".scarab/ci.yaml", yaml)
+        .with_commit("refs/heads/main", SHA);
+    trigger_runs_from_event(
+        &forge,
+        db,
+        &FakeClock::new(1_000),
+        AdmissionPorts::default().with_libraries(libs),
+        event,
+    )
+    .await
+    .unwrap()
+}
+
+const MULTIARCH_YAML: &str = r#"
+on:
+  push: {}
+  pull_request: {}
+steps:
+  - id: x
+    invoke: lib:thulasi-ram::scarab-ci::build-multiarch
+    with:
+      image: "ghcr.io/acme/web:${{ event.sha }}"
+"#;
+
+/// The stored spec of the Step `x/<id>`.
+async fn spec(db: &InMemoryDb, run: RunId, id: &str) -> StepSpec {
+    db.step_spec(&run, &StepId(format!("x/{id}")))
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("no Step x/{id}"))
+}
+
+/// build-multiarch's two builds run in the sandbox, so its source needs the
+/// build-sandbox trust; its push Step is the only one that may receive the
+/// registry credential, and receives it only by the registry-credential
+/// trust. A fork pull request's Run builds and is locked out of the
+/// credential.
+#[tokio::test]
+async fn the_multiarch_library_needs_both_trust_grants() {
+    for grants in [&[][..], &[TrustGrant::RegistryCredential][..]] {
+        let libs = library_trusted("build-multiarch", MULTIARCH_SOURCE, MULTIARCH, grants).await;
+        let db = InMemoryDb::new();
+        let out = trigger_on(&db, &libs, MULTIARCH_YAML, &push()).await;
+        assert!(out.runs.is_empty(), "{grants:?}: {:?}", out.runs);
+        let reason = &out.refused[0].reason;
+        assert!(
+            reason.contains("asks for `security.sandbox: rootless-buildkit`")
+                && reason.contains("libs/build-multiarch.yaml")
+                && reason.contains("does not trust for the build sandbox"),
+            "{grants:?}: {reason}"
+        );
+    }
+
+    let sandboxed = Some(SandboxConfig {
+        sandbox: scarab_pipeline::Sandbox::RootlessBuildkit,
+        org: "acme".into(),
+        library: content_hash(MULTIARCH),
+    });
+    // The sandbox alone: the push Step is admitted with no credential.
+    let libs = library_trusted(
+        "build-multiarch",
+        MULTIARCH_SOURCE,
+        MULTIARCH,
+        &[TrustGrant::BuildSandbox],
+    )
+    .await;
+    let db = InMemoryDb::new();
+    let out = trigger_on(&db, &libs, MULTIARCH_YAML, &push()).await;
+    assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
+    let push_step = spec(&db, out.runs[0].clone(), "push").await;
+    let auth = push_step.registry_auth.expect("registry_auth");
+    assert_eq!((auth.library, auth.forge_library), (None, None));
+
+    // Both grants: the builds run sandboxed with no credential, the push
+    // Step unsandboxed with it, as uid 1000.
+    let libs = library_trusted(
+        "build-multiarch",
+        MULTIARCH_SOURCE,
+        MULTIARCH,
+        &[TrustGrant::BuildSandbox, TrustGrant::RegistryCredential],
+    )
+    .await;
+    let db = InMemoryDb::new();
+    let out = trigger_on(&db, &libs, MULTIARCH_YAML, &push()).await;
+    assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
+    let run = out.runs[0].clone();
+    for arch in ["amd64", "arm64"] {
+        let build = spec(&db, run.clone(), arch).await;
+        assert_eq!(build.sandbox, sandboxed, "{arch}");
+        assert_eq!(build.registry_auth, None, "{arch} holds no credential");
+    }
+    let push_step = spec(&db, run.clone(), "push").await;
+    assert_eq!(push_step.sandbox, None);
+    assert_eq!(push_step.run_as_user, Some(1000));
+    assert!(!push_step.run_as_root);
+    let auth = push_step.registry_auth.expect("registry_auth");
+    assert_eq!(auth.library, Some(content_hash(MULTIARCH)));
+    assert!(!auth.locked_out);
+
+    // A fork pull request: admitted to build, locked out of the credential.
+    let db = InMemoryDb::new();
+    let out = trigger_on(&db, &libs, MULTIARCH_YAML, &fork_pr()).await;
+    assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
+    let run = out.runs[0].clone();
+    for arch in ["amd64", "arm64"] {
+        assert_eq!(spec(&db, run.clone(), arch).await.registry_auth, None);
+    }
+    let auth = spec(&db, run, "push")
+        .await
+        .registry_auth
+        .expect("registry_auth");
+    assert!(
+        auth.locked_out,
+        "a fork pull request gets no registry credential"
+    );
+}
+
+/// build-layout writes the image into the workspace and pushes nothing: it
+/// needs the build-sandbox trust and no registry trust, and none of its
+/// Steps asks for the registry credential.
+#[tokio::test]
+async fn build_layout_needs_no_registry_trust() {
+    let yaml = "on: { push: {} }\nsteps:\n  - id: x\n    invoke: lib:thulasi-ram::scarab-ci::build-layout\n";
+    let libs = library_trusted("build-layout", LAYOUT_SOURCE, LAYOUT, &[]).await;
+    let db = InMemoryDb::new();
+    let out = trigger_on(&db, &libs, yaml, &push()).await;
+    assert!(out.runs.is_empty(), "{:?}", out.runs);
+    assert!(
+        out.refused[0]
+            .reason
+            .contains("does not trust for the build sandbox"),
+        "{}",
+        out.refused[0].reason
+    );
+
+    let libs = library_trusted(
+        "build-layout",
+        LAYOUT_SOURCE,
+        LAYOUT,
+        &[TrustGrant::BuildSandbox],
+    )
+    .await;
+    let db = InMemoryDb::new();
+    let out = trigger_on(&db, &libs, yaml, &push()).await;
+    assert_eq!(out.runs.len(), 1, "{:?}", out.refused);
+    let spec = db
+        .step_spec(&out.runs[0], &StepId("x/image".into()))
+        .await
+        .unwrap()
+        .expect("the build-layout Step");
+    assert_eq!(
+        spec.sandbox,
+        Some(SandboxConfig {
+            sandbox: scarab_pipeline::Sandbox::RootlessBuildkit,
+            org: "acme".into(),
+            library: content_hash(LAYOUT),
+        })
+    );
+    assert_eq!(spec.registry_auth, None);
+}

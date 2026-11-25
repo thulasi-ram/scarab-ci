@@ -291,52 +291,68 @@ it, and a retry gets a new one.
 
 ### One image for amd64 and arm64
 
-Build once per architecture, each build pushing its own tag, and join the two with Scarab's image
-index library
-([Joining images into one multi-architecture image](/scarab-ci/usage/pipeline-syntax/#joining-images-into-one-multi-architecture-image)).
-Install it and trust its source with the registry credential, as
-[Libraries](/scarab-ci/usage/libraries/#install-scarabs-image-index-library) describes; the build
-library's trust does not reach it. Its one step holds the registry credential, so `ecr-push`
-reaches it from a plain list:
+Use Scarab's multi-architecture build library
+([Building a multi-architecture image](/scarab-ci/usage/pipeline-syntax/#building-a-multi-architecture-image)).
+It builds on an amd64 node and an arm64 node with no credential, and one step, `push`, pushes
+both images, the index, their arch tags and the index's extra tags. Install it and trust its source for
+the build sandbox and with the registry credential, as
+[Libraries](/scarab-ci/usage/libraries/#install-scarabs-multi-architecture-build-library)
+describes; the build library's trust does not reach it. Route `ecr-push` to `push` only:
 
 ```yaml
-  - id: amd64
-    invoke: lib:thulasi-ram::scarab-ci::build
-    needs: [checkout]
-    placement_profiles: { image: [amd64-builders, build-cache], push: [ecr-push] }
-    with: { image: "444455556666.dkr.ecr.eu-west-1.amazonaws.com/app:${{ event.sha }}-amd64", push: true }
-  - id: arm64
-    invoke: lib:thulasi-ram::scarab-ci::build
-    needs: [checkout]
-    placement_profiles: { image: [arm64-builders, build-cache], push: [ecr-push] }
-    with: { image: "444455556666.dkr.ecr.eu-west-1.amazonaws.com/app:${{ event.sha }}-arm64", push: true }
   - id: app
-    invoke: lib:thulasi-ram::scarab-ci::image-index
-    needs: [amd64, arm64]
-    placement_profiles: [ecr-push]
+    invoke: lib:thulasi-ram::scarab-ci::build-multiarch
+    needs: [checkout]
+    placement_profiles:
+      amd64: [amd64-builders, build-cache]
+      arm64: [arm64-builders, build-cache]
+      push: [ecr-push]
     with:
       image: "444455556666.dkr.ecr.eu-west-1.amazonaws.com/app:${{ event.sha }}"
-      images: |
-        ${{ has(outputs.amd64.push) ? outputs.amd64.push.ref : '' }}
-        ${{ has(outputs.arm64.push) ? outputs.arm64.push.ref : '' }}
+      extra_tags: latest
+      cache: s3
+      cache_bucket: acme-buildkit-cache
+      cache_region: eu-west-1
 ```
 
-A fork pull request's builds push nothing and have no `push` result, so each line reads
-`outputs.<build>.push` only when it is there. On a fork the lines are empty, and the index step
-pushes nothing and succeeds; anywhere else, empty lines fail the step.
+Never name `ecr-push` for `amd64` or `arm64`, or in a plain list: those are build steps, and
+their launch fails.
 
-The role in part 1 already reads and writes the `app` repository, which is all the join needs.
-Deploy by `${{ outputs.app.index.digest }}`.
+The role in part 1 already reads and writes the `app` repository, which is all the push needs:
+`crane tag` uses `ecr:PutImage` too. Deploy by `${{ outputs.app.push.digest }}`, in a step with
+a `when:` that keeps it off a fork's Run.
+
+- **Arch tags and lifecycle rules.** The push step tags each architecture's image
+  `<sha>-amd64` and `<sha>-arm64`. arm64 is tagged `<tag>-arm64` whether or not its config names
+  `v8`; a 32-bit arm image is tagged with its variant, `<tag>-arm-v7`.
+  Without those tags the two images are untagged, and an ECR lifecycle rule that expires untagged
+  images could delete them while the index still names them. We have not confirmed how ECR treats
+  untagged images that a tagged index names, so keep `arch_tags` on, or leave untagged images out
+  of your lifecycle rules.
+- **Tag immutability.** A repository with tag immutability on refuses a tag that moves, such as
+  `latest` on the next Run. Leave `extra_tags` empty for such a repository.
+- **Retry and disk.** A retried push step pushes both architectures again. Its Pod receives both
+  builds' workspaces, so it needs disk for the checkout and both image layouts.
+- **Order of writes.** Every check the step makes itself runs before the first registry write. A
+  failure crane or the registry reports after that can leave images pushed by digest with no tag,
+  and a retry pushes them again.
+
+To compose the pieces yourself (the build layout library for each build, then the image index
+library with `layouts`), see
+[Joining images into one multi-architecture image](/scarab-ci/usage/pipeline-syntax/#joining-images-into-one-multi-architecture-image).
+The image index library's one step holds the registry credential, so `ecr-push` reaches it from a
+plain list, `placement_profiles: [ecr-push]`; the build layout steps hold no credential and must
+not name it.
 
 ## What the marker does
 
 Pipeline authors name profiles, so without `registry_auth_only` any step could ask for
 `ecr-push`. With it, Scarab decides at each launch, before it merges the profile:
 
-- **The build library's push step**, or the image index library's step, in a Run that is not a
-  fork pull request and not locked out of its Environment's secrets, from a library source the
-  org trusted with the registry credential when the Run was created and still trusts: the profile
-  applies.
+- **The build library's push step**, the multi-architecture build library's push step, or the
+  image index library's step, in a Run that is not a fork pull request and not locked out of its
+  Environment's secrets, from a library source the org trusted with the registry credential when
+  the Run was created and still trusts: the profile applies.
 - **The same push step otherwise**: the profile is left out, and the server logs that it was. A
   fork pull request's push step pushes nothing and succeeds. Without the trust, crane pushes with
   no login and ECR refuses the push.
@@ -395,10 +411,9 @@ rules:
   - when: >-
       steps.exists(s, 'ecr-push' in s.placement_profiles
       && !s.origin.exists(o, o.kind == 'library' && has(o.source)
-      && (o.source.startsWith('github.com/thulasi-ram/scarab-ci//libs/build.yaml@')
-      || o.source.startsWith('github.com/thulasi-ram/scarab-ci//libs/image-index.yaml@'))))
+      && o.source.matches('^github[.]com/thulasi-ram/scarab-ci//libs/(build|build-multiarch|image-index)[.]yaml@')))
     effect: deny
-    message: "Only the build and image index libraries' steps may name the ecr-push placement profile."
+    message: "Only the build, multi-architecture build and image index libraries' steps may name the ecr-push placement profile."
 ```
 
 - The first rule refuses a Run that names `ecr-push` unless it is on `refs/heads/main` and not
@@ -406,9 +421,11 @@ rules:
   at all, so keep the push in a Pipeline that triggers only on `main`, as in part 4, and build pull
   requests in another Pipeline.
 - The second rule refuses, when the Run is created, a step that names `ecr-push` and does not
-  come from the build library or the image index library. It matches each library by the source
-  it was installed from, since the name is chosen at install. Leave out the image index line if
-  you do not install that library.
+  come from one of the three libraries that hold the registry credential: build,
+  multi-architecture build and image index. It matches each library by the source it was
+  installed from, since the name is chosen at install. Take a library you do not install out of
+  the pattern. The build layout library is not listed: its one step is a build step, holds no
+  credential, and must never get the push role.
 - To limit the profile to an Environment instead, use
   `has(pipeline.environment) && pipeline.environment == 'production'` in place of the ref check.
 - The editor starts a new Policy in `audit` mode. Run **Try it on recent decisions** before you

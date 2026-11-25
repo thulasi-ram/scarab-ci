@@ -506,11 +506,14 @@ The library has two steps, and `needs: [image]` reaches the second:
 
 - `image/image` builds. It runs BuildKit in the build sandbox and holds no registry credential.
   When the image is to be pushed, it writes the image as an OCI image layout to
-  `.scarab-build/oci` in the workspace, after removing anything an earlier step left at that path.
-  An image that is not pushed stays in BuildKit.
+  `/workspace/.scarab-build/<key>/oci`, after removing anything an earlier step left under
+  `.scarab-build`. The key is the first 32 hex characters of the SHA-256 of the build step's id
+  (`image/image` here), so two builds whose workspaces a later step receives write different
+  paths. An image that is not pushed stays in BuildKit.
 - `image/push` needs `image/image` and pushes the layout with
-  [crane](https://github.com/google/go-containerregistry/tree/main/cmd/crane). It holds the
-  registry credential, runs no code from your repository, and removes the layout from its own
+  [crane](https://github.com/google/go-containerregistry/tree/main/cmd/crane). It receives only
+  the build step's workspace (`inputs: [image]`), not those of the steps the invoke needs. It
+  holds the registry credential, runs no code from your repository, and removes the layout from its own
   workspace when it is done, so a step that needs only `image` does not receive it. With
   `push: false` it exits without pushing.
 
@@ -550,7 +553,10 @@ Its outputs:
   there is no such result, and a step that reads it fails before it launches, so read it only
   where the image is pushed.
 - `outputs.image.image` is what BuildKit wrote with `--metadata-file`: a JSON object whose
-  `containerimage.digest` is the digest of the image it built. Before it pushes, the push step
+  `containerimage.digest` is the digest of the image it built. The build step adds two keys to
+  it: `digest`, the same digest under a key with no `.` (`outputs.image.image.digest`), and,
+  when it wrote a layout, `layout`, the layout's path. The push step reads the path from
+  `layout`. Before it pushes, the push step
   checks that the layout's `index.json` names one manifest, that the manifest's file hashes to
   that digest, and that the digest is the build step's `containerimage.digest`. It refuses
   (exit 2) a layout that fails any of these: a stale, half-written or swapped layout. It also
@@ -560,7 +566,8 @@ Its outputs:
   step fails if crane reports another digest, so this digest and `outputs.image.push.digest` are
   the same. The check does not cover a build that rewrites its own `image` result as well as the
   layout. When the server collects no step results, there is no `image` result to compare: the
-  push step checks only the layout, pushes, and logs a line starting `scarab: warning:`. In
+  push step finds the layout from its own step id, checks only the layout, pushes, and logs
+  lines starting `scarab: warning:`. In
   `env:` this output becomes that object's compact JSON text.
 
 - **The registry credential.** Only the push step asks for `registry_auth: true`. It receives a
@@ -596,8 +603,7 @@ Its outputs:
   unconfined, which rootless BuildKit needs. Only a step from an installed library whose source
   the org trusts for the build sandbox gets it; a step written in your Pipeline file never does.
   A sandboxed step may not have `secrets:`. The push step runs in the default restricted Pod
-  shape, as root, because crane's image has no other user; an org Policy that denies run-as-root
-  therefore refuses every Run that invokes the library.
+  shape as uid 1000, so an org Policy that denies run-as-root does not refuse it.
 - **Placement per step.** A list in the invoke step's `placement_profiles` reaches both steps. A
   map from the library's step id to a list routes each list to its own step, so build-node
   placement and the S3 cache identity reach only the build step. An operator marks a profile
@@ -617,40 +623,162 @@ Its outputs:
     with: { image: "123456789012.dkr.ecr.ap-south-1.amazonaws.com/app:${{ event.sha }}", push: true }
   ```
 
-- **Other architectures.** BuildKit builds for the architecture of the node it runs on. Invoke
-  the library once per architecture, each naming the profile for those nodes and pushing its own
-  tag:
-
-  ```yaml
-  - id: amd64
-    invoke: lib:thulasi-ram::scarab-ci::build
-    placement_profiles: { image: [amd64], push: [ecr-push] }
-    with: { image: "ghcr.io/acme/app:${{ event.sha }}-amd64", push: true }
-  - id: arm64
-    invoke: lib:thulasi-ram::scarab-ci::build
-    placement_profiles: { image: [arm64], push: [ecr-push] }
-    with: { image: "ghcr.io/acme/app:${{ event.sha }}-arm64", push: true }
-  ```
-
-  To join them into one multi-architecture image, add Scarab's image index library
-  ([below](#joining-images-into-one-multi-architecture-image)). A list of profiles still
-  reaches both steps, which a per-architecture build needs; keep the push profile in the map's
-  `push` entry.
+- **Other architectures.** BuildKit builds for the architecture of the node it runs on, so the
+  build step's placement decides the image's architecture. To publish one image for amd64 and
+  arm64, use the multi-architecture build library
+  ([below](#building-a-multi-architecture-image)): it builds on both node pools and pushes
+  both images, their tags and the index from one step.
 
 The `build` step kind is gone. A `build:` step fails the pipeline check with one error that holds
 its replacement, an `invoke: lib:thulasi-ram::scarab-ci::build` step written from the old step's fields. The local executor refuses the build library's build step; it
 needs the Kubernetes executor.
 
+### Building a multi-architecture image
+
+Scarab's multi-architecture build library, `lib:thulasi-ram::scarab-ci::build-multiarch`, builds
+an image on an amd64 node and on an arm64 node, then pushes both images, their tags and the image
+index that joins them from one step. A client that pulls the tag gets the image for its own
+platform. An org admin installs it and trusts its source for the build sandbox and with the
+registry credential; no org has it until then
+([Install Scarab's multi-architecture build library](/scarab-ci/usage/libraries/#install-scarabs-multi-architecture-build-library)).
+
+```yaml
+- id: checkout
+  invoke: lib:thulasi-ram::scarab-ci::clone
+
+- id: app
+  invoke: lib:thulasi-ram::scarab-ci::build-multiarch
+  needs: [checkout]
+  placement_profiles: { amd64: [amd64-builders], arm64: [arm64-builders] }
+  with:
+    image: "ghcr.io/acme/app:${{ event.sha }}"
+    extra_tags: latest
+    context: .
+    dockerfile: Dockerfile
+
+- id: deploy
+  image: alpine:3.20
+  needs: [app]
+  when: "event.kind == 'push'"
+  env: [[DIGEST, "${{ outputs.app.push.digest }}"]]
+  command: [sh, -c, 'echo "deploy ghcr.io/acme/app@$DIGEST"']
+```
+
+The library has three steps, and `needs: [app]` reaches the last:
+
+- `app/amd64` and `app/arm64` build, each with the same BuildKit script as the build library's
+  build step, in the build sandbox and with no registry credential. Each writes its image as an
+  OCI image layout at `/workspace/.scarab-build/<key>/oci` (the key comes from the step's id, so
+  the two do not collide) and names the layout's path and the image's digest in its `image`
+  result. BuildKit builds for the architecture of the node it runs on, so route each step to its
+  node pool with the map form of `placement_profiles`; a plain list reaches all three steps.
+- `app/push` needs both builds and receives only their workspaces (`inputs: [amd64, arm64]`).
+  It is the only step that holds the registry credential. It runs as uid 1000, runs no code from
+  your repository, and runs the image index library's script
+  ([below](#joining-images-into-one-multi-architecture-image)) on the two layouts: it checks
+  both, then pushes each image by digest, pushes the index under `image`'s tag, tags each image
+  `<tag>-<architecture>`, and tags the index with each extra tag, in that order.
+
+Every check the push step makes itself runs before the first registry write, so a step it refuses
+writes nothing. A failure crane or the registry reports after that can leave images pushed by
+digest with no tag, and a retry pushes them again. A push step that fails part way through the
+tags leaves the tags it wrote until it is retried.
+
+Its inputs:
+
+| Input | Default | What it is |
+|---|---|---|
+| `image` | (required) | The tag to push the index to, such as `ghcr.io/acme/app:1.2.0`. It must name a tag, and no digest. |
+| `extra_tags` | empty | More tags for the index, in `image`'s repository: tag names such as `latest`, not references, separated by spaces or line breaks. A tag named twice, or the same as `image`'s, is written once. |
+| `arch_tags` | `true` | Also tag each architecture's image: `<tag>-amd64` and `<tag>-arm64`. |
+| `context`, `dockerfile`, `build_args`, `cache`, `cache_bucket`, `cache_region`, `cache_name` | as in the build library | The build library's inputs, with the same rules ([Building an image](#building-an-image)). Both builds use them, except that each build keeps its own layer cache: `<cache_name>-amd64` and `<cache_name>-arm64` (`buildkit-amd64` and `buildkit-arm64` when `cache_name` is empty). |
+| `insecure_push` | `false` | Reach the registry over plain HTTP. For a test or development registry with no TLS only. crane then also skips TLS verification, so the push step refuses it (exit 2) when it holds a registry login. |
+
+Its output: `outputs.app.push` is `{"ref": "<repository>@sha256:…", "digest": "sha256:…"}` for
+the index, as crane reported the push. Deploy by `outputs.app.push.digest`.
+
+- **amd64 and arm64 only.** No input chooses the architectures. A `platforms` input needs two
+  things the Pipeline compiler does not do yet: take a matrix's values from an input, and route
+  placement per matrix entry. For another set of architectures, compose the build layout and
+  image index libraries ([below](#joining-images-into-one-multi-architecture-image)). The library
+  needs a cluster with both amd64 and arm64 nodes: two builds that land on nodes of one
+  architecture make two images of one platform, and the push step refuses them (exit 2).
+- **Arch tags are on by default.** Without a tag, an architecture's image is reachable only
+  through the index, and a registry rule that expires untagged images (an ECR lifecycle policy
+  can) could delete it and break the index. We have not confirmed how ECR treats untagged images
+  that a tagged index names. arm64 is tagged `<tag>-arm64` whether or not its config names `v8`;
+  a 32-bit arm image is tagged with its variant, `<tag>-arm-v7`. The push step's log names each
+  tag it wrote
+  (`scarab: tagged <repository>@sha256:… as <tag>`). With `arch_tags: false` the step writes
+  `image`'s tag and the extra tags only.
+- **A retry pushes every architecture again.** The push is one step, so retrying it repeats every
+  write: both images, the index, the arch tags and the extra tags. Each write puts the same
+  content under the same name, and a registry skips blobs it already has. A failed build is its
+  own step and retries on its own. A repository with immutable tags refuses a tag that moves,
+  such as `latest`, with or without this library.
+- **The push step needs disk for every layout.** Its Pod receives both build steps' workspaces:
+  the checkout they received and both image layouts. Size its node's ephemeral storage for all of
+  it.
+- **A fork pull request**, or a Run locked out of its Environment's secrets, gets no registry
+  credential, and Scarab sets `SCARAB_FORK_PR=true` on every step. The builds run, export no
+  layer cache and write no layout; the push step pushes nothing, exits 0 and publishes no `push`
+  result. A step that reads `outputs.app.push` needs `when: "event.kind == 'push'"`, or another
+  condition that keeps it off a fork's Run. On any other Run, a build step that published no
+  layout fails the push step (exit 2) with `layouts line (amd64 wrote no layout) does not name a
+  path …`, so an index never leaves an architecture out.
+
 ### Joining images into one multi-architecture image
 
 Scarab's image index library, `lib:thulasi-ram::scarab-ci::image-index`, joins images built for
-different architectures into one image index and pushes it under one tag. A client that pulls the
-tag gets the image for its own platform. An org admin installs it and trusts its source with the
-registry credential; no org has it until then
+different architectures into one image index and pushes it under one tag. An org admin installs it
+and trusts its source with the registry credential; no org has it until then
 ([Install Scarab's image index library](/scarab-ci/usage/libraries/#install-scarabs-image-index-library)).
+It takes images two ways:
 
-This Pipeline builds the image on amd64 and arm64 nodes, joins the two, and deploys the index by
-digest:
+- `layouts`: OCI image layouts that Scarab's build layout library,
+  `lib:thulasi-ram::scarab-ci::build-layout`, left in the workspace. The index step pushes them
+  itself, so no build step holds a credential. This is what the multi-architecture build library
+  does in one invoke; compose the two libraries when you need another shape, such as a third
+  architecture.
+- `images`: images already in a registry, named by digest, such as the build library's pushed
+  references.
+
+The build layout library has one step, the build library's build step without a push step. It
+takes the build library's inputs except `image`, `push` and `insecure_push`, needs only the build
+sandbox trust, and publishes `digest` and `layout` in its `image` result
+([Install Scarab's build layout library](/scarab-ci/usage/libraries/#install-scarabs-build-layout-library)).
+Each `layouts` line is one build's `layout` and `digest`, read with `has(...)` so that a build
+that wrote no layout renders an empty line:
+
+```yaml
+- id: amd64
+  invoke: lib:thulasi-ram::scarab-ci::build-layout
+  needs: [checkout]
+  placement_profiles: [amd64-builders]
+
+- id: arm64
+  invoke: lib:thulasi-ram::scarab-ci::build-layout
+  needs: [checkout]
+  placement_profiles: [arm64-builders]
+
+- id: app
+  invoke: lib:thulasi-ram::scarab-ci::image-index
+  needs: [amd64, arm64]
+  with:
+    image: "ghcr.io/acme/app:${{ event.sha }}"
+    extra_tags: latest
+    layouts: |
+      ${{ has(outputs.amd64.image) && has(outputs.amd64.image.layout) ? outputs.amd64.image.layout + ' ' + outputs.amd64.image.digest : '' }}
+      ${{ has(outputs.arm64.image) && has(outputs.arm64.image.layout) ? outputs.arm64.image.layout + ' ' + outputs.arm64.image.digest : '' }}
+```
+
+A build layout step keeps its layout in its workspace, so every step that needs it receives the
+layout (a large image costs a transfer through the Data Depot); limit what a step receives with
+`inputs:`. The index step removes `.scarab-build` from its own workspace after it pushes.
+
+With `images`, this Pipeline builds the image on amd64 and arm64 nodes with the build library,
+each build pushing its own tag, joins the two, and deploys the index by digest. Each build's
+push step holds the credential too, so prefer `layouts` when the builds run in the same Run:
 
 ```yaml
 on:
@@ -690,47 +818,92 @@ steps:
 
 The library has one step, `app/index`, and `needs: [app]` reaches it. `needs: [amd64, arm64]`
 reaches each build's push step, whose `push` result holds the pushed `<repository>@sha256:…`.
-The step runs `crane index append` with the
-[crane](https://github.com/google/go-containerregistry/tree/main/cmd/crane) image the build
-library pins. It holds the registry credential, runs as uid 1000, runs no code from your
-repository, and reads nothing from the workspace.
+The step runs [crane](https://github.com/google/go-containerregistry/tree/main/cmd/crane) with
+the crane image the build library pins. It holds the registry credential, runs as uid 1000 and
+runs no code from your repository. With `images` alone it reads nothing from the workspace. With
+`layouts` it reads each layout from the workspace and uploads it.
 
 Its inputs:
 
 | Input | Default | What it is |
 |---|---|---|
 | `image` | (required) | The tag to push the index to, such as `ghcr.io/acme/app:1.2.0`. It must name a tag, and no digest. |
-| `images` | (required) | The images to join, one `<repository>@sha256:<digest>` per line. Each image is named by digest, never by tag: a tag can be moved, so a retry could join other images. |
+| `layouts` | empty | The image layouts to push and join, one `<path> sha256:<digest>` per line, the path `/workspace/.scarab-build/<key>/oci` as a build layout step reports it. |
+| `images` | empty | The images to join, one `<repository>@sha256:<digest>` per line. Each image is named by digest, never by tag: a tag can be moved, so a retry could join other images. |
+| `extra_tags` | empty | More tags for the index, in `image`'s repository: tag names such as `latest`, not references, separated by spaces or line breaks. A tag named twice, or the same as `image`'s, is written once. |
+| `arch_tags` | `true` | Also tag each image from `layouts` `<tag>-<architecture>`, or `<tag>-<architecture>-<variant>` for a variant other than arm64's `v8` and amd64's `v1` (`<tag>-arm-v7`). It does not apply to `images`. |
 | `insecure` | `false` | Reach the registry over plain HTTP. For a test or development registry with no TLS only. crane then also skips TLS verification, so the step refuses it (exit 2) when it holds a registry login. |
 
-Before it pushes, the step reads each image's manifest and config from the registry, by digest,
-and refuses (exit 2):
+`layouts` and `images` may both be given, and between them must name at least one image.
+
+Every check the step makes itself runs before the first registry write, so a step it refuses
+writes nothing and leaves the workspace as it found it. A failure crane or the registry reports
+after that can leave images pushed by digest with no tag, and a retry pushes them again. For each
+layout, the step refuses (exit 2):
+
+- a path that is not `/workspace/.scarab-build/<key>/oci` (the key 32 hex characters), that
+  holds a symlink at any level or anything other than directories and regular files, or that
+  resolves outside the workspace. A step before this one, or a Dockerfile `RUN`, could plant a
+  symlink to `/scarab/registry/config.json`, which crane would upload;
+- an `index.json` that does not name one manifest, a manifest that does not hash to its name or
+  is not the digest the line gives, a blob the manifest names (the config or a layer) that is not
+  `sha256:<64 hex>`, is missing from the layout or does not hash to its name, and a manifest
+  that names a `subject` (a referrer). The platform is read from the layout's config;
+- an architecture or variant the step does not tag: the architecture must be one of `386`,
+  `amd64`, `arm`, `arm64`, `loong64`, `mips`, `mipsle`, `mips64`, `mips64le`, `ppc64`,
+  `ppc64le`, `riscv64` and `s390x`, with no variant, or `v5` to `v8` for `arm`, or `v2` to `v4`
+  for `amd64`, whatever `arch_tags` says.
+
+The digest check shows a layout was not changed after its `layouts` line named it, not that a
+build step made it: any step of the Pipeline, a plain `run:` step included, can write a layout
+under `/workspace/.scarab-build/` and name its digest.
+
+For each image in `images`, it reads the manifest and config from the registry, by digest. For
+every source, it refuses:
 
 - an image that is itself an index (a multi-architecture image, or one with attestations): name
   each architecture's image by its own digest;
+- a manifest or config that is not one JSON object (one that starts with a byte-order mark, for
+  example), or that names `config`, `os`, `architecture`, `variant` or `os.version` anywhere but
+  as a key of its top-level object, which is the only place crane reads them;
 - an image whose config names no `os` or `architecture`, or names one of them twice (a label
   called `os`, for example);
-- two images of the same platform: `os/architecture`, then the `variant` (`arm64/v8`, `arm/v7`)
-  and the `os.version` a Windows image names. An index holds one image per platform;
+- two images of the same platform: `os/architecture`, then the `variant` (`arm/v7`) and the
+  `os.version` a Windows image names. `arm64/v8` counts as `arm64` and `amd64/v1` as `amd64`, so
+  an arm64 image with `v8` and one without are one platform. An index holds one image per
+  platform;
 - a manifest or config that writes a letter, digit, `.`, `_` or `-` with a `\u` escape, or names
   `manifests`, `os`, `architecture`, `variant` or `os.version` more than once in any case (`os`
   and `OS`). crane's JSON decoder reads both forms, so the step would otherwise check another
-  field than the one crane reads.
+  field than the one crane reads;
+- a tag over 128 characters, and an arch tag that two images, or an image and an extra tag, would
+  share.
 
-The images may live in other repositories, or other registries, than the index. crane copies
-each image into the index's repository when it is not already there, so the step's credential
-must be able to read each image and push to the index's repository.
+Then it writes, in this order: each layout's image by digest into the index's repository, the
+index under `image`'s tag, the arch tags, and each extra tag on the index. Until the index is
+pushed only untagged images exist; crane reads every config again when it pushes the index, and
+after that each write moves a tag to a digest already in the registry. It removes
+`.scarab-build` from its workspace after it pushes. A retried step writes all of them again; each
+write puts the same content under the same name. With `layouts`, the step's Pod receives every
+layout through the workspace, so it needs disk for all of them. Arch tags are on by default for
+the reason given under [Building a multi-architecture image](#building-a-multi-architecture-image).
+
+The images in `images` may live in other repositories, or other registries, than the index.
+crane copies each into the index's repository when it is not already there, so the step's
+credential must be able to read each image and push to the index's repository.
 
 Its output: `outputs.app.index` is `{"ref": "<repository>@sha256:…", "digest": "sha256:…"}`,
 as crane reported the push. Deploy by this digest.
 
 A fork pull request, or a Run locked out of its Environment's secrets, pushes nothing: the build
-library's push step writes no `push` result. Each `images` line reads `outputs.<build>.push` only
-when it is there, so on a fork the lines are empty, and the index step pushes nothing and exits 0.
-Anywhere else an empty `images` fails the step, and so does a mix of references and empty lines.
-A line written as `${{ outputs.amd64.push.ref }}` does not render when the build pushed nothing,
-and the index step fails before it launches. The steps that read `outputs.app.index` need
-`when: "event.kind == 'push'"`, or another condition that keeps them off a fork's Run.
+library's push step writes no `push` result, and a build layout step builds but writes no layout
+and publishes no `layout` key. Each line reads the result only when it is there, so on a fork the
+lines are empty, and the index step pushes nothing and exits 0 before it reads any input.
+Anywhere else, `images` and `layouts` both empty fail the step, and so does a mix of references
+or layouts and empty lines. A line written as `${{ outputs.amd64.push.ref }}` does not render
+when the build pushed nothing, and the index step fails before it launches. The steps that read
+`outputs.app.index` need `when: "event.kind == 'push'"`, or another condition that keeps them off
+a fork's Run.
 
 The step asks for `registry_auth: true` and is the library's only step, so a profile marked
 `registry_auth_only` (an ECR push role, say) can be named in a plain list:
@@ -1523,4 +1696,5 @@ for them.
 - [ADR-0057: Run provenance: trigger context and origin details](/scarab-ci/tech/adr/0057-run-provenance-trigger-context/)
 - [ADR-0074: Deployments leave core](/scarab-ci/tech/adr/0074-deployments-leave-core/)
 - [ADR-0076: Libraries and plugins through `invoke`](/scarab-ci/tech/adr/0076-libraries-and-plugins-through-invoke/)
+- [ADR-0084: One credentialed Step makes every registry write for a multi-arch image](/scarab-ci/tech/adr/0084-one-credentialed-step-makes-every-registry-write-for-a-multi-arch-image/)
 ```
