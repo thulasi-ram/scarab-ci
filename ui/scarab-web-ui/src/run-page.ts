@@ -452,10 +452,12 @@ export function fitBand(o: {
   maxH: number;
   pad: number;
   minScale?: number;
+  /** The viewer's remembered zoom: used as is instead of the fit. */
+  zoom?: number | null;
 }): { scale: number; bandH: number; pannable: boolean } {
   const min = o.minScale ?? 1;
   const avail = Math.max(1, o.bandW - o.pad * 2);
-  const scale = o.contentW <= avail ? 1 : Math.max(min, avail / o.contentW);
+  const scale = o.zoom ?? (o.contentW <= avail ? 1 : Math.max(min, avail / o.contentW));
   const fullH = Math.round(o.contentH * scale + o.pad * 2);
   const bandH = Math.min(fullH, o.maxH);
   return { scale, bandH, pannable: o.contentW * scale > avail + 0.5 || fullH > o.maxH };

@@ -342,6 +342,12 @@ describe("fitBand", () => {
     });
   });
 
+  it("opens at the viewer's remembered zoom", () => {
+    const f = fitBand({ bandW: 1000, contentW: 700, contentH: 200, maxH: 480, pad: 24, zoom: 1.2 });
+    expect(f.scale).toBe(1.2);
+    expect(f.bandH).toBe(Math.round(200 * 1.2 + 48));
+  });
+
   it("never shrinks a wider graph: it pans sideways", () => {
     const a = fitBand({ bandW: 948, contentW: 1000, contentH: 100, maxH: 480, pad: 24 });
     expect(a.scale).toBe(1);

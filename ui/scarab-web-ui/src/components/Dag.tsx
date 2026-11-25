@@ -17,6 +17,7 @@ import { isGateOpen, type GateStatus } from "../gates";
 import { allNeeds, drawnNeeds, layoutGroups, type DagCell, type OriginLink } from "../dag-layout";
 import { columnNodeWidth, fitBand, matrixHeading, nodeMeta, segmentByMatrix } from "../run-page";
 import { shortHash } from "../libraries";
+import { clearGraphZoom, MAX_ZOOM, MIN_ZOOM, readGraphZoom, writeGraphZoom } from "../graph-zoom";
 import Icon from "./Icon";
 import Pill from "./Pill";
 
@@ -147,8 +148,8 @@ export default function Dag(props: {
   // How far before its target an edge turns: past a library box's padding
   // (10px) and inside the 36px gap between columns.
   const BUS = 18;
-  const MIN_Z = 0.2;
-  const MAX_Z = 1.5;
+  const MIN_Z = MIN_ZOOM;
+  const MAX_Z = MAX_ZOOM;
   const clampZ = (z: number) => Math.min(MAX_Z, Math.max(MIN_Z, z));
   // Band ceiling ~60vh (the graph never takes more than that); floored so a
   // tiny viewport still gets a usable strip.
@@ -254,8 +255,9 @@ export default function Dag(props: {
     setEdges(es);
   }
 
-  // Back to the fitted view and the top-left corner. Runs on mount, on a
-  // topology change and on a width resize; never on a status poll.
+  // Back to the opening view and the top-left corner: the viewer's
+  // remembered zoom, else 100%. Runs on mount, on a topology change and on a
+  // width resize; never on a status poll.
   // `revealSelected`: then scroll the selected node into view. The header's
   // fit button passes false: it means "back to the top-left corner".
   function fit(revealSelected = true) {
@@ -266,7 +268,7 @@ export default function Dag(props: {
     setContentW(cw);
     setContentH(ch);
     if (cw <= 0 || ch <= 0 || bandW <= 0) return;
-    const f = fitBand({ bandW, contentW: cw, contentH: ch, maxH: maxBandH(), pad: PAD });
+    const f = fitBand({ bandW, contentW: cw, contentH: ch, maxH: maxBandH(), pad: PAD, zoom: readGraphZoom() });
     setScale(f.scale);
     setBandH(f.bandH);
     container.scrollLeft = 0;
@@ -297,10 +299,12 @@ export default function Dag(props: {
 
   // Zoom to `nz` around the band's centre. The band keeps its height (a jump
   // on every ＋/－ moved the whole page); the graph scrolls inside it instead.
+  // The zoom is remembered, so the next graph opens at it.
   function zoomTo(nz: number) {
     if (!container) return;
     const z0 = scale();
     const z = clampZ(nz);
+    writeGraphZoom(z);
     const cx = (container.scrollLeft + container.clientWidth / 2 - PAD) / z0;
     const cy = (container.scrollTop + container.clientHeight / 2 - PAD) / z0;
     setScale(z);
@@ -350,7 +354,15 @@ export default function Dag(props: {
 
   onMount(() => {
     // Hand the zoom controls up to the panel header.
-    props.onControls?.({ fit: () => fit(false), zoomIn, zoomOut });
+    // The reset button forgets the remembered zoom: back to 100%.
+    props.onControls?.({
+      fit: () => {
+        clearGraphZoom();
+        fit(false);
+      },
+      zoomIn,
+      zoomOut,
+    });
     fitAndMeasure();
     // Re-fit on a WIDTH resize only: a height change is fit's own doing (it
     // sets the band height). A change smaller than a scrollbar is the band's
