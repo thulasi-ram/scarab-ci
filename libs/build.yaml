@@ -261,13 +261,15 @@ steps:
         # SCARAB_BUILD_PLATFORM (linux/<architecture>[/<variant>]). BuildKit
         # here builds only for the node's own architecture, so a Step that
         # landed on a node of another architecture is refused before
-        # BuildKit starts. Unset, the node's own platform is built.
+        # BuildKit starts. Unset, the node's own platform is built. Only
+        # platforms this check can tell apart are taken: not 386 (an x86_64
+        # node reports the same), not mips (uname -m does not give the byte
+        # order), and 32-bit arm only with its variant.
         platform=${SCARAB_BUILD_PLATFORM-}
         if [ -n "$platform" ]; then
           case "$platform" in
-            linux/386 | linux/amd64 | linux/amd64/v[2-4] | linux/arm | linux/arm/v[5-8] | \
-              linux/arm64 | linux/loong64 | linux/mips | linux/mipsle | linux/mips64 | \
-              linux/mips64le | linux/ppc64 | linux/ppc64le | linux/riscv64 | linux/s390x) ;;
+            linux/amd64 | linux/amd64/v[2-4] | linux/arm/v[5-8] | linux/arm64 | \
+              linux/loong64 | linux/ppc64 | linux/ppc64le | linux/riscv64 | linux/s390x) ;;
             *) fail "platform $platform is not linux/<architecture>[/<variant>] of an architecture this library builds" ;;
           esac
           want=${platform#linux/}
@@ -278,12 +280,7 @@ steps:
             x86_64 | amd64) node=amd64 ;;
             aarch64 | arm64) node=arm64 ;;
             armv5* | armv6* | armv7* | armv8l | arm) node=arm ;;
-            i386 | i486 | i586 | i686) node=386 ;;
             loongarch64) node=loong64 ;;
-            mips) node=mips ;;
-            mipsel) node=mipsle ;;
-            mips64) node=mips64 ;;
-            mips64el) node=mips64le ;;
             ppc64) node=ppc64 ;;
             ppc64le) node=ppc64le ;;
             riscv64) node=riscv64 ;;

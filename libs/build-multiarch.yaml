@@ -92,10 +92,10 @@
 #               reference with a tag and no digest
 #   platforms   the platforms to build, linux/<architecture>[/<variant>],
 #               separated by commas or spaces (default
-#               "linux/amd64,linux/arm64"). The architecture is one of 386,
-#               amd64, arm, arm64, loong64, mips, mipsle, mips64, mips64le,
-#               ppc64, ppc64le, riscv64 and s390x; the variant v5 to v8 for
-#               arm or v2 to v4 for amd64. Write it as text in `with:`: the
+#               "linux/amd64,linux/arm64"). The architecture is one of
+#               amd64, arm, arm64, loong64, ppc64, ppc64le, riscv64 and
+#               s390x; 32-bit arm is written with its variant, v5 to v8
+#               (linux/arm/v7), and amd64 may name v2 to v4. Write it as text in `with:`: the
 #               build Steps are made when the Pipeline compiles, before any
 #               template has a value
 #   extra_tags  more tags for the index, in `image`'s repository: tag names,
@@ -133,7 +133,7 @@ interface:
       type: string
       required: false
       default: "linux/amd64,linux/arm64"
-      validate: 'value.matches("^[ ,\t\n]*linux/(386|amd64(/v[2-4])?|arm(/v[5-8])?|arm64|loong64|mips|mipsle|mips64|mips64le|ppc64|ppc64le|riscv64|s390x)([ ,\t\n]+linux/(386|amd64(/v[2-4])?|arm(/v[5-8])?|arm64|loong64|mips|mipsle|mips64|mips64le|ppc64|ppc64le|riscv64|s390x))*[ ,\t\n]*$")'
+      validate: 'value.matches("^[ ,\t\n]*linux/(amd64(/v[2-4])?|arm/v[5-8]|arm64|loong64|ppc64|ppc64le|riscv64|s390x)([ ,\t\n]+linux/(amd64(/v[2-4])?|arm/v[5-8]|arm64|loong64|ppc64|ppc64le|riscv64|s390x))*[ ,\t\n]*$")'
       description: the platforms to build, linux/<architecture>[/<variant>] separated by commas or spaces
     - name: extra_tags
       type: string
@@ -288,13 +288,15 @@ steps:
         # SCARAB_BUILD_PLATFORM (linux/<architecture>[/<variant>]). BuildKit
         # here builds only for the node's own architecture, so a Step that
         # landed on a node of another architecture is refused before
-        # BuildKit starts. Unset, the node's own platform is built.
+        # BuildKit starts. Unset, the node's own platform is built. Only
+        # platforms this check can tell apart are taken: not 386 (an x86_64
+        # node reports the same), not mips (uname -m does not give the byte
+        # order), and 32-bit arm only with its variant.
         platform=${SCARAB_BUILD_PLATFORM-}
         if [ -n "$platform" ]; then
           case "$platform" in
-            linux/386 | linux/amd64 | linux/amd64/v[2-4] | linux/arm | linux/arm/v[5-8] | \
-              linux/arm64 | linux/loong64 | linux/mips | linux/mipsle | linux/mips64 | \
-              linux/mips64le | linux/ppc64 | linux/ppc64le | linux/riscv64 | linux/s390x) ;;
+            linux/amd64 | linux/amd64/v[2-4] | linux/arm/v[5-8] | linux/arm64 | \
+              linux/loong64 | linux/ppc64 | linux/ppc64le | linux/riscv64 | linux/s390x) ;;
             *) fail "platform $platform is not linux/<architecture>[/<variant>] of an architecture this library builds" ;;
           esac
           want=${platform#linux/}
@@ -305,12 +307,7 @@ steps:
             x86_64 | amd64) node=amd64 ;;
             aarch64 | arm64) node=arm64 ;;
             armv5* | armv6* | armv7* | armv8l | arm) node=arm ;;
-            i386 | i486 | i586 | i686) node=386 ;;
             loongarch64) node=loong64 ;;
-            mips) node=mips ;;
-            mipsel) node=mipsle ;;
-            mips64) node=mips64 ;;
-            mips64el) node=mips64le ;;
             ppc64) node=ppc64 ;;
             ppc64le) node=ppc64le ;;
             riscv64) node=riscv64 ;;
@@ -530,6 +527,14 @@ steps:
         if [ "${SCARAB_FORK_PR-}" != false ]; then
           echo "scarab: not pushed: this Run is a fork pull request's, or is locked out of its Environment's secrets"
           exit 0
+        fi
+        # A layouts line carries a digest only a build's result supplies.
+        # Without results (/scarab/results is absent, because the server
+        # has no results token secret) nothing can be checked, so nothing
+        # is pushed. `images` alone does not need results.
+        named=$(printf '%s' "${SCARAB_INDEX_LAYOUTS-}" | tr -d '\n')
+        if [ -n "$named" ] && [ ! -d /scarab/results ]; then
+          fail "results are not collected, so the layouts' digests cannot be checked against the builds'; set the server's results token secret (SCARAB_RESULTS_TOKEN_SECRET, the chart value secrets.resultsTokenSecret)"
         fi
         # Sets r to the resolved path. The `.` keeps a trailing newline in a
         # directory name from being dropped by the command substitution.
