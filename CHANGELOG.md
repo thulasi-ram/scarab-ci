@@ -18,6 +18,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-26
+
 ### Features
 
 - **New run with these inputs** (#225). A Run page's ⋯ menu opens the run form filled in with
@@ -2701,7 +2703,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.7...v0.8.0
 [0.7.7]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.6...v0.7.7
 [0.7.6]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.5...v0.7.6
