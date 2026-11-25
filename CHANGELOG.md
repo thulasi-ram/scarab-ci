@@ -18,6 +18,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-25
+
 ### Breaking changes
 
 - **Order: servers first, then libraries and `join`.** Upgrade every server replica before an org
@@ -2678,7 +2680,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.7...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.7...v0.8.0
 [0.7.7]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.6...v0.7.7
 [0.7.6]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.4...v0.7.5
