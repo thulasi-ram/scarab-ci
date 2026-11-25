@@ -280,7 +280,7 @@ export function defaultSelection(o: {
 
 // ── URL state ───────────────────────────────────────────────────────────────
 
-export type RunTabParam = "artifacts" | "activity" | "manifest";
+export type RunTabParam = "artifacts" | "activity" | "inputs" | "manifest";
 export type PaneTabParam = "results" | "workspace" | "outputs" | "source";
 
 /**
@@ -306,7 +306,7 @@ export type RunUrlState = {
 
 type Params = Record<string, string | string[] | null | undefined>;
 
-const RUN_TABS: readonly string[] = ["artifacts", "activity", "manifest"];
+const RUN_TABS: readonly string[] = ["artifacts", "activity", "inputs", "manifest"];
 const PANE_TABS: readonly string[] = ["results", "workspace", "outputs", "source"];
 
 function first(v: string | string[] | null | undefined): string | undefined {
@@ -442,7 +442,8 @@ export function nodeMeta(s: NodeMetaInput, now: number): { text: string; tone: M
  * How the graph band draws its content. The graph is drawn at 100% and never
  * shrunk to fit the height: the band is as tall as the graph, up to `maxH`,
  * and scrolls inside past that. Only a graph wider than the band shrinks, and
- * not below `minScale`; past that it scrolls (and pans) sideways.
+ * not below `minScale` (90%, so the node text stays readable); past that it
+ * scrolls (and pans) sideways.
  */
 export function fitBand(o: {
   bandW: number;
@@ -452,7 +453,7 @@ export function fitBand(o: {
   pad: number;
   minScale?: number;
 }): { scale: number; bandH: number; pannable: boolean } {
-  const min = o.minScale ?? 0.75;
+  const min = o.minScale ?? 0.9;
   const avail = Math.max(1, o.bandW - o.pad * 2);
   const scale = o.contentW <= avail ? 1 : Math.max(min, avail / o.contentW);
   const fullH = Math.round(o.contentH * scale + o.pad * 2);

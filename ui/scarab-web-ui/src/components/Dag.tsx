@@ -133,7 +133,7 @@ export default function Dag(props: {
   // ── Zoom and scroll ─────────────────────────────────────────────────────
   // The graph sits in a zoom layer scaled by `scale`, inside a sizer as big as
   // the scaled graph, inside the band, which scrolls. `fit()` sets the scale
-  // (1, or less for a graph wider than the band, not below 0.75) and the band
+  // (1, or less for a graph wider than the band, not below 0.9) and the band
   // height (the graph's, capped at ~60vh). Edges are measured in UNSCALED
   // graph coordinates (offsetLeft/offsetTop, which transforms don't touch), so
   // the zoom never moves them off their nodes.
@@ -572,7 +572,7 @@ export default function Dag(props: {
       segmentByMatrix(col, (c) => (c.kind === "step" ? c.step.id : null)).flatMap((seg) =>
         seg.items.filter((it) => it.item.kind === "step").map((it) => it.label),
       ),
-      { minChars: 26 },
+      { minChars: 21 },
     );
   const Cols = (p: { cols: DagCell<DagStep>[][] }) => (
     <div class="dag-cols">

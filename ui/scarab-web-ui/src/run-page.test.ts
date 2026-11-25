@@ -342,12 +342,12 @@ describe("fitBand", () => {
     });
   });
 
-  it("shrinks a wider graph, but not below 75%, then pans", () => {
-    const a = fitBand({ bandW: 848, contentW: 1000, contentH: 100, maxH: 480, pad: 24 });
-    expect(a.scale).toBeCloseTo(0.8);
+  it("shrinks a wider graph, but not below 90%, then pans", () => {
+    const a = fitBand({ bandW: 948, contentW: 1000, contentH: 100, maxH: 480, pad: 24 });
+    expect(a.scale).toBeCloseTo(0.9);
     expect(a.pannable).toBe(false);
     const b = fitBand({ bandW: 448, contentW: 1000, contentH: 100, maxH: 480, pad: 24 });
-    expect(b.scale).toBe(0.75);
+    expect(b.scale).toBe(0.9);
     expect(b.pannable).toBe(true);
   });
 });

@@ -366,6 +366,33 @@ test("the run header's ⋯ menu copies the run ID and keeps snapshots", async ({
   await expect(menu).toHaveCount(0);
 });
 
+// The rich run in src/mock.ts was started with five inputs. The Inputs tab
+// lists them; ⋯ → New run with these inputs opens the run form over the page,
+// filled in with them, and Run starts the run.
+test("a run's inputs: the Inputs tab and a new run filled in with them", async ({ page }) => {
+  await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}`);
+  const runTabs = page.getByRole("tablist", { name: "Run" });
+  await runTabs.getByRole("tab", { name: /^Inputs 5/ }).click();
+  await expect(page).toHaveURL(/[?&]tab=inputs(&|$)/);
+  await expect(page.locator(".ri-row dt")).toHaveText(["channel", "dry_run", "parallelism", "sign_images", "version"]);
+
+  await page.getByRole("button", { name: "More run actions" }).click();
+  await page.getByRole("menu", { name: "More run actions" }).getByRole("menuitem", { name: /New run with these inputs/ }).click();
+  const dialog = page.getByRole("dialog", { name: "Run release" });
+  await expect(dialog.getByLabel("version")).toHaveValue("0.8.1");
+  await expect(dialog.getByRole("radio", { name: "beta" })).toHaveAttribute("aria-checked", "true");
+  await expect(dialog.getByLabel("parallelism")).toHaveValue("8");
+
+  // A required input left empty is refused here, before any dispatch.
+  await dialog.getByLabel("version").fill("");
+  await dialog.getByRole("button", { name: "Run" }).click();
+  await expect(dialog.getByRole("alert")).toContainText("required");
+  await dialog.getByLabel("version").fill("0.8.2");
+  await dialog.getByRole("button", { name: "Run" }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect(page).toHaveURL(new RegExp(`/acme/scarab/runs/${RICH_RUN_ID}$`));
+});
+
 // The RETRIES run in src/mock.ts: live, with two matrix cells waiting for a
 // node, cleared Pod conditions on earlier tries, a step with three tries, one
 // with six, and artifacts that earlier tries also wrote.
