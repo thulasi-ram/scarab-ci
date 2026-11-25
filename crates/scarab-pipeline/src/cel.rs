@@ -943,4 +943,60 @@ mod tests {
         assert!(eval_bool_product("missing", &[], &dims, &[0]).is_err());
         assert!(eval_bool_product("1 +", &[], &dims, &[]).is_err());
     }
+
+    /// `<list>.join()` and `<list>.join(<sep>)`: the list's strings in
+    /// order with the separator between; a list holding anything but
+    /// strings, or a separator that is not a string, is an error.
+    #[test]
+    fn join_table() {
+        let ctx = json!({});
+        for (expr, want) in [
+            ("[].join()", ""),
+            (r#"["a"].join(",")"#, "a"),
+            (r#"["a", "b"].join("\n")"#, "a\nb"),
+            (r#"["a", "b"].join()"#, "ab"),
+            (r#"["a", "b", "c"].join(", ")"#, "a, b, c"),
+        ] {
+            assert_eq!(eval(expr, &ctx).unwrap(), json!(want), "{expr}");
+        }
+        for expr in ["[1].join()", r#"["a", 1].join(",")"#, r#"["a"].join(1)"#] {
+            assert!(eval(expr, &ctx).is_err(), "{expr}");
+        }
+        assert!(eval_bool(r#"["a"].join() == "a""#, &ctx).unwrap());
+        // In a template, over a list from the context.
+        assert_eq!(
+            interpolate(
+                "${{ xs.map(x, x.n).join(\"-\") }}",
+                &json!({ "xs": [{ "n": "1" }, { "n": "2" }] })
+            )
+            .unwrap(),
+            "1-2"
+        );
+    }
+
+    /// `calls` finds a call to `join` wherever the parser puts it, and
+    /// nothing in a string literal, another name, or text that does not
+    /// parse.
+    #[test]
+    fn calls_finds_join() {
+        for expr in [
+            r#"["a"].join()"#,
+            "xs.map(x, [x].join(','))",
+            "{'k': xs.join()}",
+            "size(xs.join()) > 0",
+            "xs.join(',') == 'a' ? 1 : 2",
+        ] {
+            assert!(calls(expr, "join"), "{expr}");
+        }
+        for expr in [
+            "'join'",
+            "xs.joined()",
+            "join",
+            "echo join",
+            "1 +",
+            "xs.size()",
+        ] {
+            assert!(!calls(expr, "join"), "{expr}");
+        }
+    }
 }
