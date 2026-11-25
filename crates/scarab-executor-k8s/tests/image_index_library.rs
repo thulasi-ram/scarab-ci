@@ -1294,8 +1294,8 @@ fn malformed_layouts_lines_are_refused() {
         format!("\n{l1}"),
         format!("{l1}\n{l2}\n\n"),
         format!("{l1}\n{l1}"),
-        "(amd64 wrote no layout)".to_string(),
-        format!("{l1}\n(arm64 wrote no layout)"),
+        "(linux/amd64 wrote no layout)".to_string(),
+        format!("{l1}\n(linux/arm64 wrote no layout)"),
     ] {
         let ran = h.ran(&[("SCARAB_INDEX_LAYOUTS", &layouts)]);
         assert_eq!(ran.code, Some(2), "{layouts:?}: {}", ran.stderr);
@@ -1599,6 +1599,8 @@ fn a_layout_count_other_than_the_one_expected_is_refused() {
         ("-1", format!("{l1}\n{l2}"), 2),
         ("", l1.clone(), 0),
         (UNSET, format!("{l1}\n{l2}\n{l3}"), 0),
+        // Three platforms, as build-multiarch counts them.
+        ("3", format!("{l1}\n{l2}\n{l3}"), 0),
         ("2", format!("{l1}\n{l2}"), 0),
         // Compared as text: "02" is not 2.
         ("02", format!("{l1}\n{l2}"), 2),

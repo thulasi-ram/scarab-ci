@@ -2260,6 +2260,222 @@ async fn the_build_library_builds_and_pushes_to_a_local_registry() {
     exec.cancel(&h).await.expect("cleanup build");
 }
 
+/// LIVE `lib:thulasi-ram::scarab-ci::build-multiarch` with `platforms`
+/// naming one platform, the node's (`linux/<Node .status.nodeInfo
+/// .architecture>`): compiled as Run creation stores it, the one build
+/// instance `app/build[arch=linux/<arch>]` builds in the sandbox with
+/// `--opt platform=` on real BuildKit, after its script reads busybox's
+/// `uname -m` and finds the node of that architecture; its `image` result
+/// (posted by the real results sidecar) feeds the push Step's
+/// `SCARAB_INDEX_LAYOUTS` template, a `map` over the instance list joined
+/// with Scarab's `join`, rendered here as the scheduler renders it, with
+/// count 1. The push Step pushes an index of one image to the in-cluster
+/// registry, and a verification Step finds the index, the image of that
+/// architecture in it, and the arch tag `live-<arch>`. Needs
+/// SCARAB_TEST_REGISTRY, SCARAB_TEST_SIDECAR_IMAGE and SCARAB_TEST_HOST_IP,
+/// as the build library's case does. `#[ignore]`d + SCARAB_TEST_KUBE
+/// gated.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn the_build_multiarch_library_builds_one_platform_and_pushes_an_index_of_one() {
+    let ns = enter_tier();
+    let registry = tier_var("SCARAB_TEST_REGISTRY");
+    let sidecar_image = tier_var("SCARAB_TEST_SIDECAR_IMAGE");
+    let host_ip = tier_var("SCARAB_TEST_HOST_IP");
+    let ws = workspace_fixture();
+    let run_id = unique_run("run-multiarch");
+
+    // A stub results API on the server's route, recording the Step id and
+    // the body of every POST the results sidecars make.
+    let received: std::sync::Arc<tokio::sync::Mutex<Vec<(String, serde_json::Value)>>> =
+        Default::default();
+    let rec = received.clone();
+    let app = axum::Router::new().route(
+        "/v1/runs/{run}/steps/{step}/results",
+        axum::routing::post(
+            move |axum::extract::Path((_run, step)): axum::extract::Path<(String, String)>,
+                  axum::Json(body): axum::Json<serde_json::Value>| {
+                let rec = rec.clone();
+                async move {
+                    rec.lock().await.push((step, body));
+                    axum::http::StatusCode::ACCEPTED
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let client = kube_client().await;
+    // The platform is the node's: a one-architecture cluster builds one.
+    let nodes: kube::Api<k8s_openapi::api::core::v1::Node> = kube::Api::all(client.clone());
+    let arch = nodes
+        .list(&Default::default())
+        .await
+        .expect("list nodes")
+        .items
+        .into_iter()
+        .find_map(|n| n.status?.node_info.map(|i| i.architecture))
+        .expect("a node's architecture");
+    let platform = format!("linux/{arch}");
+    let exec = K8sExecutor::with_client(ns, client)
+        .with_workspace_cas(ws.cas.clone())
+        .with_workspace_depot(ws.depot.clone())
+        .with_workspace_service(ws.fetch.clone())
+        .with_results_egress(scarab_executor_k8s::ResultsEgress {
+            base_url: format!("http://{host_ip}:{port}"),
+            token_secret: b"live-multiarch-results-secret".to_vec(),
+            sidecar_image,
+        });
+
+    use scarab_storage::Cas as _;
+    let ctx = tempfile::tempdir().expect("context dir");
+    std::fs::write(
+        ctx.path().join("Dockerfile"),
+        "FROM busybox\nRUN echo scarab-multiarch > /built.txt\n",
+    )
+    .unwrap();
+    let root = ws
+        .depot
+        .ingest(ctx.path().to_str().unwrap())
+        .await
+        .expect("ingest context")
+        .root
+        .0;
+
+    let repo = format!("{registry}/scarab-multiarch");
+    let target = format!("{repo}:live");
+    let ir = scarab_pipeline::compile_with_libraries(
+        &format!(
+            "steps:\n  - id: app\n    invoke: lib:thulasi-ram::scarab-ci::build-multiarch\n    with: {{ image: \"{target}\", platforms: \"{platform}\", insecure_push: \"true\" }}\n"
+        ),
+        &scarab_pipeline::Libraries {
+            installed: std::collections::BTreeMap::from([(
+                "thulasi-ram::scarab-ci::build-multiarch".to_string(),
+                scarab_pipeline::InstalledLibrary {
+                    content: include_str!("../../../libs/build-multiarch.yaml").to_string(),
+                    source: "github.com/thulasi-ram/scarab-ci//libs/build-multiarch.yaml@test"
+                        .into(),
+                },
+            )]),
+            ..Default::default()
+        },
+    )
+    .expect("build-multiarch compiles");
+    let build_id = format!("app/build[arch={platform}]");
+    let ids: Vec<&str> = ir.steps.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, [build_id.as_str(), "app/push"]);
+    let none = scarab_pipeline::Results::default();
+
+    let build = library_step_run(&run_id, &build_id, vec![StepId("checkout".into())]);
+    let build_spec = library_spec_with(&ir, &build_id, vec![root], &none);
+    assert!(
+        build_spec
+            .env
+            .iter()
+            .any(|(k, v)| k == "SCARAB_BUILD_PLATFORM" && *v == platform),
+        "{:?}",
+        build_spec.env
+    );
+    let h = exec
+        .launch(&build, &build_spec)
+        .await
+        .expect("launch the build instance");
+    assert_eq!(
+        poll_to_terminal(&exec, &h, 300).await,
+        Some(ExecState::Succeeded),
+        "the build instance succeeds on a node of its architecture"
+    );
+    let built = exec
+        .output(&h)
+        .await
+        .expect("output")
+        .expect("the build Step published its workspace");
+    let mut image = None;
+    for _ in 0..60 {
+        image = received
+            .lock()
+            .await
+            .iter()
+            .filter(|(step, _)| *step == build_id)
+            .find_map(|(_, body)| body.get("image").cloned());
+        if image.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let image = image.expect("the build instance published its image result");
+    let digest = image["digest"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no digest in {image}"))
+        .to_string();
+    let layout = format!(
+        "/workspace/.scarab-build/{}/oci",
+        &scarab_storage::sha256_hex(build_id.as_bytes())[..32]
+    );
+    assert_eq!(image["layout"], layout.as_str(), "{image}");
+
+    let results: scarab_pipeline::Results = std::collections::BTreeMap::from([(
+        build_id.clone(),
+        std::collections::BTreeMap::from([("image".to_string(), image.clone())]),
+    )]);
+    let push = library_spec_with(&ir, "app/push", vec![built], &results);
+    let env = |name: &str| {
+        push.env
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("no {name} in {:?}", push.env))
+    };
+    assert_eq!(env("SCARAB_INDEX_LAYOUTS"), format!("{layout} {digest}"));
+    assert_eq!(env("SCARAB_INDEX_LAYOUT_COUNT"), "1");
+    let ph = exec
+        .launch(
+            &library_step_run(&run_id, "app/push", vec![StepId(build_id.clone())]),
+            &push,
+        )
+        .await
+        .expect("launch push");
+    assert_eq!(
+        poll_to_terminal(&exec, &ph, 300).await,
+        Some(ExecState::Succeeded),
+        "the push Step pushes an index of the one image"
+    );
+
+    let verify = StepSpec {
+        command: vec![
+            "/busybox/sh".into(),
+            "-c".into(),
+            format!(
+                "set -eu; m=$(crane manifest --insecure {target}); echo \"$m\"; \
+                 echo \"$m\" | grep -q '\"manifests\"'; echo \"$m\" | grep -q '{digest}'; \
+                 echo \"$m\" | grep -q '\"architecture\":\"{arch}\"'; \
+                 tags=$(crane ls --insecure {repo}); echo \"$tags\"; \
+                 echo \"$tags\" | grep -qx 'live-{arch}'; \
+                 [ \"$(crane digest --insecure {repo}:live-{arch})\" = '{digest}' ]"
+            ),
+        ],
+        env: vec![],
+        workspace_inputs: vec![],
+        registry_auth: None,
+        ..push.clone()
+    };
+    let vh = exec
+        .launch(&library_step_run(&run_id, "verify", vec![]), &verify)
+        .await
+        .expect("launch verify");
+    assert_eq!(
+        poll_to_terminal(&exec, &vh, 120).await,
+        Some(ExecState::Succeeded),
+        "the registry holds an index of the one platform and its arch tag"
+    );
+
+    for handle in [&vh, &ph, &h] {
+        exec.cancel(handle).await.expect("cleanup");
+    }
+}
+
 /// `libs/build-layout.yaml` (invoke `amd64`) feeding `libs/image-index.yaml`
 /// (invoke `app`) through the documented `layouts` line, compiled as Run
 /// creation stores them, the index pushed to `target` with the extra tag

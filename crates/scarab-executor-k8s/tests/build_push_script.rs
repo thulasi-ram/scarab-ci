@@ -117,8 +117,9 @@ echo "registry.example/app@$CRANE_DIGEST"
 
     /// Runs the script over the defaults (push `registry.example/app:1`,
     /// not a fork, not insecure, no registry login, the build Step reported
-    /// [`DIGEST`] and the layout at [`Harness::oci`], the Step is
-    /// `image/push`, crane reports [`DIGEST`]), then `given`.
+    /// [`DIGEST`] and the layout at [`Harness::oci`], crane reports
+    /// [`DIGEST`]; SCARAB_STEP unset, as the script no longer reads it),
+    /// then `given`.
     fn run(&self, given: &[(&str, &str)]) -> Ran {
         let log = self.base.join("called");
         let saw = self.base.join("saw");
@@ -143,7 +144,7 @@ echo "registry.example/app@$CRANE_DIGEST"
             .env("SCARAB_BUILD_INSECURE_PUSH", "false")
             .env("SCARAB_BUILD_DIGEST", DIGEST)
             .env("SCARAB_BUILD_LAYOUT", self.oci())
-            .env("SCARAB_STEP", "image/push")
+            .env_remove("SCARAB_STEP")
             .env("SCARAB_FORK_PR", "false");
         for (name, value) in given {
             cmd.env(name, value);
@@ -243,39 +244,73 @@ fn an_index_json_crane_would_read_differently_is_refused() {
     }
 }
 
-/// Owner decision: when Scarab does not collect results (no
-/// /scarab/results) the build Step's result cannot reach this Step, so the
-/// push goes ahead without the digest check, and the layout's path is found
-/// from this Step's id (`image/push` → the build Step `image/image`); the
-/// log says both with a warning.
+/// #219: when Scarab does not collect results (no /scarab/results) the
+/// build Step's digest cannot reach this Step, so nothing could check the
+/// layout against it: the push is refused (exit 2) before crane runs, and
+/// the message names the setting that turns results on.
 #[test]
-fn without_results_the_push_warns_that_the_digest_check_was_skipped() {
+fn without_results_the_push_is_refused() {
     let h = Harness::new();
     std::fs::remove_dir(h.base.join("results")).unwrap();
-    h.layout(&buildkit_index(DIGEST));
-    let ran = h.run(&[("SCARAB_BUILD_DIGEST", ""), ("SCARAB_BUILD_LAYOUT", "")]);
-    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
-    for warning in [
-        "scarab: warning: results are not collected, so the layout is not checked against the build step's digest",
-        "scarab: warning: results are not collected, so the layout's path is found from the step id",
+    for given in [
+        &[][..],
+        &[("SCARAB_BUILD_DIGEST", ""), ("SCARAB_BUILD_LAYOUT", "")][..],
     ] {
+        h.layout(&buildkit_index(DIGEST));
+        let ran = h.run(given);
+        assert_eq!(ran.code, Some(2), "{given:?}: {}", ran.stderr);
+        assert_eq!(
+            ran.stderr.trim_end(),
+            "scarab: push refused: results are not collected, so the image's digest cannot be \
+             checked against the build step's; set the server's results token secret \
+             (SCARAB_RESULTS_TOKEN_SECRET, the chart value secrets.resultsTokenSecret)",
+            "{given:?}"
+        );
         assert!(
-            ran.stderr.lines().any(|l| l == warning),
-            "{warning}: {}",
-            ran.stderr
+            ran.crane.is_empty(),
+            "{given:?}: crane ran: {:?}",
+            ran.crane
+        );
+        assert!(!h.base.join("called").exists(), "{given:?}");
+    }
+}
+
+/// `push: false` and a fork's Run exit 0 before the results check: they
+/// push nothing, so nothing needs checking.
+#[test]
+fn push_false_and_fork_exit_before_the_results_check() {
+    let h = Harness::new();
+    std::fs::remove_dir(h.base.join("results")).unwrap();
+    for given in [
+        &[("SCARAB_BUILD_PUSH", "false")][..],
+        &[("SCARAB_FORK_PR", "true")][..],
+        &[("SCARAB_FORK_PR", "")][..],
+    ] {
+        h.layout(&buildkit_index(DIGEST));
+        let ran = h.run(given);
+        assert_eq!(ran.code, Some(0), "{given:?}: {}", ran.stderr);
+        assert!(
+            ran.crane.is_empty(),
+            "{given:?}: crane ran: {:?}",
+            ran.crane
         );
     }
+}
+
+/// The layout comes from the build Step's result, never from this Step's
+/// id: an unrelated SCARAB_STEP changes nothing.
+#[test]
+fn with_results_the_path_ignores_scarab_step() {
+    let h = Harness::new();
+    h.layout(&buildkit_index(DIGEST));
+    let ran = h.run(&[("SCARAB_STEP", "other/thing")]);
+    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
     let layout = h.oci().display().to_string();
     assert_eq!(
         ran.crane,
         ["push", layout.as_str(), "registry.example/app:1"]
     );
-    // With results collected, the same push carries no warning.
-    std::fs::create_dir(h.base.join("results")).unwrap();
-    h.layout(&buildkit_index(DIGEST));
-    let ran = h.run(&[]);
-    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
-    assert!(!ran.stderr.contains("warning"), "{}", ran.stderr);
+    assert!(h.pushed());
 }
 
 // Attack: the build Step's `image` result is written in the build Pod, where
@@ -305,35 +340,29 @@ fn a_layout_path_the_result_names_outside_the_build_directory_is_refused() {
     }
 }
 
-// Attack: results are collected but the build Step's result names no layout
-// (a rewritten result, or a build of another library). Falling back to the
-// path from the Step id would push whatever sits there. Safe outcome: exit
-// 2 before crane runs, though a valid layout sits at that path.
+// Attack: results are collected but the build Step's result names no layout,
+// or no digest (a rewritten result, or a build of another library). Pushing
+// whatever sits at the build Step's path, or pushing unchecked, would push
+// what the build may not have built. Safe outcome: exit 2 before crane
+// runs, naming what the result lacks, though a valid layout sits there.
 #[test]
-fn results_present_but_no_layout_is_refused() {
+fn empty_layout_or_digest_is_refused_with_results() {
     let h = Harness::new();
-    h.layout(&buildkit_index(DIGEST));
-    let ran = h.run(&[("SCARAB_BUILD_LAYOUT", "")]);
-    assert_eq!(ran.code, Some(2), "{}", ran.stderr);
-    assert!(ran.crane.is_empty(), "crane ran: {:?}", ran.crane);
-    assert!(!h.pushed());
-}
-
-/// With no results, the path comes from the Step id, which must be this
-/// library's push Step (`<invoke>/push`); any other id (none included)
-/// exits 2 before crane runs.
-#[test]
-fn without_results_a_step_id_not_ending_in_push_is_refused() {
-    let h = Harness::new();
-    std::fs::remove_dir(h.base.join("results")).unwrap();
-    for step in ["image/image", "/push", ""] {
-        h.layout(&buildkit_index(DIGEST));
-        let ran = h.run(&[
+    for (given, want) in [
+        (
             ("SCARAB_BUILD_LAYOUT", ""),
+            "scarab: push refused: the build step reported no image layout (its image result has no layout)",
+        ),
+        (
             ("SCARAB_BUILD_DIGEST", ""),
-            ("SCARAB_STEP", step),
-        ]);
-        assert_eq!(ran.code, Some(2), "{step:?}: {}", ran.stderr);
-        assert!(ran.crane.is_empty(), "{step:?}: crane ran: {:?}", ran.crane);
+            "scarab: push refused: the build step reported no image digest (its image result has no containerimage.digest)",
+        ),
+    ] {
+        h.layout(&buildkit_index(DIGEST));
+        let ran = h.run(&[given]);
+        assert_eq!(ran.code, Some(2), "{given:?}: {}", ran.stderr);
+        assert_eq!(ran.stderr.trim_end(), want, "{given:?}");
+        assert!(ran.crane.is_empty(), "{given:?}: crane ran: {:?}", ran.crane);
+        assert!(!h.pushed());
     }
 }
