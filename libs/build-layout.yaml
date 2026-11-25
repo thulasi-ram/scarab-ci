@@ -232,6 +232,7 @@ steps:
           want=${platform#linux/}
           want=${want%%/*}
           m=$(uname -m) || fail "cannot read this node's architecture"
+          [ -n "$m" ] || fail "cannot read this node's architecture"
           case "$m" in
             x86_64 | amd64) node=amd64 ;;
             aarch64 | arm64) node=arm64 ;;
