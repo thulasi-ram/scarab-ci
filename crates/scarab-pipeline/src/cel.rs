@@ -341,9 +341,9 @@ pub(crate) fn eval_bool_product(
     points: &[usize],
 ) -> Result<Vec<bool>, PipelineError> {
     with_program(expr, |program| {
-        // One context: building one registers the standard functions, which
-        // costs more than the evaluation. Each binding replaces the last.
-        let mut context = Context::default();
+        // One context, over the functions every expression has (built once,
+        // `join` included). Each binding replaces the last.
+        let mut context = Context::with_env(env());
         for (name, value) in fixed {
             context.add_variable_from_value(*name, cel::Value::String(value.clone()));
         }
