@@ -2563,17 +2563,13 @@ fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineErr
     }
 
     // A Step with a scope renders differently from one without: a server
-    // that predates scopes must not launch it (see [`IR_VERSION_SCOPED`]),
-    // nor one that predates instance lists and `join`
-    // ([`IR_VERSION_INSTANCES`]).
-    let ir_version = if expanded.iter().any(needs_instances_renderer) {
-        authored.ir_version.max(IR_VERSION_INSTANCES)
-    } else if expanded.iter().any(|s| s.scope.is_some()) {
+    // that predates scopes must not launch it (see [`IR_VERSION_SCOPED`]).
+    let ir_version = if expanded.iter().any(|s| s.scope.is_some()) {
         authored.ir_version.max(IR_VERSION_SCOPED)
     } else {
         authored.ir_version
     };
-    let ir = PipelineIr {
+    let mut ir = PipelineIr {
         ir_version,
         kind: None,
         name: authored.name,
@@ -2594,6 +2590,11 @@ fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineErr
         return Err(PipelineError::Validation(vec![ir_too_large(
             "the pipeline",
         )]));
+    }
+    // Nor may a server that predates instance lists and `join`
+    // ([`IR_VERSION_INSTANCES`]) render or evaluate any of it.
+    if ir.steps.iter().any(lists_instances) || calls_join(&ir) {
+        ir.ir_version = ir.ir_version.max(IR_VERSION_INSTANCES);
     }
     validate_with(&ir, &written_build_needs).map_err(PipelineError::Validation)?;
     Ok(ir)
@@ -2619,39 +2620,55 @@ fn instances_view(scope: &mut Scope, matrixed: &BTreeMap<String, Vec<InstanceSou
     }
 }
 
-/// Whether `step` renders only on a server that has
-/// [`IR_VERSION_INSTANCES`]: a scope in its chain lists instances, or a
-/// template it renders at launch (its own, or a caller's `with:`) calls
-/// `join`.
-fn needs_instances_renderer(step: &StepSpec) -> bool {
-    let chain = || step.scope.iter().flat_map(Scope::chain);
-    let lists = chain().any(|s| {
+/// Whether a scope in `step`'s chain lists the instances of a matrix Step
+/// ([`OutputSource::Instances`]), which only a server that has
+/// [`IR_VERSION_INSTANCES`] renders.
+fn lists_instances(step: &StepSpec) -> bool {
+    step.scope.iter().flat_map(Scope::chain).any(|s| {
         s.outputs
             .values()
             .any(|o| matches!(o, OutputSource::Instances(_)))
-    });
-    let templates = interpolatable_strings(step)
-        .into_iter()
-        .chain(chain().flat_map(|s| {
-            let bindings = match &s.inputs {
-                ScopeInputs::Bound(b) => Some(b),
-                ScopeInputs::Run => None,
-            };
-            bindings
-                .into_iter()
-                .flatten()
-                .filter_map(|(_, b)| match &b.value {
-                    BoundValue::Template(t) => Some(t.as_str()),
-                    BoundValue::Literal(_) => None,
-                })
-        }));
-    lists
-        || templates.filter(|t| t.contains("join")).any(|t| {
-            cel::scan_interpolations(t)
-                .0
+    })
+}
+
+/// Whether any CEL the compiled Pipeline holds calls `join`, which only a
+/// server that has [`IR_VERSION_INSTANCES`] evaluates. Every string of the
+/// stored IR is read, so no place an expression can be written is missed:
+/// each `${{ … }}` of a template (image, command, env, a caller's `with:`
+/// in a scope, `concurrency.group`), and a string with none read whole as
+/// an expression (a Step's `when:`, a guard, a trigger's `when:`, an
+/// input's or output's `validate:`). A string that is not CEL does not
+/// parse and calls nothing; one that parses by accident only raises the
+/// version.
+fn calls_join(ir: &PipelineIr) -> bool {
+    /// Each distinct string that mentions `join`: a matrix's copies of a
+    /// Step, and a library's bindings on each of its Steps, share text.
+    fn collect<'a>(v: &'a serde_json::Value, out: &mut BTreeSet<&'a str>) {
+        match v {
+            serde_json::Value::String(text) if text.contains("join") => {
+                out.insert(text);
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|x| collect(x, out)),
+            serde_json::Value::Object(fields) => fields.values().for_each(|x| collect(x, out)),
+            _ => {}
+        }
+    }
+    let Ok(value) = serde_json::to_value(ir) else {
+        return false;
+    };
+    let mut texts = BTreeSet::new();
+    collect(&value, &mut texts);
+    let any_join = texts.into_iter().any(|text| {
+        let (found, _) = cel::scan_interpolations(text);
+        if found.is_empty() {
+            cel::calls(text.trim(), "join")
+        } else {
+            found
                 .iter()
-                .any(|i| cel::calls(t[i.inner.clone()].trim(), "join"))
-        })
+                .any(|i| cel::calls(text[i.inner.clone()].trim(), "join"))
+        }
+    });
+    any_join
 }
 
 /// The repository paths an authored pipeline's `invoke: file:` steps name, so
@@ -4881,14 +4898,24 @@ fn parse_coordinate_key(key: &str) -> Option<(&str, Vec<(&str, &str)>)> {
 }
 
 /// For a `placement_profiles` key that names no library Step: the
-/// coordinate keys to write when it is a value, or a value's last
-/// `/`-segment, of a matrix Step's dimension (`amd64` for `linux/amd64`).
+/// coordinate keys to write when it is a value of a matrix Step's
+/// dimension, the second `/`-segment of one (the architecture of
+/// `os/arch[/variant]`: `amd64` for `linux/amd64`, `arm` for
+/// `linux/arm/v7`), or its last.
 fn coordinate_key_hint(key: &str, resolved: &[StepSpec]) -> String {
     let mut keys: Vec<String> = Vec::new();
     for s in resolved.iter().filter(|s| !s.id.contains('/')) {
         for (dim, values) in s.matrix.iter().flat_map(|m| m.dimensions.iter()) {
             for v in values.values().unwrap_or_default() {
-                if v == key || v.rsplit('/').next() == Some(key) {
+                // `os/arch[/variant]`: the old key was the architecture
+                // (`arm` for `linux/arm/v7`); a value without `/` is
+                // matched whole.
+                let mut parts = v.split('/');
+                let arch = match (parts.next(), parts.next()) {
+                    (Some(_), Some(arch)) => arch,
+                    _ => v.as_str(),
+                };
+                if v == key || arch == key || v.rsplit('/').next() == Some(key) {
                     keys.push(format!("`{}[{dim}={v}]`", s.id));
                 }
             }
