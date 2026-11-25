@@ -11704,6 +11704,43 @@ mod tests {
         tempfile::TempDir,
         impl Fn(&[(&str, &str)]) -> (Option<i32>, bool),
     ) {
+        let (tmp, run) = build_script_harness(false);
+        (tmp, move |given: &[(&str, &str)]| {
+            let (out, reached) = run(given);
+            (out.status.code(), reached)
+        })
+    }
+
+    /// The first 32 hex characters of the SHA-256 of a build Step's id: the
+    /// key of the directory its image layout is written under, computed here
+    /// rather than copied from the script.
+    #[cfg(unix)]
+    fn layout_key(step: &str) -> String {
+        scarab_storage::sha256_hex(step.as_bytes())[..32].to_string()
+    }
+
+    /// Where the build Step `step` writes its layout, relative to the
+    /// workspace: `.scarab-build/<key>/oci`.
+    #[cfg(unix)]
+    fn layout_rel(step: &str) -> String {
+        format!(".scarab-build/{}/oci", layout_key(step))
+    }
+
+    /// [`build_library_harness`] with the whole process output. The stub
+    /// `buildctl-daemonless.sh` copies `STUB_METADATA` (a file) to the path
+    /// after `--metadata-file`, or links it there when `STUB_META_LINK` is
+    /// set, and exits `STUB_EXIT` (0 by default). With `results`, the
+    /// script's `/scarab/results` is `results/` in the temp dir, so it asks
+    /// BuildKit for its metadata and extends it; without, the host has no
+    /// `/scarab/results` and no metadata is asked for. `SCARAB_STEP` is
+    /// `image/image` unless a case gives another.
+    #[cfg(unix)]
+    fn build_script_harness(
+        results: bool,
+    ) -> (
+        tempfile::TempDir,
+        impl Fn(&[(&str, &str)]) -> (std::process::Output, bool),
+    ) {
         use std::os::unix::fs::PermissionsExt;
 
         let script = build_library_script("image");
@@ -11722,22 +11759,42 @@ mod tests {
         std::fs::write(
             &stub,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                r#"#!/bin/sh
+printf '%s\n' "$@" > '{}'
+meta=
+while [ $# -gt 0 ]; do
+  [ "$1" != --metadata-file ] || meta=$2
+  shift
+done
+if [ -n "$meta" ] && [ -n "${{STUB_METADATA-}}" ]; then
+  if [ -n "${{STUB_META_LINK-}}" ]; then ln -s "$STUB_METADATA" "$meta"; else cp "$STUB_METADATA" "$meta"; fi
+fi
+exit "${{STUB_EXIT:-0}}"
+"#,
                 record.display()
             ),
         )
         .unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         let pinned = format!("root={WORKSPACE_MOUNT_PATH}\n");
-        let buildctl = "exec /usr/bin/buildctl-daemonless.sh ";
+        let buildctl = "/usr/bin/buildctl-daemonless.sh ";
         assert!(script.contains(&pinned) && script.contains(buildctl));
-        let script = script
+        assert!(script.contains("/scarab/results"));
+        let mut script = script
             .replace(&pinned, &format!("root='{}'\n", ws.display()))
-            .replace(buildctl, &format!("exec '{}' ", stub.display()));
+            .replace(buildctl, &format!("'{}' ", stub.display()));
+        if results {
+            let dir = base.join("results");
+            std::fs::create_dir(&dir).unwrap();
+            script = script.replace("/scarab/results", &dir.display().to_string());
+        }
         let run = move |given: &[(&str, &str)]| {
             let _ = std::fs::remove_file(&record);
             let mut cmd = std::process::Command::new("/bin/sh");
             cmd.args(["-c", &script, "scarab-build"]).current_dir(&base);
+            for name in ["STUB_METADATA", "STUB_META_LINK", "STUB_EXIT"] {
+                cmd.env_remove(name);
+            }
             for (name, value) in [
                 ("SCARAB_BUILD_IMAGE", "registry.example/app:1"),
                 ("SCARAB_BUILD_PUSH", "false"),
@@ -11746,6 +11803,7 @@ mod tests {
                 ("SCARAB_BUILD_ARGS", ""),
                 ("SCARAB_BUILD_CACHE", "none"),
                 ("SCARAB_FORK_PR", "false"),
+                ("SCARAB_STEP", "image/image"),
             ] {
                 cmd.env(name, value);
             }
@@ -11753,7 +11811,7 @@ mod tests {
                 cmd.env(name, value);
             }
             let out = cmd.output().unwrap();
-            (out.status.code(), record.exists())
+            (out, record.exists())
         };
         (tmp, run)
     }
@@ -11947,7 +12005,7 @@ mod tests {
     }
 
     /// The build Step writes an image to push as an OCI layout at
-    /// `.scarab-build/oci` in the workspace, after removing whatever an
+    /// `.scarab-build/<key>/oci` in the workspace, after removing whatever an
     /// earlier Step left there (a symlink included, never its target). A
     /// fork pull request's build (SCARAB_FORK_PR=true, which Scarab sets on
     /// every launch of the Step, or any value but `false`) writes no layout,
@@ -11997,10 +12055,17 @@ mod tests {
         assert_eq!(run(&given), (Some(0), true));
         let argv = called();
         let argv: Vec<&str> = argv.lines().collect();
-        let layout = format!("type=oci,dest={}/.scarab-build/oci,tar=false", ws.display());
+        let layout = format!(
+            "type=oci,dest={}/{},tar=false",
+            ws.display(),
+            layout_rel("image/image")
+        );
         assert!(argv.contains(&layout.as_str()), "{argv:?}");
         assert!(argv.contains(&"--export-cache"), "{argv:?}");
-        assert!(ws.join(".scarab-build").is_dir());
+        assert!(ws
+            .join(".scarab-build")
+            .join(layout_key("image/image"))
+            .is_dir());
         assert!(
             !argv.iter().any(|a| a.starts_with("type=image")),
             "{argv:?}"
@@ -12011,6 +12076,225 @@ mod tests {
         assert!(!ws.join(".scarab-build").exists());
         // A registry cache is gone: it needs the push credential here.
         assert_eq!(run(&[("SCARAB_BUILD_CACHE", "registry")]), (Some(2), false));
+    }
+
+    /// The layout's directory is keyed by the hash of the build Step's id,
+    /// so two builds a later Step joins write different paths; an invoke
+    /// matrix's `[`, `=` and `,` in the id never reach BuildKit's `--output`
+    /// value, where a `,` would start another option.
+    #[cfg(unix)]
+    #[test]
+    fn the_layout_key_is_the_hash_of_the_step_id() {
+        let (tmp, run) = build_library_harness();
+        let base = tmp.path().canonicalize().unwrap();
+        let ws = base.join("workspace");
+        for step in [
+            "image/image",
+            "app[platform=linux/arm64,os=x]/image",
+            "a/b/c/image",
+        ] {
+            assert_eq!(
+                run(&[("SCARAB_BUILD_PUSH", "true"), ("SCARAB_STEP", step)]),
+                (Some(0), true),
+                "{step}"
+            );
+            let argv = std::fs::read_to_string(base.join("called")).unwrap();
+            let outputs: Vec<&str> = argv
+                .lines()
+                .filter(|a| a.starts_with("type=oci,"))
+                .collect();
+            let want = format!(
+                "type=oci,dest={}/{},tar=false",
+                ws.display(),
+                layout_rel(step)
+            );
+            assert_eq!(outputs, [want.as_str()], "{step}");
+            assert_eq!(outputs[0].matches(",dest=").count(), 1, "{step}");
+            assert_eq!(outputs[0].matches(',').count(), 2, "{step}");
+            assert!(
+                ws.join(".scarab-build").join(layout_key(step)).is_dir(),
+                "{step}"
+            );
+        }
+    }
+
+    /// A layout needs the Step id for its path: a push with no SCARAB_STEP
+    /// exits 2 before buildctl runs. An image kept in BuildKit needs no
+    /// path, and builds.
+    #[cfg(unix)]
+    #[test]
+    fn a_push_without_a_step_id_is_refused() {
+        let (_tmp, run) = build_library_harness();
+        assert_eq!(
+            run(&[("SCARAB_BUILD_PUSH", "true"), ("SCARAB_STEP", "")]),
+            (Some(2), false)
+        );
+        assert_eq!(
+            run(&[("SCARAB_BUILD_PUSH", "false"), ("SCARAB_STEP", "")]),
+            (Some(0), true)
+        );
+    }
+
+    /// Metadata as buildctl writes it with `--metadata-file`: indented, with
+    /// the descriptor's own nested `digest`, and the image digest `digest`.
+    #[cfg(unix)]
+    fn buildkit_metadata(digest: &str) -> String {
+        format!(
+            r#"{{
+  "buildx.build.ref": "scarab/scarab0/abcdef",
+  "containerimage.config.digest": "sha256:{config}",
+  "containerimage.descriptor": {{
+    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+    "digest": "{digest}",
+    "size": 482
+  }},
+  "containerimage.digest": "{digest}"
+}}
+"#,
+            config = "9".repeat(64)
+        )
+    }
+
+    /// With results collected, the build Step's `image` result is BuildKit's
+    /// metadata with `digest` (copied from `containerimage.digest`, a key a
+    /// template can read with no `.` in it) and, when it wrote a layout,
+    /// `layout` (the layout's path), added last. A fork's build writes no
+    /// layout, so its result has `digest` and no `layout`.
+    #[cfg(unix)]
+    #[test]
+    fn the_image_result_gains_digest_and_layout() {
+        let (tmp, run) = build_script_harness(true);
+        let base = tmp.path().canonicalize().unwrap();
+        let ws = base.join("workspace");
+        let digest = format!("sha256:{}", "b".repeat(64));
+        let metadata = base.join("metadata.json");
+        std::fs::write(&metadata, buildkit_metadata(&digest)).unwrap();
+        let from_buildkit: serde_json::Value =
+            serde_json::from_str(&buildkit_metadata(&digest)).unwrap();
+        let meta = metadata.display().to_string();
+        let result = base.join("results/image.json");
+        for (fork, layout) in [
+            (
+                "false",
+                Some(format!("{}/{}", ws.display(), layout_rel("image/image"))),
+            ),
+            ("true", None),
+        ] {
+            let _ = std::fs::remove_file(&result);
+            let (out, reached) = run(&[
+                ("SCARAB_BUILD_PUSH", "true"),
+                ("SCARAB_FORK_PR", fork),
+                ("STUB_METADATA", meta.as_str()),
+            ]);
+            assert_eq!(
+                (out.status.code(), reached),
+                (Some(0), true),
+                "fork={fork}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let text = std::fs::read_to_string(&result).unwrap();
+            let got: serde_json::Value = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("fork={fork}: not JSON ({e}): {text}"));
+            for (key, value) in from_buildkit.as_object().unwrap() {
+                assert_eq!(&got[key], value, "fork={fork}: {key} kept");
+            }
+            assert_eq!(got["digest"], digest.as_str(), "fork={fork}");
+            assert_eq!(
+                got.get("layout").and_then(|v| v.as_str()),
+                layout.as_deref(),
+                "fork={fork}"
+            );
+            assert!(
+                !base.join("results/image.json.scarab").exists(),
+                "fork={fork}"
+            );
+        }
+    }
+
+    /// Metadata the script cannot extend fails a build that wrote a layout
+    /// (exit 2: the Step that pushes it needs `digest` and `layout`); a
+    /// build that kept its image in BuildKit warns and keeps the result as
+    /// BuildKit wrote it (exit 0).
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_metadata_fails_only_when_a_layout_was_written() {
+        let (tmp, run) = build_script_harness(true);
+        let base = tmp.path().canonicalize().unwrap();
+        let result = base.join("results/image.json");
+        let hex = "b".repeat(64);
+        let one = format!(r#""containerimage.digest": "sha256:{hex}""#);
+        let rows: [(&str, Option<String>, bool); 5] = [
+            ("no metadata file", None, false),
+            ("a symlink", Some(format!("{{{one}}}")), true),
+            (
+                "no containerimage.digest",
+                Some(r#"{"containerimage.config.digest": "sha256:1"}"#.to_string()),
+                false,
+            ),
+            ("two digests", Some(format!("{{{one},\n{one}}}")), false),
+            ("not one object", Some(format!("[{{{one}}}]")), false),
+        ];
+        for (what, metadata, link) in &rows {
+            let src = base.join("metadata.json");
+            let _ = std::fs::remove_file(&src);
+            let mut given = vec![];
+            let meta = src.display().to_string();
+            if let Some(m) = metadata {
+                std::fs::write(&src, m).unwrap();
+                given.push(("STUB_METADATA", meta.as_str()));
+            }
+            if *link {
+                given.push(("STUB_META_LINK", "1"));
+            }
+            for push in ["true", "false"] {
+                let _ = std::fs::remove_file(&result);
+                let mut given = given.clone();
+                given.push(("SCARAB_BUILD_PUSH", push));
+                let (out, reached) = run(&given);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert!(reached, "{what} push={push}");
+                if push == "true" {
+                    assert_eq!(out.status.code(), Some(2), "{what}: {stderr}");
+                    continue;
+                }
+                assert_eq!(out.status.code(), Some(0), "{what}: {stderr}");
+                assert!(
+                    stderr.contains("scarab: warning: ")
+                        && stderr.contains("the image result has no digest key"),
+                    "{what}: {stderr}"
+                );
+                // Left as BuildKit wrote it: absent, or the same bytes.
+                match metadata {
+                    None => assert!(std::fs::symlink_metadata(&result).is_err(), "{what}"),
+                    Some(m) => {
+                        assert_eq!(&std::fs::read_to_string(&result).unwrap(), m, "{what}")
+                    }
+                }
+            }
+        }
+    }
+
+    /// buildctl runs as the script's child: its exit code is the Step's,
+    /// and a failed build's result is not extended.
+    #[cfg(unix)]
+    #[test]
+    fn the_build_exit_code_passes_through() {
+        let (tmp, run) = build_script_harness(true);
+        let base = tmp.path().canonicalize().unwrap();
+        let metadata = base.join("metadata.json");
+        let written = buildkit_metadata(&format!("sha256:{}", "b".repeat(64)));
+        std::fs::write(&metadata, &written).unwrap();
+        let meta = metadata.display().to_string();
+        let (out, reached) = run(&[
+            ("SCARAB_BUILD_PUSH", "true"),
+            ("STUB_METADATA", meta.as_str()),
+            ("STUB_EXIT", "7"),
+        ]);
+        assert_eq!((out.status.code(), reached), (Some(7), true));
+        assert_eq!(
+            std::fs::read_to_string(base.join("results/image.json")).unwrap(),
+            written
+        );
     }
 
     /// The manifest [`write_layout`] puts in a layout, and its digest.
@@ -12072,12 +12356,15 @@ mod tests {
             cmd.args(["-c", &script, "scarab-push"]).current_dir(&base);
             // No registry login unless a case gives one.
             cmd.env_remove("DOCKER_CONFIG");
+            let layout = ws.join(layout_rel("image/image")).display().to_string();
             for (name, value) in [
                 ("SCARAB_BUILD_IMAGE", "registry.example/app:1"),
                 ("SCARAB_BUILD_PUSH", "true"),
                 ("SCARAB_BUILD_INSECURE_PUSH", "false"),
                 ("SCARAB_BUILD_DIGEST", LAYOUT_DIGEST),
+                ("SCARAB_BUILD_LAYOUT", layout.as_str()),
                 ("SCARAB_FORK_PR", "false"),
+                ("SCARAB_STEP", "image/push"),
             ] {
                 cmd.env(name, value);
             }
@@ -12111,17 +12398,21 @@ mod tests {
     /// Writes the layout the build Step leaves in `ws`: plain directories
     /// and regular files, with an index.json naming one manifest,
     /// [`LAYOUT_MANIFEST`], stored under its digest [`LAYOUT_DIGEST`].
+    /// It is at `.scarab-build/<key>/oci`, the key that of the build Step
+    /// `image/image`.
     #[cfg(unix)]
     fn write_layout(ws: &std::path::Path) {
-        let blobs = ws.join(".scarab-build/oci/blobs/sha256");
+        write_layout_at(&ws.join(layout_rel("image/image")));
+    }
+
+    /// [`write_layout`] at the layout directory `oci`.
+    #[cfg(unix)]
+    fn write_layout_at(oci: &std::path::Path) {
+        let blobs = oci.join("blobs/sha256");
         std::fs::create_dir_all(&blobs).unwrap();
-        std::fs::create_dir_all(ws.join(".scarab-build/oci/ingest")).unwrap();
-        std::fs::write(ws.join(".scarab-build/oci/oci-layout"), "{}").unwrap();
-        std::fs::write(
-            ws.join(".scarab-build/oci/index.json"),
-            layout_index(&[LAYOUT_DIGEST]),
-        )
-        .unwrap();
+        std::fs::create_dir_all(oci.join("ingest")).unwrap();
+        std::fs::write(oci.join("oci-layout"), "{}").unwrap();
+        std::fs::write(oci.join("index.json"), layout_index(&[LAYOUT_DIGEST])).unwrap();
         std::fs::write(
             blobs.join(LAYOUT_DIGEST.trim_start_matches("sha256:")),
             LAYOUT_MANIFEST,
@@ -12145,7 +12436,7 @@ mod tests {
 
         write_layout(&ws);
         assert_eq!(run(&[]), (Some(0), true));
-        let layout = ws.join(".scarab-build/oci").display().to_string();
+        let layout = ws.join(layout_rel("image/image")).display().to_string();
         assert_eq!(
             called().lines().collect::<Vec<_>>(),
             ["push", layout.as_str(), "registry.example/app:1"]
@@ -12215,17 +12506,28 @@ mod tests {
     fn the_push_step_refuses_a_layout_with_a_symlink_or_outside_the_workspace() {
         use std::os::unix::fs::symlink;
 
+        use std::os::unix::fs::PermissionsExt;
+
         let (tmp, run) = push_library_harness();
         let base = tmp.path().canonicalize().unwrap();
         let ws = base.join("workspace");
         let secret = base.join("registry/config.json");
-        let blobs = ws.join(".scarab-build/oci/blobs/sha256");
+        let key = layout_key("image/image");
+        let keyed = ws.join(".scarab-build").join(&key);
+        let oci = ws.join(layout_rel("image/image"));
+        let blobs = oci.join("blobs/sha256");
         let reset = || {
+            // The unreadable-directory row leaves `ingest` mode 000.
+            let _ = std::fs::set_permissions(
+                oci.join("ingest"),
+                std::fs::Permissions::from_mode(0o755),
+            );
             let _ = std::fs::remove_file(ws.join(".scarab-build"));
             let _ = std::fs::remove_dir_all(ws.join(".scarab-build"));
+            let _ = std::fs::remove_dir_all(ws.join("sibling"));
             write_layout(&ws);
         };
-        let plants: [(&str, Box<dyn Fn()>); 6] = [
+        let plants: [(&str, Box<dyn Fn()>); 9] = [
             (
                 "a blob that links to the credential",
                 Box::new(|| symlink(&secret, blobs.join("cd".repeat(32))).unwrap()),
@@ -12233,26 +12535,40 @@ mod tests {
             (
                 "index.json that links to the credential",
                 Box::new(|| {
-                    std::fs::remove_file(ws.join(".scarab-build/oci/index.json")).unwrap();
-                    symlink(
-                        "../../../registry/config.json",
-                        ws.join(".scarab-build/oci/index.json"),
-                    )
-                    .unwrap();
+                    std::fs::remove_file(oci.join("index.json")).unwrap();
+                    symlink("../../../../registry/config.json", oci.join("index.json")).unwrap();
                 }),
             ),
             (
                 "a blobs directory that links out",
                 Box::new(|| {
-                    std::fs::remove_dir_all(ws.join(".scarab-build/oci/blobs")).unwrap();
-                    symlink(base.join("registry"), ws.join(".scarab-build/oci/blobs")).unwrap();
+                    std::fs::remove_dir_all(oci.join("blobs")).unwrap();
+                    symlink(base.join("registry"), oci.join("blobs")).unwrap();
                 }),
             ),
             (
                 "an oci directory that links out",
                 Box::new(|| {
-                    std::fs::remove_dir_all(ws.join(".scarab-build/oci")).unwrap();
-                    symlink(base.join("registry"), ws.join(".scarab-build/oci")).unwrap();
+                    std::fs::remove_dir_all(&oci).unwrap();
+                    symlink(base.join("registry"), &oci).unwrap();
+                }),
+            ),
+            (
+                "a .scarab-build/<key> that links out to a layout",
+                Box::new(|| {
+                    std::fs::remove_dir_all(&keyed).unwrap();
+                    let out = base.join("elsewhere");
+                    let _ = std::fs::remove_dir_all(&out);
+                    write_layout(&out);
+                    symlink(out.join(".scarab-build").join(&key), &keyed).unwrap();
+                }),
+            ),
+            (
+                "a .scarab-build/<key> that links to a layout elsewhere in the workspace",
+                Box::new(|| {
+                    std::fs::remove_dir_all(&keyed).unwrap();
+                    write_layout(&ws.join("sibling"));
+                    symlink(ws.join("sibling/.scarab-build").join(&key), &keyed).unwrap();
                 }),
             ),
             (
@@ -12277,6 +12593,20 @@ mod tests {
                     assert!(ok, "mkfifo");
                 }),
             ),
+            // find cannot list a directory it cannot read, and would not
+            // report the symlink inside it. (Run as root, find reads it and
+            // reports the symlink: refused either way.)
+            (
+                "a directory find cannot read, hiding a symlink",
+                Box::new(|| {
+                    symlink(&secret, oci.join("ingest/x")).unwrap();
+                    std::fs::set_permissions(
+                        oci.join("ingest"),
+                        std::fs::Permissions::from_mode(0o000),
+                    )
+                    .unwrap();
+                }),
+            ),
         ];
         for (what, plant) in &plants {
             reset();
@@ -12295,7 +12625,7 @@ mod tests {
         let (tmp, run) = push_library_harness();
         let base = tmp.path().canonicalize().unwrap();
         let ws = base.join("workspace");
-        let oci = ws.join(".scarab-build/oci");
+        let oci = ws.join(layout_rel("image/image"));
         let result = base.join("results/push.json");
         // Another manifest, stored under its own digest: sha256("[]").
         let other = "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945";
@@ -12367,6 +12697,51 @@ mod tests {
         reset();
         assert_eq!(run(&[]), (Some(0), true));
         assert!(result.exists());
+    }
+
+    /// With no results collected, the push Step finds the layout from its
+    /// own id (`<invoke>/push` → `<invoke>/image`), by the rule the build
+    /// Step wrote it by: the two scripts hold separate copies of the rule,
+    /// and an invoke matrix's id is where they could part.
+    #[cfg(unix)]
+    #[test]
+    fn the_build_step_and_push_step_agree_on_the_key() {
+        let (btmp, build) = build_library_harness();
+        let bbase = btmp.path().canonicalize().unwrap();
+        assert_eq!(
+            build(&[
+                ("SCARAB_BUILD_PUSH", "true"),
+                ("SCARAB_STEP", "app[x=1,y=2]/image"),
+            ]),
+            (Some(0), true)
+        );
+        let argv = std::fs::read_to_string(bbase.join("called")).unwrap();
+        let dest = argv
+            .lines()
+            .find_map(|a| a.strip_prefix("type=oci,dest="))
+            .and_then(|a| a.strip_suffix(",tar=false"))
+            .unwrap_or_else(|| panic!("no layout output in {argv}"));
+        let rel = std::path::Path::new(dest)
+            .strip_prefix(bbase.join("workspace"))
+            .unwrap()
+            .to_path_buf();
+
+        let (ptmp, push) = push_library_harness();
+        let pbase = ptmp.path().canonicalize().unwrap();
+        let pws = pbase.join("workspace");
+        std::fs::remove_dir(pbase.join("results")).unwrap();
+        write_layout_at(&pws.join(&rel));
+        assert_eq!(
+            push(&[
+                ("SCARAB_STEP", "app[x=1,y=2]/push"),
+                ("SCARAB_BUILD_LAYOUT", ""),
+                ("SCARAB_BUILD_DIGEST", ""),
+            ]),
+            (Some(0), true)
+        );
+        let called = std::fs::read_to_string(pbase.join("called")).unwrap();
+        let pushed = pws.join(&rel).display().to_string();
+        assert_eq!(called.lines().nth(1), Some(pushed.as_str()));
     }
 
     #[test]
