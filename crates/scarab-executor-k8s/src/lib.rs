@@ -11776,6 +11776,22 @@ exit "${{STUB_EXIT:-0}}"
         )
         .unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // `uname -m` reports STUB_UNAME: the node's architecture, for the
+        // per-architecture cache name.
+        let bin = base.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(
+            bin.join("uname"),
+            "#!/bin/sh\nprintf '%s\\n' \"${STUB_UNAME-}\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("uname"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
         let pinned = format!("root={WORKSPACE_MOUNT_PATH}\n");
         let buildctl = "/usr/bin/buildctl-daemonless.sh ";
         assert!(script.contains(&pinned) && script.contains(buildctl));
@@ -11791,8 +11807,16 @@ exit "${{STUB_EXIT:-0}}"
         let run = move |given: &[(&str, &str)]| {
             let _ = std::fs::remove_file(&record);
             let mut cmd = std::process::Command::new("/bin/sh");
-            cmd.args(["-c", &script, "scarab-build"]).current_dir(&base);
-            for name in ["STUB_METADATA", "STUB_META_LINK", "STUB_EXIT"] {
+            cmd.args(["-c", &script, "scarab-build"])
+                .current_dir(&base)
+                .env("PATH", &path);
+            for name in [
+                "STUB_METADATA",
+                "STUB_META_LINK",
+                "STUB_EXIT",
+                "STUB_UNAME",
+                "SCARAB_BUILD_CACHE_PER_ARCH",
+            ] {
                 cmd.env_remove(name);
             }
             for (name, value) in [
@@ -12005,12 +12029,13 @@ exit "${{STUB_EXIT:-0}}"
     }
 
     /// The build Step writes an image to push as an OCI layout at
-    /// `.scarab-build/<key>/oci` in the workspace, after removing whatever an
-    /// earlier Step left there (a symlink included, never its target). A
+    /// `.scarab-build/<key>/oci` in the workspace; a `.scarab-build` an
+    /// earlier Step left as a symlink is removed first, never its target. A
     /// fork pull request's build (SCARAB_FORK_PR=true, which Scarab sets on
     /// every launch of the Step, or any value but `false`) writes no layout,
-    /// whatever `push` says, and imports the layer cache without exporting
-    /// it. An image not pushed stays in BuildKit.
+    /// whatever `push` says, removes nothing, and imports the layer cache
+    /// without exporting it. An image not pushed stays in BuildKit and
+    /// leaves the workspace as it was.
     #[cfg(unix)]
     #[test]
     fn the_build_step_writes_a_layout_only_for_a_push_and_never_for_a_fork() {
@@ -12027,8 +12052,8 @@ exit "${{STUB_EXIT:-0}}"
         ];
         let import = "type=s3,region=ap-south-1,bucket=acme-cache";
         let kept = "type=image,name=registry.example/app:1,push=false,oci-mediatypes=true";
+        symlink(base.join("registry"), ws.join(".scarab-build")).unwrap();
         for fork in ["true", ""] {
-            symlink(base.join("registry"), ws.join(".scarab-build")).unwrap();
             let mut given = vec![("SCARAB_FORK_PR", fork), ("SCARAB_BUILD_PUSH", "true")];
             given.extend(s3);
             assert_eq!(run(&given), (Some(0), true), "fork={fork:?}");
@@ -12041,12 +12066,11 @@ exit "${{STUB_EXIT:-0}}"
                 "fork={fork:?} exports the cache: {argv:?}"
             );
             assert!(
-                std::fs::symlink_metadata(ws.join(".scarab-build")).is_err(),
-                "fork={fork:?}: the planted symlink is removed"
-            );
-            assert!(
-                base.join("registry/config.json").exists(),
-                "never its target"
+                std::fs::symlink_metadata(ws.join(".scarab-build"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "fork={fork:?}: a fork's build removes nothing"
             );
         }
         // Not a fork, pushing: the layout and the cache export.
@@ -12062,18 +12086,36 @@ exit "${{STUB_EXIT:-0}}"
         );
         assert!(argv.contains(&layout.as_str()), "{argv:?}");
         assert!(argv.contains(&"--export-cache"), "{argv:?}");
+        assert!(
+            !std::fs::symlink_metadata(ws.join(".scarab-build"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted symlink is replaced by a directory"
+        );
         assert!(ws
             .join(".scarab-build")
             .join(layout_key("image/image"))
             .is_dir());
+        assert_eq!(
+            std::fs::read_dir(base.join("registry"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["Dockerfile".to_string(), "config.json".to_string()].into(),
+            "never its target"
+        );
         assert!(
             !argv.iter().any(|a| a.starts_with("type=image")),
             "{argv:?}"
         );
-        // Not pushing: no layout.
+        // Not pushing: no layout, and the earlier one is left alone.
         assert_eq!(run(&s3), (Some(0), true));
         assert!(called().lines().any(|a| a == kept));
-        assert!(!ws.join(".scarab-build").exists());
+        assert!(ws
+            .join(".scarab-build")
+            .join(layout_key("image/image"))
+            .is_dir());
         // A registry cache is gone: it needs the push credential here.
         assert_eq!(run(&[("SCARAB_BUILD_CACHE", "registry")]), (Some(2), false));
     }
@@ -12114,6 +12156,98 @@ exit "${{STUB_EXIT:-0}}"
             assert!(
                 ws.join(".scarab-build").join(layout_key(step)).is_dir(),
                 "{step}"
+            );
+        }
+    }
+
+    /// A build Step replaces only its own key's directory: a layout another
+    /// build left at its own key (one a later push Step joins) survives,
+    /// and whatever was at this Step's key is replaced.
+    #[cfg(unix)]
+    #[test]
+    fn a_build_step_removes_only_its_own_layout() {
+        let (tmp, run) = build_library_harness();
+        let ws = tmp.path().canonicalize().unwrap().join("workspace");
+        let other = ws.join(layout_rel("app/arm64"));
+        let own = ws.join(layout_rel("app/amd64"));
+        for dir in [&other, &own] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(other.join("index.json"), "arm64").unwrap();
+        std::fs::write(own.join("index.json"), "stale").unwrap();
+        assert_eq!(
+            run(&[("SCARAB_BUILD_PUSH", "true"), ("SCARAB_STEP", "app/amd64")]),
+            (Some(0), true)
+        );
+        assert_eq!(
+            std::fs::read_to_string(other.join("index.json")).unwrap(),
+            "arm64"
+        );
+        assert!(own.parent().unwrap().is_dir());
+        assert!(
+            !own.join("index.json").exists(),
+            "the stale layout at this Step's key is removed"
+        );
+    }
+
+    /// With `SCARAB_BUILD_CACHE_PER_ARCH=true` (build-multiarch sets it) each
+    /// architecture keeps its own S3 cache, named after the node `uname -m`
+    /// reports: `<name>-arm64`, or `buildkit-arm64` with no name, for both
+    /// the import and the export. Unset, the name is the one given; any
+    /// value but `true` or `false` exits 2 before buildctl runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_per_arch_cache_is_named_after_the_node() {
+        let (tmp, run) = build_library_harness();
+        let base = tmp.path().canonicalize().unwrap();
+        let s3 = |name: &'static str, per_arch: &'static str, machine: &'static str| {
+            let mut given = vec![
+                ("SCARAB_BUILD_CACHE", "s3"),
+                ("SCARAB_BUILD_CACHE_BUCKET", "acme-cache"),
+                ("SCARAB_BUILD_CACHE_REGION", "ap-south-1"),
+                ("SCARAB_BUILD_CACHE_NAME", name),
+                ("STUB_UNAME", machine),
+            ];
+            if !per_arch.is_empty() {
+                given.push(("SCARAB_BUILD_CACHE_PER_ARCH", per_arch));
+            }
+            given
+        };
+        let base_ref = "type=s3,region=ap-south-1,bucket=acme-cache";
+        for (name, per_arch, machine, want) in [
+            ("app", "true", "aarch64", ",name=app-arm64"),
+            ("", "true", "aarch64", ",name=buildkit-arm64"),
+            ("app", "true", "x86_64", ",name=app-amd64"),
+            ("app", "false", "aarch64", ",name=app"),
+            ("app", "", "aarch64", ",name=app"),
+            ("", "", "aarch64", ""),
+        ] {
+            assert_eq!(
+                run(&s3(name, per_arch, machine)),
+                (Some(0), true),
+                "{name:?} {per_arch:?} {machine}"
+            );
+            let argv = std::fs::read_to_string(base.join("called")).unwrap();
+            let argv: Vec<&str> = argv.lines().collect();
+            let import = format!("{base_ref}{want}");
+            let export = format!("{base_ref}{want},mode=max");
+            for (flag, value) in [("--import-cache", &import), ("--export-cache", &export)] {
+                let at = argv
+                    .iter()
+                    .position(|a| *a == flag)
+                    .unwrap_or_else(|| panic!("{name:?} {per_arch:?}: no {flag} in {argv:?}"));
+                assert_eq!(
+                    argv[at + 1],
+                    value.as_str(),
+                    "{name:?} {per_arch:?} {machine}"
+                );
+            }
+        }
+        for (per_arch, machine) in [("maybe", "aarch64"), ("true", "arm 64"), ("true", "")] {
+            assert_eq!(
+                run(&s3("app", per_arch, machine)),
+                (Some(2), false),
+                "{per_arch:?} {machine:?}"
             );
         }
     }
@@ -12594,8 +12728,10 @@ exit "${{STUB_EXIT:-0}}"
                 }),
             ),
             // find cannot list a directory it cannot read, and would not
-            // report the symlink inside it. (Run as root, find reads it and
-            // reports the symlink: refused either way.)
+            // report the symlink inside it. As root this row passes through
+            // the odd-file branch (find reads the directory and reports the
+            // symlink), so it is evidence for the failed-find refusal only
+            // on a non-root runner.
             (
                 "a directory find cannot read, hiding a symlink",
                 Box::new(|| {

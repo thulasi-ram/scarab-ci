@@ -549,3 +549,25 @@ fn the_build_push_step_reads_the_layout_from_the_image_result() {
         assert_eq!(get(&env, "SCARAB_BUILD_LAYOUT"), "", "{results}");
     }
 }
+
+/// build-multiarch's two builds share one set of inputs, so the library
+/// asks the BuildKit script for a cache per architecture; build and
+/// build-layout build one image and keep the cache name they are given.
+#[test]
+fn only_build_multiarch_keeps_a_cache_per_architecture() {
+    let per_arch = |s: &StepSpec| {
+        s.env
+            .iter()
+            .filter(|(k, _)| k == "SCARAB_BUILD_CACHE_PER_ARCH")
+            .map(|(_, v)| v.clone())
+            .collect::<Vec<_>>()
+    };
+    let ir = invoke("build-multiarch", &minimal_with("build-multiarch"));
+    for id in ["x/amd64", "x/arm64"] {
+        assert_eq!(per_arch(step(&ir, id)), ["true"], "{id}");
+    }
+    for lib in ["build", "build-layout"] {
+        let ir = invoke(lib, &minimal_with(lib));
+        assert!(per_arch(step(&ir, "x/image")).is_empty(), "{lib}");
+    }
+}

@@ -173,6 +173,12 @@ fn key(step: &str) -> String {
     scarab_storage::sha256_hex(step.as_bytes())[..32].to_string()
 }
 
+/// A JSON backslash-u escape of the code point `hex4`, written with the
+/// backslash as a char so no editor or tool reads the escape on the way.
+fn esc(hex4: &str) -> String {
+    format!("{}u{hex4}", char::from(92u8))
+}
+
 /// `index.json` as BuildKit writes it, naming `digest`.
 fn buildkit_index(digest: &str) -> String {
     format!(
@@ -223,7 +229,10 @@ fn an_index_json_crane_would_read_differently_is_refused() {
     };
     for (what, index) in [
         ("a Digest key", decoy("Digest")),
-        ("an escaped digest key", decoy(r"digest")),
+        (
+            "an escaped digest key",
+            decoy(&format!("di{}est", esc("0067"))),
+        ),
         ("a non-ASCII digest key", decoy("dige\u{17f}t")),
     ] {
         h.layout(&index);

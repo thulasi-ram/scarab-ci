@@ -18,6 +18,12 @@ const PUSHED: &str = "sha256:ccccccccccccccccccccccccccccccccccccccccccccccccccc
 /// A `given` value that removes the variable instead of setting it.
 const UNSET: &str = "\u{0}unset";
 
+/// A JSON backslash-u escape of the code point `hex4`, written with the
+/// backslash as a char so no editor or tool reads the escape on the way.
+fn esc(hex4: &str) -> String {
+    format!("{}u{hex4}", char::from(92u8))
+}
+
 /// `registry.example/app@sha256:<c × 64>`.
 fn by_digest(c: char) -> String {
     format!("registry.example/app@sha256:{}", c.to_string().repeat(64))
@@ -45,8 +51,40 @@ fn key(step: &str) -> String {
 
 /// A manifest naming the config `digest` of `size` bytes and no layers.
 fn manifest_naming(digest: &str, size: usize) -> String {
+    manifest_with_layers(digest, size, &[])
+}
+
+/// A manifest naming the config `digest` of `size` bytes and `layers`
+/// (digest, size), compact, as crane writes JSON.
+fn manifest_with_layers(digest: &str, size: usize, layers: &[(String, usize)]) -> String {
+    let layers: Vec<String> = layers
+        .iter()
+        .map(|(d, n)| {
+            format!(
+                r#"{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{d}","size":{n}}}"#
+            )
+        })
+        .collect();
     format!(
-        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{digest}","size":{size}}},"layers":[]}}"#
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{digest}","size":{size}}},"layers":[{}]}}"#,
+        layers.join(",")
+    )
+}
+
+/// [`manifest_with_layers`] indented by two spaces, one key per line, as
+/// Go's `json.MarshalIndent` writes it (BuildKit's form).
+fn indented_manifest(digest: &str, size: usize, layers: &[(String, usize)]) -> String {
+    let layers: Vec<String> = layers
+        .iter()
+        .map(|(d, n)| {
+            format!(
+                "    {{\n      \"mediaType\": \"application/vnd.oci.image.layer.v1.tar\",\n      \"digest\": \"{d}\",\n      \"size\": {n}\n    }}"
+            )
+        })
+        .collect();
+    format!(
+        "{{\n  \"schemaVersion\": 2,\n  \"mediaType\": \"application/vnd.oci.image.manifest.v1+json\",\n  \"config\": {{\n    \"mediaType\": \"application/vnd.oci.image.config.v1+json\",\n    \"digest\": \"{digest}\",\n    \"size\": {size}\n  }},\n  \"layers\": [\n{}\n  ]\n}}",
+        layers.join(",\n")
     )
 }
 
@@ -164,7 +202,10 @@ case "$1" in
     [ -f "$f" ] || { echo "MANIFEST_UNKNOWN: $2" >&2; exit 1; }
     cat "$f"
     ;;
-  index) echo "registry.example/app@$CRANE_DIGEST" ;;
+  index)
+    [ -z "${CRANE_INDEX_FAIL-}" ] || { echo "MANIFEST_INVALID: $*" >&2; exit 1; }
+    echo "registry.example/app@$CRANE_DIGEST"
+    ;;
   push)
     cat "$2/index.json" >> "$CRANE_SAW"
     echo "registry.example/app@${CRANE_PUSH_DIGEST:-${3##*@}}"
@@ -237,6 +278,21 @@ esac
         }
     }
 
+    /// [`Harness::layout_with`] with each of `layers` stored as a blob and
+    /// the manifest `manifest(<config digest>, <config size>, <layers>)`.
+    fn layout_layers(
+        &self,
+        step: &str,
+        config: &str,
+        layers: &[&[u8]],
+        manifest: &dyn Fn(&str, usize, &[(String, usize)]) -> String,
+    ) -> Layout {
+        let oci = self.ws().join(".scarab-build").join(key(step)).join("oci");
+        std::fs::create_dir_all(oci.join("blobs/sha256")).unwrap();
+        let named: Vec<(String, usize)> = layers.iter().map(|b| (put(&oci, b), b.len())).collect();
+        self.layout_with(step, config, &|c, n| manifest(c, n, &named))
+    }
+
     /// Runs the script with `images` and the given env over the defaults
     /// (target `registry.example/app:1`, not insecure, not a fork, no
     /// registry login, no layouts): its exit code and crane's calls, one
@@ -276,6 +332,7 @@ esac
             .env("SCARAB_FORK_PR", "false");
         for name in [
             "CRANE_PUSH_DIGEST",
+            "CRANE_INDEX_FAIL",
             "SCARAB_INDEX_LAYOUTS",
             "SCARAB_INDEX_EXTRA_TAGS",
             "SCARAB_INDEX_ARCH_TAGS",
@@ -484,6 +541,10 @@ fn the_step_refuses_inputs_outside_their_rules_before_crane_runs() {
         (two.clone(), vec![("SCARAB_INDEX_IMAGE", "registry.example/app:.1")]),
         (two.clone(), vec![("SCARAB_INDEX_IMAGE", long_tag.as_str())]),
         (two.clone(), vec![("SCARAB_INDEX_IMAGE", "registry.example/app:1+x")]),
+        // Empty, '.' and '..' path segments, in the target and in images.
+        (two.clone(), vec![("SCARAB_INDEX_IMAGE", "example.test/../other:v1")]),
+        (two.clone(), vec![("SCARAB_INDEX_IMAGE", "example.test//app:1")]),
+        (format!("registry.example/./app@sha256:{hex}"), vec![]),
         // arch_tags is a boolean; the result name is a file name in
         // /scarab/results.
         (two.clone(), vec![("SCARAB_INDEX_ARCH_TAGS", "yes")]),
@@ -564,7 +625,7 @@ fn the_step_refuses_a_manifest_or_config_crane_would_read_differently() {
             r#"{{"architecture":"arm64","{key}":"windows","rootfs":{{"type":"layers","diff_ids":[]}},"config":{{"Labels":{{"os":"linux"}}}}}}"#
         )
     };
-    h.serve('3', image_manifest(), &decoy(r"os"));
+    h.serve('3', image_manifest(), &decoy(&format!("o{}", esc("0073"))));
     h.serve('4', image_manifest(), &decoy("OS"));
     h.serve('5', image_manifest(), &decoy("o\u{17f}"));
     for c in ['1', '2', '3', '4', '5'] {
@@ -579,15 +640,18 @@ fn the_step_refuses_a_manifest_or_config_crane_would_read_differently() {
 }
 
 /// What image builders write is not refused: Go's encoder escapes `&`, `<`
-/// and `>` as `&`, `<` and `>` (a `RUN a && b` in the
-/// history), and a label may hold any UTF-8 text.
+/// and `>` as backslash-u escapes (a `RUN a && b` in the history), and a
+/// label may hold any UTF-8 text.
 #[test]
 fn the_step_joins_images_whose_config_holds_escaped_html_and_utf8() {
     let h = Harness::new();
+    let (amp, lt, gt) = (esc("0026"), esc("003c"), esc("003e"));
     h.serve(
         '0',
         image_manifest(),
-        r#"{"architecture":"arm64","os":"linux","config":{"Labels":{"maintainer":"José <jose@example.com>"}},"history":[{"created_by":"RUN apt-get update && apt-get install -y curl"}],"rootfs":{"type":"layers","diff_ids":[]}}"#,
+        &format!(
+            r#"{{"architecture":"arm64","os":"linux","config":{{"Labels":{{"maintainer":"José {lt}jose@example.com{gt}"}}}},"history":[{{"created_by":"RUN apt-get update {amp}{amp} apt-get install -y curl"}}],"rootfs":{{"type":"layers","diff_ids":[]}}}}"#
+        ),
     );
     let (code, calls) = h.run(&format!("{}\n{}", by_digest('a'), by_digest('0')), &[]);
     assert_eq!(code, Some(0), "{calls:?}");
@@ -612,13 +676,14 @@ fn the_step_fails_on_a_digest_crane_did_not_report() {
 // ---------------------------------------------------------------------------
 
 /// Two layouts, amd64 and arm64/v8, and two extra tags: every image is
-/// pushed by digest into the index's repository, then tagged per
-/// architecture, then joined under the target tag, then the index is
-/// tagged with each extra tag, in that order. crane is asked to push an
-/// `index.json` naming only the checked manifest, and the layouts are
-/// removed from the workspace after.
+/// pushed by digest into the index's repository, then joined under the
+/// target tag, then tagged per architecture (arm64/v8 is arm64, so its tag
+/// has no variant), then the index is tagged with each extra tag, in that
+/// order: until the index is pushed nothing is tagged. crane is asked to
+/// push an `index.json` naming only the checked manifest, and the layouts
+/// are removed from the workspace after.
 #[test]
-fn layouts_are_pushed_by_digest_then_arch_tagged_then_indexed_then_extra_tagged() {
+fn layouts_are_pushed_by_digest_then_indexed_then_arch_tagged_then_extra_tagged() {
     let h = Harness::new();
     let one = h.layout("app/amd64", AMD64);
     let two = h.layout("app/arm64", ARM64);
@@ -637,9 +702,9 @@ fn layouts_are_pushed_by_digest_then_arch_tagged_then_indexed_then_extra_tagged(
         [
             format!("push {} {repo}@{d1}", one.oci.display()),
             format!("push {} {repo}@{d2}", two.oci.display()),
-            format!("tag {repo}@{d1} 1-amd64"),
-            format!("tag {repo}@{d2} 1-arm64-v8"),
             format!("index append -m {repo}@{d1} -m {repo}@{d2} -t {repo}:1"),
+            format!("tag {repo}@{d1} 1-amd64"),
+            format!("tag {repo}@{d2} 1-arm64"),
             format!("tag {repo}@{PUSHED} latest"),
             format!("tag {repo}@{PUSHED} stable"),
         ]
@@ -658,6 +723,83 @@ fn layouts_are_pushed_by_digest_then_arch_tagged_then_indexed_then_extra_tagged(
         serde_json::json!({ "ref": format!("{repo}@{PUSHED}"), "digest": PUSHED })
     );
     assert!(!h.build_dir_kept(), "the layouts are removed");
+}
+
+/// crane decodes every config again when it pushes the index, so `index
+/// append` is the last call that can fail on content. When it fails, the
+/// Step fails with the images pushed by digest only: no arch tag and no
+/// extra tag has moved, and there is no result.
+#[test]
+fn a_failed_index_append_moves_no_tag() {
+    let h = Harness::new();
+    let one = h.layout("app/amd64", AMD64);
+    let two = h.layout("app/arm64", ARM64);
+    let ran = h.ran(&[
+        (
+            "SCARAB_INDEX_LAYOUTS",
+            &format!("{}\n{}", one.line(), two.line()),
+        ),
+        ("SCARAB_INDEX_EXTRA_TAGS", "latest"),
+        ("CRANE_INDEX_FAIL", "1"),
+    ]);
+    assert_ne!(ran.code, Some(0), "{}", ran.stderr);
+    let verbs: Vec<&str> = ran
+        .calls
+        .iter()
+        .map(|c| c.split(' ').next().unwrap())
+        .collect();
+    assert_eq!(verbs, ["push", "push", "index"], "{:?}", ran.calls);
+    assert!(h.result().is_none());
+}
+
+/// A layout as BuildKit may write it, its manifest and config indented one
+/// key per line (Go's `MarshalIndent`) and its layer a blob of its own, is
+/// read like a compact one: each blob is checked, the image is pushed by
+/// digest, and crane is asked to push an `index.json` naming the indented
+/// manifest by its digest and size.
+#[test]
+fn an_indented_layout_is_pushed_like_a_compact_one() {
+    let h = Harness::new();
+    let config = serde_json::to_string_pretty(&serde_json::json!({
+        "architecture": "arm64",
+        "os": "linux",
+        "config": { "Labels": { "maintainer": "scarab" } },
+        "rootfs": { "type": "layers", "diff_ids": [] },
+    }))
+    .unwrap();
+    let l = h.layout_layers("app/arm64", &config, &[&[0u8; 1024]], &indented_manifest);
+    let manifest = std::fs::read_to_string(l.blob(&l.digest)).unwrap();
+    assert!(manifest.contains("\n    \"digest\": "), "{manifest}");
+    let ran = h.ran(&[("SCARAB_INDEX_LAYOUTS", &l.line())]);
+    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+    let repo = "registry.example/app";
+    assert_eq!(
+        ran.calls,
+        [
+            format!("push {} {repo}@{}", l.oci.display(), l.digest),
+            format!("index append -m {repo}@{} -t {repo}:1", l.digest),
+            format!("tag {repo}@{} 1-arm64", l.digest),
+        ]
+    );
+    assert_eq!(h.saw(), rewritten_index(&l.digest, l.size));
+}
+
+/// BuildKit's key order: a config whose top-level `os` comes after nested
+/// Labels and a history entry holding an escaped quote and a `{` is read
+/// as the top-level `os`, and pushed.
+#[test]
+fn a_config_with_nested_labels_and_escaped_history_is_read_at_its_top_level() {
+    let h = Harness::new();
+    let config = r#"{"architecture":"arm64","config":{"Labels":{"maintainer":"x","org.example":"{}"}},"history":[{"created_by":"/bin/sh -c echo \"{\" \"[\""}],"os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#;
+    let l = h.layout_with("app/arm64", config, &manifest_naming);
+    let ran = h.ran(&[("SCARAB_INDEX_LAYOUTS", &l.line())]);
+    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+    assert!(
+        ran.stdout
+            .contains(&format!("scarab: {} is linux/arm64", l.oci.display())),
+        "{}",
+        ran.stdout
+    );
 }
 
 /// One way a second layout is not what a build wrote; it gets the layout
@@ -764,7 +906,8 @@ fn every_layout_check_runs_before_the_first_registry_write() {
         (
             "index.json holds a backslash",
             Box::new(|_: &Harness, l: &Layout| {
-                let index = buildkit_index(&l.digest, l.size).replace("2026", r"202");
+                let index = buildkit_index(&l.digest, l.size)
+                    .replace("2026", &format!("20{}", esc("0032")));
                 std::fs::write(l.oci.join("index.json"), index).unwrap();
                 None
             }),
@@ -871,8 +1014,147 @@ fn every_layout_check_runs_before_the_first_registry_write() {
             Box::new(|h: &Harness, _: &Layout| {
                 let l = h.layout_with(
                     "app/arm64",
-                    r#"{"architecture":"arm64","os":"linux","rootfs":{}}"#,
+                    &format!(
+                        r#"{{"architecture":"arm64","o{}":"linux","rootfs":{{}}}}"#,
+                        esc("0073")
+                    ),
                     &manifest_naming,
+                );
+                Some(l.line())
+            }),
+        ),
+        // crane reads os, architecture and variant from the config's top
+        // level only; a Label of the same name must not decide the
+        // platform or the arch tag.
+        (
+            "a Label names the variant",
+            Box::new(|h: &Harness, _: &Layout| {
+                let l = h.layout_with(
+                    "app/arm64",
+                    r#"{"architecture":"arm","os":"linux","config":{"Labels":{"variant":"v7"}},"rootfs":{}}"#,
+                    &manifest_naming,
+                );
+                Some(l.line())
+            }),
+        ),
+        (
+            "os and architecture only in Labels",
+            Box::new(|h: &Harness, _: &Layout| {
+                let l = h.layout_with(
+                    "app/arm64",
+                    r#"{"config":{"Labels":{"os":"linux","architecture":"arm64"}},"rootfs":{}}"#,
+                    &manifest_naming,
+                );
+                Some(l.line())
+            }),
+        ),
+        (
+            "the manifest's only config is nested",
+            Box::new(|h: &Harness, _: &Layout| {
+                let l = h.layout_with("app/arm64", &config(ARM64), &|c: &str, n: usize| {
+                    format!(
+                        r#"{{"schemaVersion":2,"x":{{"config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{c}","size":{n}}}}},"layers":[]}}"#
+                    )
+                });
+                Some(l.line())
+            }),
+        ),
+        // Every failure crane could hit while it pushes is found first.
+        (
+            "the config starts with a byte-order mark",
+            Box::new(|h: &Harness, _: &Layout| {
+                let l = h.layout_with(
+                    "app/arm64",
+                    &format!("\u{feff}{}", config(ARM64)),
+                    &manifest_naming,
+                );
+                Some(l.line())
+            }),
+        ),
+        (
+            "a layer blob is missing",
+            Box::new(|h: &Harness, _: &Layout| {
+                let layer = format!("sha256:{}", scarab_storage::sha256_hex(b"layer"));
+                let l = h.layout_with("app/arm64", &config(ARM64), &|c: &str, n: usize| {
+                    manifest_with_layers(c, n, &[(layer.clone(), 5)])
+                });
+                Some(l.line())
+            }),
+        ),
+        (
+            "a layer blob does not hash to its name",
+            Box::new(|h: &Harness, _: &Layout| {
+                let l = h.layout_layers(
+                    "app/arm64",
+                    &config(ARM64),
+                    &[b"layer"],
+                    &manifest_with_layers,
+                );
+                let layer = format!("sha256:{}", scarab_storage::sha256_hex(b"layer"));
+                std::fs::write(l.blob(&layer), b"other").unwrap();
+                Some(l.line())
+            }),
+        ),
+        (
+            "a layer digest is sha512",
+            Box::new(|h: &Harness, _: &Layout| {
+                let l = h.layout_with("app/arm64", &config(ARM64), &|c: &str, n: usize| {
+                    manifest_with_layers(c, n, &[(format!("sha512:{}", "a".repeat(128)), 5)])
+                });
+                Some(l.line())
+            }),
+        ),
+        (
+            "a layer digest walks out of the blobs directory",
+            Box::new(|h: &Harness, _: &Layout| {
+                let l = h.layout_with("app/arm64", &config(ARM64), &|c: &str, n: usize| {
+                    manifest_with_layers(c, n, &[("sha256:../../etc/passwd".to_string(), 5)])
+                });
+                Some(l.line())
+            }),
+        ),
+        // A referrer (an attestation or signature) is not an image.
+        (
+            "the manifest names a subject",
+            Box::new(|h: &Harness, _: &Layout| {
+                let subject = format!("sha256:{}", scarab_storage::sha256_hex(b"{}"));
+                let l = h.layout_with("app/arm64", &config(ARM64), &|c: &str, n: usize| {
+                    manifest_naming(c, n).replace(
+                        r#","layers":[]"#,
+                        &format!(
+                            r#","layers":[],"subject":{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{subject}","size":2}}"#
+                        ),
+                    )
+                });
+                put(&l.oci, b"{}");
+                Some(l.line())
+            }),
+        ),
+        // An image from a layout gets an arch tag; an architecture or
+        // variant outside the known ones is refused.
+        (
+            "the architecture is not one this step tags",
+            Box::new(|h: &Harness, _: &Layout| {
+                let l = h.layout("app/arm64", r#""architecture":"0-rc1","os":"linux""#);
+                Some(l.line())
+            }),
+        ),
+        (
+            "arm64 with variant v9",
+            Box::new(|h: &Harness, _: &Layout| {
+                let l = h.layout(
+                    "app/arm64",
+                    r#""architecture":"arm64","os":"linux","variant":"v9""#,
+                );
+                Some(l.line())
+            }),
+        ),
+        (
+            "amd64 with variant v8",
+            Box::new(|h: &Harness, _: &Layout| {
+                let l = h.layout(
+                    "app/arm64",
+                    r#""architecture":"amd64","os":"linux","variant":"v8""#,
                 );
                 Some(l.line())
             }),
@@ -882,6 +1164,7 @@ fn every_layout_check_runs_before_the_first_registry_write() {
         let h = Harness::new();
         let one = h.layout("app/amd64", AMD64);
         let two = h.layout("app/arm64", ARM64);
+        let first = std::fs::read(one.oci.join("index.json")).unwrap();
         let line = broken(&h, &two).unwrap_or_else(|| two.line());
         let ran = h.ran(&[("SCARAB_INDEX_LAYOUTS", &format!("{}\n{line}\n", one.line()))]);
         let _ = std::fs::set_permissions(
@@ -900,6 +1183,37 @@ fn every_layout_check_runs_before_the_first_registry_write() {
             "{what}: {}",
             ran.stderr
         );
+        assert_eq!(
+            std::fs::read(one.oci.join("index.json")).unwrap(),
+            first,
+            "{what}: the first layout's index.json is rewritten only to push"
+        );
+    }
+}
+
+/// A Label named `os.version` must not make a platform, whether or not the
+/// image gets an arch tag; nor may an architecture this Step does not know.
+#[test]
+fn top_level_and_known_architecture_checks_hold_without_arch_tags() {
+    for (what, config) in [
+        (
+            "a Label names os.version",
+            r#"{"architecture":"arm64","os":"linux","config":{"Labels":{"os.version":"10.0.1"}},"rootfs":{}}"#
+                .to_string(),
+        ),
+        (
+            "the architecture is not one this step tags",
+            crate::config(r#""architecture":"0-rc1","os":"linux""#),
+        ),
+    ] {
+        let h = Harness::new();
+        let l = h.layout_with("app/arm64", &config, &manifest_naming);
+        let ran = h.ran(&[
+            ("SCARAB_INDEX_LAYOUTS", &l.line()),
+            ("SCARAB_INDEX_ARCH_TAGS", "false"),
+        ]);
+        assert_eq!(ran.code, Some(2), "{what}: {}", ran.stderr);
+        assert!(ran.calls.is_empty(), "{what}: crane ran: {:?}", ran.calls);
     }
 }
 
@@ -1037,6 +1351,25 @@ fn two_layouts_of_one_platform_are_refused_before_any_write() {
     assert_eq!(ran.code, Some(2), "{}", ran.stderr);
     assert_eq!(ran.calls, [format!("manifest {a}"), format!("config {a}")]);
     assert!(h.build_dir_kept());
+
+    // arm64 and arm64/v8 are one platform, as containerd reads them: two
+    // layouts, or a layout and an `images` entry (b is arm64/v8).
+    let h = Harness::new();
+    let v8 = h.layout("app/v8", ARM64);
+    let plain = h.layout("app/arm64", r#""architecture":"arm64","os":"linux""#);
+    let ran = h.ran(&[(
+        "SCARAB_INDEX_LAYOUTS",
+        &format!("{}\n{}", v8.line(), plain.line()),
+    )]);
+    assert_eq!(ran.code, Some(2), "{}", ran.stderr);
+    assert!(ran.calls.is_empty(), "crane ran: {:?}", ran.calls);
+    let b = by_digest('b');
+    let ran = h.ran(&[
+        ("SCARAB_INDEX_LAYOUTS", &plain.line()),
+        ("SCARAB_INDEX_IMAGES", &b),
+    ]);
+    assert_eq!(ran.code, Some(2), "{}", ran.stderr);
+    assert_eq!(ran.calls, [format!("manifest {b}"), format!("config {b}")]);
 }
 
 /// The tags the Step would write are all checked first: an arch tag over
@@ -1116,6 +1449,22 @@ fn arch_and_extra_tags_over_128_or_colliding_are_refused() {
         }
     }
 
+    // amd64/v1 is amd64: its arch tag has no variant.
+    let h = Harness::new();
+    let v1 = h.layout(
+        "app/amd64",
+        r#""architecture":"amd64","os":"linux","variant":"v1""#,
+    );
+    let ran = h.ran(&[("SCARAB_INDEX_LAYOUTS", &v1.line())]);
+    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+    assert!(
+        ran.calls
+            .contains(&format!("tag registry.example/app@{} 1-amd64", v1.digest)),
+        "{:?}",
+        ran.calls
+    );
+
+    // 32-bit arm keeps its variant.
     let h = Harness::new();
     let v6 = h.layout("app/v6", ARM_V6);
     let v7 = h.layout("app/v7", ARM_V7);
@@ -1251,6 +1600,8 @@ fn a_layout_count_other_than_the_one_expected_is_refused() {
         ("", l1.clone(), 0),
         (UNSET, format!("{l1}\n{l2}\n{l3}"), 0),
         ("2", format!("{l1}\n{l2}"), 0),
+        // Compared as text: "02" is not 2.
+        ("02", format!("{l1}\n{l2}"), 2),
     ] {
         // Each accepted run removes the layouts; put them back.
         let _ = h.layout("app/amd64", AMD64);

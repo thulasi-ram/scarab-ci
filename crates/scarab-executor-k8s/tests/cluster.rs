@@ -2598,16 +2598,33 @@ fn single_arch_layout(dir: &std::path::Path, arch: &str, label: Option<&str>) ->
     };
     // An empty tar archive: two zero blocks.
     let (layer, layer_size) = put(&[0u8; 1024]);
-    let labels = label
-        .map(|l| format!(r#","config":{{"Labels":{{"scarab.test":"{l}"}}}}"#))
-        .unwrap_or_default();
-    let config = format!(
-        r#"{{"architecture":"{arch}","os":"linux","rootfs":{{"type":"layers","diff_ids":["{layer}"]}}{labels}}}"#
-    );
-    let (config, config_size) = put(config.as_bytes());
-    let manifest = format!(
-        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config}","size":{config_size}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{layer}","size":{layer_size}}}]}}"#
-    );
+    // The config and manifest are indented one key per line, as Go's
+    // `json.MarshalIndent` writes them, so the index Step's checks read
+    // that form in the real crane image's busybox.
+    let mut config = serde_json::json!({
+        "architecture": arch,
+        "os": "linux",
+        "rootfs": { "type": "layers", "diff_ids": [layer] },
+    });
+    if let Some(l) = label {
+        config["config"] = serde_json::json!({ "Labels": { "scarab.test": l } });
+    }
+    let (config, config_size) = put(serde_json::to_string_pretty(&config).unwrap().as_bytes());
+    let manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": config,
+            "size": config_size,
+        },
+        "layers": [{
+            "mediaType": "application/vnd.oci.image.layer.v1.tar",
+            "digest": layer,
+            "size": layer_size,
+        }],
+    }))
+    .unwrap();
     let (manifest, manifest_size) = put(manifest.as_bytes());
     std::fs::write(dir.join("oci-layout"), r#"{"imageLayoutVersion":"1.0.0"}"#).unwrap();
     std::fs::write(
