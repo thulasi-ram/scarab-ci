@@ -305,8 +305,11 @@ trusted the source with the registry credential on that basis. Trust is kept per
 carries over to the upgrade, and with `layouts` the upgraded step reads image layouts from the
 workspace and uploads them to the registry under that trust. It still runs no code from your
 repository, and it checks each layout before it uploads anything (only directories and regular
-files, no symlink, the manifest and config hash to their names, the manifest is the digest the
-build reported). The upgrade's review page lists the registry credential under **Trust**, and you
+files, no symlink, the manifest and every blob it names hash to their names, the manifest is the
+digest its `layouts` line gives). The image index library pushes whatever layout its `layouts`
+lines name: any step of the Pipeline, a plain `run:` step included, can write a layout under
+`/workspace/.scarab-build/` and name its digest, so the digest check shows the layout was not
+changed after it was named, not that a build step made it. The upgrade's review page lists the registry credential under **Trust**, and you
 tick it to carry it over. A Pipeline that passes only `image` and `images` gets the same registry
 calls as before and no workspace read.
 

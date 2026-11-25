@@ -676,11 +676,13 @@ The library has three steps, and `needs: [app]` reaches the last:
   It is the only step that holds the registry credential. It runs as uid 1000, runs no code from
   your repository, and runs the image index library's script
   ([below](#joining-images-into-one-multi-architecture-image)) on the two layouts: it checks
-  both, then pushes each image by digest, tags each one `<tag>-<architecture>`, pushes the index
-  under `image`'s tag, and tags the index with each extra tag, in that order.
+  both, then pushes each image by digest, pushes the index under `image`'s tag, tags each image
+  `<tag>-<architecture>`, and tags the index with each extra tag, in that order.
 
-Every check runs before the first registry write, so a refused push step writes nothing. A push
-step that fails part way through the writes leaves the tags it wrote until it is retried.
+Every check the push step makes itself runs before the first registry write, so a step it refuses
+writes nothing. A failure crane or the registry reports after that can leave images pushed by
+digest with no tag, and a retry pushes them again. A push step that fails part way through the
+tags leaves the tags it wrote until it is retried.
 
 Its inputs:
 
@@ -688,8 +690,8 @@ Its inputs:
 |---|---|---|
 | `image` | (required) | The tag to push the index to, such as `ghcr.io/acme/app:1.2.0`. It must name a tag, and no digest. |
 | `extra_tags` | empty | More tags for the index, in `image`'s repository: tag names such as `latest`, not references, separated by spaces or line breaks. A tag named twice, or the same as `image`'s, is written once. |
-| `arch_tags` | `true` | Also tag each architecture's image `<tag>-<architecture>`, or `<tag>-<architecture>-<variant>` when its config names a variant. |
-| `context`, `dockerfile`, `build_args`, `cache`, `cache_bucket`, `cache_region`, `cache_name` | as in the build library | The build library's inputs, with the same rules ([Building an image](#building-an-image)). Both builds use them. |
+| `arch_tags` | `true` | Also tag each architecture's image: `<tag>-amd64` and `<tag>-arm64`. |
+| `context`, `dockerfile`, `build_args`, `cache`, `cache_bucket`, `cache_region`, `cache_name` | as in the build library | The build library's inputs, with the same rules ([Building an image](#building-an-image)). Both builds use them, except that each build keeps its own layer cache: `<cache_name>-amd64` and `<cache_name>-arm64` (`buildkit-amd64` and `buildkit-arm64` when `cache_name` is empty). |
 | `insecure_push` | `false` | Reach the registry over plain HTTP. For a test or development registry with no TLS only. crane then also skips TLS verification, so the push step refuses it (exit 2) when it holds a registry login. |
 
 Its output: `outputs.app.push` is `{"ref": "<repository>@sha256:…", "digest": "sha256:…"}` for
@@ -704,12 +706,13 @@ the index, as crane reported the push. Deploy by `outputs.app.push.digest`.
 - **Arch tags are on by default.** Without a tag, an architecture's image is reachable only
   through the index, and a registry rule that expires untagged images (an ECR lifecycle policy
   can) could delete it and break the index. We have not confirmed how ECR treats untagged images
-  that a tagged index names. The suffix comes from the image's config, so an arm64 config that
-  names the variant `v8` gives `<tag>-arm64-v8`; the push step's log names each tag it wrote
+  that a tagged index names. arm64 is tagged `<tag>-arm64` whether or not its config names `v8`;
+  a 32-bit arm image is tagged with its variant, `<tag>-arm-v7`. The push step's log names each
+  tag it wrote
   (`scarab: tagged <repository>@sha256:… as <tag>`). With `arch_tags: false` the step writes
   `image`'s tag and the extra tags only.
 - **A retry pushes every architecture again.** The push is one step, so retrying it repeats every
-  write: both images, the arch tags, the index and the extra tags. Each write puts the same
+  write: both images, the index, the arch tags and the extra tags. Each write puts the same
   content under the same name, and a registry skips blobs it already has. A failed build is its
   own step and retries on its own. A repository with immutable tags refuses a tag that moves,
   such as `latest`, with or without this library.
@@ -828,12 +831,14 @@ Its inputs:
 | `layouts` | empty | The image layouts to push and join, one `<path> sha256:<digest>` per line, the path `/workspace/.scarab-build/<key>/oci` as a build layout step reports it. |
 | `images` | empty | The images to join, one `<repository>@sha256:<digest>` per line. Each image is named by digest, never by tag: a tag can be moved, so a retry could join other images. |
 | `extra_tags` | empty | More tags for the index, in `image`'s repository: tag names such as `latest`, not references, separated by spaces or line breaks. A tag named twice, or the same as `image`'s, is written once. |
-| `arch_tags` | `true` | Also tag each image from `layouts` `<tag>-<architecture>`, or `<tag>-<architecture>-<variant>` when its config names a variant. It does not apply to `images`. |
+| `arch_tags` | `true` | Also tag each image from `layouts` `<tag>-<architecture>`, or `<tag>-<architecture>-<variant>` for a variant other than arm64's `v8` and amd64's `v1` (`<tag>-arm-v7`). It does not apply to `images`. |
 | `insecure` | `false` | Reach the registry over plain HTTP. For a test or development registry with no TLS only. crane then also skips TLS verification, so the step refuses it (exit 2) when it holds a registry login. |
 
 `layouts` and `images` may both be given, and between them must name at least one image.
 
-Every check runs before the first registry write, so a refused step writes nothing. For each
+Every check the step makes itself runs before the first registry write, so a step it refuses
+writes nothing and leaves the workspace as it found it. A failure crane or the registry reports
+after that can leave images pushed by digest with no tag, and a retry pushes them again. For each
 layout, the step refuses (exit 2):
 
 - a path that is not `/workspace/.scarab-build/<key>/oci` (the key 32 hex characters), that
@@ -841,18 +846,32 @@ layout, the step refuses (exit 2):
   resolves outside the workspace. A step before this one, or a Dockerfile `RUN`, could plant a
   symlink to `/scarab/registry/config.json`, which crane would upload;
 - an `index.json` that does not name one manifest, a manifest that does not hash to its name or
-  is not the digest the line gives, and a config that does not hash to its name. The platform is
-  read from the layout's config.
+  is not the digest the line gives, a blob the manifest names (the config or a layer) that is not
+  `sha256:<64 hex>`, is missing from the layout or does not hash to its name, and a manifest
+  that names a `subject` (a referrer). The platform is read from the layout's config;
+- an architecture or variant the step does not tag: the architecture must be one of `386`,
+  `amd64`, `arm`, `arm64`, `loong64`, `mips`, `mipsle`, `mips64`, `mips64le`, `ppc64`,
+  `ppc64le`, `riscv64` and `s390x`, with no variant, or `v5` to `v8` for `arm`, or `v2` to `v4`
+  for `amd64`, whatever `arch_tags` says.
+
+The digest check shows a layout was not changed after its `layouts` line named it, not that a
+build step made it: any step of the Pipeline, a plain `run:` step included, can write a layout
+under `/workspace/.scarab-build/` and name its digest.
 
 For each image in `images`, it reads the manifest and config from the registry, by digest. For
 every source, it refuses:
 
 - an image that is itself an index (a multi-architecture image, or one with attestations): name
   each architecture's image by its own digest;
+- a manifest or config that is not one JSON object (one that starts with a byte-order mark, for
+  example), or that names `config`, `os`, `architecture`, `variant` or `os.version` anywhere but
+  as a key of its top-level object, which is the only place crane reads them;
 - an image whose config names no `os` or `architecture`, or names one of them twice (a label
   called `os`, for example);
-- two images of the same platform: `os/architecture`, then the `variant` (`arm64/v8`, `arm/v7`)
-  and the `os.version` a Windows image names. An index holds one image per platform;
+- two images of the same platform: `os/architecture`, then the `variant` (`arm/v7`) and the
+  `os.version` a Windows image names. `arm64/v8` counts as `arm64` and `amd64/v1` as `amd64`, so
+  an arm64 image with `v8` and one without are one platform. An index holds one image per
+  platform;
 - a manifest or config that writes a letter, digit, `.`, `_` or `-` with a `\u` escape, or names
   `manifests`, `os`, `architecture`, `variant` or `os.version` more than once in any case (`os`
   and `OS`). crane's JSON decoder reads both forms, so the step would otherwise check another
@@ -861,7 +880,9 @@ every source, it refuses:
   share.
 
 Then it writes, in this order: each layout's image by digest into the index's repository, the
-arch tags, the index under `image`'s tag, and each extra tag on the index. It removes
+index under `image`'s tag, the arch tags, and each extra tag on the index. Until the index is
+pushed only untagged images exist; crane reads every config again when it pushes the index, and
+after that each write moves a tag to a digest already in the registry. It removes
 `.scarab-build` from its workspace after it pushes. A retried step writes all of them again; each
 write puts the same content under the same name. With `layouts`, the step's Pod receives every
 layout through the workspace, so it needs disk for all of them. Arch tags are on by default for

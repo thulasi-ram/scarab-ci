@@ -294,7 +294,7 @@ it, and a retry gets a new one.
 Use Scarab's multi-architecture build library
 ([Building a multi-architecture image](/scarab-ci/usage/pipeline-syntax/#building-a-multi-architecture-image)).
 It builds on an amd64 node and an arm64 node with no credential, and one step, `push`, pushes
-both images, their arch tags, the index and its extra tags. Install it and trust its source for
+both images, the index, their arch tags and the index's extra tags. Install it and trust its source for
 the build sandbox and with the registry credential, as
 [Libraries](/scarab-ci/usage/libraries/#install-scarabs-multi-architecture-build-library)
 describes; the build library's trust does not reach it. Route `ecr-push` to `push` only:
@@ -323,7 +323,8 @@ The role in part 1 already reads and writes the `app` repository, which is all t
 a `when:` that keeps it off a fork's Run.
 
 - **Arch tags and lifecycle rules.** The push step tags each architecture's image
-  `<sha>-amd64` and `<sha>-arm64` (with an arm64 config that names a variant, `<sha>-arm64-v8`).
+  `<sha>-amd64` and `<sha>-arm64`. arm64 is tagged `<tag>-arm64` whether or not its config names
+  `v8`; a 32-bit arm image is tagged with its variant, `<tag>-arm-v7`.
   Without those tags the two images are untagged, and an ECR lifecycle rule that expires untagged
   images could delete them while the index still names them. We have not confirmed how ECR treats
   untagged images that a tagged index names, so keep `arch_tags` on, or leave untagged images out
@@ -332,6 +333,9 @@ a `when:` that keeps it off a fork's Run.
   `latest` on the next Run. Leave `extra_tags` empty for such a repository.
 - **Retry and disk.** A retried push step pushes both architectures again. Its Pod receives both
   builds' workspaces, so it needs disk for the checkout and both image layouts.
+- **Order of writes.** Every check the step makes itself runs before the first registry write. A
+  failure crane or the registry reports after that can leave images pushed by digest with no tag,
+  and a retry pushes them again.
 
 To compose the pieces yourself (the build layout library for each build, then the image index
 library with `layouts`), see
@@ -407,9 +411,7 @@ rules:
   - when: >-
       steps.exists(s, 'ecr-push' in s.placement_profiles
       && !s.origin.exists(o, o.kind == 'library' && has(o.source)
-      && (o.source.startsWith('github.com/thulasi-ram/scarab-ci//libs/build.yaml@')
-      || o.source.startsWith('github.com/thulasi-ram/scarab-ci//libs/build-multiarch.yaml@')
-      || o.source.startsWith('github.com/thulasi-ram/scarab-ci//libs/image-index.yaml@'))))
+      && o.source.matches('^github[.]com/thulasi-ram/scarab-ci//libs/(build|build-multiarch|image-index)[.]yaml@')))
     effect: deny
     message: "Only the build, multi-architecture build and image index libraries' steps may name the ecr-push placement profile."
 ```
@@ -421,8 +423,8 @@ rules:
 - The second rule refuses, when the Run is created, a step that names `ecr-push` and does not
   come from one of the three libraries that hold the registry credential: build,
   multi-architecture build and image index. It matches each library by the source it was
-  installed from, since the name is chosen at install. Leave out the line of a library you do not
-  install. The build layout library is not listed: its one step is a build step, holds no
+  installed from, since the name is chosen at install. Take a library you do not install out of
+  the pattern. The build layout library is not listed: its one step is a build step, holds no
   credential, and must never get the push role.
 - To limit the profile to an Environment instead, use
   `has(pipeline.environment) && pipeline.environment == 'production'` in place of the ref check.

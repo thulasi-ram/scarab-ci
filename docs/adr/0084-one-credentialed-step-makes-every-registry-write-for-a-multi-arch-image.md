@@ -111,7 +111,7 @@ With `build-multiarch` a Pipeline writes one invoke:
 ```
 app/amd64 (rootless BuildKit, amd64 pool, no credential) ─┐
 app/arm64 (rootless BuildKit, arm64 pool, no credential) ─┴─► app/push (registry_auth):
-                                     images by digest, arch tags, index, extra tags
+                                     images by digest, index, arch tags, extra tags
 ```
 
 `needs: [app]` reaches `app/push`, the only leaf. The per-step placement map works against
@@ -205,21 +205,36 @@ this order:
 3. **Every layout, read locally:** the path is under `/workspace/.scarab-build/`; no symlink
    at any level, and nothing but directories and regular files; `oci-layout` and `index.json`
    have the expected shape and `index.json` names one manifest; the manifest blob hashes to
-   its name and to the line's digest; the config blob hashes to the manifest's
-   `config.digest`, and the platform (os, architecture, variant) is read from it. A layout
-   that is itself an index, or whose config names no os or architecture, is refused.
-   `images` sources are read from the registry by digest, as today.
+   its name and to the line's digest; every blob the manifest names (the config and each
+   layer) is `sha256:<64 hex>`, is in the layout and hashes to its name; the platform (os,
+   architecture, variant) is read from the config, and only from keys of its top-level object,
+   where crane reads them. A manifest or config that is not one JSON object (a byte-order mark,
+   for one) is refused, and so is a layout that is itself an index, one whose manifest names a
+   `subject`, one whose config names no os or architecture, and one whose architecture or
+   variant is not on the list the Step tags (`386`, `amd64`, `arm`, `arm64`, `loong64`, `mips`,
+   `mipsle`, `mips64`, `mips64le`, `ppc64`, `ppc64le`, `riscv64`, `s390x`; a variant only `v5`
+   to `v8` for `arm` or `v2` to `v4` for `amd64`). `arm64/v8` counts as `arm64` and `amd64/v1`
+   as `amd64`, for every source. `images` sources are read from the registry by digest, as
+   today. The digest check shows a layout was not changed after its line named it, not that a
+   build Step made it: any Step can write a layout under `.scarab-build/` and name its digest.
 4. **Every tag, computed:** for each layout source, `<tag>-<arch>`, or `<tag>-<arch>-<variant>`
-   when the platform has a variant (`arm/v7` gives `<tag>-arm-v7`). Two sources of one
+   when the platform has a variant (`arm/v7` gives `<tag>-arm-v7`; arm64 is `<tag>-arm64`
+   whether or not its config names `v8`). Two sources of one
    platform are refused, and so is any tag over 128 characters, and an arch tag that another
    source or an extra tag would also write. An extra tag equal to `image`'s tag, or named twice,
    is written once.
-5. **Only then, registry writes:** each layout pushed by digest
-   (`crane push <layout> <repository>@sha256:…`), the arch tags, `crane index append` onto
-   `image` (the first tag), and `crane tag` on the index digest for each extra tag. Then the
-   result, then `.scarab-build` is removed.
+5. **Only then, registry writes:** each layout's `index.json` rewritten to name only its
+   checked manifest and the layout pushed by digest
+   (`crane push <layout> <repository>@sha256:…`), then `crane index append` onto `image` (the
+   first tag), then `crane tag` for each arch tag, then `crane tag` on the index digest for
+   each extra tag. Then the result, then `.scarab-build` is removed. Until the index is pushed
+   only untagged images exist; `index append` is the last call where crane can refuse on
+   content (it reads every config), and after it each write moves a tag to a digest already in
+   the registry.
 
-A refusal exits 2 with nothing written. Before this ADR, `image-index` read platforms from the
+A refusal the Step makes exits 2 with nothing written and the workspace as it was. A failure
+crane or the registry reports after the first write can leave images pushed by digest with no
+tag, and a retry pushes them again. Before this ADR, `image-index` read platforms from the
 registry, which for layouts would have meant after the images were uploaded.
 
 The checks exist because a build Pod runs repository code. A Dockerfile `RUN` shares
@@ -273,7 +288,7 @@ Steps may name that profile, adds the new sources.
 ### 7. Arch tags are on by default
 
 `arch_tags` is a boolean input, default `true`, that applies only to images that came from
-layouts. Each such image gets its arch tag (§4) before the index is written. Without a tag,
+layouts. Each such image gets its arch tag (§4) right after the index is written. Without a tag,
 an architecture image is reachable only through the index, and a registry lifecycle rule that
 expires untagged images (ECR has one; other registries' garbage collection has similar rules)
 could delete it and break the index. We have not confirmed how ECR treats the children of a
@@ -381,7 +396,7 @@ when it deserialises into the IR's structs.
 ## Test plan
 
 - **`image-index` script** (workspace suite, real `/bin/sh`, stub crane): layouts pushed by
-  digest, then arch tags, index and extra tags, in that order; each refusal in §4 (a symlink
+  digest, then the index, arch tags and extra tags, in that order; each refusal in §4 (a symlink
   at each level, a path outside `.scarab-build/`, a non-regular file, two manifests in
   `index.json`, a manifest or config that does not hash to its name, a digest that differs
   from the line's, two sources of one platform, a tag over 128 characters) writes nothing;

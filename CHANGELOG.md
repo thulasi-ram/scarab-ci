@@ -26,8 +26,12 @@ release.yml uses that version's section as the GitHub Release text. See
   `libs/image-index.yaml` with the registry credential keeps that grant on upgrade, and the new
   `layouts` input then makes the step read image layouts from the workspace and upload them. It
   still runs no repository code, and it checks each layout before its first registry write (no
-  symlink, only directories and regular files, manifest and config hashed, the manifest is the
-  digest the build reported). The upgrade's review page lists the grant it carries. Pipelines
+  symlink, only directories and regular files, the manifest and every blob it names hashed, the
+  manifest is the digest its `layouts` line gives). The step pushes whatever layout its `layouts`
+  lines name: any step of the Pipeline, a plain `run:` step included, can write a layout under
+  `/workspace/.scarab-build/` and name its digest, so the digest check shows the layout was not
+  changed after it was named, not that a build step made it. The upgrade's review page lists the
+  grant it carries. Pipelines
   that pass only `image` and `images` make the same registry calls as before and read nothing
   from the workspace. See
   [Libraries](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#install-scarabs-image-index-library).
@@ -37,13 +41,14 @@ release.yml uses that version's section as the GitHub Release text. See
 - **One invoke builds and pushes an image for amd64 and arm64.** The new library
   `lib:thulasi-ram::scarab-ci::build-multiarch` (`libs/build-multiarch.yaml`) builds on an amd64
   node and an arm64 node with no credential, and its one `push` step pushes both images by
-  digest, tags each `<tag>-<architecture>`, pushes the index under `image`'s tag and tags it with
-  each of `extra_tags` (such as `latest`). Before, the same image took two build invokes and an
+  digest, pushes the index under `image`'s tag, tags each image `<tag>-amd64` and `<tag>-arm64`,
+  and tags the index with each of `extra_tags` (such as `latest`). Before, the same image took two build invokes and an
   image index invoke per tag, with four steps holding the push credential; now one step holds it.
   Deploy by `outputs.<id>.push.digest`. The architectures are fixed to amd64 and arm64, so the
   cluster needs nodes of both. Arch tags are on by default (`arch_tags`), so a registry rule that
   expires untagged images does not remove an image the index names. A retried push step pushes
-  both architectures again, and its Pod needs disk for the checkout and both image layouts. On a
+  both architectures again, and its Pod needs disk for the checkout and both image layouts. Each
+  build keeps its own S3 layer cache, `<cache_name>-amd64` and `<cache_name>-arm64`. On a
   fork pull request the builds write no layout and the push step pushes nothing and exits 0.
   Install it and trust its source for the build sandbox and with the registry credential; an
   ECR `ecr-push` Policy must list its source. See
@@ -54,8 +59,13 @@ release.yml uses that version's section as the GitHub Release text. See
   `lib:thulasi-ram::scarab-ci::build-layout` library, which builds with no credential and pushes
   nothing), `extra_tags` (more tags for the index, so a second tag no longer needs a second index
   step) and `arch_tags` (default `true`, for images from `layouts` only). `images` is now
-  optional; at least one of `images` and `layouts` must name an image. Every check runs before
-  the first registry write. See
+  optional; at least one of `images` and `layouts` must name an image. Every check the step
+  makes itself runs before the first registry write; a failure crane or the registry reports
+  after that can leave images pushed by digest with no tag, and a retry pushes them again. The
+  writes go in this order: images by digest, the index, arch tags, extra tags. arm64 is tagged
+  `<tag>-arm64` whether or not its config names `v8`; a 32-bit arm image is tagged with its
+  variant, `<tag>-arm-v7`. Two images that differ only by `arm64` and `arm64/v8` are one platform
+  and are refused, `images` sources included. See
   [Joining images into one multi-architecture image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#joining-images-into-one-multi-architecture-image).
 
 ### Enhancement
