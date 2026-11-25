@@ -365,6 +365,19 @@ steps:
           fail "layouts ends in more than one empty line; a mix of layouts and empty lines is refused"
         [ "$count" -gt 0 ] || [ "$nlayouts" -gt 0 ] ||
           fail "images and layouts name no image"
+        # A library that knows how many layouts it hands this script (one
+        # per build Step) sets SCARAB_INDEX_LAYOUT_COUNT, so a result that
+        # adds a line cannot add an image to the index. Unset or empty, the
+        # count is not checked.
+        expected=${SCARAB_INDEX_LAYOUT_COUNT-}
+        case "$expected" in
+          "") ;;
+          *[!0-9]*) fail "SCARAB_INDEX_LAYOUT_COUNT must be a number, not $expected" ;;
+          *)
+            [ "$nlayouts" -eq "$expected" ] ||
+              fail "layouts names $nlayouts layouts, but this step takes $expected, one per build"
+            ;;
+        esac
         # crane's --insecure also skips TLS verification, so a registry
         # login would go to whoever answers at the registry's host.
         if [ "$insecure" = true ] && [ -e "${DOCKER_CONFIG-}/config.json" ]; then
@@ -471,7 +484,11 @@ steps:
           inside "$r" || fail "the image layout $path resolves outside the workspace"
           [ "$r" = "$path" ] || fail "the image layout $path resolves to $r"
           layout=$r
-          odd=$(find "$layout" ! -type f ! -type d | head -n 1)
+          # A directory find cannot read could hide a symlink, so a find
+          # that fails refuses the layout.
+          odd=$(find "$layout" ! -type f ! -type d) ||
+            fail "cannot list every file in the image layout $path"
+          odd=${odd%%"$nl"*}
           [ -z "$odd" ] ||
             fail "the image layout $path holds $odd, which is not a regular file or a directory"
           [ -f "$layout/oci-layout" ] || fail "the image layout $path has no oci-layout file"

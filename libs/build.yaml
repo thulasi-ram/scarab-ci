@@ -382,6 +382,10 @@ steps:
   - id: push
     image: gcr.io/go-containerregistry/crane:debug@sha256:e78770b31258a3846f878036d9c1f63fbe4c871f9f56990bf77fd95c013e3c1b
     needs: [image]
+    # The Step reads only the build Step's layout from the workspace, so
+    # only that Step's workspace reaches it, not those of the Steps the
+    # invoke needs.
+    inputs: [image]
     registry_auth: true
     # The image's default user is root. crane and busybox need no user of
     # their own, so the Step runs as uid 1000, the build Step's uid. It
@@ -507,7 +511,11 @@ steps:
         inside "$r" || fail "the image layout resolves outside the workspace"
         [ "$r" = "$layout" ] || fail "the image layout resolves to $r, not $layout"
         layout=$r
-        odd=$(find "$layout" ! -type f ! -type d | head -n 1)
+        # A directory find cannot read could hide a symlink, so a find
+        # that fails refuses the layout.
+        odd=$(find "$layout" ! -type f ! -type d) ||
+          fail "cannot list every file in the image layout"
+        odd=${odd%%"$nl"*}
         [ -z "$odd" ] ||
           fail "the image layout holds $odd, which is not a regular file or a directory"
         # The layout must hold the image the build Step built, not a stale,
