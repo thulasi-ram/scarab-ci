@@ -57,6 +57,41 @@ release.yml uses that version's section as the GitHub Release text. See
 - **A `[` or `]` in a step id must pair.** Scarab reads `[…]` as a matrix coordinate when it
   splits an inlined step's name, so an unpaired bracket is now a compile error.
 
+### Features
+
+- **`build-multiarch` builds the platforms you name.** A new `platforms` input, default
+  `linux/amd64,linux/arm64`, takes platforms separated by commas or spaces: `linux/amd64` (and
+  `/v2` to `/v4`), `linux/arm/v5` to `v8`, `linux/arm64`, `linux/loong64`, `linux/ppc64`,
+  `linux/ppc64le`, `linux/riscv64` and `linux/s390x`. 32-bit arm is written with its variant;
+  `linux/386` and mips are not offered, because the node check cannot tell them apart. Each
+  platform gets its own build step, `app/build[arch=linux/arm64]`, routed with a coordinate key in
+  `placement_profiles`, and the one push step joins them all. A build step on a node of another
+  architecture fails before BuildKit starts, with a message that names the placement. See
+  [Building a multi-architecture image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#building-a-multi-architecture-image).
+- **An invoke places each instance of a library's matrix step.** The map form of
+  `placement_profiles` takes coordinate keys, `"build[arch=linux/arm64]": [arm64-builders]`,
+  checked when the invoke is inlined. An instance no coordinate key names takes the plain key for
+  its step, then the list an outer invoke gives. Each compiled step still holds a plain list, so
+  Policies and admission see no change. See
+  [Reuse: `invoke`](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#reuse-invoke).
+- **A library's matrix can take its values from an input.** A library step's dimension may be
+  exactly `${{ inputs.<name> }}`, a `string` input with a default, whose comma- or
+  space-separated value the caller writes in `with:` (a template there is a compile error, since
+  the matrix expands when the Pipeline compiles). Another step of the library reads every
+  instance as a list of `{matrix, results}`, and the new CEL function `join` joins a list of
+  strings in any Pipeline or library expression (`${{ }}`, `when:`, `validate:`, `exclude`);
+  Policies do not have it. See
+  [Libraries: a matrix from an input](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#a-matrix-from-an-input).
+
+### Bug Fixes
+
+- **A library's review page no longer reads its comments as Steps.** The install and upgrade
+  review listed an `invoke:`, an `image:` or a `forge_token` that only a YAML comment named, so a
+  library whose header comment showed an example invoke was reported as invoking that library.
+  The page now cuts each line's comment before it matches.
+
+## [0.7.7] - 2026-11-25
+
 ### Security
 
 - **Upgrading the image index library lets it upload workspace content under its existing
@@ -106,29 +141,6 @@ release.yml uses that version's section as the GitHub Release text. See
   variant, `<tag>-arm-v7`. Two images that differ only by `arm64` and `arm64/v8` are one platform
   and are refused, `images` sources included. See
   [Joining images into one multi-architecture image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#joining-images-into-one-multi-architecture-image).
-- **`build-multiarch` builds the platforms you name.** A new `platforms` input, default
-  `linux/amd64,linux/arm64`, takes platforms separated by commas or spaces: `linux/amd64` (and
-  `/v2` to `/v4`), `linux/arm/v5` to `v8`, `linux/arm64`, `linux/loong64`, `linux/ppc64`,
-  `linux/ppc64le`, `linux/riscv64` and `linux/s390x`. 32-bit arm is written with its variant;
-  `linux/386` and mips are not offered, because the node check cannot tell them apart. Each
-  platform gets its own build step, `app/build[arch=linux/arm64]`, routed with a coordinate key in
-  `placement_profiles`, and the one push step joins them all. A build step on a node of another
-  architecture fails before BuildKit starts, with a message that names the placement. See
-  [Building a multi-architecture image](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#building-a-multi-architecture-image).
-- **An invoke places each instance of a library's matrix step.** The map form of
-  `placement_profiles` takes coordinate keys, `"build[arch=linux/arm64]": [arm64-builders]`,
-  checked when the invoke is inlined. An instance no coordinate key names takes the plain key for
-  its step, then the list an outer invoke gives. Each compiled step still holds a plain list, so
-  Policies and admission see no change. See
-  [Reuse: `invoke`](https://thulasi-ram.github.io/scarab-ci/usage/pipeline-syntax/#reuse-invoke).
-- **A library's matrix can take its values from an input.** A library step's dimension may be
-  exactly `${{ inputs.<name> }}`, a `string` input with a default, whose comma- or
-  space-separated value the caller writes in `with:` (a template there is a compile error, since
-  the matrix expands when the Pipeline compiles). Another step of the library reads every
-  instance as a list of `{matrix, results}`, and the new CEL function `join` joins a list of
-  strings in any Pipeline or library expression (`${{ }}`, `when:`, `validate:`, `exclude`);
-  Policies do not have it. See
-  [Libraries: a matrix from an input](https://thulasi-ram.github.io/scarab-ci/usage/libraries/#a-matrix-from-an-input).
 
 ### Enhancement
 
@@ -2666,7 +2678,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.6...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.7...HEAD
+[0.7.7]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.6...v0.7.7
 [0.7.6]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.3...v0.7.4
