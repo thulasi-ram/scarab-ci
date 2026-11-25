@@ -58,13 +58,14 @@
 #                               image built. The build Step adds that digest
 #                               as `digest` (a key with no ".") and, when it
 #                               wrote a layout, the layout's path as
-#                               `layout`. When Scarab collects results, the
-#                               push Step pushes only a layout whose manifest
-#                               has that digest, and fails (exit 2) on any
-#                               other, so the two digests match. When it does
-#                               not, the push Step pushes without the check,
-#                               finds the layout from its own Step id, and
-#                               logs lines starting `scarab: warning:`.
+#                               `layout`. The push Step pushes only a
+#                               layout whose manifest has that digest, and
+#                               fails (exit 2) on any other, so the two
+#                               digests match. When Scarab does not collect
+#                               results (the server has no results token
+#                               secret, chart value secrets.resultsTokenSecret)
+#                               there is nothing to check against, and the
+#                               push Step fails (exit 2) with push: true.
 #
 # To build one architecture's image and leave the pushing to another Step,
 # use build-layout.yaml with image-index.yaml; to build amd64 and arm64 and
@@ -490,27 +491,16 @@ steps:
           echo "scarab: not pushed: this Run is a fork pull request's, or is locked out of its Environment's secrets"
           exit 0
         fi
-        # The build Step names the layout's path in its `image` result:
+        # The build Step names the layout's path and the image's digest in
+        # its `image` result. Without results (/scarab/results is absent,
+        # because the server has no results token secret) there is nothing
+        # to check the layout against, so nothing is pushed.
+        [ -d /scarab/results ] ||
+          fail "results are not collected, so the image's digest cannot be checked against the build step's; set the server's results token secret (SCARAB_RESULTS_TOKEN_SECRET, the chart value secrets.resultsTokenSecret)"
         # <workspace>/.scarab-build/<key>/oci, the key 32 hex characters.
-        # When Scarab does not collect results (/scarab/results is absent),
-        # there is no result, and the path is found as the build Step found
-        # it: from the build Step's id, which is this Step's id with `image`
-        # for `push` at the end.
         layout=${SCARAB_BUILD_LAYOUT-}
-        if [ -z "$layout" ]; then
-          [ ! -d /scarab/results ] ||
-            fail "the build step reported no image layout (its image result has no layout)"
-          step=${SCARAB_STEP-}
-          case "$step" in
-            ?*/push) ;;
-            *) fail "SCARAB_STEP ($step) is not this library's push step, so the image layout cannot be found" ;;
-          esac
-          sum=$(printf '%s' "${step%/push}/image" | sha256sum) || fail "cannot hash the build step's id"
-          key=${sum%% *}
-          rest=${key#????????????????????????????????}
-          layout=$root/.scarab-build/${key%"$rest"}/oci
-          echo "scarab: warning: results are not collected, so the layout's path is found from the step id" >&2
-        fi
+        [ -n "$layout" ] ||
+          fail "the build step reported no image layout (its image result has no layout)"
         case "$layout" in
           "$root"/.scarab-build/*/oci) ;;
           *) fail "the image layout $layout is not $root/.scarab-build/<key>/oci" ;;
@@ -583,14 +573,10 @@ steps:
         [ "sha256:${sum%% *}" = "$built" ] ||
           fail "the manifest in the image layout does not hash to its digest $built"
         want=${SCARAB_BUILD_DIGEST-}
-        if [ -n "$want" ]; then
-          [ "$want" = "$built" ] ||
-            fail "the image layout holds $built, but the build step built $want"
-        elif [ -d /scarab/results ]; then
+        [ -n "$want" ] ||
           fail "the build step reported no image digest (its image result has no containerimage.digest)"
-        else
-          echo "scarab: warning: results are not collected, so the layout is not checked against the build step's digest" >&2
-        fi
+        [ "$want" = "$built" ] ||
+          fail "the image layout holds $built, but the build step built $want"
         # crane pushes the manifest index.json names. It reads an index.json
         # written here, naming only the manifest checked above, by its digest
         # and size; BuildKit's oci exporter writes OCI media types. The
