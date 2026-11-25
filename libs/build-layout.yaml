@@ -1,0 +1,341 @@
+# Scarab's build-layout library: build an image from the Run's workspace
+# with rootless BuildKit and leave it in the workspace as an OCI image
+# layout, for image-index.yaml to push. It holds no registry credential and
+# pushes nothing. An org admin installs it like any library, from
+# github.com/thulasi-ram/scarab-ci//libs/build-layout.yaml at a release
+# commit, and trusts that source for the build sandbox before any Run may
+# use it. It needs no registry-credential trust.
+#
+# Build each architecture on its own node pool, then push both and the
+# index from one Step:
+#
+#   - id: amd64
+#     invoke: lib:thulasi-ram::scarab-ci::build-layout
+#     needs: [checkout]
+#     placement_profiles: [amd64-builders]
+#   - id: arm64
+#     invoke: lib:thulasi-ram::scarab-ci::build-layout
+#     needs: [checkout]
+#     placement_profiles: [arm64-builders]
+#   - id: app
+#     invoke: lib:thulasi-ram::scarab-ci::image-index
+#     needs: [amd64, arm64]
+#     placement_profiles: [ecr-push]
+#     with:
+#       image: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/app:${{ event.sha }}
+#       extra_tags: latest
+#       layouts: |
+#         ${{ has(outputs.amd64.image) && has(outputs.amd64.image.layout) ? outputs.amd64.image.layout + ' ' + outputs.amd64.image.digest : '' }}
+#         ${{ has(outputs.arm64.image) && has(outputs.arm64.image.layout) ? outputs.arm64.image.layout + ' ' + outputs.arm64.image.digest : '' }}
+#
+# Its one Step is `amd64/image` (named after the invoke); `needs: [amd64]`
+# reaches it. It asks for `security: { sandbox: rootless-buildkit }`, which
+# Run creation admits only when the org trusts this file's source for the
+# sandbox. BuildKit runs with --oci-worker-no-process-sandbox, so a
+# Dockerfile RUN shares buildkitd's PID namespace and could read anything
+# the Step holds; the Step holds no credential.
+#
+# The Step writes the image as an OCI image layout at
+# /workspace/.scarab-build/<key>/oci. The key is the first 32 hex characters
+# of the SHA-256 of the Step's id (`amd64/image` above), so the layouts of
+# two builds do not collide in a Step that needs both. The layout stays in
+# the Step's workspace, so every Step that needs this one receives it (a
+# large image costs Data Depot transfer); image-index removes the layouts
+# from its own workspace after it pushes them. Limit what another Step
+# receives with `inputs:`.
+#
+# Output:
+#   ${{ outputs.amd64.image }}  what buildctl wrote with `--metadata-file`,
+#                               when Scarab collects results, plus:
+#                                 digest  the digest of the image built
+#                                         (BuildKit's
+#                                         `containerimage.digest`, under a
+#                                         key with no ".")
+#                                 layout  the layout's path, when one was
+#                                         written
+#                               image-index takes the two as one `layouts`
+#                               line. It checks the layout against the
+#                               digest; that check does not find a build
+#                               that rewrites its own result too (a process
+#                               a Dockerfile RUN left behind can reach the
+#                               result file as it reaches the layout), and
+#                               the Dockerfile's author chooses the image's
+#                               content anyway.
+#
+# A fork pull request, or a Run locked out of its Environment's secrets, is
+# told so with SCARAB_FORK_PR=true: the Step then builds the image, keeps it
+# in BuildKit, exports no layer cache and writes no layout, and its result
+# has no `layout` key. The `has(...)` form above then renders `layouts` as
+# empty lines, and image-index pushes nothing and exits 0 on such a Run. A
+# missing SCARAB_FORK_PR is treated the same way.
+#
+# Every input reaches the script through an environment variable, never the
+# command. The Step resolves the context and the Dockerfile with realpath
+# and refuses (exit 2) anything outside /workspace.
+#
+# The layer cache is `none` or `s3`. S3 is reached with the build Pod's own
+# identity (a placement profile's ServiceAccount, for example); Scarab
+# passes no credential.
+#
+# Inputs:
+#   context     the build context, relative to the workspace (default ".")
+#   dockerfile  the Dockerfile, relative to the context (default "Dockerfile")
+#   build_args  one KEY=VALUE per line, each passed as a build argument. A
+#               name starting BUILDKIT_ (in any case) is refused: BuildKit
+#               reads those as settings, and BUILDKIT_SYNTAX names a frontend
+#               image it pulls and runs. Do not build this input from text
+#               someone else writes (a commit message, a pull request title)
+#   cache       the layer cache: none or s3 (default none)
+#   cache_bucket, cache_region, cache_name
+#               for cache: s3, where the cache is kept
+kind: library
+interface:
+  inputs:
+    - name: context
+      type: string
+      required: false
+      default: "."
+      validate: 'value != "" && !value.matches("^/|(^|/)[.][.](/|$)|[,[:cntrl:]]")'
+      description: the build context, relative to the workspace, with no ".." and no ","
+    - name: dockerfile
+      type: string
+      required: false
+      default: Dockerfile
+      validate: 'value != "" && !value.matches("^/|(^|/)[.][.](/|$)|[,[:cntrl:]]")'
+      description: the Dockerfile, relative to the context, with no ".." and no ","
+    - name: build_args
+      type: string
+      required: false
+      default: ""
+      validate: 'value == "" || (value.matches("^([A-Za-z_][A-Za-z0-9_]*=[^,[:cntrl:]]*\n)*[A-Za-z_][A-Za-z0-9_]*=[^,[:cntrl:]]*\n?$") && !value.matches("(?i)(^|\n)buildkit_"))'
+      description: build arguments, one KEY=VALUE per line, with no "," in a value and no name starting BUILDKIT_
+    - name: cache
+      type: choice
+      options: [none, s3]
+      required: false
+      default: none
+      description: where BuildKit imports and exports its layer cache
+    - name: cache_bucket
+      type: string
+      required: false
+      default: ""
+      validate: 'value.matches("^([a-z0-9][a-z0-9.-]*[a-z0-9])?$")'
+      description: for cache s3, the bucket
+    - name: cache_region
+      type: string
+      required: false
+      default: ""
+      validate: 'value.matches("^[a-z0-9-]*$")'
+      description: for cache s3, the bucket's region
+    - name: cache_name
+      type: string
+      required: false
+      default: ""
+      validate: 'value.matches("^[A-Za-z0-9._/-]*$")'
+      description: for cache s3, the cache's name in the bucket (BuildKit's default when empty)
+  outputs: [image]
+steps:
+  - id: image
+    # The BuildKit image libs/build.yaml's build Step pins.
+    image: moby/buildkit:rootless@sha256:5987568f92dafbfb679879de59c1cd8d26597f5f6635c314e166164e2615870c
+    security: { sandbox: rootless-buildkit }
+    env:
+      # Rootless buildkitd cannot use the process sandbox.
+      - [BUILDKITD_FLAGS, --oci-worker-no-process-sandbox]
+      # The name BuildKit gives the image it keeps when it writes no layout
+      # (a fork pull request's build). Nothing is pushed under it.
+      - [SCARAB_BUILD_IMAGE, scarab-build-layout]
+      - [SCARAB_BUILD_CONTEXT, "${{ inputs.context }}"]
+      - [SCARAB_BUILD_DOCKERFILE, "${{ inputs.dockerfile }}"]
+      # "true" writes the image as a layout, for another Step to push.
+      - [SCARAB_BUILD_PUSH, "true"]
+      - [SCARAB_BUILD_ARGS, "${{ inputs.build_args }}"]
+      - [SCARAB_BUILD_CACHE, "${{ inputs.cache }}"]
+      - [SCARAB_BUILD_CACHE_BUCKET, "${{ inputs.cache_bucket }}"]
+      - [SCARAB_BUILD_CACHE_REGION, "${{ inputs.cache_region }}"]
+      - [SCARAB_BUILD_CACHE_NAME, "${{ inputs.cache_name }}"]
+    # A copy of libs/build.yaml's build script; a test holds the two the
+    # same.
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        # Bracket ranges in `case` follow the locale; C keeps [a-z] to a-z.
+        export LC_ALL=C
+        root=/workspace
+        fail() { echo "scarab: build refused: $*" >&2; exit 2; }
+        nl='
+        '
+        # Sets r to the resolved path. The `.` keeps a trailing newline in a
+        # directory name from being dropped by the command substitution.
+        resolve() {
+          r=$(realpath "$1" && echo .) || return 1
+          r=${r%.}
+          r=${r%"$nl"}
+        }
+        [ -d "$root" ] || fail "no workspace at $root"
+        cd "$root" || fail "cannot enter the workspace at $root"
+        resolve . || fail "cannot resolve the workspace at $root"
+        root=$r
+        # The push Step reads the image from here. Whatever an earlier Step
+        # left at this path (a symlink included) is removed first; rm does
+        # not follow a symlink it removes.
+        rm -rf ./.scarab-build
+        ctx=${SCARAB_BUILD_CONTEXT-}
+        df=${SCARAB_BUILD_DOCKERFILE-}
+        [ -n "$ctx" ] || fail "no build context"
+        [ -n "$df" ] || fail "no dockerfile"
+        inside() {
+          case "$1" in
+            "$root" | "$root"/*) return 0 ;;
+            *) return 1 ;;
+          esac
+        }
+        [ -e "./$ctx" ] || fail "build context $ctx does not exist in the workspace"
+        resolve "./$ctx" || fail "cannot resolve build context $ctx"
+        inside "$r" || fail "build context $ctx resolves outside the workspace"
+        [ -e "./$ctx/$df" ] || fail "dockerfile $ctx/$df does not exist in the workspace"
+        resolve "./$ctx/$df" || fail "cannot resolve dockerfile $ctx/$df"
+        inside "$r" || fail "dockerfile $ctx/$df resolves outside the workspace"
+        # The inputs were checked against their `validate:` rules when the
+        # Step launched; the checks below hold the script to them too.
+        image=${SCARAB_BUILD_IMAGE-}
+        push=${SCARAB_BUILD_PUSH-false}
+        case "$image" in
+          "" | -* | *,*) fail "image $image is not an image reference" ;;
+        esac
+        case "$push" in
+          true | false) ;;
+          *) fail "push must be true or false, not $push" ;;
+        esac
+        # Scarab sets SCARAB_FORK_PR on every launch of this Step; a value
+        # other than `false` (none included) is a fork pull request's build,
+        # or a Run locked out of its Environment's secrets, which never writes
+        # the shared cache and is never pushed.
+        fork=true
+        [ "${SCARAB_FORK_PR-}" = false ] && fork=false
+        if [ "$fork" = true ]; then
+          [ "$push" = false ] ||
+            echo "scarab: not pushed: this Run is a fork pull request's, or is locked out of its Environment's secrets" >&2
+          push=false
+        fi
+        set -- build --frontend dockerfile.v0 \
+          --local "context=$ctx" --local "dockerfile=$ctx" --opt "filename=$df"
+        while IFS= read -r line; do
+          [ -n "$line" ] || continue
+          key=${line%%=*}
+          [ "$key" != "$line" ] || fail "build arg $line is not KEY=VALUE"
+          case "$key" in
+            "" | [0-9]* | *[!A-Za-z0-9_]*) fail "build arg name $key is not a name" ;;
+            # BuildKit reads BUILDKIT_* build args as settings; BUILDKIT_SYNTAX
+            # names a frontend image that it pulls and runs.
+            [Bb][Uu][Ii][Ll][Dd][Kk][Ii][Tt]_*) fail "build arg $key is refused: BuildKit reads BUILDKIT_* arguments as settings" ;;
+          esac
+          case "$line" in
+            *,*) fail "build arg $key holds a ','" ;;
+            *[[:cntrl:]]*) fail "build arg $key holds a control character" ;;
+          esac
+          set -- "$@" --opt "build-arg:$line"
+        done <<EOF
+        ${SCARAB_BUILD_ARGS-}
+        EOF
+        case "${SCARAB_BUILD_CACHE-none}" in
+          none | "") ;;
+          s3)
+            bucket=${SCARAB_BUILD_CACHE_BUCKET-}
+            region=${SCARAB_BUILD_CACHE_REGION-}
+            name=${SCARAB_BUILD_CACHE_NAME-}
+            [ -n "$bucket" ] || fail "cache s3 needs cache_bucket"
+            [ -n "$region" ] || fail "cache s3 needs cache_region"
+            case "$bucket$region$name" in
+              *,*) fail "cache_bucket, cache_region and cache_name must not hold a ','" ;;
+            esac
+            s3="type=s3,region=$region,bucket=$bucket"
+            [ -z "$name" ] || s3="$s3,name=$name"
+            set -- "$@" --import-cache "$s3"
+            [ "$fork" = true ] || set -- "$@" --export-cache "$s3,mode=max"
+            ;;
+          *) fail "cache must be none or s3" ;;
+        esac
+        # An image to push leaves this Step as an OCI image layout in the
+        # workspace, at .scarab-build/<key>/oci; one that is not pushed stays
+        # in BuildKit, so it costs no workspace transfer. Both use OCI media
+        # types. The key is the first 32 hex characters of the SHA-256 of
+        # this Step's id (SCARAB_STEP, which Scarab sets), so two builds
+        # whose workspaces a later Step joins write different paths. The id
+        # itself is not used: an invoke matrix puts "[", "=" and "," in it,
+        # and a "," would end BuildKit's --output value.
+        layout=
+        if [ "$push" = true ]; then
+          step=${SCARAB_STEP-}
+          [ -n "$step" ] || fail "SCARAB_STEP is not set, so the image layout has no path"
+          sum=$(printf '%s' "$step" | sha256sum) || fail "cannot hash the step id $step"
+          key=${sum%% *}
+          rest=${key#????????????????????????????????}
+          key=${key%"$rest"}
+          case "$key" in
+            *[!0-9a-f]*) fail "the step id hashed to $key, which is not hex" ;;
+          esac
+          [ "${#key}" -eq 32 ] || fail "the step id hashed to $key, which is not 32 hex characters"
+          case "$root" in
+            *[!A-Za-z0-9._/-]*) fail "the workspace path $root holds a character an image layout path may not" ;;
+          esac
+          layout=$root/.scarab-build/$key/oci
+          mkdir -p "./.scarab-build/$key"
+          set -- "$@" --output "type=oci,dest=$layout,tar=false"
+        else
+          set -- "$@" --output "type=image,name=$image,push=false,oci-mediatypes=true"
+        fi
+        # BuildKit's metadata, the digest among it, is the Step's `image`
+        # result when Scarab collects results (/scarab/results exists).
+        meta=
+        if [ -d /scarab/results ]; then
+          meta=/scarab/results/image.json
+          set -- "$@" --metadata-file "$meta"
+        fi
+        # The build runs as a child, not with exec, so this script can add to
+        # the result after it. A stop signal is passed on to it.
+        /usr/bin/buildctl-daemonless.sh "$@" &
+        pid=$!
+        trap 'kill -TERM "$pid" 2>/dev/null || :' TERM INT
+        code=0
+        wait "$pid" || code=$?
+        # A signal ends `wait` early; wait again for the build itself.
+        while kill -0 "$pid" 2>/dev/null; do
+          code=0
+          wait "$pid" || code=$?
+        done
+        [ "$code" -eq 0 ] || exit "$code"
+        [ -n "$meta" ] || exit 0
+        # The result also gives the digest under a key with no "." in it
+        # (`digest`) and, when the image was written as a layout, the
+        # layout's path (`layout`), so a later Step reads
+        # `outputs.<step>.image.digest` and `outputs.<step>.image.layout`.
+        # Both keys are written last: a JSON reader keeps the last of two
+        # keys of one name, should BuildKit's metadata hold one of them.
+        # Without a layout, a result this script cannot extend is kept as
+        # BuildKit wrote it; with one, the Step fails, because the Step that
+        # pushes the layout needs both keys.
+        unextended() {
+          [ -z "$layout" ] || fail "$1, so the image layout cannot be handed on"
+          echo "scarab: warning: $1; the image result has no digest key" >&2
+          exit 0
+        }
+        [ -f "$meta" ] && [ ! -L "$meta" ] || unextended "BuildKit wrote no metadata file"
+        m=$(cat "$meta") || unextended "cannot read BuildKit's metadata"
+        found=$(printf '%s\n' "$m" | grep -o '"containerimage\.digest": *"sha256:[0-9a-f]\{64\}"') || found=
+        case "$found" in
+          "" | *"$nl"*) unextended "BuildKit's metadata does not name one image digest" ;;
+        esac
+        digest=${found##*\"sha256:}
+        digest=sha256:${digest%\"}
+        case "$m" in
+          "{"*"}") ;;
+          *) unextended "BuildKit's metadata is not one JSON object" ;;
+        esac
+        add="\"digest\":\"$digest\""
+        [ -z "$layout" ] || add="$add,\"layout\":\"$layout\""
+        { printf '%s,%s}\n' "${m%\}}" "$add" > "$meta.scarab" &&
+          mv -f "$meta.scarab" "$meta"; } ||
+          fail "cannot write the image result"
