@@ -215,7 +215,7 @@ export default function RunPipeline() {
           org={org()}
           repo={repo()}
           pipeline={selected()!}
-          sha={catalogValue()!.sha}
+          gitRef={catalogValue()!.sha}
           refName={loadedRef() === "HEAD" ? null : loadedRef()}
           onClose={() => setSelected(null)}
         />

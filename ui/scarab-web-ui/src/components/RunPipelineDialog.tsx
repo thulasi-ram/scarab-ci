@@ -2,8 +2,10 @@
 // it when you pick a pipeline; a run's page opens it filled in with that run's
 // inputs ("New run with these inputs").
 //
-// The interface is read at the resolved commit and the dispatch pins to the
-// same commit, so the form and the run see the same config. Client checks are
+// The interface is read at a ref (the launcher passes the commit its catalog
+// resolved; a run's page passes the run's branch, so the new run takes the
+// branch's latest commit). The server resolves the ref to a commit, and the
+// dispatch pins to that commit, so the form and the run see the same config. Client checks are
 // static only (required, type, options); the pipeline's `validate:` rules run
 // on the server at dispatch and come back as a field error.
 //
@@ -38,18 +40,20 @@ export default function RunPipelineDialog(props: {
   org: string;
   repo: string;
   pipeline: string;
-  /** The commit the form is read at and the run pins to. */
-  sha: string;
-  /** What the commit was picked as (a branch, a tag), for the header. */
+  /** The ref the form is read at: a branch, a tag or a commit. The run pins
+   * to the commit the server resolves it to. */
+  gitRef: string;
+  /** What the ref was picked as (a branch, a tag), for the header. */
   refName?: string | null;
-  /** A prior run's inputs: the form starts from them, not the defaults. */
+  /** A prior run's inputs: the form starts from them, not the defaults. An
+   * input whose value no longer passes starts from its default. */
   prefill?: Record<string, unknown>;
   onClose: () => void;
 }) {
   const nav = useNavigate();
   const [iface] = createResource(
-    () => ({ name: props.pipeline, sha: props.sha }),
-    (k) => pipelineInterface(props.org, props.repo, k.name, k.sha),
+    () => ({ name: props.pipeline, ref: props.gitRef }),
+    (k) => pipelineInterface(props.org, props.repo, k.name, k.ref),
   );
   // Reading an errored resource throws; every read goes through this guard.
   const ifaceValue = () => (iface.error ? undefined : iface());
@@ -58,25 +62,27 @@ export default function RunPipelineDialog(props: {
   const [fieldErrors, setFieldErrors] = createSignal<Record<string, string>>({});
   const [formError, setFormError] = createSignal<string | null>(null);
   const [dropped, setDropped] = createSignal<string[]>([]);
+  const [reset, setReset] = createSignal<string[]>([]);
   const [submitting, setSubmitting] = createSignal(false);
   const [reason, setReason] = createSignal("");
 
-  // Start from the prior run's inputs when given (dropping ones the pipeline
-  // no longer declares and flagging values that no longer pass), else from
-  // the declared defaults.
+  // Start from the prior run's inputs when given (leaving out ones the
+  // pipeline no longer declares, and starting ones whose value no longer
+  // passes from their default), else from the declared defaults.
   createEffect(() => {
     const i = ifaceValue();
     if (!i) return;
     if (props.prefill) {
-      const { values: v, dropped: d } = reconcilePrefill(i.inputs, props.prefill);
-      setValues(v);
-      setDropped(d);
-      setFieldErrors(validateForm(i.inputs, v));
+      const r = reconcilePrefill(i.inputs, props.prefill);
+      setValues(r.values);
+      setDropped(r.dropped);
+      setReset(r.reset);
     } else {
       setValues(initialValues(i.inputs));
       setDropped([]);
-      setFieldErrors({});
+      setReset([]);
     }
+    setFieldErrors({});
     setFormError(null);
   });
 
@@ -125,8 +131,12 @@ export default function RunPipelineDialog(props: {
     }
   }
 
-  const shortSha = () => props.sha.slice(0, 7);
-  const where = () => (props.refName && props.refName !== props.sha ? `${props.refName} · ${shortSha()}` : shortSha());
+  // The branch or tag, then the commit it resolved to once the server says.
+  const where = () => {
+    const label = props.refName ?? (/^[0-9a-f]{40}$/.test(props.gitRef) ? null : props.gitRef);
+    const sha = ifaceValue()?.sha.slice(0, 7) ?? (label ? null : props.gitRef.slice(0, 7));
+    return [label, sha].filter(Boolean).join(" · ");
+  };
 
   const Grid = (p: { specs: ParamSpec[] }) => {
     const field = (spec: ParamSpec) => (
@@ -162,7 +172,11 @@ export default function RunPipelineDialog(props: {
       icon="play"
       eyebrow={`${props.org}/${props.repo} · ${where()}`}
       title={`Run ${props.pipeline}`}
-      purpose={props.prefill ? "Filled in with the inputs of the run you came from." : undefined}
+      purpose={
+        props.prefill
+          ? `Filled in with the inputs of the run you came from${props.refName ? `, at the latest commit on ${props.refName}` : ""}.`
+          : undefined
+      }
       busy={submitting()}
       onClose={props.onClose}
       footer={
@@ -204,6 +218,12 @@ export default function RunPipelineDialog(props: {
                   <p class="rpd-notice">
                     <Icon icon="info" size={13} /> Left out {dropped().length === 1 ? "an input" : "inputs"} the pipeline
                     no longer declares: <span class="mono">{dropped().join(", ")}</span>
+                  </p>
+                </Show>
+                <Show when={reset().length > 0}>
+                  <p class="rpd-notice">
+                    <Icon icon="info" size={13} /> Started from the default, as the earlier value no longer passes:{" "}
+                    <span class="mono">{reset().join(", ")}</span>
                   </p>
                 </Show>
                 <Show when={required().length > 0}>

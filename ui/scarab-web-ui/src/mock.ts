@@ -634,7 +634,9 @@ const richRunStatus: RunStatusDto = {
   trigger_title: "Wire shared postgres into the integration suite",
   origin_pr_base: null,
   // The generated schema types params opaquely; the values are plain JSON.
-  params: { version: "0.8.1", channel: "beta", parallelism: 8, sign_images: true, dry_run: false } as unknown as RunStatusDto["params"],
+  // `channel: edge` is an option the pipeline has since removed, so a new run
+  // with these inputs starts `channel` from its default.
+  params: { version: "0.8.1", channel: "edge", parallelism: 8, sign_images: true, dry_run: false } as unknown as RunStatusDto["params"],
   // Suspended on a gate, so likewise never GC-eligible regardless of age
   // — but PINNED, to render the "keep this run's snapshots" state.
   snapshot_retention: {

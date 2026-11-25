@@ -379,9 +379,14 @@ test("a run's inputs: the Inputs tab and a new run filled in with them", async (
   await page.getByRole("button", { name: "More run actions" }).click();
   await page.getByRole("menu", { name: "More run actions" }).getByRole("menuitem", { name: /New run with these inputs/ }).click();
   const dialog = page.getByRole("dialog", { name: "Run release" });
+  await expect(dialog).toContainText("at the latest commit on main");
   await expect(dialog.getByLabel("version")).toHaveValue("0.8.1");
-  await expect(dialog.getByRole("radio", { name: "beta" })).toHaveAttribute("aria-checked", "true");
   await expect(dialog.getByLabel("parallelism")).toHaveValue("8");
+  // The run's `channel: edge` is no longer an option: it starts empty, and
+  // the dialog says so.
+  await expect(dialog.locator(".rpd-notice")).toContainText("channel");
+  await expect(dialog.getByRole("radio", { name: "beta" })).toHaveAttribute("aria-checked", "false");
+  await dialog.getByRole("radio", { name: "beta" }).click();
 
   // A required input left empty is refused here, before any dispatch.
   await dialog.getByLabel("version").fill("");

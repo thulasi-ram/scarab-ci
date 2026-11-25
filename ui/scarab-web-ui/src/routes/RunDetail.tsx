@@ -926,11 +926,12 @@ export default function RunDetail() {
     t.branch && t.branch !== t.sha ? t.branch : null;
 
   // "New run with these inputs": the run form for this run's pipeline at the
-  // commit this run ran, filled in with this run's inputs. Without a pipeline
-  // name or a commit (an inline run), the launcher page instead.
+  // latest commit on this run's branch (the run's own commit when it names no
+  // branch), filled in with this run's inputs. Without a pipeline name or a
+  // commit (an inline run), the launcher page instead.
   const [relaunch, setRelaunch] = createSignal<{
     pipeline: string;
-    sha: string;
+    gitRef: string;
     refName: string | null;
     params: Record<string, unknown>;
   } | null>(null);
@@ -938,7 +939,8 @@ export default function RunDetail() {
     const r = run();
     const t = triggerInfo();
     if (r?.pipeline && t?.sha) {
-      setRelaunch({ pipeline: r.pipeline, sha: t.sha, refName: headBranch(t), params: runParams(r) });
+      const branch = headBranch(t);
+      setRelaunch({ pipeline: r.pipeline, gitRef: branch ?? t.sha, refName: branch, params: runParams(r) });
     } else {
       nav(`/${org()}/${repo()}/run`);
     }
@@ -1810,7 +1812,7 @@ export default function RunDetail() {
                   org={org()}
                   repo={repo()}
                   pipeline={rl().pipeline}
-                  sha={rl().sha}
+                  gitRef={rl().gitRef}
                   refName={rl().refName}
                   prefill={rl().params}
                   onClose={() => setRelaunch(null)}
