@@ -139,7 +139,7 @@ const POLL_MS = 1200;
 
 /** The step tab as the URL names it (absent = Logs; a gate's tab is not kept). */
 const paneTabParam = (t: PaneTab): PaneTabParam | undefined =>
-  t === "results" || t === "workspace" || t === "outputs" || t === "source" ? t : undefined;
+  t === "results" || t === "workspace" || t === "source" ? t : undefined;
 
 /** A run tab: Pipeline (absent from the URL), Artifacts, Activity, Inputs or Manifest. */
 type RunTab = "pipeline" | RunTabParam;
@@ -925,14 +925,31 @@ export default function RunDetail() {
   const headBranch = (t: { branch?: string; sha?: string }): string | null =>
     t.branch && t.branch !== t.sha ? t.branch : null;
 
+  // The run ID in the crumb line copies on click; the icon says it worked.
+  const [idCopied, setIdCopied] = createSignal(false);
+  let idCopiedTimer: ReturnType<typeof setTimeout> | undefined;
+  onCleanup(() => clearTimeout(idCopiedTimer));
+  async function copyRunId() {
+    try {
+      await navigator.clipboard?.writeText(id());
+      setIdCopied(true);
+      clearTimeout(idCopiedTimer);
+      idCopiedTimer = setTimeout(() => setIdCopied(false), 2000);
+    } catch {
+      /* the clipboard refused; the id is on screen to select */
+    }
+  }
+
   // "New run with these inputs": the run form for this run's pipeline at the
   // latest commit on this run's branch (the run's own commit when it names no
-  // branch), filled in with this run's inputs. Without a pipeline name or a
-  // commit (an inline run), the launcher page instead.
+  // branch; the default branch when the run's branch has since been deleted),
+  // filled in with this run's inputs. Without a pipeline name or a commit (an
+  // inline run), the launcher page instead.
   const [relaunch, setRelaunch] = createSignal<{
     pipeline: string;
     gitRef: string;
     refName: string | null;
+    branchMayBeGone: boolean;
     params: Record<string, unknown>;
   } | null>(null);
   const newRunWithInputs = () => {
@@ -940,7 +957,13 @@ export default function RunDetail() {
     const t = triggerInfo();
     if (r?.pipeline && t?.sha) {
       const branch = headBranch(t);
-      setRelaunch({ pipeline: r.pipeline, gitRef: branch ?? t.sha, refName: branch, params: runParams(r) });
+      setRelaunch({
+        pipeline: r.pipeline,
+        gitRef: branch ?? t.sha,
+        refName: branch,
+        branchMayBeGone: !!branch,
+        params: runParams(r),
+      });
     } else {
       nav(`/${org()}/${repo()}/run`);
     }
@@ -1058,45 +1081,32 @@ export default function RunDetail() {
           <>
             {/* ── Run header ── */}
             <div class="rh">
+              {/* Line 1: where the run is, its number and its id (click to
+                  copy), and at the right the actions. */}
               <div class="rh-row">
-                <h1 class="crumb-head rh-crumbs">
+                <nav class="crumb-head rh-crumbs" aria-label="Breadcrumb">
                   <HomeCrumb size={20} sepClass="crumb-head-sep" />
                   <RepoCrumb org={org()} repo={repo()} link />
                   <Icon icon="chevron-right" size={20} class="crumb-head-sep" />
                   {/* The per-repo run number `#N` is the human handle; the
                       short internal id for untenanted runs. */}
-                  <span class="rh-num" title={id()}>
+                  <span class="rh-num">
                     {r().run_number != null ? `#${r().run_number}` : `run ${id().slice(0, 8)}`}
                   </span>
-                  {/* As the runs list's line 1: the pipeline, a slash, the
-                      headline. */}
-                  <span class="rh-headline">
-                    <Show when={r().pipeline}>
-                      {(p) => (
-                        <>
-                          <span class="rh-pipe" title={`pipeline ${p()}`}>
-                            {pipelineShortName(p())}
-                          </span>
-                          <span class="rh-slash">/</span>
-                        </>
-                      )}
-                    </Show>
-                    <Show when={r().trigger_title}>
-                      {(t) => (
-                        <span class="crumb-head-title rh-title" title={t()}>
-                          {t()}
-                        </span>
-                      )}
-                    </Show>
+                  <button
+                    type="button"
+                    class="rh-id"
+                    title="Copy run ID"
+                    aria-label={`Copy run ID ${id()}`}
+                    onClick={() => void copyRunId()}
+                  >
+                    <span class="mono">{id()}</span>
+                    <Icon icon={idCopied() ? "check" : "copy"} size={12} />
+                  </button>
+                  <span class="sr-only" role="status">
+                    {idCopied() ? "Run ID copied" : ""}
                   </span>
-                </h1>
-                {/* The badge says how the version in view ended. */}
-                <StatusBadge status={shownStatus()} />
-                <Show when={live() && !timeTraveling()}>
-                  <span class="live-dot" title="live">
-                    <span class="dot" /> Live
-                  </span>
-                </Show>
+                </nav>
                 <span class="grow1" />
                 <span class="rh-actions">
                   {/* An active run's useful action is to stop it; a finished
@@ -1127,7 +1137,6 @@ export default function RunDetail() {
                     </button>
                   </Show>
                   <RunMoreMenu
-                    runId={id()}
                     onNewRun={newRunWithInputs}
                     retention={retention()}
                     pinning={pinning()}
@@ -1136,10 +1145,50 @@ export default function RunDetail() {
                 </span>
               </div>
 
+              {/* Line 2, the page title: the pipeline, a slash, the headline
+                  (as the runs list's line 1), then how the version in view
+                  ended; at the right edge, a kept or expired workspace mark
+                  and whether it is live. */}
+              <div class="rh-row">
+                <h1 class="rh-headline">
+                  <Show when={r().pipeline}>
+                    {(p) => (
+                      <>
+                        <span class="rh-pipe" title={`pipeline ${p()}`}>
+                          {pipelineShortName(p())}
+                        </span>
+                        <span class="rh-slash">/</span>
+                      </>
+                    )}
+                  </Show>
+                  <span class="rh-title" title={r().trigger_title ?? undefined}>
+                    {r().trigger_title ?? (r().run_number != null ? `Run #${r().run_number}` : "Run")}
+                  </span>
+                </h1>
+                <StatusBadge status={shownStatus()} />
+                <span class="grow1" />
+                {/* A kept or expired workspace mark, then Live. */}
+                <Show when={retention()} keyed>
+                  {(wr) => (
+                    <Show when={wr.pinned || wr.expired}>
+                      <span class="rh-keep" title={retentionNote(wr, isTerminal(run()!.status))}>
+                        <Icon icon={wr.pinned ? "pin" : "clock"} size={12} />
+                        {wr.pinned ? (wr.pinned_by ? `kept by ${wr.pinned_by}` : "kept") : "snapshots expired"}
+                      </span>
+                    </Show>
+                  )}
+                </Show>
+                <Show when={live() && !timeTraveling()}>
+                  <span class="live-dot" title="live">
+                    <span class="dot" /> Live
+                  </span>
+                </Show>
+              </div>
+
               {/* As the runs list's line 2: what started the run and what
                   it was about, then the commit, the author and a deploy run's
-                  Environment as one group. At the right edge, under the
-                  actions, a kept or expired workspace mark and the times. */}
+                  Environment as one group. At the right edge, the times.
+                  */}
               <div class="rh-prov">
                 <OriginLine
                   kind={triggerInfo()?.kind}
@@ -1157,32 +1206,7 @@ export default function RunDetail() {
                   prUrl={forgePrUrl(repoUrl(), triggerInfo()?.pr)}
                   deploy={deployTag(!!r().environment, r().environment?.display_name ?? r().environment?.name)}
                 />
-                {/* The inputs in full are on the Inputs tab; here, how many. */}
-                <Show when={Object.keys(runParams(r())).length}>
-                  {(n) => (
-                    <button
-                      type="button"
-                      class="rh-params mono"
-                      title={Object.entries(runParams(r()))
-                        .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
-                        .join("\n")}
-                      onClick={() => setRunTab("inputs")}
-                    >
-                      {n()} {n() === 1 ? "input" : "inputs"}
-                    </button>
-                  )}
-                </Show>
                 <span class="grow1" />
-                <Show when={retention()} keyed>
-                  {(wr) => (
-                    <Show when={wr.pinned || wr.expired}>
-                      <span class="rh-keep" title={retentionNote(wr, isTerminal(run()!.status))}>
-                        <Icon icon={wr.pinned ? "pin" : "clock"} size={12} />
-                        {wr.pinned ? (wr.pinned_by ? `kept by ${wr.pinned_by}` : "kept") : "snapshots expired"}
-                      </span>
-                    </Show>
-                  )}
-                </Show>
                 <Show when={startedAt()}>
                   <span class="rh-time" classList={{ live: live() && !timeTraveling() }} title={absTime(startedAt()!)}>
                     started {relTime(startedAt()!)} · {finishedAt() ? "" : "running for "}
@@ -1391,6 +1415,18 @@ export default function RunDetail() {
                 type="button"
                 role="tab"
                 class="run-tab"
+                aria-selected={runTab() === "inputs"}
+                onClick={() => setRunTab("inputs")}
+              >
+                Inputs{" "}
+                <span class="run-tab-n" classList={{ zero: Object.keys(runParams(r())).length === 0 }}>
+                  {Object.keys(runParams(r())).length}
+                </span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                class="run-tab"
                 aria-selected={runTab() === "artifacts"}
                 onClick={() => openArtifacts(null)}
               >
@@ -1417,18 +1453,6 @@ export default function RunDetail() {
                 >
                   <span class="run-tab-n">{activityCount()}</span>
                 </Show>
-              </button>
-              <button
-                type="button"
-                role="tab"
-                class="run-tab"
-                aria-selected={runTab() === "inputs"}
-                onClick={() => setRunTab("inputs")}
-              >
-                Inputs{" "}
-                <span class="run-tab-n" classList={{ zero: Object.keys(runParams(r())).length === 0 }}>
-                  {Object.keys(runParams(r())).length}
-                </span>
               </button>
               <button
                 type="button"
@@ -1814,6 +1838,7 @@ export default function RunDetail() {
                   pipeline={rl().pipeline}
                   gitRef={rl().gitRef}
                   refName={rl().refName}
+                  branchMayBeGone={rl().branchMayBeGone}
                   prefill={rl().params}
                   onClose={() => setRelaunch(null)}
                 />

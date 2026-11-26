@@ -26,7 +26,7 @@ test("run-detail walkthrough: DAG, versions, activity, gate, tries, artifacts", 
 
   // The run mounted: breadcrumb carries the human `#N` handle, provenance the
   // Headline, and the status badge reads suspended (held by the gate).
-  await expect(page.getByRole("heading", { name: /#147/ })).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Breadcrumb" })).toContainText("#147");
   await expect(page.getByText("Wire shared postgres into the integration suite")).toBeVisible();
   await expect(page.getByText("suspended", { exact: true })).toBeVisible();
 
@@ -167,7 +167,7 @@ const ENV_GATE_RUN_ID = "0190f8a2000071fb8c00e7a9b0c1d2e3";
 
 test("an environment approval gate says so, names who added it, and its wait timer", async ({ page }) => {
   await page.goto(`/acme/scarab/runs/${ENV_GATE_RUN_ID}`);
-  await expect(page.getByRole("heading", { name: /#152/ })).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Breadcrumb" })).toContainText("#152");
 
   // The DAG: the added gate is an approval gate, added by production.
   const added = page.getByRole("button", { name: /^environment-approval/ });
@@ -228,7 +228,7 @@ const MATRIX_RUN_ID = "0190f8a2000071fb8c00f00d4a7b1c33";
 
 test("a failed matrix run names where it failed and opens on the first failure", async ({ page }) => {
   await page.goto(`/acme/scarab/runs/${MATRIX_RUN_ID}`);
-  await expect(page.getByRole("heading", { name: /#33/ })).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Breadcrumb" })).toContainText("#33");
 
   // The run tabs row says what needs attention, counted, with no names.
   const attn = page.getByLabel("Needs attention");
@@ -352,16 +352,19 @@ test("a large service log offers Load full log and Download", async ({ page }) =
   await expect(last.locator(".lgln")).toHaveText("30005");
 });
 
-test("the run header's ⋯ menu copies the run ID and keeps snapshots", async ({ page, context }) => {
+test("the run ID copies from the crumb line, and the ⋯ menu keeps snapshots", async ({ page, context }) => {
   await context.grantPermissions(["clipboard-read", "clipboard-write"]);
   await page.goto(`/acme/scarab/runs/${MATRIX_RUN_ID}`);
+  await page.getByRole("button", { name: `Copy run ID ${MATRIX_RUN_ID}` }).click();
+  await expect(page.getByRole("status").filter({ hasText: "Run ID copied" })).toHaveCount(1);
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(MATRIX_RUN_ID);
+
   const more = page.getByRole("button", { name: "More run actions" });
   await more.focus();
   await page.keyboard.press("Enter");
   const menu = page.getByRole("menu", { name: "More run actions" });
   await expect(menu.getByRole("menuitem", { name: /Keep workspace snapshots/ })).toBeVisible();
-  await menu.getByRole("menuitem", { name: /Copy run ID/ }).click();
-  await expect(menu.getByRole("menuitem", { name: /Copied/ })).toBeVisible();
+  await expect(menu.getByRole("menuitem", { name: /Copy run ID/ })).toHaveCount(0);
   await page.keyboard.press("Escape");
   await expect(menu).toHaveCount(0);
 });
@@ -398,6 +401,53 @@ test("a run's inputs: the Inputs tab and a new run filled in with them", async (
   await expect(page).toHaveURL(new RegExp(`/acme/scarab/runs/${RICH_RUN_ID}$`));
 });
 
+// A step's `image` result (an image's build metadata) is a large object. The
+// Results tab shows it as one row that opens to formatted JSON, so it no
+// longer stretches the other results' cards to its height.
+test("a large object result is one row that opens to its JSON", async ({ page }) => {
+  await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}?step=2&ptab=results`);
+  const rows = page.locator(".res-list .res-name > span.mono");
+  await expect(rows).toHaveText(["tests_passed", "coverage", "image"]);
+  const image = page.getByRole("button", { name: /6 keys/ });
+  await expect(image).toContainText("digest: sha256:9f86d081");
+  const box = await page.locator(".res-list").boundingBox();
+  expect(box!.height).toBeLessThan(200);
+  await image.click();
+  await expect(image).toHaveAttribute("aria-expanded", "true");
+  await expect(page.locator(".res-json pre")).toContainText('"containerimage.descriptor": {');
+  const pre = await page.locator(".res-json pre").boundingBox();
+  expect(pre!.height).toBeLessThanOrEqual(320);
+  // Each row names the expression a later step reads it by.
+  await expect(page.locator(".res-expr").last()).toHaveText("${{ outputs.test.image }}");
+});
+
+// Results took over the Outputs tab: an old `ptab=outputs` link opens Results,
+// and on a failed try a pill says which try later steps read and selects it.
+test("Results says which try later steps read, and old Outputs links open it", async ({ page }) => {
+  await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}?step=1&try=1&ptab=outputs`);
+  await expect(page).toHaveURL(/[?&]ptab=results(&|$)/);
+  await expect(page.locator(".pane-tabbar .tab")).toHaveText(["Error", "Logs", "Results", "Workspace"]);
+  const jump = page.getByRole("button", { name: "later steps read try 2 →" });
+  await jump.click();
+  await expect(page.locator(".res-head")).toContainText("from build · try 2");
+  await expect(page.locator(".res-head")).toContainText("later steps read these");
+});
+
+// The RETRIES run's branch, fix/flaky-checkout, was deleted when its pull
+// request merged (src/mock.ts lists no such branch). A new run reads the
+// pipeline at the default branch and says why, instead of the forge's 422.
+test("a new run from a Run whose branch was deleted reads the default branch", async ({ page }) => {
+  await page.goto(`/acme/scarab/runs/${RETRIES_RUN_ID_FOR_NEW_RUN}`);
+  await page.getByRole("button", { name: "More run actions" }).click();
+  await page.getByRole("menu", { name: "More run actions" }).getByRole("menuitem", { name: /New run with these inputs/ }).click();
+  const dialog = page.getByRole("dialog", { name: "Run ci" });
+  await expect(dialog).toContainText("The branch fix/flaky-checkout no longer exists");
+  await expect(dialog).toContainText("at the latest commit on main");
+  await expect(dialog).not.toContainText("422");
+  await expect(dialog.getByRole("button", { name: "Run" })).toBeEnabled();
+});
+const RETRIES_RUN_ID_FOR_NEW_RUN = "0190f8a2000071fb8c00a11c3e5d7f34";
+
 // The RETRIES run in src/mock.ts: live, with two matrix cells waiting for a
 // node, cleared Pod conditions on earlier tries, a step with three tries, one
 // with six, and artifacts that earlier tries also wrote.
@@ -407,7 +457,7 @@ test("run tabs: the Activity filter hides cleared Pod conditions, Artifacts show
   page,
 }) => {
   await page.goto(`/acme/scarab/runs/${RETRIES_RUN_ID}`);
-  await expect(page.getByRole("heading", { name: /#34/ })).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Breadcrumb" })).toContainText("#34");
   // The run tabs row counts the cells waiting for a node; the run opens on one.
   await expect(page.getByLabel("Needs attention")).toContainText("◷ 2 waiting for a node");
   await expect(page.locator(".sp-name")).toContainText("deploy-preview");

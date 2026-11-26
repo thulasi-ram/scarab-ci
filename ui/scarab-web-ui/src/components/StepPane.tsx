@@ -74,6 +74,7 @@ import { shortHash } from "../libraries";
 import { idSegments } from "../dag-layout";
 import { waitApprovers, type WaitResolution } from "../run-tabs";
 import { absTime, relTime } from "../fmt";
+import { resultView } from "../result-value";
 import Icon from "./Icon";
 import { loadRunManifest } from "./RunManifest";
 import { pipelineShortName } from "../schedules";
@@ -82,7 +83,7 @@ import { type FilmstripTry } from "../attempts";
 import Pill from "./Pill";
 import { LogError, LogLoading, LogMarkerRow, LogSkeleton } from "./LogStates";
 
-export type PaneTab = "error" | "logs" | "results" | "outputs" | "workspace" | "source" | "gate";
+export type PaneTab = "error" | "logs" | "results" | "workspace" | "source" | "gate";
 
 // Cap rendered lines so a giant attempt can't blow up the DOM (windowing v1).
 const MAX_LINES = 1500;
@@ -94,10 +95,63 @@ function sameKey<T>(fn: () => T): () => T {
 }
 
 /** A compact display of a result value — scalars inline, structures as JSON. */
-function showValue(v: unknown): string {
-  if (typeof v === "string") return v;
-  return JSON.stringify(v);
+/** One row of the Results tab. */
+function ResultRow(props: { name: string; expr: string; type: string; value: unknown }) {
+  const view = resultView(props.value);
+  const [open, setOpen] = createSignal(false);
+  const [copied, setCopied] = createSignal(false);
+  const copy = async (json: string) => {
+    try {
+      await navigator.clipboard?.writeText(json);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      /* the clipboard refused; the JSON is on screen to select */
+    }
+  };
+  return (
+    <div class="res-row">
+      <span class="res-name">
+        <span class="mono">{props.name}</span>
+        <code class="res-expr mono" title="How a later step reads it">
+          {props.expr}
+        </code>
+      </span>
+      <span class="res-type">
+        <Pill tone="copper">{props.type}</Pill>
+      </span>
+      {view.kind === "plain" ? (
+        <span class="res-val mono">{view.text}</span>
+      ) : (
+        <>
+          <button
+            type="button"
+            class="res-val res-tree mono"
+            aria-expanded={open()}
+            onClick={() => setOpen((o) => !o)}
+            title={open() ? "Hide the value" : "Show the whole value"}
+          >
+            <Icon icon={open() ? "chevron-down" : "chevron-right"} size={13} />
+            <span class="res-size">{view.size}</span>
+            <span class="res-preview">{view.preview}</span>
+          </button>
+          <Show when={open()}>
+            <div class="res-json">
+              <div class="res-json-bar">
+                <span class="mono">{props.name}</span>
+                <button type="button" class="btn btn-ghost btn-sm res-copy" onClick={() => void copy(view.json)}>
+                  <Icon icon={copied() ? "check" : "copy"} size={13} /> {copied() ? "Copied" : "Copy"}
+                </button>
+              </div>
+              <pre class="mono">{view.json}</pre>
+            </div>
+          </Show>
+        </>
+      )}
+    </div>
+  );
 }
+
 
 export default function StepPane(props: {
   runId: string;
@@ -357,15 +411,6 @@ export default function StepPane(props: {
   // the same stream the Logs tab reads.
   const ERROR_TAIL = 6;
   const errorTail = () => logRows().filter((r) => !r.marker).slice(-ERROR_TAIL);
-  // Outputs read the try of record: name it when it is not the selected one.
-  const outputsScope = (): string | null => {
-    const c = carried();
-    if (c) return `from version ${c.take}, ${noun().toLowerCase()} ${c.try}`;
-    const rec = ofRecordTry();
-    if (!rec) return "none";
-    if (rec === scoped()?.id) return null;
-    return `from ${noun().toLowerCase()} ${ofRecordIndex() + 1}`;
-  };
 
   // Reset per-step view state when the selection moves to another step.
   createEffect(
@@ -618,21 +663,10 @@ export default function StepPane(props: {
     getStepResults(a.run, a.step, a.attempt).catch(() => []),
   );
 
-  // Outputs are OF-RECORD, not per-try: they resolve to the of-
-  // record attempt (latest success in this version) via a dedicated arg/resource
-  // pair. Null (no success, or not-run) simply doesn't fetch — the tab shows the
-  // of-record empty copy. The interpolation view AND the "built on …" consumed
-  // line both read these, so what a downstream step would see is what shows.
-  const outputsArg = sameKey(() => {
-    const s = stepId();
-    const rec = ofRecordTry();
-    return s && rec ? { run: props.runId, step: s, attempt: rec } : null;
-  });
-  const [outResults] = createResource(outputsArg, (a) =>
-    getStepResults(a.run, a.step, a.attempt).catch(() => []),
-  );
-  const [outConsumed] = createResource(outputsArg, (a) =>
-    getConsumed(a.run, a.step, a.attempt).catch(() => null),
+  // Which upstream tries the selected try was built on (the Results tab's
+  // "built on …" line).
+  const [consumed] = createResource(evidenceArg, (a) =>
+    a.attempt ? getConsumed(a.run, a.step, a.attempt).catch(() => null) : Promise.resolve(null),
   );
   const wsArg = sameKey(() => {
     const base = evidenceArg();
@@ -680,8 +714,7 @@ export default function StepPane(props: {
     switching() ||
     (viewedKey() !== null && logState() === "loading") ||
     results.loading ||
-    outResults.loading ||
-    outConsumed.loading ||
+    consumed.loading ||
     ws.loading;
 
   // The log skeleton (LogStates) stands in for the log body during a switch.
@@ -833,7 +866,6 @@ export default function StepPane(props: {
                       <TabBtn id="logs" label="Logs" />
                       <TabBtn id="results" label="Results" />
                       <TabBtn id="workspace" label="Workspace" />
-                      <TabBtn id="outputs" label="Outputs" scope={outputsScope()} />
                       <Show when={(s().origin ?? []).length > 0}>
                         <TabBtn id="source" label="Source" />
                       </Show>
@@ -841,7 +873,7 @@ export default function StepPane(props: {
                   }
                 >
                   <TabBtn id="gate" label="Gate" />
-                  <TabBtn id="outputs" label="Outputs" scope={outputsScope()} />
+                  <TabBtn id="results" label="Results" />
                 </Show>
               </div>
               <span class="grow1" />
@@ -1072,88 +1104,25 @@ export default function StepPane(props: {
             </Show>
 
             {/* Results — the scoped attempt's typed values (per-try). */}
+            {/* Results: what the selected try wrote, and which try later
+                steps read. A later step reads the try of record (the latest
+                success in this version, or the version a carried-over step
+                came from); when that is not the selected try, a note says so
+                and jumps to it. */}
             <Show when={tab() === "results"}>
               <div class="tabpane">
                 <Show
                   when={!notRun()}
-                  fallback={<p class="empty">nothing of record here</p>}
+                  fallback={<p class="empty">this step didn't run in this version</p>}
                 >
-                <Show
-                  when={(results()?.length ?? 0) > 0}
-                  fallback={<p class="empty">no results published by this try</p>}
-                >
-                  <div class="kvgrid">
-                    <For each={results()}>
-                      {(r) => (
-                        <div class="kvcard">
-                          <div class="kvk">
-                            <span>{r.name}</span>
-                            <Pill tone="copper">{r.type_name}</Pill>
-                          </div>
-                          <div class="kvv mono">{showValue(r.value)}</div>
-                          <div class="kvfrom">
-                            from{" "}
-                            <b>{scoped() ? label(s().id, scoped()!.id) : s().id}</b>
-                          </div>
-                        </div>
-                      )}
-                    </For>
-                  </div>
-                </Show>
-                </Show>
-              </div>
-            </Show>
-
-            {/* Outputs — OF-RECORD: the interpolation view + the
-                "built on …" consumed line both read the latest SUCCESSFUL attempt
-                in this version (`ofRecordTry()`), NOT the selected try. So a
-                failed / superseded / running selected try still shows what a
-                downstream step would read, and a coordinate note names which try
-                that is — with a "try N →" button that jumps the selection there.
-                Never a blank-that-reads-as-success: no success ⇒ explicit copy. */}
-            <Show when={tab() === "outputs"}>
-              <div class="tabpane">
-                <Show
-                  when={ofRecordTry()}
-                  fallback={
-                    <p class="empty">
-                      {notRun()
-                        ? "nothing of record here"
-                        : "nothing of record here — no successful attempt in this version"}
-                    </p>
-                  }
-                >
-                  {/* Coordinate note: is the of-record try the one selected? A
-                      carried-forward step names the earlier version's try. */}
-                  <div class="ofrec-note mono">
-                    <Show when={carried()}>
-                      {(c) => (
-                        <span class="ofrec-here">
-                          of record · from version {c().take}, {noun().toLowerCase()} {c().try}
-                        </span>
-                      )}
-                    </Show>
-                    <Show when={!carried()}>
-                    <Show
-                      when={ofRecordTry() === scoped()?.id}
-                      fallback={
-                        <button
-                          class="ofrec-jump"
-                          onClick={() => props.onAttemptSelect(ofRecordTry())}
-                          title={`Select the ${noun().toLowerCase()} of record`}
-                        >
-                          of record · {noun().toLowerCase()} {ofRecordIndex() + 1} →
-                        </button>
-                      }
-                    >
-                      <span class="ofrec-here">of record · this {noun().toLowerCase()}</span>
-                    </Show>
-                    </Show>
-                  </div>
-                  <Show when={outConsumed() && Object.keys(outConsumed()!.consumed).length > 0}>
-                    <div class="consumed mono">
+                <div class="res-head mono">
+                  <span>
+                    from <b>{scoped() ? label(s().id, scoped()!.id) : s().id}</b>
+                  </span>
+                  <Show when={consumed() && Object.keys(consumed()!.consumed).length > 0}>
+                    <span class="consumed">
                       built on{" "}
-                      <For each={Object.entries(outConsumed()!.consumed)}>
+                      <For each={Object.entries(consumed()!.consumed)}>
                         {([up, at], i) => (
                           <>
                             <Show when={i() > 0}> · </Show>
@@ -1161,26 +1130,63 @@ export default function StepPane(props: {
                           </>
                         )}
                       </For>
-                    </div>
+                    </span>
                   </Show>
+                  <span class="grow1" />
                   <Show
-                    when={(outResults()?.length ?? 0) > 0}
+                    when={carried()}
                     fallback={
-                      <p class="empty">nothing for a downstream step to read of record</p>
+                      <Show
+                        when={ofRecordTry()}
+                        fallback={<span class="res-rec none">no {noun().toLowerCase()} passed: later steps read nothing</span>}
+                      >
+                        <Show
+                          when={ofRecordTry() === scoped()?.id}
+                          fallback={
+                            <button
+                              type="button"
+                              class="ofrec-jump"
+                              onClick={() => props.onAttemptSelect(ofRecordTry())}
+                              title={`Select the ${noun().toLowerCase()} later steps read`}
+                            >
+                              later steps read {noun().toLowerCase()} {ofRecordIndex() + 1} →
+                            </button>
+                          }
+                        >
+                          <span class="res-rec">later steps read these</span>
+                        </Show>
+                      </Show>
                     }
                   >
-                    <div class="exprs">
-                      <For each={outResults()}>
-                        {(r) => (
-                          <div class="expr mono">
-                            <span class="expr-tok">{`\${{ outputs.${s().id}.${r.name} }}`}</span>
-                            <span class="arrow">→</span>
-                            <span class="val">{showValue(r.value)}</span>
-                          </div>
-                        )}
-                      </For>
-                    </div>
+                    {(c) => (
+                      <span class="res-rec">
+                        later steps read version {c().take}, {noun().toLowerCase()} {c().try}
+                      </span>
+                    )}
                   </Show>
+                </div>
+                <Show
+                  when={(results()?.length ?? 0) > 0}
+                  fallback={<p class="empty">no results published by this try</p>}
+                >
+                  {/* One row per result: name (and the expression a later
+                      step reads it by), type, value. A plain value shows in
+                      full; an object or a list shows one line and opens to
+                      its formatted JSON, so a large one (an image's build
+                      metadata) never stretches the others. */}
+                  <div class="res-list">
+                    <For each={results()}>
+                      {(r) => (
+                        <ResultRow
+                          name={r.name}
+                          expr={`\${{ outputs.${s().id}.${r.name} }}`}
+                          type={r.type_name}
+                          value={r.value}
+                        />
+                      )}
+                    </For>
+                  </div>
+                </Show>
                 </Show>
               </div>
             </Show>

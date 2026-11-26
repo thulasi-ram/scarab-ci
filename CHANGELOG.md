@@ -18,6 +18,35 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-11-26
+
+### Enhancement
+
+- **Text is 0.5px larger across the web UI**: Body and Label go from 13px to 13.5px, Mono from
+  12px to 12.5px, and titles from 20px to 20.5px.
+- **The step pane's Outputs tab is part of Results.** They showed the same values: Results for
+  the selected try, Outputs for the try later steps read. Results now shows the selected try's
+  values with the `${{ outputs.<step>.<name> }}` expression under each name, what the try was
+  built on, and, when later steps read a different try, a link to it. Links to the Outputs tab
+  open Results.
+- **The Run page's header is three lines**: the breadcrumb with the Run's number and its ID
+  (click the ID to copy it), then the pipeline, title and status with a kept-snapshots mark and
+  Live at the right, then where the Run came from.
+  Copy run ID left the ⋯ menu, which now shows an icon beside each item. The "N inputs" link left
+  the header; the Inputs tab has them, and is now second, after Pipeline.
+
+### Bug Fixes
+
+- **New run with these inputs works when the Run's branch was deleted** (for example when its
+  pull request merged and the forge deleted the head branch). The form reads the pipeline at the
+  repository's default branch and says so, instead of showing the forge's `422 No commit found`.
+  When a pipeline cannot be read at all, the form links to Run pipeline to pick another ref.
+- **In the run graph, a step with a sidecar no longer touches the services lane's line above
+  it.**
+- **A large step result no longer stretches the Results tab.** Results are one row each (name,
+  type, value). An object or list, such as the build library's `image` result, is one line that
+  opens to its formatted JSON, at most 320px tall, with a Copy button.
+
 ## [0.8.1] - 2026-11-26
 
 ### Features
@@ -2703,7 +2732,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.7...v0.8.0
 [0.7.7]: https://github.com/thulasi-ram/scarab-ci/compare/v0.7.6...v0.7.7

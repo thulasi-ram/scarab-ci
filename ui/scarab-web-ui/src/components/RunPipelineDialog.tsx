@@ -14,7 +14,7 @@
 // their section. The reason is not a pipeline input, so it sits last, apart.
 import { createEffect, createResource, createSignal, For, Show } from "solid-js";
 import { useNavigate } from "@solidjs/router";
-import { pipelineInterface, dispatchRun, PipelineCompileError } from "../api/client";
+import { pipelineInterface, dispatchRun, listRefs, PipelineCompileError } from "../api/client";
 import {
   initialValues,
   reconcilePrefill,
@@ -45,14 +45,34 @@ export default function RunPipelineDialog(props: {
   gitRef: string;
   /** What the ref was picked as (a branch, a tag), for the header. */
   refName?: string | null;
+  /** `gitRef` is a branch that may since have been deleted (a branch is
+   * often deleted when its pull request merges): check that it exists, and
+   * read the default branch instead when it does not. */
+  branchMayBeGone?: boolean;
   /** A prior run's inputs: the form starts from them, not the defaults. An
    * input whose value no longer passes starts from its default. */
   prefill?: Record<string, unknown>;
   onClose: () => void;
 }) {
   const nav = useNavigate();
+  // The ref the form reads. A branch that no longer exists is replaced by the
+  // default branch, and `gone` names it for the notice. When the refs call
+  // cannot tell (no forge, an error), the branch is tried as given.
+  const [target] = createResource(
+    () => ({ ref: props.gitRef, name: props.refName ?? null, check: !!props.branchMayBeGone }),
+    async (k): Promise<{ ref: string; name: string | null; gone: string | null }> => {
+      if (!k.check) return { ref: k.ref, name: k.name, gone: null };
+      const r = await listRefs(props.org, props.repo, k.ref);
+      const exists = r.refs.some((x) => x.kind === "branch" && x.name === k.ref);
+      if (exists || !r.defaultBranch) return { ref: k.ref, name: k.name, gone: null };
+      return { ref: r.defaultBranch, name: r.defaultBranch, gone: k.ref };
+    },
+  );
   const [iface] = createResource(
-    () => ({ name: props.pipeline, ref: props.gitRef }),
+    () => {
+      const t = target();
+      return t ? { name: props.pipeline, ref: t.ref } : null;
+    },
     (k) => pipelineInterface(props.org, props.repo, k.name, k.ref),
   );
   // Reading an errored resource throws; every read goes through this guard.
@@ -133,10 +153,14 @@ export default function RunPipelineDialog(props: {
 
   // The branch or tag, then the commit it resolved to once the server says.
   const where = () => {
-    const label = props.refName ?? (/^[0-9a-f]{40}$/.test(props.gitRef) ? null : props.gitRef);
-    const sha = ifaceValue()?.sha.slice(0, 7) ?? (label ? null : props.gitRef.slice(0, 7));
+    const ref = target()?.ref ?? props.gitRef;
+    const name = target() ? target()!.name : (props.refName ?? null);
+    const label = name ?? (/^[0-9a-f]{40}$/.test(ref) ? null : ref);
+    const sha = ifaceValue()?.sha.slice(0, 7) ?? (label ? null : ref.slice(0, 7));
     return [label, sha].filter(Boolean).join(" · ");
   };
+  // The launcher, for picking another ref when this one cannot be read.
+  const launcher = `/${props.org}/${props.repo}/run`;
 
   const Grid = (p: { specs: ParamSpec[] }) => {
     const field = (spec: ParamSpec) => (
@@ -174,7 +198,9 @@ export default function RunPipelineDialog(props: {
       title={`Run ${props.pipeline}`}
       purpose={
         props.prefill
-          ? `Filled in with the inputs of the run you came from${props.refName ? `, at the latest commit on ${props.refName}` : ""}.`
+          ? `Filled in with the inputs of the run you came from${
+              target()?.name ? `, at the latest commit on ${target()!.name}` : ""
+            }.`
           : undefined
       }
       busy={submitting()}
@@ -192,14 +218,31 @@ export default function RunPipelineDialog(props: {
         </>
       }
     >
-      <Show when={!iface.loading} fallback={<p class="empty">Reading the pipeline's inputs…</p>}>
+      <Show when={target()?.gone}>
+        {(g) => (
+          <p class="rpd-notice">
+            <Icon icon="info" size={13} />
+            <span>The branch <span class="mono">{g()}</span> no longer exists, so this form
+            reads the pipeline at <span class="mono">{target()!.ref}</span>, the default branch.</span>
+          </p>
+        )}
+      </Show>
+      <Show when={!target.loading && !iface.loading} fallback={<p class="empty">Reading the pipeline's inputs…</p>}>
         <Show
           when={!iface.error}
           fallback={
             iface.error instanceof PipelineCompileError ? (
               <CompileErrors errors={iface.error.failure.errors} refName={props.refName ?? undefined} sha={iface.error.failure.sha} />
             ) : (
-              <p class="error">{(iface.error as Error)?.message ?? "Could not read the pipeline's inputs."}</p>
+              <div class="rpd-fail">
+                <p class="error">{(iface.error as Error)?.message ?? "Could not read the pipeline's inputs."}</p>
+                <p class="dlg-ctx">
+                  <a href={launcher} onClick={() => props.onClose()}>
+                    Open Run pipeline
+                  </a>{" "}
+                  to pick another branch, tag or commit.
+                </p>
+              </div>
             )
           }
         >
@@ -216,14 +259,16 @@ export default function RunPipelineDialog(props: {
               >
                 <Show when={dropped().length > 0}>
                   <p class="rpd-notice">
-                    <Icon icon="info" size={13} /> Left out {dropped().length === 1 ? "an input" : "inputs"} the pipeline
-                    no longer declares: <span class="mono">{dropped().join(", ")}</span>
+                    <Icon icon="info" size={13} />
+                    <span>Left out {dropped().length === 1 ? "an input" : "inputs"} the pipeline
+                    no longer declares: <span class="mono">{dropped().join(", ")}</span></span>
                   </p>
                 </Show>
                 <Show when={reset().length > 0}>
                   <p class="rpd-notice">
-                    <Icon icon="info" size={13} /> Started from the default, as the earlier value no longer passes:{" "}
-                    <span class="mono">{reset().join(", ")}</span>
+                    <Icon icon="info" size={13} />
+                    <span>Started from the default, as the earlier value no longer passes:{" "}
+                    <span class="mono">{reset().join(", ")}</span></span>
                   </p>
                 </Show>
                 <Show when={required().length > 0}>

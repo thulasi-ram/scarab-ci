@@ -1801,7 +1801,7 @@ test("on a phone no page scrolls sideways, and the top bar keeps every link", as
     ["/acme/orders-api", "orders-api"],
     ["/acme/orders-api?tab=settings", "orders-api"],
     ["/acme/scarab?tab=schedules", "scarab"],
-    ["/acme/orders-api/runs/0190f8a2000071fb8c00a0760421aaaa", "#421"],
+    ["/acme/orders-api/runs/0190f8a2000071fb8c00a0760421aaaa", "Bump chart to 1.8.2"],
     ["/orgs/acme/settings/libraries", "Libraries"],
     ["/orgs/acme/settings/plugins", "Plugins"],
     ["/orgs/acme/settings/plugins/4f2a1c9e7b/manage", "argocd"],
