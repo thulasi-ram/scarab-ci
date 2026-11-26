@@ -32,6 +32,8 @@ release.yml uses that version's section as the GitHub Release text. See
   pull request merged and the forge deleted the head branch). The form reads the pipeline at the
   repository's default branch and says so, instead of showing the forge's `422 No commit found`.
   When a pipeline cannot be read at all, the form links to Run pipeline to pick another ref.
+- **In the run graph, a step with a sidecar no longer touches the services lane's line above
+  it.**
 
 ## [0.8.1] - 2026-11-26
 
