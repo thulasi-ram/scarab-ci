@@ -20,7 +20,7 @@ const EXEMPT = new Set([
 ]);
 
 const TOKENS: Record<string, string> = {
-  "--t-title": "600 20px/1.3 var(--font-ui)",
+  "--t-title": "600 21px/1.3 var(--font-ui)",
   "--t-label": "600 14px/1.5 var(--font-ui)",
   "--t-body": "400 14px/1.5 var(--font-ui)",
   "--t-mono": "500 13px/1.5 var(--font-mono)",

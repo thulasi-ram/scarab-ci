@@ -1098,9 +1098,33 @@ const serviceLogLines = [
   "LOG:  database system is ready to accept connections",
 ];
 
+// `image` is what the build library writes from `buildctl --metadata-file`
+// (plus `digest` and `layout`): a nested object that dwarfs the scalars.
 const testResults = [
   { name: "tests_passed", type_name: "number", value: 214 },
   { name: "coverage", type_name: "string", value: "92.4%" },
+  {
+    name: "image",
+    type_name: "object",
+    value: {
+      "containerimage.config.digest": "sha256:4f1c8e0d2b7a9c63e5f04d1b8a2c7e9f0d3b6a5c4e8f1a2b3c4d5e6f7a8b9c0d",
+      "containerimage.descriptor": {
+        mediaType: "application/vnd.oci.image.manifest.v1+json",
+        digest: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        size: 1610,
+        annotations: {
+          "org.opencontainers.image.created": "2026-11-26T04:12:09Z",
+          "org.opencontainers.image.revision": "7c2e91d04b8a3f5e6d1c0b9a87654321",
+          "org.opencontainers.image.source": "https://github.com/acme/scarab",
+        },
+        platform: { architecture: "amd64", os: "linux" },
+      },
+      "containerimage.digest": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "image.name": "registry.acme.example/scarab/server:sha-7c2e91d",
+      digest: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      layout: "/workspace/.scarab-build/5d41402abc4b2a76b9719d911017c592/oci",
+    },
+  },
 ];
 const testConsumed = { attempt: "a1", consumed: { build: "a2" } };
 

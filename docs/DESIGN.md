@@ -151,7 +151,7 @@ UI has exactly four text styles, so every page stays within that. Each is a
 
 | Style | Token | Face | Weight · size | For |
 |-------|-------|------|---------------|-----|
-| Title | `--t-title` | Inter (`--font-ui`) | 600 · 20px | page titles (`h1`, the run and settings breadcrumb headings), dialog titles, stat figures |
+| Title | `--t-title` | Inter (`--font-ui`) | 600 · 21px | page titles (`h1`, the run and settings breadcrumb headings), dialog titles, stat figures |
 | Label | `--t-label` | Inter | 600 · 14px | names, section and panel headings, column heads, field labels, buttons, active tabs and nav links |
 | Body | `--t-body` | Inter | 400 · 14px | running text, values, form controls, nav links |
 | Mono | `--t-mono` | JetBrains Mono (`--font-mono`) | 500 · 13px | machine values: ids, SHAs, refs, durations, counts, code, logs |
@@ -341,7 +341,7 @@ Placement is stricter than doodles, because motion competes with content:
 ### Modal
 - Every dialog is a `Modal` (`components/Modal.tsx`): elevated
   (`--emerald-elevated`), a blurred dark scrim, and the single permitted soft
-  shadow. A 20px title, one line saying what the dialog is for, numbered
+  shadow. A 21px title, one line saying what the dialog is for, numbered
   sections when it asks three or more questions, and a `--pine-deep` footer with
   the actions and, when useful, a line saying what applies after saving. Three
   widths: narrow 440px (a confirmation), standard 560px (a form), wide 760px (a
