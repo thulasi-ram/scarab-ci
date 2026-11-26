@@ -88,6 +88,12 @@ extensions:
       initialize:
         match: { method: POST, json: { "/method": "initialize" } }
         may: []
+      initialized:
+        match: { method: POST, json: { "/method": "notifications/initialized" } }
+        may: []
+      tools_list:
+        match: { method: POST, json: { "/method": "tools/list" } }
+        may: []
       get_step_logs:
         match: { method: POST, json: { "/method": "tools/call", "/params/name": "get_step_logs" } }
         may: [run.read, step.logs.read]
@@ -95,22 +101,29 @@ extensions:
         match: { method: POST, json: { "/method": "tools/call", "/params/name": "trigger_run" } }
         may: [repo.read, repo.dispatch]
         writes: 1
-      client_reply:
-        match: { method: POST, json: { "/result": exists } }
-        may: []
-      stream:
-        match: { method: GET }
-        may: [run.read]
 ```
+
+A protocol that streams from server to client, or asks the client questions, would also list a
+`GET` operation and one matching replies (`"/result": exists`). The stateless MCP Plugin of §10
+needs neither.
 
 - A request that matches no operation is rejected by core and never reaches the Plugin. The
   protocol's own messages are listed with `may: []`, so the manifest names everything the
   Plugin can be asked.
+- An element that matches more than one operation is rejected.
 - A body that is a list is checked element by element; one unmatched element rejects the
   request. The request's handle gets the matched operations combined and their writes summed.
   Every element comes from one caller.
 - Only a POST operation may write.
 - Core knows nothing of MCP. The MCP knowledge is in the manifest, where an admin reviews it.
+
+**What core accepts and forwards.** The endpoint takes only a Bearer `oauth` PrincipalToken
+whose audience is that URL; never a session cookie. Core reads the whole body up to a size cap,
+requires `Content-Type: application/json` with no `Content-Encoding`, rejects a body with
+duplicate keys, and evaluates the rules on its own parse. It forwards **its own re-serialised
+JSON**, so the Plugin and core never read different bytes. `equals` compares JSON strings
+only. Core strips `Authorization` and `Cookie` before forwarding; the Plugin never sees the
+client's token.
 
 ### 3. The Plugin acts as the caller through a handle, never a credential
 
@@ -118,10 +131,19 @@ With each forwarded request core gives the Plugin a **DelegatedCallerHandle**: a
 with which the Plugin calls core as that caller. Its authority is the intersection of the
 caller's token, what the caller consented to, and the `may` of the matched operations.
 
-- It lives while that request's connection is open, never longer than core's longest request.
+- It lives while that request's connection is open, and at most 10 minutes.
 - Core checks it again every 60 seconds: the token, the owner's role, the kill switch.
 - A handle for a long-lived stream (a GET) never writes.
-- Its writes are capped at the operations' `writes`.
+- Its writes are capped at the operations' `writes`, its core calls at 50.
+
+The Plugin's calls may reach any server replica, so a handle is a **Postgres row**: its hash,
+the caller, the operations, writes left, calls left and an expiry. The replica holding the
+inbound connection heartbeats the row and deletes it when the connection closes. Each call and
+each write decrements its counter in one conditional `UPDATE`, which refuses at zero.
+
+**Known limit.** A write handle is bound to the operation, not to its arguments. A Plugin can
+spend Alice's `trigger_run` on a repository or ref Alice did not name, within what Alice may
+do. Fork code (§9) and Fork Run approval bound what such a Run can reach.
 
 ### 4. PluginApi: the public API on the broker listener
 
@@ -135,6 +157,18 @@ never a private API.
 - The route's ApiOperation is checked against the handle before any handler runs.
 - Plugin egress stays broker-only (ADR-0072 §9 unchanged on egress).
 
+**PluginApi serves an allowlist, not the whole router.** A route is served only if a handle's
+`may` can name its ApiOperation. These can never appear in `may`, and an install or upgrade
+whose manifest names one is refused:
+
+- crown-jewel, conditional, browser-only and not-by-token operations;
+- the debug shell (attach and debug Pod);
+- every route that does not authenticate a Principal: `/v1/auth/*`, the OAuth endpoints, an
+  external Gate's `/release`, the results POST, webhooks.
+
+A handle never raises a StepUpConfirmationRequest. What would need one is refused, so injected
+text cannot send its owner confirmation links through a Plugin.
+
 Limits, as Helm values:
 
 | Limit | Default |
@@ -142,7 +176,7 @@ Limits, as Helm values:
 | Inbound requests per caller per installation | 60/min, 4 concurrent |
 | Inbound requests per installation | 600/min, 16 concurrent |
 | Core calls per handle | 50 |
-| Delegated calls | take a broker permit and the broker's database pool |
+| Delegated calls | take a broker permit, and run on a separate bounded database pool, not the main one |
 
 Every delegated call, reads included, is journaled in the broker journal with caller,
 operation, target and result. The broker already refuses to forward what it cannot journal.
@@ -191,9 +225,31 @@ emits), and tokens bound to the endpoint URL.
 
 Clients identify themselves only by **Client ID Metadata Documents**. An org admin lists the
 **OAuthClientMetadataHosts** Scarab may fetch them from (for example `claude.ai`). Adding a
-host loosens and needs a step-up. Core fetches only over HTTPS, follows no redirect, caps the
-size and refuses an address that is not public. The consent page names the host it fetched
-from, not a name the client chose.
+host loosens and needs a step-up, and the setting warns against hosts that serve content their
+users upload: every path on an allowed host is trusted. The consent page names the host it
+fetched from, not a name the client chose.
+
+The fetch and the flow:
+
+- HTTPS only, no redirect followed, a size cap. Core resolves the host, refuses any address
+  that is not public (IPv4 and IPv6), and connects to the address it checked, so DNS cannot
+  change between the check and the request.
+- The document's `client_id` must equal the URL it was fetched from, and it must not declare a
+  shared-secret auth method.
+- `redirect_uri` must match one of the document's `redirect_uris` exactly.
+- PKCE with `S256` only.
+- The consent page is served with `frame-ancestors 'none'`, and its POST carries a CSRF token
+  bound to the session.
+- The token's role ceiling is the user's role in the org at consent; the owner's live role
+  still caps it.
+- Refresh rotation is one conditional `UPDATE` on the refresh secret's hash. A retry of the
+  same refresh within 30 seconds gets the same successor, so a lost response does not revoke a
+  legitimate grant; a later reuse revokes it.
+
+The code assumes claude.ai sends a metadata-document `client_id` to a server that advertises
+`client_id_metadata_document_supported` and has no registration endpoint. Step 3 starts by
+checking that on dogfood; if it does not hold, this section comes back to the owner before
+anything else is built.
 
 There is no Dynamic Client Registration. An open registration endpoint lets anyone register a
 client that looks like claude.ai with their own redirect. Local agents that register only
@@ -222,6 +278,9 @@ without the caller does this by accident. The guardrails therefore choose who is
 - The **operator** names trusted publishers by image repository
   (`plugins.trustedPublishers`). The list is empty by default, Scarab's own repository
   included. A PluginPublisher signature replaces the repository once signatures are built.
+  An entry is `registry/namespace/name`, compared whole after lowercasing the registry: no
+  prefix and no glob, so `ghcr.io/acme/mcp` never matches `ghcr.io/acme-evil/mcp`. The
+  installed reference must carry a digest.
 - One org admin approves each new digest with a step-up.
 
 There is no second admin, unlike `trusted_dom`. The operator is the second key, held by another
@@ -231,23 +290,37 @@ including changing what a step-up shows.
 
 ### 9. Fork code and Fork Run approval
 
-**Fork code** is a commit Scarab treats as an outsider's:
+**Fork code** is a commit Scarab treats as an outsider's. Core classifies the **resolved
+commit**, not the ref string the caller typed, because a forge resolves many spellings (a
+short or uppercase SHA, `pull/5/head`, `refs/pull/5/merge`) to a commit:
 
-| Ref | Treated as |
+| Resolved commit | Treated as |
 |---|---|
-| a branch or tag of the repository | the repository's code |
-| `refs/pull/<N>/head` | fork code when the forge says PR N comes from another repository; no answer refuses the dispatch |
-| a raw commit SHA | fork code, always: a forge serves any fork's commits through the base repository |
+| the forge says a `refs/heads/<name>` or `refs/tags/<name>` of the repository points at it | the repository's code |
+| reached through `refs/pull/<N>/head`, and the forge says PR N's head is a branch of this repository | the repository's code |
+| anything else: another repository's PR, any `refs/pull/N/merge`, a SHA no branch or tag names, an AGit pull request whose head is not a branch | fork code |
 
-A Run of fork code gets the fork pull request limits whatever started it, a dispatch by a
-person included. This fixes the dispatch hole for people too, and needs no agent-only rule.
+When the forge does not answer, the dispatch fails with the existing forge error and a reason
+naming fork detection. It is never trusted by default.
+
+Dispatch stamps `fork_code` on the Run's trigger. Every fork limit reads that fact, along with
+the existing `pull_request` `fork` flag: secrets, the OIDC subject, the clone token, build
+push, and the Rerun, Take and `step.admit` paths. A Run of fork code gets the fork pull request
+limits whatever started it, a dispatch by a person included. This fixes the dispatch hole for
+people too, and needs no agent-only rule.
 
 **Fork Run approval** is an org setting: `off`, `agent_started` (default: started through an
 `oauth` PrincipalToken) or `all`. When it applies, core adds a **Run-start approval gate**: a
-`manual` Gate in front of every root Step, `origin` = the setting, released by any member with
-write on the repository in a browser, failing the Run (class `gate`) after 72 hours. Loosening
-the setting needs a step-up. It is a setting and not a Policy effect: ADR-0075's rule that no
-Policy adds a Gate stands.
+`manual` Gate in front of every root Step, `origin` = the setting. Nothing in the Run starts
+before it is released, Shared services included. Any member with write on the repository
+releases it, under §6's rule: in a browser, or through an `issued` token's
+StepUpConfirmationRequest. It fails the Run (class `gate`) after 72 hours. Loosening the
+setting needs a step-up.
+
+A Run-start approval gate is never an Environment approval gate. It does not count as the
+upstream `manual` Gate ADR-0078 looks for, so an Environment with approvers still adds its own.
+
+It is a setting and not a Policy effect: ADR-0075's rule that no Policy adds a Gate stands.
 
 ### 10. The MCP Plugin
 
@@ -269,7 +342,8 @@ First tools:
 
 Text outsiders wrote (logs, results, PR titles, commit messages) is returned inside a block
 marked as untrusted data. Write tools (`rerun_step`, `retry_step`, `cancel_run`,
-`reject_gate`) come later, one write each. No approve tool, ever.
+`reject_gate`) come later, one write each. There is no approve tool, and `gate.approve` cannot
+appear in a manifest's `may` (§4).
 
 ### 11. Lifecycle
 
@@ -285,9 +359,9 @@ marked as untrusted data. Write tools (`rerun_step`, `retry_step`, `cancel_run`,
 
 | # | Change | Release |
 |---|---|---|
-| 1 | Fork code detection at dispatch | 0.8.x patch |
+| 1 | Fork code detection at dispatch, `fork_code` on the Run | 0.8.x patch |
 | 2 | ApiOperations for reads, PrincipalToken, DelegationTrail, the approval rule | 0.9.0 |
-| 3 | OAuth authorization server, OAuthClientMetadataHosts, consent, Connected apps | 0.9.0 |
+| 3 | OAuth authorization server, OAuthClientMetadataHosts, consent, Connected apps (starts with the claude.ai check in §7) | 0.9.0 |
 | 4 | Fork Run approval | 0.9.0 |
 | 5 | `trusted_service` and the operator allowlist | 0.9.0 |
 | 6 | PluginApi with handles, limits and the journal | 0.9.0 |
@@ -295,14 +369,17 @@ marked as untrusted data. Write tools (`rerun_step`, `retry_step`, `cancel_run`,
 | 8 | `scarab-plugin-mcp` with the tools above, e2e and docs | 0.9.0 |
 | later | write tools | 0.9.x |
 
-Steps 1 to 4 are useful without MCP.
+Steps 1, 2 and 4 are useful without MCP. Step 3 is built against step 7's endpoint: the
+audience, the protected resource metadata and the consent ceiling all come from an endpoint
+registration, so its tests use a test endpoint until step 7 lands.
 
 ## Consequences
 
 - An installation with no public URL cannot be used from claude.ai. The docs say so.
 - A single-admin org can run the MCP Plugin: no second approval is needed.
 - An org that wants the MCP Plugin needs its operator to add the publisher's repository first.
-- A PR whose head ref is in another repository costs one forge call per dispatch.
+- Every dispatch asks the forge which branches, tags or pull request name the resolved commit:
+  one or two forge calls more than today.
 - Tests that approve Gates with a token change: they confirm the request or use a session.
 - MCP spec changes land in the Plugin and ship in a Scarab patch release; each org moves to the
   new digest when it chooses. Changes to OAuth client registration still land in core.
