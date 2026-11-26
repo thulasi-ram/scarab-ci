@@ -3469,11 +3469,28 @@ a.lgtog { text-decoration: none; }
   .rh-row { flex-wrap: nowrap; }
 }
 .rh-row .grow1 { flex: 1; }
+/* Line 1, the crumbs, at the Title size as on every page. */
 .rh-crumbs { min-width: 0; flex: 0 1 auto; max-width: 100%; }
 .rh-num { flex: none; color: var(--display-ink); }
-.rh-title { color: var(--display-ink); }
-/* As the runs list's line 1: the pipeline (mono, muted), a slash, the title. */
-.rh-headline { display: inline-flex; align-items: baseline; gap: 8px; min-width: 0; flex: 1 1 auto; margin-left: 6px; }
+/* The run ID, small (Mono), copied on click; its text sits on the run
+   number's baseline, not centred on the row. */
+.rh-id {
+  display: inline-flex; align-items: center; gap: 5px; min-width: 0; margin-left: 4px;
+  align-self: flex-end;
+  padding: 1px 6px; background: none; border: 1px solid transparent; border-radius: var(--radius-sm);
+  color: var(--muted-sage); cursor: pointer;
+}
+.rh-id .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rh-id svg { flex: none; }
+.rh-id:hover { color: var(--sage); border-color: var(--border); }
+.rh-id:focus-visible { outline: 2px solid var(--emerald); outline-offset: 0; }
+/* Line 2, the title: as the runs list's line 1, the pipeline (mono, muted),
+   a slash, the headline, which ends in an ellipsis before the badge wraps. */
+.rh-headline {
+  display: flex; align-items: baseline; gap: 8px; min-width: 0; flex: 0 1 auto; margin: 0;
+  font: var(--t-title);
+}
+.rh-title { color: var(--display-ink); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rh-pipe { font: var(--t-mono); color: var(--sage); flex: none; }
 .rh-slash { font: var(--t-body); color: var(--muted-sage); flex: none; }
 /* On a phone the title keeps the row; the pipeline is on the runs list. */
@@ -3488,12 +3505,6 @@ a.lgtog { text-decoration: none; }
    mark and the times at the right edge, under the actions. */
 .rh-prov { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 20px; color: var(--sage); min-width: 0; }
 .rh-prov .rr-l2 { display: flex; gap: 0 22px; max-width: none; flex: 0 1 auto; }
-.rh-params {
-  font: var(--t-mono); color: var(--muted-sage); min-width: 0; white-space: nowrap;
-  padding: 0; background: none; border: 0; cursor: pointer;
-  text-decoration: underline dotted; text-underline-offset: 3px;
-}
-.rh-params:hover { color: var(--emerald); }
 .rh-prov .grow1 { flex: 1; }
 .rh-keep {
   display: inline-flex; align-items: center; gap: 5px; flex: none; color: var(--muted-sage);
@@ -3513,15 +3524,17 @@ a.lgtog { text-decoration: none; }
   background: var(--emerald-elevated); border: 1px solid var(--border);
   border-radius: var(--radius); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
 }
+/* An icon column, then the label and the line under it. */
 .rmenu-item {
-  display: flex; flex-direction: column; gap: 2px; width: 100%; text-align: left;
+  display: grid; grid-template-columns: 14px minmax(0, 1fr); gap: 2px 10px; align-items: start; width: 100%; text-align: left;
   background: transparent; border: 1px solid transparent; border-radius: var(--radius-sm);
   padding: 7px 10px; cursor: pointer; color: var(--soft-white);
 }
 .rmenu-item:hover, .rmenu-item:focus-visible { background: color-mix(in srgb, var(--emerald) 10%, transparent); }
 .rmenu-item:disabled { opacity: 0.5; cursor: default; }
 .rmenu-lbl { font: var(--t-label); }
-.rmenu-item small { color: var(--muted-sage); overflow-wrap: anywhere; }
+.rmenu-item small { grid-column: 2; color: var(--muted-sage); overflow-wrap: anywhere; }
+.rmenu-ico { grid-row: 1 / span 2; margin-top: 3px; color: var(--sage); }
 
 
 
@@ -4784,3 +4797,6 @@ a.head-org:hover { color: var(--emerald); text-decoration: underline; text-under
 .ri-row dd { color: var(--soft-white); overflow-wrap: anywhere; white-space: pre-wrap; }
 .ri-row dd.str { color: var(--copper); }
 .ri-empty { margin: 0; padding: 18px 14px; }
+.rpd-fail { display: flex; flex-direction: column; gap: 8px; }
+.rpd-fail .error { margin: 0; overflow-wrap: anywhere; }
+.dlg-b:not(:has(> .dlg-sec)) > .rpd-notice { padding: 0; }

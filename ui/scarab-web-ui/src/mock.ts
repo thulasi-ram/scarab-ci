@@ -77,7 +77,13 @@ const RETRIES_RUN_ID = "0190f8a2000071fb8c00a11c3e5d7f34";
 // The manual catalog at any ref: `release` takes a spread of typed inputs,
 // `deploy` a few, `docs` none, and one file that does not parse.
 const MOCK_PIPELINE_SHA = "7c2e91d4b0a1f6e3c58d92a7b4e0f1c3d2a9b8e7";
+const MOCK_REFS = [
+  { name: "main", kind: "branch", short_sha: MOCK_PIPELINE_SHA.slice(0, 7) },
+  { name: "feature/shared-postgres", kind: "branch", short_sha: "4be1f2a" },
+  { name: "v0.8.0", kind: "tag", short_sha: "c0790f1" },
+];
 const mockCatalog = [
+  { name: "ci", manual: true, api: false },
   { name: "release", manual: true, api: true },
   { name: "deploy", manual: true, api: false },
   { name: "docs", manual: true, api: false },
@@ -2828,14 +2834,13 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   if ((m = p.match(/^\/v1\/repos\/[^/]+\/([^/]+)\/schedules$/))) {
     return json({ schedules: m[1] === "scarab" ? schedules : [] });
   }
-  // /v1/repos/{org}/{repo}/refs  (ref picker — not on the shot screens)
+  // /v1/repos/{org}/{repo}/refs  (ref picker — not on the shot screens).
+  // `q` filters by name, as the server does. The RETRIES run's branch
+  // `fix/flaky-checkout` is not here: it was deleted when its PR merged.
   if (/^\/v1\/repos\/[^/]+\/[^/]+\/refs$/.test(p)) {
+    const q = (new URLSearchParams(search).get("q") ?? "").toLowerCase();
     return json({
-      refs: [
-        { name: "main", kind: "branch", short_sha: MOCK_PIPELINE_SHA.slice(0, 7) },
-        { name: "feature/shared-postgres", kind: "branch", short_sha: "4be1f2a" },
-        { name: "v0.8.0", kind: "tag", short_sha: "c0790f1" },
-      ],
+      refs: MOCK_REFS.filter((r) => r.name.toLowerCase().includes(q)),
       default_branch: "main",
     });
   }
@@ -2846,6 +2851,15 @@ function route(pathname: string, search: string, method: string, body = ""): Res
   }
   if ((m = p.match(/^\/v1\/repos\/[^/]+\/[^/]+\/pipelines\/([^/]+)\/interface$/))) {
     const name = decodeURIComponent(m[1]!);
+    // A ref the forge does not know (a deleted branch) fails as GitHub's
+    // commits API answers it, wrapped as the server wraps it.
+    const ref = new URLSearchParams(search).get("ref") ?? "";
+    if (ref && !/^[0-9a-f]{7,40}$/.test(ref) && ref !== "HEAD" && !MOCK_REFS.some((r) => r.name === ref)) {
+      return new Response(
+        `pipeline failed to compile: forge api error: 422 Unprocessable Entity: {"message":"No commit found for SHA: ${ref}","status":"422"}`,
+        { status: 400 },
+      );
+    }
     const entry = mockCatalog.find((c) => c.name === name);
     if (!entry || entry.error) return new Response(`no pipeline "${name}"`, { status: 404 });
     return json({ sha: MOCK_PIPELINE_SHA, manual: entry.manual, api: entry.api, inputs: mockInputs[name] ?? [] });

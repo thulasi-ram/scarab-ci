@@ -18,6 +18,21 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Enhancement
+
+- **The Run page's header is three lines**: the breadcrumb with the Run's number and its ID
+  (click the ID to copy it), then the pipeline, title and status with a kept-snapshots mark and
+  Live at the right, then where the Run came from.
+  Copy run ID left the ⋯ menu, which now shows an icon beside each item. The "N inputs" link left
+  the header; the Inputs tab has them.
+
+### Bug Fixes
+
+- **New run with these inputs works when the Run's branch was deleted** (for example when its
+  pull request merged and the forge deleted the head branch). The form reads the pipeline at the
+  repository's default branch and says so, instead of showing the forge's `422 No commit found`.
+  When a pipeline cannot be read at all, the form links to Run pipeline to pick another ref.
+
 ## [0.8.1] - 2026-11-26
 
 ### Features

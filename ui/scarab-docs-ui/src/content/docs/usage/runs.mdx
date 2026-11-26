@@ -162,14 +162,16 @@ pipeline's `validate:` rules run on the server when you press **Run**.
 
 On a Run page, the **⋯** menu's **New run with these inputs** (and **New run** in the header of a
 finished Run) opens the same form, filled in with that Run's inputs, at the latest commit on the
-Run's branch. A Run with no branch uses its own commit. An input whose earlier value no longer
+Run's branch. A Run with no branch uses its own commit. When the Run's branch no longer exists
+(a forge often deletes a pull request's branch when it merges), the form reads the pipeline at
+the repository's default branch and says so. An input whose earlier value no longer
 passes the form's checks, such as an option the pipeline has since removed, starts from its
 default, and the form names it. Inputs the pipeline no longer declares are left out.
 
 ## The Inputs tab
 
 The Inputs tab lists the inputs the Run was started with, as Scarab stored them, one per row. The
-header line under the Run's title says how many there are and opens the tab.
+tab's label says how many there are.
 
 ## The Manifest tab
 

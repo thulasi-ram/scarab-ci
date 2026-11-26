@@ -1,15 +1,15 @@
 // The run header's ⋯ menu: New run with these inputs (the run form for this
-// run's pipeline, filled in with this run's inputs), Keep workspace snapshots
-// (pin or unpin this run's snapshots past the retention window) and Copy run
-// ID. Keyboard reachable:
+// run's pipeline, filled in with this run's inputs) and Keep workspace
+// snapshots (pin or unpin this run's snapshots past the retention window). The
+// run ID is copied from the crumb line above the title. Keyboard reachable:
 // Enter or Space opens it on its first enabled item, the arrow keys move
 // between enabled items, Escape closes and returns focus to the button.
 import { createSignal, onCleanup, onMount, Show } from "solid-js";
 import type { RetentionInfo } from "../api/client";
 import { pinLabel, pinTitle } from "../snapshot-retention";
+import Icon from "./Icon";
 
 export default function RunMoreMenu(props: {
-  runId: string;
   /** Opens the run form filled in with this run's inputs. */
   onNewRun: () => void;
   /** The retention promise; null hides the pin item. */
@@ -18,10 +18,8 @@ export default function RunMoreMenu(props: {
   onTogglePin: () => void;
 }) {
   const [open, setOpen] = createSignal(false);
-  const [copied, setCopied] = createSignal(false);
   let button: HTMLButtonElement | undefined;
   let menu: HTMLDivElement | undefined;
-  let copiedTimer: ReturnType<typeof setTimeout> | undefined;
 
   const items = () =>
     Array.from(menu?.querySelectorAll<HTMLButtonElement>("[role=menuitem]") ?? []).filter((b) => !b.disabled);
@@ -41,7 +39,6 @@ export default function RunMoreMenu(props: {
     document.addEventListener("keydown", onKey);
     onCleanup(() => {
       document.removeEventListener("keydown", onKey);
-      clearTimeout(copiedTimer);
     });
   });
 
@@ -53,17 +50,6 @@ export default function RunMoreMenu(props: {
     const next = e.key === "ArrowDown" ? (i + 1) % rows.length : (i - 1 + rows.length) % rows.length;
     rows[next]?.focus();
   };
-
-  async function copyId() {
-    try {
-      await navigator.clipboard?.writeText(props.runId);
-      setCopied(true);
-      clearTimeout(copiedTimer);
-      copiedTimer = setTimeout(() => setCopied(false), 2000);
-    } catch {
-      /* the clipboard refused; the id is still shown in the item */
-    }
-  }
 
   return (
     <span class="rmenu">
@@ -92,6 +78,7 @@ export default function RunMoreMenu(props: {
               props.onNewRun();
             }}
           >
+            <Icon icon="play" size={14} class="rmenu-ico" />
             <span class="rmenu-lbl">New run with these inputs</span>
             <small>Open the run form filled in with this run's inputs.</small>
           </button>
@@ -108,6 +95,7 @@ export default function RunMoreMenu(props: {
                   close();
                 }}
               >
+                <Icon icon={r().pinned ? "pin-off" : "pin"} size={14} class="rmenu-ico" />
                 <span class="rmenu-lbl">{props.pinning ? "…" : pinLabel(r())}</span>
                 <small>
                   {r().pinned
@@ -117,13 +105,6 @@ export default function RunMoreMenu(props: {
               </button>
             )}
           </Show>
-          <button type="button" role="menuitem" class="rmenu-item" onClick={() => void copyId()}>
-            <span class="rmenu-lbl">{copied() ? "Copied" : "Copy run ID"}</span>
-            <small class="mono">{props.runId}</small>
-          </button>
-          <span class="sr-only" role="status">
-            {copied() ? "Run ID copied" : ""}
-          </span>
         </div>
       </Show>
     </span>
