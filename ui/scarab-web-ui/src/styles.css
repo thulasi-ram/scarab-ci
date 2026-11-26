@@ -3017,12 +3017,41 @@ a.lgtog { text-decoration: none; }
 .tabpane { padding: 16px 18px; }
 .tabpane .empty { color: var(--muted-sage); font: var(--t-body); padding: 8px 0; }
 
-.kvgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; }
-.kvcard { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; background: var(--emerald-surface); }
-.kvcard .kvk { font: var(--t-mono); color: var(--muted-sage); display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.kvcard .kvv { font: var(--t-mono); color: var(--soft-white); margin-top: 6px; word-break: break-all; }
-.kvcard .kvfrom { font: var(--t-mono); color: var(--muted-sage); margin-top: 6px; }
-.kvcard .kvfrom b { color: var(--emerald); font: var(--t-mono); }
+/* Results tab: one row per result in a shared grid (name, type, value), so the
+   values line up. An object's row opens to its formatted JSON on a line of its
+   own, capped in height, so a large value never stretches the others. */
+.res-from { margin: 0 0 10px; color: var(--muted-sage); }
+.res-from b { font: var(--t-mono); color: var(--emerald); }
+.res-list {
+  display: grid; grid-template-columns: minmax(0, max-content) auto minmax(0, 1fr);
+  border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--emerald-surface);
+}
+.res-row { display: contents; }
+.res-row > .res-name, .res-row > .res-type, .res-row > .res-val {
+  padding: 9px 12px; border-top: 1px solid var(--border-soft); min-width: 0;
+}
+.res-row > .res-type { padding-inline: 0; }
+.res-row:first-child > * { border-top: 0; }
+.res-name { color: var(--sage); }
+.res-type { display: flex; align-items: flex-start; }
+.res-val { color: var(--soft-white); overflow-wrap: anywhere; white-space: pre-wrap; }
+.res-tree {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  background: none; border: 0; border-top: 1px solid var(--border-soft); cursor: pointer; white-space: nowrap;
+}
+.res-row:first-child > .res-tree { border-top: 0; }
+.res-tree svg { flex: none; color: var(--muted-sage); }
+.res-tree:hover .res-size, .res-tree:focus-visible .res-size { color: var(--emerald); }
+.res-tree:focus-visible { outline: 2px solid var(--emerald); outline-offset: -2px; }
+.res-size { flex: none; color: var(--sage); }
+.res-preview { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--muted-sage); }
+.res-json { grid-column: 1 / -1; border-top: 1px solid var(--border-soft); background: var(--pine-deep); min-width: 0; }
+.res-json-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 4px 8px 4px 12px; border-bottom: 1px solid var(--border-soft); color: var(--muted-sage);
+}
+.res-json pre { margin: 0; padding: 10px 12px; max-height: 320px; overflow: auto; color: var(--soft-white); }
+.res-copy { display: inline-flex; align-items: center; gap: 5px; }
 
 /* One row per output: the expression a downstream step writes, then the value
    it reads. The rows share one grid, so the arrows line up; a long value (a

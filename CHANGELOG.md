@@ -36,6 +36,9 @@ release.yml uses that version's section as the GitHub Release text. See
   When a pipeline cannot be read at all, the form links to Run pipeline to pick another ref.
 - **In the run graph, a step with a sidecar no longer touches the services lane's line above
   it.**
+- **A large step result no longer stretches the Results tab.** Results are one row each (name,
+  type, value). An object or list, such as the build library's `image` result, is one line that
+  opens to its formatted JSON, at most 320px tall, with a Copy button.
 
 ## [0.8.1] - 2026-11-26
 

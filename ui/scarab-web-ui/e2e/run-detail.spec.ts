@@ -401,6 +401,24 @@ test("a run's inputs: the Inputs tab and a new run filled in with them", async (
   await expect(page).toHaveURL(new RegExp(`/acme/scarab/runs/${RICH_RUN_ID}$`));
 });
 
+// A step's `image` result (an image's build metadata) is a large object. The
+// Results tab shows it as one row that opens to formatted JSON, so it no
+// longer stretches the other results' cards to its height.
+test("a large object result is one row that opens to its JSON", async ({ page }) => {
+  await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}?step=2&ptab=results`);
+  const rows = page.locator(".res-list .res-name");
+  await expect(rows).toHaveText(["tests_passed", "coverage", "image"]);
+  const image = page.getByRole("button", { name: /6 keys/ });
+  await expect(image).toContainText("digest: sha256:9f86d081");
+  const box = await page.locator(".res-list").boundingBox();
+  expect(box!.height).toBeLessThan(200);
+  await image.click();
+  await expect(image).toHaveAttribute("aria-expanded", "true");
+  await expect(page.locator(".res-json pre")).toContainText('"containerimage.descriptor": {');
+  const pre = await page.locator(".res-json pre").boundingBox();
+  expect(pre!.height).toBeLessThanOrEqual(320);
+});
+
 // The RETRIES run's branch, fix/flaky-checkout, was deleted when its pull
 // request merged (src/mock.ts lists no such branch). A new run reads the
 // pipeline at the default branch and says why, instead of the forge's 422.

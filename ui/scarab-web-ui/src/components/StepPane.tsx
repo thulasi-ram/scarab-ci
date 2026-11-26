@@ -74,6 +74,7 @@ import { shortHash } from "../libraries";
 import { idSegments } from "../dag-layout";
 import { waitApprovers, type WaitResolution } from "../run-tabs";
 import { absTime, relTime } from "../fmt";
+import { resultView } from "../result-value";
 import Icon from "./Icon";
 import { loadRunManifest } from "./RunManifest";
 import { pipelineShortName } from "../schedules";
@@ -94,6 +95,58 @@ function sameKey<T>(fn: () => T): () => T {
 }
 
 /** A compact display of a result value — scalars inline, structures as JSON. */
+/** One row of the Results tab. */
+function ResultRow(props: { name: string; type: string; value: unknown }) {
+  const view = resultView(props.value);
+  const [open, setOpen] = createSignal(false);
+  const [copied, setCopied] = createSignal(false);
+  const copy = async (json: string) => {
+    try {
+      await navigator.clipboard?.writeText(json);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      /* the clipboard refused; the JSON is on screen to select */
+    }
+  };
+  return (
+    <div class="res-row">
+      <span class="res-name mono">{props.name}</span>
+      <span class="res-type">
+        <Pill tone="copper">{props.type}</Pill>
+      </span>
+      {view.kind === "plain" ? (
+        <span class="res-val mono">{view.text}</span>
+      ) : (
+        <>
+          <button
+            type="button"
+            class="res-val res-tree mono"
+            aria-expanded={open()}
+            onClick={() => setOpen((o) => !o)}
+            title={open() ? "Hide the value" : "Show the whole value"}
+          >
+            <Icon icon={open() ? "chevron-down" : "chevron-right"} size={13} />
+            <span class="res-size">{view.size}</span>
+            <span class="res-preview">{view.preview}</span>
+          </button>
+          <Show when={open()}>
+            <div class="res-json">
+              <div class="res-json-bar">
+                <span class="mono">{props.name}</span>
+                <button type="button" class="btn btn-ghost btn-sm res-copy" onClick={() => void copy(view.json)}>
+                  <Icon icon={copied() ? "check" : "copy"} size={13} /> {copied() ? "Copied" : "Copy"}
+                </button>
+              </div>
+              <pre class="mono">{view.json}</pre>
+            </div>
+          </Show>
+        </>
+      )}
+    </div>
+  );
+}
+
 function showValue(v: unknown): string {
   if (typeof v === "string") return v;
   return JSON.stringify(v);
@@ -1082,22 +1135,15 @@ export default function StepPane(props: {
                   when={(results()?.length ?? 0) > 0}
                   fallback={<p class="empty">no results published by this try</p>}
                 >
-                  <div class="kvgrid">
-                    <For each={results()}>
-                      {(r) => (
-                        <div class="kvcard">
-                          <div class="kvk">
-                            <span>{r.name}</span>
-                            <Pill tone="copper">{r.type_name}</Pill>
-                          </div>
-                          <div class="kvv mono">{showValue(r.value)}</div>
-                          <div class="kvfrom">
-                            from{" "}
-                            <b>{scoped() ? label(s().id, scoped()!.id) : s().id}</b>
-                          </div>
-                        </div>
-                      )}
-                    </For>
+                  {/* One row per result: name, type, value. A plain value
+                      shows in full; an object or a list shows one line and
+                      opens to its formatted JSON, so a large one (an image's
+                      build metadata) never stretches the others. */}
+                  <p class="res-from mono">
+                    from <b>{scoped() ? label(s().id, scoped()!.id) : s().id}</b>
+                  </p>
+                  <div class="res-list">
+                    <For each={results()}>{(r) => <ResultRow name={r.name} type={r.type_name} value={r.value} />}</For>
                   </div>
                 </Show>
                 </Show>
