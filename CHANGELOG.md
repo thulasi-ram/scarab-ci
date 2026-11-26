@@ -20,6 +20,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Enhancement
 
+- **Text is 1px larger across the web UI**: Body and Label go from 13px to 14px, and Mono from
+  12px to 13px. Titles stay at 20px.
 - **The Run page's header is three lines**: the breadcrumb with the Run's number and its ID
   (click the ID to copy it), then the pipeline, title and status with a kept-snapshots mark and
   Live at the right, then where the Run came from.

@@ -318,13 +318,13 @@ describe("nodeMeta", () => {
 describe("columnNodeWidth", () => {
   it("fits the column's longest label, between the minimum and the maximum", () => {
     const w = columnNodeWidth(["superhero-tools-common · aws-post-cluster", "git"]);
-    expect(w).toBe(Math.round(41 * 7.2 + 68));
+    expect(w).toBe(Math.round(41 * 7.8 + 68));
     expect(columnNodeWidth(["git"])).toBe(196);
     expect(columnNodeWidth(["x".repeat(200)])).toBe(460);
   });
 
   it("keeps room for the meta line", () => {
-    expect(columnNodeWidth(["git"], { minChars: 26 })).toBe(Math.round(26 * 7.2 + 68));
+    expect(columnNodeWidth(["git"], { minChars: 26 })).toBe(Math.round(26 * 7.8 + 68));
   });
 });
 
