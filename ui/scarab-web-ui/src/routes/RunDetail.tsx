@@ -1415,6 +1415,18 @@ export default function RunDetail() {
                 type="button"
                 role="tab"
                 class="run-tab"
+                aria-selected={runTab() === "inputs"}
+                onClick={() => setRunTab("inputs")}
+              >
+                Inputs{" "}
+                <span class="run-tab-n" classList={{ zero: Object.keys(runParams(r())).length === 0 }}>
+                  {Object.keys(runParams(r())).length}
+                </span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                class="run-tab"
                 aria-selected={runTab() === "artifacts"}
                 onClick={() => openArtifacts(null)}
               >
@@ -1441,18 +1453,6 @@ export default function RunDetail() {
                 >
                   <span class="run-tab-n">{activityCount()}</span>
                 </Show>
-              </button>
-              <button
-                type="button"
-                role="tab"
-                class="run-tab"
-                aria-selected={runTab() === "inputs"}
-                onClick={() => setRunTab("inputs")}
-              >
-                Inputs{" "}
-                <span class="run-tab-n" classList={{ zero: Object.keys(runParams(r())).length === 0 }}>
-                  {Object.keys(runParams(r())).length}
-                </span>
               </button>
               <button
                 type="button"

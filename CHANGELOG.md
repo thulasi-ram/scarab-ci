@@ -24,7 +24,7 @@ release.yml uses that version's section as the GitHub Release text. See
   (click the ID to copy it), then the pipeline, title and status with a kept-snapshots mark and
   Live at the right, then where the Run came from.
   Copy run ID left the ⋯ menu, which now shows an icon beside each item. The "N inputs" link left
-  the header; the Inputs tab has them.
+  the header; the Inputs tab has them, and is now second, after Pipeline.
 
 ### Bug Fixes
 
