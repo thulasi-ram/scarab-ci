@@ -281,7 +281,7 @@ export function defaultSelection(o: {
 // ── URL state ───────────────────────────────────────────────────────────────
 
 export type RunTabParam = "artifacts" | "activity" | "inputs" | "manifest";
-export type PaneTabParam = "results" | "workspace" | "outputs" | "source";
+export type PaneTabParam = "results" | "workspace" | "source";
 
 /**
  * The run page's query state. Steps and services are named by their index in
@@ -307,7 +307,7 @@ export type RunUrlState = {
 type Params = Record<string, string | string[] | null | undefined>;
 
 const RUN_TABS: readonly string[] = ["artifacts", "activity", "inputs", "manifest"];
-const PANE_TABS: readonly string[] = ["results", "workspace", "outputs", "source"];
+const PANE_TABS: readonly string[] = ["results", "workspace", "source"];
 
 function first(v: string | string[] | null | undefined): string | undefined {
   if (Array.isArray(v)) return v[0];
@@ -336,7 +336,9 @@ export function parseRunUrl(params: Params): RunUrlState {
   if (v !== undefined) out.v = v;
   if (tryN !== undefined) out.try = tryN;
   if (tab && RUN_TABS.includes(tab)) out.tab = tab as RunTabParam;
-  if (ptab && PANE_TABS.includes(ptab)) out.ptab = ptab as PaneTabParam;
+  // The Outputs tab became part of Results: its old links open Results.
+  if (ptab === "outputs") out.ptab = "results";
+  else if (ptab && PANE_TABS.includes(ptab)) out.ptab = ptab as PaneTabParam;
   if (from !== undefined && out.tab === "artifacts") out.from = from;
   return out;
 }
@@ -468,7 +470,7 @@ export function fitBand(o: {
 /**
  * The width of the nodes in one graph column: wide enough for the column's
  * longest label on one line, so a label ends in an ellipsis only past `max`.
- * Labels are in the 13px mono font, `charPx` a character (JetBrains Mono's
+ * Labels are in the 12.5px mono font, `charPx` a character (JetBrains Mono's
  * advance is 0.6em); `chromePx` is the node's padding, border, status ring,
  * gaps and gate icon. `minChars` keeps room for the meta line under the label
  * ("waiting for a node · 1m10s"), which changes as the run goes and so does
@@ -478,7 +480,7 @@ export function columnNodeWidth(
   labels: string[],
   o: { charPx?: number; chromePx?: number; minChars?: number; min?: number; max?: number } = {},
 ): number {
-  const charPx = o.charPx ?? 7.8;
+  const charPx = o.charPx ?? 7.5;
   const chrome = o.chromePx ?? 68;
   const longest = labels.reduce((n, l) => Math.max(n, [...l].length), o.minChars ?? 0);
   return Math.round(Math.min(o.max ?? 460, Math.max(o.min ?? 196, longest * charPx + chrome)));

@@ -20,8 +20,13 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Enhancement
 
-- **Text is larger across the web UI**: Body and Label go from 13px to 14px, Mono from 12px to
-  13px, and titles from 20px to 21px.
+- **Text is 0.5px larger across the web UI**: Body and Label go from 13px to 13.5px, Mono from
+  12px to 12.5px, and titles from 20px to 20.5px.
+- **The step pane's Outputs tab is part of Results.** They showed the same values: Results for
+  the selected try, Outputs for the try later steps read. Results now shows the selected try's
+  values with the `${{ outputs.<step>.<name> }}` expression under each name, what the try was
+  built on, and, when later steps read a different try, a link to it. Links to the Outputs tab
+  open Results.
 - **The Run page's header is three lines**: the breadcrumb with the Run's number and its ID
   (click the ID to copy it), then the pipeline, title and status with a kept-snapshots mark and
   Live at the right, then where the Run came from.

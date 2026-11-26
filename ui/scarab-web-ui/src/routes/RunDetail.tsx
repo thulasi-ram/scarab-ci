@@ -139,7 +139,7 @@ const POLL_MS = 1200;
 
 /** The step tab as the URL names it (absent = Logs; a gate's tab is not kept). */
 const paneTabParam = (t: PaneTab): PaneTabParam | undefined =>
-  t === "results" || t === "workspace" || t === "outputs" || t === "source" ? t : undefined;
+  t === "results" || t === "workspace" || t === "source" ? t : undefined;
 
 /** A run tab: Pipeline (absent from the URL), Artifacts, Activity, Inputs or Manifest. */
 type RunTab = "pipeline" | RunTabParam;

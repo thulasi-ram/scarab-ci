@@ -151,10 +151,10 @@ UI has exactly four text styles, so every page stays within that. Each is a
 
 | Style | Token | Face | Weight · size | For |
 |-------|-------|------|---------------|-----|
-| Title | `--t-title` | Inter (`--font-ui`) | 600 · 21px | page titles (`h1`, the run and settings breadcrumb headings), dialog titles, stat figures |
-| Label | `--t-label` | Inter | 600 · 14px | names, section and panel headings, column heads, field labels, buttons, active tabs and nav links |
-| Body | `--t-body` | Inter | 400 · 14px | running text, values, form controls, nav links |
-| Mono | `--t-mono` | JetBrains Mono (`--font-mono`) | 500 · 13px | machine values: ids, SHAs, refs, durations, counts, code, logs |
+| Title | `--t-title` | Inter (`--font-ui`) | 600 · 20.5px | page titles (`h1`, the run and settings breadcrumb headings), dialog titles, stat figures |
+| Label | `--t-label` | Inter | 600 · 13.5px | names, section and panel headings, column heads, field labels, buttons, active tabs and nav links |
+| Body | `--t-body` | Inter | 400 · 13.5px | running text, values, form controls, nav links |
+| Mono | `--t-mono` | JetBrains Mono (`--font-mono`) | 500 · 12.5px | machine values: ids, SHAs, refs, durations, counts, code, logs |
 
 Every text rule sets `font:` to one of the four tokens, or `font: inherit`.
 No rule sets `font-size`, `font-weight` or `font-family` on its own, and
@@ -174,7 +174,7 @@ sits in: the class means "this is a machine value".
   `--sage` or `--muted-sage` (see Tables).
 - Secondary text is Body in `--sage` or `--muted-sage`. Colour is not a font
   variation, so it does not count against the four.
-- Mono is weight 500, not 400: at 13px, 400 reads thin next to Inter.
+- Mono is weight 500, not 400: at 12.5px, 400 reads thin next to Inter.
 - Status chips and badges keep their data values as written (`succeeded`,
   `push`, `unreachable`): lowercase Mono or Label, not upper-cased.
 
@@ -341,7 +341,7 @@ Placement is stricter than doodles, because motion competes with content:
 ### Modal
 - Every dialog is a `Modal` (`components/Modal.tsx`): elevated
   (`--emerald-elevated`), a blurred dark scrim, and the single permitted soft
-  shadow. A 21px title, one line saying what the dialog is for, numbered
+  shadow. A 20.5px title, one line saying what the dialog is for, numbered
   sections when it asks three or more questions, and a `--pine-deep` footer with
   the actions and, when useful, a line saying what applies after saving. Three
   widths: narrow 440px (a confirmation), standard 560px (a form), wide 760px (a

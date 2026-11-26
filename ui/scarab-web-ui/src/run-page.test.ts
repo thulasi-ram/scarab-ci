@@ -199,6 +199,8 @@ describe("parseRunUrl", () => {
 
   it("reads the Manifest tab", () => {
     expect(parseRunUrl({ tab: "manifest" })).toEqual({ tab: "manifest" });
+    // The Outputs tab became part of Results: an old link opens Results.
+    expect(parseRunUrl({ ptab: "outputs" })).toEqual({ ptab: "results" });
   });
 
   it("takes the first of a repeated param", () => {
@@ -221,7 +223,7 @@ describe("clampRunUrl", () => {
   };
 
   it("keeps params that exist in the run", () => {
-    expect(clampRunUrl({ step: 1, v: 2, try: 2, ptab: "outputs" }, ctx)).toEqual({ step: 1, v: 2, try: 2, ptab: "outputs" });
+    expect(clampRunUrl({ step: 1, v: 2, try: 2, ptab: "results" }, ctx)).toEqual({ step: 1, v: 2, try: 2, ptab: "results" });
   });
 
   it("drops a try past the version's tries, and a step past the end", () => {
@@ -318,13 +320,13 @@ describe("nodeMeta", () => {
 describe("columnNodeWidth", () => {
   it("fits the column's longest label, between the minimum and the maximum", () => {
     const w = columnNodeWidth(["superhero-tools-common · aws-post-cluster", "git"]);
-    expect(w).toBe(Math.round(41 * 7.8 + 68));
+    expect(w).toBe(Math.round(41 * 7.5 + 68));
     expect(columnNodeWidth(["git"])).toBe(196);
     expect(columnNodeWidth(["x".repeat(200)])).toBe(460);
   });
 
   it("keeps room for the meta line", () => {
-    expect(columnNodeWidth(["git"], { minChars: 26 })).toBe(Math.round(26 * 7.8 + 68));
+    expect(columnNodeWidth(["git"], { minChars: 26 })).toBe(Math.round(26 * 7.5 + 68));
   });
 });
 

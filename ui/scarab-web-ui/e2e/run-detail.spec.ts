@@ -406,7 +406,7 @@ test("a run's inputs: the Inputs tab and a new run filled in with them", async (
 // longer stretches the other results' cards to its height.
 test("a large object result is one row that opens to its JSON", async ({ page }) => {
   await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}?step=2&ptab=results`);
-  const rows = page.locator(".res-list .res-name");
+  const rows = page.locator(".res-list .res-name > span.mono");
   await expect(rows).toHaveText(["tests_passed", "coverage", "image"]);
   const image = page.getByRole("button", { name: /6 keys/ });
   await expect(image).toContainText("digest: sha256:9f86d081");
@@ -417,6 +417,20 @@ test("a large object result is one row that opens to its JSON", async ({ page })
   await expect(page.locator(".res-json pre")).toContainText('"containerimage.descriptor": {');
   const pre = await page.locator(".res-json pre").boundingBox();
   expect(pre!.height).toBeLessThanOrEqual(320);
+  // Each row names the expression a later step reads it by.
+  await expect(page.locator(".res-expr").last()).toHaveText("${{ outputs.test.image }}");
+});
+
+// Results took over the Outputs tab: an old `ptab=outputs` link opens Results,
+// and on a failed try a pill says which try later steps read and selects it.
+test("Results says which try later steps read, and old Outputs links open it", async ({ page }) => {
+  await page.goto(`/acme/scarab/runs/${RICH_RUN_ID}?step=1&try=1&ptab=outputs`);
+  await expect(page).toHaveURL(/[?&]ptab=results(&|$)/);
+  await expect(page.locator(".pane-tabbar .tab")).toHaveText(["Error", "Logs", "Results", "Workspace"]);
+  const jump = page.getByRole("button", { name: "later steps read try 2 →" });
+  await jump.click();
+  await expect(page.locator(".res-head")).toContainText("from build · try 2");
+  await expect(page.locator(".res-head")).toContainText("later steps read these");
 });
 
 // The RETRIES run's branch, fix/flaky-checkout, was deleted when its pull
