@@ -14,25 +14,34 @@
 //!   opaque value core gave the Plugin with the request it is serving. The
 //!   installation token alone never acts as anyone.
 //!
-//! A handle is bound to one installation, one caller PrincipalToken and the
-//! ApiOperations it may use, and it expires. On every call the middleware
-//! here, before any handler runs:
+//! A handle is bound to one installation and its org, one caller
+//! PrincipalToken and the ApiOperations it may use, and it expires. On every
+//! call the middleware here, before any handler runs:
 //!
-//! 1. proves the installation and reads its kill switch;
-//! 2. finds the handle by its SHA-256, checks it belongs to that
-//!    installation, has not expired and was heartbeated recently;
-//! 3. re-reads the caller's PrincipalToken: it must be live (not revoked or
-//!    expired);
-//! 4. checks the route's ApiOperation is in the handle's operations **and**
-//!    in the token's own operation list (fail-closed, as `authenticate`
-//!    checks every token) and is one a delegated call can use at all;
-//! 5. takes one call, and one write for an operation that is not a read,
-//!    from the handle's counters in one conditional UPDATE that refuses at
-//!    zero;
-//! 6. journals the call (no journal row, no call: 503);
+//! 1. proves the installation and reads its kill switch; it must register
+//!    an endpoint, and its image must still be of a publisher the operator
+//!    lists **now** ([`crate::plugins::check_trusted_service`]): delisting a
+//!    publisher refuses PluginApi at once, though it does not stop the Pod;
+//! 2. finds the handle by its SHA-256 and checks it belongs to that
+//!    installation and its org, has not expired and was heartbeated
+//!    recently;
+//! 3. re-reads the caller's PrincipalToken: live, an `oauth` token whose
+//!    scope is the installation's org and whose audience is one of this
+//!    installation's endpoint URLs;
+//! 4. journals the call, with a request id the server mints (no journal
+//!    row, no call: 503); every refusal from here on finishes that row with
+//!    its status;
+//! 5. checks the route's ApiOperation is in the handle's operations, in the
+//!    token's own operation list (fail-closed, as `authenticate` checks every
+//!    token), in some endpoint operation's `may` of the installed manifest,
+//!    and one a delegated call can use at all ([`ops::delegable`]);
+//! 6. takes one of the installation's broker permits (the read proxy's
+//!    budget) and holds it until the response body ends, then one call, and
+//!    one write for an operation that is not a read, from the handle's
+//!    counters in one conditional UPDATE that refuses at zero;
 //! 7. runs the route with the caller set for `authenticate`, which then
 //!    builds the narrowed [`Caller`] from the token, as a replayed
-//!    StepUpConfirmationRequest does.
+//!    StepUpConfirmationRequest does, and finishes the journal row.
 //!
 //! The handler then runs its usual authorization against the caller's live
 //! role. A delegated call never raises or satisfies a step-up
@@ -40,9 +49,12 @@
 //! served here, and no path lets it approve a gate.
 //!
 //! **Limits.** A handle's calls and writes are counted in Postgres, so they
-//! hold across replicas. The ADR's request rates per caller and per
-//! installation are not built here: the endpoint that takes outside
-//! requests counts them, and those counts are per replica.
+//! hold across replicas. The broker permits are counted per replica, as the
+//! read proxy's are. The ADR's request rates per caller and per installation
+//! are not built here: the endpoint that takes outside requests counts them,
+//! per replica too. The handles and the journal live on the broker's own
+//! pool; the route handlers a delegated call runs read and write through the
+//! main pool, as the public API does.
 //!
 //! **Which routes.** Only routes whose ApiOperation a handle could name
 //! ([`crate::step_up::ops::delegable`]), and never the three gate routes the
@@ -60,8 +72,7 @@ use sha2::{Digest, Sha256};
 use scarab_identity::{Principal, PrincipalToken};
 use scarab_plugin::{
     DelegatedCallJournalEntry, DelegatedCallSpend, DelegatedCallStore, DelegatedCallerHandle,
-    PluginEndpointOperation, PluginInstallation, DELEGATED_CALLER_HANDLE_MAX_CALLS,
-    DELEGATED_CALLER_HANDLE_MAX_LIFETIME_MS,
+    PluginInstallation, DELEGATED_CALLER_HANDLE_MAX_CALLS, DELEGATED_CALLER_HANDLE_MAX_LIFETIME_MS,
 };
 
 use crate::step_up::ops::{self, Class};
@@ -174,30 +185,63 @@ fn store(st: &AppState) -> Option<&dyn DelegatedCallStore> {
 }
 
 /// Mint a DelegatedCallerHandle for `token`'s owner, for one request
-/// `installation` serves that matched `endpoint_operations` (ADR-0086 §3).
-/// Its operations are the union of their `may`, narrowed to the token's own
-/// list when it has one; its writes the sum of their `writes`; its calls
-/// [`DELEGATED_CALLER_HANDLE_MAX_CALLS`]; its life at most
-/// [`DELEGATED_CALLER_HANDLE_MAX_LIFETIME_MS`]. Returns the value to hand
-/// the Plugin (shown nowhere else) and the stored handle.
+/// `installation` serves that matched the endpoint operations named
+/// `operation_names` (`<path>/<operation>`, ADR-0086 §3). The names are
+/// resolved in the installation's approved manifest; an unknown one is
+/// refused. The installation must be enabled and `trusted_service`, its
+/// publisher still listed, and the token live and scoped to the
+/// installation's org. The handle's operations are the union of the
+/// operations' `may`, narrowed to [delegable](ops::delegable) ones and to the
+/// token's own list when it has one; its writes the sum of their `writes`;
+/// its calls [`DELEGATED_CALLER_HANDLE_MAX_CALLS`]; its life at most
+/// [`DELEGATED_CALLER_HANDLE_MAX_LIFETIME_MS`] and never past the token's.
+/// Returns the value to hand the Plugin (shown nowhere else) and the stored
+/// handle.
 ///
-/// The endpoint that forwards outside requests to a Plugin calls this; it
-/// heartbeats the handle while its connection is open and deletes it when
-/// the connection closes.
+/// For the endpoint that forwards outside requests to a Plugin (step 7):
+/// it accepts only an `oauth` token whose audience equals, byte for byte,
+/// the canonical URL of the endpoint the request came to (PluginApi checks
+/// the audience's path again on every call); it heartbeats the handle
+/// ([`DelegatedCallStore::heartbeat_delegated_caller_handle`]) at least
+/// every 60 seconds while the inbound connection is open, and deletes it
+/// ([`DelegatedCallStore::delete_delegated_caller_handle`]) when the
+/// connection closes; and it calls
+/// [`crate::plugins::check_trusted_service`] before forwarding anything.
 pub async fn mint_delegated_caller_handle(
     st: &AppState,
     installation: &PluginInstallation,
     token: &PrincipalToken,
-    endpoint_operations: &[&PluginEndpointOperation],
+    operation_names: &[&str],
 ) -> Result<(String, DelegatedCallerHandle), ApiError> {
     let store = store(st).ok_or(ApiError::NotFound)?;
+    if installation.state != scarab_plugin::InstallationState::Enabled {
+        return Err(ApiError::Denied(format!(
+            "plugin installation `{}` is killed",
+            installation.name
+        )));
+    }
+    crate::plugins::check_trusted_service(
+        &st.plugin_policy,
+        &installation.manifest,
+        &installation.image,
+    )?;
     let now = st.clock.now().await.0;
-    if !token.is_live(now) || token.owner_subject.is_empty() {
+    if !token.is_live(now)
+        || token.owner_subject.is_empty()
+        || token.scope.org() != installation.org
+    {
         return Err(ApiError::Unauthorized);
     }
+    let declared = installation.manifest.endpoint_operations();
     let mut operations: Vec<String> = Vec::new();
     let mut writes: u32 = 0;
-    for op in endpoint_operations {
+    for name in operation_names {
+        let Some((_, op)) = declared.iter().find(|(n, _)| n.as_str() == *name) else {
+            return Err(ApiError::BadRequest(format!(
+                "plugin installation `{}` declares no endpoint operation `{name}`",
+                installation.name
+            )));
+        };
         for id in &op.may {
             let delegable = ops::by_id(id).is_some_and(|o| ops::delegable(o).is_ok());
             if delegable && token.admits_operation(Some(id.as_str())) && !operations.contains(id) {
@@ -238,6 +282,44 @@ fn random_secret() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// Is `audience` the URL of one of `installation`'s endpoints: a URL whose
+/// path ends `/v1/orgs/{org}/plugin-installations/{id}/endpoints/<path>` for
+/// a path the installation registers, with no query or fragment? A prefix
+/// before it is allowed, for a Scarab served under a path.
+fn audience_names_an_endpoint_of(audience: &str, installation: &PluginInstallation) -> bool {
+    let Ok(url) = reqwest::Url::parse(audience) else {
+        return false;
+    };
+    if url.query().is_some() || url.fragment().is_some() {
+        return false;
+    }
+    let path = url.path();
+    installation.manifest.extensions.iter().any(|r| {
+        r.point == scarab_plugin::PluginExtensionPoint::Endpoint
+            && path.ends_with(&format!(
+                "/v1/orgs/{}/plugin-installations/{}/endpoints/{}",
+                installation.org, installation.id, r.path
+            ))
+    })
+}
+
+/// A refusal, journaled: the row `journal_id` finishes with its status.
+async fn refuse_journaled(
+    st: &AppState,
+    store: &dyn DelegatedCallStore,
+    journal_id: i64,
+    refusal: Response,
+) -> Response {
+    let now = st.clock.now().await.0;
+    if let Err(e) = store
+        .finish_delegated_call(journal_id, refusal.status().as_u16(), now)
+        .await
+    {
+        tracing::warn!(error = %e, journal_id, "plugin api: a refusal was not journaled");
+    }
+    refusal
+}
+
 /// The PluginApi middleware: steps 1 to 7 of the module notes. A route
 /// layer, so the route is matched and its operation known before it runs.
 pub(crate) async fn authenticate_delegated_call(
@@ -248,7 +330,8 @@ pub(crate) async fn authenticate_delegated_call(
     let Some(store) = store(&st) else {
         return unauthorized("no delegated call store configured");
     };
-    // 1. The installation, by its `scarab-api` token, kill switch read now.
+    // 1. The installation, by its `scarab-api` token, kill switch read now;
+    //    `trusted_service`, its publisher listed now.
     let installation = match crate::plugin_gates::api_token_installation(&st, req.headers()).await {
         Ok(i) => i,
         Err(e) => return e.into_response(),
@@ -260,6 +343,13 @@ pub(crate) async fn authenticate_delegated_call(
         ))
         .into_response();
     }
+    if let Err(e) = crate::plugins::check_trusted_service(
+        &st.plugin_policy,
+        &installation.manifest,
+        &installation.image,
+    ) {
+        return e.into_response();
+    }
     if installation.held_by_the_runtime() {
         return ApiError::Denied(format!(
             "plugin installation `{}` is held by the plugin runtime ({})",
@@ -268,7 +358,8 @@ pub(crate) async fn authenticate_delegated_call(
         ))
         .into_response();
     }
-    // 2. The handle: required on every PluginApi call.
+    // 2. The handle: required on every PluginApi call, of this installation
+    //    and its org.
     let Some(value) = presented_handle(req.headers()) else {
         return unauthorized("no delegated caller handle");
     };
@@ -281,13 +372,14 @@ pub(crate) async fn authenticate_delegated_call(
         Err(e) => return crate::plugins::plugin_store_api_error(e).into_response(),
     };
     let now = st.clock.now().await.0;
-    if handle.installation_id != installation.id {
+    if handle.installation_id != installation.id || handle.org != installation.org {
         return unauthorized("a delegated caller handle of another installation");
     }
     if !handle.is_live(now) {
         return unauthorized("an expired delegated caller handle");
     }
-    // 3. The caller's token, live now.
+    // 3. The caller's token: live, `oauth`, of this org, granted for one of
+    //    this installation's endpoints.
     let Some(tokens) = st.api_tokens.as_ref() else {
         return unauthorized("no token store configured");
     };
@@ -296,42 +388,32 @@ pub(crate) async fn authenticate_delegated_call(
         Ok(_) => return unauthorized("the handle's token is revoked, expired or unknown"),
         Err(_) => return unauthorized("the token store could not be read"),
     };
-    // 4. The route's operation: in the handle, in the token's own list, and
-    //    one a delegated call can use.
+    if token.kind != scarab_identity::PrincipalTokenKind::Oauth
+        || token.scope.org() != installation.org
+        || !token
+            .audience
+            .as_deref()
+            .is_some_and(|a| audience_names_an_endpoint_of(a, &installation))
+    {
+        return unauthorized("the handle's token was not granted for this installation's endpoint");
+    }
     let matched = req.extensions().get::<MatchedPath>().map(|m| m.as_str());
     let Some(op) = crate::step_up::guard::route_entry(crate::route_table(), req.method(), matched)
         .map(|e| e.op)
     else {
         return operation_not_granted(None).into_response();
     };
-    if !handle.allows(op.id) || !token.admits_operation(Some(op.id)) || ops::delegable(op).is_err()
-    {
-        return operation_not_granted(Some(op.id)).into_response();
-    }
-    // 5. One call, and one write for anything that is not a read.
-    let write = !matches!(op.class, Class::Read);
-    match store
-        .spend_delegated_caller_handle(&handle.id, write, now)
-        .await
-    {
-        Ok(DelegatedCallSpend::Spent) => {}
-        Ok(DelegatedCallSpend::Exhausted) => {
-            return ApiError::TooManyRequests(format!(
-                "this delegated caller handle has no {} left",
-                if write { "calls or writes" } else { "calls" }
-            ))
-            .into_response()
-        }
-        Ok(DelegatedCallSpend::Gone) => return unauthorized("the handle expired meanwhile"),
-        Err(e) => return crate::plugins::plugin_store_api_error(e).into_response(),
-    }
-    // 6. The journal: a call that cannot be recorded is not made.
-    let request_id = req
+    // 4. The journal: a call that cannot be recorded is not made. The
+    //    request id is ours; the plugin's own goes beside it.
+    let plugin_request_id = req
         .headers()
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
-        .map(String::from)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        .map(|v| {
+            v.chars()
+                .take(scarab_plugin::MAX_PLUGIN_REQUEST_ID_CHARS)
+                .collect::<String>()
+        });
     let entry = DelegatedCallJournalEntry {
         installation_id: installation.id.clone(),
         org: installation.org.clone(),
@@ -343,7 +425,8 @@ pub(crate) async fn authenticate_delegated_call(
         operation: op.id.to_string(),
         method: req.method().as_str().to_string(),
         path: req.uri().path().to_string(),
-        request_id,
+        request_id: uuid::Uuid::new_v4().to_string(),
+        plugin_request_id,
         started_at: now,
     };
     let journal_id = match store.journal_delegated_call(&entry).await {
@@ -356,6 +439,54 @@ pub(crate) async fn authenticate_delegated_call(
             .into_response();
         }
     };
+    // 5. The route's operation: in the handle, in the token's own list, in
+    //    the installed manifest's `may`, and delegable at all.
+    let allowed = handle.allows(op.id)
+        && token.admits_operation(Some(op.id))
+        && installation.manifest.delegable_operations().contains(op.id)
+        && ops::delegable(op).is_ok();
+    if !allowed {
+        let refusal = operation_not_granted(Some(op.id)).into_response();
+        return refuse_journaled(&st, store, journal_id, refusal).await;
+    }
+    // 6. One of the installation's broker permits, held to the end of the
+    //    response body; then one call, and one write for anything that is
+    //    not a read.
+    let permit = match req
+        .extensions()
+        .get::<Arc<crate::broker_proxy::BrokerProxy>>()
+        .and_then(|proxy| proxy.try_plugin_api_permit(&installation.id))
+    {
+        Some(permit) => permit,
+        None => {
+            let refusal = ApiError::TooManyRequests(
+                "this plugin installation has as many broker requests in flight, or in the \
+                 last minute, as it may"
+                    .into(),
+            )
+            .into_response();
+            return refuse_journaled(&st, store, journal_id, refusal).await;
+        }
+    };
+    let write = !matches!(op.class, Class::Read);
+    let refusal = match store
+        .spend_delegated_caller_handle(&handle.id, write, now)
+        .await
+    {
+        Ok(DelegatedCallSpend::Spent) => None,
+        Ok(DelegatedCallSpend::Exhausted) => Some(
+            ApiError::TooManyRequests(format!(
+                "this delegated caller handle has no {} left",
+                if write { "calls or writes" } else { "calls" }
+            ))
+            .into_response(),
+        ),
+        Ok(DelegatedCallSpend::Gone) => Some(unauthorized("the handle expired meanwhile")),
+        Err(e) => Some(crate::plugins::plugin_store_api_error(e).into_response()),
+    };
+    if let Some(refusal) = refusal {
+        return refuse_journaled(&st, store, journal_id, refusal).await;
+    }
     // 7. The route, as the caller.
     let call = Arc::new(DelegatedCall {
         installation_id: installation.id,
@@ -370,7 +501,19 @@ pub(crate) async fn authenticate_delegated_call(
     {
         tracing::warn!(error = %e, journal_id, "plugin api: the call's result was not journaled");
     }
-    resp
+    hold_until_body_ends(resp, permit)
+}
+
+/// `resp` with `permit` held until its body has been sent or dropped, so a
+/// streamed answer keeps its broker permit to the end.
+fn hold_until_body_ends(resp: Response, permit: crate::broker_proxy::ProxyPermit) -> Response {
+    use futures::StreamExt as _;
+    let (parts, body) = resp.into_parts();
+    let stream = body.into_data_stream().map(move |chunk| {
+        let _held = &permit;
+        chunk
+    });
+    Response::from_parts(parts, axum::body::Body::from_stream(stream))
 }
 
 /// The handle a request presents, if it presents one that looks like one.

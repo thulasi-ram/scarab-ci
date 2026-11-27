@@ -45,6 +45,7 @@ pub use delegation::{
     DelegatedCallJournalEntry, DelegatedCallSpend, DelegatedCallStore, DelegatedCallerHandle,
     DELEGATED_CALLER_HANDLE_HEARTBEAT_STALE_MS, DELEGATED_CALLER_HANDLE_MAX_CALLS,
     DELEGATED_CALLER_HANDLE_MAX_LIFETIME_MS, DELEGATED_CALL_JOURNAL_RETENTION_MS,
+    MAX_PLUGIN_REQUEST_ID_CHARS,
 };
 
 pub use extension::{

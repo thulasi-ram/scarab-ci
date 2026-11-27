@@ -1063,8 +1063,9 @@ impl DelegatedCallStore for PostgresDb {
         sqlx::query_scalar(
             "INSERT INTO delegated_call_journal
                  (installation_id, org, handle_id, caller_subject, token_id, token_kind,
-                  oauth_client, operation, method, path, request_id, started_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                  oauth_client, operation, method, path, request_id, plugin_request_id,
+                  started_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
              RETURNING id",
         )
         .bind(&entry.installation_id)
@@ -1078,6 +1079,7 @@ impl DelegatedCallStore for PostgresDb {
         .bind(&entry.method)
         .bind(&entry.path)
         .bind(&entry.request_id)
+        .bind(&entry.plugin_request_id)
         .bind(entry.started_at)
         .fetch_one(self.pool())
         .await

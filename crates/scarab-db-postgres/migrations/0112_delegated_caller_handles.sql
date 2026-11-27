@@ -9,7 +9,8 @@
 -- `writes_left`, in one conditional UPDATE that refuses at zero.
 --
 -- The journal records each call with its caller, the PrincipalToken behind
--- it, the operation and the result. It is separate from
+-- it, the operation and the result. A call is journaled before its handle is
+-- spent, so a refused call leaves a row too. It is separate from
 -- `plugin_broker_journal`, whose rows name a connection slot.
 --
 -- Expand step (ADR-0003): two new tables; no existing row is read or
@@ -48,10 +49,17 @@ CREATE TABLE delegated_call_journal (
     operation       TEXT    NOT NULL,
     method          TEXT    NOT NULL,
     path            TEXT    NOT NULL,
+    -- Minted by the server for this call.
     request_id      TEXT    NOT NULL,
+    -- The `x-request-id` the plugin sent, if any: its own correlation id,
+    -- never trusted as ours.
+    plugin_request_id TEXT  CHECK (plugin_request_id IS NULL
+                                   OR char_length(plugin_request_id) <= 128),
     started_at      BIGINT  NOT NULL,
-    -- NULL until the call answers; a row left NULL is a call whose replica
-    -- stopped before it answered.
+    -- NULL until the call is refused or answers; a row left NULL is a call
+    -- whose replica stopped first. A refusal after the row is written (no
+    -- call or write left: 429; the handle gone: 401; an operation not
+    -- granted: 403) is recorded here too.
     status          INTEGER,
     finished_at     BIGINT
 );

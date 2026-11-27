@@ -20,6 +20,9 @@ pub const DELEGATED_CALLER_HANDLE_MAX_LIFETIME_MS: i64 = 10 * 60 * 1000;
 /// the connection is open (ADR-0086 §3).
 pub const DELEGATED_CALLER_HANDLE_HEARTBEAT_STALE_MS: i64 = 2 * 60 * 1000;
 
+/// The longest `x-request-id` a plugin's call is journaled with.
+pub const MAX_PLUGIN_REQUEST_ID_CHARS: usize = 128;
+
 /// How many core calls one handle may make (ADR-0086 §3).
 pub const DELEGATED_CALLER_HANDLE_MAX_CALLS: u32 = 50;
 
@@ -81,8 +84,8 @@ pub enum DelegatedCallSpend {
     Gone,
 }
 
-/// One delegated call as the journal records it before the call runs. A
-/// call that cannot be journaled is not made.
+/// One delegated call as the journal records it before its handle is spent
+/// and before it runs. A call that cannot be journaled is not made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelegatedCallJournalEntry {
     pub installation_id: String,
@@ -99,7 +102,11 @@ pub struct DelegatedCallJournalEntry {
     pub method: String,
     /// The path called, without its query.
     pub path: String,
+    /// Minted by the server for this call.
     pub request_id: String,
+    /// The `x-request-id` the plugin sent, cut to
+    /// [`MAX_PLUGIN_REQUEST_ID_CHARS`]; its own correlation id, never ours.
+    pub plugin_request_id: Option<String>,
     /// Unix-ms.
     pub started_at: i64,
 }

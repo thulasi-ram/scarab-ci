@@ -12448,7 +12448,7 @@
           },
           "endpoint_operations": {
             "$ref": "#/components/schemas/ManifestDiffGroupDto",
-            "description": "`<path>/<operation>: <match>; may <operations>; writes <n>`; an\noperation that changed is both removed and added."
+            "description": "Endpoint operations by `<path>/<operation>`, each compared as its\nwhole definition; one that changed is both removed and added."
           },
           "gates": {
             "$ref": "#/components/schemas/ManifestDiffGroupDto",

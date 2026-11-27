@@ -157,14 +157,16 @@ pub async fn sweep_delegated_calls(
         return Ok(0);
     }
     let now = clock.now().await.0;
-    let handles = store
-        .delete_expired_delegated_caller_handles(now)
-        .await
-        .map_err(|e| e.to_string())?;
-    let journal = store
-        .prune_delegated_call_journal(now - scarab_plugin::DELEGATED_CALL_JOURNAL_RETENTION_MS)
-        .await
-        .map_err(|e| e.to_string())?;
+    let handles =
+        scarab_plugin::DelegatedCallStore::delete_expired_delegated_caller_handles(store, now)
+            .await
+            .map_err(|e| e.to_string())?;
+    let journal = scarab_plugin::DelegatedCallStore::prune_delegated_call_journal(
+        store,
+        now - scarab_plugin::DELEGATED_CALL_JOURNAL_RETENTION_MS,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(handles + journal)
 }
 

@@ -185,7 +185,13 @@ fn check_endpoint_operations(manifest: &PluginManifest) -> Result<(), String> {
 /// knob, in dev only) and its repository must be one the operator lists in
 /// `plugins.trustedPublishers`. No publisher is trusted by default, Scarab's
 /// own included.
-fn check_trusted_service(
+///
+/// `policy` is the server's live one, so a publisher the operator delists
+/// is refused at once. Install, upgrade and enable call this, PluginApi on
+/// every call, and the endpoint that forwards outside requests (step 7) must
+/// call it before forwarding. It does not stop a running Pod: the runtime
+/// keeps it until an admin kills or uninstalls it.
+pub(crate) fn check_trusted_service(
     policy: &PluginPolicy,
     manifest: &PluginManifest,
     image: &str,
@@ -751,8 +757,8 @@ pub struct ManifestDiffDto {
     pub gates: ManifestDiffGroupDto,
     /// The image repository the manifest names.
     pub image: ManifestDiffGroupDto,
-    /// `<path>/<operation>: <match>; may <operations>; writes <n>`; an
-    /// operation that changed is both removed and added.
+    /// Endpoint operations by `<path>/<operation>`, each compared as its
+    /// whole definition; one that changed is both removed and added.
     pub endpoint_operations: ManifestDiffGroupDto,
 }
 
@@ -1407,11 +1413,20 @@ pub(crate) async fn uninstall_plugin(
 ) -> Result<Json<UninstalledPluginDto>, ApiError> {
     let by = org_admin(&st, &headers, &org).await?;
     let now = st.clock.now().await.0;
+    // Its id, for the delegated caller handles that go with it.
+    let installation_id = store(&st)?
+        .installation(&org, &name)
+        .await
+        .map_err(plugin_store_api_error)?
+        .map(|i| i.id);
     let removed = store(&st)?
         .uninstall(&org, &name, &by, now)
         .await
         .map_err(plugin_store_api_error)?
         .ok_or(ApiError::NotFound)?;
+    if let Some(id) = &installation_id {
+        delete_delegated_caller_handles(&st, id, "uninstalled").await;
+    }
     // Its connections went with it; their credentials live in another store.
     for credential_ref in &removed.connection_credential_refs {
         delete_connection_credential(&st, credential_ref).await;
@@ -1440,6 +1455,7 @@ async fn set_state(
             by,
             "plugin installation killed (ADR-0072 §10)"
         );
+        delete_delegated_caller_handles(st, &installation.id, "killed").await;
     }
     Ok(Json(installation_view(&st, &installation).await))
 }
@@ -1488,7 +1504,41 @@ pub(crate) async fn enable_plugin(
     headers: HeaderMap,
     Path((org, name)): Path<(String, String)>,
 ) -> Result<Json<PluginInstallationDto>, ApiError> {
+    // A `trusted_service` plugin is re-enabled only while its publisher is
+    // still listed (ADR-0086 §8).
+    org_admin(&st, &headers, &org).await?;
+    if let Some(current) = store(&st)?
+        .installation(&org, &name)
+        .await
+        .map_err(plugin_store_api_error)?
+    {
+        check_trusted_service(&st.plugin_policy, &current.manifest, &current.image)?;
+    }
     set_state(&st, &headers, &org, &name, InstallationState::Enabled).await
+}
+
+/// Delete every DelegatedCallerHandle of installation `id` (ADR-0086 §11):
+/// it was killed, uninstalled, or upgraded to a new digest. Best-effort:
+/// PluginApi refuses a killed or uninstalled installation's calls anyway,
+/// and a handle lives at most ten minutes.
+async fn delete_delegated_caller_handles(st: &AppState, id: &str, why: &str) {
+    let Some(store) = st.delegated_calls.as_deref() else {
+        return;
+    };
+    match scarab_plugin::DelegatedCallStore::delete_installation_delegated_caller_handles(store, id)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            installation = id,
+            handles = n,
+            why,
+            "delegated caller handles deleted"
+        ),
+        Err(e) => {
+            tracing::warn!(installation = id, why, error = %e, "delegated caller handles not deleted")
+        }
+    }
 }
 
 /// The installed manifest against `new`, and why the upgrade needs a
@@ -1746,6 +1796,10 @@ pub(crate) async fn upgrade_plugin(
         .ok_or(ApiError::NotFound)?;
     for credential_ref in &upgraded.connection_credential_refs {
         delete_connection_credential(&st, credential_ref).await;
+    }
+    // A new digest is new code: the handles the old code held go.
+    if body.image != current.image {
+        delete_delegated_caller_handles(&st, &current.id, "upgraded to a new digest").await;
     }
     tracing::warn!(
         org,

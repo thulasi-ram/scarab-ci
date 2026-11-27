@@ -4288,8 +4288,8 @@ export interface components {
             /** @description Connection slot names. */
             connections: components["schemas"]["ManifestDiffGroupDto"];
             /**
-             * @description `<path>/<operation>: <match>; may <operations>; writes <n>`; an
-             *     operation that changed is both removed and added.
+             * @description Endpoint operations by `<path>/<operation>`, each compared as its
+             *     whole definition; one that changed is both removed and added.
              */
             endpoint_operations: components["schemas"]["ManifestDiffGroupDto"];
             /**
