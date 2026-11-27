@@ -18,6 +18,17 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **`REGISTRY_AUTH` resolves through the Run's Environment.** A push step's registry credential
+  read only the repository's and the org's `REGISTRY_AUTH`, so a value set for an Environment,
+  by the repository or by the org, was never used. It now resolves the way a step's declared
+  secrets do: for a Run in an Environment, the repository's value for it, the org's value for it,
+  the repository default, then the org default. A Run locked out of its Environment's secrets
+  gets no registry credential, and a secret store error fails the launch instead of falling
+  through to the next scope
+  ([Pushing to ECR](/scarab-ci/usage/pushing-to-ecr/)).
+
 ## [0.8.3] - 2026-11-27
 
 ### Breaking changes

@@ -827,7 +827,8 @@ pub struct StepSpec {
     pub forge_token: Option<ForgeToken>,
     /// The Step receives the Run's registry credential (ADR-0018, amendment
     /// of 2026-11-12): resolved when each Attempt launches from the
-    /// `REGISTRY_AUTH` secret (Repo scope, then Org scope), else the
+    /// `REGISTRY_AUTH` secret (the Run's scope chain, as a declared secret
+    /// resolves: its Environment's scopes first for a Run in one), else the
     /// credential the forge derives for its own registry, and mounted as a
     /// dockerconfigjson at `/scarab/registry/config.json` with
     /// `DOCKER_CONFIG` pointing at it. Never an environment variable. A

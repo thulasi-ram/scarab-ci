@@ -438,7 +438,7 @@ removing trust does not.
 ## Trusting a library with the registry credential
 
 A step with `registry_auth: true` may receive the Run's registry credential: the `REGISTRY_AUTH`
-secret (Repo scope, then Org scope), or the credential the forge derives for its own registry.
+secret, resolved through the Run's scope chain like any secret, or the credential the forge derives for its own registry.
 Only a step from a library installed from a source your org trusts with the registry credential
 receives one; a step written in a Pipeline file, or reached through `invoke: file:`, runs your
 repository's own command and never does. The forge-derived credential can write packages, so it
