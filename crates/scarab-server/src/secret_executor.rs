@@ -676,10 +676,11 @@ impl SecretInjectingExecutor {
         }
     }
 
-    /// Enable per-attempt OIDC token minting (ADR-0015): every launched step
-    /// of a deploy-context run gets a short-lived token whose subject the
-    /// cloud's trust policy matches; a fork-PR run's subject environment is
-    /// downgraded to `none` (it can never assume a real environment's role).
+    /// Enable per-attempt OIDC token minting (ADR-0015): a launched step gets
+    /// a short-lived token whose subject the cloud's trust policy matches. In
+    /// a deploy-context run a fork-PR run's subject environment is downgraded
+    /// to `none` (it can never assume a real environment's role); a run bound
+    /// to no Environment gets a token only for the repository's own code.
     pub fn with_oidc(
         mut self,
         issuer: Arc<dyn scarab_identity::OidcIssuer>,
@@ -691,9 +692,12 @@ impl SecretInjectingExecutor {
         self
     }
 
-    /// Mint the per-attempt token for `step`, if the issuer is configured and
-    /// the run carries a deploy context (org/project/env/ref — what the
-    /// subject encodes). Ordinary tenantless CI runs get no token.
+    /// Mint the per-attempt token for `step`, if the issuer is configured.
+    /// A Run with a deploy context gets the Environment subject
+    /// (org/project/env/ref). A Run bound to no Environment gets the subject
+    /// without `env/` only when it builds the repository's own code
+    /// ([`subject_without_environment`]). Any other Step gets no token, and
+    /// its launch goes on without one.
     async fn mint_oidc_token(
         &self,
         step: &StepRun,
@@ -704,35 +708,68 @@ impl SecretInjectingExecutor {
         let Some((issuer, audience)) = &self.oidc else {
             return Ok(None);
         };
-        let Some(ctx) = ctx else {
-            return Ok(None);
+        // The trigger context recorded on the Run's event log: `event` and
+        // `sha` below, and on a Run with no deploy context, the fork fact and
+        // the ref.
+        let trigger = crate::run_trigger(self.db.as_ref(), &step.run).await;
+        let (subject, git_ref, trigger) = match ctx {
+            Some(ctx) => {
+                let trigger = trigger
+                    .map_err(|e| ExecError::Other(e.to_string()))?
+                    .map(|(event, _actor)| event);
+                // The fork-PR downgrade (ADR-0015): a locked-out run's subject
+                // says env `none` — no cloud trust policy for a real
+                // environment matches. So does a Step that no Environment
+                // approval gate upstream admits now, in an Environment with
+                // approvers (ADR-0075 §3): before the approval, or after it
+                // went stale, the approvers changed or the ref was disallowed,
+                // the cloud must not trust it as the Environment. The
+                // `step.admit` decision says which ([`StepAdmission`]).
+                let env = if ctx.locked_out || admission.before_approval {
+                    "none"
+                } else {
+                    &ctx.environment
+                };
+                if let Some(reason) = scarab_identity::Claims::subject_refusal(
+                    &ctx.org,
+                    &ctx.project,
+                    Some(env),
+                    &ctx.git_ref,
+                ) {
+                    log_no_token(step, &NoToken::Refused(reason));
+                    return Ok(None);
+                }
+                let subject =
+                    scarab_identity::Claims::run_subject(&ctx.org, &ctx.project, env, &ctx.git_ref);
+                (subject, ctx.git_ref.clone(), trigger)
+            }
+            None => {
+                let trigger = match trigger {
+                    Ok(trigger) => trigger.map(|(event, _actor)| event),
+                    Err(e) => {
+                        log_no_token(
+                            step,
+                            &NoToken::Refused(format!("reading the Run's trigger failed: {e}")),
+                        );
+                        return Ok(None);
+                    }
+                };
+                match subject_without_environment(self.db.as_ref(), step, trigger.as_ref()).await {
+                    Ok((subject, git_ref)) => (subject, git_ref, trigger),
+                    Err(no_token) => {
+                        log_no_token(step, &no_token);
+                        return Ok(None);
+                    }
+                }
+            }
         };
-        // The fork-PR downgrade (ADR-0015): a locked-out run's subject says
-        // env `none` — no cloud trust policy for a real environment matches.
-        // So does a Step that no Environment approval gate upstream admits
-        // now, in an Environment with approvers (ADR-0075 §3): before the
-        // approval, or after it went stale, the approvers changed or the ref
-        // was disallowed, the cloud must not trust it as the Environment.
-        // The `step.admit` decision says which ([`StepAdmission`]).
-        let env = if ctx.locked_out || admission.before_approval {
-            "none"
-        } else {
-            &ctx.environment
-        };
-        let subject =
-            scarab_identity::Claims::run_subject(&ctx.org, &ctx.project, env, &ctx.git_ref);
         let attempt = step
             .current_attempt()
             .map(|a| a.id.0.clone())
             .unwrap_or_default();
-        // `event` and `sha` come from the trigger context recorded on the
-        // Run's event log: its kind and the commit it builds. A value the
-        // trigger did not record (a tag or release names no commit) leaves
-        // the claim out.
-        let trigger = crate::run_trigger(self.db.as_ref(), &step.run)
-            .await
-            .map_err(|e| ExecError::Other(e.to_string()))?
-            .map(|(event, _actor)| event);
+        // `event` is the trigger's kind and `sha` the commit it builds. A
+        // value the trigger did not record (a tag or release names no commit)
+        // leaves the claim out.
         let trigger_field = |name: &str| {
             trigger
                 .as_ref()
@@ -747,7 +784,7 @@ impl SecretInjectingExecutor {
             run_id: step.run.0.clone(),
             attempt,
             event: trigger_field("kind"),
-            git_ref: ctx.git_ref.clone(),
+            git_ref,
             sha: trigger_field("sha"),
             issued_at: now_ms / 1000 - OIDC_CLOCK_SKEW_SECS,
             expires_at: now_ms / 1000 + OIDC_TOKEN_TTL_SECS,
@@ -758,6 +795,127 @@ impl SecretInjectingExecutor {
             .map_err(|e| ExecError::Other(format!("oidc mint: {e}")))?;
         Ok(Some(jwt.0))
     }
+}
+
+/// Why a Step gets no OIDC token. Either way its launch goes on without one.
+enum NoToken {
+    /// The Run is not one a token is minted for: fork code, a comment
+    /// trigger, no tenant, no known ref. Expected, so logged at debug.
+    NotEligible(&'static str),
+    /// A token was due but is withheld: its subject could be misread, or the
+    /// facts it needs could not be read. Logged as a warning.
+    Refused(String),
+}
+
+/// Log why `step` gets no token, naming the Run and the Step, never a token.
+fn log_no_token(step: &StepRun, why: &NoToken) {
+    match why {
+        NoToken::NotEligible(reason) => tracing::debug!(
+            run = %step.run.0,
+            step = %step.step.0,
+            reason = %reason,
+            "no OIDC token for this step"
+        ),
+        NoToken::Refused(reason) => tracing::warn!(
+            run = %step.run.0,
+            step = %step.step.0,
+            reason = %reason,
+            "OIDC token withheld: the step launches without one"
+        ),
+    }
+}
+
+/// The subject and ref of a token for a Step whose Run is bound to no
+/// Environment: `scarab:org/<owner>/repo/<repo>/ref/<protection ref>`, from
+/// the Run's tenant and its recorded trigger. Fails closed: a Run with no
+/// tenant, no trigger, a comment trigger, a ref that is unknown or `HEAD`, or
+/// one that is fork code or may be, gets [`NoToken`].
+async fn subject_without_environment(
+    db: &dyn Db,
+    step: &StepRun,
+    trigger: Option<&serde_json::Value>,
+) -> Result<(String, String), NoToken> {
+    let refused = |what: &str, e: scarab_engine::DbError| {
+        NoToken::Refused(format!("reading the Run's {what} failed: {e}"))
+    };
+    let Some((org, repo)) = db
+        .run_tenant(&step.run)
+        .await
+        .map_err(|e| refused("tenant", e))?
+    else {
+        return Err(NoToken::NotEligible("the Run has no tenant"));
+    };
+    let Some(trigger) = trigger else {
+        return Err(NoToken::NotEligible("the Run recorded no trigger"));
+    };
+    if trigger["kind"].as_str() == Some("comment") {
+        return Err(NoToken::NotEligible("a comment-triggered Run"));
+    }
+    let Some(git_ref) = trigger_protection_ref(trigger) else {
+        return Err(NoToken::NotEligible("the Run's ref is unknown"));
+    };
+    if !builds_repository_code(db, trigger)
+        .await
+        .map_err(|e| refused("trigger chain", e))?
+    {
+        return Err(NoToken::NotEligible(
+            "the Run builds fork code, or its trigger does not say it does not",
+        ));
+    }
+    if let Some(reason) = scarab_identity::Claims::subject_refusal(&org, &repo, None, &git_ref) {
+        return Err(NoToken::Refused(reason));
+    }
+    let subject = scarab_identity::Claims::run_subject_without_environment(&org, &repo, &git_ref);
+    Ok((subject, git_ref))
+}
+
+/// The symbolic ref a recorded trigger runs on, as `Event::protection_ref`
+/// gives it at Run creation: the branch or tag ref, `refs/pull/<n>/head` for
+/// a pull request. `None` for a comment, an unknown kind, an empty ref and
+/// `HEAD` (the ref a Run with no ref of its own falls back to).
+fn trigger_protection_ref(trigger: &serde_json::Value) -> Option<String> {
+    let field = |name: &str| trigger[name].as_str().filter(|v| !v.is_empty());
+    let git_ref = match trigger["kind"].as_str()? {
+        "push" | "tag" | "manual" | "api" | "cron" | "upstream" => field("ref")?.to_string(),
+        "release" => format!("refs/tags/{}", field("tag")?),
+        "pull_request" => format!("refs/pull/{}/head", trigger["number"].as_u64()?),
+        _ => return None,
+    };
+    (git_ref != "HEAD").then_some(git_ref)
+}
+
+/// Whether a recorded trigger says its Run builds the repository's own code
+/// (ADR-0086 §9). A push, tag, release or cron trigger does. A pull request,
+/// manual or api trigger does only when its recorded `fork` is `false`; a
+/// dispatch recorded before the flag was stored has none, so it counts as
+/// fork code. A follow-up (`upstream`) builds its upstream Run's commit, so
+/// the chain is followed to the Run that started it. Anything else does not.
+async fn builds_repository_code(
+    db: &dyn Db,
+    trigger: &serde_json::Value,
+) -> Result<bool, scarab_engine::DbError> {
+    let mut trigger = trigger.clone();
+    // A chain is a few Runs long; the bound stops a corrupt cycle.
+    for _ in 0..16 {
+        match trigger["kind"].as_str() {
+            Some("push" | "tag" | "release" | "cron") => return Ok(true),
+            Some("pull_request" | "manual" | "api") => {
+                return Ok(trigger["fork"].as_bool() == Some(false))
+            }
+            Some("upstream") => {
+                let Some(upstream) = trigger["run"].as_str().filter(|r| !r.is_empty()) else {
+                    return Ok(false);
+                };
+                let run = scarab_engine::RunId(upstream.to_string());
+                match crate::run_trigger(db, &run).await? {
+                    Some((upstream, _actor)) => trigger = upstream,
+                    None => return Ok(false),
+                }
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(false)
 }
 
 #[async_trait]

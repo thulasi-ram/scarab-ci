@@ -913,11 +913,68 @@ pub struct Claims {
     pub expires_at: i64,
 }
 
+// Both subject forms name a repository by `<org>/<repo>` alone, with no forge
+// host. That is unique only because `forge_repos` is keyed on (owner, name)
+// (migration 0023_forge_connections): one Scarab serves at most one repository
+// of that owner and name, whichever forge it is on. Relaxing that key, so two
+// forges can each have an `acme/app`, requires adding the forge host to the
+// subject first; otherwise a trust policy for one repository also trusts the
+// other.
 impl Claims {
     /// The workload-identity subject a cloud's trust policy matches against
     /// (ADR-0015, 0032): `scarab:org/<org>/repo/<repo>/env/<env>/ref/<ref>`.
+    /// For a Run bound to an Environment.
     pub fn run_subject(org: &str, repo: &str, env: &str, git_ref: &str) -> String {
         format!("scarab:org/{org}/repo/{repo}/env/{env}/ref/{git_ref}")
+    }
+
+    /// The subject for a Run bound to no Environment, building the
+    /// repository's own code: `scarab:org/<org>/repo/<repo>/ref/<ref>`, with
+    /// no `env/` segment. A trust policy written for an Environment's subject
+    /// never matches it, since the text after `repo/<repo>/` is `ref/`, not
+    /// `env/`.
+    pub fn run_subject_without_environment(org: &str, repo: &str, git_ref: &str) -> String {
+        format!("scarab:org/{org}/repo/{repo}/ref/{git_ref}")
+    }
+
+    /// Why a subject built from these values could be read with one value's
+    /// text standing in for another segment, or `None` when it cannot. `env`
+    /// is `None` for [`Claims::run_subject_without_environment`].
+    ///
+    /// `org`, `repo` and `env` must be non-empty and hold no `/`, so each is
+    /// exactly one segment. `git_ref` is the last segment and may hold `/`
+    /// (`refs/heads/main`), but not `/env/` or `/ref/`, and may not start with
+    /// `env/` or `ref/`, so the subject holds exactly the `/env/` and `/ref/`
+    /// its form puts there. Every `refs/heads/<branch>`, `refs/tags/<tag>`
+    /// and `refs/pull/<n>/head` passes unless the branch or tag name has a
+    /// path component named `env` or `ref` (`refs/heads/ref/x` is refused).
+    pub fn subject_refusal(
+        org: &str,
+        repo: &str,
+        env: Option<&str>,
+        git_ref: &str,
+    ) -> Option<String> {
+        let mut segments = vec![("org", org), ("repo", repo)];
+        segments.extend(env.map(|env| ("env", env)));
+        for (name, value) in segments {
+            if value.is_empty() {
+                return Some(format!("the {name} is empty"));
+            }
+            if value.contains('/') {
+                return Some(format!("the {name} `{value}` holds a `/`"));
+            }
+        }
+        if git_ref.is_empty() {
+            return Some("the ref is empty".into());
+        }
+        for marker in ["env/", "ref/"] {
+            if git_ref.starts_with(marker) || git_ref.contains(&format!("/{marker}")) {
+                return Some(format!(
+                    "the ref `{git_ref}` holds `{marker}`, which would read as a subject segment"
+                ));
+            }
+        }
+        None
     }
 }
 
