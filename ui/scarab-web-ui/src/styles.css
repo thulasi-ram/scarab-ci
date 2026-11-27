@@ -3901,6 +3901,7 @@ a.lgtog { text-decoration: none; }
   line-height: 1.45; color: var(--muted-sage);
 }
 .tok-life { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.tok-ops { display: grid; gap: 6px; margin-top: 8px; }
 
 /* ---- Members and a repository's Access ---- */
 /* The repositories a member also holds a role in: running text with links. */

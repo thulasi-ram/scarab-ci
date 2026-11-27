@@ -19,6 +19,10 @@
 // that ceiling and whatever the owner holds at that moment, so demoting the
 // owner demotes their tokens at once. Every place a role appears here says
 // "up to" for that reason.
+//
+// A token may also carry a list of operations (`run.read`, `repo.dispatch`,
+// …). The server refuses every request whose operation is not in it; a token
+// with no list may use every operation its role allows.
 import {
   createResource,
   createSignal,
@@ -47,9 +51,12 @@ import {
   lifetimeError,
   MAX_TOKEN_DAYS,
   mintableOrgs,
+  operationsError,
+  operationsLabel,
   ROLE_CHOICES,
   scopeLabel,
   sortTokens,
+  TOKEN_OPERATION_CHOICES,
   TOKEN_SORTS,
   tokenChips,
   tokenState,
@@ -61,7 +68,7 @@ import Chips from "./Chips";
 import Icon from "./Icon";
 import Modal, { ModalMessage, ModalSection } from "./Modal";
 import ConfirmDestructive from "./ConfirmDestructive";
-import { Field, Input, Select } from "./Field";
+import { Checkbox, Field, Input, Select } from "./Field";
 import Pill from "./Pill";
 
 /** The lifetime a token gets unless someone says otherwise. A quarter: long
@@ -230,6 +237,16 @@ function TokenRow(props: { token: ApiToken; showOwner?: boolean; onRevoke: () =>
       <td>
         <span class="mono">{scopeLabel(t())}</span>{" "}
         <Pill tone="copper">up to {t().role}</Pill>
+        <Show when={t().operations}>
+          {(ops) => (
+            <>
+              {" "}
+              <Pill tone="accent" look="dotted" title={ops().join(", ")}>
+                {operationsLabel(t())}
+              </Pill>
+            </>
+          )}
+        </Show>
       </td>
       <td class="nw" title={t().last_used_at ? absTime(t().last_used_at!) : undefined}>
         {t().last_used_at ? relTime(t().last_used_at!) : "never"}
@@ -383,6 +400,8 @@ function MintTokenDialog(props: { onClose: () => void; onMinted: () => void }) {
   const [project, setProject] = createSignal("");
   const [role, setRole] = createSignal<TokenRole>("viewer");
   const [days, setDays] = createSignal(DEFAULT_DAYS);
+  const [limited, setLimited] = createSignal(false);
+  const [ops, setOps] = createSignal<string[]>([]);
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [minted, setMinted] = createSignal<MintedToken | null>(null);
@@ -412,8 +431,14 @@ function MintTokenDialog(props: { onClose: () => void; onMinted: () => void }) {
       .sort();
 
   const lifetimeProblem = () => lifetimeError(days());
+  const operationsProblem = () => operationsError(limited(), ops());
   const ready = () =>
-    name().trim().length > 0 && org().trim().length > 0 && lifetimeProblem() === null;
+    name().trim().length > 0 &&
+    org().trim().length > 0 &&
+    lifetimeProblem() === null &&
+    operationsProblem() === null;
+  const toggleOp = (op: string, on: boolean) =>
+    setOps((cur) => (on ? [...cur.filter((o) => o !== op), op] : cur.filter((o) => o !== op)));
 
   const mint = async () => {
     if (!ready() || saving()) return;
@@ -427,6 +452,7 @@ function MintTokenDialog(props: { onClose: () => void; onMinted: () => void }) {
           role: role(),
           expires_in_days: days(),
           ...(project() ? { project: project() } : {}),
+          ...(limited() ? { operations: ops() } : {}),
         }),
       );
       // Refresh the list underneath now, so closing the reveal lands on a list
@@ -589,6 +615,36 @@ function MintTokenDialog(props: { onClose: () => void; onMinted: () => void }) {
                   </For>
                 </div>
               </Field>
+              <Field
+                label="Operations"
+                help="Without a list the token may use every operation its role allows. With one, every other request it makes is refused."
+                error={operationsProblem()}
+              >
+                <div>
+                  <Checkbox
+                    checked={limited()}
+                    onChecked={setLimited}
+                    label="Only the operations I pick"
+                  />
+                  <Show when={limited()}>
+                    <div class="tok-ops">
+                      <For each={TOKEN_OPERATION_CHOICES}>
+                        {(c) => (
+                          <Checkbox
+                            checked={ops().includes(c.op)}
+                            onChecked={(on) => toggleOp(c.op, on)}
+                            label={
+                              <>
+                                <span class="mono">{c.op}</span>: {c.what}
+                              </>
+                            }
+                          />
+                        )}
+                      </For>
+                    </div>
+                  </Show>
+                </div>
+              </Field>
             </ModalSection>
           </>
         }
@@ -609,6 +665,13 @@ function MintTokenDialog(props: { onClose: () => void; onMinted: () => void }) {
               <code class="mono">SCARAB_TOKEN</code>. It acts as <b>{m().record.owner.handle}</b>, up
               to <b>{m().record.role}</b> on <b>{scopeLabel(m().record)}</b>, and expires{" "}
               {absTime(m().record.expires_at)}.
+              <Show when={m().record.operations}>
+                {(list) => (
+                  <>
+                    {" "}It may use only: <span class="mono">{list().join(", ")}</span>.
+                  </>
+                )}
+              </Show>
             </p>
           </>
         )}
