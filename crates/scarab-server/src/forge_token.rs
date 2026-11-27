@@ -676,28 +676,29 @@ impl ForgeCredentialExecutor {
     /// working, and a push fails at the registry with its auth error.
     ///
     /// The secret resolves the way a Step's declared secrets do
-    /// (`SecretInjectingExecutor`): a Run in an Environment (`environment`,
-    /// from its deploy context) walks that Environment's chain, the
-    /// repository's value for the Environment, the org's value for it, the
-    /// repository's, then the org's; any other Run walks the repository's,
-    /// then the org's. A store error fails the launch rather than falling
-    /// through to a less specific scope or to the forge-derived credential.
+    /// (`SecretInjectingExecutor`): a Run with a deploy context (`ctx`) walks
+    /// the chain of the EnvironmentProject scope that context names, as
+    /// stored (the repository's value for the Environment, the org's value
+    /// for it, the repository's, then the org's); any other Run walks the
+    /// repository's, then the org's. A store error fails the launch rather
+    /// than falling through to a less specific scope or to the forge-derived
+    /// credential.
     async fn resolve_registry_auth(
         &self,
         owner: &str,
         name: &str,
-        environment: Option<&str>,
+        ctx: Option<&scarab_engine::DeployContext>,
         forge_derived: bool,
     ) -> Result<(Option<String>, Option<scarab_engine::RegistryCredential>), ExecError> {
         if owner.is_empty() {
             return Ok((None, None)); // inline dev run: no scope, no forge context
         }
         if let Some(secrets) = &self.secrets {
-            let scope = match environment {
-                Some(environment) => scarab_secrets::SecretScope::EnvironmentProject {
-                    org: owner.to_string(),
-                    project: name.to_string(),
-                    environment: environment.to_string(),
+            let scope = match ctx {
+                Some(ctx) => scarab_secrets::SecretScope::EnvironmentProject {
+                    org: ctx.org.clone(),
+                    project: ctx.project.clone(),
+                    environment: ctx.environment.clone(),
                 },
                 None => scarab_secrets::SecretScope::Repo {
                     org: owner.to_string(),
@@ -815,25 +816,6 @@ impl ForgeCredentialExecutor {
             out.locked_out = true;
             return Ok(out);
         }
-        // The Run's Environment, read now, as `SecretInjectingExecutor` reads
-        // it for the Step's declared secrets: a Run locked out of its
-        // Environment's secrets gets no credential either.
-        let ctx = self
-            .logs
-            .db()
-            .run_deploy_context(&step.run)
-            .await
-            .map_err(|e| ExecError::Other(format!("reading the Run's deploy context: {e}")))?;
-        if ctx.as_ref().is_some_and(|ctx| ctx.locked_out) {
-            out.locked_out = true;
-            return Ok(out);
-        }
-        // The Environment applies only to the Run's own repository; a
-        // deploy context naming another one is not used.
-        let environment = ctx
-            .as_ref()
-            .filter(|ctx| ctx.org == config.owner && ctx.project == config.name)
-            .map(|ctx| ctx.environment.clone());
         let Some(library) = &config.library else {
             return Ok(out);
         };
@@ -842,6 +824,19 @@ impl ForgeCredentialExecutor {
             .await?
             != Some(true)
         {
+            return Ok(out);
+        }
+        // The Run's deploy context, read now and used as stored, as
+        // `SecretInjectingExecutor` reads it for the Step's declared secrets.
+        // A Run locked out of its Environment's secrets gets no credential.
+        let ctx = self
+            .logs
+            .db()
+            .run_deploy_context(&step.run)
+            .await
+            .map_err(|e| ExecError::Other(format!("reading the Run's deploy context: {e}")))?;
+        if ctx.as_ref().is_some_and(|ctx| ctx.locked_out) {
+            out.locked_out = true;
             return Ok(out);
         }
         // Not a fork, not locked out, and the library is still trusted with
@@ -856,12 +851,7 @@ impl ForgeCredentialExecutor {
             None => false,
         };
         let (json, derived) = self
-            .resolve_registry_auth(
-                &config.owner,
-                &config.name,
-                environment.as_deref(),
-                forge_derived,
-            )
+            .resolve_registry_auth(&config.owner, &config.name, ctx.as_ref(), forge_derived)
             .await?;
         out.registry_auth_json = json;
         out.derived_auth = derived;
