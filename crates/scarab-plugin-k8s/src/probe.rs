@@ -358,9 +358,19 @@ pub fn assess(control_log: &str, plugin_log: &str) -> ProbeReport {
     }
 }
 
-/// `isolation-probe-<nonce>-<role>`.
+/// `scarab-probe-<role>-<nonce>`: the role BEFORE the nonce.
+///
+/// The Amazon VPC CNI's network policy agent identifies a Pod by its name
+/// up to the last hyphen, and Pods that share that identifier share
+/// policy rules. Named `isolation-probe-<nonce>-<role>`, the three probe
+/// Pods shared one identifier, and on an EKS cluster the plugin-labelled Pod
+/// took on the control Pod's egress (DNS, the canary): the probe failed
+/// with "NetworkPolicy is NOT enforced" on a cluster that enforces it, and
+/// passed on a later run depending on timing. With the role first, the
+/// identifiers are `scarab-probe-canary`, `scarab-probe-control` and
+/// `scarab-probe-plugin`, one per role.
 pub fn probe_pod_name(nonce: &str, role: &str) -> String {
-    format!("isolation-probe-{nonce}-{role}")
+    format!("scarab-probe-{role}-{nonce}")
 }
 
 fn probe_labels(nonce: &str, role: &str) -> BTreeMap<String, String> {
@@ -985,5 +995,23 @@ mod tests {
         assert_eq!(csc.read_only_root_filesystem, Some(true));
         let limits = init.resources.unwrap().limits.unwrap();
         assert!(limits.contains_key("cpu") && limits.contains_key("memory"));
+    }
+
+    /// The VPC CNI's Pod identifier (the name up to its last hyphen) must
+    /// differ per role, or the plugin-labelled Pod can share the control
+    /// Pod's rules and the probe fails on a cluster that enforces policy.
+    #[test]
+    fn each_probe_role_has_its_own_name_prefix() {
+        let identifier = |name: String| name.rsplit_once('-').unwrap().0.to_string();
+        let ids: std::collections::BTreeSet<String> =
+            [PROBE_ROLE_CANARY, PROBE_ROLE_CONTROL, PROBE_ROLE_PLUGIN]
+                .into_iter()
+                .map(|role| identifier(probe_pod_name("0a1b2c3d4e", role)))
+                .collect();
+        assert_eq!(ids.len(), 3, "{ids:?}");
+        assert_eq!(
+            probe_pod_name("0a1b2c3d4e", PROBE_ROLE_PLUGIN),
+            "scarab-probe-plugin-0a1b2c3d4e"
+        );
     }
 }

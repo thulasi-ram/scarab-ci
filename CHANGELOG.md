@@ -27,6 +27,11 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Bug Fixes
 
+- **Plugin isolation probe on EKS (Amazon VPC CNI).** The probe's three Pods are now named
+  `scarab-probe-<role>-<id>` in place of `isolation-probe-<id>-<role>`. The VPC CNI's network policy
+  agent treats Pods whose names match up to the last hyphen as one, so the plugin-side probe Pod
+  could take on the control Pod's rules and the probe failed now and then with "NetworkPolicy is
+  NOT enforced" on a cluster that enforces it.
 - **Argo CD plugin: fixes from a run against a real Argo CD 3.4.** An Application whose auto-sync is
   turned off with `automated: {enabled: false}` is no longer reported as "awaiting auto-sync". A
   `wait-live` gate whose Application Argo cannot compare now says why (Argo's `ComparisonError`
