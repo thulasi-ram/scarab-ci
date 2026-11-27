@@ -1231,3 +1231,65 @@ async fn a_project_admin_mints_for_the_project_but_not_the_org() {
     let (_, v) = call(&h, get("/v1/me", &none)).await;
     assert_eq!(v["token_mint_orgs"], serde_json::json!([]));
 }
+
+/// ADR-0086 §6: a mint may limit the token to a list of ApiOperations. No
+/// list stays no list; an empty list, an id that is not an operation, and an
+/// operation an API token can never perform (a browser-only one, minting a
+/// token) are refused 400 with nothing stored; a list is stored sorted, each
+/// id once. The own-token route passes the list through like the org route.
+/// Kills: a mint that drops the list (a "limited" token with every
+/// operation), and a list naming an operation its token could never use.
+#[tokio::test]
+async fn a_mint_checks_and_stores_the_operation_list() {
+    let h = harness();
+    let root = root_owning(&h, "acme").await;
+    let body = |name: &str, operations: serde_json::Value| {
+        let mut b = serde_json::json!({ "name": name, "role": "member", "expires_in_days": 7 });
+        if !operations.is_null() {
+            b["operations"] = operations;
+        }
+        b
+    };
+
+    for (name, operations, stored) in [
+        ("none", serde_json::Value::Null, None),
+        (
+            "listed",
+            serde_json::json!(["run.read", "repo.dispatch", "run.read"]),
+            Some(vec!["repo.dispatch".to_string(), "run.read".to_string()]),
+        ),
+    ] {
+        let (st, v) = call(&h, mint_req(&root, "acme", body(name, operations))).await;
+        assert_eq!(st, StatusCode::CREATED, "{name}: {v}");
+        let id = v["record"]["id"].as_str().unwrap();
+        assert_eq!(
+            v["record"]["operations"],
+            serde_json::json!(stored),
+            "{name}: {v}"
+        );
+        assert_eq!(v["record"]["kind"], "issued", "{name}: {v}");
+        let record = h.tokens.by_id(id).await.unwrap().expect("stored");
+        assert_eq!(record.operations, stored, "{name}");
+    }
+
+    for (name, operations) in [
+        ("empty", serde_json::json!([])),
+        ("unknown", serde_json::json!(["run.read", "run.reed"])),
+        ("browser-only", serde_json::json!(["passkey.add"])),
+        ("not-by-token", serde_json::json!(["token.mint"])),
+    ] {
+        let (st, v) = call(&h, mint_req(&root, "acme", body(name, operations))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{name}: {v}");
+    }
+    assert_eq!(
+        h.tokens.list("acme").await.unwrap().len(),
+        2,
+        "a refused mint stores nothing"
+    );
+
+    let mut own = body("own", serde_json::json!(["step.logs.read"]));
+    own["org"] = serde_json::json!("acme");
+    let (_, id) = mint_own(&h, &root, own).await;
+    let record = h.tokens.by_id(&id).await.unwrap().expect("stored");
+    assert_eq!(record.operations, Some(vec!["step.logs.read".to_string()]));
+}
