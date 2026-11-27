@@ -3,8 +3,9 @@
 //! fakes (no Postgres, no cluster), proving the engine behavior end to end.
 
 use scarab_engine::{
-    cancel_run_request, rerun_step, Attempt, AttemptId, AttemptOutcome, Db, RunId, RunStatus,
-    Scheduler, ServiceStatus, StepId, StepSpec, StepStatus, Timestamp,
+    cancel_run_request, rerun_step, Attempt, AttemptId, AttemptOutcome, Db, EventKind,
+    EventPayload, RunId, RunStatus, Scheduler, ServiceStatus, StepId, StepSpec, StepStatus,
+    Timestamp, EVENT_VERSION,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
 use serde_json::json;
@@ -566,5 +567,358 @@ async fn a_dead_lettered_run_tears_down_its_shared_services() {
     assert_eq!(
         service(&db.run_services(&run).await.unwrap(), 1, "db").status,
         ServiceStatus::TornDown
+    );
+}
+
+/// A gate Step of `kind` (an `origin` link of that kind) with `needs`.
+fn gate_of(id: &str, kind: &str, needs: &[&str]) -> serde_json::Value {
+    json!({ "id": id, "gate": "manual", "needs": needs,
+            "origin": [{ "kind": kind, "name": "n", "content_hash": "" }] })
+}
+
+const FORK: &str = "fork_run_approval_gate";
+
+/// A Run of fork code waiting at its Fork Run approval gate (ADR-0086 §9,
+/// read by this release, written by the next) starts a shared service only
+/// once a Step that uses it may run: every Fork Run approval gate upstream
+/// of that Step, directly or through other Steps, released. A rejected or
+/// skipped gate starts none. A service no Step uses waits until every such
+/// gate is released, and a gate that `uses:` a service does not start it.
+/// Every other Run starts them at Run start as before, one waiting at an
+/// Environment's gate included.
+#[tokio::test]
+async fn shared_services_wait_only_for_a_fork_run_approval_gate() {
+    use StepStatus::{Failed, Pending, Skipped, Succeeded};
+    let test = |needs: &[&str]| json!({ "id": "test", "image": "busybox", "uses": ["db"], "needs": needs });
+    // (case, the IR's Steps, each gate's status, the service starts)
+    let cases: Vec<(&str, serde_json::Value, Vec<(&str, StepStatus)>, bool)> = vec![
+        ("no gate", json!([test(&[])]), vec![], true),
+        (
+            "fork gate waiting",
+            json!([gate_of("approve", FORK, &[]), test(&["approve"])]),
+            vec![("approve", Pending)],
+            false,
+        ),
+        (
+            "fork gate released",
+            json!([gate_of("approve", FORK, &[]), test(&["approve"])]),
+            vec![("approve", Succeeded)],
+            true,
+        ),
+        (
+            "fork gate rejected",
+            json!([gate_of("approve", FORK, &[]), test(&["approve"])]),
+            vec![("approve", Failed)],
+            false,
+        ),
+        // A Skipped gate skips the Steps behind it: none runs, none needs
+        // the service.
+        (
+            "fork gate skipped",
+            json!([gate_of("approve", FORK, &[]), test(&["approve"])]),
+            vec![("approve", Skipped)],
+            false,
+        ),
+        (
+            "Environment gate waiting",
+            json!([gate_of("approve", "environment", &[]), test(&["approve"])]),
+            vec![("approve", Pending)],
+            true,
+        ),
+        (
+            "behind two fork gates, one released",
+            json!([
+                gate_of("a", FORK, &[]),
+                gate_of("b", FORK, &[]),
+                test(&["a", "b"])
+            ]),
+            vec![("a", Succeeded), ("b", Pending)],
+            false,
+        ),
+        (
+            "behind two fork gates, both released",
+            json!([
+                gate_of("a", FORK, &[]),
+                gate_of("b", FORK, &[]),
+                test(&["a", "b"])
+            ]),
+            vec![("a", Succeeded), ("b", Succeeded)],
+            true,
+        ),
+        (
+            "behind the gate through another Step",
+            json!([
+                gate_of("approve", FORK, &[]),
+                { "id": "build", "image": "busybox", "needs": ["approve"] },
+                test(&["build"])
+            ]),
+            vec![("approve", Pending)],
+            false,
+        ),
+        (
+            "through another Step, released",
+            json!([
+                gate_of("approve", FORK, &[]),
+                { "id": "build", "image": "busybox", "needs": ["approve"] },
+                test(&["build"])
+            ]),
+            vec![("approve", Succeeded)],
+            true,
+        ),
+        (
+            "used by no Step, one of two gates released",
+            json!([
+                gate_of("a", FORK, &[]),
+                gate_of("b", FORK, &[]),
+                { "id": "build", "image": "busybox", "needs": ["a"] }
+            ]),
+            vec![("a", Succeeded), ("b", Pending)],
+            false,
+        ),
+        (
+            "used by no Step, every gate released",
+            json!([
+                gate_of("a", FORK, &[]),
+                gate_of("b", FORK, &[]),
+                { "id": "build", "image": "busybox", "needs": ["a"] }
+            ]),
+            vec![("a", Succeeded), ("b", Succeeded)],
+            true,
+        ),
+        (
+            "used only by the waiting fork gate",
+            json!([
+                { "id": "approve", "gate": "manual", "uses": ["db"],
+                  "origin": [{ "kind": FORK, "name": "n", "content_hash": "" }] },
+                { "id": "build", "image": "busybox", "needs": ["approve"] }
+            ]),
+            vec![("approve", Pending)],
+            false,
+        ),
+    ];
+    for (case, steps, gates, starts) in cases {
+        let db = InMemoryDb::new();
+        let run = RunId("run-1".into());
+        db.create_run(&run, 2, 1, Timestamp(0)).await.unwrap();
+        db.store_run_ir(&run, &ir_with_db_service(steps.clone()))
+            .await
+            .unwrap();
+        for (gate, status) in &gates {
+            db.seed_step(&run, &StepId(gate.to_string()), *status, None);
+        }
+        for step in steps.as_array().unwrap() {
+            if step.get("gate").is_none() {
+                let uses: Vec<&str> = step["uses"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|u| u.as_str())
+                    .collect();
+                db.seed_step(
+                    &run,
+                    &StepId(step["id"].as_str().unwrap().into()),
+                    StepStatus::Pending,
+                    Some(spec(&uses)),
+                );
+            }
+        }
+        db.seed_run(&run, RunStatus::Running);
+
+        let clock = FakeClock::new(0);
+        let exec = FakeExecutor::new();
+        let sched = Scheduler::new(&db, &clock, &exec, "drv");
+        sched.reconcile_services(&run).await.unwrap();
+
+        let handle = FakeExecutor::service_handle("run-1", 1, "db");
+        let rows = db.run_services(&run).await.unwrap();
+        if starts {
+            assert_eq!(exec.launched_services(), vec![handle.0], "{case}");
+            assert_eq!(
+                service(&rows, 1, "db").status,
+                ServiceStatus::Starting,
+                "{case}"
+            );
+        } else {
+            assert!(exec.launched_services().is_empty(), "{case}");
+            assert!(rows.is_empty(), "{case}: a service row was born: {rows:?}");
+        }
+    }
+}
+
+/// A service of a fork Run starts as soon as a Step that uses it may run: a
+/// Step with no Fork Run approval gate upstream does not wait for the gate,
+/// so its service does not either, or the Step would wait on it forever.
+#[tokio::test]
+async fn a_service_used_outside_the_fork_gate_starts_at_run_start() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-1".into());
+    db.create_run(&run, 2, 1, Timestamp(0)).await.unwrap();
+    db.store_run_ir(
+        &run,
+        &ir_with_db_service(json!([
+            { "id": "approve", "gate": "manual",
+              "origin": [{ "kind": "fork_run_approval_gate", "name": "all", "content_hash": "" }] },
+            { "id": "test", "image": "busybox", "uses": ["db"], "needs": ["approve"] },
+            { "id": "lint", "image": "busybox", "uses": ["db"] }
+        ])),
+    )
+    .await
+    .unwrap();
+    db.seed_step(&run, &StepId("approve".into()), StepStatus::Pending, None);
+    for id in ["test", "lint"] {
+        db.seed_step(
+            &run,
+            &StepId(id.into()),
+            StepStatus::Pending,
+            Some(spec(&["db"])),
+        );
+    }
+    db.seed_run(&run, RunStatus::Running);
+
+    let clock = FakeClock::new(0);
+    let exec = FakeExecutor::new();
+    let sched = Scheduler::new(&db, &clock, &exec, "drv");
+    sched.reconcile_services(&run).await.unwrap();
+    assert_eq!(
+        exec.launched_services(),
+        vec![FakeExecutor::service_handle("run-1", 1, "db").0]
+    );
+}
+
+/// A Rerun of a released Fork Run approval gate births the next Take's
+/// services at once and re-arms the gate. They are not launched until the
+/// gate is released again, and their readiness deadline runs from that
+/// release, not from their birth: a long wait for approval does not fail
+/// them.
+#[tokio::test]
+async fn a_held_service_s_readiness_deadline_runs_from_the_release() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-1".into());
+    let gate = StepId("approve".into());
+    db.create_run(&run, 2, 1, Timestamp(0)).await.unwrap();
+    db.store_run_ir(
+        &run,
+        &ir_with_db_service(json!([
+            { "id": "approve", "gate": "manual",
+              "origin": [{ "kind": "fork_run_approval_gate", "name": "all", "content_hash": "" }] },
+            { "id": "test", "image": "busybox", "uses": ["db"], "needs": ["approve"] }
+        ])),
+    )
+    .await
+    .unwrap();
+    db.seed_step(&run, &gate, StepStatus::Pending, None);
+    db.seed_step(
+        &run,
+        &StepId("test".into()),
+        StepStatus::Pending,
+        Some(spec(&["db"])),
+    );
+    db.seed_run(&run, RunStatus::Running);
+    // Born by the Rerun at t=1s, while the gate waits again.
+    db.create_run_service(None, &run, 1, "db", Timestamp(1_000))
+        .await
+        .unwrap();
+
+    let clock = FakeClock::new(5_000);
+    let exec = FakeExecutor::new(); // never marked ready
+    let sched = Scheduler::new(&db, &clock, &exec, "drv").with_service_ready_timeout_ms(1_000);
+
+    // Held: born, not launched, and not failed past its deadline.
+    sched.reconcile_services(&run).await.unwrap();
+    assert!(exec.launched_services().is_empty());
+    let db_row = |rows: &[scarab_engine::RunService]| service(rows, 1, "db").clone();
+    let row = db_row(&db.run_services(&run).await.unwrap());
+    assert_eq!(row.status, ServiceStatus::Starting);
+    assert_eq!(row.handle, None);
+
+    // Released at t=10s.
+    db.seed_step(&run, &gate, StepStatus::Succeeded, None);
+    db.append_event(&EventKind {
+        version: EVENT_VERSION,
+        run: run.clone(),
+        kind: EventPayload::GateReleased { step: gate.clone() },
+        at: Timestamp(10_000),
+    })
+    .await
+    .unwrap();
+
+    // Half a second after the release: launched, still within its deadline.
+    clock.advance(5_500);
+    sched.reconcile_services(&run).await.unwrap();
+    assert_eq!(
+        exec.launched_services(),
+        vec![FakeExecutor::service_handle("run-1", 1, "db").0]
+    );
+    assert_eq!(
+        db_row(&db.run_services(&run).await.unwrap()).status,
+        ServiceStatus::Starting
+    );
+
+    // Past the deadline counted from the release: failed, fail-closed.
+    clock.advance(1_000);
+    sched.reconcile_services(&run).await.unwrap();
+    assert_eq!(
+        db_row(&db.run_services(&run).await.unwrap()).status,
+        ServiceStatus::Failed
+    );
+}
+
+/// A service launched before its fork gate was released, because a Step
+/// with no such gate upstream uses it, was never held: its readiness
+/// deadline runs from its birth, and the gate's release does not move it.
+#[tokio::test]
+async fn a_service_launched_before_the_release_keeps_its_deadline() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-1".into());
+    let gate = StepId("approve".into());
+    db.create_run(&run, 2, 1, Timestamp(0)).await.unwrap();
+    db.store_run_ir(
+        &run,
+        &ir_with_db_service(json!([
+            gate_of("approve", FORK, &[]),
+            { "id": "test", "image": "busybox", "uses": ["db"], "needs": ["approve"] },
+            { "id": "lint", "image": "busybox", "uses": ["db"] }
+        ])),
+    )
+    .await
+    .unwrap();
+    db.seed_step(&run, &gate, StepStatus::Pending, None);
+    for id in ["test", "lint"] {
+        db.seed_step(
+            &run,
+            &StepId(id.into()),
+            StepStatus::Pending,
+            Some(spec(&["db"])),
+        );
+    }
+    db.seed_run(&run, RunStatus::Running);
+
+    let clock = FakeClock::new(0);
+    let exec = FakeExecutor::new(); // never marked ready
+    let sched = Scheduler::new(&db, &clock, &exec, "drv").with_service_ready_timeout_ms(1_000);
+
+    // Born and launched at t=0, for `lint`.
+    sched.reconcile_services(&run).await.unwrap();
+    assert_eq!(
+        exec.launched_services(),
+        vec![FakeExecutor::service_handle("run-1", 1, "db").0]
+    );
+
+    // The gate is released at t=10s; half a second later the service is
+    // 10.5s past its birth, so past its deadline.
+    db.seed_step(&run, &gate, StepStatus::Succeeded, None);
+    db.append_event(&EventKind {
+        version: EVENT_VERSION,
+        run: run.clone(),
+        kind: EventPayload::GateReleased { step: gate.clone() },
+        at: Timestamp(10_000),
+    })
+    .await
+    .unwrap();
+    clock.advance(10_500);
+    sched.reconcile_services(&run).await.unwrap();
+    assert_eq!(
+        service(&db.run_services(&run).await.unwrap(), 1, "db").status,
+        ServiceStatus::Failed
     );
 }

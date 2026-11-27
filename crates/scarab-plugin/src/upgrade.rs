@@ -199,6 +199,7 @@ mod tests {
                 }))
                 .unwrap(),
             )]),
+            extensions: None,
         }
     }
 

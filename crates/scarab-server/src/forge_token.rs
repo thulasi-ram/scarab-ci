@@ -668,47 +668,69 @@ impl ForgeCredentialExecutor {
     }
 
     /// A Run's registry credential (ADR-0018 amendments of 2026-07-17 and
-    /// 2026-11-12), in precedence order: the scoped `REGISTRY_AUTH` secret
-    /// (Repo scope, then Org scope; a dockerconfigjson), else, when
-    /// `forge_derived` allows it, the credential the forge derives for its
-    /// own registry, which names only that registry. A Run with no
-    /// repository (`owner` empty) gets none. Missing auth degrades to an
-    /// anonymous build: public pulls keep working, and a push fails at the
-    /// registry with its auth error.
+    /// 2026-11-12), in precedence order: the scoped `REGISTRY_AUTH` secret (a
+    /// dockerconfigjson), else, when `forge_derived` allows it, the
+    /// credential the forge derives for its own registry, which names only
+    /// that registry. A Run with no repository (`owner` empty) gets none.
+    /// Missing auth degrades to an anonymous build: public pulls keep
+    /// working, and a push fails at the registry with its auth error.
+    ///
+    /// With `ctx`, the deploy context of a Step its Environment admits now,
+    /// the secret resolves through the chain of the EnvironmentProject scope
+    /// that context names, as stored (the repository's value for the
+    /// Environment, the org's value for it, the repository's, then the
+    /// org's). Without it, through the repository's, then the org's. A store
+    /// error fails the launch rather than falling through to a less specific
+    /// scope or to the forge-derived credential.
     async fn resolve_registry_auth(
         &self,
         owner: &str,
         name: &str,
+        ctx: Option<&scarab_engine::DeployContext>,
         forge_derived: bool,
-    ) -> (Option<String>, Option<scarab_engine::RegistryCredential>) {
+    ) -> Result<(Option<String>, Option<scarab_engine::RegistryCredential>), ExecError> {
         if owner.is_empty() {
-            return (None, None); // inline dev run: no scope, no forge context
+            return Ok((None, None)); // inline dev run: no scope, no forge context
         }
         if let Some(secrets) = &self.secrets {
-            for scope in [
-                scarab_secrets::SecretScope::Repo {
+            let scope = match ctx {
+                Some(ctx) => scarab_secrets::SecretScope::EnvironmentProject {
+                    org: ctx.org.clone(),
+                    project: ctx.project.clone(),
+                    environment: ctx.environment.clone(),
+                },
+                None => scarab_secrets::SecretScope::Repo {
                     org: owner.to_string(),
                     repo: name.to_string(),
                 },
-                scarab_secrets::SecretScope::Org {
-                    org: owner.to_string(),
-                },
-            ] {
-                if let Ok(secret) = secrets.get(&scope, "REGISTRY_AUTH").await {
-                    if let Ok(json) = String::from_utf8(secret.value) {
-                        return (Some(json), None);
-                    }
+            };
+            match secrets.resolve(&scope, "REGISTRY_AUTH").await {
+                Ok(secret) => {
+                    let json = String::from_utf8(secret.value).map_err(|_| {
+                        ExecError::Refused(
+                            "the `REGISTRY_AUTH` secret is not UTF-8 text, so it cannot be a \
+                             dockerconfigjson; nothing was launched"
+                                .to_string(),
+                        )
+                    })?;
+                    return Ok((Some(json), None));
+                }
+                Err(scarab_secrets::SecretError::NotFound) => {}
+                Err(e) => {
+                    return Err(ExecError::Other(format!(
+                        "reading the `REGISTRY_AUTH` secret: {e}"
+                    )))
                 }
             }
         }
         if !forge_derived {
-            return (None, None);
+            return Ok((None, None));
         }
         let repo = RepoRef {
             owner: owner.to_string(),
             name: name.to_string(),
         };
-        match self.forge.registry_credential(&repo).await {
+        Ok(match self.forge.registry_credential(&repo).await {
             Ok(Some(cred)) => (
                 None,
                 Some(scarab_engine::RegistryCredential {
@@ -718,7 +740,7 @@ impl ForgeCredentialExecutor {
                 }),
             ),
             _ => (None, None),
-        }
+        })
     }
 
     /// Whether the org `org` still trusts the library version `hash` with
@@ -780,10 +802,17 @@ impl ForgeCredentialExecutor {
     /// forge-derived credential when the org still trusts the Step's
     /// library with forge credentials too. The value ledger records each
     /// value from the final spec.
+    ///
+    /// `admission` is the Environment re-admission this launch made (`None`
+    /// when no governance store is wired). The Environment's `REGISTRY_AUTH`
+    /// values reach only a Step the Environment admits now: approved, or in
+    /// an Environment with no approvers. A Step before approval, or with no
+    /// admission, resolves the repository's value, then the org's.
     async fn step_registry_auth(
         &self,
         step: &StepRun,
         config: &scarab_engine::RegistryAuthConfig,
+        admission: Option<crate::secret_executor::StepAdmission>,
     ) -> Result<scarab_engine::RegistryAuthConfig, ExecError> {
         let mut out = config.clone();
         out.registry_auth_json = None;
@@ -803,6 +832,34 @@ impl ForgeCredentialExecutor {
         {
             return Ok(out);
         }
+        // The Run's deploy context, read now and used as stored, when this
+        // launch made an Environment re-admission.
+        let (ctx, before_approval) = match admission {
+            Some(admission) => (
+                self.logs
+                    .db()
+                    .run_deploy_context(&step.run)
+                    .await
+                    .map_err(|e| {
+                        ExecError::Other(format!("reading the Run's deploy context: {e}"))
+                    })?,
+                admission.before_approval,
+            ),
+            None => (None, true),
+        };
+        // A guard for stored state written by another release: a deploy
+        // context locked out of its Environment's secrets (a fork Run) gets
+        // no credential, before approval or after, as the locked-out config
+        // above gets none and `resolve_step_secrets` resolves no secret for
+        // it. This release also stores such a Run's config locked out, which
+        // returns first.
+        if ctx.as_ref().is_some_and(|ctx| ctx.locked_out) {
+            out.locked_out = true;
+            return Ok(out);
+        }
+        // The Environment's chain only for a Step its Environment admits now
+        // (approved, or no approvers); any other resolves the repository's.
+        let ctx = ctx.filter(|_| !before_approval);
         // Not a fork, not locked out, and the library is still trusted with
         // the registry credential: a placement profile that carries one may
         // apply (`registry_auth_only`), whether or not a secret resolves.
@@ -815,8 +872,8 @@ impl ForgeCredentialExecutor {
             None => false,
         };
         let (json, derived) = self
-            .resolve_registry_auth(&config.owner, &config.name, forge_derived)
-            .await;
+            .resolve_registry_auth(&config.owner, &config.name, ctx.as_ref(), forge_derived)
+            .await?;
         out.registry_auth_json = json;
         out.derived_auth = derived;
         Ok(out)
@@ -991,13 +1048,16 @@ impl Executor for ForgeCredentialExecutor {
             // SecretInjecting's.
             // Environment re-admission (ADR-0071 §2) likewise comes before the
             // credential here, not only in SecretInjecting.
+            // The admission is kept: it decides whether a `registry_auth` Step
+            // resolves the Environment's `REGISTRY_AUTH` (`step_registry_auth`).
+            let mut admission = None;
             if spec.forge_token.is_some() || spec.sandbox.is_some() || spec.registry_auth.is_some()
             {
                 self.ensure_not_yanked(step).await?;
                 if let Some((db, governance)) = &self.governance {
                     // The `step.admit` decision is recorded by SecretInjecting;
                     // the Environment's re-check is made here as well.
-                    crate::secret_executor::ensure_deploy_still_admitted(
+                    admission = Some(crate::secret_executor::ensure_deploy_still_admitted(
                         db.as_ref(),
                         governance.as_ref(),
                         None,
@@ -1008,7 +1068,7 @@ impl Executor for ForgeCredentialExecutor {
                         None,
                         self.clock.now().await.0,
                     )
-                    .await?;
+                    .await?);
                 }
             }
             // A sandboxed Step (ADR-0018, amendment of 2026-11-12): the org must
@@ -1028,7 +1088,8 @@ impl Executor for ForgeCredentialExecutor {
             let spec = if spec.registry_auth.is_some() || spec.sandbox.is_some() {
                 let mut enriched = spec.clone();
                 if let Some(config) = &spec.registry_auth {
-                    enriched.registry_auth = Some(self.step_registry_auth(step, config).await?);
+                    enriched.registry_auth =
+                        Some(self.step_registry_auth(step, config, admission).await?);
                 }
                 let fork = enriched
                     .registry_auth

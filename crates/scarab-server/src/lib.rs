@@ -5994,6 +5994,65 @@ async fn record_pipeline_refusal(
     .into()
 }
 
+/// A pull request event that says it is the repository's own code, checked
+/// with the forge before it is trusted (git-bug 14a694f): `head_branch` must
+/// be a branch of the repository whose commit is the pull request's `head`.
+/// `None` when the event stands as it is (not a pull request, already fork
+/// code, or confirmed); otherwise the event marked fork code. No such branch,
+/// a branch at another commit and a forge error all read as fork code, so
+/// the Run is still created, with the fork limits.
+///
+/// The adapters decide `fork` from the payload alone, where an AGit-flow
+/// pull request (pushed to `refs/for/<branch>` with read access) looks like
+/// one from a branch of the repository. A branch that moved between the
+/// delivery and this check also reads as fork code, and its Run gets the
+/// fork limits; the next push to the pull request is checked again. One
+/// forge call per same-repository pull request event.
+async fn confirm_pull_request_origin(
+    forge: &dyn scarab_forge::ForgePort,
+    event: &scarab_forge::Event,
+) -> Option<scarab_forge::Event> {
+    let scarab_forge::Event::PullRequest {
+        repo,
+        number,
+        head,
+        head_branch,
+        fork: false,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    let branch = head_branch
+        .strip_prefix("refs/heads/")
+        .unwrap_or(head_branch);
+    let why = if !scarab_forge::pull_request_head_is_branch(branch) {
+        format!("its head `{head_branch}` is not a branch name")
+    } else {
+        match forge
+            .ref_commit(repo, scarab_forge::RefKind::Branch, branch)
+            .await
+        {
+            Ok(Some(sha)) if sha == *head => return None,
+            Ok(Some(sha)) => format!("branch `{branch}` is at {sha}, not at its head {head}"),
+            Ok(None) => format!("the repository has no branch `{branch}`"),
+            Err(e) => format!("the forge could not say where branch `{branch}` is: {e}"),
+        }
+    };
+    tracing::warn!(
+        org = %repo.owner,
+        project = %repo.name,
+        pull_request = number,
+        reason = %why,
+        "a pull request from the repository is run as fork code"
+    );
+    let mut confirmed = event.clone();
+    if let scarab_forge::Event::PullRequest { fork, .. } = &mut confirmed {
+        *fork = true;
+    }
+    Some(confirmed)
+}
+
 /// [`trigger_runs_from_event`] over Pipeline files already read at the
 /// event's commit ([`read_event_pipelines`]). `complete` says `files` is the
 /// whole of `.scarab/` at that commit: each Run started then records which
@@ -6020,6 +6079,10 @@ pub(crate) async fn trigger_runs_from_files(
     complete: bool,
     delivery: Option<&DeliveryRun>,
 ) -> Result<TriggerOutcome, TriggerError> {
+    // A pull request the payload calls the repository's own code is
+    // confirmed with the forge first; every trigger path comes through here.
+    let confirmed = confirm_pull_request_origin(forge, event).await;
+    let event = confirmed.as_ref().unwrap_or(event);
     let Some(repo) = event.repo() else {
         return Ok(TriggerOutcome::default());
     };
@@ -8242,6 +8305,17 @@ pub enum DispatchError {
     /// (ADR-0086 §9). Refused: a dispatch is never trusted by default.
     #[error("could not tell whether the commit is fork code: {0}")]
     ForkCheck(scarab_forge::ForgeError),
+    /// A bare ref name that is both a branch and a tag of the repository.
+    /// Refused rather than guessed: the recorded ref decides which
+    /// Environment `allowed_refs` admit the Run.
+    #[error(
+        "`{0}` is both a branch and a tag of this repository: pass `refs/heads/{0}` or \
+         `refs/tags/{0}`"
+    )]
+    AmbiguousRef(String),
+    /// A `refs/heads/…` or `refs/tags/…` ref the repository does not have.
+    #[error("the repository has no `{0}`; pass an existing branch or tag")]
+    RefNotFound(String),
     /// No `.scarab` pipeline by that name exists at the resolved commit.
     #[error("no pipeline `{0}` found at the requested ref")]
     PipelineNotFound(String),
@@ -8398,27 +8472,112 @@ impl From<TriggerError> for DispatchError {
     }
 }
 
-/// Canonicalize a user-supplied dispatch ref into a **symbolic** ref for
-/// Environment `allowed_refs` matching (ADR-0037):
-/// - already a fully-qualified ref (`refs/…`) → taken verbatim;
+/// What a dispatch's typed ref resolved to ([`resolve_dispatch_ref`]).
+struct DispatchRef {
+    /// The symbolic ref the Run records, which `allowed_refs` matches.
+    sym: String,
+    /// The commit the Run runs.
+    sha: String,
+    /// `sha` was read from the branch or tag `sym` names, so that ref names
+    /// the commit and the dispatch is the repository's own code (ADR-0086
+    /// §9) without asking the forge again.
+    named: bool,
+}
+
+/// The symbolic ref a dispatch records, for Environment `allowed_refs`
+/// matching (ADR-0037), and the commit it runs, from the ref the caller
+/// typed, trimmed as [`dispatch_is_fork_code`] trims it:
+/// - `HEAD` → the default branch the forge reports, `refs/heads/<name>`, at
+///   that branch's commit;
+/// - `refs/heads/<name>` or `refs/tags/<name>` → taken verbatim, at the
+///   commit that branch or tag points at; one the repository does not have
+///   is refused ([`DispatchError::RefNotFound`]);
+/// - any other fully-qualified ref (`refs/pull/…`) → taken verbatim, at the
+///   commit the forge resolves it to;
 /// - a 40-char lowercase-hex string (a raw commit SHA) → taken verbatim, so it
-///   won't match a branch glob and is correctly denied from a branch-scoped
-///   Environment;
-/// - anything else → treated as a bare branch name → `refs/heads/<ref>`.
+///   does not match a branch glob;
+/// - a bare name → the kind of ref that has the name: `refs/heads/<name>` for
+///   a branch, `refs/tags/<name>` for a tag, at that ref's commit. A name that
+///   is both is refused ([`DispatchError::AmbiguousRef`]). A name that is
+///   neither (a short SHA, `pull/7/head`) records the commit the forge
+///   resolves it to, which matches no branch or tag glob.
 ///
-/// Pure and total; the resolved commit is looked up separately.
-fn canonicalize_ref(r#ref: &str) -> String {
-    let is_raw_sha = r#ref.len() == 40
-        && r#ref
+/// A forge error during a branch or tag lookup refuses the dispatch. The
+/// recorded ref and the commit always come from the same ref: before this,
+/// a bare name was recorded as a branch whatever the forge resolved it to,
+/// so a tag named `release/x` passed `allowed_refs` for
+/// `refs/heads/release/*`.
+async fn resolve_dispatch_ref(
+    forge: &dyn scarab_forge::ForgePort,
+    repo: &scarab_forge::RepoRef,
+    typed: &str,
+) -> Result<DispatchRef, DispatchError> {
+    use scarab_forge::RefKind;
+    let typed = typed.trim();
+    let lookup = |kind: RefKind, name: String| async move {
+        forge
+            .ref_commit(repo, kind, &name)
+            .await
+            .map_err(DispatchError::Forge)
+    };
+    let named = |sym: String, sha: String| DispatchRef {
+        sym,
+        sha,
+        named: true,
+    };
+    if typed == "HEAD" {
+        let branch = forge
+            .default_branch(repo)
+            .await
+            .map_err(DispatchError::Forge)?;
+        let sha = lookup(RefKind::Branch, branch.clone())
+            .await?
+            .ok_or_else(|| {
+                DispatchError::Forge(scarab_forge::ForgeError::NotFound(format!(
+                    "the default branch `{branch}`"
+                )))
+            })?;
+        return Ok(named(format!("refs/heads/{branch}"), sha));
+    }
+    let qualified = [
+        ("refs/heads/", RefKind::Branch),
+        ("refs/tags/", RefKind::Tag),
+    ]
+    .into_iter()
+    .find_map(|(prefix, kind)| typed.strip_prefix(prefix).map(|name| (kind, name)));
+    if let Some((kind, name)) = qualified {
+        return match lookup(kind, name.to_string()).await? {
+            Some(sha) => Ok(named(typed.to_string(), sha)),
+            None => Err(DispatchError::RefNotFound(typed.to_string())),
+        };
+    }
+    let is_raw_sha = typed.len() == 40
+        && typed
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
-    if r#ref.starts_with("refs/") || is_raw_sha {
-        // Already fully-qualified, or an opaque commit that must stay verbatim so
-        // it never matches a branch glob.
-        r#ref.to_string()
+    let sym = if typed.starts_with("refs/") || is_raw_sha {
+        Some(typed.to_string())
     } else {
-        format!("refs/heads/{}", r#ref)
-    }
+        let branch = lookup(RefKind::Branch, typed.to_string()).await?;
+        let tag = lookup(RefKind::Tag, typed.to_string()).await?;
+        match (branch, tag) {
+            (Some(_), Some(_)) => return Err(DispatchError::AmbiguousRef(typed.to_string())),
+            (Some(sha), None) => return Ok(named(format!("refs/heads/{typed}"), sha)),
+            (None, Some(sha)) => return Ok(named(format!("refs/tags/{typed}"), sha)),
+            // Recorded as the commit itself, below.
+            (None, None) => None,
+        }
+    };
+    let sha = forge
+        .latest_commit(repo, typed)
+        .await
+        .map_err(DispatchError::Forge)?
+        .sha;
+    Ok(DispatchRef {
+        sym: sym.unwrap_or_else(|| sha.clone()),
+        sha,
+        named: false,
+    })
 }
 
 /// Whether a dispatch's resolved commit is **fork code** (ADR-0086 §9).
@@ -8452,7 +8611,10 @@ pub async fn dispatch_is_fork_code(
         .and_then(|n| n.parse::<u64>().ok())
     {
         let origin = forge.pull_request_origin(repo, number).await?;
-        if !origin.same_repository || origin.head_sha != sha || origin.head_branch.is_empty() {
+        if !origin.same_repository
+            || origin.head_sha != sha
+            || !scarab_forge::pull_request_head_is_branch(&origin.head_branch)
+        {
             return Ok(true);
         }
         let named =
@@ -8473,8 +8635,10 @@ pub async fn dispatch_is_fork_code(
     Ok(!ref_names_commit(forge, repo, &name, kind, sha).await?)
 }
 
-/// Whether the forge lists a branch or tag called exactly `name` (of `kind`,
-/// when given) pointing at `sha`.
+/// Whether the branch or tag called exactly `name` (of `kind`, when given)
+/// points at `sha`. One single-ref lookup per kind asked
+/// ([`ForgePort::ref_commit`](scarab_forge::ForgePort::ref_commit)): the
+/// branch first, then the tag, when `kind` is not given.
 async fn ref_names_commit(
     forge: &dyn scarab_forge::ForgePort,
     repo: &scarab_forge::RepoRef,
@@ -8482,10 +8646,17 @@ async fn ref_names_commit(
     kind: Option<scarab_forge::RefKind>,
     sha: &str,
 ) -> Result<bool, scarab_forge::ForgeError> {
-    let refs = forge.list_refs(repo, Some(name)).await?;
-    Ok(refs
-        .iter()
-        .any(|r| r.name == name && r.sha == sha && kind.is_none_or(|k| r.kind == k)))
+    use scarab_forge::RefKind;
+    let kinds = match kind {
+        Some(kind) => vec![kind],
+        None => vec![RefKind::Branch, RefKind::Tag],
+    };
+    for kind in kinds {
+        if forge.ref_commit(repo, kind, name).await?.as_deref() == Some(sha) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Candidate `.scarab` paths a dispatch `pipeline` identifier resolves to. A full
@@ -8584,28 +8755,38 @@ pub async fn dispatch_run_via(
     reason: Option<String>,
     via: Option<scarab_engine::DelegationTrail>,
 ) -> Result<RunId, DispatchError> {
-    // Resolve the dispatch ref to a concrete commit — the form and the run see
-    // byte-identical config (no branch-moved skew), and the Run is reproducible
-    // (ADR-0043 §4).
-    let commit = forge
-        .latest_commit(&repo, &r#ref)
-        .await
-        .map_err(DispatchError::Forge)?;
+    // Resolve the dispatch ref to the symbolic ref the Run records and a
+    // concrete commit, both from the same ref — the form and the run see
+    // byte-identical config (no branch-moved skew), and the Run is
+    // reproducible (ADR-0043 §4). Config is read and pinned at the commit,
+    // while allowed_refs (ADR-0037) matches the symbolic ref.
+    let DispatchRef { sym, sha, named } = resolve_dispatch_ref(forge, &repo, &r#ref).await?;
     // The pinned commit reaches `git fetch` in the clone container as an
     // argument; a forge answer that is not a hex SHA never becomes a Run.
-    if !scarab_forge::is_commit_sha(&commit.sha) {
+    if !scarab_forge::is_commit_sha(&sha) {
         return Err(DispatchError::Forge(scarab_forge::ForgeError::Api(
             "the forge resolved the ref to a value that is not a commit SHA".into(),
         )));
     }
-    let sha = commit.sha;
     let dispatched_sha = sha.clone();
-    // Fork code (ADR-0086 §9): decided on the resolved commit, never the typed
-    // ref, before anything is read at it. A forge that cannot answer refuses
-    // the dispatch; it is never trusted by default.
-    let fork = dispatch_is_fork_code(forge, &repo, &r#ref, &sha)
-        .await
-        .map_err(DispatchError::ForkCheck)?;
+    // Fork code (ADR-0086 §9): decided on the resolved commit, before anything
+    // is read at it. A commit read from the branch or tag the Run records is
+    // the repository's own code, as `dispatch_is_fork_code` would find with
+    // the same lookup. Any other is asked about, for the ref the Run records
+    // when that is a `refs/` ref, else for the typed spelling. A forge that
+    // cannot answer refuses the dispatch; it is never trusted by default.
+    let fork = if named {
+        false
+    } else {
+        let fork_ref = if sym.starts_with("refs/") {
+            sym.as_str()
+        } else {
+            r#ref.as_str()
+        };
+        dispatch_is_fork_code(forge, &repo, fork_ref, &sha)
+            .await
+            .map_err(DispatchError::ForkCheck)?
+    };
 
     // Read the named pipeline at the resolved commit.
     let (path, yaml) = read_named_pipeline(forge, &repo, &sha, &pipeline).await?;
@@ -8617,12 +8798,9 @@ pub async fn dispatch_run_via(
         .map_err(DispatchError::Db)?;
     let compiled = prefetch_libs_and_compile(forge, &repo, &sha, &yaml, &installed).await;
 
-    // Build the repo+ref-aware event: the config is read/pinned at the resolved
-    // commit (`sha`), while allowed_refs (ADR-0037) matches the *symbolic* ref the
-    // launcher named, canonicalized to a `refs/...` form. A user who dispatches a
-    // raw SHA gets a SHA-shaped symbolic ref, which correctly won't match a
-    // branch-scoped Environment.
-    let sym = canonicalize_ref(&r#ref);
+    // Build the repo+ref-aware event with the symbolic ref resolved above. A
+    // user who dispatches a SHA gets a SHA-shaped symbolic ref, which does not
+    // match a branch-scoped Environment.
     // The optional dispatch reason (ADR-0057 §3) rides the Event as the run
     // Headline. The endpoint stays dumb — accept + stamp, no requiredness check
     // (that is an Environment ProtectionRule at admission, thread D). Excluded
@@ -18359,40 +18537,6 @@ mod grant_admission_tests {
         ));
         let g = admit_step_grants(Some(p.as_ref()), Some(&sec), IMG, false).unwrap();
         assert!(g.privileged);
-    }
-}
-
-#[cfg(test)]
-mod canonicalize_ref_tests {
-    use super::canonicalize_ref;
-
-    #[test]
-    fn bare_branch_becomes_a_heads_ref() {
-        assert_eq!(canonicalize_ref("main"), "refs/heads/main");
-        // A slashed branch name is still a bare branch (not a `refs/` ref).
-        assert_eq!(canonicalize_ref("release/1.2"), "refs/heads/release/1.2");
-    }
-
-    #[test]
-    fn fully_qualified_ref_is_verbatim() {
-        assert_eq!(canonicalize_ref("refs/heads/main"), "refs/heads/main");
-        assert_eq!(canonicalize_ref("refs/tags/v1"), "refs/tags/v1");
-        assert_eq!(canonicalize_ref("refs/pull/7/head"), "refs/pull/7/head");
-    }
-
-    #[test]
-    fn raw_sha_stays_verbatim_so_it_wont_match_a_branch_glob() {
-        let sha = "0123456789abcdef0123456789abcdef01234567"; // 40 hex chars
-        assert_eq!(canonicalize_ref(sha), sha);
-    }
-
-    #[test]
-    fn uppercase_or_wrong_length_hex_is_treated_as_a_branch() {
-        // 40 chars but uppercase → not a canonical SHA → a branch name.
-        let upper = "0123456789ABCDEF0123456789ABCDEF01234567";
-        assert_eq!(canonicalize_ref(upper), format!("refs/heads/{upper}"));
-        // A short hex-ish name is a branch, not a SHA.
-        assert_eq!(canonicalize_ref("abc123"), "refs/heads/abc123");
     }
 }
 

@@ -368,16 +368,33 @@ steps:
 const LOG_SHA: &str = "c4a5000000000000000000000000000000000000";
 
 /// A fake Forgejo serving `.scarab/crash.yaml` at [`LOG_SHA`]: the slice of
-/// the API a dispatch reads (the commits list and raw contents), with every
-/// other write acknowledged. The server calls it at the host address a Pod
+/// the API a dispatch reads (the commits list, the `main` branch and raw
+/// contents), with every other write acknowledged. The server calls it at the host address a Pod
 /// reaches, as happy_path's does.
 async fn fake_forgejo() -> String {
     use axum::extract::Path;
+    use axum::response::IntoResponse;
     use axum::routing::get;
     async fn commits() -> axum::Json<serde_json::Value> {
         axum::Json(serde_json::json!([
             { "sha": LOG_SHA, "commit": { "message": "crash_resume log fixture" } }
         ]))
+    }
+    // `GET branches/{name}`: the one branch, `main`, at the fixture commit.
+    // Dispatch looks a bare ref name up as a branch and as a tag; `tags/main`
+    // and every other GET fall through to a 404, so `main` is a branch only.
+    async fn branch(
+        Path((_o, _r, name)): Path<(String, String, String)>,
+    ) -> axum::response::Response {
+        if name == "main" {
+            axum::Json(serde_json::json!({ "name": "main", "commit": { "id": LOG_SHA } }))
+                .into_response()
+        } else {
+            axum::response::Response::builder()
+                .status(404)
+                .body(axum::body::Body::from("{}"))
+                .unwrap()
+        }
     }
     async fn raw(Path((_o, _r, path)): Path<(String, String, String)>) -> axum::response::Response {
         let (status, body) = if path == ".scarab/crash.yaml" {
@@ -403,6 +420,7 @@ async fn fake_forgejo() -> String {
     }
     let app = axum::Router::new()
         .route("/api/v1/repos/{owner}/{repo}/commits", get(commits))
+        .route("/api/v1/repos/{owner}/{repo}/branches/{*name}", get(branch))
         .route("/api/v1/repos/{owner}/{repo}/raw/{*path}", get(raw))
         .fallback(fallback);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0")

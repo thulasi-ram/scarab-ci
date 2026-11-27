@@ -21,6 +21,12 @@
 # ⚠ UNVERIFIED: this has never been run against a real Oracle instance.
 set -euo pipefail
 
+# The image preflight below waits with `wait -n`, which bash 4.3 added.
+if [ "${BASH_VERSINFO[0]}" -lt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 3 ]; }; then
+  echo "refusing: deploy.sh needs bash 4.3 or later (for \`wait -n\`); this is bash $BASH_VERSION." >&2
+  exit 1
+fi
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
@@ -381,14 +387,67 @@ kc create namespace "$NS" --dry-run=client -o yaml | kc apply -f -
 # `name` is a caller-supplied suffix, not a nicety: two preflights run in one
 # script, and a Pod left behind by a failed first attempt would make the second
 # `kubectl run` fail with AlreadyExists instead of with the real problem.
+#
+# The Pod is not attached to (`kubectl run --attach`). With the image already in
+# containerd's cache the container can exit before kubectl attaches, and then the
+# output is only "pod ... terminated (Error)" (git-bug 0221524). Instead: create
+# the Pod, wait for a terminal phase, and read `kubectl logs`, which keeps a
+# terminated container's output until the Pod is deleted.
+#
+# Call it inside `$(...)`: the bare `wait -n` below waits for the next job of the
+# shell it runs in, and in that subshell the two `kubectl wait`s are the only jobs.
 preflight_run() {
   local name="$1" image="$2"; shift 2
-  kc delete pod -n "$NS" "scarab-preflight-$name" --ignore-not-found --wait >/dev/null 2>&1 || true
-  kc run "scarab-preflight-$name" -n "$NS" \
-    --rm --restart=Never --attach --quiet \
-    --pod-running-timeout=300s \
+  local pod="scarab-preflight-$name" out phase succeeded failed started errs
+  kc delete pod -n "$NS" "$pod" --ignore-not-found --wait >/dev/null 2>&1 || true
+  if ! out="$(kc run "$pod" -n "$NS" --restart=Never \
     --image-pull-policy=Always \
-    --image="$image" -- "$@" 2>&1 || true
+    --image="$image" -- "$@" 2>&1)"; then
+    printf 'could not create the preflight Pod %s:\n%s\n' "$pod" "$out"
+    return 0
+  fi
+  # One `kubectl wait` per terminal phase; the first to see its phase returns.
+  # The 300s covers the image pull on a cold box. An image the node cannot pull
+  # leaves the Pod Pending, so both waits time out. Each runs as `exec kubectl`
+  # (the `kc` arguments, spelled out) so that `$!` is kubectl itself and the
+  # `kill` below stops it. Their stderr goes to a file, read when a wait ended
+  # before the 300s for a reason other than the phase (an API server error, a
+  # kubectl that does not know `--for=jsonpath`).
+  errs="$(mktemp -d)"
+  started=$SECONDS
+  (exec kubectl --kubeconfig "$KUBECONFIG_FILE" --context "$want_ctx" \
+    wait -n "$NS" "pod/$pod" --for=jsonpath='{.status.phase}'=Succeeded \
+    --timeout=300s >/dev/null 2>"$errs/succeeded") &
+  succeeded=$!
+  (exec kubectl --kubeconfig "$KUBECONFIG_FILE" --context "$want_ctx" \
+    wait -n "$NS" "pod/$pod" --for=jsonpath='{.status.phase}'=Failed \
+    --timeout=300s >/dev/null 2>"$errs/failed") &
+  failed=$!
+  wait -n || true
+  kill "$succeeded" "$failed" 2>/dev/null || true
+  wait "$succeeded" "$failed" 2>/dev/null || true
+  # The phase read now decides, not which wait returned.
+  phase="$(kc get pod -n "$NS" "$pod" -o jsonpath='{.status.phase}' 2>&1 || true)"
+  case "$phase" in
+    Succeeded | Failed)
+      kc logs -n "$NS" "$pod" 2>&1 || true
+      ;;
+    *)
+      if [ $((SECONDS - started)) -ge 300 ]; then
+        printf 'the preflight Pod did not finish within 300s (phase: %s), so the node most likely could not pull %s. Container state:\n' \
+          "${phase:-unknown}" "$image"
+        kc get pod -n "$NS" "$pod" \
+          -o jsonpath='{range .status.containerStatuses[*]}{.state.waiting.reason}: {.state.waiting.message}{"\n"}{end}' \
+          2>&1 || true
+      else
+        printf 'waiting for the preflight Pod failed after %ss, before its 300s pull timeout (phase: %s). kubectl wait said:\n' \
+          "$((SECONDS - started))" "${phase:-unknown}"
+        cat "$errs/succeeded" "$errs/failed" 2>/dev/null || true
+      fi
+      ;;
+  esac
+  rm -rf "$errs"
+  kc delete pod -n "$NS" "$pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 }
 
 echo "==> preflight: $SERVER_IMAGE (pulling on the node; this is the slow step on a cold box)"

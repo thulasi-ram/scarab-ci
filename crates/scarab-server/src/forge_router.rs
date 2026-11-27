@@ -304,6 +304,18 @@ impl ForgePort for RegistryForge {
         self.adapter_for(repo).await?.list_refs(repo, query).await
     }
 
+    async fn ref_commit(
+        &self,
+        repo: &RepoRef,
+        kind: scarab_forge::RefKind,
+        name: &str,
+    ) -> Result<Option<String>, ForgeError> {
+        self.adapter_for(repo)
+            .await?
+            .ref_commit(repo, kind, name)
+            .await
+    }
+
     /// Not routable: normalization has no repo until AFTER it runs. The
     /// per-forge webhook endpoints call their vendor's pure `normalize`
     /// directly (ADR-0046 routing); nothing should reach this.

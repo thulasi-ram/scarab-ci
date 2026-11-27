@@ -283,6 +283,16 @@ pub fn pull_request_head_branch(payload: &serde_json::Value) -> String {
     r.strip_prefix("refs/heads/").unwrap_or(r).to_string()
 }
 
+/// Whether a pull request's `head.ref` names a branch: not empty once a
+/// leading `refs/heads/` is dropped, and not another `refs/` ref. A Forgejo
+/// or Gitea AGit-flow pull request (pushed to `refs/for/<branch>`, which needs
+/// only read access) has its head in the base repository with no branch;
+/// its `head.ref` is not a branch name, and its code is fork code.
+pub fn pull_request_head_is_branch(head_ref: &str) -> bool {
+    let branch = head_ref.strip_prefix("refs/heads/").unwrap_or(head_ref);
+    !branch.is_empty() && !branch.starts_with("refs/")
+}
+
 /// Percent-encode `s` as one URL path segment or one query value: every byte
 /// except the RFC 3986 unreserved characters (`A-Z a-z 0-9 - . _ ~`) is
 /// written as `%XX`, `/` included. For a value a caller typed, such as a
@@ -297,6 +307,25 @@ pub fn encode_url_component(s: &str) -> String {
         }
     }
     out
+}
+
+/// A branch or tag name as URL path segments, each written with
+/// [`encode_url_component`] and joined by `/`, for an adapter's single-ref
+/// lookup ([`ForgePort::ref_commit`]). `None` for a name no Git ref can have:
+/// empty, an empty segment, or a segment that starts with `.` (which covers
+/// `.` and `..`, so the path never leaves the endpoint it was put in).
+pub fn ref_name_path(name: &str) -> Option<String> {
+    let segments: Vec<&str> = name.split('/').collect();
+    if name.is_empty() || segments.iter().any(|s| s.is_empty() || s.starts_with('.')) {
+        return None;
+    }
+    Some(
+        segments
+            .iter()
+            .map(|s| encode_url_component(s))
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
 }
 
 /// The most changed files Scarab takes from one trigger (git-bug 418f55e). A
@@ -1381,6 +1410,26 @@ pub trait ForgePort: Send + Sync {
         repo: &RepoRef,
         query: Option<&str>,
     ) -> Result<Vec<ForgeRef>, ForgeError>;
+
+    /// The commit the branch or tag (`kind`) called exactly `name` points at,
+    /// or `None` when the repository has no such ref; an annotated tag gives
+    /// the commit it points at. One ref, for fork detection at dispatch
+    /// (ADR-0086 §9), where listing every branch and tag per dispatch costs
+    /// a page walk. The default reads [`list_refs`](Self::list_refs) and keeps
+    /// the exact name; the GitHub and Forgejo adapters ask for the one ref.
+    async fn ref_commit(
+        &self,
+        repo: &RepoRef,
+        kind: RefKind,
+        name: &str,
+    ) -> Result<Option<String>, ForgeError> {
+        Ok(self
+            .list_refs(repo, Some(name))
+            .await?
+            .into_iter()
+            .find(|r| r.kind == kind && r.name == name)
+            .map(|r| r.sha))
+    }
 
     async fn register_webhook(&self, repo: &RepoRef, callback_url: &str) -> Result<(), ForgeError>;
 

@@ -243,14 +243,22 @@ function environmentShown(name: string, env: RunEnvironmentLike | null | undefin
   return display && display !== name ? `${display} (${name})` : name;
 }
 
+/** Is this the gate Fork Run approval added in front of a Run of fork code?
+ *  A plain `manual` gate: anyone with write releases it. */
+export function addedByForkRunApproval(s: { origin?: readonly { kind: string }[] | null }): boolean {
+  return s.origin?.some((o) => o.kind === "fork_run_approval_gate") ?? false;
+}
+
 /** "added by Production (production)" for the gate the Environment added,
- *  else `null`. */
+ *  "added by Fork Run approval" for the gate that setting added, else
+ *  `null`. */
 export function addedByLabel(
   s: EnvironmentGateLike,
   env: RunEnvironmentLike | null | undefined,
 ): string | null {
   const added = addedByEnvironment(s);
-  return added === null ? null : `added by ${environmentShown(added, env)}`;
+  if (added !== null) return `added by ${environmentShown(added, env)}`;
+  return addedByForkRunApproval(s) ? "added by Fork Run approval" : null;
 }
 
 /** The label a gate carries on its card, its DAG node and its pane, or
@@ -263,8 +271,8 @@ export function environmentGateLabel(
   s: EnvironmentGateLike,
   env: RunEnvironmentLike | null | undefined,
 ): string | null {
-  const added = addedByLabel(s, env);
-  if (added !== null) return `Environment approval gate · ${added}`;
+  const added = addedByEnvironment(s);
+  if (added !== null) return `Environment approval gate · added by ${environmentShown(added, env)}`;
   if (!isEnvironmentApprovalGate(s)) return null;
   return env ? `Environment approval gate · ${environmentShown(env.name, env)}` : "Environment approval gate";
 }

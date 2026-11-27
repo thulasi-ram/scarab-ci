@@ -515,11 +515,14 @@ async fn plugin_gate_view(
 
 /// The libraries and plugin gates `ir`'s Steps were inlined from, once each
 /// by (kind, name, content hash), in the order the Steps first name them.
-/// The gate an Environment added is not invoked, so it is left out.
+/// The gate an Environment or Fork Run approval added is not invoked, so it
+/// is left out.
 fn invoked(ir: &Ir) -> Vec<InvokedDto> {
+    let added =
+        |kind: &str| kind == "environment" || kind == scarab_pipeline::FORK_RUN_APPROVAL_GATE_KIND;
     let mut out: Vec<InvokedDto> = Vec::new();
     for step in &ir.steps {
-        for o in step.origin.iter().filter(|o| o.kind != "environment") {
+        for o in step.origin.iter().filter(|o| !added(&o.kind)) {
             let seen = out
                 .iter_mut()
                 .find(|i| i.kind == o.kind && i.name == o.name && i.content_hash == o.content_hash);

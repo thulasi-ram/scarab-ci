@@ -66,12 +66,15 @@ policy_enum! {
 }
 
 policy_enum! {
-    /// The kind of one link in an invoke chain (ADR-0076).
+    /// The kind of one link in an invoke chain (ADR-0076), or of the gate
+    /// an Environment (`environment`) or Fork Run approval
+    /// (`fork_run_approval_gate`) added to the Run.
     pub enum OriginKind {
         File => "file",
         Library => "library",
         Plugin => "plugin",
         Environment => "environment",
+        ForkRunApprovalGate => "fork_run_approval_gate",
     }
 }
 
@@ -350,6 +353,7 @@ pub fn origin_of(
                 scarab_pipeline::OriginKind::Library => OriginKind::Library,
                 scarab_pipeline::OriginKind::Plugin => OriginKind::Plugin,
                 scarab_pipeline::OriginKind::Environment => OriginKind::Environment,
+                scarab_pipeline::OriginKind::ForkRunApprovalGate => OriginKind::ForkRunApprovalGate,
             },
             name: o.name.clone(),
             source: o.source.clone(),

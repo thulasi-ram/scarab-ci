@@ -13,7 +13,7 @@
 // at 100% and scrolls inside the band; only a graph wider than the band
 // shrinks, to 75% at most. Clicking a node selects it.
 import { createSignal, onMount, onCleanup, createEffect, createMemo, on, untrack, For, Index, Show } from "solid-js";
-import { isGateOpen, type GateStatus } from "../gates";
+import { addedByForkRunApproval, isGateOpen, type GateStatus } from "../gates";
 import { allNeeds, drawnNeeds, layoutGroups, type DagCell, type OriginLink } from "../dag-layout";
 import { columnNodeWidth, fitBand, matrixHeading, nodeMeta, segmentByMatrix } from "../run-page";
 import { shortHash } from "../libraries";
@@ -64,7 +64,8 @@ export type DagStep = {
   origin?: OriginLink[] | null;
   /** An Environment approval gate: its approvers release it. */
   approvalGate?: boolean;
-  /** For the gate the Environment added to the Run: "added by <Environment>". */
+  /** For the gate the Environment added to the Run: "added by <Environment>";
+   * for the gate Fork Run approval added: "added by Fork Run approval". */
   addedBy?: string | null;
 };
 
@@ -516,7 +517,14 @@ export default function Dag(props: {
           </Show>
           <Show when={s().addedBy}>
             {(label) => (
-              <span class="dnode-origin" title="Not in the pipeline file: the environment added this approval gate">
+              <span
+                class="dnode-origin"
+                title={
+                  addedByForkRunApproval(s())
+                    ? "Not in the pipeline file: Fork Run approval added this gate in front of a Run of fork code"
+                    : "Not in the pipeline file: the environment added this approval gate"
+                }
+              >
                 {label()}
               </span>
             )}

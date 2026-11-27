@@ -37,6 +37,35 @@ release.yml uses that version's section as the GitHub Release text. See
   a token with a list needs `account.read` for `GET /v1/me` and `server.read` for
   `GET /v1/about`.
 
+### Security
+
+- **A dispatch records the kind of ref it ran.** A manual or API dispatch at a bare name such as
+  `release/x` was recorded as the branch `refs/heads/release/x` even when the name was a tag.
+  Anyone who could push a tag could create `release/x` on their own commit and pass an
+  Environment's `allowed_refs` for `refs/heads/release/*`. Scarab now looks the name up: a branch
+  is recorded as `refs/heads/<name>`, a tag as `refs/tags/<name>`, and the Run runs that ref's
+  commit. A name that is both a branch and a tag is refused with a 400 that asks for
+  `refs/heads/<name>` or `refs/tags/<name>`. A name that is neither, such as a short commit SHA,
+  is recorded as the full commit SHA, which no branch or tag pattern matches. `HEAD` is recorded
+  as the default branch, `refs/heads/<default>`, instead of `refs/heads/HEAD`. A
+  `refs/heads/<name>` or `refs/tags/<name>` the repository does not have is refused with a 400.
+  The typed ref is trimmed of spaces. A forge error during these ref lookups refuses the
+  dispatch ([Runs](/scarab-ci/usage/runs/)).
+- **A Forgejo pull request whose head is on no branch is fork code.** Scarab treated a pull
+  request as the repository's own code whenever its head was in the same repository. A Forgejo
+  AGit-flow pull request (pushed to `refs/for/<branch>`, which read access allows) has its head
+  there with no branch, so its Run could get the Environment's secrets. A pull request is now the
+  repository's own code only when its head is a branch of the repository; any other is fork
+  code, with the fork limits. A dispatch at `refs/pull/<n>/head` applies the same rule. On
+  GitHub and Forgejo alike, Scarab now asks the forge for the pull request's head branch before
+  it trusts a pull request from the repository, one call per pull request event: the branch must
+  exist and point at the pull request's head commit. A missing branch, a branch at another
+  commit, or a forge error makes the Run fork code; it is still created. So during a forge
+  outage, a pull request Run from the repository gets the fork limits. A known effect: when the
+  branch moves between the push and Scarab's check (another push right after), that Run gets the
+  fork limits too. A re-run of that Run keeps them; once the forge answers again, start the
+  pipeline again with a new push to the pull request or a dispatch at `refs/pull/<n>/head`.
+
 ### Features
 
 - **Limit an API token to a list of operations.** A token minted with `operations` may use only
@@ -47,6 +76,40 @@ release.yml uses that version's section as the GitHub Release text. See
   with a list is stored under a different hash, so a server older than this release cannot find
   it during a rolling upgrade. See
   [API tokens](/scarab-ci/usage/api-tokens/#operations).
+
+### Enhancement
+
+- **A manual or API dispatch asks the forge for one ref.** Deciding whether the dispatched commit
+  is fork code listed every branch and tag of the repository, page by page, on each dispatch. The
+  GitHub and Forgejo adapters now read the one branch or tag the dispatch names.
+- **0.8.4 reads a Fork Run approval gate.** A later release adds Fork Run approval, an org
+  setting that puts a `manual` gate in front of a Run of fork code. A server before 0.8.4 cannot
+  read a Run that has that gate, so roll back from that release to 0.8.4. On 0.8.4 the Run waits
+  at the gate as at any `manual` gate, starts none of its shared services until the gate is
+  released, and never counts the gate as an Environment approval gate. Nothing in 0.8.4 adds the
+  gate.
+
+### Bug Fixes
+
+- **`REGISTRY_AUTH` resolves through the Run's Environment.** A push step's registry credential
+  read only the repository's and the org's `REGISTRY_AUTH`, so a value set for an Environment,
+  by the repository or by the org, was never used. A push step the Environment admits (approved,
+  or an Environment with no approvers) now resolves the Run's Environment chain: the
+  repository's value for it, the org's value for it, the repository default, then the org
+  default. So an org value set for that Environment now outranks the repository's own
+  `REGISTRY_AUTH`. A push step before approval keeps the repository's and the org's values, as
+  before. A secret store error now fails the step's launch, where it used to fall through to the
+  next scope or to the forge-derived credential, and a value that is not UTF-8 text is refused
+  ([Pushing to ECR](/scarab-ci/usage/pushing-to-ecr/)).
+
+### Misc
+
+- **Rollback target for plugin manifest `extensions`.** A later release adds an `extensions`
+  field to plugin manifests. 0.8.4 reads and keeps it, so an org's plugin list still loads after
+  a rollback from that release, and keeps it when it writes the installation back. It does not
+  act on it: such a plugin gets no endpoint and no trust tier. Installing, or upgrading to, a
+  manifest that declares `extensions` is refused on 0.8.4. Manifests without the field hash as
+  before.
 
 ## [0.8.3] - 2026-11-27
 

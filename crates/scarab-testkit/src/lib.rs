@@ -329,6 +329,11 @@ fn fake_run_summary(st: &InMemoryState, run: &RunId, status: RunStatus) -> RunSu
                 .filter(|s| {
                     s["gate"] == "manual"
                         && s["environment_approval_gate"] != serde_json::Value::Bool(false)
+                        && !s["origin"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|o| o["kind"] == scarab_pipeline::FORK_RUN_APPROVAL_GATE_KIND)
                 })
                 .filter_map(|s| s["id"].as_str().map(|id| StepId(id.to_string())))
                 .collect(),
@@ -4794,6 +4799,9 @@ pub struct FakeForge {
     pr_head_fails: Mutex<bool>,
     /// Refs whose [`latest_commit`](ForgePort::latest_commit) fails.
     latest_commit_fails: Mutex<std::collections::HashSet<String>>,
+    /// When set, [`list_refs`](ForgePort::list_refs), and with it the
+    /// default [`ref_commit`](ForgePort::ref_commit), fails.
+    list_refs_fails: Mutex<bool>,
     /// Each posted status and the commit sha it was posted on.
     statuses: Mutex<Vec<(String, Status)>>,
     comments: Mutex<Vec<(u64, String)>>,
@@ -5023,6 +5031,12 @@ impl FakeForge {
     /// (`true`, an API error) or work again.
     pub fn fail_pull_request_head(&self, fail: bool) {
         *self.pr_head_fails.lock().unwrap() = fail;
+    }
+
+    /// Make [`list_refs`](ForgePort::list_refs) (and so
+    /// [`ref_commit`](ForgePort::ref_commit)) fail (`true`) or work again.
+    pub fn fail_list_refs(&self, fail: bool) {
+        *self.list_refs_fails.lock().unwrap() = fail;
     }
 
     /// Make [`latest_commit`](ForgePort::latest_commit) of `git_ref` fail
@@ -5852,6 +5866,9 @@ impl ForgePort for FakeForge {
         _repo: &RepoRef,
         query: Option<&str>,
     ) -> Result<Vec<ForgeRef>, ForgeError> {
+        if *self.list_refs_fails.lock().unwrap() {
+            return Err(ForgeError::Api("fake forge: listing refs failed".into()));
+        }
         let seeded = self.refs.lock().unwrap().clone();
         // With nothing seeded, the fake behaves as `latest_commit` does: any
         // name it is asked about is a branch at the commit that name resolves

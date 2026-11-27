@@ -1634,7 +1634,7 @@ fn pr_payload(action: &str, changes: serde_json::Value, merged: bool) -> Vec<u8>
             "merged": merged,
             "title": "feat: the widget",
             "base": { "ref": "main" },
-            "head": { "sha": PR_HEAD, "repo": { "full_name": "acme/app" } }
+            "head": { "sha": PR_HEAD, "ref": "feat/widget", "repo": { "full_name": "acme/app" } }
         },
         "repository": { "name": "app", "owner": { "login": "acme" }, "full_name": "acme/app" },
         "sender": { "login": "octocat" }
@@ -1666,7 +1666,11 @@ fn github_pr_request(delivery: &str, body: &[u8]) -> Request<Body> {
 async fn a_closed_or_merged_pull_request_starts_no_run_and_posts_no_status() {
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
     enable_app(&db, scarab_forge::ForgeKind::GitHub).await;
-    let forge = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", PR_ONLY_YAML));
+    let forge = Arc::new(
+        FakeForge::new()
+            .with_file(".scarab/ci.yaml", PR_ONLY_YAML)
+            .with_commit("refs/heads/feat/widget", PR_HEAD),
+    );
     let app = pr_app(db.clone(), forge.clone());
 
     let none = serde_json::Value::Null;
@@ -1731,7 +1735,11 @@ async fn a_closed_or_merged_pull_request_starts_no_run_and_posts_no_status() {
 async fn forgejo_pull_request_actions_start_runs_only_for_new_code() {
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
     enable_app(&db, scarab_forge::ForgeKind::Forgejo).await;
-    let forge = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", PR_ONLY_YAML));
+    let forge = Arc::new(
+        FakeForge::new()
+            .with_file(".scarab/ci.yaml", PR_ONLY_YAML)
+            .with_commit("refs/heads/feat/widget", PR_HEAD),
+    );
     let app = pr_app(db.clone(), forge.clone());
     let send = |delivery: &str, body: Vec<u8>| {
         let sig = scarab_forge_forgejo::sign_hex(b"forgejo-secret", &body);
