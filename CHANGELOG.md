@@ -22,6 +22,10 @@ release.yml uses that version's section as the GitHub Release text. See
 
 - **Step OIDC tokens carry `iat` and `nbf`.** Both are set 60 seconds before the token is minted,
   so a cloud whose clock runs up to a minute behind the server still accepts the token.
+- **Step OIDC tokens carry the Run's trigger and commit.** The `event` claim is the Run's trigger
+  kind (`push`, `pull_request`, `manual`, ...) where it was always `deploy`, and `sha` is the
+  commit the Run builds where it was empty. A claim whose value the Run did not record, such as
+  `sha` for a tag or release, is left out.
 
 ## [0.8.3] - 2026-11-27
 

@@ -40,10 +40,14 @@ struct TokenClaims {
     exp: i64,
     run_id: String,
     attempt: String,
-    event: String,
+    /// Left out when unknown: a trust policy that matches on it should see no
+    /// claim rather than an empty string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event: Option<String>,
     #[serde(rename = "ref")]
     git_ref: String,
-    sha: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha: Option<String>,
 }
 
 /// An RS256 OIDC issuer with rotatable keys.
@@ -219,9 +223,9 @@ mod tests {
                 expires_at: i64::MAX / 2,
                 run_id: "r1".into(),
                 attempt: "a1".into(),
-                event: "push".into(),
+                event: Some("push".into()),
                 git_ref: "refs/heads/main".into(),
-                sha: "deadbeef".into(),
+                sha: Some("deadbeef".into()),
                 issued_at: 0,
             })
             .await

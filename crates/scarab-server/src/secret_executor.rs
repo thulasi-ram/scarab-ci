@@ -725,15 +725,30 @@ impl SecretInjectingExecutor {
             .current_attempt()
             .map(|a| a.id.0.clone())
             .unwrap_or_default();
+        // `event` and `sha` come from the trigger context recorded on the
+        // Run's event log: its kind and the commit it builds. A value the
+        // trigger did not record (a tag or release names no commit) leaves
+        // the claim out.
+        let trigger = crate::run_trigger(self.db.as_ref(), &step.run)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?
+            .map(|(event, _actor)| event);
+        let trigger_field = |name: &str| {
+            trigger
+                .as_ref()
+                .and_then(|t| t[name].as_str())
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
         let claims = scarab_identity::Claims {
             issuer: self.issuer_url.clone(),
             subject,
             audience: audience.clone(),
             run_id: step.run.0.clone(),
             attempt,
-            event: "deploy".into(),
+            event: trigger_field("kind"),
             git_ref: ctx.git_ref.clone(),
-            sha: String::new(),
+            sha: trigger_field("sha"),
             issued_at: now_ms / 1000 - OIDC_CLOCK_SKEW_SECS,
             expires_at: now_ms / 1000 + OIDC_TOKEN_TTL_SECS,
         };

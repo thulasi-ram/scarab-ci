@@ -899,9 +899,13 @@ pub struct Claims {
     pub audience: String,
     pub run_id: String,
     pub attempt: String,
-    pub event: String,
+    /// `event` — the Run's trigger kind (`push`, `pull_request`, `manual`,
+    /// ...). `None` when the Run recorded none; the claim is then left out.
+    pub event: Option<String>,
     pub git_ref: String,
-    pub sha: String,
+    /// `sha` — the commit the Run builds. `None` when the trigger names no
+    /// commit (a tag or release event); the claim is then left out.
+    pub sha: Option<String>,
     /// `iat` and `nbf` — unix seconds. The minter sets it a little before
     /// now, so a verifier whose clock runs behind still accepts the token.
     pub issued_at: i64,
