@@ -27,10 +27,12 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 pub mod objects;
+mod placement;
 pub mod probe;
 mod runtime;
 mod token_review;
 
+pub use placement::PluginPlacement;
 pub use probe::{ProbeReport, ProbeVerdict};
 pub use runtime::{K8sPluginRuntime, PluginRuntimeConfig, RuntimeError, WorkloadState};
 pub use token_review::{TokenReviewVerifier, VERDICT_CACHE_TTL};

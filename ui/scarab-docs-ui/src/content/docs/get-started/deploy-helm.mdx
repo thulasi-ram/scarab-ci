@@ -634,6 +634,12 @@ it belongs to. If you create the namespace yourself, give it the labels
 `pod-security.kubernetes.io/enforce=restricted` and
 `scarab.io/plugin-runtime-owner=<release namespace>.<release name>`. Scarab runs no plugin in a
 namespace labelled for another release, so two releases can't share one plugin namespace.
+If every node in your cluster is tainted, set `plugins.tolerations` and `plugins.nodeSelector`.
+Scarab puts them on every plugin Pod and on the isolation probe's Pods, so the probe checks the
+nodes plugins run on. Without a matching toleration the probe's Pods stay Pending and no plugin
+starts. These settings don't place the server, the Data Depot or step Pods. A toleration field
+Scarab doesn't know (a misspelling such as `efect`) stops the server from starting, with the
+field named in the error.
 A plugin that needs storage brings its own: you create a PersistentVolumeClaim in the plugin
 namespace and the plugin runtime mounts it. Scarab doesn't provision, back up or read that
 volume, and its data is outside what Scarab keeps.

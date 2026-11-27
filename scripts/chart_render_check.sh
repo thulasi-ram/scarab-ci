@@ -39,6 +39,9 @@
 #   7. retention.webhookDeliveryDays reaches the ConfigMap, 30 by default,
 #      and 0 renders as "0" (not dropped for the default), so the server's
 #      start check refuses it.
+#   8. plugins.tolerations / plugins.nodeSelector reach the ConfigMap as one
+#      SCARAB_PLUGIN_PLACEMENT JSON value (git-bug 1b8202c), a number kept a
+#      number, and nothing renders when both are empty.
 #
 # Run by `just check all`. Usage: scripts/chart_render_check.sh [chart-dir]
 # (needs helm, yq v4).
@@ -253,4 +256,20 @@ got=$(delivery_days)
 got=$(delivery_days --set retention.webhookDeliveryDays=0)
 [ "$got" = "0" ] || fail "retention.webhookDeliveryDays=0 renders '$got', want 0 (the server refuses it)"
 
-echo "chart_render_check: SCARAB_UI_URL, the provider secrets, the step namespace, the placement config, the step Pod admission policy, the server's startupProbe and the webhook delivery retention render as expected"
+# 8. The plugin placement: one JSON value, absent when empty.
+plugin_placement() {
+  yq 'select(.kind == "ConfigMap" and .metadata.name == "t-scarab") | .data.SCARAB_PLUGIN_PLACEMENT' \
+    <<<"$(helm template t "$chart" --set plugins.enabled=true "$@")"
+}
+got=$(plugin_placement)
+[ "$got" = null ] || fail "SCARAB_PLUGIN_PLACEMENT renders '$got' with no plugin placement"
+got=$(plugin_placement \
+  --set-json 'plugins.tolerations=[{"key":"workload-type","operator":"Equal","value":"app","effect":"NoExecute","tolerationSeconds":300}]' \
+  --set-json 'plugins.nodeSelector={"kubernetes.io/arch":"arm64"}')
+want='{"nodeSelector":{"kubernetes.io/arch":"arm64"},"tolerations":[{"effect":"NoExecute","key":"workload-type","operator":"Equal","tolerationSeconds":300,"value":"app"}]}'
+[ "$got" = "$want" ] || fail "SCARAB_PLUGIN_PLACEMENT is
+$got
+want
+$want"
+
+echo "chart_render_check: SCARAB_UI_URL, the provider secrets, the step namespace, the placement config, the step Pod admission policy, the server's startupProbe, the webhook delivery retention and the plugin placement render as expected"

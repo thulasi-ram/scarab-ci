@@ -128,6 +128,18 @@ fn probe_image() -> String {
         .unwrap_or_else(|| DEFAULT_PROBE_IMAGE.to_string())
 }
 
+/// A placement every case runs under (git-bug 1b8202c): a nodeSelector the
+/// kind node matches and a toleration for a taint no node has, so the probe
+/// and the workload still schedule, and the workload case can see both on
+/// the Pod.
+fn test_placement() -> scarab_plugin_k8s::PluginPlacement {
+    scarab_plugin_k8s::PluginPlacement::parse(
+        r#"{"tolerations":[{"key":"scarab.test/plugins","operator":"Exists","effect":"NoSchedule"}],
+            "nodeSelector":{"kubernetes.io/os":"linux"}}"#,
+    )
+    .expect("test placement")
+}
+
 /// The throwaway namespaces one case runs in.
 struct Fixture {
     client: Client,
@@ -150,6 +162,7 @@ impl Fixture {
                 }),
                 broker_port: BROKER_PORT,
                 probe_image: probe_image(),
+                placement: test_placement(),
                 owner: Some(TEST_OWNER.to_string()),
             },
         )
@@ -387,6 +400,7 @@ async fn a_cidr_peer_lets_a_plugin_reach_a_broker_outside_the_cluster() {
                     broker_peer: Some(BrokerPeer::parse(peer).expect("a cidr peer")),
                     broker_port: port,
                     probe_image: probe_image(),
+                    placement: Default::default(),
                     owner: Some(TEST_OWNER.to_string()),
                 },
             )
@@ -595,6 +609,19 @@ async fn a_workload_is_admitted_stopped_and_uninstalled() {
         assert_eq!(
             spec.service_account_name.as_deref(),
             Some("plugin-0123456789")
+        );
+        // The operator's placement reached the Pod (git-bug 1b8202c).
+        assert_eq!(
+            spec.node_selector.as_ref(),
+            Some(&test_placement().node_selector)
+        );
+        assert!(
+            spec.tolerations
+                .iter()
+                .flatten()
+                .any(|t| t.key.as_deref() == Some("scarab.test/plugins")),
+            "{:?}",
+            spec.tolerations
         );
         assert_eq!(
             runtime
