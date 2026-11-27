@@ -139,6 +139,35 @@ pub async fn sweep_plugin_broker_journal(
         .map_err(|e| e.to_string())
 }
 
+/// Delete expired DelegatedCallerHandles, and delegated-call journal rows
+/// older than [`scarab_plugin::DELEGATED_CALL_JOURNAL_RETENTION_MS`]
+/// (ADR-0086 §4), under the same leader lease as the log sweep. Returns how
+/// many rows went.
+pub async fn sweep_delegated_calls(
+    db: &Arc<dyn Db>,
+    store: &dyn scarab_plugin::DelegatedCallStore,
+    clock: &Arc<dyn Clock>,
+    owner: &str,
+) -> Result<u64, String> {
+    let lease = db
+        .lease(RETENTION_LEASE, owner, RETENTION_LEASE_TTL_MS)
+        .await
+        .map_err(|e| e.to_string())?;
+    if lease.owner != owner {
+        return Ok(0);
+    }
+    let now = clock.now().await.0;
+    let handles = store
+        .delete_expired_delegated_caller_handles(now)
+        .await
+        .map_err(|e| e.to_string())?;
+    let journal = store
+        .prune_delegated_call_journal(now - scarab_plugin::DELEGATED_CALL_JOURNAL_RETENTION_MS)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(handles + journal)
+}
+
 /// How long a `pc-*` connection credential must stay unreferenced before
 /// [`sweep_orphaned_connection_secrets`] deletes it: far longer than a bind
 /// takes between writing the secret and writing the binding that names it.
@@ -847,6 +876,7 @@ pub fn spawn_sweeper(
     gc: GcConfig,
     depot: Option<Arc<dyn DepotDurableIndex>>,
     plugins: Option<Arc<dyn scarab_plugin::PluginStore>>,
+    delegated_calls: Option<Arc<dyn scarab_plugin::DelegatedCallStore>>,
     connection_secrets: Option<Arc<dyn scarab_secrets::SecretProvider>>,
     step_up: Option<StepUpStores>,
     step_pods: Option<crate::step_pods::StepPodSweep>,
@@ -864,6 +894,13 @@ pub fn spawn_sweeper(
                 Ok(0) => {}
                 Ok(n) => tracing::info!(deliveries = n, "retention: pruned webhook deliveries"),
                 Err(e) => tracing::warn!(error = %e, "webhook delivery prune failed"),
+            }
+            if let Some(delegated) = &delegated_calls {
+                match sweep_delegated_calls(&db, delegated.as_ref(), &clock, &owner).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(rows = n, "retention: pruned delegated calls"),
+                    Err(e) => tracing::warn!(error = %e, "delegated call prune failed"),
+                }
             }
             if let Some(plugins) = &plugins {
                 match sweep_plugin_broker_journal(&db, plugins.as_ref(), &clock, &owner).await {

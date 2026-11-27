@@ -40,13 +40,22 @@ pub struct RouteEntry {
 pub(crate) struct Routes {
     pub(crate) router: Router<AppState>,
     pub(crate) table: Vec<RouteEntry>,
+    /// Which routes of the list this router serves: every one for the main
+    /// API; for PluginApi, only those a delegated call may use.
+    keep: fn(&'static str, &'static Op) -> bool,
 }
 
 impl Routes {
     fn new() -> Self {
+        Self::keeping(|_, _| true)
+    }
+
+    /// A router that serves only the routes `keep` accepts.
+    fn keeping(keep: fn(&'static str, &'static Op) -> bool) -> Self {
         Self {
             router: Router::new(),
             table: Vec::new(),
+            keep,
         }
     }
 
@@ -57,6 +66,9 @@ impl Routes {
         op: &'static Op,
         mr: MethodRouter<AppState>,
     ) -> Self {
+        if !(self.keep)(path, op) {
+            return self;
+        }
         // axum merges method routers registered on the same path, and panics
         // on a duplicate (path, method) — so the table cannot hold one either.
         self.router = self.router.route(path, mr);
@@ -107,11 +119,23 @@ pub fn route_table() -> &'static [RouteEntry] {
     TABLE.get_or_init(|| governed_routes().table)
 }
 
-/// The single route list.
+/// The single route list, every route of it.
 pub(crate) fn governed_routes() -> Routes {
+    route_list(Routes::new())
+}
+
+/// The routes PluginApi serves on the broker listener (ADR-0086 §4): the
+/// public API's own routes and handlers, only those whose ApiOperation a
+/// DelegatedCallerHandle could name ([`crate::plugin_api::served`]).
+pub(crate) fn plugin_api_routes() -> Routes {
+    route_list(Routes::keeping(crate::plugin_api::served))
+}
+
+/// The single route list, registered on `routes`.
+fn route_list(routes: Routes) -> Routes {
     use crate::step_up::ceremony;
     use crate::*;
-    Routes::new()
+    routes
         .get("/healthz", &ops::SERVER_READ, healthz)
         .get("/livez", &ops::SERVER_READ, livez)
         .get("/readyz", &ops::SERVER_READ, readyz)

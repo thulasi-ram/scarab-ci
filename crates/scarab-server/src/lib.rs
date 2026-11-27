@@ -105,6 +105,7 @@ pub mod org_environments;
 pub mod people;
 /// ADR-0072: PluginInstallations — fetch a manifest to review, install,
 /// uninstall and the kill switch.
+pub mod plugin_api;
 pub mod plugin_gates;
 /// ADR-0072 §9: the plugin runtime's leased reconcile loop — namespace
 /// baseline, isolation probe, one workload per installation.
@@ -244,6 +245,10 @@ pub struct AppState {
     /// and an admin's kill switch use. `None` = the broker uses `plugins`
     /// (a hand-built state).
     pub broker_plugins: Option<Arc<dyn scarab_plugin::PluginStore>>,
+    /// PluginApi's DelegatedCallerHandles and its journal (ADR-0086 §3,
+    /// §4), on the broker's own pool when the server wires one. `None`:
+    /// every PluginApi call is a 401.
+    pub delegated_calls: Option<Arc<dyn scarab_plugin::DelegatedCallStore>>,
     /// How many entries the CredentialBroker's journal queue holds between
     /// the read proxy and its writer (ADR-0072 §5). Full, the proxy refuses
     /// to forward (503) rather than forward what it cannot journal.
@@ -452,6 +457,7 @@ impl AppState {
             org_environments: None,
             plugins: None,
             broker_plugins: None,
+            delegated_calls: None,
             broker_journal_queue: broker_proxy::JOURNAL_QUEUE,
             broker_upstream_loopback_allowed: false,
             plugin_tokens: None,
@@ -674,6 +680,15 @@ impl AppState {
     /// small pool — instead of [`Self::with_plugins`]'s.
     pub fn with_broker_plugin_store(mut self, store: Arc<dyn scarab_plugin::PluginStore>) -> Self {
         self.broker_plugins = Some(store);
+        self
+    }
+
+    /// Serve PluginApi's handles and journal from `store` (ADR-0086 §4).
+    pub fn with_delegated_calls(
+        mut self,
+        store: Arc<dyn scarab_plugin::DelegatedCallStore>,
+    ) -> Self {
+        self.delegated_calls = Some(store);
         self
     }
 
@@ -12885,6 +12900,10 @@ struct Caller {
     /// The session behind the request, when it was one (cookie or Bearer) —
     /// what a StepUpConfirmation is bound to (ADR-0073 §4, §7).
     session: Option<SessionFacts>,
+    /// The Plugin installation (its id) acting for this caller through
+    /// PluginApi with a DelegatedCallerHandle (ADR-0086 §4). A delegated
+    /// call never raises or satisfies a step-up.
+    plugin_installation: Option<String>,
 }
 
 /// What ADR-0073 needs to know about the session a request rode on.
@@ -12910,6 +12929,7 @@ impl Caller {
             grant: None,
             via: None,
             session: None,
+            plugin_installation: None,
         }
     }
 
@@ -12923,7 +12943,15 @@ impl Caller {
     /// The `caller` column of an OrgSecurityEventLog row.
     fn event_label(&self) -> String {
         match (&self.grant, self.via) {
-            (Some(token), _) => format!("api_token:{}", token.id),
+            (Some(token), _) => match &self.plugin_installation {
+                Some(installation) => {
+                    format!(
+                        "api_token:{} via plugin_installation:{installation}",
+                        token.id
+                    )
+                }
+                None => format!("api_token:{}", token.id),
+            },
             (None, Some(AuthVia::Cookie)) => "session:cookie".to_string(),
             (None, Some(AuthVia::Bearer)) => "session:bearer".to_string(),
             (None, None) => "dev:insecure".to_string(),
@@ -12964,6 +12992,7 @@ impl Caller {
                 token_id: token.id.clone(),
                 token_kind: token.kind.as_str().to_string(),
                 oauth_client: token.oauth_client.clone(),
+                plugin_installation: self.plugin_installation.clone(),
             })
     }
 
@@ -13087,6 +13116,16 @@ async fn authenticate(
     // and narrowed to the human's live authority; headers are ignored, and
     // CSRF has nothing to defend (no browser sent this request). The
     // task-local is set only by the confirm endpoint around its replay.
+    // A Plugin's call through PluginApi (ADR-0086 §4): the request carries
+    // the installation's token and a DelegatedCallerHandle, which the
+    // PluginApi middleware already checked. The caller is the handle's
+    // PrincipalToken, narrowed to it; headers are ignored, as on a replay.
+    // The task-local is set only by that middleware.
+    if let Some(call) = plugin_api::delegated_call() {
+        let caller = plugin_api::delegated_caller(st, &call).await?;
+        caller.admit_route_operation()?;
+        return Ok(caller);
+    }
     if let Some(authority) = step_up::requests::replay_authority() {
         let caller = step_up::requests::replay_caller(st, &authority).await?;
         caller.admit_route_operation()?;
@@ -13136,6 +13175,7 @@ async fn authenticate(
         grant: None,
         via: Some(via),
         session: Some(facts),
+        plugin_installation: None,
     })
 }
 
@@ -13238,6 +13278,7 @@ async fn authenticate_api_token(
         grant: Some(token),
         via: Some(via),
         session: None,
+        plugin_installation: None,
     })
 }
 
@@ -13441,6 +13482,15 @@ async fn approve_gate(
     // owner) is refused with no request raised, so text an outsider wrote
     // into a log cannot send the owner a stream of confirmations. A session
     // decides as before.
+    // Nor does a Plugin acting for its caller (ADR-0086 §4): PluginApi does
+    // not serve this route, and this refuses a call that reaches it anyway.
+    if caller.plugin_installation.is_some() {
+        return Err(ApiError::Ceremony {
+            status: StatusCode::FORBIDDEN,
+            code: "token_never_approves",
+            message: "a plugin acting for its caller never approves a gate".into(),
+        });
+    }
     let token_approval = match caller.grant.as_ref().map(|t| t.kind) {
         None => false,
         Some(scarab_identity::PrincipalTokenKind::Issued) => true,

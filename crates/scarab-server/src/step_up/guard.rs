@@ -61,7 +61,7 @@ pub(crate) fn route_operation() -> Option<&'static Op> {
 
 /// The table entry for `method` (HEAD as the GET that serves it) on the
 /// matched path `matched`.
-fn route_entry<'t>(
+pub(crate) fn route_entry<'t>(
     table: &'t [RouteEntry],
     method: &Method,
     matched: Option<&str>,

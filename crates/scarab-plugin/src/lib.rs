@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 mod connection;
+mod delegation;
 mod extension;
 mod storage;
 mod store;
@@ -38,6 +39,12 @@ pub use connection::{
     ReadRequestRefusal, BROKER_JOURNAL_RETENTION_MS, MAX_CONNECTION_BASE_URL_CHARS,
     MAX_CONNECTION_CA_PEM_BYTES, MAX_CONNECTION_CREDENTIAL_BYTES, MAX_PROXY_PATH_CHARS,
     MAX_PROXY_PATH_SEGMENTS, MAX_PROXY_QUERY_CHARS, MAX_PROXY_QUERY_PARAMS,
+};
+
+pub use delegation::{
+    DelegatedCallJournalEntry, DelegatedCallSpend, DelegatedCallStore, DelegatedCallerHandle,
+    DELEGATED_CALLER_HANDLE_HEARTBEAT_STALE_MS, DELEGATED_CALLER_HANDLE_MAX_CALLS,
+    DELEGATED_CALLER_HANDLE_MAX_LIFETIME_MS, DELEGATED_CALL_JOURNAL_RETENTION_MS,
 };
 
 pub use extension::{

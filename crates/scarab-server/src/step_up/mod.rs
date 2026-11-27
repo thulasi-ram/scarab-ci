@@ -951,6 +951,27 @@ pub(crate) async fn require(
         expires_at: None,
     };
 
+    // A Plugin acting for its caller through PluginApi (ADR-0086 §4): a
+    // delegated call never raises a StepUpConfirmationRequest and is never
+    // satisfied by one, so text injected into what a Plugin reads cannot send
+    // its caller confirmation links, and an agent never approves a gate.
+    // PluginApi serves no operation that can need one; this refuses one that
+    // reaches here anyway.
+    if let Some(installation) = &caller.plugin_installation {
+        let reason = "delegated call";
+        let ev = p.refused_event(op, &summary.target, mode.as_str(), reason, now);
+        svc.record_refusal(ev).await;
+        return Err(ApiError::Ceremony {
+            status: axum::http::StatusCode::FORBIDDEN,
+            code: "delegated_call_never_steps_up",
+            message: format!(
+                "{} needs a step-up, and a call a plugin (installation {installation}) makes \
+                 for its caller never raises or satisfies one; do it from a signed-in browser",
+                op.label
+            ),
+        });
+    }
+
     // A StepUpConfirmationRequest being replayed (ADR-0073 §6): its human
     // confirmed exactly one operation and one digest. Nothing else — another
     // operation, or the same one with any byte changed — is satisfied, so a
