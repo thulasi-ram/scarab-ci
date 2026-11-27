@@ -29,6 +29,7 @@ fn run_claims() -> Claims {
         event: "push".into(),
         git_ref: "refs/heads/main".into(),
         sha: "cafebabe".into(),
+        issued_at: 0,
         expires_at: EXP_2100,
     }
 }

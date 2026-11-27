@@ -35,6 +35,8 @@ struct TokenClaims {
     iss: String,
     sub: String,
     aud: String,
+    iat: i64,
+    nbf: i64,
     exp: i64,
     run_id: String,
     attempt: String,
@@ -135,6 +137,8 @@ impl OidcIssuer for Rs256Issuer {
             iss: claims.issuer,
             sub: claims.subject,
             aud: claims.audience,
+            iat: claims.issued_at,
+            nbf: claims.issued_at,
             exp: claims.expires_at,
             run_id: claims.run_id,
             attempt: claims.attempt,
@@ -218,6 +222,7 @@ mod tests {
                 event: "push".into(),
                 git_ref: "refs/heads/main".into(),
                 sha: "deadbeef".into(),
+                issued_at: 0,
             })
             .await
             .unwrap();

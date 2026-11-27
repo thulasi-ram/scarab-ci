@@ -18,6 +18,11 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Enhancement
+
+- **Step OIDC tokens carry `iat` and `nbf`.** Both are set 60 seconds before the token is minted,
+  so a cloud whose clock runs up to a minute behind the server still accepts the token.
+
 ## [0.8.3] - 2026-11-27
 
 ### Breaking changes

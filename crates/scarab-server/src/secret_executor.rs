@@ -556,6 +556,10 @@ fn step_admit_input(
 /// for the cloud exchange at step start, not the step's whole runtime).
 const OIDC_TOKEN_TTL_SECS: i64 = 15 * 60;
 
+/// How far before now a token's `iat` and `nbf` are set, so a cloud whose
+/// clock runs up to this far behind the server's still accepts the token.
+const OIDC_CLOCK_SKEW_SECS: i64 = 60;
+
 impl SecretInjectingExecutor {
     pub fn new(
         inner: Arc<dyn Executor>,
@@ -730,6 +734,7 @@ impl SecretInjectingExecutor {
             event: "deploy".into(),
             git_ref: ctx.git_ref.clone(),
             sha: String::new(),
+            issued_at: now_ms / 1000 - OIDC_CLOCK_SKEW_SECS,
             expires_at: now_ms / 1000 + OIDC_TOKEN_TTL_SECS,
         };
         let jwt = issuer

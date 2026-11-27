@@ -902,6 +902,9 @@ pub struct Claims {
     pub event: String,
     pub git_ref: String,
     pub sha: String,
+    /// `iat` and `nbf` — unix seconds. The minter sets it a little before
+    /// now, so a verifier whose clock runs behind still accepts the token.
+    pub issued_at: i64,
     /// `exp` — unix-seconds expiry (short TTL).
     pub expires_at: i64,
 }
