@@ -716,6 +716,18 @@ plugins:
   # pinned by digest. An override should be digest-pinned too: the probe's
   # verdict is only as good as the image printing it.
   probeImage: ""
+  # The image repositories a `trusted_service` plugin may run from
+  # (SCARAB_PLUGIN_TRUSTED_PUBLISHERS). A plugin whose manifest registers an
+  # endpoint acts for every caller that connects to it, so an org admin can
+  # install one only from a repository listed here, pinned by digest. Each
+  # entry is `registry/namespace/name`, compared whole after lowercasing the
+  # registry: no prefix, no glob, so `ghcr.io/acme/mcp` never matches
+  # `ghcr.io/acme-evil/mcp`. Empty (the default) trusts no publisher,
+  # Scarab's own included.
+  #
+  #   trustedPublishers:
+  #     - ghcr.io/thulasi-ram/scarab-plugin-mcp
+  trustedPublishers: []
   # Where plugin Pods and the isolation probe's Pods schedule
   # (SCARAB_PLUGIN_PLACEMENT). On a cluster whose every node is tainted this
   # is REQUIRED: without a matching toleration the probe's Pods stay Pending,

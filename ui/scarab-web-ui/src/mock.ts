@@ -1716,6 +1716,7 @@ const argocdManifest: PluginManifestDto = {
       outputs: [{ name: "revision", type: "string", required: true }],
     },
   ],
+  endpoint_operations: [],
 };
 const ARGOCD_MANIFEST_SHA = "b7e3".padEnd(64, "9");
 const ARGOCD_SOURCE_PATH = "github.com/acme/scarab-plugin-argocd//manifest.json";
@@ -1761,6 +1762,7 @@ const fetchedPluginUpgrade = (
       config_keys: group([], [], [...argocdManifest.config_keys]),
       gates: group(wider ? ["wait-synced"] : [], [], ["wait-live"]),
       image: group([], [], [ARGOCD_REPO]),
+      endpoint_operations: group([], [], []),
     },
     ...(() => {
       const reasons = [

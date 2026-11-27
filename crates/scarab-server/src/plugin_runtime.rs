@@ -674,6 +674,7 @@ mod tests {
                 connections: vec![],
                 config_keys: vec![],
                 gates: Default::default(),
+                extensions: Vec::new(),
             },
             manifest_sha256: "0".repeat(64),
             source: None,

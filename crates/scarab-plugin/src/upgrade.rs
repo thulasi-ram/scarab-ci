@@ -8,8 +8,10 @@
 //! means
 //! the new manifest asks for something the installed one did not: a
 //! capability, a connection slot, an auth scheme on a slot, a read rule, or a
-//! gate (a gate whose definition changed counts as added), or it stops
-//! naming the image repository it named, or names another. Removing anything
+//! gate (a gate whose definition changed counts as added), an endpoint
+//! operation (one whose match, `may` or writes changed counts as added:
+//! ADR-0086 §1), or it stops naming the image repository it named, or names
+//! another. Removing anything
 //! and adding a config key are not wider: a config value is set by the
 //! admin, never by the plugin. The server decides this from the two
 //! manifests it holds, never from what a client says.
@@ -61,6 +63,10 @@ pub struct ManifestDiff {
     pub gates: SetDiff<String>,
     /// The image repository the manifest names, when it names one.
     pub image: SetDiff<String>,
+    /// `<path>/<operation>: <what it matches, may and writes>`
+    /// ([`crate::PluginEndpointOperation::describe`]). An operation that
+    /// changed in any way is both removed and added.
+    pub endpoint_operations: SetDiff<String>,
 }
 
 impl ManifestDiff {
@@ -85,6 +91,12 @@ impl ManifestDiff {
                 .collect()
         };
         let image = |m: &PluginManifest| -> Vec<String> { m.image.iter().cloned().collect() };
+        let endpoint_operations = |m: &PluginManifest| -> Vec<String> {
+            m.endpoint_operations()
+                .into_iter()
+                .map(|(name, op)| format!("{name}: {}", op.describe()))
+                .collect()
+        };
         // A gate is its name and its whole definition: the same name with
         // another interface is not the gate an admin approved.
         let gates = SetDiff::of(
@@ -106,6 +118,7 @@ impl ManifestDiff {
                 unchanged: names(gates.unchanged),
             },
             image: SetDiff::of(&image(old), &image(new)),
+            endpoint_operations: SetDiff::of(&endpoint_operations(old), &endpoint_operations(new)),
         }
     }
 
@@ -130,6 +143,23 @@ impl ManifestDiff {
                 out.push(format!("changes gate `{g}`"));
             } else {
                 out.push(format!("adds gate `{g}`"));
+            }
+        }
+        // An endpoint operation is one approval: a new one, or any change to
+        // one, is asked about again (ADR-0086 §1).
+        let operation_name =
+            |line: &String| line.split(": ").next().unwrap_or_default().to_string();
+        for line in &self.endpoint_operations.added {
+            let name = operation_name(line);
+            if self
+                .endpoint_operations
+                .removed
+                .iter()
+                .any(|r| operation_name(r) == name)
+            {
+                out.push(format!("changes endpoint operation `{line}`"));
+            } else {
+                out.push(format!("adds endpoint operation `{line}`"));
             }
         }
         // Naming no image, or another, loosens which code the manifest runs
@@ -199,6 +229,7 @@ mod tests {
                 }))
                 .unwrap(),
             )]),
+            extensions: Vec::new(),
         }
     }
 

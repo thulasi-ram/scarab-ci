@@ -848,6 +848,11 @@ pub struct PluginsConfig {
     /// Dev only: static `(installation id, token)` pairs standing in for
     /// TokenReview.
     pub dev_tokens: Vec<(String, Redacted)>,
+    /// `SCARAB_PLUGIN_TRUSTED_PUBLISHERS` (ADR-0086 §8): the image
+    /// repositories (`registry/namespace/name`, the registry lowercased) a
+    /// `trusted_service` Plugin may run from, compared whole. Empty (the
+    /// default): no Plugin with an endpoint can be installed.
+    pub trusted_publishers: Vec<String>,
 }
 
 impl PluginsConfig {
@@ -994,6 +999,25 @@ impl PluginsConfig {
                 tokens
             }
         };
+        let trusted_publishers = match set("SCARAB_PLUGIN_TRUSTED_PUBLISHERS") {
+            None => Vec::new(),
+            Some(raw) => {
+                let mut publishers: Vec<String> = Vec::new();
+                for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+                    let publisher = crate::plugins::trusted_publisher(entry).ok_or_else(|| {
+                        invalid(format!(
+                            "SCARAB_PLUGIN_TRUSTED_PUBLISHERS: `{entry}` is not an image \
+                             repository `registry/namespace/name` (or `registry/name`) with no tag, digest or \
+                             glob"
+                        ))
+                    })?;
+                    if !publishers.contains(&publisher) {
+                        publishers.push(publisher);
+                    }
+                }
+                publishers
+            }
+        };
         Ok(PluginsConfig {
             enabled,
             broker_addr,
@@ -1005,6 +1029,7 @@ impl PluginsConfig {
             owner,
             dev_allow_tag,
             dev_tokens,
+            trusted_publishers,
         })
     }
 
@@ -1021,6 +1046,7 @@ impl PluginsConfig {
             owner: None,
             dev_allow_tag: false,
             dev_tokens: Vec::new(),
+            trusted_publishers: Vec::new(),
         }
     }
 }

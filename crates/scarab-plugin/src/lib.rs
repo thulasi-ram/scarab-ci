@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 mod connection;
+mod extension;
 mod storage;
 mod store;
 mod upgrade;
@@ -37,6 +38,13 @@ pub use connection::{
     ReadRequestRefusal, BROKER_JOURNAL_RETENTION_MS, MAX_CONNECTION_BASE_URL_CHARS,
     MAX_CONNECTION_CA_PEM_BYTES, MAX_CONNECTION_CREDENTIAL_BYTES, MAX_PROXY_PATH_CHARS,
     MAX_PROXY_PATH_SEGMENTS, MAX_PROXY_QUERY_CHARS, MAX_PROXY_QUERY_PARAMS,
+};
+
+pub use extension::{
+    PluginEndpointJsonCheck, PluginEndpointJsonPresence, PluginEndpointOperation,
+    PluginEndpointRequestRule, PluginExtensionPoint, PluginExtensionRegistration, PluginTrustTier,
+    MAX_ENDPOINT_JSON_CHECKS, MAX_ENDPOINT_MAY_OPERATIONS, MAX_ENDPOINT_OPERATIONS,
+    MAX_ENDPOINT_OPERATION_WRITES, MAX_EXTENSION_REGISTRATIONS,
 };
 
 pub use storage::{
@@ -263,12 +271,50 @@ pub struct PluginManifest {
     /// does not change.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub gates: BTreeMap<String, GateDefinition>,
+    /// Where core calls this Plugin (ADR-0086 §1): its
+    /// PluginExtensionRegistrations, approved with the manifest. Absent from
+    /// a manifest that has none, so the SHA-256 of a manifest approved before
+    /// extensions existed does not change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<PluginExtensionRegistration>,
 }
 
 impl PluginManifest {
     /// Does it ask for `capability`?
     pub fn has(&self, capability: PluginCapability) -> bool {
         self.capabilities.contains(&capability)
+    }
+
+    /// The trust tier its registrations put it in (ADR-0086 §8): an endpoint
+    /// makes it `trusted_service`. `None`: no tier beyond the ordinary
+    /// isolation every Plugin gets.
+    pub fn trust_tier(&self) -> Option<PluginTrustTier> {
+        self.extensions
+            .iter()
+            .any(|r| r.point == PluginExtensionPoint::Endpoint)
+            .then_some(PluginTrustTier::TrustedService)
+    }
+
+    /// Every endpoint operation it declares, as `<path>/<operation>` with
+    /// the operation.
+    pub fn endpoint_operations(&self) -> Vec<(String, &PluginEndpointOperation)> {
+        self.extensions
+            .iter()
+            .filter(|r| r.point == PluginExtensionPoint::Endpoint)
+            .flat_map(|r| {
+                r.operations
+                    .iter()
+                    .map(move |(name, op)| (format!("{}/{name}", r.path), op))
+            })
+            .collect()
+    }
+
+    /// Every ApiOperation id any endpoint operation's `may` names, each once.
+    pub fn delegable_operations(&self) -> std::collections::BTreeSet<&str> {
+        self.endpoint_operations()
+            .into_iter()
+            .flat_map(|(_, op)| op.may.iter().map(String::as_str))
+            .collect()
     }
 
     /// Check every rule the types do not already guarantee: names, no
@@ -355,6 +401,23 @@ impl PluginManifest {
                 "at most {MAX_CONFIG_KEYS} config keys, got {}",
                 self.config_keys.len()
             ));
+        }
+        if self.extensions.len() > MAX_EXTENSION_REGISTRATIONS {
+            return invalid(format!(
+                "at most {MAX_EXTENSION_REGISTRATIONS} extension registrations, got {}",
+                self.extensions.len()
+            ));
+        }
+        let mut paths = std::collections::BTreeSet::new();
+        for registration in &self.extensions {
+            registration.validate()?;
+            if !paths.insert((registration.point, registration.path.as_str())) {
+                return invalid(format!(
+                    "{} `{}` is registered twice",
+                    registration.point.as_str(),
+                    registration.path
+                ));
+            }
         }
         let mut keys = std::collections::BTreeSet::new();
         for key in &self.config_keys {
@@ -945,6 +1008,7 @@ mod tests {
             }],
             config_keys: vec!["ARGOCD_UI_URL".into()],
             gates: BTreeMap::new(),
+            extensions: Vec::new(),
         }
     }
 

@@ -397,7 +397,7 @@ fn plugin_env(installation: &PluginInstallation, broker_url: &str) -> Vec<EnvVar
         PLUGIN_ENV_BROKER_TOKEN_FILE,
         &format!("{BROKER_TOKEN_DIR}/{BROKER_TOKEN_FILE}"),
     ));
-    if resolves_gates(installation) {
+    if needs_api_token(installation) {
         vars.push(env(
             scarab_plugin::PLUGIN_ENV_API_TOKEN_FILE,
             &format!("{BROKER_TOKEN_DIR}/{API_TOKEN_FILE}"),
@@ -406,12 +406,14 @@ fn plugin_env(installation: &PluginInstallation, broker_url: &str) -> Vec<EnvVar
     vars
 }
 
-/// Whether the installation's approved manifest asks to resolve gates: only
-/// then does its Pod get a `scarab-api` token (ADR-0076 §7).
-fn resolves_gates(installation: &PluginInstallation) -> bool {
+/// Whether the installation's Pod gets a `scarab-api` token: only when its
+/// approved manifest asks to resolve gates (ADR-0076 §7), or registers an
+/// endpoint, whose Plugin calls PluginApi with it (ADR-0086 §4).
+fn needs_api_token(installation: &PluginInstallation) -> bool {
     installation
         .manifest
         .has(scarab_plugin::PluginCapability::ResolveGates)
+        || installation.manifest.trust_tier().is_some()
 }
 
 /// `plugin-<id>`: one replica, `Recreate` — one instance per installation,
@@ -478,7 +480,7 @@ pub fn deployment(
                         ..Default::default()
                     };
                     let mut sources = vec![token(BROKER_TOKEN_AUDIENCE, BROKER_TOKEN_FILE)];
-                    if resolves_gates(installation) {
+                    if needs_api_token(installation) {
                         sources.push(token(scarab_plugin::API_TOKEN_AUDIENCE, API_TOKEN_FILE));
                     }
                     sources
@@ -679,6 +681,7 @@ mod tests {
                 connections: vec![],
                 config_keys: vec!["ARGOCD_UI_URL".into()],
                 gates: Default::default(),
+                extensions: Vec::new(),
             },
             manifest_sha256: "f".repeat(64),
             source: None,

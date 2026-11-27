@@ -121,6 +121,7 @@ async fn world() -> Option<World> {
                 enabled: true,
                 namespace: NAMESPACE.into(),
                 dev_allow_tag: false,
+                trusted_publishers: Vec::new(),
             },
         )
         .with_plugin_tokens(Arc::new(FakeTokenReview))

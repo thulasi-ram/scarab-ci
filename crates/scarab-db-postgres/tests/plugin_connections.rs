@@ -54,6 +54,7 @@ fn installation(org: &str, name: &str, id: &str) -> PluginInstallation {
             }],
             config_keys: vec![],
             gates: Default::default(),
+            extensions: Vec::new(),
         },
         manifest_sha256: "0".repeat(64),
         source: None,

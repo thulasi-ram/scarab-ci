@@ -80,6 +80,9 @@ pub struct PluginPolicy {
     /// Dev only: any install may name `<repository>:<tag>` instead of a
     /// digest.
     pub dev_allow_tag: bool,
+    /// The image repositories a `trusted_service` Plugin may run from
+    /// (ADR-0086 §8), as [`trusted_publisher`] normalises them. Empty: none.
+    pub trusted_publishers: Vec<String>,
 }
 
 impl PluginPolicy {
@@ -88,6 +91,7 @@ impl PluginPolicy {
             enabled: c.enabled,
             namespace: c.namespace.clone(),
             dev_allow_tag: c.dev_allow_tag,
+            trusted_publishers: c.trusted_publishers.clone(),
         }
     }
 
@@ -137,6 +141,76 @@ fn check_image(image: &str, allow_tag: bool) -> Result<(), ApiError> {
             ""
         }
     )))
+}
+
+/// An operator's trusted-publisher entry, or an installed image's
+/// repository, as the two are compared (ADR-0086 §8): `registry/namespace/
+/// name` (or `registry/name` on a registry without namespaces) with the
+/// registry lowercased, no tag, no digest, no glob. `None` for anything
+/// else, a reference without a registry host included: the registry is part
+/// of who published it.
+pub fn trusted_publisher(repository: &str) -> Option<String> {
+    let (registry, rest) = repository.split_once('/')?;
+    let registry = registry.to_ascii_lowercase();
+    let normalised = format!("{registry}/{rest}");
+    let looks_like_registry = registry.contains('.') || registry.contains(':');
+    (looks_like_registry && is_image_repository(&normalised)).then_some(normalised)
+}
+
+/// Check a manifest's endpoint registrations against this server
+/// (ADR-0086 §4): every ApiOperation an endpoint operation `may` use exists
+/// and is one a DelegatedCallerHandle can be given ([`ops::delegable`]).
+fn check_endpoint_operations(manifest: &PluginManifest) -> Result<(), String> {
+    for (name, operation) in manifest.endpoint_operations() {
+        for id in &operation.may {
+            let Some(op) = crate::step_up::ops::by_id(id) else {
+                return Err(format!(
+                    "endpoint operation `{name}` may use `{id}`, which is not an operation"
+                ));
+            };
+            if let Err(why) = crate::step_up::ops::delegable(op) {
+                return Err(format!(
+                    "endpoint operation `{name}` may use `{id}`, which a plugin can never use \
+                     for a caller: {why}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// May `image` run as a `trusted_service` Plugin with `manifest` (ADR-0086
+/// §8)? Only when the manifest has an endpoint registration does this ask
+/// anything: then the image must be pinned by digest (a tag under the dev
+/// knob, in dev only) and its repository must be one the operator lists in
+/// `plugins.trustedPublishers`. No publisher is trusted by default, Scarab's
+/// own included.
+fn check_trusted_service(
+    policy: &PluginPolicy,
+    manifest: &PluginManifest,
+    image: &str,
+) -> Result<(), ApiError> {
+    if manifest.trust_tier().is_none() {
+        return Ok(());
+    }
+    if !image.contains("@sha256:") && !policy.dev_allow_tag {
+        return Err(ApiError::BadRequest(format!(
+            "image `{image}` is not pinned by digest; a plugin with an endpoint runs as \
+             `trusted_service` and only from a digest"
+        )));
+    }
+    let repository = image_repository(image);
+    let trusted = trusted_publisher(repository)
+        .is_some_and(|r| policy.trusted_publishers.iter().any(|t| *t == r));
+    if !trusted {
+        return Err(ApiError::Denied(format!(
+            "plugin `{}` registers an endpoint, so it runs as `trusted_service`, and the \
+             operator has not listed its image repository `{repository}` in \
+             plugins.trustedPublishers (SCARAB_PLUGIN_TRUSTED_PUBLISHERS)",
+            manifest.plugin
+        )));
+    }
+    Ok(())
 }
 
 /// A server-minted installation id: 10 random lowercase hex characters. It
@@ -282,6 +356,14 @@ pub struct PluginManifestDto {
     /// The gates the plugin resolves, by name; empty without
     /// `resolve_gates`.
     pub gates: Vec<GateDefinitionDto>,
+    /// `trusted_service` when the plugin registers an endpoint: it acts for
+    /// many callers, and runs only from a publisher the operator lists.
+    /// Absent otherwise.
+    pub trust_tier: Option<String>,
+    /// Each request its endpoints take, one line each: `<path>/<operation>:
+    /// <method> <JSON checks>; may <operations>; writes <n>`. Empty when it
+    /// registers no endpoint.
+    pub endpoint_operations: Vec<String>,
 }
 
 /// A gate a plugin resolves: a Pipeline waits on it with `invoke:
@@ -357,6 +439,12 @@ impl From<&PluginManifest> for PluginManifestDto {
                         })
                         .collect(),
                 })
+                .collect(),
+            trust_tier: m.trust_tier().map(|t| t.as_str().to_string()),
+            endpoint_operations: m
+                .endpoint_operations()
+                .into_iter()
+                .map(|(name, op)| format!("{name}: {}", op.describe()))
                 .collect(),
         }
     }
@@ -663,6 +751,9 @@ pub struct ManifestDiffDto {
     pub gates: ManifestDiffGroupDto,
     /// The image repository the manifest names.
     pub image: ManifestDiffGroupDto,
+    /// `<path>/<operation>: <match>; may <operations>; writes <n>`; an
+    /// operation that changed is both removed and added.
+    pub endpoint_operations: ManifestDiffGroupDto,
 }
 
 impl From<&ManifestDiff> for ManifestDiffDto {
@@ -675,6 +766,7 @@ impl From<&ManifestDiff> for ManifestDiffDto {
             config_keys: (&d.config_keys).into(),
             gates: (&d.gates).into(),
             image: (&d.image).into(),
+            endpoint_operations: (&d.endpoint_operations).into(),
         }
     }
 }
@@ -1044,6 +1136,8 @@ async fn read_manifest(
     .map_err(|e| ApiError::BadRequest(format!("{src} is not a plugin manifest: {e}")))?;
     admit_for_mmp(&manifest)
         .map_err(|e| ApiError::BadRequest(format!("{src} cannot be installed: {e}")))?;
+    check_endpoint_operations(&manifest)
+        .map_err(|e| ApiError::BadRequest(format!("{src} cannot be installed: {e}")))?;
     Ok((src, content, manifest))
 }
 
@@ -1178,6 +1272,7 @@ pub(crate) async fn install_plugin(
     manifest
         .check_image(&body.image)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    check_trusted_service(&st.plugin_policy, &manifest, &body.image)?;
     manifest
         .validate_config(&body.config)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -1509,6 +1604,13 @@ pub(crate) async fn fetch_plugin_upgrade(
             .check_image(image)
             .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     }
+    // Refused here too, so an admin learns before the upgrade that this
+    // image cannot run the new manifest as `trusted_service`.
+    check_trusted_service(
+        &st.plugin_policy,
+        &manifest,
+        image.unwrap_or(current.image.as_str()),
+    )?;
     let (diff, reasons) = upgrade_step_up_reasons(&current, &manifest, image);
     Ok(Json(FetchedPluginUpgradeDto {
         source: src.to_string(),
@@ -1615,6 +1717,7 @@ pub(crate) async fn upgrade_plugin(
     manifest
         .check_image(&body.image)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    check_trusted_service(&st.plugin_policy, &manifest, &body.image)?;
     let (_, reasons) = upgrade_step_up_reasons(&current, &manifest, Some(&body.image));
     if reasons.is_empty() {
         guard.exempt("a same-or-narrower manifest on the installed image");

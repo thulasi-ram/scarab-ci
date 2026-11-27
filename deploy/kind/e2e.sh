@@ -69,7 +69,7 @@ plugin_repo=scarab.local/scarab-plugin-argocd
 mkdir -p "$here/.state"
 plugin_values="$here/.state/e2e-plugin-values.json"
 cat > "$plugin_values" <<EOF
-{"plugins": {"enabled": true},
+{"plugins": {"enabled": true, "trustedPublishers": ["scarab.local/scarab-plugin-mcp"]},
  "scarab": {"extraEnv": {"SCARAB_DEV_PLUGIN_ALLOW_TAG": "1"}}}
 EOF
 # Only this recipe asks up.sh for the public Forgejo tunnel.

@@ -946,6 +946,7 @@ DNS, which must be the usual `kube-system` Pods labelled `k8s-app=kube-dns`.
 | `plugins.namespace` / `.createNamespace` | `scarab-plugins` / `true` | the shared plugin namespace; must enforce Pod Security `restricted`. A namespace of its own: the render fails on the release namespace, `scarab.namespace`, `default` or `kube-*` |
 | `plugins.brokerPort` | `8090` | the broker listener and its ClusterIP Service port |
 | `plugins.probeImage` | `""` = `busybox:1.36.1@sha256:73aa…` | the isolation probe's and the per-Pod self-check's image; digest-pin an override |
+| `plugins.trustedPublishers` | `[]` | image repositories (`registry/namespace/name`, compared whole) a plugin that registers an endpoint (`trusted_service`) may run from, pinned by digest; empty trusts none |
 | `ingress.enabled` | `false` | expose the HTTP API. The web UI, the CLI and the results sidecar name a Step by its key and need nothing from the proxy; an API caller that sends a Step id holding `/` needs a proxy that passes `%2F` on unchanged (with Envoy Gateway, `escapedSlashesAction: KeepUnchanged` in a `ClientTrafficPolicy`) |
 | `scarab.resultsApiUrl` | `""` = `http://<fullname>.<ns>.svc` | where step Pods post results; leave it empty, or point it at the in-cluster Service, not at a gateway that redirects or rewrites paths |
 | `service.type` / `service.nodePort` | `ClusterIP` / `""` | the API Service; with `NodePort`, `nodePort` fixes the port (empty => assigned) |

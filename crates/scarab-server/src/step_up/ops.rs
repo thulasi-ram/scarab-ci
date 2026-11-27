@@ -312,6 +312,49 @@ pub fn by_id(id: &str) -> Option<&'static Op> {
         .find(|op| op.id == id)
 }
 
+/// The operations whose routes authenticate no Principal (ADR-0086 §4): a
+/// health check, a login, a webhook, the results POST, an external gate's
+/// `/release`. A DelegatedCallerHandle could not act as anyone there.
+const AUTHENTICATES_NO_PRINCIPAL: [&str; 7] = [
+    "server.read",
+    "auth.login",
+    "auth.logout",
+    "webhook.github",
+    "webhook.forgejo",
+    "step.results_ingest",
+    "gate.release_external",
+];
+
+/// May a Plugin's DelegatedCallerHandle use `op` (ADR-0086 §4)? `Err`
+/// says why not. A manifest whose endpoint `may` names an operation this
+/// refuses is refused at install and upgrade, and PluginApi serves no route
+/// of one:
+///
+/// - a crown jewel or a conditional operation: it can need a step-up, and a
+///   delegated call never raises or satisfies one (so `gate.approve` is
+///   never delegable);
+/// - a passkey ceremony;
+/// - a browser-only or not-by-token operation, the debug shell among them;
+/// - a route that authenticates no Principal.
+pub fn delegable(op: &Op) -> Result<(), &'static str> {
+    match op.class {
+        Class::CrownJewel(_) | Class::Conditional { .. } => {
+            return Err("it can need a step-up, which a delegated call never raises or satisfies")
+        }
+        Class::Ceremony => return Err("it is a passkey ceremony"),
+        Class::Read | Class::Exempt(_) | Class::NotGoverned(_) => {}
+    }
+    match op.machine {
+        StepUpMachineUse::BrowserOnly => return Err("only a person in a browser may do it"),
+        StepUpMachineUse::NotByToken => return Err("a token may never do it"),
+        StepUpMachineUse::Requestable => {}
+    }
+    if AUTHENTICATES_NO_PRINCIPAL.contains(&op.id) {
+        return Err("its route authenticates no person to act as");
+    }
+    Ok(())
+}
+
 /// [`Op::max_request_body`] unless an operation says otherwise.
 pub const DEFAULT_MAX_REQUEST_BODY: usize = 64 * 1024;
 

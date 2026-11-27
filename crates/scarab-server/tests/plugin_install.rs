@@ -75,6 +75,7 @@ fn policy(enabled: bool) -> PluginPolicy {
         enabled,
         namespace: NAMESPACE.into(),
         dev_allow_tag: false,
+        trusted_publishers: Vec::new(),
     }
 }
 
