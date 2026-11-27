@@ -1297,7 +1297,14 @@ async fn a_fork_pull_requests_k8s_overlay_is_refused_at_run_creation() {
         .put_environment_project_privilege_grant(&grant, "amy", 1)
         .await
         .unwrap();
-    let forge = FakeForge::new().with_file(".scarab/ci.yaml", OVERLAY_PR_YAML);
+    // `feature` is a branch at the pull request's head, so the forge confirms
+    // the same-repository pull request is the repository's code.
+    let forge = FakeForge::new()
+        .with_file(".scarab/ci.yaml", OVERLAY_PR_YAML)
+        .with_commit(
+            "refs/heads/feature",
+            "1234567890abcdef1234567890abcdef12345678",
+        );
 
     let db = InMemoryDb::new();
     let outcome = trigger_runs_from_event(

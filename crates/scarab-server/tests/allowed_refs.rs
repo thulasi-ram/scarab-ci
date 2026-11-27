@@ -65,7 +65,14 @@ fn push(branch: &str) -> Event {
 
 fn setup() -> (FakeForge, InMemoryDb, FakeClock) {
     (
-        FakeForge::new().with_file(".scarab/deploy.yaml", DEPLOY_YAML),
+        // `feature` is a branch at the pull requests' head, so the forge
+        // confirms they are the repository's code.
+        FakeForge::new()
+            .with_file(".scarab/deploy.yaml", DEPLOY_YAML)
+            .with_commit(
+                "refs/heads/feature",
+                "1234567890abcdef1234567890abcdef12345678",
+            ),
         InMemoryDb::new(),
         FakeClock::new(1_000),
     )

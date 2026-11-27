@@ -5981,6 +5981,65 @@ async fn record_pipeline_refusal(
 /// Without it, a [`TriggerError::Forge`] comes only from reading an
 /// `invoke:` library, before any Run or refusal is recorded.
 #[allow(clippy::too_many_arguments)] // the delivery's context beside the trigger's
+/// A pull request event that says it is the repository's own code, checked
+/// with the forge before it is trusted (git-bug 14a694f): `head_branch` must
+/// be a branch of the repository whose commit is the pull request's `head`.
+/// `None` when the event stands as it is (not a pull request, already fork
+/// code, or confirmed); otherwise the event marked fork code. No such branch,
+/// a branch at another commit and a forge error all read as fork code, so
+/// the Run is still created, with the fork limits.
+///
+/// The adapters decide `fork` from the payload alone, where an AGit-flow
+/// pull request (pushed to `refs/for/<branch>` with read access) looks like
+/// one from a branch of the repository. A branch that moved between the
+/// delivery and this check also reads as fork code, and its Run gets the
+/// fork limits; the next push to the pull request is checked again. One
+/// forge call per same-repository pull request event.
+async fn confirm_pull_request_origin(
+    forge: &dyn scarab_forge::ForgePort,
+    event: &scarab_forge::Event,
+) -> Option<scarab_forge::Event> {
+    let scarab_forge::Event::PullRequest {
+        repo,
+        number,
+        head,
+        head_branch,
+        fork: false,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    let branch = head_branch
+        .strip_prefix("refs/heads/")
+        .unwrap_or(head_branch);
+    let why = if !scarab_forge::pull_request_head_is_branch(branch) {
+        format!("its head `{head_branch}` is not a branch name")
+    } else {
+        match forge
+            .ref_commit(repo, scarab_forge::RefKind::Branch, branch)
+            .await
+        {
+            Ok(Some(sha)) if sha == *head => return None,
+            Ok(Some(sha)) => format!("branch `{branch}` is at {sha}, not at its head {head}"),
+            Ok(None) => format!("the repository has no branch `{branch}`"),
+            Err(e) => format!("the forge could not say where branch `{branch}` is: {e}"),
+        }
+    };
+    tracing::warn!(
+        org = %repo.owner,
+        project = %repo.name,
+        pull_request = number,
+        reason = %why,
+        "a pull request from the repository is run as fork code"
+    );
+    let mut confirmed = event.clone();
+    if let scarab_forge::Event::PullRequest { fork, .. } = &mut confirmed {
+        *fork = true;
+    }
+    Some(confirmed)
+}
+
 pub(crate) async fn trigger_runs_from_files(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
@@ -5991,6 +6050,10 @@ pub(crate) async fn trigger_runs_from_files(
     complete: bool,
     delivery: Option<&DeliveryRun>,
 ) -> Result<TriggerOutcome, TriggerError> {
+    // A pull request the payload calls the repository's own code is
+    // confirmed with the forge first; every trigger path comes through here.
+    let confirmed = confirm_pull_request_origin(forge, event).await;
+    let event = confirmed.as_ref().unwrap_or(event);
     let Some(repo) = event.repo() else {
         return Ok(TriggerOutcome::default());
     };

@@ -35,7 +35,13 @@ release.yml uses that version's section as the GitHub Release text. See
   AGit-flow pull request (pushed to `refs/for/<branch>`, which read access allows) has its head
   there with no branch, so its Run could get the Environment's secrets. A pull request is now the
   repository's own code only when its head is a branch of the repository; any other is fork
-  code, with the fork limits. A dispatch at `refs/pull/<n>/head` applies the same rule.
+  code, with the fork limits. A dispatch at `refs/pull/<n>/head` applies the same rule. On
+  GitHub and Forgejo alike, Scarab now asks the forge for the pull request's head branch before
+  it trusts a pull request from the repository, one call per pull request event: the branch must
+  exist and point at the pull request's head commit. A missing branch, a branch at another
+  commit, or a forge error makes the Run fork code; it is still created. A known effect: when
+  the branch moves between the push and Scarab's check (another push right after), that Run
+  gets the fork limits; the next push, or running the pipeline again, checks again.
 
 ### Enhancement
 
