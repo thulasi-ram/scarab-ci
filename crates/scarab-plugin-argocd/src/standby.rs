@@ -50,6 +50,9 @@ pub async fn run(cfg: Config, mut stop: watch::Receiver<bool>) -> Result<(), Str
         None => cfg.check_interval,
     };
     let mut last_check: Option<std::time::Instant> = None;
+    // Each open wait's last reason, so a wait is logged when its reason
+    // changes, not every pass.
+    let mut waiting_why = std::collections::BTreeMap::<String, String>::new();
     loop {
         if last_check.is_none_or(|t| t.elapsed() >= cfg.check_interval) {
             last_check = Some(std::time::Instant::now());
@@ -71,6 +74,12 @@ pub async fn run(cfg: Config, mut stop: watch::Receiver<bool>) -> Result<(), Str
                     if !(r.released.is_empty() && r.failed.is_empty()) {
                         tracing::info!(released = ?r.released, failed = ?r.failed, "argocd: gates answered");
                     }
+                    for (gate, why) in &r.waiting_why {
+                        if waiting_why.get(gate) != Some(why) {
+                            tracing::info!(%gate, %why, "argocd: gate waiting");
+                        }
+                    }
+                    waiting_why = r.waiting_why;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, status = ?e.status(), "argocd: gate pass failed")
