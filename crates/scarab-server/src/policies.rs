@@ -1370,6 +1370,7 @@ fn test_event(
             repo,
             r#ref: needs_ref()?,
             sha,
+            fork: false,
             reason: t.reason,
         },
         TriggerKind::Api => Event::Api {
@@ -1377,6 +1378,7 @@ fn test_event(
             repo,
             r#ref: needs_ref()?,
             sha,
+            fork: false,
             reason: t.reason,
         },
         TriggerKind::Cron => Event::Cron {

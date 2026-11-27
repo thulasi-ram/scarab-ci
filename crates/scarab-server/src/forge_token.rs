@@ -652,11 +652,12 @@ impl ForgeCredentialExecutor {
         self
     }
 
-    /// Whether the Run was created from a fork pull request, as its recorded
-    /// trigger says. With no Run store wired (inline dev runs) it is `false`,
+    /// Whether the Run builds fork code (a fork pull request, or a dispatch of
+    /// a commit no branch or tag names, ADR-0086 §9), as its recorded trigger's
+    /// `fork` flag says. With no Run store wired (inline dev runs) it is `false`,
     /// and the Step's stored `locked_out` flag decides alone. A failed read
     /// fails the launch.
-    async fn run_is_fork_pr(&self, step: &StepRun) -> Result<bool, ExecError> {
+    async fn run_is_fork_code(&self, step: &StepRun) -> Result<bool, ExecError> {
         let Some((db, _)) = &self.governance else {
             return Ok(false);
         };
@@ -788,7 +789,7 @@ impl ForgeCredentialExecutor {
         out.registry_auth_json = None;
         out.derived_auth = None;
         out.credential_eligible = false;
-        if config.locked_out || self.run_is_fork_pr(step).await? {
+        if config.locked_out || self.run_is_fork_code(step).await? {
             out.locked_out = true;
             return Ok(out);
         }
@@ -1033,7 +1034,7 @@ impl Executor for ForgeCredentialExecutor {
                     .registry_auth
                     .as_ref()
                     .is_some_and(|r| r.locked_out)
-                    || self.run_is_fork_pr(step).await?;
+                    || self.run_is_fork_code(step).await?;
                 enriched
                     .env
                     .retain(|(name, _)| name != scarab_pipeline::FORK_PR_ENV);

@@ -197,6 +197,37 @@ pub fn pull_request_head_sha(body: &serde_json::Value) -> Result<String, ForgeEr
         .ok_or_else(|| ForgeError::Malformed("pull request head.sha".into()))
 }
 
+/// Where a pull request's head lives, from the forge's `GET pulls/{n}`
+/// answer (the same fields on GitHub and Forgejo). Dispatch reads it to decide
+/// whether a commit reached through `refs/pull/<n>/head` is fork code
+/// (ADR-0086 §9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestOrigin {
+    /// `head.sha`.
+    pub head_sha: String,
+    /// `head.ref`: the branch the pull request comes from. Empty when absent.
+    pub head_branch: String,
+    /// `head.repo.full_name` equals `base.repo.full_name`. False when either is
+    /// absent (a deleted fork): untrusted.
+    pub same_repository: bool,
+}
+
+/// Parse a [`PullRequestOrigin`] from a `GET pulls/{n}` answer. A missing or
+/// malformed `head.sha` is an error.
+pub fn pull_request_origin(body: &serde_json::Value) -> Result<PullRequestOrigin, ForgeError> {
+    let head_sha = pull_request_head_sha(body)?;
+    let name = |p: &str| body.pointer(p).and_then(serde_json::Value::as_str);
+    let same_repository = matches!(
+        (name("/head/repo/full_name"), name("/base/repo/full_name")),
+        (Some(head), Some(base)) if head == base
+    );
+    Ok(PullRequestOrigin {
+        head_sha,
+        head_branch: name("/head/ref").unwrap_or_default().to_string(),
+        same_repository,
+    })
+}
+
 /// Whether `s` has the shape of a git commit SHA: 4 to 64 lower-case hex
 /// digits (4 is git's shortest abbreviation, 64 a SHA-256 object name).
 ///
@@ -722,6 +753,12 @@ pub enum Event {
         repo: RepoRef,
         r#ref: String,
         sha: String,
+        /// The resolved commit is **fork code** (ADR-0086 §9): no branch or tag
+        /// of this repository names it, nor the head of a pull request from one of
+        /// its branches. Such a Run gets the fork pull request limits, whoever
+        /// dispatched it. Absent on Runs recorded before the flag existed.
+        #[serde(default)]
+        fork: bool,
         /// The operator-supplied **reason** for this dispatch (optional). Source of
         /// the run **Headline** for `manual` runs via [`Event::trigger_title`]
         /// (ADR-0057 §3). Display/audit only — **deliberately excluded from
@@ -738,6 +775,12 @@ pub enum Event {
         repo: RepoRef,
         r#ref: String,
         sha: String,
+        /// The resolved commit is **fork code** (ADR-0086 §9): no branch or tag
+        /// of this repository names it, nor the head of a pull request from one of
+        /// its branches. Such a Run gets the fork pull request limits, whoever
+        /// dispatched it. Absent on Runs recorded before the flag existed.
+        #[serde(default)]
+        fork: bool,
         /// The caller-supplied **reason** for this dispatch (optional). Source of
         /// the run **Headline** for `api` runs via [`Event::trigger_title`]
         /// (ADR-0057 §3). Display/audit only — **deliberately excluded from
@@ -830,10 +873,17 @@ impl Event {
         }
     }
 
-    /// Is this an untrusted fork pull request (head repo ≠ base repo)? Fork PRs
-    /// are locked out of secrets and get a restricted OIDC subject (ADR-0015).
-    pub fn is_fork_pr(&self) -> bool {
-        matches!(self, Event::PullRequest { fork: true, .. })
+    /// Does this Run build **fork code** (ADR-0086 §9)? A fork pull request
+    /// (head repo ≠ base repo), or a dispatch whose resolved commit no branch or
+    /// tag of the repository names. Fork code is locked out of secrets and gets
+    /// a restricted OIDC subject (ADR-0015), whatever started the Run.
+    pub fn is_fork_code(&self) -> bool {
+        matches!(
+            self,
+            Event::PullRequest { fork: true, .. }
+                | Event::Manual { fork: true, .. }
+                | Event::Api { fork: true, .. }
+        )
     }
 
     /// The symbolic branch/tag ref this event runs on, for Environment
@@ -1389,6 +1439,18 @@ pub trait ForgePort: Send + Sync {
     /// `head.sha`): the commit a comment on it is pinned to for the head
     /// rule (ADR-0083 §5).
     async fn pull_request_head(&self, _repo: &RepoRef, _number: u64) -> Result<String, ForgeError> {
+        Err(ForgeError::Unsupported("reading a pull request".into()))
+    }
+
+    /// Where pull request `number`'s head lives ([`PullRequestOrigin`]), for
+    /// fork detection at dispatch (ADR-0086 §9). Defaults to
+    /// [`Unsupported`](ForgeError::Unsupported): a dispatch at a pull request
+    /// ref on such a forge is refused, never trusted.
+    async fn pull_request_origin(
+        &self,
+        _repo: &RepoRef,
+        _number: u64,
+    ) -> Result<PullRequestOrigin, ForgeError> {
         Err(ForgeError::Unsupported("reading a pull request".into()))
     }
 
@@ -2291,6 +2353,7 @@ mod tests {
             (cron("0 * * * *"), TriggerKind::Cron),
             (
                 Event::Manual {
+                    fork: false,
                     actor: "u".into(),
                     repo: repo(),
                     r#ref: "refs/heads/main".into(),
@@ -2301,6 +2364,7 @@ mod tests {
             ),
             (
                 Event::Api {
+                    fork: false,
                     actor: "bot".into(),
                     repo: repo(),
                     r#ref: "refs/heads/main".into(),
@@ -2349,6 +2413,7 @@ mod tests {
         // A dispatch carries its actor too.
         assert_eq!(
             Event::Manual {
+                fork: false,
                 actor: "alice".into(),
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
@@ -2401,8 +2466,8 @@ mod tests {
             head_branch: "feature".into(),
             fork: false,
         };
-        assert!(fork.is_fork_pr());
-        assert!(!internal.is_fork_pr());
+        assert!(fork.is_fork_code());
+        assert!(!internal.is_fork_code());
         assert!(fork.context()["event"]["fork"].as_bool().unwrap());
         // Non-PR events are never fork PRs.
         assert!(!Event::Push {
@@ -2415,7 +2480,7 @@ mod tests {
             before: String::new(),
             changed_paths: Default::default(),
         }
-        .is_fork_pr());
+        .is_fork_code());
     }
 
     #[test]
@@ -2433,6 +2498,7 @@ mod tests {
         // and `context()` still exposes the actor (ADR-0043).
         for event in [
             Event::Manual {
+                fork: false,
                 actor: "u".into(),
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
@@ -2440,6 +2506,7 @@ mod tests {
                 reason: None,
             },
             Event::Api {
+                fork: false,
                 actor: "bot".into(),
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
@@ -2492,6 +2559,7 @@ mod tests {
         );
         assert_eq!(
             Event::Manual {
+                fork: false,
                 actor: "u".into(),
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
@@ -2504,6 +2572,7 @@ mod tests {
         );
         assert_eq!(
             Event::Api {
+                fork: false,
                 actor: "bot".into(),
                 repo: repo(),
                 r#ref: "refs/heads/release/1.2".into(),
@@ -3018,6 +3087,7 @@ mod tests {
         // exactly as lean as a reason-less dispatch.
         for event in [
             Event::Manual {
+                fork: false,
                 actor: "alice".into(),
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
@@ -3025,6 +3095,7 @@ mod tests {
                 reason: Some("$(rm -rf /) ship it".into()),
             },
             Event::Api {
+                fork: false,
                 actor: "bot".into(),
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
@@ -3051,6 +3122,7 @@ mod tests {
         // (ADR-0057 §3). Present on both kinds; a `None` reason yields no headline.
         assert_eq!(
             Event::Manual {
+                fork: false,
                 actor: "alice".into(),
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
@@ -3064,6 +3136,7 @@ mod tests {
         );
         assert_eq!(
             Event::Api {
+                fork: false,
                 actor: "bot".into(),
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
@@ -3077,6 +3150,7 @@ mod tests {
         // No reason ⇒ no headline (optional at dispatch; requiredness is thread D).
         assert_eq!(
             Event::Api {
+                fork: false,
                 actor: "bot".into(),
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
@@ -3123,6 +3197,7 @@ mod tests {
         // A manual dispatch with no reason carries no headline (graceful degrade).
         assert_eq!(
             Event::Manual {
+                fork: false,
                 actor: "u".into(),
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),

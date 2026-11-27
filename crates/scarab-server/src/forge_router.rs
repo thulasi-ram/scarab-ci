@@ -346,6 +346,17 @@ impl ForgePort for RegistryForge {
             .await
     }
 
+    async fn pull_request_origin(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<scarab_forge::PullRequestOrigin, ForgeError> {
+        self.adapter_for(repo)
+            .await?
+            .pull_request_origin(repo, number)
+            .await
+    }
+
     async fn set_status(
         &self,
         repo: &RepoRef,

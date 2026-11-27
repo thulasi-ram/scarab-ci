@@ -18,6 +18,18 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Security
+
+- **A Run started by hand at a fork's commit gets the fork limits.** A manual or API dispatch at
+  `refs/pull/<n>/head` of a pull request from another repository, or at a commit no branch or tag
+  of the repository points at, read and ran the fork's own pipeline with none of the limits a
+  fork's pull request gets. Scarab now decides on the commit the forge resolved: it is the
+  repository's code only when a branch or tag of the repository, or the head of a pull request
+  from one of its branches, points at it. Anything else runs as fork code (no secrets, the
+  `env=none` OIDC subject, a read-only clone token, no build push), whoever started it. When the
+  forge cannot say, the dispatch is refused. `HEAD` means the default branch (git-bug 14be9e3,
+  ADR-0086 §9).
+
 ## [0.8.2] - 2026-11-26
 
 ### Enhancement
