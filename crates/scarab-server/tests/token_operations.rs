@@ -142,27 +142,26 @@ async fn token(
 ) -> String {
     let plaintext = format!("scarab_pat_{id}_0123456789abcdef0123456789abcdef");
     let now = h.now().await;
+    let record = PrincipalToken {
+        id: id.into(),
+        name: format!("ci-{id}"),
+        owner_subject: "amy".into(),
+        scope: Scope::Org("acme".into()),
+        role: Role::Admin,
+        expires_at: now + 30 * DAY,
+        created_by: "amy".into(),
+        created_at: now,
+        last_used_at: None,
+        use_count: 0,
+        revoked_at: None,
+        kind,
+        operations: operations.map(|list| list.iter().map(|o| o.to_string()).collect()),
+        audience: audience.map(str::to_string),
+        oauth_client: None,
+    };
+    // Stored as the mint stores it: a restricted token under its `r1:` hash.
     h.tokens
-        .put(
-            &PrincipalToken {
-                id: id.into(),
-                name: format!("ci-{id}"),
-                owner_subject: "amy".into(),
-                scope: Scope::Org("acme".into()),
-                role: Role::Admin,
-                expires_at: now + 30 * DAY,
-                created_by: "amy".into(),
-                created_at: now,
-                last_used_at: None,
-                use_count: 0,
-                revoked_at: None,
-                kind,
-                operations: operations.map(|list| list.iter().map(|o| o.to_string()).collect()),
-                audience: audience.map(str::to_string),
-                oauth_client: None,
-            },
-            &api_token_hash(&plaintext),
-        )
+        .put(&record, &record.stored_hash(&plaintext))
         .await
         .unwrap();
     plaintext
@@ -524,4 +523,75 @@ async fn a_token_write_records_its_trail() {
                 .collect();
         assert_eq!(vias, vec![want], "{}", run.0);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Restricted tokens under their own hash; the trail on a Run's start
+// ---------------------------------------------------------------------------
+
+/// J1 (rolling upgrade): a token with an operation list is stored under its
+/// `r1:` hash, so the plain-hash lookup a server built before 0111 makes does
+/// not find it; it still authenticates here, and so does a plain token.
+/// Kills: a listed token stored under the plain hash (an older replica would
+/// let it do everything its role allows), and an in-memory store that matches
+/// a row under the hash its restrictions do not call for.
+#[tokio::test]
+async fn a_listed_token_is_invisible_to_a_plain_hash_lookup_and_still_authenticates() {
+    let (h, _governance, _amy, _soft) = world().await;
+    let listed = issued(&h, "listed-j1", Some(&["account.read"])).await;
+    let plain = issued(&h, "plain-j1", None).await;
+
+    assert_eq!(
+        h.tokens
+            .by_hash(&api_token_hash(&listed), "")
+            .await
+            .unwrap(),
+        None,
+        "a plain-hash lookup must not find a listed token"
+    );
+    assert!(h
+        .tokens
+        .by_hash(&api_token_hash(&plain), "")
+        .await
+        .unwrap()
+        .is_some());
+    for (id, bearer) in [("listed", &listed), ("plain", &plain)] {
+        let (st, b) = h.bearer("GET", "/v1/me", None, bearer).await;
+        assert_eq!(st, StatusCode::OK, "{id}: {b}");
+    }
+}
+
+/// J11: a dispatch made with a token records the token on the Run's start;
+/// a session's dispatch records none.
+/// Kills: a dispatch handler that drops the caller's trail, and an admission
+/// path that never stamps it.
+#[tokio::test]
+async fn a_token_dispatch_records_its_trail_on_the_run() {
+    let h = harness_with(|st| st.with_forge(Arc::new(forge())));
+    h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
+    let bearer = issued(&h, "dispatcher", None).await;
+    let body = json!({ "ref": "refs/heads/main", "pipeline": "plain" });
+
+    let (st, b) = h
+        .bearer(
+            "POST",
+            "/v1/repos/acme/web/dispatch",
+            Some(body.clone()),
+            &bearer,
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{b}");
+    let by_token = RunId(b["id"].as_str().expect("a run id").to_string());
+    assert_eq!(
+        h.db.run_origin_via(&by_token).await.unwrap(),
+        trail("dispatcher")
+    );
+
+    let s = h.browser_session(owner("amy")).await;
+    let (st, b) = h
+        .cookie("POST", "/v1/repos/acme/web/dispatch", Some(body), &s)
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{b}");
+    let by_session = RunId(b["id"].as_str().expect("a run id").to_string());
+    assert_eq!(h.db.run_origin_via(&by_session).await.unwrap(), None);
 }

@@ -606,10 +606,13 @@ async fn the_plaintext_appears_once_and_is_never_stored() {
 
     // Nor is it in the store: the record is reachable only by the HASH of the
     // plaintext, so a database dump carries no usable credential.
-    assert!(h.tokens.by_hash(&token).await.unwrap().is_none());
+    assert!(h.tokens.by_hash(&token, "").await.unwrap().is_none());
     let stored = h
         .tokens
-        .by_hash(&scarab_identity::api_token_hash(&token))
+        .by_hash(
+            &scarab_identity::api_token_hash(&token),
+            &scarab_identity::restricted_api_token_hash(&token),
+        )
         .await
         .unwrap()
         .expect("stored under its digest");
@@ -680,7 +683,12 @@ async fn a_tokens_last_use_is_recorded() {
 
     let hash = scarab_identity::api_token_hash(&token);
     assert_eq!(
-        h.tokens.by_hash(&hash).await.unwrap().unwrap().last_used_at,
+        h.tokens
+            .by_hash(&hash, "")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_used_at,
         None
     );
 
@@ -693,7 +701,12 @@ async fn a_tokens_last_use_is_recorded() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        h.tokens.by_hash(&hash).await.unwrap().unwrap().last_used_at,
+        h.tokens
+            .by_hash(&hash, "")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_used_at,
         Some(6_000)
     );
 }

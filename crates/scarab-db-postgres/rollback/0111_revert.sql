@@ -10,7 +10,8 @@
 -- Then run it, e.g. `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0111_revert.sql`
 -- (so psql exits non-zero when a statement fails), and start 0.8.3.
 --
--- What is lost: each token's operation list. A 0.8.3 server would let a
+-- What is lost: each token's operation list, and the record of which token
+-- started each Run. A 0.8.3 server would let a
 -- token that had a list use every operation its role and scope allow, so
 -- this revokes every token that has a list or is not an issued token before
 -- it drops the columns. Their owners mint new ones.
@@ -24,7 +25,8 @@ DO $$
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'api_tokens' AND column_name = 'operations'
+        WHERE table_schema = current_schema()
+          AND table_name = 'api_tokens' AND column_name = 'operations'
     ) THEN
         UPDATE api_tokens
            SET revoked_at = (EXTRACT(EPOCH FROM now()) * 1000)::BIGINT
@@ -38,6 +40,7 @@ ALTER TABLE api_tokens DROP COLUMN IF EXISTS kind;
 ALTER TABLE api_tokens DROP COLUMN IF EXISTS operations;
 ALTER TABLE api_tokens DROP COLUMN IF EXISTS audience;
 ALTER TABLE api_tokens DROP COLUMN IF EXISTS oauth_client;
+ALTER TABLE runs DROP COLUMN IF EXISTS origin_via;
 
 DELETE FROM _sqlx_migrations WHERE version = 111;
 

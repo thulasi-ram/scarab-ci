@@ -2180,7 +2180,9 @@ async fn create_run(
     headers: HeaderMap,
     Json(req): Json<CreateRunRequest>,
 ) -> Result<(StatusCode, Json<CreateRunResponse>), ApiError> {
-    authorize(&st, &headers, Action::Write).await?;
+    // The caller, for the DelegationTrail its Run's start records (ADR-0086
+    // §6). Global roles only: an inline Run names no org or Project.
+    let caller = authorize_scoped_caller(&st, &headers, Action::Write, None).await?;
     // No `run.create` Policy is consulted (ADR-0075): an inline Run names no org or Project.
     refuse_nul_reason(req.reason.as_deref())?;
 
@@ -2338,6 +2340,10 @@ async fn create_run(
         {
             st.db.set_run_trigger_title(&run, &title).await?;
         }
+        // How the start arrived when a token made it (ADR-0086 §6).
+        if let Some(via) = caller.delegation_trail() {
+            st.db.set_run_origin_via(&run, &via).await?;
+        }
         st.db
             .append_event(&EventKind {
                 version: EVENT_VERSION,
@@ -2435,7 +2441,8 @@ async fn dispatch(
         org: org.clone(),
         name: repo.clone(),
     };
-    let principal = authorize_scoped(&st, &headers, Action::Write, Some(&scope)).await?;
+    let caller = authorize_scoped_caller(&st, &headers, Action::Write, Some(&scope)).await?;
+    let principal = caller.principal.clone();
     refuse_nul_reason(req.reason.as_deref())?;
     refuse_unreachable_repo(&st, &org, &repo).await?;
 
@@ -2445,7 +2452,7 @@ async fn dispatch(
         .as_ref()
         .ok_or_else(|| ApiError::BadRequest("no forge configured".into()))?;
 
-    let run = dispatch_run(
+    let run = dispatch_run_via(
         forge.as_ref(),
         st.db.as_ref(),
         st.clock.as_ref(),
@@ -2462,6 +2469,8 @@ async fn dispatch(
         req.params,
         req.kind,
         req.reason,
+        // How the dispatch arrived (ADR-0086 §6): the token, when one made it.
+        caller.delegation_trail(),
     )
     .await
     .map_err(ApiError::from)?;
@@ -8168,6 +8177,7 @@ impl DispatchKind {
     /// is the **symbolic** dispatch ref (canonicalized, used for `allowed_refs`
     /// matching, ADR-0037), `sha` the **resolved commit** the config is read at and
     /// the Run pins to.
+    #[allow(clippy::too_many_arguments)] // the event's fields, one each
     fn into_event(
         self,
         actor: String,
@@ -8176,6 +8186,7 @@ impl DispatchKind {
         sha: String,
         reason: Option<String>,
         fork: bool,
+        via: Option<scarab_forge::DelegationTrail>,
     ) -> scarab_forge::Event {
         match self {
             DispatchKind::Manual => scarab_forge::Event::Manual {
@@ -8185,6 +8196,7 @@ impl DispatchKind {
                 sha,
                 fork,
                 reason,
+                via,
             },
             DispatchKind::Api => scarab_forge::Event::Api {
                 actor,
@@ -8193,8 +8205,28 @@ impl DispatchKind {
                 sha,
                 fork,
                 reason,
+                via,
             },
         }
+    }
+}
+
+/// The engine's DelegationTrail as the forge event carries it (the two crates
+/// each hold a copy; ADR-0086 §6).
+fn forge_delegation_trail(via: &scarab_engine::DelegationTrail) -> scarab_forge::DelegationTrail {
+    scarab_forge::DelegationTrail {
+        token_id: via.token_id.clone(),
+        token_kind: via.token_kind.clone(),
+        oauth_client: via.oauth_client.clone(),
+    }
+}
+
+/// The forge event's DelegationTrail as the engine records it.
+fn engine_delegation_trail(via: &scarab_forge::DelegationTrail) -> scarab_engine::DelegationTrail {
+    scarab_engine::DelegationTrail {
+        token_id: via.token_id.clone(),
+        token_kind: via.token_kind.clone(),
+        oauth_client: via.oauth_client.clone(),
     }
 }
 
@@ -8529,6 +8561,29 @@ pub async fn dispatch_run(
     kind: DispatchKind,
     reason: Option<String>,
 ) -> Result<RunId, DispatchError> {
+    dispatch_run_via(
+        forge, db, clock, ports, actor, repo, r#ref, pipeline, params, kind, reason, None,
+    )
+    .await
+}
+
+/// [`dispatch_run`], recording `via`, how the dispatch arrived when a
+/// PrincipalToken made it (ADR-0086 §6), on the dispatch event and the Run.
+#[allow(clippy::too_many_arguments)] // the dispatch coordinates are irreducible
+pub async fn dispatch_run_via(
+    forge: &dyn scarab_forge::ForgePort,
+    db: &dyn Db,
+    clock: &dyn Clock,
+    ports: AdmissionPorts<'_>,
+    actor: String,
+    repo: scarab_forge::RepoRef,
+    r#ref: String,
+    pipeline: String,
+    params: std::collections::BTreeMap<String, serde_json::Value>,
+    kind: DispatchKind,
+    reason: Option<String>,
+    via: Option<scarab_engine::DelegationTrail>,
+) -> Result<RunId, DispatchError> {
     // Resolve the dispatch ref to a concrete commit — the form and the run see
     // byte-identical config (no branch-moved skew), and the Run is reproducible
     // (ADR-0043 §4).
@@ -8572,7 +8627,15 @@ pub async fn dispatch_run(
     // Headline. The endpoint stays dumb — accept + stamp, no requiredness check
     // (that is an Environment ProtectionRule at admission, thread D). Excluded
     // from `context()`, so it never reaches trigger-matching / interpolation.
-    let event = kind.into_event(actor, repo, sym, sha, reason, fork);
+    let event = kind.into_event(
+        actor,
+        repo,
+        sym,
+        sha,
+        reason,
+        fork,
+        via.as_ref().map(forge_delegation_trail),
+    );
     let ir = record_compile_failure(db, clock, &event, &path, compiled).await?;
     // The `when:` context: a dispatch has no changed paths, so
     // `event.changed_paths_known` reads `false` here as on a push whose list
@@ -9111,6 +9174,12 @@ async fn write_run_from_ir(
         origin_pr_head(event).as_deref(),
     )
     .await?;
+    // How the start arrived when a token made it (ADR-0086 §6): the
+    // dispatch's DelegationTrail, beside the Actor.
+    if let Some(via) = event.delegation_trail() {
+        db.set_run_origin_via(run, &engine_delegation_trail(via))
+            .await?;
+    }
     // The pipeline name (the runs-list/detail "which pipeline is this") — the
     // explicit `name:` from the IR when set, else the bare `.scarab/<name>`
     // selection. Stamped beside origin.
@@ -12443,7 +12512,7 @@ async fn mint_personal_token(
     };
     note_org(st, token.scope.org()).await?;
     store
-        .put(&token, &scarab_identity::api_token_hash(&plaintext))
+        .put(&token, &token.stored_hash(&plaintext))
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
@@ -13003,7 +13072,8 @@ async fn token_owner_roles(st: &AppState, subject: &str) -> Vec<scarab_identity:
 
 /// Authenticate the request: resolve the credential (Bearer or cookie), enforce
 /// expiry + the CSRF double-submit on cookie mutations, and return the
-/// [`Caller`] — **no role decision** (that's [`authorize`]/[`authorize_scoped`]).
+/// [`Caller`] — **no role decision** (that's [`authorize_scoped`]; `None` scope
+/// for an untenanted resource).
 /// With no session store configured, authn is **disabled** (dev/test) and every
 /// caller is a synthetic Owner (the loud SCARAB_DEV_INSECURE posture).
 async fn authenticate(
@@ -13124,7 +13194,10 @@ async fn authenticate_api_token(
         return Err(ApiError::Unauthorized);
     };
     let token = store
-        .by_hash(&scarab_identity::api_token_hash(plaintext))
+        .by_hash(
+            &scarab_identity::api_token_hash(plaintext),
+            &scarab_identity::restricted_api_token_hash(plaintext),
+        )
         .await
         .map_err(|_| ApiError::Unauthorized)?
         .ok_or(ApiError::Unauthorized)?;
@@ -13175,16 +13248,6 @@ async fn authenticate_api_token(
 /// rather than trusted.
 pub(crate) fn usable_on_core_routes(token: &scarab_identity::PrincipalToken) -> bool {
     token.kind == scarab_identity::PrincipalTokenKind::Issued && token.audience.is_none()
-}
-
-/// Authorize `action` with **global** (flat) roles only — for resources that
-/// belong to no tenant (inline dev runs, the catch-all default).
-async fn authorize(
-    st: &AppState,
-    headers: &HeaderMap,
-    action: Action,
-) -> Result<Principal, ApiError> {
-    authorize_scoped(st, headers, action, None).await
 }
 
 /// Authorize `action` in `scope` (ADR-0049 C2). The decision is scope-aware:

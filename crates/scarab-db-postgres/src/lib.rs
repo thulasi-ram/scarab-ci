@@ -1773,6 +1773,40 @@ impl Db for PostgresDb {
         Ok(row.and_then(|r| r.get::<Option<String>, _>("trigger_title")))
     }
 
+    async fn set_run_origin_via(
+        &self,
+        run: &RunId,
+        via: &scarab_engine::DelegationTrail,
+    ) -> Result<(), DbError> {
+        let via = serde_json::to_value(via).map_err(|e| DbError::Other(e.to_string()))?;
+        sqlx::query("UPDATE runs SET origin_via = $2 WHERE id = $1")
+            .bind(&run.0)
+            .bind(via)
+            .execute(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn run_origin_via(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<scarab_engine::DelegationTrail>, DbError> {
+        let row = sqlx::query("SELECT origin_via FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(db_err)?;
+        // A value that does not read as a trail is reported, not dropped: it
+        // is the record of who started the Run.
+        match row.and_then(|r| r.get::<Option<serde_json::Value>, _>("origin_via")) {
+            None => Ok(None),
+            Some(v) => serde_json::from_value(v)
+                .map(Some)
+                .map_err(|e| DbError::Other(format!("runs.origin_via: {e}"))),
+        }
+    }
+
     async fn count_in_flight_runs(&self, project: Option<&str>) -> Result<u32, DbError> {
         let row = sqlx::query(
             "SELECT count(*) AS n FROM runs
@@ -6587,12 +6621,22 @@ impl scarab_identity::ApiTokenStore for PostgresDb {
 
     async fn by_hash(
         &self,
-        hash: &str,
+        plain_hash: &str,
+        restricted_hash: &str,
     ) -> Result<Option<scarab_identity::ApiToken>, scarab_identity::IdentityError> {
+        // A row matches only under the hash its restrictions call for
+        // (ADR-0086 §6): a restricted row is stored under the `r1:` hash, so a
+        // server built before restrictions, which looks up the plain hash,
+        // never finds it.
         let row = sqlx::query(&format!(
-            "SELECT {API_TOKEN_COLS} FROM api_tokens WHERE token_hash = $1"
+            "SELECT {API_TOKEN_COLS} FROM api_tokens
+              WHERE (token_hash = $1 AND operations IS NULL AND kind = 'issued'
+                     AND audience IS NULL)
+                 OR (token_hash = $2 AND (operations IS NOT NULL OR kind <> 'issued'
+                     OR audience IS NOT NULL))"
         ))
-        .bind(hash)
+        .bind(plain_hash)
+        .bind(restricted_hash)
         .fetch_optional(self.pool())
         .await
         .map_err(identity_err)?;

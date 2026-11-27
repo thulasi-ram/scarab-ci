@@ -87,7 +87,10 @@ async fn a_0_8_3_token_reads_after_0111_as_issued_with_no_list() {
     let db = PostgresDb::with_pool(pool.clone());
     for (id, plaintext) in [("t-old", "scarab_pat_old"), ("t-mixed", "scarab_pat_mixed")] {
         let read = db
-            .by_hash(&api_token_hash(plaintext))
+            .by_hash(
+                &api_token_hash(plaintext),
+                &scarab_identity::restricted_api_token_hash(plaintext),
+            )
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("{id} reads"));
@@ -132,7 +135,7 @@ async fn the_0111_revert_revokes_limited_tokens_and_runs_twice() {
             ..token("t-audience")
         },
     ] {
-        db.put(&t, &api_token_hash(&format!("scarab_pat_{}", t.id)))
+        db.put(&t, &t.stored_hash(&format!("scarab_pat_{}", t.id)))
             .await
             .unwrap();
     }
@@ -150,11 +153,14 @@ async fn the_0111_revert_revokes_limited_tokens_and_runs_twice() {
             "{c} left after the revert: {cols:?}"
         );
     }
-    let max: i64 = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(max, 110);
+    // Version 111 is gone; a later migration (one this branch's successors
+    // add) may still be recorded, so the newest version is not asserted.
+    let has_0111: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = 111)")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!has_0111, "migration 111 still recorded after the revert");
     let revoked: Vec<(String, bool)> =
         sqlx::query_as("SELECT id, revoked_at IS NOT NULL FROM api_tokens ORDER BY id")
             .fetch_all(&pool)
@@ -172,7 +178,10 @@ async fn the_0111_revert_revokes_limited_tokens_and_runs_twice() {
 
     db.migrate().await.unwrap();
     let plain = db
-        .by_hash(&api_token_hash("scarab_pat_t-plain"))
+        .by_hash(
+            &api_token_hash("scarab_pat_t-plain"),
+            &scarab_identity::restricted_api_token_hash("scarab_pat_t-plain"),
+        )
         .await
         .unwrap()
         .expect("the plain token reads again");

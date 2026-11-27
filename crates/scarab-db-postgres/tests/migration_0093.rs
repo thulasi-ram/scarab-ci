@@ -154,7 +154,7 @@ async fn current_state_moves_to_ids_and_history_keeps_its_handles() {
     );
 
     // The token follows its owner's id; who minted it is history.
-    let token = db.by_hash("hash-1").await.unwrap().unwrap();
+    let token = db.by_hash("hash-1", "").await.unwrap().unwrap();
     assert_eq!(token.owner_subject, alice);
     assert_eq!(token.created_by, "github:alice");
 
@@ -425,7 +425,7 @@ async fn a_merge_after_the_upgrade_moves_everything_by_id() {
             .unwrap();
     assert_eq!(approvers, vec![ada.clone()], "folded, not listed twice");
     assert_eq!(
-        ApiTokenStore::by_hash(&db, "hash-1")
+        ApiTokenStore::by_hash(&db, "hash-1", "")
             .await
             .unwrap()
             .unwrap()

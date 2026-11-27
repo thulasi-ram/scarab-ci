@@ -852,6 +852,18 @@ pub trait Db: Send + Sync {
     /// The run's Headline, if stamped.
     async fn run_trigger_title(&self, run: &RunId) -> Result<Option<String>, DbError>;
 
+    /// Stamp how the Run's start arrived when a PrincipalToken made it
+    /// (ADR-0086 §6): the dispatch or inline creation's DelegationTrail. Set
+    /// once at creation; a Run started from a session or by the forge has none.
+    async fn set_run_origin_via(
+        &self,
+        run: &RunId,
+        via: &crate::DelegationTrail,
+    ) -> Result<(), DbError>;
+
+    /// The DelegationTrail the Run's start recorded, if any.
+    async fn run_origin_via(&self, run: &RunId) -> Result<Option<crate::DelegationTrail>, DbError>;
+
     /// Record one keyed-cache save (ADR-0065 s1): upsert the `(project, key,
     /// dir) → tree_root` mapping, refreshing `saved_at` and the provenance on
     /// conflict. **Advisory only**: under replica-local warm + eviction a row

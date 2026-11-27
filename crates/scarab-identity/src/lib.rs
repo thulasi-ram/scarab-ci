@@ -381,6 +381,36 @@ pub fn api_token_hash(plaintext: &str) -> String {
     out
 }
 
+/// The prefix of a **restricted** token's stored hash
+/// ([`restricted_api_token_hash`]).
+pub const RESTRICTED_API_TOKEN_HASH_PREFIX: &str = "r1:";
+
+/// The domain a restricted token's hash is computed in, so it can never equal
+/// [`api_token_hash`] of the same plaintext.
+const RESTRICTED_API_TOKEN_HASH_DOMAIN: &[u8] = b"scarab-principal-token-restricted-v1\0";
+
+/// The stored identity of a **restricted** token's plaintext (one with an
+/// operation list, a kind other than `issued`, or an audience):
+/// `r1:` + SHA-256 (lowercase hex) of the domain and the plaintext.
+///
+/// A server built before PrincipalTokens had restrictions looks tokens up by
+/// [`api_token_hash`] alone and knows nothing of the restriction columns, so
+/// during a rolling upgrade it would let a restricted token do everything its
+/// role allows. Stored under this hash, a restricted token is a token that
+/// server cannot find.
+pub fn restricted_api_token_hash(plaintext: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(RESTRICTED_API_TOKEN_HASH_DOMAIN);
+    hasher.update(plaintext.as_bytes());
+    let mut out = String::from(RESTRICTED_API_TOKEN_HASH_PREFIX);
+    for byte in hasher.finalize() {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 /// A PrincipalToken's **record** (ADR-0086 §6): everything about a token
 /// except the one thing that would let someone use it. The plaintext exists
 /// exactly once, in the response to the mint call; what survives here is
@@ -391,6 +421,16 @@ pub fn api_token_hash(plaintext: &str) -> String {
 /// [`Scope`], down to a [`Role`] at or below what its owner holds there, and,
 /// when it carries an operation list, down to those ApiOperations. Everything
 /// downstream ([`Rbac`], tenancy scoping) is unchanged.
+///
+/// **Restricted tokens are stored under another hash.** A token with an
+/// operation list, a kind other than `issued`, or an audience is
+/// [restricted](Self::is_restricted) and stored under
+/// [`restricted_api_token_hash`], every other token under [`api_token_hash`]
+/// ([`Self::stored_hash`]), and a lookup matches a row only under the hash its
+/// restrictions call for ([`ApiTokenStore::by_hash`]). The invariant this
+/// rests on: no code changes a row's restrictions in place, so a row's hash
+/// always matches them; and any later code that mints restricted tokens (an
+/// OAuth refresh rotation, say) stores them under the `r1:` hash too.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrincipalToken {
     /// Opaque row id. Safe to log, safe to show, safe to put in a revoke URL —
@@ -499,6 +539,26 @@ impl PrincipalTokenKind {
 pub type ApiToken = PrincipalToken;
 
 impl PrincipalToken {
+    /// Does it carry a restriction a server built before PrincipalTokens had
+    /// them would ignore: an operation list, a kind other than `issued`, or an
+    /// audience?
+    pub fn is_restricted(&self) -> bool {
+        self.operations.is_some()
+            || self.kind != PrincipalTokenKind::Issued
+            || self.audience.is_some()
+    }
+
+    /// The hash to store this token under for `plaintext`:
+    /// [`restricted_api_token_hash`] when it [is restricted](Self::is_restricted),
+    /// [`api_token_hash`] otherwise.
+    pub fn stored_hash(&self, plaintext: &str) -> String {
+        if self.is_restricted() {
+            restricted_api_token_hash(plaintext)
+        } else {
+            api_token_hash(plaintext)
+        }
+    }
+
     /// Is this token still usable at `now_ms`? Revocation beats expiry beats
     /// everything; neither is a judgement call.
     pub fn is_live(&self, now_ms: i64) -> bool {
@@ -557,7 +617,18 @@ pub trait ApiTokenStore: Send + Sync {
     /// revocation are the caller's decision ([`PrincipalToken::is_live`]) so that
     /// "this token is revoked" stays distinguishable from "no such token" in
     /// the code, even though both answer 401 on the wire.
-    async fn by_hash(&self, hash: &str) -> Result<Option<PrincipalToken>, IdentityError>;
+    ///
+    /// `plain_hash` is [`api_token_hash`] of the plaintext and
+    /// `restricted_hash` its [`restricted_api_token_hash`]. A row matches only
+    /// under the hash its restrictions call for: an unrestricted row under
+    /// `plain_hash`, a [restricted](PrincipalToken::is_restricted) one under
+    /// `restricted_hash`. A restricted row stored under a plain hash is never
+    /// found.
+    async fn by_hash(
+        &self,
+        plain_hash: &str,
+        restricted_hash: &str,
+    ) -> Result<Option<PrincipalToken>, IdentityError>;
     /// The token record with row id `id`, live or not (ADR-0073: a
     /// StepUpConfirmationRequest's replay re-checks its requesting token by
     /// id, never by plaintext).
@@ -1360,6 +1431,36 @@ mod tests {
         assert_eq!(t.effective_role(Some(Role::Viewer)), Some(Role::Viewer));
         // Offboard the owner entirely and the token holds nothing at all.
         assert_eq!(t.effective_role(None), None);
+    }
+
+    /// J1: a restricted token's stored hash is the `r1:` hash, never the
+    /// plain one; an unrestricted token's is the plain hash.
+    #[test]
+    fn a_restricted_token_is_stored_under_its_own_hash() {
+        let secret = "scarab_pat_0123456789abcdef";
+        let plain = token(Scope::Org("acme".into()), Role::Member);
+        assert!(!plain.is_restricted());
+        assert_eq!(plain.stored_hash(secret), api_token_hash(secret));
+        for restricted in [
+            PrincipalToken {
+                operations: Some(vec!["run.read".into()]),
+                ..plain.clone()
+            },
+            PrincipalToken {
+                kind: PrincipalTokenKind::Oauth,
+                ..plain.clone()
+            },
+            PrincipalToken {
+                audience: Some("https://ci.example.com/mcp".into()),
+                ..plain.clone()
+            },
+        ] {
+            assert!(restricted.is_restricted());
+            let hash = restricted.stored_hash(secret);
+            assert!(hash.starts_with(RESTRICTED_API_TOKEN_HASH_PREFIX), "{hash}");
+            assert_ne!(hash, api_token_hash(secret));
+            assert_eq!(hash, restricted_api_token_hash(secret));
+        }
     }
 
     #[test]

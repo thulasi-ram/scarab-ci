@@ -316,7 +316,11 @@ async fn link_merges_a_claimed_single_identity_principal_with_its_tokens() {
         }
     );
     assert_eq!(
-        db.by_hash("hash-1").await.unwrap().unwrap().owner_subject,
+        db.by_hash("hash-1", "")
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_subject,
         ada,
         "the token follows the person"
     );
