@@ -18,6 +18,30 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **Migration 0111 adds `kind`, `operations`, `audience` and `oauth_client` to `api_tokens`.**
+  No row is rewritten; every existing token keeps working as before. A 0.8.3 server does not
+  start on a database that ran it: to roll back, run
+  `crates/scarab-db-postgres/rollback/0111_revert.sql` with the server scaled to zero. It revokes
+  the tokens that carry an operation list. See the chart README, "Upgrading from 0.8.3".
+- **An API token no longer approves a gate by itself.** Its approval of any `manual` gate, a
+  plain one included, answers `403 step_up_required` with a confirmation request its owner
+  confirms with a passkey. A script that approved plain gates with a token must confirm each
+  approval or approve from a browser. Rejecting is unchanged.
+- **Reads are named by the data they return.** The shared `read` operation is split into
+  `run.read`, `step.logs.read`, `step.workspace.read`, `run.artifacts.read`, `repo.read`,
+  `account.read`, `access.read`, `security.read`, `secret.names.read`, `settings.read` and
+  `server.read`. Security events for reads carry the new names.
+
+### Features
+
+- **Limit an API token to a list of operations.** A token minted with `operations` may use only
+  those; every other request is refused with `403 operation_not_granted`. Each token records its
+  kind (`issued`), and every rerun, retry, cancel, pin, approval and rejection made with a token
+  records the token beside the person in the Run's events. See
+  [API tokens](/scarab-ci/usage/api-tokens/#operations).
+
 ## [0.8.3] - 2026-11-27
 
 ### Breaking changes

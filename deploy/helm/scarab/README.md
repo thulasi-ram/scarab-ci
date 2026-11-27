@@ -563,6 +563,30 @@ The StatefulSet's `serviceName` is unchanged, so upgrading needs no migration.
 
 > **Unverified in this chart version:** per-availability-zone placement.
 
+### Upgrading from 0.8.3: token kinds and operation lists
+
+Migration 0111 adds four columns to `api_tokens`: `kind` (`NOT NULL DEFAULT
+'issued'`), and the nullable `operations`, `audience` and `oauth_client`. No
+row is rewritten, and every existing token reads as an issued token with no
+operation list, so it works as before. The `ALTER` waits at most 5 seconds for
+its lock on `api_tokens`; on a busy database the server stops with `canceling
+statement due to lock timeout` and runs it again when the Pod restarts.
+
+Two behaviour changes reach existing tokens. Every GET now names a read
+operation (`run.read`, `step.logs.read`, …) instead of one shared `read`, so
+the `op` of security events changes for reads. And an API token's approval of
+any `manual` gate, a plain one included, now raises a confirmation request its
+owner confirms; a script that approved plain gates with a token must confirm
+each approval, or approve from a browser.
+
+To roll back: scale the server to zero, back up the database, run
+[`rollback/0111_revert.sql`](../../../crates/scarab-db-postgres/rollback/0111_revert.sql)
+(`psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0111_revert.sql`; a second run
+changes nothing), then install the 0.8.3 chart. A 0.8.3 server would let a
+token with an operation list use every operation, so the revert revokes those
+tokens before it drops the columns; their owners mint new ones. To go back to
+0.8.2, run `0110_revert.sql` next.
+
 ### Upgrading from 0.8.2: gate notes
 
 Migration 0110 adds two nullable columns to `attempts`, `gate_note` and
