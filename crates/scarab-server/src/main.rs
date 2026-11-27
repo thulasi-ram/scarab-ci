@@ -941,11 +941,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Per-attempt OIDC federation tokens (ADR-0015),
                     // tmpfs-delivered.
                     if let Some((issuer, oidc_cfg)) = oidc {
-                        secret_exec = secret_exec.with_oidc(
-                            issuer,
-                            oidc_cfg.issuer_url.clone(),
-                            oidc_cfg.audience.clone(),
-                        );
+                        secret_exec = secret_exec
+                            .with_oidc(
+                                issuer,
+                                oidc_cfg.issuer_url.clone(),
+                                oidc_cfg.audience.clone(),
+                            )
+                            .with_oidc_token_max_ttl(oidc_cfg.token_max_ttl_secs);
                         tracing::info!("per-run OIDC token injection enabled (ADR-0015)");
                     }
                     secret_exec

@@ -49,6 +49,9 @@ pub struct SecretInjectingExecutor {
     /// The OIDC issuer + token audience (ADR-0015). `None` = no token minted.
     oidc: Option<(Arc<dyn scarab_identity::OidcIssuer>, String)>,
     issuer_url: String,
+    /// The longest an OIDC token lives, in seconds: a Step's token lives for
+    /// its timeout, at most this long, and this long when it has no timeout.
+    oidc_max_ttl_secs: u32,
     /// Org Environment governance (ADR-0071). `None` = no launch-time
     /// re-check (a hand-built executor; `main.rs` wires it).
     governance: Option<Arc<dyn scarab_project::EnvironmentGovernanceStore>>,
@@ -552,9 +555,20 @@ fn step_admit_input(
     Ok(value)
 }
 
-/// Per-attempt OIDC token TTL (ADR-0015: short-lived by design — long enough
-/// for the cloud exchange at step start, not the step's whole runtime).
-const OIDC_TOKEN_TTL_SECS: i64 = 15 * 60;
+/// The default cap on a step OIDC token's lifetime (`SCARAB_OIDC_TOKEN_MAX_TTL_SECS`).
+/// A token lives as long as its Step may run, so a cloud SDK that reads the
+/// token file again later in the step still gets a valid one; there is no
+/// refresh.
+pub const DEFAULT_OIDC_TOKEN_MAX_TTL_SECS: u32 = 3_600;
+
+/// How long a Step's token lives: its timeout, capped at `max_secs`, and
+/// `max_secs` when it has no timeout.
+fn oidc_token_ttl_secs(timeout_seconds: Option<u32>, max_secs: u32) -> i64 {
+    let ttl = timeout_seconds
+        .filter(|t| *t > 0)
+        .map_or(max_secs, |t| t.min(max_secs));
+    i64::from(ttl)
+}
 
 /// How far before now a token's `iat` and `nbf` are set, so a cloud whose
 /// clock runs up to this far behind the server's still accepts the token.
@@ -574,6 +588,7 @@ impl SecretInjectingExecutor {
             logs,
             oidc: None,
             issuer_url: String::new(),
+            oidc_max_ttl_secs: DEFAULT_OIDC_TOKEN_MAX_TTL_SECS,
             governance: None,
             libraries: None,
             clock: Arc::new(crate::SystemClock),
@@ -692,6 +707,13 @@ impl SecretInjectingExecutor {
         self
     }
 
+    /// Cap a step OIDC token's lifetime at `secs` (default
+    /// [`DEFAULT_OIDC_TOKEN_MAX_TTL_SECS`]).
+    pub fn with_oidc_token_max_ttl(mut self, secs: u32) -> Self {
+        self.oidc_max_ttl_secs = secs;
+        self
+    }
+
     /// Mint the per-attempt token for `step`, if the issuer is configured.
     /// A Run with a deploy context gets the Environment subject
     /// (org/project/env/ref). A Run bound to no Environment gets the subject
@@ -701,6 +723,7 @@ impl SecretInjectingExecutor {
     async fn mint_oidc_token(
         &self,
         step: &StepRun,
+        timeout_seconds: Option<u32>,
         ctx: Option<&scarab_engine::DeployContext>,
         admission: StepAdmission,
         now_ms: i64,
@@ -787,7 +810,8 @@ impl SecretInjectingExecutor {
             git_ref,
             sha: trigger_field("sha"),
             issued_at: now_ms / 1000 - OIDC_CLOCK_SKEW_SECS,
-            expires_at: now_ms / 1000 + OIDC_TOKEN_TTL_SECS,
+            expires_at: now_ms / 1000
+                + oidc_token_ttl_secs(timeout_seconds, self.oidc_max_ttl_secs),
         };
         let jwt = issuer
             .issue(claims)
@@ -956,7 +980,7 @@ impl Executor for SecretInjectingExecutor {
             .await
             .map_err(|e| ExecError::Other(e.to_string()))?;
         let oidc_token = self
-            .mint_oidc_token(step, ctx.as_ref(), admission, now_ms)
+            .mint_oidc_token(step, spec.timeout_seconds, ctx.as_ref(), admission, now_ms)
             .await?;
         // The token is mounted into the step container. The value ledger
         // records it from the final spec before the backend writes it.
