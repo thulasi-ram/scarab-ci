@@ -577,6 +577,12 @@ the repository, issued API tokens included, with no confirmation step. The
 release that adds Fork Run approval is stricter: an API token cannot release
 the gate itself, and its owner confirms each release.
 
+A later release also adds `extensions` to plugin manifests. 0.8.4 reads and
+keeps the field of an installation that release made, so the org's plugin list
+still loads after a rollback, but it does not act on it: such a plugin gets no
+endpoint and no trust tier on 0.8.4. 0.8.4 refuses to install, or upgrade to, a
+manifest that declares `extensions`.
+
 ### Upgrading from 0.8.2: gate notes
 
 Migration 0110 adds two nullable columns to `attempts`, `gate_note` and

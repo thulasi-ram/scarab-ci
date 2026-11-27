@@ -679,6 +679,7 @@ mod tests {
                 connections: vec![],
                 config_keys: vec!["ARGOCD_UI_URL".into()],
                 gates: Default::default(),
+                extensions: None,
             },
             manifest_sha256: "f".repeat(64),
             source: None,
