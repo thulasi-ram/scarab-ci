@@ -10525,6 +10525,51 @@ mod tests {
         assert!(errs.iter().any(|e| e.contains(refused)), "{errs:?}");
     }
 
+    /// A Run IR written by the release that adds Fork Run approval (ADR-0086
+    /// §9) loads here: `OriginEntry` is strict, so without the kind the whole
+    /// IR is refused and the Run cannot be read after a rollback. Its gate
+    /// is never an Environment approval gate, marked or not; a gate added by
+    /// an Environment, or one with no origin, still counts when unmarked.
+    #[test]
+    fn a_fork_run_approval_gate_decodes_and_is_never_an_environment_approval_gate() {
+        let gate = |kind: Option<&str>, mark: Option<bool>| -> StepSpec {
+            let mut step = json!({ "id": "g", "gate": "manual" });
+            if let Some(kind) = kind {
+                step["origin"] = json!([{ "kind": kind, "name": "n", "content_hash": "" }]);
+            }
+            if let Some(mark) = mark {
+                step["environment_approval_gate"] = json!(mark);
+            }
+            let ir =
+                json!({ "steps": [step, { "id": "ship", "image": "busybox", "needs": ["g"] }] });
+            let ir: PipelineIr = serde_json::from_value(ir)
+                .unwrap_or_else(|e| panic!("kind {kind:?} mark {mark:?}: {e}"));
+            ir.steps[0].clone()
+        };
+        // (origin kind, mark, is the fork gate, counts as an Environment approval gate)
+        for (kind, mark, fork, counts) in [
+            (Some("fork_run_approval_gate"), None, true, false),
+            (Some("fork_run_approval_gate"), Some(true), true, false),
+            (Some("fork_run_approval_gate"), Some(false), true, false),
+            (Some("environment"), None, false, true),
+            (None, None, false, true),
+            (None, Some(false), false, false),
+        ] {
+            let g = gate(kind, mark);
+            assert_eq!(g.is_fork_run_approval_gate(), fork, "{kind:?} {mark:?}");
+            assert_eq!(
+                g.counts_as_environment_approval_gate(),
+                counts,
+                "{kind:?} {mark:?}"
+            );
+        }
+        // The const code reads a stored IR with is the kind's wire name.
+        assert_eq!(
+            serde_json::to_value(OriginKind::ForkRunApprovalGate).unwrap(),
+            json!(FORK_RUN_APPROVAL_GATE_KIND)
+        );
+    }
+
     #[test]
     fn an_invoke_step_carries_when_timeout_resources_and_placement() {
         let lib = r#"

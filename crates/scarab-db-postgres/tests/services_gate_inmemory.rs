@@ -568,3 +568,84 @@ async fn a_dead_lettered_run_tears_down_its_shared_services() {
         ServiceStatus::TornDown
     );
 }
+
+/// A Run of fork code waiting at its Fork Run approval gate (ADR-0086 §9,
+/// read by this release, written by the next) starts none of its shared
+/// services until the gate is released; a rejected gate starts none at all.
+/// Every other Run starts them at Run start as before, one waiting at an
+/// Environment's gate included.
+#[tokio::test]
+async fn shared_services_wait_only_for_a_fork_run_approval_gate() {
+    // (case, the gate's origin kind, the gate's status, the service starts)
+    for (case, kind, gate_status, starts) in [
+        ("no gate", None, None, true),
+        (
+            "fork gate waiting",
+            Some("fork_run_approval_gate"),
+            Some(StepStatus::Pending),
+            false,
+        ),
+        (
+            "fork gate released",
+            Some("fork_run_approval_gate"),
+            Some(StepStatus::Succeeded),
+            true,
+        ),
+        (
+            "fork gate rejected",
+            Some("fork_run_approval_gate"),
+            Some(StepStatus::Failed),
+            false,
+        ),
+        (
+            "Environment gate waiting",
+            Some("environment"),
+            Some(StepStatus::Pending),
+            true,
+        ),
+    ] {
+        let db = InMemoryDb::new();
+        let run = RunId("run-1".into());
+        db.create_run(&run, 2, 1, Timestamp(0)).await.unwrap();
+        let steps = match kind {
+            Some(kind) => json!([
+                { "id": "approve", "gate": "manual",
+                  "origin": [{ "kind": kind, "name": "n", "content_hash": "" }] },
+                { "id": "test", "image": "busybox", "uses": ["db"], "needs": ["approve"] }
+            ]),
+            None => json!([{ "id": "test", "image": "busybox", "uses": ["db"] }]),
+        };
+        db.store_run_ir(&run, &ir_with_db_service(steps))
+            .await
+            .unwrap();
+        if let Some(status) = gate_status {
+            db.seed_step(&run, &StepId("approve".into()), status, None);
+        }
+        db.seed_step(
+            &run,
+            &StepId("test".into()),
+            StepStatus::Pending,
+            Some(spec(&["db"])),
+        );
+        db.seed_run(&run, RunStatus::Running);
+
+        let clock = FakeClock::new(0);
+        let exec = FakeExecutor::new();
+        let sched = Scheduler::new(&db, &clock, &exec, "drv");
+        sched.reconcile_services(&run).await.unwrap();
+
+        let handle = FakeExecutor::service_handle("run-1", 1, "db");
+        let rows = db.run_services(&run).await.unwrap();
+        if starts {
+            assert_eq!(exec.launched_services(), vec![handle.0], "{case}");
+            assert_eq!(
+                service(&rows, 1, "db").status,
+                ServiceStatus::Starting,
+                "{case}"
+            );
+        } else {
+            assert!(exec.launched_services().is_empty(), "{case}");
+            assert!(rows.is_empty(), "{case}: a service row was born: {rows:?}");
+        }
+    }
+}
