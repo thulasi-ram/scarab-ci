@@ -290,7 +290,7 @@ async fn retrying_a_rejected_gate_opens_a_fresh_wait_with_no_approvals() {
     seed(&pg, &run, "manual", true).await;
 
     // An approval of the first wait (recorded, not enough to release) ...
-    record_gate_approval(pg.as_ref(), &FakeClock::new(1_500), &run, &g, "alice")
+    record_gate_approval(pg.as_ref(), &FakeClock::new(1_500), &run, &g, "alice", None)
         .await
         .unwrap();
     assert_eq!(

@@ -178,7 +178,7 @@ async fn an_approval_given_before_an_upstream_rerun_does_not_carry_into_the_next
     assert_eq!(step_of(&db, "build").await.status, StepStatus::Succeeded);
     assert!(step_of(&db, "approve").await.attempts.is_empty());
 
-    record_gate_approval(&db, &clock, &run_id(), &g, "alice")
+    record_gate_approval(&db, &clock, &run_id(), &g, "alice", None)
         .await
         .unwrap();
 

@@ -227,7 +227,8 @@ async fn a_rejected_gate_shows_its_verdict_reason_and_who(w: World) {
         &rid("ra"),
         &id("approve"),
         "amy",
-        "wrong build"
+        "wrong build",
+        None
     )
     .await
     .unwrap());

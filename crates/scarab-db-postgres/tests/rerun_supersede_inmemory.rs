@@ -125,7 +125,7 @@ async fn rerun_supersedes_in_flight_descendant_pod() {
     let events = db.events(&run).await.unwrap();
     assert!(
         events.iter().any(|e| matches!(&e.kind,
-            EventPayload::AttemptSuperseded { step, attempt, by }
+            EventPayload::AttemptSuperseded { step, attempt, by, .. }
                 if step == &c && attempt == &a1 && by.as_deref() == Some("alice"))),
         "AttemptSuperseded event appended with attribution"
     );
@@ -435,7 +435,7 @@ async fn rerun_captures_descendant_that_raced_into_running() {
     let events = db.events(&run).await.unwrap();
     assert!(
         events.iter().any(|e| matches!(&e.kind,
-            EventPayload::AttemptSuperseded { step, attempt, by }
+            EventPayload::AttemptSuperseded { step, attempt, by, .. }
                 if step == &c && attempt == &a1 && by.as_deref() == Some("alice"))),
         "AttemptSuperseded recorded for the raced attempt"
     );
@@ -730,7 +730,7 @@ async fn cancelled_attempt_survives_teardown_induced_lost() {
     // The human cancels the run: c → Cancelled, a1 stamped Cancelled, run →
     // Cancelled, and a CANCEL_ATTEMPT teardown naming a1 is enqueued.
     let clock = FakeClock::new(1_000);
-    let cancelled = cancel_run_request(&db, &clock, &run, Some("alice".to_string()))
+    let cancelled = cancel_run_request(&db, &clock, &run, Some("alice".to_string()), None)
         .await
         .expect("cancel_run_request");
     assert!(cancelled, "an in-flight run is cancellable");

@@ -3465,6 +3465,7 @@ impl Db for InMemoryDb {
                 reason: "released".to_string(),
                 expired: false,
                 by: None,
+                via: None,
                 fence: None,
                 legacy_started_at: at,
                 at,

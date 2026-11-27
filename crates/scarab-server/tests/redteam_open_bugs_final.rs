@@ -461,7 +461,7 @@ async fn a_unit_created_by_a_failed_launch_is_torn_down_after_a_cancel(w: World)
     );
     assert!(w.pending("launch:ra/bump/a1").await, "precondition");
 
-    assert!(cancel_run_request(&*w.db, &w.clock, &rid("ra"), None)
+    assert!(cancel_run_request(&*w.db, &w.clock, &rid("ra"), None, None)
         .await
         .unwrap());
     w.ticks(7).await;
@@ -528,7 +528,7 @@ async fn a_launch_in_flight_across_the_cancel_is_waited_out(w: World) {
         w.exec.during_next_launch(Box::new(move || {
             Box::pin(async move {
                 let clock = FakeClock::new(T0);
-                assert!(cancel_run_request(&*db, &clock, &rid("ra"), None)
+                assert!(cancel_run_request(&*db, &clock, &rid("ra"), None, None)
                     .await
                     .unwrap());
                 Scheduler::new(&*db, &clock, &*exec, "replica-b")
@@ -571,7 +571,7 @@ async fn a_launch_outliving_the_teardown_ceiling_is_still_torn_down(w: World) {
         w.exec.during_next_launch(Box::new(move || {
             Box::pin(async move {
                 let clock = FakeClock::new(T0);
-                assert!(cancel_run_request(&*db, &clock, &rid("ra"), None)
+                assert!(cancel_run_request(&*db, &clock, &rid("ra"), None, None)
                     .await
                     .unwrap());
                 let b =
@@ -615,7 +615,7 @@ async fn a_stale_services_cancel_spares_the_reruns_services(w: World) {
     w.exec
         .mark_service_ready(&FakeExecutor::service_handle("rs", 1, "db"));
     w.running_on("rs", "test", "a1").await;
-    assert!(cancel_run_request(&*w.db, &w.clock, &rid("rs"), None)
+    assert!(cancel_run_request(&*w.db, &w.clock, &rid("rs"), None, None)
         .await
         .unwrap());
     // The services teardown hits one k8s blip: the CANCEL_RUN stays pending.
@@ -655,11 +655,11 @@ both!(a_stale_services_cancel_spares_the_reruns_services);
 async fn a_resent_cancel_enqueues_one_services_teardown(w: World) {
     w.seed_plain("rp").await;
     w.running_on("rp", "build", "a1").await;
-    assert!(cancel_run_request(&*w.db, &w.clock, &rid("rp"), None)
+    assert!(cancel_run_request(&*w.db, &w.clock, &rid("rp"), None, None)
         .await
         .unwrap());
     assert!(
-        !cancel_run_request(&*w.db, &w.clock, &rid("rp"), Some("amy".into()))
+        !cancel_run_request(&*w.db, &w.clock, &rid("rp"), Some("amy".into()), None)
             .await
             .unwrap()
     );
@@ -674,7 +674,7 @@ async fn a_resent_cancel_enqueues_one_services_teardown(w: World) {
         .await
         .unwrap();
     w.running_on("rp", "build", "a2").await;
-    assert!(cancel_run_request(&*w.db, &w.clock, &rid("rp"), None)
+    assert!(cancel_run_request(&*w.db, &w.clock, &rid("rp"), None, None)
         .await
         .unwrap());
     let rows =
@@ -697,7 +697,7 @@ both!(a_resent_cancel_enqueues_one_services_teardown);
 async fn an_old_replica_finds_no_services_teardown_under_its_cancel_kind(w: World) {
     w.seed_plain("ru").await;
     w.running_on("ru", "build", "a1").await;
-    assert!(cancel_run_request(&*w.db, &w.clock, &rid("ru"), None)
+    assert!(cancel_run_request(&*w.db, &w.clock, &rid("ru"), None, None)
         .await
         .unwrap());
 
@@ -770,7 +770,7 @@ async fn an_attempt_minted_after_its_cancel_is_not_left_running(w: World) {
             .await
             .unwrap();
     assert!(claimed.iter().any(|s| s.step == id("build")));
-    assert!(cancel_run_request(&*w.db, &w.clock, &rid("rp"), None)
+    assert!(cancel_run_request(&*w.db, &w.clock, &rid("rp"), None, None)
         .await
         .unwrap());
     w.ticks(3).await;
@@ -799,7 +799,7 @@ both!(an_attempt_minted_after_its_cancel_is_not_left_running);
 // the step's LATEST attempt and the legacy drain skips it.
 // ---------------------------------------------------------------------------
 async fn old_binary_cancel(w: &World) {
-    assert!(cancel_run_request(&*w.db, &w.clock, &rid("rp"), None)
+    assert!(cancel_run_request(&*w.db, &w.clock, &rid("rp"), None, None)
         .await
         .unwrap());
     // An old binary wrote neither new row: retire them unprocessed.
@@ -941,7 +941,7 @@ async fn a_redelivered_start_post_after_a_cancel_is_retired(w: World) {
     drain_forge_statuses(&flaky, &*w.db, "x", 100, lease, "http://s")
         .await
         .unwrap();
-    assert!(cancel_run_request(&*w.db, &w.clock, &rid("rp"), None)
+    assert!(cancel_run_request(&*w.db, &w.clock, &rid("rp"), None, None)
         .await
         .unwrap());
     let healthy = FakeForge::new();

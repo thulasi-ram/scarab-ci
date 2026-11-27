@@ -434,6 +434,7 @@ async fn a_run_a_person_cancels_first_is_not_marked_superseded() {
                     clock2.as_ref(),
                     &run,
                     Some("alice".into()),
+                    None,
                 )
                 .await
                 .expect("cancel");

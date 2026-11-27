@@ -1478,7 +1478,16 @@ pub(crate) async fn yank_library(
     Path(org): Path<String>,
     Json(body): Json<YankLibraryRequest>,
 ) -> Result<Json<LibraryYankDto>, ApiError> {
-    let by = org_caller(&st, &headers, &org, Action::Administer).await?;
+    let caller = crate::authorize_scoped_caller(
+        &st,
+        &headers,
+        Action::Administer,
+        Some(&rbac_scope(&org, None)),
+    )
+    .await?;
+    // The Runs the yank cancels record how the request arrived (ADR-0086 §6).
+    let via = caller.delegation_trail();
+    let by = caller.principal.subject;
     check_hash(&body.content_hash)?;
     let reason = body.reason.trim();
     if reason.is_empty() || reason.len() > MAX_REASON_BYTES {
@@ -1506,8 +1515,14 @@ pub(crate) async fn yank_library(
     if body.cancel_runs {
         for r in yank_impact(&st, &y.org, &y.content_hash).await?.runs {
             let run = scarab_engine::RunId(r.id.clone());
-            match scarab_engine::cancel_run_request(&*st.db, &*st.clock, &run, Some(by.clone()))
-                .await
+            match scarab_engine::cancel_run_request(
+                &*st.db,
+                &*st.clock,
+                &run,
+                Some(by.clone()),
+                via.clone(),
+            )
+            .await
             {
                 Ok(true) => dto.cancelled_runs.push(r.id),
                 Ok(false) => {}

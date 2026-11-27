@@ -3807,8 +3807,9 @@ async fn rerun_step(
     let scope = run_scope(&st, &run).await;
     // Bind the principal (ADR-0056): a rerun is a Take boundary and the
     // event it emits carries WHO pressed it — the same attribution pattern as
-    // gate approval.
-    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
+    // gate approval — and how the request arrived (ADR-0086 §6).
+    let caller = authorize_scoped_caller(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let via = caller.delegation_trail();
     let oracle = snapshot_oracle(&st);
     // The EXECUTED plan comes back as the body (git-bug 4afaa3e): the preview →
     // confirm window is a real TOCTOU (a snapshot can expire between the two),
@@ -3821,7 +3822,8 @@ async fn rerun_step(
             oracle.as_deref(),
             &run,
             &StepId(step),
-            Some(principal.subject),
+            Some(caller.principal.subject),
+            via,
         )
         .await,
     )?;
@@ -3869,7 +3871,8 @@ async fn retry_step(
 ) -> Result<(StatusCode, Json<RerunPlanResponse>), ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
-    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let caller = authorize_scoped_caller(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let via = caller.delegation_trail();
     let oracle = snapshot_oracle(&st);
     let plan = rerun_outcome(
         scarab_engine::retry_step_widened(
@@ -3878,7 +3881,8 @@ async fn retry_step(
             oracle.as_deref(),
             &run,
             &StepId(step),
-            Some(principal.subject),
+            Some(caller.principal.subject),
+            via,
         )
         .await,
     )?;
@@ -4055,9 +4059,16 @@ async fn pin_run_snapshots(
 ) -> Result<Json<SnapshotRetentionDto>, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
-    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
-    if !scarab_engine::pin_run_snapshots(&*st.db, &*st.clock, &run, Some(principal.subject.clone()))
-        .await?
+    let caller = authorize_scoped_caller(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let via = caller.delegation_trail();
+    if !scarab_engine::pin_run_snapshots(
+        &*st.db,
+        &*st.clock,
+        &run,
+        Some(caller.principal.subject),
+        via,
+    )
+    .await?
     {
         return Err(ApiError::NotFound);
     }
@@ -4082,12 +4093,14 @@ async fn unpin_run_snapshots(
 ) -> Result<Json<SnapshotRetentionDto>, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
-    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let caller = authorize_scoped_caller(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let via = caller.delegation_trail();
     if !scarab_engine::unpin_run_snapshots(
         &*st.db,
         &*st.clock,
         &run,
-        Some(principal.subject.clone()),
+        Some(caller.principal.subject),
+        via,
     )
     .await?
     {
@@ -4132,12 +4145,19 @@ async fn cancel_run(
 ) -> Result<StatusCode, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
-    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let caller = authorize_scoped_caller(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let via = caller.delegation_trail();
     let Some(status) = st.db.run_status(&run).await? else {
         return Err(ApiError::NotFound);
     };
-    match scarab_engine::cancel_run_request(&*st.db, &*st.clock, &run, Some(principal.subject))
-        .await
+    match scarab_engine::cancel_run_request(
+        &*st.db,
+        &*st.clock,
+        &run,
+        Some(caller.principal.subject),
+        via,
+    )
+    .await
     {
         Ok(true) => Ok(StatusCode::ACCEPTED),
         Ok(false) => {
@@ -12866,6 +12886,18 @@ impl Caller {
         }
     }
 
+    /// How this caller's writes arrived (ADR-0086 §6): the PrincipalToken
+    /// that authenticated it, or `None` for a session.
+    fn delegation_trail(&self) -> Option<scarab_engine::DelegationTrail> {
+        self.grant
+            .as_ref()
+            .map(|token| scarab_engine::DelegationTrail {
+                token_id: token.id.clone(),
+                token_kind: token.kind.as_str().to_string(),
+                oauth_client: token.oauth_client.clone(),
+            })
+    }
+
     /// Refuse a token that carries an ApiOperation list (ADR-0086 §5, §6)
     /// on a request whose route's operation is not in it, or whose route
     /// names no operation at all: fail-closed, so a route the guard did not
@@ -13166,13 +13198,28 @@ async fn authorize_scoped(
     action: Action,
     scope: Option<&scarab_identity::Scope>,
 ) -> Result<Principal, ApiError> {
+    Ok(authorize_scoped_caller(st, headers, action, scope)
+        .await?
+        .principal)
+}
+
+/// [`authorize_scoped`], answering the whole [`Caller`]: what a write that
+/// records how it arrived needs ([`Caller::delegation_trail`], ADR-0086 §6),
+/// and what a decision that depends on the credential needs (a token never
+/// approves a Gate by itself).
+async fn authorize_scoped_caller(
+    st: &AppState,
+    headers: &HeaderMap,
+    action: Action,
+    scope: Option<&scarab_identity::Scope>,
+) -> Result<Caller, ApiError> {
     let caller = authenticate(st, headers, action).await?;
     if caller.may_globally(action) {
-        return Ok(caller.principal);
+        return Ok(caller);
     }
     if let Some(scope) = scope {
         if caller.may(st, action, scope).await? {
-            return Ok(caller.principal);
+            return Ok(caller);
         }
     }
     Err(ApiError::Forbidden)
@@ -13319,7 +13366,8 @@ async fn approve_gate(
 ) -> Result<Response, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
-    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let caller = authorize_scoped_caller(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let principal = caller.principal.clone();
     let step = StepId(step);
 
     // 0. The governing Environment's effective rules for this Project
@@ -13507,6 +13555,7 @@ async fn approve_gate(
         &run,
         &step,
         &principal.subject,
+        caller.delegation_trail(),
     )
     .await
     {
@@ -13746,7 +13795,7 @@ async fn reject_gate(
 ) -> Result<Response, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
-    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let caller = authorize_scoped_caller(&st, &headers, Action::Write, scope.as_ref()).await?;
     let req: RejectGateRequest = serde_json::from_slice(&body)
         .map_err(|e| ApiError::BadRequest(format!("bad reject body: {e}")))?;
     let reason = gate_reject_reason(&req.reason)?;
@@ -13756,8 +13805,9 @@ async fn reject_gate(
             st.clock.as_ref(),
             &run,
             &StepId(step),
-            &principal.subject,
+            &caller.principal.subject,
             reason,
+            caller.delegation_trail(),
         )
         .await,
     )?;
@@ -13928,6 +13978,7 @@ async fn release_gate_external(
                 &step,
                 &format!("external:{}", step.0),
                 reason,
+                None,
             )
             .await,
         )?;

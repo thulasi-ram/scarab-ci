@@ -56,9 +56,9 @@ const TIMEOUT_BACKSTOP_GRACE_MS: i64 = 60_000;
 pub const PROVISIONING_DEADLINE_SECS: u32 = 30 * 60;
 use crate::{
     ports::WorkspaceSnapshots, Attempt, AttemptFrontier, AttemptId, AttemptOutcome, AttemptStamp,
-    Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, ExecError, Executor,
-    FailureKind, GateResolution, OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec,
-    StepStatus, Timestamp, TransitionError, EVENT_VERSION,
+    Clock, ConcurrencyPolicy, Db, DbError, DelegationTrail, EventKind, EventPayload, ExecError,
+    Executor, FailureKind, GateResolution, OutboxMessage, RunId, RunStatus, StepId, StepRun,
+    StepSpec, StepStatus, Timestamp, TransitionError, EVENT_VERSION,
 };
 
 /// Outbox `kind` for "launch this step".
@@ -634,6 +634,7 @@ pub async fn pin_run_snapshots(
     clock: &dyn Clock,
     run: &RunId,
     by: Option<String>,
+    via: Option<DelegationTrail>,
 ) -> Result<bool, DbError> {
     let now = clock.now().await;
     if !db.pin_run_snapshots(run, by.as_deref(), now).await? {
@@ -642,7 +643,7 @@ pub async fn pin_run_snapshots(
     db.append_event(&EventKind {
         version: EVENT_VERSION,
         run: run.clone(),
-        kind: EventPayload::RunSnapshotsPinned { by },
+        kind: EventPayload::RunSnapshotsPinned { by, via },
         at: now,
     })
     .await?;
@@ -656,6 +657,7 @@ pub async fn unpin_run_snapshots(
     clock: &dyn Clock,
     run: &RunId,
     by: Option<String>,
+    via: Option<DelegationTrail>,
 ) -> Result<bool, DbError> {
     if !db.unpin_run_snapshots(run).await? {
         return Ok(false);
@@ -664,7 +666,7 @@ pub async fn unpin_run_snapshots(
     db.append_event(&EventKind {
         version: EVENT_VERSION,
         run: run.clone(),
-        kind: EventPayload::RunSnapshotsUnpinned { by },
+        kind: EventPayload::RunSnapshotsUnpinned { by, via },
         at: now,
     })
     .await?;
@@ -707,7 +709,7 @@ pub async fn rerun_step(
     target: &StepId,
     by: Option<String>,
 ) -> Result<(), RerunError> {
-    rerun_step_widened(db, clock, None, run, target, by)
+    rerun_step_widened(db, clock, None, run, target, by, None)
         .await
         .map(|_| ())
 }
@@ -733,6 +735,7 @@ pub async fn rerun_step_widened(
     run: &RunId,
     target: &StepId,
     by: Option<String>,
+    via: Option<DelegationTrail>,
 ) -> Result<RerunPlan, RerunError> {
     ensure_creation_finished(db, run).await?;
     let steps = db.steps_of_run(run).await?;
@@ -767,6 +770,7 @@ pub async fn rerun_step_widened(
             invalidated: plan.invalidated.clone(),
             by: by.clone(),
             widened: plan.widened.clone(),
+            via: via.clone(),
         },
         at: now,
     })
@@ -791,7 +795,7 @@ pub async fn rerun_step_widened(
         }
     }
 
-    rearm_invalidation_set(db, clock, run, target, &plan, &steps, by).await?;
+    rearm_invalidation_set(db, clock, run, target, &plan, &steps, by, via).await?;
     Ok(plan)
 }
 
@@ -809,7 +813,7 @@ pub async fn retry_step(
     target: &StepId,
     by: Option<String>,
 ) -> Result<(), RerunError> {
-    retry_step_widened(db, clock, None, run, target, by)
+    retry_step_widened(db, clock, None, run, target, by, None)
         .await
         .map(|_| ())
 }
@@ -825,6 +829,7 @@ pub async fn retry_step_widened(
     run: &RunId,
     target: &StepId,
     by: Option<String>,
+    via: Option<DelegationTrail>,
 ) -> Result<RerunPlan, RerunError> {
     ensure_creation_finished(db, run).await?;
     let steps = db.steps_of_run(run).await?;
@@ -858,12 +863,13 @@ pub async fn retry_step_widened(
             invalidated: plan.invalidated.clone(),
             by: by.clone(),
             widened: plan.widened.clone(),
+            via: via.clone(),
         },
         at: now,
     })
     .await?;
 
-    rearm_invalidation_set(db, clock, run, target, &plan, &steps, by).await?;
+    rearm_invalidation_set(db, clock, run, target, &plan, &steps, by, via).await?;
     Ok(plan)
 }
 
@@ -890,6 +896,7 @@ fn blocking_dep(step: &StepRun, steps: &[StepRun]) -> Option<StepId> {
 /// Shared by rerun ([`rerun_step`]) and retry ([`retry_step`]); the caller has
 /// already emitted the boundary/attribution event (and, for rerun, bumped the
 /// service generation).
+#[allow(clippy::too_many_arguments)] // the re-arm's arguments plus who acted and how
 async fn rearm_invalidation_set(
     db: &dyn Db,
     clock: &dyn Clock,
@@ -898,6 +905,7 @@ async fn rearm_invalidation_set(
     plan: &RerunPlan,
     steps: &[StepRun],
     by: Option<String>,
+    via: Option<DelegationTrail>,
 ) -> Result<(), RerunError> {
     // The set to re-arm comes from the PLAN, not from a second `invalidation_set`
     // call: the plan is what was recorded on the boundary event and (for a widened
@@ -943,19 +951,28 @@ async fn rearm_invalidation_set(
         // Pod, so nothing joins the teardown intent.
         if invalid.contains(&s.step) && s.status == StepStatus::Pending {
             if let Some(a) = open_gate_attempt(s) {
-                let closed =
-                    supersede_gate_attempt(db, clock, run, &s.step, &a.id, by.as_deref()).await?;
+                let closed = supersede_gate_attempt(
+                    db,
+                    clock,
+                    run,
+                    &s.step,
+                    &a.id,
+                    by.as_deref(),
+                    via.as_ref(),
+                )
+                .await?;
                 if !closed {
                     // The wait ended under us — the gate resolved between the
                     // snapshot and now (or a cancel closed it). A resolved gate
                     // is terminal, so re-arm it from its LIVE status, exactly
                     // like a step that raced past the snapshot.
-                    rearm_raced_step(db, clock, run, target, &s.step, by.as_deref()).await?;
+                    rearm_raced_step(db, clock, run, target, &s.step, by.as_deref(), via.as_ref())
+                        .await?;
                 }
             }
         }
         if invalid.contains(&s.step) && s.status != StepStatus::Pending {
-            match commit_rearm(db, clock, run, target, s, by.as_deref()).await {
+            match commit_rearm(db, clock, run, target, s, by.as_deref(), via.as_ref()).await {
                 Ok(()) => {}
                 // TOCTOU (orphan fix): the optimistic `from` came from a stale
                 // snapshot. A descendant may have raced Pending/Ready→Running
@@ -965,7 +982,8 @@ async fn rearm_invalidation_set(
                 // Re-read the live row and re-arm from its ACTUAL status,
                 // capturing an in-flight attempt for teardown.
                 Err(DbError::Conflict) => {
-                    rearm_raced_step(db, clock, run, target, &s.step, by.as_deref()).await?;
+                    rearm_raced_step(db, clock, run, target, &s.step, by.as_deref(), via.as_ref())
+                        .await?;
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -1027,6 +1045,7 @@ async fn commit_rearm(
     target: &StepId,
     s: &StepRun,
     by: Option<&str>,
+    via: Option<&DelegationTrail>,
 ) -> Result<(), DbError> {
     let now = clock.now().await;
     let mut events = vec![event(
@@ -1061,6 +1080,7 @@ async fn commit_rearm(
                     step: s.step.clone(),
                     attempt: a.id.clone(),
                     by: by.map(str::to_string),
+                    via: via.cloned(),
                 },
                 now,
             ));
@@ -1107,6 +1127,7 @@ async fn rearm_raced_step(
     target: &StepId,
     step: &StepId,
     by: Option<&str>,
+    via: Option<&DelegationTrail>,
 ) -> Result<(), RerunError> {
     for _ in 0..8 {
         let live = db.steps_of_run(run).await?;
@@ -1116,7 +1137,7 @@ async fn rearm_raced_step(
         if s.status == StepStatus::Pending {
             return Ok(());
         }
-        match commit_rearm(db, clock, run, target, s, by).await {
+        match commit_rearm(db, clock, run, target, s, by, via).await {
             Ok(()) => return Ok(()),
             Err(DbError::Conflict) => continue,
             Err(e) => return Err(e.into()),
@@ -1163,7 +1184,7 @@ pub async fn release_gate(
         expired: false,
     };
     // Already resolved (or never gated) — exactly-once: do not resume again.
-    if !resolve_gate(db, clock, run, gate, &verdict, None, None).await? {
+    if !resolve_gate(db, clock, run, gate, &verdict, None, None, None).await? {
         return Ok(());
     }
     reopen_if_runnable(db, clock, run).await
@@ -1192,6 +1213,7 @@ pub async fn reject_gate(
     step: &StepId,
     by: &str,
     reason: &str,
+    via: Option<DelegationTrail>,
 ) -> Result<bool, RerunError> {
     ensure_creation_finished(db, run).await?;
     let steps = db.steps_of_run(run).await?;
@@ -1218,7 +1240,17 @@ pub async fn reject_gate(
         reason: reason.to_string(),
         expired: false,
     };
-    let resolved = resolve_gate(db, clock, run, gate, &verdict, Some(by.to_string()), None).await?;
+    let resolved = resolve_gate(
+        db,
+        clock,
+        run,
+        gate,
+        &verdict,
+        Some(by.to_string()),
+        via,
+        None,
+    )
+    .await?;
     if resolved {
         reopen_if_runnable(db, clock, run).await?;
     }
@@ -1359,6 +1391,7 @@ pub async fn resolve_plugin_gate(
         reason,
         expired: false,
         by: Some(releaser.to_string()),
+        via: None,
         fence: Some(attempt.clone()),
         legacy_started_at: now,
         at: now,
@@ -1512,7 +1545,7 @@ pub fn gate_approvers(events: &[EventKind], step: &StepId) -> Vec<String> {
         .map_or(0, |i| i + 1);
     let mut seen: Vec<String> = Vec::new();
     for e in &events[from..] {
-        if let EventPayload::GateApproved { step: s, by } = &e.kind {
+        if let EventPayload::GateApproved { step: s, by, .. } = &e.kind {
             if s == step && !seen.contains(by) {
                 seen.push(by.clone());
             }
@@ -1665,6 +1698,7 @@ pub fn wait_began_at(events: &[EventKind], gate: &StepRun, now: Timestamp) -> Ti
 /// writes nothing.
 ///
 /// Returns whether this call resolved it.
+#[allow(clippy::too_many_arguments)] // the verdict's arguments plus who decided and how
 async fn resolve_gate(
     db: &dyn Db,
     clock: &dyn Clock,
@@ -1672,6 +1706,7 @@ async fn resolve_gate(
     gate: &StepRun,
     verdict: &GateVerdict,
     by: Option<String>,
+    via: Option<DelegationTrail>,
     fence: Option<AttemptId>,
 ) -> Result<bool, DbError> {
     let now = clock.now().await;
@@ -1686,6 +1721,7 @@ async fn resolve_gate(
         reason: verdict.reason.clone(),
         expired: verdict.expired,
         by,
+        via,
         fence,
         legacy_started_at,
         at: now,
@@ -1708,6 +1744,7 @@ async fn supersede_gate_attempt(
     step: &StepId,
     attempt: &AttemptId,
     by: Option<&str>,
+    via: Option<&DelegationTrail>,
 ) -> Result<bool, DbError> {
     let now = clock.now().await;
     let event = EventKind {
@@ -1717,6 +1754,7 @@ async fn supersede_gate_attempt(
             step: step.clone(),
             attempt: attempt.clone(),
             by: by.map(str::to_string),
+            via: via.cloned(),
         },
         at: now,
     };
@@ -1854,6 +1892,7 @@ pub async fn record_gate_approval(
     run: &RunId,
     step: &StepId,
     by: &str,
+    via: Option<DelegationTrail>,
 ) -> Result<(), RerunError> {
     ensure_creation_finished(db, run).await?;
     // The target must be a known step (404 otherwise) ...
@@ -1903,6 +1942,7 @@ pub async fn record_gate_approval(
         kind: EventPayload::GateApproved {
             step: step.clone(),
             by: by.to_string(),
+            via,
         },
         at: now,
     })
@@ -1921,6 +1961,7 @@ pub async fn cancel_run_request(
     clock: &dyn Clock,
     run: &RunId,
     by: Option<String>,
+    via: Option<DelegationTrail>,
 ) -> Result<bool, SchedulerError> {
     let Some(current) = db.run_status(run).await? else {
         return Ok(false);
@@ -1947,7 +1988,7 @@ pub async fn cancel_run_request(
     db.append_event(&EventKind {
         version: EVENT_VERSION,
         run: run.clone(),
-        kind: EventPayload::RunCancelRequested { by },
+        kind: EventPayload::RunCancelRequested { by, via },
         at: now,
     })
     .await?;
@@ -4670,7 +4711,7 @@ impl<'a> Scheduler<'a> {
                 .all(|d| status_by_id.get(d).copied() == Some(StepStatus::Succeeded));
             if !reached {
                 if let Some(a) = open_gate_attempt(gate) {
-                    supersede_gate_attempt(self.db, self.clock, run, &gate.step, &a.id, None)
+                    supersede_gate_attempt(self.db, self.clock, run, &gate.step, &a.id, None, None)
                         .await?;
                 }
                 continue;
@@ -4726,6 +4767,7 @@ impl<'a> Scheduler<'a> {
                             run,
                             gate,
                             &verdict,
+                            None,
                             None,
                             Some(attempt.id.clone()),
                         )
@@ -4785,6 +4827,7 @@ impl<'a> Scheduler<'a> {
                     run,
                     gate,
                     &verdict,
+                    None,
                     None,
                     Some(attempt.id.clone()),
                 )
@@ -6002,6 +6045,7 @@ mod tests {
             invalidated: vec![StepId("build".into()), gate.clone()],
             by: None,
             widened: vec![],
+            via: None,
         }));
         assert!(!skipped_as_unneeded(&events, &gate), "a rerun re-armed it");
 

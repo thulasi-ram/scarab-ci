@@ -255,7 +255,7 @@ async fn the_impact_counts_runs_in_progress_and_a_yank_can_cancel_them() {
             .unwrap()
             .into_iter()
             .filter_map(|e| match e.kind {
-                EventPayload::RunCancelRequested { by } => Some(by),
+                EventPayload::RunCancelRequested { by, .. } => Some(by),
                 _ => None,
             })
             .collect();

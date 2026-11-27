@@ -74,7 +74,7 @@ async fn approving_a_skipped_gate_is_rejected_and_records_nothing() {
         .await
         .unwrap();
 
-    let err = record_gate_approval(&db, &clock, &run, &gate, "alice")
+    let err = record_gate_approval(&db, &clock, &run, &gate, "alice", None)
         .await
         .expect_err("approving a skipped gate must be rejected");
     match err {
@@ -109,7 +109,7 @@ async fn approving_a_released_gate_is_rejected() {
         .await
         .unwrap();
 
-    let err = record_gate_approval(&db, &clock, &run, &gate, "alice")
+    let err = record_gate_approval(&db, &clock, &run, &gate, "alice", None)
         .await
         .expect_err("approving a released gate must be rejected");
     assert!(matches!(err, RerunError::GateNotPending { .. }));
@@ -132,13 +132,13 @@ async fn approving_a_pending_gate_works_and_is_idempotent() {
     db.set_step_gate(&run, &gate, "manual", None).await.unwrap();
     // Left Pending (awaiting approval).
 
-    record_gate_approval(&db, &clock, &run, &gate, "alice")
+    record_gate_approval(&db, &clock, &run, &gate, "alice", None)
         .await
         .expect("a pending gate accepts an approval");
     assert_eq!(gate_approved_count(&db, &run).await, 1);
 
     // Idempotent: same principal again is a no-op.
-    record_gate_approval(&db, &clock, &run, &gate, "alice")
+    record_gate_approval(&db, &clock, &run, &gate, "alice", None)
         .await
         .expect("duplicate approval is a no-op, not an error");
     assert_eq!(
@@ -163,7 +163,7 @@ async fn approving_a_non_gate_step_distinguishes_from_unknown() {
         .await
         .unwrap();
 
-    let err = record_gate_approval(&db, &clock, &run, &build, "alice")
+    let err = record_gate_approval(&db, &clock, &run, &build, "alice", None)
         .await
         .expect_err("approving a non-gate step must be rejected");
     match err {
@@ -173,7 +173,7 @@ async fn approving_a_non_gate_step_distinguishes_from_unknown() {
 
     // An unknown step is still a genuine 404-mapped StepNotFound.
     let ghost = StepId("ghost".into());
-    let err = record_gate_approval(&db, &clock, &run, &ghost, "alice")
+    let err = record_gate_approval(&db, &clock, &run, &ghost, "alice", None)
         .await
         .expect_err("approving an unknown step must be StepNotFound");
     assert!(matches!(err, RerunError::StepNotFound(s) if s == ghost));
@@ -196,7 +196,7 @@ async fn operator_cancel_emits_attributed_request_event() {
         .await
         .unwrap();
 
-    let cancelled = cancel_run_request(&db, &clock, &run, Some("alice".to_string()))
+    let cancelled = cancel_run_request(&db, &clock, &run, Some("alice".to_string()), None)
         .await
         .expect("cancel a non-terminal run");
     assert!(cancelled, "a non-terminal run is cancellable");
@@ -207,7 +207,7 @@ async fn operator_cancel_emits_attributed_request_event() {
         .unwrap()
         .into_iter()
         .find_map(|e| match e.kind {
-            EventPayload::RunCancelRequested { by } => Some(by),
+            EventPayload::RunCancelRequested { by, .. } => Some(by),
             _ => None,
         })
         .expect("an operator cancel emits a RunCancelRequested event");
@@ -219,7 +219,7 @@ async fn operator_cancel_emits_attributed_request_event() {
 
     // Idempotent: a second cancel of the now-terminal run is a no-op (no second
     // request event).
-    let again = cancel_run_request(&db, &clock, &run, Some("alice".to_string()))
+    let again = cancel_run_request(&db, &clock, &run, Some("alice".to_string()), None)
         .await
         .expect("re-cancel is a no-op, not an error");
     assert!(!again, "a terminal run reports nothing to cancel");

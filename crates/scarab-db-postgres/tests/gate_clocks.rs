@@ -311,6 +311,7 @@ fn resolution(passed: bool, fence: Option<&str>, at: i64) -> GateResolution {
         reason: if passed { "released" } else { "no" }.to_string(),
         expired: false,
         by: None,
+        via: None,
         fence: fence.map(|f| AttemptId(f.into())),
         legacy_started_at: Timestamp(2_000),
         at: Timestamp(at),
@@ -461,6 +462,7 @@ async fn scenario_superseded_fence(db: &dyn Db, run: &RunId) {
             step: id("approve"),
             attempt: a1.clone(),
             by: None,
+            via: None,
         },
         at: Timestamp(3_500),
     };
@@ -508,9 +510,11 @@ async fn scenario_cancel_after_mint(db: &dyn Db, run: &RunId) {
     .unwrap()
     .unwrap();
     let clock = FakeClock::new(4_000);
-    assert!(cancel_run_request(db, &clock, run, Some("alice".into()))
-        .await
-        .unwrap());
+    assert!(
+        cancel_run_request(db, &clock, run, Some("alice".into()), None)
+            .await
+            .unwrap()
+    );
     let gate = gate_row(db, run).await;
     assert_eq!(gate.status, StepStatus::Cancelled);
     assert_eq!(gate.attempts.len(), 1);
