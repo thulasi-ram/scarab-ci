@@ -180,12 +180,11 @@ git revision Argo synced; for a multi-source Application it
 is each source's revision, in the order of `spec.sources`, joined by commas. The run fails when
 the gate expires. See [Plugin gates](/scarab-ci/usage/pipeline-syntax/#plugin-gates).
 
-While the gate waits, the Run page shows only "waiting for its plugin". The plugin writes why it
-is waiting to its own log, once each time the reason changes, as an `argocd: gate waiting` line
-with the gate and the reason. Examples: `awaiting auto-sync`; the images the manifests render when
-none is `image`; Argo's error, such as a `ComparisonError`, while Argo CD cannot compare the
-Application (sync status `Unknown`). Read it with
-`kubectl logs -n scarab-plugins deploy/<the installation's Deployment>`.
+While the gate waits, the Run page says why, after "waiting for its plugin": for example
+`awaiting auto-sync`, the images the manifests render when none is `image`, or Argo's error, such
+as a `ComparisonError`, while Argo CD cannot compare the Application (sync status `Unknown`). The
+plugin updates it each time the reason changes, and writes the same reason to its own log as an
+`argocd: gate waiting` line.
 
 To see what the plugin asked Argo CD for, open **Settings → Plugins**, then the installation's page,
 and read its **Broker journal**. It lists each request the broker forwarded or refused in the last 14 days,

@@ -247,6 +247,9 @@ describe("gateWaitHint", () => {
 
   it("says a plugin gate waits for its plugin, which no person can pass", () => {
     expect(gateWaitHint(gate("live", "pending", "plugin", ["bump"]), statusOf)).toBe("waiting for its plugin");
+    // The plugin's latest note says why (shown as text).
+    const noted = { ...gate("live", "pending", "plugin", ["bump"]), gate_note: { note: "awaiting auto-sync", at: 1 } };
+    expect(gateWaitHint(noted, statusOf)).toBe("waiting for its plugin · awaiting auto-sync");
     expect(isApprovable(gate("live", "pending", "plugin"))).toBe(false);
   });
 });

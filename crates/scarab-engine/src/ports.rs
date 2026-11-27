@@ -957,6 +957,28 @@ pub trait Db: Send + Sync {
         attempt: &AttemptId,
     ) -> Result<Option<serde_json::Value>, DbError>;
 
+    /// Store `note` on gate `step`'s wait `attempt` while that wait is open
+    /// (the Attempt `Running`), replacing any earlier note: why the releasing
+    /// plugin has not answered yet, shown on the Run page. Not journalled;
+    /// not leader-fenced (a plugin's API call writes it). Returns whether the
+    /// wait was open.
+    async fn set_gate_wait_note(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        note: &str,
+        at: Timestamp,
+    ) -> Result<bool, DbError>;
+
+    /// The note last stored on gate `step`'s wait `attempt`, and when.
+    async fn gate_wait_note(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<(String, Timestamp)>, DbError>;
+
     /// The open waits of `plugin` gates released by `releaser` in Runs of org
     /// `org` (ADR-0076 §7): the gate `Pending`, its last Attempt `Running`
     /// with its inputs stored. Ordered by [`PendingGateKey`], those after

@@ -3951,6 +3951,16 @@ export interface components {
             /** @description `string`, `boolean`, `number` or `choice` (inputs only). */
             type: string;
         };
+        /** @description A plugin's latest note on its gate's open wait. */
+        GateNoteDto: {
+            /**
+             * Format: int64
+             * @description Unix-ms the note was stored.
+             */
+            at: number;
+            /** @description Text the plugin wrote, at most 1024 bytes. Shown as plain text. */
+            note: string;
+        };
         /** @description One output a plugin gate returns on release. */
         GateOutputDto: {
             name: string;
@@ -6494,6 +6504,7 @@ export interface components {
              *     gate holds only the steps that need it.
              */
             gate?: string | null;
+            gate_note?: null | components["schemas"]["GateNoteDto"];
             gate_resolution?: null | components["schemas"]["GateResolutionDto"];
             id: string;
             /**

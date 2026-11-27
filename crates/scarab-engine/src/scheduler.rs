@@ -1376,6 +1376,49 @@ pub async fn resolve_plugin_gate(
     Ok(resolved)
 }
 
+/// Store `releaser`'s note on plugin gate `step` of `run`: why its open wait
+/// `attempt` is not answered yet (git-bug 9f76ee1). The same ownership and
+/// wait checks as [`resolve_plugin_gate`] (a gate that is not the caller's
+/// is [`PluginGateError::NotFound`]; a closed or superseded wait is
+/// [`PluginGateError::NotWaiting`]), and nothing else: a note never moves
+/// the gate. The caller checks the Run's org and the note's size.
+pub async fn note_plugin_gate(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    run: &RunId,
+    step: &StepId,
+    releaser: &str,
+    attempt: &AttemptId,
+    note: &str,
+) -> Result<(), PluginGateError> {
+    let steps = db.steps_of_run(run).await?;
+    let Some(gate) = steps
+        .iter()
+        .find(|s| &s.step == step && s.gate_kind.as_deref() == Some("plugin"))
+    else {
+        return Err(PluginGateError::NotFound);
+    };
+    if !releases_plugin_gate(db, run, step, releaser).await? {
+        return Err(PluginGateError::NotFound);
+    }
+    if gate.status != StepStatus::Pending || !gate_reached(gate, &steps) {
+        return Err(PluginGateError::NotWaiting("it has no open wait".into()));
+    }
+    let open = open_gate_attempt(gate)
+        .ok_or_else(|| PluginGateError::NotWaiting("it has no open wait".into()))?;
+    if &open.id != attempt {
+        return Err(PluginGateError::NotWaiting(format!(
+            "its open wait is `{}`, not `{}`",
+            open.id.0, attempt.0
+        )));
+    }
+    let now = clock.now().await;
+    if !db.set_gate_wait_note(run, step, attempt, note, now).await? {
+        return Err(PluginGateError::NotWaiting("it has no open wait".into()));
+    }
+    Ok(())
+}
+
 /// Reopen a `Suspended` run once something besides gate waits is outstanding
 /// (a gate just resolved). A run that still has only gate waits stays
 /// suspended — it bills no budget — and the next tick reopens it if needed.

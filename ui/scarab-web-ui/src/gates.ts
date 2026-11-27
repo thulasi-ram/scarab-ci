@@ -91,7 +91,15 @@ export type GateResolutionLike = {
 export type GateStatusLike = GateLike & {
   attempt_list?: { id: string }[];
   gate_resolution?: GateResolutionLike | null;
+  /** A waiting plugin gate: why its plugin has not answered yet. */
+  gate_note?: { note: string; at: number } | null;
 };
+
+/** What a waiting plugin gate shows: its plugin's latest note, when it
+ * posted one. */
+export function pluginGateWaitText(s: Pick<GateStatusLike, "gate_note">): string {
+  return s.gate_note?.note ? `waiting for its plugin · ${s.gate_note.note}` : "waiting for its plugin";
+}
 
 /** The tone a status line renders with, and its text. */
 export type GateStatus = { tone: "passed" | "failed" | "waiting"; text: string };
@@ -187,7 +195,7 @@ export function gateWaitHint(
     case "external":
       return "waiting for an external release";
     case "plugin":
-      return "waiting for its plugin";
+      return pluginGateWaitText(s);
     default:
       return "waiting for a decision";
   }

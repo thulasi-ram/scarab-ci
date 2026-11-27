@@ -18,8 +18,26 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Security
+
+- **A Run started by hand at a fork's commit gets the fork limits.** A manual or API dispatch at
+  `refs/pull/<n>/head` of a pull request from another repository, or at a commit no branch or tag
+  of the repository points at, read and ran the fork's own pipeline with none of the limits a
+  fork's pull request gets. Scarab now decides on the commit the forge resolved: it is the
+  repository's code only when a branch or tag of the repository, or the head of a pull request
+  from one of its branches, points at it. Anything else runs as fork code (no secrets, the
+  `env=none` OIDC subject, a read-only clone token, no build push), whoever started it. When the
+  forge cannot say, the dispatch is refused. `HEAD` means the default branch (git-bug 14be9e3,
+  ADR-0086 §9).
+
 ### Features
 
+- **The Run page says why a plugin gate waits.** A plugin can post a note on its gate's open wait
+  (`POST /v1/runs/{id}/gates/{step}/note` on the broker listener, `{"attempt", "note"}`, at most
+  1024 bytes), and the Run page shows the latest one after "waiting for its plugin". It never moves
+  the gate. The Argo CD plugin posts why `wait-live` still waits (`awaiting auto-sync`, the images
+  the manifests render, Argo's `ComparisonError`) each time the reason changes. See
+  [Deploying with Argo CD](/scarab-ci/usage/deploying-with-argo-cd/#waiting-with-the-argo-cd-plugin).
 - **Plugin Pods on tainted nodes.** The chart's `plugins.tolerations` and `plugins.nodeSelector`
   (server: `SCARAB_PLUGIN_PLACEMENT`) go on every plugin Pod and on the isolation probe's Pods.
   Before, on a cluster whose every node is tainted, the probe's Pods stayed Pending and no plugin
@@ -50,20 +68,7 @@ release.yml uses that version's section as the GitHub Release text. See
 - **Argo CD plugin: why a `wait-live` gate waits is now logged.** The plugin worked out the reason
   every pass but dropped it, so neither the Run page nor the plugin's log said why a gate was still
   open. It now logs an `argocd: gate waiting` line with the gate and the reason each time the
-  reason changes. The Run page still shows only "waiting for its plugin". See
-  [Deploying with Argo CD](/scarab-ci/usage/deploying-with-argo-cd/#waiting-with-the-argo-cd-plugin).
-
-### Security
-
-- **A Run started by hand at a fork's commit gets the fork limits.** A manual or API dispatch at
-  `refs/pull/<n>/head` of a pull request from another repository, or at a commit no branch or tag
-  of the repository points at, read and ran the fork's own pipeline with none of the limits a
-  fork's pull request gets. Scarab now decides on the commit the forge resolved: it is the
-  repository's code only when a branch or tag of the repository, or the head of a pull request
-  from one of its branches, points at it. Anything else runs as fork code (no secrets, the
-  `env=none` OIDC subject, a read-only clone token, no build push), whoever started it. When the
-  forge cannot say, the dispatch is refused. `HEAD` means the default branch (git-bug 14be9e3,
-  ADR-0086 §9).
+  reason changes.
 
 ## [0.8.2] - 2026-11-26
 

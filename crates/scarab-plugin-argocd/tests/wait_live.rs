@@ -248,6 +248,24 @@ impl World {
             .status
     }
 
+    /// The note the plugin last posted on `step`'s open wait.
+    async fn note(&self, step: &str) -> Option<String> {
+        let step_run = self
+            .pg
+            .steps_of_run(&self.run)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.step.0 == step)
+            .unwrap();
+        let attempt = step_run.attempts.last()?.id.clone();
+        self.pg
+            .gate_wait_note(&self.run, &step_run.step, &attempt)
+            .await
+            .unwrap()
+            .map(|(note, _)| note)
+    }
+
     async fn finish(self) {
         let _ = std::fs::remove_file(&self.token_file);
         for r in self.fake.requests() {
@@ -268,6 +286,9 @@ async fn wait_live_releases_the_gate_once_argo_reports_the_image_live() {
     let report = standby::gates_once(&w.broker, &w.api).await.unwrap();
     assert_eq!(report.waiting, [key.clone()], "{report:?}");
     assert_eq!(w.status("live").await, StepStatus::Pending);
+    // Why it waits reaches the Run page (git-bug 9f76ee1).
+    let first = w.note("live").await.expect("a note on the open wait");
+    assert_eq!(Some(&first), report.waiting_why.get(&key), "{report:?}");
 
     // Synced and healthy, but at another image: still waiting.
     let mut other = spec("Synced", "Healthy", None);
@@ -275,6 +296,12 @@ async fn wait_live_releases_the_gate_once_argo_reports_the_image_live() {
     w.fake.put_app("argocd", "payments-api", other);
     let report = standby::gates_once(&w.broker, &w.api).await.unwrap();
     assert_eq!(report.waiting, [key.clone()], "{report:?}");
+    let second = w.note("live").await.expect("a note on the open wait");
+    assert!(
+        second.contains("ghcr.io/acme/payments-api:1.4.1"),
+        "{second}"
+    );
+    assert_ne!(first, second, "a new reason replaces the note");
 
     // Live at the image: released with the synced revision.
     w.fake

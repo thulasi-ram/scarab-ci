@@ -803,3 +803,168 @@ async fn a_person_can_reject_a_plugin_gate_but_not_pass_it() {
     );
     w.tdb.cleanup().await;
 }
+
+async fn note(
+    app: &axum::Router,
+    run: &RunId,
+    step: &str,
+    token: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    call(
+        app,
+        "POST",
+        &format!("/v1/runs/{}/gates/{}/note", run.0, step.replace('/', "%2F")),
+        Some(token),
+        Some(body),
+    )
+    .await
+}
+
+/// The step `step` of `GET /v1/runs/{id}`.
+async fn run_step(w: &World, step: &str) -> Value {
+    let (status, run) = call(
+        &w.public,
+        "GET",
+        &format!("/v1/runs/{}", w.run.0),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{run}");
+    run["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == step)
+        .unwrap_or_else(|| panic!("no step {step}: {run}"))
+        .clone()
+}
+
+/// git-bug 9f76ee1: a plugin says why its gate still waits, and the Run
+/// page shows the latest note. Only on its own open wait; a note never
+/// moves the gate, and it goes once the wait is answered.
+#[tokio::test]
+async fn a_plugin_notes_why_its_own_gate_waits_and_the_run_shows_it() {
+    let Some(w) = world(PIPELINE, None, true).await else {
+        return;
+    };
+    let (_, page) = pending(&w.broker, "acme", &w.prod, "").await;
+    let live = attempt_of(&page, "live");
+    let (_, page) = pending(&w.broker, "acme", &w.stage, "").await;
+    let stage = attempt_of(&page, "stage");
+
+    let (status, body) = note(
+        &w.broker,
+        &w.run,
+        "live",
+        &w.prod,
+        json!({ "attempt": live, "note": "awaiting auto-sync" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, _) = note(
+        &w.broker,
+        &w.run,
+        "live",
+        &w.prod,
+        json!({ "attempt": live, "note": "  synced and healthy, but renders web:1.0  " }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let step = run_step(&w, "live").await;
+    assert_eq!(
+        step["gate_note"]["note"], "synced and healthy, but renders web:1.0",
+        "the latest note, trimmed: {step}"
+    );
+    assert_eq!(step["gate_note"]["at"], CLOCK_START_MS);
+    assert!(run_step(&w, "stage").await.get("gate_note").is_none());
+    assert_eq!(
+        status_of(w.pg.as_ref(), &w.run, "live").await,
+        StepStatus::Pending,
+        "a note never moves the gate"
+    );
+
+    // Not the caller's gate: another installation's, a manual gate, another
+    // org's installation of the same name. The same 404 as no gate.
+    for (step, token, attempt) in [
+        ("stage", &w.prod, stage.as_str()),
+        ("approve", &w.prod, "a1"),
+        ("live", &w.other_org_prod, live.as_str()),
+    ] {
+        let (status, _) = note(
+            &w.broker,
+            &w.run,
+            step,
+            token,
+            json!({ "attempt": attempt, "note": "x" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{step}");
+    }
+    // Another wait: 409. A note out of bounds or a field it does not know:
+    // 400. No token: 401.
+    let (status, _) = note(
+        &w.broker,
+        &w.run,
+        "live",
+        &w.prod,
+        json!({ "attempt": "a9", "note": "x" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    for body in [
+        json!({ "attempt": live, "note": "  " }),
+        json!({ "attempt": live, "note": "x".repeat(1025) }),
+        json!({ "attempt": live, "note": "a\u{0}b" }),
+        json!({ "attempt": live, "note": "x", "passed": true }),
+    ] {
+        let (status, _) = note(&w.broker, &w.run, "live", &w.prod, body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    let (status, _) = call(
+        &w.broker,
+        "POST",
+        &format!("/v1/runs/{}/gates/live/note", w.run.0),
+        None,
+        Some(json!({ "attempt": live, "note": "x" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // Only the broker listener serves it.
+    let (status, _) = note(
+        &w.public,
+        &w.run,
+        "live",
+        &w.prod,
+        json!({ "attempt": live, "note": "x" }),
+    )
+    .await;
+    assert!(status.is_client_error() && status != StatusCode::NO_CONTENT);
+    assert_eq!(
+        run_step(&w, "live").await["gate_note"]["note"],
+        "synced and healthy, but renders web:1.0"
+    );
+
+    // Answered: the note is gone from the Run, and no new one is taken.
+    let (status, body) = release(
+        &w.broker,
+        &w.run,
+        "live",
+        &w.prod,
+        json!({ "attempt": live, "passed": true, "outputs": { "revision": "abc" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert!(run_step(&w, "live").await.get("gate_note").is_none());
+    let (status, _) = note(
+        &w.broker,
+        &w.run,
+        "live",
+        &w.prod,
+        json!({ "attempt": live, "note": "late" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    w.tdb.cleanup().await;
+}

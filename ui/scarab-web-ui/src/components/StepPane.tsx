@@ -68,7 +68,7 @@ import {
   type LogFollower,
   type StoreState,
 } from "../log-stream";
-import { approvalReleaseIn, type GateStatus } from "../gates";
+import { approvalReleaseIn, pluginGateWaitText, type GateStatus } from "../gates";
 import { clock, clockLow, expiryPercent, isYankRefusal, pluginGateState } from "../run-origin";
 import { shortHash } from "../libraries";
 import { idSegments } from "../dag-layout";
@@ -844,7 +844,7 @@ export default function StepPane(props: {
               >
                 {pluginGateState(s()) === "killed"
                   ? "waiting for its plugin · the plugin is killed"
-                  : "waiting for its plugin"}
+                  : pluginGateWaitText(s())}
               </div>
             </Show>
             <Show when={yankRefusal()}>
