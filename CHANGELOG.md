@@ -18,6 +18,19 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Security
+
+- **A dispatch records the kind of ref it ran.** A manual or API dispatch at a bare name such as
+  `release/x` was recorded as the branch `refs/heads/release/x` even when the name was a tag.
+  Anyone who could push a tag could create `release/x` on their own commit and pass an
+  Environment's `allowed_refs` for `refs/heads/release/*`. Scarab now looks the name up: a branch
+  is recorded as `refs/heads/<name>`, a tag as `refs/tags/<name>`, and the Run runs that ref's
+  commit. A name that is both a branch and a tag is refused with a 400 that asks for
+  `refs/heads/<name>` or `refs/tags/<name>`. A name that is neither, such as a short commit SHA,
+  is recorded as the full commit SHA, which no branch or tag pattern matches. `HEAD` is recorded
+  as the default branch, `refs/heads/<default>`, instead of `refs/heads/HEAD`
+  ([Runs](/scarab-ci/usage/runs/)).
+
 ### Enhancement
 
 - **A manual or API dispatch asks the forge for one ref.** Deciding whether the dispatched commit
