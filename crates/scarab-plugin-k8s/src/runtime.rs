@@ -397,7 +397,8 @@ impl K8sPluginRuntime {
         installation
             .validate()
             .map_err(|e| RuntimeError::Invalid(e.to_string()))?;
-        let name = objects::workload_name(&installation.id);
+        let sa_name = objects::service_account_name(&installation.id);
+        let name = objects::deployment_name(installation);
         if let Some(storage) = &installation.storage {
             let claim = self
                 .namespaced::<PersistentVolumeClaim>()
@@ -410,7 +411,7 @@ impl K8sPluginRuntime {
                 storage,
                 claim.as_ref(),
             ) {
-                self.scale_to_zero(&name).await?;
+                self.scale_all_to_zero(&installation.id).await?;
                 return Err(RuntimeError::Storage(why));
             }
         }
@@ -419,9 +420,38 @@ impl K8sPluginRuntime {
             installation,
         ));
         self.namespaced::<ServiceAccount>()
-            .patch(&name, &Self::apply_params(), &Patch::Apply(&sa))
+            .patch(&sa_name, &Self::apply_params(), &Patch::Apply(&sa))
             .await
             .map_err(kube_err)?;
+        // A Deployment of this installation under another name — the
+        // `plugin-<id>` of earlier releases, or a name from before a rename
+        // of the installation — is deleted first, and the new one is applied
+        // only once it is gone (foreground deletion keeps it listed until its
+        // Pods are), so two instances never run at once. The next pass
+        // applies the new one.
+        let stale: Vec<String> = self
+            .deployments_of(&installation.id)
+            .await?
+            .into_iter()
+            .filter_map(|d| d.metadata.name)
+            .filter(|n| *n != name)
+            .collect();
+        if !stale.is_empty() {
+            for old in &stale {
+                gone_is_fine(
+                    self.namespaced::<Deployment>()
+                        .delete(old, &DeleteParams::foreground())
+                        .await,
+                )?;
+            }
+            tracing::info!(
+                installation = %installation.id,
+                old = ?stale,
+                new = %name,
+                "plugin workload renamed: the old Deployment is deleted first"
+            );
+            return Ok(());
+        }
         let mut deployment = self.stamped(objects::deployment(
             &self.config.namespace,
             installation,
@@ -453,13 +483,15 @@ impl K8sPluginRuntime {
     /// security-relevant half, so a failed scale-down (or the reverse) must
     /// never leave it valid. Errors are combined, and the next pass retries.
     pub async fn stop(&self, installation_id: &str) -> Result<(), RuntimeError> {
-        let name = objects::workload_name(installation_id);
         let revoked = gone_is_fine(
             self.namespaced::<ServiceAccount>()
-                .delete(&name, &DeleteParams::default())
+                .delete(
+                    &objects::service_account_name(installation_id),
+                    &DeleteParams::default(),
+                )
                 .await,
         );
-        let scaled_down = self.scale_to_zero(&name).await;
+        let scaled_down = self.scale_all_to_zero(installation_id).await;
         // `gone_is_fine` already says "kubernetes: …"; keep it said once.
         let detail = |e: RuntimeError| match e {
             RuntimeError::Kube(m) => m,
@@ -485,21 +517,43 @@ impl K8sPluginRuntime {
     /// while one someone scaled back up or re-created is stopped again
     /// (git-bug da0af59).
     pub async fn is_stopped(&self, installation_id: &str) -> Result<bool, RuntimeError> {
-        let name = objects::workload_name(installation_id);
         let service_account = self
             .namespaced::<ServiceAccount>()
-            .get_opt(&name)
+            .get_opt(&objects::service_account_name(installation_id))
             .await
             .map_err(kube_err)?;
-        let deployment = self
+        let replicas: Vec<Option<i32>> = self
+            .deployments_of(installation_id)
+            .await?
+            .into_iter()
+            .map(|d| d.spec.and_then(|s| s.replicas))
+            .collect();
+        Ok(already_stopped(service_account.is_some(), &replicas))
+    }
+
+    /// Every Deployment of one installation, by its label (whatever its
+    /// name), of this release.
+    async fn deployments_of(&self, installation_id: &str) -> Result<Vec<Deployment>, RuntimeError> {
+        let owner = self.config.owner.as_deref();
+        Ok(self
             .namespaced::<Deployment>()
-            .get_opt(&name)
+            .list(&ListParams::default().labels(&format!("{LABEL_INSTALLATION}={installation_id}")))
             .await
-            .map_err(kube_err)?;
-        Ok(already_stopped(
-            service_account.is_some(),
-            deployment.map(|d| d.spec.and_then(|s| s.replicas)),
-        ))
+            .map_err(kube_err)?
+            .items
+            .into_iter()
+            .filter(|d| owned_by(d.metadata.labels.as_ref(), owner))
+            .collect())
+    }
+
+    /// Scale every Deployment of one installation to zero; none is fine.
+    async fn scale_all_to_zero(&self, installation_id: &str) -> Result<(), RuntimeError> {
+        for d in self.deployments_of(installation_id).await? {
+            if let Some(name) = d.metadata.name {
+                self.scale_to_zero(&name).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Scale the Deployment `name` to zero; a missing one is fine.
@@ -524,15 +578,21 @@ impl K8sPluginRuntime {
     /// Uninstall: delete the Deployment (its Pods with it) and the
     /// ServiceAccount.
     pub async fn uninstall(&self, installation_id: &str) -> Result<(), RuntimeError> {
-        let name = objects::workload_name(installation_id);
-        gone_is_fine(
-            self.namespaced::<Deployment>()
-                .delete(&name, &DeleteParams::background())
-                .await,
-        )?;
+        for d in self.deployments_of(installation_id).await? {
+            if let Some(name) = d.metadata.name {
+                gone_is_fine(
+                    self.namespaced::<Deployment>()
+                        .delete(&name, &DeleteParams::background())
+                        .await,
+                )?;
+            }
+        }
         gone_is_fine(
             self.namespaced::<ServiceAccount>()
-                .delete(&name, &DeleteParams::default())
+                .delete(
+                    &objects::service_account_name(installation_id),
+                    &DeleteParams::default(),
+                )
                 .await,
         )
     }
@@ -552,8 +612,16 @@ impl K8sPluginRuntime {
             .map_err(kube_err)?
             .items
         {
+            // By label: a Deployment's name is for people, not keyed.
             if owned_by(d.metadata.labels.as_ref(), owner) {
-                ids.extend(id_of(d.metadata.name.as_deref()));
+                ids.extend(
+                    d.metadata
+                        .labels
+                        .as_ref()
+                        .and_then(|l| l.get(LABEL_INSTALLATION))
+                        .filter(|id| scarab_plugin::is_installation_id(id))
+                        .cloned(),
+                );
             }
         }
         for sa in self
@@ -576,7 +644,7 @@ impl K8sPluginRuntime {
         installation: &PluginInstallation,
     ) -> Result<WorkloadState, RuntimeError> {
         let installation_id = installation.id.as_str();
-        let name = objects::workload_name(installation_id);
+        let name = objects::deployment_name(installation);
         let Some(deployment) = self
             .namespaced::<Deployment>()
             .get_opt(&name)
@@ -861,10 +929,11 @@ fn policy_spec_drifted(applied: &NetworkPolicy, stored: &NetworkPolicy) -> bool 
 }
 
 /// Stopped means the token is revoked (no ServiceAccount) and nothing is
-/// scheduled: no Deployment (`None`), or one whose replicas are zero. A
-/// Deployment with no replicas field runs one.
-fn already_stopped(service_account: bool, deployment_replicas: Option<Option<i32>>) -> bool {
-    !service_account && deployment_replicas.map_or(true, |r| r == Some(0))
+/// scheduled: every Deployment of the installation (whatever its name; none
+/// at all is fine) has zero replicas. A Deployment with no replicas field
+/// runs one.
+fn already_stopped(service_account: bool, deployment_replicas: &[Option<i32>]) -> bool {
+    !service_account && deployment_replicas.iter().all(|r| *r == Some(0))
 }
 
 #[cfg(test)]
@@ -1103,17 +1172,20 @@ mod tests {
     /// counts as stopped; anything else is stopped again.
     #[test]
     fn stopped_means_no_service_account_and_nothing_scheduled() {
-        assert!(already_stopped(false, None));
-        assert!(already_stopped(false, Some(Some(0))));
+        assert!(already_stopped(false, &[]));
+        assert!(already_stopped(false, &[Some(0)]));
         assert!(
-            !already_stopped(true, Some(Some(0))),
+            !already_stopped(true, &[Some(0)]),
             "the token still verifies"
         );
-        assert!(!already_stopped(false, Some(Some(1))), "scaled back up");
+        assert!(!already_stopped(false, &[Some(1)]), "scaled back up");
         assert!(
-            !already_stopped(false, Some(None)),
+            !already_stopped(false, &[None]),
             "no replicas field runs one"
         );
-        assert!(!already_stopped(true, None));
+        assert!(!already_stopped(true, &[]));
+        // An old-named Deployment still running is not stopped.
+        assert!(!already_stopped(false, &[Some(0), Some(1)]));
+        assert!(already_stopped(false, &[Some(0), Some(0)]));
     }
 }

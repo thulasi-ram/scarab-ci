@@ -81,11 +81,55 @@ pub const PLUGIN_CPU_LIMIT: &str = "500m";
 /// How long a stopping Plugin Pod gets before the kubelet kills it.
 pub const PLUGIN_TERMINATION_GRACE_SECS: i64 = 5;
 
-/// The name of an installation's ServiceAccount AND Deployment:
-/// `plugin-<id>`. Keyed by id (never the name), so a reinstall under a new id
-/// cannot be reached with the old installation's tokens.
-pub fn workload_name(installation_id: &str) -> String {
+/// The name of an installation's ServiceAccount: `plugin-<id>`. Keyed by id
+/// (never the name), so a reinstall under a new id cannot be reached with the
+/// old installation's tokens. The broker reads the installation from it
+/// (TokenReview names the ServiceAccount), so it never changes shape.
+pub fn service_account_name(installation_id: &str) -> String {
     service_account_for(installation_id)
+}
+
+/// The prefix of every plugin Deployment's name.
+pub const DEPLOYMENT_PREFIX: &str = "scarab-plugin-";
+
+/// The longest Deployment name whose Pods keep their full name: a Pod is
+/// `<deployment>-<pod-template-hash, up to 10>-<5 random>`, and a Pod name
+/// longer than 63 characters is not a valid hostname.
+pub const MAX_DEPLOYMENT_NAME: usize = 63 - 17;
+
+/// The name of an installation's Deployment, for people reading `kubectl`:
+/// `scarab-plugin-<name, vowels dropped>-<id>`, e.g. `argocd-staging` with
+/// id `a987fb14ae` is `scarab-plugin-rgcd-stgng-a987fb14ae`. The id keeps it
+/// unique (installation names are unique within an org, not across orgs).
+/// Nothing is keyed by this name: the runtime finds an installation's
+/// Deployments by the [`LABEL_INSTALLATION`] label, and the broker by the
+/// ServiceAccount ([`service_account_name`]).
+pub fn deployment_name(installation: &PluginInstallation) -> String {
+    let room = MAX_DEPLOYMENT_NAME - DEPLOYMENT_PREFIX.len() - 1 - installation.id.len();
+    match name_abbreviation(&installation.name, room) {
+        abbreviation if abbreviation.is_empty() => {
+            format!("{DEPLOYMENT_PREFIX}{}", installation.id)
+        }
+        abbreviation => format!("{DEPLOYMENT_PREFIX}{abbreviation}-{}", installation.id),
+    }
+}
+
+/// An installation name with its vowels dropped, word by word (a word with
+/// nothing left is dropped too), cut to at most `max` characters, never
+/// ending in `-`. Digits are kept: `prod-eu-2` is `prd-2`.
+fn name_abbreviation(name: &str, max: usize) -> String {
+    let words: Vec<String> = name
+        .split('-')
+        .map(|word| {
+            word.chars()
+                .filter(|c| c.is_ascii_alphanumeric() && !"aeiou".contains(*c))
+                .collect::<String>()
+        })
+        .filter(|word| !word.is_empty())
+        .collect();
+    let mut joined = words.join("-");
+    joined.truncate(max);
+    joined.trim_end_matches('-').to_string()
 }
 
 /// The labels every object of one installation carries; the Deployment's
@@ -323,7 +367,7 @@ pub fn restricted_container_security_context() -> SecurityContext {
 pub fn service_account(namespace: &str, installation: &PluginInstallation) -> ServiceAccount {
     ServiceAccount {
         metadata: meta(
-            &workload_name(&installation.id),
+            &service_account_name(&installation.id),
             namespace,
             installation_labels(&installation.id),
         ),
@@ -386,7 +430,7 @@ pub fn deployment(
     broker_url: &str,
     probe_image: &str,
 ) -> Deployment {
-    let name = workload_name(&installation.id);
+    let name = deployment_name(installation);
     let mut pod_labels = installation_labels(&installation.id);
     pod_labels.insert(LABEL_PLUGIN_WORKLOAD.to_string(), "true".to_string());
     let mut annotations = BTreeMap::from([
@@ -475,7 +519,7 @@ pub fn deployment(
         // A killed or held Plugin is gone within seconds, not the default
         // 30 (git-bug da0af59).
         termination_grace_period_seconds: Some(PLUGIN_TERMINATION_GRACE_SECS),
-        service_account_name: Some(name.clone()),
+        service_account_name: Some(service_account_name(&installation.id)),
         automount_service_account_token: Some(false),
         enable_service_links: Some(false),
         security_context: Some(restricted_pod_security_context()),
@@ -693,6 +737,41 @@ mod tests {
     }
 
     #[test]
+    fn a_deployment_name_drops_vowels_keeps_digits_and_fits_a_pod_name() {
+        let named = |name: &str| {
+            deployment_name(&PluginInstallation {
+                name: name.into(),
+                id: "a987fb14ae".into(),
+                ..installation()
+            })
+        };
+        assert_eq!(
+            named("argocd-staging"),
+            "scarab-plugin-rgcd-stgng-a987fb14ae"
+        );
+        assert_eq!(named("prod-eu-2"), "scarab-plugin-prd-2-a987fb14ae");
+        // Nothing left of the name: the id alone.
+        assert_eq!(named("io-a"), "scarab-plugin-a987fb14ae");
+        // A long name is cut, never to a trailing `-`, and the Pod
+        // (`<deployment>-<hash>-<random>`) stays a valid hostname.
+        let long = named(&"bcd-".repeat(15).trim_end_matches('-').to_string());
+        assert!(long.len() <= MAX_DEPLOYMENT_NAME, "{long}");
+        assert!(
+            long.ends_with("-a987fb14ae") && !long.contains("--"),
+            "{long}"
+        );
+        for name in ["argocd-staging", "x", &"z".repeat(63)] {
+            let d = named(name);
+            assert!(d.len() + 17 <= 63, "{d}");
+            let dns_label = d
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                && !d.ends_with('-');
+            assert!(dns_label, "{d}");
+        }
+    }
+
+    #[test]
     fn the_service_account_has_no_token_automount() {
         let sa = service_account("scarab-plugins", &installation());
         assert_eq!(sa.metadata.name.as_deref(), Some("plugin-0123456789"));
@@ -707,7 +786,12 @@ mod tests {
     fn the_deployment_is_one_recreated_replica_as_its_own_service_account() {
         let d = deployment("scarab-plugins", &installation(), BROKER_URL, PROBE_IMAGE);
         let spec = d.spec.as_ref().unwrap();
-        assert_eq!(d.metadata.name.as_deref(), Some("plugin-0123456789"));
+        // A name people can read; the Pod still runs as `plugin-<id>`,
+        // the ServiceAccount the broker knows it by.
+        assert_eq!(
+            d.metadata.name.as_deref(),
+            Some("scarab-plugin-rgcd-prd-0123456789")
+        );
         assert_eq!(spec.replicas, Some(1));
         assert_eq!(
             spec.strategy.as_ref().unwrap().type_.as_deref(),

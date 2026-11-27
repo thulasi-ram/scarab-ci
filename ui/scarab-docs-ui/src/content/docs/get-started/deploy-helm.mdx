@@ -634,6 +634,10 @@ it belongs to. If you create the namespace yourself, give it the labels
 `pod-security.kubernetes.io/enforce=restricted` and
 `scarab.io/plugin-runtime-owner=<release namespace>.<release name>`. Scarab runs no plugin in a
 namespace labelled for another release, so two releases can't share one plugin namespace.
+Each installation runs as one Deployment named after it, with the vowels dropped and its id
+added: `argocd-staging` runs as `scarab-plugin-rgcd-stgng-<id>`. Its ServiceAccount is
+`plugin-<id>`. The isolation probe's Pods are named `scarab-probe-<role>-<id>`.
+
 If every node in your cluster is tainted, set `plugins.tolerations` and `plugins.nodeSelector`.
 Scarab puts them on every plugin Pod and on the isolation probe's Pods, so the probe checks the
 nodes plugins run on. Without a matching toleration the probe's Pods stay Pending and no plugin

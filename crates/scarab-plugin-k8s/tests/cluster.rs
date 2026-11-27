@@ -666,6 +666,75 @@ async fn a_workload_is_admitted_stopped_and_uninstalled() {
     .await;
 }
 
+/// A Deployment from before readable names (`plugin-<id>`) is deleted before
+/// the new `scarab-plugin-<name>-<id>` one is applied, never beside it, and
+/// the ServiceAccount keeps its name (the broker knows the plugin by it).
+#[tokio::test]
+#[ignore]
+async fn an_old_named_deployment_is_replaced_never_run_beside_the_new_one() {
+    enter_tier();
+    with_fixture(|f| async move {
+        let (runtime, pod_broker_url) = f.ready_runtime().await;
+        let inst = installation(&probe_image());
+        let deployments: Api<Deployment> = Api::namespaced(f.client.clone(), &f.plugins_ns);
+        // What an earlier release applied: the same Deployment under the
+        // old name, stamped for this release.
+        let mut old = scarab_plugin_k8s::objects::deployment(
+            &f.plugins_ns,
+            &inst,
+            &pod_broker_url,
+            &probe_image(),
+        );
+        old.metadata.name = Some("plugin-0123456789".to_string());
+        old.metadata
+            .labels
+            .get_or_insert_with(BTreeMap::new)
+            .insert(
+                scarab_plugin_k8s::LABEL_OWNER.to_string(),
+                TEST_OWNER.to_string(),
+            );
+        deployments
+            .create(&PostParams::default(), &old)
+            .await
+            .expect("the old-named Deployment");
+
+        let new_name = scarab_plugin_k8s::objects::deployment_name(&inst);
+        assert_eq!(new_name, "scarab-plugin-rgcd-prd-0123456789");
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            runtime
+                .ensure(&inst, &pod_broker_url)
+                .await
+                .expect("ensure");
+            let old_left = deployments.get_opt("plugin-0123456789").await.unwrap();
+            let new = deployments.get_opt(&new_name).await.unwrap();
+            assert!(
+                old_left.is_none() || new.is_none(),
+                "the old and the new Deployment exist at once"
+            );
+            if new.is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the new Deployment within 90s");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        let sas: Api<ServiceAccount> = Api::namespaced(f.client.clone(), &f.plugins_ns);
+        assert!(sas.get_opt("plugin-0123456789").await.unwrap().is_some());
+        assert_eq!(
+            runtime
+                .workload_ids()
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![INSTALLATION_ID.to_string()]
+        );
+        runtime.uninstall(INSTALLATION_ID).await.expect("uninstall");
+        assert!(deployments.get_opt(&new_name).await.unwrap().is_none());
+    })
+    .await;
+}
+
 /// The first exit code of `pod_name`'s isolation self-check, waiting up to
 /// its deadline plus slack; `None` if it never finished.
 async fn wait_self_check_exit(pods: &Api<Pod>, pod_name: &str) -> Option<i32> {
@@ -1068,7 +1137,7 @@ async fn a_plugin_pod_mounts_its_annotated_claim_and_can_write_to_it() {
             .await
             .expect("ensure with an annotated claim");
         let deployment = Api::<Deployment>::namespaced(f.client.clone(), &f.plugins_ns)
-            .get("plugin-0123456789")
+            .get(&scarab_plugin_k8s::objects::deployment_name(&inst))
             .await
             .expect("the Deployment");
         let template = deployment.spec.unwrap().template;
@@ -1093,7 +1162,7 @@ async fn a_plugin_pod_mounts_its_annotated_claim_and_can_write_to_it() {
         // only user.
         Api::<Deployment>::namespaced(f.client.clone(), &f.plugins_ns)
             .patch(
-                "plugin-0123456789",
+                &scarab_plugin_k8s::objects::deployment_name(&inst),
                 &PatchParams::default(),
                 &Patch::Merge(&serde_json::json!({ "spec": { "replicas": 0 } })),
             )

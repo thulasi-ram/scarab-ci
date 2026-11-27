@@ -25,6 +25,15 @@ release.yml uses that version's section as the GitHub Release text. See
   Before, on a cluster whose every node is tainted, the probe's Pods stayed Pending and no plugin
   could start. See [Plugins](/scarab-ci/get-started/deploy-helm/#plugins) (git-bug 1b8202c).
 
+### Enhancement
+
+- **Plugin Deployments have readable names.** An installation's Deployment is now
+  `scarab-plugin-<name without vowels>-<id>` (`argocd-staging` runs as
+  `scarab-plugin-rgcd-stgng-<id>`) in place of `plugin-<id>`, so `kubectl get` shows which
+  plugin each workload is. On upgrade the runtime deletes the old `plugin-<id>` Deployment and
+  creates the new one once the old Pod is gone, so the two never run at once. The ServiceAccount
+  stays `plugin-<id>`.
+
 ### Bug Fixes
 
 - **Plugin isolation probe on EKS (Amazon VPC CNI).** The probe's three Pods are now named
