@@ -16,10 +16,11 @@ use serde::{Deserialize, Serialize};
 /// The org-level Environment (ADR-0071), which governs Deploy Runs.
 mod org_environment;
 pub use org_environment::{
-    duplicate_display_name, normalize_display_name, validate_org_environment_display_name,
-    validate_org_environment_name, OrgEnvironment, OrgEnvironmentError, OrgEnvironmentStore,
-    WritePrecondition, DUPLICATE_DISPLAY_NAME_SUFFIX, MAX_INSTALLATION_NAME_CHARS,
-    MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS, MAX_ORG_ENVIRONMENT_DISPLAY_NAME_CHARS,
+    duplicate_display_name, normalize_display_name, refuse_reserved_org_environment_name,
+    validate_org_environment_display_name, validate_org_environment_name, OrgEnvironment,
+    OrgEnvironmentError, OrgEnvironmentStore, WritePrecondition, DUPLICATE_DISPLAY_NAME_SUFFIX,
+    MAX_INSTALLATION_NAME_CHARS, MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS,
+    MAX_ORG_ENVIRONMENT_DISPLAY_NAME_CHARS, RESERVED_ORG_ENVIRONMENT_NAME,
 };
 
 /// The org-level Environment's governance model and its pure resolution

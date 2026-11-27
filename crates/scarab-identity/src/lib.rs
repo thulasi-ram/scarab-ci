@@ -913,6 +913,13 @@ pub struct Claims {
     pub expires_at: i64,
 }
 
+/// The `env` segment of the subject of a Step in an Environment that the
+/// Environment does not admit: fork code, or a Step before its approval.
+/// No Environment may be named this (`scarab_project`'s
+/// `RESERVED_ORG_ENVIRONMENT_NAME`), and a Step of one created before that
+/// rule gets no token.
+pub const NO_ENVIRONMENT_SUBJECT: &str = "none";
+
 // Both subject forms name a repository by `<org>/<repo>` alone, with no forge
 // host. That is unique only because `forge_repos` is keyed on (owner, name)
 // (migration 0023_forge_connections): one Scarab serves at most one repository

@@ -323,7 +323,7 @@ scarab:
   #       ...
   #       -----END PUBLIC KEY-----
   oidcPublicKeys: []
-  # The longest a step OIDC token lives, in seconds (60 to 82800). A token
+  # The longest a step OIDC token lives, in seconds (60 to 43200). A token
   # lives for its step's timeout, at most this long, and this long for a step
   # with no timeout. Empty => 3600. Rendered as SCARAB_OIDC_TOKEN_MAX_TTL_SECS.
   oidcTokenMaxTtlSecs: ""

@@ -1100,6 +1100,12 @@ async fn which_runs_get_a_token() {
             None,
         ),
         ("head", true, Some(push("HEAD")), None),
+        (
+            "dispatch-head",
+            true,
+            Some(json!({ "kind": "manual", "ref": "refs/heads/HEAD", "sha": SHA, "fork": false })),
+            None,
+        ),
         ("empty-ref", true, Some(push("")), None),
         ("ref-segment", true, Some(push("refs/heads/ref/x")), None),
         ("env-segment", true, Some(push("refs/heads/env/prod")), None),
@@ -1108,10 +1114,13 @@ async fn which_runs_get_a_token() {
         seed_trigger(&db, run, *tenant, trigger.clone()).await;
     }
     // In an Environment: the `env/` subject, `event` from the trigger; a ref
-    // that holds a subject segment gets none there too.
-    for (run, r#ref) in [
-        ("env", "refs/heads/main"),
-        ("env-bad-ref", "refs/heads/env/x"),
+    // that holds a subject segment gets none there too, and so does an
+    // Environment named `none` (created before the name was reserved), whose
+    // subject would be the one fork and pre-approval Steps get.
+    for (run, r#ref, environment) in [
+        ("env", "refs/heads/main", "prod"),
+        ("env-bad-ref", "refs/heads/env/x", "prod"),
+        ("env-named-none", "refs/heads/main", "none"),
     ] {
         seed_trigger(&db, run, true, Some(push(r#ref))).await;
         db.set_run_deploy_context(
@@ -1119,7 +1128,7 @@ async fn which_runs_get_a_token() {
             &DeployContext {
                 org: "acme".into(),
                 project: "web".into(),
-                environment: "prod".into(),
+                environment: environment.into(),
                 git_ref: r#ref.into(),
                 locked_out: false,
             },
@@ -1148,6 +1157,7 @@ async fn which_runs_get_a_token() {
             )),
         ),
         ("env-bad-ref", None),
+        ("env-named-none", None),
     ];
     let all = rows
         .into_iter()

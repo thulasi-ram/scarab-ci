@@ -480,6 +480,7 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
         // stored, as Postgres copies it, so a row written before a pattern
         // rule existed does not stop a duplicate.
         scarab_project::validate_org_environment_name(&copy.name)?;
+        scarab_project::refuse_reserved_org_environment_name(&copy.name)?;
         if let Some(d) = &copy.display_name {
             scarab_project::validate_org_environment_display_name(d)?;
         }

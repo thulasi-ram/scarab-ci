@@ -42,7 +42,7 @@
 //! | `SCARAB_OIDC_ISSUER` | env | enables the OIDC issuer (keyless federation, ADR-0015) |
 //! | `SCARAB_OIDC_SIGNING_KEY_FILE` | env | PKCS#8 RSA PEM the issuer signs with — **required** when the issuer is enabled (persistent across restarts/replicas) |
 //! | `SCARAB_OIDC_AUDIENCE` | env | `aud` of minted per-run tokens (ADR-0015); default `scarab` |
-//! | `SCARAB_OIDC_TOKEN_MAX_TTL_SECS` | env | the longest a step OIDC token lives; a token lives for its step's timeout, at most this long, and this long for a step with no timeout. Default 3600, from 60 to 82800 |
+//! | `SCARAB_OIDC_TOKEN_MAX_TTL_SECS` | env | the longest a step OIDC token lives; a token lives for its step's timeout, at most this long, and this long for a step with no timeout. Default 3600, from 60 to 43200 (12h, the longest AWS session) |
 //! | `SCARAB_OIDC_PUBLIC_KEYS` | env | further RSA public keys (SPKI PEM blocks) the JWKS lists beside the signing key: the previous and the next key of a key change. Never signed with |
 //! | `SCARAB_MASTER_KEYS` | env | comma-separated base64 32-byte KEKs for envelope encryption; **first = active writer**, the rest decrypt-only (rotation, git-bug f37463a). Authoritative when set |
 //! | `SCARAB_MASTER_KEY` | env | legacy single KEK ≡ a one-key list (ADR-0014) — one of the two is **required** unless `SCARAB_DEV_INSECURE=1`. When both are set the list wins; a legacy key that is not a list member refuses to boot |
@@ -1418,8 +1418,8 @@ pub enum ConfigError {
 
     #[error(
         "SCARAB_OIDC_TOKEN_MAX_TTL_SECS is set but invalid — want a whole number of seconds \
-         from 60 to 82800 (23h; the longest a step may run). It caps how long a step OIDC \
-         token lives; default 3600."
+         from 60 to 43200 (12h, the longest session AWS grants for one). It caps how long \
+         a step OIDC token lives; default 3600."
     )]
     InvalidOidcTokenMaxTtl,
 
@@ -1668,7 +1668,9 @@ impl Config {
                         .trim()
                         .parse::<u32>()
                         .ok()
-                        .filter(|s| (60..=scarab_pipeline::MAX_STEP_TIMEOUT_SECS).contains(s))
+                        .filter(|s| {
+                            (60..=crate::secret_executor::MAX_OIDC_TOKEN_MAX_TTL_SECS).contains(s)
+                        })
                         .ok_or(ConfigError::InvalidOidcTokenMaxTtl)?,
                     None => crate::secret_executor::DEFAULT_OIDC_TOKEN_MAX_TTL_SECS,
                 },

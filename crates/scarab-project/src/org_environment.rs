@@ -205,6 +205,26 @@ pub fn validate_org_environment_name(name: &str) -> Result<(), OrgEnvironmentErr
     Ok(())
 }
 
+/// The name a new Environment may not take: `none`. A step OIDC token's
+/// subject says `env/none` for a Step no Environment admits (fork code, or
+/// before its approval), so an Environment of that name would share that
+/// subject with them. Checked when an Environment is created (a PUT of a
+/// name that does not exist, or a Duplicate), not on later writes, so an
+/// Environment created before the rule can still be edited and deleted;
+/// its Steps get no token.
+pub const RESERVED_ORG_ENVIRONMENT_NAME: &str = "none";
+
+/// Refuse [`RESERVED_ORG_ENVIRONMENT_NAME`] as a new Environment's name.
+pub fn refuse_reserved_org_environment_name(name: &str) -> Result<(), OrgEnvironmentError> {
+    if name == RESERVED_ORG_ENVIRONMENT_NAME {
+        return Err(OrgEnvironmentError::Invalid(format!(
+            "environment name `{name}` is reserved: a step's OIDC subject says `env/{name}` \
+             when no Environment admits the step"
+        )));
+    }
+    Ok(())
+}
+
 /// Errors from [`OrgEnvironment`] validation and the [`OrgEnvironmentStore`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum OrgEnvironmentError {
