@@ -3,9 +3,13 @@
 //! [`Rs256Issuer`] mints short-lived, per-attempt RS256 JWTs whose subject
 //! encodes `{org, repo, env, ref}`, and publishes its public keys as a JWKS so a
 //! cloud's OIDC trust policy can verify them — no long-lived cloud credentials.
-//! Signing keys are generated at startup for dev (or loaded from PEM); rotation
-//! adds a new signing key while keeping prior public keys in the JWKS so
-//! in-flight tokens still verify.
+//!
+//! The server signs with one private key, loaded from a PEM. The JWKS lists
+//! that key's public half and any further public keys the operator configures
+//! ([`Rs256Issuer::with_public_keys`]): the previous key, so tokens signed
+//! before a key change still verify, and the next key, so that while replicas
+//! roll from one signing key to the other, every replica's JWKS holds the key
+//! any replica signs with. Each key's `kid` is its RFC 7638 thumbprint.
 //!
 //! This is an adapter (it uses RSA key generation / RNG, so it cannot live in
 //! the pure `scarab-identity` crate) — it implements that crate's `OidcIssuer`.
@@ -13,21 +17,49 @@
 use async_trait::async_trait;
 use base64::Engine;
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
+use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, LineEnding};
 use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 
 use scarab_identity::{Claims, IdentityError, Jwt, OidcIssuer};
 
-/// One RSA signing key: its id (the RFC 7638 thumbprint of the public key),
-/// the private key (PKCS#8 PEM), and the public modulus/exponent as base64url
-/// (for the JWK).
-struct SigningKey {
+/// A public key as the JWKS lists it: its id (the RFC 7638 thumbprint) and the
+/// modulus/exponent as base64url.
+struct PublicJwk {
     kid: String,
-    private_pem: String,
     n: String,
     e: String,
+}
+
+impl PublicJwk {
+    fn of(public: &RsaPublicKey) -> Self {
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let n = b64.encode(public.n().to_bytes_be());
+        let e = b64.encode(public.e().to_bytes_be());
+        Self {
+            kid: jwk_thumbprint(&n, &e),
+            n,
+            e,
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "kty": "RSA",
+            "use": "sig",
+            "alg": "RS256",
+            "kid": self.kid,
+            "n": self.n,
+            "e": self.e,
+        })
+    }
+}
+
+/// One RSA signing key: the private key (PKCS#8 PEM) and its public JWK.
+struct SigningKey {
+    private_pem: String,
+    public: PublicJwk,
 }
 
 /// The JWT body Scarab signs (the OIDC claims).
@@ -57,6 +89,9 @@ pub struct Rs256Issuer {
     /// Signing keys; the last is current. Earlier keys remain published so
     /// tokens signed before a rotation still verify.
     keys: Vec<SigningKey>,
+    /// Public keys published beside the signing keys and never signed with
+    /// here: the previous and the next key of a key change.
+    published: Vec<PublicJwk>,
 }
 
 impl Rs256Issuer {
@@ -65,6 +100,7 @@ impl Rs256Issuer {
         Ok(Self {
             issuer_url: issuer_url.into(),
             keys: vec![generate_key()?],
+            published: Vec::new(),
         })
     }
 
@@ -80,7 +116,18 @@ impl Rs256Issuer {
         Ok(Self {
             issuer_url: issuer_url.into(),
             keys: vec![signing_key(private)?],
+            published: Vec::new(),
         })
+    }
+
+    /// Also publish the RSA public keys in `pem`: one or more
+    /// `-----BEGIN PUBLIC KEY-----` (SPKI) blocks, one after the other. The
+    /// issuer never signs with them; they are in the JWKS so a token signed
+    /// with one of them, by another replica or before a key change, verifies.
+    /// Any other block, a private key among them, is refused.
+    pub fn with_public_keys(mut self, pem: &str) -> Result<Self, IdentityError> {
+        self.published.extend(public_keys_from_pem(pem)?);
+        Ok(self)
     }
 
     /// Rotate: add a new current signing key, retaining the old for verification.
@@ -93,22 +140,18 @@ impl Rs256Issuer {
         &self.issuer_url
     }
 
-    /// The JWKS document: every public key, so both current and pre-rotation
-    /// tokens verify.
+    /// The JWKS document: the signing keys first, the current one last among
+    /// them, then the configured public keys. A key is listed once, even when
+    /// the configured list repeats the signing key.
     pub fn jwks(&self) -> serde_json::Value {
+        let mut seen = std::collections::BTreeSet::new();
         let keys: Vec<serde_json::Value> = self
             .keys
             .iter()
-            .map(|k| {
-                serde_json::json!({
-                    "kty": "RSA",
-                    "use": "sig",
-                    "alg": "RS256",
-                    "kid": k.kid,
-                    "n": k.n,
-                    "e": k.e,
-                })
-            })
+            .map(|k| &k.public)
+            .chain(&self.published)
+            .filter(|k| seen.insert(k.kid.clone()))
+            .map(PublicJwk::to_json)
             .collect();
         serde_json::json!({ "keys": keys })
     }
@@ -134,7 +177,7 @@ impl OidcIssuer for Rs256Issuer {
     async fn issue(&self, claims: Claims) -> Result<Jwt, IdentityError> {
         let key = self.current();
         let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(key.kid.clone());
+        header.kid = Some(key.public.kid.clone());
         let enc = EncodingKey::from_rsa_pem(key.private_pem.as_bytes())
             .map_err(|e| IdentityError::Issuance(e.to_string()))?;
         let body = TokenClaims {
@@ -185,16 +228,46 @@ fn signing_key(private: RsaPrivateKey) -> Result<SigningKey, IdentityError> {
         .to_pkcs8_pem(LineEnding::LF)
         .map_err(|e| IdentityError::Issuance(format!("pem: {e}")))?
         .to_string();
-    let public = RsaPublicKey::from(&private);
-    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let n = b64.encode(public.n().to_bytes_be());
-    let e = b64.encode(public.e().to_bytes_be());
     Ok(SigningKey {
-        kid: jwk_thumbprint(&n, &e),
         private_pem,
-        n,
-        e,
+        public: PublicJwk::of(&RsaPublicKey::from(&private)),
     })
+}
+
+/// Split `pem` into its PEM blocks and read each as an SPKI RSA public key.
+/// Text outside the blocks is ignored. An error names the block by its
+/// position and label, never by its content.
+fn public_keys_from_pem(pem: &str) -> Result<Vec<PublicJwk>, IdentityError> {
+    const BEGIN: &str = "-----BEGIN ";
+    let err = |msg: String| IdentityError::Issuance(format!("OIDC public keys: {msg}"));
+    let mut keys = Vec::new();
+    let mut rest = pem;
+    while let Some(start) = rest.find(BEGIN) {
+        let block = &rest[start..];
+        let n = keys.len() + 1;
+        let label = block[BEGIN.len()..]
+            .split_once("-----")
+            .map(|(label, _)| label)
+            .ok_or_else(|| err(format!("block {n} has no closing dashes on its BEGIN line")))?;
+        let end_line = format!("-----END {label}-----");
+        let end = block
+            .find(&end_line)
+            .ok_or_else(|| err(format!("block {n} (`{label}`) has no END line")))?
+            + end_line.len();
+        if label != "PUBLIC KEY" {
+            return Err(err(format!(
+                "block {n} is `{label}`; only `PUBLIC KEY` (SPKI) blocks are accepted"
+            )));
+        }
+        let key = RsaPublicKey::from_public_key_pem(&format!("{}\n", &block[..end]))
+            .map_err(|e| err(format!("block {n} is not an RSA public key: {e}")))?;
+        keys.push(PublicJwk::of(&key));
+        rest = &block[end..];
+    }
+    if keys.is_empty() && !pem.trim().is_empty() {
+        return Err(err("no `-----BEGIN PUBLIC KEY-----` block found".into()));
+    }
+    Ok(keys)
 }
 
 /// The RFC 7638 thumbprint of an RSA public key, used as its `kid`: SHA-256

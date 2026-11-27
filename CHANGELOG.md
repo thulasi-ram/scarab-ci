@@ -27,6 +27,16 @@ release.yml uses that version's section as the GitHub Release text. See
   JWKS again. One that has `scarab-key-1` written into its own configuration must be changed to
   the new value, which `/.well-known/jwks.json` shows after the upgrade.
 
+### Features
+
+- **The OIDC issuer's signing key can be changed without breaking cloud trust.** The chart's
+  `scarab.oidcPublicKeys` (server: `SCARAB_OIDC_PUBLIC_KEYS`) lists further RSA public keys that
+  `/.well-known/jwks.json` publishes beside the signing key: the next key before servers sign with
+  it, and the previous key until its last token has expired. The server still signs with the one
+  private key in `SCARAB_OIDC_SIGNING_KEY_FILE`. The chart README, "Changing the signing key",
+  gives the three upgrades in order. See
+  [Environment variables](/scarab-ci/usage/environment-variables/).
+
 ### Enhancement
 
 - **Step OIDC tokens carry `iat` and `nbf`.** Both are set 60 seconds before the token is minted,
