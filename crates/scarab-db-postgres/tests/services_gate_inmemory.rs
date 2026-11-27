@@ -3,8 +3,9 @@
 //! fakes (no Postgres, no cluster), proving the engine behavior end to end.
 
 use scarab_engine::{
-    cancel_run_request, rerun_step, Attempt, AttemptId, AttemptOutcome, Db, RunId, RunStatus,
-    Scheduler, ServiceStatus, StepId, StepSpec, StepStatus, Timestamp,
+    cancel_run_request, rerun_step, Attempt, AttemptId, AttemptOutcome, Db, EventKind,
+    EventPayload, RunId, RunStatus, Scheduler, ServiceStatus, StepId, StepSpec, StepStatus,
+    Timestamp, EVENT_VERSION,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
 use serde_json::json;
@@ -571,7 +572,8 @@ async fn a_dead_lettered_run_tears_down_its_shared_services() {
 
 /// A Run of fork code waiting at its Fork Run approval gate (ADR-0086 §9,
 /// read by this release, written by the next) starts none of its shared
-/// services until the gate is released; a rejected gate starts none at all.
+/// services until the gate is released; a rejected or skipped gate starts
+/// none at all.
 /// Every other Run starts them at Run start as before, one waiting at an
 /// Environment's gate included.
 #[tokio::test]
@@ -595,6 +597,14 @@ async fn shared_services_wait_only_for_a_fork_run_approval_gate() {
             "fork gate rejected",
             Some("fork_run_approval_gate"),
             Some(StepStatus::Failed),
+            false,
+        ),
+        // A Skipped gate skips the Steps behind it: none runs, none needs
+        // the service.
+        (
+            "fork gate skipped",
+            Some("fork_run_approval_gate"),
+            Some(StepStatus::Skipped),
             false,
         ),
         (
@@ -648,4 +658,122 @@ async fn shared_services_wait_only_for_a_fork_run_approval_gate() {
             assert!(rows.is_empty(), "{case}: a service row was born: {rows:?}");
         }
     }
+}
+
+/// A service of a fork Run starts as soon as a Step that uses it may run: a
+/// Step with no Fork Run approval gate upstream does not wait for the gate,
+/// so its service does not either, or the Step would wait on it forever.
+#[tokio::test]
+async fn a_service_used_outside_the_fork_gate_starts_at_run_start() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-1".into());
+    db.create_run(&run, 2, 1, Timestamp(0)).await.unwrap();
+    db.store_run_ir(
+        &run,
+        &ir_with_db_service(json!([
+            { "id": "approve", "gate": "manual",
+              "origin": [{ "kind": "fork_run_approval_gate", "name": "all", "content_hash": "" }] },
+            { "id": "test", "image": "busybox", "uses": ["db"], "needs": ["approve"] },
+            { "id": "lint", "image": "busybox", "uses": ["db"] }
+        ])),
+    )
+    .await
+    .unwrap();
+    db.seed_step(&run, &StepId("approve".into()), StepStatus::Pending, None);
+    for id in ["test", "lint"] {
+        db.seed_step(
+            &run,
+            &StepId(id.into()),
+            StepStatus::Pending,
+            Some(spec(&["db"])),
+        );
+    }
+    db.seed_run(&run, RunStatus::Running);
+
+    let clock = FakeClock::new(0);
+    let exec = FakeExecutor::new();
+    let sched = Scheduler::new(&db, &clock, &exec, "drv");
+    sched.reconcile_services(&run).await.unwrap();
+    assert_eq!(
+        exec.launched_services(),
+        vec![FakeExecutor::service_handle("run-1", 1, "db").0]
+    );
+}
+
+/// A Rerun of a released Fork Run approval gate births the next Take's
+/// services at once and re-arms the gate. They are not launched until the
+/// gate is released again, and their readiness deadline runs from that
+/// release, not from their birth: a long wait for approval does not fail
+/// them.
+#[tokio::test]
+async fn a_held_service_s_readiness_deadline_runs_from_the_release() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-1".into());
+    let gate = StepId("approve".into());
+    db.create_run(&run, 2, 1, Timestamp(0)).await.unwrap();
+    db.store_run_ir(
+        &run,
+        &ir_with_db_service(json!([
+            { "id": "approve", "gate": "manual",
+              "origin": [{ "kind": "fork_run_approval_gate", "name": "all", "content_hash": "" }] },
+            { "id": "test", "image": "busybox", "uses": ["db"], "needs": ["approve"] }
+        ])),
+    )
+    .await
+    .unwrap();
+    db.seed_step(&run, &gate, StepStatus::Pending, None);
+    db.seed_step(
+        &run,
+        &StepId("test".into()),
+        StepStatus::Pending,
+        Some(spec(&["db"])),
+    );
+    db.seed_run(&run, RunStatus::Running);
+    // Born by the Rerun at t=1s, while the gate waits again.
+    db.create_run_service(None, &run, 1, "db", Timestamp(1_000))
+        .await
+        .unwrap();
+
+    let clock = FakeClock::new(5_000);
+    let exec = FakeExecutor::new(); // never marked ready
+    let sched = Scheduler::new(&db, &clock, &exec, "drv").with_service_ready_timeout_ms(1_000);
+
+    // Held: born, not launched, and not failed past its deadline.
+    sched.reconcile_services(&run).await.unwrap();
+    assert!(exec.launched_services().is_empty());
+    let db_row = |rows: &[scarab_engine::RunService]| service(rows, 1, "db").clone();
+    let row = db_row(&db.run_services(&run).await.unwrap());
+    assert_eq!(row.status, ServiceStatus::Starting);
+    assert_eq!(row.handle, None);
+
+    // Released at t=10s.
+    db.seed_step(&run, &gate, StepStatus::Succeeded, None);
+    db.append_event(&EventKind {
+        version: EVENT_VERSION,
+        run: run.clone(),
+        kind: EventPayload::GateReleased { step: gate.clone() },
+        at: Timestamp(10_000),
+    })
+    .await
+    .unwrap();
+
+    // Half a second after the release: launched, still within its deadline.
+    clock.advance(5_500);
+    sched.reconcile_services(&run).await.unwrap();
+    assert_eq!(
+        exec.launched_services(),
+        vec![FakeExecutor::service_handle("run-1", 1, "db").0]
+    );
+    assert_eq!(
+        db_row(&db.run_services(&run).await.unwrap()).status,
+        ServiceStatus::Starting
+    );
+
+    // Past the deadline counted from the release: failed, fail-closed.
+    clock.advance(1_000);
+    sched.reconcile_services(&run).await.unwrap();
+    assert_eq!(
+        db_row(&db.run_services(&run).await.unwrap()).status,
+        ServiceStatus::Failed
+    );
 }

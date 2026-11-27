@@ -1467,6 +1467,17 @@ fn is_fork_run_approval_gate(step: &serde_json::Value) -> bool {
         })
 }
 
+/// The shared services a Fork Run approval gate (ADR-0086 §9) holds in one
+/// services reconcile pass, and the gates already released. Empty for a Run
+/// with no such gate.
+#[derive(Debug, Default)]
+struct ForkApprovalHold {
+    /// The services not to birth or launch yet.
+    held: std::collections::BTreeSet<String>,
+    /// The Fork Run approval gates that have Succeeded.
+    released: Vec<StepId>,
+}
+
 /// A gate's settings that live only in the run's IR (see
 /// `Scheduler::gate_settings`).
 #[derive(Debug, Clone, Default)]
@@ -5543,52 +5554,144 @@ impl<'a> Scheduler<'a> {
         .collect()
     }
 
-    /// The pipeline-level shared services declared in the run's stored IR
+    /// The pipeline-level shared services declared in the run's stored `ir`
     /// (ADR-0058), read the same way per-step config is (self-describing runs,
-    /// ADR-0022). Tolerant: an absent/malformed IR yields none.
-    async fn pipeline_services(
-        &self,
-        run: &RunId,
-    ) -> Result<Vec<scarab_pipeline::SharedServiceSpec>, SchedulerError> {
-        let Some(ir) = self.db.run_ir(run).await? else {
-            return Ok(Vec::new());
-        };
-        Ok(ir
-            .get("services")
+    /// ADR-0022). Tolerant: a malformed IR yields none.
+    fn pipeline_services(ir: &serde_json::Value) -> Vec<scarab_pipeline::SharedServiceSpec> {
+        ir.get("services")
             .and_then(|s| s.as_array())
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| serde_json::from_value(v.clone()).ok())
                     .collect()
             })
-            .unwrap_or_default())
+            .unwrap_or_default()
     }
 
-    /// Whether a Fork Run approval gate of `run` (ADR-0086 §9) is not yet
-    /// released. Read from the stored IR as JSON, as
-    /// [`pipeline_services`](Self::pipeline_services) is: a Run with no such
-    /// gate, or no readable IR, has none pending.
-    async fn fork_run_approval_pending(&self, run: &RunId) -> Result<bool, SchedulerError> {
-        let Some(ir) = self.db.run_ir(run).await? else {
-            return Ok(false);
-        };
-        let gates: Vec<&str> = ir
+    /// Which of `services` a Fork Run approval gate (ADR-0086 §9) still holds,
+    /// read from the Run's stored `ir` as JSON, as
+    /// [`pipeline_services`](Self::pipeline_services) is. A service may start
+    /// once a Step that `uses:` it may run: once every Fork Run approval gate
+    /// upstream of that Step, through `needs`, has Succeeded, which is when
+    /// admission may promote it (a Step behind a Skipped or Failed gate is
+    /// Skipped). A service no Step uses waits until every such gate has
+    /// Succeeded. A Run whose IR has no such gate holds nothing, and its step
+    /// rows are not read.
+    async fn fork_approval_hold(
+        &self,
+        run: &RunId,
+        ir: &serde_json::Value,
+        services: &[scarab_pipeline::SharedServiceSpec],
+    ) -> Result<ForkApprovalHold, SchedulerError> {
+        fn id_of(s: &serde_json::Value) -> Option<&str> {
+            s.get("id").and_then(|i| i.as_str())
+        }
+        fn strings(s: &serde_json::Value, field: &str) -> Vec<String> {
+            s.get(field)
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        }
+        let ir_steps: Vec<&serde_json::Value> = ir
             .get("steps")
             .and_then(|s| s.as_array())
             .into_iter()
             .flatten()
+            .collect();
+        let gates: Vec<&str> = ir_steps
+            .iter()
+            .copied()
             .filter(|s| is_fork_run_approval_gate(s))
-            .filter_map(|s| s.get("id").and_then(|i| i.as_str()))
+            .filter_map(id_of)
             .collect();
         if gates.is_empty() {
-            return Ok(false);
+            return Ok(ForkApprovalHold::default());
         }
-        Ok(self
-            .db
-            .steps_of_run(run)
-            .await?
+        let rows = self.db.steps_of_run(run).await?;
+        let released = |g: &str| {
+            rows.iter()
+                .any(|r| r.step.0 == g && r.status == StepStatus::Succeeded)
+        };
+        let needs: HashMap<&str, Vec<String>> = ir_steps
             .iter()
-            .any(|s| gates.contains(&s.step.0.as_str()) && s.status != StepStatus::Succeeded))
+            .copied()
+            .filter_map(|s| Some((id_of(s)?, strings(s, "needs"))))
+            .collect();
+        // Every Fork Run approval gate upstream of `step` has Succeeded.
+        let approved = |step: &str| {
+            let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+            let mut stack: Vec<&str> = needs
+                .get(step)
+                .into_iter()
+                .flatten()
+                .map(String::as_str)
+                .collect();
+            while let Some(id) = stack.pop() {
+                if !seen.insert(id) {
+                    continue;
+                }
+                if gates.contains(&id) && !released(id) {
+                    return false;
+                }
+                stack.extend(needs.get(id).into_iter().flatten().map(String::as_str));
+            }
+            true
+        };
+        let mut used: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut startable: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for s in ir_steps.iter().copied() {
+            let uses = strings(s, "uses");
+            let may_run = id_of(s).is_some_and(approved);
+            for name in uses {
+                if may_run {
+                    startable.insert(name.clone());
+                }
+                used.insert(name);
+            }
+        }
+        let all_released = gates.iter().all(|&g| released(g));
+        Ok(ForkApprovalHold {
+            held: services
+                .iter()
+                .map(|svc| &svc.name)
+                .filter(|n| !startable.contains(*n) && (used.contains(*n) || !all_released))
+                .cloned()
+                .collect(),
+            released: gates
+                .iter()
+                .filter(|&&g| released(g))
+                .map(|g| StepId(g.to_string()))
+                .collect(),
+        })
+    }
+
+    /// When a `Starting` service's readiness deadline starts: its birth or,
+    /// for a service born before its Fork Run approval gate was released (a
+    /// Rerun of the gate births the next Take's rows at once, and the hold
+    /// keeps them unlaunched), the latest release of such a gate. The event
+    /// log is read at most once per pass, and only for a Run with a released
+    /// Fork Run approval gate.
+    async fn service_clock_start(
+        &self,
+        run: &RunId,
+        created_at: Timestamp,
+        hold: &ForkApprovalHold,
+        events: &mut Option<Vec<EventKind>>,
+    ) -> Result<Timestamp, SchedulerError> {
+        if hold.released.is_empty() {
+            return Ok(created_at);
+        }
+        if events.is_none() {
+            *events = Some(self.db.events(run).await?);
+        }
+        let log = events.as_deref().unwrap_or_default();
+        Ok(hold
+            .released
+            .iter()
+            .filter_map(|g| gate_released_at(log, g))
+            .fold(created_at, Timestamp::max))
     }
 
     /// The engine's "current Take" for a run's shared services: the max stored
@@ -5687,7 +5790,10 @@ impl<'a> Scheduler<'a> {
     }
 
     async fn reconcile_services_as_leader(&self, run: &RunId) -> Result<(), SchedulerError> {
-        let services = self.pipeline_services(run).await?;
+        let Some(ir) = self.db.run_ir(run).await? else {
+            return Ok(());
+        };
+        let services = Self::pipeline_services(&ir);
         if services.is_empty() {
             return Ok(());
         }
@@ -5730,15 +5836,17 @@ impl<'a> Scheduler<'a> {
 
         // A Run of fork code waiting at its Fork Run approval gate starts
         // nothing before the gate is released, its shared services included
-        // (ADR-0086 §9). Its Steps already wait on the gate through `needs`.
-        if self.fork_run_approval_pending(run).await? {
-            return Ok(());
-        }
+        // (ADR-0086 §9): a held service is neither born nor launched. Its
+        // Steps already wait on the gate through `needs`.
+        let hold = self.fork_approval_hold(run, &ir, &services).await?;
+        let mut events: Option<Vec<EventKind>> = None;
 
         // Birth (eager) + launch + readiness-poll the current Take.
         for svc in &services {
             let row = rows.iter().find(|r| r.take == take && r.name == svc.name);
+            let held = hold.held.contains(&svc.name);
             match row {
+                None if held => {}
                 None => {
                     // Eager birth at Run start, then launch the standalone unit.
                     // `create_run_service` persists the `Starting` row (with
@@ -5754,7 +5862,17 @@ impl<'a> Scheduler<'a> {
                     self.launch_service_bounded(run, take, svc, now, now)
                         .await?;
                 }
+                // Born but not launched while a Fork Run approval gate holds
+                // it: it stays so until the gate is released.
+                Some(r)
+                    if r.status == crate::ServiceStatus::Starting && r.handle.is_none() && held => {
+                }
                 Some(r) if r.status == crate::ServiceStatus::Starting => {
+                    // The readiness deadline runs from the birth, or from the
+                    // release of a Fork Run approval gate that held the service.
+                    let born = self
+                        .service_clock_start(run, r.created_at, &hold, &mut events)
+                        .await?;
                     // Resolve the handle (relaunch idempotently if a crash lost it).
                     // A relaunch error is bounded by the readiness deadline, not
                     // `?`-propagated (git-bug 6825830): within the window it leaves
@@ -5764,7 +5882,7 @@ impl<'a> Scheduler<'a> {
                     let handle = match &r.handle {
                         Some(h) => Some(ExecHandle(h.clone())),
                         None => {
-                            self.launch_service_bounded(run, take, svc, r.created_at, now)
+                            self.launch_service_bounded(run, take, svc, born, now)
                                 .await?
                         }
                     };
@@ -5782,7 +5900,7 @@ impl<'a> Scheduler<'a> {
                                 None,
                             )
                             .await?;
-                    } else if now.0 - r.created_at.0 > self.cfg.service_ready_timeout_ms {
+                    } else if now.0 - born.0 > self.cfg.service_ready_timeout_ms {
                         // Startup flake, fail-closed (ADR-0058): nothing has been
                         // written yet, so the flaky Pod is auto-retried in place —
                         // the k8s `restartPolicy: Always` restarts it, and *this*
