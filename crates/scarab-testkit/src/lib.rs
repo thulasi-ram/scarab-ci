@@ -329,6 +329,11 @@ fn fake_run_summary(st: &InMemoryState, run: &RunId, status: RunStatus) -> RunSu
                 .filter(|s| {
                     s["gate"] == "manual"
                         && s["environment_approval_gate"] != serde_json::Value::Bool(false)
+                        && !s["origin"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|o| o["kind"] == scarab_pipeline::FORK_RUN_APPROVAL_GATE_KIND)
                 })
                 .filter_map(|s| s["id"].as_str().map(|id| StepId(id.to_string())))
                 .collect(),

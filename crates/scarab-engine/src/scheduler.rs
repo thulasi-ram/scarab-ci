@@ -1453,6 +1453,20 @@ struct GateVerdict {
     expired: bool,
 }
 
+/// Whether `step`, a Step of a stored IR read as JSON, is a Fork Run approval
+/// gate (ADR-0086 §9): an `origin` link of that kind. Never an Environment
+/// approval gate (`StepSpec::counts_as_environment_approval_gate`).
+fn is_fork_run_approval_gate(step: &serde_json::Value) -> bool {
+    step.get("origin")
+        .and_then(|o| o.as_array())
+        .into_iter()
+        .flatten()
+        .any(|link| {
+            link.get("kind").and_then(|k| k.as_str())
+                == Some(scarab_pipeline::FORK_RUN_APPROVAL_GATE_KIND)
+        })
+}
+
 /// A gate's settings that live only in the run's IR (see
 /// `Scheduler::gate_settings`).
 #[derive(Debug, Clone, Default)]
@@ -1460,8 +1474,9 @@ struct GateSettings {
     /// `gate_expires_after`, seconds.
     expires_after_secs: Option<i64>,
     /// A `manual` gate that may be an Environment approval gate (ADR-0078):
-    /// marked one, or of a Run created before the mark existed. Its
-    /// approvals may have met the rules with a wait timer still running.
+    /// marked one, or of a Run created before the mark existed, and never a
+    /// Fork Run approval gate. Its approvals may have met the rules with a
+    /// wait timer still running.
     environment_approval: bool,
 }
 
@@ -5090,7 +5105,8 @@ impl<'a> Scheduler<'a> {
                         .map(|secs| secs as i64),
                     environment_approval: s.get("gate").and_then(|g| g.as_str()) == Some("manual")
                         && s.get("environment_approval_gate").and_then(|m| m.as_bool())
-                            != Some(false),
+                            != Some(false)
+                        && !is_fork_run_approval_gate(s),
                 };
                 Some((id.to_string(), settings))
             })
@@ -5556,22 +5572,12 @@ impl<'a> Scheduler<'a> {
         let Some(ir) = self.db.run_ir(run).await? else {
             return Ok(false);
         };
-        let is_fork_gate = |s: &serde_json::Value| {
-            s.get("origin")
-                .and_then(|o| o.as_array())
-                .into_iter()
-                .flatten()
-                .any(|link| {
-                    link.get("kind").and_then(|k| k.as_str())
-                        == Some(scarab_pipeline::FORK_RUN_APPROVAL_GATE_KIND)
-                })
-        };
         let gates: Vec<&str> = ir
             .get("steps")
             .and_then(|s| s.as_array())
             .into_iter()
             .flatten()
-            .filter(|s| is_fork_gate(s))
+            .filter(|s| is_fork_run_approval_gate(s))
             .filter_map(|s| s.get("id").and_then(|i| i.as_str()))
             .collect();
         if gates.is_empty() {
