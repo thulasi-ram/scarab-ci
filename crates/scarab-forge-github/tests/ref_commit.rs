@@ -158,3 +158,23 @@ async fn a_ref_name_no_git_ref_can_have_sends_no_request() {
     }
     assert_eq!(seen.lock().unwrap().clone(), Vec::<String>::new());
 }
+
+/// An answer for another ref than the one asked for is read as no such ref,
+/// though it names a commit.
+#[tokio::test]
+async fn an_answer_for_another_ref_is_no_such_ref() {
+    let routes = HashMap::from([(
+        "/repos/acme/app/git/ref/heads/main".to_string(),
+        json!({ "ref": "refs/heads/main-old",
+                "object": { "type": "commit", "sha": BRANCH } }),
+    )]);
+    let (base, _seen) = serve(routes).await;
+    let forge = GithubForge::new("ghp_test").with_base_url(&base);
+    assert_eq!(
+        forge
+            .ref_commit(&repo(), RefKind::Branch, "main")
+            .await
+            .unwrap(),
+        None
+    );
+}

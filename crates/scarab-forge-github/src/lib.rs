@@ -1268,9 +1268,10 @@ impl ForgePort for GithubForge {
     }
 
     /// `GET /repos/{o}/{r}/git/ref/{heads|tags}/{name}`, which matches the
-    /// name exactly (`404` when there is no such ref). An annotated tag's ref
-    /// points at a tag object, read with `git/tags/{sha}` to reach the commit;
-    /// a tag of a tree or a blob names no commit.
+    /// name exactly (`404` when there is no such ref). An answer whose `ref`
+    /// is not `refs/{heads|tags}/{name}` is read as no such ref. An annotated
+    /// tag's ref points at a tag object, read with `git/tags/{sha}` to reach
+    /// the commit; a tag of a tree or a blob names no commit.
     async fn ref_commit(
         &self,
         repo: &RepoRef,
@@ -1303,6 +1304,10 @@ impl ForgePort for GithubForge {
         }
         let body: Value =
             serde_json::from_slice(&body).map_err(|e| ForgeError::Api(format!("bad JSON: {e}")))?;
+        let full_name = format!("refs/{namespace}/{name}");
+        if body.get("ref").and_then(Value::as_str) != Some(full_name.as_str()) {
+            return Ok(None);
+        }
         let mut object = body.get("object").cloned().unwrap_or(Value::Null);
         // A tag of a tag is read again; a few levels at most.
         for _ in 0..4 {
