@@ -832,26 +832,34 @@ impl ForgeCredentialExecutor {
         {
             return Ok(out);
         }
-        // The Run's deploy context, read now and used as stored, only for a
-        // Step its Environment admits now (approved, or no approvers).
-        let ctx = match admission {
-            Some(admission) if !admission.before_approval => self
-                .logs
-                .db()
-                .run_deploy_context(&step.run)
-                .await
-                .map_err(|e| ExecError::Other(format!("reading the Run's deploy context: {e}")))?,
-            _ => None,
+        // The Run's deploy context, read now and used as stored, when this
+        // launch made an Environment re-admission.
+        let (ctx, before_approval) = match admission {
+            Some(admission) => (
+                self.logs
+                    .db()
+                    .run_deploy_context(&step.run)
+                    .await
+                    .map_err(|e| {
+                        ExecError::Other(format!("reading the Run's deploy context: {e}"))
+                    })?,
+                admission.before_approval,
+            ),
+            None => (None, true),
         };
         // A guard for stored state written by another release: a deploy
         // context locked out of its Environment's secrets (a fork Run) gets
-        // no credential, as the locked-out config above gets none and
-        // `resolve_step_secrets` resolves no secret for it. This release
-        // also stores such a Run's config locked out, which returns first.
+        // no credential, before approval or after, as the locked-out config
+        // above gets none and `resolve_step_secrets` resolves no secret for
+        // it. This release also stores such a Run's config locked out, which
+        // returns first.
         if ctx.as_ref().is_some_and(|ctx| ctx.locked_out) {
             out.locked_out = true;
             return Ok(out);
         }
+        // The Environment's chain only for a Step its Environment admits now
+        // (approved, or no approvers); any other resolves the repository's.
+        let ctx = ctx.filter(|_| !before_approval);
         // Not a fork, not locked out, and the library is still trusted with
         // the registry credential: a placement profile that carries one may
         // apply (`registry_auth_only`), whether or not a secret resolves.
