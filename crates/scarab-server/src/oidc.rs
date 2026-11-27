@@ -20,8 +20,9 @@ use serde::{Deserialize, Serialize};
 
 use scarab_identity::{Claims, IdentityError, Jwt, OidcIssuer};
 
-/// One RSA signing key: its id, the private key (PKCS#8 PEM), and the public
-/// modulus/exponent as base64url (for the JWK).
+/// One RSA signing key: its id (the RFC 7638 thumbprint of the public key),
+/// the private key (PKCS#8 PEM), and the public modulus/exponent as base64url
+/// (for the JWK).
 struct SigningKey {
     kid: String,
     private_pem: String,
@@ -63,7 +64,7 @@ impl Rs256Issuer {
     pub fn generate(issuer_url: impl Into<String>) -> Result<Self, IdentityError> {
         Ok(Self {
             issuer_url: issuer_url.into(),
-            keys: vec![generate_key("scarab-key-1")?],
+            keys: vec![generate_key()?],
         })
     }
 
@@ -78,14 +79,13 @@ impl Rs256Issuer {
             .map_err(|e| IdentityError::Issuance(format!("signing key PEM: {e}")))?;
         Ok(Self {
             issuer_url: issuer_url.into(),
-            keys: vec![signing_key("scarab-key-1", private)?],
+            keys: vec![signing_key(private)?],
         })
     }
 
     /// Rotate: add a new current signing key, retaining the old for verification.
     pub fn rotate(&mut self) -> Result<(), IdentityError> {
-        let kid = format!("scarab-key-{}", self.keys.len() + 1);
-        self.keys.push(generate_key(&kid)?);
+        self.keys.push(generate_key()?);
         Ok(())
     }
 
@@ -173,26 +173,40 @@ pub fn verify(
     Ok(data.claims)
 }
 
-fn generate_key(kid: &str) -> Result<SigningKey, IdentityError> {
+fn generate_key() -> Result<SigningKey, IdentityError> {
     let mut rng = rand::rngs::OsRng;
     let private = RsaPrivateKey::new(&mut rng, 2048)
         .map_err(|e| IdentityError::Issuance(format!("keygen: {e}")))?;
-    signing_key(kid, private)
+    signing_key(private)
 }
 
-fn signing_key(kid: &str, private: RsaPrivateKey) -> Result<SigningKey, IdentityError> {
+fn signing_key(private: RsaPrivateKey) -> Result<SigningKey, IdentityError> {
     let private_pem = private
         .to_pkcs8_pem(LineEnding::LF)
         .map_err(|e| IdentityError::Issuance(format!("pem: {e}")))?
         .to_string();
     let public = RsaPublicKey::from(&private);
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let n = b64.encode(public.n().to_bytes_be());
+    let e = b64.encode(public.e().to_bytes_be());
     Ok(SigningKey {
-        kid: kid.to_string(),
+        kid: jwk_thumbprint(&n, &e),
         private_pem,
-        n: b64.encode(public.n().to_bytes_be()),
-        e: b64.encode(public.e().to_bytes_be()),
+        n,
+        e,
     })
+}
+
+/// The RFC 7638 thumbprint of an RSA public key, used as its `kid`: SHA-256
+/// over the JWK's required members `e`, `kty` and `n`, in that order with no
+/// whitespace, encoded base64url without padding. The `kid` follows from the
+/// key itself, so every replica and every restart that loads the same key
+/// names it the same way, and two keys never share a `kid`.
+fn jwk_thumbprint(n: &str, e: &str) -> String {
+    use sha2::{Digest, Sha256};
+    // `n` and `e` are base64url, so neither needs JSON escaping.
+    let canonical = format!(r#"{{"e":"{e}","kty":"RSA","n":"{n}"}}"#);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()))
 }
 
 #[cfg(test)]

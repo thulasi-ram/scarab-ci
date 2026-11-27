@@ -18,6 +18,15 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **The OIDC issuer's key id changes.** The `kid` of the signing key, in the JWKS and in every
+  step token's header, was the fixed string `scarab-key-1`. It is now the RFC 7638 thumbprint of
+  the public key (SHA-256, base64url), so the same key keeps the same `kid` on every replica. A
+  verifier that looks the key up in the JWKS by `kid` picks up the new value when it fetches the
+  JWKS again. One that has `scarab-key-1` written into its own configuration must be changed to
+  the new value, which `/.well-known/jwks.json` shows after the upgrade.
+
 ### Enhancement
 
 - **Step OIDC tokens carry `iat` and `nbf`.** Both are set 60 seconds before the token is minted,
