@@ -175,3 +175,61 @@ async fn a_token_is_found_by_its_row_id_revoked_or_not() {
 
     tdb.cleanup().await;
 }
+
+/// ADR-0086 §6: a PrincipalToken's kind, operation list, audience and OAuth
+/// client survive the SQL as the in-memory store keeps them (the server
+/// suite runs on that store), and a row whose kind this binary does not know
+/// reads as no token at all.
+/// Kills: a column left out of the INSERT or the SELECT (a listed token read
+/// back as unlimited), and an unknown kind defaulted to `issued`.
+#[tokio::test]
+async fn a_token_s_kind_and_operation_list_round_trip_and_an_unknown_kind_is_no_token() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+
+    let listed = ApiToken {
+        operations: Some(vec!["repo.dispatch".into(), "run.read".into()]),
+        ..token("t-listed", Scope::Org("acme".into()), 1_000)
+    };
+    let oauth = ApiToken {
+        kind: scarab_identity::PrincipalTokenKind::Oauth,
+        audience: Some("https://ci.example.com/mcp".into()),
+        oauth_client: Some("client-1".into()),
+        ..token("t-oauth", Scope::Org("acme".into()), 2_000)
+    };
+    let plain = token("t-plain", Scope::Org("acme".into()), 3_000);
+    for (t, plaintext) in [
+        (&listed, "scarab_pat_listed"),
+        (&oauth, "scarab_pat_oauth"),
+        (&plain, "scarab_pat_plain"),
+    ] {
+        db.put(t, &api_token_hash(plaintext)).await.unwrap();
+        assert_eq!(
+            db.by_hash(&api_token_hash(plaintext))
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(t),
+            "{}",
+            t.id
+        );
+    }
+
+    sqlx::query("UPDATE api_tokens SET kind = 'bogus' WHERE id = 't-plain'")
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.by_hash(&api_token_hash("scarab_pat_plain"))
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(db.by_id("t-plain").await.unwrap(), None);
+
+    tdb.cleanup().await;
+}
