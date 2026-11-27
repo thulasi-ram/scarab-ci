@@ -200,7 +200,7 @@ pub async fn mint_delegated_caller_handle(
     for op in endpoint_operations {
         for id in &op.may {
             let delegable = ops::by_id(id).is_some_and(|o| ops::delegable(o).is_ok());
-            if delegable && token.admits_operation(Some(id)) && !operations.contains(id) {
+            if delegable && token.admits_operation(Some(id.as_str())) && !operations.contains(id) {
                 operations.push(id.clone());
             }
         }
