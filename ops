@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1795808760,"nonce":"v51+REU5p7XwCPDfXS3E8nNvCI4=","added":["security"],"removed":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1795808763,"nonce":"LqcPh9S/f819PXM2G4uG4TehkHQ=","message":"Fail-closed change in 40913ac8 (fix/small-tickets-2026-11-28). Left open: a live Forgejo AGit payload must be recorded to confirm head.ref is a refs/ ref (see the description).","files":null}]}
