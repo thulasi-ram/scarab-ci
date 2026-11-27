@@ -334,4 +334,113 @@ mod tests {
     fn from_pem_rejects_garbage() {
         assert!(Rs256Issuer::from_pem("https://x", "not a pem").is_err());
     }
+
+    /// The example RSA public key of RFC 7638 §3.1 and its thumbprint.
+    const RFC7638_N: &str = "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw";
+    const RFC7638_E: &str = "AQAB";
+    const RFC7638_THUMBPRINT: &str = "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs";
+
+    /// The RFC 7638 example key, as an RSA public key.
+    fn rfc7638_key() -> RsaPublicKey {
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        RsaPublicKey::new(
+            rsa::BigUint::from_bytes_be(&b64.decode(RFC7638_N).unwrap()),
+            rsa::BigUint::from_bytes_be(&b64.decode(RFC7638_E).unwrap()),
+        )
+        .unwrap()
+    }
+
+    /// The RFC 7638 example key, as an SPKI PEM block (encoded here from its
+    /// published modulus and exponent; nothing is generated).
+    fn rfc7638_pem() -> String {
+        use rsa::pkcs8::EncodePublicKey;
+        rfc7638_key().to_public_key_pem(LineEnding::LF).unwrap()
+    }
+
+    /// A key's `kid` is its RFC 7638 thumbprint, from the JWK members and
+    /// from the key itself (the modulus with no leading zero byte).
+    /// Kills: members out of order, whitespace in the canonical JSON, a
+    /// standard (not URL-safe) or padded encoding, a modulus encoded with a
+    /// sign byte; any of which gives a `kid` no other implementation computes.
+    #[test]
+    fn kid_is_the_rfc_7638_thumbprint() {
+        assert_eq!(jwk_thumbprint(RFC7638_N, RFC7638_E), RFC7638_THUMBPRINT);
+        let jwk = PublicJwk::of(&rfc7638_key());
+        assert_eq!(jwk.n, RFC7638_N);
+        assert_eq!(jwk.e, RFC7638_E);
+        assert_eq!(jwk.kid, RFC7638_THUMBPRINT);
+    }
+
+    /// Further public keys are read from SPKI blocks, text between them is
+    /// ignored, and the JWKS lists a key once however often it is configured.
+    /// Kills: a JWKS with two entries of one `kid` (a verifier may refuse the
+    /// whole set), and a parser that stops after the first block.
+    #[test]
+    fn further_public_keys_are_read_and_listed_once() {
+        let pem = format!(
+            "the previous key\n{}\nthe next key\n{}",
+            rfc7638_pem(),
+            rfc7638_pem()
+        );
+        let keys = public_keys_from_pem(&pem).unwrap();
+        let kids: Vec<&str> = keys.iter().map(|k| k.kid.as_str()).collect();
+        assert_eq!(kids, [RFC7638_THUMBPRINT, RFC7638_THUMBPRINT]);
+
+        let issuer = Rs256Issuer {
+            issuer_url: "https://scarab.example".into(),
+            keys: Vec::new(),
+            published: keys,
+        };
+        let jwks = issuer.jwks();
+        let listed = jwks["keys"].as_array().unwrap();
+        assert_eq!(listed.len(), 1, "{jwks}");
+        assert_eq!(listed[0]["kid"], RFC7638_THUMBPRINT);
+        assert_eq!(listed[0]["n"], RFC7638_N);
+    }
+
+    /// `SCARAB_OIDC_PUBLIC_KEYS` refusals: anything but SPKI `PUBLIC KEY`
+    /// blocks is refused (a private key above all), and the error names the
+    /// block, never its bytes, since it ends up in the boot log. Blank text
+    /// is no keys.
+    /// Kills: a private key accepted as a "public" one; a malformed BEGIN
+    /// line whose label runs into the key body and is echoed (727782d3).
+    #[test]
+    fn a_bad_public_key_block_is_refused_without_its_bytes() {
+        const SECRET: &str = "MIIEvQIBADANBgkqSECRETBYTES";
+        let good = rfc7638_pem();
+        for (name, pem) in [
+            (
+                "private",
+                format!("-----BEGIN PRIVATE KEY-----\n{SECRET}\n-----END PRIVATE KEY-----\n"),
+            ),
+            (
+                "private after a good block",
+                format!("{good}-----BEGIN PRIVATE KEY-----\n{SECRET}\n-----END PRIVATE KEY-----\n"),
+            ),
+            (
+                "label runs into the body",
+                format!("-----BEGIN PUBLIC KEY\n{SECRET}\n-----END PUBLIC KEY-----\n"),
+            ),
+            (
+                "no END line",
+                format!("-----BEGIN PUBLIC KEY-----\n{SECRET}\n"),
+            ),
+            (
+                "PKCS#1",
+                format!("-----BEGIN RSA PUBLIC KEY-----\n{SECRET}\n-----END RSA PUBLIC KEY-----\n"),
+            ),
+            (
+                "not a key",
+                format!("-----BEGIN PUBLIC KEY-----\n{SECRET}\n-----END PUBLIC KEY-----\n"),
+            ),
+            ("no block", SECRET.to_string()),
+        ] {
+            let err = public_keys_from_pem(&pem)
+                .err()
+                .unwrap_or_else(|| panic!("{name}: accepted"))
+                .to_string();
+            assert!(!err.contains("SECRETBYTES"), "{name}: {err}");
+        }
+        assert!(public_keys_from_pem("  \n").unwrap().is_empty());
+    }
 }
