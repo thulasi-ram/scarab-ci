@@ -1,6 +1,7 @@
 # 0049. Identity & access: forge-agnostic authn, Scarab-native RBAC
 
 - **Status:** Accepted
+- **Superseded in part:** by [0086](0086-agents-reach-scarab-through-a-plugin-endpoint.md) (2026-11-27, Proposed): an issued token becomes a PrincipalToken with an optional operation list and audience, beside a new `oauth` kind granted through a consent page; writes record a DelegationTrail.
 - **Date:** 2026-07-17
 - **Deciders:** thulasi.ram (architect)
 - **Refines:** [0032](0032-slices-3-5-implementation-decisions.md) (auth sketch),

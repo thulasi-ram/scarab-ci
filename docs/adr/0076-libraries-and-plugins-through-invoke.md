@@ -1,6 +1,7 @@
 # 0076. Libraries and plugins through `invoke`: installed YAML libraries, plugins as Principals that resolve gates
 
 - **Status:** Proposed
+- **Superseded in part:** by [0086](0086-agents-reach-scarab-through-a-plugin-endpoint.md) (2026-11-27, Proposed): §7 "core never calls a plugin" becomes: no Run, Gate or engine path calls a Plugin, and core calls one only at a PluginExtensionPoint its manifest registers.
 - **Date:** 2026-10-28 (simplified 2026-10-29, see the end)
 - **Amended:** 2026-10-30 (§1: a library invocation is a scope rendered once at launch, and
   inputs are no longer bound into the text at compile time; see "Amendment (2026-10-30)");
@@ -279,7 +280,9 @@ digest, plus a yank of the old one.
 
 A plugin acts through the same public API people use, under its **PluginPrincipal**
 `plugin:<installation-name>`, unique within its org (installation names are unique per
-org, migration `0055`). Core never calls a plugin.
+org, migration `0055`). Core never calls a plugin. (Superseded in part 2026-11-27 by ADR-0086 §1:
+core calls a Plugin only at a PluginExtensionPoint its manifest registers, never from a Run, a
+Gate or the engine.)
 
 **Credential.** The plugin calls the API with a projected ServiceAccount token for the
 audience `scarab-api`, beside the `scarab-broker` token it already has: rotated by the
