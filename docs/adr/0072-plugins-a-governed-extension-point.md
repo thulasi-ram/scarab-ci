@@ -7,6 +7,7 @@
 - **Amended:** 2026-11-10 by PR #152 (§10 publisher trust, Consequences and Implementation
   horizon: every plugin installs through one path, third-party installs are on, no publisher
   is trusted by default, and no image signature is checked yet; see the notes at those places)
+- **Superseded in part:** by [0086](0086-agents-reach-scarab-through-a-plugin-endpoint.md) (2026-11-27): §1 a `trusted_service` Plugin reads, logs included, as the caller through a DelegatedCallerHandle; §7 the trust tiers gain `trusted_service`; §9 core forwards outside requests to a Plugin endpoint, the first ingress into the plugins namespace (egress unchanged).
 - **Date:** 2026-10-22
 - **Deciders:** thulasi.ram (architect)
 - **Builds on:** [0008](0008-step-contract.md) (a Step is any OCI image; the step

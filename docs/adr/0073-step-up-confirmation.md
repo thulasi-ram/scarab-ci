@@ -3,6 +3,7 @@
 - **Status:** Accepted; the loosening rules for adding a deployment source (E3) and for an overlay's longer gate deadline (E1) superseded by [0074](0074-deployments-leave-core.md) (2026-10-28). Built 2026-10-24 as one build on `feat/step-up`; where the build
   differs from the text, the text is amended in place or recorded in
   [Implementation notes](#implementation-notes-2026-10-24).
+- **Superseded in part:** by [0086](0086-agents-reach-scarab-through-a-plugin-endpoint.md) (2026-11-27): a PrincipalToken never approves a Gate itself (an `oauth` one is refused, an `issued` one raises a StepUpConfirmationRequest even for a plain Gate); OAuth consent confirms every time, as API token creation does; a DelegatedCallerHandle never raises a request.
 - **Date:** 2026-10-24
 - **Deciders:** thulasi.ram (architect)
 - **Builds on:** [0049](0049-identity-and-access.md) (principals, sessions, RBAC,
