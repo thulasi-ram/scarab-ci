@@ -35,9 +35,12 @@ release.yml uses that version's section as the GitHub Release text. See
   server logs a warning naming the Run and the reason. See
   [Step OIDC tokens](/scarab-ci/usage/oidc-tokens/#which-steps-get-no-token).
 - **A manual or API Run of fork code is recorded as fork code.** The trigger a Run records now
-  holds `fork` for a dispatch, as it did for a pull request. A dispatch at a commit no branch or
-  tag of the repository points at no longer starts follow-up Runs, as a fork pull request's Run
-  already did not.
+  holds `fork` for a dispatch, as it did for a pull request. Such a Run already got the fork
+  limits at creation (no secrets, `env=none`, a read-only clone token, no registry credential).
+  What changes for it: it no longer starts follow-up Runs, as a fork pull request's Run already
+  did not; its sandboxed Steps without `registry_auth` now see `SCARAB_FORK_PR=true` (it was
+  `false`), so the build library's build Step does not export its cache; and a `when:` guard can
+  read `event.fork` on a `manual` or `api` trigger.
 
 ### Features
 
@@ -56,6 +59,13 @@ release.yml uses that version's section as the GitHub Release text. See
   private key in `SCARAB_OIDC_SIGNING_KEY_FILE`. The chart README, "Changing the signing key",
   gives the three upgrades in order. See
   [Environment variables](/scarab-ci/usage/environment-variables/).
+
+- **Step OIDC tokens live as long as the step may run.** A token lived 15 minutes; it now lives
+  for the step's `timeout:`, at most `SCARAB_OIDC_TOKEN_MAX_TTL_SECS` (chart:
+  `scarab.oidcTokenMaxTtlSecs`, default one hour), so a cloud SDK that exchanges the token again
+  later in the step still can. A new docs page shows how to publish the issuer as static files
+  and how a step assumes an AWS role with two `env:` lines. See
+  [Assuming an AWS role from a step](/scarab-ci/usage/aws-roles/).
 
 ### Enhancement
 

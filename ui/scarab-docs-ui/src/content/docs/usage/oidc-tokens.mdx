@@ -4,23 +4,32 @@ description: The short-lived token Scarab signs for a step so a cloud can trust 
 ---
 
 With the issuer on (`SCARAB_OIDC_ISSUER`, chart value `scarab.oidcIssuer`), Scarab signs a token
-for each Attempt of a step and mounts it in the step Pod at `/scarab/oidc/token`. A cloud that
-trusts Scarab as an OIDC provider exchanges the token for its own short-lived credentials, so the
-step needs no long-lived cloud key. The cloud fetches the discovery document at
-`<issuer>/.well-known/openid-configuration` and the keys at `<issuer>/.well-known/jwks.json`. The
-chart README covers the signing key and how to change it ("Changing the signing key").
+for each Attempt of a step and mounts it in the step container at `/scarab/oidc/token`
+(`SCARAB_OIDC_TOKEN_FILE` holds the path). A cloud that trusts Scarab as an OIDC provider
+exchanges the token for its own short-lived credentials, so the step needs no long-lived cloud
+key. The cloud fetches the discovery document at `<issuer>/.well-known/openid-configuration` and
+the keys at `<issuer>/.well-known/jwks.json`. The chart README covers the signing key
+("The OIDC issuer for step tokens"). For AWS, see
+[Assuming an AWS role from a step](/scarab-ci/usage/aws-roles/).
+
+The token is mounted only in the step container of a Kubernetes step Pod: not in its init
+containers or sidecars, and not by the local executor.
 
 ## The token
 
-The token is an RS256 JWT that lives 15 minutes. Its claims:
+The token is an RS256 JWT. It lives as long as the step may run: the step's `timeout:`, at most
+`SCARAB_OIDC_TOKEN_MAX_TTL_SECS` (chart value `scarab.oidcTokenMaxTtlSecs`, default one hour), and
+that maximum for a step with no `timeout:`. A cloud SDK that reads the token file again later in
+the step still finds a valid token. Scarab does not refresh it: a step that runs longer than the
+maximum has an expired token for the rest of its run. Its claims:
 
 | Claim | Value |
 |---|---|
 | `iss` | the issuer URL |
 | `sub` | the subject, below |
-| `aud` | `SCARAB_OIDC_AUDIENCE`, one value for the whole server (default `scarab`) |
+| `aud` | `SCARAB_OIDC_AUDIENCE`, one value for the whole server (default `scarab`; set it to `sts.amazonaws.com` for AWS) |
 | `iat`, `nbf` | 60 seconds before the token was signed, so a cloud whose clock runs up to a minute behind still accepts it |
-| `exp` | 15 minutes after the token was signed |
+| `exp` | the token's lifetime, above, after it was signed |
 | `run_id`, `attempt` | the Run and the Attempt |
 | `event` | the Run's trigger: `push`, `pull_request`, `tag`, `release`, `cron`, `manual`, `api`, `upstream` |
 | `ref` | the ref in the subject |
@@ -90,3 +99,41 @@ the last segment you wrote:
 A wildcard in the middle can match across segments. `scarab:org/acme/repo/*/ref/refs/heads/main`
 matches `scarab:org/acme/repo/app/env/none/ref/refs/heads/main`, the subject of a fork Run's Step
 in an Environment, as well as the subjects it was written for.
+
+## Publishing the issuer
+
+A cloud fetches the discovery document and the keys from the issuer URL over the public internet.
+The Scarab server can stay private: publish the two documents as static files, on a bucket or a
+CDN, and set the issuer URL to that public location. No Ingress to the server is needed.
+
+1. Pick the public base URL, for example `https://oidc.example.com/scarab`, with no trailing `/`.
+   It must be `https`.
+2. Set `scarab.oidcIssuer` (`SCARAB_OIDC_ISSUER`) to it and upgrade. Every token's `iss` is now
+   that URL, and the discovery document names it as `issuer` and gives
+   `<issuer>/.well-known/jwks.json` as `jwks_uri`, whatever host the server itself answers on.
+3. Fetch both documents from the server's own routes, through its Service (here `scarab` in
+   namespace `scarab`) from inside the cluster, or through `kubectl port-forward`:
+
+   ```sh
+   curl -sf http://scarab.scarab.svc/.well-known/openid-configuration > openid-configuration
+   curl -sf http://scarab.scarab.svc/.well-known/jwks.json > jwks.json
+   ```
+
+4. Upload them so they are served at `<issuer>/.well-known/openid-configuration` and
+   `<issuer>/.well-known/jwks.json`, with `Content-Type: application/json`, and readable without
+   credentials.
+5. Check: `curl https://oidc.example.com/scarab/.well-known/openid-configuration` returns the
+   document, and its `issuer` and `jwks_uri` start with the public URL.
+
+The published JWKS is a copy: it changes only when you publish it again. Publish it again after
+each change to the signing key or to `scarab.oidcPublicKeys`. To change the signing key:
+
+1. Add the next key's public half to `scarab.oidcPublicKeys`, upgrade, and publish the JWKS.
+2. Once each cloud that trusts the issuer has had time to fetch the new JWKS, point the signing
+   key Secret at the next key, list the old key's public half in `scarab.oidcPublicKeys`, and
+   upgrade.
+3. Once the last token the old key signed has expired (at most `scarab.oidcTokenMaxTtlSecs`
+   later), remove the old key from `scarab.oidcPublicKeys`, upgrade, and publish the JWKS.
+
+The chart README, "Changing the signing key", gives the same steps for a server whose own routes
+are the issuer.

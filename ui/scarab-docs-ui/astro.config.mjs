@@ -123,6 +123,7 @@ export default defineConfig({
             { label: 'Step OIDC tokens', slug: 'usage/oidc-tokens' },
             { label: 'Policies', slug: 'usage/policies' },
             { label: 'Deploying with Argo CD', slug: 'usage/deploying-with-argo-cd' },
+            { label: 'Assuming an AWS role', slug: 'usage/aws-roles' },
             { label: 'Pushing to Amazon ECR', slug: 'usage/pushing-to-ecr' },
             { label: 'Environment Variables', slug: 'usage/environment-variables' },
           ],
