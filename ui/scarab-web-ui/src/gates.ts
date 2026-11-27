@@ -245,7 +245,7 @@ function environmentShown(name: string, env: RunEnvironmentLike | null | undefin
 
 /** Is this the gate Fork Run approval added in front of a Run of fork code?
  *  A plain `manual` gate: anyone with write releases it. */
-export function addedByForkRunApproval(s: EnvironmentGateLike): boolean {
+export function addedByForkRunApproval(s: { origin?: readonly { kind: string }[] | null }): boolean {
   return s.origin?.some((o) => o.kind === "fork_run_approval_gate") ?? false;
 }
 
