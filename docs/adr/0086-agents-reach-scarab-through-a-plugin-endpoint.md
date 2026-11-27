@@ -200,7 +200,8 @@ only.
 Two kinds:
 
 - **`issued`**: today's `scarab_pat_` token.
-- **`oauth`**: granted through the consent page. An access secret (`scarab_oat_`, 1 hour) and a
+- **`oauth`**: granted through the consent page, with a step-up each time (§7). It is the only
+  kind a Plugin endpoint accepts; an `issued` token is refused there. An access secret (`scarab_oat_`, 1 hour) and a
   refresh secret (`scarab_ort_`) that rotates on each use; a reused refresh secret revokes the
   grant. The grant ends 30 days after its last use and at most 90 days after consent. Its
   operations never widen: changing them means consenting again.
@@ -256,8 +257,14 @@ client that looks like claude.ai with their own redirect. Local agents that regi
 through DCR (opencode) cannot connect yet; git-bug 5d2aace holds a loopback-only design for
 when one is needed.
 
-**Consent.** The ceiling is the union of the endpoint operations' `may`. The org comes from the
-URL. Defaults:
+**Consent.** Granting is a crown-jewel operation, as creating an API token is: the user
+confirms **every** consent with a passkey step-up, with a challenge committed to that client,
+endpoint and operation list. Otherwise someone holding a stolen session cookie could start the
+flow in their own claude.ai account, approve it as the victim, and receive a 90-day token that
+acts as them. A user with no passkey enrols one the first time.
+
+The ceiling is the union of the endpoint operations' `may`. The org comes from the URL.
+Defaults:
 
 | Group | Default |
 |---|---|
