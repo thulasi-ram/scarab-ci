@@ -120,6 +120,7 @@ export default defineConfig({
             { label: 'Runs', slug: 'usage/runs' },
             { label: 'Run logs', slug: 'usage/run-logs' },
             { label: 'Environments', slug: 'usage/environments' },
+            { label: 'Step OIDC tokens', slug: 'usage/oidc-tokens' },
             { label: 'Policies', slug: 'usage/policies' },
             { label: 'Deploying with Argo CD', slug: 'usage/deploying-with-argo-cd' },
             { label: 'Pushing to Amazon ECR', slug: 'usage/pushing-to-ecr' },

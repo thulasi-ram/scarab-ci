@@ -1,0 +1,92 @@
+---
+title: Step OIDC tokens
+description: The short-lived token Scarab signs for a step so a cloud can trust the step by repository, Environment and ref, which Steps get one, and how to match its subject in a trust policy.
+---
+
+With the issuer on (`SCARAB_OIDC_ISSUER`, chart value `scarab.oidcIssuer`), Scarab signs a token
+for each Attempt of a step and mounts it in the step Pod at `/scarab/oidc/token`. A cloud that
+trusts Scarab as an OIDC provider exchanges the token for its own short-lived credentials, so the
+step needs no long-lived cloud key. The cloud fetches the discovery document at
+`<issuer>/.well-known/openid-configuration` and the keys at `<issuer>/.well-known/jwks.json`. The
+chart README covers the signing key and how to change it ("Changing the signing key").
+
+## The token
+
+The token is an RS256 JWT that lives 15 minutes. Its claims:
+
+| Claim | Value |
+|---|---|
+| `iss` | the issuer URL |
+| `sub` | the subject, below |
+| `aud` | `SCARAB_OIDC_AUDIENCE`, one value for the whole server (default `scarab`) |
+| `iat`, `nbf` | 60 seconds before the token was signed, so a cloud whose clock runs up to a minute behind still accepts it |
+| `exp` | 15 minutes after the token was signed |
+| `run_id`, `attempt` | the Run and the Attempt |
+| `event` | the Run's trigger: `push`, `pull_request`, `tag`, `release`, `cron`, `manual`, `api`, `upstream` |
+| `ref` | the ref in the subject |
+| `sha` | the commit the Run builds |
+
+A claim whose value the Run did not record is left out, never sent empty. A tag or release Run
+has no `sha` claim.
+
+## The subject
+
+A Run bound to an Environment gets:
+
+```
+scarab:org/<org>/repo/<repo>/env/<environment>/ref/<ref>
+```
+
+The environment is `none` for a Run of fork code, and for a Step that no Environment approval gate
+upstream admits at its launch (see [The approval gate](/scarab-ci/usage/environments/#the-approval-gate)).
+
+A Run bound to no Environment gets the same subject without the `env/` segment:
+
+```
+scarab:org/<org>/repo/<repo>/ref/<ref>
+```
+
+`<ref>` is the ref the Run was started on, not a commit: `refs/heads/<branch>` for a push or a
+cron Run, `refs/tags/<tag>` for a tag or release, `refs/pull/<n>/head` for a pull request, the
+ref given for a manual or API Run, and the upstream Run's ref for a follow-up.
+
+The subject names a repository by its owner and name, with no forge host. One Scarab holds at
+most one repository of a given owner and name, whichever forge it is on, so the subject still
+names one repository.
+
+## Which Steps get no token
+
+A Run bound to no Environment gets a token only when Scarab can tell that it builds the
+repository's own code. Its Steps get no token when:
+
+- the Run is fork code: a pull request from another repository, or a manual or API Run at a commit
+  no branch or tag of the repository points at (see [Runs](/scarab-ci/usage/runs/));
+- the Run is a manual or API Run created before Scarab recorded whether a dispatch is fork code,
+  including a rerun of one;
+- the Run is a follow-up whose chain of upstream Runs started from one of the Runs above;
+- a comment started the Run;
+- the Run has no repository (a pipeline submitted inline);
+- the Run's ref is unknown or `HEAD`.
+
+On any Run, a Step also gets no token when a value would make the subject read another way: an
+org, repository or Environment name that holds a `/`, or a ref with a path component named `env`
+or `ref`. A branch named `ref/x` is `refs/heads/ref/x`, and `env/prod` is `refs/heads/env/prod`;
+Steps of their Runs get no token. The server logs a warning naming the Run and the reason.
+
+A Step with no token still launches. A step that needs cloud access then fails at the call it
+makes, not at launch.
+
+## Matching the subject in a trust policy
+
+Match the whole subject, or put a wildcard only at the end. A wildcard at the end stays inside
+the last segment you wrote:
+
+| Pattern | Matches |
+|---|---|
+| `scarab:org/acme/repo/app/env/production/ref/refs/heads/main` | `main` of `acme/app` in Environment `production` |
+| `scarab:org/acme/repo/app/env/production/ref/*` | any ref of `acme/app` in `production` |
+| `scarab:org/acme/repo/app/ref/refs/tags/*` | any tag of `acme/app`, outside an Environment |
+
+A wildcard in the middle can match across segments. `scarab:org/acme/repo/*/ref/refs/heads/main`
+matches `scarab:org/acme/repo/app/env/none/ref/refs/heads/main`, the subject of a fork Run's Step
+in an Environment, as well as the subjects it was written for.

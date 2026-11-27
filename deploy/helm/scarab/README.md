@@ -234,8 +234,8 @@ the signed synthetic `installation` event `just stack up dogfood` sends). A fres
 ## The OIDC issuer for step tokens (`scarab.oidcIssuer`, ADR-0015)
 
 With `scarab.oidcIssuer` set, the server signs a token for each Attempt of a
-step in a Run bound to an Environment and mounts it in the step Pod at
-`/scarab/oidc/token`. A cloud that trusts the issuer verifies the token against
+step and mounts it in the step Pod at `/scarab/oidc/token`. Which Steps get
+one, and the subject a cloud matches, are on the docs page "Step OIDC tokens". A cloud that trusts the issuer verifies the token against
 the keys at `<issuer>/.well-known/jwks.json`. The server signs with the PKCS#8
 RSA private key at `SCARAB_OIDC_SIGNING_KEY_FILE`, and does not start without
 it. Mount the key from your own Secret through `extraVolumes` and

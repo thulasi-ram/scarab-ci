@@ -27,7 +27,27 @@ release.yml uses that version's section as the GitHub Release text. See
   JWKS again. One that has `scarab-key-1` written into its own configuration must be changed to
   the new value, which `/.well-known/jwks.json` shows after the upgrade.
 
+### Security
+
+- **No step OIDC token when its subject could read another way.** A Step gets no token when the
+  org, repository or Environment name holds a `/`, or the ref has a path component named `env`
+  or `ref` (a branch `ref/x` is `refs/heads/ref/x`). Its launch goes on without a token, and the
+  server logs a warning naming the Run and the reason. See
+  [Step OIDC tokens](/scarab-ci/usage/oidc-tokens/#which-steps-get-no-token).
+- **A manual or API Run of fork code is recorded as fork code.** The trigger a Run records now
+  holds `fork` for a dispatch, as it did for a pull request. A dispatch at a commit no branch or
+  tag of the repository points at no longer starts follow-up Runs, as a fork pull request's Run
+  already did not.
+
 ### Features
+
+- **Step OIDC tokens outside an Environment.** A Run bound to no Environment that builds the
+  repository's own code now gets a token with the subject
+  `scarab:org/<org>/repo/<repo>/ref/<ref>`, with no `env/` segment, so a trust policy can name a
+  repository and a ref without an Environment. Fork code, comment-triggered Runs, Runs with no
+  repository and Runs whose ref is unknown get none; so do manual and API Runs created before this
+  release, which did not record whether they were fork code. Subjects of Runs bound to an
+  Environment do not change. See [Step OIDC tokens](/scarab-ci/usage/oidc-tokens/).
 
 - **The OIDC issuer's signing key can be changed without breaking cloud trust.** The chart's
   `scarab.oidcPublicKeys` (server: `SCARAB_OIDC_PUBLIC_KEYS`) lists further RSA public keys that
