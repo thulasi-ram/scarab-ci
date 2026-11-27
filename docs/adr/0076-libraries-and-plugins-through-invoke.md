@@ -1,7 +1,7 @@
 # 0076. Libraries and plugins through `invoke`: installed YAML libraries, plugins as Principals that resolve gates
 
 - **Status:** Proposed
-- **Superseded in part:** by [0086](0086-agents-reach-scarab-through-a-plugin-endpoint.md) (2026-11-27, Proposed): §7 "core never calls a plugin" becomes: no Run, Gate or engine path calls a Plugin, and core calls one only at a PluginExtensionPoint its manifest registers.
+- **Superseded in part:** by [0086](0086-agents-reach-scarab-through-a-plugin-endpoint.md) (2026-11-27): §7 "core never calls a plugin" becomes: no Run, Gate or engine path calls a Plugin, and core calls one only at a PluginExtensionPoint its manifest registers.
 - **Date:** 2026-10-28 (simplified 2026-10-29, see the end)
 - **Amended:** 2026-10-30 (§1: a library invocation is a scope rendered once at launch, and
   inputs are no longer bound into the text at compile time; see "Amendment (2026-10-30)");

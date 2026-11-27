@@ -1,6 +1,6 @@
 # 0086. Agents reach Scarab through a Plugin endpoint
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-11-27
 - **Deciders:** thulasi.ram (architect)
 - **Amends:** [0072](0072-plugins-a-governed-extension-point.md) (§1 a Plugin may read through
