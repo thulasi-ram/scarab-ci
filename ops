@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1795764252,"nonce":"aBDi4TK7A5ekBmh+Y5Dd/GbxGrI=","status":2}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1795764252,"nonce":"rfEcHXiGRSRDdXR2QkM+3LztpBc=","message":"Fixed by PR #228 (merged 2026-11-27): dispatch classifies the resolved commit; Manual/Api events carry fork. ci:full e2e deferred until the rest of ADR-0086 is built (owner).","files":null}]}
