@@ -283,6 +283,16 @@ pub fn pull_request_head_branch(payload: &serde_json::Value) -> String {
     r.strip_prefix("refs/heads/").unwrap_or(r).to_string()
 }
 
+/// Whether a pull request's `head.ref` names a branch: not empty once a
+/// leading `refs/heads/` is dropped, and not another `refs/` ref. A Forgejo
+/// or Gitea AGit-flow pull request (pushed to `refs/for/<branch>`, which needs
+/// only read access) has its head in the base repository with no branch;
+/// its `head.ref` is not a branch name, and its code is fork code.
+pub fn pull_request_head_is_branch(head_ref: &str) -> bool {
+    let branch = head_ref.strip_prefix("refs/heads/").unwrap_or(head_ref);
+    !branch.is_empty() && !branch.starts_with("refs/")
+}
+
 /// Percent-encode `s` as one URL path segment or one query value: every byte
 /// except the RFC 3986 unreserved characters (`A-Z a-z 0-9 - . _ ~`) is
 /// written as `%XX`, `/` included. For a value a caller typed, such as a

@@ -8461,7 +8461,10 @@ pub async fn dispatch_is_fork_code(
         .and_then(|n| n.parse::<u64>().ok())
     {
         let origin = forge.pull_request_origin(repo, number).await?;
-        if !origin.same_repository || origin.head_sha != sha || origin.head_branch.is_empty() {
+        if !origin.same_repository
+            || origin.head_sha != sha
+            || !scarab_forge::pull_request_head_is_branch(&origin.head_branch)
+        {
             return Ok(true);
         }
         let named =

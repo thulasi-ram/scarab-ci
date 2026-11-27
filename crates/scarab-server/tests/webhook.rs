@@ -1634,7 +1634,7 @@ fn pr_payload(action: &str, changes: serde_json::Value, merged: bool) -> Vec<u8>
             "merged": merged,
             "title": "feat: the widget",
             "base": { "ref": "main" },
-            "head": { "sha": PR_HEAD, "repo": { "full_name": "acme/app" } }
+            "head": { "sha": PR_HEAD, "ref": "feat/widget", "repo": { "full_name": "acme/app" } }
         },
         "repository": { "name": "app", "owner": { "login": "acme" }, "full_name": "acme/app" },
         "sender": { "login": "octocat" }

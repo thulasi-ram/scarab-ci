@@ -30,6 +30,12 @@ release.yml uses that version's section as the GitHub Release text. See
   is recorded as the full commit SHA, which no branch or tag pattern matches. `HEAD` is recorded
   as the default branch, `refs/heads/<default>`, instead of `refs/heads/HEAD`
   ([Runs](/scarab-ci/usage/runs/)).
+- **A Forgejo pull request whose head is on no branch is fork code.** Scarab treated a pull
+  request as the repository's own code whenever its head was in the same repository. A Forgejo
+  AGit-flow pull request (pushed to `refs/for/<branch>`, which read access allows) has its head
+  there with no branch, so its Run could get the Environment's secrets. A pull request is now the
+  repository's own code only when its head is a branch of the repository; any other is fork
+  code, with the fork limits. A dispatch at `refs/pull/<n>/head` applies the same rule.
 
 ### Enhancement
 
