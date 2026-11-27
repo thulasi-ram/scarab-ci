@@ -209,11 +209,14 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
             let head_repo = p
                 .pointer("/pull_request/head/repo/full_name")
                 .and_then(Value::as_str);
-            let fork = match (base_repo, head_repo) {
-                (Some(base), Some(head_repo)) => head_repo != base,
-                // Absent head repo (deleted fork) → treat as a fork (untrusted).
-                _ => head_repo.is_none(),
-            };
+            // Not a fork only when both names are present and equal. An absent
+            // head repo (a deleted fork) or an absent base name is a fork
+            // (untrusted). The server then confirms a same-repo head branch
+            // with the forge before it trusts it.
+            let fork = !matches!(
+                (base_repo, head_repo),
+                (Some(base), Some(head_repo)) if head_repo == base
+            );
             // The PR title — source of the run Headline (ADR-0057) — and the base
             // branch (`base ← head` display). Display/audit only; both are
             // deliberately kept out of Event::context(). Absent → empty.
@@ -1962,6 +1965,22 @@ mod tests {
         });
         let event = normalize(&delivery("pull_request", fork)).unwrap();
         assert!(event.is_fork_code(), "head repo != base → fork");
+        // A base repository name missing from the delivery is a fork too,
+        // whatever the head repo says.
+        let no_base = json!({
+            "action": "opened",
+            "pull_request": {
+                "number": 7,
+                "head": { "sha": "abc1234", "ref": "main", "repo": { "full_name": "acme/app" } }
+            },
+            "repository": { "name": "app", "owner": { "login": "acme" } }
+        });
+        assert!(
+            normalize(&delivery("pull_request", no_base))
+                .unwrap()
+                .is_fork_code(),
+            "no base name → fork"
+        );
         // A fork PR's head branch is the fork's branch name, as GitHub sends it.
         assert!(
             matches!(&event, Event::PullRequest { head_branch, .. } if head_branch == "main"),
