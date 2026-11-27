@@ -398,6 +398,10 @@ async fn the_org_summary_counts_admins_without_a_passkey() {
                 last_used_at: None,
                 use_count: 0,
                 revoked_at: None,
+                kind: scarab_identity::PrincipalTokenKind::Issued,
+                operations: None,
+                audience: None,
+                oauth_client: None,
             },
             &api_token_hash(plaintext),
         )
@@ -751,6 +755,10 @@ async fn merged_bob(pg: &Arc<PostgresDb>) -> (Harness, String) {
             last_used_at: None,
             use_count: 0,
             revoked_at: None,
+            kind: scarab_identity::PrincipalTokenKind::Issued,
+            operations: None,
+            audience: None,
+            oauth_client: None,
         },
         &api_token_hash(&plaintext),
     )
@@ -807,6 +815,10 @@ async fn an_api_token_does_not_read_its_owner_s_passkeys_or_history() {
                 last_used_at: None,
                 use_count: 0,
                 revoked_at: None,
+                kind: scarab_identity::PrincipalTokenKind::Issued,
+                operations: None,
+                audience: None,
+                oauth_client: None,
             },
             &api_token_hash(plaintext),
         )
@@ -1716,6 +1728,10 @@ async fn an_unrecorded_request_confirmation_runs_nothing() {
                 last_used_at: None,
                 use_count: 0,
                 revoked_at: None,
+                kind: scarab_identity::PrincipalTokenKind::Issued,
+                operations: None,
+                audience: None,
+                oauth_client: None,
             },
             &api_token_hash(plaintext),
         )

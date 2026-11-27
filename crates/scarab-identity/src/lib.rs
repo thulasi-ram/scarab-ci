@@ -356,7 +356,7 @@ pub trait SessionStore: Send + Sync {
 pub const API_TOKEN_PREFIX: &str = "scarab_pat_";
 
 /// How long a token may be issued for, in days. An expiry is **mandatory**
-/// (see [`ApiToken`]); this only bounds how far out it may be pushed.
+/// (see [`PrincipalToken`]); this only bounds how far out it may be pushed.
 pub const MAX_API_TOKEN_DAYS: u32 = 365;
 
 /// The stored identity of a token plaintext: its SHA-256, lowercase hex.
@@ -381,17 +381,18 @@ pub fn api_token_hash(plaintext: &str) -> String {
     out
 }
 
-/// An issued API token's **record** — everything about a token except the one
-/// thing that would let someone use it. The plaintext exists exactly once, in
-/// the response to the mint call; what survives here is
+/// A PrincipalToken's **record** (ADR-0086 §6): everything about a token
+/// except the one thing that would let someone use it. The plaintext exists
+/// exactly once, in the response to the mint call; what survives here is
 /// [`api_token_hash`] of it, held by the store rather than on this struct.
 ///
 /// A token is not a second authorization model. It is a *narrowing* of an
-/// existing [`Principal`]'s authority along two axes at once — down to one
-/// [`Scope`], and down to a [`Role`] at or below what its owner holds there —
-/// and everything downstream ([`Rbac`], tenancy scoping) is unchanged.
+/// existing [`Principal`]'s authority along three axes at once: down to one
+/// [`Scope`], down to a [`Role`] at or below what its owner holds there, and,
+/// when it carries an operation list, down to those ApiOperations. Everything
+/// downstream ([`Rbac`], tenancy scoping) is unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApiToken {
+pub struct PrincipalToken {
     /// Opaque row id. Safe to log, safe to show, safe to put in a revoke URL —
     /// it is not the credential.
     pub id: String,
@@ -412,7 +413,7 @@ pub struct ApiToken {
     pub scope: Scope,
     /// The **ceiling** the minter set, not the token's effective role. What the
     /// token can actually do is this capped by the owner's live authority — see
-    /// [`ApiToken::effective_role`].
+    /// [`PrincipalToken::effective_role`].
     pub role: Role,
     /// Unix-ms expiry. **Mandatory.** `values.yaml` already records why, about
     /// the workspace results token: it "carries no verb and never expires", and
@@ -440,9 +441,64 @@ pub struct ApiToken {
     /// an opaque secret in a table rather than a self-describing JWT, which
     /// could not be withdrawn before its own expiry.
     pub revoked_at: Option<i64>,
+    /// How it was granted. Every token minted before PrincipalTokens had
+    /// kinds is [`PrincipalTokenKind::Issued`].
+    #[serde(default)]
+    pub kind: PrincipalTokenKind,
+    /// The ApiOperation ids it may use (`run.read`, `repo.dispatch`, …).
+    /// `None`: no list, so every operation its role and scope allow, as every
+    /// token before lists existed. `Some`: a request is refused unless its
+    /// route's operation is in the list, and refused when the route names no
+    /// operation (fail-closed).
+    #[serde(default)]
+    pub operations: Option<Vec<String>>,
+    /// The one URL it may be used at (RFC 8707). Always `None` for an issued
+    /// token; the server refuses to authenticate an issued token that has one.
+    #[serde(default)]
+    pub audience: Option<String>,
+    /// The OAuth client an `oauth` token was granted to. `None` for an issued
+    /// token.
+    #[serde(default)]
+    pub oauth_client: Option<String>,
 }
 
-impl ApiToken {
+/// The kinds of [`PrincipalToken`] (ADR-0086 §6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipalTokenKind {
+    /// A `scarab_pat_` token a person minted for themselves: an API token.
+    #[default]
+    Issued,
+    /// A token granted to an app through a consent page. It is accepted only
+    /// at its audience, never approves a Gate, and nothing mints one yet.
+    Oauth,
+}
+
+impl PrincipalTokenKind {
+    /// The stored and wire name: `issued` or `oauth`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Issued => "issued",
+            Self::Oauth => "oauth",
+        }
+    }
+
+    /// The kind a stored name reads as; `None` for a name this binary does
+    /// not know, which a reader refuses rather than defaults.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "issued" => Some(Self::Issued),
+            "oauth" => Some(Self::Oauth),
+            _ => None,
+        }
+    }
+}
+
+/// The name [`PrincipalToken`] had before it had kinds. The routes, the
+/// `scarab_pat_` prefix and the `api_tokens` table keep that name too.
+pub type ApiToken = PrincipalToken;
+
+impl PrincipalToken {
     /// Is this token still usable at `now_ms`? Revocation beats expiry beats
     /// everything; neither is a judgement call.
     pub fn is_live(&self, now_ms: i64) -> bool {
@@ -476,6 +532,17 @@ impl ApiToken {
     pub fn effective_role(&self, live: Option<Role>) -> Option<Role> {
         live.map(|live| live.min(self.role))
     }
+
+    /// May this token be used for the ApiOperation `operation` (the matched
+    /// route's, `None` when the request matched none)? A token with no list
+    /// may use any; a token with a list only one it names, and never one
+    /// whose operation is unknown.
+    pub fn admits_operation(&self, operation: Option<&str>) -> bool {
+        match &self.operations {
+            None => true,
+            Some(allowed) => operation.is_some_and(|op| allowed.iter().any(|a| a == op)),
+        }
+    }
 }
 
 /// Durable store of issued API tokens (ADR-0049 amendment). Keyed on the
@@ -485,22 +552,22 @@ impl ApiToken {
 pub trait ApiTokenStore: Send + Sync {
     /// Record a freshly minted token. `hash` is [`api_token_hash`] of the
     /// plaintext the caller is about to return once and forget.
-    async fn put(&self, token: &ApiToken, hash: &str) -> Result<(), IdentityError>;
+    async fn put(&self, token: &PrincipalToken, hash: &str) -> Result<(), IdentityError>;
     /// The token a presented plaintext hashes to, live or not — expiry and
-    /// revocation are the caller's decision ([`ApiToken::is_live`]) so that
+    /// revocation are the caller's decision ([`PrincipalToken::is_live`]) so that
     /// "this token is revoked" stays distinguishable from "no such token" in
     /// the code, even though both answer 401 on the wire.
-    async fn by_hash(&self, hash: &str) -> Result<Option<ApiToken>, IdentityError>;
+    async fn by_hash(&self, hash: &str) -> Result<Option<PrincipalToken>, IdentityError>;
     /// The token record with row id `id`, live or not (ADR-0073: a
     /// StepUpConfirmationRequest's replay re-checks its requesting token by
     /// id, never by plaintext).
-    async fn by_id(&self, id: &str) -> Result<Option<ApiToken>, IdentityError>;
+    async fn by_id(&self, id: &str) -> Result<Option<PrincipalToken>, IdentityError>;
     /// Every token issued within `org` — org- and project-scoped alike —
     /// newest first. Records only; there is no plaintext to return.
-    async fn list(&self, org: &str) -> Result<Vec<ApiToken>, IdentityError>;
+    async fn list(&self, org: &str) -> Result<Vec<PrincipalToken>, IdentityError>;
     /// Every token `owner` holds, in every org, newest first — what a person
     /// sees under their own account.
-    async fn list_owned(&self, owner: &str) -> Result<Vec<ApiToken>, IdentityError>;
+    async fn list_owned(&self, owner: &str) -> Result<Vec<PrincipalToken>, IdentityError>;
     /// Revoke `id` at `now_ms`. `false` if no such token, or it was already
     /// revoked — revocation is idempotent but not silent.
     async fn revoke(&self, id: &str, now_ms: i64) -> Result<bool, IdentityError>;
@@ -1233,8 +1300,8 @@ mod tests {
         assert_ne!(hash, api_token_hash("scarab_pat_0123456789abcdee"));
     }
 
-    fn token(scope: Scope, role: Role) -> ApiToken {
-        ApiToken {
+    fn token(scope: Scope, role: Role) -> PrincipalToken {
+        PrincipalToken {
             id: "t1".into(),
             name: "ci".into(),
             owner_subject: "amy".into(),
@@ -1246,6 +1313,10 @@ mod tests {
             last_used_at: None,
             use_count: 0,
             revoked_at: None,
+            kind: PrincipalTokenKind::Issued,
+            operations: None,
+            audience: None,
+            oauth_client: None,
         }
     }
 
@@ -1298,7 +1369,7 @@ mod tests {
         assert!(!t.is_live(2_000), "expiry is exclusive at the instant");
         assert!(!t.is_live(2_001));
 
-        let revoked = ApiToken {
+        let revoked = PrincipalToken {
             revoked_at: Some(1_500),
             ..t
         };

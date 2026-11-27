@@ -5820,6 +5820,12 @@ fn api_token_from_row(r: &sqlx::postgres::PgRow) -> Option<scarab_identity::ApiT
         // BIGINT, never negative: it only ever grows by `touch`'s `uses`.
         use_count: u64::try_from(r.get::<i64, _>("use_count")).unwrap_or(0),
         revoked_at: r.get::<Option<i64>, _>("revoked_at"),
+        // An unknown kind fails CLOSED like an unknown role: the row is
+        // dropped, so the token authenticates nothing.
+        kind: scarab_identity::PrincipalTokenKind::parse(&r.get::<String, _>("kind"))?,
+        operations: r.get::<Option<Vec<String>>, _>("operations"),
+        audience: r.get::<Option<String>, _>("audience"),
+        oauth_client: r.get::<Option<String>, _>("oauth_client"),
     })
 }
 
@@ -6538,7 +6544,7 @@ impl scarab_identity::IdentityStore for PostgresDb {
 
 const API_TOKEN_COLS: &str = "id, name, owner_subject, scope_org, scope_project, role, \
                               expires_at, created_by, created_at, last_used_at, use_count, \
-                              revoked_at";
+                              revoked_at, kind, operations, audience, oauth_client";
 
 #[async_trait]
 impl scarab_identity::ApiTokenStore for PostgresDb {
@@ -6555,8 +6561,9 @@ impl scarab_identity::ApiTokenStore for PostgresDb {
         sqlx::query(
             "INSERT INTO api_tokens
                  (id, token_hash, name, owner_subject, scope_org, scope_project,
-                  role, expires_at, created_by, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                  role, expires_at, created_by, created_at,
+                  kind, operations, audience, oauth_client)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(&token.id)
         .bind(hash)
@@ -6568,6 +6575,10 @@ impl scarab_identity::ApiTokenStore for PostgresDb {
         .bind(token.expires_at)
         .bind(&token.created_by)
         .bind(token.created_at)
+        .bind(token.kind.as_str())
+        .bind(&token.operations)
+        .bind(&token.audience)
+        .bind(&token.oauth_client)
         .execute(self.pool())
         .await
         .map_err(identity_err)?;

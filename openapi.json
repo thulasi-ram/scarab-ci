@@ -9891,7 +9891,8 @@
           "created_by",
           "created_at",
           "expires_at",
-          "use_count"
+          "use_count",
+          "kind"
         ],
         "properties": {
           "created_at": {
@@ -9911,6 +9912,10 @@
           "id": {
             "type": "string"
           },
+          "kind": {
+            "type": "string",
+            "description": "`issued`: a token a person minted (an API token)."
+          },
           "last_used_at": {
             "type": [
               "integer",
@@ -9921,6 +9926,16 @@
           },
           "name": {
             "type": "string"
+          },
+          "operations": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The ApiOperations it may use. `None`: every operation its role and\nscope allow."
           },
           "org": {
             "type": "string"
@@ -12679,6 +12694,16 @@
             "type": "string",
             "description": "Human label — what makes the token revocable in practice."
           },
+          "operations": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The ApiOperations the token may use; absent for every operation its\nrole and scope allow. See [`MintTokenRequest::operations`]."
+          },
           "org": {
             "type": "string",
             "description": "The org the token is scoped to (or the org of its project)."
@@ -12714,6 +12739,16 @@
           "name": {
             "type": "string",
             "description": "Human label — what makes the token revocable in practice. \"demo\nkeepalive\", \"amy's laptop\"."
+          },
+          "operations": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The ApiOperations the token may use (`run.read`, `step.logs.read`,\n`repo.dispatch`, …). Absent: every operation its role and scope\nallow. Present: every other request is refused. At least one, each\nan operation an API token can perform."
           },
           "project": {
             "type": [

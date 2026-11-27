@@ -2872,6 +2872,8 @@ export interface components {
              */
             expires_at: number;
             id: string;
+            /** @description `issued`: a token a person minted (an API token). */
+            kind: string;
             /**
              * Format: int64
              * @description Unix-ms of the last request that presented it, written back at most once
@@ -2879,6 +2881,11 @@ export interface components {
              */
             last_used_at?: number | null;
             name: string;
+            /**
+             * @description The ApiOperations it may use. `None`: every operation its role and
+             *     scope allow.
+             */
+            operations?: string[] | null;
             org: string;
             /** @description That Principal, as people read it. */
             owner: components["schemas"]["PersonDto"];
@@ -4425,6 +4432,11 @@ export interface components {
             expires_in_days: number;
             /** @description Human label — what makes the token revocable in practice. */
             name: string;
+            /**
+             * @description The ApiOperations the token may use; absent for every operation its
+             *     role and scope allow. See [`MintTokenRequest::operations`].
+             */
+            operations?: string[] | null;
             /** @description The org the token is scoped to (or the org of its project). */
             org: string;
             /** @description Project within the org to scope the token to. Absent = the whole org. */
@@ -4451,6 +4463,13 @@ export interface components {
              *     keepalive", "amy's laptop".
              */
             name: string;
+            /**
+             * @description The ApiOperations the token may use (`run.read`, `step.logs.read`,
+             *     `repo.dispatch`, …). Absent: every operation its role and scope
+             *     allow. Present: every other request is refused. At least one, each
+             *     an operation an API token can perform.
+             */
+            operations?: string[] | null;
             /**
              * @description Project within the org to scope the token to. Absent = the whole org,
              *     inheriting down to its projects exactly as an org binding does.

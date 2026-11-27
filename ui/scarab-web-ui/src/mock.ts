@@ -2387,6 +2387,7 @@ const apiTokens: components["schemas"]["ApiTokenDto"][] = [
     last_used_at: ago(4 * min),
     use_count: 18_412,
     revoked_at: null,
+    kind: "issued",
   },
   {
     id: "3b7a9c02-6d41-4b8e-8c22-71f0ab993c55",
@@ -2402,6 +2403,7 @@ const apiTokens: components["schemas"]["ApiTokenDto"][] = [
     last_used_at: ago(20 * min),
     use_count: 1_203,
     revoked_at: null,
+    kind: "issued",
   },
   {
     id: "c41e7f60-2a88-4f19-b0d3-5e6a7c1b2d34",
@@ -2417,6 +2419,7 @@ const apiTokens: components["schemas"]["ApiTokenDto"][] = [
     last_used_at: ago(52 * min),
     use_count: 9_870,
     revoked_at: null,
+    kind: "issued",
   },
   {
     id: "7d5b0e13-9c44-4a27-8e61-0f3d2c8a55b7",
@@ -2432,6 +2435,7 @@ const apiTokens: components["schemas"]["ApiTokenDto"][] = [
     last_used_at: ago(30 * day),
     use_count: 312,
     revoked_at: ago(11 * day),
+    kind: "issued",
   },
 ];
 
@@ -2446,6 +2450,7 @@ function mintMockToken(body: string, pathOrg?: string): Response {
     project?: string;
     role?: string;
     expires_in_days?: number;
+    operations?: string[] | null;
   };
   mintedTokens += 1;
   const record: MockToken = {
@@ -2462,6 +2467,8 @@ function mintMockToken(body: string, pathOrg?: string): Response {
     last_used_at: null,
     use_count: 0,
     revoked_at: null,
+    kind: "issued",
+    operations: req.operations ?? null,
   };
   apiTokens.unshift(record);
   return json(

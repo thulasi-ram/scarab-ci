@@ -12113,6 +12113,12 @@ pub struct MintTokenRequest {
     pub role: String,
     /// Lifetime in days, `1..=365`. No default and no "never".
     pub expires_in_days: u32,
+    /// The ApiOperations the token may use (`run.read`, `step.logs.read`,
+    /// `repo.dispatch`, …). Absent: every operation its role and scope
+    /// allow. Present: every other request is refused. At least one, each
+    /// an operation an API token can perform.
+    #[serde(default)]
+    pub operations: Option<Vec<String>>,
 }
 
 /// `POST /v1/me/tokens` body: [`MintTokenRequest`] plus the org, which the
@@ -12131,6 +12137,10 @@ pub struct MintOwnTokenRequest {
     pub role: String,
     /// Lifetime in days, `1..=365`.
     pub expires_in_days: u32,
+    /// The ApiOperations the token may use; absent for every operation its
+    /// role and scope allow. See [`MintTokenRequest::operations`].
+    #[serde(default)]
+    pub operations: Option<Vec<String>>,
 }
 
 /// The mint response — the **only** place the plaintext ever appears.
@@ -12175,6 +12185,11 @@ pub struct ApiTokenDto {
     pub use_count: u64,
     /// Unix-ms revocation, or `None` while it is live.
     pub revoked_at: Option<i64>,
+    /// `issued`: a token a person minted (an API token).
+    pub kind: String,
+    /// The ApiOperations it may use. `None`: every operation its role and
+    /// scope allow.
+    pub operations: Option<Vec<String>>,
 }
 
 impl From<scarab_identity::ApiToken> for ApiTokenDto {
@@ -12201,6 +12216,8 @@ impl From<scarab_identity::ApiToken> for ApiTokenDto {
             last_used_at: t.last_used_at,
             use_count: t.use_count,
             revoked_at: t.revoked_at,
+            kind: t.kind.as_str().to_string(),
+            operations: t.operations,
         }
     }
 }
@@ -12277,6 +12294,7 @@ async fn mint_own_api_token(
         project,
         role,
         expires_in_days,
+        operations,
     } = req;
     if org.trim().is_empty() {
         return Err(ApiError::BadRequest("token `org` must not be empty".into()));
@@ -12290,6 +12308,7 @@ async fn mint_own_api_token(
             project,
             role,
             expires_in_days,
+            operations,
         },
     )
     .await
@@ -12336,6 +12355,7 @@ async fn mint_personal_token(
         )));
     }
     let role = parse_role(&req.role)?;
+    let operations = token_operation_list(req.operations)?;
 
     // Least privilege, enforced at mint: the grant may not exceed what the
     // minter holds in this scope. The easy implementation — clone the minter's
@@ -12396,6 +12416,10 @@ async fn mint_personal_token(
         last_used_at: None,
         use_count: 0,
         revoked_at: None,
+        kind: scarab_identity::PrincipalTokenKind::Issued,
+        operations,
+        audience: None,
+        oauth_client: None,
     };
     note_org(st, token.scope.org()).await?;
     store
@@ -12417,6 +12441,41 @@ async fn mint_personal_token(
         ),
     )
         .into_response())
+}
+
+/// The operation list a mint asked for, checked (ADR-0086 §6): `None` stays
+/// `None` (no list). A list must name at least one operation, each an
+/// ApiOperation of the route table that an API token can perform; it is
+/// stored sorted, each id once.
+fn token_operation_list(requested: Option<Vec<String>>) -> Result<Option<Vec<String>>, ApiError> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    if requested.is_empty() {
+        return Err(ApiError::BadRequest(
+            "`operations` must name at least one operation; leave it out for a token that may \
+             use every operation its role allows"
+                .into(),
+        ));
+    }
+    let mut out: Vec<String> = Vec::with_capacity(requested.len());
+    for id in requested {
+        let Some(op) = step_up::ops::by_id(&id) else {
+            return Err(ApiError::BadRequest(format!(
+                "`operations` names `{id}`, which is not an operation"
+            )));
+        };
+        if op.machine != step_up::ops::StepUpMachineUse::Requestable {
+            return Err(ApiError::BadRequest(format!(
+                "`operations` names `{id}`, which an API token can never perform"
+            )));
+        }
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out.sort();
+    Ok(Some(out))
 }
 
 /// 32 bytes of CSPRNG, base64url without padding — a high-entropy bearer
@@ -12807,6 +12866,36 @@ impl Caller {
         }
     }
 
+    /// Refuse a token that carries an ApiOperation list (ADR-0086 §5, §6)
+    /// on a request whose route's operation is not in it, or whose route
+    /// names no operation at all: fail-closed, so a route the guard did not
+    /// see can never widen a limited token. Any other caller passes.
+    fn admit_route_operation(&self) -> Result<(), ApiError> {
+        let Some(token) = &self.grant else {
+            return Ok(());
+        };
+        let operation = step_up::guard::route_operation();
+        if token.admits_operation(operation.map(|op| op.id)) {
+            return Ok(());
+        }
+        let message = match operation {
+            Some(op) => format!(
+                "this API token may not use the operation `{}` ({}); it may use: {}",
+                op.id,
+                op.label,
+                token.operations.as_deref().unwrap_or_default().join(", ")
+            ),
+            None => "this API token is limited to a list of operations, and this request \
+                     matched no route that names one"
+                .to_string(),
+        };
+        Err(ApiError::Ceremony {
+            status: StatusCode::FORBIDDEN,
+            code: "operation_not_granted",
+            message,
+        })
+    }
+
     /// May this caller perform `action` in `scope`?
     async fn may(
         &self,
@@ -12897,7 +12986,9 @@ async fn authenticate(
     // CSRF has nothing to defend (no browser sent this request). The
     // task-local is set only by the confirm endpoint around its replay.
     if let Some(authority) = step_up::requests::replay_authority() {
-        return step_up::requests::replay_caller(st, &authority).await;
+        let caller = step_up::requests::replay_caller(st, &authority).await?;
+        caller.admit_route_operation()?;
+        return Ok(caller);
     }
     let Some(sessions) = st.sessions.as_ref() else {
         return Ok(Caller::dev_insecure_owner(Principal {
@@ -12912,7 +13003,9 @@ async fn authenticate(
     // amendment): a mistyped token must fail as a token, with no chance of
     // being taken for a session id.
     if sid.starts_with(scarab_identity::API_TOKEN_PREFIX) {
-        return authenticate_api_token(st, &sid, via).await;
+        let caller = authenticate_api_token(st, &sid, via).await?;
+        caller.admit_route_operation()?;
+        return Ok(caller);
     }
     let session = sessions
         .get(&sid)
@@ -13004,7 +13097,7 @@ async fn authenticate_api_token(
         .map_err(|_| ApiError::Unauthorized)?
         .ok_or(ApiError::Unauthorized)?;
     let now = st.clock.now().await.0;
-    if !token.is_live(now) {
+    if !token.is_live(now) || !usable_on_core_routes(&token) {
         return Err(ApiError::Unauthorized);
     }
     // Observability, coarse and best-effort: a failure to record the use must
@@ -13041,6 +13134,15 @@ async fn authenticate_api_token(
         via: Some(via),
         session: None,
     })
+}
+
+/// May `token` authenticate a request to the core API (ADR-0086 §6)? Only
+/// an issued token with no audience. An `oauth` token is bound to the one
+/// URL it was granted for and is never accepted on the core routes; an
+/// issued token never carries an audience, so one that does is refused
+/// rather than trusted.
+pub(crate) fn usable_on_core_routes(token: &scarab_identity::PrincipalToken) -> bool {
+    token.kind == scarab_identity::PrincipalTokenKind::Issued && token.audience.is_none()
 }
 
 /// Authorize `action` with **global** (flat) roles only — for resources that

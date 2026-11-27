@@ -25,6 +25,10 @@ fn token(id: &str, scope: Scope, created_at: i64) -> ApiToken {
         last_used_at: None,
         use_count: 0,
         revoked_at: None,
+        kind: scarab_identity::PrincipalTokenKind::Issued,
+        operations: None,
+        audience: None,
+        oauth_client: None,
     }
 }
 
