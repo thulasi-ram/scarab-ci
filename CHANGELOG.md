@@ -18,6 +18,17 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **Migration 0110 adds two nullable columns to `attempts`** (a plugin gate's note). No row is
+  rewritten. A 0.8.2 server does not start on a database that ran it: to roll back, run
+  `crates/scarab-db-postgres/rollback/0110_revert.sql` with the server scaled to zero. See the
+  chart README, "Upgrading from 0.8.2".
+- **Plugin Deployments are renamed** to `scarab-plugin-<name>-<id>`. On upgrade each plugin is down
+  for about 15 to 30 seconds while the old Deployment goes and the new one starts. A 0.8.2 server
+  knows only the old names: to roll back, delete the new Deployments first (chart README,
+  "Upgrading from 0.8.2").
+
 ### Security
 
 - **A Run started by hand at a fork's commit gets the fork limits.** A manual or API dispatch at
