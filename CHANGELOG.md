@@ -28,18 +28,24 @@ release.yml uses that version's section as the GitHub Release text. See
 - **An API token no longer approves a gate by itself.** Its approval of any `manual` gate, a
   plain one included, answers `403 step_up_required` with a confirmation request its owner
   confirms with a passkey. A script that approved plain gates with a token must confirm each
-  approval or approve from a browser. Rejecting is unchanged.
+  approval or approve from a browser. Rejecting is unchanged. Under `SCARAB_DEV_INSECURE`, where
+  step-up is off, a token's approval is still recorded at once.
 - **Reads are named by the data they return.** The shared `read` operation is split into
   `run.read`, `step.logs.read`, `step.workspace.read`, `run.artifacts.read`, `repo.read`,
   `account.read`, `access.read`, `security.read`, `secret.names.read`, `settings.read` and
-  `server.read`. Security events for reads carry the new names.
+  `server.read`. Security events for reads carry the new names. No operation implies another:
+  a token with a list needs `account.read` for `GET /v1/me` and `server.read` for
+  `GET /v1/about`.
 
 ### Features
 
 - **Limit an API token to a list of operations.** A token minted with `operations` may use only
   those; every other request is refused with `403 operation_not_granted`. Each token records its
   kind (`issued`), and every rerun, retry, cancel, pin, approval and rejection made with a token
-  records the token beside the person in the Run's events. See
+  records the token beside the person in the Run's events, and so does a dispatch on the Run
+  itself. The token's id (never its secret) is visible to anyone who can read the Run. A token
+  with a list is stored under a different hash, so a server older than this release cannot find
+  it during a rolling upgrade. See
   [API tokens](/scarab-ci/usage/api-tokens/#operations).
 
 ## [0.8.3] - 2026-11-27

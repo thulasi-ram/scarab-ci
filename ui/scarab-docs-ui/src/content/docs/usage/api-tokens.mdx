@@ -62,13 +62,20 @@ Writes keep the names the step-up events already use, such as `repo.dispatch`, `
 `step.retry`, `run.cancel`, `gate.reject` and `gate.approve`. A token limited to a list cannot
 use a route that names no operation.
 
+No operation implies another. A list needs `account.read` for `GET /v1/me` (the CLI calls it to
+say who you are) and to poll a confirmation request, and `server.read` for `GET /v1/about`.
+
 ## Approving a gate with a token
 
 A token never approves a gate by itself. Its approval of any `manual` gate, a plain one
 included, is refused with `403 step_up_required` and a link to a confirmation request; the
 approval is recorded once you confirm it with your passkey. A token can reject a gate without a
-confirmation. Every rerun, retry, cancel, approval and rejection a token makes is recorded with
-the token beside your name.
+confirmation. This does not hold on a server run with `SCARAB_DEV_INSECURE`, where step-up is
+off and a token's approval is recorded at once.
+
+Every dispatch, rerun, retry, cancel, approval and rejection a token makes is recorded with the
+token's id and kind beside your name. Anyone who can read the Run can see that id in its events.
+The id names the token; it is never the secret, and it cannot be used to authenticate.
 
 ## The org's list
 

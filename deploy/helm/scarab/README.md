@@ -566,10 +566,14 @@ The StatefulSet's `serviceName` is unchanged, so upgrading needs no migration.
 ### Upgrading from 0.8.3: token kinds and operation lists
 
 Migration 0111 adds four columns to `api_tokens`: `kind` (`NOT NULL DEFAULT
-'issued'`), and the nullable `operations`, `audience` and `oauth_client`. No
+'issued'`), and the nullable `operations`, `audience` and `oauth_client`, and
+one nullable column to `runs`, `origin_via`, the token that started a Run. No
 row is rewritten, and every existing token reads as an issued token with no
-operation list, so it works as before. The `ALTER` waits at most 5 seconds for
-its lock on `api_tokens`; on a busy database the server stops with `canceling
+operation list, so it works as before. A token minted with an operation list
+is stored under a different hash, so a 0.8.3 replica still running during the
+rolling update cannot find it and cannot let it use every operation its role
+allows. The `ALTER` waits at most 5 seconds for
+its lock on `api_tokens` and on `runs`; on a busy database the server stops with `canceling
 statement due to lock timeout` and runs it again when the Pod restarts.
 
 Two behaviour changes reach existing tokens. Every GET now names a read
