@@ -28,8 +28,10 @@ release.yml uses that version's section as the GitHub Release text. See
   commit. A name that is both a branch and a tag is refused with a 400 that asks for
   `refs/heads/<name>` or `refs/tags/<name>`. A name that is neither, such as a short commit SHA,
   is recorded as the full commit SHA, which no branch or tag pattern matches. `HEAD` is recorded
-  as the default branch, `refs/heads/<default>`, instead of `refs/heads/HEAD`
-  ([Runs](/scarab-ci/usage/runs/)).
+  as the default branch, `refs/heads/<default>`, instead of `refs/heads/HEAD`. A
+  `refs/heads/<name>` or `refs/tags/<name>` the repository does not have is refused with a 400.
+  The typed ref is trimmed of spaces. A forge error during these ref lookups refuses the
+  dispatch ([Runs](/scarab-ci/usage/runs/)).
 - **A Forgejo pull request whose head is on no branch is fork code.** Scarab treated a pull
   request as the repository's own code whenever its head was in the same repository. A Forgejo
   AGit-flow pull request (pushed to `refs/for/<branch>`, which read access allows) has its head
@@ -39,9 +41,11 @@ release.yml uses that version's section as the GitHub Release text. See
   GitHub and Forgejo alike, Scarab now asks the forge for the pull request's head branch before
   it trusts a pull request from the repository, one call per pull request event: the branch must
   exist and point at the pull request's head commit. A missing branch, a branch at another
-  commit, or a forge error makes the Run fork code; it is still created. A known effect: when
-  the branch moves between the push and Scarab's check (another push right after), that Run
-  gets the fork limits; the next push, or running the pipeline again, checks again.
+  commit, or a forge error makes the Run fork code; it is still created. So during a forge
+  outage, a pull request Run from the repository gets the fork limits. A known effect: when the
+  branch moves between the push and Scarab's check (another push right after), that Run gets the
+  fork limits too. A re-run of that Run keeps them; once the forge answers again, start the
+  pipeline again with a new push to the pull request or a dispatch at `refs/pull/<n>/head`.
 
 ### Enhancement
 

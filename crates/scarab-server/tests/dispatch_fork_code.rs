@@ -379,3 +379,38 @@ async fn head_records_the_default_branch() {
     assert_eq!(recorded_ref(&db, &run).await, "refs/heads/trunk");
     assert_eq!(pinned_sha(&db, &run).await, HEAD);
 }
+
+/// A fully-qualified branch or tag the repository does not have is refused,
+/// not recorded as fork code.
+#[tokio::test]
+async fn a_full_ref_the_repository_does_not_have_is_refused() {
+    let forge = FakeForge::new()
+        .with_file(".scarab/deploy.yaml", DEPLOY_YAML)
+        .with_branch("main", HEAD)
+        .with_tag("v1", HEAD);
+    let db = InMemoryDb::new();
+    for missing in ["refs/heads/gone", "refs/tags/v2"] {
+        let err = dispatch(&forge, &db, missing)
+            .await
+            .expect_err("no such ref");
+        assert!(
+            matches!(&err, DispatchError::RefNotFound(r) if r == missing),
+            "{missing}: got {err}"
+        );
+    }
+    assert!(db.list_runs(100).await.unwrap().is_empty(), "no Run");
+}
+
+/// The typed ref is trimmed before it is looked up and recorded.
+#[tokio::test]
+async fn a_typed_ref_is_trimmed() {
+    let forge = FakeForge::new()
+        .with_file(".scarab/deploy.yaml", DEPLOY_YAML)
+        .with_branch("release/1", HEAD);
+    let db = InMemoryDb::new();
+    let run = dispatch(&forge, &db, "  release/1\n")
+        .await
+        .expect("dispatch");
+    assert_eq!(recorded_ref(&db, &run).await, "refs/heads/release/1");
+    assert_eq!(pinned_sha(&db, &run).await, HEAD);
+}
