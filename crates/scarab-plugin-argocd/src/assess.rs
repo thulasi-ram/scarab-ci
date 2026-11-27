@@ -176,7 +176,22 @@ pub fn assess(app: &Application) -> Assessment {
             )
         }
         "Synced" => {}
-        _ => return assessment(Status::InProgress, "sync status unknown"),
+        // Argo could not compare live with target. Its reason is in an
+        // `…Error` condition (a ComparisonError such as "app path does not
+        // exist"); name it, so the wait says why. It can be transient (a
+        // repo server timeout), so the wait stays open.
+        _ => {
+            let label = match app
+                .status
+                .conditions
+                .iter()
+                .find(|c| c.kind.ends_with("Error") && !c.message.trim().is_empty())
+            {
+                Some(c) => format!("sync status unknown: {}: {}", c.kind, c.message),
+                None => "sync status unknown".to_string(),
+            };
+            return assessment(Status::InProgress, label);
+        }
     }
     let health = &app.status.health;
     let message = health_message(app);

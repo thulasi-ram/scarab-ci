@@ -172,7 +172,12 @@ when Argo gives up: a failed sync of the current revision, a failed hook, or a r
 progress deadline. For an Application outside Argo CD's own namespace (apps in any namespace),
 write `app` as `<namespace>/<name>`, as the `argocd` CLI does. The plugin fails the gate at once
 when `app` or its namespace is empty, `.` or `..`, or `app` holds a second `/`, which no
-Application name does. The gate's output `revision` is the git revision Argo synced; for a multi-source Application it
+Application name does. Write `image` as your manifests write it: the plugin compares it with the
+images in the Application's target manifests, exactly, except that a Docker Hub short name matches
+its full form (`busybox:1.36` is `docker.io/library/busybox:1.36`). A name a registry mirror
+rewrote it to, which Argo CD's UI may show, does not match, and the gate's wait message lists
+what the manifests do render. While Argo CD cannot compare the Application (sync status
+`Unknown`), the wait message carries Argo's error, such as a `ComparisonError`. The gate's output `revision` is the git revision Argo synced; for a multi-source Application it
 is each source's revision, in the order of `spec.sources`, joined by commas. The run fails when
 the gate expires. See [Plugin gates](/scarab-ci/usage/pipeline-syntax/#plugin-gates).
 

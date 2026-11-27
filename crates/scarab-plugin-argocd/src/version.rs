@@ -139,6 +139,38 @@ pub fn target_images(resources: &ManagedResources) -> BTreeSet<String> {
     images
 }
 
+/// An image reference in the form Docker resolves it to, so that two
+/// spellings of one image compare equal: a Docker Hub reference gets its
+/// registry (`docker.io`) and, for an official image, `library/`
+/// (`busybox:1.36` is `docker.io/library/busybox:1.36`); `index.docker.io`
+/// is `docker.io`. Any other registry is left as written. A registry
+/// mirror's rewritten name (`<mirror>/docker-hub/library/busybox:1.36`) is
+/// another reference and does not match.
+pub fn normalize_image(reference: &str) -> String {
+    // No trimming or case folding: anything but the Docker Hub forms must
+    // match exactly (tests/redteam_plugin_gates_r1.rs).
+    let (first, rest) = match reference.split_once('/') {
+        Some((first, rest)) => (Some(first), rest),
+        None => (None, reference),
+    };
+    // A first segment is a registry when it has a `.` or a `:` (a port), or
+    // is `localhost`, as Docker decides it.
+    let registry = first.filter(|f| f.contains('.') || f.contains(':') || *f == "localhost");
+    match registry {
+        Some("docker.io" | "index.docker.io") => docker_hub(rest),
+        Some(_) => reference.to_string(),
+        None => docker_hub(reference),
+    }
+}
+
+fn docker_hub(path: &str) -> String {
+    if path.contains('/') {
+        format!("docker.io/{path}")
+    } else {
+        format!("docker.io/library/{path}")
+    }
+}
+
 /// The version string: the sorted, de-duplicated references joined by `,`.
 /// `None` for an empty set — an Application with no pod templates (only
 /// ConfigMaps, CRDs, …) has no version in this scheme and is not reported

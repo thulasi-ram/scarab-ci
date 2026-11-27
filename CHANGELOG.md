@@ -18,6 +18,15 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **Argo CD plugin: fixes from a run against a real Argo CD 3.4.** An Application whose auto-sync is
+  turned off with `automated: {enabled: false}` is no longer reported as "awaiting auto-sync". A
+  `wait-live` gate whose Application Argo cannot compare now says why (Argo's `ComparisonError`
+  message) in place of "sync status unknown". A Docker Hub short name in the manifest
+  (`busybox:1.36.1`) matches its full form (`docker.io/library/busybox:1.36.1`), and a wait for an
+  image the manifests do not render lists the images they do (git-bug 9f76ee1).
+
 ### Security
 
 - **A Run started by hand at a fork's commit gets the fork limits.** A manual or API dispatch at

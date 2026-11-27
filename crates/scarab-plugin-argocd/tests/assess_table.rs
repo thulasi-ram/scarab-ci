@@ -267,3 +267,133 @@ fn a_multi_source_pass_outputs_its_revisions_in_source_order() {
         }
     );
 }
+
+// --- shapes from a real Argo CD 3.4 (staging captures, 2026-11-27) -------------
+//
+// Three things the synthetic fixtures did not have, each found by running
+// `judge` over real Applications: `automated: {enabled: false}`, a sync status
+// of `Unknown` with a ComparisonError condition, and an image written as a
+// Docker Hub short name.
+
+fn real_shape(
+    sync: &str,
+    sync_policy: serde_json::Value,
+    conditions: serde_json::Value,
+) -> Application {
+    serde_json::from_value(serde_json::json!({
+        "metadata": { "name": "tools", "namespace": "argocd" },
+        "spec": { "project": "default", "syncPolicy": sync_policy },
+        "status": {
+            "sync": { "status": sync, "revision": "2336bfba7918998ffb3437efdb2b0c676b8ad76b" },
+            "health": { "status": "Healthy" },
+            "conditions": conditions
+        }
+    }))
+    .expect("an Argo CD 3.4 Application")
+}
+
+#[test]
+fn automated_with_enabled_false_is_not_auto_sync() {
+    // Argo CD 3.x keeps the block and turns auto-sync off with `enabled`.
+    let off = real_shape(
+        "OutOfSync",
+        serde_json::json!({ "automated": { "selfHeal": false, "enabled": false } }),
+        serde_json::json!([]),
+    );
+    assert!(!off.automated());
+    assert_eq!(assess(&off).label, "awaiting sync");
+
+    let on = real_shape(
+        "OutOfSync",
+        serde_json::json!({ "automated": { "prune": true, "selfHeal": true } }),
+        serde_json::json!([]),
+    );
+    assert!(on.automated());
+    assert_eq!(assess(&on).label, "awaiting auto-sync");
+}
+
+#[test]
+fn an_unknown_sync_status_names_argos_comparison_error() {
+    let app = real_shape(
+        "Unknown",
+        serde_json::json!({ "automated": { "prune": true, "selfHeal": true } }),
+        serde_json::json!([
+            { "type": "ComparisonError", "message": "Failed to load target state: app path does not exist" },
+            { "type": "OrphanedResourceWarning", "message": "Application has 1 orphaned resources" }
+        ]),
+    );
+    let a = assess(&app);
+    assert_eq!(
+        a.status,
+        Status::InProgress,
+        "a comparison error can be transient"
+    );
+    assert!(
+        a.label.contains("ComparisonError") && a.label.contains("app path does not exist"),
+        "the wait says why: {}",
+        a.label
+    );
+    // Without an error condition the label stays as before.
+    let bare = real_shape("Unknown", serde_json::json!(null), serde_json::json!(null));
+    assert_eq!(assess(&bare).label, "sync status unknown");
+}
+
+#[test]
+fn image_references_compare_in_the_form_docker_resolves_them() {
+    use scarab_plugin_argocd::version::normalize_image as n;
+    for (a, b) in [
+        ("busybox:1.36.1", "docker.io/library/busybox:1.36.1"),
+        ("busybox:1.36.1", "index.docker.io/library/busybox:1.36.1"),
+        ("acme/web:1", "docker.io/acme/web:1"),
+    ] {
+        assert_eq!(n(a), n(b), "{a} and {b} are one image");
+    }
+    for (a, b) in [
+        // Exact otherwise: no trimming, no case folding.
+        (" busybox:1.36.1", "busybox:1.36.1"),
+        ("GHCR.IO/acme/web:1", "ghcr.io/acme/web:1"),
+        // Another registry is left as written.
+        ("ghcr.io/acme/web:1", "docker.io/acme/web:1"),
+        ("localhost:5000/web:1", "docker.io/localhost:5000/web:1"),
+        // A mirror's rewritten name is another reference.
+        (
+            "123456789012.dkr.ecr.ap-south-1.amazonaws.com/docker-hub/library/busybox:1.36.1",
+            "busybox:1.36.1",
+        ),
+    ] {
+        assert_ne!(n(a), n(b), "{a} and {b} differ");
+    }
+}
+
+#[test]
+fn a_docker_hub_short_name_in_the_manifest_matches_its_full_form() {
+    let managed: ManagedResources = serde_json::from_value(serde_json::json!({
+        "items": [{
+            "group": "apps", "kind": "Deployment", "namespace": "wallet", "name": "wallet-app-server",
+            "targetState": serde_json::json!({
+                "apiVersion": "apps/v1", "kind": "Deployment",
+                "metadata": { "name": "wallet-app-server" },
+                "spec": { "template": { "spec": {
+                    "initContainers": [{ "name": "wait", "image": "busybox:1.36.1" }],
+                    "containers": [{ "name": "app", "image": "123456789012.dkr.ecr.ap-south-1.amazonaws.com/wallet:staging-0b783933" }]
+                }}}
+            }).to_string()
+        }]
+    }))
+    .expect("managed resources");
+    let app = real_shape("Synced", serde_json::json!(null), serde_json::json!([]));
+
+    assert!(matches!(
+        judge(&app, &managed, "docker.io/library/busybox:1.36.1"),
+        Judgement::Pass { .. }
+    ));
+    // A mirror's name waits, and the wait names what the manifests render.
+    match judge(
+        &app,
+        &managed,
+        "123456789012.dkr.ecr.ap-south-1.amazonaws.com/docker-hub/library/busybox:1.36.1",
+    ) {
+        Judgement::Wait { why } => assert!(why.contains("`busybox:1.36.1`"), "{why}"),
+        other => panic!("expected a wait, got {other:?}"),
+    }
+}
