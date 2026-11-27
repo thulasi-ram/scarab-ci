@@ -28,13 +28,13 @@ release.yml uses that version's section as the GitHub Release text. See
 
 - **`REGISTRY_AUTH` resolves through the Run's Environment.** A push step's registry credential
   read only the repository's and the org's `REGISTRY_AUTH`, so a value set for an Environment,
-  by the repository or by the org, was never used. It now resolves the way a step's declared
-  secrets do: for a Run in an Environment, the repository's value for it, the org's value for it,
-  the repository default, then the org default. Two results differ from before for a Run in an
-  Environment: an org value set for that Environment now outranks the repository's own
-  `REGISTRY_AUTH`, and a Run locked out of its Environment's secrets gets no registry credential.
-  A secret store error now fails the step's launch, where it used to fall through to the next
-  scope or to the forge-derived credential, and a value that is not UTF-8 text is refused
+  by the repository or by the org, was never used. A push step the Environment admits (approved,
+  or an Environment with no approvers) now resolves the Run's Environment chain: the
+  repository's value for it, the org's value for it, the repository default, then the org
+  default. So an org value set for that Environment now outranks the repository's own
+  `REGISTRY_AUTH`. A push step before approval keeps the repository's and the org's values, as
+  before. A secret store error now fails the step's launch, where it used to fall through to the
+  next scope or to the forge-derived credential, and a value that is not UTF-8 text is refused
   ([Pushing to ECR](/scarab-ci/usage/pushing-to-ecr/)).
 
 ## [0.8.3] - 2026-11-27

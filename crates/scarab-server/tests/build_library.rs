@@ -26,7 +26,7 @@ use scarab_policy::library::{
     content_hash, trust_key, LibraryStore, LibraryVersion, NewInstallation, Replaces, TrustGrant,
     TrustedSource,
 };
-use scarab_project::EnvironmentProjectEligibility;
+use scarab_project::{EnvironmentProjectEligibility, EnvironmentProtectionRules};
 use scarab_secrets::{Secret, SecretError, SecretProvider, SecretScope};
 use scarab_server::forge_token::ForgeCredentialExecutor;
 use scarab_server::{trigger_runs_from_event, AdmissionPorts, TriggerOutcome};
@@ -388,17 +388,31 @@ async fn executor_with(
     fork: bool,
     deploy: Option<DeployContext>,
 ) -> ForgeCredentialExecutor {
-    let db = Arc::new(InMemoryDb::new());
-    let run = RunId("r1".into());
-    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
     let mut governance = InMemoryEnvironmentGovernance::new();
     if let Some(ctx) = &deploy {
-        db.set_run_deploy_context(&run, ctx).await.unwrap();
         governance = governance.with_environment(
             &ctx.org,
             &ctx.environment,
             EnvironmentProjectEligibility::AllProjects,
         );
+    }
+    executor_over(inner, libs, secrets, fork, deploy, governance).await
+}
+
+/// [`executor_with`] over the Environment store `governance`.
+async fn executor_over(
+    inner: Arc<FakeExecutor>,
+    libs: Arc<InMemoryLibraries>,
+    secrets: Arc<dyn SecretProvider>,
+    fork: bool,
+    deploy: Option<DeployContext>,
+    governance: InMemoryEnvironmentGovernance,
+) -> ForgeCredentialExecutor {
+    let db = Arc::new(InMemoryDb::new());
+    let run = RunId("r1".into());
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    if let Some(ctx) = &deploy {
+        db.set_run_deploy_context(&run, ctx).await.unwrap();
     }
     db.append_event(&EventKind {
         version: EVENT_VERSION,
@@ -726,43 +740,46 @@ async fn registry_auth_takes_the_environments_value_first() {
     );
 }
 
-/// A Run locked out of its Environment's secrets (a fork pull request into
-/// a deploy) gets neither the `REGISTRY_AUTH` secret nor the forge-derived
-/// credential, though its library is trusted with both and its recorded
-/// trigger is not a fork; its Steps are told they run for one. Before the
-/// fix the deploy context was not read and the Repo value was mounted.
+/// A push Step its Environment does not admit yet resolves the repository's
+/// value, not the Environment's. The Environment has approvers and the Run
+/// has no stored pipeline, so no approval gate is upstream of the Step and
+/// it is before approval. Only a Step the Environment admits (approved, or
+/// no approvers) reads the Environment's chain.
 #[tokio::test]
-async fn a_run_locked_out_of_its_environment_gets_no_registry_credential() {
+async fn a_push_step_before_approval_takes_the_repository_value() {
+    let env_project = r#"{"auths":{"prod.corp":{"auth":"ZW52"}}}"#;
+    let repo = r#"{"auths":{"registry.corp":{"auth":"cmVw"}}}"#;
     let secrets = FakeSecrets::new()
-        .with_secret(&prod_project(), "REGISTRY_AUTH", REGISTRY_AUTH)
-        .with_secret(&repo_scope(), "REGISTRY_AUTH", REGISTRY_AUTH);
+        .with_secret(&prod_project(), "REGISTRY_AUTH", env_project.as_bytes())
+        .with_secret(&repo_scope(), "REGISTRY_AUTH", repo.as_bytes());
+    let governance = InMemoryEnvironmentGovernance::new().with_project_overlay(
+        "acme",
+        "web",
+        "prod",
+        EnvironmentProtectionRules {
+            approvers: vec!["amy".to_string()],
+            ..Default::default()
+        },
+    );
     let inner = Arc::new(FakeExecutor::new());
-    let exec = executor_with(
+    let exec = executor_over(
         inner.clone(),
         fully_trusted().await,
         Arc::new(secrets),
         false,
-        Some(prod(true)),
+        Some(prod(false)),
+        governance,
     )
     .await;
     let handle = exec
         .launch(&step_run("push"), &push_spec(true))
         .await
         .unwrap();
-    let launched = inner.launched_spec(&handle).unwrap();
-    let auth = launched.registry_auth.clone().unwrap();
-    assert_eq!((auth.registry_auth_json, auth.derived_auth), (None, None));
-    assert!(auth.locked_out);
-    assert!(
-        !auth.credential_eligible,
-        "a locked-out Run gets no registry_auth_only placement profile"
-    );
-    assert!(
-        launched
-            .env
-            .contains(&(scarab_pipeline::FORK_PR_ENV.to_string(), "true".to_string())),
-        "the push Step is not told to skip the push: {:?}",
-        launched.env
+    let auth = inner.launched_spec(&handle).unwrap().registry_auth.unwrap();
+    assert_eq!(
+        auth.registry_auth_json.as_deref(),
+        Some(repo),
+        "a Step before approval does not read the Environment's value"
     );
 }
 
