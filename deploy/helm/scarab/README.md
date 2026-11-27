@@ -583,13 +583,23 @@ any `manual` gate, a plain one included, now raises a confirmation request its
 owner confirms; a script that approved plain gates with a token must confirm
 each approval, or approve from a browser.
 
+Migration 0112 adds two tables, `delegated_caller_handles` and
+`delegated_call_journal`, for PluginApi: a plugin that registers an endpoint
+calls the public API on the broker listener for one caller at a time. No
+existing row is touched. A plugin whose manifest registers no endpoint works
+as before. A plugin that registers one (a `trusted_service` plugin) installs
+only from a digest of an image repository listed in
+`plugins.trustedPublishers`, which is empty by default.
+
 To roll back: scale the server to zero, back up the database, run
 [`rollback/0111_revert.sql`](../../../crates/scarab-db-postgres/rollback/0111_revert.sql)
 (`psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0111_revert.sql`; a second run
 changes nothing), then install the 0.8.3 chart. A 0.8.3 server would let a
 token with an operation list use every operation, so the revert revokes those
-tokens before it drops the columns; their owners mint new ones. To go back to
-0.8.2, run `0110_revert.sql` next.
+tokens before it drops the columns; their owners mint new ones. Run
+[`rollback/0112_revert.sql`](../../../crates/scarab-db-postgres/rollback/0112_revert.sql)
+first: it drops the PluginApi tables and their journal. To go back to 0.8.2,
+run `0110_revert.sql` next.
 
 ### Upgrading from 0.8.2: gate notes
 

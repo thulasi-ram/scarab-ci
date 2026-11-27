@@ -36,6 +36,23 @@ release.yml uses that version's section as the GitHub Release text. See
   `server.read`. Security events for reads carry the new names. No operation implies another:
   a token with a list needs `account.read` for `GET /v1/me` and `server.read` for
   `GET /v1/about`.
+- **Migration 0112 adds `delegated_caller_handles` and `delegated_call_journal`.** Two new
+  tables; nothing existing changes. To roll back, run
+  `crates/scarab-db-postgres/rollback/0112_revert.sql` before `0111_revert.sql`.
+
+### Security
+
+- **A plugin that registers an endpoint runs only from a publisher the operator trusts.** A
+  manifest may now register an endpoint and the API operations each of its requests may use. Such
+  a plugin is `trusted_service`: an org admin can install or upgrade it only from a digest of an
+  image repository listed in `plugins.trustedPublishers`, which is empty by default. Its `may`
+  cannot name an operation that can need a step-up, a browser-only one, or a route that
+  authenticates nobody.
+- **A plugin acts for a caller only with a handle.** On the broker listener a plugin calls the
+  public API for one caller with its installation token and a delegated caller handle bound to
+  that installation, the caller's token and an operation list. The installation token alone acts
+  as nobody. A delegated call obeys both the handle's and the token's operation lists, is counted
+  and journaled, never raises or satisfies a step-up, and never approves a gate.
 
 ### Features
 
