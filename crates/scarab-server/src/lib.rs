@@ -5965,22 +5965,6 @@ async fn record_pipeline_refusal(
     .into()
 }
 
-/// [`trigger_runs_from_event`] over Pipeline files already read at the
-/// event's commit ([`read_event_pipelines`]). `complete` says `files` is the
-/// whole of `.scarab/` at that commit: each Run started then records which
-/// of them follow it (`on: upstream:`), so its `run_finished` needs no forge
-/// read when nothing does.
-///
-/// With `delivery` (the webhook path, ADR-0083), what each file decided is
-/// recorded once per delivery: the outcomes earlier tries recorded are read
-/// first and those files are not decided again; a file that could not be
-/// read, or whose decision could not be recorded (a store or admission
-/// error), is left undecided for a redelivery and the others go on; a file
-/// that does not compile is reported in the outcome rather than as an error.
-///
-/// Without it, a [`TriggerError::Forge`] comes only from reading an
-/// `invoke:` library, before any Run or refusal is recorded.
-#[allow(clippy::too_many_arguments)] // the delivery's context beside the trigger's
 /// A pull request event that says it is the repository's own code, checked
 /// with the forge before it is trusted (git-bug 14a694f): `head_branch` must
 /// be a branch of the repository whose commit is the pull request's `head`.
@@ -6040,6 +6024,22 @@ async fn confirm_pull_request_origin(
     Some(confirmed)
 }
 
+/// [`trigger_runs_from_event`] over Pipeline files already read at the
+/// event's commit ([`read_event_pipelines`]). `complete` says `files` is the
+/// whole of `.scarab/` at that commit: each Run started then records which
+/// of them follow it (`on: upstream:`), so its `run_finished` needs no forge
+/// read when nothing does.
+///
+/// With `delivery` (the webhook path, ADR-0083), what each file decided is
+/// recorded once per delivery: the outcomes earlier tries recorded are read
+/// first and those files are not decided again; a file that could not be
+/// read, or whose decision could not be recorded (a store or admission
+/// error), is left undecided for a redelivery and the others go on; a file
+/// that does not compile is reported in the outcome rather than as an error.
+///
+/// Without it, a [`TriggerError::Forge`] comes only from reading an
+/// `invoke:` library, before any Run or refusal is recorded.
+#[allow(clippy::too_many_arguments)] // the delivery's context beside the trigger's
 pub(crate) async fn trigger_runs_from_files(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
