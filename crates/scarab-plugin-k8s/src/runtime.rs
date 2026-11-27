@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{
-    ContainerStatus, Namespace, PersistentVolumeClaim, Pod, ServiceAccount,
+    ContainerStatus, Namespace, PersistentVolumeClaim, Pod, Service, ServiceAccount,
 };
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use kube::api::{DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams};
@@ -452,6 +452,29 @@ impl K8sPluginRuntime {
             );
             return Ok(());
         }
+        // The endpoint Service (ADR-0086 §1): applied for an installation
+        // that registers an endpoint, deleted for one that no longer does.
+        let service_name = objects::endpoint_service_name(&installation.id);
+        if objects::serves_endpoint(installation) {
+            let service = self.stamped(objects::endpoint_service(
+                &self.config.namespace,
+                installation,
+            ));
+            self.namespaced::<Service>()
+                .patch(
+                    &service_name,
+                    &Self::apply_params(),
+                    &Patch::Apply(&service),
+                )
+                .await
+                .map_err(kube_err)?;
+        } else {
+            gone_is_fine(
+                self.namespaced::<Service>()
+                    .delete(&service_name, &DeleteParams::default())
+                    .await,
+            )?;
+        }
         let mut deployment = self.stamped(objects::deployment(
             &self.config.namespace,
             installation,
@@ -575,9 +598,17 @@ impl K8sPluginRuntime {
         )
     }
 
-    /// Uninstall: delete the Deployment (its Pods with it) and the
-    /// ServiceAccount.
+    /// Uninstall: delete the Deployment (its Pods with it), the endpoint
+    /// Service, if any, and the ServiceAccount.
     pub async fn uninstall(&self, installation_id: &str) -> Result<(), RuntimeError> {
+        gone_is_fine(
+            self.namespaced::<Service>()
+                .delete(
+                    &objects::endpoint_service_name(installation_id),
+                    &DeleteParams::default(),
+                )
+                .await,
+        )?;
         for d in self.deployments_of(installation_id).await? {
             if let Some(name) = d.metadata.name {
                 gone_is_fine(

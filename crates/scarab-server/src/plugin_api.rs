@@ -79,7 +79,8 @@ use crate::step_up::ops::{self, Class};
 use crate::{ApiError, AppState, AuthVia, Caller};
 
 /// The header a Plugin presents its DelegatedCallerHandle in.
-pub const DELEGATED_CALLER_HANDLE_HEADER: &str = "x-scarab-delegated-caller-handle";
+pub const DELEGATED_CALLER_HANDLE_HEADER: &str =
+    scarab_plugin::PLUGIN_DELEGATED_CALLER_HANDLE_HEADER;
 
 /// The prefix of a handle's value, so a secret scanner can be taught it.
 pub const DELEGATED_CALLER_HANDLE_PREFIX: &str = "scarab_dch_";

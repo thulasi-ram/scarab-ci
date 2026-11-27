@@ -7,10 +7,11 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, EmptyDirVolumeSource, EnvVar, PersistentVolumeClaim,
+    Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, PersistentVolumeClaim,
     PersistentVolumeClaimVolumeSource, PodSecurityContext, PodSpec, PodTemplateSpec,
-    ProjectedVolumeSource, ResourceRequirements, SeccompProfile, SecurityContext, ServiceAccount,
-    ServiceAccountTokenProjection, Volume, VolumeMount, VolumeProjection,
+    ProjectedVolumeSource, ResourceRequirements, SeccompProfile, SecurityContext, Service,
+    ServiceAccount, ServiceAccountTokenProjection, ServicePort, ServiceSpec, Volume, VolumeMount,
+    VolumeProjection,
 };
 use k8s_openapi::api::networking::v1::{
     IPBlock, NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
@@ -22,8 +23,8 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
 use scarab_plugin::{
     service_account_for, PluginInstallation, PluginStorage, BROKER_TOKEN_AUDIENCE,
-    PLUGIN_ENV_BROKER_TOKEN_FILE, PLUGIN_ENV_BROKER_URL, PLUGIN_STORAGE_OWNER_ANNOTATION,
-    RESERVED_CONFIG_KEY_PREFIX,
+    PLUGIN_ENDPOINT_PORT, PLUGIN_ENV_BROKER_TOKEN_FILE, PLUGIN_ENV_BROKER_URL,
+    PLUGIN_ENV_ENDPOINT_PORT, PLUGIN_STORAGE_OWNER_ANNOTATION, RESERVED_CONFIG_KEY_PREFIX,
 };
 
 use crate::{BrokerPeer, LABEL_INSTALLATION, LABEL_MANAGED_BY, LABEL_PLUGIN_WORKLOAD, MANAGED_BY};
@@ -36,6 +37,17 @@ pub const PLUGIN_EGRESS_POLICY: &str = "plugin-egress";
 /// namespace. Neither selects a Plugin workload.
 pub const PROBE_CONTROL_EGRESS_POLICY: &str = "isolation-probe-control-egress";
 pub const PROBE_CANARY_INGRESS_POLICY: &str = "isolation-probe-canary-ingress";
+/// The baseline policy that admits the Scarab server, and nothing else, to a
+/// Plugin's endpoint port (ADR-0086 §1).
+pub const PLUGIN_ENDPOINT_INGRESS_POLICY: &str = "plugin-endpoint-ingress";
+
+/// The label on the Pods of an installation that registers an endpoint:
+/// what [`PLUGIN_ENDPOINT_INGRESS_POLICY`] selects. Only those Pods take
+/// any ingress at all; every other Plugin Pod keeps `default-deny`'s none.
+pub const LABEL_PLUGIN_ENDPOINT: &str = "scarab.io/plugin-endpoint";
+
+/// The prefix of an installation's endpoint Service: `<prefix><id>`.
+pub const ENDPOINT_SERVICE_PREFIX: &str = "scarab-plugin-endpoint-";
 
 /// The isolation probe's Pods: `scarab.io/isolation-probe=<nonce>` on all
 /// three, and a role.
@@ -210,19 +222,9 @@ fn dns_egress_rule() -> NetworkPolicyEgressRule {
     }
 }
 
-/// `plugin-egress`: what a Plugin workload may reach — the CredentialBroker's
-/// port, nothing else (ADR-0072 §9). Not even DNS: CoreDNS's default
-/// `forward .` resolves `<data>.attacker.example` recursively, so a DNS
-/// allowance is a two-way channel out (data in the query names, commands in
-/// the answers). A Plugin needs none — its only peer is the broker, and it is
-/// handed the broker by IP. Egress only: its ingress stays at
-/// `default-deny`'s nothing (owner default 4).
-pub fn plugin_egress_policy(
-    namespace: &str,
-    broker: &BrokerPeer,
-    broker_port: u16,
-) -> NetworkPolicy {
-    let broker_peer = match broker {
+/// The broker (the Scarab server's Pods) as a NetworkPolicy peer.
+fn broker_peer(broker: &BrokerPeer) -> NetworkPolicyPeer {
+    match broker {
         BrokerPeer::Pods {
             namespace: broker_ns,
             labels,
@@ -244,7 +246,22 @@ pub fn plugin_egress_policy(
             }),
             ..Default::default()
         },
-    };
+    }
+}
+
+/// `plugin-egress`: what a Plugin workload may reach — the CredentialBroker's
+/// port, nothing else (ADR-0072 §9). Not even DNS: CoreDNS's default
+/// `forward .` resolves `<data>.attacker.example` recursively, so a DNS
+/// allowance is a two-way channel out (data in the query names, commands in
+/// the answers). A Plugin needs none — its only peer is the broker, and it is
+/// handed the broker by IP. Egress only: its ingress stays at
+/// `default-deny`'s nothing (owner default 4).
+pub fn plugin_egress_policy(
+    namespace: &str,
+    broker: &BrokerPeer,
+    broker_port: u16,
+) -> NetworkPolicy {
+    let broker_peer = broker_peer(broker);
     NetworkPolicy {
         metadata: meta(PLUGIN_EGRESS_POLICY, namespace, managed_labels()),
         spec: Some(NetworkPolicySpec {
@@ -304,6 +321,26 @@ pub fn probe_canary_ingress_policy(namespace: &str) -> NetworkPolicy {
     }
 }
 
+/// `plugin-endpoint-ingress`: the Pods of an installation that registers an
+/// endpoint ([`LABEL_PLUGIN_ENDPOINT`]) accept connections on
+/// [`PLUGIN_ENDPOINT_PORT`] from the Scarab server's Pods (the broker peer,
+/// which is the server) and from nothing else: not another Plugin, not a
+/// step Pod, not the internet. The Pod's egress stays `plugin-egress`.
+pub fn plugin_endpoint_ingress_policy(namespace: &str, server: &BrokerPeer) -> NetworkPolicy {
+    NetworkPolicy {
+        metadata: meta(PLUGIN_ENDPOINT_INGRESS_POLICY, namespace, managed_labels()),
+        spec: Some(NetworkPolicySpec {
+            pod_selector: Some(selector(&[(LABEL_PLUGIN_ENDPOINT, "true")])),
+            policy_types: Some(vec!["Ingress".to_string()]),
+            ingress: Some(vec![NetworkPolicyIngressRule {
+                from: Some(vec![broker_peer(server)]),
+                ports: Some(vec![tcp(PLUGIN_ENDPOINT_PORT)]),
+            }]),
+            egress: None,
+        }),
+    }
+}
+
 /// Every NetworkPolicy of the namespace baseline, in apply order: the deny
 /// first, so there is never a moment with an allowance and no deny.
 pub fn baseline_policies(
@@ -316,7 +353,48 @@ pub fn baseline_policies(
         plugin_egress_policy(namespace, broker, broker_port),
         probe_control_egress_policy(namespace),
         probe_canary_ingress_policy(namespace),
+        plugin_endpoint_ingress_policy(namespace, broker),
     ]
+}
+
+/// The name of an installation's endpoint Service.
+pub fn endpoint_service_name(installation_id: &str) -> String {
+    format!("{ENDPOINT_SERVICE_PREFIX}{installation_id}")
+}
+
+/// The endpoint Service of an installation that registers one: a ClusterIP
+/// on [`PLUGIN_ENDPOINT_PORT`], selecting that installation's Pods by their
+/// id label and nothing else. The server reaches the Plugin through it by
+/// a name it builds from the installation id; no caller chooses it.
+pub fn endpoint_service(namespace: &str, installation: &PluginInstallation) -> Service {
+    Service {
+        metadata: meta(
+            &endpoint_service_name(&installation.id),
+            namespace,
+            installation_labels(&installation.id),
+        ),
+        spec: Some(ServiceSpec {
+            type_: Some("ClusterIP".to_string()),
+            selector: Some(BTreeMap::from([(
+                LABEL_INSTALLATION.to_string(),
+                installation.id.clone(),
+            )])),
+            ports: Some(vec![ServicePort {
+                name: Some("endpoint".to_string()),
+                port: i32::from(PLUGIN_ENDPOINT_PORT),
+                target_port: Some(IntOrString::Int(i32::from(PLUGIN_ENDPOINT_PORT))),
+                protocol: Some("TCP".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Does `installation` serve an endpoint (its manifest registers one)?
+pub fn serves_endpoint(installation: &PluginInstallation) -> bool {
+    installation.manifest.trust_tier().is_some()
 }
 
 /// The Pod-level `restricted` profile: non-root, a fixed unprivileged
@@ -403,6 +481,12 @@ fn plugin_env(installation: &PluginInstallation, broker_url: &str) -> Vec<EnvVar
             &format!("{BROKER_TOKEN_DIR}/{API_TOKEN_FILE}"),
         ));
     }
+    if serves_endpoint(installation) {
+        vars.push(env(
+            PLUGIN_ENV_ENDPOINT_PORT,
+            &PLUGIN_ENDPOINT_PORT.to_string(),
+        ));
+    }
     vars
 }
 
@@ -435,6 +519,10 @@ pub fn deployment(
     let name = deployment_name(installation);
     let mut pod_labels = installation_labels(&installation.id);
     pod_labels.insert(LABEL_PLUGIN_WORKLOAD.to_string(), "true".to_string());
+    // Only an endpoint Pod is selected by `plugin-endpoint-ingress`.
+    if serves_endpoint(installation) {
+        pod_labels.insert(LABEL_PLUGIN_ENDPOINT.to_string(), "true".to_string());
+    }
     let mut annotations = BTreeMap::from([
         ("scarab.io/org".to_string(), installation.org.clone()),
         (
@@ -534,6 +622,14 @@ pub fn deployment(
             image: Some(installation.image.clone()),
             image_pull_policy: Some("IfNotPresent".to_string()),
             env: Some(plugin_env(installation, broker_url)),
+            ports: serves_endpoint(installation).then(|| {
+                vec![ContainerPort {
+                    name: Some("endpoint".to_string()),
+                    container_port: i32::from(PLUGIN_ENDPOINT_PORT),
+                    protocol: Some("TCP".to_string()),
+                    ..Default::default()
+                }]
+            }),
             security_context: Some(restricted_container_security_context()),
             resources: Some(ResourceRequirements {
                 requests: Some(BTreeMap::from([
@@ -1256,8 +1352,36 @@ mod tests {
                 DEFAULT_DENY_POLICY,
                 PLUGIN_EGRESS_POLICY,
                 PROBE_CONTROL_EGRESS_POLICY,
-                PROBE_CANARY_INGRESS_POLICY
+                PROBE_CANARY_INGRESS_POLICY,
+                PLUGIN_ENDPOINT_INGRESS_POLICY
             ]
+        );
+    }
+
+    /// The endpoint ingress admits the server's Pods, on the endpoint port
+    /// only, to the Pods labelled as endpoints only.
+    #[test]
+    fn only_the_server_reaches_an_endpoint_pod_on_its_port() {
+        let server = BrokerPeer::Pods {
+            namespace: "scarab".into(),
+            labels: BTreeMap::from([("app.kubernetes.io/name".to_string(), "scarab".to_string())]),
+        };
+        let spec = plugin_endpoint_ingress_policy("scarab-plugins", &server)
+            .spec
+            .unwrap();
+        assert_eq!(
+            spec.pod_selector.unwrap().match_labels.unwrap(),
+            BTreeMap::from([(LABEL_PLUGIN_ENDPOINT.to_string(), "true".to_string())])
+        );
+        assert_eq!(spec.policy_types, Some(vec!["Ingress".to_string()]));
+        let rules = spec.ingress.unwrap();
+        assert_eq!(rules.len(), 1);
+        let from = rules[0].from.as_ref().unwrap();
+        assert_eq!(from.len(), 1);
+        assert!(from[0].namespace_selector.is_some() && from[0].pod_selector.is_some());
+        assert_eq!(
+            rules[0].ports.as_ref().unwrap()[0].port,
+            Some(IntOrString::Int(i32::from(PLUGIN_ENDPOINT_PORT)))
         );
     }
 }

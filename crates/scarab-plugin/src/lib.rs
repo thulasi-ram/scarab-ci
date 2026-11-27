@@ -112,6 +112,21 @@ pub const API_TOKEN_AUDIENCE: &str = "scarab-api";
 /// API's paths.
 pub const PLUGIN_ENV_API_TOKEN_FILE: &str = "SCARAB_API_TOKEN_FILE";
 
+/// The port a Plugin that registers an endpoint serves it on (ADR-0086 §1),
+/// inside its Pod. Core reaches it through the installation's own Service,
+/// and a NetworkPolicy admits the Scarab server to it and nothing else.
+pub const PLUGIN_ENDPOINT_PORT: u16 = 8080;
+
+/// The variable a Plugin that registers an endpoint reads its port from
+/// ([`PLUGIN_ENDPOINT_PORT`]). Core sends it a POST to `/<path>` for each
+/// request of a registered endpoint `path`, with the request's JSON body and
+/// the [`PLUGIN_DELEGATED_CALLER_HANDLE_HEADER`]; never the caller's token.
+pub const PLUGIN_ENV_ENDPOINT_PORT: &str = "SCARAB_ENDPOINT_PORT";
+
+/// The header core passes a Plugin's endpoint the DelegatedCallerHandle in,
+/// and the Plugin presents it back in on PluginApi.
+pub const PLUGIN_DELEGATED_CALLER_HANDLE_HEADER: &str = "x-scarab-delegated-caller-handle";
+
 /// The Plugin contract's environment, as the runtime sets it: where the
 /// broker is, and the file the projected broker token is kept current in.
 /// The kubelet rotates the token in place before it expires, so a Plugin
