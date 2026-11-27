@@ -918,6 +918,43 @@ impl ForgePort for ForgejoForge {
         Ok(filter_refs(refs, query))
     }
 
+    /// `GET /repos/{o}/{r}/branches/{name}` or `/tags/{name}` (`404` when there
+    /// is no such ref). The tip is read as [`list_refs`](Self::list_refs) reads
+    /// it: `commit.id` for a branch, `commit.sha` for a tag, which is the
+    /// commit an annotated tag points at. An answer for another name is read
+    /// as no such ref.
+    async fn ref_commit(
+        &self,
+        repo: &RepoRef,
+        kind: RefKind,
+        name: &str,
+    ) -> Result<Option<String>, ForgeError> {
+        let Some(path) = scarab_forge::ref_name_path(name) else {
+            return Ok(None);
+        };
+        let coll = match kind {
+            RefKind::Branch => "branches",
+            RefKind::Tag => "tags",
+        };
+        let url = self.url(&format!(
+            "/repos/{}/{}/{coll}/{path}",
+            repo.owner, repo.name
+        ));
+        let resp = self.send(|| self.client.get(&url)).await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let body = ok_json(resp).await?;
+        if body.get("name").and_then(Value::as_str) != Some(name) {
+            return Ok(None);
+        }
+        body.pointer("/commit/sha")
+            .or_else(|| body.pointer("/commit/id"))
+            .and_then(Value::as_str)
+            .map(|sha| Some(sha.to_string()))
+            .ok_or_else(|| ForgeError::Api(format!("{coll} entry `{name}` has no commit")))
+    }
+
     /// REAL webhook registration (ADR-0046): Forgejo has no single-app
     /// webhook, so each repo gets one. Idempotent: the repo ends with exactly
     /// one hook for `callback_url`.

@@ -1267,6 +1267,73 @@ impl ForgePort for GithubForge {
         Ok(filter_refs(refs, query))
     }
 
+    /// `GET /repos/{o}/{r}/git/ref/{heads|tags}/{name}`, which matches the
+    /// name exactly (`404` when there is no such ref). An annotated tag's ref
+    /// points at a tag object, read with `git/tags/{sha}` to reach the commit;
+    /// a tag of a tree or a blob names no commit.
+    async fn ref_commit(
+        &self,
+        repo: &RepoRef,
+        kind: RefKind,
+        name: &str,
+    ) -> Result<Option<String>, ForgeError> {
+        let Some(path) = scarab_forge::ref_name_path(name) else {
+            return Ok(None);
+        };
+        let token = self.auth_token_for(repo).await?;
+        let namespace = match kind {
+            RefKind::Branch => "heads",
+            RefKind::Tag => "tags",
+        };
+        let url = self.url(&format!(
+            "/repos/{}/{}/git/ref/{namespace}/{path}",
+            repo.owner, repo.name
+        ));
+        let (status, body) = self
+            .get_conditional(&url, "application/vnd.github+json", &token)
+            .await?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(ForgeError::Api(format!(
+                "{status}: {}",
+                String::from_utf8_lossy(&body)
+            )));
+        }
+        let body: Value =
+            serde_json::from_slice(&body).map_err(|e| ForgeError::Api(format!("bad JSON: {e}")))?;
+        let mut object = body.get("object").cloned().unwrap_or(Value::Null);
+        // A tag of a tag is read again; a few levels at most.
+        for _ in 0..4 {
+            let (Some(object_type), Some(sha)) = (
+                object.get("type").and_then(Value::as_str),
+                object.get("sha").and_then(Value::as_str),
+            ) else {
+                return Err(ForgeError::Api("ref.object missing".into()));
+            };
+            match object_type {
+                "commit" => return Ok(Some(sha.to_string())),
+                "tag" => {
+                    let url = self.url(&format!(
+                        "/repos/{}/{}/git/tags/{}",
+                        repo.owner,
+                        repo.name,
+                        scarab_forge::encode_url_component(sha)
+                    ));
+                    object = self
+                        .get_json_conditional(&url, &token)
+                        .await?
+                        .get("object")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
     /// A no-op by design (ADR-0046): the GitHub App receives every
     /// installation event through its single App webhook — installing the App
     /// *is* webhook registration. Kept in the port because Forgejo needs it

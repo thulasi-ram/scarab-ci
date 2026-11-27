@@ -8421,8 +8421,10 @@ pub async fn dispatch_is_fork_code(
     Ok(!ref_names_commit(forge, repo, &name, kind, sha).await?)
 }
 
-/// Whether the forge lists a branch or tag called exactly `name` (of `kind`,
-/// when given) pointing at `sha`.
+/// Whether the branch or tag called exactly `name` (of `kind`, when given)
+/// points at `sha`. One single-ref lookup per kind asked
+/// ([`ForgePort::ref_commit`](scarab_forge::ForgePort::ref_commit)): the
+/// branch first, then the tag, when `kind` is not given.
 async fn ref_names_commit(
     forge: &dyn scarab_forge::ForgePort,
     repo: &scarab_forge::RepoRef,
@@ -8430,10 +8432,17 @@ async fn ref_names_commit(
     kind: Option<scarab_forge::RefKind>,
     sha: &str,
 ) -> Result<bool, scarab_forge::ForgeError> {
-    let refs = forge.list_refs(repo, Some(name)).await?;
-    Ok(refs
-        .iter()
-        .any(|r| r.name == name && r.sha == sha && kind.is_none_or(|k| r.kind == k)))
+    use scarab_forge::RefKind;
+    let kinds = match kind {
+        Some(kind) => vec![kind],
+        None => vec![RefKind::Branch, RefKind::Tag],
+    };
+    for kind in kinds {
+        if forge.ref_commit(repo, kind, name).await?.as_deref() == Some(sha) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Candidate `.scarab` paths a dispatch `pipeline` identifier resolves to. A full

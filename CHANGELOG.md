@@ -18,6 +18,12 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Enhancement
+
+- **A manual or API dispatch asks the forge for one ref.** Deciding whether the dispatched commit
+  is fork code listed every branch and tag of the repository, page by page, on each dispatch. The
+  GitHub and Forgejo adapters now read the one branch or tag the dispatch names.
+
 ### Bug Fixes
 
 - **`REGISTRY_AUTH` resolves through the Run's Environment.** A push step's registry credential
