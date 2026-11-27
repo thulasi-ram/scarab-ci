@@ -5548,6 +5548,43 @@ impl<'a> Scheduler<'a> {
             .unwrap_or_default())
     }
 
+    /// Whether a Fork Run approval gate of `run` (ADR-0086 §9) is not yet
+    /// released. Read from the stored IR as JSON, as
+    /// [`pipeline_services`](Self::pipeline_services) is: a Run with no such
+    /// gate, or no readable IR, has none pending.
+    async fn fork_run_approval_pending(&self, run: &RunId) -> Result<bool, SchedulerError> {
+        let Some(ir) = self.db.run_ir(run).await? else {
+            return Ok(false);
+        };
+        let is_fork_gate = |s: &serde_json::Value| {
+            s.get("origin")
+                .and_then(|o| o.as_array())
+                .into_iter()
+                .flatten()
+                .any(|link| {
+                    link.get("kind").and_then(|k| k.as_str())
+                        == Some(scarab_pipeline::FORK_RUN_APPROVAL_GATE_KIND)
+                })
+        };
+        let gates: Vec<&str> = ir
+            .get("steps")
+            .and_then(|s| s.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|s| is_fork_gate(s))
+            .filter_map(|s| s.get("id").and_then(|i| i.as_str()))
+            .collect();
+        if gates.is_empty() {
+            return Ok(false);
+        }
+        Ok(self
+            .db
+            .steps_of_run(run)
+            .await?
+            .iter()
+            .any(|s| gates.contains(&s.step.0.as_str()) && s.status != StepStatus::Succeeded))
+    }
+
     /// The engine's "current Take" for a run's shared services: the max stored
     /// generation, or `1` when none have been born yet (ADR-0058). A Rerun
     /// advances it by birthing rows at `max + 1` in [`rerun_step`].
@@ -5683,6 +5720,13 @@ impl<'a> Scheduler<'a> {
                     )
                     .await?;
             }
+        }
+
+        // A Run of fork code waiting at its Fork Run approval gate starts
+        // nothing before the gate is released, its shared services included
+        // (ADR-0086 §9). Its Steps already wait on the gate through `needs`.
+        if self.fork_run_approval_pending(run).await? {
+            return Ok(());
         }
 
         // Birth (eager) + launch + readiness-poll the current Take.

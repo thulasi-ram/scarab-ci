@@ -16,12 +16,15 @@ use crate::run_create::uses_environment_authority;
 /// already has it, this id with `-2`, `-3`, ... appended.
 pub const ADDED_GATE_ID: &str = "environment-approval";
 
+/// A `manual` gate that can be an Environment approval gate: any but the
+/// Run-start approval gate Fork Run approval adds, which is never one and
+/// does not count as the `manual` gate upstream of a Step (ADR-0086 §9).
 fn is_manual_gate(s: &StepSpec) -> bool {
-    s.gate.as_deref() == Some("manual")
+    s.gate.as_deref() == Some("manual") && !s.is_fork_run_approval_gate()
 }
 
 /// Whether a `gate: manual` is upstream of Step `step` of `ir`, through
-/// `needs`, transitively.
+/// `needs`, transitively. A Fork Run approval gate does not count.
 pub fn manual_gate_upstream(ir: &PipelineIr, step: &str) -> bool {
     let by_id: HashMap<&str, &StepSpec> = ir.steps.iter().map(|s| (s.id.as_str(), s)).collect();
     let mut seen: BTreeSet<&str> = BTreeSet::new();
@@ -107,10 +110,15 @@ pub fn environment_approval_gates(ir: &PipelineIr) -> Vec<String> {
 /// Mark each `manual` gate of `ir` with whether it is an Environment
 /// approval gate ([`StepSpec::environment_approval_gate`]), for a Run that
 /// an Environment governs. Run creation calls it once; the mark is stored
-/// with the Run and never decided again.
+/// with the Run and never decided again. A Fork Run approval gate is marked
+/// `false`.
 pub fn mark_environment_approval_gates(ir: &mut PipelineIr) {
     let approval: BTreeSet<String> = environment_approval_gates(ir).into_iter().collect();
-    for s in ir.steps.iter_mut().filter(|s| is_manual_gate(s)) {
+    for s in ir
+        .steps
+        .iter_mut()
+        .filter(|s| s.gate.as_deref() == Some("manual"))
+    {
         s.environment_approval_gate = Some(approval.contains(&s.id));
     }
 }

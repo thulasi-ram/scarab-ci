@@ -1257,7 +1257,19 @@ pub enum OriginKind {
     /// The Environment approval gate an Environment added to the Run
     /// (ADR-0078 §2): `name` is the Environment, `content_hash` is empty.
     Environment,
+    /// The Run-start approval gate the org's Fork Run approval setting adds
+    /// in front of every root Step of a Run of fork code (ADR-0086 §9): a
+    /// `manual` gate, `name` is the setting that applied, `content_hash` is
+    /// empty. It is never an Environment approval gate
+    /// ([`StepSpec::counts_as_environment_approval_gate`]). This release
+    /// only reads it, so that it can load and hold such a Run created by a
+    /// later release; nothing here writes it.
+    ForkRunApprovalGate,
 }
+
+/// The wire name of [`OriginKind::ForkRunApprovalGate`], for code that reads
+/// a stored IR as JSON.
+pub const FORK_RUN_APPROVAL_GATE_KIND: &str = "fork_run_approval_gate";
 
 /// One link of a compiled Step's [`origin`](StepSpec::origin).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1297,9 +1309,20 @@ impl StepSpec {
     /// **Environment approval gate** (ADR-0078 §1): a `manual` gate that Run
     /// creation marked one, or left unmarked. A gate is unmarked only in a
     /// Run created before the mark existed, when every `manual` gate of a
-    /// governed Run needed the approvers, so it counts as one.
+    /// governed Run needed the approvers, so it counts as one. A Fork Run
+    /// approval gate never counts, whatever its mark.
     pub fn counts_as_environment_approval_gate(&self) -> bool {
-        self.gate.as_deref() == Some("manual") && self.environment_approval_gate != Some(false)
+        self.gate.as_deref() == Some("manual")
+            && self.environment_approval_gate != Some(false)
+            && !self.is_fork_run_approval_gate()
+    }
+
+    /// Whether this Step is the Run-start approval gate Fork Run approval
+    /// added ([`OriginKind::ForkRunApprovalGate`]).
+    pub fn is_fork_run_approval_gate(&self) -> bool {
+        self.origin
+            .iter()
+            .any(|link| link.kind == OriginKind::ForkRunApprovalGate)
     }
 
     /// Is this an image-less invoke step (a compile-time library inline point)?

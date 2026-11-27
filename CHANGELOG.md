@@ -23,6 +23,12 @@ release.yml uses that version's section as the GitHub Release text. See
 - **A manual or API dispatch asks the forge for one ref.** Deciding whether the dispatched commit
   is fork code listed every branch and tag of the repository, page by page, on each dispatch. The
   GitHub and Forgejo adapters now read the one branch or tag the dispatch names.
+- **0.8.4 reads a Fork Run approval gate.** A later release adds Fork Run approval, an org
+  setting that puts a `manual` gate in front of a Run of fork code. A server before 0.8.4 cannot
+  read a Run that has that gate, so roll back from that release to 0.8.4. On 0.8.4 the Run waits
+  at the gate as at any `manual` gate, starts none of its shared services until the gate is
+  released, and never counts the gate as an Environment approval gate. Nothing in 0.8.4 adds the
+  gate.
 
 ### Bug Fixes
 

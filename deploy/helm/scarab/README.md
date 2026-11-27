@@ -563,6 +563,17 @@ The StatefulSet's `serviceName` is unchanged, so upgrading needs no migration.
 
 > **Unverified in this chart version:** per-availability-zone placement.
 
+### Upgrading from 0.8.3: rollback target for Fork Run approval
+
+No migration. A later release adds Fork Run approval, an org setting that puts
+a `manual` gate in front of a Run of fork code. 0.8.4 reads that gate; an
+earlier 0.8.x server cannot load a Run that has it. Roll back from that release
+to 0.8.4. On 0.8.4 such a Run waits at the gate as at any `manual` gate and
+starts none of its shared services until the gate is released. Anyone with
+write on the repository releases it, as on the later release, but an API token
+releases it without the confirmation the later release asks its owner for. It
+is never an Environment approval gate.
+
 ### Upgrading from 0.8.2: gate notes
 
 Migration 0110 adds two nullable columns to `attempts`, `gate_note` and

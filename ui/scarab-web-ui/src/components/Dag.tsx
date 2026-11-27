@@ -516,7 +516,7 @@ export default function Dag(props: {
           </Show>
           <Show when={s().addedBy}>
             {(label) => (
-              <span class="dnode-origin" title="Not in the pipeline file: the environment added this approval gate">
+              <span class="dnode-origin" title={`Not in the pipeline file: ${label()}`}>
                 {label()}
               </span>
             )}

@@ -35,7 +35,8 @@
       "file",
       "library",
       "plugin",
-      "environment"
+      "environment",
+      "fork_run_approval_gate"
      ]
     },
     "TriggerKind": {
@@ -899,7 +900,8 @@
       "file",
       "library",
       "plugin",
-      "environment"
+      "environment",
+      "fork_run_approval_gate"
      ]
     }
    },
@@ -1409,7 +1411,8 @@
       "file",
       "library",
       "plugin",
-      "environment"
+      "environment",
+      "fork_run_approval_gate"
      ]
     },
     "Verdict": {
