@@ -2198,7 +2198,9 @@ export interface paths {
          *     clock. Approvals that complete the rules early are kept: the gate is
          *     released by the scheduler when the timer runs out. On release the
          *     deployment is written to the legacy history. Every other `manual` gate is
-         *     a plain gate: it releases on the first approval, with no step-up. If the
+         *     a plain gate: it releases on the first approval, with no step-up. An API
+         *     token never approves a gate by itself: its approval of any gate, a plain
+         *     one included, raises a StepUpConfirmationRequest its owner confirms. If the
          *     Environment no longer exists or no longer admits the Project, no gate of
          *     the Run releases (409). Authz'd as a write.
          */

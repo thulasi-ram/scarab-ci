@@ -13341,7 +13341,9 @@ pub struct GateApprovalDto {
 /// clock. Approvals that complete the rules early are kept: the gate is
 /// released by the scheduler when the timer runs out. On release the
 /// deployment is written to the legacy history. Every other `manual` gate is
-/// a plain gate: it releases on the first approval, with no step-up. If the
+/// a plain gate: it releases on the first approval, with no step-up. An API
+/// token never approves a gate by itself: its approval of any gate, a plain
+/// one included, raises a StepUpConfirmationRequest its owner confirms. If the
 /// Environment no longer exists or no longer admits the Project, no gate of
 /// the Run releases (409). Authz'd as a write.
 #[utoipa::path(
@@ -13369,6 +13371,26 @@ async fn approve_gate(
     let caller = authorize_scoped_caller(&st, &headers, Action::Write, scope.as_ref()).await?;
     let principal = caller.principal.clone();
     let step = StepId(step);
+    // ADR-0086 §6: a PrincipalToken never approves a `manual` Gate by
+    // itself. An issued token (an API token) raises a
+    // StepUpConfirmationRequest for every Gate, a plain one included, so its
+    // owner confirms each approval. An `oauth` token (an app acting for its
+    // owner) is refused with no request raised, so text an outsider wrote
+    // into a log cannot send the owner a stream of confirmations. A session
+    // decides as before.
+    let token_approval = match caller.grant.as_ref().map(|t| t.kind) {
+        None => false,
+        Some(scarab_identity::PrincipalTokenKind::Issued) => true,
+        Some(scarab_identity::PrincipalTokenKind::Oauth) => {
+            return Err(ApiError::Ceremony {
+                status: StatusCode::FORBIDDEN,
+                code: "token_never_approves",
+                message: "a token granted to an app never approves a gate; approve it in a \
+                          browser, or with an API token whose owner confirms the approval"
+                    .into(),
+            })
+        }
+    };
 
     // 0. The governing Environment's effective rules for this Project
     //    (ADR-0071 §3), resolved NOW — before the approval is recorded,
@@ -13394,8 +13416,7 @@ async fn approve_gate(
     )
     .await;
     match (&ctx, &governance) {
-        _ if !approval_gate => guard.exempt("not an Environment approval gate"),
-        (Some(c), Ok(Some(p))) if !p.approvers.is_empty() => {
+        (Some(c), Ok(Some(p))) if approval_gate && !p.approvers.is_empty() => {
             guard
                 .require(
                     &st,
@@ -13406,7 +13427,7 @@ async fn approve_gate(
                 )
                 .await?
         }
-        (Some(c), Err(_)) => {
+        (Some(c), Err(_)) if approval_gate => {
             guard
                 .require(
                     &st,
@@ -13417,6 +13438,19 @@ async fn approve_gate(
                 )
                 .await?
         }
+        _ if token_approval => {
+            guard
+                .require(
+                    &st,
+                    vec![format!(
+                        "approves the gate `{}` with an API token; its owner confirms every \
+                         approval a token makes",
+                        step.0
+                    )],
+                )
+                .await?
+        }
+        _ if !approval_gate => guard.exempt("not an Environment approval gate"),
         _ => guard.exempt("no approvers required"),
     }
 

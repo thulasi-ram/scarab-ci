@@ -1391,9 +1391,10 @@ pub static GATE_APPROVE: Op = op(
     "Approve a gate",
     Class::Conditional {
         mode: W,
-        rule: "the run's Environment has approvers",
+        rule: "the run's Environment has approvers, or an API token approves (any gate)",
     },
-    "§3 approvals on Gates of Environments with approvers",
+    "§3 approvals on Gates of Environments with approvers; ADR-0086 §6: a token never \
+     approves a gate by itself",
     MEMBER,
     OrgOf::Run,
     &[],
