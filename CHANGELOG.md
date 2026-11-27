@@ -37,22 +37,29 @@ release.yml uses that version's section as the GitHub Release text. See
   a token with a list needs `account.read` for `GET /v1/me` and `server.read` for
   `GET /v1/about`.
 - **Migration 0112 adds `delegated_caller_handles` and `delegated_call_journal`.** Two new
-  tables; nothing existing changes. To roll back, run
-  `crates/scarab-db-postgres/rollback/0112_revert.sql` before `0111_revert.sql`.
+  tables; nothing existing changes. To roll back, uninstall every plugin that registers an
+  endpoint, then run `crates/scarab-db-postgres/rollback/0112_revert.sql` before
+  `0111_revert.sql`; it refuses while one is installed.
 
 ### Security
 
 - **A plugin that registers an endpoint runs only from a publisher the operator trusts.** A
   manifest may now register an endpoint and the API operations each of its requests may use. Such
   a plugin is `trusted_service`: an org admin can install or upgrade it only from a digest of an
-  image repository listed in `plugins.trustedPublishers`, which is empty by default. Its `may`
-  cannot name an operation that can need a step-up, a browser-only one, or a route that
-  authenticates nobody.
+  image repository listed in `plugins.trustedPublishers`, which is empty by default, and is
+  refused again (install, upgrade, enable, and every PluginApi call) once the operator delists
+  it. Its `may` can name only `repo.read`, `run.read`, `step.logs.read`, `step.workspace.read`,
+  `run.artifacts.read`, `repo.dispatch`, `step.rerun`, `step.retry`, `run.cancel` and
+  `gate.reject`. Such a plugin may not also resolve gates.
 - **A plugin acts for a caller only with a handle.** On the broker listener a plugin calls the
   public API for one caller with its installation token and a delegated caller handle bound to
-  that installation, the caller's token and an operation list. The installation token alone acts
-  as nobody. A delegated call obeys both the handle's and the token's operation lists, is counted
-  and journaled, never raises or satisfies a step-up, and never approves a gate.
+  that installation and its org, the caller's `oauth` token (granted for that installation's
+  endpoint) and an operation list. The installation token alone acts as nobody. A delegated call
+  obeys the handle's, the token's and the manifest's operation lists, spends the installation's
+  broker permits and the handle's counters, is journaled before it runs (refusals included),
+  never raises or satisfies a step-up, and never approves a gate. Killing, uninstalling or
+  upgrading the plugin to a new digest deletes its handles. The handles and journal use the
+  broker's own database pool; the API handlers a delegated call runs use the main pool.
 
 ### Features
 

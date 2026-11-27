@@ -589,7 +589,10 @@ calls the public API on the broker listener for one caller at a time. No
 existing row is touched. A plugin whose manifest registers no endpoint works
 as before. A plugin that registers one (a `trusted_service` plugin) installs
 only from a digest of an image repository listed in
-`plugins.trustedPublishers`, which is empty by default.
+`plugins.trustedPublishers`, which is empty by default. The handles and the
+journal live on the broker's own small database pool, but the API handlers a
+plugin's delegated calls run read and write through the server's main pool,
+as the public API does: a busy endpoint plugin shares that pool.
 
 To roll back: scale the server to zero, back up the database, run
 [`rollback/0111_revert.sql`](../../../crates/scarab-db-postgres/rollback/0111_revert.sql)
@@ -598,7 +601,9 @@ changes nothing), then install the 0.8.3 chart. A 0.8.3 server would let a
 token with an operation list use every operation, so the revert revokes those
 tokens before it drops the columns; their owners mint new ones. Run
 [`rollback/0112_revert.sql`](../../../crates/scarab-db-postgres/rollback/0112_revert.sql)
-first: it drops the PluginApi tables and their journal. To go back to 0.8.2,
+first: it drops the PluginApi tables and their journal, and refuses to run
+while a plugin that registers an endpoint is installed, since a 0.8.3 server
+cannot read its manifest. Uninstall those plugins first. To go back to 0.8.2,
 run `0110_revert.sql` next.
 
 ### Upgrading from 0.8.2: gate notes
