@@ -52,6 +52,9 @@ pub struct PluginRuntimeConfig {
     pub broker_port: u16,
     /// The isolation probe's image (`SCARAB_PLUGIN_PROBE_IMAGE`).
     pub probe_image: String,
+    /// Tolerations and a nodeSelector for every plugin Pod and every probe
+    /// Pod (`SCARAB_PLUGIN_PLACEMENT`). Empty = none.
+    pub placement: crate::PluginPlacement,
     /// The release this runtime is (`SCARAB_PLUGIN_OWNER`), as stamped on
     /// the namespace under [`LABEL_OWNER`]. `None` = not configured: the
     /// baseline refuses, and nothing starts.
@@ -339,7 +342,12 @@ impl K8sPluginRuntime {
     ) -> Result<ProbeReport, String> {
         let ns = &self.config.namespace;
         let image = &self.config.probe_image;
-        let create = |pod: Pod| async move {
+        let placement = &self.config.placement;
+        // On the nodes Plugins run on, so the probe tests their network.
+        let create = |mut pod: Pod| async move {
+            if let Some(spec) = pod.spec.as_mut() {
+                placement.apply(spec);
+            }
             pods.create(&PostParams::default(), &pod)
                 .await
                 .map_err(|e| format!("creating a probe Pod: {e}"))
@@ -414,12 +422,19 @@ impl K8sPluginRuntime {
             .patch(&name, &Self::apply_params(), &Patch::Apply(&sa))
             .await
             .map_err(kube_err)?;
-        let deployment = self.stamped(objects::deployment(
+        let mut deployment = self.stamped(objects::deployment(
             &self.config.namespace,
             installation,
             pod_broker_url,
             &self.config.probe_image,
         ));
+        if let Some(spec) = deployment
+            .spec
+            .as_mut()
+            .and_then(|d| d.template.spec.as_mut())
+        {
+            self.config.placement.apply(spec);
+        }
         self.namespaced::<Deployment>()
             .patch(&name, &Self::apply_params(), &Patch::Apply(&deployment))
             .await

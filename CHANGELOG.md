@@ -18,6 +18,13 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Features
+
+- **Plugin Pods on tainted nodes.** The chart's `plugins.tolerations` and `plugins.nodeSelector`
+  (server: `SCARAB_PLUGIN_PLACEMENT`) go on every plugin Pod and on the isolation probe's Pods.
+  Before, on a cluster whose every node is tainted, the probe's Pods stayed Pending and no plugin
+  could start. See [Plugins](/scarab-ci/get-started/deploy-helm/#plugins) (git-bug 1b8202c).
+
 ### Bug Fixes
 
 - **Argo CD plugin: fixes from a run against a real Argo CD 3.4.** An Application whose auto-sync is

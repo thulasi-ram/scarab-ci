@@ -77,6 +77,7 @@
 //! | `SCARAB_PLUGIN_OWNER` | env | which Scarab release this is, `<release namespace>.<release name>` (a label value): stamped on the plugin namespace (`scarab.io/plugin-runtime-owner`) and on everything the runtime creates. The runtime refuses a namespace stamped for another release, or not stamped. Unset = the runtime refuses its baseline and no Plugin runs. The chart sets it |
 //! | `SCARAB_PLUGIN_BROKER_PEER` | env | how the `plugin-egress` NetworkPolicy names the broker: `pods:<namespace>:<k=v,…>` or `cidr:<ip>/<prefix>` (at most a /24). Unset = the runtime refuses its baseline and no Plugin runs |
 //! | `SCARAB_PLUGIN_PROBE_IMAGE` | env | the isolation-probe and per-Pod self-check image (ADR-0072 §9); default `busybox:1.36.1` pinned by digest. Pin an override by digest too |
+//! | `SCARAB_PLUGIN_PLACEMENT` | env | JSON `{"tolerations": [...], "nodeSelector": {...}}`: put on every plugin Pod and every isolation-probe Pod, for clusters whose nodes are all tainted (git-bug 1b8202c). Unset = none. An unknown key, top-level or in a toleration, refuses boot |
 //! | `SCARAB_DEV_PLUGIN_TOKENS` | env | **dev only, needs `SCARAB_DEV_INSECURE`**: `<installation-id>=<token>,…` static broker tokens standing in for TokenReview (slice d2). Loud at boot |
 //! | `SCARAB_DEV_PLUGIN_ALLOW_TAG` | env | **dev only, needs `SCARAB_DEV_INSECURE`**: `1` lets any plugin install name a tag instead of a digest (kind/colima images have no repo digest). Loud at boot |
 //!
@@ -834,6 +835,8 @@ pub struct PluginsConfig {
     pub broker_peer: Option<String>,
     /// `None` = the runtime's default probe image (busybox).
     pub probe_image: Option<String>,
+    /// `SCARAB_PLUGIN_PLACEMENT`, parsed. Empty = none.
+    pub placement: scarab_plugin_k8s::PluginPlacement,
     /// `SCARAB_PLUGIN_OWNER`: which Scarab release this is
     /// (`<release namespace>.<release name>`), stamped on the plugin
     /// namespace and on everything the runtime creates. Validated as a
@@ -935,6 +938,13 @@ impl PluginsConfig {
                 return Err(invalid(format!("SCARAB_PLUGIN_BROKER_PEER: {e}")));
             }
         }
+        // Parsed here, not per pass: a placement the runtime cannot read
+        // would leave every plugin Pod Pending, so refuse boot instead.
+        let placement = match set("SCARAB_PLUGIN_PLACEMENT") {
+            None => scarab_plugin_k8s::PluginPlacement::default(),
+            Some(raw) => scarab_plugin_k8s::PluginPlacement::parse(&raw)
+                .map_err(|e| invalid(format!("SCARAB_PLUGIN_PLACEMENT: {e}")))?,
+        };
         let dev_allow_tag = match set("SCARAB_DEV_PLUGIN_ALLOW_TAG").as_deref() {
             None | Some("0") | Some("false") => false,
             Some("1") | Some("true") if dev_insecure => true,
@@ -991,6 +1001,7 @@ impl PluginsConfig {
             broker_url,
             broker_peer,
             probe_image: set("SCARAB_PLUGIN_PROBE_IMAGE"),
+            placement,
             owner,
             dev_allow_tag,
             dev_tokens,
@@ -1006,6 +1017,7 @@ impl PluginsConfig {
             broker_url: "http://scarab-broker:8090".into(),
             broker_peer: None,
             probe_image: None,
+            placement: scarab_plugin_k8s::PluginPlacement::default(),
             owner: None,
             dev_allow_tag: false,
             dev_tokens: Vec::new(),
@@ -2233,7 +2245,7 @@ impl Config {
             if self.plugins.enabled {
                 format!(
                     "plugins: ON (ADR-0072) — broker {}, namespace {}; \
-                     token verification: {}; installs: {}",
+                     token verification: {}; installs: {}; pod placement: {}",
                     if self.role.serves_broker() {
                         format!("on {}", self.plugins.broker_addr)
                     } else {
@@ -2258,6 +2270,22 @@ impl Config {
                         "reviewed manifest, digest or DEV tag"
                     } else {
                         "reviewed manifest, digest-pinned only"
+                    },
+                    {
+                        let p = &self.plugins.placement;
+                        if p.tolerations.is_empty() && p.node_selector.is_empty() {
+                            "none (SCARAB_PLUGIN_PLACEMENT)".to_string()
+                        } else {
+                            format!(
+                                "{} toleration(s), nodeSelector {{{}}}",
+                                p.tolerations.len(),
+                                p.node_selector
+                                    .iter()
+                                    .map(|(k, v)| format!("{k}={v}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        }
                     },
                 )
             } else {
@@ -4422,6 +4450,13 @@ connections:
             &[("SCARAB_DEV_PLUGIN_TOKENS", "0123456789=")],
             &[("SCARAB_DEV_PLUGIN_TOKENS", "0123456789=a,abcdefabcd=a")],
             &[("SCARAB_DEV_PLUGIN_ALLOW_TAG", "maybe")],
+            // A misspelled toleration field would be dropped and every
+            // plugin Pod left Pending (git-bug 1b8202c).
+            &[(
+                "SCARAB_PLUGIN_PLACEMENT",
+                r#"{"tolerations":[{"key":"k","efect":"NoSchedule"}]}"#,
+            )],
+            &[("SCARAB_PLUGIN_PLACEMENT", "tolerations: []")],
         ] {
             assert!(
                 matches!(

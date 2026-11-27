@@ -716,6 +716,24 @@ plugins:
   # pinned by digest. An override should be digest-pinned too: the probe's
   # verdict is only as good as the image printing it.
   probeImage: ""
+  # Where plugin Pods and the isolation probe's Pods schedule
+  # (SCARAB_PLUGIN_PLACEMENT). On a cluster whose every node is tainted this
+  # is REQUIRED: without a matching toleration the probe's Pods stay Pending,
+  # the probe never passes, and no plugin starts. Both go on every plugin Pod
+  # and every probe Pod, so the probe tests the nodes plugins run on. It does
+  # not place the server, the Data Depot or step Pods (`tolerations`,
+  # `workspace.tolerations`, `scarab.placement`). A toleration field the
+  # server does not know refuses its boot.
+  #
+  #   tolerations:
+  #     - key: workload-type
+  #       operator: Equal
+  #       value: application
+  #       effect: NoSchedule
+  #   nodeSelector:
+  #     kubernetes.io/arch: arm64
+  tolerations: []
+  nodeSelector: {}
 
 # RBAC the k8s executor needs to run one Pod per step in scarab.namespace
 # (`<release namespace>-steps` by default). With `create: false`, you grant
