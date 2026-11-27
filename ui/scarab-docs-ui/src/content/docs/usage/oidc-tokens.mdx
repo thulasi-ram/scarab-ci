@@ -48,6 +48,7 @@ scarab:org/<org>/repo/<repo>/env/<environment>/ref/<ref>
 
 The environment is `none` for a Run of fork code, and for a Step that no Environment approval gate
 upstream admits at its launch (see [The approval gate](/scarab-ci/usage/environments/#the-approval-gate)).
+No Environment can be named `none`, so `env/none` never names a real one.
 
 A Run bound to no Environment gets the same subject without the `env/` segment:
 
@@ -75,30 +76,44 @@ repository's own code. Its Steps get no token when:
 - the Run is a follow-up whose chain of upstream Runs started from one of the Runs above;
 - a comment started the Run;
 - the Run has no repository (a pipeline submitted inline);
-- the Run's ref is unknown or `HEAD`.
+- the Run's ref is unknown, `HEAD`, or `refs/heads/HEAD` (a manual or API Run started at `HEAD`).
 
 On any Run, a Step also gets no token when a value would make the subject read another way: an
 org, repository or Environment name that holds a `/`, or a ref with a path component named `env`
 or `ref`. A branch named `ref/x` is `refs/heads/ref/x`, and `env/prod` is `refs/heads/env/prod`;
-Steps of their Runs get no token. The server logs a warning naming the Run and the reason.
+Steps of their Runs get no token. So do the Steps of an Environment named `none` created before
+the name was reserved: rename it by creating a new Environment and moving its pipelines there. The
+server logs a warning naming the Run and the reason.
 
 A Step with no token still launches. A step that needs cloud access then fails at the call it
-makes, not at launch.
+makes, not at launch. When Scarab cannot read what it needs to decide (the Run's trigger, its
+repository, an upstream Run), the launch fails and the scheduler retries it, rather than going on
+without a token.
 
 ## Matching the subject in a trust policy
 
-Match the whole subject, or put a wildcard only at the end. A wildcard at the end stays inside
-the last segment you wrote:
+A `*` in a trust policy matches any text, `/` included, so it can match across segments. Match the
+whole subject where you can, and put a `*` only after `/ref/`, where the rest of the subject is
+the ref:
 
 | Pattern | Matches |
 |---|---|
-| `scarab:org/acme/repo/app/env/production/ref/refs/heads/main` | `main` of `acme/app` in Environment `production` |
-| `scarab:org/acme/repo/app/env/production/ref/*` | any ref of `acme/app` in `production` |
-| `scarab:org/acme/repo/app/ref/refs/tags/*` | any tag of `acme/app`, outside an Environment |
+| `scarab:org/acme/repo/app/env/production/ref/refs/heads/main` | `main` of `acme/app` in Environment `production`. Use this form where you can |
+| `scarab:org/acme/repo/app/env/production/ref/refs/tags/*` | any tag of `acme/app` in `production` |
+| `scarab:org/acme/repo/app/ref/refs/heads/main` | `main` of `acme/app`, outside an Environment |
 
-A wildcard in the middle can match across segments. `scarab:org/acme/repo/*/ref/refs/heads/main`
-matches `scarab:org/acme/repo/app/env/none/ref/refs/heads/main`, the subject of a fork Run's Step
-in an Environment, as well as the subjects it was written for.
+`…/ref/*` matches every ref, including `refs/pull/<n>/head`: a pull request from any branch of the
+same repository, before anyone has reviewed it. Prefer `…/ref/refs/heads/<branch>`.
+
+Never put a `*` in or right after the `repo/` or `env/` segment:
+
+- `scarab:org/acme/repo/app/*` and `scarab:org/acme/repo/app/env/*` match
+  `scarab:org/acme/repo/app/env/none/ref/refs/pull/7/head`, the subject of a fork pull request's
+  Step or of a Step before its approval, and `scarab:org/acme/repo/app/*` also matches every
+  subject outside an Environment.
+- `scarab:org/acme/repo/app*` also matches `scarab:org/acme/repo/app2/...`, another repository.
+- `scarab:org/acme/repo/*/ref/refs/heads/main` matches
+  `scarab:org/acme/repo/app/env/none/ref/refs/heads/main`.
 
 ## Publishing the issuer
 

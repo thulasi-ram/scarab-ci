@@ -26,14 +26,38 @@ release.yml uses that version's section as the GitHub Release text. See
   verifier that looks the key up in the JWKS by `kid` picks up the new value when it fetches the
   JWKS again. One that has `scarab-key-1` written into its own configuration must be changed to
   the new value, which `/.well-known/jwks.json` shows after the upgrade.
+- **Step OIDC tokens of Runs in an Environment change, though their `sub` does not.** Check any
+  trust policy that matches on more than `sub` and `aud`:
+  - A token lives for the step's `timeout:`, at most `SCARAB_OIDC_TOKEN_MAX_TTL_SECS` (default
+    one hour, at most 12 hours); it lived 15 minutes. A copy that leaks from a step stays usable
+    for that long. Set the maximum lower if your steps exchange the token only at the start.
+  - `event` is the Run's trigger kind (`push`, `pull_request`, `manual`, ...); it was always
+    `deploy`. A policy that matched `event` = `deploy` no longer matches.
+  - `sha` is the commit the Run builds; it was always empty. A token with no known commit (a tag
+    or release Run) has no `sha` claim at all.
+  - A Step whose ref has a path component named `env` or `ref` (a branch `env/prod` is
+    `refs/heads/env/prod`), or whose org, repository or Environment name holds a `/`, gets no
+    token. So does a Step of an Environment named `none`.
+- **No new Environment can be named `none`.** It is the `env` segment of the subject of a Step
+  that no Environment admits (fork code, or before its approval). Creating or duplicating to that
+  name answers 400. An Environment named `none` from before this release can still be edited and
+  deleted, but its Steps get no OIDC token: create an Environment with another name and move its
+  pipelines there.
+- **The OIDC issuer refuses keys under 2048 bits.** A signing key or a
+  `SCARAB_OIDC_PUBLIC_KEYS` entry with a shorter RSA modulus stops the server at boot.
 
 ### Security
 
 - **No step OIDC token when its subject could read another way.** A Step gets no token when the
-  org, repository or Environment name holds a `/`, or the ref has a path component named `env`
-  or `ref` (a branch `ref/x` is `refs/heads/ref/x`). Its launch goes on without a token, and the
-  server logs a warning naming the Run and the reason. See
+  org, repository or Environment name holds a `/`, the ref has a path component named `env` or
+  `ref` (a branch `ref/x` is `refs/heads/ref/x`), or its Environment is named `none`. Its launch
+  goes on without a token, and the server logs a warning naming the Run and the reason. See
   [Step OIDC tokens](/scarab-ci/usage/oidc-tokens/#which-steps-get-no-token).
+- **Trust policies: a `*` belongs only after `/ref/`.** A `*` in a cloud trust policy matches `/`
+  too, so `…/repo/app/*` or `…/repo/app/env/*` also matches the `env/none` subject of a fork pull
+  request's Step, and `…/repo/app*` matches another repository. The docs now say so and give
+  exact patterns. See
+  [Matching the subject](/scarab-ci/usage/oidc-tokens/#matching-the-subject-in-a-trust-policy).
 - **A manual or API Run of fork code is recorded as fork code.** The trigger a Run records now
   holds `fork` for a dispatch, as it did for a pull request. Such a Run already got the fork
   limits at creation (no secrets, `env=none`, a read-only clone token, no registry credential).
@@ -48,9 +72,10 @@ release.yml uses that version's section as the GitHub Release text. See
   repository's own code now gets a token with the subject
   `scarab:org/<org>/repo/<repo>/ref/<ref>`, with no `env/` segment, so a trust policy can name a
   repository and a ref without an Environment. Fork code, comment-triggered Runs, Runs with no
-  repository and Runs whose ref is unknown get none; so do manual and API Runs created before this
-  release, which did not record whether they were fork code. Subjects of Runs bound to an
-  Environment do not change. See [Step OIDC tokens](/scarab-ci/usage/oidc-tokens/).
+  repository and Runs whose ref is unknown or `HEAD` get none; so do manual and API Runs created
+  before this release, which did not record whether they were fork code. The `sub` of a Run bound
+  to an Environment does not change; Breaking changes lists what else in its token does. See
+  [Step OIDC tokens](/scarab-ci/usage/oidc-tokens/).
 
 - **The OIDC issuer's signing key can be changed without breaking cloud trust.** The chart's
   `scarab.oidcPublicKeys` (server: `SCARAB_OIDC_PUBLIC_KEYS`) lists further RSA public keys that
@@ -62,8 +87,8 @@ release.yml uses that version's section as the GitHub Release text. See
 
 - **Step OIDC tokens live as long as the step may run.** A token lived 15 minutes; it now lives
   for the step's `timeout:`, at most `SCARAB_OIDC_TOKEN_MAX_TTL_SECS` (chart:
-  `scarab.oidcTokenMaxTtlSecs`, default one hour), so a cloud SDK that exchanges the token again
-  later in the step still can. A new docs page shows how to publish the issuer as static files
+  `scarab.oidcTokenMaxTtlSecs`, default one hour, at most 12 hours), so a cloud SDK that exchanges
+  the token again later in the step still can. A new docs page shows how to publish the issuer as static files
   and how a step assumes an AWS role with two `env:` lines. See
   [Assuming an AWS role from a step](/scarab-ci/usage/aws-roles/).
 
@@ -71,10 +96,9 @@ release.yml uses that version's section as the GitHub Release text. See
 
 - **Step OIDC tokens carry `iat` and `nbf`.** Both are set 60 seconds before the token is minted,
   so a cloud whose clock runs up to a minute behind the server still accepts the token.
-- **Step OIDC tokens carry the Run's trigger and commit.** The `event` claim is the Run's trigger
-  kind (`push`, `pull_request`, `manual`, ...) where it was always `deploy`, and `sha` is the
-  commit the Run builds where it was empty. A claim whose value the Run did not record, such as
-  `sha` for a tag or release, is left out.
+- **A step launch reads only its Run's trigger record.** Deciding a Step's OIDC token, its fork
+  status and its follow-ups read the one event Run creation records, not the Run's whole event
+  log, at each launch.
 
 ## [0.8.3] - 2026-11-27
 

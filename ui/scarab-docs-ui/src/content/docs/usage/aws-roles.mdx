@@ -70,12 +70,20 @@ and `:aud`. This role may be assumed only by steps of `acme/app` on `main` in th
 }
 ```
 
-Match `sub` exactly with `StringEquals` where you can. When a role covers several refs, use
-`StringLike` with a `*` only at the end, for example
-`scarab:org/acme/repo/app/env/production/ref/refs/tags/*`. A `*` in the middle can match across
-segments: `scarab:org/acme/repo/*/ref/refs/heads/main` also matches the subject a fork Run's Step
-gets in an Environment (`.../env/none/ref/refs/heads/main`). A Run bound to no Environment has a
-subject with no `env/` segment (`scarab:org/acme/repo/app/ref/refs/heads/main`); see
+Match `sub` exactly with `StringEquals` where you can. A `*` in `StringLike` matches any text,
+`/` included, so put one only after `/ref/`, for example
+`scarab:org/acme/repo/app/env/production/ref/refs/tags/*` for every tag. `…/ref/*` also matches
+`refs/pull/<n>/head`, a pull request from any of the repository's own branches, before anyone has
+reviewed it; name the branch instead (`…/ref/refs/heads/main`).
+
+Never put a `*` in or right after `repo/` or `env/`. `scarab:org/acme/repo/app/*` and
+`scarab:org/acme/repo/app/env/*` match `…/env/none/ref/refs/pull/7/head`, the subject of a fork
+pull request's Step or of a Step before its approval; `scarab:org/acme/repo/app*` matches the
+repository `app2` too. See
+[Matching the subject](/scarab-ci/usage/oidc-tokens/#matching-the-subject-in-a-trust-policy).
+
+A Run bound to no Environment has a subject with no `env/` segment
+(`scarab:org/acme/repo/app/ref/refs/heads/main`); see
 [The subject](/scarab-ci/usage/oidc-tokens/#the-subject) for which Runs get one.
 
 ## 4. The step
