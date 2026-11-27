@@ -248,6 +248,8 @@ fn public_keys_from_pem(pem: &str) -> Result<Vec<PublicJwk>, IdentityError> {
         let label = block[BEGIN.len()..]
             .split_once("-----")
             .map(|(label, _)| label)
+            // A label never spans lines; one that does would echo key bytes.
+            .filter(|label| !label.contains('\n'))
             .ok_or_else(|| err(format!("block {n} has no closing dashes on its BEGIN line")))?;
         let end_line = format!("-----END {label}-----");
         let end = block
