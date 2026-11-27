@@ -11774,6 +11774,25 @@
           }
         }
       },
+      "GateNoteDto": {
+        "type": "object",
+        "description": "A plugin's latest note on its gate's open wait.",
+        "required": [
+          "note",
+          "at"
+        ],
+        "properties": {
+          "at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms the note was stored."
+          },
+          "note": {
+            "type": "string",
+            "description": "Text the plugin wrote, at most 1024 bytes. Shown as plain text."
+          }
+        }
+      },
       "GateOutputDto": {
         "type": "object",
         "description": "One output a plugin gate returns on release.",
@@ -16563,6 +16582,17 @@
               "null"
             ],
             "description": "`manual`/`timer`/`external` if this step is a gate, else\nabsent. Gates launch no pod; a waiting\ngate holds only the steps that need it."
+          },
+          "gate_note": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GateNoteDto",
+                "description": "A waiting `gate: plugin` node: why its plugin has not answered yet,\nas the plugin last said. Absent when the gate is not waiting or the\nplugin posted no note."
+              }
+            ]
           },
           "gate_resolution": {
             "oneOf": [

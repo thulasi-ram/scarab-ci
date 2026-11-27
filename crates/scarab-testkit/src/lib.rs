@@ -526,6 +526,7 @@ struct InMemoryState {
     attempt_evidence: HashMap<(RunId, StepId, AttemptId), AttemptEvidenceRec>,
     /// A plugin gate wait's rendered inputs (ADR-0076 §7), by its Attempt.
     gate_inputs: HashMap<(RunId, StepId, AttemptId), serde_json::Value>,
+    gate_notes: HashMap<(RunId, StepId, AttemptId), (String, Timestamp)>,
     /// Run-scoped shared services (ADR-0058), keyed `{run, take, name}` —
     /// value is `(status, handle, created_at)`.
     #[allow(clippy::type_complexity)]
@@ -2168,6 +2169,44 @@ impl Db for InMemoryDb {
             .lock()
             .unwrap()
             .gate_inputs
+            .get(&(run.clone(), step.clone(), attempt.clone()))
+            .cloned())
+    }
+
+    async fn set_gate_wait_note(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        note: &str,
+        at: Timestamp,
+    ) -> Result<bool, DbError> {
+        let mut st = self.state.lock().unwrap();
+        let running = st
+            .steps
+            .get(&(run.clone(), step.clone()))
+            .and_then(|r| r.attempts.iter().find(|a| &a.id == attempt))
+            .is_some_and(|a| a.outcome == AttemptOutcome::Running);
+        if running {
+            st.gate_notes.insert(
+                (run.clone(), step.clone(), attempt.clone()),
+                (note.to_string(), at),
+            );
+        }
+        Ok(running)
+    }
+
+    async fn gate_wait_note(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<(String, Timestamp)>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .gate_notes
             .get(&(run.clone(), step.clone(), attempt.clone()))
             .cloned())
     }

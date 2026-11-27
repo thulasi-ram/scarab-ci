@@ -6,6 +6,9 @@
 //!   latest `GateResolved` in the run's journal. Never re-folded: the verdict
 //!   is the one the engine recorded.
 //!
+//! - **`gate_note`** — a waiting plugin gate's progress note: why its plugin
+//!   has not answered yet, as the plugin last posted it on the open wait.
+//!
 //! Cheap by construction: the caller reads the run's journal once and hands it
 //! in; the view walks it only when the run has a gate.
 
@@ -23,6 +26,8 @@ pub(crate) struct StepGateView {
     /// A waiting Environment approval gate whose approvals are in: when its
     /// wait timer runs out and the scheduler releases it (Unix ms).
     pub approval_release_at: Option<i64>,
+    /// A waiting plugin gate's note on its open wait.
+    pub gate_note: Option<crate::GateNoteDto>,
 }
 
 /// A gate step whose wait is open: `Pending`, every need `Succeeded`, and its
@@ -75,6 +80,24 @@ pub(crate) async fn step_gate_views(
                 .entry(gate.step.0.clone())
                 .or_default()
                 .approval_release_at = Some(met.release_at);
+        }
+    }
+    // One read per waiting plugin gate, of its open wait's note.
+    for gate in waiting_gates(steps)
+        .into_iter()
+        .filter(|s| s.gate_kind.as_deref() == Some("plugin"))
+    {
+        let Some(open) = gate.attempts.last() else {
+            continue;
+        };
+        match st.db.gate_wait_note(&gate.run, &gate.step, &open.id).await {
+            Ok(Some((note, at))) => {
+                views.entry(gate.step.0.clone()).or_default().gate_note =
+                    Some(crate::GateNoteDto { note, at: at.0 });
+            }
+            Ok(None) => {}
+            // A status line: the page renders without it.
+            Err(e) => tracing::warn!(error = %e, step = %gate.step.0, "reading a gate note"),
         }
     }
     for e in &events {

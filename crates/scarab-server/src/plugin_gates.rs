@@ -10,7 +10,11 @@
 //!   gates of kind `plugin` whose releaser is the calling installation, with
 //!   their rendered inputs, paged by a cursor;
 //! - `POST /v1/runs/{id}/gates/{step}/release` with `{"attempt", "passed",
-//!   "outputs" | "reason"}`: answer one of those waits, fenced on its Attempt.
+//!   "outputs" | "reason"}`: answer one of those waits, fenced on its Attempt;
+//! - `POST /v1/runs/{id}/gates/{step}/note` with `{"attempt", "note"}`, on the
+//!   broker listener only: say why one of those waits is not answered yet.
+//!   The Run page shows the latest note while the gate waits; it never moves
+//!   the gate.
 //!
 //! Everything else is refused: another org's Run or gate list (404), a gate
 //! of another kind, a manual gate among them (404, the same answer as no
@@ -354,6 +358,72 @@ pub(crate) async fn release(
         ));
     }
     Ok(StatusCode::ACCEPTED)
+}
+
+/// The most a gate note may hold, as a fail's reason.
+pub const GATE_NOTE_MAX_BYTES: usize = 1024;
+
+/// A plugin's note on `POST /v1/runs/{id}/gates/{step}/note`.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PluginGateNote {
+    /// The open wait the note is about, as the pending-gates query listed it.
+    pub attempt: String,
+    /// Why the wait is not answered yet: 1 to 1024 bytes, no NUL.
+    pub note: String,
+}
+
+/// Store the calling plugin's note on one of its open waits (git-bug
+/// 9f76ee1). The same ownership order as [`release`]: another org's Run, a
+/// gate of another kind or another installation's gate is a 404 before the
+/// body is read. A closed or superseded wait is a 409.
+pub async fn note_on_broker(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    crate::step_path::RunStep { run: id, step }: crate::step_path::RunStep,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let installation = authenticate(&st, &headers).await?;
+    let run = RunId(id);
+    let step = StepId(step);
+    let tenant = st.db.run_tenant(&run).await.map_err(ApiError::Db)?;
+    if tenant.map(|(org, _)| org) != Some(installation.org.clone()) {
+        return Err(ApiError::NotFound);
+    }
+    let releaser = installation.principal().subject().to_string();
+    if !scarab_engine::releases_plugin_gate(st.db.as_ref(), &run, &step, &releaser)
+        .await
+        .map_err(ApiError::Db)?
+    {
+        return Err(ApiError::NotFound);
+    }
+    let req: PluginGateNote = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::BadRequest(format!("bad gate note body: {e}")))?;
+    let note = req.note.trim();
+    if note.is_empty() || note.len() > GATE_NOTE_MAX_BYTES || note.contains('\0') {
+        return Err(ApiError::BadRequest(format!(
+            "note: 1 to {GATE_NOTE_MAX_BYTES} bytes, no NUL character"
+        )));
+    }
+    scarab_engine::note_plugin_gate(
+        st.db.as_ref(),
+        st.clock.as_ref(),
+        &run,
+        &step,
+        &releaser,
+        &AttemptId(req.attempt),
+        note,
+    )
+    .await
+    .map_err(|e| match e {
+        PluginGateError::NotFound => ApiError::NotFound,
+        e @ (PluginGateError::NotWaiting(_) | PluginGateError::Expired(_)) => {
+            ApiError::Conflict(e.to_string())
+        }
+        PluginGateError::Invalid(m) => ApiError::BadRequest(m),
+        PluginGateError::Db(e) => ApiError::Db(e),
+    })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// The release route as the broker listener serves it: a plugin's answer

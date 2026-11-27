@@ -118,6 +118,10 @@ pub fn router_with_journal(state: AppState) -> (Router, Option<broker_proxy::Bro
         .route(
             "/v1/runs/{id}/gates/{step}/release",
             axum::routing::post(crate::plugin_gates::release_on_broker),
+        )
+        .route(
+            "/v1/runs/{id}/gates/{step}/note",
+            axum::routing::post(crate::plugin_gates::note_on_broker),
         );
     let router = Router::new()
         // Unauthenticated: the reachability probe (the isolation probe,

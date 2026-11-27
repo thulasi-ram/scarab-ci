@@ -1795,6 +1795,20 @@ pub struct StepStatusDto {
     /// Absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_release_at: Option<i64>,
+    /// A waiting `gate: plugin` node: why its plugin has not answered yet,
+    /// as the plugin last said. Absent when the gate is not waiting or the
+    /// plugin posted no note.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_note: Option<GateNoteDto>,
+}
+
+/// A plugin's latest note on its gate's open wait.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GateNoteDto {
+    /// Text the plugin wrote, at most 1024 bytes. Shown as plain text.
+    pub note: String,
+    /// Unix-ms the note was stored.
+    pub at: i64,
 }
 
 /// How a gate's wait resolved: its `GateResolved` journal entry.
@@ -3205,6 +3219,7 @@ async fn get_run(
             plugin_gate: origin_view.plugin_gate,
             environment_approval_gate: origin_view.environment_approval_gate,
             approval_release_at: view.approval_release_at,
+            gate_note: view.gate_note,
         });
     }
     Ok(Json(RunStatusResponse {
@@ -17376,6 +17391,7 @@ impl utoipa::Modify for StepUpResponses {
         ExpiredInputDto,
         StepStatusDto,
         GateResolutionDto,
+        GateNoteDto,
         StepServiceDto,
         AttemptDto,
         ServiceStatusDto,

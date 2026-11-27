@@ -135,7 +135,13 @@ pub struct GateApi {
     base: String,
     token_file: PathBuf,
     request_timeout: Duration,
+    /// The note last posted on each open wait (`<run>/<step>/<attempt>`), so
+    /// a note is posted when the reason changes, not every pass.
+    noted: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
 }
+
+/// The most a gate note may hold (the server's bound).
+pub const GATE_NOTE_MAX_BYTES: usize = 1024;
 
 impl GateApi {
     pub fn new(
@@ -154,7 +160,74 @@ impl GateApi {
             base: base_url.trim_end_matches('/').to_string(),
             token_file,
             request_timeout,
+            noted: Default::default(),
         })
+    }
+
+    fn wait_key(gate: &PendingGate) -> String {
+        format!("{}/{}/{}", gate.run, gate.step, gate.attempt)
+    }
+
+    /// Post `why` as the note on `gate`'s open wait, unless it is the note
+    /// already posted there. The Run page shows it while the gate waits. A
+    /// server without the note route (404) is not asked again until the
+    /// reason changes; any other failure is tried again next pass.
+    pub async fn note_if_changed(&self, gate: &PendingGate, why: &str) -> Result<(), BrokerError> {
+        let key = Self::wait_key(gate);
+        let mut note = why.trim().to_string();
+        if note.len() > GATE_NOTE_MAX_BYTES {
+            let mut end = GATE_NOTE_MAX_BYTES;
+            while !note.is_char_boundary(end) {
+                end -= 1;
+            }
+            note.truncate(end);
+        }
+        if note.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut noted = self.noted.lock().unwrap_or_else(|p| p.into_inner());
+            if noted.get(&key) == Some(&note) {
+                return Ok(());
+            }
+            noted.insert(key.clone(), note.clone());
+        }
+        let url = format!(
+            "{}/v1/runs/{}/gates/{}/note",
+            self.base,
+            encode_component(&gate.run),
+            encode_component(gate.key.as_deref().unwrap_or(&gate.step))
+        );
+        let body = json!({ "attempt": gate.attempt, "note": note });
+        let sent = self
+            .send(
+                self.http
+                    .post(url)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body.to_string()),
+            )
+            .await;
+        match sent {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if e.status() != Some(404) {
+                    self.noted
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&key);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Forget the notes of waits that are no longer open.
+    fn keep_notes_of(&self, gates: &[PendingGate]) {
+        let open: std::collections::HashSet<String> = gates.iter().map(Self::wait_key).collect();
+        self.noted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|k, _| open.contains(k));
     }
 
     fn token(&self) -> Result<String, BrokerError> {
@@ -330,6 +403,7 @@ pub async fn resolve_pass(
         .collect()
         .await;
     outcomes.sort_by_key(|(i, _)| *i);
+    api.keep_notes_of(&gates);
     let mut report = PassReport::default();
     for (i, outcome) in outcomes {
         let gate = &gates[i];
@@ -387,6 +461,13 @@ async fn resolve_one(broker: &Broker, api: &GateApi, gate: &PendingGate) -> Outc
     match verdict {
         Judgement::Pass { .. } => Outcome::Released,
         Judgement::Fail { .. } => Outcome::Failed,
-        Judgement::Wait { why } => Outcome::Waiting(why),
+        Judgement::Wait { why } => {
+            // A status line for the Run page: a note that cannot be posted
+            // never holds the wait up.
+            if let Err(e) = api.note_if_changed(gate, &why).await {
+                tracing::debug!(error = %e, status = ?e.status(), "argocd: gate note not posted");
+            }
+            Outcome::Waiting(why)
+        }
     }
 }

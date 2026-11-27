@@ -1906,6 +1906,54 @@ impl Db for PostgresDb {
         Ok(row.and_then(|r| r.get::<Option<Value>, _>("gate_inputs")))
     }
 
+    async fn set_gate_wait_note(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        note: &str,
+        at: Timestamp,
+    ) -> Result<bool, DbError> {
+        let stored = sqlx::query(&format!(
+            "UPDATE attempts SET gate_note = $4, gate_note_at = $5
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
+               AND {ATTEMPT_IS_RUNNING}"
+        ))
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .bind(note)
+        .bind(at.0)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        Ok(stored == 1)
+    }
+
+    async fn gate_wait_note(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<(String, Timestamp)>, DbError> {
+        let row = sqlx::query(
+            "SELECT gate_note, gate_note_at FROM attempts
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(row.and_then(|r| {
+            let note = r.get::<Option<String>, _>("gate_note")?;
+            let at = r.get::<Option<i64>, _>("gate_note_at")?;
+            Some((note, Timestamp(at)))
+        }))
+    }
+
     async fn pending_plugin_gates(
         &self,
         org: &str,

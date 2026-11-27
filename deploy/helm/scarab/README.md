@@ -563,6 +563,28 @@ The StatefulSet's `serviceName` is unchanged, so upgrading needs no migration.
 
 > **Unverified in this chart version:** per-availability-zone placement.
 
+### Upgrading from 0.8.2: gate notes
+
+Migration 0110 adds two nullable columns to `attempts`, `gate_note` and
+`gate_note_at`: the note a plugin posts on its gate's open wait, which the Run
+page shows. No row is rewritten. The `ALTER` waits at most 5 seconds for its
+lock on `attempts`; on a busy database the server stops with `canceling
+statement due to lock timeout` and runs it again when the Pod restarts.
+
+To roll back: scale the server to zero, back up the database, run
+[`rollback/0110_revert.sql`](../../../crates/scarab-db-postgres/rollback/0110_revert.sql)
+(`psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0110_revert.sql`; a second run
+changes nothing), then install the 0.8.2 chart. The notes are dropped. To go
+back to 0.7.5, run `0109_revert.sql` next.
+
+Plugin Deployments are renamed from `plugin-<id>` to
+`scarab-plugin-<name>-<id>`. The server deletes each old Deployment and creates
+the new one once the old Pod is gone, so a plugin is down for about 15 to 30
+seconds after the upgrade. A 0.8.2 server knows only the old names: when you
+roll back, delete the new Deployments while the server is scaled to zero
+(`kubectl -n scarab-plugins delete deployment -l scarab.io/plugin-installation`),
+or 0.8.2 starts a second copy of each plugin beside them.
+
 ### Upgrading from 0.7.7: build libraries and IR version 4
 
 No migration. The library changes below take effect when an org admin
