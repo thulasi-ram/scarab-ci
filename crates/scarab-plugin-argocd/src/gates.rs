@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 use crate::argo::{Application, ManagedResources};
 use crate::assess::{assess, Status};
 use crate::broker::{encode_component, Broker, BrokerError};
-use crate::version::target_images;
+use crate::version::{normalize_image, target_images};
 
 /// The gate's name in `manifest.json`.
 pub const WAIT_LIVE: &str = "wait-live";
@@ -91,14 +91,25 @@ pub fn judge(app: &Application, managed: &ManagedResources, image: &str) -> Judg
         Status::InProgress => Judgement::Wait { why: a.label },
         Status::Live => {
             let images = target_images(managed);
-            if images.contains(image) {
+            let wanted = normalize_image(image);
+            if images.iter().any(|i| normalize_image(i) == wanted) {
                 Judgement::Pass {
                     revision: synced_revision(app),
                 }
             } else {
+                // Name what the manifests do render: a mistyped reference,
+                // or one copied from a registry mirror's rewritten name,
+                // otherwise waits with no clue.
+                let rendered: Vec<&str> = images.iter().map(String::as_str).take(3).collect();
+                let more = if images.len() > 3 { ", …" } else { "" };
                 Judgement::Wait {
                     why: format!(
-                        "synced and healthy, but its manifests do not render `{image}` yet"
+                        "synced and healthy, but its manifests do not render `{image}` yet (they render {}{more})",
+                        if rendered.is_empty() {
+                            "no images".to_string()
+                        } else {
+                            rendered.iter().map(|i| format!("`{i}`")).collect::<Vec<_>>().join(", ")
+                        }
                     ),
                 }
             }

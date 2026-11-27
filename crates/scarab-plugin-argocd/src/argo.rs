@@ -53,7 +53,9 @@ pub struct ApplicationSpec {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct SyncPolicy {
-    /// Present (even `{}`) = automated sync is on.
+    /// Present (even `{}`) = automated sync is on, unless it says
+    /// `enabled: false`: Argo CD 3.x keeps the block and turns auto-sync off
+    /// with that field (seen on a real staging Application, 2026-11-27).
     pub automated: Option<serde_json::Value>,
     pub retry: Option<RetryStrategy>,
 }
@@ -78,6 +80,18 @@ pub struct ApplicationStatus {
     pub reconciled_at: Option<String>,
     #[serde(deserialize_with = "null_default")]
     pub resources: Vec<ResourceStatus>,
+    /// Argo's conditions on the Application (`ComparisonError`,
+    /// `OrphanedResourceWarning`, …).
+    #[serde(deserialize_with = "null_default")]
+    pub conditions: Vec<ApplicationCondition>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ApplicationCondition {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -262,6 +276,7 @@ impl Application {
         self.spec
             .sync_policy
             .as_ref()
-            .is_some_and(|p| p.automated.is_some())
+            .and_then(|p| p.automated.as_ref())
+            .is_some_and(|a| a.get("enabled").and_then(serde_json::Value::as_bool) != Some(false))
     }
 }
