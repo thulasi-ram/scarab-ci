@@ -218,6 +218,7 @@ fn trail(id: &str) -> Option<DelegationTrail> {
         token_id: id.into(),
         token_kind: "issued".into(),
         oauth_client: None,
+        plugin_installation: None,
     })
 }
 

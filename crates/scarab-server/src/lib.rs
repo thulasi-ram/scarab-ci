@@ -8233,6 +8233,7 @@ fn forge_delegation_trail(via: &scarab_engine::DelegationTrail) -> scarab_forge:
         token_id: via.token_id.clone(),
         token_kind: via.token_kind.clone(),
         oauth_client: via.oauth_client.clone(),
+        plugin_installation: via.plugin_installation.clone(),
     }
 }
 
@@ -8242,6 +8243,7 @@ fn engine_delegation_trail(via: &scarab_forge::DelegationTrail) -> scarab_engine
         token_id: via.token_id.clone(),
         token_kind: via.token_kind.clone(),
         oauth_client: via.oauth_client.clone(),
+        plugin_installation: via.plugin_installation.clone(),
     }
 }
 
