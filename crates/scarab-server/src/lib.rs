@@ -7713,7 +7713,7 @@ async fn library_admission(
         repo,
         clone_url.as_deref(),
         ir,
-        event.is_fork_pr() || gov.locked_out(),
+        event.is_fork_code() || gov.locked_out(),
         write,
     )
     .await
@@ -7906,7 +7906,7 @@ fn run_create_trigger(
         kind,
         r#ref: event.protection_ref(),
         sha,
-        fork: event.is_fork_pr(),
+        fork: event.is_fork_code(),
         actor: event.actor().map(str::to_string),
         principal: principal.as_ref().map(|p| p.handle.clone()),
         principal_id: principal.as_ref().map(|p| p.id.clone()),
@@ -8140,6 +8140,7 @@ impl DispatchKind {
         r#ref: String,
         sha: String,
         reason: Option<String>,
+        fork: bool,
     ) -> scarab_forge::Event {
         match self {
             DispatchKind::Manual => scarab_forge::Event::Manual {
@@ -8147,6 +8148,7 @@ impl DispatchKind {
                 repo,
                 r#ref,
                 sha,
+                fork,
                 reason,
             },
             DispatchKind::Api => scarab_forge::Event::Api {
@@ -8154,6 +8156,7 @@ impl DispatchKind {
                 repo,
                 r#ref,
                 sha,
+                fork,
                 reason,
             },
         }
@@ -8168,6 +8171,10 @@ impl DispatchKind {
 pub enum DispatchError {
     #[error(transparent)]
     Forge(scarab_forge::ForgeError),
+    /// The forge could not say whether the resolved commit is fork code
+    /// (ADR-0086 §9). Refused: a dispatch is never trusted by default.
+    #[error("could not tell whether the commit is fork code: {0}")]
+    ForkCheck(scarab_forge::ForgeError),
     /// No `.scarab` pipeline by that name exists at the resolved commit.
     #[error("no pipeline `{0}` found at the requested ref")]
     PipelineNotFound(String),
@@ -8347,6 +8354,73 @@ fn canonicalize_ref(r#ref: &str) -> String {
     }
 }
 
+/// Whether a dispatch's resolved commit is **fork code** (ADR-0086 §9).
+///
+/// Decided on the commit the forge resolved, never on the spelling the caller
+/// typed, because a forge resolves many spellings (a short or upper-case SHA,
+/// `pull/5/head`, `refs/pull/5/merge`) to a commit. The commit is the
+/// repository's own code only when:
+///
+/// - the typed ref names a branch or tag of the repository (`main`,
+///   `refs/heads/main`, `refs/tags/v1`, or `HEAD` for the default branch) and
+///   the forge lists that branch or tag at this commit; or
+/// - it is `refs/pull/<n>/head`, the forge says pull request `n`'s head is a
+///   branch of this repository at this commit, and that branch is listed there
+///   (an AGit pull request has no such branch).
+///
+/// Everything else is fork code: another repository's pull request, any other
+/// `refs/…` ref, a SHA no branch or tag names. A forge error is returned, so
+/// the dispatch is refused rather than trusted.
+pub async fn dispatch_is_fork_code(
+    forge: &dyn scarab_forge::ForgePort,
+    repo: &scarab_forge::RepoRef,
+    typed_ref: &str,
+    sha: &str,
+) -> Result<bool, scarab_forge::ForgeError> {
+    use scarab_forge::RefKind;
+    let typed = typed_ref.trim();
+    if let Some(number) = typed
+        .strip_prefix("refs/pull/")
+        .and_then(|rest| rest.strip_suffix("/head"))
+        .and_then(|n| n.parse::<u64>().ok())
+    {
+        let origin = forge.pull_request_origin(repo, number).await?;
+        if !origin.same_repository || origin.head_sha != sha || origin.head_branch.is_empty() {
+            return Ok(true);
+        }
+        let named =
+            ref_names_commit(forge, repo, &origin.head_branch, Some(RefKind::Branch), sha).await?;
+        return Ok(!named);
+    }
+    let (name, kind) = if typed == "HEAD" {
+        (forge.default_branch(repo).await?, Some(RefKind::Branch))
+    } else if let Some(branch) = typed.strip_prefix("refs/heads/") {
+        (branch.to_string(), Some(RefKind::Branch))
+    } else if let Some(tag) = typed.strip_prefix("refs/tags/") {
+        (tag.to_string(), Some(RefKind::Tag))
+    } else if typed.starts_with("refs/") || typed.is_empty() {
+        return Ok(true);
+    } else {
+        (typed.to_string(), None)
+    };
+    Ok(!ref_names_commit(forge, repo, &name, kind, sha).await?)
+}
+
+/// Whether the forge lists a branch or tag called exactly `name` (of `kind`,
+/// when given) pointing at `sha`.
+async fn ref_names_commit(
+    forge: &dyn scarab_forge::ForgePort,
+    repo: &scarab_forge::RepoRef,
+    name: &str,
+    kind: Option<scarab_forge::RefKind>,
+    sha: &str,
+) -> Result<bool, scarab_forge::ForgeError> {
+    let refs = forge.list_refs(repo, Some(name)).await?;
+    Ok(refs
+        .iter()
+        .any(|r| r.name == name && r.sha == sha && kind.is_none_or(|k| r.kind == k)))
+}
+
 /// Candidate `.scarab` paths a dispatch `pipeline` identifier resolves to. A full
 /// `.scarab/**.yaml`/`.yml` path (or any path containing `/`) is taken verbatim;
 /// a bare name maps to `.scarab/<name>.yaml` then `.yml`.
@@ -8436,6 +8510,12 @@ pub async fn dispatch_run(
     }
     let sha = commit.sha;
     let dispatched_sha = sha.clone();
+    // Fork code (ADR-0086 §9): decided on the resolved commit, never the typed
+    // ref, before anything is read at it. A forge that cannot answer refuses
+    // the dispatch; it is never trusted by default.
+    let fork = dispatch_is_fork_code(forge, &repo, &r#ref, &sha)
+        .await
+        .map_err(DispatchError::ForkCheck)?;
 
     // Read the named pipeline at the resolved commit.
     let (path, yaml) = read_named_pipeline(forge, &repo, &sha, &pipeline).await?;
@@ -8457,7 +8537,7 @@ pub async fn dispatch_run(
     // Headline. The endpoint stays dumb — accept + stamp, no requiredness check
     // (that is an Environment ProtectionRule at admission, thread D). Excluded
     // from `context()`, so it never reaches trigger-matching / interpolation.
-    let event = kind.into_event(actor, repo, sym, sha, reason);
+    let event = kind.into_event(actor, repo, sym, sha, reason, fork);
     let ir = record_compile_failure(db, clock, &event, &path, compiled).await?;
     // The `when:` context: a dispatch has no changed paths, so
     // `event.changed_paths_known` reads `false` here as on a push whose list
@@ -9195,7 +9275,7 @@ async fn write_run_from_ir(
                 .then(|| scarab_engine::RegistryAuthConfig {
                     owner: event.repo().map(|r| r.owner.clone()).unwrap_or_default(),
                     name: event.repo().map(|r| r.name.clone()).unwrap_or_default(),
-                    locked_out: locked_out || event.is_fork_pr(),
+                    locked_out: locked_out || event.is_fork_code(),
                     library: admitted.registry.library.get(&step.id).cloned(),
                     forge_library: admitted.registry.forge.get(&step.id).cloned(),
                     registry_auth_json: None,
@@ -9238,7 +9318,7 @@ async fn write_run_from_ir(
                 // Step may hold a long-lived token.
                 forge_token: step.forge_token.and_then(|asked| {
                     let repo = event.repo()?;
-                    let read_only = locked_out || event.is_fork_pr();
+                    let read_only = locked_out || event.is_fork_code();
                     Some(scarab_engine::ForgeTokenConfig {
                         access: if read_only {
                             scarab_pipeline::ForgeToken::Read
@@ -16646,7 +16726,7 @@ pub struct ForkPolicy {
 }
 
 pub fn fork_policy(event: &scarab_forge::Event, target_env: &str) -> ForkPolicy {
-    if event.is_fork_pr() {
+    if event.is_fork_code() {
         ForkPolicy {
             secrets_locked_out: true,
             oidc_env: "none".to_string(),

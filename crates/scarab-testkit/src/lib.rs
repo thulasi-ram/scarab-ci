@@ -4725,6 +4725,9 @@ pub struct FakeForge {
     /// Pull request heads [`pull_request_head`](ForgePort::pull_request_head)
     /// answers ([`set_pr_head`](Self::set_pr_head)).
     pr_heads: Mutex<HashMap<u64, String>>,
+    /// Pull request origins [`pull_request_origin`](ForgePort::pull_request_origin)
+    /// answers ([`set_pr_origin`](Self::set_pr_origin)).
+    pr_origins: Mutex<HashMap<u64, scarab_forge::PullRequestOrigin>>,
     /// When set, [`pull_request_head`](ForgePort::pull_request_head) fails.
     pr_head_fails: Mutex<bool>,
     /// Refs whose [`latest_commit`](ForgePort::latest_commit) fails.
@@ -4943,6 +4946,12 @@ impl FakeForge {
         );
     }
 
+    /// Where pull request `number`'s head lives, for fork detection at
+    /// dispatch (ADR-0086 §9).
+    pub fn set_pr_origin(&self, number: u64, origin: scarab_forge::PullRequestOrigin) {
+        self.pr_origins.lock().unwrap().insert(number, origin);
+    }
+
     /// The head commit pull request `number` is at.
     pub fn set_pr_head(&self, number: u64, sha: impl Into<String>) {
         self.pr_heads.lock().unwrap().insert(number, sha.into());
@@ -4968,6 +4977,27 @@ impl FakeForge {
     /// Make [`set_status`](ForgePort::set_status) fail (`true`) or work again.
     pub fn set_failing_status(&self, failing: bool) {
         *self.fail_status.lock().unwrap() = failing;
+    }
+
+    /// The commit `git_ref` resolves to: a seeded mapping for that spelling,
+    /// else for the same name with or without `refs/heads/` or `refs/tags/`,
+    /// else [`fake_commit_sha`] of the bare name. Every spelling of one branch
+    /// resolves to one commit, as on a real forge.
+    fn resolve(&self, git_ref: &str) -> String {
+        let commits = self.commits.lock().unwrap();
+        let bare = git_ref
+            .strip_prefix("refs/heads/")
+            .or_else(|| git_ref.strip_prefix("refs/tags/"))
+            .unwrap_or(git_ref);
+        [
+            git_ref.to_string(),
+            bare.to_string(),
+            format!("refs/heads/{bare}"),
+            format!("refs/tags/{bare}"),
+        ]
+        .iter()
+        .find_map(|k| commits.get(k).cloned())
+        .unwrap_or_else(|| fake_commit_sha(bare))
     }
 
     pub fn set_commit(&self, git_ref: impl Into<String>, sha: impl Into<String>) {
@@ -5677,13 +5707,7 @@ impl ForgePort for FakeForge {
                 r#ref
             )));
         }
-        let sha = self
-            .commits
-            .lock()
-            .unwrap()
-            .get(r#ref)
-            .cloned()
-            .unwrap_or_else(|| fake_commit_sha(r#ref));
+        let sha = self.resolve(r#ref);
         Ok(Commit {
             sha,
             message: String::new(),
@@ -5766,7 +5790,39 @@ impl ForgePort for FakeForge {
         _repo: &RepoRef,
         query: Option<&str>,
     ) -> Result<Vec<ForgeRef>, ForgeError> {
-        Ok(filter_refs(self.refs.lock().unwrap().clone(), query))
+        let seeded = self.refs.lock().unwrap().clone();
+        // With nothing seeded, the fake behaves as `latest_commit` does: any
+        // name it is asked about is a branch at the commit that name resolves
+        // to. A test that needs a ref to be absent seeds the list.
+        if seeded.is_empty() {
+            if let Some(name) = query.map(str::trim).filter(|q| !q.is_empty()) {
+                return Ok(vec![ForgeRef {
+                    kind: scarab_forge::RefKind::Branch,
+                    name: name.to_string(),
+                    sha: self.resolve(name),
+                }]);
+            }
+        }
+        Ok(filter_refs(seeded, query))
+    }
+
+    async fn pull_request_origin(
+        &self,
+        _repo: &RepoRef,
+        number: u64,
+    ) -> Result<scarab_forge::PullRequestOrigin, ForgeError> {
+        self.check_rate_limit()?;
+        if *self.pr_head_fails.lock().unwrap() {
+            return Err(ForgeError::Api(
+                "fake forge: pull request read failed".into(),
+            ));
+        }
+        self.pr_origins
+            .lock()
+            .unwrap()
+            .get(&number)
+            .cloned()
+            .ok_or_else(|| ForgeError::NotFound(format!("pull request #{number}")))
     }
 
     async fn list_accessible_repos(&self) -> Result<Vec<RepoRef>, ForgeError> {

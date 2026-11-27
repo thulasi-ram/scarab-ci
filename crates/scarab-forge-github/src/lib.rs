@@ -1448,6 +1448,22 @@ impl ForgePort for GithubForge {
         scarab_forge::pull_request_head_sha(&body)
     }
 
+    /// `GET /repos/{o}/{r}/pulls/{n}`: where the head lives, for fork
+    /// detection at dispatch (ADR-0086 §9).
+    async fn pull_request_origin(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<scarab_forge::PullRequestOrigin, ForgeError> {
+        let token = self.auth_token_for(repo).await?;
+        let url = self.url(&format!(
+            "/repos/{}/{}/pulls/{number}",
+            repo.owner, repo.name
+        ));
+        let body = ok_json(self.send(|| self.client.get(&url), &token).await?).await?;
+        scarab_forge::pull_request_origin(&body)
+    }
+
     async fn set_status(
         &self,
         repo: &RepoRef,
@@ -1873,7 +1889,7 @@ mod tests {
             "repository": { "name": "app", "owner": { "login": "acme" }, "full_name": "acme/app" }
         });
         let event = normalize(&delivery("pull_request", fork)).unwrap();
-        assert!(event.is_fork_pr(), "head repo != base → fork");
+        assert!(event.is_fork_code(), "head repo != base → fork");
         // A fork PR's head branch is the fork's branch name, as GitHub sends it.
         assert!(
             matches!(&event, Event::PullRequest { head_branch, .. } if head_branch == "main"),
