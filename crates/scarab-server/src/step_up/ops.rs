@@ -13,8 +13,10 @@
 //! - **Exempt** — tightening: never a step-up.
 //! - **NotGoverned** — not on ADR-0073 §3's list, with the reason.
 //!
-//! Every GET is [`READ`], except the debug shell ([`STEP_ATTACH`],
-//! [`STEP_DEBUG_POD`]): a WebSocket upgrade that opens a shell in a step Pod.
+//! Every GET is a [`Class::Read`] operation named by the data it exposes
+//! ([`RUN_READ`], [`STEP_LOGS_READ`], …), except the debug shell
+//! ([`STEP_ATTACH`], [`STEP_DEBUG_POD`]): a WebSocket upgrade that opens a
+//! shell in a step Pod.
 
 use scarab_identity::Role;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -692,17 +694,63 @@ const W: Mode = Mode::Window;
 const A: Mode = Mode::AlwaysAsk;
 
 // --- reads ------------------------------------------------------------------
+//
+// ADR-0086 §5: every GET names the ApiOperation of the data it exposes. The
+// ids are a public contract: a token's operation list, and later OAuth
+// consent and a Plugin endpoint's `may`, name them. Renaming one breaks
+// every token that lists it.
 
-/// Every GET route.
-pub static READ: Op = op(
-    "read",
-    "Read",
-    Class::Read,
-    "reads are never governed",
-    ANYONE,
-    OrgOf::None,
-    &[],
-    &[],
+/// A read operation: never governed by step-up.
+const fn read(id: &'static str, label: &'static str) -> Op {
+    op(
+        id,
+        label,
+        Class::Read,
+        "reads are never governed; ADR-0086 §5 names each by the data it exposes",
+        ANYONE,
+        OrgOf::None,
+        &[],
+        &[],
+    )
+}
+
+/// Health, version, metrics, the OpenAPI document and sign-in settings:
+/// the routes that need no Principal.
+pub static SERVER_READ: Op = read(
+    "server.read",
+    "Read the server's health, version and sign-in settings",
+);
+/// The caller's own account: profile, identities, passkeys, own tokens, own
+/// security events and the StepUpConfirmationRequests it raised.
+pub static ACCOUNT_READ: Op = read("account.read", "Read your own account");
+/// Repositories, their refs, Pipelines with their typed inputs, and
+/// schedules.
+pub static REPO_READ: Op = read(
+    "repo.read",
+    "Read repositories, refs, Pipelines and schedules",
+);
+/// Runs and Steps: status, events, the step graph, results, what an Attempt
+/// consumed, refused deliveries, pending gate waits and a Run's Policy
+/// decisions.
+pub static RUN_READ: Op = read("run.read", "Read Runs and Steps");
+/// The logs of Steps and of their service containers.
+pub static STEP_LOGS_READ: Op = read("step.logs.read", "Read Step logs");
+/// A Step's workspace files.
+pub static STEP_WORKSPACE_READ: Op = read("step.workspace.read", "Read a Step's workspace files");
+/// A Run's artifacts: the list and the files.
+pub static RUN_ARTIFACTS_READ: Op = read("run.artifacts.read", "Read a Run's artifacts");
+/// Role bindings, members, Principal search and the org's API tokens.
+pub static ACCESS_READ: Op = read("access.read", "Read role bindings, members and API tokens");
+/// Security events, their summary, leak check limits and a plugin's broker
+/// journal.
+pub static SECURITY_READ: Op = read("security.read", "Read security events");
+/// Secret names and where each is set. Never a value: no route returns one.
+pub static SECRET_NAMES_READ: Op = read("secret.names.read", "Read secret names");
+/// Environments, Policies and their decisions, libraries, plugins and forge
+/// connections.
+pub static SETTINGS_READ: Op = read(
+    "settings.read",
+    "Read Environments, Policies, libraries, plugins and connections",
 );
 
 // --- not governed -----------------------------------------------------------
@@ -1863,13 +1911,13 @@ mod tests {
     #[test]
     fn long_values_are_cut_on_a_char_boundary() {
         let body = json!({"x": "é".repeat(300)});
-        let s = describe_generic(&READ, &input(body));
+        let s = describe_generic(&RUN_READ, &input(body));
         assert!(s.changes[0].contains('…'), "{:?}", s.changes);
         assert!(s.changes[0].ends_with("(600 bytes)"), "{:?}", s.changes);
     }
 
     fn changes(body: Value) -> Vec<String> {
-        describe_generic(&READ, &input(body)).changes
+        describe_generic(&RUN_READ, &input(body)).changes
     }
 
     #[test]

@@ -4,6 +4,9 @@
 //!
 //! 1. A mutating request on a (method, path) the table does not know is
 //!    refused 500 — fail-closed at runtime, whatever the tests missed.
+//! 0. Every request runs with its route's ApiOperation set
+//!    ([`route_operation`], ADR-0086 §5), reads included, so `authenticate`
+//!    can hold a token to its operation list.
 //! 2. Reads, ceremonies, tightenings and ungoverned routes pass untouched.
 //!    A GET registered as a crown jewel (the debug shell) is not a read.
 //! 3. With step-up off (dev-insecure, hand-built test states) everything
@@ -41,6 +44,40 @@ use crate::{authenticate, route_table, run_scope, AppState, Caller, RouteEntry};
 /// `DefaultBodyLimit` (2 MiB), which the handlers' extractors apply too.
 pub const GUARD_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
+tokio::task_local! {
+    /// The ApiOperation of the route the current request matched (ADR-0086
+    /// §5), set by [`guard_with`] around the whole request: what
+    /// `authenticate` checks a token's operation list against. `None` when
+    /// the request matched no route of the table.
+    static ROUTE_OPERATION: Option<&'static Op>;
+}
+
+/// The ApiOperation of the route the current request matched. `None` when
+/// it matched none, or outside a request the guard runs (a token that
+/// carries an operation list is then refused).
+pub(crate) fn route_operation() -> Option<&'static Op> {
+    ROUTE_OPERATION.try_with(|op| *op).ok().flatten()
+}
+
+/// The table entry for `method` (HEAD as the GET that serves it) on the
+/// matched path `matched`.
+fn route_entry<'t>(
+    table: &'t [RouteEntry],
+    method: &Method,
+    matched: Option<&str>,
+) -> Option<&'t RouteEntry> {
+    let matched = matched?;
+    let head = *method == Method::HEAD;
+    table.iter().find(|e| {
+        e.path == matched
+            && (if head {
+                e.method == Method::GET
+            } else {
+                e.method == *method
+            })
+    })
+}
+
 /// The middleware, over [`route_table`].
 ///
 /// It also scopes the request for API token counting: the guard and the
@@ -50,9 +87,19 @@ pub(crate) async fn guard(State(st): State<AppState>, req: Request, next: Next) 
 }
 
 /// [`guard`] over an explicit table — so a test can prove an unclassified
-/// mutating route is refused.
+/// mutating route is refused. The route's operation is set for the whole
+/// request ([`route_operation`]), reads included.
 #[doc(hidden)]
 pub async fn guard_with(table: &[RouteEntry], st: AppState, req: Request, next: Next) -> Response {
+    let matched = req.extensions().get::<MatchedPath>().map(|m| m.as_str());
+    let operation = route_entry(table, req.method(), matched).map(|e| e.op);
+    ROUTE_OPERATION
+        .scope(operation, guard_route(table, st, req, next))
+        .await
+}
+
+/// [`guard_with`] once the route's operation is set.
+async fn guard_route(table: &[RouteEntry], st: AppState, req: Request, next: Next) -> Response {
     let method = req.method().clone();
     let matched = req
         .extensions()
@@ -74,15 +121,7 @@ pub async fn guard_with(table: &[RouteEntry], st: AppState, req: Request, next: 
             return next.run(req).await;
         }
     }
-    let lookup = if method == Method::HEAD {
-        Method::GET
-    } else {
-        method.clone()
-    };
-    let entry = matched
-        .as_deref()
-        .and_then(|m| table.iter().find(|e| e.method == lookup && e.path == m));
-    let Some(entry) = entry else {
+    let Some(entry) = route_entry(table, &method, matched.as_deref()) else {
         tracing::error!(
             method = %method,
             path = matched.as_deref().unwrap_or("<unmatched>"),
