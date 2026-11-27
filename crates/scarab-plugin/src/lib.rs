@@ -265,38 +265,16 @@ pub struct PluginManifest {
     pub gates: BTreeMap<String, GateDefinition>,
     /// Where core calls this Plugin, as a later release declares it
     /// (ADR-0086 §1). This release does not act on it: it decodes and keeps
-    /// it so an installation a later release made still reads after a
-    /// rollback, gives the Plugin no endpoint and no trust tier for it, and
-    /// refuses to install or upgrade to a manifest that has it
-    /// ([`admit_for_mmp`]). Absent from a manifest that has none, so the
-    /// SHA-256 of every other manifest does not change.
+    /// it, from any format a manifest is read in, so an installation a later
+    /// release made still reads after a rollback; gives the Plugin no
+    /// endpoint and no trust tier for it; and refuses to install or upgrade
+    /// to a manifest that has it ([`admit_for_mmp`]), so it never hashes
+    /// one. Absent from a manifest that has none, so the SHA-256 of every
+    /// other manifest does not change. A JSON value: the store keeps the
+    /// manifest as JSONB, which keeps neither key order nor layout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extensions: Option<UnreadExtensions>,
+    pub extensions: Option<serde_json::Value>,
 }
-
-/// A manifest's `extensions`, kept as the JSON text it was read from and
-/// written back unchanged ([`PluginManifest::extensions`]). Raw JSON rather
-/// than a `serde_json::Value`: this workspace's `serde_json` has no
-/// `preserve_order`, so a `Value` would write object keys sorted, not in
-/// the order the later release writes them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct UnreadExtensions(Box<serde_json::value::RawValue>);
-
-impl UnreadExtensions {
-    /// The JSON text as read.
-    pub fn json(&self) -> &str {
-        self.0.get()
-    }
-}
-
-impl PartialEq for UnreadExtensions {
-    fn eq(&self, other: &Self) -> bool {
-        self.json() == other.json()
-    }
-}
-
-impl Eq for UnreadExtensions {}
 
 impl PluginManifest {
     /// Does it ask for `capability`?
@@ -989,10 +967,11 @@ mod tests {
         }
     }
 
-    /// A manifest a later release wrote with `extensions` decodes, is written
-    /// back byte for byte, validates and is refused at admission. A manifest
-    /// without it writes no `extensions` key, so its SHA-256 (over what serde
-    /// writes) is what it was.
+    /// A manifest a later release wrote with `extensions` decodes the way
+    /// the store reads it (a JSON value from JSONB) and from text, keeps the
+    /// field when written back, validates and is refused at admission. A
+    /// manifest without it writes no `extensions` key, so its SHA-256 (over
+    /// what serde writes) is what it was.
     #[test]
     fn extensions_from_a_later_release_are_kept_and_not_admitted() {
         let base = serde_json::to_string(&argo_like()).unwrap();
@@ -1000,36 +979,26 @@ mod tests {
         let back: PluginManifest = serde_json::from_str(&base).unwrap();
         assert_eq!(serde_json::to_string(&back).unwrap(), base);
 
-        // Keys out of sorted order, as the later release's structs write them.
-        const EXTENSIONS: &str =
-            r#"[{"point":"endpoint","path":"mcp","operations":{"call":{"z":1,"a":2}}}]"#;
-        let text = format!("{},\"extensions\":{EXTENSIONS}}}", &base[..base.len() - 1]);
-        let m: PluginManifest = serde_json::from_str(&text).unwrap();
+        let extensions = serde_json::json!([
+            { "point": "endpoint", "path": "mcp", "operations": { "call": { "method": "POST" } } }
+        ]);
+        let mut row = serde_json::to_value(argo_like()).unwrap();
+        row["extensions"] = extensions.clone();
+        // As `installation_from_row` decodes the manifest column.
+        let stored: PluginManifest = serde_json::from_value(row.clone()).unwrap();
+        assert_eq!(stored.extensions.as_ref(), Some(&extensions));
         assert_eq!(
-            m.extensions.as_ref().map(UnreadExtensions::json),
-            Some(EXTENSIONS)
+            serde_json::to_value(&stored).unwrap(),
+            row,
+            "kept when written back"
         );
-        assert_eq!(
-            serde_json::to_string(&m).unwrap(),
-            text,
-            "written back unchanged"
-        );
-        assert_eq!(m.validate(), Ok(()));
+        let from_text: PluginManifest = serde_json::from_str(&row.to_string()).unwrap();
+        assert_eq!(from_text, stored);
+        assert_eq!(stored.validate(), Ok(()));
         assert!(
-            matches!(admit_for_mmp(&m), Err(PluginError::InvalidManifest(e)) if e.contains("extensions")),
+            matches!(admit_for_mmp(&stored), Err(PluginError::InvalidManifest(e)) if e.contains("extensions")),
             "a manifest with extensions is not installed by this release"
         );
-
-        // The store reads a manifest back as a JSON value (Postgres JSONB).
-        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let stored: PluginManifest = serde_json::from_value(value).unwrap();
-        let kept: serde_json::Value =
-            serde_json::from_str(stored.extensions.as_ref().unwrap().json()).unwrap();
-        assert_eq!(
-            kept,
-            serde_json::from_str::<serde_json::Value>(EXTENSIONS).unwrap()
-        );
-        assert!(serde_json::to_value(&stored).unwrap()["extensions"].is_array());
     }
 
     #[test]

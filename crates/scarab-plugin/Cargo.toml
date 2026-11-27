@@ -15,9 +15,7 @@ license.workspace = true
 # items are the broker's wire shape: serde is part of the domain here, not a
 # leaked format (ADR-0072 §2, §11).
 serde = { workspace = true }
-# `raw_value`: a manifest's `extensions`, which this release does not act
-# on, is kept as the JSON text it was read from (`UnreadExtensions`).
-serde_json = { workspace = true, features = ["raw_value"] }
+serde_json = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 # A report's (installation, vendor grouping) IS an EnvironmentDeploymentSource

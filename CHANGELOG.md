@@ -76,9 +76,10 @@ release.yml uses that version's section as the GitHub Release text. See
 
 - **Rollback target for plugin manifest `extensions`.** A later release adds an `extensions`
   field to plugin manifests. 0.8.4 reads and keeps it, so an org's plugin list still loads after
-  a rollback from that release, and writes it back unchanged. It does not act on it: such a
-  plugin gets no endpoint and no trust tier. Installing, or upgrading to, a manifest that
-  declares `extensions` is refused on 0.8.4. Manifests without the field hash as before.
+  a rollback from that release, and keeps it when it writes the installation back. It does not
+  act on it: such a plugin gets no endpoint and no trust tier. Installing, or upgrading to, a
+  manifest that declares `extensions` is refused on 0.8.4. Manifests without the field hash as
+  before.
 
 ## [0.8.3] - 2026-11-27
 
