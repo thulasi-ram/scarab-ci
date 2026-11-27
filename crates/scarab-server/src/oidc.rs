@@ -223,7 +223,23 @@ fn generate_key() -> Result<SigningKey, IdentityError> {
     signing_key(private)
 }
 
+/// The smallest RSA modulus, in bits, the issuer signs with or publishes.
+const MIN_RSA_KEY_BITS: usize = 2048;
+
+/// Refuse a key whose modulus is under [`MIN_RSA_KEY_BITS`]: a cloud that
+/// trusts the issuer trusts every token any published key verifies.
+fn refuse_weak_key(public: &RsaPublicKey, what: &str) -> Result<(), IdentityError> {
+    let bits = public.n().bits();
+    if bits < MIN_RSA_KEY_BITS {
+        return Err(IdentityError::Issuance(format!(
+            "{what} is a {bits}-bit RSA key; at least {MIN_RSA_KEY_BITS} bits are required"
+        )));
+    }
+    Ok(())
+}
+
 fn signing_key(private: RsaPrivateKey) -> Result<SigningKey, IdentityError> {
+    refuse_weak_key(&RsaPublicKey::from(&private), "the signing key")?;
     let private_pem = private
         .to_pkcs8_pem(LineEnding::LF)
         .map_err(|e| IdentityError::Issuance(format!("pem: {e}")))?
@@ -263,6 +279,7 @@ fn public_keys_from_pem(pem: &str) -> Result<Vec<PublicJwk>, IdentityError> {
         }
         let key = RsaPublicKey::from_public_key_pem(&format!("{}\n", &block[..end]))
             .map_err(|e| err(format!("block {n} is not an RSA public key: {e}")))?;
+        refuse_weak_key(&key, &format!("OIDC public keys: block {n}"))?;
         keys.push(PublicJwk::of(&key));
         rest = &block[end..];
     }
@@ -402,13 +419,27 @@ mod tests {
     /// blocks is refused (a private key above all), and the error names the
     /// block, never its bytes, since it ends up in the boot log. Blank text
     /// is no keys.
+    /// A key under 2048 bits is refused, as a further public key and as the
+    /// signing key.
     /// Kills: a private key accepted as a "public" one; a malformed BEGIN
-    /// line whose label runs into the key body and is echoed (727782d3).
+    /// line whose label runs into the key body and is echoed (727782d3); a
+    /// 1024-bit key a verifier would trust.
     #[test]
     fn a_bad_public_key_block_is_refused_without_its_bytes() {
+        use rsa::pkcs8::EncodePublicKey;
         const SECRET: &str = "MIIEvQIBADANBgkqSECRETBYTES";
         let good = rfc7638_pem();
+        let weak = RsaPrivateKey::new(&mut rand::rngs::OsRng, 1024).unwrap();
+        let weak_public = RsaPublicKey::from(&weak)
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let weak_private = weak.to_pkcs8_pem(LineEnding::LF).unwrap().to_string();
+        assert!(
+            Rs256Issuer::from_pem("https://x", &weak_private).is_err(),
+            "a 1024-bit signing key is refused"
+        );
         for (name, pem) in [
+            ("1024-bit", weak_public),
             (
                 "private",
                 format!("-----BEGIN PRIVATE KEY-----\n{SECRET}\n-----END PRIVATE KEY-----\n"),
@@ -442,5 +473,73 @@ mod tests {
             assert!(!err.contains("SECRETBYTES"), "{name}: {err}");
         }
         assert!(public_keys_from_pem("  \n").unwrap().is_empty());
+    }
+
+    /// During a key change, replica A signs with key A and lists key B as a
+    /// further public key; replica B signs with key B. A token B signed
+    /// verifies against A's JWKS, by the key whose `kid` the token names.
+    /// Kills: further public keys left out of the JWKS, or listed under a
+    /// `kid` the signing replica does not put in the token header.
+    #[tokio::test]
+    async fn a_token_signed_by_a_further_key_verifies() {
+        use rsa::pkcs8::EncodePublicKey;
+        let mut rng = rand::rngs::OsRng;
+        let key_a = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let key_b = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let pem_a = key_a.to_pkcs8_pem(LineEnding::LF).unwrap().to_string();
+        let pem_b = key_b.to_pkcs8_pem(LineEnding::LF).unwrap().to_string();
+        let public_b = RsaPublicKey::from(&key_b)
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+
+        let replica_a = Rs256Issuer::from_pem("https://scarab.example", &pem_a)
+            .unwrap()
+            .with_public_keys(&public_b)
+            .unwrap();
+        let replica_b = Rs256Issuer::from_pem("https://scarab.example", &pem_b).unwrap();
+        let token = replica_b
+            .issue(Claims {
+                issuer: "https://scarab.example".into(),
+                subject: "scarab:org/acme/repo/app/ref/refs/heads/main".into(),
+                audience: "sts.example".into(),
+                expires_at: i64::MAX / 2,
+                run_id: "r1".into(),
+                attempt: "a1".into(),
+                event: Some("push".into()),
+                git_ref: "refs/heads/main".into(),
+                sha: None,
+                issued_at: 0,
+            })
+            .await
+            .unwrap();
+        let kid = jsonwebtoken::decode_header(&token.0)
+            .unwrap()
+            .kid
+            .expect("the token names its key");
+
+        let jwks = replica_a.jwks();
+        let listed = jwks["keys"].as_array().unwrap();
+        assert_eq!(listed.len(), 2, "{jwks}");
+        let key = listed
+            .iter()
+            .find(|k| k["kid"] == kid.as_str())
+            .unwrap_or_else(|| panic!("A's JWKS lists the key B signs with: {jwks}"));
+        verify(
+            &token.0,
+            key["n"].as_str().unwrap(),
+            key["e"].as_str().unwrap(),
+            "sts.example",
+        )
+        .expect("B's token verifies against A's JWKS");
+        // A's own key does not verify it: the further key is what does.
+        let own = &listed[0];
+        assert_ne!(own["kid"], kid.as_str());
+        assert!(verify(
+            &token.0,
+            own["n"].as_str().unwrap(),
+            own["e"].as_str().unwrap(),
+            "sts.example",
+        )
+        .is_err());
     }
 }

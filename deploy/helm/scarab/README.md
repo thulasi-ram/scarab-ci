@@ -294,7 +294,7 @@ openssl pkey -in oidc-b.pem -pubout -out oidc-b.pub.pem
 
 The server never signs with a key in `scarab.oidcPublicKeys`, and refuses to
 start when an entry is not a `-----BEGIN PUBLIC KEY-----` block holding an RSA
-key.
+key of at least 2048 bits. The signing key must be at least 2048 bits too.
 
 ## Declarative connections (`scarab.connections`, ADR-0060 part D)
 
