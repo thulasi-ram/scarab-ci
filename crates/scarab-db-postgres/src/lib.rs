@@ -2267,6 +2267,22 @@ impl Db for PostgresDb {
             .collect()
     }
 
+    async fn run_trigger_record(&self, run: &RunId) -> Result<Option<Value>, DbError> {
+        // The trigger is the second event Run creation writes; the
+        // (run_id, seq) index walks the Run's events in order and stops at
+        // the first match.
+        let row = sqlx::query(
+            "SELECT payload->'Raw' AS raw FROM events
+             WHERE run_id = $1 AND jsonb_typeof(payload->'Raw'->'trigger'->'event') = 'object'
+             ORDER BY seq LIMIT 1",
+        )
+        .bind(&run.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(|r| r.get::<Value, _>("raw")))
+    }
+
     async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError> {
         let rows = sqlx::query(
             "SELECT step_id, status, needs, gate_kind, step_key FROM step_runs

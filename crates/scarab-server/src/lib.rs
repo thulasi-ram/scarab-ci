@@ -9670,20 +9670,19 @@ fn run_status_to_forge(s: RunStatus) -> scarab_forge::StatusState {
 }
 
 /// The trigger context (`event`) a Run was created from, and its actor, as
-/// [`persist_run_from_ir`] recorded them on the Run's event log.
+/// [`persist_run_from_ir`] recorded them on the Run's event log. Reads only
+/// that record ([`Db::run_trigger_record`]), not the whole log: a launch
+/// reads it for every Step.
 pub(crate) async fn run_trigger(
     db: &dyn Db,
     run: &RunId,
 ) -> Result<Option<(serde_json::Value, Option<String>)>, DbError> {
-    for e in db.events(run).await? {
-        if let EventPayload::Raw(v) = &e.kind {
-            if v["trigger"]["event"].is_object() {
-                let actor = v["actor"].as_str().map(str::to_string);
-                return Ok(Some((v["trigger"]["event"].clone(), actor)));
-            }
-        }
-    }
-    Ok(None)
+    Ok(db.run_trigger_record(run).await?.and_then(|v| {
+        let event = &v["trigger"]["event"];
+        event
+            .is_object()
+            .then(|| (event.clone(), v["actor"].as_str().map(str::to_string)))
+    }))
 }
 
 /// Recover a run's `(repo, sha)` from the normalized trigger recorded on its
