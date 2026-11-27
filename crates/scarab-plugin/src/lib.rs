@@ -415,6 +415,15 @@ impl PluginManifest {
                 self.extensions.len()
             ));
         }
+        // A plugin that resolves gates holds a `scarab-api` token of its own
+        // that acts as its installation, and an endpoint plugin acts for many
+        // callers: one Plugin is never both, so neither authority can stand
+        // in for the other.
+        if !self.extensions.is_empty() && self.has(PluginCapability::ResolveGates) {
+            return invalid(
+                "a plugin that registers an extension may not also ask for `resolve_gates`".into(),
+            );
+        }
         let mut paths = std::collections::BTreeSet::new();
         for registration in &self.extensions {
             registration.validate()?;
@@ -1017,6 +1026,36 @@ mod tests {
             gates: BTreeMap::new(),
             extensions: Vec::new(),
         }
+    }
+
+    /// J7: an endpoint registration never comes with `resolve_gates`.
+    #[test]
+    fn an_endpoint_plugin_may_not_resolve_gates() {
+        let endpoint: PluginExtensionRegistration = serde_json::from_value(serde_json::json!({
+            "point": "endpoint",
+            "path": "mcp",
+            "operations": {
+                "tools_list": {
+                    "match": { "method": "POST", "json": { "/method": "tools/list" } },
+                    "may": []
+                }
+            }
+        }))
+        .unwrap();
+        let mut m = argo_like();
+        m.extensions = vec![endpoint];
+        assert_eq!(m.validate(), Ok(()));
+        assert_eq!(m.trust_tier(), Some(PluginTrustTier::TrustedService));
+
+        m.capabilities.push(PluginCapability::ResolveGates);
+        m.gates = BTreeMap::from([(
+            "wait-live".to_string(),
+            serde_json::from_value(serde_json::json!({ "description": "x" })).unwrap(),
+        )]);
+        assert!(matches!(
+            m.validate(),
+            Err(PluginError::InvalidManifest(msg)) if msg.contains("resolve_gates")
+        ));
     }
 
     #[test]

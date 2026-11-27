@@ -312,31 +312,38 @@ pub fn by_id(id: &str) -> Option<&'static Op> {
         .find(|op| op.id == id)
 }
 
-/// The operations whose routes authenticate no Principal (ADR-0086 §4): a
-/// health check, a login, a webhook, the results POST, an external gate's
-/// `/release`. A DelegatedCallerHandle could not act as anyone there.
-const AUTHENTICATES_NO_PRINCIPAL: [&str; 7] = [
-    "server.read",
-    "auth.login",
-    "auth.logout",
-    "webhook.github",
-    "webhook.forgejo",
-    "step.results_ingest",
-    "gate.release_external",
+/// The only ApiOperations a Plugin's DelegatedCallerHandle may ever use
+/// (ADR-0086 §4): a closed list, so a new route is not delegable until it is
+/// added here on purpose. Reads of Runs, Steps, logs, workspaces, artifacts
+/// and repositories, and the Run writes an agent may make for its caller.
+/// Settings, access, security, account, Policy, Environment, token, plugin
+/// and library operations, an inline `run.create`, and the snapshot pin are
+/// not on it.
+pub const DELEGABLE_OPERATIONS: [&str; 10] = [
+    "repo.read",
+    "run.read",
+    "step.logs.read",
+    "step.workspace.read",
+    "run.artifacts.read",
+    "repo.dispatch",
+    "step.rerun",
+    "step.retry",
+    "run.cancel",
+    "gate.reject",
 ];
 
 /// May a Plugin's DelegatedCallerHandle use `op` (ADR-0086 §4)? `Err`
-/// says why not. A manifest whose endpoint `may` names an operation this
-/// refuses is refused at install and upgrade, and PluginApi serves no route
-/// of one:
-///
-/// - a crown jewel or a conditional operation: it can need a step-up, and a
-///   delegated call never raises or satisfies one (so `gate.approve` is
-///   never delegable);
-/// - a passkey ceremony;
-/// - a browser-only or not-by-token operation, the debug shell among them;
-/// - a route that authenticates no Principal.
+/// says why not. Only an operation on [`DELEGABLE_OPERATIONS`]; and, as a
+/// second guard should the list ever name one, never an operation that can
+/// need a step-up (a delegated call never raises or satisfies one, so
+/// `gate.approve` is never delegable), a passkey ceremony, or a browser-only
+/// or not-by-token operation. A manifest whose endpoint `may` names any
+/// other is refused at fetch, install and upgrade, and PluginApi serves no
+/// route of one.
 pub fn delegable(op: &Op) -> Result<(), &'static str> {
+    if !DELEGABLE_OPERATIONS.contains(&op.id) {
+        return Err("it is not one of the operations a plugin may use for its caller");
+    }
     match op.class {
         Class::CrownJewel(_) | Class::Conditional { .. } => {
             return Err("it can need a step-up, which a delegated call never raises or satisfies")
@@ -348,9 +355,6 @@ pub fn delegable(op: &Op) -> Result<(), &'static str> {
         StepUpMachineUse::BrowserOnly => return Err("only a person in a browser may do it"),
         StepUpMachineUse::NotByToken => return Err("a token may never do it"),
         StepUpMachineUse::Requestable => {}
-    }
-    if AUTHENTICATES_NO_PRINCIPAL.contains(&op.id) {
-        return Err("its route authenticates no person to act as");
     }
     Ok(())
 }

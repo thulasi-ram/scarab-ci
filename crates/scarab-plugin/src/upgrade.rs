@@ -63,9 +63,9 @@ pub struct ManifestDiff {
     pub gates: SetDiff<String>,
     /// The image repository the manifest names, when it names one.
     pub image: SetDiff<String>,
-    /// `<path>/<operation>: <what it matches, may and writes>`
-    /// ([`crate::PluginEndpointOperation::describe`]). An operation that
-    /// changed in any way is both removed and added.
+    /// Endpoint operations by `<path>/<operation>`, each compared as its
+    /// whole definition in canonical JSON (`may` sorted): one whose match,
+    /// `may` or writes changed is in both `removed` and `added`.
     pub endpoint_operations: SetDiff<String>,
 }
 
@@ -91,11 +91,18 @@ impl ManifestDiff {
                 .collect()
         };
         let image = |m: &PluginManifest| -> Vec<String> { m.image.iter().cloned().collect() };
-        let endpoint_operations = |m: &PluginManifest| -> Vec<String> {
+        // An endpoint operation is its `<path>/<operation>` key and its whole
+        // definition, in canonical JSON so that listing `may` in another
+        // order is not a change.
+        let endpoint_operations = |m: &PluginManifest| -> Vec<(String, serde_json::Value)> {
             m.endpoint_operations()
                 .into_iter()
-                .map(|(name, op)| format!("{name}: {}", op.describe()))
+                .map(|(name, op)| (name, canonical_endpoint_operation(op)))
                 .collect()
+        };
+        let operations = SetDiff::of(&endpoint_operations(old), &endpoint_operations(new));
+        let keys = |xs: Vec<(String, serde_json::Value)>| {
+            xs.into_iter().map(|(n, _)| n).collect::<Vec<_>>()
         };
         // A gate is its name and its whole definition: the same name with
         // another interface is not the gate an admin approved.
@@ -118,7 +125,11 @@ impl ManifestDiff {
                 unchanged: names(gates.unchanged),
             },
             image: SetDiff::of(&image(old), &image(new)),
-            endpoint_operations: SetDiff::of(&endpoint_operations(old), &endpoint_operations(new)),
+            endpoint_operations: SetDiff {
+                added: keys(operations.added),
+                removed: keys(operations.removed),
+                unchanged: keys(operations.unchanged),
+            },
         }
     }
 
@@ -147,19 +158,11 @@ impl ManifestDiff {
         }
         // An endpoint operation is one approval: a new one, or any change to
         // one, is asked about again (ADR-0086 §1).
-        let operation_name =
-            |line: &String| line.split(": ").next().unwrap_or_default().to_string();
-        for line in &self.endpoint_operations.added {
-            let name = operation_name(line);
-            if self
-                .endpoint_operations
-                .removed
-                .iter()
-                .any(|r| operation_name(r) == name)
-            {
-                out.push(format!("changes endpoint operation `{line}`"));
+        for name in &self.endpoint_operations.added {
+            if self.endpoint_operations.removed.contains(name) {
+                out.push(format!("changes endpoint operation `{name}`"));
             } else {
-                out.push(format!("adds endpoint operation `{line}`"));
+                out.push(format!("adds endpoint operation `{name}`"));
             }
         }
         // Naming no image, or another, loosens which code the manifest runs
@@ -177,6 +180,14 @@ impl ManifestDiff {
     pub fn widens(&self) -> bool {
         !self.widenings().is_empty()
     }
+}
+
+/// An endpoint operation as one comparable value: its JSON with `may`
+/// sorted.
+fn canonical_endpoint_operation(op: &crate::PluginEndpointOperation) -> serde_json::Value {
+    let mut op = op.clone();
+    op.may.sort();
+    serde_json::to_value(&op).unwrap_or(serde_json::Value::Null)
 }
 
 /// A read rule with the query keys it allows: `GET /api/v1/applications
@@ -333,5 +344,65 @@ mod tests {
         let d = ManifestDiff::between(&old, &manifest());
         assert_eq!(d.image.added, vec!["ghcr.io/acme/argocd".to_string()]);
         assert!(!d.widens());
+    }
+
+    /// A manifest with one endpoint `mcp` whose `trigger_run` may use `may`.
+    fn with_endpoint(may: &[&str], writes: u32) -> PluginManifest {
+        let mut m = manifest();
+        m.capabilities = vec![PluginCapability::UseConnection];
+        m.gates.clear();
+        m.extensions = vec![serde_json::from_value(serde_json::json!({
+            "point": "endpoint",
+            "path": "mcp",
+            "operations": {
+                "trigger_run": {
+                    "match": { "method": "POST", "json": { "/method": "tools/call" } },
+                    "may": may,
+                    "writes": writes
+                }
+            }
+        }))
+        .unwrap()];
+        m
+    }
+
+    /// J2: an endpoint operation is keyed by `<path>/<operation>` and
+    /// compared as its whole definition: `may` in another order is no
+    /// change, while one more `may` or one more write is a change, named by
+    /// its key.
+    #[test]
+    fn an_endpoint_operation_is_compared_whole_and_named_by_its_key() {
+        let old = with_endpoint(&["run.read", "repo.dispatch"], 1);
+        let reordered = with_endpoint(&["repo.dispatch", "run.read"], 1);
+        let d = ManifestDiff::between(&old, &reordered);
+        assert_eq!(
+            d.endpoint_operations.unchanged,
+            vec!["mcp/trigger_run".to_string()]
+        );
+        assert!(!d.widens(), "{:?}", d.widenings());
+
+        for new in [
+            with_endpoint(&["run.read", "repo.dispatch", "step.rerun"], 1),
+            with_endpoint(&["run.read", "repo.dispatch"], 2),
+        ] {
+            let d = ManifestDiff::between(&old, &new);
+            assert_eq!(
+                d.endpoint_operations.added,
+                vec!["mcp/trigger_run".to_string()]
+            );
+            assert_eq!(
+                d.endpoint_operations.removed,
+                vec!["mcp/trigger_run".to_string()]
+            );
+            assert_eq!(
+                d.widenings(),
+                vec!["changes endpoint operation `mcp/trigger_run`".to_string()]
+            );
+        }
+
+        let d = ManifestDiff::between(&manifest(), &old);
+        assert!(d
+            .widenings()
+            .contains(&"adds endpoint operation `mcp/trigger_run`".to_string()));
     }
 }

@@ -267,16 +267,21 @@ impl PluginEndpointOperation {
         Ok(())
     }
 
-    /// One line an admin reads on the approval screen and in an upgrade's
-    /// diff: `POST /method=tools/call /params/name=trigger_run; may
-    /// repo.dispatch, repo.read; writes 1`.
+    /// One line an admin reads on the approval screen: `POST
+    /// "/method"="tools/call" "/params/name"="trigger_run"; may
+    /// repo.dispatch, repo.read; writes 1`. Pointers and values are JSON
+    /// strings, so a space, `=` or `;` inside one cannot pass for another
+    /// check.
     pub fn describe(&self) -> String {
+        let quoted = |s: &str| serde_json::to_string(s).unwrap_or_default();
         let mut line = self.request_rule.method.clone();
         for (pointer, check) in &self.request_rule.json {
             match check {
-                PluginEndpointJsonCheck::Equals(v) => line.push_str(&format!(" {pointer}={v}")),
+                PluginEndpointJsonCheck::Equals(v) => {
+                    line.push_str(&format!(" {}={}", quoted(pointer), quoted(v)))
+                }
                 PluginEndpointJsonCheck::Presence(_) => {
-                    line.push_str(&format!(" {pointer} exists"))
+                    line.push_str(&format!(" {} exists", quoted(pointer)))
                 }
             }
         }
