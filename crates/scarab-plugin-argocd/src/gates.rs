@@ -263,6 +263,9 @@ pub struct PassReport {
     pub released: Vec<String>,
     pub failed: Vec<String>,
     pub waiting: Vec<String>,
+    /// Why each wait in `waiting` is not answered yet, by the same key.
+    /// Core has no place for it, so it is only logged (when it changes).
+    pub waiting_why: std::collections::BTreeMap<String, String>,
     /// Waits not answered this pass: an input missing, Argo unreadable, or
     /// the answer refused. Logged and tried again next pass.
     pub errors: Vec<String>,
@@ -282,7 +285,7 @@ enum Outcome {
     Skipped,
     Released,
     Failed,
-    Waiting,
+    Waiting(String),
     Error(String),
 }
 
@@ -335,7 +338,10 @@ pub async fn resolve_pass(
             Outcome::Skipped => {}
             Outcome::Released => report.released.push(key),
             Outcome::Failed => report.failed.push(key),
-            Outcome::Waiting => report.waiting.push(key),
+            Outcome::Waiting(why) => {
+                report.waiting_why.insert(key.clone(), why);
+                report.waiting.push(key);
+            }
             Outcome::Error(e) => report.errors.push(format!("{key}: {e}")),
         }
     }
@@ -381,6 +387,6 @@ async fn resolve_one(broker: &Broker, api: &GateApi, gate: &PendingGate) -> Outc
     match verdict {
         Judgement::Pass { .. } => Outcome::Released,
         Judgement::Fail { .. } => Outcome::Failed,
-        Judgement::Wait { .. } => Outcome::Waiting,
+        Judgement::Wait { why } => Outcome::Waiting(why),
     }
 }

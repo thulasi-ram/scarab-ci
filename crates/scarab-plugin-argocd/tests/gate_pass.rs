@@ -463,7 +463,13 @@ async fn the_plugin_sends_its_own_rotating_token_and_never_the_argo_token() {
         },
     );
     w.waits(&["web"]);
-    assert_eq!(w.pass().await.waiting, [key("web")]);
+    let report = w.pass().await;
+    assert_eq!(report.waiting, [key("web")]);
+    // Why it waits is kept for the log (core has no place for it).
+    assert!(
+        report.waiting_why[&key("web")].contains("awaiting auto-sync"),
+        "{report:?}"
+    );
     std::fs::write(&w.broker_token, "broker-token-2\n").unwrap();
     w.live("web");
     assert_eq!(w.pass().await.released, [key("web")]);

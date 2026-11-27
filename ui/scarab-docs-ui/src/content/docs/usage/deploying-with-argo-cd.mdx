@@ -175,11 +175,17 @@ when `app` or its namespace is empty, `.` or `..`, or `app` holds a second `/`, 
 Application name does. Write `image` as your manifests write it: the plugin compares it with the
 images in the Application's target manifests, exactly, except that a Docker Hub short name matches
 its full form (`busybox:1.36` is `docker.io/library/busybox:1.36`). A name a registry mirror
-rewrote it to, which Argo CD's UI may show, does not match, and the gate's wait message lists
-what the manifests do render. While Argo CD cannot compare the Application (sync status
-`Unknown`), the wait message carries Argo's error, such as a `ComparisonError`. The gate's output `revision` is the git revision Argo synced; for a multi-source Application it
+rewrote it to, which Argo CD's UI may show, does not match. The gate's output `revision` is the
+git revision Argo synced; for a multi-source Application it
 is each source's revision, in the order of `spec.sources`, joined by commas. The run fails when
 the gate expires. See [Plugin gates](/scarab-ci/usage/pipeline-syntax/#plugin-gates).
+
+While the gate waits, the Run page shows only "waiting for its plugin". The plugin writes why it
+is waiting to its own log, once each time the reason changes, as an `argocd: gate waiting` line
+with the gate and the reason. Examples: `awaiting auto-sync`; the images the manifests render when
+none is `image`; Argo's error, such as a `ComparisonError`, while Argo CD cannot compare the
+Application (sync status `Unknown`). Read it with
+`kubectl logs -n scarab-plugins deploy/<the installation's Deployment>`.
 
 To see what the plugin asked Argo CD for, open **Settings → Plugins**, then the installation's page,
 and read its **Broker journal**. It lists each request the broker forwarded or refused in the last 14 days,

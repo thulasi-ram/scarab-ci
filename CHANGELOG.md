@@ -34,10 +34,15 @@ release.yml uses that version's section as the GitHub Release text. See
   NOT enforced" on a cluster that enforces it.
 - **Argo CD plugin: fixes from a run against a real Argo CD 3.4.** An Application whose auto-sync is
   turned off with `automated: {enabled: false}` is no longer reported as "awaiting auto-sync". A
-  `wait-live` gate whose Application Argo cannot compare now says why (Argo's `ComparisonError`
-  message) in place of "sync status unknown". A Docker Hub short name in the manifest
+  `wait-live` gate whose Application Argo cannot compare now gives Argo's `ComparisonError`
+  message as its reason in place of "sync status unknown". A Docker Hub short name in the manifest
   (`busybox:1.36.1`) matches its full form (`docker.io/library/busybox:1.36.1`), and a wait for an
-  image the manifests do not render lists the images they do (git-bug 9f76ee1).
+  image the manifests do not render gives the images they do (git-bug 9f76ee1).
+- **Argo CD plugin: why a `wait-live` gate waits is now logged.** The plugin worked out the reason
+  every pass but dropped it, so neither the Run page nor the plugin's log said why a gate was still
+  open. It now logs an `argocd: gate waiting` line with the gate and the reason each time the
+  reason changes. The Run page still shows only "waiting for its plugin". See
+  [Deploying with Argo CD](/scarab-ci/usage/deploying-with-argo-cd/#waiting-with-the-argo-cd-plugin).
 
 ### Security
 
