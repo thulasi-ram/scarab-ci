@@ -15,6 +15,10 @@
           "match": { "method": "POST", "json": { "/method": "notifications/initialized" } },
           "may": []
         },
+        "cancelled": {
+          "match": { "method": "POST", "json": { "/method": "notifications/cancelled" } },
+          "may": []
+        },
         "ping": {
           "match": { "method": "POST", "json": { "/method": "ping" } },
           "may": []

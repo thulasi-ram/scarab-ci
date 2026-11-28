@@ -51,6 +51,17 @@ pub fn encode_component(s: &str) -> String {
     out
 }
 
+/// `s` percent-encoded as one URL path segment, or `None` when it is empty,
+/// `.` or `..`: those pass [`encode_component`] unchanged (`.` is
+/// unreserved), and a URL parser resolves them as dot segments, so the
+/// request would reach another path than the one the tool means.
+pub fn path_segment(s: &str) -> Option<String> {
+    match s {
+        "" | "." | ".." => None,
+        s => Some(encode_component(s)),
+    }
+}
+
 /// A PluginApi client for one request: the delegated caller handle it was
 /// given is the only authority it carries.
 pub struct ScarabApi<'a> {
@@ -176,5 +187,20 @@ impl ScarabApi<'_> {
         }
         let body = self.send(req).await?;
         Self::json(&body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_dot_segment_or_an_empty_one_is_refused() {
+        assert_eq!(path_segment(""), None);
+        assert_eq!(path_segment("."), None);
+        assert_eq!(path_segment(".."), None);
+        assert_eq!(path_segment("..."), Some("...".into()));
+        assert_eq!(path_segment("a/../b"), Some("a%2F..%2Fb".into()));
+        assert_eq!(path_segment("%2e%2e"), Some("%252e%252e".into()));
     }
 }

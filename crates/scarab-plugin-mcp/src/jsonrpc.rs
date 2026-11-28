@@ -1,6 +1,12 @@
 //! JSON-RPC 2.0 framing for MCP's Streamable HTTP transport, written by hand
 //! with serde: one message per POST, one JSON answer, no batches (MCP removed
 //! them in 2025-06-18), no server-to-client stream.
+//!
+//! Behind core's plugin endpoint, a body that is not JSON, a method or a
+//! tool the manifest declares no operation for never reaches this code:
+//! core answers it with its own 400. The parse, method and tool errors here
+//! answer what does get through (a malformed `params`, for one) and a
+//! direct caller.
 
 use serde_json::{json, Value};
 
