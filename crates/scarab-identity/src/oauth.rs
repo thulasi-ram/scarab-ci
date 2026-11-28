@@ -146,6 +146,20 @@ pub trait OAuthStore: Send + Sync {
         now_ms: i64,
     ) -> Result<Option<OAuthAuthorizationCode>, IdentityError>;
 
+    /// The code `code_hash`, without spending it, when it is unspent,
+    /// unexpired at `now_ms` and was issued to `client_id` for
+    /// `redirect_uri` with `code_challenge`: what the token endpoint checks
+    /// before it spends the code, so a refusal it can recover from (the
+    /// endpoint not running) leaves the code usable.
+    async fn pending_authorization_code(
+        &self,
+        code_hash: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        code_challenge: &str,
+        now_ms: i64,
+    ) -> Result<Option<OAuthAuthorizationCode>, IdentityError>;
+
     /// The grant id of a code that matches all four and was already spent:
     /// a replay by someone who holds the code and its verifier.
     async fn replayed_authorization_code(

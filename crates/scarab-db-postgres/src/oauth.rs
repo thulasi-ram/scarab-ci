@@ -222,6 +222,30 @@ impl OAuthStore for PostgresDb {
         row.as_ref().map(code_from_row).transpose()
     }
 
+    async fn pending_authorization_code(
+        &self,
+        code_hash: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        code_challenge: &str,
+        now_ms: i64,
+    ) -> Result<Option<OAuthAuthorizationCode>, IdentityError> {
+        let row = sqlx::query(&format!(
+            "SELECT {CODE_COLUMNS} FROM oauth_authorization_codes
+              WHERE code_hash = $1 AND client_id = $3 AND redirect_uri = $4
+                AND code_challenge = $5 AND consumed_at IS NULL AND expires_at > $2"
+        ))
+        .bind(code_hash)
+        .bind(now_ms)
+        .bind(client_id)
+        .bind(redirect_uri)
+        .bind(code_challenge)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(identity_err)?;
+        row.as_ref().map(code_from_row).transpose()
+    }
+
     async fn replayed_authorization_code(
         &self,
         code_hash: &str,

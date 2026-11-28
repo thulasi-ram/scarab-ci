@@ -7255,6 +7255,28 @@ impl scarab_identity::OAuthStore for InMemoryOAuth {
         }
     }
 
+    async fn pending_authorization_code(
+        &self,
+        code_hash: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        code_challenge: &str,
+        now_ms: i64,
+    ) -> Result<Option<scarab_identity::OAuthAuthorizationCode>, IdentityError> {
+        let st = self.state.lock().unwrap();
+        Ok(match st.codes.get(code_hash) {
+            Some((code, false))
+                if code.expires_at > now_ms
+                    && code.client_id == client_id
+                    && code.redirect_uri == redirect_uri
+                    && code.code_challenge == code_challenge =>
+            {
+                Some(code.clone())
+            }
+            _ => None,
+        })
+    }
+
     async fn replayed_authorization_code(
         &self,
         code_hash: &str,

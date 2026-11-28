@@ -307,7 +307,20 @@ pub(crate) async fn protected_resource_metadata(
     Path((org, id, endpoint_path)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     enabled(&st)?;
-    let installation = usable_endpoint(&st, &org, &id, &endpoint_path).await?;
+    // Unauthenticated: say only whether it can be used, never the
+    // installation's name or image.
+    let used = endpoint_use(&st, &org, &id, &endpoint_path)
+        .await
+        .map_err(|_| ApiError::Unavailable("the plugin endpoint cannot be read now".into()))?;
+    let installation = match used {
+        EndpointUse::Usable(installation) => installation,
+        EndpointUse::Gone => return Err(ApiError::NotFound),
+        EndpointUse::Unavailable(_) => {
+            return Err(ApiError::Unavailable(
+                "the plugin endpoint is not running".into(),
+            ))
+        }
+    };
     Ok(Json(serde_json::json!({
         "resource": canonical_endpoint_url(&st.public_url, &org, &id, &endpoint_path),
         "authorization_servers": [issuer(&st)],
@@ -882,53 +895,70 @@ async fn authorization_code_grant(
     }
     let challenge = pkce_s256_challenge(verifier);
     let code_hash = sha256_hex(code);
-    // A client that names the resource learns that the endpoint is not
-    // running before its code is spent, and can retry with it.
-    if let Some(resource) = req.resource.as_deref() {
-        if let Err((answer, _)) = token_endpoint_use(st, resource).await {
-            return answer;
-        }
-    }
-    let code = match store
-        .consume_authorization_code(&code_hash, client_id, redirect_uri, &challenge, now)
+    // Every check reads the code before spending it, so a refusal the client
+    // can recover from (the endpoint not running) leaves the code usable.
+    let pending = match store
+        .pending_authorization_code(&code_hash, client_id, redirect_uri, &challenge, now)
         .await
     {
-        Ok(Some(c)) => c,
-        Ok(None) => {
-            // Spent already, and presented again with the right client and
-            // verifier: whoever holds it, the grant it became is revoked.
-            match store
-                .replayed_authorization_code(&code_hash, client_id, redirect_uri, &challenge)
-                .await
-            {
-                Ok(Some(grant_id)) => {
-                    if revoke_grant(st, &grant_id, "authorization code replayed")
-                        .await
-                        .is_err()
-                    {
-                        tracing::error!(grant = %grant_id, "oauth: a replayed code's grant was not revoked");
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => return store_failure("checking a replayed code", &e),
-            }
-            return invalid_grant(
-                "the code is unknown, used or expired, or was issued to another client, \
-                 redirect URI or verifier",
-            );
-        }
-        Err(e) => return store_failure("spending a code", &e),
+        Ok(p) => p,
+        Err(e) => return store_failure("reading a code", &e),
     };
-    if req.resource.as_deref().is_some_and(|r| r != code.resource) {
+    let Some(pending) = pending else {
+        // Spent already, and presented again with the right client and
+        // verifier: whoever holds it, the grant it became is revoked.
+        match store
+            .replayed_authorization_code(&code_hash, client_id, redirect_uri, &challenge)
+            .await
+        {
+            Ok(Some(grant_id)) => {
+                if revoke_grant(st, &grant_id, "authorization code replayed")
+                    .await
+                    .is_err()
+                {
+                    tracing::error!(grant = %grant_id, "oauth: a replayed code's grant was not revoked");
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return store_failure("checking a replayed code", &e),
+        }
+        return invalid_grant(
+            "the code is unknown, used or expired, or was issued to another client, \
+             redirect URI or verifier",
+        );
+    };
+    if req
+        .resource
+        .as_deref()
+        .is_some_and(|r| r != pending.resource)
+    {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_target",
             "resource is not the one the code was issued for",
         );
     }
-    if let Err((answer, _)) = token_endpoint_use(st, &code.resource).await {
+    if let Err((answer, _)) = token_endpoint_use(st, &pending.resource).await {
         return answer;
     }
+    // The host the client's document came from must still be one the org
+    // allows: a code issued before an admin removed it is refused.
+    match store.client_metadata_hosts(&pending.org).await {
+        Ok(hosts) if hosts.iter().any(|h| h.host == pending.client_host) => {}
+        Ok(_) => {
+            return invalid_grant("the org no longer allows this app's host; connect it again")
+        }
+        Err(e) => return store_failure("reading the metadata hosts", &e),
+    }
+    let code = match store
+        .consume_authorization_code(&code_hash, client_id, redirect_uri, &challenge, now)
+        .await
+    {
+        Ok(Some(c)) => c,
+        // Another redemption spent it between the read and here.
+        Ok(None) => return invalid_grant("the code is unknown, used or expired"),
+        Err(e) => return store_failure("spending a code", &e),
+    };
     let mut grant = OAuthGrant {
         id: code.grant_id,
         org: code.org,
@@ -1035,6 +1065,28 @@ async fn refresh_token_grant(
         return invalid_grant(
             "the previous refresh secret was already retried; use the latest one",
         );
+    }
+    if retry_of_last_rotation {
+        // A legitimate retry happens because the response to the rotation was
+        // lost: the client never received the access token that rotation
+        // minted, so that token was never used. If it was used, someone
+        // received the rotation's answer, and whoever now retries the old
+        // secret is not that holder (or the holder is replaying a stolen
+        // one to stay in step). Either way the grant ends.
+        let used = match (st.api_tokens.as_ref(), grant.access_token_id.as_deref()) {
+            (Some(tokens), Some(id)) => match tokens.by_id(id).await {
+                Ok(Some(t)) => t.last_used_at.is_some(),
+                Ok(None) => false,
+                Err(e) => return store_failure("reading the rotation's access token", &e),
+            },
+            _ => false,
+        };
+        if used {
+            let _ = revoke_grant(st, &grant.id, "refresh retried after its token was used").await;
+            return invalid_grant(
+                "the access token of the last refresh was already used; the grant is revoked",
+            );
+        }
     }
     let (access, token) = match mint_access_token(store, &grant, now).await {
         Ok(t) => t,

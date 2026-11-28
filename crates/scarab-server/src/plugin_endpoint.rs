@@ -458,11 +458,19 @@ async fn endpoint_token(
         && token.kind == PrincipalTokenKind::Oauth
         && token.audience.as_deref() == Some(audience)
         && token.scope.org() == org;
-    if usable {
-        Ok(token)
-    } else {
-        Err(true)
+    if !usable {
+        return Err(true);
     }
+    // A token's first use is stored at once: the token endpoint refuses a
+    // refresh retry, and revokes the grant, once the access token minted by
+    // the rotation being retried has been used (oauth_server.rs). Later uses
+    // are not recorded here.
+    if token.last_used_at.is_none() {
+        if let Err(e) = tokens.touch(&token.id, now, 1).await {
+            tracing::warn!(token = %token.id, error = %e, "plugin endpoint: a token's first use was not stored");
+        }
+    }
+    Ok(token)
 }
 
 /// Delete the handle when the request ends, however it ends (a dropped
