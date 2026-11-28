@@ -890,7 +890,10 @@ index library’s <code dir="auto">layouts</code> need results too: without them
 credential only when the org trusts the library’s source with the registry credential
 (<a href="/scarab-ci/v0.8/usage/libraries/#trusting-a-library-with-the-registry-credential">Libraries</a>); a
 step written in your Pipeline file never receives one. Each time it launches, Scarab resolves
-the <code dir="auto">REGISTRY_AUTH</code> secret (Repo scope, then Org scope) and mounts it as
+the <code dir="auto">REGISTRY_AUTH</code> secret: a Step that the Environment admits (approved, or no approvers) uses
+the Run’s Environment chain
+(<a href="/scarab-ci/v0.8/usage/secrets/#scoping-and-inheritance">Secrets</a>); any other Step uses the
+repository default, then the org default. Scarab mounts it as
 <code dir="auto">/scarab/registry/config.json</code>, with <code dir="auto">DOCKER_CONFIG</code> pointing at that directory. It is never an
 environment variable, and Scarab replaces it with <code dir="auto">***</code> in the step’s log. With no
 <code dir="auto">REGISTRY_AUTH</code> secret, the step gets the credential the forge derives for its own registry
