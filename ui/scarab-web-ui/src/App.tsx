@@ -17,6 +17,7 @@ import ConnectionManage from "./routes/ConnectionManage";
 import MemberManage from "./routes/MemberManage";
 import { EnvironmentManage, EnvironmentRedirect } from "./routes/EnvironmentPage";
 import ConfirmRequest from "./routes/ConfirmRequest";
+import OAuthAuthorize from "./routes/OAuthAuthorize";
 import OrgPage from "./routes/OrgPage";
 import PolicyEditor from "./routes/PolicyEditor";
 import About from "./routes/About";
@@ -94,6 +95,9 @@ export default function App() {
           `confirmation_url` its human opens. Three segments, so it can't
           collide with the two-segment /:org/:repo tier. */}
       <Route path="/security/confirm/:id" component={ConfirmRequest} />
+      {/* An app's OAuth authorization endpoint: consent to connect it to a
+          plugin endpoint. Static, so it outranks /:org/:repo. */}
+      <Route path="/oauth/authorize" component={OAuthAuthorize} />
       {/* Start a Run of a pipeline in this repository. */}
       <Route path="/:org/:repo/run" component={RunPipeline} />
       <Route path="/:org/:repo/runs/:id" component={RunDetail} />
