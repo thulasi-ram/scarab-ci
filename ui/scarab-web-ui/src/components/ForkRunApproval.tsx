@@ -39,6 +39,13 @@ export default function ForkRunApproval(props: { org: string }) {
   const [busy, setBusy] = createSignal(false);
   const [notice, setNotice] = createSignal<string | null>(null);
   const [refusal, setRefusal] = createSignal<string | null>(null);
+  // The radio inputs: the browser checks the clicked one before the server
+  // answers, so a refused or cancelled change puts the saved value back.
+  const inputs: HTMLInputElement[] = [];
+  const showSaved = () => {
+    const saved = setting()?.setting;
+    for (const el of inputs) el.checked = el.value === saved;
+  };
 
   const change = async (next: ForkRunApprovalChoice) => {
     setBusy(true);
@@ -48,8 +55,10 @@ export default function ForkRunApproval(props: { org: string }) {
       mutate(await setForkRunApproval(props.org, next));
       setNotice("Saved. It applies to Runs created from now on.");
     } catch (e) {
-      // Not an admin, a cancelled confirmation: the server's message.
+      // Not an admin, a cancelled confirmation, another admin's change in
+      // between: the server's message, and the saved value checked again.
       setRefusal(e instanceof Error ? e.message : "Could not save the setting.");
+      showSaved();
     } finally {
       setBusy(false);
     }
@@ -86,6 +95,7 @@ export default function ForkRunApproval(props: { org: string }) {
                   {(c) => (
                     <label classList={{ on: s().setting === c.id }}>
                       <input
+                        ref={(el) => inputs.push(el)}
                         type="radio"
                         name="fork-run-approval"
                         value={c.id}

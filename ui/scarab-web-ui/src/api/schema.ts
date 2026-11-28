@@ -11855,7 +11855,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state */
+            /** @description another admin changed the setting since this request read it (plain text): reload and choose again */
             409: {
                 headers: {
                     [name: string]: unknown;

@@ -3,7 +3,9 @@
 -- starts, at a `manual` gate someone with write on the repository releases.
 -- `off` (none), `agent_started` (those started through an `oauth` token) or
 -- `all`. An org admin changes it in Org settings, Security. An org with no
--- row has `agent_started`.
+-- row has `agent_started`. `org` is the org name in ASCII lower case
+-- (`fork_run_approval_org_key`): the API and Run creation spell an org as
+-- its URL and its forge do, and org names are case-insensitive there.
 --
 -- Numbered 0114, not 0112: 0112 and 0113 are taken on other branches, and
 -- this file keeps clear of both. The migrator applies by version, so the gap

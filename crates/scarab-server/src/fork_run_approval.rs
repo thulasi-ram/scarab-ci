@@ -149,7 +149,8 @@ pub(crate) async fn get_fork_run_approval(
 /// `agent_started`, `all` → `off`, `agent_started` → `off`) asks for a
 /// passkey confirmation of its own; one that gates more asks for none. A
 /// request that changes nothing asks for no confirmation and records
-/// nothing. Recorded in the org's security events
+/// nothing. The write is a compare-and-set on the value the request read:
+/// when another admin changed it in between, nothing is written (409). Recorded in the org's security events
 /// (`fork_run_approval.changed`) with the old and the new value. Runs
 /// created before the change keep or lack their gate.
 #[utoipa::path(
@@ -162,7 +163,8 @@ pub(crate) async fn get_fork_run_approval(
         (status = 200, body = ForkRunApprovalDto),
         (status = 400, description = "a body that is not `{\"setting\": \"off\" | \"agent_started\" | \"all\"}`, or a reserved org (plain text)"),
         (status = 403, description = "`browser_session_required` (an API token or a Bearer session, even for a request that changes nothing), with `code` and `message`; not an admin of the org; or `step_up_required` (mode `action`) for a change that gates fewer Runs"),
-        (status = 404, description = "the setting cannot be stored on this server")
+        (status = 404, description = "the setting cannot be stored on this server"),
+        (status = 409, description = "another admin changed the setting since this request read it (plain text): reload and choose again")
     )
 )]
 pub(crate) async fn put_fork_run_approval(
@@ -223,13 +225,20 @@ pub(crate) async fn put_fork_run_approval(
 
     let subject = caller.principal.subject.clone();
     let now = st.clock.now().await.0;
-    // The setting this write replaced, read with it: another admin may have
-    // changed it since the read above.
-    let old = store
-        .put_fork_run_approval(&org, new, &subject, now)
+    // A compare-and-set on the value the step-up was decided (and
+    // confirmed) against: when another admin changed it since, nothing is
+    // written and the caller reloads.
+    let written = store
+        .put_fork_run_approval(&org, old, new, &subject, now)
         .await
-        .map_err(crate::step_up::store_err)?
-        .unwrap_or_default();
+        .map_err(crate::step_up::store_err)?;
+    if !written {
+        return Err(ApiError::Conflict(format!(
+            "the Fork Run approval setting changed from `{}` since it was read; reload and \
+             choose again",
+            old.as_str()
+        )));
+    }
     if let Some(log) = st.security_events.as_deref() {
         let mut ev = crate::step_up::event(
             kind::FORK_RUN_APPROVAL_CHANGED,

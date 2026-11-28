@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 /// An org's Fork Run approval setting (ADR-0086 §9).
 mod fork_run_approval;
 pub use fork_run_approval::{
-    ForkRunApproval, ForkRunApprovalStore, FORK_RUN_APPROVAL_SETTING_NAME,
+    fork_run_approval_org_key, ForkRunApproval, ForkRunApprovalStore,
+    FORK_RUN_APPROVAL_SETTING_NAME,
 };
 
 /// An org's limits on leak checks (`secret.match`).

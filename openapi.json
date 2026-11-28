@@ -6444,7 +6444,7 @@
             "description": "the setting cannot be stored on this server"
           },
           "409": {
-            "description": "the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state"
+            "description": "another admin changed the setting since this request read it (plain text): reload and choose again"
           },
           "429": {
             "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting"

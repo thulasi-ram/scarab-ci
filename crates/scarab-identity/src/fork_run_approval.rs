@@ -75,25 +75,36 @@ impl ForkRunApproval {
     }
 }
 
-/// Where each org's [`ForkRunApproval`] is kept.
+/// The key an org's setting is stored under: the org name in ASCII lower
+/// case. The settings API takes the org from its URL and Run creation from
+/// the repository's owner as the forge spells it; GitHub and Forgejo org
+/// names are case-insensitive, so `Acme` and `acme` are one org, and a
+/// letter-case difference must never fall back to the default.
+pub fn fork_run_approval_org_key(org: &str) -> String {
+    org.to_ascii_lowercase()
+}
+
+/// Where each org's [`ForkRunApproval`] is kept, under
+/// [`fork_run_approval_org_key`].
 #[async_trait]
 pub trait ForkRunApprovalStore: Send + Sync {
     /// The setting stored for `org`; `None` when it has none (the default,
     /// [`ForkRunApproval::AgentStarted`], applies).
     async fn fork_run_approval(&self, org: &str) -> Result<Option<ForkRunApproval>, IdentityError>;
 
-    /// Store `setting` for `org`, replacing any stored before, as changed by
-    /// `updated_by` at `updated_at` (unix ms). Returns the setting it
-    /// replaced (`None`: the org had none), read in the same transaction as
-    /// the write, so of two concurrent changes the second returns the
-    /// first's setting.
+    /// Store `new` for `org`, as changed by `updated_by` at `updated_at`
+    /// (unix ms), only when `org`'s setting is still `expected` (the
+    /// default when it has none): a compare-and-set, so a change decided
+    /// (and confirmed) against one value never lands on another. `false`,
+    /// with nothing written, when the setting is no longer `expected`.
     async fn put_fork_run_approval(
         &self,
         org: &str,
-        setting: ForkRunApproval,
+        expected: ForkRunApproval,
+        new: ForkRunApproval,
         updated_by: &str,
         updated_at: i64,
-    ) -> Result<Option<ForkRunApproval>, IdentityError>;
+    ) -> Result<bool, IdentityError>;
 }
 
 #[cfg(test)]
@@ -131,5 +142,13 @@ mod tests {
         assert!(All.gates(false));
         assert!(AgentStarted.gates(true));
         assert!(!AgentStarted.gates(false));
+    }
+
+    #[test]
+    fn the_org_key_ignores_letter_case() {
+        assert_eq!(
+            fork_run_approval_org_key("Acme"),
+            fork_run_approval_org_key("acme")
+        );
     }
 }

@@ -5,7 +5,9 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use scarab_identity::{ForkRunApproval, ForkRunApprovalStore, IdentityError};
+use scarab_identity::{
+    fork_run_approval_org_key, ForkRunApproval, ForkRunApprovalStore, IdentityError,
+};
 
 /// Each org's Fork Run approval setting, in memory.
 #[derive(Default)]
@@ -22,20 +24,28 @@ impl InMemoryForkRunApproval {
 #[async_trait]
 impl ForkRunApprovalStore for InMemoryForkRunApproval {
     async fn fork_run_approval(&self, org: &str) -> Result<Option<ForkRunApproval>, IdentityError> {
-        Ok(self.settings.lock().unwrap().get(org).copied())
+        Ok(self
+            .settings
+            .lock()
+            .unwrap()
+            .get(&fork_run_approval_org_key(org))
+            .copied())
     }
 
     async fn put_fork_run_approval(
         &self,
         org: &str,
-        setting: ForkRunApproval,
+        expected: ForkRunApproval,
+        new: ForkRunApproval,
         _updated_by: &str,
         _updated_at: i64,
-    ) -> Result<Option<ForkRunApproval>, IdentityError> {
-        Ok(self
-            .settings
-            .lock()
-            .unwrap()
-            .insert(org.to_string(), setting))
+    ) -> Result<bool, IdentityError> {
+        let mut settings = self.settings.lock().unwrap();
+        let key = fork_run_approval_org_key(org);
+        if settings.get(&key).copied().unwrap_or_default() != expected {
+            return Ok(false);
+        }
+        settings.insert(key, new);
+        Ok(true)
     }
 }
