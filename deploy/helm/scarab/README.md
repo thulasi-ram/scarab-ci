@@ -231,6 +231,71 @@ separate durable state, registered by the App's `installation` /
 `installation_repositories` webhook deliveries (or, for the local dogfood stack,
 the signed synthetic `installation` event `just stack up dogfood` sends). A fresh database still needs one delivery.
 
+## The OIDC issuer for step tokens (`scarab.oidcIssuer`, ADR-0015)
+
+With `scarab.oidcIssuer` set, the server signs a token for each Attempt of a
+step and mounts it in the step Pod at `/scarab/oidc/token`. Which Steps get
+one, the subject a cloud matches, and how to publish the issuer's documents as
+static files while the server stays private, are on the docs page "Step OIDC
+tokens". A cloud that trusts the issuer verifies the token against
+the keys at `<issuer>/.well-known/jwks.json`. The server signs with the PKCS#8
+RSA private key at `SCARAB_OIDC_SIGNING_KEY_FILE`, and does not start without
+it. Mount the key from your own Secret through `extraVolumes` and
+`extraVolumeMounts`, and set the variable through `scarab.extraEnv`:
+
+```sh
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out oidc-a.pem
+kubectl -n scarab create secret generic scarab-oidc --from-file=oidc.pem=./oidc-a.pem
+```
+
+```yaml
+scarab:
+  oidcIssuer: https://scarab.example.com
+  extraEnv:
+    SCARAB_OIDC_SIGNING_KEY_FILE: /etc/scarab/oidc/oidc.pem
+extraVolumes:
+  - name: oidc-key
+    secret:
+      secretName: scarab-oidc
+extraVolumeMounts:
+  - name: oidc-key
+    mountPath: /etc/scarab/oidc
+    readOnly: true
+```
+
+Each key in the JWKS has the RFC 7638 thumbprint of the public key (SHA-256,
+base64url) as its `kid`, so its `kid` changes only when the key does.
+
+### Changing the signing key
+
+The JWKS lists the signing key's public half and every key in
+`scarab.oidcPublicKeys`, each once. A cloud accepts a token only when the JWKS
+it last fetched holds the key that signed it, and clouds keep a fetched JWKS for
+a while. So publish the next key before any server signs with it, and keep the
+old one published until its last token has expired. Get a key's public half
+with:
+
+```sh
+openssl pkey -in oidc-b.pem -pubout -out oidc-b.pub.pem
+```
+
+1. **Publish the next key.** Add the public half of the next key (`oidc-b`) to
+   `scarab.oidcPublicKeys` and upgrade. Every server still signs with `oidc-a`;
+   every JWKS now lists both keys. Wait until each cloud that trusts the issuer
+   has fetched the JWKS again.
+2. **Sign with the next key.** Point the Secret at `oidc-b.pem`, set
+   `scarab.oidcPublicKeys` to the public halves of both `oidc-a` and `oidc-b`,
+   and upgrade. The change to `scarab.oidcPublicKeys` rolls the server Pods, so
+   each one reads the new signing key at boot. While old and new Pods run side
+   by side, a token from either verifies.
+3. **Drop the old key.** Once the last token `oidc-a` signed has expired (a
+   step token lives at most `scarab.oidcTokenMaxTtlSecs`, one hour by
+   default), remove `oidc-a` from `scarab.oidcPublicKeys` and upgrade.
+
+The server never signs with a key in `scarab.oidcPublicKeys`, and refuses to
+start when an entry is not a `-----BEGIN PUBLIC KEY-----` block holding an RSA
+key of at least 2048 bits. The signing key must be at least 2048 bits too.
+
 ## Declarative connections (`scarab.connections`, ADR-0060 part D)
 
 A forge connection can be **declared in config** instead of created through the
@@ -917,6 +982,9 @@ DNS, which must be the usual `kube-system` Pods labelled `k8s-app=kube-dns`.
 | `scarab.createNamespace` | `true` | render `<release ns>-steps` when `scarab.namespace` is empty; `false` runs step Pods in the release namespace |
 | `scarab.s3.*` | — | object store; set `bucket` to enable S3/MinIO |
 | `scarab.oauth.*` | — | OAuth/OIDC login: `clientId`, `authorizeUrl`, `tokenUrl`, `userinfoUrl`, `scopes`, `owners`, `issuer` (above) |
+| `scarab.oidcIssuer` | `""` = off | the issuer URL of step OIDC tokens; needs `SCARAB_OIDC_SIGNING_KEY_FILE` (above) |
+| `scarab.oidcTokenMaxTtlSecs` | `""` = 3600 | the longest a step OIDC token lives; a token lives for its step's timeout, at most this long |
+| `scarab.oidcPublicKeys` | `[]` | further public keys the issuer's JWKS lists: the previous and next key of a key change (above) |
 | `scarab.devInsecure` | `false` | ⚠ dev/eval only — no auth; mutually exclusive with `scarab.oauth` |
 | `secrets.*` / `secrets.existingSecret` | — | sensitive `SCARAB_*` env |
 | `secrets.oauthClientSecret.name` / `.key` | — / `oauth-client-secret` | OAuth client secret by reference from your own Secret (above) |

@@ -27,8 +27,8 @@ use axum::{Extension, Json};
 use scarab_engine::DbError;
 use scarab_identity::Action;
 use scarab_project::{
-    duplicate_display_name, normalize_display_name, validate_org_environment_display_name,
-    validate_org_environment_name,
+    duplicate_display_name, normalize_display_name, refuse_reserved_org_environment_name,
+    validate_org_environment_display_name, validate_org_environment_name,
 };
 use scarab_project::{
     eligibility_loosenings, overlay_loosenings, privilege_grant_loosenings, protection_loosenings,
@@ -504,6 +504,18 @@ pub(crate) async fn put_org_environment(
         updated_by: principal.subject,
     };
     environment.validate().map_err(org_environment_api_error)?;
+    // A reserved name may not be created; an Environment that already has
+    // it (created before the rule) can still be written.
+    if let Err(reserved) = refuse_reserved_org_environment_name(&environment.name) {
+        let exists = store
+            .get_org_environment(&environment.org, &environment.name)
+            .await
+            .map_err(org_environment_api_error)?
+            .is_some();
+        if !exists {
+            return Err(org_environment_api_error(reserved));
+        }
+    }
     // Held through the write and released before the answer. Only a create
     // claims: a Duplicate never writes under a name that exists.
     let claim = match st.environment_governance.as_deref() {
@@ -1239,6 +1251,7 @@ async fn duplicate_org_environment_holding(
     let store = governance_store(&st)?;
     let new_name = body.name;
     validate_org_environment_name(&new_name).map_err(org_environment_api_error)?;
+    refuse_reserved_org_environment_name(&new_name).map_err(org_environment_api_error)?;
     let source = stored_environment(store, &org, &env).await?;
     let display_name = match normalize_display_name(body.display_name.as_deref()) {
         Some(d) => d,

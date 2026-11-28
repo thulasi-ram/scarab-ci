@@ -2535,6 +2535,22 @@ impl Db for InMemoryDb {
             .collect())
     }
 
+    async fn run_trigger_record(&self, run: &RunId) -> Result<Option<serde_json::Value>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .filter(|e| &e.run == run)
+            .find_map(|e| match &e.kind {
+                scarab_engine::EventPayload::Raw(v) if v["trigger"]["event"].is_object() => {
+                    Some(v.clone())
+                }
+                _ => None,
+            }))
+    }
+
     async fn append_log_row(
         &self,
         stream: &scarab_engine::LogStreamId,

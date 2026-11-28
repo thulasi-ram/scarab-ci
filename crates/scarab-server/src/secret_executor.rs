@@ -49,6 +49,9 @@ pub struct SecretInjectingExecutor {
     /// The OIDC issuer + token audience (ADR-0015). `None` = no token minted.
     oidc: Option<(Arc<dyn scarab_identity::OidcIssuer>, String)>,
     issuer_url: String,
+    /// The longest an OIDC token lives, in seconds: a Step's token lives for
+    /// its timeout, at most this long, and this long when it has no timeout.
+    oidc_max_ttl_secs: u32,
     /// Org Environment governance (ADR-0071). `None` = no launch-time
     /// re-check (a hand-built executor; `main.rs` wires it).
     governance: Option<Arc<dyn scarab_project::EnvironmentGovernanceStore>>,
@@ -552,9 +555,29 @@ fn step_admit_input(
     Ok(value)
 }
 
-/// Per-attempt OIDC token TTL (ADR-0015: short-lived by design — long enough
-/// for the cloud exchange at step start, not the step's whole runtime).
-const OIDC_TOKEN_TTL_SECS: i64 = 15 * 60;
+/// The default cap on a step OIDC token's lifetime (`SCARAB_OIDC_TOKEN_MAX_TTL_SECS`).
+/// A token lives as long as its Step may run, so a cloud SDK that reads the
+/// token file again later in the step still gets a valid one; there is no
+/// refresh.
+pub const DEFAULT_OIDC_TOKEN_MAX_TTL_SECS: u32 = 3_600;
+
+/// The highest `SCARAB_OIDC_TOKEN_MAX_TTL_SECS` accepted: 12 hours, the
+/// longest session AWS grants. A token that outlives every session it can
+/// buy is only a longer window for a stolen copy.
+pub const MAX_OIDC_TOKEN_MAX_TTL_SECS: u32 = 12 * 3_600;
+
+/// How long a Step's token lives: its timeout, capped at `max_secs`, and
+/// `max_secs` when it has no timeout.
+fn oidc_token_ttl_secs(timeout_seconds: Option<u32>, max_secs: u32) -> i64 {
+    let ttl = timeout_seconds
+        .filter(|t| *t > 0)
+        .map_or(max_secs, |t| t.min(max_secs));
+    i64::from(ttl)
+}
+
+/// How far before now a token's `iat` and `nbf` are set, so a cloud whose
+/// clock runs up to this far behind the server's still accepts the token.
+const OIDC_CLOCK_SKEW_SECS: i64 = 60;
 
 impl SecretInjectingExecutor {
     pub fn new(
@@ -570,6 +593,7 @@ impl SecretInjectingExecutor {
             logs,
             oidc: None,
             issuer_url: String::new(),
+            oidc_max_ttl_secs: DEFAULT_OIDC_TOKEN_MAX_TTL_SECS,
             governance: None,
             libraries: None,
             clock: Arc::new(crate::SystemClock),
@@ -672,10 +696,11 @@ impl SecretInjectingExecutor {
         }
     }
 
-    /// Enable per-attempt OIDC token minting (ADR-0015): every launched step
-    /// of a deploy-context run gets a short-lived token whose subject the
-    /// cloud's trust policy matches; a fork-PR run's subject environment is
-    /// downgraded to `none` (it can never assume a real environment's role).
+    /// Enable per-attempt OIDC token minting (ADR-0015): a launched step gets
+    /// a short-lived token whose subject the cloud's trust policy matches. In
+    /// a deploy-context run a fork-PR run's subject environment is downgraded
+    /// to `none` (it can never assume a real environment's role); a run bound
+    /// to no Environment gets a token only for the repository's own code.
     pub fn with_oidc(
         mut self,
         issuer: Arc<dyn scarab_identity::OidcIssuer>,
@@ -687,12 +712,23 @@ impl SecretInjectingExecutor {
         self
     }
 
-    /// Mint the per-attempt token for `step`, if the issuer is configured and
-    /// the run carries a deploy context (org/project/env/ref — what the
-    /// subject encodes). Ordinary tenantless CI runs get no token.
+    /// Cap a step OIDC token's lifetime at `secs` (default
+    /// [`DEFAULT_OIDC_TOKEN_MAX_TTL_SECS`]).
+    pub fn with_oidc_token_max_ttl(mut self, secs: u32) -> Self {
+        self.oidc_max_ttl_secs = secs;
+        self
+    }
+
+    /// Mint the per-attempt token for `step`, if the issuer is configured.
+    /// A Run with a deploy context gets the Environment subject
+    /// (org/project/env/ref). A Run bound to no Environment gets the subject
+    /// without `env/` only when it builds the repository's own code
+    /// ([`subject_without_environment`]). Any other Step gets no token, and
+    /// its launch goes on without one.
     async fn mint_oidc_token(
         &self,
         step: &StepRun,
+        timeout_seconds: Option<u32>,
         ctx: Option<&scarab_engine::DeployContext>,
         admission: StepAdmission,
         now_ms: i64,
@@ -700,37 +736,91 @@ impl SecretInjectingExecutor {
         let Some((issuer, audience)) = &self.oidc else {
             return Ok(None);
         };
-        let Some(ctx) = ctx else {
-            return Ok(None);
+        // The trigger context recorded on the Run's event log: `event` and
+        // `sha` below, and on a Run with no deploy context, the fork fact and
+        // the ref. A failed read fails the launch, so the scheduler retries
+        // it; only a Run that is not eligible launches without a token.
+        let trigger = crate::run_trigger(self.db.as_ref(), &step.run)
+            .await
+            .map_err(|e| ExecError::Other(format!("reading the Run's trigger: {e}")))?
+            .map(|(event, _actor)| event);
+        let (subject, git_ref) = match ctx {
+            Some(ctx) => {
+                // An Environment named `none` would share its subject with
+                // fork and pre-approval Steps, so its Steps get no token.
+                // New Environments cannot take the name.
+                if ctx.environment == scarab_identity::NO_ENVIRONMENT_SUBJECT {
+                    log_no_token(
+                        step,
+                        &NoToken::Refused(format!(
+                            "the Environment is named `{}`, the subject of Steps it does not admit",
+                            scarab_identity::NO_ENVIRONMENT_SUBJECT
+                        )),
+                    );
+                    return Ok(None);
+                }
+                // The fork-PR downgrade (ADR-0015): a locked-out run's subject
+                // says env `none` — no cloud trust policy for a real
+                // environment matches. So does a Step that no Environment
+                // approval gate upstream admits now, in an Environment with
+                // approvers (ADR-0075 §3): before the approval, or after it
+                // went stale, the approvers changed or the ref was disallowed,
+                // the cloud must not trust it as the Environment. The
+                // `step.admit` decision says which ([`StepAdmission`]).
+                let env = if ctx.locked_out || admission.before_approval {
+                    scarab_identity::NO_ENVIRONMENT_SUBJECT
+                } else {
+                    &ctx.environment
+                };
+                if let Some(reason) = scarab_identity::Claims::subject_refusal(
+                    &ctx.org,
+                    &ctx.project,
+                    Some(env),
+                    &ctx.git_ref,
+                ) {
+                    log_no_token(step, &NoToken::Refused(reason));
+                    return Ok(None);
+                }
+                let subject =
+                    scarab_identity::Claims::run_subject(&ctx.org, &ctx.project, env, &ctx.git_ref);
+                (subject, ctx.git_ref.clone())
+            }
+            None => {
+                match subject_without_environment(self.db.as_ref(), step, trigger.as_ref()).await? {
+                    Ok(subject_and_ref) => subject_and_ref,
+                    Err(no_token) => {
+                        log_no_token(step, &no_token);
+                        return Ok(None);
+                    }
+                }
+            }
         };
-        // The fork-PR downgrade (ADR-0015): a locked-out run's subject says
-        // env `none` — no cloud trust policy for a real environment matches.
-        // So does a Step that no Environment approval gate upstream admits
-        // now, in an Environment with approvers (ADR-0075 §3): before the
-        // approval, or after it went stale, the approvers changed or the ref
-        // was disallowed, the cloud must not trust it as the Environment.
-        // The `step.admit` decision says which ([`StepAdmission`]).
-        let env = if ctx.locked_out || admission.before_approval {
-            "none"
-        } else {
-            &ctx.environment
-        };
-        let subject =
-            scarab_identity::Claims::run_subject(&ctx.org, &ctx.project, env, &ctx.git_ref);
         let attempt = step
             .current_attempt()
             .map(|a| a.id.0.clone())
             .unwrap_or_default();
+        // `event` is the trigger's kind and `sha` the commit it builds. A
+        // value the trigger did not record (a tag or release names no commit)
+        // leaves the claim out.
+        let trigger_field = |name: &str| {
+            trigger
+                .as_ref()
+                .and_then(|t| t[name].as_str())
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
         let claims = scarab_identity::Claims {
             issuer: self.issuer_url.clone(),
             subject,
             audience: audience.clone(),
             run_id: step.run.0.clone(),
             attempt,
-            event: "deploy".into(),
-            git_ref: ctx.git_ref.clone(),
-            sha: String::new(),
-            expires_at: now_ms / 1000 + OIDC_TOKEN_TTL_SECS,
+            event: trigger_field("kind"),
+            git_ref,
+            sha: trigger_field("sha"),
+            issued_at: now_ms / 1000 - OIDC_CLOCK_SKEW_SECS,
+            expires_at: now_ms / 1000
+                + oidc_token_ttl_secs(timeout_seconds, self.oidc_max_ttl_secs),
         };
         let jwt = issuer
             .issue(claims)
@@ -738,6 +828,120 @@ impl SecretInjectingExecutor {
             .map_err(|e| ExecError::Other(format!("oidc mint: {e}")))?;
         Ok(Some(jwt.0))
     }
+}
+
+/// Why a Step gets no OIDC token. Either way its launch goes on without one.
+/// A failed read of the facts is neither: it fails the launch.
+enum NoToken {
+    /// The Run is not one a token is minted for: fork code, a comment
+    /// trigger, no tenant, no known ref. Expected, so logged at debug.
+    NotEligible(&'static str),
+    /// A token was due but is withheld: its subject could be misread.
+    /// Logged as a warning.
+    Refused(String),
+}
+
+/// Log why `step` gets no token, naming the Run and the Step, never a token.
+fn log_no_token(step: &StepRun, why: &NoToken) {
+    match why {
+        NoToken::NotEligible(reason) => tracing::debug!(
+            run = %step.run.0,
+            step = %step.step.0,
+            reason = %reason,
+            "no OIDC token for this step"
+        ),
+        NoToken::Refused(reason) => tracing::warn!(
+            run = %step.run.0,
+            step = %step.step.0,
+            reason = %reason,
+            "OIDC token withheld: the step launches without one"
+        ),
+    }
+}
+
+/// The subject and ref of a token for a Step whose Run is bound to no
+/// Environment: `scarab:org/<owner>/repo/<repo>/ref/<protection ref>`, from
+/// the Run's tenant and its recorded trigger. Fails closed: a Run with no
+/// tenant, no trigger, a comment trigger, a ref that is unknown or `HEAD`, or
+/// one that is fork code or may be, gets [`NoToken`]. A failed read of the
+/// tenant or of an upstream Run's trigger is an error, which fails the
+/// launch.
+async fn subject_without_environment(
+    db: &dyn Db,
+    step: &StepRun,
+    trigger: Option<&serde_json::Value>,
+) -> Result<Result<(String, String), NoToken>, ExecError> {
+    let read_failed = |what: &str, e: scarab_engine::DbError| {
+        ExecError::Other(format!("reading the Run's {what}: {e}"))
+    };
+    let Some((org, repo)) = db
+        .run_tenant(&step.run)
+        .await
+        .map_err(|e| read_failed("tenant", e))?
+    else {
+        return Ok(Err(NoToken::NotEligible("the Run has no tenant")));
+    };
+    let Some(trigger) = trigger else {
+        return Ok(Err(NoToken::NotEligible("the Run recorded no trigger")));
+    };
+    if trigger["kind"].as_str() == Some("comment") {
+        return Ok(Err(NoToken::NotEligible("a comment-triggered Run")));
+    }
+    let Some(git_ref) = trigger_protection_ref(trigger) else {
+        return Ok(Err(NoToken::NotEligible("the Run's ref is unknown")));
+    };
+    if !builds_repository_code(db, trigger)
+        .await
+        .map_err(|e| read_failed("upstream chain", e))?
+    {
+        return Ok(Err(NoToken::NotEligible(
+            "the Run builds fork code, or its trigger does not say it does not",
+        )));
+    }
+    if let Some(reason) = scarab_identity::Claims::subject_refusal(&org, &repo, None, &git_ref) {
+        return Ok(Err(NoToken::Refused(reason)));
+    }
+    let subject = scarab_identity::Claims::run_subject_without_environment(&org, &repo, &git_ref);
+    Ok(Ok((subject, git_ref)))
+}
+
+/// The symbolic ref a recorded trigger runs on, as `Event::protection_ref`
+/// gives it at Run creation: the branch or tag ref, `refs/pull/<n>/head` for
+/// a pull request. `None` for a comment, an unknown kind, an empty ref,
+/// `HEAD` (the ref a Run with no ref of its own falls back to) and
+/// `refs/heads/HEAD` (a dispatch at `HEAD`, recorded as a branch name; it
+/// names no branch).
+fn trigger_protection_ref(trigger: &serde_json::Value) -> Option<String> {
+    let field = |name: &str| trigger[name].as_str().filter(|v| !v.is_empty());
+    let git_ref = match trigger["kind"].as_str()? {
+        "push" | "tag" | "manual" | "api" | "cron" | "upstream" => field("ref")?.to_string(),
+        "release" => format!("refs/tags/{}", field("tag")?),
+        "pull_request" => format!("refs/pull/{}/head", trigger["number"].as_u64()?),
+        _ => return None,
+    };
+    (git_ref != "HEAD" && git_ref != "refs/heads/HEAD").then_some(git_ref)
+}
+
+/// Whether a recorded trigger says its Run builds the repository's own code
+/// (ADR-0086 §9), for a step OIDC token. A push, tag, release or cron trigger
+/// does. A pull request, manual or api trigger does only when its recorded
+/// `fork` is `false`; a dispatch recorded before the flag was stored has
+/// none, so it counts as fork code. A follow-up (`upstream`) builds its
+/// upstream Run's commit, so the chain is followed to the Run that started
+/// it ([`crate::trigger_chain_root`]). Anything else does not, a comment
+/// trigger included: unlike [`crate::trigger_is_fork_code`], which counts a
+/// comment as the repository's own code for follow-ups and the forge token,
+/// a token is minted only for a trigger that names the code it builds.
+async fn builds_repository_code(
+    db: &dyn Db,
+    trigger: &serde_json::Value,
+) -> Result<bool, scarab_engine::DbError> {
+    Ok(match crate::trigger_chain_root(db, trigger).await? {
+        Some(root) => {
+            root["kind"].as_str() != Some("comment") && !crate::root_trigger_is_fork_code(&root)
+        }
+        None => false,
+    })
 }
 
 #[async_trait]
@@ -778,7 +982,7 @@ impl Executor for SecretInjectingExecutor {
             .await
             .map_err(|e| ExecError::Other(e.to_string()))?;
         let oidc_token = self
-            .mint_oidc_token(step, ctx.as_ref(), admission, now_ms)
+            .mint_oidc_token(step, spec.timeout_seconds, ctx.as_ref(), admission, now_ms)
             .await?;
         // The token is mounted into the step container. The value ledger
         // records it from the final spec before the backend writes it.

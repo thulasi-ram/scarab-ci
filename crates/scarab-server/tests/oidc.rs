@@ -26,9 +26,10 @@ fn run_claims() -> Claims {
         audience: AUD.into(),
         run_id: "run-1".into(),
         attempt: "a1".into(),
-        event: "push".into(),
+        event: Some("push".into()),
         git_ref: "refs/heads/main".into(),
-        sha: "cafebabe".into(),
+        sha: Some("cafebabe".into()),
+        issued_at: 0,
         expires_at: EXP_2100,
     }
 }

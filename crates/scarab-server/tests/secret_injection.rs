@@ -555,7 +555,7 @@ async fn fork_pr_token_subject_is_downgraded_to_env_none() {
 }
 
 #[tokio::test]
-async fn no_issuer_or_no_deploy_context_means_no_token() {
+async fn no_issuer_or_no_tenant_means_no_token() {
     let db = Arc::new(InMemoryDb::new());
     seed_deploy(&db, "r1", false).await;
 
@@ -570,7 +570,8 @@ async fn no_issuer_or_no_deploy_context_means_no_token() {
     exec.launch(&step("r1"), &plain_spec()).await.unwrap();
     assert_eq!(inner.last.lock().unwrap().clone().unwrap().oidc_token, None);
 
-    // Issuer configured but an untenanted (non-deploy) run: absent.
+    // Issuer configured, but a Run with no tenant and no deploy context:
+    // absent (`which_runs_get_a_token` holds the tenanted cases).
     let inner = Arc::new(SpecCapturingExec::default());
     let exec = SecretInjectingExecutor::new(
         inner.clone(),
@@ -926,4 +927,303 @@ async fn a_binary_secret_marked_env_true_is_refused() {
         inner.last_secrets.lock().unwrap().is_none(),
         "the executor was not launched"
     );
+}
+
+/// Seed Run `run`: its tenant `acme/web` when `tenant`, and `trigger` as the
+/// trigger context Run creation records.
+async fn seed_trigger(
+    db: &InMemoryDb,
+    run: &str,
+    tenant: bool,
+    trigger: Option<serde_json::Value>,
+) {
+    let id = RunId(run.into());
+    db.create_run(&id, 1, 1, scarab_engine::Timestamp(0))
+        .await
+        .unwrap();
+    if tenant {
+        db.set_run_tenant(&id, "acme", "web").await.unwrap();
+    }
+    if let Some(event) = trigger {
+        db.append_event(&scarab_engine::EventKind {
+            version: scarab_engine::EVENT_VERSION,
+            run: id,
+            kind: scarab_engine::EventPayload::Raw(
+                serde_json::json!({ "trigger": { "event": event } }),
+            ),
+            at: scarab_engine::Timestamp(0),
+        })
+        .await
+        .unwrap();
+    }
+}
+
+/// The claims of the token the last launch mounted, verified against the
+/// issuer's JWKS; `None` when it mounted none.
+fn mounted_claims(inner: &SpecCapturingExec, issuer: &Rs256Issuer) -> Option<serde_json::Value> {
+    let token = inner.last.lock().unwrap().clone()?.oidc_token?;
+    let jwks = issuer.jwks();
+    let key = &jwks["keys"][0];
+    Some(
+        verify(
+            &token,
+            key["n"].as_str().unwrap(),
+            key["e"].as_str().unwrap(),
+            "sts.example.com",
+        )
+        .expect("verifies against the JWKS"),
+    )
+}
+
+/// ADR-0086 §9: which Steps get a token, and with which subject. A Run bound
+/// to no Environment gets `scarab:org/<org>/repo/<repo>/ref/<ref>` only when
+/// it builds the repository's own code on a ref that cannot be read as a
+/// subject segment; every other Run gets none and still launches. A Run in
+/// an Environment keeps its `env/` subject. `event` and `sha` come from the
+/// recorded trigger, and a value the trigger does not name is left out
+/// rather than sent empty. `iat` = `nbf` = 60 s before now, and the token
+/// lives for the Step's timeout, capped.
+/// Kills: fork code (a fork PR, a dispatch of fork code or one recorded
+/// before the fork flag, a follow-up of either) trusted as the repository;
+/// a ref like `refs/heads/env/prod` minting a subject a trust policy for an
+/// Environment matches; `event` stuck at `deploy`; an empty `sha` claim; a
+/// lifetime that ignores the timeout or the cap.
+#[tokio::test]
+async fn which_runs_get_a_token() {
+    use serde_json::json;
+    const SHA: &str = "1234567890abcdef1234567890abcdef12345678";
+    let push = |r#ref: &str| json!({ "kind": "push", "ref": r#ref, "sha": SHA });
+    let db = Arc::new(InMemoryDb::new());
+
+    // The upstream Runs a follow-up's chain leads to.
+    seed_trigger(&db, "up-push", true, Some(push("refs/heads/main"))).await;
+    seed_trigger(
+        &db,
+        "up-fork",
+        true,
+        Some(json!({ "kind": "pull_request", "number": 9, "fork": true, "sha": SHA })),
+    )
+    .await;
+
+    let sub = |git_ref: &str| format!("scarab:org/acme/repo/web/ref/{git_ref}");
+    // (run, tenant, trigger, want: (subject, event, sha))
+    let rows: Vec<(
+        &str,
+        bool,
+        Option<serde_json::Value>,
+        Option<(String, &str, Option<&str>)>,
+    )> = vec![
+        (
+            "push",
+            true,
+            Some(push("refs/heads/main")),
+            Some((sub("refs/heads/main"), "push", Some(SHA))),
+        ),
+        (
+            "tag",
+            true,
+            Some(json!({ "kind": "tag", "tag": "v1", "ref": "refs/tags/v1" })),
+            Some((sub("refs/tags/v1"), "tag", None)),
+        ),
+        (
+            "release",
+            true,
+            Some(json!({ "kind": "release", "tag": "v1" })),
+            Some((sub("refs/tags/v1"), "release", None)),
+        ),
+        (
+            "pr",
+            true,
+            Some(json!({ "kind": "pull_request", "number": 7, "fork": false, "sha": SHA })),
+            Some((sub("refs/pull/7/head"), "pull_request", Some(SHA))),
+        ),
+        (
+            "manual",
+            true,
+            Some(json!({ "kind": "manual", "ref": "refs/heads/main", "sha": SHA, "fork": false })),
+            Some((sub("refs/heads/main"), "manual", Some(SHA))),
+        ),
+        (
+            "upstream-push",
+            true,
+            Some(
+                json!({ "kind": "upstream", "run": "up-push", "ref": "refs/heads/rel", "sha": SHA }),
+            ),
+            Some((sub("refs/heads/rel"), "upstream", Some(SHA))),
+        ),
+        (
+            "near-miss",
+            true,
+            Some(push("refs/heads/environment/ref-x")),
+            Some((sub("refs/heads/environment/ref-x"), "push", Some(SHA))),
+        ),
+        ("no-tenant", false, Some(push("refs/heads/main")), None),
+        ("no-trigger", true, None, None),
+        (
+            "comment",
+            true,
+            Some(json!({ "kind": "comment", "issue": 3 })),
+            None,
+        ),
+        (
+            "fork-pr",
+            true,
+            Some(json!({ "kind": "pull_request", "number": 8, "fork": true, "sha": SHA })),
+            None,
+        ),
+        (
+            "fork-unknown",
+            true,
+            Some(json!({ "kind": "manual", "ref": "refs/heads/main", "sha": SHA })),
+            None,
+        ),
+        (
+            "fork-manual",
+            true,
+            Some(json!({ "kind": "api", "ref": "refs/heads/main", "sha": SHA, "fork": true })),
+            None,
+        ),
+        (
+            "upstream-fork",
+            true,
+            Some(
+                json!({ "kind": "upstream", "run": "up-fork", "ref": "refs/heads/main", "sha": SHA }),
+            ),
+            None,
+        ),
+        (
+            "upstream-missing",
+            true,
+            Some(
+                json!({ "kind": "upstream", "run": "gone", "ref": "refs/heads/main", "sha": SHA }),
+            ),
+            None,
+        ),
+        ("head", true, Some(push("HEAD")), None),
+        (
+            "dispatch-head",
+            true,
+            Some(json!({ "kind": "manual", "ref": "refs/heads/HEAD", "sha": SHA, "fork": false })),
+            None,
+        ),
+        ("empty-ref", true, Some(push("")), None),
+        ("ref-segment", true, Some(push("refs/heads/ref/x")), None),
+        ("env-segment", true, Some(push("refs/heads/env/prod")), None),
+    ];
+    for (run, tenant, trigger, _) in &rows {
+        seed_trigger(&db, run, *tenant, trigger.clone()).await;
+    }
+    // In an Environment: the `env/` subject, `event` from the trigger; a ref
+    // that holds a subject segment gets none there too, and so does an
+    // Environment named `none` (created before the name was reserved), whose
+    // subject would be the one fork and pre-approval Steps get.
+    for (run, r#ref, environment) in [
+        ("env", "refs/heads/main", "prod"),
+        ("env-bad-ref", "refs/heads/env/x", "prod"),
+        ("env-named-none", "refs/heads/main", "none"),
+    ] {
+        seed_trigger(&db, run, true, Some(push(r#ref))).await;
+        db.set_run_deploy_context(
+            &RunId(run.into()),
+            &DeployContext {
+                org: "acme".into(),
+                project: "web".into(),
+                environment: environment.into(),
+                git_ref: r#ref.into(),
+                locked_out: false,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let issuer = Arc::new(Rs256Issuer::generate("https://scarab.example").unwrap());
+    let inner = Arc::new(SpecCapturingExec::default());
+    let exec = SecretInjectingExecutor::new(
+        inner.clone(),
+        db.clone() as Arc<dyn Db>,
+        Arc::new(FakeSecrets::new()),
+        logs(db.clone()),
+    )
+    .with_oidc(issuer.clone(), "https://scarab.example", "sts.example.com");
+
+    let env_rows = vec![
+        (
+            "env",
+            Some((
+                "scarab:org/acme/repo/web/env/prod/ref/refs/heads/main".to_string(),
+                "push",
+                Some(SHA),
+            )),
+        ),
+        ("env-bad-ref", None),
+        ("env-named-none", None),
+    ];
+    let all = rows
+        .into_iter()
+        .map(|(run, _, _, want)| (run, want))
+        .chain(env_rows);
+    for (run, want) in all {
+        *inner.last.lock().unwrap() = None;
+        exec.launch(&step(run), &plain_spec())
+            .await
+            .unwrap_or_else(|e| panic!("{run}: the launch goes on without a token: {e}"));
+        assert!(inner.last.lock().unwrap().is_some(), "{run}: launched");
+        let claims = mounted_claims(&inner, &issuer);
+        let Some((subject, event, sha)) = want else {
+            assert_eq!(claims, None, "{run}: no token");
+            continue;
+        };
+        let claims = claims.unwrap_or_else(|| panic!("{run}: a token"));
+        assert_eq!(claims["sub"], subject, "{run}");
+        assert_eq!(claims["event"], event, "{run}");
+        match sha {
+            Some(sha) => assert_eq!(claims["sha"], sha, "{run}"),
+            None => assert!(claims.get("sha").is_none(), "{run}: {claims}"),
+        }
+    }
+
+    // The lifetime: the Step's timeout, capped (3600 s by default), the cap
+    // when it has none; `iat` = `nbf` = 60 s before the launch.
+    let capped = SecretInjectingExecutor::new(
+        inner.clone(),
+        db.clone() as Arc<dyn Db>,
+        Arc::new(FakeSecrets::new()),
+        logs(db.clone()),
+    )
+    .with_oidc(issuer.clone(), "https://scarab.example", "sts.example.com")
+    .with_oidc_token_max_ttl(300);
+    let now_s = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    };
+    for (exec, timeout, ttl) in [
+        (&exec, None, 3_600),
+        (&exec, Some(600), 600),
+        (&exec, Some(7_200), 3_600),
+        (&capped, None, 300),
+        (&capped, Some(600), 300),
+    ] {
+        let spec = StepSpec {
+            timeout_seconds: timeout,
+            ..plain_spec()
+        };
+        let before = now_s();
+        exec.launch(&step("push"), &spec).await.unwrap();
+        let after = now_s();
+        let claims = mounted_claims(&inner, &issuer).expect("a token");
+        let (iat, nbf, exp) = (
+            claims["iat"].as_i64().unwrap(),
+            claims["nbf"].as_i64().unwrap(),
+            claims["exp"].as_i64().unwrap(),
+        );
+        assert_eq!(nbf, iat, "{timeout:?}");
+        assert!(
+            (before - 60..=after - 60).contains(&iat),
+            "{timeout:?}: iat {iat} not 60 s before {before}..{after}"
+        );
+        assert_eq!(exp - iat, ttl + 60, "{timeout:?}");
+    }
 }

@@ -313,6 +313,20 @@ scarab:
   # RSA PEM (mount it via extraEnv + a volume, or bake it into existingSecret) —
   # the server refuses to boot without one (ADR-0048).
   oidcIssuer: ""
+  # Further RSA public keys the issuer's JWKS lists beside the signing key, each
+  # a `-----BEGIN PUBLIC KEY-----` PEM block (SPKI). List the previous and the
+  # next key of a key change here; the server never signs with them. Rendered
+  # as SCARAB_OIDC_PUBLIC_KEYS. See the README, "Changing the signing key".
+  #   oidcPublicKeys:
+  #     - |
+  #       -----BEGIN PUBLIC KEY-----
+  #       ...
+  #       -----END PUBLIC KEY-----
+  oidcPublicKeys: []
+  # The longest a step OIDC token lives, in seconds (60 to 43200). A token
+  # lives for its step's timeout, at most this long, and this long for a step
+  # with no timeout. Empty => 3600. Rendered as SCARAB_OIDC_TOKEN_MAX_TTL_SECS.
+  oidcTokenMaxTtlSecs: ""
 
   # --- OAuth/OIDC login (ADR-0049) ----------------------------------------
   # Real authentication: a forge-agnostic OAuth/OIDC provider (GitHub, Forgejo,

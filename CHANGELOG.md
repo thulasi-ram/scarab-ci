@@ -18,6 +18,34 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **The OIDC issuer's key id changes.** The `kid` of the signing key, in the JWKS and in every
+  step token's header, was the fixed string `scarab-key-1`. It is now the RFC 7638 thumbprint of
+  the public key (SHA-256, base64url), so the same key keeps the same `kid` on every replica. A
+  verifier that looks the key up in the JWKS by `kid` picks up the new value when it fetches the
+  JWKS again. One that has `scarab-key-1` written into its own configuration must be changed to
+  the new value, which `/.well-known/jwks.json` shows after the upgrade.
+- **Step OIDC tokens of Runs in an Environment change, though their `sub` does not.** Check any
+  trust policy that matches on more than `sub` and `aud`:
+  - A token lives for the step's `timeout:`, at most `SCARAB_OIDC_TOKEN_MAX_TTL_SECS` (default
+    one hour, at most 12 hours); it lived 15 minutes. A copy that leaks from a step stays usable
+    for that long. Set the maximum lower if your steps exchange the token only at the start.
+  - `event` is the Run's trigger kind (`push`, `pull_request`, `manual`, ...); it was always
+    `deploy`. A policy that matched `event` = `deploy` no longer matches.
+  - `sha` is the commit the Run builds; it was always empty. A token with no known commit (a tag
+    or release Run) has no `sha` claim at all.
+  - A Step whose ref has a path component named `env` or `ref` (a branch `env/prod` is
+    `refs/heads/env/prod`), or whose org, repository or Environment name holds a `/`, gets no
+    token. So does a Step of an Environment named `none`.
+- **No new Environment can be named `none`.** It is the `env` segment of the subject of a Step
+  that no Environment admits (fork code, or before its approval). Creating or duplicating to that
+  name answers 400. An Environment named `none` from before this release can still be edited and
+  deleted, but its Steps get no OIDC token: create an Environment with another name and move its
+  pipelines there.
+- **The OIDC issuer refuses keys under 2048 bits.** A signing key or a
+  `SCARAB_OIDC_PUBLIC_KEYS` entry with a shorter RSA modulus stops the server at boot.
+
 ### Security
 
 - **A dispatch records the kind of ref it ran.** A manual or API dispatch at a bare name such as
@@ -47,14 +75,54 @@ release.yml uses that version's section as the GitHub Release text. See
   fork limits too. A re-run of that Run keeps them; once the forge answers again, start the
   pipeline again with a new push to the pull request or a dispatch at `refs/pull/<n>/head`.
 
-- **A dispatch of fork code starts no follow-up.** A manual or API dispatch whose commit no
-  branch or tag of the repository names is fork code, but its Run recorded no `fork` flag, so its
-  `on: upstream:` follow-ups started and ran the pipelines at the fork's commit with secrets and
-  write tokens. A dispatch now records `fork`, its Run starts no follow-up, and a follow-up whose
-  chain started from fork code counts as fork code at launch. Changes you may see: a manual or
-  API Run recorded before this release has no `fork` flag and is treated as fork code, so it
-  starts no follow-up when it finishes again after a re-run; a `when:` or template on a manual or
-  API trigger can read `event.fork`.
+- **A dispatch of fork code starts no follow-up and is recorded as fork code.** A manual or API
+  dispatch whose commit no branch or tag of the repository names is fork code. Such a Run already
+  got the fork limits at creation (no secrets, `env=none`, a read-only clone token, no registry
+  credential), but it recorded no `fork` flag, so its `on: upstream:` follow-ups started and ran
+  the pipelines at the fork's commit with secrets and write tokens. A dispatch now records `fork`,
+  as a pull request does. Its Run starts no follow-up, a follow-up whose chain started from fork
+  code counts as fork code at launch, and its sandboxed Steps without `registry_auth` see
+  `SCARAB_FORK_PR=true` (it was `false`), so the build library's build Step does not export its
+  cache. Changes you may see: a manual or API Run recorded before this release has no `fork` flag
+  and is treated as fork code, so it starts no follow-up when it finishes again after a re-run;
+  a `when:` or template on a manual or API trigger can read `event.fork`.
+
+- **No step OIDC token when its subject could read another way.** A Step gets no token when the
+  org, repository or Environment name holds a `/`, the ref has a path component named `env` or
+  `ref` (a branch `ref/x` is `refs/heads/ref/x`), or its Environment is named `none`. Its launch
+  goes on without a token, and the server logs a warning naming the Run and the reason. See
+  [Step OIDC tokens](/scarab-ci/usage/oidc-tokens/#which-steps-get-no-token).
+- **Trust policies: a `*` belongs only after `/ref/`.** A `*` in a cloud trust policy matches `/`
+  too, so `…/repo/app/*` or `…/repo/app/env/*` also matches the `env/none` subject of a fork pull
+  request's Step, and `…/repo/app*` matches another repository. The docs now say so and give
+  exact patterns. See
+  [Matching the subject](/scarab-ci/usage/oidc-tokens/#matching-the-subject-in-a-trust-policy).
+
+### Features
+
+- **Step OIDC tokens outside an Environment.** A Run bound to no Environment that builds the
+  repository's own code now gets a token with the subject
+  `scarab:org/<org>/repo/<repo>/ref/<ref>`, with no `env/` segment, so a trust policy can name a
+  repository and a ref without an Environment. Fork code, comment-triggered Runs, Runs with no
+  repository and Runs whose ref is unknown or `HEAD` get none; so do manual and API Runs created
+  before this release, which did not record whether they were fork code. The `sub` of a Run bound
+  to an Environment does not change; Breaking changes lists what else in its token does. See
+  [Step OIDC tokens](/scarab-ci/usage/oidc-tokens/).
+
+- **The OIDC issuer's signing key can be changed without breaking cloud trust.** The chart's
+  `scarab.oidcPublicKeys` (server: `SCARAB_OIDC_PUBLIC_KEYS`) lists further RSA public keys that
+  `/.well-known/jwks.json` publishes beside the signing key: the next key before servers sign with
+  it, and the previous key until its last token has expired. The server still signs with the one
+  private key in `SCARAB_OIDC_SIGNING_KEY_FILE`. The chart README, "Changing the signing key",
+  gives the three upgrades in order. See
+  [Environment variables](/scarab-ci/usage/environment-variables/).
+
+- **Step OIDC tokens live as long as the step may run.** A token lived 15 minutes; it now lives
+  for the step's `timeout:`, at most `SCARAB_OIDC_TOKEN_MAX_TTL_SECS` (chart:
+  `scarab.oidcTokenMaxTtlSecs`, default one hour, at most 12 hours), so a cloud SDK that exchanges
+  the token again later in the step still can. A new docs page shows how to publish the issuer as static files
+  and how a step assumes an AWS role with two `env:` lines. See
+  [Assuming an AWS role from a step](/scarab-ci/usage/aws-roles/).
 
 ### Enhancement
 
@@ -67,6 +135,12 @@ release.yml uses that version's section as the GitHub Release text. See
   at the gate as at any `manual` gate, starts none of its shared services until the gate is
   released, and never counts the gate as an Environment approval gate. Nothing in 0.8.4 adds the
   gate.
+
+- **Step OIDC tokens carry `iat` and `nbf`.** Both are set 60 seconds before the token is minted,
+  so a cloud whose clock runs up to a minute behind the server still accepts the token.
+- **A step launch reads only its Run's trigger record.** Deciding a Step's OIDC token, its fork
+  status and its follow-ups read the one event Run creation records, not the Run's whole event
+  log, at each launch.
 
 ### Bug Fixes
 

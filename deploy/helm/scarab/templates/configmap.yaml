@@ -25,6 +25,14 @@ data:
   {{- with .Values.scarab.oidcIssuer }}
   SCARAB_OIDC_ISSUER: {{ . | quote }}
   {{- end }}
+  {{- with .Values.scarab.oidcPublicKeys }}
+  {{- /* toJson, not quote: a double-quoted YAML scalar folds literal line
+         breaks into spaces, which breaks a PEM block. */}}
+  SCARAB_OIDC_PUBLIC_KEYS: {{ join "\n" . | toJson }}
+  {{- end }}
+  {{- with .Values.scarab.oidcTokenMaxTtlSecs }}
+  SCARAB_OIDC_TOKEN_MAX_TTL_SECS: {{ . | quote }}
+  {{- end }}
   {{- if include "scarab.oauthConfigured" . }}
   {{- /* OAuth/OIDC login (ADR-0049). The client SECRET is deliberately absent
          here — the Deployment injects it with a secretKeyRef. These four render

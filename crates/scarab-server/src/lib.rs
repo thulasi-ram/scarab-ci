@@ -9848,20 +9848,58 @@ fn run_status_to_forge(s: RunStatus) -> scarab_forge::StatusState {
 }
 
 /// The trigger context (`event`) a Run was created from, and its actor, as
-/// [`persist_run_from_ir`] recorded them on the Run's event log.
+/// [`persist_run_from_ir`] recorded them on the Run's event log. Reads only
+/// that record ([`Db::run_trigger_record`]), not the whole log: a launch
+/// reads it for every Step.
 pub(crate) async fn run_trigger(
     db: &dyn Db,
     run: &RunId,
 ) -> Result<Option<(serde_json::Value, Option<String>)>, DbError> {
-    for e in db.events(run).await? {
-        if let EventPayload::Raw(v) = &e.kind {
-            if v["trigger"]["event"].is_object() {
-                let actor = v["actor"].as_str().map(str::to_string);
-                return Ok(Some((v["trigger"]["event"].clone(), actor)));
-            }
+    Ok(db.run_trigger_record(run).await?.and_then(|v| {
+        let event = &v["trigger"]["event"];
+        event
+            .is_object()
+            .then(|| (event.clone(), v["actor"].as_str().map(str::to_string)))
+    }))
+}
+
+/// The trigger a recorded trigger's chain starts from: the trigger itself,
+/// or for a follow-up (`upstream`, which builds its upstream Run's commit)
+/// the trigger of the Run that started the chain, at most 16 links away.
+/// `None` when a link names no upstream Run, an upstream Run recorded no
+/// trigger, or the chain is longer (a cycle). Each link is one
+/// [`run_trigger`] read.
+pub(crate) async fn trigger_chain_root(
+    db: &dyn Db,
+    trigger: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, DbError> {
+    let mut trigger = trigger.clone();
+    // A chain is a few Runs long; the bound stops a corrupt cycle.
+    for _ in 0..16 {
+        if trigger["kind"].as_str() != Some("upstream") {
+            return Ok(Some(trigger));
+        }
+        let Some(upstream) = trigger["run"].as_str().filter(|r| !r.is_empty()) else {
+            return Ok(None);
+        };
+        match run_trigger(db, &RunId(upstream.to_string())).await? {
+            Some((upstream, _actor)) => trigger = upstream,
+            None => return Ok(None),
         }
     }
     Ok(None)
+}
+
+/// Whether the trigger a chain starts from ([`trigger_chain_root`]) is fork
+/// code (ADR-0086 §9): a pull request, manual or api trigger unless its
+/// recorded `fork` is exactly `false`; never a push, tag, release, cron or
+/// comment trigger; any other kind always.
+pub(crate) fn root_trigger_is_fork_code(root: &serde_json::Value) -> bool {
+    match root["kind"].as_str() {
+        Some("push" | "tag" | "release" | "cron" | "comment") => false,
+        Some("pull_request" | "manual" | "api") => root["fork"].as_bool() != Some(false),
+        _ => true,
+    }
 }
 
 /// Whether a Run's recorded trigger (its [`run_trigger`] event) says it
@@ -9875,31 +9913,17 @@ pub(crate) async fn run_trigger(
 ///   chain (a cycle) is fork code;
 /// - a push, tag, release, cron or comment trigger is not;
 /// - any other kind is fork code.
+///
+/// The step OIDC token reads the same chain but also refuses a comment
+/// trigger (`secret_executor::builds_repository_code`).
 pub async fn trigger_is_fork_code(
     db: &dyn Db,
     trigger: &serde_json::Value,
 ) -> Result<bool, DbError> {
-    let mut trigger = trigger.clone();
-    // A chain is a few Runs long; the bound stops a corrupt cycle.
-    for _ in 0..16 {
-        match trigger["kind"].as_str() {
-            Some("push" | "tag" | "release" | "cron" | "comment") => return Ok(false),
-            Some("pull_request" | "manual" | "api") => {
-                return Ok(trigger["fork"].as_bool() != Some(false))
-            }
-            Some("upstream") => {
-                let Some(upstream) = trigger["run"].as_str().filter(|r| !r.is_empty()) else {
-                    return Ok(true);
-                };
-                match run_trigger(db, &RunId(upstream.to_string())).await? {
-                    Some((upstream, _actor)) => trigger = upstream,
-                    None => return Ok(true),
-                }
-            }
-            _ => return Ok(true),
-        }
-    }
-    Ok(true)
+    Ok(match trigger_chain_root(db, trigger).await? {
+        Some(root) => root_trigger_is_fork_code(&root),
+        None => true,
+    })
 }
 
 /// Recover a run's `(repo, sha)` from the normalized trigger recorded on its

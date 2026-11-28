@@ -42,6 +42,8 @@
 //! | `SCARAB_OIDC_ISSUER` | env | enables the OIDC issuer (keyless federation, ADR-0015) |
 //! | `SCARAB_OIDC_SIGNING_KEY_FILE` | env | PKCS#8 RSA PEM the issuer signs with — **required** when the issuer is enabled (persistent across restarts/replicas) |
 //! | `SCARAB_OIDC_AUDIENCE` | env | `aud` of minted per-run tokens (ADR-0015); default `scarab` |
+//! | `SCARAB_OIDC_TOKEN_MAX_TTL_SECS` | env | the longest a step OIDC token lives; a token lives for its step's timeout, at most this long, and this long for a step with no timeout. Default 3600, from 60 to 43200 (12h, the longest AWS session) |
+//! | `SCARAB_OIDC_PUBLIC_KEYS` | env | further RSA public keys (SPKI PEM blocks) the JWKS lists beside the signing key: the previous and the next key of a key change. Never signed with |
 //! | `SCARAB_MASTER_KEYS` | env | comma-separated base64 32-byte KEKs for envelope encryption; **first = active writer**, the rest decrypt-only (rotation, git-bug f37463a). Authoritative when set |
 //! | `SCARAB_MASTER_KEY` | env | legacy single KEK ≡ a one-key list (ADR-0014) — one of the two is **required** unless `SCARAB_DEV_INSECURE=1`. When both are set the list wins; a legacy key that is not a list member refuses to boot |
 //! | `SCARAB_DEV_INSECURE` | env | `1`/`true`: downgrade the **security** hard-fails (KEK, auth) to loud boot warnings — dev only, never relaxes the Postgres requirement |
@@ -484,6 +486,14 @@ pub struct OidcConfig {
     /// The `aud` claim of minted per-run tokens (ADR-0015) — what the cloud's
     /// trust policy is configured to expect. Default `scarab`.
     pub audience: String,
+    /// Further RSA public keys (`SCARAB_OIDC_PUBLIC_KEYS`, SPKI PEM blocks one
+    /// after the other) the JWKS lists beside the signing key: the previous
+    /// and the next key of a key change. The issuer never signs with them.
+    pub public_keys_pem: Option<String>,
+    /// The longest a step token lives, in seconds
+    /// (`SCARAB_OIDC_TOKEN_MAX_TTL_SECS`, default 3600). A token lives for its
+    /// Step's timeout, at most this long, and this long when the Step has none.
+    pub token_max_ttl_secs: u32,
 }
 
 /// A string whose value must never reach a log line. `Debug` prints `***`, so
@@ -1407,6 +1417,13 @@ pub enum ConfigError {
     InvalidStepTimeout,
 
     #[error(
+        "SCARAB_OIDC_TOKEN_MAX_TTL_SECS is set but invalid — want a whole number of seconds \
+         from 60 to 43200 (12h, the longest session AWS grants for one). It caps how long \
+         a step OIDC token lives; default 3600."
+    )]
+    InvalidOidcTokenMaxTtl,
+
+    #[error(
         "SCARAB_PROJECT_RUN_CAP is set but invalid (got {0:?}) — want a non-negative \
          integer: the most Runs of one project that may be Running at once (ADR-0011); \
          0 or unset means no cap."
@@ -1643,6 +1660,20 @@ impl Config {
                 audience: env("SCARAB_OIDC_AUDIENCE")
                     .filter(|v| !v.is_empty())
                     .unwrap_or_else(|| "scarab".into()),
+                public_keys_pem: env("SCARAB_OIDC_PUBLIC_KEYS").filter(|v| !v.trim().is_empty()),
+                token_max_ttl_secs: match env("SCARAB_OIDC_TOKEN_MAX_TTL_SECS")
+                    .filter(|v| !v.trim().is_empty())
+                {
+                    Some(v) => v
+                        .trim()
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|s| {
+                            (60..=crate::secret_executor::MAX_OIDC_TOKEN_MAX_TTL_SECS).contains(s)
+                        })
+                        .ok_or(ConfigError::InvalidOidcTokenMaxTtl)?,
+                    None => crate::secret_executor::DEFAULT_OIDC_TOKEN_MAX_TTL_SECS,
+                },
             }),
             None => None,
         };
@@ -2237,8 +2268,13 @@ impl Config {
             ),
             match &self.oidc {
                 Some(o) => format!(
-                    "oidc issuer: {} (signing key: {})",
-                    o.issuer_url, o.signing_key_file,
+                    "oidc issuer: {} (signing key: {}; token max ttl: {}s; further public keys: {})",
+                    o.issuer_url,
+                    o.signing_key_file,
+                    o.token_max_ttl_secs,
+                    o.public_keys_pem
+                        .as_deref()
+                        .map_or(0, |pem| pem.matches("-----BEGIN ").count()),
                 ),
                 None => "oidc issuer: disabled".to_string(),
             },

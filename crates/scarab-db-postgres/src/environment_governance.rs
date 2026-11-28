@@ -853,6 +853,7 @@ impl EnvironmentGovernanceStore for PostgresDb {
         updated_at: i64,
     ) -> Result<OrgEnvironment, OrgEnvironmentError> {
         validate_org_environment_name(to)?;
+        scarab_project::refuse_reserved_org_environment_name(to)?;
         if let Some(d) = display_name {
             validate_org_environment_display_name(d)?;
         }

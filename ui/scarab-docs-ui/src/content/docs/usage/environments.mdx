@@ -68,7 +68,9 @@ refused and the dialog lists them; its button then deletes them with the Environ
 
 An Environment's **name** cannot be changed. It is the key every pipeline's `environment:` uses,
 and the OIDC subject a Run presents to a cloud provider contains it
-(`scarab:org/<org>/repo/<repo>/env/<name>/ref/<ref>`), so cloud trust policies match on it.
+(`scarab:org/<org>/repo/<repo>/env/<name>/ref/<ref>`), so cloud trust policies match on it (see
+[Step OIDC tokens](/scarab-ci/usage/oidc-tokens/)). The name `none` is reserved: it is the `env`
+segment of the subject of a Step that no Environment admits.
 
 The **display name** is what lists, headings and pickers show, with the name beside it, for
 example *Production (EU) · prod*. It is optional (blank shows the name) and an org admin can

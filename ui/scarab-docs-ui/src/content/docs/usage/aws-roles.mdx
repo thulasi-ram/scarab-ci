@@ -1,0 +1,132 @@
+---
+title: Assuming an AWS role from a step
+description: Let AWS trust Scarab's step OIDC tokens, so each repository, Environment and ref assumes its own IAM role, and replace a shared IRSA role on the step ServiceAccount.
+---
+
+A step can assume an IAM role with the [OIDC token](/scarab-ci/usage/oidc-tokens/) Scarab mounts
+in it, so the role's trust policy decides which repository, Environment and ref may use it. You
+need three things: an IAM OIDC identity provider for Scarab's issuer, a role whose trust policy
+matches the token's subject, and two `env:` lines in the step.
+
+The AWS details (the IAM provider, trust policy condition keys, the SDKs' web identity
+credentials) are AWS's; we name them so you know what to look up. See "Create an OpenID Connect
+(OIDC) identity provider in IAM" and "Create a role for OpenID Connect federation" in the AWS
+docs.
+
+## 1. The issuer and the audience
+
+AWS fetches the issuer's discovery document and keys over the public internet. Publish them
+(see [Publishing the issuer](/scarab-ci/usage/oidc-tokens/#publishing-the-issuer)) and set the
+audience the tokens carry to the one AWS STS expects:
+
+```yaml
+scarab:
+  oidcIssuer: https://oidc.example.com/scarab
+  extraEnv:
+    SCARAB_OIDC_AUDIENCE: sts.amazonaws.com
+```
+
+The audience is one value for the whole server. Its default, `scarab`, is kept so existing trust
+policies keep matching; changing it changes `aud` in every token, so update any provider that
+lists `scarab` at the same time.
+
+## 2. The IAM OIDC identity provider
+
+Create one provider per Scarab issuer, with the issuer URL and the audience as its client ID:
+
+```sh
+aws iam create-open-id-connect-provider \
+  --url https://oidc.example.com/scarab \
+  --client-id-list sts.amazonaws.com
+```
+
+Its ARN is `arn:aws:iam::111122223333:oidc-provider/oidc.example.com/scarab`. Some AWS CLI
+versions also ask for `--thumbprint-list`; see the AWS docs.
+
+## 3. A role per repository, Environment and ref
+
+The trust policy's condition keys are the provider URL without `https://`, followed by `:sub`
+and `:aud`. This role may be assumed only by steps of `acme/app` on `main` in the Environment
+`production`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::111122223333:oidc-provider/oidc.example.com/scarab"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "oidc.example.com/scarab:aud": "sts.amazonaws.com",
+          "oidc.example.com/scarab:sub": "scarab:org/acme/repo/app/env/production/ref/refs/heads/main"
+        }
+      }
+    }
+  ]
+}
+```
+
+Match `sub` exactly with `StringEquals` where you can. A `*` in `StringLike` matches any text,
+`/` included, so put one only after `/ref/`, for example
+`scarab:org/acme/repo/app/env/production/ref/refs/tags/*` for every tag. `…/ref/*` also matches
+`refs/pull/<n>/head`, a pull request from any of the repository's own branches, before anyone has
+reviewed it; name the branch instead (`…/ref/refs/heads/main`).
+
+Never put a `*` in or right after `repo/` or `env/`. `scarab:org/acme/repo/app/*` and
+`scarab:org/acme/repo/app/env/*` match `…/env/none/ref/refs/pull/7/head`, the subject of a fork
+pull request's Step or of a Step before its approval; `scarab:org/acme/repo/app*` matches the
+repository `app2` too. See
+[Matching the subject](/scarab-ci/usage/oidc-tokens/#matching-the-subject-in-a-trust-policy).
+
+A Run bound to no Environment has a subject with no `env/` segment
+(`scarab:org/acme/repo/app/ref/refs/heads/main`); see
+[The subject](/scarab-ci/usage/oidc-tokens/#the-subject) for which Runs get one.
+
+## 4. The step
+
+The AWS SDKs and CLI read a role and a token file from two variables. Set them in the step's
+`env:`:
+
+```yaml
+environment: production
+
+steps:
+  - id: plan
+    image: ghcr.io/example/tofu:1.8
+    env:
+      - [AWS_ROLE_ARN, "arn:aws:iam::111122223333:role/acme-app-production"]
+      - [AWS_WEB_IDENTITY_TOKEN_FILE, /scarab/oidc/token]
+    command: ["tofu", "plan"]
+```
+
+Scarab sets neither variable; they are ordinary `env:` entries. The SDK exchanges the token for
+credentials when the step first calls AWS, and again when those expire, reading the file each
+time. The token lives for the step's `timeout:`, at most `SCARAB_OIDC_TOKEN_MAX_TTL_SECS` (one hour
+by default), so a step that runs longer than that cannot get new credentials near its end.
+
+If the step gets no token (see
+[Which Steps get no token](/scarab-ci/usage/oidc-tokens/#which-steps-get-no-token)), the file does
+not exist, and the step's first AWS call fails.
+
+## Replacing a shared IRSA role
+
+If step Pods today run as a ServiceAccount with an `eks.amazonaws.com/role-arn` annotation, every
+step of every repository gets that role. Move to per-repository roles in this order, so no
+pipeline is left without AWS access:
+
+1. Publish the issuer and create the IAM OIDC provider (sections 1 and 2).
+2. Create the new roles, each with a trust policy for the subjects that need it (section 3), and
+   the permissions the shared role gave those pipelines.
+3. Add the two `env:` lines to each pipeline's steps that call AWS, and check that their Runs
+   succeed. While the annotation is still on the ServiceAccount, EKS's IRSA webhook also adds
+   AWS variables to step Pods; check which role a step uses with
+   `aws sts get-caller-identity`.
+4. Only then remove the `eks.amazonaws.com/role-arn` annotation from the step ServiceAccount.
+   Step Pods are created per Attempt, so the next Attempts start without the shared role.
+
+The ECR login in [Pushing images to Amazon ECR](/scarab-ci/usage/pushing-to-ecr/) runs in an
+init container, which has no Scarab token; it keeps its own ServiceAccount and IRSA role.

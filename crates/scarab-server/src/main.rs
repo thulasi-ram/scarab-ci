@@ -682,8 +682,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     oidc.signing_key_file
                 )
             })?;
-            let issuer = scarab_server::oidc::Rs256Issuer::from_pem(oidc.issuer_url.clone(), &pem)
-                .map_err(|e| format!("invalid OIDC signing key {}: {e}", oidc.signing_key_file))?;
+            let mut issuer =
+                scarab_server::oidc::Rs256Issuer::from_pem(oidc.issuer_url.clone(), &pem).map_err(
+                    |e| format!("invalid OIDC signing key {}: {e}", oidc.signing_key_file),
+                )?;
+            // The previous and next public keys of a key change, listed in
+            // the JWKS beside the signing key. A bad block is a boot failure:
+            // a JWKS missing a key another replica signs with breaks trust.
+            if let Some(public) = &oidc.public_keys_pem {
+                issuer = issuer
+                    .with_public_keys(public)
+                    .map_err(|e| format!("invalid SCARAB_OIDC_PUBLIC_KEYS: {e}"))?;
+            }
             Some(Arc::new(issuer))
         }
         None => None,
@@ -931,11 +941,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Per-attempt OIDC federation tokens (ADR-0015),
                     // tmpfs-delivered.
                     if let Some((issuer, oidc_cfg)) = oidc {
-                        secret_exec = secret_exec.with_oidc(
-                            issuer,
-                            oidc_cfg.issuer_url.clone(),
-                            oidc_cfg.audience.clone(),
-                        );
+                        secret_exec = secret_exec
+                            .with_oidc(
+                                issuer,
+                                oidc_cfg.issuer_url.clone(),
+                                oidc_cfg.audience.clone(),
+                            )
+                            .with_oidc_token_max_ttl(oidc_cfg.token_max_ttl_secs);
                         tracing::info!("per-run OIDC token injection enabled (ADR-0015)");
                     }
                     secret_exec

@@ -1,0 +1,154 @@
+---
+title: Step OIDC tokens
+description: The short-lived token Scarab signs for a step so a cloud can trust the step by repository, Environment and ref, which Steps get one, and how to match its subject in a trust policy.
+---
+
+With the issuer on (`SCARAB_OIDC_ISSUER`, chart value `scarab.oidcIssuer`), Scarab signs a token
+for each Attempt of a step and mounts it in the step container at `/scarab/oidc/token`
+(`SCARAB_OIDC_TOKEN_FILE` holds the path). A cloud that trusts Scarab as an OIDC provider
+exchanges the token for its own short-lived credentials, so the step needs no long-lived cloud
+key. The cloud fetches the discovery document at `<issuer>/.well-known/openid-configuration` and
+the keys at `<issuer>/.well-known/jwks.json`. The chart README covers the signing key
+("The OIDC issuer for step tokens"). For AWS, see
+[Assuming an AWS role from a step](/scarab-ci/usage/aws-roles/).
+
+The token is mounted only in the step container of a Kubernetes step Pod: not in its init
+containers or sidecars, and not by the local executor.
+
+## The token
+
+The token is an RS256 JWT. It lives as long as the step may run: the step's `timeout:`, at most
+`SCARAB_OIDC_TOKEN_MAX_TTL_SECS` (chart value `scarab.oidcTokenMaxTtlSecs`, default one hour), and
+that maximum for a step with no `timeout:`. A cloud SDK that reads the token file again later in
+the step still finds a valid token. Scarab does not refresh it: a step that runs longer than the
+maximum has an expired token for the rest of its run. Its claims:
+
+| Claim | Value |
+|---|---|
+| `iss` | the issuer URL |
+| `sub` | the subject, below |
+| `aud` | `SCARAB_OIDC_AUDIENCE`, one value for the whole server (default `scarab`; set it to `sts.amazonaws.com` for AWS) |
+| `iat`, `nbf` | 60 seconds before the token was signed, so a cloud whose clock runs up to a minute behind still accepts it |
+| `exp` | the token's lifetime, above, after it was signed |
+| `run_id`, `attempt` | the Run and the Attempt |
+| `event` | the Run's trigger: `push`, `pull_request`, `tag`, `release`, `cron`, `manual`, `api`, `upstream` |
+| `ref` | the ref in the subject |
+| `sha` | the commit the Run builds |
+
+A claim whose value the Run did not record is left out, never sent empty. A tag or release Run
+has no `sha` claim.
+
+## The subject
+
+A Run bound to an Environment gets:
+
+```
+scarab:org/<org>/repo/<repo>/env/<environment>/ref/<ref>
+```
+
+The environment is `none` for a Run of fork code, and for a Step that no Environment approval gate
+upstream admits at its launch (see [The approval gate](/scarab-ci/usage/environments/#the-approval-gate)).
+No Environment can be named `none`, so `env/none` never names a real one.
+
+A Run bound to no Environment gets the same subject without the `env/` segment:
+
+```
+scarab:org/<org>/repo/<repo>/ref/<ref>
+```
+
+`<ref>` is the ref the Run was started on, not a commit: `refs/heads/<branch>` for a push or a
+cron Run, `refs/tags/<tag>` for a tag or release, `refs/pull/<n>/head` for a pull request, the
+ref given for a manual or API Run, and the upstream Run's ref for a follow-up.
+
+The subject names a repository by its owner and name, with no forge host. One Scarab holds at
+most one repository of a given owner and name, whichever forge it is on, so the subject still
+names one repository.
+
+## Which Steps get no token
+
+A Run bound to no Environment gets a token only when Scarab can tell that it builds the
+repository's own code. Its Steps get no token when:
+
+- the Run is fork code: a pull request from another repository, or a manual or API Run at a commit
+  no branch or tag of the repository points at (see [Runs](/scarab-ci/usage/runs/));
+- the Run is a manual or API Run created before Scarab recorded whether a dispatch is fork code,
+  including a rerun of one;
+- the Run is a follow-up whose chain of upstream Runs started from one of the Runs above;
+- a comment started the Run;
+- the Run has no repository (a pipeline submitted inline);
+- the Run's ref is unknown, `HEAD`, or `refs/heads/HEAD` (a manual or API Run started at `HEAD`).
+
+On any Run, a Step also gets no token when a value would make the subject read another way: an
+org, repository or Environment name that holds a `/`, or a ref with a path component named `env`
+or `ref`. A branch named `ref/x` is `refs/heads/ref/x`, and `env/prod` is `refs/heads/env/prod`;
+Steps of their Runs get no token. So do the Steps of an Environment named `none` created before
+the name was reserved: rename it by creating a new Environment and moving its pipelines there. The
+server logs a warning naming the Run and the reason.
+
+A Step with no token still launches. A step that needs cloud access then fails at the call it
+makes, not at launch. When Scarab cannot read what it needs to decide (the Run's trigger, its
+repository, an upstream Run), the launch fails and the scheduler retries it, rather than going on
+without a token.
+
+## Matching the subject in a trust policy
+
+A `*` in a trust policy matches any text, `/` included, so it can match across segments. Match the
+whole subject where you can, and put a `*` only after `/ref/`, where the rest of the subject is
+the ref:
+
+| Pattern | Matches |
+|---|---|
+| `scarab:org/acme/repo/app/env/production/ref/refs/heads/main` | `main` of `acme/app` in Environment `production`. Use this form where you can |
+| `scarab:org/acme/repo/app/env/production/ref/refs/tags/*` | any tag of `acme/app` in `production` |
+| `scarab:org/acme/repo/app/ref/refs/heads/main` | `main` of `acme/app`, outside an Environment |
+
+`…/ref/*` matches every ref, including `refs/pull/<n>/head`: a pull request from any branch of the
+same repository, before anyone has reviewed it. Prefer `…/ref/refs/heads/<branch>`.
+
+Never put a `*` in or right after the `repo/` or `env/` segment:
+
+- `scarab:org/acme/repo/app/*` and `scarab:org/acme/repo/app/env/*` match
+  `scarab:org/acme/repo/app/env/none/ref/refs/pull/7/head`, the subject of a fork pull request's
+  Step or of a Step before its approval, and `scarab:org/acme/repo/app/*` also matches every
+  subject outside an Environment.
+- `scarab:org/acme/repo/app*` also matches `scarab:org/acme/repo/app2/...`, another repository.
+- `scarab:org/acme/repo/*/ref/refs/heads/main` matches
+  `scarab:org/acme/repo/app/env/none/ref/refs/heads/main`.
+
+## Publishing the issuer
+
+A cloud fetches the discovery document and the keys from the issuer URL over the public internet.
+The Scarab server can stay private: publish the two documents as static files, on a bucket or a
+CDN, and set the issuer URL to that public location. No Ingress to the server is needed.
+
+1. Pick the public base URL, for example `https://oidc.example.com/scarab`, with no trailing `/`.
+   It must be `https`.
+2. Set `scarab.oidcIssuer` (`SCARAB_OIDC_ISSUER`) to it and upgrade. Every token's `iss` is now
+   that URL, and the discovery document names it as `issuer` and gives
+   `<issuer>/.well-known/jwks.json` as `jwks_uri`, whatever host the server itself answers on.
+3. Fetch both documents from the server's own routes, through its Service (here `scarab` in
+   namespace `scarab`) from inside the cluster, or through `kubectl port-forward`:
+
+   ```sh
+   curl -sf http://scarab.scarab.svc/.well-known/openid-configuration > openid-configuration
+   curl -sf http://scarab.scarab.svc/.well-known/jwks.json > jwks.json
+   ```
+
+4. Upload them so they are served at `<issuer>/.well-known/openid-configuration` and
+   `<issuer>/.well-known/jwks.json`, with `Content-Type: application/json`, and readable without
+   credentials.
+5. Check: `curl https://oidc.example.com/scarab/.well-known/openid-configuration` returns the
+   document, and its `issuer` and `jwks_uri` start with the public URL.
+
+The published JWKS is a copy: it changes only when you publish it again. Publish it again after
+each change to the signing key or to `scarab.oidcPublicKeys`. To change the signing key:
+
+1. Add the next key's public half to `scarab.oidcPublicKeys`, upgrade, and publish the JWKS.
+2. Once each cloud that trusts the issuer has had time to fetch the new JWKS, point the signing
+   key Secret at the next key, list the old key's public half in `scarab.oidcPublicKeys`, and
+   upgrade.
+3. Once the last token the old key signed has expired (at most `scarab.oidcTokenMaxTtlSecs`
+   later), remove the old key from `scarab.oidcPublicKeys`, upgrade, and publish the JWKS.
+
+The chart README, "Changing the signing key", gives the same steps for a server whose own routes
+are the issuer.

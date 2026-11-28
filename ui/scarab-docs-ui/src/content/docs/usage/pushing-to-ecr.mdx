@@ -26,6 +26,10 @@ credential. The setup has four parts:
    registry credential.
 4. A Pipeline that routes `ecr-push` to the library's push step only.
 
+For AWS calls a step's own commands make, use a role per repository instead of a shared one: see
+[Assuming an AWS role from a step](/scarab-ci/usage/aws-roles/). The ECR login below runs in an
+init container, which has no Scarab OIDC token, so it keeps a ServiceAccount of its own.
+
 This page uses IAM Roles for Service Accounts (IRSA). EKS Pod Identity is covered at the end of
 part 1. The AWS details (IAM actions, trust policies, the IRSA webhook) are AWS's; we name them so
 you know what to look up, and the AWS docs are the reference for each.

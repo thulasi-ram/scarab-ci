@@ -1202,7 +1202,8 @@ impl Event {
                 // Whether the dispatched commit is fork code (ADR-0086 §9),
                 // recorded with the Run like a pull request's, so the paths
                 // that read the recorded trigger back see it: a fork dispatch
-                // starts no follow-up, and its launches count as fork code.
+                // starts no follow-up, its launches count as fork code, and it
+                // gets no step OIDC token outside an Environment.
                 e.insert("fork".into(), json!(fork));
                 // Exposed like push's (ADR-0043): `ref` is the symbolic dispatch
                 // ref, `branch` its short form, and `sha` the resolved commit the
