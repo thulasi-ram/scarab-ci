@@ -99,43 +99,9 @@ release.yml uses that version's section as the GitHub Release text. See
   never raises or satisfies a step-up, and never approves a gate. Killing, uninstalling or
   upgrading the plugin to a new digest deletes its handles. The handles and journal use the
   broker's own database pool; the API handlers a delegated call runs use the main pool.
-- **A dispatch records the kind of ref it ran.** A manual or API dispatch at a bare name such as
-  `release/x` was recorded as the branch `refs/heads/release/x` even when the name was a tag.
-  Anyone who could push a tag could create `release/x` on their own commit and pass an
-  Environment's `allowed_refs` for `refs/heads/release/*`. Scarab now looks the name up: a branch
-  is recorded as `refs/heads/<name>`, a tag as `refs/tags/<name>`, and the Run runs that ref's
-  commit. A name that is both a branch and a tag is refused with a 400 that asks for
-  `refs/heads/<name>` or `refs/tags/<name>`. A name that is neither, such as a short commit SHA,
-  is recorded as the full commit SHA, which no branch or tag pattern matches. `HEAD` is recorded
-  as the default branch, `refs/heads/<default>`, instead of `refs/heads/HEAD`. A
-  `refs/heads/<name>` or `refs/tags/<name>` the repository does not have is refused with a 400.
-  The typed ref is trimmed of spaces. A forge error during these ref lookups refuses the
-  dispatch ([Runs](/scarab-ci/usage/runs/)).
-- **A Forgejo pull request whose head is on no branch is fork code.** Scarab treated a pull
-  request as the repository's own code whenever its head was in the same repository. A Forgejo
-  AGit-flow pull request (pushed to `refs/for/<branch>`, which read access allows) has its head
-  there with no branch, so its Run could get the Environment's secrets. A pull request is now the
-  repository's own code only when its head is a branch of the repository; any other is fork
-  code, with the fork limits. A dispatch at `refs/pull/<n>/head` applies the same rule. On
-  GitHub and Forgejo alike, Scarab now asks the forge for the pull request's head branch before
-  it trusts a pull request from the repository, one call per pull request event: the branch must
-  exist and point at the pull request's head commit. A missing branch, a branch at another
-  commit, or a forge error makes the Run fork code; it is still created. So during a forge
-  outage, a pull request Run from the repository gets the fork limits. A known effect: when the
-  branch moves between the push and Scarab's check (another push right after), that Run gets the
-  fork limits too. A re-run of that Run keeps them; once the forge answers again, start the
-  pipeline again with a new push to the pull request or a dispatch at `refs/pull/<n>/head`.
-- **A dispatch of fork code starts no follow-up and is recorded as fork code.** A manual or API
-  dispatch whose commit no branch or tag of the repository names is fork code. Such a Run already
-  got the fork limits at creation (no secrets, `env=none`, a read-only clone token, no registry
-  credential), but it recorded no `fork` flag, so its `on: upstream:` follow-ups started and ran
-  the pipelines at the fork's commit with secrets and write tokens. A dispatch now records `fork`,
-  as a pull request does. Its Run starts no follow-up, a follow-up whose chain started from fork
-  code counts as fork code at launch, and its sandboxed Steps without `registry_auth` see
-  `SCARAB_FORK_PR=true` (it was `false`), so the build library's build Step does not export its
-  cache. Changes you may see: a manual or API Run recorded before this release has no `fork` flag
-  and is treated as fork code, so it starts no follow-up when it finishes again after a re-run;
-  a `when:` or template on a manual or API trigger can read `event.fork`.
+- **A sandboxed Step of a dispatch of fork code sees `SCARAB_FORK_PR=true`.** Its sandboxed Steps
+  without `registry_auth` saw `false`, so the build library's build Step exported its cache. It now
+  does not.
 - **No step OIDC token when its subject could read another way.** A Step gets no token when the
   org, repository or Environment name holds a `/`, the ref has a path component named `env` or
   `ref` (a branch `ref/x` is `refs/heads/ref/x`), or its Environment is named `none`. Its launch
@@ -207,6 +173,54 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Enhancement
 
+- **Step OIDC tokens carry `iat` and `nbf`.** Both are set 60 seconds before the token is minted,
+  so a cloud whose clock runs up to a minute behind the server still accepts the token.
+- **A step launch reads only its Run's trigger record.** Deciding a Step's OIDC token, its fork
+  status and its follow-ups read the one event Run creation records, not the Run's whole event
+  log, at each launch.
+
+## [0.8.4] - 2026-11-28
+
+### Security
+
+- **A dispatch records the kind of ref it ran.** A manual or API dispatch at a bare name such as
+  `release/x` was recorded as the branch `refs/heads/release/x` even when the name was a tag.
+  Anyone who could push a tag could create `release/x` on their own commit and pass an
+  Environment's `allowed_refs` for `refs/heads/release/*`. Scarab now looks the name up: a branch
+  is recorded as `refs/heads/<name>`, a tag as `refs/tags/<name>`, and the Run runs that ref's
+  commit. A name that is both a branch and a tag is refused with a 400 that asks for
+  `refs/heads/<name>` or `refs/tags/<name>`. A name that is neither, such as a short commit SHA,
+  is recorded as the full commit SHA, which no branch or tag pattern matches. `HEAD` is recorded
+  as the default branch, `refs/heads/<default>`, instead of `refs/heads/HEAD`. A
+  `refs/heads/<name>` or `refs/tags/<name>` the repository does not have is refused with a 400.
+  The typed ref is trimmed of spaces. A forge error during these ref lookups refuses the
+  dispatch ([Runs](/scarab-ci/usage/runs/)).
+- **A Forgejo pull request whose head is on no branch is fork code.** Scarab treated a pull
+  request as the repository's own code whenever its head was in the same repository. A Forgejo
+  AGit-flow pull request (pushed to `refs/for/<branch>`, which read access allows) has its head
+  there with no branch, so its Run could get the Environment's secrets. A pull request is now the
+  repository's own code only when its head is a branch of the repository; any other is fork
+  code, with the fork limits. A dispatch at `refs/pull/<n>/head` applies the same rule. On
+  GitHub and Forgejo alike, Scarab now asks the forge for the pull request's head branch before
+  it trusts a pull request from the repository, one call per pull request event: the branch must
+  exist and point at the pull request's head commit. A missing branch, a branch at another
+  commit, or a forge error makes the Run fork code; it is still created. So during a forge
+  outage, a pull request Run from the repository gets the fork limits. A known effect: when the
+  branch moves between the push and Scarab's check (another push right after), that Run gets the
+  fork limits too. A re-run of that Run keeps them; once the forge answers again, start the
+  pipeline again with a new push to the pull request or a dispatch at `refs/pull/<n>/head`.
+
+- **A dispatch of fork code starts no follow-up.** A manual or API dispatch whose commit no
+  branch or tag of the repository names is fork code, but its Run recorded no `fork` flag, so its
+  `on: upstream:` follow-ups started and ran the pipelines at the fork's commit with secrets and
+  write tokens. A dispatch now records `fork`, its Run starts no follow-up, and a follow-up whose
+  chain started from fork code counts as fork code at launch. Changes you may see: a manual or
+  API Run recorded before this release has no `fork` flag and is treated as fork code, so it
+  starts no follow-up when it finishes again after a re-run; a `when:` or template on a manual or
+  API trigger can read `event.fork`.
+
+### Enhancement
+
 - **A manual or API dispatch asks the forge for one ref.** Deciding whether the dispatched commit
   is fork code listed every branch and tag of the repository, page by page, on each dispatch. The
   GitHub and Forgejo adapters now read the one branch or tag the dispatch names.
@@ -216,11 +230,6 @@ release.yml uses that version's section as the GitHub Release text. See
   at the gate as at any `manual` gate, starts none of its shared services until the gate is
   released, and never counts the gate as an Environment approval gate. Nothing in 0.8.4 adds the
   gate.
-- **Step OIDC tokens carry `iat` and `nbf`.** Both are set 60 seconds before the token is minted,
-  so a cloud whose clock runs up to a minute behind the server still accepts the token.
-- **A step launch reads only its Run's trigger record.** Deciding a Step's OIDC token, its fork
-  status and its follow-ups read the one event Run creation records, not the Run's whole event
-  log, at each launch.
 
 ### Bug Fixes
 
@@ -3023,7 +3032,8 @@ The first release: the `scarab-server`, `scarab-clone`, `scarab-wsfetch` and
 `scarab-results-sidecar` images and the Helm chart at
 `oci://ghcr.io/thulasi-ram/charts/scarab`. It had no GitHub Release notes.
 
-[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.3...HEAD
+[Unreleased]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.4...HEAD
+[0.8.4]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/thulasi-ram/scarab-ci/compare/v0.8.0...v0.8.1
