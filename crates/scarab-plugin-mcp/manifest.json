@@ -1,0 +1,77 @@
+{
+  "plugin": "mcp",
+  "image": "ghcr.io/thulasi-ram/scarab-plugin-mcp",
+  "capabilities": [],
+  "extensions": [
+    {
+      "point": "endpoint",
+      "path": "mcp",
+      "operations": {
+        "initialize": {
+          "match": { "method": "POST", "json": { "/method": "initialize" } },
+          "may": []
+        },
+        "initialized": {
+          "match": { "method": "POST", "json": { "/method": "notifications/initialized" } },
+          "may": []
+        },
+        "ping": {
+          "match": { "method": "POST", "json": { "/method": "ping" } },
+          "may": []
+        },
+        "tools_list": {
+          "match": { "method": "POST", "json": { "/method": "tools/list" } },
+          "may": []
+        },
+        "list_repos": {
+          "match": { "method": "POST", "json": { "/method": "tools/call", "/params/name": "list_repos" } },
+          "may": ["repo.read"]
+        },
+        "describe_pipeline": {
+          "match": { "method": "POST", "json": { "/method": "tools/call", "/params/name": "describe_pipeline" } },
+          "may": ["repo.read"]
+        },
+        "list_runs": {
+          "match": { "method": "POST", "json": { "/method": "tools/call", "/params/name": "list_runs" } },
+          "may": ["run.read"]
+        },
+        "get_run": {
+          "match": { "method": "POST", "json": { "/method": "tools/call", "/params/name": "get_run" } },
+          "may": ["run.read"]
+        },
+        "get_step_logs": {
+          "match": { "method": "POST", "json": { "/method": "tools/call", "/params/name": "get_step_logs" } },
+          "may": ["run.read", "step.logs.read"]
+        },
+        "get_step_results": {
+          "match": { "method": "POST", "json": { "/method": "tools/call", "/params/name": "get_step_results" } },
+          "may": ["run.read"]
+        },
+        "list_artifacts": {
+          "match": { "method": "POST", "json": { "/method": "tools/call", "/params/name": "list_artifacts" } },
+          "may": ["run.artifacts.read"]
+        },
+        "trigger_run": {
+          "match": { "method": "POST", "json": { "/method": "tools/call", "/params/name": "trigger_run" } },
+          "may": ["repo.dispatch"],
+          "writes": 1
+        },
+        "rerun_step": {
+          "match": { "method": "POST", "json": { "/method": "tools/call", "/params/name": "rerun_step" } },
+          "may": ["step.rerun"],
+          "writes": 1
+        },
+        "retry_step": {
+          "match": { "method": "POST", "json": { "/method": "tools/call", "/params/name": "retry_step" } },
+          "may": ["step.retry"],
+          "writes": 1
+        },
+        "cancel_run": {
+          "match": { "method": "POST", "json": { "/method": "tools/call", "/params/name": "cancel_run" } },
+          "may": ["run.cancel"],
+          "writes": 1
+        }
+      }
+    }
+  ]
+}
