@@ -33,31 +33,26 @@ fn gate_id(ir: &PipelineIr) -> String {
 /// Add the Fork Run approval gate to `ir`, named in its `origin` by
 /// `setting` (the setting that applied): one `manual` gate with no `needs`,
 /// first in the Pipeline, that every root Step (a Step with no `needs`) now
-/// needs, so every Step of the Run is behind it. A root Step in `excluded`
-/// (a `when:` that is false, so it starts Skipped) is left alone. Run
+/// needs, so every Step of the Run is behind it. That includes a root whose
+/// `when:` is false: it starts Skipped, but a Step behind it must still have
+/// the gate upstream, or the scheduler would let a shared service it uses
+/// start before the release, and a Rerun of it could start it ungated.
+/// Whether the Run gets the gate is the setting's decision alone. Run
 /// creation calls it last, after the Environment's gate requirement, so an
 /// Environment approval gate the Environment added as a root is behind it
-/// too. Returns the gate's id; `None` when no root Step would start, which
-/// leaves `ir` unchanged.
+/// too. Returns the gate's id.
 ///
 /// The gate: `gate: manual`, `gate_expires_after` 72 hours,
 /// `environment_approval_gate: false`, and one `origin` link of kind
 /// `fork_run_approval_gate` with an empty `content_hash`. Every other field
 /// is at its default, as a gate written `{ id, gate: manual }` has it.
-pub fn add_fork_run_approval_gate(
-    ir: &mut PipelineIr,
-    setting: &str,
-    excluded: &[String],
-) -> Option<String> {
+pub fn add_fork_run_approval_gate(ir: &mut PipelineIr, setting: &str) -> String {
     let roots: Vec<String> = ir
         .steps
         .iter()
-        .filter(|s| s.needs.0.is_empty() && !excluded.contains(&s.id))
+        .filter(|s| s.needs.0.is_empty())
         .map(|s| s.id.clone())
         .collect();
-    if roots.is_empty() {
-        return None;
-    }
     let id = gate_id(ir);
     for s in ir.steps.iter_mut().filter(|s| roots.contains(&s.id)) {
         s.needs.0.push(id.clone());
@@ -74,7 +69,7 @@ pub fn add_fork_run_approval_gate(
     }];
     gate.environment_approval_gate = Some(false);
     ir.steps.insert(0, gate);
-    Some(id)
+    id
 }
 
 #[cfg(test)]
@@ -90,10 +85,10 @@ mod tests {
         ir.steps.iter().find(|s| s.id == id).expect(id)
     }
 
-    /// The gate comes first, has the documented shape, and every root that
-    /// will start needs it; a root excluded by its `when:` is left alone.
+    /// The gate comes first, has the documented shape, and every root needs
+    /// it, one its `when:` excludes included.
     #[test]
-    fn the_gate_fronts_every_root_that_starts() {
+    fn the_gate_fronts_every_root() {
         let mut ir = ir(r#"
 steps:
   - { id: build, image: busybox }
@@ -101,8 +96,8 @@ steps:
   - { id: docs, image: busybox }
   - { id: test, image: busybox, needs: [build] }
 "#);
-        let id = add_fork_run_approval_gate(&mut ir, "fork_run_approval", &["docs".into()]);
-        assert_eq!(id.as_deref(), Some(FORK_RUN_APPROVAL_GATE_ID));
+        let id = add_fork_run_approval_gate(&mut ir, "fork_run_approval");
+        assert_eq!(id, FORK_RUN_APPROVAL_GATE_ID);
         assert_eq!(ir.steps[0].id, FORK_RUN_APPROVAL_GATE_ID);
         let gate = step(&ir, FORK_RUN_APPROVAL_GATE_ID);
         assert_eq!(gate.gate.as_deref(), Some("manual"));
@@ -118,24 +113,18 @@ steps:
         assert!(!gate.counts_as_environment_approval_gate());
         assert_eq!(step(&ir, "build").needs.0, vec![FORK_RUN_APPROVAL_GATE_ID]);
         assert_eq!(step(&ir, "lint").needs.0, vec![FORK_RUN_APPROVAL_GATE_ID]);
-        assert!(step(&ir, "docs").needs.0.is_empty(), "excluded");
+        assert_eq!(step(&ir, "docs").needs.0, vec![FORK_RUN_APPROVAL_GATE_ID]);
         assert_eq!(step(&ir, "test").needs.0, vec!["build"]);
         assert!(scarab_pipeline::validate(&ir).is_ok(), "a valid DAG");
     }
 
-    /// No root starts: no gate. A taken id gets a suffix.
+    /// A taken id gets a suffix.
     #[test]
-    fn no_gate_without_a_root_and_the_id_never_collides() {
-        let mut none = ir("steps:\n  - { id: build, image: busybox }\n");
-        assert_eq!(
-            add_fork_run_approval_gate(&mut none, "fork_run_approval", &["build".into()]),
-            None
-        );
-        assert_eq!(none.steps.len(), 1);
+    fn the_id_never_collides() {
         let mut taken = ir("steps:\n  - { id: fork-run-approval, image: busybox }\n");
         assert_eq!(
-            add_fork_run_approval_gate(&mut taken, "fork_run_approval", &[]).as_deref(),
-            Some("fork-run-approval-2")
+            add_fork_run_approval_gate(&mut taken, "fork_run_approval"),
+            "fork-run-approval-2"
         );
     }
 
@@ -157,7 +146,7 @@ steps:
         let mut ir = ir(yaml);
         let env = ag::add_environment_approval_gate(&mut ir, "prod", None, &[]).unwrap();
         ag::mark_environment_approval_gates(&mut ir);
-        let fork = add_fork_run_approval_gate(&mut ir, "fork_run_approval", &[]).unwrap();
+        let fork = add_fork_run_approval_gate(&mut ir, "fork_run_approval");
         assert_eq!(step(&ir, &env.id).needs.0, vec![fork.clone()]);
         assert_eq!(step(&ir, &env.id).environment_approval_gate, Some(true));
         assert_eq!(step(&ir, &fork).environment_approval_gate, Some(false));
@@ -171,7 +160,7 @@ steps:
         // The other order: the fork gate alone in front of an authority Step
         // leaves it missing its Environment gate.
         let mut ir = self::ir(yaml);
-        add_fork_run_approval_gate(&mut ir, "fork_run_approval", &[]).unwrap();
+        add_fork_run_approval_gate(&mut ir, "fork_run_approval");
         assert_eq!(
             ag::steps_missing_approval_gate(&ir, &[]),
             vec!["build".to_string(), "ship".to_string()]

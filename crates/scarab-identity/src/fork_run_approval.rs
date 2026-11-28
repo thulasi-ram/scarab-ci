@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{IdentityError, PrincipalTokenKind};
+use crate::IdentityError;
 
 /// The `name` of the `origin` link of the gate the setting adds to a Run
 /// (`kind: fork_run_approval_gate`).
@@ -63,17 +63,14 @@ impl ForkRunApproval {
         next.rank() < self.rank()
     }
 
-    /// Does a Run of fork code get the gate? `started_by_token_kind` is the
-    /// kind of the PrincipalToken that started the Run, as its
-    /// DelegationTrail records it; `None` when no token started it (a
-    /// session, a forge event). A kind this binary does not know counts as
-    /// an app's: the gate is never skipped by default.
-    pub fn gates(self, started_by_token_kind: Option<&str>) -> bool {
+    /// Does a Run of fork code get the gate? `agent_started`: an app acting
+    /// for someone, such as an agent, started the Run, as the server decides
+    /// from the DelegationTrail it records as the Run's origin.
+    pub fn gates(self, agent_started: bool) -> bool {
         match self {
             Self::Off => false,
+            Self::AgentStarted => agent_started,
             Self::All => true,
-            Self::AgentStarted => started_by_token_kind
-                .is_some_and(|k| PrincipalTokenKind::parse(k) != Some(PrincipalTokenKind::Issued)),
         }
     }
 }
@@ -130,12 +127,9 @@ mod tests {
 
     #[test]
     fn which_fork_runs_get_the_gate() {
-        assert!(!Off.gates(Some("oauth")));
-        assert!(All.gates(None));
-        assert!(All.gates(Some("issued")));
-        assert!(AgentStarted.gates(Some("oauth")));
-        assert!(AgentStarted.gates(Some("a-kind-from-a-later-release")));
-        assert!(!AgentStarted.gates(Some("issued")));
-        assert!(!AgentStarted.gates(None));
+        assert!(!Off.gates(true));
+        assert!(All.gates(false));
+        assert!(AgentStarted.gates(true));
+        assert!(!AgentStarted.gates(false));
     }
 }

@@ -3793,9 +3793,11 @@ fn rerun_outcome<T>(res: Result<T, RerunError>) -> Result<T, ApiError> {
             Err(ApiError::Conflict(e.to_string()))
         }
         Err(e @ RerunError::NotFailed { .. }) => Err(ApiError::Conflict(e.to_string())),
-        Err(e @ (RerunError::CreationUnfinished | RerunError::Replaced(_))) => {
-            Err(ApiError::Conflict(e.to_string()))
-        }
+        Err(
+            e @ (RerunError::CreationUnfinished
+            | RerunError::Replaced(_)
+            | RerunError::WhenExcluded(_)),
+        ) => Err(ApiError::Conflict(e.to_string())),
         // Gate-approval-only variants (never produced by rerun/retry); mapped to
         // 409 for exhaustiveness.
         Err(
@@ -7698,8 +7700,7 @@ async fn admit_unrecorded(
     // ADR-0086 §9: then the Fork Run approval gate, in front of every root
     // Step, so it is in front of a gate the Environment added as a root too.
     // The Policies and the stored Run see it.
-    let ir =
-        fork_run_approval_ir(ports.fork_run_approval, event, &repo.owner, ir, excluded).await?;
+    let ir = fork_run_approval_ir(db, ports.fork_run_approval, event, &repo.owner, ir).await?;
     let ir = &ir;
 
     // The library and credential PolicyInvariants, before any Policy is
@@ -7938,15 +7939,36 @@ fn environment_approval_ir(
     }
 }
 
+/// Was the Run `trail` describes started by an app acting for someone, such
+/// as an agent (ADR-0086 §9, Fork Run approval's `agent_started`)? `trail`
+/// is the DelegationTrail Run creation records as the Run's origin
+/// (`runs.origin_via`); `None` when no PrincipalToken started the Run (a
+/// session, a forge event).
+///
+/// Requirement for delegated callers: a Run an agent starts through a
+/// Plugin's delegated call (a DelegatedCallerHandle, PluginApi) must count
+/// here. Its trail names the Plugin installation; once `DelegationTrail`
+/// carries that field (`plugin_installation`, on the PluginApi branch), add
+/// `|| t.plugin_installation.is_some()` to the check below.
+///
+/// Fails closed: an `oauth` token counts, and so does a token kind this
+/// binary does not know. Only an `issued` token does not.
+fn started_by_an_agent(trail: Option<&scarab_forge::DelegationTrail>) -> bool {
+    trail.is_some_and(|t| {
+        scarab_identity::PrincipalTokenKind::parse(&t.token_kind)
+            != Some(scarab_identity::PrincipalTokenKind::Issued)
+    })
+}
+
 /// `ir` with the Fork Run approval gate (ADR-0086 §9) when `event` builds
-/// fork code and `org`'s setting gates it: `all` gates every Run of fork
-/// code, `agent_started` (the default, for an org with no stored setting)
-/// one started through an `oauth` PrincipalToken, as the dispatch's
-/// DelegationTrail on `event` records it, and `off` none. Nothing mints an
-/// `oauth` token yet, so until one can, `agent_started` gates no Run. The
-/// gate is one `manual` gate in front of every root Step, so nothing in the
-/// Run starts, its shared services included, until someone with write on
-/// the repository releases it
+/// fork code ([`trigger_is_fork_code`] on the trigger the Run records, the
+/// check follow-ups and launches use) and `org`'s setting gates it: `all`
+/// gates every Run of fork code, `agent_started` (the default, for an org
+/// with no stored setting) one an app started ([`started_by_an_agent`]),
+/// and `off` none. Nothing mints an `oauth` token yet, so until one can,
+/// `agent_started` gates no Run. The gate is one `manual` gate in front of
+/// every root Step, so nothing in the Run starts, its shared services
+/// included, until someone with write on the repository releases it
 /// ([`add_fork_run_approval_gate`](scarab_policy::fork_run_approval_gate::add_fork_run_approval_gate)).
 /// It is a setting, not a Policy: no Policy adds a gate (ADR-0075). The gate
 /// unlocks nothing: a released Run is still fork code, so Environment
@@ -7954,13 +7976,13 @@ fn environment_approval_ir(
 /// store that cannot answer refuses the Run: the gate is never skipped by
 /// default. `store` `None` (a hand-built state): the default applies.
 async fn fork_run_approval_ir(
+    db: &dyn Db,
     store: Option<&dyn scarab_identity::ForkRunApprovalStore>,
     event: &scarab_forge::Event,
     org: &str,
     mut ir: scarab_pipeline::PipelineIr,
-    excluded: &[String],
 ) -> Result<scarab_pipeline::PipelineIr, TriggerError> {
-    if !event.is_fork_code() {
+    if !trigger_is_fork_code(db, &event.context()["event"]).await? {
         return Ok(ir);
     }
     let setting = match store {
@@ -7976,20 +7998,17 @@ async fn fork_run_approval_ir(
             .unwrap_or_default(),
         None => scarab_identity::ForkRunApproval::default(),
     };
-    let started_by = event.delegation_trail().map(|t| t.token_kind.as_str());
-    if setting.gates(started_by) {
-        if let Some(gate) = scarab_policy::fork_run_approval_gate::add_fork_run_approval_gate(
+    if setting.gates(started_by_an_agent(event.delegation_trail())) {
+        let gate = scarab_policy::fork_run_approval_gate::add_fork_run_approval_gate(
             &mut ir,
             scarab_identity::FORK_RUN_APPROVAL_SETTING_NAME,
-            excluded,
-        ) {
-            tracing::info!(
-                org,
-                gate = %gate,
-                setting = setting.as_str(),
-                "Fork Run approval added its gate to a Run of fork code"
-            );
-        }
+        );
+        tracing::info!(
+            org,
+            gate = %gate,
+            setting = setting.as_str(),
+            "Fork Run approval added its gate to a Run of fork code"
+        );
     }
     Ok(ir)
 }
@@ -13974,7 +13993,8 @@ async fn approve_gate(
             | RerunError::GateNotReached { .. }
             | RerunError::NotARejectableGate(_)
             | RerunError::CreationUnfinished
-            | RerunError::Replaced(_)),
+            | RerunError::Replaced(_)
+            | RerunError::WhenExcluded(_)),
         ) => return Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
@@ -14106,7 +14126,8 @@ async fn approve_gate(
             | RerunError::GateNotReached { .. }
             | RerunError::NotARejectableGate(_)
             | RerunError::CreationUnfinished
-            | RerunError::Replaced(_)),
+            | RerunError::Replaced(_)
+            | RerunError::WhenExcluded(_)),
         ) => return Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
@@ -14407,7 +14428,8 @@ async fn release_gate_external(
             | RerunError::GateNotReached { .. }
             | RerunError::NotARejectableGate(_)
             | RerunError::CreationUnfinished
-            | RerunError::Replaced(_)),
+            | RerunError::Replaced(_)
+            | RerunError::WhenExcluded(_)),
         ) => Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => Err(ApiError::Db(e)),
     }
