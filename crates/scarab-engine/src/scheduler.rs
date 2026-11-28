@@ -258,6 +258,15 @@ pub enum RerunError {
     /// its creation never finished (ADR-0083 §4). Mapped to 409.
     #[error("this Run's creation did not finish and Run {} replaced it", .0 .0)]
     Replaced(RunId),
+    /// Rerun refused in a Run with a Fork Run approval gate (ADR-0086 §9):
+    /// the Step was skipped by its `when:` at creation, and a Rerun does not
+    /// evaluate `when:` again, so it would run a Step the Run never meant
+    /// to. Mapped to 409. A Run without such a gate reruns it, as before.
+    #[error(
+        "step {0:?} was skipped by its `when:`, and a rerun does not evaluate `when:` again; \
+         start a new Run"
+    )]
+    WhenExcluded(StepId),
 }
 
 /// Refuse to act on `run` while its creation is unfinished
@@ -308,8 +317,8 @@ pub enum PlanReason {
     /// A descendant of a [`Regenerate`](PlanReason::Regenerate) root that the
     /// target's own cascade did not already contain.
     RegenerateCascade,
-    /// A Rerun in a Run of fork code (ADR-0086 §9): the released Fork Run
-    /// approval gate, which waits for a release again, or a Step between it
+    /// A Rerun in a Run of fork code (ADR-0086 §9): the Fork Run approval
+    /// gate, which waits for a release again, or a Step between it
     /// and the target's cascade, which re-arms so the cascade waits behind the
     /// gate through its `needs`. Such a Step skips when its inputs are
     /// unchanged. A Retry re-arms none of these.
@@ -399,8 +408,7 @@ impl RerunPlan {
 /// because a preview of a blocked rerun is still a useful thing to render (the
 /// UI already knows the prerequisite rule and the POST still enforces it).
 ///
-/// It plans a Rerun: in a Run with a released Fork Run approval gate the
-/// plan holds the [`PlanReason::ForkRunApproval`] members, which a Retry
+/// It plans a Rerun: in a Run with a Fork Run approval gate the plan holds the [`PlanReason::ForkRunApproval`] members, which a Retry
 /// leaves out, so a client previewing a Retry drops them.
 pub async fn plan_rerun(
     db: &dyn Db,
@@ -428,9 +436,10 @@ fn fork_run_approval_gate_ids(ir: &serde_json::Value) -> Vec<StepId> {
         .collect()
 }
 
-/// What a Rerun re-arms besides `base` (the target's cascade) in a Run of
-/// fork code (ADR-0086 §9): each of `gates` (the Run's released Fork Run
-/// approval gates) that is upstream of a member of `base`, and every Step
+/// What a Rerun re-arms besides `base` (the target's cascade, widened for
+/// expired snapshots) in a Run of fork code (ADR-0086 §9): each of `gates`
+/// (the Run's Fork Run approval gates) that is upstream of a member of
+/// `base`, and every Step
 /// that is both downstream of such a gate and upstream of a member of
 /// `base`. Re-armed with the cascade, those Steps put the gate back in front
 /// of it through `needs`, so nothing of the cascade starts, and the scheduler
@@ -483,29 +492,6 @@ async fn plan_rerun_over(
     let base = crate::invalidation_set(target, steps);
     let mut invalid = base.clone();
     let mut expired: Vec<ExpiredInput> = Vec::new();
-
-    // ADR-0086 §9: only a gate that has released is re-armed. One still
-    // waiting already holds the cascade; one that failed failed the Run.
-    let ir = if rearm_fork_gates {
-        db.run_ir(run).await?
-    } else {
-        None
-    };
-    let fork_rearm = match ir {
-        Some(ir) => {
-            let released: Vec<StepId> = fork_run_approval_gate_ids(&ir)
-                .into_iter()
-                .filter(|g| {
-                    steps
-                        .iter()
-                        .any(|s| &s.step == g && s.status == StepStatus::Succeeded)
-                })
-                .collect();
-            fork_run_approval_rearm(&released, &base, steps)
-        }
-        None => std::collections::HashSet::new(),
-    };
-    invalid.extend(fork_rearm.iter().cloned());
 
     if let Some(oracle) = snapshots {
         // The consumption sets and recorded output snapshots, read once. Both are
@@ -580,16 +566,29 @@ async fn plan_rerun_over(
         }
     }
 
+    // The widened set: the cascade, plus what expired snapshots dragged in.
+    let mut widened: Vec<StepId> = invalid.difference(&base).cloned().collect();
+    widened.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // ADR-0086 §9: then the Fork Run approval gates, against the widened set,
+    // so a producer whose snapshot expired is a Regenerate root (it re-runs,
+    // its signature cleared) and never a Step that skips and carries the dead
+    // snapshot forward. Every Fork Run approval gate re-arms, whatever its
+    // status: one left `Pending` by a Rerun that failed partway still puts the
+    // path back in front of the cascade, so the target never runs while the
+    // gate waits.
+    let fork_rearm = if rearm_fork_gates {
+        match db.run_ir(run).await? {
+            Some(ir) => fork_run_approval_rearm(&fork_run_approval_gate_ids(&ir), &invalid, steps),
+            None => std::collections::HashSet::new(),
+        }
+    } else {
+        std::collections::HashSet::new()
+    };
+    invalid.extend(fork_rearm.iter().cloned());
+
     let mut invalidated: Vec<StepId> = invalid.iter().cloned().collect();
     invalidated.sort_by(|a, b| a.0.cmp(&b.0));
-    // A Step re-armed for the Fork Run approval gate is not widened: its
-    // input signature is kept, so it skips when its inputs are unchanged.
-    let mut widened: Vec<StepId> = invalid
-        .difference(&base)
-        .filter(|s| !fork_rearm.contains(*s))
-        .cloned()
-        .collect();
-    widened.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Where the run effectively restarts: the members with no dependency inside
     // the set. `needs` (not the consumption subset) is the right edge here — a
@@ -855,6 +854,15 @@ pub async fn rerun_step_widened(
             blocker,
         });
     }
+    // ADR-0086 §9: the Run's Fork Run approval gates; empty for a Run
+    // without one, which reruns exactly as before.
+    let fork_gates: Vec<StepId> = match db.run_ir(run).await? {
+        Some(ir) => fork_run_approval_gate_ids(&ir),
+        None => Vec::new(),
+    };
+    if !fork_gates.is_empty() && when_excluded(target_step, &steps) {
+        return Err(RerunError::WhenExcluded(target.clone()));
+    }
     let plan = plan_rerun_over(db, snapshots, run, target, &steps, true).await?;
 
     // The Take boundary (ADR-0056): record the human intervention FIRST, so a
@@ -877,15 +885,19 @@ pub async fn rerun_step_widened(
     })
     .await?;
 
-    // Each resolved gate the Rerun re-arms goes back to `Pending` before the
-    // new Take's shared services are born, so a gate that holds them (a Fork
-    // Run approval gate, ADR-0086 §9, holds every service of a Run of fork
-    // code until it is released) holds them from their birth: no service of
-    // the new Take launches on the old Take's release. The rest of the set is
-    // re-armed below, from a fresh read of the Steps.
+    // Each resolved Fork Run approval gate (ADR-0086 §9) the Rerun re-arms
+    // goes back to `Pending` before the new Take's shared services are born,
+    // so it holds them from their birth: no service of the new Take launches
+    // on the old Take's release. The rest of the set is re-armed below, from
+    // a fresh read of the Steps. Only those gates: a Run without one writes
+    // exactly the events it did before.
     let resolved_gates: Vec<&StepRun> = steps
         .iter()
-        .filter(|s| s.is_gate() && s.status.is_terminal() && plan.invalidated.contains(&s.step))
+        .filter(|s| {
+            fork_gates.contains(&s.step)
+                && s.status.is_terminal()
+                && plan.invalidated.contains(&s.step)
+        })
         .collect();
     for s in &resolved_gates {
         match commit_rearm(db, clock, run, target, s, by.as_deref(), via.as_ref()).await {
@@ -1000,6 +1012,20 @@ pub async fn retry_step_widened(
 
     rearm_invalidation_set(db, clock, run, target, &plan, &steps, by, via).await?;
     Ok(plan)
+}
+
+/// Was `step` skipped by its `when:` at Run creation? A Step that is not a
+/// gate, `Skipped`, with every need `Succeeded` (or none): the scheduler
+/// skips a Step only for a need that did not succeed, so nothing else skips
+/// such a Step. A `when:`-excluded Step that also has a skipped need reads
+/// as skipped by that need, which a rerun skips again.
+fn when_excluded(step: &StepRun, steps: &[StepRun]) -> bool {
+    let succeeded = |id: &StepId| {
+        steps
+            .iter()
+            .any(|s| &s.step == id && s.status == StepStatus::Succeeded)
+    };
+    !step.is_gate() && step.status == StepStatus::Skipped && step.needs.iter().all(succeeded)
 }
 
 /// The first `need` of `step` that is **not** in a non-failing terminal state
