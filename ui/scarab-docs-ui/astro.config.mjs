@@ -122,6 +122,7 @@ export default defineConfig({
             { label: 'Environments', slug: 'usage/environments' },
             { label: 'Policies', slug: 'usage/policies' },
             { label: 'Deploying with Argo CD', slug: 'usage/deploying-with-argo-cd' },
+            { label: 'Using Scarab from Claude', slug: 'usage/mcp-plugin' },
             { label: 'Pushing to Amazon ECR', slug: 'usage/pushing-to-ecr' },
             { label: 'Environment Variables', slug: 'usage/environment-variables' },
           ],

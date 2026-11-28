@@ -71,6 +71,14 @@ release.yml uses that version's section as the GitHub Release text. See
 
 ### Features
 
+- **The MCP plugin.** `scarab-plugin-mcp` is an MCP server that runs as a plugin behind a plugin
+  endpoint, so claude.ai can read your repositories, Runs, Step logs, results and artifact names,
+  start a pipeline, rerun or retry a Step, or cancel a Run as you, within the operations you tick.
+  It has no approve tool and no tool for secrets, settings or Policies, and it returns text from
+  logs and results inside a block marked as untrusted. The image is published as
+  `ghcr.io/thulasi-ram/scarab-plugin-mcp`. See
+  [Using Scarab from Claude](/scarab-ci/usage/mcp-plugin/).
+
 - **Connected apps.** An app such as claude.ai can act for you at one plugin endpoint with an OAuth
   token you approve with your passkey; you list and disconnect your apps under Account settings.
   Off by default (`oauthServer.enabled`). See

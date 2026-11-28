@@ -1,0 +1,112 @@
+---
+title: Using Scarab from Claude (MCP)
+description: Install the MCP plugin, connect claude.ai to it, and let Claude read your Runs and logs, start a pipeline, rerun or retry a Step, or cancel a Run as you.
+---
+
+The MCP plugin is an [MCP](https://modelcontextprotocol.io) server that runs as a Scarab plugin.
+An app that speaks MCP, such as claude.ai, connects to it as a
+[connected app](/scarab-ci/usage/connected-apps/): you approve the connection with your passkey,
+and every tool call acts as you, within what you ticked. The plugin never sees your token. It has
+no standing of its own: it installs and runs like any other plugin that registers an endpoint.
+
+## What Claude can do
+
+| Tool | What it does | Operation it needs |
+|---|---|---|
+| `list_repos` | the repositories you can see | `repo.read` |
+| `describe_pipeline` | a repository's pipelines at a ref, or one pipeline's launch parameters | `repo.read` |
+| `list_runs` | a repository's recent Runs, filtered by branch, status or pull request; 20 by default, 100 at most | `run.read` |
+| `get_run` | a Run's status, its Steps and each Step's tries and failure | `run.read` |
+| `get_step_logs` | the end of a Step's log: the last 32 KiB by default, 256 KiB at most, optionally one try and only lines containing a pattern | `run.read`, `step.logs.read` |
+| `get_step_results` | the named results a Step published | `run.read` |
+| `list_artifacts` | a Run's artifacts by name, size and Step | `run.artifacts.read` |
+| `trigger_run` | start a pipeline on a ref, as a manual dispatch by you | `repo.dispatch` |
+| `rerun_step` | rerun a Step and the Steps that depend on it | `step.rerun` |
+| `retry_step` | try a failed Step again | `step.retry` |
+| `cancel_run` | cancel a Run that has not finished | `run.cancel` |
+
+The consent page ticks the reads and leaves the four writes unticked. Tick a write only if you
+want Claude to be able to do it. Each write tool makes one write per call, and the Run's events
+record that it came through this app, beside your name.
+
+## What Claude cannot do
+
+- Approve a gate. No tool does, and no plugin can be granted `gate.approve`.
+- Read or change secrets, settings, Policies, Environments, tokens, plugins or libraries.
+- Read artifact contents or a Step's workspace files.
+- Do more than you can. Every call is checked against your role in the org at the time of the
+  call, and against the operations you ticked.
+
+## Text from your Runs is marked as untrusted
+
+Logs, results and commit titles can contain text written by anyone who can push to the
+repository or print in a Step, including text written to steer an agent. The plugin returns that
+text inside a block marked `<untrusted-data>` with a line telling the agent to treat it as data,
+and it never puts fetched text into a tool's description. This lowers the risk; it does not
+remove it, because the agent decides what to do with what it reads. What it can do is bounded by
+the operations you ticked, so leave the writes unticked unless you need them.
+
+## Install the plugin (operator and org admin)
+
+1. **Operator:** turn on the OAuth server and trust the plugin's image repository, as
+   [Connected apps](/scarab-ci/usage/connected-apps/#turning-it-on) describes. In the chart:
+
+   ```yaml
+   oauthServer:
+     enabled: true
+   scarab:
+     publicUrl: https://scarab.example.com
+   plugins:
+     enabled: true
+     trustedPublishers:
+       - ghcr.io/thulasi-ram/scarab-plugin-mcp
+   ```
+
+   with `secrets.oauthRefreshKey` set. The list is empty by default: no endpoint plugin runs
+   until an operator names its repository, Scarab's own included.
+2. **Org admin:** install it like any other plugin
+   ([Install a plugin](/scarab-ci/get-started/deploy-helm/#install-a-plugin)). Its manifest is
+   `github.com/thulasi-ram/scarab-ci//crates/scarab-plugin-mcp/manifest.json@<commit>` at the
+   full commit of a release tag. It asks for no capability and registers one endpoint, `mcp`,
+   with one operation per MCP message and per tool, each naming the operations in the table
+   above. Scarab publishes the image as `ghcr.io/thulasi-ram/scarab-plugin-mcp` for linux/amd64
+   and linux/arm64, with the same tags as the Argo CD plugin. Install the build from the
+   manifest's commit, pinned by digest:
+
+   ```sh
+   docker buildx imagetools inspect ghcr.io/thulasi-ram/scarab-plugin-mcp:<version>
+   ```
+
+   Installing asks for your passkey, and so does each new digest. The install answer carries the
+   installation's `id`.
+3. **Org admin:** list the host claude.ai publishes its app description on, `claude.ai`
+   (`PUT /v1/orgs/{org}/oauth/client-metadata-hosts/claude.ai`; it asks for your passkey).
+
+The endpoint's URL is:
+
+```
+https://scarab.example.com/v1/orgs/<org>/plugin-installations/<id>/endpoints/mcp
+```
+
+Give it to the people who will connect.
+
+## Connect from claude.ai
+
+1. In claude.ai, add a custom connector and give it the endpoint URL above.
+2. claude.ai sends you to Scarab's consent page. Check the plugin and endpoint it names, tick the
+   operations you want Claude to have, and confirm with your passkey.
+3. Ask Claude about your Runs: "why did the last Run on main fail?" calls `list_runs`, `get_run`
+   and `get_step_logs`.
+
+To disconnect, use **Account settings › Connected apps**. Uninstalling the plugin disconnects
+everyone.
+
+## Limits
+
+- `get_step_logs` returns at most the last 256 KiB of a log, and `pattern` filters only within
+  that window. `list_runs` applies its filters to the 200 most recent Runs.
+- Answers other than logs are cut at 128 KiB.
+- The endpoint's request limits apply: 60 requests a minute and 4 at once per person, per
+  plugin. See [Connected apps](/scarab-ci/usage/connected-apps/#limits).
+- The plugin keeps no session. A restart or an upgrade of its Pod drops nothing, and the next
+  tool call goes to the new Pod.
