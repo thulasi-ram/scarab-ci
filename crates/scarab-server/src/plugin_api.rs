@@ -283,24 +283,23 @@ fn random_secret() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// Is `audience` the URL of one of `installation`'s endpoints: a URL whose
-/// path ends `/v1/orgs/{org}/plugin-installations/{id}/endpoints/<path>` for
-/// a path the installation registers, with no query or fragment? A prefix
-/// before it is allowed, for a Scarab served under a path.
-fn audience_names_an_endpoint_of(audience: &str, installation: &PluginInstallation) -> bool {
-    let Ok(url) = reqwest::Url::parse(audience) else {
-        return false;
-    };
-    if url.query().is_some() || url.fragment().is_some() {
-        return false;
-    }
-    let path = url.path();
+/// Is `audience` the URL of one of `installation`'s endpoints: byte for
+/// byte the canonical URL under this server's public URL, so a token minted
+/// for another host, a prefixed path, or a URL with a query names nothing.
+fn audience_names_an_endpoint_of(
+    audience: &str,
+    public_url: &str,
+    installation: &PluginInstallation,
+) -> bool {
     installation.manifest.extensions.iter().any(|r| {
         r.point == scarab_plugin::PluginExtensionPoint::Endpoint
-            && path.ends_with(&format!(
-                "/v1/orgs/{}/plugin-installations/{}/endpoints/{}",
-                installation.org, installation.id, r.path
-            ))
+            && audience
+                == crate::plugin_endpoint::canonical_endpoint_url(
+                    public_url,
+                    &installation.org,
+                    &installation.id,
+                    &r.path,
+                )
     })
 }
 
@@ -394,7 +393,7 @@ pub(crate) async fn authenticate_delegated_call(
         || !token
             .audience
             .as_deref()
-            .is_some_and(|a| audience_names_an_endpoint_of(a, &installation))
+            .is_some_and(|a| audience_names_an_endpoint_of(a, &st.public_url, &installation))
     {
         return unauthorized("the handle's token was not granted for this installation's endpoint");
     }

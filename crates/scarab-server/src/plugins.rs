@@ -1520,7 +1520,7 @@ pub(crate) async fn enable_plugin(
 }
 
 /// Delete every DelegatedCallerHandle of installation `id` (ADR-0086 §11):
-/// it was killed, uninstalled, or upgraded to a new digest. Best-effort:
+/// it was killed, uninstalled, or upgraded. Best-effort:
 /// PluginApi refuses a killed or uninstalled installation's calls anyway,
 /// and a handle lives at most ten minutes.
 async fn delete_delegated_caller_handles(st: &AppState, id: &str, why: &str) {
@@ -1799,10 +1799,10 @@ pub(crate) async fn upgrade_plugin(
     for credential_ref in &upgraded.connection_credential_refs {
         delete_connection_credential(&st, credential_ref).await;
     }
-    // A new digest is new code: the handles the old code held go.
-    if body.image != current.image {
-        delete_delegated_caller_handles(&st, &current.id, "upgraded to a new digest").await;
-    }
+    // Every upgrade ends the handles the old approval held: a new digest
+    // is new code, and a new manifest can drop or narrow the operations a
+    // handle was minted for.
+    delete_delegated_caller_handles(&st, &current.id, "upgraded").await;
     tracing::warn!(
         org,
         installation = name,

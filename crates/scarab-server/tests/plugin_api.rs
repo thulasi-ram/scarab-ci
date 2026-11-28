@@ -158,6 +158,8 @@ fn state(
         .with_delegated_calls(pg.clone())
         .with_forge(Arc::new(FakeForge::new()))
         .with_library_fetcher(fetcher.clone())
+        // The host every `oauth` token's audience below names.
+        .with_public_url("https://scarab.example")
 }
 
 struct World {
@@ -839,9 +841,9 @@ async fn a_refusal_after_the_handle_is_proven_is_journaled_and_spends_nothing_it
 }
 
 /// ADR-0086 §8, §11: open handles end when the installation is killed (and
-/// stay ended after it is enabled again), upgraded to a new digest, or
-/// uninstalled; an upgrade that takes an operation out of `may` refuses it
-/// on a handle already open; delisting the publisher refuses every call and
+/// stay ended after it is enabled again), upgraded (on any digest), or
+/// uninstalled; after an upgrade that takes an operation out of `may` a new
+/// handle cannot use it; delisting the publisher refuses every call and
 /// every mint at once. The mint also refuses a killed installation, an
 /// endpoint operation the manifest does not declare, and another org's
 /// token.
@@ -902,11 +904,17 @@ async fn kill_upgrade_uninstall_and_delisting_end_open_handles() {
     );
 
     // An upgrade on the same digest that takes `run.cancel` out of `may`:
-    // a handle that holds it may no longer use it; reads go on.
+    // every upgrade ends the open handles, and one minted after it may no
+    // longer cancel; reads go on.
     let mcp = w.installation("mcp").await;
     let (handle, _) = mint(&w, &mcp, &token, &["mcp/read_run", "mcp/cancel_run"]).await;
     w.fetcher.serve(&source('2'), &endpoint_manifest(&[]));
     upgrade(&w, '2', &image('a')).await;
+    assert_eq!(open_handles(&w.tdb.pool, &mcp.id).await, 0);
+    let (status, body) = call(&w, "POST", &format!("/v1/runs/{}/cancel", run.0), &handle).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "after an upgrade: {body}");
+    let narrowed = w.installation("mcp").await;
+    let (handle, _) = mint(&w, &narrowed, &token, &["mcp/read_run", "mcp/cancel_run"]).await;
     let (status, body) = call(&w, "POST", &format!("/v1/runs/{}/cancel", run.0), &handle).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "narrowed: {body}");
     assert!(cancel_requests(&w.pg, &run).await.is_empty());
