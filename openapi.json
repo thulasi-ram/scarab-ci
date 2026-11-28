@@ -28,6 +28,71 @@
         "security": []
       }
     },
+    "/.well-known/oauth-authorization-server": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "OAuth authorization server metadata for plugin endpoints",
+        "operationId": "authorization_server_metadata",
+        "responses": {
+          "200": {
+            "description": "the metadata (RFC 8414)"
+          },
+          "404": {
+            "description": "the OAuth authorization server is off"
+          }
+        },
+        "security": []
+      }
+    },
+    "/.well-known/oauth-protected-resource/v1/orgs/{org}/plugin-installations/{id}/endpoints/{endpoint_path}": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "OAuth protected resource metadata of a plugin endpoint",
+        "operationId": "protected_resource_metadata",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the installation's id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpoint_path",
+            "in": "path",
+            "description": "a path the installation registers",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the metadata (RFC 9728)"
+          },
+          "404": {
+            "description": "no such endpoint, or the OAuth authorization server is off"
+          }
+        },
+        "security": []
+      }
+    },
     "/.well-known/openid-configuration": {
       "get": {
         "tags": [
@@ -89,6 +154,30 @@
         "responses": {
           "200": {
             "description": "Prometheus text exposition"
+          }
+        },
+        "security": []
+      }
+    },
+    "/oauth/token": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "OAuth token endpoint for plugin endpoints",
+        "operationId": "token",
+        "responses": {
+          "200": {
+            "description": "an access token, its lifetime and the next refresh secret"
+          },
+          "400": {
+            "description": "an OAuth error (RFC 6749 §5.2)"
+          },
+          "404": {
+            "description": "the OAuth authorization server is off"
+          },
+          "503": {
+            "description": "`temporarily_unavailable`: the plugin endpoint is not running, or the store could not be read; the grant stays"
           }
         },
         "security": []
@@ -951,6 +1040,70 @@
         ]
       }
     },
+    "/v1/me/connected-apps": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Your connected apps (OAuth grants)",
+        "operationId": "list_connected_apps",
+        "responses": {
+          "200": {
+            "description": "your connected apps, newest first"
+          },
+          "401": {
+            "description": "not signed in"
+          },
+          "404": {
+            "description": "the OAuth authorization server is off"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/connected-apps/{id}": {
+      "delete": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Disconnect one of your connected apps",
+        "operationId": "revoke_connected_app",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the connected app's id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "disconnected"
+          },
+          "404": {
+            "description": "no such connected app of yours, already disconnected, or the OAuth authorization server is off"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/me/identities/link": {
       "post": {
         "tags": [
@@ -1647,6 +1800,84 @@
           },
           "404": {
             "description": "no such live token of yours"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/oauth/authorization-requests": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Check an OAuth authorization request and describe it for consent",
+        "operationId": "describe_authorization_request",
+        "responses": {
+          "200": {
+            "description": "what the consent page shows"
+          },
+          "400": {
+            "description": "a request that is not one this server takes"
+          },
+          "403": {
+            "description": "not a person in a browser, or a client host the org does not allow"
+          },
+          "404": {
+            "description": "no role in the org, no such endpoint, or the OAuth authorization server is off"
+          },
+          "503": {
+            "description": "the plugin installation is killed, held or its publisher delisted"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/oauth/consent": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Consent to an OAuth authorization request (passkey every time)",
+        "operationId": "consent",
+        "responses": {
+          "200": {
+            "description": "where to send the browser: the client's redirect URI with the code"
+          },
+          "400": {
+            "description": "an operation the request does not offer, or a request this server does not take"
+          },
+          "403": {
+            "description": "not a person in a browser, or no confirmation — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no role in the org, no such endpoint, or the OAuth authorization server is off"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting"
+          },
+          "503": {
+            "description": "the plugin installation is killed, held or its publisher delisted"
           }
         },
         "security": [
@@ -3680,6 +3911,152 @@
         ]
       }
     },
+    "/v1/orgs/{org}/oauth/client-metadata-hosts": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Hosts OAuth client metadata documents may be read from",
+        "operationId": "list_client_metadata_hosts",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the hosts, by name"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "the OAuth authorization server is off"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/oauth/client-metadata-hosts/{host}": {
+      "put": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Allow a host to serve OAuth client metadata documents",
+        "operationId": "put_client_metadata_host",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "host",
+            "in": "path",
+            "description": "a lowercase DNS name, e.g. `claude.ai`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "allowed"
+          },
+          "400": {
+            "description": "not a lowercase DNS name"
+          },
+          "403": {
+            "description": "not an org admin — or `step_up_required`: a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "the OAuth authorization server is off"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Stop allowing a host to serve OAuth client metadata documents",
+        "operationId": "delete_client_metadata_host",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "host",
+            "in": "path",
+            "description": "the host",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "removed; its clients' grants and tokens are revoked"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "not listed, or the OAuth authorization server is off"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/plugin-fetch": {
       "post": {
         "tags": [
@@ -3782,6 +4159,81 @@
           },
           "404": {
             "description": "no installation with this id in the org, or plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugin-installations/{id}/endpoints/{endpoint_path}": {
+      "post": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "Call a plugin's endpoint as yourself, with an OAuth token granted for it",
+        "operationId": "plugin_endpoint",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the installation's id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpoint_path",
+            "in": "path",
+            "description": "a path the installation's manifest registers",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the plugin's answer, passed on as data"
+          },
+          "400": {
+            "description": "a body that is not JSON, repeats a key, or matches no operation or more than one"
+          },
+          "401": {
+            "description": "no OAuth token for this endpoint, or one that is not usable here; `WWW-Authenticate` names the protected resource metadata"
+          },
+          "404": {
+            "description": "no such installation or endpoint in this org, or the OAuth authorization server is off"
+          },
+          "413": {
+            "description": "the body is too large"
+          },
+          "415": {
+            "description": "not `application/json`, or a `Content-Encoding`"
+          },
+          "429": {
+            "description": "the caller or the installation is at its request limit"
+          },
+          "502": {
+            "description": "the plugin could not be reached, or answered with something the endpoint does not pass on"
+          },
+          "503": {
+            "description": "the installation is killed, held by the plugin runtime, or its publisher is no longer trusted"
           }
         },
         "security": [
