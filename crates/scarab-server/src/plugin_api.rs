@@ -524,3 +524,130 @@ fn presented_handle(headers: &HeaderMap) -> Option<String> {
         .filter(|v| v.starts_with(DELEGATED_CALLER_HANDLE_PREFIX))
         .map(str::to_string)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    /// The routes PluginApi serves, as `(METHOD, path)`.
+    fn plugin_api_served() -> BTreeSet<(String, &'static str)> {
+        crate::routes::plugin_api_routes()
+            .table
+            .iter()
+            .map(|e| (e.method.to_string(), e.path))
+            .collect()
+    }
+
+    /// PluginApi serves exactly the public routes whose ApiOperation is on
+    /// the closed delegable list, minus the three gate routes the broker
+    /// serves to a gate-resolving plugin. Nothing that can need a step-up, a
+    /// passkey or a browser is among them, every listed operation is served
+    /// by some route (a misspelt id on the list would name nothing), and the
+    /// routes a plugin must never reach for its caller are absent.
+    #[test]
+    fn plugin_api_serves_exactly_the_routes_of_the_delegable_operations() {
+        let served = plugin_api_served();
+        let expected: BTreeSet<(String, &'static str)> = crate::route_table()
+            .iter()
+            .filter(|e| {
+                ops::DELEGABLE_OPERATIONS.contains(&e.op.id) && !PLUGIN_GATE_PATHS.contains(&e.path)
+            })
+            .map(|e| (e.method.to_string(), e.path))
+            .collect();
+        assert_eq!(served, expected);
+
+        let table = crate::routes::plugin_api_routes().table;
+        for e in &table {
+            assert!(
+                matches!(
+                    e.op.class,
+                    Class::Read | Class::Exempt(_) | Class::NotGoverned(_)
+                ),
+                "{} {} ({}) can need a step-up or a ceremony",
+                e.method,
+                e.path,
+                e.op.id
+            );
+            assert!(
+                matches!(e.op.machine, ops::StepUpMachineUse::Requestable),
+                "{} {} ({}) is browser-only or not by token",
+                e.method,
+                e.path,
+                e.op.id
+            );
+        }
+        for id in ops::DELEGABLE_OPERATIONS {
+            assert!(
+                table.iter().any(|e| e.op.id == id),
+                "`{id}` is delegable but PluginApi serves no route of it"
+            );
+        }
+
+        for (method, path) in [
+            ("POST", "/v1/runs/{id}/gates/{step}/approve"),
+            ("POST", "/v1/runs/{id}/gates/{step}/release"),
+            ("POST", "/v1/runs/{id}/gates/{step}/note"),
+            ("GET", "/v1/orgs/{org}/gates"),
+            ("GET", "/v1/runs/{id}/steps/{step}/attach"),
+            ("GET", "/v1/runs/{id}/steps/{step}/debug-pod"),
+            ("POST", "/v1/runs"),
+            ("POST", "/v1/secrets"),
+            ("POST", "/v1/orgs/{org}/tokens"),
+            ("GET", "/v1/me"),
+            ("GET", "/v1/me/tokens"),
+            ("POST", "/v1/auth/login"),
+            ("GET", "/v1/auth/callback"),
+            ("GET", "/.well-known/jwks.json"),
+            ("GET", "/healthz"),
+        ] {
+            assert!(
+                !served.contains(&(method.to_string(), path)),
+                "PluginApi serves {method} {path}"
+            );
+        }
+        for path in served.iter().map(|(_, p)| *p) {
+            assert!(
+                !path.starts_with("/v1/auth/")
+                    && !path.starts_with("/.well-known/")
+                    && !path.contains("/oauth")
+                    && !path.contains("webhook"),
+                "PluginApi serves {path}, a route that authenticates no Principal"
+            );
+        }
+    }
+
+    /// A manifest's `may` is refused for anything off the closed list,
+    /// whatever its step-up class: an Exempt write (a Policy, a kill), an
+    /// account read, an inline Run, as well as a crown jewel or the debug
+    /// shell.
+    #[test]
+    fn only_the_listed_operations_are_delegable() {
+        for id in [
+            "gate.approve",
+            "step.debug_pod",
+            "step.attach",
+            "token.mint_own",
+            "token.revoke",
+            "policy.create",
+            "plugin.kill",
+            "plugin.uninstall",
+            "run.create",
+            "run.snapshots_pin",
+            "account.read",
+            "settings.read",
+            "gate.release_external",
+            "step.results_ingest",
+            "auth.login",
+            "server.read",
+        ] {
+            let op = ops::by_id(id).unwrap_or_else(|| panic!("`{id}` is an operation"));
+            assert!(ops::delegable(op).is_err(), "`{id}` is delegable");
+        }
+        for id in ops::DELEGABLE_OPERATIONS {
+            let op = ops::by_id(id).unwrap_or_else(|| panic!("`{id}` is an operation"));
+            assert_eq!(ops::delegable(op), Ok(()), "{id}");
+        }
+    }
+}

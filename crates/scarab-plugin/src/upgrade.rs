@@ -405,4 +405,40 @@ mod tests {
             .widenings()
             .contains(&"adds endpoint operation `mcp/trigger_run`".to_string()));
     }
+
+    /// [`with_endpoint`] with `trigger_run`'s JSON checks replaced by `json`.
+    fn with_checks(json: serde_json::Value) -> PluginManifest {
+        let mut m = with_endpoint(&["run.read"], 0);
+        let op = m.extensions[0]
+            .operations
+            .get_mut("trigger_run")
+            .expect("with_endpoint registers trigger_run");
+        op.request_rule.json = serde_json::from_value(json).unwrap();
+        m
+    }
+
+    /// Two match rules whose one-line descriptions could read alike (a value
+    /// holding ` /c=d`) are still two rules: the change is asked about.
+    /// Dropping an endpoint operation, or the whole endpoint, is narrower.
+    #[test]
+    fn a_match_rule_change_is_a_change_and_a_removal_is_narrower() {
+        let two_checks = with_checks(serde_json::json!({ "/a": "b", "/c": "d" }));
+        let one_check = with_checks(serde_json::json!({ "/a": "b /c=d" }));
+        for (old, new) in [(&two_checks, &one_check), (&one_check, &two_checks)] {
+            let d = ManifestDiff::between(old, new);
+            assert_eq!(
+                d.widenings(),
+                vec!["changes endpoint operation `mcp/trigger_run`".to_string()]
+            );
+        }
+
+        let mut no_endpoint = with_endpoint(&["run.read"], 0);
+        no_endpoint.extensions.clear();
+        let d = ManifestDiff::between(&with_endpoint(&["run.read"], 0), &no_endpoint);
+        assert_eq!(
+            d.endpoint_operations.removed,
+            vec!["mcp/trigger_run".to_string()]
+        );
+        assert!(!d.widens(), "{:?}", d.widenings());
+    }
 }

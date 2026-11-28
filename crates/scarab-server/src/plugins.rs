@@ -2318,4 +2318,84 @@ mod tests {
             assert!(scarab_plugin::is_installation_id(&mint_installation_id()));
         }
     }
+
+    /// An operator's `plugins.trustedPublishers` entry and an image's
+    /// repository compare as `registry/namespace/name`, the registry
+    /// lowercased; a reference with no registry host, a tag, a digest or a
+    /// glob names no publisher.
+    #[test]
+    fn a_trusted_publisher_is_a_whole_repository_with_its_registry() {
+        for (entry, publisher) in [
+            ("ghcr.io/acme/mcp", Some("ghcr.io/acme/mcp")),
+            ("GHCR.io/acme/mcp", Some("ghcr.io/acme/mcp")),
+            (
+                "registry.example.com:5000/mcp",
+                Some("registry.example.com:5000/mcp"),
+            ),
+            ("acme/mcp", None),
+            ("mcp", None),
+            ("ghcr.io/acme/mcp:v1", None),
+            ("ghcr.io/acme/mcp@sha256:abc", None),
+            ("ghcr.io/acme/*", None),
+            ("ghcr.io/Acme/mcp", None),
+        ] {
+            assert_eq!(trusted_publisher(entry).as_deref(), publisher, "{entry}");
+        }
+    }
+
+    /// A plugin with an endpoint runs only by digest and only from a
+    /// repository the operator lists whole; a plugin without one is not
+    /// asked.
+    #[test]
+    fn a_trusted_service_plugin_runs_only_from_a_listed_publisher() {
+        let plain: PluginManifest =
+            serde_json::from_str(include_str!("../../scarab-plugin-argocd/manifest.json")).unwrap();
+        let mut endpoint = plain.clone();
+        endpoint.extensions = vec![serde_json::from_value(serde_json::json!({
+            "point": "endpoint",
+            "path": "mcp",
+            "operations": {
+                "tools_list": {
+                    "match": { "method": "POST", "json": { "/method": "tools/list" } },
+                    "may": []
+                }
+            }
+        }))
+        .unwrap()];
+        let policy = |publishers: &[&str], dev_allow_tag: bool| PluginPolicy {
+            enabled: true,
+            namespace: "scarab-plugins".into(),
+            dev_allow_tag,
+            trusted_publishers: publishers.iter().map(|p| p.to_string()).collect(),
+        };
+        let digest = format!("ghcr.io/acme/mcp@sha256:{}", "a".repeat(64));
+        let listed = policy(&["ghcr.io/acme/mcp"], false);
+
+        assert!(check_trusted_service(&policy(&[], false), &plain, &digest).is_ok());
+        assert!(check_trusted_service(&listed, &endpoint, &digest).is_ok());
+        for (why, publishers) in [
+            ("nothing listed", vec![]),
+            ("another repository", vec!["ghcr.io/acme/other"]),
+            ("a namespace is not a repository", vec!["ghcr.io/acme"]),
+            ("another registry", vec!["docker.io/acme/mcp"]),
+        ] {
+            assert!(
+                matches!(
+                    check_trusted_service(&policy(&publishers, false), &endpoint, &digest),
+                    Err(ApiError::Denied(_))
+                ),
+                "{why}"
+            );
+        }
+        assert!(matches!(
+            check_trusted_service(&listed, &endpoint, "ghcr.io/acme/mcp:v1"),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(check_trusted_service(
+            &policy(&["ghcr.io/acme/mcp"], true),
+            &endpoint,
+            "ghcr.io/acme/mcp:v1"
+        )
+        .is_ok());
+    }
 }
