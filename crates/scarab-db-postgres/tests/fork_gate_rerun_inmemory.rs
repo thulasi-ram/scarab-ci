@@ -5,9 +5,10 @@
 //! The Run: `approve` (the gate) → `build` (uses the shared service `db`) →
 //! `test`, and `docs`, which needs `approve` and was skipped by its `when:`.
 
+use scarab_engine::ports::ExecState;
 use scarab_engine::{
-    rerun_step_widened, retry_step_widened, Db, EventPayload, PlanReason, RerunError, RunId,
-    RunStatus, Scheduler, StepId, StepStatus, Timestamp,
+    release_gate, rerun_step_widened, retry_step_widened, Clock, Db, EventPayload, Executor,
+    PlanReason, RerunError, RunId, RunStatus, Scheduler, StepId, StepSpec, StepStatus, Timestamp,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
 use serde_json::json;
@@ -306,4 +307,250 @@ async fn a_rerun_of_a_when_excluded_step_is_refused_only_behind_a_fork_gate() {
             assert_eq!(statuses(&db, &run).await[3], Pending);
         }
     }
+}
+
+// --- A Step below or inside a `when:` skip --------------------------------
+//
+// The Run: `approve` (the gate) → `build` → `test`, and `docs`, which needs
+// `build` and was skipped by its `when:`, → `report`, skipped because
+// `docs` was. Every executed Step has a launch spec, so the scheduler runs
+// the Run to its end.
+
+fn spec() -> StepSpec {
+    serde_json::from_value(json!({ "image": "busybox", "command": ["true"], "env": [] })).unwrap()
+}
+
+const BELOW: [&str; 5] = ["approve", "build", "test", "docs", "report"];
+
+/// The stored IR of that Run, the gate's `origin` of kind `gate_origin`.
+fn ir_below(gate_origin: Option<&str>) -> serde_json::Value {
+    let mut gate = json!({ "id": "approve", "gate": "manual" });
+    if let Some(kind) = gate_origin {
+        gate["origin"] = json!([{ "kind": kind, "name": "n", "content_hash": "" }]);
+    }
+    json!({
+        "ir_version": 2,
+        "steps": [
+            gate,
+            { "id": "build", "image": "busybox", "needs": ["approve"] },
+            { "id": "test", "image": "busybox", "needs": ["build"] },
+            { "id": "docs", "image": "busybox", "needs": ["build"], "when": "false" },
+            { "id": "report", "image": "busybox", "needs": ["docs"] }
+        ],
+    })
+}
+
+/// That Run after its first Take: the gate released, `build` and `test`
+/// done, `docs` and `report` skipped, the Run Succeeded.
+async fn seed_below(db: &InMemoryDb, run: &RunId, gate_origin: Option<&str>) {
+    db.create_run(run, 2, 1, Timestamp(0)).await.unwrap();
+    db.store_run_ir(run, &ir_below(gate_origin)).await.unwrap();
+    let steps: [(&str, &[&str], StepStatus); 5] = [
+        ("approve", &[], Succeeded),
+        ("build", &["approve"], Succeeded),
+        ("test", &["build"], Succeeded),
+        ("docs", &["build"], Skipped),
+        ("report", &["docs"], Skipped),
+    ];
+    for (step, needs, _) in steps {
+        let needs: Vec<StepId> = needs.iter().map(|n| id(n)).collect();
+        let spec = (step != "approve").then(spec);
+        db.create_step_run(run, &id(step), spec.as_ref(), &needs, Timestamp(0))
+            .await
+            .unwrap();
+    }
+    db.set_step_gate(run, &id("approve"), "manual", None)
+        .await
+        .unwrap();
+    for (step, _, status) in steps {
+        db.record_step_transition(run, &id(step), Pending, status)
+            .await
+            .unwrap();
+    }
+    db.seed_run(run, RunStatus::Succeeded);
+}
+
+async fn statuses_below(db: &InMemoryDb, run: &RunId) -> [StepStatus; 5] {
+    let rows = db.steps_of_run(run).await.unwrap();
+    BELOW.map(|s| rows.iter().find(|r| r.step.0 == s).unwrap().status)
+}
+
+/// How many Attempts `step` has: a Step that never launched has none.
+async fn attempts(db: &InMemoryDb, run: &RunId, step: &str) -> usize {
+    db.steps_of_run(run)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.step.0 == step)
+        .unwrap()
+        .attempts
+        .len()
+}
+
+async fn tick(db: &InMemoryDb, clock: &FakeClock, exec: &FakeExecutor, run: &RunId) {
+    Scheduler::new(
+        db as &dyn Db,
+        clock as &dyn Clock,
+        exec as &dyn Executor,
+        "drv",
+    )
+    .with_outbox_visibility_ms(0)
+    .tick(run)
+    .await
+    .unwrap();
+}
+
+/// Tick until the Run is terminal, at most `n` times.
+async fn tick_to_end(db: &InMemoryDb, clock: &FakeClock, exec: &FakeExecutor, run: &RunId, n: u32) {
+    for _ in 0..n {
+        let status = db.run_status(run).await.unwrap().unwrap();
+        if matches!(
+            status,
+            RunStatus::Succeeded | RunStatus::Failed | RunStatus::Cancelled
+        ) {
+            return;
+        }
+        tick(db, clock, exec, run).await;
+    }
+}
+
+/// A Rerun of `build`, whose cascade holds the `when:`-skipped `docs` and
+/// `report` behind it, in a Run with a Fork Run approval gate: the gate
+/// waits again, `build` and `test` run after the release, and `docs` and
+/// `report` stay Skipped and never launch, as in the first Take.
+/// Kills: a Rerun that re-arms a Step `when:` excluded (it would run after
+/// the release, `when:` never evaluated again), or one behind it.
+#[tokio::test]
+async fn a_rerun_leaves_a_when_skipped_step_in_its_cascade_skipped() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-1".into());
+    seed_below(&db, &run, Some(FORK)).await;
+    let clock = FakeClock::new(1_000);
+    let plan = rerun_step_widened(
+        &db,
+        &clock,
+        None,
+        &run,
+        &id("build"),
+        Some("alice".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let invalidated: Vec<&str> = plan.invalidated.iter().map(|s| s.0.as_str()).collect();
+    assert_eq!(invalidated, vec!["approve", "build", "test"]);
+    assert_eq!(
+        statuses_below(&db, &run).await,
+        [Pending, Pending, Pending, Skipped, Skipped]
+    );
+
+    let exec = FakeExecutor::new();
+    for _ in 0..4 {
+        exec.script_outcome(ExecState::Succeeded);
+    }
+    tick(&db, &clock, &exec, &run).await; // the gate's wait opens
+    assert_eq!(statuses_below(&db, &run).await[1], Pending, "build waits");
+    release_gate(&db, &clock, &run, &id("approve"))
+        .await
+        .unwrap();
+    tick_to_end(&db, &clock, &exec, &run, 10).await;
+
+    assert_eq!(
+        statuses_below(&db, &run).await,
+        [Succeeded, Succeeded, Succeeded, Skipped, Skipped]
+    );
+    assert_eq!(attempts(&db, &run, "build").await, 1, "build ran");
+    assert_eq!(attempts(&db, &run, "docs").await, 0, "docs never launched");
+    assert_eq!(
+        attempts(&db, &run, "report").await,
+        0,
+        "report never launched"
+    );
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
+}
+
+/// A Rerun of `report`, below the `when:`-skipped `docs`, in a Run with a
+/// Fork Run approval gate: `docs` stays Skipped and never launches, the gate
+/// stays released (nothing that can run is behind it), and `report`, its
+/// need still skipped, is skipped again as in the first Take. It cannot run:
+/// a Step whose need was skipped never runs.
+/// Kills: the reported bug, a Rerun below a `when:` skip that re-arms the
+/// skipped Step as part of the path from the gate and runs it after the next
+/// release; a gate left waiting with nothing behind it.
+#[tokio::test]
+async fn a_rerun_below_a_when_skipped_step_leaves_it_skipped() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-1".into());
+    seed_below(&db, &run, Some(FORK)).await;
+    let clock = FakeClock::new(1_000);
+    let plan = rerun_step_widened(
+        &db,
+        &clock,
+        None,
+        &run,
+        &id("report"),
+        Some("alice".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let invalidated: Vec<&str> = plan.invalidated.iter().map(|s| s.0.as_str()).collect();
+    assert_eq!(invalidated, vec!["report"]);
+    assert!(plan
+        .steps
+        .iter()
+        .all(|s| s.reason != PlanReason::ForkRunApproval));
+    assert_eq!(
+        statuses_below(&db, &run).await,
+        [Succeeded, Succeeded, Succeeded, Skipped, Pending]
+    );
+
+    let exec = FakeExecutor::new();
+    tick_to_end(&db, &clock, &exec, &run, 10).await;
+    assert_eq!(
+        statuses_below(&db, &run).await,
+        [Succeeded, Succeeded, Succeeded, Skipped, Skipped]
+    );
+    assert_eq!(attempts(&db, &run, "docs").await, 0, "docs never launched");
+    assert_eq!(
+        attempts(&db, &run, "report").await,
+        0,
+        "report never launched"
+    );
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
+}
+
+/// Without a Fork Run approval gate a Rerun of `build` re-arms its whole
+/// cascade, `docs` and `report` included, and leaves the gate alone: the
+/// Run reruns as it did before Fork Run approval.
+/// Kills: the `when:` rule leaking into Runs without the gate.
+#[tokio::test]
+async fn without_the_gate_a_rerun_re_arms_its_whole_cascade_as_before() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-1".into());
+    seed_below(&db, &run, None).await;
+    let clock = FakeClock::new(1_000);
+    let plan = rerun_step_widened(
+        &db,
+        &clock,
+        None,
+        &run,
+        &id("build"),
+        Some("alice".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let invalidated: Vec<&str> = plan.invalidated.iter().map(|s| s.0.as_str()).collect();
+    assert_eq!(invalidated, vec!["build", "docs", "report", "test"]);
+    assert_eq!(
+        statuses_below(&db, &run).await,
+        [Succeeded, Pending, Pending, Pending, Pending]
+    );
 }
