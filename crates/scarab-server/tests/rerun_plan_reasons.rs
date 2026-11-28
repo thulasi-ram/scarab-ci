@@ -228,3 +228,74 @@ async fn a_shared_expired_producer_is_one_regenerate_root_not_two() {
     assert_eq!(right.reason, PlanReason::RegenerateCascade);
     assert_eq!(right.because_of, Some(StepId("base".into())));
 }
+
+/// ADR-0086 §9: in a Run with a Fork Run approval gate, a Rerun of `test`
+/// whose input (`build`'s snapshot) expired widens to `build` first, so
+/// `build` is a Regenerate root with its signature cleared; only then are
+/// the gate and `clone` (between the gate and the widened set) added as
+/// `ForkRunApproval` members.
+///
+/// ```text
+///   approve(fork gate) → clone → build(snapshot gone) → test(target)
+/// ```
+///
+/// Kills: the re-arm computed before the widening, which puts `build` in
+/// the set as a path Step, so the widening never probes its snapshot,
+/// `build` keeps its signature, skips as unchanged and hands `test` the
+/// dead snapshot.
+#[tokio::test]
+async fn a_fork_gate_re_arm_never_hides_an_expired_producer() {
+    let db = InMemoryDb::new();
+    let run = RunId("r-fork".into());
+    db.create_run(&run, 2, 1, Timestamp(0)).await.unwrap();
+    db.store_run_ir(
+        &run,
+        &serde_json::json!({
+            "ir_version": 2,
+            "steps": [
+                { "id": "approve", "gate": "manual",
+                  "origin": [{ "kind": "fork_run_approval_gate", "name": "fork_run_approval",
+                               "content_hash": "" }] },
+                { "id": "clone", "image": "busybox", "needs": ["approve"] },
+                { "id": "build", "image": "busybox", "needs": ["clone"] },
+                { "id": "test", "image": "busybox", "needs": ["build"] }
+            ]
+        }),
+    )
+    .await
+    .unwrap();
+    db.create_step_run(&run, &StepId("approve".into()), None, &[], Timestamp(0))
+        .await
+        .unwrap();
+    db.set_step_gate(&run, &StepId("approve".into()), "manual", None)
+        .await
+        .unwrap();
+    step(&db, &run, "clone", &["approve"], "root-clone").await;
+    step(&db, &run, "build", &["clone"], "root-build").await;
+    step(&db, &run, "test", &["build"], "root-test").await;
+
+    let oracle = FixedRoots(
+        ["root-clone", "root-test"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+    );
+    let plan = plan_rerun(&db as &dyn Db, Some(&oracle), &run, &StepId("test".into()))
+        .await
+        .unwrap();
+
+    assert_eq!(plan.widened, vec![StepId("build".into())]);
+    let of = |id: &str| {
+        plan.steps
+            .iter()
+            .find(|s| s.step.0 == id)
+            .unwrap_or_else(|| panic!("{id} missing from the plan"))
+    };
+    assert_eq!(of("build").reason, PlanReason::Regenerate);
+    assert_eq!(of("build").because_of, Some(StepId("test".into())));
+    for id in ["approve", "clone"] {
+        assert_eq!(of(id).reason, PlanReason::ForkRunApproval, "{id}");
+        assert_eq!(of(id).because_of, Some(StepId("test".into())), "{id}");
+    }
+    assert_eq!(of("test").reason, PlanReason::Target);
+}
