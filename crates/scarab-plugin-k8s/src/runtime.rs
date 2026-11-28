@@ -429,9 +429,11 @@ impl K8sPluginRuntime {
         // only once it is gone (foreground deletion keeps it listed until its
         // Pods are), so two instances never run at once. The next pass
         // applies the new one.
-        let stale: Vec<String> = self
-            .deployments_of(&installation.id)
-            .await?
+        let existing = self.deployments_of(&installation.id).await?;
+        // Whether the workload served an endpoint before this pass: only
+        // then can an endpoint Service of it exist.
+        let served_endpoint = existing.iter().any(objects::deployment_serves_endpoint);
+        let stale: Vec<String> = existing
             .into_iter()
             .filter_map(|d| d.metadata.name)
             .filter(|n| *n != name)
@@ -452,23 +454,15 @@ impl K8sPluginRuntime {
             );
             return Ok(());
         }
-        // The endpoint Service (ADR-0086 §1): applied for an installation
-        // that registers an endpoint, deleted for one that no longer does.
+        // The endpoint Service (ADR-0086 §1) is touched only for an
+        // installation that serves an endpoint, or whose workload served one
+        // until this upgrade: an installation that never served one makes
+        // no Service call. The Service of one that stopped serving goes
+        // BEFORE its Deployment loses the endpoint label, so a failed delete
+        // is retried next pass (the label still says it may exist).
         let service_name = objects::endpoint_service_name(&installation.id);
-        if objects::serves_endpoint(installation) {
-            let service = self.stamped(objects::endpoint_service(
-                &self.config.namespace,
-                installation,
-            ));
-            self.namespaced::<Service>()
-                .patch(
-                    &service_name,
-                    &Self::apply_params(),
-                    &Patch::Apply(&service),
-                )
-                .await
-                .map_err(kube_err)?;
-        } else {
+        let serves = objects::serves_endpoint(installation);
+        if !serves && served_endpoint {
             gone_is_fine(
                 self.namespaced::<Service>()
                     .delete(&service_name, &DeleteParams::default())
@@ -492,6 +486,22 @@ impl K8sPluginRuntime {
             .patch(&name, &Self::apply_params(), &Patch::Apply(&deployment))
             .await
             .map_err(kube_err)?;
+        // After the Deployment, so a Service never exists without a
+        // Deployment labelled as an endpoint (what `uninstall` reads).
+        if serves {
+            let service = self.stamped(objects::endpoint_service(
+                &self.config.namespace,
+                installation,
+            ));
+            self.namespaced::<Service>()
+                .patch(
+                    &service_name,
+                    &Self::apply_params(),
+                    &Patch::Apply(&service),
+                )
+                .await
+                .map_err(kube_err)?;
+        }
         Ok(())
     }
 
@@ -598,18 +608,24 @@ impl K8sPluginRuntime {
         )
     }
 
-    /// Uninstall: delete the Deployment (its Pods with it), the endpoint
-    /// Service, if any, and the ServiceAccount.
+    /// Uninstall: delete the endpoint Service, when the workload served an
+    /// endpoint, then the Deployment (its Pods with it) and the
+    /// ServiceAccount. The installation is gone from the database by now, so
+    /// whether it served an endpoint is read from its Deployment's label;
+    /// one that never did makes no Service call.
     pub async fn uninstall(&self, installation_id: &str) -> Result<(), RuntimeError> {
-        gone_is_fine(
-            self.namespaced::<Service>()
-                .delete(
-                    &objects::endpoint_service_name(installation_id),
-                    &DeleteParams::default(),
-                )
-                .await,
-        )?;
-        for d in self.deployments_of(installation_id).await? {
+        let deployments = self.deployments_of(installation_id).await?;
+        if deployments.iter().any(objects::deployment_serves_endpoint) {
+            gone_is_fine(
+                self.namespaced::<Service>()
+                    .delete(
+                        &objects::endpoint_service_name(installation_id),
+                        &DeleteParams::default(),
+                    )
+                    .await,
+            )?;
+        }
+        for d in deployments {
             if let Some(name) = d.metadata.name {
                 gone_is_fine(
                     self.namespaced::<Deployment>()

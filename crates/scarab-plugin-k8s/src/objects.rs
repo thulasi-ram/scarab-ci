@@ -397,6 +397,18 @@ pub fn serves_endpoint(installation: &PluginInstallation) -> bool {
     installation.manifest.trust_tier().is_some()
 }
 
+/// Was `deployment` applied for an installation that serves an endpoint: its
+/// Pod template carries [`LABEL_PLUGIN_ENDPOINT`]?
+pub fn deployment_serves_endpoint(deployment: &Deployment) -> bool {
+    deployment
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.metadata.as_ref())
+        .and_then(|m| m.labels.as_ref())
+        .and_then(|l| l.get(LABEL_PLUGIN_ENDPOINT))
+        .is_some_and(|v| v == "true")
+}
+
 /// The Pod-level `restricted` profile: non-root, a fixed unprivileged
 /// uid/gid, RuntimeDefault seccomp.
 ///
@@ -1383,5 +1395,25 @@ mod tests {
             rules[0].ports.as_ref().unwrap()[0].port,
             Some(IntOrString::Int(i32::from(PLUGIN_ENDPOINT_PORT)))
         );
+    }
+
+    /// The endpoint label on a Deployment's Pods is what uninstall and an
+    /// upgrade read to know an endpoint Service may exist.
+    #[test]
+    fn only_an_endpoint_installations_deployment_reads_as_serving_one() {
+        let plain = deployment("scarab-plugins", &installation(), BROKER_URL, PROBE_IMAGE);
+        assert!(!deployment_serves_endpoint(&plain));
+        let mut inst = installation();
+        inst.manifest.extensions = vec![serde_json::from_value(serde_json::json!({
+            "point": "endpoint",
+            "path": "mcp",
+            "operations": {
+                "ping": { "match": { "method": "POST", "json": { "/method": "ping" } }, "may": [] }
+            }
+        }))
+        .unwrap()];
+        let served = deployment("scarab-plugins", &inst, BROKER_URL, PROBE_IMAGE);
+        assert!(deployment_serves_endpoint(&served));
+        assert!(!deployment_serves_endpoint(&Deployment::default()));
     }
 }
