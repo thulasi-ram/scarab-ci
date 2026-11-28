@@ -32,6 +32,9 @@ pub use environment_governance::InMemoryEnvironmentGovernance;
 /// versioning, name and concurrency rules.
 mod policies;
 pub use policies::InMemoryPolicies;
+// The in-memory `ForkRunApprovalStore` (ADR-0086 §9).
+mod fork_run_approval;
+pub use fork_run_approval::InMemoryForkRunApproval;
 // The in-memory `LibraryStore` (ADR-0076).
 mod leak_checks;
 pub use leak_checks::InMemoryLeakCheckLimits;
