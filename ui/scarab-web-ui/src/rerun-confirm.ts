@@ -131,8 +131,11 @@ function rowNote(s: PlannedStepInfo, kind: ConfirmKind): string {
       note = s.because_of ? `re-runs because ${s.because_of} re-runs` : "re-runs to regenerate";
       break;
     case "fork_run_approval":
+      // A gate here asks again in the new version: the Fork Run approval
+      // gate, and any other gate on the path (an Environment's approvers, a
+      // plugin gate).
       note = s.is_gate
-        ? "fork code: an approval does not carry into a new version"
+        ? "asks again in the new version"
         : "between the Fork Run approval gate and the step you picked";
       break;
     default:

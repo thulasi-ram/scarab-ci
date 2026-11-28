@@ -48,9 +48,9 @@ runs without one.
 ## The gate
 
 For each Run of fork code the setting holds, Scarab adds one `manual` gate, `fork-run-approval`, with no `needs`, and puts it in the `needs`
-of every step that had none. Nothing in the Run starts before it is approved, and the Run's shared
-services wait too. The Run page labels the gate "added by Fork Run approval". A step whose
-`when:` is false at creation is left out, and a Run with no step that would start gets no gate.
+of every step that had none, including a step whose `when:` is false. Nothing in the Run starts
+before it is approved, and the Run's shared services wait too. The Run page labels the gate
+"added by Fork Run approval".
 
 In the stored Run the gate looks like this:
 
@@ -58,6 +58,7 @@ In the stored Run the gate looks like this:
 - id: fork-run-approval
   gate: manual
   gate_expires_after: 259200
+  environment_approval_gate: false
   origin: [{ kind: fork_run_approval_gate, name: fork_run_approval, content_hash: "" }]
 ```
 
@@ -91,13 +92,19 @@ code run; it does not give the code anything a Run of fork code would not get.
 An approval covers the version of the Run it was given in. A **Rerun** opens a new version, so in
 a Run of fork code it puts the gate back: the gate waits for approval again, and the steps between
 the gate and the step you reran wait behind it. Those steps are skipped when their inputs did not
-change. The rerun's confirm box lists them under "Waits for Fork Run approval again".
+change, but a gate among them asks again: an Environment's approvers are asked again, and a
+plugin gate runs again. The rerun's confirm box lists them under "Waits for Fork Run approval
+again".
+
+In a Run with the gate, Scarab refuses a Rerun of a step its `when:` skipped (409): a Rerun does
+not evaluate `when:` again. Start a new Run instead.
 
 A **Retry** of a failed step stays in the current version and does not ask again.
 
 ## Rolling back
 
 The setting is stored in migration 0114. 0.8.4 is the release to roll back to: it reads Runs that
-have the gate and holds them at it, and an earlier server cannot load such a Run. Before you roll
-back, set it to `off` in every org and approve or reject the gates still waiting. See the
-chart README, "Upgrading from 0.8.4", for the revert script.
+have the gate and holds them at it, and an earlier server cannot load such a Run. On 0.8.4 a Rerun
+of a Run whose gate was released does not put the gate back. Before you roll back, set it to `off`
+in every org and let the Runs that have the gate finish. See the chart README, "Upgrading from
+0.8.4", for the revert script.

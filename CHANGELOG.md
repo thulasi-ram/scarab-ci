@@ -21,10 +21,10 @@ release.yml uses that version's section as the GitHub Release text. See
 ### Breaking changes
 
 - **Migration 0111 adds `kind`, `operations`, `audience` and `oauth_client` to `api_tokens`.**
-  No row is rewritten; every existing token keeps working as before. A 0.8.3 server does not
+  No row is rewritten; every existing token keeps working as before. A 0.8.4 server does not
   start on a database that ran it: to roll back, run
   `crates/scarab-db-postgres/rollback/0111_revert.sql` with the server scaled to zero. It revokes
-  the tokens that carry an operation list. See the chart README, "Upgrading from 0.8.3".
+  the tokens that carry an operation list. See the chart README, "Upgrading from 0.8.4".
 - **Migration 0114 adds the table `org_fork_run_approval`** (each org's Fork Run approval
   setting; an org with no row has `agent_started`). No row is rewritten. A server that does not
   know 0114 does not start on a database that ran it: to roll back, set it to `off` in every org,
@@ -100,7 +100,10 @@ release.yml uses that version's section as the GitHub Release text. See
   the gate from the Run page; an API token's owner confirms each approval, and an app cannot
   approve. The gate fails the Run after 72 hours. It never counts as an Environment approval gate,
   and approving it unlocks no Environment secrets, registry credentials or OIDC roles: the Run is
-  still fork code. A Rerun waits at the gate again; a Retry does not. An org admin changes the
+  still fork code. A Rerun waits at the gate again, and asks the other gates between it and the
+  rerun step again (an Environment's approvers, a plugin gate); a Retry does not. After a
+  rollback to 0.8.4 a Rerun no longer puts the gate back, so set the setting to `off` and let gated
+  Runs finish first. An org admin changes the
   setting from a browser in Org settings › Security
   (`/v1/orgs/{org}/security/fork-run-approval`); a change that holds fewer Runs asks for a passkey
   confirmation. See [Fork Run approval](/scarab-ci/usage/fork-run-approval/).
