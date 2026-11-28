@@ -1284,6 +1284,62 @@ mod tests {
         );
     }
 
+    /// Each segment is exactly one segment and the ref adds no `/env/` or
+    /// `/ref/` of its own, or the subject is refused before it is signed.
+    #[test]
+    fn subject_refusal_names_each_value_that_could_stand_in_for_another_segment() {
+        let refused = |org, repo, env, git_ref| Claims::subject_refusal(org, repo, env, git_ref);
+        for git_ref in ["refs/heads/main", "refs/tags/v1.2", "refs/pull/7/head"] {
+            assert_eq!(
+                refused("acme", "app", Some("prod"), git_ref),
+                None,
+                "{git_ref}"
+            );
+            assert_eq!(refused("acme", "app", None, git_ref), None, "{git_ref}");
+        }
+        assert_eq!(
+            refused("", "app", Some("prod"), "refs/heads/main").as_deref(),
+            Some("the org is empty")
+        );
+        assert_eq!(
+            refused("acme", "", None, "refs/heads/main").as_deref(),
+            Some("the repo is empty")
+        );
+        assert_eq!(
+            refused("acme", "app", Some(""), "refs/heads/main").as_deref(),
+            Some("the env is empty")
+        );
+        assert_eq!(
+            refused("acme/x", "app", Some("prod"), "refs/heads/main").as_deref(),
+            Some("the org `acme/x` holds a `/`")
+        );
+        assert_eq!(
+            refused("acme", "app/env/prod", None, "refs/heads/main").as_deref(),
+            Some("the repo `app/env/prod` holds a `/`")
+        );
+        assert_eq!(
+            refused("acme", "app", Some("prod/ref/x"), "refs/heads/main").as_deref(),
+            Some("the env `prod/ref/x` holds a `/`")
+        );
+        assert_eq!(
+            refused("acme", "app", Some("prod"), "").as_deref(),
+            Some("the ref is empty")
+        );
+        for git_ref in [
+            "env/prod",
+            "ref/x",
+            "refs/heads/env/prod",
+            "refs/heads/ref/x",
+        ] {
+            let why = refused("acme", "app", None, git_ref);
+            assert!(
+                why.as_deref()
+                    .is_some_and(|w| w.starts_with(&format!("the ref `{git_ref}` holds"))),
+                "{git_ref}: {why:?}"
+            );
+        }
+    }
+
     #[test]
     fn session_validity_tracks_expiry() {
         let s = Session {
