@@ -121,6 +121,7 @@ export default defineConfig({
             { label: 'Run logs', slug: 'usage/run-logs' },
             { label: 'Environments', slug: 'usage/environments' },
             { label: 'Policies', slug: 'usage/policies' },
+            { label: 'Fork Run approval', slug: 'usage/fork-run-approval' },
             { label: 'Deploying with Argo CD', slug: 'usage/deploying-with-argo-cd' },
             { label: 'Pushing to Amazon ECR', slug: 'usage/pushing-to-ecr' },
             { label: 'Environment Variables', slug: 'usage/environment-variables' },

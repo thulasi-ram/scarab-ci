@@ -563,6 +563,36 @@ The StatefulSet's `serviceName` is unchanged, so upgrading needs no migration.
 
 > **Unverified in this chart version:** per-availability-zone placement.
 
+### Upgrading from 0.8.4: Fork Run approval
+
+Migration 0114 adds the table `org_fork_run_approval`: each org's Fork Run
+approval setting. It is a new table, so it rewrites no row and locks no other
+table; it waits at most 5 seconds for its lock, and on a busy database the
+server stops with `canceling statement due to lock timeout` and runs it again
+when the Pod restarts. It is numbered 0114 because 0112 and 0113 are taken by
+other changes of this release line; the migrator applies by version, so the
+gap does nothing. Every org starts with the setting off, so no Run changes
+until an admin turns it on (Org settings › Security).
+
+While the setting is on, a Run of fork code gets one `manual` gate,
+`fork-run-approval`, in front of every root step. A Rerun in such a Run waits
+at the gate again; a Retry does not.
+
+0.8.4 is the release to roll back to: it reads a Run that has the gate, holds
+it and its shared services at the gate, and never counts the gate as an
+Environment approval gate. A server before 0.8.4 cannot load such a Run, so
+do not roll back past 0.8.4 while one exists. On 0.8.4 an issued API token
+releases a plain gate without a confirmation, so the gate is weaker there.
+
+To roll back: turn Fork Run approval off in every org, approve or reject the
+gates still waiting, scale the server to zero, back up the database, run
+[`rollback/0114_revert.sql`](../../../crates/scarab-db-postgres/rollback/0114_revert.sql)
+(`psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0114_revert.sql`; a second run
+changes nothing), then the revert scripts of the other migrations above 0111
+this database ran, newest first, then `0111_revert.sql` (see "Upgrading from
+0.8.3: token kinds and operation lists"), then install the 0.8.4 chart. The
+settings are dropped.
+
 ### Upgrading from 0.8.3: token kinds and operation lists
 
 Migration 0111 adds four columns to `api_tokens`: `kind` (`NOT NULL DEFAULT
