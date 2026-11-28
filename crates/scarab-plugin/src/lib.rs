@@ -1079,6 +1079,35 @@ mod tests {
         ));
     }
 
+    /// 90ec77bf: an endpoint registration is what a plugin asks for, so a
+    /// plugin that only serves an endpoint (the MCP plugin) needs no
+    /// capability; a plugin that asks for nothing at all is still refused.
+    #[test]
+    fn an_endpoint_alone_is_enough_to_ask_for_and_nothing_is_not() {
+        let mut m = argo_like();
+        m.capabilities.clear();
+        m.connections.clear();
+        m.extensions = vec![serde_json::from_value(serde_json::json!({
+            "point": "endpoint",
+            "path": "mcp",
+            "operations": {
+                "ping": {
+                    "match": { "method": "POST", "json": { "/method": "ping" } },
+                    "may": []
+                }
+            }
+        }))
+        .unwrap()];
+        assert_eq!(m.validate(), Ok(()));
+        assert_eq!(admit_for_mmp(&m), Ok(()));
+
+        m.extensions.clear();
+        assert!(matches!(
+            m.validate(),
+            Err(PluginError::InvalidManifest(msg)) if msg.contains("at least one capability")
+        ));
+    }
+
     #[test]
     fn the_argocd_shape_validates_and_is_admitted() {
         assert_eq!(argo_like().validate(), Ok(()));

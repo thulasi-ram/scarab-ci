@@ -1,0 +1,14 @@
+[
+  { "method": "GET", "path": "/v1/repos", "operation": "repo.read" },
+  { "method": "GET", "path": "/v1/repos/{org}/{repo}/pipelines", "operation": "repo.read" },
+  { "method": "GET", "path": "/v1/repos/{org}/{repo}/pipelines/{name}/interface", "operation": "repo.read" },
+  { "method": "GET", "path": "/v1/repos/{org}/{repo}/runs", "operation": "run.read" },
+  { "method": "GET", "path": "/v1/runs/{id}", "operation": "run.read" },
+  { "method": "GET", "path": "/v1/runs/{id}/steps/{step}/logs/raw", "operation": "step.logs.read" },
+  { "method": "GET", "path": "/v1/runs/{id}/steps/{step}/results", "operation": "run.read" },
+  { "method": "GET", "path": "/v1/runs/{id}/artifacts", "operation": "run.artifacts.read" },
+  { "method": "POST", "path": "/v1/repos/{org}/{repo}/dispatch", "operation": "repo.dispatch" },
+  { "method": "POST", "path": "/v1/runs/{id}/steps/{step}/rerun", "operation": "step.rerun" },
+  { "method": "POST", "path": "/v1/runs/{id}/steps/{step}/retry", "operation": "step.retry" },
+  { "method": "POST", "path": "/v1/runs/{id}/cancel", "operation": "run.cancel" }
+]

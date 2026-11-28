@@ -650,4 +650,32 @@ mod tests {
             assert_eq!(ops::delegable(op), Ok(()), "{id}");
         }
     }
+
+    /// The MCP plugin's tests map each PluginApi call they observe to an
+    /// ApiOperation through `fixtures/plugin_api_routes.json`. Every entry
+    /// there must be a route of this server with that operation, served on
+    /// PluginApi: otherwise the plugin's "uses exactly what it may" test
+    /// would pass against a table that no longer matches the server.
+    #[test]
+    fn the_mcp_plugin_s_route_fixture_matches_this_server() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../scarab-plugin-mcp/tests/fixtures/plugin_api_routes.json"
+        ))
+        .unwrap();
+        let served = plugin_api_served();
+        for entry in fixture.as_array().unwrap() {
+            let method = entry["method"].as_str().unwrap();
+            let path = entry["path"].as_str().unwrap();
+            let operation = entry["operation"].as_str().unwrap();
+            let route = crate::route_table()
+                .iter()
+                .find(|e| e.method.as_str() == method && e.path == path)
+                .unwrap_or_else(|| panic!("{method} {path} is not a route"));
+            assert_eq!(route.op.id, operation, "{method} {path}");
+            assert!(
+                served.contains(&(method.to_string(), route.path)),
+                "{method} {path} is not served on PluginApi"
+            );
+        }
+    }
 }
