@@ -594,14 +594,25 @@ journal live on the broker's own small database pool, but the API handlers a
 plugin's delegated calls run read and write through the server's main pool,
 as the public API does: a busy endpoint plugin shares that pool.
 
+Migration 0113 adds three tables for the OAuth authorization server that
+plugin endpoints use (`oauth_client_metadata_hosts`,
+`oauth_authorization_codes`, `oauth_grants`). It is off until you set
+`oauthServer.enabled` and `secrets.oauthRefreshKey`. A plugin whose manifest
+registers an endpoint gets a Service, `scarab-plugin-endpoint-<id>`, and the
+baseline gains the `plugin-endpoint-ingress` NetworkPolicy, which admits the
+server's Pods to port 8080 of those plugins' Pods and nothing else. The
+endpoint's request limits are counted per server replica.
+
 To roll back: scale the server to zero, back up the database, run
+[`rollback/0113_revert.sql`](../../../crates/scarab-db-postgres/rollback/0113_revert.sql)
+(it revokes every connected app's access token), then
 [`rollback/0111_revert.sql`](../../../crates/scarab-db-postgres/rollback/0111_revert.sql)
 (`psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 0111_revert.sql`; a second run
 changes nothing), then install the 0.8.3 chart. A 0.8.3 server would let a
 token with an operation list use every operation, so the revert revokes those
 tokens before it drops the columns; their owners mint new ones. Run
 [`rollback/0112_revert.sql`](../../../crates/scarab-db-postgres/rollback/0112_revert.sql)
-first: it drops the PluginApi tables and their journal, and refuses to run
+between those two: it drops the PluginApi tables and their journal, and refuses to run
 while a plugin that registers an endpoint is installed, since a 0.8.3 server
 cannot read its manifest. Uninstall those plugins first. To go back to 0.8.2,
 run `0110_revert.sql` next.

@@ -1,0 +1,48 @@
+---
+title: Connected apps
+description: Let an app such as claude.ai act for you at one plugin endpoint, with an OAuth token you approve with your passkey, and disconnect it at any time.
+---
+
+A plugin can register an **endpoint**: a URL under
+`/v1/orgs/<org>/plugin-installations/<id>/endpoints/<path>` that an app outside Scarab calls as
+you. The app gets a token for that one endpoint through OAuth, and the plugin acts for you only
+through a short-lived handle Scarab gives it per request. It never sees your token.
+
+## Turning it on
+
+An operator sets, in the chart:
+
+- `oauthServer.enabled: true` and `secrets.oauthRefreshKey` (at least 32 random bytes, the same
+  on every replica). The render fails without the key.
+- `scarab.publicUrl` to the address apps reach the server at. Tokens are bound to endpoint URLs
+  under it.
+- `plugins.trustedPublishers` to the image repository of the plugin that registers the endpoint.
+
+An org admin then lists the hosts Scarab may read app descriptions from, such as `claude.ai`
+(`PUT /v1/orgs/{org}/oauth/client-metadata-hosts/{host}`; it asks for a passkey). Every path on a
+listed host is trusted, so do not list a host that serves files its users upload.
+
+## Connecting an app
+
+The app sends you to `/oauth/authorize`. The page names the host the app's description came from,
+the plugin and its endpoint, the role the app is capped at (yours in the org, and never above what
+you hold at each call), and the operations it may use. Reads of Runs, Steps and logs are ticked;
+everything else starts unticked. Connecting asks for your passkey every time. No app can approve a
+gate.
+
+The app gets a token that lasts an hour and a refresh secret that changes each time it is used. A
+refresh secret used twice revokes the connection, except a retry within 30 seconds. A connection
+ends 30 days after its last use and 90 days after you approved it.
+
+## Disconnecting
+
+**Account settings › Connected apps** lists your connected apps. **Disconnect** revokes the
+connection and its token at once; whatever the plugin was doing for you stops at its next call to
+Scarab. Uninstalling the plugin disconnects every app connected to it.
+
+## Limits
+
+The endpoint takes POST requests of at most 1 MiB, each matching exactly one operation the plugin
+declares. It counts 60 requests a minute and 4 at once per person per plugin, and 600 a minute and
+16 at once per plugin. These counts are kept by each server replica, so with two replicas a person
+can make up to twice as many.

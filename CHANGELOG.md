@@ -41,6 +41,14 @@ release.yml uses that version's section as the GitHub Release text. See
   endpoint, then run `crates/scarab-db-postgres/rollback/0112_revert.sql` before
   `0111_revert.sql`; it refuses while one is installed.
 
+- **Migration 0113 adds `oauth_client_metadata_hosts`, `oauth_authorization_codes` and
+  `oauth_grants`.** Three new tables; nothing existing changes. To roll back, run
+  `crates/scarab-db-postgres/rollback/0113_revert.sql` before `0112_revert.sql`; it revokes every
+  connected app's token.
+- **A plugin that registers an endpoint gets a Service and an ingress policy.** Its Pods accept
+  connections on port 8080 from the Scarab server's Pods and nothing else. The chart grants the
+  plugin runtime `services` in the plugin namespace.
+
 ### Security
 
 - **A plugin that registers an endpoint runs only from a publisher the operator trusts.** A
@@ -62,6 +70,11 @@ release.yml uses that version's section as the GitHub Release text. See
   broker's own database pool; the API handlers a delegated call runs use the main pool.
 
 ### Features
+
+- **Connected apps.** An app such as claude.ai can act for you at one plugin endpoint with an OAuth
+  token you approve with your passkey; you list and disconnect your apps under Account settings.
+  Off by default (`oauthServer.enabled`). See
+  [Connected apps](/scarab-ci/usage/connected-apps/).
 
 - **Limit an API token to a list of operations.** A token minted with `operations` may use only
   those; every other request is refused with `403 operation_not_granted`. Each token records its
