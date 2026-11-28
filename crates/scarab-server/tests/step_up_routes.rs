@@ -110,6 +110,18 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "COND-A",
     ),
     (
+        "GET",
+        "/v1/orgs/{org}/security/fork-run-approval",
+        "settings.read",
+        "READ",
+    ),
+    (
+        "PUT",
+        "/v1/orgs/{org}/security/fork-run-approval",
+        "fork_run_approval.put",
+        "COND-A",
+    ),
+    (
         "POST",
         "/v1/orgs/{org}/members/{id}/passkeys/reset",
         "passkey.reset",

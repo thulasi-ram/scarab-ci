@@ -1049,6 +1049,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_org_environments(pg.clone())
         // Each org's leak check limits.
         .with_leak_check_limits(pg.clone())
+        // Each org's Fork Run approval setting (ADR-0086 §9), which Run
+        // creation reads.
+        .with_fork_run_approval(pg.clone())
         // The PluginInstallation registry (ADR-0072). Wired whatever
         // SCARAB_PLUGINS says: it is data — an operator who turned plugins
         // off can still list, kill and uninstall. The policy decides whether

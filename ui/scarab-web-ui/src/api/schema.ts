@@ -1692,6 +1692,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/security/fork-run-approval": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** An org's Fork Run approval setting */
+        get: operations["get_fork_run_approval"];
+        /** Turn an org's Fork Run approval on or off (admin; always-ask step-up to turn it off) */
+        put: operations["put_fork_run_approval"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/security/leak-checks": {
         parameters: {
             query?: never;
@@ -3923,6 +3941,30 @@ export interface components {
              *     Empty = a narrowing on the same image, which needs none.
              */
             step_up_reasons: string[];
+        };
+        /**
+         * @description An org's Fork Run approval setting: `GET` and `PUT`
+         *     `/v1/orgs/{org}/security/fork-run-approval`.
+         */
+        ForkRunApprovalDto: {
+            /**
+             * @description The caller may change the setting: an admin of the org, in a
+             *     signed-in browser.
+             */
+            can_change: boolean;
+            /**
+             * @description A Run of fork code waits at a `manual` gate before any of its Steps
+             *     starts, until someone with write on the repository releases it.
+             */
+            enabled: boolean;
+        };
+        /** @description `PUT /v1/orgs/{org}/security/fork-run-approval` body. */
+        ForkRunApprovalUpdate: {
+            /**
+             * @description `true` turns Fork Run approval on. `false` turns it off, which asks
+             *     for a passkey confirmation.
+             */
+            enabled: boolean;
         };
         /** @description The answer to a gate approval. */
         GateApprovalDto: {
@@ -6262,7 +6304,8 @@ export interface components {
              *     `op.completed`, `request.raised|confirmed|executed|failed`,
              *     `passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,
              *     `guard.not_consulted`, `binding.operator_grant`,
-             *     `secret.match_checked`, `secret.match_limits_changed`.
+             *     `secret.match_checked`, `secret.match_limits_changed`,
+             *     `fork_run_approval.changed`.
              */
             kind: string;
             op?: string | null;
@@ -11710,6 +11753,112 @@ export interface operations {
             };
             /** @description not an admin of the Org */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_fork_run_approval: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ForkRunApprovalDto"];
+                };
+            };
+            /** @description a reserved org (plain text) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not signed in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member of the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    put_fork_run_approval: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ForkRunApprovalUpdate"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ForkRunApprovalDto"];
+                };
+            };
+            /** @description a body that is not `{"enabled": true}` or `{"enabled": false}`, or a reserved org (plain text) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `browser_session_required` (an API token or a Bearer session, even for a request that changes nothing), with `code` and `message`; not an admin of the org; or `step_up_required` (mode `action`) to turn it off */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description the setting cannot be stored on this server */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };

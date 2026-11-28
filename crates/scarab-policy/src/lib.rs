@@ -17,6 +17,9 @@
 //!   input.
 //! - [`environment_rules`]: the Environment's approval-gate settings as
 //!   built-in rules at each checkpoint (ADR-0078 §6).
+//! - [`fork_run_approval_gate`]: the gate the org's Fork Run approval
+//!   setting adds to a Run of fork code (ADR-0086 §9). A setting, not a
+//!   Policy: no Policy adds a gate.
 //! - [`check`]: the type checker over the AST `cel` 0.15 parses, with the
 //!   `has()` guard warning, literal regexes and the static cost bound. It and
 //!   every evaluation run on a large-stack thread.
@@ -29,6 +32,7 @@ pub mod check;
 pub mod environment_rules;
 pub mod eval;
 pub mod evaluate;
+pub mod fork_run_approval_gate;
 pub mod gate_resolve;
 pub mod ir;
 pub mod library;

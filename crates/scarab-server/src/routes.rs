@@ -218,6 +218,18 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::LEAK_CHECK_LIMITS_PUT,
             crate::secret_match::put_leak_check_limits,
         )
+        // An org's Fork Run approval setting (ADR-0086 §9): members read
+        // it, admins change it from a browser.
+        .get(
+            "/v1/orgs/{org}/security/fork-run-approval",
+            &ops::SETTINGS_READ,
+            crate::fork_run_approval::get_fork_run_approval,
+        )
+        .put(
+            "/v1/orgs/{org}/security/fork-run-approval",
+            &ops::FORK_RUN_APPROVAL_PUT,
+            crate::fork_run_approval::put_fork_run_approval,
+        )
         .post(
             "/v1/orgs/{org}/members/{id}/passkeys/reset",
             &ops::PASSKEY_RESET,

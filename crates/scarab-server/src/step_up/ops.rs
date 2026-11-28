@@ -746,8 +746,8 @@ pub static ACCESS_READ: Op = read("access.read", "Read role bindings, members an
 pub static SECURITY_READ: Op = read("security.read", "Read security events");
 /// Secret names and where each is set. Never a value: no route returns one.
 pub static SECRET_NAMES_READ: Op = read("secret.names.read", "Read secret names");
-/// Environments, Policies and their decisions, libraries, plugins and forge
-/// connections.
+/// Environments, Policies and their decisions, libraries, plugins, forge
+/// connections and the org's Fork Run approval setting.
 pub static SETTINGS_READ: Op = read(
     "settings.read",
     "Read Environments, Policies, libraries, plugins and connections",
@@ -1148,6 +1148,25 @@ pub static LEAK_CHECK_LIMITS_PUT: Op = op(
     &[],
     &["path:org"],
 )
+.browser_only();
+pub static FORK_RUN_APPROVAL_PUT: Op = op(
+    "fork_run_approval.put",
+    "Change the org's Fork Run approval setting",
+    // Turning it off asks for a passkey confirmation of its own: a Run of
+    // fork code would start with no approval. Turning it on, or a request
+    // that changes nothing, is exempt.
+    Class::Conditional {
+        mode: A,
+        rule: "turning it off",
+    },
+    "ADR-0086 §9: loosening the setting needs a step-up",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org"],
+)
+// Only a human in a browser: no API token, Bearer session or app acting
+// for someone may change it, so no request is raised for a machine.
 .browser_only();
 pub static ENVIRONMENT_DELETE: Op = op(
     "environment.delete",
@@ -1792,6 +1811,7 @@ mod tests {
         assert_eq!(
             browser_only,
             vec![
+                "fork_run_approval.put",
                 "identity.link",
                 "identity.unlink",
                 "passkey.add",

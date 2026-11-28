@@ -706,6 +706,9 @@ pub mod security_event_kind {
     /// An org Owner changed the org's leak check limits. The detail holds
     /// the old and the new `per_hour` and `per_day`.
     pub const SECRET_MATCH_LIMITS_CHANGED: &str = "secret.match_limits_changed";
+    /// An org admin turned the org's Fork Run approval setting on or off
+    /// (ADR-0086 §9). The detail holds the old and the new `enabled`.
+    pub const FORK_RUN_APPROVAL_CHANGED: &str = "fork_run_approval.changed";
 
     /// The Org-less kinds an Org's log shows about its members: the human's
     /// own confirmations and passkey lifecycle. Org-less operations,

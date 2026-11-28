@@ -6341,6 +6341,125 @@
         ]
       }
     },
+    "/v1/orgs/{org}/security/fork-run-approval": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "An org's Fork Run approval setting",
+        "operationId": "get_fork_run_approval",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForkRunApprovalDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "a reserved org (plain text)"
+          },
+          "401": {
+            "description": "not signed in"
+          },
+          "403": {
+            "description": "not a member of the org"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Turn an org's Fork Run approval on or off (admin; always-ask step-up to turn it off)",
+        "operationId": "put_fork_run_approval",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ForkRunApprovalUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForkRunApprovalDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "a body that is not `{\"enabled\": true}` or `{\"enabled\": false}`, or a reserved org (plain text)"
+          },
+          "403": {
+            "description": "`browser_session_required` (an API token or a Bearer session, even for a request that changes nothing), with `code` and `message`; not an admin of the org; or `step_up_required` (mode `action`) to turn it off",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "the setting cannot be stored on this server"
+          },
+          "409": {
+            "description": "the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/security/leak-checks": {
       "get": {
         "tags": [
@@ -11704,6 +11823,38 @@
           }
         }
       },
+      "ForkRunApprovalDto": {
+        "type": "object",
+        "description": "An org's Fork Run approval setting: `GET` and `PUT`\n`/v1/orgs/{org}/security/fork-run-approval`.",
+        "required": [
+          "enabled",
+          "can_change"
+        ],
+        "properties": {
+          "can_change": {
+            "type": "boolean",
+            "description": "The caller may change the setting: an admin of the org, in a\nsigned-in browser."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "A Run of fork code waits at a `manual` gate before any of its Steps\nstarts, until someone with write on the repository releases it."
+          }
+        }
+      },
+      "ForkRunApprovalUpdate": {
+        "type": "object",
+        "description": "`PUT /v1/orgs/{org}/security/fork-run-approval` body.",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "`true` turns Fork Run approval on. `false` turns it off, which asks\nfor a passkey confirmation."
+          }
+        },
+        "additionalProperties": false
+      },
       "GateApprovalDto": {
         "type": "object",
         "description": "The answer to a gate approval.",
@@ -16190,7 +16341,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`step_up.confirmed`, `step_up.refused`, `op.authorised`,\n`op.completed`, `request.raised|confirmed|executed|failed`,\n`passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,\n`guard.not_consulted`, `binding.operator_grant`,\n`secret.match_checked`, `secret.match_limits_changed`."
+            "description": "`step_up.confirmed`, `step_up.refused`, `op.authorised`,\n`op.completed`, `request.raised|confirmed|executed|failed`,\n`passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,\n`guard.not_consulted`, `binding.operator_grant`,\n`secret.match_checked`, `secret.match_limits_changed`,\n`fork_run_approval.changed`."
           },
           "op": {
             "type": [
