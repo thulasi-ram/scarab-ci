@@ -10042,6 +10042,44 @@ pub(crate) async fn run_trigger(
     Ok(None)
 }
 
+/// Whether a Run's recorded trigger (its [`run_trigger`] event) says it
+/// builds fork code (ADR-0086 §9), failing closed:
+/// - a pull request, manual or api trigger is fork code unless its recorded
+///   `fork` is exactly `false`; a dispatch recorded before the flag was
+///   stored has none, so it counts as fork code;
+/// - a follow-up (`upstream`) builds its upstream Run's commit, so the chain
+///   is followed to the Run that started it, at most 16 links; a link with no
+///   upstream Run id, an upstream Run with no recorded trigger, or a longer
+///   chain (a cycle) is fork code;
+/// - a push, tag, release, cron or comment trigger is not;
+/// - any other kind is fork code.
+pub async fn trigger_is_fork_code(
+    db: &dyn Db,
+    trigger: &serde_json::Value,
+) -> Result<bool, DbError> {
+    let mut trigger = trigger.clone();
+    // A chain is a few Runs long; the bound stops a corrupt cycle.
+    for _ in 0..16 {
+        match trigger["kind"].as_str() {
+            Some("push" | "tag" | "release" | "cron" | "comment") => return Ok(false),
+            Some("pull_request" | "manual" | "api") => {
+                return Ok(trigger["fork"].as_bool() != Some(false))
+            }
+            Some("upstream") => {
+                let Some(upstream) = trigger["run"].as_str().filter(|r| !r.is_empty()) else {
+                    return Ok(true);
+                };
+                match run_trigger(db, &RunId(upstream.to_string())).await? {
+                    Some((upstream, _actor)) => trigger = upstream,
+                    None => return Ok(true),
+                }
+            }
+            _ => return Ok(true),
+        }
+    }
+    Ok(true)
+}
+
 /// Recover a run's `(repo, sha)` from the normalized trigger recorded on its
 /// event log (persisted by [`persist_run_from_ir`]).
 async fn run_forge_coords(

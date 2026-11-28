@@ -1218,12 +1218,25 @@ impl Event {
                 e.insert("sha".into(), json!(sha));
             }
             Event::Manual {
-                actor, r#ref, sha, ..
+                actor,
+                r#ref,
+                sha,
+                fork,
+                ..
             }
             | Event::Api {
-                actor, r#ref, sha, ..
+                actor,
+                r#ref,
+                sha,
+                fork,
+                ..
             } => {
                 e.insert("actor".into(), json!(actor));
+                // Whether the dispatched commit is fork code (ADR-0086 §9),
+                // recorded with the Run like a pull request's, so the paths
+                // that read the recorded trigger back see it: a fork dispatch
+                // starts no follow-up, and its launches count as fork code.
+                e.insert("fork".into(), json!(fork));
                 // Exposed like push's (ADR-0043): `ref` is the symbolic dispatch
                 // ref, `branch` its short form, and `sha` the resolved commit the
                 // run is pinned to — so a `when:` guard on `manual`/`api`, the

@@ -653,10 +653,12 @@ impl ForgeCredentialExecutor {
     }
 
     /// Whether the Run builds fork code (a fork pull request, or a dispatch of
-    /// a commit no branch or tag names, ADR-0086 §9), as its recorded trigger's
-    /// `fork` flag says. With no Run store wired (inline dev runs) it is `false`,
-    /// and the Step's stored `locked_out` flag decides alone. A failed read
-    /// fails the launch.
+    /// a commit no branch or tag names, ADR-0086 §9), as its recorded trigger
+    /// says ([`crate::trigger_is_fork_code`]: a pull request or dispatch whose
+    /// `fork` is not `false`, or a follow-up whose chain started from one).
+    /// With no Run store wired (inline dev runs), or no recorded trigger, it is
+    /// `false`, and the Step's stored `locked_out` flag decides alone. A failed
+    /// read fails the launch.
     async fn run_is_fork_code(&self, step: &StepRun) -> Result<bool, ExecError> {
         let Some((db, _)) = &self.governance else {
             return Ok(false);
@@ -664,7 +666,12 @@ impl ForgeCredentialExecutor {
         let trigger = crate::run_trigger(db.as_ref(), &step.run)
             .await
             .map_err(|e| ExecError::Other(format!("reading the Run's trigger: {e}")))?;
-        Ok(trigger.is_some_and(|(event, _)| event["fork"].as_bool() == Some(true)))
+        match trigger {
+            Some((event, _)) => crate::trigger_is_fork_code(db.as_ref(), &event)
+                .await
+                .map_err(|e| ExecError::Other(format!("reading the Run's trigger chain: {e}"))),
+            None => Ok(false),
+        }
     }
 
     /// A Run's registry credential (ADR-0018 amendments of 2026-07-17 and
