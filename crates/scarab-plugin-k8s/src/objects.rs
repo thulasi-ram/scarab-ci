@@ -397,6 +397,17 @@ pub fn serves_endpoint(installation: &PluginInstallation) -> bool {
     installation.manifest.trust_tier().is_some()
 }
 
+/// Was `service_account` applied for an installation that serves an
+/// endpoint: it carries [`LABEL_PLUGIN_ENDPOINT`]?
+pub fn service_account_serves_endpoint(service_account: &ServiceAccount) -> bool {
+    service_account
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|l| l.get(LABEL_PLUGIN_ENDPOINT))
+        .is_some_and(|v| v == "true")
+}
+
 /// Was `deployment` applied for an installation that serves an endpoint: its
 /// Pod template carries [`LABEL_PLUGIN_ENDPOINT`]?
 pub fn deployment_serves_endpoint(deployment: &Deployment) -> bool {
@@ -455,12 +466,14 @@ pub fn restricted_container_security_context() -> SecurityContext {
 /// `plugin-<id>`: no token automount and no RBAC (nothing binds it) — the
 /// only credential its Pod gets is the projected broker token.
 pub fn service_account(namespace: &str, installation: &PluginInstallation) -> ServiceAccount {
+    let mut labels = installation_labels(&installation.id);
+    // Read by uninstall when no Deployment is left to say whether an
+    // endpoint Service may exist (a rename deleted it first).
+    if serves_endpoint(installation) {
+        labels.insert(LABEL_PLUGIN_ENDPOINT.to_string(), "true".to_string());
+    }
     ServiceAccount {
-        metadata: meta(
-            &service_account_name(&installation.id),
-            namespace,
-            installation_labels(&installation.id),
-        ),
+        metadata: meta(&service_account_name(&installation.id), namespace, labels),
         automount_service_account_token: Some(false),
         ..Default::default()
     }
@@ -1415,5 +1428,13 @@ mod tests {
         let served = deployment("scarab-plugins", &inst, BROKER_URL, PROBE_IMAGE);
         assert!(deployment_serves_endpoint(&served));
         assert!(!deployment_serves_endpoint(&Deployment::default()));
+        assert!(service_account_serves_endpoint(&service_account(
+            "scarab-plugins",
+            &inst
+        )));
+        assert!(!service_account_serves_endpoint(&service_account(
+            "scarab-plugins",
+            &installation()
+        )));
     }
 }

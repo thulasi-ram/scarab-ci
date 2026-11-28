@@ -439,6 +439,20 @@ impl K8sPluginRuntime {
             .filter(|n| *n != name)
             .collect();
         if !stale.is_empty() {
+            // An installation that stopped serving an endpoint in the same
+            // upgrade as a rename: its Service goes now, while the stale
+            // Deployment's label still says it may exist; after this pass no
+            // Deployment would.
+            if served_endpoint && !objects::serves_endpoint(installation) {
+                gone_is_fine(
+                    self.namespaced::<Service>()
+                        .delete(
+                            &objects::endpoint_service_name(&installation.id),
+                            &DeleteParams::default(),
+                        )
+                        .await,
+                )?;
+            }
             for old in &stale {
                 gone_is_fine(
                     self.namespaced::<Deployment>()
@@ -615,7 +629,19 @@ impl K8sPluginRuntime {
     /// one that never did makes no Service call.
     pub async fn uninstall(&self, installation_id: &str) -> Result<(), RuntimeError> {
         let deployments = self.deployments_of(installation_id).await?;
-        if deployments.iter().any(objects::deployment_serves_endpoint) {
+        // The ServiceAccount's label covers an installation whose Deployment
+        // a rename deleted before it was uninstalled. Neither read is a
+        // Service call.
+        let service_account = self
+            .namespaced::<ServiceAccount>()
+            .get_opt(&objects::service_account_name(installation_id))
+            .await
+            .map_err(kube_err)?;
+        let served = deployments.iter().any(objects::deployment_serves_endpoint)
+            || service_account
+                .as_ref()
+                .is_some_and(objects::service_account_serves_endpoint);
+        if served {
             gone_is_fine(
                 self.namespaced::<Service>()
                     .delete(
